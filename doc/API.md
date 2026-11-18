@@ -36,6 +36,11 @@ surfaces built over the same core protocols.
 
 ## Provider selection surface
 
+The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
+launches Harbor trials. Its command, JSON output and HTTP launch contract are
+documented in [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
+AgentCore ABI and SDK layouts are unchanged.
+
 ### Metask device OAuth and gateway
 
 `metacodes login --provider metask` performs the Metask JSON device flow:

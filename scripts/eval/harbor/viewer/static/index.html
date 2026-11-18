@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MetaCodes · Bench 看板</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script src="/viewer.js" defer></script>
+</head>
+<body>
+  <aside class="rail" aria-label="主导航">
+    <a class="mark" href="#/" title="Bench 看板" aria-label="总览">MC</a>
+    <nav>
+      <a href="#/new" data-nav="new" title="新建评测" aria-label="新建评测"><svg viewBox="0 0 24 24"><path d="m8 4 12 8-12 8Z"/></svg><span>运行</span></a>
+      <a href="#/" data-nav="overview" title="总览" aria-label="总览"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg><span>总览</span></a>
+      <a href="#/compare" data-nav="compare" title="对比" aria-label="对比"><svg viewBox="0 0 24 24"><path d="M5 4v16M19 4v16M5 8h6M13 16h6M9 12h6"/></svg><span>对比</span></a>
+    </nav>
+  </aside>
+  <main class="canvas">
+    <header class="header">
+      <div>
+        <div class="brand">MetaCodes <span>/ Harbor 评测</span></div>
+        <h1 id="title">Bench 看板</h1>
+        <div id="crumbs" class="crumbs"></div>
+      </div>
+      <div class="header-actions">
+        <a class="button primary" href="#/new">新建评测</a>
+        <span id="connection" class="connection"><i></i><span>正在连接</span></span>
+        <button id="auto" class="button" type="button" aria-pressed="true">自动刷新 <span id="countdown" class="num"></span></button>
+        <button id="refresh" class="button" type="button">刷新</button>
+      </div>
+    </header>
+    <div id="error" class="error" role="alert" hidden></div>
+    <div id="app" aria-live="polite"><div class="empty">读取中…</div></div>
+    <footer>
+      <span>Harbor 评测工作台 · 无效结局（判分超时、provider/环境故障）不计入通过率</span>
+      <span id="updated" class="mono"></span>
+    </footer>
+  </main>
+</body>
+</html>

@@ -29,6 +29,7 @@ fn addHlWithProjectHarnessActuation(
         g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
     }
     mod.addImport("hl", g_hl_mod.?);
+    mod.addImport("bench_assets", b.createModule(.{ .root_source_file = b.path("scripts/bench_assets.zig") }));
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
     const project_harness_options = b.addOptions();
     project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
@@ -2813,6 +2814,10 @@ pub fn build(b: *std.Build) void {
         target.result.os.tag == @import("builtin").os.tag and
         target.result.cpu.arch == @import("builtin").cpu.arch;
     if (runtime_tests_can_execute_target) {
+        const bench_cli_smoke = b.addSystemCommand(&.{ eval_python_exe, "scripts/eval/bench_cli_smoke.py", "--binary" });
+        bench_cli_smoke.addArtifactArg(exe);
+        eval_test_step.dependOn(&bench_cli_smoke.step);
+        product_test_step.dependOn(&bench_cli_smoke.step);
         if (staged_tinykg) |tinykg| {
             // Native Python cases discover the installed TinyKG by path.  On
             // a clean checkout they must wait for installation; otherwise
