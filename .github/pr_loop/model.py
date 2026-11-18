@@ -30,6 +30,12 @@ class ReadUnavailable(LoopError):
     """A transient remote read failed without performing a remote mutation."""
 
 
+class Agent(str, Enum):
+    """Local agent CLIs the controller can drive as a worker or reviewer."""
+    CODEX = "codex"
+    CLAUDE = "claude"
+
+
 class Verdict(str, Enum):
     PASS = "pass"
     FIX = "fix_required"
@@ -50,6 +56,9 @@ class State(str, Enum):
     WAITING = "waiting"
     QUEUED = "queued"
     DECISION = "needs_decision"
+    # Every automatic gate passed; a high-risk head waits for a human approval
+    # bound to its exact SHA. Polling continues so approvals are observed.
+    HUMAN = "needs_human"
     MERGED = "merged"
     CLOSED = "closed"
 
@@ -68,6 +77,9 @@ class Binding:
     head_repo: str
     remote: str = "origin"
     timeout: int = 1800
+    # Registrations made before multi-agent support were Codex on both sides.
+    agent: str = Agent.CODEX.value
+    reviewer: str = Agent.CODEX.value
 
     def __post_init__(self):
         if not REPO.fullmatch(self.repo) or not REPO.fullmatch(self.head_repo):
@@ -75,7 +87,10 @@ class Binding:
         if self.number < 1 or self.timeout < 1:
             raise LoopError("PR number and timeout must be positive")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.thread):
-            raise LoopError("an explicit Codex thread ID is required")
+            raise LoopError("an explicit worker session or thread ID is required")
+        for value in (self.agent, self.reviewer):
+            if value not in {a.value for a in Agent}:
+                raise LoopError(f"unknown agent {value!r}; expected codex or claude")
         if not Path(self.worktree).is_absolute() or not self.branch or self.branch.startswith("-"):
             raise LoopError("an absolute worktree path and a branch are required")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.remote) or self.remote.startswith("-"):
@@ -132,12 +147,30 @@ REPORT_SCHEMA = {
             }, "required": ["path", "line", "reason", "acceptance"], "additionalProperties": False,
         }},
         "question": {"type": "string"},
-    }, "required": ["verdict", "summary", "findings", "question"], "additionalProperties": False,
+        "risk": {"type": "object", "properties": {
+            "level": {"type": "string", "enum": ["normal", "high"]},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["level", "reasons"], "additionalProperties": False},
+    }, "required": ["verdict", "summary", "findings", "question", "risk"], "additionalProperties": False,
+}
+
+REPORT_KEYS = frozenset(REPORT_SCHEMA["required"])
+
+WORKER_SCHEMA = {
+    "type": "object", "properties": {
+        "result": {"type": "string", "enum": ["updated", "disputed", "needs_decision"]},
+        "summary": {"type": "string"}, "question": {"type": "string"},
+        # A worker answers a finding it believes is wrong with an argument
+        # instead of a change; the next adversarial review must rule on it.
+        "rebuttals": {"type": "array", "items": {"type": "object", "properties": {
+            "finding": {"type": "integer"}, "argument": {"type": "string"},
+        }, "required": ["finding", "argument"], "additionalProperties": False}},
+    }, "required": ["result", "summary", "question", "rebuttals"], "additionalProperties": False,
 }
 
 
 def validate_report(value: dict) -> dict:
-    if not isinstance(value, dict) or set(value) != {"verdict", "summary", "findings", "question"}:
+    if not isinstance(value, dict) or set(value) != REPORT_KEYS:
         raise LoopError("reviewer returned an invalid report")
     try:
         verdict = Verdict(value["verdict"])
@@ -164,6 +197,40 @@ def validate_report(value: dict) -> dict:
         raise LoopError("a retry verdict needs no findings or decision question")
     if verdict == Verdict.DECISION and not value["question"].strip():
         raise LoopError("a decision verdict needs a question")
+    risk = value["risk"]
+    if (not isinstance(risk, dict) or set(risk) != {"level", "reasons"} or risk["level"] not in ("normal", "high")
+            or not isinstance(risk["reasons"], list)
+            or not all(isinstance(r, str) and r.strip() for r in risk["reasons"])):
+        raise LoopError("review report needs a risk level and string reasons")
+    if risk["level"] == "high" and not risk["reasons"]:
+        raise LoopError("a high-risk classification needs a reason")
+    return value
+
+
+def validate_worker(value: dict, findings: int) -> dict:
+    """Each result kind has exactly one legal shape; contradictions stop the loop."""
+    if (not isinstance(value, dict) or set(value) != set(WORKER_SCHEMA["required"])
+            or not all(isinstance(value[k], str) for k in ("result", "summary", "question"))
+            or not value["summary"].strip() or not isinstance(value["rebuttals"], list)):
+        raise LoopError("worker returned an invalid result")
+    seen = set()
+    for item in value["rebuttals"]:
+        if (not isinstance(item, dict) or set(item) != {"finding", "argument"}
+                or type(item["finding"]) is not int or not 0 <= item["finding"] < findings
+                or item["finding"] in seen or not isinstance(item["argument"], str) or not item["argument"].strip()):
+            raise LoopError("a rebuttal must name one existing finding index once and argue it")
+        seen.add(item["finding"])
+    kind = value["result"]
+    if kind == "needs_decision":
+        if not value["question"].strip():
+            raise LoopError("worker requested a decision without a question")
+    elif kind in ("updated", "disputed"):
+        if value["question"]:
+            raise LoopError(f"worker returned {kind} with an unresolved question")
+        if kind == "disputed" and not value["rebuttals"]:
+            raise LoopError("a disputed result needs at least one rebuttal")
+    else:
+        raise LoopError("worker returned an invalid result")
     return value
 
 

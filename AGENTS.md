@@ -74,19 +74,28 @@ devbox through `dx`. Closing its terminal or taking the Mac offline pauses
 local review and repair. Registration alone does not start the watcher.
 Before handing a PR over, confirm that the developer has the watcher running.
 
-- Submit PRs to **metask-ai/metacodes**, including when `origin` is a fork.
-  Use `python3 .github/pr-loop.py submit` to create and register a PR, or
-  `python3 .github/pr-loop.py bind` for an existing PR. Follow the command
-  examples in [CONTRIBUTING](CONTRIBUTING.md#initial-development-setup).
-- Register the original Codex chat ID and its dedicated worktree explicitly.
-  The branch must already be pushed, the checkout must be clean, and the
-  source chat must be accessible to the local App Server. Fork it once for a
-  dedicated repair worker and save that worker ID before starting its turn.
-  Keep the source chat available for discussion. Avoid concurrent edits to
-  the bound worktree. Do not invent a thread ID.
-- The controller reviews each head/base revision in an independent read-only
-  conversation. Blocking findings, failed CI and failed local validation go
-  back to the saved repair worker. During repair, the worker edits; the controller
+- Work on a task branch in a dedicated worktree. When the change is ready,
+  show the developer a summary of the diff and ask before shipping it. Only
+  after an explicit yes, commit and run `python3 .github/pr-loop.py ship
+  --title ... --body-file ...`: it pushes the branch with an ordinary push,
+  opens the PR against **metask-ai/metacodes** (also when `origin` is a fork)
+  and registers it. `submit` registers an already pushed branch and `bind` an
+  existing PR. Follow the examples in
+  [CONTRIBUTING](CONTRIBUTING.md#initial-development-setup).
+- Register the invoking session explicitly. Codex sessions and Claude Code
+  sessions are both supported (`--agent codex|claude`); run from inside the
+  session, `ship` detects it from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`.
+  The checkout must be clean. The watcher forks the source session once into
+  a dedicated repair worker and saves that worker ID before its first edit;
+  the source session stays free for discussion. Avoid concurrent edits to the
+  bound worktree. Do not invent a session ID.
+- The controller reviews each head/base revision in a fresh, read-only,
+  adversarial conversation, by default with the other agent than the worker
+  (`--reviewer`). Blocking findings, failed CI and failed local validation go
+  back to the saved repair worker. The worker may rebut a finding it believes
+  is wrong instead of changing code; the next fresh review must rule on the
+  rebuttal. A disagreement that survives two rebuttal rounds becomes a recorded
+  decision. During repair, the worker edits; the controller
   owns checkpoint commits, `dx zig build gate:pr`, and ordinary pushes. Failed
   checkpoints stay local. A pushed revision receives a fresh review.
   Record review findings, repair summaries, validation, CI, pushes and merge
@@ -102,6 +111,17 @@ Before handing a PR over, confirm that the developer has the watcher running.
   may be merged. Require strict up-to-date branch protection; no merge queue,
   deferred auto-merge or admin bypass. Preserve review-thread resolution and
   revision checks; a quiet reviewer is not an approval.
+- High-risk heads wait for a human. A head needs an approval bound to its exact
+  SHA when it touches a path in `.github/pr_loop/risk.py` (CODEOWNERS core
+  directories, the permission, sandbox, formal and plugin boundaries,
+  credentials, pinned binaries, build, release, CI, public API and agent
+  policy) or when the reviewer classifies it as high risk. The watcher notifies
+  the developer, comments on the PR once per head, and keeps repairing CI while
+  it waits. Approve with a GitHub review on that commit, a maintainer comment
+  `/approve <sha>`, or `python3 .github/pr-loop.py approve --pr N --sha <sha>`.
+  A later push requires a new approval. Never approve on the developer's behalf.
+  Stale branches, merge conflicts and failed checks are not human work: the
+  controller merges main and the worker resolves them.
 - Ambiguous requirements, additional permissions, policy changes and interrupted
   writes require a recorded decision. Check with
   `python3 .github/pr-loop.py status`; the developer responds with

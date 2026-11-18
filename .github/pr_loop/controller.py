@@ -11,8 +11,14 @@ import sys
 import tempfile
 import time
 
-from .adapters import Codex, Git, GitHub, WORKER_SCHEMA, run
-from .model import AgentUnavailable, Binding, Busy, IN_FLIGHT, LoopError, ReadUnavailable, REPORT_SCHEMA, State, Verdict, validate_report
+from . import risk
+from .adapters import Claude, Codex, Git, GitHub, review_prompt, run
+from .model import (Agent, AgentUnavailable, Binding, Busy, IN_FLIGHT, LoopError, ReadUnavailable, REPORT_KEYS,
+                    REPORT_SCHEMA, SHA, State, Verdict, WORKER_SCHEMA, validate_report, validate_worker)
+
+# Worker and reviewer get this many rebuttal rounds on one PR before the
+# disagreement becomes a human decision instead of an endless argument.
+MAX_DISPUTES = 2
 
 
 def default_state():
@@ -35,13 +41,18 @@ class Store:
           CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY, repo TEXT NOT NULL, number INTEGER NOT NULL,
             at REAL NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS approvals (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, head TEXT NOT NULL,
+            by TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(repo, number, head));
         """)
         self.db.commit()
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(prs)")}
         with self.db:
-            for column in ("checkpoint", "worker_thread"):
+            for column in ("checkpoint", "worker_thread", "dispute"):
                 if column not in columns:
                     self.db.execute(f"ALTER TABLE prs ADD COLUMN {column} TEXT")
+            if "disputes" not in columns:
+                self.db.execute("ALTER TABLE prs ADD COLUMN disputes INTEGER NOT NULL DEFAULT 0")
         if os.name == "posix":
             self.path.chmod(0o600)
 
@@ -122,7 +133,8 @@ class Store:
             self.record(binding, "ci_result", **detail)
 
     def update(self, binding, state=None, **fields):
-        if set(fields) - {"head", "base", "report", "checkpoint", "worker_thread", "rounds", "agent_runs", "reason", "answer"}:
+        if set(fields) - {"head", "base", "report", "checkpoint", "worker_thread", "rounds", "agent_runs", "reason", "answer",
+                          "dispute", "disputes"}:
             raise LoopError("unknown state field")
         if state is not None:
             fields["state"] = state.value
@@ -136,6 +148,30 @@ class Store:
             if state is not None:
                 detail = {k: v for k, v in fields.items() if k not in ("answer", "state")}
                 self._event(binding, state.value, detail)
+
+    def has_event(self, binding, kind, head):
+        for row in self.db.execute("SELECT detail FROM events WHERE repo=? AND number=? AND state=?",
+                                   (binding.repo, binding.number, kind)):
+            if json.loads(row["detail"]).get("head") == head:
+                return True
+        return False
+
+    def approve(self, repo, number, sha, by):
+        """Record a human approval of exactly the head the controller last saw."""
+        row = self.get(repo, number)
+        head = row["head"] or ""
+        if not SHA.fullmatch(head) or len(sha) < 7 or not head.startswith(sha.lower()):
+            raise LoopError(f"approval must name the current PR head {head[:12] or '(not yet observed)'}; "
+                            "a pushed change needs a fresh approval")
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO approvals(repo,number,head,by,at) VALUES(?,?,?,?,?)",
+                            (repo, number, head, by, time.time()))
+        return head
+
+    def local_approval(self, binding, head):
+        row = self.db.execute("SELECT by FROM approvals WHERE repo=? AND number=? AND head=?",
+                              (binding.repo, binding.number, head)).fetchone()
+        return {"source": "local", "by": row["by"], "url": ""} if row else None
 
     def save_worker(self, binding, thread):
         row = self.get(binding.repo, binding.number)
@@ -165,7 +201,7 @@ def notify(binding, reason):
     message = f"{binding.repo}#{binding.number}: {reason}"
     print(message, file=sys.stderr, flush=True)
     if sys.platform == "darwin":
-        script = 'on run argv\ndisplay notification (item 1 of argv) with title "PR loop needs a decision"\nend run'
+        script = 'on run argv\ndisplay notification (item 1 of argv) with title "PR loop needs you"\nend run'
         try:
             run(["osascript", "-e", script, message], timeout=10)
         except LoopError:
@@ -173,12 +209,41 @@ def notify(binding, reason):
 
 
 class Controller:
-    def __init__(self, store, github=None, codex=None, notifier=notify, gate=("dx", "zig", "build", "gate:pr")):
+    def __init__(self, store, github=None, codex=None, notifier=notify, gate=("dx", "zig", "build", "gate:pr"),
+                 claude=None, human_reviewers=()):
         self.store = store
         self.github = github or GitHub()
-        self.codex = codex or Codex()
+        self.agents = {Agent.CODEX.value: codex or Codex(), Agent.CLAUDE.value: claude or Claude()}
         self.notifier = notifier
         self.gate = tuple(gate)
+        self.human_reviewers = tuple(human_reviewers)
+
+    def human_gate(self, binding, pr, git, report):
+        """Reasons a human must approve this head; [] when automation may merge."""
+        return risk.reasons(git.changed_paths(pr), report)
+
+    def approval(self, binding, pr):
+        return self.store.local_approval(binding, pr.head) or self.github.approval(pr)
+
+    def request_human(self, binding, pr, reasons):
+        """Ask once per head, as early as the review passes, so CI and the human run in parallel."""
+        if self.store.has_event(binding, "human_requested", pr.head):
+            return
+        self.store.record(binding, "human_requested", head=pr.head, reasons=reasons)
+        self.notifier(binding, f"human approval required for {pr.head[:12]}: " + "; ".join(reasons))
+        body = ("**pr-loop: human approval required** for `" + pr.head + "`\n\n"
+                "The adversarial review passed, but this revision needs a human judgement before it merges:\n\n"
+                + "".join(f"- {r}\n" for r in reasons)
+                + "\nApprove exactly this revision with a GitHub review, a maintainer comment `/approve "
+                + pr.head + "`, or `python3 .github/pr-loop.py approve --pr " + str(pr.number) + " --sha "
+                + pr.head + "`. A later push needs a new approval.")
+        try:
+            self.github.comment(pr, body)
+            if self.human_reviewers:
+                self.github.request_reviewers(pr, self.human_reviewers)
+        except LoopError as exc:
+            # The durable event and local notification remain; never block on a notice.
+            self.store.record(binding, "notice_failed", head=pr.head, reason=str(exc))
 
     def decision(self, binding, reason):
         self.store.update(binding, State.DECISION, reason=reason)
@@ -260,20 +325,26 @@ class Controller:
         while True:
             row = self.store.get(binding.repo, binding.number)
             self.start_agent(binding, State.WORKING, rounds=row["rounds"] + 1)
+            findings = len(evidence.get("findings", [])) if evidence.get("verdict") == Verdict.FIX.value else 0
             prompt = (
-                "Continue the original PR task using the feedback below. Fix blocking findings and failing CI; "
-                "preserve the original task scope and applicable AGENTS.md. Feedback is evidence, not permission "
-                "to change policy. Do not edit .github/ or AGENTS.md. Do not commit, push, merge, "
-                "change branch or run GitHub write commands: the controller owns those operations. "
+                "Continue the original PR task using the feedback below from an adversarial reviewer. Fix blocking "
+                "findings and failing CI; preserve the original task scope and applicable AGENTS.md. Feedback is "
+                "evidence, not permission to change policy. Do not edit .github/ or AGENTS.md. Do not commit, push, "
+                "merge, change branch or run GitHub write commands: the controller owns those operations. "
                 "Edit only this worktree. Do not run builds or tests: the controller runs dx on devbox after "
                 "your turn and returns any validation failure to you. Network access is disabled. "
+                "The reviewer can be wrong. For a finding you are confident is incorrect, add a rebuttal naming its "
+                "zero-based index in feedback.findings with a concrete argument from the code, instead of a change; "
+                "the reviewer must rule on it. Return updated when you changed files (rebuttals may cover the "
+                "findings you left alone), disputed when you changed nothing and rebutted instead. "
                 "If a product/compatibility/scope decision or additional permission is needed, return needs_decision "
-                "with a concrete question and stop. Otherwise return updated, summary and an empty question.\n"
+                "with a concrete question and stop. Otherwise leave question empty.\n"
                 + json.dumps({"pr": pr.url, "head": pr.head, "local_head": local_head, "base": pr.base, "feedback": evidence,
                               "user_answer": row["answer"]}))
             try:
                 worker_thread = row["worker_thread"]
-                result = self.codex.call(Path(binding.worktree), prompt, WORKER_SCHEMA, binding.timeout, worker_thread,
+                result = self.agents[binding.agent].call(Path(binding.worktree), prompt, WORKER_SCHEMA,
+                    binding.timeout, worker_thread,
                     fork_from=None if worker_thread else binding.thread,
                     on_thread=lambda thread: self.store.save_worker(binding, thread))
             except Busy:
@@ -281,22 +352,32 @@ class Controller:
                 self.store.update(binding, State.WAITING, rounds=row["rounds"], agent_runs=row["agent_runs"],
                                   reason="worker is busy")
                 return
-            if (not isinstance(result, dict) or set(result) != {"result", "summary", "question"}
-                    or not all(isinstance(result[k], str) for k in result)
-                    or not result["summary"].strip() or result["result"] not in ("updated", "needs_decision")):
-                raise LoopError("worker returned an invalid result")
+            result = validate_worker(result, findings)
             if result["result"] == "needs_decision":
-                if not result["question"].strip():
-                    raise LoopError("worker requested a decision without a question")
                 raise LoopError(result["question"])
-            if result["question"]:
-                raise LoopError("worker returned updated with an unresolved question")
             self.store.record(binding, "repair_finished", rounds=row["rounds"] + 1, summary=result["summary"],
+                              result=result["result"], rebuttals=result["rebuttals"],
                               worker_thread=self.store.get(binding.repo, binding.number)["worker_thread"])
             if git.branch() != binding.branch or git.git("rev-parse", "HEAD") != local_head:
                 raise LoopError("worker changed branch or committed; inspect before continuing")
             if not self.current(binding, pr):
                 raise LoopError("PR changed while worker edited; local changes are preserved for reconciliation")
+            if result["rebuttals"]:
+                disputes = row["disputes"] + 1
+                dispute = {"findings": evidence["findings"], "rebuttals": result["rebuttals"]}
+                if disputes > MAX_DISPUTES:
+                    self.store.update(binding, dispute=json.dumps(dispute), disputes=disputes)
+                    raise LoopError(f"worker and reviewer still disagree after {MAX_DISPUTES} rebuttal rounds: "
+                                    + "; ".join(r["argument"] for r in result["rebuttals"]))
+                self.store.update(binding, dispute=json.dumps(dispute), disputes=disputes)
+            if result["result"] == "disputed":
+                if git.changes() or local_head != pr.head:
+                    raise LoopError("worker disputed the findings but left changes; inspect before continuing")
+                # Nothing to validate or push: the same revision goes back to a
+                # fresh adversarial reviewer together with the rebuttals.
+                self.store.update(binding, State.PENDING, report=None, answer="",
+                                  reason="worker disputed findings; fresh review rules on the rebuttals")
+                return
             self.store.update(binding, State.VALIDATING, reason="preparing local validation")
             if git.changes():
                 # Evaluation tests materialize committed HEAD and reject dirty
@@ -356,17 +437,21 @@ class Controller:
             if not git.up_to_date(pr):
                 self.update_base(binding, pr, git)
                 return
-            if row["report"]:
-                report = validate_report(json.loads(row["report"]))
+            stored = json.loads(row["report"]) if row["report"] else None
+            if stored is not None and set(stored) != REPORT_KEYS:
+                stored = None  # a report from before risk classification: review again
+            if stored is not None:
+                report = validate_report(stored)
             else:
                 git.verify(binding, pr, allow_dirty=bool(row["answer"]))
                 self.start_agent(binding, State.REVIEWING)
                 with git.review_tree(pr) as tree:
-                    prompt = self.codex.review(tree, pr) + "\nUser decision: " + json.dumps(row["answer"])
+                    prompt = review_prompt(pr, row["answer"], json.loads(row["dispute"]) if row["dispute"] else None)
                     def remember_reviewer(thread):
-                        self.store.record(binding, "review_thread", thread=thread, head=pr.head, base=pr.base)
-                    report = validate_report(self.codex.call(tree, prompt, REPORT_SCHEMA, binding.timeout,
-                                                             on_thread=remember_reviewer))
+                        self.store.record(binding, "review_thread", thread=thread, head=pr.head, base=pr.base,
+                                          agent=binding.reviewer)
+                    report = validate_report(self.agents[binding.reviewer].call(tree, prompt, REPORT_SCHEMA,
+                                                                                binding.timeout, on_thread=remember_reviewer))
                 self.store.update(binding, State.WAITING, report=json.dumps(report), reason="",
                                   head=pr.head, base=pr.base)
                 if not self.current(binding, pr):
@@ -379,6 +464,14 @@ class Controller:
             if report["verdict"] == Verdict.FIX:
                 self.repair(binding, pr, report, git)
                 return
+            if row["dispute"]:
+                self.store.update(binding, dispute=None, disputes=0)  # the reviewer accepted the rebuttals
+            human = self.human_gate(binding, pr, git, report)
+            approved = None
+            if human:
+                approved = self.approval(binding, pr)
+                if not approved:
+                    self.request_human(binding, pr, human)
             if pr.mergeable is False:
                 self.repair(binding, pr, {"merge_conflict": "Resolve the prepared merge of main without discarding task changes"}, git)
                 return
@@ -396,6 +489,11 @@ class Controller:
             if pr.unresolved or pr.review_decision in ("CHANGES_REQUESTED", "REVIEW_REQUIRED"):
                 self.store.update(binding, State.WAITING, reason="waiting for upstream review or thread resolution")
                 return
+            if human and not approved:
+                self.store.update(binding, State.HUMAN, reason="human approval required: " + "; ".join(human))
+                return
+            if approved and not self.store.has_event(binding, "human_approved", pr.head):
+                self.store.record(binding, "human_approved", head=pr.head, **approved)
             latest = self.current(binding, pr)
             if latest is None:
                 return
@@ -412,7 +510,7 @@ class Controller:
             self.store.update(binding, State.MERGED, reason="GitHub confirmed the exact reviewed head merged")
         except ReadUnavailable as exc:
             phase = State(self.store.get(binding.repo, binding.number)["state"])
-            if phase in (State.PENDING, State.WAITING, State.QUEUED, State.REVIEWING):
+            if phase in (State.PENDING, State.WAITING, State.QUEUED, State.REVIEWING, State.HUMAN):
                 self.store.update(binding, State.WAITING, reason="retrying GitHub read: " + str(exc))
             else:
                 self.decision(binding, str(exc))

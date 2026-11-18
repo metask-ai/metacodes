@@ -37,10 +37,11 @@ first so we can agree on the boundary before you write code.
 
 Start the [PR watcher](.github/pr-loop.py) as part of setting up your
 development environment, before submitting your first PR. You need Python
-3.9+, Git, authenticated GitHub CLI (`gh`) and Codex CLI, and `dx` configured
-for the worker checkout. The original Codex chat must be accessible to the
-local App Server. The watcher forks it before the first repair so you can keep
-using the original chat. See the [PR workflow guide](doc/PR_AGENT_LOOP.md).
+3.9+, Git, authenticated GitHub CLI (`gh`), Codex CLI and Claude Code CLI
+(`claude`), and `dx` configured for the worker checkout. Either agent can be
+the session you work in; by default the other one reviews. The watcher forks
+your session before the first repair so you can keep using it. See the
+[PR workflow guide](doc/PR_AGENT_LOOP.md).
 
 From the repository root, start one watcher in a dedicated terminal:
 
@@ -56,9 +57,18 @@ on your Mac. The loop polls registered PRs every sixty seconds; GitHub CI
 runs on GitHub independently. Local review and repair
 pause while the watcher is stopped or your Mac is asleep or offline.
 
-For each task, push its branch and register the PR with its original chat
-and worktree. Use `submit` to create the PR in the mother repository
-and register it together:
+For each task, work on a branch in its own worktree. When you have confirmed
+the change, the agent commits it and runs `ship` from inside its session: it
+pushes the branch, creates the PR in the mother repository and registers the
+session and worktree (detected from `CODEX_THREAD_ID` or
+`CLAUDE_CODE_SESSION_ID`; pass `--agent` and `--thread` otherwise):
+
+```sh
+python3 .github/pr-loop.py ship \
+  --title "fix: describe the change" --body-file "$PR_BODY_FILE"
+```
+
+`submit` does the same for a branch you already pushed:
 
 ```sh
 python3 .github/pr-loop.py submit \
@@ -75,10 +85,10 @@ python3 .github/pr-loop.py bind --pr "$PR_NUMBER" \
   --worktree "$TASK_WORKTREE" --thread "$TASK_THREAD_ID"
 ```
 
-`submit` and `bind` register work for the running watcher; they do not start
-it. The watcher reviews each revision in an independent read-only Codex
+`ship`, `submit` and `bind` register work for the running watcher; they do not
+start it. The watcher reviews each revision in a fresh read-only adversarial
 conversation, sends blocking findings or CI failures to the dedicated repair
-worker, checkpoints repairs and validates them through `dx zig build gate:pr`
+worker (which may rebut a finding instead of changing code), checkpoints repairs and validates them through `dx zig build gate:pr`
 on devbox before pushing. It merges current main into a stale branch, validates
 and pushes that revision, and repeats review and PR CI. When both pass, it
 requests an exact-head merge under strict up-to-date branch protection.
@@ -104,9 +114,20 @@ python3 .github/pr-loop.py status
 python3 .github/pr-loop.py answer --pr "$PR_NUMBER" --text "Your decision"
 ```
 
+A revision that touches core or boundary code, or that the reviewer calls high
+risk, waits in `needs_human` after review and CI pass. The watcher notifies you
+and comments on the PR. Approve that exact head with a GitHub review, a
+maintainer comment `/approve <sha>`, or locally:
+
+```sh
+python3 .github/pr-loop.py approve --pr "$PR_NUMBER" --sha "$HEAD_SHA"
+```
+
+Add `--human-reviewer LOGIN` to `run` to also request a reviewer on GitHub.
+
 The [PR workflow guide](doc/PR_AGENT_LOOP.md) covers invocation tracking,
-recovery and state storage. Model calls use your existing Codex account and
-incur its normal usage; the controller does not upload credentials to CI.
+recovery and state storage. Model calls use your existing Codex and Claude
+accounts and incur their normal usage; the controller does not upload credentials to CI.
 
 ## Your first build
 

@@ -14,6 +14,8 @@ LABELS = {
     "ci_result": "GitHub CI", "pushing": "开始推送", "pushed": "已推送",
     "updating_base": "同步 main", "merging": "提交合并", "merged": "已合并",
     "closed": "已关闭", "needs_decision": "等待处理决定",
+    "needs_human": "等待人工批准", "human_requested": "请求人工批准",
+    "human_approved": "人工已批准", "notice_failed": "通知失败",
 }
 
 

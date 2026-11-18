@@ -1,9 +1,10 @@
 # PR review and repair loop
 
 `python3 .github/pr-loop.py` is an opt-in delivery controller for PRs submitted
-to **metask-ai/metacodes**. It registers a PR with its original Codex thread
-and worktree, independently reviews each revision, returns actionable feedback
-to that thread, validates and pushes repairs, and requests an exact-head
+to **metask-ai/metacodes**. It registers a PR with the Codex or Claude Code
+session that wrote it and its worktree, reviews each revision adversarially,
+returns actionable feedback to a fork of that session, validates and pushes
+repairs, holds high-risk revisions for a human, and requests an exact-head
 upstream merge after validation against current main. Decisions and interrupted writes stop in a durable
 `needs_decision` state. Ordinary review findings, failing CI and failed local
 validation return to the worker automatically, with no fixed call or repair-round cap.
@@ -25,17 +26,39 @@ and per-PR registration checklist. Run it on your computer throughout the PR
 lifecycle and restart it after closing its terminal or restarting the computer.
 Placing the script in `.github/` does not make it a hosted Actions workflow.
 
+## Delivery flow
+
+1. The developer states a requirement in a local Codex or Claude Code session.
+2. That session makes the change on a task branch in a dedicated worktree.
+3. It shows the developer the change and asks. After an explicit yes it
+   commits and runs `ship`, which pushes the branch, opens the PR and
+   registers the session, the worktree and both agents.
+4. The watcher starts a fresh, read-only, adversarial review of the exact
+   head/base revision, by default with the agent that did not write the code.
+5. Findings go to a dedicated fork of the source session. It repairs them or
+   rebuts a finding with an argument; the next fresh review rules on each
+   rebuttal. The controller validates, commits and pushes repairs, merges a
+   moved main itself, and returns conflicts and CI failures to the worker.
+6. The loop repeats until a review passes and the four required checks
+   succeed on the same head.
+7. A normal-risk head is merged. A high-risk head, or a disagreement that
+   survives two rebuttal rounds, waits for a human (see
+   [Human approval](#human-approval)).
+
 ## Prerequisites
 
-- Python 3.9+, Git, authenticated GitHub CLI (`gh`) and Codex CLI with the
-  stdio App Server protocol. No additional Python packages are required.
+- Python 3.9+, Git, authenticated GitHub CLI (`gh`), Codex CLI with the
+  stdio App Server protocol, and Claude Code CLI (`claude`) with print mode
+  and structured output. Only the agents a binding names are invoked.
+  No additional Python packages are required.
 - An already pushed PR branch in a clean, dedicated worktree. Its configured
   push remote must point to the PR's head repository. The target is upstream
   `metask-ai/metacodes`, even when that remote is a contributor's fork.
-- A persisted source chat accessible to the local App Server, whose `cwd`
-  is that worktree. The watcher derives a separate repair worker from that chat.
-  A desktop or remote chat is usable only if that host exposes its history
-  to this App Server. Continue discussion in the source chat and keep edits
+- A persisted source session. For Codex, a chat accessible to the local App
+  Server whose `cwd` is that worktree; a desktop or remote chat is usable only
+  if that host exposes its history to this App Server. For Claude Code, a
+  session ID `claude --resume` can open. The watcher derives a separate repair
+  worker from that session. Continue discussion in the source chat and keep edits
   in the bound worktree exclusive to the active worker.
 - `dx` configured for the worker checkout. The controller always executes
   `dx zig build gate:pr` before pushing an automatic repair. It saves local
@@ -45,7 +68,7 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
 - GitHub permission to push the head branch and merge the PR upstream.
   No admin bypass is used or requested.
 
-Codex uses its existing local authentication. The controller does not copy
+Codex and Claude Code use their existing local authentication. The controller does not copy
 credentials to GitHub Actions, read auth tokens or write secrets to PR bodies.
 Agent calls incur the signed-in account's normal usage. The watcher has no fixed
 cap on agent calls or repair rounds. It retains both counters for audit and keeps
@@ -54,8 +77,24 @@ invocation still has a configurable timeout, thirty minutes by default.
 
 ## New PR entry point
 
-From the checkout containing this tooling, create a PR **in the mother
-repository** and bind it in one command. Supply your own branch and thread ID:
+After the developer confirms the change, the session that wrote it commits
+and ships it from its worktree. `ship` pushes the current branch to `--remote`
+(default `origin`) with an ordinary push, creates the PR **in the mother
+repository** and binds it:
+
+```sh
+python3 .github/pr-loop.py ship \
+  --title "fix: describe the change" \
+  --body-file "$PR_BODY_FILE"
+```
+
+Run inside Claude Code, `ship` binds `CLAUDE_CODE_SESSION_ID` as a `claude`
+worker; inside Codex, `CODEX_THREAD_ID` as a `codex` worker. Pass `--agent`
+and `--thread` to register another session. `--reviewer` defaults to the
+other agent. `ship` refuses `main`.
+
+For a branch that is already pushed, `submit` creates and binds the PR.
+Supply your own branch and thread ID:
 
 ```sh
 python3 .github/pr-loop.py submit \
@@ -69,7 +108,7 @@ python3 .github/pr-loop.py submit \
 
 The branch must already be pushed. `--repo` defaults to
 `metask-ai/metacodes`; the command never infers the target from `origin`.
-`--thread` can be omitted when the invoking agent supplies `CODEX_THREAD_ID`.
+`--thread` can be omitted when the invoking agent supplies its session ID.
 Thread IDs and local paths are stored locally, not in the public PR.
 
 For a PR created with another tool, register it explicitly:
@@ -121,6 +160,51 @@ repair. The upgrade preserves review history, checkpoints, decisions, and
 counters. Older records contain only the events the previous watcher saved.
 Validation logs live in the private directory alongside the SQLite database.
 
+## Adversarial review and rebuttals
+
+The reviewer is told to find reasons the PR must not merge: error and cleanup
+paths, allocation ownership, concurrency, platform differences, the provider
+cache contract, kernel boundaries and tests that declare without proving.
+It reports only blocking defects, each with a failure scenario and an
+acceptance condition, and it classifies the revision's risk.
+
+A worker that believes a finding is wrong returns a rebuttal naming the
+finding's index and arguing from the code. `disputed` means it changed
+nothing: the same revision goes to a fresh reviewer with the rebuttals and is
+neither validated nor pushed. `updated` may carry rebuttals for the findings it
+left alone. A passing review clears the dispute. A third rebuttal round on one
+PR becomes a `needs_decision` for the developer.
+
+## Human approval
+
+A revision needs a human approval bound to its exact head SHA when either:
+
+- a changed path matches a rule in
+  [`.github/pr_loop/risk.py`](../.github/pr_loop/risk.py): the CODEOWNERS core
+  directories, the permission, sandbox, formal and plugin boundaries,
+  credentials and authentication, pinned binaries, the build graph and
+  toolchain pins, release and CI scripts, the public API contract, `.github/`
+  and `AGENTS.md`; or
+- the adversarial reviewer sets `risk.level` to `high`, for example for data
+  deletion or migration, authentication, release or branch policy, a public API
+  or wire-format break, or a change too broad to verify.
+
+The rules run from the watcher's checkout, never from the candidate, so a PR
+cannot weaken its own gate. As soon as the review passes, the watcher records
+the request, notifies the developer and comments on the PR, once per head. With
+`run --human-reviewer LOGIN` it also requests that reviewer. CI repairs
+continue meanwhile. After review and checks pass, the PR stays in
+`needs_human` until one of these names the current head:
+
+- an `APPROVED` GitHub review on that commit by a collaborator with write,
+  maintain or admin access (GitHub does not let authors approve their own PR);
+- a PR comment `/approve <sha>` (at least seven hex digits) by a maintainer or
+  admin;
+- `python3 .github/pr-loop.py approve --pr "$PR_NUMBER" --sha "$HEAD_SHA"`.
+
+Any push changes the head and needs a new approval. Stale branches, conflicts
+and failing checks never wait for a human; they go to the worker.
+
 ## Decisions and recovery
 
 ```sh
@@ -155,10 +239,12 @@ answering; an answer does not automatically reconcile a divergent checkout.
 
 ## Admission contract
 
-1. A review is a fresh, persisted, read-only Codex conversation in a detached snapshot.
+1. A review is a fresh, persisted, read-only Codex or Claude Code conversation in a detached snapshot.
    Persisting the reviewer retains its identity and audit history; it never
    reuses the original worker's context.
-   It returns schema-validated `pass`, `fix_required`, `retry` or `needs_decision`.
+   It returns schema-validated `pass`, `fix_required`, `retry` or `needs_decision`,
+   and a `risk` level with a reason for each high-risk concern. Reports stored
+   before risk classification are discarded and reviewed again.
    A passing report cannot contain unresolved findings or a question.
    A tool or repository-access failure returns `retry` with no findings or
    decision question. The next poll starts a complete review of the current
@@ -174,8 +260,9 @@ answering; an answer does not automatically reconcile a divergent checkout.
    and exact-head merging. Policy, workflow and controller edits require
    a decision. The worker's network is disabled; the controller executes the
    devbox gate and returns failures as feedback. Writable tool access is
-   limited by Codex's workspace sandbox; approval and user-input requests
-   are escalated rather than fabricated.
+   limited by Codex's workspace sandbox, or for Claude Code by file tools plus
+   read-only git with `--permission-prompts none`; approval and user-input
+   requests are escalated or denied rather than fabricated.
 4. The four existing gate result checks must report **success** for the current
    PR head, from the GitHub Actions app (PR workflows execute the test merge,
    but their check runs are attached to the head SHA). Missing, pending,
@@ -187,6 +274,8 @@ answering; an answer does not automatically reconcile a divergent checkout.
    branch rules must require all four checks from GitHub Actions and an
    up-to-date branch, with no merge queue. GitHub must confirm the merge;
    no deferred auto-merge request or admin bypass is used.
+6. A high-risk revision merges only with a human approval of its exact head
+   (see [Human approval](#human-approval)).
 
 The controller stores its review evidence and progress locally. It does not
 publish an `agent/review` commit status or add a required review check to the
@@ -210,7 +299,11 @@ provider calls. It also exercises stale review rejection, CI failures, busy
 workers, decision recovery, the replayable timeline, durable counters, legacy
 registrations, policy edits and interrupted
 operations. It also proves unavailable tools → full review retry → repair →
-validation → fresh review → merge without publishing a review status gate.
+validation → fresh review → merge without publishing a review status gate;
+a Claude Code worker forked once and then resumed, reviewed by Codex; a
+read-only Claude Code reviewer; rebuttal → fresh review → merge and the
+dispute limit; core paths and reviewer risk → one notice → exact-head local,
+review or comment approval → merge; and `ship` pushing, opening and binding.
 No live PR is opened or merged by the tests.
 
 Protocol references: [Codex App Server](https://learn.chatgpt.com/docs/app-server),

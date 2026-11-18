@@ -13,16 +13,45 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / ".github"))
 
-from pr_loop.adapters import Codex, Git, GitHub, run
+from pr_loop.adapters import Claude, Codex, Git, GitHub, run
 from pr_loop.controller import Controller, Store
-from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, ReadUnavailable, REQUIRED_CHECKS, State, validate_report
+from pr_loop.model import (Binding, Busy, DEFAULT_REPO, LoopError, ReadUnavailable, REQUIRED_CHECKS, State,
+                           validate_report, validate_worker)
+from pr_loop import risk
 from pr_loop.timeline import snapshot
 
 
-PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": ""}
-RETRY = {"verdict": "retry", "summary": "Repository tools timed out", "findings": [], "question": ""}
+NORMAL = {"level": "normal", "reasons": []}
+PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": "", "risk": NORMAL}
+RETRY = {"verdict": "retry", "summary": "Repository tools timed out", "findings": [], "question": "", "risk": NORMAL}
 FIX = {"verdict": "fix_required", "summary": "Incorrect result", "findings": [
-    {"path": "app.txt", "line": 1, "reason": "The result is incorrect", "acceptance": "The file says fixed"}], "question": ""}
+    {"path": "app.txt", "line": 1, "reason": "The result is incorrect", "acceptance": "The file says fixed"}], "question": "", "risk": NORMAL}
+
+HIGH = {"level": "high", "reasons": ["Deletes persisted sessions without a migration"]}
+DISPUTED = {"result": "disputed", "summary": "The finding misreads app.txt", "question": "",
+            "rebuttals": [{"finding": 0, "argument": "bug is the specified output for this task"}]}
+
+# A stand-in for `claude -p`: records argv/stdin, answers with the schema the
+# controller asked for, and edits the checkout only on a worker turn.
+CLAUDE = r'''
+import json, pathlib, sys
+config, trace = map(pathlib.Path, sys.argv[1:3])
+argv = sys.argv[3:]
+prompt = sys.stdin.read()
+cfg = json.loads(config.read_text())
+with trace.open("a") as f:
+    f.write(json.dumps({"argv": argv, "stdin": prompt, "cwd": str(pathlib.Path.cwd().resolve())}) + "\n")
+schema = json.loads(argv[argv.index("--json-schema") + 1])
+if "verdict" in schema["properties"]:
+    output = cfg["claude_reports"].pop(0)
+else:
+    output = {"result": "updated", "summary": "Claude fixed it", "question": "", "rebuttals": []}
+    pathlib.Path("app.txt").write_text(cfg["worker_texts"].pop(0))
+config.write_text(json.dumps(cfg))
+session = argv[argv.index("--session-id") + 1] if "--session-id" in argv else argv[argv.index("--resume") + 1]
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": session,
+                  "structured_output": output}))
+'''
 
 SERVER = r'''
 import json, pathlib, sys, time
@@ -59,7 +88,7 @@ for line in sys.stdin:
         if "verdict" in params["outputSchema"]["properties"]:
             output = cfg["reports"].pop(0)
         else:
-            output = cfg.get("worker_result", {"result": "updated", "summary": "Fixed the result", "question": ""})
+            output = cfg.get("worker_result", {"result": "updated", "summary": "Fixed the result", "question": "", "rebuttals": []})
             if output["result"] == "updated":
                 text = cfg["worker_texts"].pop(0)
                 path = pathlib.Path(params["cwd"]) / cfg.get("worker_path", "app.txt")
@@ -96,6 +125,8 @@ class FixtureGitHub(GitHub):
         self.base_branch = "main"
         self.snapshots = 0
         self.read_unavailable = False
+        self.reviews, self.comments, self.posted, self.requested = [], [], [], []
+        self.roles = {}
 
     def api(self, path, method="GET", payload=None):
         self.calls.append((path, method, payload))
@@ -135,6 +166,21 @@ class FixtureGitHub(GitHub):
                 "status": "in_progress" if self.check_state == "pending" else "completed",
                 "conclusion": self.check_state, "html_url": "https://github.com/check/1"}
                 for i, name in enumerate(REQUIRED_CHECKS)]}
+        if "/pulls/7/reviews?" in path:
+            return self.reviews
+        if "/issues/7/comments" in path:
+            if method == "POST":
+                self.posted.append(payload["body"])
+                return {}
+            return self.comments
+        if "/collaborators/" in path:
+            login = path.split("/collaborators/")[1].split("/")[0]
+            if login not in self.roles:
+                raise LoopError("gh exited 1: HTTP 404 Not Found")
+            return {"role_name": self.roles[login]}
+        if path.endswith("/pulls/7/requested_reviewers"):
+            self.requested.append(payload)
+            return {}
         raise AssertionError((path, method, payload))
 
 
@@ -557,8 +603,212 @@ class LoopIntegrationTest(unittest.TestCase):
         finally:
             submitted.close()
 
+    def commit_feature(self, path, text):
+        target = self.work / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        git(self.work, "add", path)
+        git(self.work, "commit", "-qm", "touch " + path)
+        git(self.work, "push", "-q", "origin", "feature")
+        return git(self.work, "rev-parse", "HEAD")
+
+    def test_core_path_waits_for_exact_head_human_approval_then_merges(self):
+        head = self.commit_feature("src/core/agent_loop.zig", "// changed\n")
+        self.configure(reports=[PASS])
+        self.controller.human_reviewers = ("wayfind",)
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_human")
+        self.assertIn("core runtime", self.row()["reason"])
+        self.assertFalse(self.github.merged)
+        self.assertEqual(len(self.notifications), 1)
+        self.assertIn(head[:12], self.notifications[0])
+        self.assertEqual(len(self.github.posted), 1)
+        self.assertIn(f"/approve {head}", self.github.posted[0])
+        self.assertEqual(self.github.requested, [{"reviewers": ["wayfind"]}])
+        self.controller.once()  # polling neither re-reviews nor re-notifies
+        self.assertEqual(len(self.requests("turn/start")), 1)
+        self.assertEqual((len(self.notifications), len(self.github.posted)), (1, 1))
+        with self.assertRaisesRegex(LoopError, "current PR head"):
+            self.store.approve(DEFAULT_REPO, 7, self.head[:12], "dev")
+        self.store.approve(DEFAULT_REPO, 7, head[:12], "dev")
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        events = snapshot(self.store, DEFAULT_REPO, 7, 0)["events"]
+        approved = [e["detail"] for e in events if e["state"] == "human_approved"]
+        self.assertEqual(approved, [{"head": head, "source": "local", "by": "dev", "url": ""}])
+
+    def test_reviewer_risk_needs_maintainer_comment_naming_the_current_head(self):
+        self.configure(reports=[dict(PASS, risk=HIGH)])
+        self.github.roles = {"dev": "maintain", "outsider": "write"}
+        self.github.comments = [
+            {"user": {"login": "outsider"}, "body": f"/approve {self.head}"},   # not a maintainer
+            {"user": {"login": "dev"}, "body": "/approve 0123456789abcdef"},     # another revision
+            {"user": {"login": "stranger"}, "body": f"/approve {self.head}"},   # not a collaborator
+        ]
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_human")
+        self.assertIn("reviewer: Deletes persisted sessions", self.row()["reason"])
+        self.github.comments.append({"user": {"login": "dev"}, "body": f" /approve {self.head[:9]} ",
+                                     "html_url": "https://github.com/c/1"})
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+
+    def test_github_review_approves_only_the_commit_it_reviewed(self):
+        head = self.commit_feature("vendor/tinykg/bin/manifest.json", "{}\n")
+        self.configure(reports=[PASS])
+        self.github.roles = {"wayfind": "write"}
+        self.github.reviews = [{"state": "APPROVED", "commit_id": self.head, "user": {"login": "wayfind"}}]
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_human")
+        self.github.reviews.append({"state": "APPROVED", "commit_id": head, "user": {"login": "wayfind"}})
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+
+    def test_normal_risk_merges_without_human_or_notice(self):
+        self.commit_feature("src/repl/hint.zig", "// ok\n")
+        self.configure(reports=[PASS])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        self.assertEqual((self.notifications, self.github.posted), ([], []))
+
+    def test_worker_rebuttal_goes_to_a_fresh_review_without_a_push(self):
+        self.configure(reports=[FIX, PASS], worker_result=DISPUTED)
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "pending")
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)  # nothing validated or pushed
+        self.assertEqual(self.row()["disputes"], 1)
+        self.controller.once()
+        second_review = self.requests("turn/start")[2]["params"]["input"][0]["text"]
+        self.assertIn("bug is the specified output for this task", second_review)
+        self.assertIn("Rule on each rebuttal", second_review)
+        self.assertEqual(self.row()["state"], "merged")
+        self.assertEqual((self.row()["dispute"], self.row()["disputes"]), (None, 0))
+        self.assertEqual(self.notifications, [])
+
+    def test_unresolved_dispute_becomes_a_human_decision(self):
+        self.configure(reports=[FIX, FIX, FIX], worker_result=DISPUTED)
+        for _ in range(3):
+            self.controller.once()
+        self.assertEqual(self.row()["state"], "needs_decision")
+        self.assertIn("still disagree", self.notifications[-1])
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
+
+    def test_report_from_before_risk_classification_is_reviewed_again(self):
+        legacy = {k: v for k, v in PASS.items() if k != "risk"}
+        self.store.update(self.binding, State.WAITING, head=self.head, base=self.base, report=json.dumps(legacy))
+        self.configure(reports=[PASS])
+        self.controller.once()
+        self.assertEqual(len(self.requests("turn/start")), 1)
+        self.assertEqual(self.row()["state"], "merged")
+
+    def claude_controller(self, reviewer):
+        fake, ctrace = self.root / "claude.py", self.root / "claude.jsonl"
+        fake.write_text(CLAUDE)
+        claude = Claude((sys.executable, str(fake), str(self.config), str(ctrace)))
+        binding = replace(self.binding, agent="claude", reviewer=reviewer)
+        with self.store.db:
+            self.store.db.execute("UPDATE prs SET binding=?", (json.dumps(binding.__dict__),))
+        self.controller.agents["claude"] = claude
+        return ctrace
+
+    def test_claude_session_forks_once_then_resumes_and_codex_reviews(self):
+        ctrace = self.claude_controller("codex")
+        self.configure(reports=[FIX, PASS], worker_texts=["still bug\n", "fixed\n"])
+        self.controller.once()   # the first repair fails the gate, so the same worker repairs again
+        calls = [json.loads(line) for line in ctrace.read_text().splitlines()]
+        first, second = calls[0]["argv"], calls[1]["argv"]
+        worker = first[first.index("--session-id") + 1]
+        self.assertEqual(first[first.index("--resume") + 1], "worker-7")
+        self.assertIn("--fork-session", first)
+        self.assertEqual(second[second.index("--resume") + 1], worker)
+        self.assertNotIn("--fork-session", second)
+        self.assertIn("local_gate_failure", calls[1]["stdin"])
+        self.assertEqual(self.row()["worker_thread"], worker)
+        self.assertEqual(first[first.index("--tools") + 1], "Read,Edit,Write,Glob,Grep,Bash")
+        allowed = first[first.index("--allowedTools") + 1:first.index("--permission-prompts")]
+        self.assertTrue(all(a.startswith("Bash(git ") or a == "Bash(rg:*)" for a in allowed))
+        self.assertEqual(first[first.index("--permission-prompts") + 1], "none")
+        self.assertIn("--strict-mcp-config", first)
+        self.assertIn("Incorrect result", calls[0]["stdin"])
+        self.assertEqual(calls[0]["cwd"], str(self.work.resolve()))
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        self.assertEqual(len(self.requests("thread/start")), 2)  # the Codex reviewer judged both revisions
+
+    def test_claude_reviewer_is_read_only_and_adversarial(self):
+        ctrace = self.claude_controller("claude")
+        self.configure(claude_reports=[PASS])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        call = json.loads(ctrace.read_text().splitlines()[0])
+        argv = call["argv"]
+        self.assertNotIn("--resume", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+        self.assertNotIn("Edit", argv[argv.index("--tools") + 1])
+        self.assertIn("adversarial reviewer", call["stdin"])
+        self.assertNotEqual(call["cwd"], str(self.work.resolve()))  # a detached review snapshot
+        self.assertEqual(self.requests("turn/start"), [])
+
+    def test_ship_pushes_the_confirmed_branch_then_opens_and_registers_it(self):
+        from pr_loop import __main__ as cli
+        local = self.commit_feature("app.txt", "shipped\n")
+        git(self.bare, "update-ref", "refs/heads/feature", self.head)  # the new commit is not on GitHub yet
+        capture, shim = self.root / "create.json", self.root / "create.py"
+        shim.write_text("import json,sys,pathlib; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:])); print('https://github.com/metask-ai/metacodes/pull/7')")
+        self.github.command = (sys.executable, str(shim), str(capture))
+        body = self.root / "body.md"
+        body.write_text("PR description\n")
+        state = self.root / "shipped.sqlite3"
+        env = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "0f0e0d0c-aaaa-bbbb-cccc-000000000001"}
+        with patch.object(cli, "GitHub", return_value=self.github), patch.dict("os.environ", env, clear=False):
+            code = cli.main(["--state", str(state), "ship", "--worktree", str(self.work),
+                             "--title", "fix: result", "--body-file", str(body)])
+        self.assertEqual(code, 0)
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), local)
+        argv = json.loads(capture.read_text())
+        self.assertEqual(argv[argv.index("--head") + 1], "example:feature")
+        shipped = Store(state)
+        try:
+            binding = json.loads(shipped.get(DEFAULT_REPO, 7)["binding"])
+            self.assertEqual((binding["agent"], binding["reviewer"], binding["thread"]),
+                             ("claude", "codex", env["CLAUDE_CODE_SESSION_ID"]))
+        finally:
+            shipped.close()
+
+    def test_ship_refuses_main(self):
+        from pr_loop import __main__ as cli
+        git(self.work, "switch", "-q", "main")
+        body = self.root / "body.md"
+        body.write_text("x\n")
+        with patch.object(cli, "GitHub", return_value=self.github):
+            code = cli.main(["--state", str(self.root / "s.sqlite3"), "ship", "--thread", "t1", "--worktree",
+                             str(self.work), "--title", "t", "--body-file", str(body)])
+        self.assertEqual(code, 1)
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
+        self.assertFalse(any(m == "POST" for _, m, _ in self.github.calls))
+
 
 class BoundaryTest(unittest.TestCase):
+    def test_risk_rules_cover_kernel_boundaries_but_not_ordinary_code(self):
+        hits = risk.classify(["src/core/agent_loop.zig", "src/permission/rule.zig", "src/api/oauth_login.zig",
+                              ".github/pr_loop/risk.py", "doc/AGENTS.md", "src/repl/hint.zig", "doc/guide.md"])
+        flagged = sorted(p for paths in hits.values() for p in paths)
+        self.assertEqual(flagged, [".github/pr_loop/risk.py", "doc/AGENTS.md", "src/api/oauth_login.zig",
+                                   "src/core/agent_loop.zig", "src/permission/rule.zig"])
+        self.assertEqual(risk.reasons(["doc/guide.md"], PASS), [])
+
+    def test_high_risk_and_rebuttals_have_one_legal_shape(self):
+        with self.assertRaisesRegex(LoopError, "high-risk"):
+            validate_report(dict(PASS, risk={"level": "high", "reasons": []}))
+        with self.assertRaisesRegex(LoopError, "invalid report"):
+            validate_report({k: v for k, v in PASS.items() if k != "risk"})
+        with self.assertRaisesRegex(LoopError, "existing finding"):
+            validate_worker(dict(DISPUTED, rebuttals=[{"finding": 1, "argument": "x"}]), 1)
+        with self.assertRaisesRegex(LoopError, "existing finding"):
+            validate_worker(DISPUTED, 0)  # CI or gate feedback has nothing to rebut
+        with self.assertRaisesRegex(LoopError, "at least one rebuttal"):
+            validate_worker(dict(DISPUTED, rebuttals=[]), 1)
+        validate_worker(DISPUTED, 1)
     def test_only_transient_read_failures_are_retryable(self):
         with tempfile.TemporaryDirectory() as temp:
             script = Path(temp) / 'gh.py'
