@@ -329,6 +329,14 @@ status, compatibility boundaries, and entry points are defined by
   a key in `.env`). An OpenRouter that is not set up says `/login openrouter`
   in `/model`'s setup, as Metask's says `/login`.
 
+- **OpenRouter requests say who is calling.** Every request on a route in
+  OpenRouter's dialect carries OpenRouter's app attribution
+  (https://openrouter.ai/docs/app-attribution): `HTTP-Referer:
+  https://github.com/metask-ai/metacodes`, `X-OpenRouter-Title: metacodes`,
+  `X-OpenRouter-Categories: cli-agent`, and no visibility header, so the app
+  is listed in OpenRouter's rankings. Nothing in them is about the user, and
+  no other provider's requests carry them.
+
 - **A configuration entry that names a built-in provider is passed over
   alone.** `custom_providers.<built-in id>` used to fail the whole
   `custom_providers` section; it is now skipped by itself, said once, and the

@@ -55,6 +55,7 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const openrouter_dialect = @import("dialects/openrouter.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
@@ -421,6 +422,16 @@ pub const OpenAIClient = struct {
             return credential_mod.requestError(err);
         };
         defer secureFree(self.allocator, auth.value);
+        // A route in OpenRouter's dialect says who is calling (its app
+        // attribution); no other route carries those headers.
+        var headers: [2 + openrouter_dialect.ATTRIBUTION_HEADERS.len]std.http.Header = undefined;
+        headers[0] = .{ .name = "content-type", .value = "application/json" };
+        headers[1] = .{ .name = auth.name, .value = auth.value };
+        var header_count: usize = 2;
+        if (self.declared_dialect.vendorFor(self.model, self.model) == .openrouter) {
+            @memcpy(headers[2..], &openrouter_dialect.ATTRIBUTION_HEADERS);
+            header_count = headers.len;
+        }
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,
@@ -431,10 +442,7 @@ pub const OpenAIClient = struct {
             // takes the offer (DeepSeek, #467) sends bytes the SSE parser
             // cannot read.
             .headers = .{ .accept_encoding = .omit },
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json" },
-                .{ .name = auth.name, .value = auth.value },
-            },
+            .extra_headers = headers[0..header_count],
         }) catch |err| {
             // req_ptr.* 未初始化, errdefer destroy 即可
             return client_mod.requestSetupFailure("openai", rid, err);

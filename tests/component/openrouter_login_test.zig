@@ -750,6 +750,13 @@ test "L2 OpenRouter: /model lists the account's models; switching to and from th
     try testing.expectEqualStrings("POST /api/v1/chat/completions HTTP/1.1", requestLine(chat));
     try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(chat, "authorization").?);
     try testing.expectEqualStrings("\"deepseek/deepseek-v4.1-flash\"", chat.jsonField("model").?);
+    // Who is calling, as OpenRouter's app attribution asks: the project's
+    // address, its name, a terminal coding agent. Nothing about the user.
+    try testing.expectEqualStrings("https://github.com/metask-ai/metacodes", headerValue(chat, "http-referer").?);
+    try testing.expectEqualStrings("metacodes", headerValue(chat, "x-openrouter-title").?);
+    try testing.expectEqualStrings("cli-agent", headerValue(chat, "x-openrouter-categories").?);
+    try testing.expect(headerValue(chat, "x-openrouter-app-visibility") == null);
+    try testing.expectEqualStrings("metacodes/" ++ cc.VERSION, headerValue(chat, "user-agent") orelse "");
 
     // Away to the user's relay: its key, and OpenRouter's stays behind.
     try pick(app, "relay-model", "house-relay");
@@ -757,6 +764,9 @@ test "L2 OpenRouter: /model lists the account's models; switching to and from th
     try sendHi(app);
     try testing.expectEqual(@as(usize, 1), relay.requestCount());
     try testing.expectEqualStrings("Bearer relay-key-77", headerValue(relay.lastRequest().?, "authorization").?);
+    // OpenRouter's attribution is OpenRouter's: another provider gets none.
+    try testing.expect(headerValue(relay.lastRequest().?, "http-referer") == null);
+    try testing.expect(headerValue(relay.lastRequest().?, "x-openrouter-title") == null);
 
     // And back: OpenRouter's key again, never the relay's.
     try pick(app, "kimi-k3", "openrouter");
