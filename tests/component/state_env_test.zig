@@ -671,7 +671,7 @@ fn expectSetupOf(text: []const u8, variable: []const u8, env_path: []const u8) !
     try testing.expect(std.mem.indexOf(u8, text, "paste") == null);
 }
 
-test "state .env: a provider with no key is listed not configured, and choosing it names its variable, this install's .env and the guide (#483, #488)" {
+test "state .env: a provider with no key is omitted from the picker (#483, #488)" {
     var case: Case = undefined;
     try case.initInProcess();
     defer case.deinit();
@@ -690,15 +690,9 @@ test "state .env: a provider with no key is listed not configured, and choosing 
     cc.repl_picker_host.open(app, &ui, .unguarded);
     // Moonshot's open platform (`kimi`): no key, and neither a sign-in nor a
     // key page the picker could offer.
-    const row = try cursorOnProvider(app, &ui, "kimi");
-    try testing.expect(!row.ready);
-    try testing.expectEqual(cc.repl_picker_host.Result.redraw, cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded));
-    try testing.expectEqual(cc.repl_model_picker.Stage.setup, app.model_picker.stage);
-    var buffer: [16384]u8 = undefined;
-    const text = drawPicker(app, &buffer);
-    try expectSetupOf(text, "MOONSHOT_API_KEY", try std.fs.path.join(a, &.{ case.state, ".env" }));
-    // KIMI_API_KEY is Kimi Code's (#487).
-    try testing.expect(std.mem.indexOf(u8, text, "KIMI_API_KEY") == null);
+    try testing.expectError(error.ProviderNotListed, cursorOnProvider(app, &ui, "kimi"));
+    try testing.expectEqual(cc.repl_model_picker.Stage.provider, app.model_picker.stage);
+    try testing.expect(app.model_picker.setup == null);
     try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
 }
 
@@ -725,7 +719,7 @@ test "state .env: a provider whose two key names disagree stays listed, and a pi
     const picker = &app.model_picker;
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
-    try testing.expect((try cursorOnProvider(app, &ui, "gemini")).ready);
+    _ = try cursorOnProvider(app, &ui, "gemini");
     // Provider, model, channel: Enter takes the first of each, up to the
     // options; Enter there applies the route.
     var steps: usize = 0;
@@ -759,7 +753,7 @@ test "state .env: a pick whose key went away after the picker opened shows the p
     const picker = &app.model_picker;
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
-    try testing.expect((try cursorOnProvider(app, &ui, "kimi")).ready);
+    _ = try cursorOnProvider(app, &ui, "kimi");
     // Provider, model, channel: each Enter takes the first. Then the key
     // goes, and Enter on the options applies the route.
     for (0..3) |_| _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
@@ -796,20 +790,20 @@ test "state .env: /model lists a provider whose key is only in the file as one a
     var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
     defer io_runtime.deinit();
 
-    // Without the layer, the same install lists Kimi as not configured.
+    // Without the layer, the same install omits Kimi.
     {
         const bare = try startedApp(&case, io_runtime.io(), null);
         defer bare.deinit();
         var ui: cc.tui_ui_state.UiState = .{};
         cc.repl_picker_host.open(bare, &ui, .unguarded);
-        try testing.expect(!(try cursorOnProvider(bare, &ui, "kimi")).ready);
+        try testing.expectError(error.ProviderNotListed, cursorOnProvider(bare, &ui, "kimi"));
     }
 
     const app = try startedApp(&case, io_runtime.io(), &layer);
     defer app.deinit();
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
-    try testing.expect((try cursorOnProvider(app, &ui, "kimi")).ready);
+    _ = try cursorOnProvider(app, &ui, "kimi");
     var result: cc.repl_picker_host.Result = .ignored;
     for (0..4) |_| {
         result = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
@@ -829,7 +823,7 @@ fn relayApp(case: *Case, io: std.Io) !*App {
     return App.init(testing.allocator, io, config, "sk-relay-flag");
 }
 
-test "state .env: on another provider's session, Metask is listed with the sign-in auth.json holds, and not configured without one (#488)" {
+test "state .env: on another provider's session, Metask is listed with the sign-in auth.json holds, and omitted without one (#488)" {
     var case: Case = undefined;
     try case.initInProcess();
     defer case.deinit();
@@ -843,18 +837,14 @@ test "state .env: on another provider's session, Metask is listed with the sign-
     var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
     defer io_runtime.deinit();
 
-    // No sign-in: Metask is in the not-configured group, and its setup
-    // points at /login first.
+    // No sign-in: Metask is omitted rather than offered as a setup row.
     {
         const app = try relayApp(&case, io_runtime.io());
         defer app.deinit();
         var ui: cc.tui_ui_state.UiState = .{};
         cc.repl_picker_host.open(app, &ui, .unguarded);
-        try testing.expect(!(try cursorOnProvider(app, &ui, "metask")).ready);
-        _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
-        const setup = app.model_picker.setup orelse return error.NoSetup;
-        try testing.expect(setup.sign_in);
-        try testing.expectEqualStrings("METASK_API_KEY", setup.variable.?);
+        try testing.expectError(error.ProviderNotListed, cursorOnProvider(app, &ui, "metask"));
+        try testing.expect(app.model_picker.setup == null);
     }
 
     // The key `metacodes login` stored: Metask is a route a pick applies,
@@ -866,7 +856,7 @@ test "state .env: on another provider's session, Metask is listed with the sign-
     defer app.deinit();
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
-    try testing.expect((try cursorOnProvider(app, &ui, "metask")).ready);
+    _ = try cursorOnProvider(app, &ui, "metask");
     var result: cc.repl_picker_host.Result = .ignored;
     for (0..4) |_| {
         result = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
@@ -877,11 +867,10 @@ test "state .env: on another provider's session, Metask is listed with the sign-
     try testing.expect(std.mem.indexOf(u8, app.model_picker.notice(), "from now on billed to your Metask account") != null);
 }
 
-test "state .env: a session that started without a key lists Metask as not configured, pointing at /login (#488)" {
+test "state .env: a session that started without a key omits Metask (#488)" {
     // What the start-up that opens the TUI with nothing configured (#484)
     // would hand App: the historical route, and no key. An empty key binds
-    // nothing (credential.resolve), so Metask is not configured either, and
-    // its setup points at /login.
+    // nothing (credential.resolve), so Metask is omitted.
     var case: Case = undefined;
     try case.initInProcess();
     defer case.deinit();
@@ -901,10 +890,9 @@ test "state .env: a session that started without a key lists Metask as not confi
 
     var ui: cc.tui_ui_state.UiState = .{};
     cc.repl_picker_host.open(app, &ui, .unguarded);
-    try testing.expect(!(try cursorOnProvider(app, &ui, "metask")).ready);
-    _ = cc.repl_picker_host.onKey(app, &ui, .enter, .unguarded);
+    try testing.expectError(error.ProviderNotListed, cursorOnProvider(app, &ui, "metask"));
     var buffer: [16384]u8 = undefined;
     const text = drawPicker(app, &buffer);
-    try testing.expect(std.mem.indexOf(u8, text, "metask not signed in") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Sign in: /login") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "metask not signed in") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Not configured") == null);
 }

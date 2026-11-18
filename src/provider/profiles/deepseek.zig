@@ -32,6 +32,7 @@ const CONTROLS = [_]controls.ControlSpec{.{
     .label = "Reasoning effort",
     .kind = .enumeration,
     .allowed_values = &EFFORTS,
+    .default_value = .{ .text = controls.ControlText.parse("high") catch unreachable },
 }};
 
 /// 1M window as the official `/models` listing declares it (1,048,576), and
@@ -142,6 +143,7 @@ test "deepseek profile: both wires, both declaring the DeepSeek dialect" {
     };
     for (MODELS) |model| {
         const spec = controls.findSpec(model.controls, "reasoning_effort").?;
+        try std.testing.expect(spec.default_value.?.text.eqlText("high"));
         for (spec.allowed_values) |value| try std.testing.expect(@import("../../types.zig").ReasoningEffort.parse(value) != null);
     }
 }

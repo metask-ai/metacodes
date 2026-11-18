@@ -8,8 +8,8 @@
 //! and a `/model` pick of a Z.AI model without one ended in
 //! `MissingCredentials`.
 //!
-//! `/model` takes no key itself (#488): a provider without one is listed as
-//! not configured, and the key this login stores makes its routes ones a
+//! `/model` takes no key itself (#488): a provider without one is omitted,
+//! and the key this login stores makes its routes ones a
 //! pick applies.
 
 const std = @import("std");
@@ -292,7 +292,7 @@ test "L2 key login: a stored key starts a Z.AI session and reaches its requests,
     try std.testing.expectEqualStrings("Bearer " ++ GOOD_KEY, headerValue(captured, "authorization").?);
 }
 
-test "L2 key login (#488): /model takes no key; a provider without one is not configured, and the key /login stored makes its routes applicable" {
+test "L2 key login (#488): /model hides a provider without a key, and the key /login stored makes its routes applicable" {
     var case: Case = undefined;
     try case.init();
     defer case.deinit();
@@ -311,22 +311,16 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     var rows = cc.repl_model_picker.Picker.RowBuffer.init(std.testing.allocator);
     defer rows.deinit();
 
-    // No key: the plan is listed, in the not-configured group, and Enter on
-    // it shows where the key goes. No key stage, no worker, no request.
+    // No key: the plan is omitted, so there is no row on which Enter could
+    // open a key stage, start a worker or make a request.
     var ui: cc.tui_ui_state.UiState = .{};
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
     const unconfigured = try picker.rows(&rows);
-    try std.testing.expectEqual(@as(usize, 1), unconfigured.len);
-    try std.testing.expect(!unconfigured[0].provider.ready);
-    try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
-    try std.testing.expectEqual(cc.repl_model_picker.Stage.setup, picker.stage);
-    try std.testing.expectEqualStrings("ZAI_API_KEY", picker.setup.?.variable.?);
-    const env_path = try std.fs.path.join(allocator, &.{ case.root, ".env" });
-    try std.testing.expectEqualStrings(env_path, picker.localConfigPath());
-    for ([_]cc.repl_model_picker.Key{ .enter, .{ .char = 'k' }, .cycle_scope }) |key| {
-        try std.testing.expectEqual(picker_host.Result.ignored, picker_host.onKey(app, &ui, key, .unguarded));
-    }
+    try std.testing.expectEqual(@as(usize, 0), unconfigured.len);
+    try std.testing.expectEqual(picker_host.Result.ignored, picker_host.onKey(app, &ui, .enter, .unguarded));
+    try std.testing.expectEqual(cc.repl_model_picker.Stage.provider, picker.stage);
+    try std.testing.expect(picker.setup == null);
     try std.testing.expectEqual(@as(usize, 0), check.requestCount());
     try std.testing.expect(try key_store.load(std.testing.allocator, case.root, Slug.lit("zai-coding-plan")) == null);
     // The session stays on the route it started on.
@@ -340,7 +334,7 @@ test "L2 key login (#488): /model takes no key; a provider without one is not co
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
     const configured = try picker.rows(&rows);
     try std.testing.expectEqual(@as(usize, 1), configured.len);
-    try std.testing.expect(configured[0].provider.ready);
+    try std.testing.expectEqualStrings("zai-coding-plan", configured[0].provider.label);
     _ = picker_host.onKey(app, &ui, .enter, .unguarded); // provider
     _ = picker_host.onKey(app, &ui, .enter, .unguarded); // GLM-5.3, listed first
     _ = picker_host.onKey(app, &ui, .enter, .unguarded); // its first channel (cn-anthropic)

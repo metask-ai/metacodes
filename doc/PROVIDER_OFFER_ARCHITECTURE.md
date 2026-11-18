@@ -912,16 +912,16 @@ session's own key or the `auth.json` sign-in, `--api-key`, the environment and
 the `.env` layer below it) through `runtime_binding.bindOffer`, with one
 difference — a stored OAuth login stands for the token a commit would refresh
 first, so judging sends no request. The picker hides the offers that would
-not bind (`Picker.setReadiness`), and lists a provider none of whose offers
-would as a dimmed row under "Not configured", below the others. Choosing it
-enters `Stage.setup`, which shows the provider's `model_picker.Setup` — the
-variable its key is read from, `/login` for Metask — with this install's
-`.env` and `doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. A
-commit that still fails with `MissingCredentials` (the credential went away
-after the picker opened) shows the same setup. The picker never signs in or
-takes a key: the credential stage #67 put in it is gone, and `/login <id>` is
-where both happen. A commit that moves the session to another provider says,
-on a second line of its confirmation, who bills the session from then on.
+not bind (`Picker.setReadiness`) and omits a provider none of whose offers
+would. If no provider is usable, it points to `/login` and this install's
+`.env`. A commit that still fails with `MissingCredentials` (the credential
+went away after the picker opened) enters `Stage.setup`, which shows the
+provider's `model_picker.Setup` — the variable its key is read from, `/login`
+for Metask — with this install's `.env` and `doc/LOCAL_CONFIG.md`, and takes
+no other key than Esc and `q`. The picker never signs in or takes a key: the
+credential stage #67 put in it is gone, and `/login <id>` is where both happen.
+A commit that moves the session to another provider says, on a second line of
+its confirmation, who bills the session from then on.
 
 ## Module map
 

@@ -62,7 +62,7 @@ const Case = struct {
     tmp: std.testing.TmpDir,
     root_buf: [std.fs.max_path_bytes]u8,
     root: []const u8,
-    guards: [cleared_variables.len + 4]EnvGuard,
+    guards: [cleared_variables.len + 5]EnvGuard,
     guard_count: usize,
 
     fn init(self: *Case, relay_origin: []const u8) !void {
@@ -173,6 +173,34 @@ test "L2 picker: a reasoning level chosen on the options step is the one the req
     const captured = gateway.lastRequest() orelse return error.NoRequestCaptured;
     try std.testing.expectEqualStrings("\"relay-reasoner\"", captured.jsonField("model").?);
     try std.testing.expectEqualStrings("\"high\"", captured.jsonField("reasoning_effort").?);
+}
+
+test "L2 picker: an explicit none survives DeepSeek's declared default high" {
+    var case: Case = undefined;
+    try case.init("http://127.0.0.1:9");
+    defer case.deinit();
+    try case.setEnv("DEEPSEEK_API_KEY", "deepseek-test-key");
+    const allocator = case.arena.allocator();
+
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), try case.config(), "metask-key");
+    defer app.deinit();
+    try app.setReasoningEffort(.none);
+
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    for ("deepseek") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // provider
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // model → its two channels
+    try std.testing.expectEqual(cc.repl_model_picker.Stage.offer, app.model_picker.stage);
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // channel → options
+    try std.testing.expectEqual(cc.repl_model_picker.Stage.options, app.model_picker.stage);
+    try std.testing.expect(app.model_picker.controls.get("reasoning_effort").?.text.eqlText("none"));
+
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
+    try std.testing.expectEqualStrings("deepseek-v4-pro", app.activeModel());
+    try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .none), app.config.reasoning_effort);
 }
 
 test "L2 picker: the level the session runs with starts selected and survives the switch" {

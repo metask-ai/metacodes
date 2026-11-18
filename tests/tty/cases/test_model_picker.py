@@ -3,9 +3,9 @@
 Offline: the picker reads compiled provider profiles, so no request is made —
 except on the two Metask logins, whose inventory is the gateway's own
 `/v1/models`; those cases run against a local mock gateway. Every route listed
-can be applied as it is (#488): a provider is a normal row only with a
-credential, so a case that walks into one gives it a placeholder key, and the
-others sit dimmed under "Not configured".
+can be applied as it is (#488): a provider is a row only with a credential, so
+a case that walks into one gives it a placeholder key, and the others are
+omitted.
 What is asserted here is the behaviour the requirement names and that unit
 tests cannot see — that the overlay reaches a real terminal,
 that it owns the keyboard without eating the draft, and that a mid-stream
@@ -49,11 +49,11 @@ def _provider_rows(text):
     return rows
 
 
-def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
+def test_model_command_lists_configured_providers_and_reaches_their_models(bin_path):
     # metask / openai / gemini 的 id 都是 6 字节。分组标签曾指向循环变量的栈拷贝,
-    # 等长 id 被并成一行 "metask 16 models",进去只有 metask 的模型:openai、gemini
+    # 等长 id 被并成一行 "metask 16 models",进去只有 metask 的模型:openai
     # 在 /model 里根本选不到。OpenAI 给占位 key,它才是能进去的正常行(#488);
-    # gemini 没有 key,排在 "Not configured" 下面,仍是独立一行。
+    # gemini 和 zai-coding-plan 没有 key,不再出现在列表里。
     raw = run(
         bin_path,
         submit("/model", "Provider") + ["sleep:0.3", "key:down", "sleep:0.3", "key:enter", wait_for("Model")],
@@ -68,8 +68,10 @@ def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
     provider_frames = [screen_text(sc) for sc in a.frame_screens if "Provider" in screen_text(sc)]
     assert provider_frames, "/model 未打开 picker:\n" + text
     providers = _provider_rows(provider_frames[-1])
-    for wanted in ("metask", "openai", "gemini", "zai-coding-plan"):
+    for wanted in ("metask", "openai"):
         assert providers.count(wanted) == 1, f"provider {wanted} 不是独立一行: {providers}\n" + provider_frames[-1]
+    for unwanted in ("gemini", "zai-coding-plan"):
+        assert unwanted not in providers, f"未配置的 {unwanted} 不应列出: {providers}\n" + provider_frames[-1]
     # 第二行是 openai(编译期目录顺序);Enter 进去必须是 openai 自己的模型。
     assert providers[1] == "openai", f"目录顺序变了,第二行不是 openai: {providers}"
     lines = text.splitlines()
@@ -90,6 +92,7 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
     raw = run(
         bin_path,
         ["sleep:0.8", "type:explain this", "sleep:0.3", "key:ctrl_o", "sleep:0.4", "type:zai", "sleep:0.4"],
+        env={"ZAI_API_KEY": "tty-dummy-zai-key"},
         per_key_drain=0.08,
     )
     _, text = _screen(raw)
@@ -164,6 +167,7 @@ def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
              wait_for("Provider"), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("metask")],
             base_url=srv.url,
+            env={"ZAI_API_KEY": "tty-dummy-zai-key"},
             startup_drain=0.8,
             per_key_drain=0.08,
         )
@@ -322,7 +326,21 @@ def test_picker_options_step_changes_reasoning_with_arrows_and_applies_with_ente
     assert "from now on billed to your Z.AI GLM Coding Plan account" in flat, "切到另一家没写明扣钱的一方:\n" + text
 
 
-GUIDE = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md"
+def test_picker_deepseek_defaults_to_high(bin_path):
+    raw = run(
+        bin_path,
+        submit("/model", "Provider") + [
+            "type:deepseek", wait_for("deepseek"), "key:enter", f"waitline:Model:{WAIT_S}",
+            "key:enter", wait_for("Channel / offer"), "key:enter", wait_for("Reasoning effort = high"),
+        ],
+        env={"DEEPSEEK_API_KEY": "tty-dummy-deepseek-key"},
+        per_key_drain=0.1,
+    )
+    _, text = _screen(raw)
+    assert "Reasoning effort = high" in text, text
+    assert "[none low high max]" in text, text
+    assert "Reasoning effort = unset" not in text, text
+
 
 # Every variable a built-in vendor reads its key from: cleared, so a case sees
 # only the keys it gives.
@@ -339,22 +357,6 @@ def _no_vendor_keys(**given):
     return env
 
 
-def _provider_groups(screen):
-    """(normal rows, rows under "Not configured") of one Provider-stage frame."""
-    normal, unconfigured, target = [], [], None
-    for line in screen.splitlines():
-        if line.strip() == "Provider":
-            target = normal
-            continue
-        if line.strip() == "Not configured":
-            target = unconfigured
-            continue
-        parts = line.replace(">", " ").replace("*", " ").split()
-        if target is not None and len(parts) == 3 and parts[2] in ("model", "models") and parts[1].isdigit():
-            target.append(parts[0])
-    return normal, unconfigured
-
-
 def _last_provider_frame(raw, rows, cols):
     a = TTYAssert(raw, rows=rows, cols=cols)
     frames = []
@@ -366,51 +368,58 @@ def _last_provider_frame(raw, rows, cols):
     return frames[-1]
 
 
-def test_picker_lists_only_providers_with_a_credential_and_dims_the_rest_last(bin_path):
+def test_picker_omits_providers_without_a_credential(bin_path):
     # #488: with no vendor key, only Metask (the session's own key) is a row a
-    # pick applies; every vendor sits dimmed under "Not configured", last. A
-    # key makes its vendor a normal row.
+    # pick applies; every vendor without one is omitted. A key adds its vendor.
     events = submit("/model", "Provider") + ["sleep:0.4"]
     bare = _last_provider_frame(run(bin_path, events, term_size=(40, 120), env=_no_vendor_keys(),
                                     per_key_drain=0.1), 40, 120)
-    normal, unconfigured = _provider_groups(bare)
-    assert normal == ["metask"], f"没有 key 时只该有 Metask 一行:{normal}\n" + bare
+    providers = _provider_rows(bare)
+    assert providers == ["metask"], f"没有 key 时只该有 Metask 一行:{providers}\n" + bare
     for vendor in ("openai", "gemini", "zai-coding-plan", "deepseek", "kimi", "kimi-code"):
-        assert vendor in unconfigured, f"{vendor} 应灰显在 Not configured 组:{unconfigured}\n" + bare
+        assert vendor not in providers, f"未配置的 {vendor} 不应列出:{providers}\n" + bare
+    assert "Not configured" not in bare, bare
+    assert "PgUp/PgDn" not in bare, "只剩一行时不应出现滚动提示:\n" + bare
 
-    keyed = _last_provider_frame(run(bin_path, events, term_size=(40, 120),
-                                     env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key"),
-                                     per_key_drain=0.1), 40, 120)
-    normal, unconfigured = _provider_groups(keyed)
-    assert normal == ["metask", "deepseek"], f"有 DEEPSEEK_API_KEY 时 DeepSeek 应是正常行:{normal}\n" + keyed
-    assert "deepseek" not in unconfigured, keyed
+    logged_out = _last_provider_frame(run(
+        bin_path, events, term_size=(40, 120),
+        env=_no_vendor_keys(METASK_API_KEY=None, DEEPSEEK_API_KEY="tty-dummy-deepseek-key",
+                            KIMI_CODE_API_KEY="tty-dummy-kimi-code-key"),
+        per_key_drain=0.1), 40, 120)
+    providers = _provider_rows(logged_out)
+    assert providers == ["deepseek", "kimi-code"], f"logout 时应只列出 DeepSeek 和 Kimi Code:{providers}\n" + logged_out
+    assert "Not configured" not in logged_out, logged_out
+    assert "PgUp/PgDn" not in logged_out, "两行都不应出现滚动提示:\n" + logged_out
+
+    logged_in = _last_provider_frame(run(
+        bin_path, events, term_size=(40, 120),
+        env=_no_vendor_keys(DEEPSEEK_API_KEY="tty-dummy-deepseek-key",
+                            KIMI_CODE_API_KEY="tty-dummy-kimi-code-key"),
+        per_key_drain=0.1), 40, 120)
+    providers = _provider_rows(logged_in)
+    assert providers == ["metask", "deepseek", "kimi-code"], \
+        f"login 时应只列出 Metask、DeepSeek 和 Kimi Code:{providers}\n" + logged_in
+    assert "Not configured" not in logged_in, logged_in
+    assert "PgUp/PgDn" not in logged_in, "三行都不应出现滚动提示:\n" + logged_in
 
 
-def test_picker_names_the_variable_and_the_env_file_for_a_provider_without_a_key(bin_path):
-    # #483, #488: Kimi on Moonshot's open platform has no sign-in and no key
-    # page. A route chosen without MOONSHOT_API_KEY ended in a bare
-    # "switch failed (MissingCredentials)". Now the provider is listed dimmed,
-    # and choosing it shows the variable, this install's .env and the guide,
-    # and nothing to type. KIMI_API_KEY is Kimi Code's (#487).
-    home = case_tmpdir("cc-tty-nokey-home-")
-    env_file = os.path.join(home, ".metacodes", ".env")
+def test_picker_offers_no_setup_row_for_a_provider_without_a_key(bin_path):
+    # #488: Kimi on Moonshot's open platform has no key, so neither it nor a
+    # setup row is listed. Filtering to it produces an empty result, and Enter
+    # cannot open a key field or start a sign-in.
     raw = run(
         bin_path,
         submit("/model", "Provider") + [
-            "type:kimi", wait_for("kimi-code"), "key:enter", wait_for("MOONSHOT_API_KEY"),
+            "type:kimi", wait_for("nothing matches"), "key:enter", "sleep:0.3",
         ],
         term_size=(30, 160),
-        env=_no_vendor_keys(HOME=home),
+        env=_no_vendor_keys(),
         per_key_drain=0.1,
     )
     _, text = _screen(raw, rows=30, cols=160)
-    assert "kimi not configured" in text, text
-    assert f"Set MOONSHOT_API_KEY in {env_file}, then restart" in text, text
-    assert f"How to: {GUIDE}" in text, text
-    assert "esc back · q close" in text, text
-    assert "MissingCredentials" not in text, text
-    assert "KIMI_API_KEY" not in text, text
-    assert "enter apply" not in text, "setup 不该提供应用线路:\n" + text
+    assert "nothing matches this filter" in text, text
+    for unwanted in ("Not configured", "kimi not configured", "MOONSHOT_API_KEY", "enter shows where"):
+        assert unwanted not in text, f"未配置厂商的旧入口仍显示 {unwanted!r}:\n{text}"
 
 
 class _DeviceGatewayMock(http.server.BaseHTTPRequestHandler):

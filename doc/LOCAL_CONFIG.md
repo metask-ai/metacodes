@@ -174,9 +174,9 @@ So `METACODES_PROVIDER` and `METACODES_MODEL` in the file apply only when
 nothing above them decides: once you sign in to Metask (`/login`, or
 `metacodes login`), the file's provider no longer takes over. Its keys still
 work: a provider you choose with `--provider` or in `/model` reads its key
-from the file. `/model` lists a provider as usable only once its key is here
-(or in the environment, or stored by `/login <provider>`); until then it sits
-under "Not configured" and, when you choose it, names the variable and this
+from the file. `/model` lists a provider only once its key is here
+(or in the environment, or stored by `/login <provider>`); until then the
+provider is omitted. If none is usable, the picker points to `/login` and this
 file. While the terminal UI starts on Metask instead of this file's provider,
 it says so once under its banner (`.env configures DeepSeek; the default is
 Metask. To use DeepSeek: /model, or /logout`). `/logout` signs you out of

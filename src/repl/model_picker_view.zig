@@ -40,18 +40,7 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     const window = @max(picker.page_rows, 1);
     const top = @min(picker.window_top, visible.len -| 1);
     const end = @min(top + window, visible.len);
-    var group_named = false;
     for (visible[top..end], top..) |row, index| {
-        // The providers no credential is configured for come last, under a
-        // heading of their own: named once, above the first of them drawn,
-        // so a list scrolled into the group still says what it is (#488).
-        if (!group_named and row == .provider and !row.provider.ready) {
-            line(w);
-            w.print("  {s}Not configured{s}", .{ th.dim, th.reset }) catch {};
-            newline(w);
-            rows += 1;
-            group_named = true;
-        }
         rows += drawRow(picker, w, th, cols, row, index == picker.cursor);
     }
     if (end < visible.len or top > 0) {
@@ -69,22 +58,18 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         newline(w);
         rows += 1;
     }
-    // Enter on a provider in the "Not configured" group applies nothing; the
-    // footer says what it does instead (#488).
-    const on_unconfigured = switch (visible[@min(picker.cursor, visible.len - 1)]) {
-        .provider => |group| !group.ready,
-        else => false,
-    };
-    return rows + footer(picker, w, th, on_unconfigured);
+    return rows + footer(picker, w, th, true);
 }
 
 fn emptyText(picker: *const Picker) []const u8 {
     return switch (picker.status) {
         .loading => "loading providers…",
         .failed => "provider catalog unavailable — Esc to close",
-        .empty => "no providers configured",
+        .empty => "no providers configured · /login or configure .env",
         else => if (picker.filter_len > 0)
             "nothing matches this filter — Esc clears it"
+        else if (picker.stage == .provider)
+            "no providers configured · /login or configure .env"
         else
             "no routes on this step",
     };
@@ -197,9 +182,6 @@ fn drawRow(
         .provider => |group| {
             const offer = picker.offers.items[group.offer_index];
             paint(w, th, selected, group.is_current);
-            // A provider with no credential is drawn dim: it can be chosen
-            // to see where its credential goes, not to switch (#488).
-            if (!group.ready) w.print("{s}{s}", .{ th.reset, th.dim }) catch {};
             w.print("{s}", .{offer.provider_id.slice()}) catch {};
             w.print("{s} {s}{d} model", .{ th.reset, th.dim, group.offer_count }) catch {};
             if (group.offer_count != 1) w.writeAll("s") catch {};
@@ -342,25 +324,25 @@ fn writeHealth(w: *std.Io.Writer, health: offer_mod.Health, availability: offer_
     if (health.latency_ms_p50) |latency| w.print(" p50={d}ms", .{latency}) catch {};
 }
 
-fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, on_unconfigured: bool) u16 {
+fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, has_rows: bool) u16 {
     line(w);
-    // Scope and its next-turn semantics are stated, not implied: a commit that
-    // silently outlived the session would be a surprise the user cannot undo
-    // from here.
-    const scope_text = switch (picker.scope) {
-        .session => "this session",
-        .global => "every future session (durable)",
-        .once => "the next turn only",
-    };
-    if (on_unconfigured) {
-        w.print("  {s}enter shows where its credential goes · esc back · q close{s}", .{ th.dim, th.reset }) catch {};
-    } else {
+    if (has_rows) {
+        // Scope and its next-turn semantics are stated, not implied: a commit that
+        // silently outlived the session would be a surprise the user cannot undo
+        // from here.
+        const scope_text = switch (picker.scope) {
+            .session => "this session",
+            .global => "every future session (durable)",
+            .once => "the next turn only",
+        };
         // On the options step the values change with ←/→ and Enter applies
         // them; a footer that named only Enter left the values looking fixed.
         w.print(
             "  {s}{s}enter apply to {s} · tab scope · esc back · q close{s}",
             .{ th.dim, if (picker.stage == .options) "←/→ change · " else "", scope_text, th.reset },
         ) catch {};
+    } else {
+        w.print("  {s}esc back · q close{s}", .{ th.dim, th.reset }) catch {};
     }
     newline(w);
     line(w);
@@ -774,7 +756,7 @@ fn offerOf(provider: []const u8, model: []const u8) control_plane.OfferSummary {
     return offer;
 }
 
-test "providers with no credential are drawn last, dim, under a Not configured heading (#488)" {
+test "providers with no credential are omitted from the rendered list (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]control_plane.OfferSummary{
@@ -795,33 +777,31 @@ test "providers with no credential are drawn last, dim, under a Not configured h
     const rows = try visibleRows(arena_state.allocator(), text);
     try testing.expectEqual(rows.len, @as(usize, drawn));
 
-    // Order on screen: the two configured, the heading, the two without.
-    var order: [5]usize = undefined;
-    for ([_][]const u8{ "metask", "deepseek", "Not configured", "kimi", "qwen" }, 0..) |needle, slot| {
+    // The two configured providers stay in catalog order, with no group or
+    // paging footer for the two that were omitted.
+    var order: [2]usize = undefined;
+    for ([_][]const u8{ "metask", "deepseek" }, 0..) |needle, slot| {
         order[slot] = for (rows, 0..) |row, index| {
             if (std.mem.indexOf(u8, row, needle) != null) break index;
         } else return error.RowMissing;
     }
-    for (order[1..], order[0 .. order.len - 1]) |later, earlier| try testing.expect(later > earlier);
-    // The heading is drawn once, and the rows under it are dim.
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Not configured"));
-    try testing.expect(std.mem.indexOf(u8, text, theme_mod.dark.dim ++ "kimi") != null);
-    try testing.expect(std.mem.indexOf(u8, text, theme_mod.dark.dim ++ "deepseek") == null);
+    try testing.expect(order[1] > order[0]);
+    for ([_][]const u8{ "Not configured", "kimi", "qwen", "PgUp/PgDn" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, text, needle) == null);
+    }
 }
 
-test "on a provider with no credential the footer says what Enter does there, not that it applies (#488)" {
+test "a provider list with no usable route says how to configure one" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]control_plane.OfferSummary{ offerOf("metask", "m1"), offerOf("kimi", "k1") };
     try seed(&picker, &offers, null);
-    try picker.setReadiness(&.{ true, false }, &.{});
+    try picker.setReadiness(&.{ false, false }, &.{});
     var buffer: [8192]u8 = undefined;
-    const on_ready = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, on_ready, "enter apply to this session") != null);
-    _ = picker.onKey(.down);
-    const on_unready = draw(&picker, &buffer);
-    try testing.expect(std.mem.indexOf(u8, on_unready, "enter shows where its credential goes") != null);
-    try testing.expect(std.mem.indexOf(u8, on_unready, "enter apply") == null);
+    const text = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "no providers configured · /login or configure .env") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Not configured") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "enter apply") == null);
 }
 
 test "the setup stage shows the variable, this install's .env and the guide, and no way to type a key (#488)" {
@@ -830,16 +810,11 @@ test "the setup stage shows the variable, this install's .env and the guide, and
     const offers = [_]control_plane.OfferSummary{ offerOf("metask", "m1"), offerOf("kimi", "k1") };
     try seed(&picker, &offers, null);
     const guide = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md";
-    try picker.setReadiness(&.{ false, false }, &.{
-        .{ .provider = ids.Slug.lit("metask"), .variable = "METASK_API_KEY", .sign_in = true },
-        .{ .provider = ids.Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" },
-    });
+    try picker.setReadiness(&.{ false, false }, &.{});
     picker.setLocalConfig("/home/u/.local/opt/metacodes/state/.env", guide);
 
     var buffer: [8192]u8 = undefined;
-    _ = picker.onKey(.down); // kimi
-    _ = picker.onKey(.enter);
-    try testing.expectEqual(picker_mod.Stage.setup, picker.stage);
+    picker.enterSetup(.{ .provider = ids.Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" });
     const kimi = draw(&picker, &buffer);
     for ([_][]const u8{
         "kimi",
@@ -860,8 +835,7 @@ test "the setup stage shows the variable, this install's .env and the guide, and
 
     // Metask is signed in to: /login comes first, the .env key after it.
     _ = picker.onKey(.escape);
-    _ = picker.onKey(.up);
-    _ = picker.onKey(.enter);
+    picker.enterSetup(.{ .provider = ids.Slug.lit("metask"), .variable = "METASK_API_KEY", .sign_in = true });
     const metask = draw(&picker, &buffer);
     const sign_in = std.mem.indexOf(u8, metask, "Sign in: /login") orelse return error.NoSignIn;
     const key = std.mem.indexOf(u8, metask, "Or set METASK_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart") orelse return error.NoKeyLine;

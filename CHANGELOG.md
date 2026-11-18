@@ -112,11 +112,12 @@ status, compatibility boundaries, and entry points are defined by
   `MissingCredentials`). Only a missing credential takes a route off the
   list: one refused for another reason (two names of its key that
   disagree, say) stays listed, and a pick says why. A provider with no such
-  credential is no longer a row that leads to a sign-in or a key field: it
-  is listed dimmed under
-  "Not configured", below the others, and choosing it shows the variable to
-  set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
-  first), and starts nothing. The in-picker sign-in and key-paste stage of
+  credential is omitted rather than shown as a row that leads to a sign-in
+  or a key field. When no provider is usable, the picker points to `/login`
+  and this install's `.env`. If a credential goes away after its route was
+  listed, the failed commit shows the variable to set, this install's `.env`
+  and `doc/LOCAL_CONFIG.md` (for Metask, `/login` first), and starts nothing.
+  The in-picker sign-in and key-paste stage of
   #67 are gone; `/login <provider>` pastes a key or signs in, as before. A
   pick that moves the session to another provider says on a second line who
   bills it from then on (`from now on billed to your DeepSeek account`).
