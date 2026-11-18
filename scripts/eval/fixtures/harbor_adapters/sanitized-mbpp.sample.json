@@ -1,0 +1,40 @@
+[
+ {
+  "source_file": "Benchmark Questions Verification V2.ipynb",
+  "task_id": 2,
+  "prompt": "Write a function to find the shared elements from the given two lists.",
+  "code": "def similar_elements(test_tup1, test_tup2):\n  res = tuple(set(test_tup1) & set(test_tup2))\n  return (res) ",
+  "test_imports": [],
+  "test_list": [
+   "assert set(similar_elements((3, 4, 5, 6),(5, 7, 4, 10))) == set((4, 5))",
+   "assert set(similar_elements((1, 2, 3, 4),(5, 4, 3, 7))) == set((3, 4))",
+   "assert set(similar_elements((11, 12, 14, 13),(17, 15, 14, 13))) == set((13, 14))"
+  ]
+ },
+ {
+  "source_file": "Benchmark Questions Verification V2.ipynb",
+  "task_id": 11,
+  "prompt": "Write a python function to remove first and last occurrence of a given character from the string.",
+  "code": "def remove_Occ(s,ch): \n    for i in range(len(s)): \n        if (s[i] == ch): \n            s = s[0 : i] + s[i + 1:] \n            break\n    for i in range(len(s) - 1,-1,-1):  \n        if (s[i] == ch): \n            s = s[0 : i] + s[i + 1:] \n            break\n    return s ",
+  "test_imports": [],
+  "test_list": [
+   "assert remove_Occ(\"hello\",\"l\") == \"heo\"",
+   "assert remove_Occ(\"abcda\",\"a\") == \"bcd\"",
+   "assert remove_Occ(\"PHP\",\"P\") == \"H\""
+  ]
+ },
+ {
+  "source_file": "Mike's Copy of Benchmark Questions Verification V2.ipynb",
+  "task_id": 82,
+  "prompt": "Write a function to find the volume of a sphere.",
+  "code": "import math\ndef volume_sphere(r):\n  volume=(4/3)*math.pi*r*r*r\n  return volume",
+  "test_imports": [
+   "import math"
+  ],
+  "test_list": [
+   "assert math.isclose(volume_sphere(10), 4188.790204786391, rel_tol=0.001)",
+   "assert math.isclose(volume_sphere(25), 65449.84694978735, rel_tol=0.001)",
+   "assert math.isclose(volume_sphere(20), 33510.32163829113, rel_tol=0.001)"
+  ]
+ }
+]
