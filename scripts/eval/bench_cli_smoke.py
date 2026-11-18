@@ -10,10 +10,32 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.eval.tests.test_bench_workbench import fixture  # noqa: E402
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+from scripts.eval.harbor.viewer.runner import RunManager, atomic_json  # noqa: E402
+from scripts.eval.tests.test_bench_workbench import fixture, wait_run, wait_status  # noqa: E402
+
+# Run the server with the base revision's headers in a separate process.
+LEGACY_SERVER = """
+import sys
+from scripts.eval.harbor.viewer import server
+server.SECURITY_HEADERS = (
+    ("Cache-Control", "no-store"),
+    ("X-Content-Type-Options", "nosniff"),
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    ),
+    ("Referrer-Policy", "no-referrer"),
+)
+sys.exit(server.main())
+"""
 
 
 def main():
@@ -24,7 +46,7 @@ def main():
         print('bench CLI worker smoke: POSIX executable fixture only')
         return 0
     with tempfile.TemporaryDirectory(prefix='bench-cli-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         native = root / 'metacodes'
         shutil.copy2(args.binary.resolve(), native)
         cfg, binary_dir = fixture(root)
@@ -39,36 +61,81 @@ def main():
             assert p.returncode == expected, (p.returncode, p.stdout, p.stderr)
             return p.stdout
         ready = state / 'bench/service.json'
+        release = root / 'release-harbor'
+        legacy = None
         try:
             assert '暂无' in invoke(['list'])
             initial = json.loads(invoke(['info', '--json']))
             assert initial['service'] == 'metacodes-bench'
             invoke(['--not-an-option'], expected=2)
-            started = json.loads(invoke(['--no-open', '--json', '--bundle', config['bundle'],
-                                '--provider-config', config['provider_config'], '--model', config['model'],
-                                '--harbor', config['harbor']]))
-            assert '?token=' in started['url']
+            jobs_dir = ready.parent / 'jobs'
+            config_path = ready.with_name('workbench.json')
+            atomic_json(config_path, {**config, 'jobs_dir': str(jobs_dir)})
+            manager = RunManager(jobs_dir, config_path)
+            legacy = subprocess.Popen(
+                [sys.executable, '-c', LEGACY_SERVER, '--config', str(config_path),
+                 '--jobs-dir', str(jobs_dir), '--port', '0', '--ready-file', str(ready)],
+                env={**env, 'FAKE_BENCH_RELEASE_FILE': str(release)}, cwd=REPO,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert legacy.poll() is None, 'legacy workbench exited before ready'
+                assert time.monotonic() < deadline, 'legacy workbench did not become ready'
+                time.sleep(.05)
+            old_url = json.loads(ready.read_text())['url']
+            port = str(urlsplit(old_url).port)
+            reused = json.loads(invoke(['--no-open', '--json']))
+            assert reused['url'].startswith(old_url + '?token='), reused
+            with urlopen(old_url, timeout=5) as response:
+                assert 'Content-Security-Policy' in response.headers
+            active = json.loads(invoke(['run', '--task', 'fix-git', '--json']))
+            assert wait_status(manager, active['name'], 'running') == 'running', active
+            assert json.loads(invoke(['stop', '--json']))['stopped']
+            assert legacy.wait(timeout=10) == 0
+
+            started = json.loads(invoke(['--no-open', '--json', '--port', port,
+                                        '--bundle', config['bundle'], '--provider-config', config['provider_config'],
+                                        '--model', config['model'], '--harbor', config['harbor']]))
+            assert started['url'].startswith(old_url + '?token='), started
+            assert started['url'] != reused['url'], 'reopening must issue a new capability'
+            for path in ('', 'index.html'):
+                with urlopen(old_url + path, timeout=5) as response:
+                    assert 'Content-Security-Policy' not in response.headers, path
+                    assert response.headers['X-Frame-Options'] == 'DENY', path
+                    assert response.headers['X-Content-Type-Options'] == 'nosniff', path
+            with urlopen(old_url + 'api/run?name=' + active['name'], timeout=5) as response:
+                assert json.load(response)['status'] == 'running', active
+            release.touch()
+            upgraded_run = wait_run(manager, active['name'])
+            assert upgraded_run['status'] == 'finished', upgraded_run
+
             second = json.loads(invoke(['--no-open', '--json']))
             assert started['url'] == second['url'], 'must reuse ready service'
             completed = json.loads(invoke(['run', '--task', 'fix-git', '--wait', '--json']))
             assert completed['status'] == 'finished', completed
             assert '#/run/' in completed['url']
             jobs = json.loads(invoke(['list', '--json']))['jobs']
-            assert len(jobs) == 1 and jobs[0]['summary']['counts']['pass'] == 1, jobs
+            assert len(jobs) == 2 and all(job['summary']['counts']['pass'] == 1 for job in jobs), jobs
             assert 'private-cli-fixture' not in json.dumps(jobs)
             with_config = [str(native), '--state-dir', str(root / 'remote'), 'bench', 'info', '--json', '--url', started['url']]
             remote = subprocess.run(with_config, env=env, cwd=root, capture_output=True, text=True, timeout=15)
             assert remote.returncode == 0, remote.stderr
             assert json.loads(remote.stdout)['can_run']
             assert json.loads(invoke(['stop', '--json']))['stopped']
-            print('bench CLI smoke: extraction, info/list, service reuse, remote client, run/wait and result link passed (paid=0)')
+            print('bench CLI smoke: extraction, info/list, reuse, upgrade with active worker, remote client, run/wait and result link passed (paid=0)')
         finally:
+            release.touch()
+            if legacy is not None and legacy.poll() is None:
+                legacy.kill()
+                legacy.wait(timeout=5)
             if ready.exists():
                 record = json.loads(ready.read_text())
-                try:
-                    os.kill(record['pid'], signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                if legacy is None or record['pid'] != legacy.pid:
+                    try:
+                        os.kill(record['pid'], signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
     return 0
 
 

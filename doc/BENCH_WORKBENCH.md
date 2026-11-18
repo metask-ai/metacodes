@@ -118,6 +118,14 @@ client can also supply `METACODES_BENCH_TOKEN`. The workbench keeps its service
 receipt (including capability) at `<state root>/bench/service.json` with mode
 0600 on POSIX.
 
+After upgrading the binary, a running workbench keeps serving the previous
+version. On the service host, use the existing state directory for both
+commands. Run `metacodes bench stop` and wait for the old listener to stop
+responding, then rerun `metacodes bench` with the same jobs directory and any
+bind, port, and public URL options. Open the new link to use selection and
+annotation in Codex desktop. Active benchmark workers continue through the
+restart.
+
 ## Using the page
 
 ### Metric definitions
