@@ -18,7 +18,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import READY, case_tmpdir, run, submit, wait_for  # noqa: E402
+from tty_driver import READY, WAIT_S, case_tmpdir, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 NOT_SET = "not set — /login, or configure .env"
@@ -218,3 +218,74 @@ def test_incomplete_metask_login_opens_unbound(bin_path):
         assert b"at-never-sent" not in raw
         _assert_nothing_sent(case)
         assert case.session_entries() == []
+
+
+ENV_KEYS_NOTICE = (".env has keys for DeepSeek and OpenAI. "
+                   "Choose one with /model; Tab there applies it to every future session.")
+
+
+def _write_two_provider_env(case):
+    """`.env` with keys of two providers and no METACODES_PROVIDER (#486)."""
+    os.makedirs(case.state, exist_ok=True)
+    path = os.path.join(case.state, ".env")
+    with open(path, "w") as f:
+        f.write(f"DEEPSEEK_API_KEY={PLACEHOLDER}-deepseek\nOPENAI_API_KEY={PLACEHOLDER}-openai\n")
+    os.chmod(path, 0o600)
+
+
+def test_env_keys_of_several_providers_open_unbound_and_say_once_where_to_choose(bin_path):
+    # Keys of two providers and no name: the file chooses neither, and the TUI
+    # no longer leaves it at "add METACODES_PROVIDER, then restart". It opens
+    # without a model, says once under the banner which providers and that
+    # /model chooses, and a prompt's reminder points there too. Nothing is
+    # sent and no key value reaches the terminal.
+    with _Case() as case:
+        case.bin = bin_path
+        _write_two_provider_env(case)
+        raw = case.run([READY, "type:hi", "key:enter", wait_for("Or use a key in .env", 10)],
+                       term_size=(40, 180))
+        a = TTYAssert(raw, rows=40, cols=180)
+        a.assert_prose_contains(NOT_SET)
+        screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+        assert screen.count(ENV_KEYS_NOTICE) == 1, screen
+        echo = a.final.find_row("❯ hi")
+        if echo is None:
+            a._fail("the prompt's echo is missing")
+        a.assert_line_contains(echo + 1, "⎿  No model is set up.")
+        assert "Or use a key in .env:         /model (DeepSeek, OpenAI)" in screen, screen
+        assert "METACODES_PROVIDER" not in screen, screen
+        assert PLACEHOLDER.encode() not in raw, "a key's value reached the terminal"
+        _assert_nothing_sent(case)
+        assert case.session_entries() == []
+
+
+def test_env_keys_of_several_providers_a_durable_model_pick_is_the_next_start(bin_path):
+    # The way out the notice names: /model, a DeepSeek model, Tab to "from
+    # now on" (every future session), Enter. The pick binds this session with
+    # the file's key, and the next start begins on it (the stored default,
+    # level 2), with no notice and nothing left to choose.
+    with _Case() as case:
+        case.bin = bin_path
+        _write_two_provider_env(case)
+        raw = case.run(
+            [READY] + submit("/model", "apply to") + [
+                "type:deepseek", "sleep:0.4", "key:tab", wait_for("[from now on]"),
+                "key:enter", wait_for("switched to"),
+            ],
+            term_size=(40, 180), per_key_drain=0.1,
+        )
+        a = TTYAssert(raw, rows=40, cols=180)
+        flat = " ".join("\n".join(a.final.line_text(r) for r in range(a.final.rows)).split())
+        assert "switched to deepseek" in flat and "from now on" in flat, flat
+        assert PLACEHOLDER.encode() not in raw
+        with open(os.path.join(case.state, "config.json")) as f:
+            stored = json.load(f)
+        assert stored.get("global_selection"), stored
+
+        again = case.run([READY, "sleep:0.5"], term_size=(40, 180))
+        b = TTYAssert(again, rows=40, cols=180)
+        screen = "\n".join(b.final.line_text(r) for r in range(b.final.rows))
+        assert "· from .env" in screen, screen
+        assert NOT_SET not in screen, screen
+        assert ".env has keys for" not in screen, screen
+        assert PLACEHOLDER.encode() not in again
