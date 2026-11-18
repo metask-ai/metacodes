@@ -27,7 +27,7 @@ from http.cookies import SimpleCookie
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.store import config as store_config
-from scripts.eval.harbor.store.backend import Store, open_ephemeral
+from scripts.eval.harbor.store.backend import Store, json_text, open_ephemeral
 from scripts.eval.harbor.store.library import StoreLibrary
 from scripts.eval.harbor.viewer import data
 from scripts.eval.harbor.viewer.runner import ACTIVE, RunManager, atomic_json, runtime_env, settings
@@ -55,6 +55,8 @@ SECURITY_HEADERS = (
 def make_handler(library: StoreLibrary, manager=None, token=""):
     setups = SetupManager(manager.config_path) if manager else None
     logins = LoginManager(manager.config_path) if manager else None
+    if manager is not None:
+        manager.setup_running = setups.mutating
 
     def managed_view(name, with_rows=True):
         view = library.job_view(name)
@@ -116,8 +118,12 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                 if path == "/api/runs":
                     self.send_json(manager.launch(payload), 202)
                 elif path == "/api/setup":
-                    busy = any(run.get("status") in ACTIVE for run in manager.runs())
-                    self.send_json(setups.start(payload, runtime_env(), str(RUNTIME_ROOT), busy=busy), 202)
+                    # Under the launch lock: a launch and a setup that may
+                    # restart Docker never start at the same time.
+                    with manager.lock:
+                        busy = any(run.get("status") in ACTIVE for run in manager.runs())
+                        started = setups.start(payload, runtime_env(), str(RUNTIME_ROOT), busy=busy)
+                    self.send_json(started, 202)
                 elif path == "/api/login" and payload == {}:
                     self.send_json(logins.start(runtime_env()), 202)
                 elif path == "/api/cancel" and isinstance(payload, dict):
@@ -214,7 +220,7 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                 if view is None:
                     self.send_json({"error": "no such job"}, 404)
                     return
-                body = data.job_csv(view).encode("utf-8")
+                body = data.job_csv(view).encode("utf-8", "replace")
                 self.send_bytes(
                     body,
                     "text/csv; charset=utf-8",
@@ -224,7 +230,9 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                 self.send_json({"error": "not found"}, 404)
 
         def send_json(self, value, status: int = 200) -> None:
-            body = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            # A lone surrogate (a broken emoji in a trajectory) is sent as
+            # its JSON escape instead of failing the response.
+            body = json_text(value).encode("utf-8")
             self.send_bytes(body, "application/json; charset=utf-8", status=status)
 
         def send_bytes(self, body: bytes, mime: str, status: int = 200, attachment: Optional[str] = None) -> None:

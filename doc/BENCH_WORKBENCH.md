@@ -20,6 +20,7 @@ metacodes bench run --suite aime-2025 --wait          # the suite's default samp
 metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
+metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
 ```
 
 Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
@@ -149,7 +150,8 @@ step reports the exact command to run. The page's `POST /api/setup`
 (`{"executor": NAME, "dry_run": bool}`) has the same capability and
 same-origin rules as `/api/runs`, and its progress (`GET /api/setup`) is only
 shown to the capability holder. Setup refuses to run while a benchmark is
-active, because it may restart Docker.
+active, because it may restart Docker, and a launch is refused while a setup
+that is not a dry run is in progress; the service checks both under one lock.
 
 | Step | What it does |
 |---|---|
@@ -289,8 +291,12 @@ does the same):
 An `ssh` entry also accepts `harbor` (written by setup), `python`
 (default `python3`), `metrics_bind` (default `172.17.0.1`) and
 `metrics_enabled`. Names, hosts, users and paths are validated before any
-`ssh` argv is built; unknown fields are refused. Readiness probes are cached
-for 15 seconds.
+`ssh` argv is built; unknown fields are refused. `harbor` and `python` may
+contain spaces and `@` (a home directory can), since they only travel as one
+argv word; `state_dir` may not. Setup saves a Harbor path only when the entry
+still validates afterwards, and otherwise says to set it by hand. A malformed
+entry is shown as not ready with its reason and leaves the other executors
+usable. Readiness probes are cached for 15 seconds.
 
 ### SSH prerequisites
 
@@ -325,9 +331,22 @@ account (or provider) key exactly as for a local run, then
    the executor's `metrics_bind`), runs Harbor in its own process group and
    prints heartbeats; Harbor's output reaches the local run log;
 5. the worker copies the remote job directory into the local jobs directory
-   every 10 seconds and once more at the end, transferring only files whose
-   size or modification time changed. The viewer and other readers of local
-   job directories see ordinary Harbor files.
+   on a background thread, every 10 seconds, transferring only files whose
+   size or modification time changed. Each pass is bounded (128 MiB or 2000
+   files, smallest first, at least one file) and is extracted while it
+   streams, so every pass finishes and makes progress; a file that only grew
+   since its last copy is sent as an append (checked against the 64 KiB
+   before its old end). The heartbeat and cancel handling never wait for a
+   copy. The viewer and other readers of local job directories see ordinary
+   Harbor files;
+6. after Harbor exits, the worker copies what is left until a fresh remote
+   listing matches the local copy (up to 30 minutes,
+   `METACODES_BENCH_FINAL_SYNC_TIMEOUT` seconds if set). Only then is a run
+   `finished`. Otherwise the run is `failed` (keeping Harbor's `exit_code`),
+   its `error` says that the results are still on the executor and where,
+   `remote_results` names the executor and path, and
+   `metacodes bench sync --run NAME` copies them later; a run whose Harbor
+   exited 0 then becomes `finished`.
 
 Suites on an SSH executor: `harbor-registry` suites run there unchanged
 (the remote Harbor resolves `-d` itself). A `harbor-local` suite's dataset
@@ -480,7 +499,27 @@ job every 15 seconds during a run and does a final, content-verified sync
 before it writes the finished receipt. Ingestion is idempotent. Only files
 whose size or mtime changed are read again, so a job that is still running
 can be ingested safely. A partially written file is replaced on the next
-pass. Symlinks are never followed.
+pass. Symlinks are never followed. A trial is derived again only when its
+own files or request metrics change: Harbor rewriting the job's
+`result.json` after each trial updates the job header, not every trial. A
+trial that cannot be derived is logged and retried on the next pass without
+keeping the job's other trials out.
+
+Text that a database cannot hold is stored the same way in SQLite and
+PostgreSQL: in the normalized text columns (file paths, verifier messages,
+stop reasons, …) a lone UTF-16 surrogate (a truncated emoji, a non-UTF-8
+file name) or NUL becomes U+FFFD; the projections keep the exact value as a
+JSON escape, so the page shows what the files show. Names read back from a
+database (job names, file paths, trial directories) are validated before
+anything is written to disk: a path with `..`, an absolute path, a
+backslash, NUL or an empty component is ignored, and migration refuses to
+copy one.
+
+A trial is keyed by its directory relative to the job (`task__id`, or
+`workbuddy/<run>/task__id`), so a trial name repeated in two WorkBuddy runs
+counts twice, as in the live directory; the trial page opens the first by
+path. A job whose directory was deleted stays listed from the database: the
+database, not the directory, is the record.
 
 | Layer | Tables | Content |
 |---|---|---|
@@ -496,8 +535,10 @@ are deleted. CHECK and foreign-key constraints reject unknown statuses,
 scored trials without a reward, costs whose source contradicts them, and
 dangling rows. Each schema change is a numbered migration recorded in
 `schema_migrations`. A database whose schema is newer than the binary is
-refused. Files larger than 256 MiB are recorded with size and mtime, but
-their content is not stored.
+refused. Files larger than 256 MiB are recorded with size and mtime and
+their last 64 KiB: the projections read such a file only through its size
+and tail (stderr and verifier output tails, the partial-token mark), so they
+match the live files.
 
 ```sh
 metacodes bench db status                       # backend, schema, row counts
@@ -512,12 +553,21 @@ job name that is already stored from another existing directory is skipped.
 `--verify` re-reads every file by content.
 
 `db migrate` copies everything from the active database to the target, in
-either direction. It reads the source in one snapshot and commits the target
-in batches, so an interrupted migration resumes when run again. Rows already
-present and identical are skipped. If the target holds a different row under
-the same key, the command stops before writing and changes nothing. After
-the copy, every source row is compared with the target, and every target blob
-is re-hashed. The command reports row counts per table. `--switch` then
+either direction. It reads the source in one snapshot, used for the copy and
+for its verification, and commits the target in batches, so an interrupted
+migration resumes when run again. Rows already present and identical are
+skipped. A target row that is an older version of the source row (an
+earlier ingestion of the same job, trial or launch record, an older mtime of
+the same file, and the per-request/usage/test rows of such a trial) is
+updated, so a migration rerun after the source moved on resumes instead of
+failing. Any other difference under the same key stops the command before
+it writes and changes nothing. After the copy, every row of the snapshot is
+compared with the target, and every target blob is re-hashed. The command
+reports row counts per table (copied, updated, already present, verified).
+Migrating while a run is active is safe: the target holds the source as of
+the snapshot, and what is ingested later reaches it when the service syncs
+after `--switch` (it re-reads the jobs directories) or when `db migrate` is
+run again. `--switch` then
 writes the target into `workbench.json`; restart the service with
 `metacodes bench stop && metacodes bench`. A new `metacodes bench` replaces
 a running service that uses a different database.
@@ -532,7 +582,11 @@ command. Each is saved in `workbench.json` as follows:
            "password_env": "BENCH_PG_PASSWORD"}}
 ```
 
-A DSN containing a password is refused. The password comes from the named
+A target is PostgreSQL when it is a `postgres://`/`postgresql://` URI in any
+letter case or a libpq keyword string (`host=db dbname=bench user=bench`);
+anything else is a SQLite path, and a path that looks like a connection
+string or contains `password` is refused. A DSN containing a password is
+refused, and the refusal never repeats it. The password comes from the named
 environment variable, or from libpq's `PGPASSWORD`/`~/.pgpass`. It never
 enters `workbench.json`, a run spec, or the browser. PostgreSQL needs
 psycopg 3 in the Python that runs bench

@@ -16,7 +16,6 @@ recomputes its projections from its own blobs when the code changes.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import sys
 import tempfile
@@ -28,15 +27,19 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from scripts.eval.harbor import profiling
 from scripts.eval.harbor.store import schema
-from scripts.eval.harbor.store.backend import Store, Tx, blob_bytes, now
+from scripts.eval.harbor.store.backend import Store, StoreError, Tx, blob_bytes, clean_text, json_text, now
 from scripts.eval.harbor.viewer import data
 
 MAX_FILE_BYTES = 256 * 1024 * 1024
+# What an oversize file keeps: its last bytes. data.py reads a file over
+# data.MAX_JSON_BYTES (always smaller than MAX_FILE_BYTES) only through
+# data.tail(), so this tail and the size reproduce its projection exactly.
+OVERSIZE_TAIL_BYTES = 64 * 1024
 BATCH_BYTES = 32 * 1024 * 1024
 JOB_FILES = ("config.json", "result.json")
 METRICS_DIR = ".bench-metrics"
 # Bump when ingestion itself changes how projections are derived.
-INGEST_VERSION = "2"
+INGEST_VERSION = "3"
 
 
 def _projection() -> str:
@@ -87,8 +90,9 @@ def get_blobs(tx: Tx, digests: Iterable[str]) -> Dict[str, bytes]:
 def collect_garbage(tx: Tx, digests: Iterable[str]) -> None:
     for digest in set(d for d in digests if d):
         tx.execute("DELETE FROM blobs WHERE sha256 = ? AND NOT EXISTS (SELECT 1 FROM files WHERE sha256 = ?) "
+                   "AND NOT EXISTS (SELECT 1 FROM files WHERE tail_sha256 = ?) "
                    "AND NOT EXISTS (SELECT 1 FROM runs WHERE spec_sha256 = ? OR log_sha256 = ?)",
-                   (digest, digest, digest, digest))
+                   (digest, digest, digest, digest, digest))
 
 
 # ------------------------------------------------------------- job layout
@@ -108,6 +112,25 @@ class StoredFile:
     sha256: Optional[str]
     trial: Optional[str] = None
     kind: str = "job_other"
+    tail_sha256: Optional[str] = None
+
+
+def safe_name(name: Any) -> bool:
+    """A job name as data.Library admits it: one plain path component."""
+    return isinstance(name, str) and bool(data.NAME.match(name)) and "/" not in name
+
+
+def safe_relpath(relpath: Any) -> bool:
+    """A stored relative path that stays inside its job directory on every
+    platform: POSIX separators, no empty, `.` or `..` component, no
+    absolute path, drive, backslash, NUL or other control character."""
+    if not isinstance(relpath, str) or not relpath or len(relpath) > 4096:
+        return False
+    if relpath.startswith("/") or "\\" in relpath or ":" in relpath.split("/", 1)[0]:
+        return False
+    if any(ord(ch) < 32 for ch in relpath):
+        return False
+    return all(part not in ("", ".", "..") for part in relpath.split("/"))
 
 
 def is_job_dir(path: Path) -> bool:
@@ -117,7 +140,12 @@ def is_job_dir(path: Path) -> bool:
 
 
 def scan(job_dir: Path) -> Dict[str, Tuple[Stat, Path]]:
-    """Every regular file under the job, by POSIX relative path; no symlinks."""
+    """Every regular file under the job, by POSIX relative path; no symlinks.
+
+    The key is the path as the store holds it (clean_text: a non-UTF-8 name
+    is stored with U+FFFD, the first of several such names wins); a path the
+    store could not write back safely (a backslash in a POSIX name) is left
+    out."""
     found: Dict[str, Tuple[Stat, Path]] = {}
     for directory, dirnames, filenames in os.walk(job_dir, followlinks=False):
         dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(directory, name))]
@@ -129,8 +157,9 @@ def scan(job_dir: Path) -> Dict[str, Tuple[Stat, Path]]:
                 continue
             if not os.path.isfile(path) or os.path.islink(path):
                 continue
-            relpath = path.relative_to(job_dir).as_posix()
-            found[relpath] = (Stat(info.st_size, info.st_mtime_ns), path)
+            relpath = clean_text(path.relative_to(job_dir).as_posix())
+            if safe_relpath(relpath) and relpath not in found:
+                found[relpath] = (Stat(info.st_size, info.st_mtime_ns), path)
     return found
 
 
@@ -149,23 +178,13 @@ def trial_prefix(relpath: str) -> Optional[str]:
     return None
 
 
-def trial_locations(relpaths: Iterable[str]) -> Dict[str, str]:
-    """Trial name -> trial directory, as data.trial_dirs sees them: a
-    candidate directory whose config.json exists. A name repeated in two
-    nested runs resolves like data.Library.trial_dir: the first by path."""
-    found: Dict[str, str] = {}
-    for relpath in relpaths:
-        prefix = trial_prefix(relpath)
-        if prefix is None or relpath != prefix + "/config.json":
-            continue
-        name = prefix.rsplit("/", 1)[-1]
-        if name not in found or prefix < found[name]:
-            found[name] = prefix
-    return found
-
-
-def trial_names(relpaths: Iterable[str]) -> List[str]:
-    return sorted(trial_locations(relpaths))
+def trial_locations(relpaths: Iterable[str]) -> List[str]:
+    """The trial directories (relative to the job) as data.trial_dirs sees
+    them: a candidate directory whose config.json exists. Each directory is
+    one trial, keyed by this path: a name repeated in two nested runs is two
+    trials, as the live view lists them."""
+    return sorted({prefix for prefix, relpath in ((trial_prefix(r), r) for r in relpaths)
+                   if prefix is not None and relpath == prefix + "/config.json"})
 
 
 def _metrics_path(prefix: str) -> str:
@@ -173,12 +192,12 @@ def _metrics_path(prefix: str) -> str:
     return (parent + "/" if parent else "") + f"{METRICS_DIR}/{name}.jsonl"
 
 
-def classify_file(relpath: str, trials: Dict[str, str]) -> Tuple[Optional[str], str]:
-    """(trial, kind) of one job file; `trials` maps name -> directory."""
-    owners = {prefix: name for name, prefix in trials.items()}
+def classify_file(relpath: str, trials: Iterable[str]) -> Tuple[Optional[str], str]:
+    """(trial, kind) of one job file; `trials` holds the trial directories."""
+    trials = trials if isinstance(trials, (set, frozenset)) else set(trials)
     prefix = trial_prefix(relpath)
-    if prefix is not None and prefix in owners:
-        trial, rest = owners[prefix], relpath[len(prefix) + 1:]
+    if prefix is not None and prefix in trials:
+        trial, rest = prefix, relpath[len(prefix) + 1:]
         first = rest.split("/", 1)[0]
         if rest == "config.json":
             return trial, "trial_config"
@@ -198,24 +217,25 @@ def classify_file(relpath: str, trials: Dict[str, str]) -> Tuple[Optional[str], 
     parts = relpath.split("/")
     if len(parts) >= 2 and parts[-2] == METRICS_DIR and parts[-1].endswith(".jsonl") and (
             len(parts) == 2 or (len(parts) == 4 and parts[0] == data.NESTED_RUNS)):
-        stem = parts[-1][: -len(".jsonl")]
-        owner = trials.get(stem)
-        return (stem if owner is not None and _metrics_path(owner) == relpath else None), "request_metrics"
+        owner = "/".join(parts[:-2] + [parts[-1][: -len(".jsonl")]])
+        return (owner if owner in trials else None), "request_metrics"
     return None, "job_other"
 
 
 def trial_inputs(prefix: str, relpaths: Iterable[str]) -> List[str]:
-    """The files a trial's projection reads: its directory, its request
-    metrics (beside the directory) and the job's config/result."""
+    """The files a trial's projection reads: its directory and its request
+    metrics (beside the directory). data.trial_row and trial_detail never
+    read the job's config.json or result.json, so a running job rewriting
+    its result.json after each trial re-derives no other trial."""
     metrics = _metrics_path(prefix)
-    return sorted(r for r in relpaths if r.startswith(prefix + "/") or r == metrics or r in JOB_FILES)
+    return sorted(r for r in relpaths if r.startswith(prefix + "/") or r == metrics)
 
 
 def digest_inputs(relpaths: Iterable[str], files: Dict[str, StoredFile]) -> str:
     digest = hashlib.sha256()
     for relpath in sorted(relpaths):
         stored = files[relpath]
-        token = stored.sha256 if stored.state == "stored" else f"oversize:{stored.size}"
+        token = stored.sha256 if stored.state == "stored" else f"oversize:{stored.size}:{stored.tail_sha256}"
         digest.update(f"{relpath}\0{token}\n".encode())
     return digest.hexdigest()
 
@@ -223,15 +243,43 @@ def digest_inputs(relpaths: Iterable[str], files: Dict[str, StoredFile]) -> str:
 # -------------------------------------------------------------- projection
 
 
-def materialize(root: Path, job: str, entries: Iterable[Tuple[str, bytes, int]]) -> Path:
-    """Write stored bytes back as a job directory with the recorded mtimes."""
-    job_dir = root / job
+@dataclass(frozen=True)
+class Entry:
+    """One stored file to write back: its whole content, or for an oversize
+    file the stored tail and the recorded size."""
+    relpath: str
+    content: bytes
+    mtime_ns: int
+    size: Optional[int] = None  # oversize only
+
+
+def materialize(root: Path, job: str, entries: Iterable[Entry]) -> Path:
+    """Write stored bytes back as a job directory with the recorded mtimes.
+
+    Names come from the database, which may be shared or handed over: a job
+    name or path that could leave `root` is refused, never written."""
+    if not safe_name(job):
+        raise StoreError(f"refusing to write stored job {job!r}: not a plain job name")
+    job_dir = Path(root).resolve() / job
     job_dir.mkdir()
-    for relpath, content, mtime_ns in entries:
-        path = job_dir.joinpath(*relpath.split("/"))
+    for entry in entries:
+        if not safe_relpath(entry.relpath):
+            raise StoreError(f"refusing to write stored file {entry.relpath!r} of job {job}: unsafe path")
+        path = job_dir.joinpath(*entry.relpath.split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-        os.utime(path, ns=(mtime_ns, mtime_ns))
+        if job_dir not in path.resolve().parents:
+            raise StoreError(f"refusing to write stored file {entry.relpath!r} of job {job}: outside the job")
+        if entry.size is None:
+            path.write_bytes(entry.content)
+        else:
+            # A sparse file of the recorded size ending in the stored tail:
+            # the size and the tail are all data.py reads of a large file.
+            tail = entry.content[len(entry.content) - min(entry.size, len(entry.content)):]
+            with open(path, "wb") as handle:
+                handle.truncate(entry.size)
+                handle.seek(entry.size - len(tail))
+                handle.write(tail)
+        os.utime(path, ns=(entry.mtime_ns, entry.mtime_ns))
     return job_dir
 
 
@@ -248,7 +296,7 @@ def _text(value: Any) -> Optional[str]:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=False)
+    return json_text(value)
 
 
 def project_trial(trial_dir: Path) -> Dict[str, Any]:
@@ -265,11 +313,11 @@ def project_trial(trial_dir: Path) -> Dict[str, Any]:
     return {"row": row, "detail": detail, "requests": requests, "usage": usage, "tests": tests}
 
 
-def trial_values(job: str, projected: Dict[str, Any], digest: str) -> Tuple[Any, ...]:
+def trial_values(job: str, trial: str, projected: Dict[str, Any], digest: str) -> Tuple[Any, ...]:
     row = projected["row"]
     phases, tests = row["phases"], row["tests"]
     values = {
-        "job": job, "name": row["trial"], "task": row["task"], "status": row["status"], "cause": _text(row["cause"]),
+        "job": job, "name": trial, "task": row["task"], "status": row["status"], "cause": _text(row["cause"]),
         "reward": row["reward"], "exception": _text(row["exception"]), "stop_reason": _text(row["stop_reason"]),
         "empty_final": bool(row["empty_final"]), "turns": _int(row["turns"]), "tool_calls": _int(row["tool_calls"]),
         "input_tokens": _float(row["input_tokens"]), "cache_tokens": _float(row["cache_tokens"]),
@@ -301,9 +349,9 @@ def _insert_sql(table: str) -> str:
     return f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})"
 
 
-def write_trial(tx: Tx, job: str, projected: Dict[str, Any], digest: str) -> None:
-    trial = projected["row"]["trial"]
-    tx.execute(_upsert_sql("trials", ("job", "name")), trial_values(job, projected, digest))
+def write_trial(tx: Tx, job: str, trial: str, projected: Dict[str, Any], digest: str) -> None:
+    """`trial` is the trial directory relative to the job: the row's key."""
+    tx.execute(_upsert_sql("trials", ("job", "name")), trial_values(job, trial, projected, digest))
     for table in ("requests", "usage_events", "verifier_tests"):
         tx.execute(f"DELETE FROM {table} WHERE job = ? AND trial = ?", (job, trial))
     tx.executemany(_insert_sql("requests"), [
@@ -343,10 +391,11 @@ class JobResult:
     files_removed: int = 0
     trials_derived: int = 0
     trials_removed: int = 0
+    trials_failed: int = 0
     reason: Optional[str] = None
 
     def to_json(self) -> Dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if v is not None}
+        return {k: v for k, v in self.__dict__.items() if v is not None and not (k == "trials_failed" and not v)}
 
 
 @dataclass
@@ -360,24 +409,38 @@ class RootResult:
 
 
 def _stored_files(tx: Tx, job: str) -> Dict[str, StoredFile]:
-    return {relpath: StoredFile(int(size), int(mtime), state, sha, trial, kind)
-            for relpath, size, mtime, state, sha, trial, kind in tx.query(
-                "SELECT relpath, size, mtime_ns, state, sha256, trial, kind FROM files WHERE job = ?", (job,))}
+    """The job's file rows. A path that could not be written back safely
+    (a database edited elsewhere) is ignored."""
+    return {relpath: StoredFile(int(size), int(mtime), state, sha, trial, kind, tail)
+            for relpath, size, mtime, state, sha, trial, kind, tail in tx.query(
+                "SELECT relpath, size, mtime_ns, state, sha256, trial, kind, tail_sha256 FROM files WHERE job = ?",
+                (job,))
+            if safe_relpath(relpath)}
 
 
-def _read(path: Path, stat: Stat) -> Tuple[Stat, Optional[bytes]]:
-    """Current bytes (None when oversize); the stat describes what was read."""
-    info = os.lstat(path)
-    if info.st_size > MAX_FILE_BYTES:
-        return Stat(info.st_size, info.st_mtime_ns), None
+@dataclass(frozen=True)
+class Read:
+    stat: Stat
+    content: Optional[bytes]  # None when oversize
+    tail: Optional[bytes] = None  # oversize: the last OVERSIZE_TAIL_BYTES
+
+
+def _read(path: Path) -> Read:
+    """Current bytes, or the size and tail of an oversize file; the stat
+    describes what was read."""
     with open(path, "rb") as handle:  # no symlink: scan() admitted regular files only
-        content = handle.read(MAX_FILE_BYTES + 1)
-    if len(content) > MAX_FILE_BYTES:
-        return Stat(len(content), info.st_mtime_ns), None
-    return Stat(len(content), info.st_mtime_ns), content
+        info = os.fstat(handle.fileno())
+        if info.st_size <= MAX_FILE_BYTES:
+            content = handle.read(MAX_FILE_BYTES + 1)
+            if len(content) <= MAX_FILE_BYTES:
+                return Read(Stat(len(content), info.st_mtime_ns), content)
+        size = handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, size - OVERSIZE_TAIL_BYTES))
+        return Read(Stat(size, info.st_mtime_ns), None, handle.read(OVERSIZE_TAIL_BYTES))
 
 
-def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResult:
+def ingest_job(store: Store, job_dir: Path, *, verify: bool = False,
+               log: Callable[[str], None] = lambda message: None) -> JobResult:
     """Bring one job directory's files and projections up to date."""
     job_dir = Path(job_dir).expanduser().resolve()
     name = job_dir.name
@@ -392,16 +455,16 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
         # data.Library does when listing several roots.
         return JobResult(name, "skipped", reason="a job with this name is stored from " + existing[0])
     disk = scan(job_dir)
-    trials = trial_locations(disk)
+    trials = set(trial_locations(disk))
     result = JobResult(name, "new" if not existing else "unchanged")
 
     # Job header first: its row owns every file row.
     header_files: Dict[str, Tuple[bytes, int]] = {}
     for relpath in JOB_FILES:
-        stat, content = _read(disk[relpath][1], disk[relpath][0])
-        if content is None:
+        read = _read(disk[relpath][1])
+        if read.content is None:
             return JobResult(name, "skipped", reason=relpath + " exceeds the size limit")
-        header_files[relpath] = (content, stat.mtime_ns)
+        header_files[relpath] = (read.content, read.stat.mtime_ns)
     header_digest = hashlib.sha256()
     for relpath in JOB_FILES:
         header_digest.update(f"{relpath}\0{sha256(header_files[relpath][0])}\n".encode())
@@ -410,14 +473,14 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
     if not existing or existing[1] != header_digest_hex or existing[2] != PROJECTION or existing[0] != source:
         with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
             header = data.job_header(materialize(Path(temp), name, (
-                (r, header_files[r][0], header_files[r][1]) for r in JOB_FILES)))
+                Entry(r, header_files[r][0], header_files[r][1]) for r in JOB_FILES)))
         with store.transaction() as tx:
             tx.execute(_upsert_sql("jobs", ("name",)), header_values(name, source, header, header_digest_hex))
         if existing:
             result.outcome = "updated"
 
     # Files: only those whose size/mtime moved (or all, when verifying).
-    pending: List[Tuple[str, Stat, Optional[bytes]]] = []
+    pending: List[Tuple[str, Read]] = []
     pending_bytes = 0
 
     def flush() -> None:
@@ -425,19 +488,20 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
         if not pending:
             return
         with store.transaction() as tx:
-            for relpath, stat, content in pending:
+            for relpath, read in pending:
                 trial, kind = classify_file(relpath, trials)
-                digest = sha256(content) if content is not None else None
-                if digest is not None:
-                    put_blob(tx, digest, content)
+                digest = sha256(read.content) if read.content is not None else None
+                tail = sha256(read.tail) if read.tail is not None else None
+                for blob, raw in ((digest, read.content), (tail, read.tail)):
+                    if blob is not None:
+                        put_blob(tx, blob, raw)
+                state = "stored" if digest else "oversize"
                 tx.execute(_upsert_sql("files", ("job", "relpath")),
-                           (name, relpath, trial, kind, stat.size, stat.mtime_ns,
-                            "stored" if digest else "oversize", digest))
+                           (name, relpath, trial, kind, read.stat.size, read.stat.mtime_ns, state, digest, tail))
                 old = stored.get(relpath)
-                if old and old.sha256 and old.sha256 != digest:
-                    replaced.append(old.sha256)
-                stored[relpath] = StoredFile(stat.size, stat.mtime_ns, "stored" if digest else "oversize", digest,
-                                             trial, kind)
+                if old:
+                    replaced.extend(d for d in (old.sha256, old.tail_sha256) if d and d not in (digest, tail))
+                stored[relpath] = StoredFile(read.stat.size, read.stat.mtime_ns, state, digest, trial, kind, tail)
                 result.files_written += 1
         pending, pending_bytes = [], 0
 
@@ -449,21 +513,22 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
             current = StoredFile(len(content), mtime_ns, "stored", sha256(content))
             if old and (old.sha256, old.size, old.mtime_ns) == (current.sha256, current.size, current.mtime_ns):
                 continue
-            pending.append((relpath, Stat(len(content), mtime_ns), content))
+            pending.append((relpath, Read(Stat(len(content), mtime_ns), content)))
             pending_bytes += len(content)
         else:
             unchanged_stat = old is not None and old.size == stat.size and old.mtime_ns == stat.mtime_ns
             if unchanged_stat and not verify:
                 continue
             try:
-                read_stat, content = _read(path, stat)
+                read = _read(path)
             except OSError:
                 continue  # vanished while scanning; the next pass sees it gone
-            if (old is not None and content is not None and old.sha256 == sha256(content)
-                    and (old.size, old.mtime_ns) == (read_stat.size, read_stat.mtime_ns)):
+            if old is not None and (old.size, old.mtime_ns) == (read.stat.size, read.stat.mtime_ns) and (
+                    (read.content is not None and old.sha256 == sha256(read.content))
+                    or (read.tail is not None and old.tail_sha256 == sha256(read.tail))):
                 continue
-            pending.append((relpath, read_stat, content))
-            pending_bytes += len(content or b"")
+            pending.append((relpath, read))
+            pending_bytes += len(read.content or read.tail or b"")
         if pending_bytes >= BATCH_BYTES:
             flush()
     flush()
@@ -484,39 +549,57 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
         with store.transaction() as tx:
             for relpath in removed:
                 tx.execute("DELETE FROM files WHERE job = ? AND relpath = ?", (name, relpath))
-                if stored[relpath].sha256:
-                    replaced.append(stored[relpath].sha256)
+                replaced.extend(d for d in (stored[relpath].sha256, stored[relpath].tail_sha256) if d)
                 del stored[relpath]
             collect_garbage(tx, replaced)
         result.files_removed = len(removed)
 
-    derive_trials(store, name, stored, result)
+    derive_trials(store, name, stored, result, log)
     if result.outcome == "unchanged" and (result.files_written or result.files_removed or result.trials_derived
                                           or result.trials_removed):
         result.outcome = "updated"
     return result
 
 
-def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result: JobResult) -> None:
-    """Recompute trial projections whose input bytes or code changed."""
+def _entries(tx: Tx, relpaths: Sequence[str], stored: Dict[str, StoredFile]) -> List[Entry]:
+    """The stored files among `relpaths`, ready to materialize."""
+    contents = get_blobs(tx, (d for r in relpaths for d in (stored[r].sha256, stored[r].tail_sha256) if d))
+    entries = []
+    for relpath in relpaths:
+        file = stored[relpath]
+        if file.sha256 in contents:
+            entries.append(Entry(relpath, contents[file.sha256], file.mtime_ns))
+        elif file.state == "oversize" and file.tail_sha256 in contents:
+            entries.append(Entry(relpath, contents[file.tail_sha256], file.mtime_ns, file.size))
+    return entries
+
+
+def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result: JobResult,
+                  log: Callable[[str], None] = lambda message: None) -> None:
+    """Recompute trial projections whose input bytes or code changed. A trial
+    that cannot be projected or stored is logged and retried on the next
+    pass; it never keeps the job's other trials out of the store."""
     trials = trial_locations(stored)
     with store.read() as tx:
         known = {name: (digest, projection) for name, digest, projection in tx.query(
             "SELECT name, inputs_digest, projection FROM trials WHERE job = ?", (job,))}
-    for trial, prefix in sorted(trials.items()):
+    for prefix in trials:
         inputs = trial_inputs(prefix, stored)
         digest = digest_inputs(inputs, stored)
-        if known.get(trial) == (digest, PROJECTION):
+        if known.get(prefix) == (digest, PROJECTION):
             continue
-        with store.read() as tx:
-            contents = get_blobs(tx, (stored[r].sha256 for r in inputs if stored[r].sha256))
-        entries = [(r, contents[stored[r].sha256], stored[r].mtime_ns) for r in inputs
-                   if stored[r].sha256 in contents]
-        with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
-            job_dir = materialize(Path(temp), job, entries)
-            projected = project_trial(job_dir.joinpath(*prefix.split("/")))
-        with store.transaction() as tx:
-            write_trial(tx, job, projected, digest)
+        try:
+            with store.read() as tx:
+                entries = _entries(tx, inputs, stored)
+            with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
+                job_dir = materialize(Path(temp), job, entries)
+                projected = project_trial(job_dir.joinpath(*prefix.split("/")))
+            with store.transaction() as tx:
+                write_trial(tx, job, prefix, projected, digest)
+        except Exception as exc:
+            log(f"bench store: deriving {job}/{prefix} failed: {type(exc).__name__}: {exc}")
+            result.trials_failed += 1
+            continue
         result.trials_derived += 1
     gone = sorted(set(known) - set(trials))
     if gone:
@@ -526,29 +609,35 @@ def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result:
         result.trials_removed = len(gone)
 
 
-def refresh_projections(store: Store) -> List[JobResult]:
+def refresh_projections(store: Store, log: Callable[[str], None] = lambda message: None) -> List[JobResult]:
     """Recompute stale projections of jobs that exist only in the store
-    (copied from another machine, or whose directory was removed)."""
+    (copied from another machine, or whose directory was removed). A job
+    whose name could not be written back safely is left alone."""
     with store.read() as tx:
         stale = sorted({row[0] for row in tx.query(
             "SELECT name FROM jobs WHERE projection <> ? UNION SELECT job FROM trials WHERE projection <> ?",
             (PROJECTION, PROJECTION))})
     results = []
     for name in stale:
-        result = JobResult(name, "updated")
-        with store.read() as tx:
-            row = tx.one("SELECT source_dir, inputs_digest FROM jobs WHERE name = ?", (name,))
-            stored = _stored_files(tx, name)
-        if row is None or any(r not in stored or not stored[r].sha256 for r in JOB_FILES):
+        if not safe_name(name):
+            log(f"bench store: ignoring stored job {name!r}: not a plain job name")
             continue
-        with store.read() as tx:
-            contents = get_blobs(tx, (stored[r].sha256 for r in JOB_FILES))
-        with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
-            header = data.job_header(materialize(Path(temp), name, (
-                (r, contents[stored[r].sha256], stored[r].mtime_ns) for r in JOB_FILES)))
-        with store.transaction() as tx:
-            tx.execute(_upsert_sql("jobs", ("name",)), header_values(name, row[0], header, row[1]))
-        derive_trials(store, name, stored, result)
+        result = JobResult(name, "updated")
+        try:
+            with store.read() as tx:
+                row = tx.one("SELECT source_dir, inputs_digest FROM jobs WHERE name = ?", (name,))
+                stored = _stored_files(tx, name)
+                if row is None or any(r not in stored or not stored[r].sha256 for r in JOB_FILES):
+                    continue
+                entries = _entries(tx, JOB_FILES, stored)
+            with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
+                header = data.job_header(materialize(Path(temp), name, entries))
+            with store.transaction() as tx:
+                tx.execute(_upsert_sql("jobs", ("name",)), header_values(name, row[0], header, row[1]))
+        except Exception as exc:
+            log(f"bench store: refreshing {name} failed: {type(exc).__name__}: {exc}")
+            continue
+        derive_trials(store, name, stored, result, log)
         results.append(result)
     return results
 
@@ -578,10 +667,10 @@ def _small_file(path: Path) -> Optional[Tuple[bytes, Stat]]:
     try:
         if path.is_symlink() or not path.is_file():
             return None
-        stat, content = _read(path, Stat(0, 0))
+        read = _read(path)
     except OSError:
         return None
-    return (content, stat) if content is not None else None
+    return (read.content, read.stat) if read.content is not None else None
 
 
 def ingest_run(store: Store, records_dir: Path, record: Dict[str, Any]) -> int:
@@ -641,7 +730,7 @@ def ingest_root(store: Store, root: Path, *, verify: bool = False,
         if not is_job_dir(child):
             continue
         try:
-            result.jobs.append(ingest_job(store, child, verify=verify))
+            result.jobs.append(ingest_job(store, child, verify=verify, log=log))
         except Exception as exc:  # one damaged job must not stop the others
             log(f"bench store: ingesting {child.name} failed: {type(exc).__name__}: {exc}")
             result.jobs.append(JobResult(child.name, "skipped", reason=type(exc).__name__))
@@ -689,7 +778,7 @@ class WorkerSync:
         try:
             store = self._open()
             if store is not None and is_job_dir(self.job_dir):
-                ingest_job(store, self.job_dir, verify=verify)
+                ingest_job(store, self.job_dir, verify=verify, log=stderr_log)
         except Exception as exc:
             if not self.failed:
                 stderr_log(f"bench store: ingestion failed: {type(exc).__name__}: {exc}")

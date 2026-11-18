@@ -66,6 +66,10 @@ def provider_models(config):
 
 
 class RunManager:
+    # A worker rewrites its receipt every two seconds; one older than this
+    # belongs to a worker that stopped.
+    STALE_AFTER = 30
+
     def __init__(self, jobs_dir, config_path):
         self.jobs_dir = Path(jobs_dir).expanduser().resolve()
         self.config_path = Path(config_path).expanduser().resolve()
@@ -75,6 +79,11 @@ class RunManager:
         self.account_cache = None
         self.probe_lock = threading.Lock()
         self.probe_cache = {}
+        from scripts.eval.harbor.viewer.setup import SetupManager
+        # Whether a setup that may restart Docker or Colima is running; the
+        # service replaces this with its own SetupManager's view. A launch
+        # and such a setup exclude each other under self.lock.
+        self.setup_running = SetupManager(self.config_path).mutating
 
     def executor_facts(self, executor):
         """Probe results per executor, reused for 15 s (an SSH probe is a
@@ -90,8 +99,9 @@ class RunManager:
         return facts
 
     def executor_states(self, cfg):
+        invalid = []
         try:
-            configured, default = executors.configured(cfg)
+            configured, default = executors.configured(cfg, invalid)
         except ValueError as exc:
             return [], None, [str(exc)]
         states = []
@@ -100,6 +110,10 @@ class RunManager:
             problems = executors.reasons(executor, facts)
             states.append({**executor.public(), "ready": not problems, "reasons": problems,
                            "default": executor.name == default, "harbor": facts.get("harbor") or None})
+        # A malformed entry is shown, not ready, without hiding the others.
+        for name, problem in invalid:
+            states.append({"name": name, "kind": "invalid", "label": name + "（配置无效）", "ready": False,
+                           "reasons": [problem], "default": False, "harbor": None})
         return states, default, []
 
     def account_catalog(self, cfg):
@@ -224,7 +238,7 @@ class RunManager:
             value = data.read_json(path)
             if not isinstance(value, dict) or not data.NAME.fullmatch(value.get("name", "")):
                 continue
-            if value.get("status") in ACTIVE and time.time() - path.stat().st_mtime > 30:
+            if value.get("status") in ACTIVE and time.time() - path.stat().st_mtime > self.STALE_AFTER:
                 value = {**value, "status": "interrupted", "error": "执行进程已停止更新，请检查运行日志"}
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
@@ -240,6 +254,8 @@ class RunManager:
         if "dataset" in request and suite_id != suites.DEFAULT_SUITE:
             raise ValueError("suite 与 dataset 不一致")
         suite = suites.resolved(suites.get(suite_id))
+        if self.setup_running():  # checked again under the lock below
+            raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
         catalog = self.catalog()
         wanted = request.get("executor", catalog["default_executor"])
         state = next((e for e in catalog["executors"] if e["name"] == wanted), None)
@@ -261,6 +277,8 @@ class RunManager:
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
+            if self.setup_running():
+                raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
             cfg = settings(self.config_path)
             executor = executors.find(cfg, state["name"])
             facts = self.executor_facts(executor)
