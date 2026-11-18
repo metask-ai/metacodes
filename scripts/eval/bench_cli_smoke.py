@@ -56,7 +56,10 @@ def main():
             jobs = json.loads(invoke(['list', '--json']))['jobs']
             assert len(jobs) == 1 and jobs[0]['summary']['counts']['pass'] == 1, jobs
             assert 'private-cli-fixture' not in json.dumps(jobs)
-            suites = {s['id']: s for s in json.loads(invoke(['info', '--json']))['suites']}
+            info = json.loads(invoke(['info', '--json']))
+            assert [e['name'] for e in info['executors']] == ['local'] and info['default_executor'] == 'local', info
+            suites = {s['id']: s for s in info['suites']}
+            assert suites['aime-2025']['executors']['local']['ready'], suites['aime-2025']
             assert suites['aime-2025']['ready'] and suites['aime-2025']['task_count'] == 30, suites['aime-2025']
             aime = json.loads(invoke(['run', '--suite', 'aime-2025', '--task', 'aime_ii-3', '--wait', '--json']))
             assert aime['status'] == 'finished' and aime['suite'] == 'aime-2025', aime
@@ -68,14 +71,14 @@ def main():
             assert json.loads(remote.stdout)['can_run']
             assert json.loads(invoke(['stop', '--json']))['stopped']
             status = json.loads(invoke(['db', 'status', '--json']))
-            assert status['format'] == 'SQLite' and status['counts']['trials'] == 1, status
+            assert status['format'] == 'SQLite' and status['counts']['trials'] == 2, status  # fix-git and aime
             assert status['location'] == str((state / 'bench/bench.sqlite3').resolve()), status
             copy = root / 'copy.sqlite3'
             moved = json.loads(invoke(['db', 'migrate', '--to', str(copy), '--switch', '--json']))
-            assert moved['switched'] and moved['tables']['trials']['verified'] == 1, moved
+            assert moved['switched'] and moved['tables']['trials']['verified'] == 2, moved
             assert json.loads(invoke(['db', 'status', '--json']))['location'] == str(copy.resolve())
             invoke(['db', 'status', '--store-postgres', 'postgresql://u:secret@db/bench'], expected=1)
-            print('bench CLI smoke: extraction, info/list, suites, service reuse, remote client, run/wait, result link '
+            print('bench CLI smoke: extraction, info/list, suites, executors, service reuse, remote client, run/wait, result link '
                   'and evaluation database status/migrate passed (paid=0)')
         finally:
             if ready.exists():
