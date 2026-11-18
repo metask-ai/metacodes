@@ -4254,10 +4254,7 @@ fn printProviderCredentialHelp(
                 }
             }
             // A provider that signs in only (`chatgpt-codex`) takes no key.
-            const takes_key = for (profile.accepted_credential_kinds) |kind| {
-                if (!kind.isOAuth()) break true;
-            } else false;
-            if (takes_key) std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
+            if (profile.takesApiKey()) std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
             std.debug.print("No token value was printed.\n", .{});
         },
     }

@@ -752,12 +752,16 @@ test "catalog offers survive the registry that produced them" {
     );
 }
 
-test "every built-in vendor but Metask declares a key page, and every page that checks one says where" {
+test "every built-in vendor that takes a key, but Metask, declares a key page, and every page that checks one says where" {
     // `/login <id>` and `login --provider <id>` take a pasted key for these
-    // (phase 2 of the provider plan); Metask signs in with its own grant.
+    // (phase 2 of the provider plan); Metask signs in with its own grant. A
+    // vendor that only signs in (every credential kind it accepts is an OAuth
+    // token) takes no key, so it has no page to create one on and declares
+    // none; its sign-in is the only way in, so it must declare one.
     for (BUILTIN_PROFILES) |entry| {
-        if (entry.id.eqlText("metask")) {
+        if (entry.id.eqlText("metask") or !entry.takesApiKey()) {
             try std.testing.expect(entry.api_key_setup == null);
+            if (!entry.takesApiKey()) try std.testing.expect(entry.declaresInteractiveOAuth());
             continue;
         }
         const setup = entry.api_key_setup orelse {

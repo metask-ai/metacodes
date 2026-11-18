@@ -207,9 +207,12 @@ test "chatgpt-codex: the sign-in is the Codex client's, on its two ports, and sa
     try std.testing.expectEqualStrings("localhost", PROFILE.oauth_redirect_host);
     try std.testing.expectEqual(profile.SupportLevel.unofficial, PROFILE.oauth_support);
     try std.testing.expectEqualStrings("metacodes", AUTHORIZE_PARAMS[2].value);
-    // Only the Codex token kind, and no variable a key could come from.
+    // Only the Codex token kind, and no variable a key could come from: it
+    // takes no key, so there is no key page to paste one from either.
     try std.testing.expectEqualSlices(profile.CredentialKind, &.{.openai_codex_oauth}, PROFILE.accepted_credential_kinds);
     try std.testing.expectEqual(@as(usize, 0), PROFILE.env_aliases.len);
+    try std.testing.expect(!PROFILE.takesApiKey());
+    try std.testing.expect(PROFILE.api_key_setup == null);
     try std.testing.expect(PROFILE.subscription_plan);
 }
 

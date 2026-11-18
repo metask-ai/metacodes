@@ -516,6 +516,17 @@ pub const ProviderProfile = struct {
         return null;
     }
 
+    /// Whether a key can authenticate this provider at all: some credential
+    /// kind it accepts is not an OAuth token. One that only signs in
+    /// (`chatgpt-codex`) takes none, so it has no key page, no key variable
+    /// and no `--api-key` to offer.
+    pub fn takesApiKey(self: ProviderProfile) bool {
+        for (self.accepted_credential_kinds) |kind| {
+            if (!kind.isOAuth()) return true;
+        }
+        return false;
+    }
+
     /// True when this profile can obtain a first token without the user
     /// producing a token response by other means.
     pub fn declaresInteractiveOAuth(self: ProviderProfile) bool {
