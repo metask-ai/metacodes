@@ -133,11 +133,11 @@ def main():
             assert json.loads(remote.stdout)['can_run']
             assert json.loads(invoke(['stop', '--json']))['stopped']
             status = json.loads(invoke(['db', 'status', '--json']))
-            assert status['format'] == 'SQLite' and status['counts']['trials'] == 2, status  # fix-git and aime
+            assert status['format'] == 'SQLite' and status['counts']['trials'] == 3, status  # fix-git, aime and the upgrade run
             assert status['location'] == str((state / 'bench/bench.sqlite3').resolve()), status
             copy = root / 'copy.sqlite3'
             moved = json.loads(invoke(['db', 'migrate', '--to', str(copy), '--switch', '--json']))
-            assert moved['switched'] and moved['tables']['trials']['verified'] == 2, moved
+            assert moved['switched'] and moved['tables']['trials']['verified'] == 3, moved
             assert json.loads(invoke(['db', 'status', '--json']))['location'] == str(copy.resolve())
             invoke(['db', 'status', '--store-postgres', 'postgresql://u:secret@db/bench'], expected=1)
             print('bench CLI smoke: extraction, info/list, suites, executors, service reuse, upgrade with active worker, remote client, run/wait, result link '
