@@ -402,12 +402,27 @@ pub const Host = struct {
             channel.base_url = try std.fmt.allocPrint(scratch, "{s}{s}", .{ to_origin, channel.base_url[from_origin.len..] });
             changed = true;
         }
+        // The key pages' checks too: a pasted key is checked there, and the
+        // check carries the key. The pages themselves are only shown and
+        // opened in a browser, and stay as declared.
+        var setup = current.api_key_setup;
+        if (setup) |*value| {
+            const pages = try scratch.dupe(profile_mod.KeyPage, value.pages);
+            for (pages) |*page| {
+                if (page.check_url) |url| if (std.mem.startsWith(u8, url, from_origin)) {
+                    page.check_url = try std.fmt.allocPrint(scratch, "{s}{s}", .{ to_origin, url[from_origin.len..] });
+                    changed = true;
+                };
+            }
+            value.pages = pages;
+        }
         if (!changed) {
             arena.deinit();
             return;
         }
         var built = current.*;
         built.channels = channels;
+        built.api_key_setup = setup;
         try self.registry.checkReplace(built);
         try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
         self.registry.replaceAssumeCapacity(built);

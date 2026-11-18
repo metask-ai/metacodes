@@ -3366,6 +3366,21 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
         }
         return 1;
     };
+    // What a provider whose site creates keys (OpenRouter) said about it.
+    if (profile.key_grant != null) {
+        var stored = provider_api_key_store.load(allocator, state_dir, profile.id) catch null;
+        defer if (stored) |*value| value.deinit();
+        if (stored) |value| if (value.meta.described) {
+            var line_buf: [512]u8 = undefined;
+            var line: std.Io.Writer = .fixed(&line_buf);
+            openrouter_login.writeStored(&line, profile.display_name, value.meta) catch {};
+            std.debug.print("{s}\n", .{line.buffered()});
+            var notes_buf: [512]u8 = undefined;
+            var notes: std.Io.Writer = .fixed(&notes_buf);
+            openrouter_login.writeAfterSignIn(&notes, profile.display_name, openrouter_login.origin(profile.key_grant.?), value.meta, null, null) catch {};
+            std.debug.print("{s}", .{notes.buffered()});
+        };
+    }
     // A key variable for this provider in the shell or in `.env` is read
     // before the stored key (`credential.resolve`): say so, by name, rather
     // than promise that new sessions use the key just stored.

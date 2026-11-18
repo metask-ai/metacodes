@@ -240,6 +240,10 @@ pub const ApiKeyPrepared = struct {
     classify_error: provider_profile.ClassifyFn = provider_profile.defaultClassifyError,
     /// False stores the key without the check (`login --no-check`).
     check: bool = true,
+    /// The check is the provider's key description (`KeyGrant.key_info_path`:
+    /// OpenRouter's `/api/v1/key`): what it says about the key is stored
+    /// beside it, as a sign-in stores it, and the key is marked pasted.
+    describes: bool = false,
 
     pub fn run(
         self: ApiKeyPrepared,
@@ -249,6 +253,9 @@ pub const ApiKeyPrepared = struct {
         diagnostic: ?*ImportDiagnostic,
     ) !Outcome {
         _ = diagnostic;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        var meta: api_key_store.Meta = .{ .obtained = if (self.describes) .pasted else null };
         if (self.check) if (keyCheckOverride() orelse self.page.check_url) |url| {
             var line: [512]u8 = undefined;
             notify.say(std.fmt.bufPrint(&line, "Checking the key with {s}\n", .{url}) catch "Checking the key\n");
@@ -262,15 +269,23 @@ pub const ApiKeyPrepared = struct {
             };
             defer allocator.free(answer.body);
             try keyCheckVerdict(allocator, answer, self.classify_error);
+            if (self.describes) if (openrouter_login.parseKeyInfo(arena_state.allocator(), answer.body)) |info| {
+                meta.described = true;
+                meta.label = info.label;
+                meta.limit_usd = info.limit_usd;
+                meta.expires_at = info.expires_at;
+                meta.free_tier = info.free_tier;
+            };
             if (self.aborted()) return error.Aborted;
         };
-        try api_key_store.save(
+        try api_key_store.saveWithMeta(
             allocator,
             self.options.state_root,
             self.provider_id,
             self.kind,
             self.secret,
             self.page.id.slice(),
+            meta,
             time.nowUnix(),
         );
         var line: [256]u8 = undefined;
@@ -494,6 +509,9 @@ pub fn prepareApiKey(
         .secret = key,
         .auth = profile.auth,
         .classify_error = profile.classify_error,
+        // A provider whose site creates keys checks a pasted one against its
+        // key description; the same answer then describes it.
+        .describes = profile.key_grant != null,
     };
 }
 

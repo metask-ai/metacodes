@@ -98,7 +98,12 @@ pub fn applyOriginOverride(host: *provider_host.Host) void {
         const grant = profile.key_grant orelse continue;
         const moved_to = origin(grant);
         if (std.mem.eql(u8, moved_to, grant.origin)) continue;
-        host.rebaseOrigin(id, grant.origin, moved_to) catch {};
+        // Never fall back: with the override set, the profile left as it was
+        // would send keys and requests to the real site the variable was set
+        // to keep them from. An accepted origin always rebases, so this is
+        // out of memory or a profile this check no longer admits.
+        host.rebaseOrigin(id, grant.origin, moved_to) catch |err|
+            std.debug.panic("{s} is set, but {s} could not be moved onto it ({s})", .{ ORIGIN_ENV, profile.display_name, @errorName(err) });
     }
 }
 
@@ -186,7 +191,8 @@ pub fn exchangeFailure(status: u16, body: []const u8) Error {
 
 /// The key in a 2xx exchange answer, borrowed from `arena`.
 pub fn parseExchange(arena: std.mem.Allocator, body: []const u8) Error![]const u8 {
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return error.KeyGrantExchangeFailed;
+    // Copied into the arena: the caller zeroes the answer, then this copy.
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{ .allocate = .alloc_always }) catch return error.KeyGrantExchangeFailed;
     if (root != .object) return error.KeyGrantExchangeFailed;
     const value = root.object.get("key") orelse return error.KeyGrantExchangeFailed;
     if (value != .string or std.mem.trim(u8, value.string, " \t\r\n").len == 0) return error.KeyGrantExchangeFailed;
@@ -201,8 +207,10 @@ pub const KeyInfo = struct {
     free_tier: ?bool = null,
 };
 
+/// Strings are copied into `arena`: the answer they came from may be freed
+/// before they are stored.
 pub fn parseKeyInfo(arena: std.mem.Allocator, body: []const u8) ?KeyInfo {
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{ .allocate = .alloc_always }) catch return null;
     if (root != .object) return null;
     const data = root.object.get("data") orelse return null;
     if (data != .object) return null;
@@ -419,6 +427,19 @@ pub fn storedKeyManageUrl(allocator: std.mem.Allocator, state_root: []const u8, 
 /// the first part when it said nothing. No newline.
 pub fn writeSignedIn(w: *std.Io.Writer, provider_label: []const u8, meta: api_key_store.Meta) std.Io.Writer.Error!void {
     try w.print("Signed in to {s}", .{provider_label});
+    try writeDescription(w, meta);
+}
+
+/// `Stored the key for OpenRouter · key "work" on your account · …`: a pasted
+/// key, described as a sign-in's is. No newline.
+pub fn writeStored(w: *std.Io.Writer, provider_label: []const u8, meta: api_key_store.Meta) std.Io.Writer.Error!void {
+    try w.print("Stored the key for {s}", .{provider_label});
+    try writeDescription(w, meta);
+}
+
+/// ` · key "metacodes" on your account · no spending limit · never expires`,
+/// or nothing when the provider said nothing about the key.
+fn writeDescription(w: *std.Io.Writer, meta: api_key_store.Meta) std.Io.Writer.Error!void {
     if (!meta.described) return;
     if (meta.label) |label| {
         try w.print(" · key \"{s}\" on your account", .{label});
@@ -603,6 +624,10 @@ test "the signed-in line says what the provider said about the key, and nothing 
     w = .fixed(&buffer);
     try writeSignedIn(&w, "OpenRouter", .{ .obtained = .browser_sign_in });
     try testing.expectEqualStrings("Signed in to OpenRouter", w.buffered());
+    // A pasted key, described the same way.
+    w = .fixed(&buffer);
+    try writeStored(&w, "OpenRouter", .{ .obtained = .pasted, .described = true, .label = "work", .limit_usd = 5 });
+    try testing.expectEqualStrings("Stored the key for OpenRouter · key \"work\" on your account · spending limit $5.00 · never expires", w.buffered());
 
     w = .fixed(&buffer);
     try writeAfterSignIn(&w, "OpenRouter", "https://openrouter.ai", .{ .described = true, .free_tier = true }, "https://openrouter.ai/keys/aa", "https://openrouter.ai/keys/bb");

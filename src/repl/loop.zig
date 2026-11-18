@@ -3212,7 +3212,11 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .interrupted => cmd_output.print("Login interrupted\n", .{}),
         .failed => |why| cmd_output.print("{s}Login failed: {s}{s}\n", .{ th.danger, why, th.reset }),
         .signed_in, .key_stored => |label| {
-            if (dialog.outcome == .key_stored) {
+            if (dialog.outcome == .key_stored and dialog.chosenProfile().key_grant != null) {
+                // A key pasted for a provider whose site describes keys
+                // (OpenRouter): what it said, and what a sign-in's key says.
+                printKeyGrantSignedIn(app, dialog.chosenProfile(), previous_keys.forProvider(dialog.chosenProfile().id));
+            } else if (dialog.outcome == .key_stored) {
                 cmd_output.print("Stored the key for {s} · /model to choose a model\n", .{label});
                 // A key variable in the shell or `.env` is read before the
                 // stored key: say which, by name.
@@ -3273,7 +3277,8 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     const meta: api_key_store.Meta = if (stored) |value| value.meta else .{};
     var line_buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&line_buf);
-    openrouter_login.writeSignedIn(&w, profile.display_name, meta) catch {};
+    const pasted = meta.obtained != null and meta.obtained.? == .pasted;
+    (if (pasted) openrouter_login.writeStored(&w, profile.display_name, meta) else openrouter_login.writeSignedIn(&w, profile.display_name, meta)) catch {};
     w.writeAll(" · /model to choose a model\n") catch {};
     cmd_output.print("{s}", .{w.buffered()});
     const current = if (stored) |value| openrouter_login.manageUrl(app.allocator, grant_origin, grant, value.secret) catch null else null;

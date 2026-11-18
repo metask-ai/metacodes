@@ -446,6 +446,53 @@ test "L2 OpenRouter: on another device the page shows the code; the code pasted 
     try testing.expectEqualStrings(KEY, stored.secret);
 }
 
+/// A pasted key for OpenRouter, prepared the way `/login openrouter` and
+/// `login --provider openrouter --api-key-stdin` prepare it, against the host
+/// a session builds (the override moved its key page too).
+fn pasteKey(case: *Case, io: std.Io, key: []const u8) !void {
+    const host = try cc.provider_host.Host.create(testing.allocator);
+    defer host.destroy();
+    openrouter_login.applyOriginOverride(host);
+    const profile = host.registry.find("openrouter").?;
+    const flow = try provider_login.prepareApiKey(profile, null, profile.default_channel, key, .{ .state_root = case.root });
+    try testing.expect(flow.describes);
+    // The check carries the key: it must be on the mock before anything is sent.
+    try testing.expect(std.mem.startsWith(u8, flow.page.check_url.?, "http://127.0.0.1:"));
+    _ = try flow.run(testing.allocator, io, oauth_login.stderrNotify(), null);
+}
+
+test "L2 OpenRouter: a pasted key is checked at /api/v1/key, stored as pasted with what that said, and a refused one is not stored" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    {
+        var server = try harness.MockServer.startRepeatingStatus("{\"error\":{\"code\":401,\"message\":\"User not found.\"}}", "HTTP/1.1 401 Unauthorized", "");
+        defer server.stop();
+        _ = try case.openRouterAt(server);
+        try testing.expectError(error.KeyRefused, pasteKey(&case, io_runtime.io(), "sk-or-v1-wrong"));
+        try testing.expectEqualStrings("GET /api/v1/key HTTP/1.1", requestLine(server.lastRequest().?));
+        try testing.expect(try key_store.load(testing.allocator, case.root, OPENROUTER) == null);
+    }
+    var server = try harness.MockServer.start(DESCRIBED, 0);
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    try pasteKey(&case, io_runtime.io(), "  " ++ KEY ++ "\n");
+    const check = server.lastRequest().?;
+    try testing.expectEqualStrings("GET /api/v1/key HTTP/1.1", requestLine(check));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(check, "authorization").?);
+    var stored = (try key_store.load(testing.allocator, case.root, OPENROUTER)).?;
+    defer stored.deinit();
+    try testing.expectEqualStrings(KEY, stored.secret);
+    try testing.expectEqual(key_store.Obtained.pasted, stored.meta.obtained.?);
+    try testing.expect(stored.meta.described);
+    try testing.expectEqualStrings("metacodes", stored.meta.label.?);
+    try testing.expectEqualStrings("keys", stored.page.?);
+}
+
 test "L2 OpenRouter: the origin override moves every address, requests included, and only to https or a loopback host" {
     var case: Case = undefined;
     try case.init();
@@ -467,6 +514,9 @@ test "L2 OpenRouter: the origin override moves every address, requests included,
         if (!item.provider_id.eqlText("openrouter")) continue;
         try testing.expect(std.mem.startsWith(u8, item.endpoint_ref, origin));
     }
+    // The key page's check, which carries a pasted key.
+    const page = host.registry.find("openrouter").?.api_key_setup.?.pages[0];
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/api/v1/key", .{origin}), page.check_url.?);
 
     // Not a host other than the loopback over plain HTTP: the profile's own.
     try case.setEnv(openrouter_login.ORIGIN_ENV, "http://openrouter.example.com");

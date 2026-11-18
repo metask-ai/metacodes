@@ -655,7 +655,13 @@ pub fn validateProfile(profile: ProviderProfile) ProfileError!void {
         if (!accepted or setup.pages.len == 0) return error.InvalidKeySetup;
         for (setup.pages, 0..) |page, index| {
             if (!std.mem.startsWith(u8, page.url, "https://")) return error.InvalidKeySetup;
-            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidKeySetup;
+            // The check carries the key, so it goes only where the provider's
+            // own requests may: https, or the plain loopback the endpoint
+            // policy admits (a key grant's development origin moves it there,
+            // `Host.rebaseOrigin`).
+            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) {
+                profile.endpoint_policy.validate(url) catch return error.InvalidKeySetup;
+            };
             for (setup.pages[index + 1 ..]) |other| {
                 if (page.id.eql(other.id)) return error.InvalidKeySetup;
             }

@@ -301,7 +301,10 @@ status, compatibility boundaries, and entry points are defined by
   — trade the code and the verifier as JSON, and store the key in
   `<state root>/keys/openrouter.json` like a pasted one, with what
   `GET /api/v1/key` said about it then (label, spending limit, expiry, free
-  tier). Nothing here can delete the key on OpenRouter (that takes a
+  tier). The third way is a key the user already has (`/login openrouter`'s
+  last choice, or `--api-key-stdin`): checked against `GET /api/v1/key`,
+  which answers 401 without a valid key and is not billed, and described the
+  same way. Nothing here can delete the key on OpenRouter (that takes a
   management key): `/logout openrouter` removes it from this machine and
   names the page where its owner deletes it
   (`https://openrouter.ai/keys/<sha256 of the key>`), and a new sign-in names
