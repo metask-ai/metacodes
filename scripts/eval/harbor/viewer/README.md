@@ -27,7 +27,7 @@ Pages refresh every 10 s while a job runs. The server syncs the jobs
 directories into the [evaluation database](../../../../doc/BENCH_WORKBENCH.md#evaluation-database)
 (`../store/`) and serves every view from it; names in requests are looked up
 in the database, never used as paths, and every value reaches the page as
-text (no markup from the data, `script-src 'self'`).
+plain text (no markup from the data).
 
 The overview, job, trial and CSV views expose total/initial tokens, first-attempt
 full-score rate, request-weighted generation TPS, TTFT mean/P50/P95, and cost

@@ -298,6 +298,16 @@ def local_facts(executor: LocalExecutor, runner=subprocess.run) -> Dict:
             facts["compose"] = "1" if compose.returncode == 0 else "0"
         except (OSError, subprocess.TimeoutExpired):
             facts["docker_daemon"] = "down"
+    if facts["os"] == "Darwin" and facts.get("docker_daemon") != "ok":
+        # A Mac that is itself a VM cannot start Colima's VM: say so instead
+        # of pointing at a setup that cannot succeed.
+        try:
+            hv = runner(["/usr/sbin/sysctl", "-n", "kern.hv_support"], stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, timeout=5)
+            if hv.returncode == 0 and hv.stdout.strip() == "0":
+                facts["hypervisor"] = "0"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     return facts
 
 
@@ -355,7 +365,9 @@ def reasons(executor: Executor, facts: Dict) -> List[str]:
             return ["无法检查本机执行环境"]
     if not facts.get("harbor"):
         result.append("未找到 Harbor，请在执行机器安装：uv tool install harbor==0.26.0" + setup)
-    if not facts.get("docker"):
+    if facts.get("hypervisor") == "0":
+        result.append("这台 Mac 本身是虚拟机，没有嵌套虚拟化，不能运行 Docker；请配置一台 Linux SSH 执行机器")
+    elif not facts.get("docker"):
         result.append("未找到 Docker；Harbor 任务需要 Docker 环境" + setup)
     elif facts.get("docker_daemon") == "permission":
         result.append("当前用户无权访问 Docker daemon（需要加入 docker 组）" + setup)

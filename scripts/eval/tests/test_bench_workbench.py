@@ -45,6 +45,12 @@ if os.environ.get('FAKE_ACCOUNT_REQUEST'):
  gateway = next(args[i + 1].removeprefix('account_gateway=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('account_gateway='))
  req = urllib.request.Request(gateway + '/v1/messages', data=json.dumps({{'model':arg('-m').split('/',1)[1]}}).encode(), headers={{'Authorization':'Bearer ' + os.environ['METASK_API_KEY'], 'Content-Type':'application/json'}})
  with urllib.request.urlopen(req,timeout=5) as response: response.read()
+release_file = os.environ.get('FAKE_BENCH_RELEASE_FILE')
+if release_file:
+ deadline = time.monotonic() + 30
+ while not pathlib.Path(release_file).exists():
+  if time.monotonic() >= deadline: sys.exit(8)
+  time.sleep(.05)
 time.sleep(float(os.environ.get('FAKE_BENCH_DELAY', '.2')))
 if os.environ.get('FAKE_BENCH_FAIL'): sys.exit(7)
 t = root / 'fix-git__fake'; t.mkdir()

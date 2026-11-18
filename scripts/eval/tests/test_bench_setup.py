@@ -400,6 +400,20 @@ class LocalSetupTest(SetupFixture):
 
 
 class ExecutorConfigTest(unittest.TestCase):
+    def test_mac_vm_without_hypervisor_names_the_ssh_executor_remedy(self):
+        def runner(argv, **_kwargs):
+            out = "0\n" if argv[0].endswith("sysctl") else ""
+            return subprocess.CompletedProcess(argv, 0 if argv[0].endswith("sysctl") else 1, out, "Cannot connect")
+        with patch.object(executors.os, "uname", return_value=os.uname_result(("Darwin", "h", "", "", "arm64"))), \
+                patch.object(executors.shutil, "which", side_effect=lambda name, path=None: "/opt/homebrew/bin/" + name):
+            facts = executors.local_facts(executors.LocalExecutor(), runner=runner)
+        self.assertEqual(facts["hypervisor"], "0")
+        found = executors.reasons(executors.LocalExecutor(), facts)
+        self.assertTrue(any("没有嵌套虚拟化" in r and "SSH 执行机器" in r for r in found), found)
+        self.assertFalse(any("一键配置" in r and "Docker" in r for r in found), found)
+        facts.pop("hypervisor")
+        self.assertTrue(any("Docker daemon" in r for r in executors.reasons(executors.LocalExecutor(), facts)))
+
     def test_entries_are_validated_before_any_ssh_argv(self):
         bad = [{"name": "x", "kind": "ssh", "host": "-oProxyCommand=sh"},
                {"name": "x", "kind": "ssh", "host": "h", "port": 0},
