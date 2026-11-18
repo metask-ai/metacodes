@@ -19,6 +19,12 @@
 //! endRun 写 run_done;其间 emit 的内核事件都带这个 run_id。本宿主不收 trace ID,故无 trace_id。
 //! 浏览器回填的 JSON 由 wire.parseResponse 解析。
 //!
+//! UI request ids are never reused, across the daemon's restarts and across
+//! a session destroyed and restored (`nextRequestId`). `respond` matches an
+//! answer by id alone, so an answer to an earlier process's request, delivered
+//! again after a restart, is refused as stale instead of answering a newer
+//! request that took the same number.
+//!
 //! 能力声明(doc/WIRE_PROTOCOL.md §2):前端 POST /capabilities 的帧经 declareCapabilities
 //! 装进 `capabilities` 槽,并把 capabilities_accepted 行落 journal。之后 requester 先路由:
 //! 声明里没有的 kind 不通告,落 ui_request_unavailable 行并立即返 .unavailable。未声明 =
@@ -41,6 +47,7 @@ const abort_mod = @import("../util/abort.zig");
 const usage_mod = @import("../core/usage.zig");
 const journal_mod = @import("../core/event_journal.zig");
 const log = @import("../util/log.zig");
+const util_time = @import("../util/time.zig");
 const wire = @import("../core/protocol/wire.zig");
 const frontend_capabilities = @import("../core/protocol/frontend_capabilities.zig");
 
@@ -54,6 +61,29 @@ const RequestOutcome = ui_request.RequestOutcome;
 const UiRequester = ui_request.UiRequester;
 const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
 const EventJournal = journal_mod.EventJournal;
+
+/// The last UI request id this process handed out, on any WebBackend.
+var last_request_id: std.atomic.Value(u64) = .init(0);
+
+/// The next UI request id: above every id this process handed out, on any
+/// WebBackend, and above the wall clock in milliseconds. A session restored
+/// in this process (destroyed, then created with `resume`) gets ids above its
+/// earlier ones. A restarted daemon starts above every id an earlier process
+/// handed out, since that process cannot have handed out more ids than it ran
+/// milliseconds (each request takes a model turn). SessionHost reasons the
+/// same way when it cannot read its request file. An answer to an earlier
+/// request therefore never reaches a newer one: `respond` refuses it as stale.
+/// Ids stay JSON integers far below 2^53 (about 1.8e12 today), which a
+/// JavaScript client reads exactly.
+fn nextRequestId() u64 {
+    const wall_ns = util_time.nowWallNs();
+    const floor: u64 = if (wall_ns > 0) @intCast(@divTrunc(wall_ns, std.time.ns_per_ms)) else 0;
+    var last = last_request_id.load(.monotonic);
+    while (true) {
+        const next = @max(last, floor) + 1;
+        last = last_request_id.cmpxchgWeak(last, next, .monotonic, .monotonic) orelse return next;
+    }
+}
 
 pub const WebBackend = struct {
     /// 必须线程安全(见模块注释)。
@@ -69,8 +99,7 @@ pub const WebBackend = struct {
     // ── pending UI request 槽(一次一个:agent_loop 单线程同步问答;subagent 无 requester)──
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
-    next_req_id: u64 = 1,
-    /// 0 = 无挂起请求。
+    /// 0 = 无挂起请求。Ids come from `nextRequestId`, never 0.
     pending_id: u64 = 0,
     /// POST /respond 回填的原始 JSON(owned by allocator)。
     response_json: ?[]u8 = null,
@@ -250,8 +279,7 @@ pub const WebBackend = struct {
 
         // 注册挂起槽(先注册再 append:浏览器看到 ui_request 时 respond 一定有槽可回填)
         self.lock();
-        const id = self.next_req_id;
-        self.next_req_id += 1;
+        const id = nextRequestId();
         self.pending_id = id;
         if (self.response_json) |old| {
             self.allocator.free(old);
@@ -411,9 +439,9 @@ test "requester: permission 请求经 journal 通告,respond 回填 → answered
                 for (batch) |l| std.testing.allocator.free(l);
                 std.testing.allocator.free(batch);
             }
-            // 从通告行解析 id(测试里恒 1)
+            // 槽先注册再通告:通告行出现时 pendingId 就是它的 id
             if (std.mem.indexOf(u8, batch[0], "\"type\":\"ui_request\"") == null) return;
-            _ = b.respond(1, "{\"choice\":\"allow_always\"}");
+            _ = b.respond(b.pendingId(), "{\"choice\":\"allow_always\"}");
         }
     };
     const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j });
@@ -438,11 +466,12 @@ test "requester: permission 请求经 journal 通告,respond 回填 → answered
 
 test "#446 requester: the answer's approver is recorded on ui_request_closed; an unusable one is not, and the answer still applies" {
     const Case = struct { answer: []const u8, closed: []const u8, choice: PermissionChoice };
+    // `closed` is a format string: the request's id goes in `{d}`.
     const cases = [_]Case{
-        .{ .answer = "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}", .closed = "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\",\"by\":\"alice@example.com\"}", .choice = .allow_once },
-        .{ .answer = "{\"choice\":\"deny_once\",\"by\":42}", .closed = "{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"answered\"}", .choice = .deny_once },
+        .{ .answer = "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}", .closed = "{{\"v\":1,\"type\":\"ui_request_closed\",\"id\":{d},\"outcome\":\"answered\",\"by\":\"alice@example.com\"}}", .choice = .allow_once },
+        .{ .answer = "{\"choice\":\"deny_once\",\"by\":42}", .closed = "{{\"v\":1,\"type\":\"ui_request_closed\",\"id\":{d},\"outcome\":\"answered\"}}", .choice = .deny_once },
     };
-    for (cases) |case| {
+    inline for (cases) |case| {
         var j = EventJournal.init(testing.allocator);
         defer j.deinit();
         var wb = WebBackend.init(testing.allocator, &j);
@@ -454,7 +483,7 @@ test "#446 requester: the answer's approver is recorded on ui_request_closed; an
                     for (batch) |l| std.testing.allocator.free(l);
                     std.testing.allocator.free(batch);
                 }
-                _ = b.respond(1, answer);
+                _ = b.respond(b.pendingId(), answer);
             }
         };
         const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j, case.answer });
@@ -468,7 +497,9 @@ test "#446 requester: the answer's approver is recorded on ui_request_closed; an
             for (all) |l| testing.allocator.free(l);
             testing.allocator.free(all);
         }
-        try testing.expectEqualStrings(case.closed, all[all.len - 1]);
+        const closed = try std.fmt.allocPrint(testing.allocator, case.closed, .{try announcedId(all[0])});
+        defer testing.allocator.free(closed);
+        try testing.expectEqualStrings(closed, all[all.len - 1]);
     }
 }
 
@@ -578,7 +609,7 @@ test "requester: 读不懂的应答按取消处理,记 malformed 而非 answered
             const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
             for (batch) |l| std.testing.allocator.free(l);
             std.testing.allocator.free(batch);
-            _ = b.respond(1, "{\"choice\":\"pretty_please\"}");
+            _ = b.respond(b.pendingId(), "{\"choice\":\"pretty_please\"}");
         }
     };
     const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j });
@@ -604,7 +635,7 @@ test "#446 requester: an unreadable answer closes malformed under its approver" 
             const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
             for (batch) |l| std.testing.allocator.free(l);
             std.testing.allocator.free(batch);
-            _ = b.respond(1, "{\"choice\":\"pretty_please\",\"by\":\"alice\"}");
+            _ = b.respond(b.pendingId(), "{\"choice\":\"pretty_please\",\"by\":\"alice\"}");
         }
     };
     const t = try std.Thread.spawn(.{}, Responder.run, .{ &wb, &j });
@@ -617,5 +648,88 @@ test "#446 requester: an unreadable answer closes malformed under its approver" 
         for (all) |l| testing.allocator.free(l);
         testing.allocator.free(all);
     }
-    try testing.expectEqualStrings("{\"v\":1,\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"malformed\",\"by\":\"alice\"}", all[all.len - 1]);
+    const closed = try std.fmt.allocPrint(testing.allocator, "{{\"v\":1,\"type\":\"ui_request_closed\",\"id\":{d},\"outcome\":\"malformed\",\"by\":\"alice\"}}", .{try announcedId(all[0])});
+    defer testing.allocator.free(closed);
+    try testing.expectEqualStrings(closed, all[all.len - 1]);
+}
+
+/// The id a `ui_request` line announces.
+fn announcedId(line: []const u8) !u64 {
+    const key = "\"type\":\"ui_request\",\"id\":";
+    const at = std.mem.indexOf(u8, line, key) orelse return error.TestNotARequest;
+    const rest = line[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse return error.TestNotARequest;
+    return std.fmt.parseInt(u64, rest[0..end], 10);
+}
+
+test "request ids are never reused: after a restart, an answer to the earlier request is refused, not applied to the newer one" {
+    const before_ms: u64 = @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
+
+    // The session before the restart: its request is answered by alice.
+    var j1 = EventJournal.init(testing.allocator);
+    defer j1.deinit();
+    var earlier = WebBackend.init(testing.allocator, &j1);
+    defer earlier.deinit();
+    const Alice = struct {
+        fn run(b: *WebBackend, jj: *EventJournal) void {
+            const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+            for (batch) |l| std.testing.allocator.free(l);
+            std.testing.allocator.free(batch);
+            _ = b.respond(b.pendingId(), "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}");
+        }
+    };
+    const earlier_id = blk: {
+        const t = try std.Thread.spawn(.{}, Alice.run, .{ &earlier, &j1 });
+        defer t.join();
+        const req = UiRequest{ .permission = .{ .tool = "Write", .args = "{\"file_path\":\"a.txt\",\"content\":\"a\"}" } };
+        var resp: UiResponse = undefined;
+        try testing.expectEqual(RequestOutcome.answered, try earlier.requester().request(SessionId.single, testing.allocator, &req, &resp));
+        try testing.expectEqual(PermissionChoice.allow_once, resp.permission);
+        const lines = (try j1.waitSince(testing.allocator, 0, 10)).?;
+        defer {
+            for (lines) |l| testing.allocator.free(l);
+            testing.allocator.free(lines);
+        }
+        break :blk try announcedId(lines[0]);
+    };
+
+    // The same session restored: a new WebBackend, and another action asks.
+    // Alice's answer is delivered again (a retried webhook, a reconnecting
+    // client) while that request is open.
+    var j2 = EventJournal.init(testing.allocator);
+    defer j2.deinit();
+    var restored = WebBackend.init(testing.allocator, &j2);
+    defer restored.deinit();
+    const Redelivery = struct {
+        stale_applied: bool = true,
+        fn run(self: *@This(), b: *WebBackend, jj: *EventJournal, stale_id: u64) void {
+            const batch = (jj.waitSince(std.testing.allocator, 0, 2000) catch return) orelse return;
+            for (batch) |l| std.testing.allocator.free(l);
+            std.testing.allocator.free(batch);
+            self.stale_applied = b.respond(stale_id, "{\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}");
+            _ = b.respond(b.pendingId(), "{\"choice\":\"deny_once\"}");
+        }
+    };
+    var redelivery = Redelivery{};
+    const t = try std.Thread.spawn(.{}, Redelivery.run, .{ &redelivery, &restored, &j2, earlier_id });
+    const req = UiRequest{ .permission = .{ .tool = "Write", .args = "{\"file_path\":\"c.txt\",\"content\":\"c\"}" } };
+    var resp: UiResponse = undefined;
+    const outcome = restored.requester().request(SessionId.single, testing.allocator, &req, &resp);
+    t.join();
+
+    try testing.expect(!redelivery.stale_applied);
+    try testing.expectEqual(RequestOutcome.answered, try outcome);
+    try testing.expectEqual(PermissionChoice.deny_once, resp.permission);
+    const lines = (try j2.waitSince(testing.allocator, 0, 10)).?;
+    defer {
+        for (lines) |l| testing.allocator.free(l);
+        testing.allocator.free(lines);
+    }
+    const restored_id = try announcedId(lines[0]);
+    try testing.expect(earlier_id > before_ms);
+    try testing.expect(restored_id > earlier_id);
+    // The close names the request's own answer, not alice.
+    const closed = try std.fmt.allocPrint(testing.allocator, "{{\"v\":1,\"type\":\"ui_request_closed\",\"id\":{d},\"outcome\":\"answered\"}}", .{restored_id});
+    defer testing.allocator.free(closed);
+    try testing.expectEqualStrings(closed, lines[lines.len - 1]);
 }

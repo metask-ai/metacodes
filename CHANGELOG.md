@@ -644,6 +644,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Security
 
+- **On `serve` and `--web`, an answer from before a restart no longer
+  answers a newer request** (#563). Both numbered UI requests from 1 in every
+  process, and again for every session they restored, and `POST /respond`
+  and the UDS `respond` op matched an answer by that number alone. So an
+  answer delivered a second time after a restart was applied to whichever
+  request held the same number then. That happened with a webhook that
+  retries, a client that reconnects, or an old card clicked again. One
+  Write's approval approved another Write, and the journal recorded the
+  original approver for it. Request ids now come from one counter per
+  process that stays above the wall clock in milliseconds, so they are never
+  reused, across restarts or for a session destroyed and restored. Such an
+  answer is refused as stale: 409, or the UDS `no pending request with this
+  id`. Ids are larger integers now, about 1.8×10¹² and below 2⁵³; a frontend
+  copies them back as before. `tests/component/serve_sessions_test.zig`
+  restarts the daemon between one granted Write and the next, then delivers
+  the first approval again; `src/web/backend.zig` checks the same across two
+  `WebBackend`s.
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
   (#473). The TUI, `-p`, `--web` and `serve` permissioned a tool an MCP
   server contributes as a read, so `default`, `acceptEdits` and `auto` ran it
