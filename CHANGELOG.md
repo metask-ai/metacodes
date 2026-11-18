@@ -292,6 +292,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **OpenRouter is built in, and `/login openrouter` signs in on OpenRouter's
+  own site.** OpenRouter's PKCE sign-in creates an API key on the user's own
+  account: `/login openrouter` and `metacodes login --provider openrouter` ask
+  which way — the browser on this machine (a loopback callback on any free
+  port, taken only with its own state), or another device (`--device-code`;
+  the page shows a code to paste back, the way over SSH, offered first there)
+  — trade the code and the verifier as JSON, and store the key in
+  `<state root>/keys/openrouter.json` like a pasted one, with what
+  `GET /api/v1/key` said about it then (label, spending limit, expiry, free
+  tier). Nothing here can delete the key on OpenRouter (that takes a
+  management key): `/logout openrouter` removes it from this machine and
+  names the page where its owner deletes it
+  (`https://openrouter.ai/keys/<sha256 of the key>`), and a new sign-in names
+  the key the previous one left. `login status` shows where the key came from
+  when OpenRouter is the provider a start uses. `OPENROUTER_API_KEY` is read
+  without a configured catalog. A 401 from OpenRouter says to sign in again; a
+  403 (a spent key limit, a guardrail) keeps OpenRouter's own words.
+  `METACODES_OPENROUTER_URL` (https, or plain http to a loopback host) moves
+  every OpenRouter address, requests included, for development and tests.
+
+- **A configuration entry that names a built-in provider is passed over
+  alone.** `custom_providers.<built-in id>` used to fail the whole
+  `custom_providers` section; it is now skipped by itself, said once, and the
+  user's other providers load. `provider_catalogs.openrouter` is passed over
+  the same way now that OpenRouter is built in.
+
 - **`/login <provider>` and `metacodes login --provider <provider>` reach every
   built-in vendor.** OpenAI, Google Gemini, Alibaba Qwen, MiniMax and the
   Moonshot Kimi open platform declare their key pages now, as DeepSeek, the

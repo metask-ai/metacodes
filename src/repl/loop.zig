@@ -16,6 +16,8 @@ const posix = std.posix;
 const app_mod = @import("../app.zig");
 const provider_login = @import("../api/provider_login.zig");
 const oauth_login_mod = @import("../api/oauth_login.zig");
+const openrouter_login = @import("../api/openrouter_login.zig");
+const api_key_store = @import("../provider/api_key_store.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
@@ -3044,7 +3046,9 @@ fn printLoginUsage() void {
         \\does, and choose a model and a reasoning level; the session and new
         \\sessions use it. /login metask does the same with a code confirmed on
         \\any device. With another provider, sign in to that provider; the login
-        \\is stored where `metacodes login --provider <id>` stores it.
+        \\is stored where `metacodes login --provider <id>` stores it. A provider
+        \\whose site creates the key (OpenRouter) asks which way: the browser here,
+        \\or another device (--device-code), whose page shows a code to paste back.
         \\/logout signs out of Metask; /logout <provider> forgets that provider's key.
         \\
     , .{});
@@ -3162,8 +3166,16 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .allocator = app.allocator,
         .io = app.io,
         .key_options = .{ .state_root = app.stateRoot(), .open_browser = options.open_browser },
+        // A key grant (OpenRouter) offers the other device first over SSH,
+        // and starts there with `--device-code`.
+        .how_ssh = openrouter_login.sshSession(),
+        .how_start = if (options.method == .device_code) .other_device else .ask,
     };
     defer dialog.deinit();
+    // The key a key-grant provider has stored now, as its manage page: a new
+    // sign-in leaves it working on the provider's site, and the user is told.
+    var previous_keys: PreviousKeys = .{};
+    defer previous_keys.deinit(app.allocator);
     var start_at: ?usize = null;
     for (host.registry.profiles.items) |*profile| {
         // Metask signs in by `/login` and `/login metask`, which go on to its
@@ -3185,6 +3197,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             };
             continue;
         };
+        if (flow == .key_grant) previous_keys.note(app.allocator, app.stateRoot(), flow.key_grant);
         offerLogin(&dialog, &start_at, named, .{ .profile = profile, .method = .{ .flow = flow } });
     }
     if (named) |name| if (start_at == null) {
@@ -3207,6 +3220,8 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
                 if (app.storedKeyShadowNotice(dialog.chosenProfile(), &notice_buf)) |notice| {
                     cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
                 }
+            } else if (dialog.chosenProfile().key_grant != null) {
+                printKeyGrantSignedIn(app, dialog.chosenProfile(), previous_keys.forProvider(dialog.chosenProfile().id));
             } else {
                 cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
             }
@@ -3216,6 +3231,60 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
                 cmd_output.print("{s}The model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, @errorName(err), th.reset });
             };
         },
+    }
+}
+
+/// The manage page of the key each key-grant provider (OpenRouter) has stored
+/// before `/login` runs, so a sign-in that replaces it can say the old one
+/// still works on the provider's site. Owned.
+const PreviousKeys = struct {
+    entries: [4]Entry = undefined,
+    len: usize = 0,
+
+    const Entry = struct { provider_id: @import("../provider/ids.zig").Slug, manage_url: []u8 };
+
+    fn note(self: *PreviousKeys, allocator: std.mem.Allocator, state_root: []const u8, prepared: provider_login.KeyGrantPrepared) void {
+        if (self.len == self.entries.len) return;
+        const url = openrouter_login.storedKeyManageUrl(allocator, state_root, prepared.provider_id, prepared.origin, prepared.grant) orelse return;
+        self.entries[self.len] = .{ .provider_id = prepared.provider_id, .manage_url = url };
+        self.len += 1;
+    }
+
+    fn forProvider(self: *const PreviousKeys, id: @import("../provider/ids.zig").Slug) ?[]const u8 {
+        for (self.entries[0..self.len]) |entry| if (entry.provider_id.eql(id)) return entry.manage_url;
+        return null;
+    }
+
+    fn deinit(self: *PreviousKeys, allocator: std.mem.Allocator) void {
+        for (self.entries[0..self.len]) |entry| allocator.free(entry.manage_url);
+        self.len = 0;
+    }
+};
+
+/// After a key grant (OpenRouter) stored a key: what the provider said about
+/// it, an account without credits, the key a previous sign-in left behind,
+/// and a variable that is read before the stored key.
+fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile, previous: ?[]const u8) void {
+    const th = app.theme;
+    const grant = profile.key_grant orelse return;
+    const grant_origin = openrouter_login.origin(grant);
+    var stored = api_key_store.load(app.allocator, app.stateRoot(), profile.id) catch null;
+    defer if (stored) |*value| value.deinit();
+    const meta: api_key_store.Meta = if (stored) |value| value.meta else .{};
+    var line_buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line_buf);
+    openrouter_login.writeSignedIn(&w, profile.display_name, meta) catch {};
+    w.writeAll(" · /model to choose a model\n") catch {};
+    cmd_output.print("{s}", .{w.buffered()});
+    const current = if (stored) |value| openrouter_login.manageUrl(app.allocator, grant_origin, grant, value.secret) catch null else null;
+    defer if (current) |url| app.allocator.free(url);
+    var notes_buf: [1024]u8 = undefined;
+    var notes: std.Io.Writer = .fixed(&notes_buf);
+    openrouter_login.writeAfterSignIn(&notes, profile.display_name, grant_origin, meta, previous, current) catch {};
+    if (notes.buffered().len > 0) cmd_output.print("{s}{s}{s}", .{ th.warn, notes.buffered(), th.reset });
+    var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+    if (app.storedKeyShadowNotice(profile, &notice_buf)) |notice| {
+        cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
     }
 }
 
@@ -3389,7 +3458,10 @@ fn logoutProvider(app: *app_mod.App, profile: *const @import("../provider/profil
         cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
     };
-    if (result.removed) {
+    if (result.removed and profile.key_grant != null) {
+        cmd_output.print("Removed the {s} key stored on this machine.\n", .{profile.display_name});
+        if (result.manageUrl()) |url| cmd_output.print("It still works on {s} until you delete it there: {s}\n", .{ profile.display_name, url });
+    } else if (result.removed) {
         cmd_output.print("Removed the stored key for {s}.\n", .{profile.display_name});
     } else {
         cmd_output.print("No key is stored for {s}.\n", .{profile.display_name});
@@ -3434,9 +3506,25 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         cmd_output.print("\x1b[31mCannot sign in to {s}: {s}\x1b[0m\n", .{ built.display_name, provider_login.refusalText(err, options.method) });
         return;
     };
+    if (flow == .key_grant and options.method == .device_code) {
+        // The code is pasted back at a prompt; without a dialog there is no
+        // safe place to type it here.
+        cmd_output.print("Run `metacodes login --provider {s} --device-code` to sign in on another device.\n", .{built.id.slice()});
+        return;
+    }
+    var previous_keys: PreviousKeys = .{};
+    defer previous_keys.deinit(allocator);
+    if (flow == .key_grant) previous_keys.note(allocator, app.stateRoot(), flow.key_grant);
     cmd_output.print("Signing in to {s}…\n", .{built.display_name});
     var diagnostic: provider_login.ImportDiagnostic = .{};
     const outcome = flow.run(allocator, app.io, oauth_login_mod.stderrNotify(), &diagnostic) catch |err| {
+        if (flow == .key_grant) {
+            var line_buf: [256]u8 = undefined;
+            var retry_buf: [96]u8 = undefined;
+            const retry = std.fmt.bufPrint(&retry_buf, "/login {s}", .{built.id.slice()}) catch "/login";
+            cmd_output.print("\x1b[31m{s}\x1b[0m\n", .{openrouter_login.failureLine(&line_buf, err, built.display_name, retry)});
+            return;
+        }
         if (diagnostic.cause) |cause| {
             cmd_output.print("\x1b[31mLogin failed: {s} ({s})\x1b[0m\n", .{ @errorName(err), @errorName(cause) });
         } else {
@@ -3444,7 +3532,11 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         }
         return;
     };
-    cmd_output.print("Signed in to {s} · /model to choose a model\n", .{outcome.provider_id.slice()});
+    if (flow == .key_grant) {
+        printKeyGrantSignedIn(app, built, previous_keys.forProvider(built.id));
+    } else {
+        cmd_output.print("Signed in to {s} · /model to choose a model\n", .{outcome.provider_id.slice()});
+    }
     // A route on this provider may have been unusable for want of a
     // credential; the picker catalog is rebuilt so it reflects the login.
     app.refreshModelPicker() catch |err| {

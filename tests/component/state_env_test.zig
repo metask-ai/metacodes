@@ -655,8 +655,10 @@ test "state .env: a catalog refresh reads its credential_env from it (#486)" {
     defer env.deinit();
     var catalog = try harness.MockServer.startRepeatingStatus("{\"data\":[]}", "HTTP/1.1 200 OK", "");
     defer catalog.stop();
+    // Not "openrouter": that id is built in, and a configured catalog naming
+    // it is passed over.
     try case.write("state/config.json", try std.fmt.allocPrint(a,
-        \\{{"provider_catalogs": {{"openrouter": {{"models_url": "{s}/api/v1/models", "credential_env": "CATALOG_TOKEN"}}}}}}
+        \\{{"provider_catalogs": {{"or-catalog": {{"models_url": "{s}/api/v1/models", "credential_env": "CATALOG_TOKEN"}}}}}}
     , .{try originOf(a, catalog)}));
     try case.write("state/.env", "CATALOG_TOKEN=sk-catalog-from-file\n");
     var layer = try cc.app_state_env.load(testing.allocator, case.state, .{ .others = &.{"CATALOG_TOKEN"} });

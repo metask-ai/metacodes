@@ -39,6 +39,7 @@ pub const kimi_code = @import("profiles/kimi_code.zig");
 pub const qwen = @import("profiles/qwen.zig");
 pub const minimax = @import("profiles/minimax.zig");
 pub const bedrock = @import("profiles/bedrock.zig");
+pub const openrouter = @import("profiles/openrouter.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
 /// point the requirement asks for. Each vendor's integration notes (dialect,
@@ -55,6 +56,7 @@ pub const BUILTIN_PROFILES = [_]ProviderProfile{
     qwen.PROFILE,
     minimax.PROFILE,
     bedrock.PROFILE,
+    openrouter.PROFILE,
 };
 
 // ── transport bridge ─────────────────────────────────────────────────────────

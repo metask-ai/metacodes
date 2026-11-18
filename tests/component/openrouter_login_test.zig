@@ -1,0 +1,564 @@
+//! L2 evidence: OpenRouter's sign-in (`ProviderProfile.key_grant`) — a PKCE
+//! grant that ends in an API key of the user's own account.
+//!
+//! - The browser way: the page address carries the challenge (S256), a
+//!   loopback callback and a state; the callback is taken only with that
+//!   state; the code and the verifier are traded as JSON; the key is stored in
+//!   `keys/openrouter.json` with what `/api/v1/key` said about it.
+//! - A refusal ends the wait at once, with or without a state (OpenRouter
+//!   sends none with one); an expired or refused code says which. Nothing is
+//!   stored in any of these.
+//! - The other-device way: the page carries no callback and no state; the
+//!   code pasted back is traded with the verifier this machine kept.
+//! - `METACODES_OPENROUTER_URL` moves every address, the requests included,
+//!   and is taken only for https or a loopback host. Every case here points it
+//!   at a local mock and checks the page address is on the mock before a code
+//!   is delivered: no made-up code ever reaches openrouter.ai.
+//! - Logging out removes the key and names the page where its owner deletes
+//!   it (only a management key could delete it from here); a new sign-in can
+//!   name the key the previous one left.
+//! - The stored key answers for OpenRouter only.
+
+const std = @import("std");
+const harness = @import("harness");
+const cc = @import("cc");
+
+const ppaths = @import("platform").paths;
+const net = @import("platform").net;
+
+const testing = std.testing;
+const oauth_login = cc.api_oauth_login;
+const provider_login = cc.api_provider_login;
+const openrouter_login = cc.api_openrouter_login;
+const key_store = cc.provider_api_key_store;
+const Slug = cc.provider_ids.Slug;
+const App = cc.app_module.App;
+
+const OPENROUTER = Slug.lit("openrouter");
+const KEY = "sk-or-v1-0e6f44a47a05f1dad2ad7e88c4c1d6b7";
+const EXCHANGED = "{\"key\":\"" ++ KEY ++ "\",\"user_id\":\"user_2yOPcMpKoQhcd4bVgSMlELRaIah\"}";
+const DESCRIBED = "{\"data\":{\"label\":\"metacodes\",\"limit\":null,\"limit_remaining\":null,\"expires_at\":null,\"is_free_tier\":false,\"usage\":0}}";
+const OPENAI_SSE =
+    "data: {\"id\":\"gen-1\",\"provider\":\"DeepInfra\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" ++
+    "data: {\"id\":\"gen-1\",\"provider\":\"DeepInfra\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" ++
+    "data: [DONE]\n\n";
+
+const EnvGuard = struct {
+    allocator: std.mem.Allocator,
+    name: [*:0]const u8,
+    previous: ?[:0]u8,
+
+    fn set(allocator: std.mem.Allocator, name: [*:0]const u8, value: ?[*:0]const u8) !EnvGuard {
+        const previous = if (std.c.getenv(name)) |raw| try allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        if (value) |v| ppaths.setEnv(name, v) else ppaths.unsetEnv(name);
+        return .{ .allocator = allocator, .name = name, .previous = previous };
+    }
+
+    fn restore(self: *EnvGuard) void {
+        if (self.previous) |previous| {
+            ppaths.setEnv(self.name, previous.ptr);
+            self.allocator.free(previous);
+        } else {
+            ppaths.unsetEnv(self.name);
+        }
+        self.* = undefined;
+    }
+};
+
+const cleared_variables = [_][*:0]const u8{
+    "OPENROUTER_API_KEY",
+    "METACODES_OPENROUTER_URL",
+    "DEEPSEEK_API_KEY",
+    "METASK_API_KEY",
+    "METASK_GATEWAY_URL",
+    "METACODES_PROVIDER",
+    "METACODES_KEY_CHECK_URL",
+    "METACODES_CONFIG_FILE",
+    "SSH_CONNECTION",
+    "SSH_TTY",
+};
+
+/// A scratch state root as HOME, every key variable cleared, no probe, no KG.
+const Case = struct {
+    arena: std.heap.ArenaAllocator,
+    tmp: testing.TmpDir,
+    root_buf: [std.fs.max_path_bytes]u8,
+    root: []const u8,
+    guards: [cleared_variables.len + 4]EnvGuard,
+    guard_count: usize,
+
+    fn init(self: *Case) !void {
+        self.arena = std.heap.ArenaAllocator.init(testing.allocator);
+        self.tmp = testing.tmpDir(.{});
+        self.guard_count = 0;
+        self.root = self.root_buf[0..try self.tmp.dir.realPath(testing.io, &self.root_buf)];
+        for (cleared_variables) |name| try self.setEnv(name, null);
+        try self.setEnv("HOME", (try self.arena.allocator().dupeZ(u8, self.root)).ptr);
+        try self.setEnv("METACODES_NO_PROBE", "1");
+        try self.setEnv("METACODES_KG_AUTOSTART", "0");
+    }
+
+    fn setEnv(self: *Case, name: [*:0]const u8, value: ?[*:0]const u8) !void {
+        for (self.guards[0..self.guard_count]) |*guard| {
+            if (std.mem.orderZ(u8, guard.name, name) == .eq) {
+                if (value) |v| ppaths.setEnv(name, v) else ppaths.unsetEnv(name);
+                return;
+            }
+        }
+        self.guards[self.guard_count] = try EnvGuard.set(self.arena.allocator(), name, value);
+        self.guard_count += 1;
+    }
+
+    /// Every OpenRouter address on `server` (`METACODES_OPENROUTER_URL`);
+    /// returns the origin.
+    fn openRouterAt(self: *Case, server: *harness.MockServer) ![]const u8 {
+        const url = try server.urlOwned(self.arena.allocator());
+        const origin = url[0 .. url.len - "/v1/messages".len];
+        try self.setEnv(openrouter_login.ORIGIN_ENV, (try self.arena.allocator().dupeZ(u8, origin)).ptr);
+        return origin;
+    }
+
+    fn deinit(self: *Case) void {
+        var index = self.guard_count;
+        while (index > 0) {
+            index -= 1;
+            self.guards[index].restore();
+        }
+        self.tmp.cleanup();
+        self.arena.deinit();
+    }
+
+    fn config(self: *Case, argv: []const [*:0]const u8) !cc.types_mod.Config {
+        var parsed = cc.parseArgsForTest(argv, self.arena.allocator());
+        try testing.expect(parsed.parse_error == null);
+        parsed.state_root = self.root;
+        return parsed;
+    }
+};
+
+/// Collects what the flow tells the user, published with release/acquire.
+/// The flow says its instructions in one write before it waits on the
+/// callback, so once `ready` is seen nothing appends until the test delivers
+/// one.
+const Instructions = struct {
+    buffer: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
+    ready: std.atomic.Value(bool) = .init(false),
+
+    fn write(raw: *anyopaque, said: []const u8) void {
+        const self: *Instructions = @ptrCast(@alignCast(raw));
+        self.buffer.appendSlice(self.allocator, said) catch {};
+        self.ready.store(true, .release);
+    }
+
+    fn wait(self: *Instructions) bool {
+        var spins: usize = 0;
+        while (spins < 500) : (spins += 1) {
+            if (self.ready.load(.acquire)) return true;
+            cc.util_time.sleepMs(10);
+        }
+        return false;
+    }
+
+    fn notify(self: *Instructions) oauth_login.Notify {
+        return .{ .ctx = self, .write = write };
+    }
+
+    fn snapshot(self: *Instructions) []const u8 {
+        return self.buffer.items;
+    }
+
+    fn deinit(self: *Instructions) void {
+        self.buffer.deinit(self.allocator);
+    }
+};
+
+/// The page address in what the flow said: the line that starts with the
+/// origin's `/auth?`.
+fn pageIn(text: []const u8, origin: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, origin) and std.mem.indexOf(u8, line, "/auth?") != null) return line;
+    }
+    return null;
+}
+
+/// The value of query parameter `name` in `url`, still encoded.
+fn paramIn(url: []const u8, name: []const u8) ?[]const u8 {
+    const query = url[(std.mem.indexOfScalar(u8, url, '?') orelse return null) + 1 ..];
+    var parts = std.mem.splitScalar(u8, query, '&');
+    while (parts.next()) |part| {
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        if (std.mem.eql(u8, part[0..eq], name)) return part[eq + 1 ..];
+    }
+    return null;
+}
+
+fn callbackPortIn(url: []const u8) !u16 {
+    const callback = paramIn(url, "callback_url") orelse return error.NoCallbackInPage;
+    const marker = "http%3A%2F%2Flocalhost%3A";
+    if (!std.mem.startsWith(u8, callback, marker)) return error.NoCallbackInPage;
+    var port: u32 = 0;
+    for (callback[marker.len..]) |c| {
+        if (!std.ascii.isDigit(c)) break;
+        port = port * 10 + (c - '0');
+    }
+    return std.math.cast(u16, port) orelse error.NoCallbackInPage;
+}
+
+/// Drive the redirect OpenRouter's page would perform.
+fn deliverCallback(port: u16, query: []const u8) !void {
+    const socket = try net.connectLoopback(port);
+    defer net.closeSocket(socket);
+    var request_buffer: [1024]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buffer, "GET /auth/callback?{s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{query});
+    _ = net.send(socket, request);
+    var drain: [1024]u8 = undefined;
+    while (net.recv(socket, &drain) > 0) {}
+}
+
+/// The S256 challenge of `verifier`, as the page carries it.
+fn challengeOf(buffer: []u8, verifier: []const u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
+    return std.base64.url_safe_no_pad.Encoder.encode(buffer, &digest);
+}
+
+/// A string field of a captured JSON body, without its quotes (none of the
+/// values here carry escapes).
+fn jsonString(captured: *const harness.CapturedRequest, key: []const u8) ?[]const u8 {
+    const raw = captured.jsonField(key) orelse return null;
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return null;
+    return raw[1 .. raw.len - 1];
+}
+
+fn requestLine(captured: harness.CapturedRequest) []const u8 {
+    const end = std.mem.indexOf(u8, captured.raw, "\r\n") orelse captured.raw.len;
+    return captured.raw[0..end];
+}
+
+fn headerValue(captured: harness.CapturedRequest, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, captured.raw, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " ");
+    }
+    return null;
+}
+
+/// OpenRouter's sign-in as `/login openrouter` prepares it.
+fn prepared(case: *Case) !provider_login.KeyGrantPrepared {
+    var registry = try cc.provider_registry.ProviderRegistry.initWithBuiltins(testing.allocator);
+    defer registry.deinit();
+    const flow = try provider_login.prepareFlow(registry.find("openrouter").?, .{ .state_root = case.root, .open_browser = false, .port = 0 }, null);
+    return flow.key_grant;
+}
+
+const FlowRun = struct {
+    prepared: provider_login.KeyGrantPrepared,
+    io: std.Io,
+    notify: oauth_login.Notify,
+    result: ?anyerror!provider_login.Outcome = null,
+
+    fn run(self: *FlowRun) void {
+        self.result = self.prepared.run(testing.allocator, self.io, self.notify, null);
+    }
+};
+
+test "L2 OpenRouter: the browser sign-in takes only its own state back, trades code and verifier as JSON, and stores the key with what OpenRouter said" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startCassette(&.{ EXCHANGED, DESCRIBED }, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    var instructions = Instructions{ .allocator = testing.allocator };
+    defer instructions.deinit();
+    // A failed check below still ends the flow's wait (100 ms steps).
+    var abort = cc.util_abort.AbortSignal.init();
+    var run = FlowRun{ .prepared = try prepared(&case), .io = io_runtime.io(), .notify = instructions.notify() };
+    run.prepared.options.abort_signal = &abort;
+    try testing.expectEqualStrings(origin, run.prepared.origin);
+    var thread = try std.Thread.spawn(.{}, FlowRun.run, .{&run});
+    var joined = false;
+    defer if (!joined) {
+        abort.abort(.user_interrupt);
+        thread.join();
+    };
+
+    if (!instructions.wait()) return error.FlowNeverPublishedInstructions;
+    const said = try a.dupe(u8, instructions.snapshot());
+    // The page is on the mock — the precondition for delivering any code.
+    const page = pageIn(said, origin) orelse {
+        std.debug.print("instructions:\n{s}\n", .{said});
+        return error.PageNotOnTheMock;
+    };
+    try testing.expect(std.mem.startsWith(u8, page, try std.fmt.allocPrint(a, "{s}/auth?callback_url=http%3A%2F%2Flocalhost%3A", .{origin})));
+    try testing.expectEqualStrings("S256", paramIn(page, "code_challenge_method").?);
+    try testing.expectEqualStrings("metacodes", paramIn(page, "key_label").?);
+    try testing.expect(paramIn(page, "client_id") == null);
+    const port = try callbackPortIn(page);
+    const state = paramIn(page, "state") orelse return error.NoStateInPage;
+    const challenge = paramIn(page, "code_challenge") orelse return error.NoChallengeInPage;
+    try testing.expect(std.mem.indexOf(u8, said, try std.fmt.allocPrint(a, "OpenRouter shows this sign-in as \"localhost:{d}\".", .{port})) != null);
+    try testing.expect(std.mem.indexOf(u8, said, "Open this URL to sign in:") != null);
+
+    // A callback with another state is neither taken nor exchanged.
+    try deliverCallback(port, "code=stray-code&state=not-the-state");
+    try testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    try deliverCallback(port, try std.fmt.allocPrint(a, "code=auth-code-42&state={s}", .{state}));
+    thread.join();
+    joined = true;
+    _ = try (run.result orelse return error.FlowDidNotRun);
+
+    // The exchange: JSON, the code, S256, and the verifier the page's
+    // challenge was made from.
+    try testing.expectEqual(@as(usize, 2), server.requestCount());
+    const exchange = server.requestAt(0).?;
+    try testing.expectEqualStrings("POST /api/v1/auth/keys HTTP/1.1", requestLine(exchange));
+    try testing.expectEqualStrings("application/json", headerValue(exchange, "content-type").?);
+    try testing.expectEqualStrings("auth-code-42", jsonString(&exchange, "code").?);
+    try testing.expectEqualStrings("S256", jsonString(&exchange, "code_challenge_method").?);
+    const verifier = jsonString(&exchange, "code_verifier").?;
+    var challenge_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(challenge, challengeOf(&challenge_buf, verifier));
+    try testing.expect(headerValue(exchange, "authorization") == null);
+    try testing.expectEqualStrings("metacodes/" ++ cc.VERSION, headerValue(exchange, "user-agent") orelse "");
+    // The description: the new key, on the key page.
+    const described = server.requestAt(1).?;
+    try testing.expectEqualStrings("GET /api/v1/key HTTP/1.1", requestLine(described));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(described, "authorization").?);
+
+    var stored = (try key_store.load(testing.allocator, case.root, OPENROUTER)).?;
+    defer stored.deinit();
+    try testing.expectEqualStrings(KEY, stored.secret);
+    try testing.expectEqual(cc.provider_credential.CredentialKind.api_key, stored.kind);
+    try testing.expectEqual(key_store.Obtained.browser_sign_in, stored.meta.obtained.?);
+    try testing.expect(stored.meta.described);
+    try testing.expectEqualStrings("metacodes", stored.meta.label.?);
+    try testing.expect(stored.meta.limit_usd == null and stored.meta.expires_at == null);
+    // Nothing the user was shown carries the key or the verifier.
+    const shown = instructions.snapshot();
+    try testing.expect(std.mem.indexOf(u8, shown, KEY) == null);
+    try testing.expect(std.mem.indexOf(u8, shown, verifier) == null);
+}
+
+test "L2 OpenRouter: a refusal ends the sign-in at once, with or without a state, and stores nothing" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startCassette(&.{EXCHANGED}, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    for ([_]bool{ false, true }) |with_state| {
+        var instructions = Instructions{ .allocator = testing.allocator };
+        defer instructions.deinit();
+        var run = FlowRun{ .prepared = try prepared(&case), .io = io_runtime.io(), .notify = instructions.notify() };
+        var thread = try std.Thread.spawn(.{}, FlowRun.run, .{&run});
+        if (!instructions.wait()) {
+            thread.join();
+            return error.FlowNeverPublishedInstructions;
+        }
+        const said = try a.dupe(u8, instructions.snapshot());
+        const page = pageIn(said, origin) orelse {
+            thread.join();
+            return error.PageNotOnTheMock;
+        };
+        const port = try callbackPortIn(page);
+        const query = if (with_state)
+            try std.fmt.allocPrint(a, "error=access_denied&state={s}", .{paramIn(page, "state").?})
+        else
+            "error=access_denied";
+        try deliverCallback(port, query);
+        thread.join();
+        try testing.expectError(error.KeyGrantDeclined, run.result.?);
+    }
+    try testing.expectEqual(@as(usize, 0), server.requestCount());
+    try testing.expect(try key_store.load(testing.allocator, case.root, OPENROUTER) == null);
+}
+
+test "L2 OpenRouter: an expired or refused code says which, and stores nothing" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    const Expectation = struct { body: []const u8, err: anyerror };
+    for ([_]Expectation{
+        .{ .body = "{\"error\":{\"code\":403,\"message\":\"Authorization code expired\"}}", .err = error.KeyGrantCodeExpired },
+        .{ .body = "{\"error\":{\"code\":403,\"message\":\"Invalid code or code_verifier\"}}", .err = error.KeyGrantCodeRefused },
+    }) |expectation| {
+        var server = try harness.MockServer.startRepeatingStatus(expectation.body, "HTTP/1.1 403 Forbidden", "");
+        defer server.stop();
+        const origin = try case.openRouterAt(server);
+        var pending = try openrouter_login.Pending.begin(testing.allocator, origin, cc.provider_registry.openrouter.KEY_GRANT);
+        defer pending.deinit();
+        var flow = try prepared(&case);
+        flow.pasted = .{ .code = "pasted-code", .verifier = pending.verifier() };
+        try testing.expectError(expectation.err, flow.run(testing.allocator, io_runtime.io(), oauth_login.stderrNotify(), null));
+        try testing.expectEqual(@as(usize, 1), server.requestCount());
+        try testing.expect(try key_store.load(testing.allocator, case.root, OPENROUTER) == null);
+    }
+}
+
+test "L2 OpenRouter: on another device the page shows the code; the code pasted back is traded with the verifier kept here" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startCassette(&.{ EXCHANGED, DESCRIBED }, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    var flow = try prepared(&case);
+    var pending = try openrouter_login.Pending.begin(testing.allocator, flow.origin, flow.grant);
+    defer pending.deinit();
+    // No callback and no state: the page shows the code instead.
+    try testing.expect(std.mem.startsWith(u8, pending.url, try std.fmt.allocPrint(a, "{s}/auth?code_challenge=", .{origin})));
+    try testing.expect(paramIn(pending.url, "callback_url") == null);
+    try testing.expect(paramIn(pending.url, "state") == null);
+    try testing.expect(std.mem.indexOf(u8, pending.url, pending.verifier()) == null);
+
+    flow.pasted = .{ .code = "  shown-code-7 \n", .verifier = pending.verifier() };
+    _ = try flow.run(testing.allocator, io_runtime.io(), oauth_login.stderrNotify(), null);
+    const exchange = server.requestAt(0).?;
+    // Whitespace a paste carries is not part of the code.
+    try testing.expectEqualStrings("shown-code-7", jsonString(&exchange, "code").?);
+    var challenge_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(paramIn(pending.url, "code_challenge").?, challengeOf(&challenge_buf, jsonString(&exchange, "code_verifier").?));
+    var stored = (try key_store.load(testing.allocator, case.root, OPENROUTER)).?;
+    defer stored.deinit();
+    try testing.expectEqualStrings(KEY, stored.secret);
+}
+
+test "L2 OpenRouter: the origin override moves every address, requests included, and only to https or a loopback host" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.start(OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+
+    // The sign-in's addresses.
+    const flow = try prepared(&case);
+    try testing.expectEqualStrings(origin, flow.origin);
+    // The requests': the host's profile is moved there too.
+    const host = try cc.provider_host.Host.create(testing.allocator);
+    defer host.destroy();
+    openrouter_login.applyOriginOverride(host);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/api/v1", .{origin}), host.registry.find("openrouter").?.channels[0].base_url);
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        try testing.expect(std.mem.startsWith(u8, item.endpoint_ref, origin));
+    }
+
+    // Not a host other than the loopback over plain HTTP: the profile's own.
+    try case.setEnv(openrouter_login.ORIGIN_ENV, "http://openrouter.example.com");
+    try testing.expectEqualStrings("https://openrouter.ai", (try prepared(&case)).origin);
+    const unmoved = try cc.provider_host.Host.create(testing.allocator);
+    defer unmoved.destroy();
+    openrouter_login.applyOriginOverride(unmoved);
+    try testing.expectEqualStrings("https://openrouter.ai/api/v1", unmoved.registry.find("openrouter").?.channels[0].base_url);
+}
+
+test "L2 OpenRouter: logging out removes the key and names the page its owner deletes it on; a new sign-in can name the key the last one left" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    const grant = cc.provider_registry.openrouter.KEY_GRANT;
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+
+    // Before a new sign-in replaces it: the old key's page.
+    const previous = openrouter_login.storedKeyManageUrl(testing.allocator, case.root, OPENROUTER, grant.origin, grant).?;
+    defer testing.allocator.free(previous);
+    const expected = try openrouter_login.manageUrl(a, grant.origin, grant, KEY);
+    try testing.expectEqualStrings(expected, previous);
+    try testing.expect(std.mem.startsWith(u8, previous, "https://openrouter.ai/keys/"));
+    try testing.expect(std.mem.indexOf(u8, previous, KEY) == null);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const argv = [_][*:0]const u8{"metacodes"};
+    const app = try App.init(testing.allocator, io_runtime.io(), try case.config(&argv), "metask-key");
+    defer app.deinit();
+    const forgotten = try app.forgetProviderKey(OPENROUTER);
+    try testing.expect(forgotten.removed);
+    try testing.expectEqualStrings(expected, forgotten.manageUrl().?);
+    try testing.expect(try key_store.load(testing.allocator, case.root, OPENROUTER) == null);
+    // Nothing left to name the second time.
+    const again = try app.forgetProviderKey(OPENROUTER);
+    try testing.expect(!again.removed and again.manageUrl() == null);
+}
+
+test "L2 OpenRouter: the stored key starts an OpenRouter session and reaches its requests, and no other provider's" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+
+    const argv = [_][*:0]const u8{ "metacodes", "--provider", "openrouter" };
+    const config = try case.config(&argv);
+    const secret = try cc.resolveProviderScopedSecret(testing.allocator, config, "openrouter");
+    defer testing.allocator.free(secret);
+    try testing.expectEqualStrings(KEY, secret);
+    // ...and not for another provider.
+    try testing.expectError(error.MissingCredentials, cc.resolveProviderScopedSecret(testing.allocator, config, "deepseek"));
+
+    // `--provider openrouter` the way a start resolves it, with the override
+    // moving the route onto the mock: OpenRouter's router channel and model,
+    // OpenRouter's dialect, the stored key.
+    var server = try harness.MockServer.start(OPENAI_SSE, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+    const host = try cc.provider_host.Host.create(testing.allocator);
+    defer host.destroy();
+    openrouter_login.applyOriginOverride(host);
+    const outcome = try cc.provider_startup.resolve(testing.allocator, &host.registry, .{ .provider = "openrouter" });
+    var route = switch (outcome) {
+        .route => |value| value,
+        .failure => return error.RouteNotResolved,
+    };
+    defer route.deinit();
+    try testing.expect(route.channel_id.eqlText("auto"));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/api/v1/chat/completions", .{origin}), route.endpoint_url);
+    try testing.expectEqualStrings("openrouter/auto", route.request_model_id);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.api_openai.OpenAIClient.init(testing.allocator, io_runtime.io(), secret, route.request_model_id, route.endpoint_url);
+    defer client.deinit();
+    client.protocol = route.openai_protocol;
+    client.auth_scheme = route.auth_scheme;
+    client.declared_dialect = route.dialect;
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = try client.provider().sendStream(&messages, null, null, null, null, null, "");
+    while (try handle.next()) |event| switch (event) {
+        .text, .thinking, .reasoning_item, .web_search_query => |bytes| testing.allocator.free(bytes),
+        else => {},
+    };
+    handle.deinit();
+    const captured = server.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expectEqualStrings("POST /api/v1/chat/completions HTTP/1.1", requestLine(captured));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(captured, "authorization").?);
+    try testing.expectEqualStrings("\"openrouter/auto\"", captured.jsonField("model").?);
+}

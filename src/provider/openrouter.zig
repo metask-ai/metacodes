@@ -943,14 +943,14 @@ test "a compiled policy actually rejects and orders real offers" {
     defer registry.deinit();
     const kinds = [_]profile_mod.CredentialKind{.api_key};
     try registry.register(.{
-        .id = Slug.lit("openrouter"),
-        .implementation_id = Slug.lit("openrouter"),
+        .id = Slug.lit("router-test"),
+        .implementation_id = Slug.lit("router-test"),
         .display_name = "OpenRouter",
         .channels = channels,
         .accepted_credential_kinds = &kinds,
         .default_channel = channels[0].id,
     });
-    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("openrouter") });
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("router-test") });
     defer catalog.deinit();
     try testing.expectEqual(@as(usize, 3), catalog.items().len);
 
@@ -1009,7 +1009,7 @@ test "router metadata fills the actual route without rewriting what was requeste
         .requested = .{ .pinned = pinned },
         .actual_offer_id = ids.OfferId{ .digest = @splat(0x44) },
         .actual_offer_revision = 1,
-        .provider_id = Slug.lit("openrouter"),
+        .provider_id = Slug.lit("router-test"),
         .channel_id = Slug.lit("deepinfra"),
         .protocol = "openai_chat",
     };

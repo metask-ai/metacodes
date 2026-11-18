@@ -1986,6 +1986,14 @@ pub const App = struct {
         local_variable: ?[]const u8 = null,
         /// One the shell sets.
         shell_variable: ?[]const u8 = null,
+        /// A key the provider's site created (`ProviderProfile.key_grant`)
+        /// still works there after this: the page its owner deletes it on.
+        manage_url_buf: [256]u8 = undefined,
+        manage_url_len: usize = 0,
+
+        pub fn manageUrl(self: *const ProviderKeyForgotten) ?[]const u8 {
+            return if (self.manage_url_len == 0) null else self.manage_url_buf[0..self.manage_url_len];
+        }
     };
 
     /// `/logout <provider>` (#485, 第十节第 6 条): forget the key `/login
@@ -1993,9 +2001,20 @@ pub const App = struct {
     /// running on that key keeps nothing of it. `.env` and the shell are not
     /// edited; the result names what of them still holds a key.
     pub fn forgetProviderKey(app: *App, provider_id: provider_ids_mod.Slug) !ProviderKeyForgotten {
+        const host = try app.providerHost();
+        // Read before the file goes: the page is named after the key in it.
+        var manage_url: ?[]u8 = null;
+        defer if (manage_url) |url| app.allocator.free(url);
+        if (host.registry.findById(provider_id)) |found| if (found.key_grant) |grant| {
+            const openrouter_login = @import("api/openrouter_login.zig");
+            manage_url = openrouter_login.storedKeyManageUrl(app.allocator, app.stateRoot(), provider_id, openrouter_login.origin(grant), grant);
+        };
         const removed = try provider_api_key_store.remove(app.allocator, app.stateRoot(), provider_id);
         var result: ProviderKeyForgotten = .{ .removed = removed };
-        const host = try app.providerHost();
+        if (removed) if (manage_url) |url| if (url.len <= result.manage_url_buf.len) {
+            @memcpy(result.manage_url_buf[0..url.len], url);
+            result.manage_url_len = url.len;
+        };
         const profile = host.registry.findById(provider_id) orelse return result;
         const on_saved_key = switch (app.route_state) {
             .bound => |origin| origin == .saved_key,
@@ -2460,6 +2479,9 @@ pub const App = struct {
         if (app.provider_host) |host| return host;
         const host = try provider_host_mod.Host.create(app.allocator);
         errdefer host.destroy();
+        // `METACODES_OPENROUTER_URL` (development, tests) moves every
+        // OpenRouter address, its requests included.
+        @import("api/openrouter_login.zig").applyOriginOverride(host);
         // Seed the durable revision and any previously committed global
         // selection, so `selection.commit` compares against the number the
         // store actually holds rather than an invented one.
@@ -2479,6 +2501,8 @@ pub const App = struct {
                 .{why},
             );
         }
+        var shadowed_buf: [256]u8 = undefined;
+        if (host.shadowedNotice(&shadowed_buf)) |notice| @import("util/log.zig").warn("provider", "{s}", .{notice});
         app.applyMetaskKeyCatalog(host);
         app.seedStartupSelection(host);
         app.provider_host = host;
@@ -4102,6 +4126,9 @@ pub const App = struct {
             if (entry != .object) continue;
             const models_url = stringField(entry.object.get("models_url")) orelse continue;
             const provider_id = provider_ids_mod.Slug.parse(pair.key_ptr.*) catch continue;
+            // A built-in provider (OpenRouter) is not a configured catalog's
+            // to replace; the host says so once (`Host.shadowedNotice`).
+            if (host.isBuiltinId(provider_id)) continue;
             const bearer = if (stringField(entry.object.get("credential_env"))) |name|
                 provider_credential_mod.EnvLookup.process().get(name) orelse app.credentialEnvFallback().get(name)
             else
