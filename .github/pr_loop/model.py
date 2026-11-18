@@ -171,7 +171,9 @@ REPORT_KEYS = frozenset(REPORT_SCHEMA["required"])
 
 WORKER_SCHEMA = {
     "type": "object", "properties": {
-        "result": {"type": "string", "enum": ["updated", "disputed", "needs_decision"]},
+        # rerun_ci: the failure is not caused by this change (flaky runner,
+        # outage); the controller reruns the failed jobs once per head.
+        "result": {"type": "string", "enum": ["updated", "disputed", "rerun_ci", "needs_decision"]},
         "summary": {"type": "string"}, "question": {"type": "string"},
         # A worker answers a finding it believes is wrong with an argument
         # instead of a change; the next adversarial review must rule on it.
@@ -236,7 +238,7 @@ def upgrade_report(value):
     return upgraded if set(upgraded) == REPORT_KEYS else None
 
 
-def validate_worker(value: dict, findings: int) -> dict:
+def validate_worker(value: dict, findings: int, ci: bool = False) -> dict:
     """Each result kind has exactly one legal shape; contradictions stop the loop."""
     if (not isinstance(value, dict) or set(value) != set(WORKER_SCHEMA["required"])
             or not all(isinstance(value[k], str) for k in ("result", "summary", "question"))
@@ -253,6 +255,9 @@ def validate_worker(value: dict, findings: int) -> dict:
     if kind == "needs_decision":
         if not value["question"].strip():
             raise LoopError("worker requested a decision without a question")
+    elif kind == "rerun_ci":
+        if not ci or value["question"] or value["rebuttals"]:
+            raise LoopError("rerun_ci answers CI failures only, with evidence in the summary and nothing else")
     elif kind in ("updated", "disputed"):
         if value["question"]:
             raise LoopError(f"worker returned {kind} with an unresolved question")

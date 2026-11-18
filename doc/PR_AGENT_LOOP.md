@@ -33,7 +33,14 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
 3. It shows the developer the change and asks. After an explicit yes it
    commits and runs `ship`, which pushes the branch, opens the PR and
    registers the session, the worktree and both agents.
-4. The watcher starts a fresh, read-only, adversarial review of the exact
+4. CI comes first. The watcher waits for the four required checks on the
+   head. A failure goes to the worker with the failed jobs' error lines and
+   log tails, which the controller downloads because the worker has no
+   network. The worker fixes the root cause, and the controller validates and
+   pushes, until CI is green. A failure the logs show to be unrelated (runner
+   outage, network flake) can be answered with `rerun_ci`: the failed jobs
+   rerun once per head, and a second failure goes to the developer.
+   Only a green head gets a fresh, read-only, adversarial review of the exact
    head/base revision, by default with the agent that did not write the code.
 5. Findings go back to the developer's own live session (attended; see
    [Visible review conversation](#visible-review-conversation)), or to a
@@ -42,8 +49,8 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
    Pre-existing defects come back as non-blocking follow-ups for a separate
    session and PR. The controller validates, commits and pushes repairs, merges a
    moved main itself, and returns conflicts and CI failures to the worker.
-6. The loop repeats until a review passes and the four required checks
-   succeed on the same head.
+6. Every pushed repair repeats CI first, then review, until one head is green
+   and passes review.
 7. A normal-risk head is merged. A high-risk head, or a disagreement that
    survives two rebuttal rounds, waits for a human (see
    [Human approval](#human-approval)).
@@ -306,7 +313,7 @@ answering; an answer does not automatically reconcile a divergent checkout.
    repair. Approval and user-input requests are escalated or denied rather
    than fabricated.
 4. The four existing gate result checks must report **success** for the current
-   PR head, from the GitHub Actions app (PR workflows execute the test merge,
+   PR head before it is reviewed and again when it merges, from the GitHub Actions app (PR workflows execute the test merge,
    but their check runs are attached to the head SHA). Missing, pending,
    skipped, neutral and untrusted-source results never satisfy this test.
    GitHub additionally enforces current approvals and review-thread resolution.

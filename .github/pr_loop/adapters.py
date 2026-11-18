@@ -30,6 +30,8 @@ def stop_process(proc):
     if os.name == "posix":
         signal_group(signal.SIGTERM)
     elif proc.poll() is None:
+        # No process groups on Windows: taskkill /T reaches the leader's descendants.
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
         proc.terminate()
     try:
         proc.wait(timeout=5)
@@ -66,9 +68,9 @@ def run(argv, cwd=None, stdin=None, timeout=120, log=None):
         except subprocess.TimeoutExpired:
             # A descendant in another session still holds the pipe: give up
             # on the tail of the log rather than block the watcher's lock.
+            # The reader threads keep draining in the background; closing a
+            # pipe another thread reads blocks on Windows, so just let go.
             stdout, stderr = "", "\n[pr-loop: output collection abandoned after timeout]\n"
-            for stream in (proc.stdout, proc.stderr):
-                stream.close()
         if log is not None:
             log.write(stdout or "")
             log.write(stderr or "")
@@ -76,6 +78,27 @@ def run(argv, cwd=None, stdin=None, timeout=120, log=None):
     except BaseException:
         stop_process(proc)
         raise
+
+
+ERROR_LINE = re.compile(r"(?i)\b(?:FAIL(?:ED)?:|ERROR:|error(?:\[\w+\])?:|Traceback|AssertionError|"
+                        r"panic|exited with|exit code [1-9]|not ok\b|\bfailed\b(?! command:))")
+
+
+def log_excerpt(text, context=3, tail=60, limit=12000):
+    """Error lines with context plus the log's tail, timestamps removed, bounded."""
+    lines = [re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", "", line) for line in text.splitlines()]
+    keep = set(range(max(0, len(lines) - tail), len(lines)))
+    for i, line in enumerate(lines):
+        if ERROR_LINE.search(line):
+            keep.update(range(max(0, i - context), min(len(lines), i + context + 1)))
+    out, previous = [], -2
+    for i in sorted(keep):
+        if i != previous + 1:
+            out.append("…")
+        out.append(lines[i])
+        previous = i
+    text = "\n".join(out)
+    return text if len(text) <= limit else "…" + text[-limit:]
 
 
 class GitHub:
@@ -138,6 +161,43 @@ class GitHub:
                     and self.role(pr.repo, login) in ("admin", "maintain")):
                 return {"source": "github-comment", "by": login, "url": comment.get("html_url", "")}
         return None
+
+    def text(self, path):
+        """A raw (non-JSON) API response, e.g. a job log; ANSI escapes stripped."""
+        out = run([*self.command, "api", "--allow-escape-sequences", path], timeout=180)
+        return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out)
+
+    def failed_jobs(self, pr, limit=4):
+        """Failed GitHub Actions jobs on this head, with the log lines that explain them.
+
+        The worker has no network, so the controller reads the logs for it.
+        Leaf jobs come before the aggregate result jobs that only repeat them.
+        """
+        latest, page = {}, 1
+        while True:
+            result = self.api(f"repos/{pr.repo}/commits/{pr.head}/check-runs?per_page=100&page={page}")
+            for check in result["check_runs"]:
+                if check["app"]["id"] == 15368 and check.get("conclusion") in ("failure", "timed_out", "startup_failure"):
+                    if check["name"] not in latest or check["id"] > latest[check["name"]]["id"]:
+                        latest[check["name"]] = check
+            if len(result["check_runs"]) < 100:
+                break
+            page += 1
+        jobs = []
+        for check in sorted(latest.values(), key=lambda c: (" / " not in c["name"], c["name"]))[:limit]:
+            try:
+                log = log_excerpt(self.text(f"repos/{pr.repo}/actions/jobs/{check['id']}/logs"))
+            except LoopError as exc:
+                log = f"(log unavailable: {str(exc)[:300]})"
+            jobs.append({"name": check["name"], "job": check["id"], "url": check.get("html_url", ""),
+                         "conclusion": check["conclusion"], "log": log})
+        return jobs
+
+    def rerun_failed(self, repo, job_ids):
+        runs = {self.api(f"repos/{repo}/actions/jobs/{job}")["run_id"] for job in job_ids}
+        for run_id in sorted(runs):
+            self.api(f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs", "POST", {})
+        return sorted(runs)
 
     def comment(self, pr, body):
         self.api(f"repos/{pr.repo}/issues/{pr.number}/comments", "POST", {"body": body})

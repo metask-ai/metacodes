@@ -150,6 +150,15 @@ class FixtureGitHub(GitHub):
         self.reviews, self.comments, self.posted, self.requested, self.created = [], [], [], [], []
         self.roles = {}
         self.forks = {"example/source": DEFAULT_REPO}
+        self.reruns = []
+
+    def text(self, path):
+        self.calls.append((path, "GET", None))
+        if path.endswith("/logs"):
+            noise = "\n".join(f"2026-11-18T14:00:{i:02d}.0Z setup noise line {i}" for i in range(200))
+            return (noise + "\n2026-11-18T14:01:00.0Z FAIL: test_app\n"
+                    "2026-11-18T14:01:00.1Z AssertionError: app.txt says bug\n" + "\n".join(f"tail {i}" for i in range(70)))
+        raise AssertionError(path)
 
     def api(self, path, method="GET", payload=None):
         self.calls.append((path, method, payload))
@@ -195,6 +204,11 @@ class FixtureGitHub(GitHub):
         if path.startswith("repos/") and path.count("/") == 2 and method == "GET":
             name = path.removeprefix("repos/")
             return {"fork": name in self.forks, "source": {"full_name": self.forks.get(name, name)}}
+        if "/actions/jobs/" in path:
+            return {"run_id": 900}
+        if path.endswith("/rerun-failed-jobs"):
+            self.reruns.append(path)
+            return {}
         if "/pulls/7/reviews?" in path:
             return self.reviews
         if "/issues/7/comments" in path:
@@ -305,8 +319,9 @@ class LoopIntegrationTest(unittest.TestCase):
         gate = next(e for e in events if e["state"] == "validation_passed")
         self.assertTrue(Path(gate["detail"]["log"]).is_file())
         self.assertEqual(gate["detail"]["checkpoint"], fixed)
-        for kind in ("pushed", "ci_result", "merged"):
+        for kind in ("pushed", "merged"):
             self.assertEqual(sum(e["state"] == kind for e in events), 1)
+        self.assertEqual([e["detail"]["head"] for e in events if e["state"] == "ci_result"], [self.head, fixed])
         self.assertEqual(snapshot(self.store, DEFAULT_REPO, 7, view["cursor"])["events"], [])
 
     def test_unavailable_review_automatically_retries_then_repairs_without_status_gate(self):
@@ -370,13 +385,13 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(len(self.requests("thread/fork")), 1)
         self.assertEqual([r["params"]["threadId"] for r in self.requests("thread/resume")], ["repair-7"])
 
-    def test_pending_checks_reuse_report_and_do_not_merge(self):
+    def test_pending_checks_wait_before_review_and_do_not_merge(self):
         self.configure()
         self.github.check_state = "pending"
         self.controller.once()
         self.controller.once()
         self.assertEqual(self.row()["state"], "waiting")
-        self.assertEqual(len(self.requests("turn/start")), 1)
+        self.assertEqual(self.requests("turn/start"), [])
         self.assertFalse(self.github.merged)
 
     def test_github_read_outage_recovers_without_spending_an_agent_invocation(self):
@@ -404,12 +419,54 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertIn("push remote", self.row()["reason"])
         self.assertEqual(self.requests("turn/start"), [])
 
-    def test_ci_failure_is_returned_to_original_worker(self):
+    def test_failing_ci_is_repaired_from_its_logs_before_any_review(self):
         self.configure(reports=[PASS], worker_texts=["fixed\n"])
         self.github.check_state = "failure"
         self.controller.once()
         self.assertEqual(self.row()["state"], "pending")
-        self.assertIn("ci_failures", self.requests("turn/start")[1]["params"]["input"][0]["text"])
+        self.assertEqual(self.requests("thread/start"), [])  # no reviewer for a red head
+        prompt = self.requests("turn/start")[0]["params"]["input"][0]["text"]
+        self.assertIn("ci_failures", prompt)
+        self.assertIn("AssertionError: app.txt says bug", prompt)  # the controller read the log for the worker
+        self.assertNotIn("setup noise line 3", prompt)
+        fixed = git(self.bare, "rev-parse", "feature")
+        self.assertNotEqual(fixed, self.head)
+        self.github.check_state = "pending"
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "waiting")
+        self.assertIn("waiting for CI before review", self.row()["reason"])
+        self.assertEqual(self.requests("thread/start"), [])
+        self.github.check_state = "success"
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        self.assertEqual(len(self.requests("thread/start")), 1)
+
+    def test_unrelated_ci_failure_is_rerun_once_then_needs_a_decision(self):
+        rerun = {"result": "rerun_ci", "summary": "Runner lost network: 'Could not resolve host' in setup",
+                 "question": "", "rebuttals": []}
+        self.configure(reports=[PASS], worker_result=rerun)
+        self.github.check_state = "failure"
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "waiting")
+        self.assertEqual(self.github.reruns, [f"repos/{DEFAULT_REPO}/actions/runs/900/rerun-failed-jobs"])
+        self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)  # nothing pushed
+        self.controller.once()  # the rerun failed again on the same head
+        self.assertEqual(self.row()["state"], "needs_decision")
+        self.assertIn("CI failed again after a rerun", self.notifications[-1])
+        self.assertEqual(len(self.github.reruns), 1)
+
+    def test_attended_session_sees_the_failing_ci_log(self):
+        from pr_loop import __main__ as cli
+        self.rebind(attended=True)
+        self.configure(reports=[PASS])
+        self.github.check_state = "failure"
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "awaiting_session")
+        shown = cli.render_feedback(self.row(), 7)
+        self.assertIn("CI failed: Gates (Linux)", shown)
+        self.assertIn("AssertionError: app.txt says bug", shown)
+        with self.assertRaisesRegex(LoopError, "rerun_ci answers CI failures only"):
+            validate_worker({"result": "rerun_ci", "summary": "x", "question": "", "rebuttals": []}, 1)
 
     def test_revision_change_discards_completed_review(self):
         self.configure()
@@ -480,7 +537,7 @@ class LoopIntegrationTest(unittest.TestCase):
         self.controller.once()
         self.assertEqual(self.row()["state"], "merged")
         self.assertEqual(self.github.assert_merge["sha"], merged_head)
-        self.assertEqual(len(self.requests("thread/start")), 2)
+        self.assertEqual(len(self.requests("thread/start")), 1)  # no review while CI was pending
 
     def test_main_update_conflict_returns_prepared_merge_to_worker(self):
         git(self.work, "switch", "-q", "main")
@@ -1001,6 +1058,17 @@ class LoopIntegrationTest(unittest.TestCase):
 
 
 class BoundaryTest(unittest.TestCase):
+    def test_log_excerpt_keeps_errors_and_tail_within_a_bound(self):
+        from pr_loop.adapters import log_excerpt
+        text = "\n".join(["2026-11-18T14:00:00.0Z ok"] * 500 + ["2026-11-18T14:00:01.0Z error: boom"]
+                         + ["ok"] * 500 + ["the end"])
+        out = log_excerpt(text, tail=5)
+        self.assertIn("error: boom", out)
+        self.assertTrue(out.endswith("the end"))
+        self.assertNotIn("2026-11-18T", out)
+        self.assertLess(out.count("\n"), 20)
+        self.assertLessEqual(len(log_excerpt("x" * 50000)), 12001)
+
     def test_timeout_reaps_descendants_holding_the_pipes(self):
         import time
         start = time.monotonic()

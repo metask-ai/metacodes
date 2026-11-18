@@ -218,7 +218,7 @@ class Store:
             raise LoopError("no feedback is waiting for a reply on this PR")
         evidence = json.loads(row["feedback"])
         count = len(evidence.get("findings", [])) if evidence.get("verdict") == Verdict.FIX.value else 0
-        validate_worker(reply, count)
+        validate_worker(reply, count, ci="ci_failures" in evidence)
         with self.db:
             self.db.execute("UPDATE prs SET reply=? WHERE repo=? AND number=?", (json.dumps(reply), repo, number))
 
@@ -439,10 +439,17 @@ class Controller:
             "the reviewer must rule on it. Return updated when you changed files (rebuttals may cover the "
             "findings you left alone), disputed when you changed nothing and rebutted instead. Summaries and "
             "rebuttals are posted on the PR: never quote the developer's decision text. "
+            "For CI failures, feedback.ci_jobs holds each failed job's error lines and log tail, read for you: "
+            "find the root cause in this change and fix it. Only when the log shows the failure is not caused by "
+            "this change (runner outage, network flake, an unrelated job broken on main) return rerun_ci with that "
+            "evidence in the summary and no edits; the controller reruns the failed jobs once. "
             "If a product/compatibility/scope decision or additional permission is needed, return needs_decision "
             "with a concrete question and stop. Otherwise leave question empty.\n"
             + json.dumps({"pr": pr.url, "head": pr.head, "local_head": local_head, "base": pr.base,
                           "feedback": evidence, "user_answer": answer}, ensure_ascii=False))
+
+    def ci_evidence(self, pr, failed):
+        return {"ci_failures": failed, "ci_jobs": self.github.failed_jobs(pr)}
 
     @staticmethod
     def finding_count(evidence):
@@ -461,7 +468,7 @@ class Controller:
     def finish_repair(self, binding, pr, evidence, git, result, local_head, attended):
         """Admit one worker result. Returns (new evidence, local head) when the gate failed."""
         row = self.store.get(binding.repo, binding.number)
-        result = validate_worker(result, self.finding_count(evidence))
+        result = validate_worker(result, self.finding_count(evidence), ci="ci_failures" in evidence)
         if result["result"] == "needs_decision":
             raise LoopError(result["question"])
         self.store.record(binding, "repair_finished", rounds=row["rounds"], summary=result["summary"],
@@ -478,6 +485,22 @@ class Controller:
                 self.publish(binding, pr, self.publish_reply(binding, row["rounds"], result, attended))
                 raise LoopError(f"worker and reviewer still disagree after {MAX_DISPUTES} rebuttal rounds: "
                                 + "; ".join(r["argument"] for r in result["rebuttals"]))
+        if result["result"] == "rerun_ci":
+            if git.changes() or local_head != pr.head:
+                raise LoopError("worker asked for a CI rerun but left changes; inspect before continuing")
+            if self.store.has_event(binding, "ci_rerun", pr.head):
+                raise LoopError("CI failed again after a rerun of the same head; the worker still calls it "
+                                "unrelated: " + result["summary"])
+            jobs = [j["job"] for j in evidence.get("ci_jobs", [])]
+            if not jobs:
+                raise LoopError("no failed job to rerun: " + result["summary"])
+            runs = self.github.rerun_failed(pr.repo, jobs)
+            self.store.record(binding, "ci_rerun", head=pr.head, runs=runs, summary=result["summary"])
+            self.publish(binding, pr, f"### pr-loop: rerunning failed CI jobs on `{pr.head[:12]}`\n\n"
+                                      f"{result['summary']}\n\nOne rerun per revision; another failure goes to the developer.\n")
+            self.store.update(binding, State.WAITING, feedback=None, reply=None, answer="",
+                              reason="failed CI jobs rerun once; waiting for the new result")
+            return None
         if result["result"] == "disputed":
             if git.changes() or local_head != pr.head:
                 raise LoopError("worker disputed the findings but left changes; inspect before continuing")
@@ -602,6 +625,18 @@ class Controller:
             if not git.up_to_date(pr):
                 self.update_base(binding, pr, git)
                 return
+            checks, failed = self.github.checks(pr)
+            if checks != "pending":
+                # Record once per observed check result, even if upstream
+                # review requirements keep the same revision waiting.
+                self.store.record_ci(binding, pr.head, checks, failed)
+            if checks == "failure":
+                # CI comes first: the worker fixes it from the job logs before any review.
+                self.repair(binding, pr, self.ci_evidence(pr, failed), git)
+                return
+            if checks == "pending":
+                self.store.update(binding, State.WAITING, reason="waiting for CI before review: " + ", ".join(failed))
+                return
             stored = upgrade_report(json.loads(row["report"])) if row["report"] else None
             if stored is not None:
                 report = validate_report(stored)
@@ -644,16 +679,8 @@ class Controller:
             if pr.mergeable is False:
                 self.repair(binding, pr, {"merge_conflict": "Resolve the prepared merge of main without discarding task changes"}, git)
                 return
-            checks, evidence = self.github.checks(pr)
-            if checks != "pending":
-                # Record once per observed check result, even if upstream
-                # review requirements keep the same revision waiting.
-                self.store.record_ci(binding, pr.head, checks, evidence)
-            if checks == "failure":
-                self.repair(binding, pr, {"ci_failures": evidence}, git)
-                return
-            if checks == "pending" or pr.mergeable is None:
-                self.store.update(binding, State.WAITING, reason="waiting for current head checks: " + ", ".join(evidence))
+            if pr.mergeable is None:
+                self.store.update(binding, State.WAITING, reason="waiting for GitHub to compute mergeability")
                 return
             if pr.unresolved or pr.review_decision in ("CHANGES_REQUESTED", "REVIEW_REQUIRED"):
                 self.store.update(binding, State.WAITING, reason="waiting for upstream review or thread resolution")

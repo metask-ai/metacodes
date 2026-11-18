@@ -50,11 +50,16 @@ def render_feedback(row, number):
             lines += [f"[{i}] {f['path']}:{f['line']}", f"    {f['reason']}", f"    acceptance: {f['acceptance']}"]
         for f in evidence.get("followups", []):
             lines += [f"[follow-up, not blocking] {f['path']}:{f['line']}: {f['reason']}"]
-    for key in ("ci_failures", "local_gate_failure", "merge_conflict", "prior_feedback"):
+    if "ci_failures" in evidence:
+        lines += ["CI failed: " + ", ".join(evidence["ci_failures"])]
+        for job in evidence.get("ci_jobs", []):
+            lines += ["", f"--- {job['name']} ({job['conclusion']}) {job['url']}", job["log"]]
+        lines += ["", "Fix the root cause, or answer --result rerun_ci with evidence if the failure is unrelated."]
+    for key in ("local_gate_failure", "merge_conflict", "prior_feedback"):
         if key in evidence:
             lines += [f"{key}:", json.dumps(evidence[key], ensure_ascii=False, indent=2)[:6000]]
     lines += ["", "Edit the worktree (do not commit or push), then answer with:",
-              f"  python3 .github/pr-loop.py reply --pr {number} --result updated|disputed "
+              f"  python3 .github/pr-loop.py reply --pr {number} --result updated|disputed|rerun_ci "
               "--summary '...' [--rebuttal 'INDEX:argument']"]
     return "\n".join(lines)
 
@@ -135,7 +140,7 @@ def main(argv=None):
     reply = commands.add_parser("reply", help="answer the waiting feedback after editing the worktree")
     reply.add_argument("--repo", default=DEFAULT_REPO)
     reply.add_argument("--pr", type=int, required=True)
-    reply.add_argument("--result", choices=("updated", "disputed", "needs_decision"), required=True)
+    reply.add_argument("--result", choices=("updated", "disputed", "rerun_ci", "needs_decision"), required=True)
     reply.add_argument("--summary", required=True)
     reply.add_argument("--rebuttal", action="append", default=[], metavar="INDEX:ARGUMENT")
     reply.add_argument("--question", default="")

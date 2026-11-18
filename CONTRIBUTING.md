@@ -94,8 +94,9 @@ also posted on the PR. A finding the reviewer marks as a pre-existing follow-up
 does not block the PR; fix it in a new session and a separate PR.
 
 `ship`, `submit` and `bind` register work for the running watcher; they do not
-start it. The watcher reviews each revision in a fresh read-only adversarial
-conversation, sends blocking findings or CI failures to the dedicated repair
+start it. The watcher first waits for CI and sends failing jobs' logs to the
+worker until the required checks are green. It then reviews each green
+revision in a fresh read-only adversarial conversation, sends blocking findings or CI failures to the dedicated repair
 worker (which may rebut a finding instead of changing code), checkpoints repairs and validates them through `dx zig build gate:pr`
 on devbox before pushing. It merges current main into a stale branch, validates
 and pushes that revision, and repeats review and PR CI. When both pass, it

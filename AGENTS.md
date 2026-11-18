@@ -100,8 +100,11 @@ Before handing a PR over, confirm that the developer has the watcher running.
   follow-up is a pre-existing defect outside this PR's scope: after the
   developer agrees, fix it in a new session and worktree and ship it as a
   separate PR. Never widen the current PR to absorb it.
-- The controller reviews each head/base revision in a fresh, read-only,
-  adversarial conversation, by default with the other agent than the worker
+- CI is repaired before review. Red required checks go back to the worker
+  with the failed jobs' log excerpts; fix the root cause. Answer `rerun_ci`
+  only with log evidence that the failure is unrelated to the change: it
+  reruns once per head. The controller reviews each green head/base revision
+  in a fresh, read-only, adversarial conversation, by default with the other agent than the worker
   (`--reviewer`). Blocking findings, failed CI and failed local validation go
   back to the saved repair worker. The worker may rebut a finding it believes
   is wrong instead of changing code; the next fresh review must rule on the
