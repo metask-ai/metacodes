@@ -38,6 +38,7 @@ request metrics through the host streaming relay.
 `data.py` is the projection (applied to the stored bytes by `../store/ingest.py`),
 `runner.py` validates selections, and `worker.py` owns one durable execution
 and ingests its job. HTTP launch/cancel routes require the workbench
-capability. Contract tests are `scripts/eval/tests/test_harbor_viewer.py`,
-`scripts/eval/tests/test_bench_workbench.py` and
-`scripts/eval/tests/test_bench_store.py`.
+capability. The benchmark catalog (suites, categories, adapters, WorkBuddy
+runner) is `scripts/eval/harbor/suites/`. Contract tests are
+`scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
+`test_bench_store.py` and `test_bench_suites.py`.

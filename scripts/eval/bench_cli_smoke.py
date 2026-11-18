@@ -56,6 +56,12 @@ def main():
             jobs = json.loads(invoke(['list', '--json']))['jobs']
             assert len(jobs) == 1 and jobs[0]['summary']['counts']['pass'] == 1, jobs
             assert 'private-cli-fixture' not in json.dumps(jobs)
+            suites = {s['id']: s for s in json.loads(invoke(['info', '--json']))['suites']}
+            assert suites['aime-2025']['ready'] and suites['aime-2025']['task_count'] == 30, suites['aime-2025']
+            aime = json.loads(invoke(['run', '--suite', 'aime-2025', '--task', 'aime_ii-3', '--wait', '--json']))
+            assert aime['status'] == 'finished' and aime['suite'] == 'aime-2025', aime
+            argv = json.loads((state / 'bench/jobs' / aime['name'] / 'argv.json').read_text())
+            assert argv[argv.index('-d') + 1] == 'aime@1.0' and argv[argv.index('-i') + 1] == 'aime_ii-3', argv
             with_config = [str(native), '--state-dir', str(root / 'remote'), 'bench', 'info', '--json', '--url', started['url']]
             remote = subprocess.run(with_config, env=env, cwd=root, capture_output=True, text=True, timeout=15)
             assert remote.returncode == 0, remote.stderr
@@ -69,7 +75,7 @@ def main():
             assert moved['switched'] and moved['tables']['trials']['verified'] == 1, moved
             assert json.loads(invoke(['db', 'status', '--json']))['location'] == str(copy.resolve())
             invoke(['db', 'status', '--store-postgres', 'postgresql://u:secret@db/bench'], expected=1)
-            print('bench CLI smoke: extraction, info/list, service reuse, remote client, run/wait, result link '
+            print('bench CLI smoke: extraction, info/list, suites, service reuse, remote client, run/wait, result link '
                   'and evaluation database status/migrate passed (paid=0)')
         finally:
             if ready.exists():

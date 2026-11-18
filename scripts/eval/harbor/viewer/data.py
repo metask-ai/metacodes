@@ -427,12 +427,25 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
 # -------------------------------------------------------------------- jobs
 
 
+# A runner that drives Harbor itself (WorkBuddy) leaves Harbor's own run
+# directories under <job>/<NESTED_RUNS>/<run>/<trial>; their trials belong to
+# the workbench job.
+NESTED_RUNS = "workbuddy"
+
+
 def trial_dirs(job_dir: Path) -> List[Path]:
-    return sorted(
-        child
-        for child in job_dir.iterdir()
-        if child.is_dir() and "__" in child.name and (child / "config.json").is_file()
-    )
+    def trials(parent: Path) -> List[Path]:
+        return [child for child in parent.iterdir()
+                if child.is_dir() and not child.is_symlink() and "__" in child.name
+                and (child / "config.json").is_file()]
+
+    found = trials(job_dir)
+    nested = job_dir / NESTED_RUNS
+    if nested.is_dir() and not nested.is_symlink():
+        for run in sorted(nested.iterdir()):
+            if run.is_dir() and not run.is_symlink():
+                found += trials(run)
+    return sorted(found, key=lambda path: (path.name, str(path)))
 
 
 def job_identity(job_dir: Path) -> Dict[str, Any]:
@@ -613,10 +626,8 @@ class Library:
         job_dir = self.job_dir(job)
         if job_dir is None or not isinstance(trial, str) or not NAME.match(trial):
             return None
-        candidate = job_dir / trial
-        if candidate.is_symlink() or candidate.parent != job_dir or not (candidate / "config.json").is_file():
-            return None
-        return candidate
+        # Only a trial this job actually lists, never a constructed path.
+        return next((path for path in trial_dirs(job_dir) if path.name == trial), None)
 
     def overview(self) -> List[Dict[str, Any]]:
         views = [job_view(path, with_rows=False) for path in self.jobs().values()]

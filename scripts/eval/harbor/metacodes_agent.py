@@ -205,11 +205,16 @@ class MetacodesAgent(BaseInstalledAgent):
             local_instruction.write_text(instruction, encoding="utf-8")
             await environment.upload_file(local_instruction, remote_instruction)
             config = self.config_source
-            if config is not None:
+            servers = cmd.mcp_servers_config(self.mcp_servers)
+            if config is not None or servers:
                 local_config = Path(scratch) / "config.json"
-                document = config if isinstance(config, dict) else json.loads(Path(config).read_text(encoding="utf-8"))
-                if self._metrics_proxy:
+                document = {} if config is None else (
+                    config if isinstance(config, dict) else json.loads(Path(config).read_text(encoding="utf-8")))
+                if self._metrics_proxy and config is not None:
                     document = routed_config(document, self._provider, self._metrics_proxy, trial_name)
+                if servers:
+                    # The task's own MCP servers (GAIA2 CLI's ARE sidecar).
+                    document = {**document, "mcpServers": {**(document.get("mcpServers") or {}), **servers}}
                 local_config.write_text(json.dumps(document), encoding="utf-8")
                 remote_config = f"/tmp/metacodes-config-{trial}.json"
                 await environment.upload_file(local_config, remote_config)

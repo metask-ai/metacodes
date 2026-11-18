@@ -29,7 +29,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from scripts.eval.harbor import cli
+from scripts.eval.harbor import cli, suites
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest, library as library_module, migrate, schema
 from scripts.eval.harbor.store.backend import Store, StoreError
@@ -205,17 +205,83 @@ class EquivalenceTest(StoreCase):
             with urllib.request.urlopen(base + path, timeout=10) as response:
                 return response.read()
 
+        def labelled(view):
+            # The service adds suite/category display fields (bench-suites).
+            return {**view, **suites.label(suites.infer(view.get("dataset")))}
+
         jobs = json.loads(get("/api/jobs"))
-        self.assertEqual(jobs["jobs"], expected["overview"])
+        self.assertEqual(jobs["jobs"], [labelled(view) for view in expected["overview"]])
+        self.assertIn("terminal-bench-2.1", {view.get("suite") for view in jobs["jobs"]})
         self.assertEqual(jobs["summary"], expected["summary"])
         self.assertEqual(jobs["storage"]["format"], "SQLite")
         self.assertEqual(jobs["storage"]["database"]["location"], str(self.temp / "bench.sqlite3"))
         shutil.rmtree(self.root / "metrics-job")  # served from the store now
-        self.assertEqual(json.loads(get("/api/job?name=metrics-job")), expected["jobs"]["metrics-job"])
+        self.assertEqual(json.loads(get("/api/job?name=metrics-job")), labelled(expected["jobs"]["metrics-job"]))
         self.assertEqual(get("/api/job.csv?name=metrics-job").decode(), expected["csv"]["metrics-job"])
         detail = json.loads(get("/api/trial?job=metrics-job&trial=one__aaa"))
         file_row = next(r for r in expected["jobs"]["metrics-job"]["rows"] if r["trial"] == "one__aaa")
         self.assertEqual(detail, {**expected["trials"]["metrics-job|one__aaa"], "row": file_row})
+
+
+    def test_workbuddy_nested_runs_are_stored_identically(self):
+        """bench-suites puts a WorkBuddy run's Harbor trials under
+        <job>/workbuddy/<run>/<trial>; the store must find, classify and
+        project them exactly like data.trial_dirs, and keep serving them
+        after the files are gone."""
+        frozen_time(self)
+        job = _job(self.root, "bench-wb", "metask/session-model", planned=3)
+        run_a = job / data.NESTED_RUNS / "metacodes-bench-wb"
+        _write(run_a / "config.json", {"job_name": "metacodes-bench-wb"})
+        _write(run_a / "result.json", {"started_at": "2026-11-16T08:00:00Z"})
+        _trial(run_a, "bug_fix-easy-alpha__wb1", reward=1.0,
+               tests=[{"name": "t.py::test_a", "status": "passed"}])
+        _write(run_a / "bug_fix-easy-alpha__wb1" / "agent" / "metacodes-stderr.log", "warning\n")
+        _trial(run_a, "data_quality-hard-beta__wb2", reward=0.0)
+        _write(run_a / ".bench-metrics" / "bug_fix-easy-alpha__wb1.jsonl", json.dumps(
+            {"request": 1, "complete": True, "input_tokens": 50, "output_tokens": 5, "ttft_ms": 120,
+             "generation_ms": 500}))
+        run_b = job / data.NESTED_RUNS / "metacodes-bench-wb-retry"
+        _trial(run_b, "doc-easy-gamma__wb3", finished=False)
+        _trial(job, "top__level", reward=1.0)  # a top-level trial still counts
+        # Not a trial: no config.json, or not a <task>__<id> directory.
+        _write(run_b / "half__made" / "result.json", {})
+        _write(job / data.NESTED_RUNS / "notes.txt", "x")
+
+        expected = normal(file_outputs(self.root))
+        self.assertEqual(sorted(r["trial"] for r in expected["jobs"]["bench-wb"]["rows"]),
+                         ["bug_fix-easy-alpha__wb1", "data_quality-hard-beta__wb2", "doc-easy-gamma__wb3",
+                          "top__level"])
+        store = self.sqlite()
+        library = StoreLibrary(store, [self.root])
+        library.sync()
+        actual = normal(store_outputs(library))
+        for key in ("overview", "jobs", "trials", "csv", "summary"):
+            with self.subTest(key=key):
+                self.assertEqual(actual[key], expected[key])
+        row = next(r for r in actual["jobs"]["bench-wb"]["rows"] if r["trial"] == "bug_fix-easy-alpha__wb1")
+        self.assertEqual((row["status"], row["ttft_ms"]), ("pass", 120))
+        with store.read() as tx:
+            kinds = dict(((relpath), (trial, kind)) for relpath, trial, kind in tx.query(
+                "SELECT relpath, trial, kind FROM files WHERE job = ?", ("bench-wb",)))
+        prefix = "workbuddy/metacodes-bench-wb/"
+        self.assertEqual(kinds[prefix + "bug_fix-easy-alpha__wb1/result.json"],
+                         ("bug_fix-easy-alpha__wb1", "trial_result"))
+        self.assertEqual(kinds[prefix + "bug_fix-easy-alpha__wb1/agent/metacodes-stderr.log"],
+                         ("bug_fix-easy-alpha__wb1", "agent_log"))
+        self.assertEqual(kinds[prefix + ".bench-metrics/bug_fix-easy-alpha__wb1.jsonl"],
+                         ("bug_fix-easy-alpha__wb1", "request_metrics"))
+        self.assertEqual(kinds[prefix + "config.json"], (None, "job_other"))
+        self.assertEqual(kinds["workbuddy/metacodes-bench-wb-retry/half__made/result.json"], (None, "job_other"))
+
+        # A finishing nested trial updates; then the store outlives the files.
+        _trial(run_b, "doc-easy-gamma__wb3", reward=1.0)
+        expected = normal(file_outputs(self.root))
+        library.sync()
+        self.assertEqual(normal(store_outputs(library))["jobs"], expected["jobs"])
+        shutil.rmtree(self.root)
+        self.root.mkdir()
+        library.sync()
+        self.assertEqual(normal(store_outputs(library))["jobs"], expected["jobs"])
 
 
 class IngestTest(StoreCase):

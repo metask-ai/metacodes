@@ -36,7 +36,7 @@ BATCH_BYTES = 32 * 1024 * 1024
 JOB_FILES = ("config.json", "result.json")
 METRICS_DIR = ".bench-metrics"
 # Bump when ingestion itself changes how projections are derived.
-INGEST_VERSION = "1"
+INGEST_VERSION = "2"
 
 
 def _projection() -> str:
@@ -134,48 +134,81 @@ def scan(job_dir: Path) -> Dict[str, Tuple[Stat, Path]]:
     return found
 
 
-def trial_names(relpaths: Iterable[str]) -> List[str]:
-    """Trials as data.trial_dirs sees them: `<task>__<id>/config.json` exists."""
-    names = set()
-    for relpath in relpaths:
-        parts = relpath.split("/")
-        if len(parts) == 2 and parts[1] == "config.json" and "__" in parts[0]:
-            names.add(parts[0])
-    return sorted(names)
-
-
-def classify_file(relpath: str, trials: Sequence[str]) -> Tuple[Optional[str], str]:
-    """(trial, kind) of one job file."""
+def trial_prefix(relpath: str) -> Optional[str]:
+    """The trial directory (relative to the job) that would own `relpath`, as
+    data.trial_dirs admits them: `<task>__<id>/` at the top level, or
+    `<NESTED_RUNS>/<run>/<task>__<id>/` for runners that drive Harbor
+    themselves (WorkBuddy)."""
     parts = relpath.split("/")
-    if len(parts) > 1 and parts[0] in trials:
-        trial, rest = parts[0], "/".join(parts[1:])
+    if parts[0] == data.NESTED_RUNS:
+        if len(parts) >= 4 and "__" in parts[2] and parts[1] != METRICS_DIR:
+            return "/".join(parts[:3])
+        return None
+    if len(parts) >= 2 and "__" in parts[0]:
+        return parts[0]
+    return None
+
+
+def trial_locations(relpaths: Iterable[str]) -> Dict[str, str]:
+    """Trial name -> trial directory, as data.trial_dirs sees them: a
+    candidate directory whose config.json exists. A name repeated in two
+    nested runs resolves like data.Library.trial_dir: the first by path."""
+    found: Dict[str, str] = {}
+    for relpath in relpaths:
+        prefix = trial_prefix(relpath)
+        if prefix is None or relpath != prefix + "/config.json":
+            continue
+        name = prefix.rsplit("/", 1)[-1]
+        if name not in found or prefix < found[name]:
+            found[name] = prefix
+    return found
+
+
+def trial_names(relpaths: Iterable[str]) -> List[str]:
+    return sorted(trial_locations(relpaths))
+
+
+def _metrics_path(prefix: str) -> str:
+    parent, _, name = prefix.rpartition("/")
+    return (parent + "/" if parent else "") + f"{METRICS_DIR}/{name}.jsonl"
+
+
+def classify_file(relpath: str, trials: Dict[str, str]) -> Tuple[Optional[str], str]:
+    """(trial, kind) of one job file; `trials` maps name -> directory."""
+    owners = {prefix: name for name, prefix in trials.items()}
+    prefix = trial_prefix(relpath)
+    if prefix is not None and prefix in owners:
+        trial, rest = owners[prefix], relpath[len(prefix) + 1:]
+        first = rest.split("/", 1)[0]
         if rest == "config.json":
             return trial, "trial_config"
         if rest == "result.json":
             return trial, "trial_result"
         if rest == "agent/trajectory.json":
             return trial, "trajectory"
-        if parts[1] == "agent":
+        if first == "agent":
             return trial, "agent_log"
-        if parts[1] == "verifier":
+        if first == "verifier":
             return trial, "verifier"
         return trial, "trial_other"
     if relpath == "config.json":
         return None, "job_config"
     if relpath == "result.json":
         return None, "job_result"
-    if len(parts) == 2 and parts[0] == METRICS_DIR and parts[1].endswith(".jsonl"):
-        stem = parts[1][: -len(".jsonl")]
-        return (stem if stem in trials else None), "request_metrics"
+    parts = relpath.split("/")
+    if len(parts) >= 2 and parts[-2] == METRICS_DIR and parts[-1].endswith(".jsonl") and (
+            len(parts) == 2 or (len(parts) == 4 and parts[0] == data.NESTED_RUNS)):
+        stem = parts[-1][: -len(".jsonl")]
+        owner = trials.get(stem)
+        return (stem if owner is not None and _metrics_path(owner) == relpath else None), "request_metrics"
     return None, "job_other"
 
 
-def trial_inputs(trial: str, relpaths: Iterable[str]) -> List[str]:
+def trial_inputs(prefix: str, relpaths: Iterable[str]) -> List[str]:
     """The files a trial's projection reads: its directory, its request
-    metrics and the job's config/result."""
-    prefix = trial + "/"
-    metrics = f"{METRICS_DIR}/{trial}.jsonl"
-    return sorted(r for r in relpaths if r.startswith(prefix) or r == metrics or r in JOB_FILES)
+    metrics (beside the directory) and the job's config/result."""
+    metrics = _metrics_path(prefix)
+    return sorted(r for r in relpaths if r.startswith(prefix + "/") or r == metrics or r in JOB_FILES)
 
 
 def digest_inputs(relpaths: Iterable[str], files: Dict[str, StoredFile]) -> str:
@@ -359,7 +392,7 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
         # data.Library does when listing several roots.
         return JobResult(name, "skipped", reason="a job with this name is stored from " + existing[0])
     disk = scan(job_dir)
-    trials = trial_names(disk)
+    trials = trial_locations(disk)
     result = JobResult(name, "new" if not existing else "unchanged")
 
     # Job header first: its row owns every file row.
@@ -466,12 +499,12 @@ def ingest_job(store: Store, job_dir: Path, *, verify: bool = False) -> JobResul
 
 def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result: JobResult) -> None:
     """Recompute trial projections whose input bytes or code changed."""
-    trials = trial_names(stored)
+    trials = trial_locations(stored)
     with store.read() as tx:
         known = {name: (digest, projection) for name, digest, projection in tx.query(
             "SELECT name, inputs_digest, projection FROM trials WHERE job = ?", (job,))}
-    for trial in trials:
-        inputs = trial_inputs(trial, stored)
+    for trial, prefix in sorted(trials.items()):
+        inputs = trial_inputs(prefix, stored)
         digest = digest_inputs(inputs, stored)
         if known.get(trial) == (digest, PROJECTION):
             continue
@@ -481,7 +514,7 @@ def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result:
                    if stored[r].sha256 in contents]
         with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
             job_dir = materialize(Path(temp), job, entries)
-            projected = project_trial(job_dir / trial)
+            projected = project_trial(job_dir.joinpath(*prefix.split("/")))
         with store.transaction() as tx:
             write_trial(tx, job, projected, digest)
         result.trials_derived += 1

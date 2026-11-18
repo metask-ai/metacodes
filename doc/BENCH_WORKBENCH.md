@@ -10,12 +10,18 @@ the job-local timing relay's ephemeral TLS certificate.
 ```sh
 metacodes bench                         # start/reuse service and open browser
 metacodes bench --no-open               # print the workbench link
-metacodes bench info                    # dependencies, models and readiness
+metacodes bench info                    # dependencies, models, suites and readiness
 metacodes bench list --json             # previous jobs and results
 metacodes bench stop                    # stop HTTP service; workers continue
 metacodes bench db status               # evaluation database: SQLite or PostgreSQL
 metacodes bench run --task fix-git --task cancel-async-tasks --wait
+metacodes bench run --suite aime-2025 --wait          # the suite's default sample
+metacodes bench run --suite terminal-bench-2.0 --task fix-git
+metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 ```
+
+Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
+it runs the suite's default sample (an error when the suite has none).
 
 `run --wait` waits for the worker, returns its exit status (0 on successful
 execution, 1 on failure/interruption), and prints the stable result link.
@@ -23,6 +29,90 @@ Without `--wait`, it returns as soon as the job starts. A scored failure is
 a valid benchmark outcome and does not itself make the execution fail.
 `--json` produces JSON on stdout; misuse exits 2. Read-only `info` and `list`
 do not start a service or call a model.
+
+## Benchmarks
+
+The 新建评测 page groups the suites by category. `metacodes bench info` and
+`GET /api/workbench` (`suites`, `categories`) list each suite with its task
+count and readiness; `GET /api/suite?id=<suite>` returns its task ids and
+default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
+
+| Category | Suite id | Runner | Harbor 0.26 source | Tasks (cap per launch) |
+|---|---|---|---|---|
+| 代码生成 | `humaneval` | harbor-local | adapter `humaneval` (not yet available) | per adapter (164) |
+| 基础编程 | `mbpp` | harbor-local | adapter `mbpp` (not yet available) | per adapter (200) |
+| 交互规划 | `alfworld` | harbor-local | adapter `alfworld` (not yet available) | per adapter (134) |
+| 问答 | `searchqa` | harbor-local | adapter `searchqa` (not yet available) | per adapter (200) |
+| 数学推理 | `livemath` | harbor-local | adapter `livemath` (not yet available) | per adapter (200) |
+| 竞赛数学 | `aime` | harbor-registry | `-d aime@1.0` | 60 (60) |
+| 竞赛数学 | `aime-2025` | harbor-registry | `-d aime@1.0`, 2025 I/II only | 30 (30) |
+| 终端工程 | `terminal-bench-2.1` | harbor-registry | `-d terminal-bench/terminal-bench-2-1` | 89 (89) |
+| 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
+| 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
+| 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
+| 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
+
+Each task runs 1–5 times; concurrency is 1–3 (AIME and the small-task
+adapters allow up to 8, WorkBuddy 2). Task ids must belong to the chosen
+suite, and the worker passes each as an exact Harbor `-i` pattern.
+
+Harbor 0.26 resolves `-d name@version` through its legacy registry (tasks
+matched by bare name, e.g. `fix-git`, `aime_i-1`) and `-d org/name[@ref]`
+through the Harbor Hub (tasks matched as `org/name`, e.g.
+`terminal-bench/fix-git`; `latest` of `terminal-bench-2-1` is revision 6).
+AIME ids are `aime_60`…`aime_89` (2024), `aime_i-1`…`aime_i-15` (2025-I) and
+`aime_ii-1`…`aime_ii-15` (2025-II); `aime-2025` selects the last 30. GAIA2
+is in neither registry, so `gaia2-cli` runs a locally generated dataset with
+`-p`. Its tasks reach the agent's tools through an MCP sidecar
+(`[[environment.mcp_servers]]`), which the metacodes Harbor agent writes into
+the trial's `mcpServers`; its verifier is an LLM judge that needs
+`OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL`, default OpenRouter, and
+`JUDGE_MODEL`) in the execution service's environment. `bench prepare
+--suite gaia2-cli` runs Harbor's adapter from a Harbor source checkout named
+by `METACODES_BENCH_HARBOR_SOURCE` (`uv` and the Hugging Face `datasets`
+package; the dataset is public), or register an existing directory with
+`metacodes bench --dataset gaia2-cli=<dir>`.
+
+### Adding a harbor-local suite
+
+An adapter is `scripts/eval/harbor/adapters/<name>.py`, registered by an entry
+in `ADAPTER_SUITES` (its id and category are authoritative) and listed in
+`scripts/bench_assets.zig` so the binary carries it. It exposes:
+
+```python
+SUITE = {"name": "HumanEval", "description": "…", "default_tasks": [...],
+         "max_tasks": 164, "max_concurrency": 8}       # all optional
+
+def prepare(dest: Path) -> Path:
+    """Write Harbor task dirs (<dest>/<task-id>/task.toml, …); return the dataset dir."""
+
+def check(ctx) -> list[str]:          # optional extra readiness reasons
+def tasks(dataset: Path) -> list[str]: # optional; default: dirs with task.toml
+```
+
+Task ids must match `[A-Za-z0-9][A-Za-z0-9._-]*` (no glob characters).
+`metacodes bench prepare --suite <id>` calls `prepare` on the execution
+machine with `dest = <state root>/bench/datasets/<suite id>`; a returned
+directory elsewhere is recorded in `workbench.json` `datasets`. Until the
+module exists the page lists the suite as not yet available.
+
+### WorkBuddy
+
+The `workbuddy` runner drives the pinned integration in
+[scripts/eval/workbuddy](../scripts/eval/workbuddy/README.md) under the same
+durable worker. Readiness requires a checkout from `provision_checkout.sh`
+(`metacodes bench --workbuddy-checkout <dir>` or
+`METACODES_WORKBUDDY_CHECKOUT`) at the pinned commit with the overlay and
+`.venv`, production linux/amd64 artifacts staged by `stage_artifacts`, the
+subset fetched by WorkBuddy's `scripts/dataset/fetch-dataset.sh`, Docker,
+`uv`, `bash`, and Metask account authentication. A launch writes a transient
+`configs/models|jobs/metacodes-<run>.yaml` (removed afterwards), runs
+`uv run --frozen bash scripts/run.sh --job metacodes-<run>` in the checkout
+with the account key in a dedicated variable and the judge key removed, and
+sets the job's `jobs_dir` to `<jobs-dir>/<run>/workbuddy`, whose Harbor
+trials the job view reads. These are ordinary WorkBuddy runs, not
+launch-gate receipts or quality evidence; the judged Web/Office subsets
+remain with `launch_gate`.
 
 ## Configure execution
 
@@ -167,6 +257,7 @@ Harbor writes each run as ordinary files on the execution machine:
       config.json, result.json     # trial score, timings and usage
       agent/                      # NDJSON, transcript, ATIF trajectory, stderr
       verifier/                   # reward, test output, CTRF report
+    workbuddy/<harbor run>/<trial>/  # WorkBuddy launches: trials of its own Harbor runs
 ```
 
 The page reads the [evaluation database](#evaluation-database), which holds
@@ -247,9 +338,10 @@ Keep the database (or the jobs directory) when moving or backing up the
 workbench. The state root's `bench/` directory also holds service settings
 and the private authorization receipt.
 
-- **新建评测:** choose a configured model and 1–20 Terminal-Bench 2.1 tasks;
-  each task runs 1–5 times, with concurrency 1–3. The suggested task names are
-  a starter list, and additional names can be entered directly.
+- **新建评测:** choose a suite by category, then its tasks (search, default
+  sample, all, or a random N) and a configured model; caps are per suite.
+- **总览:** each job shows its suite and category and can be filtered by
+  category; launches from before suites existed are recognised by dataset.
 - **运行状态:** queued/running/completed status, execution log, stop button,
   and a stable result URL. The worker survives HTTP service restarts; a
   durable cancellation marker asks that worker to stop its own process group.
@@ -263,8 +355,11 @@ shown as interrupted. Closing the browser or CLI does not stop the worker.
 Jobs refresh every ten seconds while active; per-trial trajectories become
 available when Harbor copies the agent logs back from the container.
 
-The run endpoint accepts task/model selections, not shell commands, paths,
-keys, or arbitrary Harbor flags. Full task names are passed as separate argv
+The run endpoint (`POST /api/runs`) accepts `suite`, `tasks`, `model`,
+`attempts` and `concurrency`; the original `dataset:
+"terminal-bench/terminal-bench-2-1"` field is still accepted and means
+`suite: "terminal-bench-2.1"`. It takes task/model selections, not shell
+commands, paths, keys, or arbitrary Harbor flags. Full task names are passed as separate argv
 elements; there is no shell interpolation and retries are disabled at the
 Harbor orchestration layer.
 
