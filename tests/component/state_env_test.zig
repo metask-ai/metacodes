@@ -222,6 +222,8 @@ test "preview: CLI flags and persisted config change the actual provider tool me
     const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, enabled: bool }{
         .{ .enabled = false },
         .{ .flags = &.{"--preview"}, .enabled = true },
+        .{ .flags = &.{ "--preview", "--no-preview" }, .enabled = false },
+        .{ .flags = &.{ "--no-preview", "--preview" }, .enabled = true },
         .{ .saved = "{\"preview\":true}", .enabled = true },
         .{ .saved = "{\"preview\":true}", .flags = &.{"--no-preview"}, .enabled = false },
         .{ .saved = "{\"preview\":false}", .flags = &.{"--preview"}, .enabled = true },
