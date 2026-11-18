@@ -480,7 +480,9 @@ pub fn writeAfterSignIn(
     }
     const old = previous orelse return;
     if (current) |now| if (std.mem.eql(u8, old, now)) return;
-    try w.print("The key from your previous sign-in still works on {s}; delete it there if you no longer need it: {s}\n", .{ provider_label, old });
+    // "May": it may be gone already (deleted on the site, or expired), which
+    // only a management key could tell.
+    try w.print("The key from your previous sign-in may still work on {s}; delete it there if you no longer need it: {s}\n", .{ provider_label, old });
 }
 
 /// `2026-11-18` for a unix time, into `buffer` (at least 10 bytes).
@@ -639,7 +641,7 @@ test "the signed-in line says what the provider said about the key, and nothing 
     try writeAfterSignIn(&w, "OpenRouter", "https://openrouter.ai", .{ .described = true, .free_tier = true }, "https://openrouter.ai/keys/aa", "https://openrouter.ai/keys/bb");
     try testing.expectEqualStrings(
         "Your OpenRouter account has no credits yet: only free models (:free) answer until you add some at https://openrouter.ai/credits\n" ++
-            "The key from your previous sign-in still works on OpenRouter; delete it there if you no longer need it: https://openrouter.ai/keys/aa\n",
+            "The key from your previous sign-in may still work on OpenRouter; delete it there if you no longer need it: https://openrouter.ai/keys/aa\n",
         w.buffered(),
     );
     // The same key again (a pasted key re-stored): nothing to delete.
