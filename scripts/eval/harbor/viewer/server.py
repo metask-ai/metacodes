@@ -25,7 +25,10 @@ from urllib.parse import parse_qs, urlsplit
 from http.cookies import SimpleCookie
 
 from scripts.eval.harbor.viewer import data
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
+from scripts.eval.harbor.viewer.runner import ACTIVE, RunManager, atomic_json, runtime_env
+from scripts.eval.harbor.viewer.setup import LoginManager, SetupManager
+
+RUNTIME_ROOT = Path(__file__).resolve().parents[4]
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC = {
@@ -47,6 +50,9 @@ SECURITY_HEADERS = (
 
 
 def make_handler(library: data.Library, manager=None, token=""):
+    setups = SetupManager(manager.config_path) if manager else None
+    logins = LoginManager(manager.config_path) if manager else None
+
     def managed_view(path, with_rows=True):
         view = data.job_view(path)
         run = next((r for r in manager.runs() if r["name"] == path.name), None) if manager else None
@@ -101,6 +107,11 @@ def make_handler(library: data.Library, manager=None, token=""):
                 path = urlsplit(self.path).path
                 if path == "/api/runs":
                     self.send_json(manager.launch(payload), 202)
+                elif path == "/api/setup":
+                    busy = any(run.get("status") in ACTIVE for run in manager.runs())
+                    self.send_json(setups.start(payload, runtime_env(), str(RUNTIME_ROOT), busy=busy), 202)
+                elif path == "/api/login" and payload == {}:
+                    self.send_json(logins.start(runtime_env()), 202)
                 elif path == "/api/cancel" and isinstance(payload, dict):
                     self.send_json(manager.cancel(payload.get("name")))
                 elif path == "/api/stop" and payload == {}:
@@ -137,6 +148,14 @@ def make_handler(library: data.Library, manager=None, token=""):
             elif path == "/api/workbench":
                 catalog = manager.catalog() if manager else {"service": "metacodes-bench", "schema_version": 1, "ready": False, "reasons": ["当前服务为只读模式"], "runs": []}
                 self.send_json({**catalog, "can_run": self.authorized()})
+            elif path in ("/api/setup", "/api/login"):
+                # Setup logs and the device code are for the capability holder.
+                if not self.authorized():
+                    self.send_json({"error": "请使用 metacodes bench 输出的工作台授权链接"}, 403)
+                elif path == "/api/setup":
+                    self.send_json({"setup": setups.latest()})
+                else:
+                    self.send_json(logins.status())
             elif path == "/api/run":
                 record = next((r for r in manager.runs() if r["name"] == query.get("name")), None) if manager else None
                 if not record:

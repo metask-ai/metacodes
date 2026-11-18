@@ -122,7 +122,7 @@ def ensure_service(args, root, config, jobs_dir):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
-    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop"])
+    parser.add_argument("action", nargs="?", default="open", choices=["open", "info", "list", "run", "stop", "setup"])
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--url", default=os.environ.get("METACODES_BENCH_URL"), help="连接已有工作台（例如 devbox）")
     parser.add_argument("--jobs-dir", type=Path)
@@ -142,6 +142,12 @@ def main(argv=None):
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--wait", action="store_true", help="等待评测结束后返回结果和工作台链接")
+    parser.add_argument("--executor", help="执行机器名称（workbench.json 的 executors）")
+    parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
+    parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
+    parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
+    parser.add_argument("--metacodes-binary", help=argparse.SUPPRESS)
+    parser.add_argument("--metacodes-version", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         state = args.state_root.expanduser().resolve()
@@ -161,6 +167,10 @@ def main(argv=None):
             if value is not None:
                 cfg[name] = value
         cfg.setdefault("account_state_dir", str(state))
+        if args.metacodes_binary or args.metacodes_version:
+            # Non-secret: lets setup pick the matching Linux release and the
+            # page start `metacodes login` for this install.
+            cfg["metacodes"] = {"binary": args.metacodes_binary or "", "version": args.metacodes_version or ""}
         if args.auth:
             cfg["auth_mode"] = args.auth
         elif args.provider_config:
@@ -188,14 +198,35 @@ def main(argv=None):
                 value = client.request("api/stop", {})
             print(json.dumps(value, ensure_ascii=False) if args.json else "Bench 工作台已停止；评测 worker 继续运行。")
             return 0
+        if args.action == "setup":
+            from scripts.eval.harbor.viewer import setup
+
+            def show(progress, seen=set()):
+                if args.json:
+                    return
+                for step in progress["steps"]:
+                    key = (step["id"], step["status"])
+                    if step["status"] != "running" and key not in seen:
+                        seen.add(key)
+                        print(f"  {step['title']}: {step['status']} {step['detail']}", file=sys.stderr, flush=True)
+            options = {"bundle_version": args.bundle_version,
+                       "source": str(args.source.expanduser().resolve()) if args.source else None}
+            progress = setup.run_setup(config, args.executor, dry_run=args.dry_run, on_change=show, options=options)
+            print(json.dumps(progress, ensure_ascii=False) if args.json else setup.format_progress(progress))
+            return 0 if progress["status"] in ("ready", "planned") else 1
         if args.action in ("info", "list"):
             if args.action == "info":
                 value = client.request("api/workbench") if client else RunManager(jobs_dir, config).catalog()
                 if not args.json:
                     print("Bench 工作台：" + (client.url if client else "运行 metacodes bench 启动"))
                     print("执行环境：" + ("已就绪" if value.get("ready") else "待配置"))
-                    for reason in value.get("reasons", []):
+                    for reason in value.get("global_reasons", value.get("reasons", [])):
                         print("  " + reason)
+                    for executor in value.get("executors", []):
+                        print("执行机器：" + executor["label"] + ("（默认）" if executor.get("default") else "") + "：" +
+                              ("已就绪" if executor["ready"] else "待配置"))
+                        for reason in executor["reasons"]:
+                            print("    " + reason)
                     for model in value.get("models", []):
                         print("模型：" + model["id"])
             else:
@@ -214,8 +245,10 @@ def main(argv=None):
             if not args.task:
                 parser.error("bench run 需要 --task，可重复选择几道题")
             model = args.model or client.request("api/workbench").get("default_model")
-            record = client.request("api/runs", {"model": model, "tasks": args.task,
-                                    "attempts": args.attempts, "concurrency": args.concurrency})
+            request = {"model": model, "tasks": args.task, "attempts": args.attempts, "concurrency": args.concurrency}
+            if args.executor:
+                request["executor"] = args.executor
+            record = client.request("api/runs", request)
             url = client.url + "#/run/" + record["name"]
             if args.wait:
                 while record["status"] in ("queued", "starting", "running", "cancelling"):

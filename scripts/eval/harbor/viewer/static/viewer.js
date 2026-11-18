@@ -211,6 +211,10 @@ async function renderOverview() {
 }
 
 // ------------------------------------------------------------ run workbench
+const SETUP_STATUS = { running: '进行中', ok: '已就绪', done: '已完成', planned: '将执行', manual: '需要你操作',
+  failed: '失败', skipped: '跳过' };
+const SETUP_RESULT = { running: '进行中', ready: '已就绪', planned: '预演完成', needs_user: '还有需要你操作的步骤',
+  failed: '有步骤失败', interrupted: '已中断' };
 const RUN_STATUS = { queued: '等待启动', starting: '准备环境', running: '运行中',
   cancelling: '正在停止', cancelled: '已停止', finished: '运行完成', failed: '执行失败', interrupted: '执行中断' };
 
@@ -220,7 +224,17 @@ async function renderNewRun() {
   $('#title').textContent = '新建评测';
   crumbs([{ text: '所有作业', href: '#/' }, { text: '选择任务和模型' }]);
   const c = await api('/api/workbench');
+  const executorsList = c.executors || [];
+  if (!executorsList.some((e) => e.name === state.executor)) state.executor = c.default_executor;
+  const selectedExecutor = () => executorsList.find((e) => e.name === state.executor) || { reasons: [], ready: true };
   const form = h('form', { class: 'run-form' });
+  const executor = h('select', { name: 'executor', onchange: () => { state.executor = executor.value; drawNotes(); } },
+    executorsList.map((e) => h('option', { value: e.name, selected: e.name === state.executor },
+      e.label + (e.ready ? '' : ' · 待配置'))));
+  if (executorsList.length) {
+    form.append(h('label', { class: 'field' }, h('span', { text: '执行机器' }), executor,
+      h('small', { text: '运行 Harbor 和 Docker 的机器。SSH 执行机器的结果会同步回本机作业目录。' })));
+  }
   const model = h('select', { name: 'model', required: true },
     (c.models || []).map((m) => h('option', { value: m.id, selected: m.id === c.default_model }, m.label)));
   form.append(h('label', { class: 'field' }, h('span', { text: '模型' }), model,
@@ -238,7 +252,7 @@ async function renderNewRun() {
   form.append(h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
     h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)));
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
-  const submit = h('button', { type: 'submit', class: 'button primary', disabled: !c.ready || !c.can_run }, '开始评测');
+  const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
   form.append(h('p', { class: 'muted', text: '评测会调用所选模型。提交后可在工作台持续查看进度，完成后保留结果链接。' }), feedback, submit);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -247,16 +261,80 @@ async function renderNewRun() {
     submit.disabled = true;
     feedback.textContent = '正在启动…';
     try {
-      const record = await api('/api/runs', { model: model.value, tasks: [...new Set(tasks)],
-        attempts: Number(attempts.value), concurrency: Number(concurrency.value) });
+      const request = { model: model.value, tasks: [...new Set(tasks)],
+        attempts: Number(attempts.value), concurrency: Number(concurrency.value) };
+      if (executorsList.length) request.executor = executor.value;
+      const record = await api('/api/runs', request);
       location.hash = '#/run/' + record.name;
     } catch (error) {
       feedback.textContent = error.message;
       submit.disabled = false;
     }
   });
-  const notes = [...(c.reasons || []), ...(c.warnings || [])];
-  if (!c.can_run) notes.push('请使用 metacodes bench 输出的授权链接打开工作台，启用运行操作。');
+  const callout = h('div', { class: 'callout' });
+  const setupBox = h('div', {});
+  function drawNotes() {
+    const reasons = [...(c.global_reasons || c.reasons || []), ...(selectedExecutor().reasons || [])];
+    const notes = [...reasons, ...(c.warnings || [])];
+    if (!c.can_run) notes.push('请使用 metacodes bench 输出的授权链接打开工作台，启用运行操作。');
+    submit.disabled = reasons.length > 0 || !c.can_run;
+    const actions = [];
+    if (c.can_run && reasons.length) {
+      actions.push(h('button', { type: 'button', class: 'button primary', onclick: () => startSetup(false) }, '一键配置'),
+        h('button', { type: 'button', class: 'button', onclick: () => startSetup(true) }, '预演（不修改）'));
+    }
+    if (c.can_run && c.login?.available && !c.login?.signed_in) {
+      actions.push(h('button', { type: 'button', class: 'button', onclick: startLogin }, '登录 Metask'));
+    }
+    callout.hidden = !notes.length && !actions.length;
+    callout.replaceChildren(...notes.map((text) => h('p', { text })),
+      actions.length ? h('div', { class: 'header-actions setup-actions' }, actions) : '');
+  }
+  async function startSetup(dryRun) {
+    try {
+      await api('/api/setup', { executor: state.executor, dry_run: dryRun });
+      state.setupWatch = true;
+      await drawSetup();
+    } catch (error) { setupBox.replaceChildren(h('div', { class: 'callout', text: error.message })); }
+  }
+  async function startLogin() {
+    try { await api('/api/login', {}); state.setupWatch = true; await drawSetup(); }
+    catch (error) { setupBox.replaceChildren(h('div', { class: 'callout', text: error.message })); }
+  }
+  async function drawSetup() {
+    if (!c.can_run) return;
+    let latest = null;
+    try { latest = (await api('/api/setup')).setup; } catch (_) { return; }
+    let login = null;
+    if (c.login?.available) { try { login = await api('/api/login'); } catch (_) { login = null; } }
+    const parts = [];
+    if (login && (login.running || login.verification_uri)) {
+      parts.push(panel('Metask 登录', login.running ? '等待确认' : (login.signed_in ? '已登录' : '已结束'),
+        h('div', { class: 'panel-body run-state' },
+          login.verification_uri ? h('p', {}, '在自己的浏览器打开 ',
+            h('a', { href: login.verification_uri, target: '_blank', rel: 'noopener noreferrer', text: login.verification_uri }),
+            ' 并输入代码 ', h('b', { class: 'mono', text: login.user_code || '' })) : h('p', { class: 'muted', text: '正在获取设备码…' }),
+          h('p', { class: 'muted', text: '工作台只显示设备码，不接触密码。确认后页面会刷新模型列表。' }))));
+    }
+    if (latest) {
+      const rows = (latest.steps || []).map((step) => h('details', { class: 'setup-step', 'data-key': 'setup-' + step.id },
+        h('summary', {}, h('span', { class: 'setup-status s-' + step.status, text: SETUP_STATUS[step.status] || step.status }),
+          h('b', { text: step.title }), h('span', { class: 'muted', text: step.detail || '' })),
+        step.command ? h('p', { class: 'mono', text: '请运行：' + step.command }) : null,
+        (step.commands || []).length ? h('pre', { text: step.commands.map((x) => (x.executed ? '$ ' : '将执行 ') + x.command).join('\n') }) : null,
+        (step.log || []).length ? h('pre', { class: 'muted', text: step.log.join('\n') }) : null));
+      parts.push(panel('一键配置 · ' + latest.executor, (latest.dry_run ? '预演 · ' : '') + (SETUP_RESULT[latest.status] || latest.status),
+        h('div', { class: 'panel-body' }, rows.length ? rows : h('p', { class: 'muted', text: '正在检查…' }))));
+    }
+    const open = new Set([...setupBox.querySelectorAll('details[open]')].map((d) => d.dataset.key));
+    setupBox.replaceChildren(...parts);
+    for (const d of setupBox.querySelectorAll('details')) if (open.has(d.dataset.key)) d.open = true;
+    const active = (latest && latest.status === 'running') || (login && login.running);
+    if (active && route().view === 'new') { state.setupWatch = true; setTimeout(drawSetup, 2000); }
+    else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(render, 500); }
+  }
+  drawNotes();
+  drawSetup();
   const groupRows = (c.account_groups || []).map((g) => h('tr', {},
     h('td', { text: g.name }), h('td', { text: g.configured ? '已有账号 Key' : '尚未配置 Key' })));
   const groupTable = h('div', { class: 'table-scroll' }, h('table', {},
@@ -265,7 +343,7 @@ async function renderNewRun() {
     h('div', { class: 'panel-body' },
       h('p', { class: 'muted', text: '模型下拉框合并了已有 Key 的模型目录。其他可选组需要先在 Metask 账号中配置对应 Key，刷新后自动加入。' }),
       groupTable)) : null;
-  return h('div', {}, notes.length ? h('div', { class: 'callout' }, notes.map((text) => h('p', { text }))) : null,
+  return h('div', {}, callout, setupBox,
     panel('Terminal-Bench 2.1', '独立容器运行 · 完整轨迹 · 自动判分', form), groups);
 }
 

@@ -10,7 +10,6 @@ import datetime as dt
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -19,7 +18,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor.command import check_bundle
-from scripts.eval.harbor.viewer import data
+from scripts.eval.harbor.viewer import data, executors
 from scripts.eval.harbor.viewer.account import Account
 
 DATASET = "terminal-bench/terminal-bench-2-1"
@@ -73,6 +72,34 @@ class RunManager:
         self.lock = threading.Lock()
         self.account_lock = threading.Lock()
         self.account_cache = None
+        self.probe_lock = threading.Lock()
+        self.probe_cache = {}
+
+    def executor_facts(self, executor):
+        """Probe results per executor, reused for 15 s (an SSH probe is a
+        round trip; the page and each launch read the catalog)."""
+        key = json.dumps(executor.spec(), sort_keys=True)
+        with self.probe_lock:
+            cached = self.probe_cache.get(executor.name)
+            if cached and cached[0] == key and time.monotonic() - cached[1] < 15:
+                return cached[2]
+        facts = executors.probe(executor)
+        with self.probe_lock:
+            self.probe_cache[executor.name] = (key, time.monotonic(), facts)
+        return facts
+
+    def executor_states(self, cfg):
+        try:
+            configured, default = executors.configured(cfg)
+        except ValueError as exc:
+            return [], None, [str(exc)]
+        states = []
+        for executor in configured:
+            facts = self.executor_facts(executor)
+            problems = executors.reasons(executor, facts)
+            states.append({**executor.public(), "ready": not problems, "reasons": problems,
+                           "default": executor.name == default, "harbor": facts.get("harbor") or None})
+        return states, default, []
 
     def account_catalog(self, cfg):
         account = Account(cfg.get("account_state_dir"), cfg.get("account_gateway"))
@@ -116,18 +143,22 @@ class RunManager:
         else:
             models, model, key_env = [], "", ""
             reasons.append("auth_mode 必须是 metask 或 provider")
-        harbor = shutil.which(cfg.get("harbor", "harbor"))
-        if not harbor:
-            reasons.append("未找到 Harbor，请在执行机器安装：uv tool install harbor==0.26.0")
-        if not shutil.which("docker"):
-            reasons.append("未找到 Docker；Harbor 任务需要 Docker 环境")
+        states, default_executor, problems = self.executor_states(cfg)
+        reasons += problems
         try:
             check_bundle(Path(cfg.get("bundle") or "/nonexistent-metacodes-bundle"))
         except ValueError:
             reasons.append("请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本")
         if not models and mode == "provider":
             reasons.append("请配置 --model，第三方网关同时设置 --provider-config")
+        global_reasons = list(reasons)
+        selected = next((s for s in states if s["name"] == default_executor), None)
+        reasons += selected["reasons"] if selected else []
         return {"service": "metacodes-bench", "schema_version": 1,
+                "executors": [{k: v for k, v in s.items() if k != "harbor"} for s in states],
+                "default_executor": default_executor, "global_reasons": global_reasons,
+                "login": {"available": mode == "metask" and bool((cfg.get("metacodes") or {}).get("binary")),
+                          "signed_in": mode == "metask" and bool(models)},
                 "dataset": DATASET, "tasks": SAMPLE_TASKS, "models": models,
                 "default_model": model or (models[0]["id"] if models else ""),
                 "key_env": key_env, "ready": not reasons, "reasons": reasons,
@@ -150,12 +181,17 @@ class RunManager:
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
     def launch(self, request):
-        allowed = {"model", "tasks", "attempts", "concurrency", "dataset"}
+        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "executor"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 model、tasks、attempts、concurrency、dataset")
+            raise ValueError("只接受 model、tasks、attempts、concurrency、dataset、executor")
         catalog = self.catalog()
-        if not catalog["ready"]:
-            raise ValueError("；".join(catalog["reasons"]))
+        wanted = request.get("executor", catalog["default_executor"])
+        state = next((e for e in catalog["executors"] if e["name"] == wanted), None)
+        if state is None:
+            raise ValueError("请选择已配置的执行机器")
+        problems = catalog["global_reasons"] + state["reasons"]
+        if problems:
+            raise ValueError("；".join(problems))
         model = request.get("model")
         if model not in {m["id"] for m in catalog["models"]}:
             raise ValueError("请选择服务已配置的模型")
@@ -175,12 +211,15 @@ class RunManager:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
             cfg = settings(self.config_path)
+            executor = executors.find(cfg, state["name"])
+            facts = self.executor_facts(executor)
             mode = catalog["authentication"]["kind"]
             account_key_id = self.account_catalog(cfg)["routes"].get(model) if mode == "metask" else None
             if mode == "metask" and account_key_id is None:
                 raise ValueError("账号模型目录已变化，请刷新后重试")
             name = "bench-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
             record = {"name": name, "status": "queued", "created_at": now(), "model": model,
+                      "executor": executor.name,
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
             self.records.mkdir(parents=True, exist_ok=True)
@@ -194,7 +233,11 @@ class RunManager:
                     "key_env": catalog["key_env"],
                     "metrics_enabled": cfg.get("metrics_enabled", True),
                     "metrics_bind": cfg.get("metrics_bind", "172.17.0.1"),
-                    "harbor": shutil.which(cfg.get("harbor", "harbor")), "dataset": DATASET}
+                    "metrics_host": cfg.get("metrics_host"),
+                    "executor": executor.spec(),
+                    "harbor": facts.get("harbor") if executor.kind == "local" else None,
+                    "remote_harbor": facts.get("harbor") if executor.kind == "ssh" else None,
+                    "dataset": DATASET}
             spec_path = self.records / (name + ".spec")
             atomic_json(spec_path, spec)
             try:
@@ -221,6 +264,9 @@ class RunManager:
 
 def runtime_env():
     env = dict(os.environ)
+    # Tools installed by `bench setup` (uv tools, Homebrew) are found even
+    # when the service started with a minimal PATH; existing entries win.
+    env["PATH"] = executors.search_path()
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
     env["PYTHONUNBUFFERED"] = "1"
     return env
