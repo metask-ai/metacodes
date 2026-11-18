@@ -3,6 +3,21 @@ const std = @import("std");
 /// See `Config.mcp_connect`.
 pub const McpConnect = enum { app_init, first_request };
 
+/// Only configuration may inherit preview opt-in; execution receives a bool.
+pub const PreviewSetting = enum {
+    inherit,
+    disabled,
+    enabled,
+
+    pub fn resolve(self: PreviewSetting, persisted: ?bool) PreviewSetting {
+        return if (self != .inherit) self else if (persisted orelse false) .enabled else .disabled;
+    }
+
+    pub fn isEnabled(self: PreviewSetting) bool {
+        return self == .enabled;
+    }
+};
+
 /// 通用配置
 pub const Config = struct {
     /// 第一个无法识别的命令行参数(fail-closed:main 检查后报错退出)。
@@ -152,9 +167,10 @@ pub const Config = struct {
     allowed_tools: ?[]const u8 = null,
     /// `--disallowedTools "..."`:逗号分隔,注入 CLI 层 deny。
     disallowed_tools: ?[]const u8 = null,
+    /// User opt-in for preview features, resolved against persisted configuration.
+    preview: PreviewSetting = .inherit,
     /// Experimental, opt-in progress checkpoint for coding evaluations. Kept
     /// out of the default product path until measured on fixed benchmarks.
-    preview: @import("preview.zig").Setting = .inherit,
     verification_checkpoint: bool = false,
     verification_final_gate: bool = false,
     requirement_ledger: bool = false,
