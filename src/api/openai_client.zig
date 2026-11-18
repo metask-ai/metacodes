@@ -486,13 +486,7 @@ pub const OpenAIClient = struct {
                 return error.HttpError;
             }
             var err_body: [4096]u8 = undefined;
-            const body_reader = req_ptr.reader.bodyReader(
-                err_body[0..],
-                response.head.transfer_encoding,
-                response.head.content_length,
-            );
-            const n = body_reader.readSliceShort(err_body[0..]) catch 0;
-            const preview = err_body[0..@min(n, err_body.len)];
+            const preview = client_mod.readErrorBody(req_ptr, response.head, &err_body);
             client_mod.reportHttpFailure("openai", rid, status, preview, err_body.len, auth.value);
             // The Messages client's classification (issue #434): 429 and 5xx are
             // retried, an overflow is ContextWindowExceeded with its numbers kept.
