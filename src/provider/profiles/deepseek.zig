@@ -27,11 +27,19 @@ pub const ANTHROPIC_BASE = "https://api.deepseek.com/anthropic";
 /// `none` switches thinking off; the rest are DeepSeek's three levels.
 const EFFORTS = [_][]const u8{ "none", "low", "high", "max" };
 
+/// The level DeepSeek uses when a request names none: "Thinking mode is
+/// enabled by default, with the default effort being `high`"
+/// (api-docs.deepseek.com/guides/thinking_mode, 2026-11; the API reference
+/// says the same of `reasoning_effort`). Declared, `/model` shows it as the
+/// level a route starts at and a pick sends it by name.
+const DEFAULT_EFFORT = controls.Value{ .text = controls.ControlText.parse("high") catch unreachable };
+
 const CONTROLS = [_]controls.ControlSpec{.{
     .id = "reasoning_effort",
     .label = "Reasoning effort",
     .kind = .enumeration,
     .allowed_values = &EFFORTS,
+    .default_value = DEFAULT_EFFORT,
 }};
 
 /// 1M window as the official `/models` listing declares it (1,048,576), and
@@ -143,5 +151,10 @@ test "deepseek profile: both wires, both declaring the DeepSeek dialect" {
     for (MODELS) |model| {
         const spec = controls.findSpec(model.controls, "reasoning_effort").?;
         for (spec.allowed_values) |value| try std.testing.expect(@import("../../types.zig").ReasoningEffort.parse(value) != null);
+        // The documented default, as a value of the vocabulary: one the
+        // picker can show and the kernel accepts.
+        const default = spec.default_value orelse return error.NoDeclaredDefault;
+        try std.testing.expect(default.text.eqlText("high"));
+        _ = try controls.validate(spec, default);
     }
 }

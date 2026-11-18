@@ -82,12 +82,27 @@ status, compatibility boundaries, and entry points are defined by
   route, Enter on a route takes that one. The reasoning level is a line under
   the list, changed with ←/→ from any row, and kept as the level wanted: each
   model shows and commits the nearest one it takes. The three scopes are named
-  in the header. Providers without a key are one "Not configured" line at the
-  bottom; Enter lists them. Closing the picker without a choice prints
-  `kept <model>`. On the Metask session, `/model` lists only the models the
-  gateway serves on `/v1/messages`, with the reasoning levels it names
-  (`capabilities.reasoning.efforts`); before, it listed the gateway's image
-  and video models too, and offered no level.
+  in the header. Providers without a key are not listed, and a filter does
+  not find their models; when none is listed, the picker says so and points
+  to `/login` and to this install's `.env`, by its path. Closing the picker
+  without a choice prints `kept <model>`. On the Metask session, `/model`
+  lists only the models the gateway serves on `/v1/messages`, with the
+  reasoning levels it names (`capabilities.reasoning.efforts`); before, it
+  listed the gateway's image and video models too, and offered no level.
+- **`/model` starts a DeepSeek model at `high`, and keeps a level the
+  session already runs with** (follow-up to #539). DeepSeek's
+  `reasoning_effort` control declares `high`, the level its API uses when a
+  request names none ("Thinking mode is enabled by default, with the default
+  effort being `high`", api-docs.deepseek.com/guides/thinking_mode). With no
+  level set, a DeepSeek model in `/model` shows `[high]` where it showed
+  `[default]`, and a pick sends it by name: the request that carried
+  `"thinking":{"type":"enabled"}` alone now also carries
+  `"reasoning_effort":"high"` (on the Anthropic wire,
+  `"output_config":{"effort":"high"}` and the same `thinking`). A route bound
+  without the picker (`--provider`, `.env`, `/model use`) still names no
+  level. When `/model` opens, the level the session runs with starts
+  selected even when it is `none` or `minimal` (before, only a level that
+  thinks did), so DeepSeek's default does not replace thinking turned off.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
@@ -235,10 +250,10 @@ status, compatibility boundaries, and entry points are defined by
   list: one refused for another reason (two names of its key that
   disagree, say) stays listed, and a pick says why. A provider with no such
   credential is no longer a row that leads to a sign-in or a key field: it
-  is listed dimmed under
-  "Not configured", below the others, and choosing it shows the variable to
-  set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
-  first), and starts nothing. The in-picker sign-in and key-paste stage of
+  is not listed. A pick whose credential went away after the picker listed
+  it shows the variable to set, this install's `.env` and
+  `doc/LOCAL_CONFIG.md` (for Metask, `/login` first), and starts nothing.
+  The in-picker sign-in and key-paste stage of
   #67 are gone; `/login <provider>` pastes a key or signs in, as before. A
   pick that moves the session to another provider says on a second line who
   bills it from then on (`from now on billed to your DeepSeek account`).
@@ -517,8 +532,8 @@ status, compatibility boundaries, and entry points are defined by
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these
   providers have neither a sign-in nor a key page the picker could open.
-  Such a provider is now listed under "Not configured" (#488), and a pick
-  whose key went away after the picker opened shows the same setup: the
+  Such a provider is no longer listed (#488), and a pick whose key went
+  away after the picker opened shows where it goes: the
   variable to set (the canonical one, e.g. `MOONSHOT_API_KEY`), this
   install's `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the
   previous route stays active. A picker notice longer than the terminal is

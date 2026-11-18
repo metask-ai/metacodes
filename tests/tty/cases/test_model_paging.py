@@ -59,37 +59,33 @@ def _run(bin_path, events, rows=40, cols=120):
     return "\n".join(a.final.line_text(r) for r in range(a.final.rows))
 
 
-# The picker opens on the models; with no vendor key the list ends with the
-# "Not configured" line, one more stop for the cursor after the last model.
+# The picker opens on the models; with no vendor key, no other provider is
+# listed (#488), so the last model is the last stop for the cursor.
 OPEN_MODEL_STAGE = [READY, "type:/model", "key:enter", wait_for("apply to")]
 VENDOR_KEYS = (
     "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY",
     "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY", "KIMI_API_KEY", "DASHSCOPE_API_KEY",
     "MINIMAX_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
 )
-STOPS = COUNT + 1  # every model, and the "Not configured" line
 
 
 def test_picker_end_reaches_the_last_of_many_models(bin_path):
-    # End: the "Not configured" line; one up: the 300th model.
-    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:end", wait_for(f"[{STOPS}/{STOPS}]"), "key:up",
-                                               wait_for(f"[{COUNT}/{STOPS}]")])
+    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:end", wait_for(f"[{COUNT}/{COUNT}]")])
     assert f"> Model {COUNT}" in text.replace(">  ", "> "), "End 没有到最后一个模型:\n" + text
-    assert f"[{COUNT}/{STOPS}] · PgUp/PgDn page · Home/End · type to filter" in text, "长列表没有说明翻页键:\n" + text
+    assert f"[{COUNT}/{COUNT}] · PgUp/PgDn page · Home/End · type to filter" in text, "长列表没有说明翻页键:\n" + text
+    assert "Not configured" not in text, "没有 key 的厂商不该列出:\n" + text
 
 
 def test_picker_up_from_the_first_row_commits_the_last_model(bin_path):
-    # Up from the first model wraps to the last row, the "Not configured" line;
-    # up again is the 300th model.
-    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:up", wait_for(f"[{STOPS}/{STOPS}]"), "key:up",
-                                               wait_for(f"[{COUNT}/{STOPS}]"), "key:enter",
+    # Up from the first model wraps to the last row: the 300th model.
+    text = _run(bin_path, OPEN_MODEL_STAGE + ["key:up", wait_for(f"[{COUNT}/{COUNT}]"), "key:enter",
                                                wait_for(f"switched to m-{COUNT}")])
     assert f"switched to m-{COUNT}" in text, "从第一行上翻绕到最后一个并提交失败:\n" + text
 
 
 def test_picker_page_down_moves_a_page(bin_path):
     text = _run(bin_path, OPEN_MODEL_STAGE + ["raw:\\x1b[6~", "raw:\\x1b[6~", "sleep:0.5"])
-    assert f"/{STOPS}]" in text and f"/256]" not in text, "计数被截断:\n" + text
+    assert f"/{COUNT}]" in text and f"/256]" not in text, "计数被截断:\n" + text
     assert "[1/" not in text, "PgDn 没有移动:\n" + text
 
 
