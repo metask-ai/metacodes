@@ -95,7 +95,8 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
         per_key_drain=0.08,
     )
     _, text = _screen(raw)
-    assert "zai-coding-plan" in text, "过滤未生效:\n" + text
+    # The flat list names each match's provider: the plan, by its name.
+    assert "Z.AI GLM Coding Plan" in text, "过滤未生效:\n" + text
     assert "metask" not in text, "过滤后仍显示不匹配项:\n" + text
     assert "explain this" in text, "picker 吃掉了输入框里的草稿:\n" + text
 
@@ -170,7 +171,7 @@ def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     a, text = _screen(raw)
     kept = [sc for sc in _frames(a)
             if "tok9" in sc and "esc to interrupt" not in sc
-            and "zai-coding-plan" in sc and "billed to your Metask account" not in sc]
+            and "Z.AI GLM Coding Plan" in sc and "billed to your Metask account" not in sc]
     assert kept, "回复结束后过滤状态丢了(#220):\n" + text
     assert OPEN in text and "billed to your Metask account" in text, "回复结束后 picker 不再接收按键:\n" + text
 
