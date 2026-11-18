@@ -428,8 +428,10 @@ pub const App = struct {
     /// The provider `<state root>/.env` configures, which `/logout` falls
     /// back to (#485). Borrowed from the host; null when it configures none.
     local_provider: ?LocalProvider = null,
-    /// Said once under the banner (#485: a stored default passed over for
-    /// want of a credential). Borrowed from the host.
+    /// Said once under the banner, one notice per line: a stored default
+    /// passed over for want of a credential (#485), `.env`'s provider ranked
+    /// below Metask, `.env` keys of several providers and none chosen (#486).
+    /// Borrowed from the host.
     startup_notice: ?[]const u8 = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
@@ -1340,9 +1342,33 @@ pub const App = struct {
             .template = template,
             .guide_url = state_env.guide_url,
             .environment_keys = keys,
-            .unchosen_local = app.unchosen_local_providers,
-            .provider_variable = state_env.provider_variable,
+            .unchosen_local = if (host) |found| try displayNames(arena, found, app.unchosen_local_providers) else app.unchosen_local_providers,
         });
+    }
+
+    /// After `/login <provider>` stored a key: the line naming a key variable
+    /// for that provider which is read before the stored key (the shell's,
+    /// else this install's `.env`), written into `buffer`; null when none is
+    /// set. Names only, never a value.
+    pub fn storedKeyShadowNotice(app: *const App, profile: *const @import("provider/profile.zig").ProviderProfile, buffer: []u8) ?[]const u8 {
+        const provider_login = @import("api/provider_login.zig");
+        const shadow = provider_login.keyShadowedBy(profile, provider_credential_mod.EnvLookup.process(), app.config.credential_env_fallback) orelse return null;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = app.stateRoot();
+        const env_path = if (root.len == 0) ".env" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ root, std.fs.path.sep, @import("app/state_env.zig").file_name }) catch ".env";
+        var w: std.Io.Writer = .fixed(buffer);
+        provider_login.writeKeyShadowNotice(&w, shadow, env_path) catch return null;
+        return w.buffered();
+    }
+
+    /// `ids` as `/model` lists them: each provider's display name, the id
+    /// itself for one the registry does not know. In `arena`.
+    fn displayNames(arena: std.mem.Allocator, host: *provider_host_mod.Host, ids: []const []const u8) ![]const []const u8 {
+        const names = try arena.alloc([]const u8, ids.len);
+        for (ids, names) |id, *name| {
+            name.* = if (host.registry.find(id)) |profile| profile.display_name else id;
+        }
+        return names;
     }
 
     /// The provider `id` as the reminder names it: its display name, the

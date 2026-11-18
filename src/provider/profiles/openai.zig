@@ -111,6 +111,25 @@ const ENV_ALIASES = [_]profile.EnvAlias{
     .{ .name = "OPENAI_API_KEY", .kind = .api_key, .canonical = true },
 };
 
+/// Where an OpenAI API key is created (platform.openai.com/api-keys, opened
+/// 2026-11-17: it signs in and returns there). The model listing answers 401
+/// without a valid key (2026-11-17, a made-up key: `invalid_api_key`) and is
+/// not a model call.
+const KEY_PAGES = [_]profile.KeyPage{.{
+    .id = Slug.lit("platform"),
+    .label = "OpenAI Platform",
+    .url = "https://platform.openai.com/api-keys",
+    .check_url = BASE_URL ++ "/models",
+}};
+
+/// The pasted key is the way in while the OAuth grant below has no client to
+/// present (`oauth_client_id`); with `--client-id` the browser sign-in runs.
+const KEY_SETUP = profile.ApiKeySetup{
+    .kind = .api_key,
+    .pages = &KEY_PAGES,
+    .note = "An OpenAI API key is billed to your OpenAI Platform account, not to a ChatGPT Plus or Pro plan.",
+};
+
 pub const PROFILE = profile.ProviderProfile{
     .id = Slug.lit("openai"),
     .implementation_id = Slug.lit("openai"),
@@ -129,7 +148,17 @@ pub const PROFILE = profile.ProviderProfile{
     // --provider openai --client-id <id>` supplies it, and a `custom_providers`
     // entry persists it.
     .oauth_client_id = null,
+    .api_key_setup = KEY_SETUP,
 };
+
+test "openai profile: a pasted key is checked against the model listing, as a bearer" {
+    try profile.validateProfile(PROFILE);
+    const page = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
+    try std.testing.expectEqualStrings("https://platform.openai.com/api-keys", page.url);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/models", page.check_url.?);
+    try std.testing.expectEqual(profile.CredentialKind.api_key, PROFILE.api_key_setup.?.kind);
+    try std.testing.expect(PROFILE.auth == .bearer);
+}
 
 test "openai profile routes both wire families from one channel" {
     try profile.validateProfile(PROFILE);

@@ -25,6 +25,7 @@ const provider_profile = @import("../provider/profile.zig");
 const time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const api_key_store = @import("../provider/api_key_store.zig");
+const provider_credential = @import("../provider/credential.zig");
 const catalog_fetch = @import("catalog_fetch.zig");
 
 pub const Method = oauth_login.Method;
@@ -217,9 +218,10 @@ pub const KeyError = error{
 
 /// A key the user pasted for a provider with a guided key setup
 /// (`ProviderProfile.api_key_setup`). Running it checks the key where the key
-/// page says — a GET the provider does not bill — and stores it in the
-/// provider's own key file. Every string is borrowed; the login worker copies
-/// them (`LoginWorker.ownFlow`).
+/// page says — a GET the provider does not bill, with the key where the
+/// provider's requests carry it (`auth`) — and stores it in the provider's
+/// own key file. Every string is borrowed; the login worker copies them
+/// (`LoginWorker.ownFlow`).
 pub const ApiKeyPrepared = struct {
     options: Options,
     provider_id: provider_ids.Slug,
@@ -227,6 +229,14 @@ pub const ApiKeyPrepared = struct {
     kind: provider_profile.CredentialKind,
     page: provider_profile.KeyPage,
     secret: []const u8,
+    /// Where the check carries the key: the profile's own scheme, so a key
+    /// is checked the way it will be sent (Gemini reads `x-goog-api-key`
+    /// and answers a bearer token 401 whatever the key).
+    auth: provider_profile.AuthScheme = .bearer,
+    /// What a refusal other than 401/403 means, in the provider's words
+    /// (`ProviderProfile.classify_error`): Gemini refuses a wrong key with
+    /// 400 `API_KEY_INVALID`.
+    classify_error: provider_profile.ClassifyFn = provider_profile.defaultClassifyError,
     /// False stores the key without the check (`login --no-check`).
     check: bool = true,
 
@@ -242,13 +252,15 @@ pub const ApiKeyPrepared = struct {
             var line: [512]u8 = undefined;
             notify.say(std.fmt.bufPrint(&line, "Checking the key with {s}\n", .{url}) catch "Checking the key\n");
             if (self.aborted()) return error.Aborted;
-            const answer = catalog_fetch.fetch(allocator, io, .{ .url = url, .bearer = self.secret }) catch |err| switch (err) {
-                error.Unauthorized => return error.KeyRefused,
+            const answer = catalog_fetch.fetchAnswer(allocator, io, .{
+                .url = url,
+                .credential = .{ .scheme = self.auth, .secret = self.secret },
+            }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.KeyCheckFailed,
             };
             defer allocator.free(answer.body);
-            if (!checkAnswered(allocator, answer.body)) return error.KeyCheckFailed;
+            try keyCheckVerdict(allocator, answer, self.classify_error);
             if (self.aborted()) return error.Aborted;
         };
         try api_key_store.save(
@@ -270,6 +282,55 @@ pub const ApiKeyPrepared = struct {
         return signal.isAborted();
     }
 };
+
+/// What the check's answer says about the key. 401 and 403 refuse it, as
+/// does any status the provider classifies as an invalid key or a denial
+/// (`ProviderProfile.classify_error`: Gemini's 400 `API_KEY_INVALID`). A 2xx
+/// passes only as the provider's own answer (`checkAnswered`). Anything else
+/// — 429, 5xx, a 3xx that was not followed — learned nothing about the key.
+fn keyCheckVerdict(
+    allocator: std.mem.Allocator,
+    answer: catalog_fetch.Answer,
+    classify: provider_profile.ClassifyFn,
+) KeyError!void {
+    if (answer.status >= 200 and answer.status < 300) {
+        if (!checkAnswered(allocator, answer.body)) return error.KeyCheckFailed;
+        return;
+    }
+    if (answer.status == 401 or answer.status == 403) return error.KeyRefused;
+    return switch (classify(answer.status, answer.body)) {
+        .auth_invalid, .auth_expired, .permission_denied => error.KeyRefused,
+        else => error.KeyCheckFailed,
+    };
+}
+
+test "key login: the check refuses on 401/403 and on what the provider calls an invalid key, and learns nothing from the rest" {
+    const a = std.testing.allocator;
+    const Verdict = struct {
+        fn of(status: u16, body: []const u8, classify: provider_profile.ClassifyFn) KeyError!void {
+            var copy: [256]u8 = undefined;
+            @memcpy(copy[0..body.len], body);
+            return keyCheckVerdict(a, .{ .status = status, .body = copy[0..body.len] }, classify);
+        }
+        fn gemini(status: u16, body: []const u8) provider_profile.ErrorClass {
+            if (status == 400 and std.mem.indexOf(u8, body, "API_KEY_INVALID") != null) return .auth_invalid;
+            return provider_profile.defaultClassifyError(status, body);
+        }
+    };
+    const default = provider_profile.defaultClassifyError;
+    try Verdict.of(200, "{\"data\":[]}", default);
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(200, "<html></html>", default));
+    try std.testing.expectError(error.KeyRefused, Verdict.of(401, "{}", default));
+    try std.testing.expectError(error.KeyRefused, Verdict.of(403, "", default));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(429, "{}", default));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(500, "{}", default));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(302, "", default));
+    // 400 says nothing about the key, unless the provider says it does.
+    const invalid = "{\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"reason\":\"API_KEY_INVALID\"}]}}";
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(400, invalid, default));
+    try std.testing.expectError(error.KeyRefused, Verdict.of(400, invalid, Verdict.gemini));
+    try std.testing.expectError(error.KeyCheckFailed, Verdict.of(400, "{\"error\":{\"status\":\"FAILED_PRECONDITION\"}}", Verdict.gemini));
+}
 
 /// A 2xx from the check is a pass only when it is the provider answering: a
 /// JSON object that does not report failure. A captive portal or proxy page
@@ -326,6 +387,82 @@ test "the key check override takes https or a loopback host, nothing else" {
     try std.testing.expect(!keyCheckUrlAccepted("ftp://127.0.0.1/models"));
 }
 
+/// A variable `profile` reads its key from, set where credential resolution
+/// looks before a stored key (`credential.resolve`: the process
+/// environment, then `<state root>/.env`). While one is set, a key `/login
+/// <provider>` stores is not the one used: the login says so, by the
+/// variable's name and never its value.
+pub const KeyShadow = struct {
+    name: []const u8,
+    /// Set in `<state root>/.env` rather than in the process environment.
+    in_local_config: bool,
+};
+
+/// The first of `profile`'s key variables that would win over a stored key:
+/// the process environment's, else the `.env` layer's (`local_config`).
+pub fn keyShadowedBy(
+    profile: *const provider_profile.ProviderProfile,
+    process: provider_credential.EnvLookup,
+    local_config: ?provider_credential.EnvLookup,
+) ?KeyShadow {
+    for (profile.env_aliases) |alias| {
+        if (process.get(alias.name) != null) return .{ .name = alias.name, .in_local_config = false };
+    }
+    const layer = local_config orelse return null;
+    for (profile.env_aliases) |alias| {
+        if (layer.get(alias.name) != null) return .{ .name = alias.name, .in_local_config = true };
+    }
+    return null;
+}
+
+/// `GEMINI_API_KEY is set in your shell and is used before the stored key:
+/// unset it to use the key you just stored.`, or for `.env` `GEMINI_API_KEY
+/// in <env_path> is used before the stored key: remove it from that file to
+/// use the key you just stored.` One line, no newline.
+pub fn writeKeyShadowNotice(w: *std.Io.Writer, shadow: KeyShadow, env_path: []const u8) std.Io.Writer.Error!void {
+    if (shadow.in_local_config) {
+        try w.print("{s} in {s} is used before the stored key: remove it from that file to use the key you just stored.", .{ shadow.name, env_path });
+    } else {
+        try w.print("{s} is set in your shell and is used before the stored key: unset it to use the key you just stored.", .{shadow.name});
+    }
+}
+
+test "key login: a key variable set in the shell, else in .env, is named as winning over the stored key" {
+    const Env = struct {
+        names: []const []const u8,
+        fn get(ctx: *anyopaque, name: []const u8) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            for (self.names) |set| if (std.mem.eql(u8, set, name)) return "value-never-named";
+            return null;
+        }
+        fn lookup(self: *const @This()) provider_credential.EnvLookup {
+            return .{ .ctx = @ptrCast(@constCast(self)), .getFn = get };
+        }
+    };
+    const gemini = &@import("../provider/profiles/gemini.zig").PROFILE;
+    const none: Env = .{ .names = &.{} };
+    const shell: Env = .{ .names = &.{"GOOGLE_API_KEY"} };
+    const file: Env = .{ .names = &.{"GEMINI_API_KEY"} };
+    try std.testing.expect(keyShadowedBy(gemini, none.lookup(), none.lookup()) == null);
+    try std.testing.expect(keyShadowedBy(gemini, none.lookup(), null) == null);
+    // The shell's comes first, as resolution reads it first.
+    const from_shell = keyShadowedBy(gemini, shell.lookup(), file.lookup()).?;
+    try std.testing.expectEqualStrings("GOOGLE_API_KEY", from_shell.name);
+    try std.testing.expect(!from_shell.in_local_config);
+    const from_file = keyShadowedBy(gemini, none.lookup(), file.lookup()).?;
+    try std.testing.expectEqualStrings("GEMINI_API_KEY", from_file.name);
+    try std.testing.expect(from_file.in_local_config);
+
+    var buffer: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try writeKeyShadowNotice(&w, from_shell, "/s/.env");
+    try std.testing.expectEqualStrings("GOOGLE_API_KEY is set in your shell and is used before the stored key: unset it to use the key you just stored.", w.buffered());
+    w = .fixed(&buffer);
+    try writeKeyShadowNotice(&w, from_file, "/s/.env");
+    try std.testing.expectEqualStrings("GEMINI_API_KEY in /s/.env is used before the stored key: remove it from that file to use the key you just stored.", w.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "value-never-named") == null);
+}
+
 pub const KeySetupError = error{
     /// The profile declares no guided key setup.
     NoKeySetup,
@@ -354,6 +491,8 @@ pub fn prepareApiKey(
         .kind = setup.kind,
         .page = page,
         .secret = key,
+        .auth = profile.auth,
+        .classify_error = profile.classify_error,
     };
 }
 

@@ -561,6 +561,39 @@ fn printLocalConfigHint(local: *const state_env_mod.Loaded, unchosen: []const []
     std.debug.print(") and names none: add {s}=<id> to choose one.\n", .{state_env_mod.provider_variable});
 }
 
+/// The notices said once under the banner, one per line; null when none
+/// is set. In `arena` (a notice alone is returned as it is).
+fn joinNotices(arena: std.mem.Allocator, notices: []const ?[]const u8) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var count: usize = 0;
+    for (notices) |maybe| {
+        const notice = maybe orelse continue;
+        if (count == 0) first = notice;
+        if (count > 0) out.writer.writeByte('\n') catch return first;
+        out.writer.writeAll(notice) catch return first;
+        count += 1;
+    }
+    return if (count <= 1) first else out.written();
+}
+
+/// What the TUI says once under its banner when `.env` holds keys of
+/// several providers and names none (#486): which ones, by display name, and
+/// that `/model` chooses (`route_state.writeUnchosenLocalNotice`). In `arena`.
+fn unchosenLocalNotice(arena: std.mem.Allocator, ids: []const []const u8) ?[]const u8 {
+    if (ids.len == 0) return null;
+    const names = arena.alloc([]const u8, ids.len) catch return null;
+    const host = buildProviderHost(arena);
+    defer if (host) |built| built.destroy();
+    for (ids, names) |id, *name| {
+        const profile = if (host) |built| built.registry.find(id) else null;
+        name.* = if (profile) |found| (arena.dupe(u8, found.display_name) catch id) else id;
+    }
+    var out: std.Io.Writer.Allocating = .init(arena);
+    route_state_mod.writeUnchosenLocalNotice(&out.writer, names) catch return null;
+    return out.written();
+}
+
 /// ` (template: <dir>/.env.example)` when that file exists, else "".
 fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     const dir = std.fs.path.dirname(env_path) orelse return "";
@@ -1506,10 +1539,19 @@ pub fn main(init: std.process.Init) !void {
         const name = providerDisplayName(allocator, chosen.name);
         break :shadowed std.fmt.allocPrint(allocator, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
     };
-    const startup_notice: ?[]const u8 = if (skipped_default_notice != null and shadowed_local_notice != null)
-        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ skipped_default_notice.?, shadowed_local_notice.? }) catch skipped_default_notice
-    else
-        skipped_default_notice orelse shadowed_local_notice;
+    // `.env` holds keys of several providers and names none, and nothing
+    // above it decided (#486): the TUI opens without a model, as with nothing
+    // set up, and says once which providers and that `/model` chooses. `-p`
+    // and the rest stopped above, naming them (`printLocalConfigHint`).
+    const unchosen_local_notice: ?[]const u8 = unchosen: {
+        const reason = unbound orelse break :unchosen null;
+        if (!interactive_tui or reason != .nothing_configured) break :unchosen null;
+        break :unchosen switch (local_choice) {
+            .several => |ids| unchosenLocalNotice(allocator, ids),
+            else => null,
+        };
+    };
+    const startup_notice: ?[]const u8 = joinNotices(allocator, &.{ skipped_default_notice, shadowed_local_notice, unchosen_local_notice });
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -2611,7 +2653,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (provider_name) |name| {
         // A provider without an OAuth grant but with a page to create a key on
         // signs in with a pasted key (`ProviderProfile.api_key_setup`).
-        if (providerTakesPastedKey(allocator, name) or key_page != null or key_from_stdin or !check_key) {
+        if (providerTakesPastedKey(allocator, name, client_id, login_method) or key_page != null or key_from_stdin or !check_key) {
             if (mode == .oauth_json) {
                 std.debug.print("error: --oauth-token-json is for providers that sign in with OAuth\n", .{});
                 return 2;
@@ -2940,13 +2982,19 @@ const KeyLoginRequest = struct {
 };
 
 /// Whether `name` is a provider whose login is a pasted key: it declares a
-/// key page and no OAuth grant.
-fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8) bool {
+/// key page and no OAuth grant this login could run, the rule `/login`
+/// follows (`prepareFlow`). OpenAI declares a grant but no client to present
+/// with it, so it takes a key unless a client is configured for it. Asking
+/// for the grant (`--client-id`, `--device-code`) keeps it for a provider
+/// that has one, which then says what it lacks.
+fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8, client_id: ?[]const u8, method: oauth_login.Method) bool {
     const host = buildProviderHost(allocator) orelse return false;
     defer host.destroy();
     const profile = host.registry.find(name) orelse return false;
     if (profile.api_key_setup == null) return false;
     provider_login.requireOAuthCapable(profile) catch return true;
+    if (client_id != null or method != .loopback) return false;
+    _ = provider_login.prepareProfileWith(profile, .{ .state_root = "" }, host.oauthClientIdFor(profile.id)) catch return true;
     return false;
 }
 
@@ -3067,6 +3115,19 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
         }
         return 1;
     };
+    // A key variable for this provider in the shell or in `.env` is read
+    // before the stored key (`credential.resolve`): say so, by name, rather
+    // than promise that new sessions use the key just stored.
+    var local_config = loadLocalConfig(allocator, allocator, state_dir);
+    defer local_config.deinit();
+    if (provider_login.keyShadowedBy(profile, provider_credential.EnvLookup.process(), local_config.lookup())) |shadow| {
+        var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+        var notice: std.Io.Writer = .fixed(&notice_buf);
+        provider_login.writeKeyShadowNotice(&notice, shadow, local_config.path) catch {};
+        std.debug.print("warning: {s}\n", .{notice.buffered()});
+        std.debug.print("No key was printed.\n", .{});
+        return 0;
+    }
     std.debug.print("New sessions on {s} use it (`metacodes --provider {s}`, or pick a {s} model in /model). No key was printed.\n", .{ profile.display_name, profile.id.slice(), profile.display_name });
     return 0;
 }
@@ -3321,7 +3382,9 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             else => {},
         },
         .local_unchosen => switch (facts.local) {
-            .several => |ids| std.debug.print("This start uses no provider: {s} holds keys of several ({s}) and names none. Add {s}=<one of them> to it.\n", .{
+            // The terminal UI opens without a model and says to choose in
+            // /model (`route_state.writeUnchosenLocalNotice`); -p stops.
+            .several => |ids| std.debug.print("This start uses no provider: {s} holds keys of several ({s}) and names none. Choose one with /model; Tab there applies it to every future session. Or add {s}=<one of them> to it.\n", .{
                 env_path, std.mem.join(arena, ", ", ids) catch "", state_env_mod.provider_variable,
             }),
             else => {},

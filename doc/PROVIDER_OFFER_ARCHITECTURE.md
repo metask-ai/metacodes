@@ -537,12 +537,31 @@ Code Console twice, China and Global, each checked on its own host's
 `/coding/v1/models`; its note says a Moonshot open-platform key does not work
 there.
 
+Every other built-in vendor declares its key pages too, so `/login <id>` and
+`login --provider <id>` reach all of them; a test in `provider/registry.zig`
+holds every built-in profile but Metask to it. OpenAI (`platform.openai.com/
+api-keys`) and Gemini (`aistudio.google.com/apikey`) have one page; Qwen
+(the Model Studio console of Beijing and of Singapore), MiniMax
+(`platform.minimax.cn` and `platform.minimax.io`) and the Moonshot open
+platform (`platform.kimi.com` and `platform.kimi.ai`) have one per region,
+each checked against its own region's `/models`, because their keys do not
+cross regions. OpenAI also declares an OAuth grant but no client to present
+with it (see above): until an installation configures one, both front ends
+take a pasted key for it, as `/login` always did when `prepareFlow` refused.
+
 The login is a `provider_login.Flow` variant (`ApiKeyPrepared`), so the CLI,
 `/login` and the picker share it with the OAuth grants and run it on the same
 `LoginWorker`. `prepareApiKey` trims what a paste adds around the key; `run`
 checks the key with a GET of the page's `check_url` — the plan's
 `/models` list, which answers 401 without a valid key and is not a model call
-— and only then writes it. A 401/403 is `KeyRefused`. Any other failure is
+— and only then writes it. The GET carries the key the way the profile's
+requests do (`ProviderProfile.auth`, through `catalog_fetch.Request.credential`):
+Gemini reads `x-goog-api-key` and takes a bearer token for an OAuth token,
+answering 401 whatever the key. A 401/403 is `KeyRefused`, and so is any
+status the profile's `classify_error` reads as an invalid key or a denial:
+Gemini answers a wrong key with 400 `INVALID_ARGUMENT`, reason
+`API_KEY_INVALID` (a 400 for any other reason, an unsupported location say,
+is not about the key). Any other failure is
 `KeyCheckFailed`, and so is a 2xx that is not the provider answering — HTML
 from a captive portal, or the `"success": false` body Z.AI answers some
 failures with — and a redirect: a GET that carries a credential never follows
@@ -571,7 +590,10 @@ The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
 echo goes off before the prompt is written, so a paste that arrives early is
 not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
-`/login` lists such a provider as "API key" and walks plan page → paste. Both
+`/login` lists such a provider as "API key" and walks plan page → paste. Its
+list shows twelve providers; the pane neither scrolls nor filters, so the
+ones past them are named under the list by id (`N more not shown: /login
+<provider> (…)`), and `/login <id>` starts any of them directly. Both
 mask the key as a character count and draw the page URL whole so it can be
 copied. The picker takes no key (#488): it lists such a provider as not
 configured until a key resolves for it, and says where one goes.

@@ -122,10 +122,10 @@ pub const Reminder = struct {
     /// are never used on their own (#484 item 6); the reminder points to
     /// `/model`, where choosing one is the explicit choice.
     environment_keys: []const []const u8 = &.{},
-    /// Providers `.env` holds keys for while naming none of them (#486): the
-    /// file does not choose, so the reminder says how to.
+    /// Providers `.env` holds keys for while naming none of them (#486), by
+    /// display name: the file does not choose, so the reminder points to
+    /// `/model`, where choosing one is the choice.
     unchosen_local: []const []const u8 = &.{},
-    provider_variable: []const u8 = "METACODES_PROVIDER",
 };
 
 /// The red reminder a submission in the unbound state gets, one line per
@@ -143,16 +143,16 @@ pub fn writeReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void {
         .missing_credential => return writeMissingReminder(w, r),
     }
     try w.writeAll("  Sign in to Metask:            /login\n");
-    if (r.env_path.len > 0) {
+    if (r.unchosen_local.len > 0 and r.env_path.len > 0) {
+        // The keys are in `.env` already: what is left is choosing one.
+        try w.writeAll("  Or use a key in .env:         /model (");
+        try writeList(w, r.unchosen_local);
+        try w.writeAll(")\n");
+    } else if (r.env_path.len > 0) {
         try w.print("  Or use your own provider key: edit {s}{s}, then restart\n", .{
             r.env_path,
             if (r.template) " (template: .env.example)" else "",
         });
-    }
-    if (r.unchosen_local.len > 0 and r.env_path.len > 0) {
-        try w.print("  {s} holds keys for several providers (", .{r.env_path});
-        try writeList(w, r.unchosen_local);
-        try w.print(") and names none: add {s}=<id>, then restart\n", .{r.provider_variable});
     }
     // A key only in the shell is never used on its own: choosing its
     // provider in /model is what makes it the session's.
@@ -202,6 +202,22 @@ fn writeList(w: *std.Io.Writer, items: []const []const u8) std.Io.Writer.Error!v
         if (index > 0) try w.writeAll(", ");
         try w.writeAll(item);
     }
+}
+
+/// Said once under the banner when `.env` holds keys of several providers
+/// and names none (#486), so the TUI opened without a model: which ones, by
+/// display name, and where choosing one is done. Tab in `/model` is what
+/// makes the choice the default of later starts (level 2 of the startup
+/// order), which no longer stop here.
+///
+///     .env has keys for DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every future session.
+pub fn writeUnchosenLocalNotice(w: *std.Io.Writer, providers: []const []const u8) std.Io.Writer.Error!void {
+    try w.writeAll(".env has keys for ");
+    for (providers, 0..) |name, index| {
+        if (index > 0) try w.writeAll(if (index + 1 == providers.len) " and " else ", ");
+        try w.writeAll(name);
+    }
+    try w.writeAll(". Choose one with /model; Tab there applies it to every future session.");
 }
 
 /// The provider key variables `env` sets among `profiles`' declared aliases,
@@ -277,18 +293,29 @@ test "the reminder lists shell keys and unchosen .env providers by name, and say
         .template = false,
         .guide_url = "https://guide",
         .environment_keys = &.{ "DEEPSEEK_API_KEY", "KIMI_API_KEY" },
-        .unchosen_local = &.{ "deepseek", "openai" },
+        .unchosen_local = &.{ "DeepSeek", "OpenAI" },
     });
     defer testing.allocator.free(text);
+    // The file's keys are there already: the way on is choosing one in
+    // /model, not editing the file and restarting.
     try testing.expectEqualStrings(
         \\No model is set up: the Metask sign-in has no API key and model chosen yet.
         \\  Sign in to Metask:            /login
-        \\  Or use your own provider key: edit /s/.env, then restart
-        \\  /s/.env holds keys for several providers (deepseek, openai) and names none: add METACODES_PROVIDER=<id>, then restart
+        \\  Or use a key in .env:         /model (DeepSeek, OpenAI)
         \\  Or use a key in your shell:   /model (DEEPSEEK_API_KEY, KIMI_API_KEY)
         \\  How to: https://guide
         \\
     , text);
+}
+
+test "the banner notice for .env keys of several providers names them and where to choose" {
+    var buffer: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try writeUnchosenLocalNotice(&w, &.{ "DeepSeek", "OpenAI" });
+    try testing.expectEqualStrings(".env has keys for DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every future session.", w.buffered());
+    w = .fixed(&buffer);
+    try writeUnchosenLocalNotice(&w, &.{ "DeepSeek", "OpenAI", "Moonshot Kimi" });
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), ".env has keys for DeepSeek, OpenAI and Moonshot Kimi. "));
 }
 
 test "the reminder for a named provider without a key names its variables, not another provider" {
