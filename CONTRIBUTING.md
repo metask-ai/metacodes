@@ -38,9 +38,9 @@ first so we can agree on the boundary before you write code.
 Start the [PR watcher](.github/pr-loop.py) as part of setting up your
 development environment, before submitting your first PR. You need Python
 3.9+, Git, authenticated GitHub CLI (`gh`) and Codex CLI, and `dx` configured
-for the worker checkout. The original Codex worker thread must be accessible
-to the local App Server and handed over idle when the watcher needs to repair
-the PR. See the [PR workflow guide](doc/PR_AGENT_LOOP.md) for prerequisites.
+for the worker checkout. The original Codex chat must be accessible to the
+local App Server. The watcher forks it before the first repair so you can keep
+using the original chat. See the [PR workflow guide](doc/PR_AGENT_LOOP.md).
 
 From the repository root, start one watcher in a dedicated terminal:
 
@@ -56,8 +56,8 @@ on your Mac. The loop polls registered PRs every sixty seconds; GitHub CI
 runs on GitHub independently. Local review and repair
 pause while the watcher is stopped or your Mac is asleep or offline.
 
-For each task, push its branch and register the PR with its original worker
-thread and worktree. Use `submit` to create the PR in the mother repository
+For each task, push its branch and register the PR with its original chat
+and worktree. Use `submit` to create the PR in the mother repository
 and register it together:
 
 ```sh
@@ -77,7 +77,7 @@ python3 .github/pr-loop.py bind --pr "$PR_NUMBER" \
 
 `submit` and `bind` register work for the running watcher; they do not start
 it. The watcher reviews each revision in an independent read-only Codex
-conversation, returns blocking findings or CI failures to the original
+conversation, sends blocking findings or CI failures to the dedicated repair
 worker, checkpoints repairs and validates them through `dx zig build gate:pr`
 on devbox before pushing. It merges current main into a stale branch, validates
 and pushes that revision, and repeats review and PR CI. When both pass, it
@@ -93,6 +93,8 @@ or repair rounds; counters and review evidence persist across restarts.
 Product/permission decisions and interrupted writes preserve progress for a
 recorded decision.
 Temporary GitHub read outages retry without consuming an agent invocation.
+Use `python3 .github/pr-loop.py timeline --pr "$PR_NUMBER" --follow` to watch
+the recorded stages and `--format html` to render a snapshot for the source chat.
 
 When a decision or additional permission is needed, the loop pauses and notifies
 you locally. Check progress and answer:

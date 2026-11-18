@@ -32,15 +32,16 @@ Placing the script in `.github/` does not make it a hosted Actions workflow.
 - An already pushed PR branch in a clean, dedicated worktree. Its configured
   push remote must point to the PR's head repository. The target is upstream
   `metask-ai/metacodes`, even when that remote is a contributor's fork.
-- A persisted Codex thread accessible to the local App Server, whose `cwd`
-  is that worktree. The worker must be idle before it receives repair work.
-  A desktop or remote chat is usable only if that host exposes the same
-  thread to this App Server; an arbitrary UI chat ID is not sufficient.
+- A persisted source chat accessible to the local App Server, whose `cwd`
+  is that worktree. The watcher derives a separate repair worker from that chat.
+  A desktop or remote chat is usable only if that host exposes its history
+  to this App Server. Continue discussion in the source chat and keep edits
+  in the bound worktree exclusive to the active worker.
 - `dx` configured for the worker checkout. The controller always executes
   `dx zig build gate:pr` before pushing an automatic repair. It saves local
   checkpoint commits first: some evaluation tests materialize committed HEAD
   and intentionally refuse dirty pinned inputs. A failed checkpoint is never
-  pushed; its validation output goes back to the original worker.
+  pushed. Its validation output goes back to the repair worker.
 - GitHub permission to push the head branch and merge the PR upstream.
   No admin bypass is used or requested.
 
@@ -99,6 +100,27 @@ reconciliation passes are refused by its process lock.
 New PR registration remains available while another PR is being processed.
 Answer commands should be run between reconciliation passes.
 
+## PR timeline
+
+```sh
+python3 .github/pr-loop.py timeline --pr "$PR_NUMBER" --follow
+python3 .github/pr-loop.py timeline --pr "$PR_NUMBER" --format html
+```
+
+The timeline stores the review report and reviewer ID, repair summary and
+worker ID, local validation result and log path, CI result, published
+revision, and merge outcome. Its JSON output includes a cursor for fetching
+only subsequent events with `--after`. Read it while the watcher is working and
+render a snapshot in the source chat when a contributor asks for progress.
+The watcher records events locally. Updating the contents of a desktop chat
+automatically requires a chat-side consumer. The timeline commands do not
+start or resume an App Server conversation.
+
+Existing PR registrations acquire their dedicated worker on the next allowed
+repair. The upgrade preserves review history, checkpoints, decisions, and
+counters. Older records contain only the events the previous watcher saved.
+Validation logs live in the private directory alongside the SQLite database.
+
 ## Decisions and recovery
 
 ```sh
@@ -145,9 +167,10 @@ answering; an answer does not automatically reconcile a divergent checkout.
 2. Reports are bound to both head and base SHA. A changed revision invalidates
    them; the controller rechecks the revision after review, repair and local
    validation, and immediately before merging.
-3. The bound worker thread is resumed by ID, never by `--last`. It must be
-   handed over idle and must not be driven concurrently by another host.
-   It edits the original checkout. The controller owns validation, commit, ordinary push
+3. The first repair forks the persisted source chat and saves the new worker ID
+   before any edit turn. Later repairs resume that worker by ID. The source chat
+   stays available for discussion. The worker edits the bound checkout and must
+   have exclusive access for edits. The controller owns validation, commit, ordinary push
    and exact-head merging. Policy, workflow and controller edits require
    a decision. The worker's network is disabled; the controller executes the
    devbox gate and returns failures as feedback. Writable tool access is
@@ -181,10 +204,11 @@ dx zig build test:pr-loop
 
 This suite also runs in `test:units` on every PR. It uses real temporary Git
 repositories and pushes to a local bare repository, a fake stdio Codex process,
-and recorded GitHub API requests. It proves review → original-thread repair →
+and recorded GitHub API requests. It proves review → dedicated-worker repair →
 validation → push → fresh review → exact-head merge → observed merge, without
 provider calls. It also exercises stale review rejection, CI failures, busy
-workers, decision recovery, durable counters, legacy registrations, policy edits and interrupted
+workers, decision recovery, the replayable timeline, durable counters, legacy
+registrations, policy edits and interrupted
 operations. It also proves unavailable tools → full review retry → repair →
 validation → fresh review → merge without publishing a review status gate.
 No live PR is opened or merged by the tests.

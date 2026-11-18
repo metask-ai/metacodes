@@ -72,16 +72,19 @@ Before handing a PR over, confirm that the developer has the watcher running.
   Use `python3 .github/pr-loop.py submit` to create and register a PR, or
   `python3 .github/pr-loop.py bind` for an existing PR. Follow the command
   examples in [CONTRIBUTING](CONTRIBUTING.md#initial-development-setup).
-- Register the original Codex thread ID and its dedicated worktree explicitly.
+- Register the original Codex chat ID and its dedicated worktree explicitly.
   The branch must already be pushed, the checkout must be clean, and the
-  thread must be accessible to the local App Server. Hand the thread over
-  idle and avoid concurrent edits by another host. Do not invent a thread ID
-  or claim automatic delivery when these prerequisites are missing.
+  source chat must be accessible to the local App Server. Fork it once for a
+  dedicated repair worker and save that worker ID before starting its turn.
+  Keep the source chat available for discussion. Avoid concurrent edits to
+  the bound worktree. Do not invent a thread ID.
 - The controller reviews each head/base revision in an independent read-only
   conversation. Blocking findings, failed CI and failed local validation go
-  back to the original worker. During repair, the worker edits; the controller
+  back to the saved repair worker. During repair, the worker edits; the controller
   owns checkpoint commits, `dx zig build gate:pr`, and ordinary pushes. Failed
   checkpoints stay local. A pushed revision receives a fresh review.
+  Record review findings, repair summaries, validation, CI, pushes and merge
+  outcomes in the PR timeline so they can be read without opening a worker.
 - Review and repair are automatic work, not an additional `agent/review`
   commit-status gate. Unavailable tools and interrupted read-only reviews
   retry full review automatically. There is no fixed invocation or repair-round

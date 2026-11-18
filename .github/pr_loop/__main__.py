@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import time
 from .adapters import Git, GitHub
 from .controller import Controller, Store, default_state
 from .model import Binding, DEFAULT_REPO, LoopError, REPO
+from .timeline import html_fragment, snapshot
 
 
 def main(argv=None):
@@ -35,6 +37,13 @@ def main(argv=None):
     watch.add_argument("--once", action="store_true")
     watch.add_argument("--interval", type=int, default=60)
     commands.add_parser("status")
+    timeline = commands.add_parser("timeline", help="read recorded review, repair, validation and delivery events")
+    timeline.add_argument("--repo", default=DEFAULT_REPO)
+    timeline.add_argument("--pr", type=int, required=True)
+    timeline.add_argument("--after", type=int, default=0, help="only include events after this cursor")
+    timeline.add_argument("--format", choices=("json", "html"), default="json")
+    timeline.add_argument("--utc-offset", type=int, default=0, help="display offset in minutes for HTML")
+    timeline.add_argument("--follow", action="store_true", help="stream newly recorded events as JSON")
     answer = commands.add_parser("answer")
     answer.add_argument("--repo", default=DEFAULT_REPO)
     answer.add_argument("--pr", type=int, required=True)
@@ -75,6 +84,21 @@ def main(argv=None):
         elif args.command == "status":
             for row in store.rows():
                 print(json.dumps({k: row[k] for k in ("repo", "number", "state", "rounds", "agent_runs", "reason")}, ensure_ascii=False))
+        elif args.command == "timeline":
+            if args.follow and args.format != "json":
+                raise LoopError("--follow requires JSON output")
+            cursor = args.after
+            view = snapshot(store, args.repo, args.pr, cursor)
+            if args.format == "html":
+                print(html_fragment(view, timezone(timedelta(minutes=args.utc_offset))), end="")
+            else:
+                print(json.dumps(view, ensure_ascii=False), flush=True)
+                while args.follow and view["state"] not in ("merged", "closed"):
+                    cursor = view["cursor"]
+                    time.sleep(2)
+                    view = snapshot(store, args.repo, args.pr, cursor)
+                    if view["events"]:
+                        print(json.dumps(view, ensure_ascii=False), flush=True)
         else:
             if args.interval < 1:
                 raise LoopError("poll interval must be positive")

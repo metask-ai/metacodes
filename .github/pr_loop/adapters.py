@@ -36,18 +36,25 @@ def stop_process(proc):
             proc.wait()
 
 
-def run(argv, cwd=None, stdin=None, timeout=120):
+def run(argv, cwd=None, stdin=None, timeout=120, log=None):
     """Timeouts and cancellation kill the whole local child process group."""
     proc = subprocess.Popen(list(argv), cwd=cwd, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             start_new_session=os.name == "posix")
     try:
         stdout, stderr = proc.communicate(stdin, timeout=timeout)
+        if log is not None:
+            log.write(stdout)
+            log.write(stderr)
         if proc.returncode:
             raise LoopError(f"{argv[0]} exited {proc.returncode}: {stderr[-4000:]}")
         return stdout.rstrip("\n")
     except subprocess.TimeoutExpired as exc:
         stop_process(proc)
+        if log is not None:
+            stdout, stderr = proc.communicate()
+            log.write(stdout)
+            log.write(stderr)
         raise LoopError(f"{argv[0]} exceeded its {timeout}s timeout") from exc
     except BaseException:
         stop_process(proc)
@@ -215,11 +222,15 @@ class Git:
 
 
 class Codex:
-    """Each call owns its app-server process; persisted worker history is resumed."""
+    """Use a separate App Server, without resuming the contributor's chat."""
     def __init__(self, command=("codex", "app-server")):
         self.command = tuple(command)
 
-    def call(self, cwd, prompt, schema, timeout, thread=None):
+    def call(self, cwd, prompt, schema, timeout, thread=None, *, fork_from=None, on_thread=None):
+        if schema is WORKER_SCHEMA and ((thread is None) == (fork_from is None)):
+            raise LoopError("a repair needs either a saved worker or a source chat")
+        if fork_from is not None and on_thread is None:
+            raise LoopError("a new worker must be saved before it can edit")
         messages = queue.Queue()
         notifications = []
         with tempfile.TemporaryFile(mode="w+t") as stderr:
@@ -275,18 +286,29 @@ class Codex:
             try:
                 request("initialize", {"clientInfo": {"name": "metacodes_pr_loop", "title": "PR loop", "version": "1.0"}})
                 send({"method": "initialized", "params": {}})
-                if thread:
-                    info = request("thread/read", {"threadId": thread, "includeTurns": False})["thread"]
-                    if info.get("status", {}).get("type") == "active":
+                if thread or fork_from:
+                    info = request("thread/read", {"threadId": thread or fork_from, "includeTurns": False})["thread"]
+                    if thread and info.get("status", {}).get("type") == "active":
                         raise Busy("worker has an active turn")
                     if Path(info["cwd"]).resolve() != Path(cwd).resolve():
                         raise LoopError("worker thread belongs to a different worktree")
-                    request("thread/resume", {"threadId": thread})
+                    if fork_from:
+                        child = request("thread/fork", {"threadId": fork_from, "cwd": str(cwd),
+                            "sandbox": "workspace-write", "approvalPolicy": "never",
+                            "ephemeral": False, "excludeTurns": True})["thread"]
+                        thread = child["id"]
+                        if (not isinstance(thread, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", thread)
+                                or thread == fork_from or Path(child["cwd"]).resolve() != Path(cwd).resolve()):
+                            raise LoopError("App Server did not create an independent worker in the bound worktree")
+                    else:
+                        request("thread/resume", {"threadId": thread, "excludeTurns": True})
                 else:
                     # Persist independent read-only reviewers so their identity
                     # and audit history survive the app-server process.
                     thread = request("thread/start", {"cwd": str(cwd), "sandbox": "read-only",
                                                       "approvalPolicy": "never", "ephemeral": False})["thread"]["id"]
+                if on_thread is not None:
+                    on_thread(thread)
                 # Writable work is confined to the bound checkout. Existing safety
                 # requirements may reject the requested profile; do not bypass them.
                 policy = ({"type": "workspaceWrite", "writableRoots": [str(cwd)], "networkAccess": False}

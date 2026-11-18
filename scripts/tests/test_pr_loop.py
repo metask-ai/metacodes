@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / ".github"))
 from pr_loop.adapters import Codex, Git, GitHub, run
 from pr_loop.controller import Controller, Store
 from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, ReadUnavailable, REQUIRED_CHECKS, State, validate_report
+from pr_loop.timeline import snapshot
 
 
 PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": ""}
@@ -41,6 +42,8 @@ for line in sys.stdin:
         result = {"thread": {"cwd": cfg["cwd"], "status": {"type": cfg.get("worker_status", "idle")}}}
     if method == "thread/start":
         result = {"thread": {"id": "review-thread"}}
+    if method == "thread/fork":
+        result = {"thread": {"id": "repair-7", "cwd": cfg["cwd"]}}
     if method == "turn/start":
         response = {"id": msg["id"], "result": {"turn": {"id": "turn-1"}}}
         if not cfg.get("early_notifications"):
@@ -197,8 +200,11 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertNotEqual(fixed, self.head)
         self.assertEqual(git(self.work, "status", "--porcelain"), "")
         self.assertEqual(self.row()["state"], "pending")
-        self.assertEqual(self.requests("thread/resume")[0]["params"]["threadId"], "worker-7")
+        self.assertEqual(self.requests("thread/fork")[0]["params"]["threadId"], "worker-7")
+        self.assertEqual(self.requests("thread/resume"), [])
+        self.assertEqual(self.row()["worker_thread"], "repair-7")
         worker_turn = self.requests("turn/start")[1]["params"]
+        self.assertEqual(worker_turn["threadId"], "repair-7")
         self.assertIn("Incorrect result", worker_turn["input"][0]["text"])
         self.assertEqual(worker_turn["sandboxPolicy"]["type"], "workspaceWrite")
         self.controller.once()
@@ -215,6 +221,18 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()["state"], "merged")
         self.assertEqual(self.notifications, [])
         self.assertFalse(any('/statuses/' in path for path, _, _ in self.github.calls))
+        view = snapshot(self.store, DEFAULT_REPO, 7, 0)
+        events = view["events"]
+        reports = [e["detail"]["report"] for e in events if e["detail"].get("report")]
+        self.assertEqual(reports, [FIX, PASS])
+        self.assertEqual([e["detail"]["summary"] for e in events if e["state"] == "repair_finished"],
+                         ["Fixed the result"])
+        gate = next(e for e in events if e["state"] == "validation_passed")
+        self.assertTrue(Path(gate["detail"]["log"]).is_file())
+        self.assertEqual(gate["detail"]["checkpoint"], fixed)
+        for kind in ("pushed", "ci_result", "merged"):
+            self.assertEqual(sum(e["state"] == kind for e in events), 1)
+        self.assertEqual(snapshot(self.store, DEFAULT_REPO, 7, view["cursor"])["events"], [])
 
     def test_unavailable_review_automatically_retries_then_repairs_without_status_gate(self):
         self.configure(reports=[RETRY, FIX, PASS], worker_texts=['fixed\n'])
@@ -274,6 +292,8 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()["state"], "pending")
         self.assertIn("local_gate_failure", self.requests("turn/start")[2]["params"]["input"][0]["text"])
         self.assertEqual(self.notifications, [])
+        self.assertEqual(len(self.requests("thread/fork")), 1)
+        self.assertEqual([r["params"]["threadId"] for r in self.requests("thread/resume")], ["repair-7"])
 
     def test_pending_checks_reuse_report_and_do_not_merge(self):
         self.configure()
@@ -339,7 +359,7 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()["state"], "needs_decision")
         self.assertIn("dirty", self.row()["reason"])
         self.assertEqual(git(self.bare, "rev-parse", "feature"), self.head)
-        self.assertEqual(len(self.requests("thread/resume")), 1)
+        self.assertEqual(len(self.requests("thread/fork")), 1)
 
     def test_crashed_in_flight_work_is_not_replayed(self):
         self.store.update(self.binding, State.PUSHING)
@@ -351,6 +371,7 @@ class LoopIntegrationTest(unittest.TestCase):
 
     def test_worker_busy_does_not_count_an_unstarted_repair(self):
         self.configure(reports=[FIX], worker_status="active")
+        self.store.update(self.binding, worker_thread="repair-7")
         self.controller.once()
         self.assertEqual(self.row()["state"], "waiting")
         self.assertEqual(self.row()["rounds"], 0)

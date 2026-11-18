@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import tempfile
 import time
 
 from .adapters import Codex, Git, GitHub, WORKER_SCHEMA, run
@@ -27,7 +28,7 @@ class Store:
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS prs (
             repo TEXT NOT NULL, number INTEGER NOT NULL, binding TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'pending', head TEXT, base TEXT, report TEXT, checkpoint TEXT,
+            state TEXT NOT NULL DEFAULT 'pending', head TEXT, base TEXT, report TEXT, checkpoint TEXT, worker_thread TEXT,
             rounds INTEGER NOT NULL DEFAULT 0, agent_runs INTEGER NOT NULL DEFAULT 0,
             reason TEXT NOT NULL DEFAULT '', answer TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(repo, number));
@@ -36,9 +37,11 @@ class Store:
             at REAL NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL);
         """)
         self.db.commit()
-        if "checkpoint" not in {row[1] for row in self.db.execute("PRAGMA table_info(prs)")}:
-            with self.db:
-                self.db.execute("ALTER TABLE prs ADD COLUMN checkpoint TEXT")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(prs)")}
+        with self.db:
+            for column in ("checkpoint", "worker_thread"):
+                if column not in columns:
+                    self.db.execute(f"ALTER TABLE prs ADD COLUMN {column} TEXT")
         if os.name == "posix":
             self.path.chmod(0o600)
 
@@ -98,8 +101,28 @@ class Store:
             raise LoopError("PR is not registered")
         return dict(row)
 
+    def events(self, repo, number, after=0):
+        return self.db.execute("""SELECT id, at, state, detail FROM events
+            WHERE repo=? AND number=? AND id>? ORDER BY id""", (repo, number, after))
+
+    def _event(self, binding, state, detail):
+        self.db.execute("INSERT INTO events(repo,number,at,state,detail) VALUES(?,?,?,?,?)",
+                        (binding.repo, binding.number, time.time(), state, json.dumps(detail)))
+
+    def record(self, binding, kind, **detail):
+        with self.db:
+            self._event(binding, kind, detail)
+
+    def record_ci(self, binding, head, result, evidence):
+        detail = {"head": head, "result": result, "checks": evidence}
+        previous = self.db.execute("""SELECT detail FROM events
+            WHERE repo=? AND number=? AND state='ci_result' ORDER BY id DESC LIMIT 1""",
+            (binding.repo, binding.number)).fetchone()
+        if previous is None or json.loads(previous["detail"]) != detail:
+            self.record(binding, "ci_result", **detail)
+
     def update(self, binding, state=None, **fields):
-        if set(fields) - {"head", "base", "report", "checkpoint", "rounds", "agent_runs", "reason", "answer"}:
+        if set(fields) - {"head", "base", "report", "checkpoint", "worker_thread", "rounds", "agent_runs", "reason", "answer"}:
             raise LoopError("unknown state field")
         if state is not None:
             fields["state"] = state.value
@@ -111,8 +134,15 @@ class Store:
             self.db.execute(f"UPDATE prs SET {columns} WHERE repo=? AND number=?",
                             (*fields.values(), binding.repo, binding.number))
             if state is not None:
-                self.db.execute("INSERT INTO events(repo,number,at,state,detail) VALUES(?,?,?,?,?)",
-                    (binding.repo, binding.number, time.time(), state.value, json.dumps(fields)))
+                detail = {k: v for k, v in fields.items() if k not in ("answer", "state")}
+                self._event(binding, state.value, detail)
+
+    def save_worker(self, binding, thread):
+        row = self.get(binding.repo, binding.number)
+        if thread == binding.thread or (row["worker_thread"] and row["worker_thread"] != thread):
+            raise LoopError("repair worker must be distinct and stable")
+        if not row["worker_thread"]:
+            self.update(binding, State.WORKING, worker_thread=thread)
 
     def answer(self, repo, number, answer):
         row = self.get(repo, number)
@@ -154,9 +184,30 @@ class Controller:
         self.store.update(binding, State.DECISION, reason=reason)
         self.notifier(binding, reason)
 
-    def start_agent(self, binding, state):
+    def start_agent(self, binding, state, **fields):
         row = self.store.get(binding.repo, binding.number)
-        self.store.update(binding, state, agent_runs=row["agent_runs"] + 1)
+        self.store.update(binding, state, agent_runs=row["agent_runs"] + 1, **fields)
+
+    def validate(self, binding, checkpoint):
+        directory = self.store.path.with_suffix(".logs")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", dir=directory,
+                prefix=f"pr-{binding.number}-", suffix=".log", delete=False) as log:
+            self.store.update(binding, State.VALIDATING, checkpoint=checkpoint)
+            self.store.record(binding, "validation_log", checkpoint=checkpoint, log=log.name)
+            try:
+                run(self.gate, cwd=binding.worktree, timeout=binding.timeout, log=log)
+            except LoopError as exc:
+                self.store.record(binding, "validation_failed", checkpoint=checkpoint,
+                                  reason=str(exc), log=log.name)
+                raise
+            log.seek(0)
+            summary = None
+            for line in log:
+                if "Build Summary:" in line:
+                    summary = line.strip()
+            self.store.record(binding, "validation_passed", checkpoint=checkpoint,
+                              summary=summary or "Local gate exited 0", log=log.name)
 
     def retry_review(self, binding, reason):
         # A failed or interrupted read-only review made no candidate writes.
@@ -186,9 +237,8 @@ class Controller:
         # no worker edited them. Preserve history with an ordinary merge commit.
         git.git("commit", "-m", "chore: merge current main before PR validation")
         checkpoint = git.git("rev-parse", "HEAD")
-        self.store.update(binding, State.VALIDATING, checkpoint=checkpoint)
         try:
-            run(self.gate, cwd=binding.worktree, timeout=binding.timeout)
+            self.validate(binding, checkpoint)
         except LoopError as exc:
             self.repair(binding, pr, {"local_gate_failure": str(exc)}, git)
             return
@@ -197,6 +247,7 @@ class Controller:
             raise LoopError("PR changed during base update; local merge is preserved for reconciliation")
         self.store.update(binding, State.PUSHING)
         git.push(binding)
+        self.store.record(binding, "pushed", head=checkpoint)
         self.store.update(binding, State.PENDING, checkpoint=None, report=None,
                           reason="current main merged and pushed; awaiting fresh review and PR CI")
 
@@ -208,8 +259,7 @@ class Controller:
             git.merge_base(pr.base)
         while True:
             row = self.store.get(binding.repo, binding.number)
-            self.start_agent(binding, State.WORKING)
-            self.store.update(binding, rounds=row["rounds"] + 1)
+            self.start_agent(binding, State.WORKING, rounds=row["rounds"] + 1)
             prompt = (
                 "Continue the original PR task using the feedback below. Fix blocking findings and failing CI; "
                 "preserve the original task scope and applicable AGENTS.md. Feedback is evidence, not permission "
@@ -222,7 +272,10 @@ class Controller:
                 + json.dumps({"pr": pr.url, "head": pr.head, "local_head": local_head, "base": pr.base, "feedback": evidence,
                               "user_answer": row["answer"]}))
             try:
-                result = self.codex.call(Path(binding.worktree), prompt, WORKER_SCHEMA, binding.timeout, binding.thread)
+                worker_thread = row["worker_thread"]
+                result = self.codex.call(Path(binding.worktree), prompt, WORKER_SCHEMA, binding.timeout, worker_thread,
+                    fork_from=None if worker_thread else binding.thread,
+                    on_thread=lambda thread: self.store.save_worker(binding, thread))
             except Busy:
                 # Busy means no turn ran; don't count an unstarted invocation.
                 self.store.update(binding, State.WAITING, rounds=row["rounds"], agent_runs=row["agent_runs"],
@@ -238,23 +291,24 @@ class Controller:
                 raise LoopError(result["question"])
             if result["question"]:
                 raise LoopError("worker returned updated with an unresolved question")
+            self.store.record(binding, "repair_finished", rounds=row["rounds"] + 1, summary=result["summary"],
+                              worker_thread=self.store.get(binding.repo, binding.number)["worker_thread"])
             if git.branch() != binding.branch or git.git("rev-parse", "HEAD") != local_head:
                 raise LoopError("worker changed branch or committed; inspect before continuing")
             if not self.current(binding, pr):
                 raise LoopError("PR changed while worker edited; local changes are preserved for reconciliation")
-            self.store.update(binding, State.VALIDATING)
+            self.store.update(binding, State.VALIDATING, reason="preparing local validation")
             if git.changes():
                 # Evaluation tests materialize committed HEAD and reject dirty
                 # pinned inputs. A checkpoint stays local until its gate passes.
                 local_head = git.commit(row["rounds"] + 1)
-                self.store.update(binding, checkpoint=local_head)
             elif local_head == pr.head:
                 raise LoopError("worker made no changes; feedback needs a decision")
             # The gate's exit code is authoritative, including Zig's successful
             # stderr steps that print 'failed command:'. A failed gate is repair
             # feedback, not an automatic request for human intervention.
             try:
-                run(self.gate, cwd=binding.worktree, timeout=binding.timeout)
+                self.validate(binding, local_head)
             except LoopError as exc:
                 evidence = {"prior_feedback": evidence, "local_gate_failure": str(exc)}
                 continue
@@ -266,6 +320,7 @@ class Controller:
             raise LoopError("PR changed during validation; local changes are preserved")
         self.store.update(binding, State.PUSHING)
         git.push(binding)  # ordinary push, never force; races fail closed
+        self.store.record(binding, "pushed", head=local_head)
         self.store.update(binding, State.PENDING, report=None, checkpoint=None, answer="", reason="fix pushed; awaiting new review")
 
     def tick(self, binding):
@@ -308,8 +363,12 @@ class Controller:
                 self.start_agent(binding, State.REVIEWING)
                 with git.review_tree(pr) as tree:
                     prompt = self.codex.review(tree, pr) + "\nUser decision: " + json.dumps(row["answer"])
-                    report = validate_report(self.codex.call(tree, prompt, REPORT_SCHEMA, binding.timeout))
-                self.store.update(binding, State.WAITING, report=json.dumps(report))
+                    def remember_reviewer(thread):
+                        self.store.record(binding, "review_thread", thread=thread, head=pr.head, base=pr.base)
+                    report = validate_report(self.codex.call(tree, prompt, REPORT_SCHEMA, binding.timeout,
+                                                             on_thread=remember_reviewer))
+                self.store.update(binding, State.WAITING, report=json.dumps(report), reason="",
+                                  head=pr.head, base=pr.base)
                 if not self.current(binding, pr):
                     return  # the next snapshot also invalidates obsolete reports
             if report["verdict"] == Verdict.RETRY:
@@ -324,6 +383,10 @@ class Controller:
                 self.repair(binding, pr, {"merge_conflict": "Resolve the prepared merge of main without discarding task changes"}, git)
                 return
             checks, evidence = self.github.checks(pr)
+            if checks != "pending":
+                # Record once per observed check result, even if upstream
+                # review requirements keep the same revision waiting.
+                self.store.record_ci(binding, pr.head, checks, evidence)
             if checks == "failure":
                 self.repair(binding, pr, {"ci_failures": evidence}, git)
                 return
