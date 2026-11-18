@@ -127,6 +127,35 @@ const ENV_ALIASES = [_]profile.EnvAlias{
     .{ .name = "DASHSCOPE_API_KEY", .kind = .api_key, .canonical = true },
 };
 
+/// Where a key is created, one page per region: help.aliyun.com/zh/
+/// model-studio/get-api-key (updated 2026-11-14) and alibabacloud.com/help/
+/// en/model-studio/get-api-key (2026-11-15) link these two, each console
+/// opened 2026-11-17. A key works only in its own region, so each page checks
+/// against its own region's model listing, which answers 401 without a valid
+/// key (`invalid_api_key`, 2026-11-17) and is not a model call.
+const KEY_PAGES = [_]profile.KeyPage{
+    .{
+        .id = Slug.lit("cn"),
+        .label = "China (Beijing) · Alibaba Cloud Model Studio",
+        .url = "https://bailian.console.aliyun.com/cn-beijing/model/settings/api-key",
+        .check_url = CN_OPENAI_BASE ++ "/models",
+        .region = "cn",
+    },
+    .{
+        .id = Slug.lit("intl"),
+        .label = "International (Singapore) · Alibaba Cloud Model Studio",
+        .url = "https://modelstudio.console.alibabacloud.com/ap-southeast-1/settings/api-key",
+        .check_url = INTL_OPENAI_BASE ++ "/models",
+        .region = "intl",
+    },
+};
+
+const KEY_SETUP = profile.ApiKeySetup{
+    .kind = .api_key,
+    .pages = &KEY_PAGES,
+    .note = "Keys are per region: a Beijing key works only on the China endpoints, a Singapore key only on the international ones.",
+};
+
 pub const PROFILE = profile.ProviderProfile{
     .id = Slug.lit("qwen"),
     .implementation_id = Slug.lit("qwen"),
@@ -138,7 +167,23 @@ pub const PROFILE = profile.ProviderProfile{
     .env_aliases = &ENV_ALIASES,
     .auth = .bearer,
     .default_channel = Slug.lit("cn-openai"),
+    .api_key_setup = KEY_SETUP,
 };
+
+test "qwen profile: each region's key page checks against that region's model listing" {
+    try profile.validateProfile(PROFILE);
+    // The default channel is Beijing's, so is the default page.
+    const default = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
+    try std.testing.expectEqualStrings("cn", default.id.slice());
+    try std.testing.expectEqualStrings("https://dashscope.aliyuncs.com/compatible-mode/v1/models", default.check_url.?);
+    const intl = PROFILE.defaultKeyPage(Slug.lit("intl-anthropic")).?;
+    try std.testing.expectEqualStrings("intl", intl.id.slice());
+    try std.testing.expectEqualStrings("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models", intl.check_url.?);
+    // Every channel's region has a page.
+    for (CHANNELS) |channel| {
+        try std.testing.expectEqualStrings(channel.region.?, PROFILE.defaultKeyPage(channel.id).?.region.?);
+    }
+}
 
 test "qwen profile: workspace endpoints pass, cross-protocol overrides do not" {
     try profile.validateProfile(PROFILE);

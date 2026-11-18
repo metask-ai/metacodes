@@ -749,3 +749,35 @@ test "catalog offers survive the registry that produced them" {
         catalog.items()[0].endpoint_ref,
     );
 }
+
+test "every built-in vendor but Metask declares a key page, and every page that checks one says where" {
+    // `/login <id>` and `login --provider <id>` take a pasted key for these
+    // (phase 2 of the provider plan); Metask signs in with its own grant.
+    for (BUILTIN_PROFILES) |entry| {
+        if (entry.id.eqlText("metask")) {
+            try std.testing.expect(entry.api_key_setup == null);
+            continue;
+        }
+        const setup = entry.api_key_setup orelse {
+            std.debug.print("{s} declares no key page\n", .{entry.id.slice()});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(setup.pages.len > 0);
+        // Bedrock alone stores its key unchecked: no unbilled endpoint is
+        // known to accept it.
+        for (setup.pages) |page| {
+            if (entry.id.eqlText("bedrock")) continue;
+            try std.testing.expect(std.mem.startsWith(u8, page.check_url orelse return error.TestUnexpectedResult, "https://"));
+        }
+        // Pages that name regions cover every region the channels name, so
+        // the default page follows the channel a session is on. A single
+        // page without one (Bedrock's documentation) serves them all.
+        const regional = for (setup.pages) |page| {
+            if (page.region != null) break true;
+        } else false;
+        if (regional) for (entry.channels) |channel| if (channel.region) |region| {
+            const page = entry.defaultKeyPage(channel.id).?;
+            try std.testing.expectEqualStrings(region, page.region orelse "");
+        };
+    }
+}

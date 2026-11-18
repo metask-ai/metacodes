@@ -182,6 +182,21 @@ stream; `global-responses` and `global-chat` use the overseas host
 (legacy Andante plans have `kimi-for-coding` only). `/model` sets the reasoning
 effort (low, high or max; unset is the server's default).
 
+## Other vendors' keys
+
+```sh
+metacodes login --provider gemini        # or openai, qwen, minimax, kimi, deepseek, bedrock
+```
+
+Every built-in vendor takes a pasted key the same way: the login opens the
+page the key is created on (Qwen, MiniMax and the Moonshot open platform have
+a China and an international one, whose keys do not cross), checks the key
+against the vendor's model list without billing anything, and stores it in
+`$HOME/.metacodes/keys/<id>.json` (0600). `/login <id>` in the TUI offers the
+same steps; `--api-key-stdin` reads the key from a script. A key in the
+environment or in `.env` wins over the stored one, and the login says so,
+naming the variable, when one is set.
+
 ## Metask OAuth
 
 `metacodes login` (and `/login` in the TUI) signs in to Metask in the browser,
