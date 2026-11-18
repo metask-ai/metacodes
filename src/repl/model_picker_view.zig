@@ -34,10 +34,9 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     // Rows that cannot be built draw as an empty list, never as a crash.
     const visible = picker.rows(&buffer) catch &.{};
     if (visible.len == 0) {
-        line(w);
-        w.print("  {s}{s}{s}", .{ th.dim, emptyText(picker), th.reset }) catch {};
-        newline(w);
-        return rows + 1 + footer(picker, w, th, null);
+        var text_buf: [picker_mod.MAX_LOCAL_CONFIG_PATH + 128]u8 = undefined;
+        rows += writeWrapped(w, th.dim, th.reset, emptyText(picker, &text_buf), cols);
+        return rows + footer(picker, w, th, !noneConfigured(picker));
     }
 
     const window = @max(picker.page_rows, 1);
@@ -71,18 +70,35 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         rows += 1;
     }
     if (picker.stage == .list) rows += controls(picker, w, th, cols);
-    return rows + footer(picker, w, th, visible[@min(picker.cursor, visible.len - 1)]);
+    return rows + footer(picker, w, th, true);
 }
 
-fn emptyText(picker: *const Picker) []const u8 {
+/// What an empty list says instead of rows, written into `buf` when it
+/// names this install's `.env`.
+fn emptyText(picker: *const Picker, buf: []u8) []const u8 {
     return switch (picker.status) {
         .loading => "loading models…",
         .failed => "model catalog unavailable — Esc to close",
         .empty => "no models configured",
-        else => if (picker.filter_len > 0)
+        .ready, .stale => if (picker.filter_len > 0)
             "nothing matches this filter — Esc clears it"
         else
-            "nothing to choose here",
+            // No provider has a credential (#488): where one comes from, as
+            // the banner of a start with nothing configured says it, with
+            // this install's `.env` by its path.
+            std.fmt.bufPrint(buf, "no providers configured — /login, or configure {s}", .{
+                if (picker.local_config_path_len > 0) picker.localConfigPath() else ".env",
+            }) catch "no providers configured — /login, or configure .env",
+    };
+}
+
+/// The list is empty because no provider has a credential, not because of a
+/// filter or the catalog's state (#488).
+fn noneConfigured(picker: *const Picker) bool {
+    if (picker.filter_len > 0) return false;
+    return switch (picker.status) {
+        .ready, .stale => true,
+        .loading, .empty, .failed => false,
     };
 }
 
@@ -90,7 +106,6 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 
     line(w);
     const title = switch (picker.stage) {
         .list => "Model",
-        .unconfigured => "Not configured",
         // By pointer: the slug's bytes are inline, and a copy captured by
         // value would be gone before `title` is printed.
         .setup => if (picker.setup) |*setup| setup.provider.slice() else "Provider",
@@ -224,10 +239,6 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
         .model => |group| {
             const offer = picker.offers.items[group.offer_index];
             paint(w, th, selected, group.is_current);
-            // A model of a provider with no credential is drawn dim: it can
-            // be chosen to see where its credential goes, not to switch
-            // (#488).
-            if (!group.ready) w.print("{s}{s}", .{ th.reset, th.dim }) catch {};
             writePadded(w, clip(offer.display_name, layout.name_width -| 1), layout.name_width);
             w.print("{s}{s}", .{ th.reset, th.dim }) catch {};
             writeWindow(w, offer.limits);
@@ -237,8 +248,7 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
                 var used: usize = 5 + layout.name_width + 6 + (if (group.offer_count > 1) @as(usize, 11) else 0);
                 if (layout.priced) used += 22;
                 const provider = providerName(picker, offer.provider_id);
-                const suffix: []const u8 = if (group.ready) "" else " · not configured";
-                w.print("   {s}{s}", .{ clip(provider, layout.cols -| (used + 4 + suffix.len)), suffix }) catch {};
+                w.print("   {s}", .{clip(provider, layout.cols -| (used + 4))}) catch {};
             }
             w.print("{s}", .{th.reset}) catch {};
         },
@@ -256,52 +266,16 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
             if (route.preferred) w.writeAll("   preferred") catch {};
             w.print("{s}", .{th.reset}) catch {};
         },
-        .unconfigured => |summary| {
-            paint(w, th, selected, false);
-            w.print("{s}{s}Not configured · ", .{ th.reset, th.dim }) catch {};
-            // Their names when they fit, else how many there are.
-            var names_buf: [512]u8 = undefined;
-            var names: std.Io.Writer = .fixed(&names_buf);
-            var listed: usize = 0;
-            for (picker.offers.items, 0..) |*offer, index| {
-                if (picker.providerReady(offer.provider_id)) continue;
-                const first = for (picker.offers.items[0..index]) |earlier| {
-                    if (earlier.provider_id.eql(offer.provider_id)) break false;
-                } else true;
-                if (!first) continue;
-                names.print("{s}{s}", .{ if (listed > 0) ", " else "", offer.provider_id.slice() }) catch {};
-                listed += 1;
-            }
-            const room = layout.cols -| 24;
-            if (textWidth(names.buffered()) <= room) {
-                w.print("{s}", .{names.buffered()}) catch {};
-            } else {
-                w.print("{d} providers", .{summary.count}) catch {};
-            }
-            w.print("{s}", .{th.reset}) catch {};
-        },
-        .provider => |group| {
-            const offer = &picker.offers.items[group.offer_index];
-            paint(w, th, selected, false);
-            w.print("{s}{s}", .{ th.reset, th.dim }) catch {};
-            writePadded(w, offer.provider_id.slice(), 20);
-            const setup = picker.setupFor(offer.provider_id);
-            if (setup.sign_in) {
-                w.writeAll("/login") catch {};
-            } else if (setup.variable) |variable| {
-                w.print("{s} in .env", .{clip(variable, layout.cols -| 40)}) catch {};
-            }
-            w.print("{s}", .{th.reset}) catch {};
-        },
     }
     newline(w);
     return 1;
 }
 
 /// The controls of the focused route, a line each: the vocabulary after
-/// "default" (unset, the provider's own), the value it would commit
-/// bracketed, and the value wanted when this route shows the nearest one it
-/// has instead. ←/→ change the first.
+/// "default" (unset, the provider's own; not drawn for a control that
+/// declares its default, which is then one of the values), the value it
+/// would commit bracketed, and the value wanted when this route shows the
+/// nearest one it has instead. ←/→ change the first.
 fn controls(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     const offer = picker.focusedOffer() orelse return 0;
     if (offer.controls.len == 0) {
@@ -328,7 +302,7 @@ fn controls(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u1
         const indent = 3 + textWidth(spec.label);
         var row: ChoiceRow = .{ .w = w, .limit = cols -| 1, .indent = indent, .at = indent };
         const shown = picker.effectiveValue(spec);
-        row.choice(th, "default", shown == null);
+        if (picker_mod.declaredDefault(spec) == null) row.choice(th, "default", shown == null);
         for (spec.allowed_values) |candidate| {
             row.choice(th, candidate, if (shown) |value| std.mem.eql(u8, value, candidate) else false);
         }
@@ -395,27 +369,13 @@ fn writeChoice(w: *std.Io.Writer, th: Theme, text: []const u8, chosen: bool) voi
     }
 }
 
-fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, under: ?Row) u16 {
+/// The keys, then the next-turn rule. A list no provider is configured for
+/// has nothing to apply, and names only the ways out (#488).
+fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, applies: bool) u16 {
     line(w);
-    const esc: []const u8 = if (picker.filter_len > 0)
-        "esc clear filter"
-    else switch (picker.stage) {
-        .list => "esc cancel",
-        else => "esc back",
-    };
-    // On a row that applies nothing the footer says what Enter does there
-    // instead (#488).
-    const instead: []const u8 = switch (picker.stage) {
-        .unconfigured => "enter shows where its credential goes",
-        else => if (under) |row| switch (row) {
-            .unconfigured => "enter lists them",
-            .model => |group| if (group.ready) "" else "enter shows where its credential goes",
-            .provider => "enter shows where its credential goes",
-            else => "",
-        } else "",
-    };
-    if (instead.len > 0) {
-        w.print("  {s}{s} · {s} · q close{s}", .{ th.dim, instead, esc, th.reset }) catch {};
+    const esc: []const u8 = if (picker.filter_len > 0) "esc clear filter" else "esc cancel";
+    if (!applies) {
+        w.print("  {s}{s} · q close{s}", .{ th.dim, esc, th.reset }) catch {};
     } else {
         const reasoning = if (picker.focusedOffer()) |offer| picker_mod.firstEnumeration(offer.controls) != null else false;
         w.print("  {s}enter apply{s} · tab scope{s} · {s}{s}", .{
@@ -436,10 +396,11 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, under: ?Row) u16 
     return 2;
 }
 
-/// Where a provider that is not configured gets its credential, in place of
-/// the list (#488): the variable, this install's `.env` and the guide; for a
-/// provider one signs in to (Metask), `/login` first. Nothing to choose and
-/// nothing to type, so the only keys named are the ones that leave.
+/// Where the provider of a route a commit found no credential for gets one,
+/// in place of the list (#483, #488): the variable, this install's `.env`
+/// and the guide; for a provider one signs in to (Metask), `/login` first.
+/// Nothing to choose and nothing to type, so the only keys named are the
+/// ones that leave.
 fn setupBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     var rows: u16 = 0;
     if (picker.setup) |setup| {
@@ -765,7 +726,7 @@ test "a heading per provider says where its key comes from and who bills it; a r
         picker_mod.ProviderNote.init(ids.Slug.lit("metask"), "Metask", .signed_in),
         picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .local_config),
     };
-    try picker.setReadiness(&.{ true, true, true }, &.{}, &notes);
+    try picker.setReadiness(&.{ true, true, true }, &notes);
     const text = try screen(arena, &picker, 120);
     try testing.expect(std.mem.indexOf(u8, text, "Metask · signed in · billed to your Metask account") != null);
     try testing.expect(std.mem.indexOf(u8, text, "DeepSeek · key from .env · billed to your DeepSeek account") != null);
@@ -894,7 +855,32 @@ test "the reasoning line shows default and the vocabulary, the level shown brack
     try testing.expect(std.mem.indexOf(u8, text, "←/→ reasoning") == null);
 }
 
-test "providers with no credential are one dim line; Enter lists them; the footer says what Enter does there (#488)" {
+test "a control that declares its default shows it bracketed, with no default slot before the values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const declared = [_]controls_mod.ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Reasoning effort",
+        .kind = .enumeration,
+        .allowed_values = &.{ "none", "low", "high", "max" },
+        .default_value = .{ .text = controls_mod.ControlText.parse("high") catch unreachable },
+    }};
+    var offer = offerOf("deepseek", "default", "deepseek-v4-pro", "openai_chat");
+    offer.controls = &declared;
+    try seed(&picker, &.{offer}, null);
+    var text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "Reasoning effort   none   low  [high]  max   ←/→") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "default") == null);
+    // A level the session runs with is bracketed instead.
+    picker.presetControl("reasoning_effort", "none");
+    text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "Reasoning effort  [none]  low   high   max   ←/→") != null);
+}
+
+test "a provider with no credential is not drawn, and a filter does not find it (#488)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -906,17 +892,55 @@ test "providers with no credential are one dim line; Enter lists them; the foote
         offerOf("gemini", "default", "gemini-3", "gemini_generate"),
     };
     try seed(&picker, &offers, null);
-    const setups = [_]picker_mod.Setup{.{ .provider = ids.Slug.lit("openai"), .variable = "OPENAI_API_KEY" }};
-    try picker.setReadiness(&.{ true, false, false }, &setups, &.{});
-    _ = picker.onKey(.down);
+    try picker.setReadiness(&.{ true, false, false }, &.{});
     var text = try screen(arena, &picker, 120);
-    try testing.expect(std.mem.indexOf(u8, text, "Not configured · openai, gemini") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "enter lists them · esc cancel · q close") != null);
-    _ = picker.onKey(.enter);
+    try testing.expect(std.mem.indexOf(u8, text, "deepseek-v4-pro") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "enter apply") != null);
+    for ([_][]const u8{ "gpt-6", "gemini", "openai", "configured", "credential" }) |gone| {
+        try testing.expect(std.mem.indexOf(u8, text, gone) == null);
+    }
+    // Typed, the model of a provider with no credential is not found.
+    for ("gpt") |byte| _ = picker.onKey(.{ .char = byte });
     text = try screen(arena, &picker, 120);
-    try testing.expect(std.mem.indexOf(u8, text, "Not configured") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "OPENAI_API_KEY in .env") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "enter shows where its credential goes · esc back · q close") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing matches this filter — Esc clears it") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "gpt-6") == null);
+}
+
+test "with no provider configured, the list says /login and this install's .env, and the footer only the ways out (#488)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{
+        offerOf("metask", "default", "m1", "anthropic_messages"),
+        offerOf("kimi", "default", "k1", "openai_chat"),
+    };
+    try seed(&picker, &offers, null);
+    picker.setLocalConfig("/home/u/.metacodes/.env", "https://example.invalid/guide");
+    try picker.setReadiness(&.{ false, false }, &.{});
+    const text = try screen(arena, &picker, 120);
+    const hint = "no providers configured — /login, or configure /home/u/.metacodes/.env";
+    try testing.expect(std.mem.indexOf(u8, text, hint) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "esc cancel · q close") != null);
+    for ([_][]const u8{ "enter apply", "m1", "k1", "Not configured" }) |gone| {
+        try testing.expect(std.mem.indexOf(u8, text, gone) == null);
+    }
+    // A long path wraps inside the width, and the rows drawn are the rows
+    // counted.
+    picker.setLocalConfig("/home/someone/with/a/rather/long/path/to/the/install/state/root/.env", "");
+    for ([_]usize{ 80, 60 }) |cols| {
+        const buffer = try arena.alloc(u8, 32 * 1024);
+        var writer = std.Io.Writer.fixed(buffer);
+        const counted = render(&picker, &writer, theme_mod.dark, cols);
+        try testing.expectEqual(@as(usize, counted), std.mem.count(u8, writer.buffered(), "\r\n"));
+        for (try visibleRows(arena, writer.buffered())) |row| {
+            if (textWidth(row) >= cols) {
+                std.debug.print("too wide at {d} ({d}): {s}\n", .{ cols, textWidth(row), row });
+                return error.RowTooWide;
+            }
+        }
+    }
 }
 
 test "the setup stage shows the variable, this install's .env and the guide, and no way to type a key (#488)" {
@@ -947,12 +971,11 @@ test "a filter lists the matches flat, each naming its provider" {
         offerOf("zai-coding-plan", "default", "glm-4.6", "anthropic_messages"),
     };
     try seed(&picker, &offers, null);
-    try picker.setReadiness(&.{ true, false }, &.{}, &.{});
     for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
     const text = try screen(arena, &picker, 120);
     try testing.expect(std.mem.indexOf(u8, text, "Model  /glm") != null);
     try testing.expect(std.mem.indexOf(u8, text, "metask") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "zai-coding-plan · not configured") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "zai-coding-plan") != null);
     try testing.expect(std.mem.indexOf(u8, text, "billed to") == null);
 }
 
@@ -1000,7 +1023,7 @@ test "every row fits an 80-column terminal" {
         picker_mod.ProviderNote.init(ids.Slug.lit("metask"), "Metask", .signed_in),
         picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .environment),
     };
-    try picker.setReadiness(&.{ true, true, true, false, false, false, false, false }, &.{}, &notes);
+    try picker.setReadiness(&.{ true, true, true, false, false, false, false, false }, &notes);
     picker.presetControl("reasoning_effort", "high");
     const states = [_][]const u8{ "", "g", "glm" };
     for (states) |typed| {

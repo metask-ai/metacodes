@@ -29,6 +29,7 @@ pub const app_sign_out = @import("app/sign_out.zig"); // pub: component tests si
 const sign_out_mod = app_sign_out;
 const app_startup_order = @import("app/startup_order.zig");
 const startup_order = app_startup_order;
+const presets_mod = @import("app/presets.zig");
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
@@ -544,7 +545,7 @@ fn warnLocalConfig(allocator: std.mem.Allocator, local: *const state_env_mod.Loa
     if (quiet) log.warn("config", "{s}", .{summary}) else std.debug.print("warning: {s}\n", .{summary});
 }
 
-/// Level 5's other way in, after the sign-in hint: where this install's
+/// Level 7's other way in, after the sign-in hint: where this install's
 /// `.env` is, the template beside it when an install wrote one, and which
 /// providers' keys the file holds when it names none of them.
 fn printLocalConfigHint(local: *const state_env_mod.Loaded, unchosen: []const []const u8) void {
@@ -561,6 +562,39 @@ fn printLocalConfigHint(local: *const state_env_mod.Loaded, unchosen: []const []
     std.debug.print(") and names none: add {s}=<id> to choose one.\n", .{state_env_mod.provider_variable});
 }
 
+/// The notices said once under the banner, one per line; null when none
+/// is set. In `arena` (a notice alone is returned as it is).
+fn joinNotices(arena: std.mem.Allocator, notices: []const ?[]const u8) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var count: usize = 0;
+    for (notices) |maybe| {
+        const notice = maybe orelse continue;
+        if (count == 0) first = notice;
+        if (count > 0) out.writer.writeByte('\n') catch return first;
+        out.writer.writeAll(notice) catch return first;
+        count += 1;
+    }
+    return if (count <= 1) first else out.written();
+}
+
+/// What the TUI says once under its banner when `.env` holds keys of
+/// several providers and names none (#486): which ones, by display name, and
+/// that `/model` chooses (`route_state.writeUnchosenLocalNotice`). In `arena`.
+fn unchosenLocalNotice(arena: std.mem.Allocator, ids: []const []const u8) ?[]const u8 {
+    if (ids.len == 0) return null;
+    const names = arena.alloc([]const u8, ids.len) catch return null;
+    const host = buildProviderHost(arena);
+    defer if (host) |built| built.destroy();
+    for (ids, names) |id, *name| {
+        const profile = if (host) |built| built.registry.find(id) else null;
+        name.* = if (profile) |found| (arena.dupe(u8, found.display_name) catch id) else id;
+    }
+    var out: std.Io.Writer.Allocating = .init(arena);
+    route_state_mod.writeUnchosenLocalNotice(&out.writer, names) catch return null;
+    return out.written();
+}
+
 /// ` (template: <dir>/.env.example)` when that file exists, else "".
 fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     const dir = std.fs.path.dirname(env_path) orelse return "";
@@ -570,7 +604,7 @@ fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, " (template: {s})", .{template}) catch "";
 }
 
-/// Level 2 of the startup order, judged before it is applied (#485).
+/// Level 4 of the startup order, judged before it is applied (#485).
 const StoredDefault = startup_order.StoredDefault;
 
 /// Whether the default stored by `/model` can serve this start: its route
@@ -630,20 +664,116 @@ fn applyAuthPrecedenceEnv(config: *types.Config) void {
 
 /// What the startup order reads (`startup_order.Facts`), for `config` as the
 /// start holds it once its flags and the environment are applied (level 1),
-/// and `local`, the install's `.env`. Reads files, sends nothing, changes
-/// nothing: a start applies the decision, `login status` shows it.
-fn startupFacts(allocator: std.mem.Allocator, config: types.Config, local: *const state_env_mod.Loaded, local_metask_key: ?[]const u8) startup_order.Facts {
+/// `local`, the install's `.env`, and `presets`, what `presetFacts` read.
+/// Reads files, sends nothing, changes nothing: a start applies the
+/// decision, `login status` shows it.
+fn startupFacts(allocator: std.mem.Allocator, config: types.Config, local: *const state_env_mod.Loaded, local_metask_key: ?[]const u8, presets: *const presets_mod.Facts) startup_order.Facts {
     const named = config.provider_profile != null or config.provider_offer != null;
+    // A level above the stored default decides: the default is not judged.
+    const above_default = named or presets.named == .found or presets.directory_preset == .found;
     const metask_key_requested = config.api_key != null or
         (config.auth_precedence == .api_key_first and (std.c.getenv("METASK_API_KEY") != null or local_metask_key != null));
     return .{
         .named = named,
-        .stored_default = if (named) .none else storedDefault(allocator, config, metask_key_requested),
+        .preset = presets.named,
+        .directory_preset = presets.directory_preset,
+        .stored_default = if (above_default) .none else storedDefault(allocator, config, metask_key_requested),
         .metask_key = metaskSignInPresent(allocator, config, local_metask_key),
         .metask_key_requested = metask_key_requested,
         .metask_session = metaskSessionStored(allocator, config.state_root),
+        .local_preset = presets.local_preset,
         .local = local.choice(),
     };
+}
+
+/// Levels 2, 3 and 6 of the startup order (#489): the preset `--preset` (or
+/// `METACODES_PRESET` in the shell) names, the one the working directory
+/// remembers, and `METACODES_PRESET` in `local`, each judged against
+/// config.json (`src/app/presets.zig`). `with_routes` names each found
+/// preset's route (`login status`), which builds the provider runtime once
+/// more. Reads files, sends nothing; everything is in `arena`.
+fn presetFacts(arena: std.mem.Allocator, config: types.Config, local: *const state_env_mod.Loaded, with_routes: bool) presets_mod.Facts {
+    var inputs: presets_mod.Inputs = .{
+        .flag = config.preset,
+        .local = local.get(state_env_mod.preset_variable),
+        .cwd = @import("util/fs.zig").getCwd(arena) catch null,
+    };
+    var store = provider_config_store.Store.initHome(arena, hostRoot()) catch
+        return presets_mod.gather(arena, inputs) catch presetFactsOutOfMemory();
+    defer store.deinit();
+    inputs.config_path = store.path;
+    var loaded = store.load();
+    defer if (loaded) |*document| document.deinit() else |_| {};
+    if (loaded) |*document| {
+        inputs.document = .{ .read = document };
+    } else |err| {
+        inputs.document = .{ .unreadable = @errorName(err) };
+    }
+    const host: ?*provider_host.Host = if (with_routes and inputs.document == .read) buildProviderHost(arena) else null;
+    defer if (host) |value| value.destroy();
+    if (host) |value| inputs.registry = &value.registry;
+    var facts = presets_mod.gather(arena, inputs) catch presetFactsOutOfMemory();
+    facts.config_path = arena.dupe(u8, store.path) catch presetFactsOutOfMemory();
+    return facts;
+}
+
+fn presetFactsOutOfMemory() noreturn {
+    std.debug.print("error: out of memory while reading the presets\n", .{});
+    std.process.exit(2);
+}
+
+/// A preset this start was asked for that config.json does not define
+/// (#489): `-p`, `serve`, `--web` and the rest stop, listing the presets
+/// there; the interactive TUI starts as if it had not been named and says so
+/// once under its banner (the returned notice).
+fn presetNotice(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    facts: *const presets_mod.Facts,
+    unknown: startup_order.Unknown,
+    env_path: []const u8,
+) ?[]const u8 {
+    const report = (presets_mod.unknownReport(allocator, facts, unknown, env_path) catch presetFactsOutOfMemory()) orelse return null;
+    if (!(interactiveRepl(config) and platform_term.isatty(0))) {
+        std.debug.print("error: {s}\n", .{report});
+        std.process.exit(2);
+    }
+    return std.fmt.allocPrint(allocator, "{s}\nStarted without it.", .{report}) catch report;
+}
+
+/// Levels 2, 3 and 6 (#489): the preset that decided names the route the
+/// way `--provider`, `--channel`, `--model` (or `--offer`) and
+/// `--reasoning-effort` would; a flag the start was given keeps its field.
+/// A preset whose route does not resolve stops the start, as a stored
+/// default's does. Returns whether a preset decided.
+fn applyDecidedPreset(
+    config: *types.Config,
+    allocator: std.mem.Allocator,
+    local: *const state_env_mod.Loaded,
+    facts: *const presets_mod.Facts,
+    decision: startup_order.Decision,
+) bool {
+    const found = facts.decided(decision) orelse return false;
+    const selection = facts.selection(found.name) orelse return false;
+    // `.env`'s METACODES_MODEL is `--model` for the file's own choice.
+    if (decision == .local_preset and !config.model_explicit) if (local.get(state_env_mod.model_variable)) |model| {
+        config.model = model;
+        config.model_explicit = true;
+    };
+    const host = buildProviderHost(allocator) orelse {
+        std.debug.print("error: provider registry initialization failed\n", .{});
+        std.process.exit(2);
+    };
+    defer host.destroy();
+    const outcome = presets_mod.apply(allocator, &host.registry, selection.*, config) catch presetFactsOutOfMemory();
+    switch (outcome) {
+        .refused => |why| {
+            std.debug.print("error: {s}\n", .{why.message(allocator, found.name, facts.config_path) catch "the preset cannot be applied"});
+            std.process.exit(2);
+        },
+        .applied => |applied| @import("util/log.zig").info("config", "preset {s}: provider {s}", .{ found.name, applied.provider }),
+    }
+    return true;
 }
 
 /// The API key a browser sign-in (`metacodes login`, `/login`) stored in
@@ -677,12 +807,12 @@ fn skippedDefaultNotice(arena: std.mem.Allocator, label: []const u8, instead: ?S
     return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in; this session uses {s}.", .{ label, line }) catch null;
 }
 
-/// Level 3 of the startup order: a Metask sign-in the historical path would
+/// Level 5 of the startup order: a Metask sign-in the historical path would
 /// use — `--api-key`, a runtime key descriptor, `METASK_API_KEY` (the
 /// environment's, or `file_key` from `.env`), or a login stored in
 /// `auth.json`. A stored login that cannot be read counts, so the run says
 /// why rather than quietly using another provider. The Metask session
-/// (`metaskSessionStored`) is level 3 too, after these (#499, #527).
+/// (`metaskSessionStored`) is level 5 too, after these (#499, #527).
 fn metaskSignInPresent(allocator: std.mem.Allocator, config: types.Config, file_key: ?[]const u8) bool {
     if (config.api_key != null) return true;
     if (std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) return true;
@@ -1066,9 +1196,11 @@ pub fn main(init: std.process.Init) !void {
     // The state root, after `--version` (which needs no state) and before
     // anything that reads or writes some.
     config.state_root = hostStateRoot() catch std.process.exit(2);
-    // The CLI is the host that opts into the built-in System-One advisor
-    // service; config.json and METACODES_JEV_* still override or empty it.
-    config.jev_builtin_default = true;
+    // The CLI does not take the built-in System-One advisor service (#474):
+    // a session's request and memory excerpts leave the machine for the
+    // advisor only when config.json or METACODES_JEV_URL names one. `doctor`
+    // reads the same constant.
+    config.jev_builtin_default = @import("jev/runtime.zig").CLI_USES_BUILTIN_DEFAULT;
     if (config.state_root.len > 0) {
         // Every subsystem writes beneath the root; create it (and an install's
         // `<prefix>/state` parent chain) once, owner-only, before any of them
@@ -1137,15 +1269,17 @@ pub fn main(init: std.process.Init) !void {
     // (endpoint + 协议 + wire model id + auth scheme),不再靠 model 名前缀猜。
     // 没命名 provider 的会话保持历史推断路径,行为零变化。
     //
-    // The startup order (#486), first that applies wins:
+    // The startup order (#486, #489), first that applies wins:
     //   1. flags and the process environment: --provider, --offer,
     //      METACODES_PROVIDER (--model and METACODES_MODEL pick the model);
-    //   2. the default stored by /model (config.json `global_selection`);
-    //   3. a Metask sign-in: --api-key, METASK_API_KEY, auth.json — the
+    //   2. a preset named at start: --preset, METACODES_PRESET;
+    //   3. the preset the working directory remembers;
+    //   4. the default stored by /model (config.json `global_selection`);
+    //   5. a Metask sign-in: --api-key, METASK_API_KEY, auth.json — the
     //      historical path. The file's METASK_API_KEY counts only while the
     //      file names no provider other than Metask;
-    //   4. the provider `<state root>/.env` configures;
-    //   5. none: the historical path stops at credential resolution.
+    //   6. `<state root>/.env`: its preset, else the provider it configures;
+    //   7. none: the historical path stops at credential resolution.
     // A file that simply fed the environment would put its
     // METACODES_PROVIDER in level 1, above a stored default and a sign-in.
     if (config.provider_profile == null) {
@@ -1162,23 +1296,24 @@ pub fn main(init: std.process.Init) !void {
     // development override and is an origin, never a /v1/messages URL.
     // The levels, decided once from what they read (src/app/startup_order.zig;
     // `metacodes login status` shows the same decision).
-    const startup_facts = startupFacts(allocator, config, &local_config, local_metask_key);
+    const preset_facts = presetFacts(allocator, config, &local_config, false);
+    const startup_facts = startupFacts(allocator, config, &local_config, local_metask_key, &preset_facts);
     const startup_decision = startup_order.decide(startup_facts);
     const metask_legacy_requested = startup_facts.metask_key_requested;
-    // Level 2 (#485): a stored default counts only while its provider has a
+    // Level 4 (#485): a stored default counts only while its provider has a
     // credential; one that lacks it is passed over for the levels below, and
     // the start says so once (`skipped_default_notice`).
     const stored_default: StoredDefault = startup_facts.stored_default;
-    // Whether a flag or the shell named the route: then nothing below is a
-    // "default" the start chose for the user.
-    const named_at_start = startup_facts.named;
-    // Level 3 by the Metask session (#499, #527): the browser sign-in
+    // Whether a flag, the shell or a preset named the route: then nothing
+    // below is a "default" the start chose for the user.
+    const named_at_start = startup_facts.named or startup_decision.byPreset();
+    // Level 5 by the Metask session (#499, #527): the browser sign-in
     // (`/login`, `metacodes login`) and the device code both store it, and a
     // plain launch signs in with it the way `--provider metask` does. A key
     // that signs Metask in (`--api-key`, `METASK_API_KEY`, a key in
     // `auth.json`) is the historical path's and keeps serving it.
     const metask_session_sign_in = startup_decision == .metask_session;
-    // Level 4. Nothing below a stored default or a sign-in reads the file's
+    // Level 6. Nothing below a stored default or a sign-in reads the file's
     // choice, and a key that is only in the shell environment never selects
     // a provider: those keys were not put there for metacodes.
     var unchosen_local_providers: []const []const u8 = &.{};
@@ -1203,6 +1338,11 @@ pub fn main(init: std.process.Init) !void {
             },
         }
     }
+    // Levels 2, 3 and 6 by a preset (#489): it names its route as the flags
+    // would, so everything below treats it as a named provider. A preset
+    // config.json does not define decides nothing (`presetNotice`).
+    const preset_notice = presetNotice(allocator, config, &preset_facts, startup_order.unknownPresets(startup_facts, startup_decision), local_config.path);
+    const preset_applied = applyDecidedPreset(&config, allocator, &local_config, &preset_facts, startup_decision);
     if (metask_session_sign_in) {
         config.provider_profile = "metask";
         // The model and reasoning level the sign-in chose (`auth.json`): the
@@ -1244,7 +1384,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-    // Whether level 2 decided the route: a stored Metask default then also
+    // Whether level 4 decided the route: a stored Metask default then also
     // takes the browser sign-in's key (`browserSignInKey`).
     var stored_default_applied = false;
     if (config.provider_profile) |profile_name| {
@@ -1369,10 +1509,11 @@ pub fn main(init: std.process.Init) !void {
         var browser_key = false;
         provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
             const no_sign_in = err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession;
-            // Level 2 (#485): a stored Metask default with no device-code
+            // Level 4 (#485): a stored Metask default with no device-code
             // session authenticates with the browser sign-in's key, on the
-            // stored route, as the historical path would.
-            if (no_sign_in and stored_default_applied) if (browserSignInKey(allocator, config.state_root)) |key| {
+            // stored route, as the historical path would; so does a Metask
+            // preset (#489).
+            if (no_sign_in and (stored_default_applied or preset_applied)) if (browserSignInKey(allocator, config.state_root)) |key| {
                 browser_key = true;
                 break :blk key;
             };
@@ -1393,7 +1534,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (!introspection_only and !metask_scope) {
-        // Level 1 (and 2 and 4, which name their provider the same way): a
+        // Level 1 (and 2 to 4 and 6, which name their provider the same way): a
         // provider without a key opens the TUI unbound, naming the key it
         // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
         const report: CredentialReport = if (may_open_unbound) .quiet else .print_help;
@@ -1424,7 +1565,7 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(secret);
     };
 
-    // Level 5 of the startup order (#484): with no credential at all, the
+    // Level 7 of the startup order (#484): with no credential at all, the
     // interactive TUI opens unbound — no model, nothing sent, a reminder of
     // what to set up — instead of exiting (`may_open_unbound`).
     var resolved_credential: ?auth.ResolvedCredential = null;
@@ -1472,7 +1613,7 @@ pub fn main(init: std.process.Init) !void {
         @as([]const u8, credential.bearer_token)
     else
         "";
-    // Level 2 passed over (#485): said once — in the TUI under its banner,
+    // Level 4 passed over (#485): said once — in the TUI under its banner,
     // elsewhere on stderr now — with what this start uses instead.
     const skipped_default_notice: ?[]const u8 = switch (stored_default) {
         .lacks_credential => |label| skippedDefaultNotice(allocator, label, if (unbound != null) null else .{
@@ -1506,10 +1647,19 @@ pub fn main(init: std.process.Init) !void {
         const name = providerDisplayName(allocator, chosen.name);
         break :shadowed std.fmt.allocPrint(allocator, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
     };
-    const startup_notice: ?[]const u8 = if (skipped_default_notice != null and shadowed_local_notice != null)
-        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ skipped_default_notice.?, shadowed_local_notice.? }) catch skipped_default_notice
-    else
-        skipped_default_notice orelse shadowed_local_notice;
+    // `.env` holds keys of several providers and names none, and nothing
+    // above it decided (#486): the TUI opens without a model, as with nothing
+    // set up, and says once which providers and that `/model` chooses. `-p`
+    // and the rest stopped above, naming them (`printLocalConfigHint`).
+    const unchosen_local_notice: ?[]const u8 = unchosen: {
+        const reason = unbound orelse break :unchosen null;
+        if (!interactive_tui or reason != .nothing_configured) break :unchosen null;
+        break :unchosen switch (local_choice) {
+            .several => |ids| unchosenLocalNotice(allocator, ids),
+            else => null,
+        };
+    };
+    const startup_notice: ?[]const u8 = joinNotices(allocator, &.{ preset_notice, skipped_default_notice, shadowed_local_notice, unchosen_local_notice });
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -1812,11 +1962,12 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
 }
 
 /// The System-One advisor as a CLI session's `App.init` would configure it
-/// (METACODES_JEV_* over config.json `jev` over the built-in default), judged
-/// without contacting the service. Strings live in `arena`.
+/// (METACODES_JEV_* over config.json `jev`, and the built-in default only if
+/// the CLI takes it: `jev.CLI_USES_BUILTIN_DEFAULT`), judged without
+/// contacting the service. Strings live in `arena`.
 fn jevDiagnosis(arena: std.mem.Allocator, io: std.Io, state_root: []const u8) doctor.JevDiagnosis {
     const jev = @import("jev/runtime.zig");
-    return switch (jev.resolve(arena, io, state_root, true, jev.rawFromEnv())) {
+    return switch (jev.resolve(arena, io, state_root, jev.CLI_USES_BUILTIN_DEFAULT, jev.rawFromEnv())) {
         .off => |source| .{ .state = "off", .source = @tagName(source) },
         .invalid => |invalid| .{ .state = "invalid", .source = @tagName(invalid.source), .err = @errorName(invalid.err) },
         .on => |on| if (!@import("jev/client.zig").validOrigin(std.mem.trimEnd(u8, on.settings.origin, "/")))
@@ -2456,7 +2607,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
+    const subcommands = [_][]const u8{ "bench", "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -2468,6 +2619,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     // `update` repairs an install whose state root may be broken, like `doctor`.
     if (std.mem.eql(u8, cmd, "update")) return runUpdate(&args, init, allocator);
     const state_dir = hostStateRoot() catch return 2;
+    if (std.mem.eql(u8, cmd, "bench")) return @import("app/bench_cli.zig").run(&args, allocator, init.io, state_dir);
     if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
@@ -2611,7 +2763,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (provider_name) |name| {
         // A provider without an OAuth grant but with a page to create a key on
         // signs in with a pasted key (`ProviderProfile.api_key_setup`).
-        if (providerTakesPastedKey(allocator, name) or key_page != null or key_from_stdin or !check_key) {
+        if (providerTakesPastedKey(allocator, name, client_id, login_method) or key_page != null or key_from_stdin or !check_key) {
             if (mode == .oauth_json) {
                 std.debug.print("error: --oauth-token-json is for providers that sign in with OAuth\n", .{});
                 return 2;
@@ -2785,8 +2937,9 @@ fn printLoginHelp() void {
 /// token response is stored as the Metask session (`oauth/metask.json`), and
 /// the choice in `auth.json`, replacing a key or an older sign-in there (left
 /// there they would outrank the session at the next start). A stored `/model`
-/// default is forgotten, as `/login` does. Prints `done` (no full stop),
-/// the account it signed in as when the server says, on success.
+/// default is forgotten, and a Metask session it replaced revoked (#560), as
+/// `/login` does. Prints `done` (no full stop), the account it signed in as
+/// when the server says, on success.
 fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, token_json: []const u8, done: []const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2818,6 +2971,9 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         return 1;
     };
 
+    // The session this one replaces (#560), revoked once the sign-in is stored.
+    var replaced = metask_oauth_mod.Replaced.capture(allocator, state_dir);
+    defer replaced.deinit();
     var diagnostic: provider_login.ImportDiagnostic = .{};
     provider_login.importTokenResponse(allocator, state_dir, provider_ids_mod.Slug.lit("metask"), token_json, null, &diagnostic) catch |err| {
         std.debug.print("The sign-in was not stored: {s}\n", .{@errorName(diagnostic.cause orelse err)});
@@ -2843,8 +2999,15 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         catalog.entries.items[choice.model].model_id,
         choice.effort.name(),
     });
+    printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     forgetDefaultForSignIn(allocator, state_dir);
     return 0;
+}
+
+/// What a sign-in says about the Metask session it replaced (#560).
+fn printReplacedNote(outcome: metask_oauth_mod.ReplacedOutcome) void {
+    const note = metask_oauth_mod.replacedNote(outcome) orelse return;
+    std.debug.print("{s}{s}\n", .{ if (note.warn) "warning: " else "", note.text });
 }
 
 const ModelChoice = struct { model: usize, effort: types.ReasoningEffort };
@@ -2929,13 +3092,19 @@ const KeyLoginRequest = struct {
 };
 
 /// Whether `name` is a provider whose login is a pasted key: it declares a
-/// key page and no OAuth grant.
-fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8) bool {
+/// key page and no OAuth grant this login could run, the rule `/login`
+/// follows (`prepareFlow`). OpenAI declares a grant but no client to present
+/// with it, so it takes a key unless a client is configured for it. Asking
+/// for the grant (`--client-id`, `--device-code`) keeps it for a provider
+/// that has one, which then says what it lacks.
+fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8, client_id: ?[]const u8, method: oauth_login.Method) bool {
     const host = buildProviderHost(allocator) orelse return false;
     defer host.destroy();
     const profile = host.registry.find(name) orelse return false;
     if (profile.api_key_setup == null) return false;
     provider_login.requireOAuthCapable(profile) catch return true;
+    if (client_id != null or method != .loopback) return false;
+    _ = provider_login.prepareProfileWith(profile, .{ .state_root = "" }, host.oauthClientIdFor(profile.id)) catch return true;
     return false;
 }
 
@@ -3056,6 +3225,19 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
         }
         return 1;
     };
+    // A key variable for this provider in the shell or in `.env` is read
+    // before the stored key (`credential.resolve`): say so, by name, rather
+    // than promise that new sessions use the key just stored.
+    var local_config = loadLocalConfig(allocator, allocator, state_dir);
+    defer local_config.deinit();
+    if (provider_login.keyShadowedBy(profile, provider_credential.EnvLookup.process(), local_config.lookup())) |shadow| {
+        var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+        var notice: std.Io.Writer = .fixed(&notice_buf);
+        provider_login.writeKeyShadowNotice(&notice, shadow, local_config.path) catch {};
+        std.debug.print("warning: {s}\n", .{notice.buffered()});
+        std.debug.print("No key was printed.\n", .{});
+        return 0;
+    }
     std.debug.print("New sessions on {s} use it (`metacodes --provider {s}`, or pick a {s} model in /model). No key was printed.\n", .{ profile.display_name, profile.id.slice(), profile.display_name });
     return 0;
 }
@@ -3240,7 +3422,7 @@ fn readLine(buf: []u8) !usize {
 
 /// `metacodes login status`: which credential a plain start here uses and
 /// why, the startup order's decision (src/app/startup_order.zig, the one
-/// `main` applies), then what each of its five levels holds. Names, paths
+/// `main` applies), then what each of its seven levels holds. Names, paths
 /// and an expiry only: never a key or a token.
 fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -3256,10 +3438,11 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     config.credential_env_fallback = local_config.lookup();
     applyAuthPrecedenceEnv(&config);
     if (std.c.getenv("METACODES_PROVIDER")) |raw| config.provider_profile = std.mem.span(raw);
-    const facts = startupFacts(arena, config, &local_config, local_metask_key);
+    const preset_facts = presetFacts(arena, config, &local_config, true);
+    const facts = startupFacts(arena, config, &local_config, local_metask_key, &preset_facts);
     const decision = startup_order.decide(facts);
 
-    // Level 3's two stores: the session (#527) and auth.json.
+    // Level 5's two stores: the session (#527) and auth.json.
     const session_text: ?[]const u8 = session: {
         var session = provider_oauth_mod.Session.initHome(arena, state_dir, provider_ids_mod.Slug.lit("metask")) catch break :session null;
         defer session.deinit();
@@ -3291,6 +3474,12 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             if (env_model != null) " · " else "",
             env_model orelse "",
         }),
+        .preset => if (preset_facts.decided(decision)) |found|
+            std.debug.print("This start uses the preset {s} ({s} in the shell){s}.\n", .{ found.name, presets_mod.variable, presetRoute(arena, found) }),
+        .directory_preset => if (preset_facts.decided(decision)) |found|
+            std.debug.print("This start uses the preset {s}, remembered for {s}{s}.\n", .{ found.name, preset_facts.directory, presetRoute(arena, found) }),
+        .local_preset => if (preset_facts.decided(decision)) |found|
+            std.debug.print("This start uses the preset {s} from {s}{s}.\n", .{ found.name, env_path, presetRoute(arena, found) }),
         .stored_default => switch (facts.stored_default) {
             .usable => |usable| if (usable.label) |name|
                 std.debug.print("This start uses the default stored with /model: {s}.\n", .{name})
@@ -3310,14 +3499,16 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             else => {},
         },
         .local_unchosen => switch (facts.local) {
-            .several => |ids| std.debug.print("This start uses no provider: {s} holds keys of several ({s}) and names none. Add {s}=<one of them> to it.\n", .{
+            // The terminal UI opens without a model and says to choose in
+            // /model (`route_state.writeUnchosenLocalNotice`); -p stops.
+            .several => |ids| std.debug.print("This start uses no provider: {s} holds keys of several ({s}) and names none. Choose one with /model; Tab there applies it to every future session. Or add {s}=<one of them> to it.\n", .{
                 env_path, std.mem.join(arena, ", ", ids) catch "", state_env_mod.provider_variable,
             }),
             else => {},
         },
         .nothing => std.debug.print("This start uses no provider: nothing is set up. Sign in with `{s} login`, or put a provider's key in {s}.\n", .{ invokedCommand(arena), env_path }),
     }
-    std.debug.print("Level {d} of 5 decided; the first that applies wins:\n", .{decision.level()});
+    std.debug.print("Level {d} of {d} decided; the first that applies wins:\n", .{ decision.level(), startup_order.levels });
 
     const mark = struct {
         fn at(level: u8, decided: startup_order.Decision) []const u8 {
@@ -3330,15 +3521,29 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     } else {
         std.debug.print("{s}1 named at start: nothing (METACODES_PROVIDER is not set)\n", .{mark.at(1, decision)});
     }
-    // 2. The default stored with /model.
-    switch (facts.stored_default) {
-        .none => std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), if (facts.named) "not consulted, level 1 names a provider" else "none" }),
-        .unreadable => std.debug.print("{s}2 stored default: config.json cannot be read\n", .{mark.at(2, decision)}),
-        .usable => |usable| std.debug.print("{s}2 stored default: {s}\n", .{ mark.at(2, decision), usable.label orelse "set" }),
-        .lacks_credential => |label| std.debug.print("{s}2 stored default: {s}, which has no key or sign-in: passed over\n", .{ mark.at(2, decision), label }),
+    // 2. A preset named at start: the shell's.
+    std.debug.print("{s}2 preset named at start: ", .{mark.at(2, decision)});
+    switch (facts.preset) {
+        .none => std.debug.print("nothing ({s} is not set)\n", .{presets_mod.variable}),
+        .found => |found| std.debug.print("{s}={s} in the shell{s}{s}\n", .{ presets_mod.variable, found.name, presetRoute(arena, found), if (facts.named) " (not consulted, level 1 names a provider)" else "" }),
+        .unknown => |name| std.debug.print("{s}={s} in the shell, {s}\n", .{ presets_mod.variable, name, presetMissing(arena, &preset_facts) }),
     }
-    // 3. A Metask sign-in: the historical path's key, else the session.
-    std.debug.print("{s}3 Metask sign-in: {s}\n", .{ mark.at(3, decision), session_text orelse "no session" });
+    // 3. The preset this directory remembers.
+    std.debug.print("{s}3 this directory ({s}): ", .{ mark.at(3, decision), if (preset_facts.directory.len > 0) preset_facts.directory else "the working directory cannot be read" });
+    switch (facts.directory_preset) {
+        .none => std.debug.print("remembers no preset\n", .{}),
+        .found => |found| std.debug.print("remembers {s}{s}{s}\n", .{ found.name, presetRoute(arena, found), if (decision.level() < 3) " (not consulted, a level above decides)" else "" }),
+        .unknown => |name| std.debug.print("remembers {s}, {s}\n", .{ name, presetMissing(arena, &preset_facts) }),
+    }
+    // 4. The default stored with /model.
+    switch (facts.stored_default) {
+        .none => std.debug.print("{s}4 stored default: {s}\n", .{ mark.at(4, decision), if (facts.named) "not consulted, level 1 names a provider" else if (facts.decidedAboveDefault()) "not consulted, a preset above decides" else "none" }),
+        .unreadable => std.debug.print("{s}4 stored default: config.json cannot be read\n", .{mark.at(4, decision)}),
+        .usable => |usable| std.debug.print("{s}4 stored default: {s}\n", .{ mark.at(4, decision), usable.label orelse "set" }),
+        .lacks_credential => |label| std.debug.print("{s}4 stored default: {s}, which has no key or sign-in: passed over\n", .{ mark.at(4, decision), label }),
+    }
+    // 5. A Metask sign-in: the historical path's key, else the session.
+    std.debug.print("{s}5 Metask sign-in: {s}\n", .{ mark.at(5, decision), session_text orelse "no session" });
     if (auth_error) |why| {
         std.debug.print("      {s}: cannot be read ({s})\n", .{ auth_path, why });
     } else if (stored) |value| {
@@ -3364,22 +3569,30 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     } else {
         std.debug.print("      METASK_API_KEY: not set\n", .{});
     }
-    // 4. The install's .env: names only.
+    // 6. The install's .env: names only. Its preset comes before its provider.
     const diagnosis = localConfigDiagnosis(arena, &local_config) catch return;
-    std.debug.print("{s}4 {s}: {s}", .{ mark.at(4, decision), env_path, localStateWords(diagnosis.state) });
+    std.debug.print("{s}6 {s}: {s}", .{ mark.at(6, decision), env_path, localStateWords(diagnosis.state) });
     if (diagnosis.accepted.len > 0) std.debug.print("; {s}", .{std.mem.join(arena, ", ", diagnosis.accepted) catch ""});
     if (diagnosis.ignored.len > 0) std.debug.print("; ignored: {s}", .{std.mem.join(arena, ", ", diagnosis.ignored) catch ""});
-    switch (facts.local) {
+    switch (facts.local_preset) {
+        .none => {},
+        .found => |found| {
+            std.debug.print("; selects the preset {s}{s}\n", .{ found.name, presetRoute(arena, found) });
+        },
+        .unknown => |name| std.debug.print("; {s}={s}, {s}", .{ presets_mod.variable, name, presetMissing(arena, &preset_facts) }),
+    }
+    if (facts.local_preset != .found) switch (facts.local) {
         .none => std.debug.print("; configures no provider\n", .{}),
         .provider => |chosen| std.debug.print("; configures {s}{s}\n", .{ providerDisplayName(arena, chosen.name), if (chosen.named) "" else " (the one provider whose key it holds)" }),
         .several => |ids| std.debug.print("; keys of several providers ({s}) and no {s}\n", .{ std.mem.join(arena, ", ", ids) catch "", state_env_mod.provider_variable }),
-    }
-    // 5. Nothing.
-    std.debug.print("{s}5 nothing: the TUI opens without a model; -p and the rest stop\n", .{mark.at(5, decision)});
+    };
+    // 7. Nothing.
+    std.debug.print("{s}7 nothing: the TUI opens without a model; -p and the rest stop\n", .{mark.at(7, decision)});
 
     // Keys only in the shell are not metacodes' to pick up (第四节).
     const chosen_provider: ?[]const u8 = switch (decision) {
         .named => config.provider_profile,
+        .preset, .directory_preset, .local_preset => if (preset_facts.decided(decision)) |found| found.provider else null,
         .stored_default => switch (facts.stored_default) {
             .usable => |usable| usable.provider,
             else => null,
@@ -3393,6 +3606,26 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     const shell_keys = shellOnlyKeys(arena, chosen_provider);
     if (shell_keys.len > 0) std.debug.print("Keys in the shell choose no provider: {s}. To use one: --provider <id>, or put it in {s}.\n", .{ shell_keys, env_path });
     std.debug.print("No secret was printed.\n", .{});
+}
+
+/// `: House relay · relay-model`, a found preset's route for `login status`;
+/// what a start does instead when it does not resolve.
+fn presetRoute(arena: std.mem.Allocator, found: startup_order.Preset.Found) []const u8 {
+    const label = found.label orelse return ", whose route does not resolve: a start stops and says why";
+    return std.fmt.allocPrint(arena, ": {s}", .{label}) catch "";
+}
+
+/// What `login status` says of a preset config.json does not define: why,
+/// and that the start passes it over (stopping, outside the TUI).
+fn presetMissing(arena: std.mem.Allocator, facts: *const presets_mod.Facts) []const u8 {
+    const path = if (facts.config_path.len > 0) facts.config_path else "config.json";
+    const why = if (facts.unreadable) |err|
+        std.fmt.allocPrint(arena, "which cannot be looked up: {s} cannot be read ({s})", .{ path, err }) catch ""
+    else if (facts.defined.len == 0)
+        std.fmt.allocPrint(arena, "which {s} does not define (it defines no presets)", .{path}) catch ""
+    else
+        std.fmt.allocPrint(arena, "which {s} does not define (presets: {s})", .{ path, std.mem.join(arena, ", ", facts.defined) catch "" }) catch "";
+    return std.fmt.allocPrint(arena, "{s}: passed over by the TUI, -p and the rest stop", .{why}) catch why;
 }
 
 /// What signs Metask in on the historical path, in the order it reads them
@@ -3669,11 +3902,15 @@ fn runMetaskDeviceLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []c
         std.debug.print("error: could not initialize the Metask OAuth store ({s})\n", .{@errorName(err)});
         return 2;
     };
+    // The session this one replaces (#560), revoked once it is stored.
+    var replaced = metask_oauth_mod.Replaced.capture(allocator, hostRoot());
+    defer replaced.deinit();
     session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
         std.debug.print("error: could not store the Metask OAuth session ({s})\n", .{@errorName(err)});
         return 2;
     };
     std.debug.print("Stored Metask OAuth session. No secret was printed.\n", .{});
+    printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     std.debug.print("No model was chosen (not at a terminal): start with --model <id>, or choose one with /model.\n", .{});
     return 0;
 }
@@ -3772,6 +4009,9 @@ fn importProviderTokenResponse(
     token_json: []const u8,
     client_id: ?[]const u8,
 ) u8 {
+    // A Metask session this replaces (#560), revoked once it is stored.
+    var replaced = if (provider_id.eqlText("metask")) metask_oauth_mod.Replaced.capture(allocator, hostRoot()) else metask_oauth_mod.Replaced.none;
+    defer replaced.deinit();
     var diagnostic: provider_login.ImportDiagnostic = .{};
     provider_login.importTokenResponse(allocator, hostRoot(), provider_id, token_json, client_id, &diagnostic) catch |err|
         return reportImportFailure(err, diagnostic);
@@ -3779,6 +4019,7 @@ fn importProviderTokenResponse(
         "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
         .{provider_id.slice()},
     );
+    printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     return 0;
 }
 
@@ -4304,6 +4545,12 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 return;
             };
             config.provider_offer = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--preset")) {
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --preset", .{});
+                return;
+            };
+            config.preset = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--openai-protocol")) {
             // 值域 fail-closed:拼错的协议名静默落默认 = 请求打到错误端点还不知情。
             const v = args.next() orelse {
@@ -4781,6 +5028,9 @@ fn printHelp() void {
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
         \\  --version             Print version and build identity and exit (--json: one JSON document)
+        \\  bench [open|info|list|run] [--url <workbench>] [--no-open]
+        \\                        Open Bench workbench; select tasks/models and run evaluations.
+        \\                        bench run --task <name> --wait prints the result link when done.
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
@@ -4873,6 +5123,8 @@ fn printHelp() void {
         \\  --provider <id>       Provider profile id or alias (metask | openai | gemini | zai-coding-plan)
         \\  --channel <id>        Channel within the provider (e.g. cn-anthropic, global-openai)
         \\  --offer <offer-id>    Pin one exact model route (offer-...); see --provider output
+        \\  --preset <name>       Use a preset from config.json "presets" (env METACODES_PRESET); --provider/--offer
+        \\                        set it aside, --model/--channel/--reasoning-effort replace its field for this run
         \\  --check-providers     Validate provider configuration and list every route, then exit (no network)
         \\  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
         \\  --auth-precedence <p> api-key-first | oauth-first
@@ -5127,6 +5379,7 @@ test {
     _ = &@import("app/route_state.zig");
     _ = &@import("app/sign_out.zig");
     _ = &@import("app/startup_order.zig");
+    _ = &@import("app/presets.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");

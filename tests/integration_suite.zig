@@ -56,6 +56,7 @@ test {
     _ = @import("component/cli_help_test.zig");
     _ = @import("component/launcher_hint_test.zig");
     _ = @import("component/state_env_test.zig");
+    _ = @import("component/preset_test.zig");
     _ = @import("component/unbound_session_test.zig");
     _ = @import("component/login_logout_test.zig");
     _ = @import("component/next_step_test.zig");

@@ -3176,10 +3176,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             // No grant to run, but a page to create a key on: the user pastes
             // the key here (`ProviderProfile.api_key_setup`).
             if (profile.api_key_setup != null) {
-                if (named) |name| if (profile.matchesName(name)) {
-                    start_at = dialog.choices_len;
-                };
-                dialog.add(.{ .profile = profile, .method = .api_key });
+                offerLogin(&dialog, &start_at, named, .{ .profile = profile, .method = .api_key });
                 continue;
             }
             if (named) |name| if (profile.matchesName(name)) {
@@ -3188,10 +3185,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             };
             continue;
         };
-        if (named) |name| if (profile.matchesName(name)) {
-            start_at = dialog.choices_len;
-        };
-        dialog.add(.{ .profile = profile, .method = .{ .flow = flow } });
+        offerLogin(&dialog, &start_at, named, .{ .profile = profile, .method = .{ .flow = flow } });
     }
     if (named) |name| if (start_at == null) {
         cmd_output.print("{s}Unknown provider '{s}'{s}\n", .{ th.danger, name, th.reset });
@@ -3207,6 +3201,12 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .signed_in, .key_stored => |label| {
             if (dialog.outcome == .key_stored) {
                 cmd_output.print("Stored the key for {s} · /model to choose a model\n", .{label});
+                // A key variable in the shell or `.env` is read before the
+                // stored key: say which, by name.
+                var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+                if (app.storedKeyShadowNotice(dialog.chosenProfile(), &notice_buf)) |notice| {
+                    cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
+                }
             } else {
                 cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
             }
@@ -3215,8 +3215,21 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             app.refreshModelPicker() catch |err| {
                 cmd_output.print("{s}The model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, @errorName(err), th.reset });
             };
+            // A session on this provider sends what was just stored (#566).
+            _ = app.adoptProviderLogin(dialog.chosenProfile().id);
         },
     }
+}
+
+/// Offer one provider in `/login`'s list. The one `/login <id>` named is
+/// held even past the rows the list shows (`LoginDialog.addNamed`), and
+/// `start_at` takes its index.
+fn offerLogin(dialog: *dialogs.LoginDialog, start_at: *?usize, named: ?[]const u8, choice: dialogs.LoginDialog.Choice) void {
+    if (named) |name| if (choice.profile.matchesName(name)) {
+        start_at.* = dialog.addNamed(choice);
+        return;
+    };
+    dialog.add(choice);
 }
 
 /// `/login` (#485, #527): the Metask browser sign-in, or with `device_code`
@@ -3285,6 +3298,10 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
     cmd_output.print(" · {s}", .{app.activeModel()});
     if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
     cmd_output.print("\n", .{});
+    // The session this sign-in replaced, revoked at Metask (#560).
+    if (@import("../api/metask_oauth.zig").replacedNote(applied.replaced)) |note| {
+        cmd_output.print("{s}{s}{s}\n", .{ if (note.warn) th.warn else th.dim, note.text, th.reset });
+    }
     if (applied.default_error) |err| {
         cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
     } else {
@@ -3435,6 +3452,8 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     app.refreshModelPicker() catch |err| {
         cmd_output.print("\x1b[33mThe model list did not refresh ({s}); /providers refresh retries\x1b[0m\n", .{@errorName(err)});
     };
+    // A session on this provider sends what was just stored (#566).
+    _ = app.adoptProviderLogin(outcome.provider_id);
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
