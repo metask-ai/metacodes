@@ -463,12 +463,14 @@ def test_picker_filter_does_not_find_a_provider_without_a_key(bin_path):
 def test_picker_filter_lists_whole_matches_before_scattered_ones(bin_path):
     # The filter also matches letters in order, so `glm` matches
     # `google/gemini-…` (g…l…m) as well as GLM-5.3. The models that hold the
-    # typed text whole come first, and the cursor starts on one of them.
+    # typed text whole come first, and the cursor starts on one of them. Both
+    # providers get a placeholder key: a filter finds only configured ones.
     raw = run(
         bin_path,
         submit("/model", OPEN) + ["type:glm", wait_for("GLM-5.3"), "sleep:0.3"],
         term_size=(30, 160),
-        env=_no_vendor_keys(HOME=case_tmpdir("cc-tty-rank-home-")),
+        env=_no_vendor_keys(HOME=case_tmpdir("cc-tty-rank-home-"), ZAI_API_KEY="tty-dummy-zai-key",
+                            GEMINI_API_KEY="tty-dummy-gemini-key"),
         per_key_drain=0.1,
     )
     _, text = _screen(raw, rows=30, cols=160)
