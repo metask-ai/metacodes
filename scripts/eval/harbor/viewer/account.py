@@ -190,6 +190,7 @@ class Account:
                     raise ValueError("catalog too large")
                 return json.loads(body)
         except urllib.error.HTTPError as exc:
+            exc.close()
             raise AccountHTTPError(exc.code) from None
         except (OSError, ValueError):
             raise ValueError("无法读取 Metask 账号目录，请检查执行机器的网络和登录状态") from None

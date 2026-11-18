@@ -68,6 +68,8 @@ class Client:
                 message = json.load(exc).get("error", str(exc.code))
             except (ValueError, AttributeError):
                 message = str(exc.code)
+            finally:
+                exc.close()
             raise ValueError(message) from None
 
     def open_url(self):

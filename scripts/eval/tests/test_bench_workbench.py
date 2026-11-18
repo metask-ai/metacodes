@@ -321,6 +321,7 @@ class WorkbenchTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request)
         self.assertEqual(caught.exception.code, 403)
+        caught.exception.close()
         self.assertEqual(self.manager.runs(), [])
 
     def test_unknown_models_shell_fragments_and_bad_ranges_are_refused_before_spawn(self):

@@ -196,7 +196,8 @@ class ServerTest(unittest.TestCase):
             with urllib.request.urlopen(self.base + path, timeout=10) as response:
                 return response.status, response.headers, response.read()
         except urllib.error.HTTPError as error:
-            return error.code, error.headers, error.read()
+            with error:
+                return error.code, error.headers, error.read()
 
     def test_public_bind_serves_http_without_reverse_dns(self):
         with patch('socket.getfqdn', side_effect=AssertionError('startup must not depend on reverse DNS')):

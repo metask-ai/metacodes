@@ -90,6 +90,7 @@ class RelayTest(unittest.TestCase):
                     with self.assertRaises(urllib.error.HTTPError) as caught:
                         urllib.request.urlopen(relay.url + '/missing', context=context, timeout=3)
                     self.assertEqual(caught.exception.code, 404)
+                    caught.exception.close()
                     # Leave the idle peer connected while shutting down.
                     relay.server.shutdown()
                     idle.shutdown(socket.SHUT_RDWR)
@@ -146,6 +147,7 @@ class RelayTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 urllib.request.urlopen(urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}'))
             self.assertEqual(caught.exception.code, 401)
+            caught.exception.close()
             self.assertEqual(len(seen), 1)
 
     def test_route_rewrite_preserves_model_protocol_and_original_configuration(self):
