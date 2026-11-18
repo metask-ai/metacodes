@@ -522,6 +522,20 @@ status, compatibility boundaries, and entry points are defined by
   the request failed as `McpOutcomeIndeterminate`. A reset before any
   response byte now counts as that close. A `tools/call` whose body went out
   is still never sent twice.
+- **A provider's error answer is shown as it was sent, whatever pieces it
+  arrived in** (#565). A non-2xx body that reached metacodes in more than one
+  read (the chunks of a `Transfer-Encoding: chunked` body, or a
+  `Content-Length` body whose bytes came in apart) came out scrambled in the
+  TUI's `HTTP <status>: …` line, the `body=` log line and the failure detail:
+  each later piece landed on the start of what had been read, so the first
+  piece was lost and the end repeated. OpenRouter's 402 for an account without
+  credits was one, and with it went the provider's explanation; an upstream
+  error code or the numbers of a context-limit message could go the same way,
+  since the failure detail and the overflow check read that text. All four
+  provider clients (Anthropic Messages, OpenAI-compatible, Gemini, Bedrock)
+  now read the body through one function, `client.readErrorBody`, which gives
+  the HTTP reader a buffer of its own; how much of a body is kept (2 KiB on
+  Messages, 4 KiB on the others) is unchanged.
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft
   went into the pending queue, the input box was cleared, and when the reply

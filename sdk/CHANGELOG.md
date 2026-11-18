@@ -86,6 +86,12 @@ empty `### Migration`.
   liveness monitor exits while no request is in flight and starts again with
   the next one. Nothing changes in the ABI, and a Host needs no new
   configuration; closing a Session still releases everything it held.
+- A `model_error` for a non-2xx answer whose body reached the provider client
+  in more than one read (several chunks, or a `Content-Length` body whose bytes
+  came in apart) now carries what the provider said (#565). The body used to be
+  read scrambled, each later piece over the start of what had been read, and
+  `message` and `code` were taken from that text; a context-limit message cut
+  up that way could also miss `context_window`. No ABI change.
 - A tool call whose arguments name a key twice (#494), such as `Grep` with
   `"-i"` twice or `Read` with `file_path` twice, no longer ends as
   `permission_denied` (`safety`, `recoverable: false`) in every permission
