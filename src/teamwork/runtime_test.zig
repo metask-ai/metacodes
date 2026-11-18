@@ -271,6 +271,8 @@ test "teamwork runtime L2: the SWE loop's happy path changes the workspace by ex
     try writeFile(fx.repo(), "draft.txt", "draft\n");
     const head_before = try sh(fx.repo(), "git rev-parse HEAD");
     defer testing.allocator.free(head_before);
+    const index_before = readFile(fx.repo(), ".git/index") orelse return error.FileMissing;
+    defer testing.allocator.free(index_before);
 
     const plans = [_]Plan{
         .{ .seat = "implementer-1", .require = "draft.txt", .files = &.{ feature, .{ .path = "src/app.txt", .bytes = "v2\n" } }, .user_files = &.{.{ .path = "README.md", .bytes = "readme edited by the user\n" }} },
@@ -296,6 +298,7 @@ test "teamwork runtime L2: the SWE loop's happy path changes the workspace by ex
     try expectFile(fx.repo(), "src/app.txt", "v2\n");
     try expectFile(fx.repo(), "README.md", "readme edited by the user\n");
     try expectFile(fx.repo(), "draft.txt", "draft\n");
+    try expectFile(fx.repo(), ".git/index", index_before);
     const porcelain = try sh(fx.repo(), "git status --porcelain");
     defer testing.allocator.free(porcelain);
     try testing.expectEqualStrings(" M README.md\n M src/app.txt\n?? draft.txt\n?? feature.txt\n", porcelain);

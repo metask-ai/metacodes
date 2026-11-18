@@ -295,29 +295,24 @@ pub fn mergeBackAfterScan(gpa: std.mem.Allocator, in: Input, after_scan: ?*const
         return .apply_failed;
     }
 
-    const conflicts = try recordConflicts(gpa, in, ours.items.items);
-    if (conflicts != 0) return .{ .conflict = conflicts };
     if (ours.items.items.len == 0) return .{ .applied = .{ .files = 0 } };
-    if (after_scan) |hook| try hook(in);
 
-    // Seed the throwaway index from the approved diff's preimages, with no
-    // stat data copied from the user checkout. --index makes apply verify the
-    // complete target files and modes against those preimages in the same
-    // operation that checks and writes the patch. The real index is untouched.
+    // Keep the index that produced the conflict scan's tree. Its rehashed
+    // entries describe the actual worktree and include the file stat data
+    // git apply --index needs to check the relevant preimages before writing.
     const index = try std.fs.path.joinZ(gpa, &.{ in.scratch_dir, "merge-index" });
     defer gpa.free(index);
-    pfs.unlinkPath(index.ptr) catch |err| switch (err) {
-        error.NotFound => {},
-        error.UnlinkFailed => return error.GitFailed,
-    };
     defer pfs.unlinkPath(index.ptr) catch {};
-    var seeded = try gitWithIndex(gpa, in.repo, &.{ "-c", "core.splitIndex=false", "read-tree", in.base.commit.slice() }, null, index);
-    defer seeded.deinit(gpa);
-    if (seeded.exit_code != 0) return error.GitFailed;
+    const user_now = try reviewer.workspaceTreeWithIndex(gpa, in.repo, index, null);
+    const conflicts = try recordConflicts(gpa, in, ours.items.items, user_now);
+    if (conflicts != 0) return .{ .conflict = conflicts };
+    if (after_scan) |hook| try hook(in);
+
     var out = try gitWithIndex(gpa, in.repo, &.{ "-c", "core.splitIndex=false", "apply", "--index", "--binary", "--whitespace=nowarn", in.patch_path }, null, index);
     defer out.deinit(gpa);
     if (out.exit_code != 0) {
-        const late_conflicts = try recordConflicts(gpa, in, ours.items.items);
+        const latest = try reviewer.workspaceTree(gpa, in.repo, in.scratch_dir, null);
+        const late_conflicts = try recordConflicts(gpa, in, ours.items.items, latest);
         if (late_conflicts != 0) return .{ .conflict = late_conflicts };
         run_dir.writeAtomic(in.conflicts_path, out.stderr) catch {};
         log.warn("teamwork", "merge-back: git apply refused the patch: {s}", .{std.mem.trimEnd(u8, out.stderr, "\r\n")});
@@ -340,15 +335,7 @@ fn changesGitlinks(gpa: std.mem.Allocator, in: Input) Error!bool {
     return false;
 }
 
-fn recordConflicts(gpa: std.mem.Allocator, in: Input, ours: []const []u8) Error!u32 {
-    const user_now = reviewer.workspaceTree(gpa, in.repo, in.scratch_dir, null) catch |err| return switch (err) {
-        error.NotARepository => error.NotARepository,
-        error.Unsupported => error.Unsupported,
-        error.PathTooLong => error.PathTooLong,
-        error.Aborted => error.Aborted,
-        error.OutOfMemory => error.OutOfMemory,
-        error.GitFailed => error.GitFailed,
-    };
+fn recordConflicts(gpa: std.mem.Allocator, in: Input, ours: []const []u8, user_now: TreeId) Error!u32 {
     var theirs = try changedPaths(gpa, in.repo, in.base.tree, user_now, null);
     defer theirs.deinit(gpa);
 

@@ -528,6 +528,15 @@ const git_timeout_ms: u64 = 60_000;
 /// effect is blob objects in the repository's object store. Repository hooks,
 /// fsmonitor and content filters are disabled for controller invocations.
 pub fn workspaceTree(gpa: std.mem.Allocator, workspace: []const u8, scratch_dir: []const u8, abort: ?*const AbortSignal) TreeError!TreeId {
+    const scratch = try std.fs.path.joinZ(gpa, &.{ scratch_dir, scratch_index_name });
+    defer gpa.free(scratch);
+    defer pfs.unlinkPath(scratch.ptr) catch {};
+    return workspaceTreeWithIndex(gpa, workspace, scratch, abort);
+}
+
+/// Rebuild a caller-owned scratch index and return the tree it describes.
+/// Retaining this index lets merge-back validate the same preimages at apply.
+pub fn workspaceTreeWithIndex(gpa: std.mem.Allocator, workspace: []const u8, scratch: [:0]const u8, abort: ?*const AbortSignal) TreeError!TreeId {
     if (builtin.os.tag == .windows) return error.Unsupported;
     const index_rel = (try git(gpa, workspace, null, &.{ "rev-parse", "--git-path", "index" }, abort)) orelse
         return error.NotARepository;
@@ -539,10 +548,10 @@ pub fn workspaceTree(gpa: std.mem.Allocator, workspace: []const u8, scratch_dir:
         try std.fs.path.join(gpa, &.{ workspace, index_text });
     defer gpa.free(index_path);
 
-    const scratch = try std.fs.path.joinZ(gpa, &.{ scratch_dir, scratch_index_name });
-    defer gpa.free(scratch);
-    defer pfs.unlinkPath(scratch.ptr) catch {};
-    pfs.unlinkPath(scratch.ptr) catch {};
+    pfs.unlinkPath(scratch.ptr) catch |err| switch (err) {
+        error.NotFound => {},
+        error.UnlinkFailed => return error.GitFailed,
+    };
     // Retain indexed paths (including staged ignored files), but not the
     // stat cache: copying the index gives it a new timestamp and invalidates
     // Git's racy-file protection. Re-read tracked bytes before adding new paths.
@@ -579,6 +588,10 @@ fn git(gpa: std.mem.Allocator, dir: []const u8, index_file: ?[]const u8, args: [
         try appendGitArgument(gpa, &owned, &argv, assignment);
     }
     for (prefix.items) |arg| try appendGitArgument(gpa, &owned, &argv, arg);
+    if (index_file != null) {
+        try appendGitArgument(gpa, &owned, &argv, "-c");
+        try appendGitArgument(gpa, &owned, &argv, "core.splitIndex=false");
+    }
     for (args) |arg| try appendGitArgument(gpa, &owned, &argv, arg);
     try argv.append(gpa, null);
     const out = common.spawnCaptureWithStderrTimed(argv.items, gpa, abort, git_timeout_ms, null, 64 * 1024, dir) catch |err| switch (err) {
