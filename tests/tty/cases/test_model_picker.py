@@ -153,16 +153,17 @@ def test_picker_opens_during_generation_without_alt_screen(bin_path):
 
 def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     # #220:生成期里筛到一半的浏览状态(过滤词)在回复结束后原样还在,而且 picker
-    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量(Metask 的标题回来),picker 仍开着。
+    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量(厂商标题回来),picker 仍开着。
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
     with SlowMockServer([slow_text_then_end(n_chunks=10, delay=0.4)]) as srv:
         raw = run(
             bin_path,
             # 回复结束后先等空闲输入框再按 Esc(生成结束到下次读输入之间的键会被 TCSAFLUSH
-            # 丢掉);过滤期间没有标题,Esc 清掉过滤后 Metask 的标题回来,以它为末态标志。
+            # 丢掉);过滤期间没有标题,Esc 清掉过滤后标题回来,以它为末态标志。光标留在
+            # 过滤时所在的 GLM-5.3 上,窗口跟着它,Metask 的标题可能滚出窗口,所以不认哪一家。
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
-             wait_for(OPEN), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("billed to your Metask account")],
+             wait_for(OPEN), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("billed to your")],
             base_url=srv.url,
             env={"ZAI_API_KEY": "tty-dummy-zai-key"},
             startup_drain=0.8,
@@ -171,9 +172,9 @@ def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     a, text = _screen(raw)
     kept = [sc for sc in _frames(a)
             if "tok9" in sc and "esc to interrupt" not in sc
-            and "Z.AI GLM Coding Plan" in sc and "billed to your Metask account" not in sc]
+            and "Z.AI GLM Coding Plan" in sc and "billed to your" not in sc]
     assert kept, "回复结束后过滤状态丢了(#220):\n" + text
-    assert OPEN in text and "billed to your Metask account" in text, "回复结束后 picker 不再接收按键:\n" + text
+    assert OPEN in text and "billed to your" in text, "回复结束后 picker 不再接收按键:\n" + text
 
 
 STORED_KEY = "tty-stored-gateway-key"
