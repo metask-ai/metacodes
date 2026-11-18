@@ -94,4 +94,3 @@ def run(command: Optional[str], *, active: store_config.StoreConfig, jobs_dirs: 
         return migrate(active, store_config.from_target(target, password_env), as_json, switch,
                        config_path, settings, save)
     raise ValueError("bench db 需要子命令：status、import 或 migrate")
-
