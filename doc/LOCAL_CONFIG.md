@@ -106,6 +106,11 @@ as `--model` does; without it the provider's default model is used. In a
 session, `/model` changes the model and the reasoning effort; the context
 length follows the model chosen.
 
+One file holds the keys of as many providers as you use: each key is read
+when its provider is chosen, by `--provider`, by `/model`, or by a default
+you stored there. Without `METACODES_PROVIDER` the file chooses none of
+them; [what a start does then](#which-provider-and-model-are-used).
+
 Any other name is ignored, with one warning that lists the ignored names and
 never their values. Only names written like variable names (capital letters,
 digits and `_`) are listed: any other ignored line is reported by its line
@@ -204,11 +209,18 @@ No secret was printed.
 ```
 
 A file with keys of several providers and no `METACODES_PROVIDER` chooses
-none: the terminal UI opens without a model, as in step 5, and its red note
-lists those providers; you add `METACODES_PROVIDER` to pick one. `-p` stops
-instead, listing them the same way. A `METASK_API_KEY` among them is the
-exception: with no name in the file it is a Metask sign-in (step 3), so that
-file starts on Metask.
+none, and metacodes does not guess. The terminal UI opens without a model,
+as in step 5, and says once under its banner which providers the file has
+keys for (`.env has keys for DeepSeek and OpenAI. Choose one with /model;
+Tab there applies it to every future session.`); a message you send gets
+the red note, which points to `/model` with the same names. A route you
+choose there is this session's; press Tab first, to "from now on", and it
+is stored as the default of step 2, so later starts use it without
+asking, with its key still read from this file. `-p`, `serve` and
+`--web` stop instead, listing the providers by id; add
+`METACODES_PROVIDER=<id>` to the file, or store a default in `/model` once.
+A `METASK_API_KEY` among them is the exception: with no name in the file it
+is a Metask sign-in (step 3), so that file starts on Metask.
 
 An endpoint you set in the shell (`--base-url`, `METACODES_BASE_URL`) applies
 to whichever provider is selected, the one this file configures included, as

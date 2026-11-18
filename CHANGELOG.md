@@ -59,6 +59,31 @@ status, compatibility boundaries, and entry points are defined by
   be refused with `INVALID_ARGUMENT`; the blocks now lead the Skill's
   invocation record, so the selected Skill sees them, and the date, from its
   first request (`doc/AGENTCORE_BINARY_ABI.md`).
+
+- **A key login says when a variable is read before the key it stores.**
+  Credential resolution reads a provider's key variables (the shell's, then
+  `<state root>/.env`) before a key stored with `/login <provider>` or
+  `metacodes login --provider <provider>`, and that order stays. The login
+  used to say only that new sessions use the stored key; with such a variable
+  set it now says which one wins and how to use the new key, by name only:
+  `DASHSCOPE_API_KEY is set in your shell and is used before the stored key:
+  unset it to use the key you just stored.` (or `… in <path>/.env is used
+  before the stored key: remove it from that file …`).
+
+- **One `.env` with keys of several providers opens the terminal UI and says
+  where to choose** (#486). A `<state root>/.env` holding keys of several
+  providers and no `METACODES_PROVIDER` still chooses none, but the terminal
+  UI no longer leaves it at "add `METACODES_PROVIDER=<id>`, then restart": it
+  opens without a model and says once under its banner `.env has keys for
+  DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every
+  future session.`, and the red note of a message sent before then points to
+  `/model (DeepSeek, OpenAI)`. A pick for every future session is the stored
+  default later starts use (its key still read from the file); a default
+  stored before ranks above the file, as it did. `-p`, `serve` and `--web`
+  are unchanged: they stop and list the providers by id. `metacodes login
+  status` says the same: choose one with `/model`, or add
+  `METACODES_PROVIDER`.
+
 - **The Metask sign-in moves to `www.metask-ai.com` and is kept as the Metask
   session** (#527). `/login` and `metacodes login` sign in at Metask's OAuth
   server as the public client `metacodes`, ask for `read model:invoke`, and
@@ -232,6 +257,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`/login <provider>` and `metacodes login --provider <provider>` reach every
+  built-in vendor.** OpenAI, Google Gemini, Alibaba Qwen, MiniMax and the
+  Moonshot Kimi open platform declare their key pages now, as DeepSeek, the
+  GLM Coding Plan, Kimi Code and Bedrock did: the login opens the page
+  (Qwen, MiniMax and Kimi have one per region, the default following the
+  region of the default channel), reads the pasted key, checks it against the
+  vendor's unbilled `/models` and stores it in `<state root>/keys/<id>.json`.
+  The check now carries the key where the vendor's requests do: Gemini's
+  `x-goog-api-key`, where a bearer token is answered 401 whatever the key, and
+  Gemini's 400 `API_KEY_INVALID` counts as a refused key rather than a failed
+  check. `metacodes login --provider openai` takes a pasted key too while no
+  OAuth client is configured for OpenAI; it used to start the browser sign-in
+  and stop on the missing client id.
 - **`chatgpt-codex`: a ChatGPT plan's Codex quota, the way the Codex CLI
   reaches it. Unofficial.** `/login chatgpt-codex` and `metacodes login
   --provider chatgpt-codex` sign in at `auth.openai.com` in the browser with
@@ -427,6 +465,10 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/login` names the providers it cannot list.** Its list holds twelve, and
+  the ones past them were dropped without a word; `/login <id>` for one of
+  them then showed the list without it. The list now ends with `N more not
+  shown: /login <provider> (<ids>)`, and `/login <id>` starts any of them.
 - **A provider's own OAuth sign-in is used by a start, and signed out of by
   `logout`.** A sign-in `login --provider <id>` stored in
   `oauth/<provider>.json` reached a session only through a `/model` pick:

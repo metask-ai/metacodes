@@ -75,6 +75,16 @@ pub const LoginWorker = struct {
                 page.url = try a.dupe(u8, page.url);
                 if (page.check_url) |url| page.check_url = try a.dupe(u8, url);
                 if (page.region) |region| page.region = try a.dupe(u8, region);
+                // A configured provider's header name lives in its config.
+                prepared.auth = switch (prepared.auth) {
+                    .bearer => .bearer,
+                    .api_key_header => |name| .{ .api_key_header = try a.dupe(u8, name) },
+                    .custom_header => |custom| .{ .custom_header = .{
+                        .name = try a.dupe(u8, custom.name),
+                        .value_prefix = try a.dupe(u8, custom.value_prefix),
+                    } },
+                    .signed_adapter => |adapter| .{ .signed_adapter = try a.dupe(u8, adapter) },
+                };
             },
             .oauth => |*prepared| {
                 const source = prepared.profile;

@@ -597,9 +597,10 @@ pub const KeyPage = struct {
     /// What the user reads, e.g. "China · Personal Coding Plan".
     label: []const u8,
     url: []const u8,
-    /// A GET with the key as bearer that the provider does not bill: 200 means
-    /// it accepts the key, 401/403 that it refuses it. Null: keys are stored
-    /// unchecked.
+    /// A GET the provider does not bill, carrying the key where the
+    /// provider's requests do (`ProviderProfile.auth`): 200 means it accepts
+    /// the key; 401/403, or a status `classify_error` reads as an invalid key
+    /// or a denial, that it refuses it. Null: keys are stored unchecked.
     check_url: ?[]const u8 = null,
     /// Matched against `ChannelDescriptor.region` to pick the default page.
     region: ?[]const u8 = null,

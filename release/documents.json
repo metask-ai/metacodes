@@ -1,0 +1,16 @@
+{
+  "schema": "metacodes.release-documents/v1",
+  "files": [
+    {"source": "LICENSE", "destination": "share/licenses/metacodes-LICENSE"},
+    {"source": "vendor/tinykg/LICENSE", "destination": "share/licenses/tinykg-LICENSE"},
+    {"source": "THIRD_PARTY_NOTICES.md", "destination": "share/licenses/THIRD_PARTY_NOTICES.md"},
+    {"source": "vendor/lean-runtime/lean4-LICENSE", "destination": "share/licenses/lean4-LICENSE"},
+    {"source": "vendor/lean-runtime/gmp-COPYING.LESSERv3", "destination": "share/licenses/gmp-COPYING.LESSERv3"},
+    {"source": "vendor/lean-runtime/gmp-COPYINGv3", "destination": "share/licenses/gmp-COPYINGv3"},
+    {"source": "vendor/lean-runtime/gmp-COPYINGv2", "destination": "share/licenses/gmp-COPYINGv2"},
+    {"source": "vendor/lean-runtime/libuv-LICENSE", "destination": "share/licenses/libuv-LICENSE"},
+    {"source": "vendor/lean-runtime/libuv-LICENSE-extra", "destination": "share/licenses/libuv-LICENSE-extra"},
+    {"source": "README.md", "destination": "share/doc/README.md"},
+    {"source": "CHANGELOG.md", "destination": "share/doc/CHANGELOG-{version}.md"}
+  ]
+}
