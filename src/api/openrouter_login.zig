@@ -201,6 +201,8 @@ pub fn parseExchange(arena: std.mem.Allocator, body: []const u8) Error![]const u
 
 /// What `GET /api/v1/key` said about a key. Strings borrow its arena.
 pub const KeyInfo = struct {
+    /// The key's short form (`sk-or-v1-0e6...1c96`), not its name: OpenRouter
+    /// shows it under the name on its keys page, and this answer has no name.
     label: ?[]const u8 = null,
     limit_usd: ?f64 = null,
     expires_at: ?[]const u8 = null,
@@ -422,27 +424,29 @@ pub fn storedKeyManageUrl(allocator: std.mem.Allocator, state_root: []const u8, 
     return manageUrl(allocator, grant_origin, grant, stored.secret) catch null;
 }
 
-/// `Signed in to OpenRouter · key "metacodes" on your account · no spending
-/// limit · never expires`, from what the provider said about the key; just
+/// `Signed in to OpenRouter · key sk-or-v1-0e6...1c96 on your account · no
+/// spending limit · never expires`, from what the provider said about the key; just
 /// the first part when it said nothing. No newline.
 pub fn writeSignedIn(w: *std.Io.Writer, provider_label: []const u8, meta: api_key_store.Meta) std.Io.Writer.Error!void {
     try w.print("Signed in to {s}", .{provider_label});
     try writeDescription(w, meta);
 }
 
-/// `Stored the key for OpenRouter · key "work" on your account · …`: a pasted
+/// `Stored the key for OpenRouter · key sk-or-v1-4a2...07fe on your account · …`: a pasted
 /// key, described as a sign-in's is. No newline.
 pub fn writeStored(w: *std.Io.Writer, provider_label: []const u8, meta: api_key_store.Meta) std.Io.Writer.Error!void {
     try w.print("Stored the key for {s}", .{provider_label});
     try writeDescription(w, meta);
 }
 
-/// ` · key "metacodes" on your account · no spending limit · never expires`,
-/// or nothing when the provider said nothing about the key.
+/// ` · key sk-or-v1-0e6...1c96 on your account · no spending limit · never
+/// expires`, or nothing when the provider said nothing about the key. The key
+/// is named by its short form, as the keys page shows it under the key's
+/// name, unquoted: it is not a name.
 fn writeDescription(w: *std.Io.Writer, meta: api_key_store.Meta) std.Io.Writer.Error!void {
     if (!meta.described) return;
     if (meta.label) |label| {
-        try w.print(" · key \"{s}\" on your account", .{label});
+        try w.print(" · key {s} on your account", .{label});
     } else {
         try w.writeAll(" · a new key on your account");
     }
@@ -586,12 +590,12 @@ test "the key's description: label, limit, expiry and free tier, absent or null 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const full = parseKeyInfo(arena, "{\"data\":{\"label\":\"metacodes\",\"limit\":25.5,\"expires_at\":\"2027-02-16T00:00:00Z\",\"is_free_tier\":false,\"usage\":1.2}}").?;
-    try testing.expectEqualStrings("metacodes", full.label.?);
+    const full = parseKeyInfo(arena, "{\"data\":{\"label\":\"sk-or-v1-0e6...1c96\",\"limit\":25.5,\"expires_at\":\"2027-02-16T00:00:00Z\",\"is_free_tier\":false,\"usage\":1.2}}").?;
+    try testing.expectEqualStrings("sk-or-v1-0e6...1c96", full.label.?);
     try testing.expectEqual(@as(f64, 25.5), full.limit_usd.?);
     try testing.expectEqualStrings("2027-02-16T00:00:00Z", full.expires_at.?);
     try testing.expectEqual(false, full.free_tier.?);
-    const bare = parseKeyInfo(arena, "{\"data\":{\"label\":\"metacodes\",\"limit\":null,\"expires_at\":null,\"is_free_tier\":true}}").?;
+    const bare = parseKeyInfo(arena, "{\"data\":{\"label\":\"sk-or-v1-0e6...1c96\",\"limit\":null,\"expires_at\":null,\"is_free_tier\":true}}").?;
     try testing.expect(bare.limit_usd == null and bare.expires_at == null);
     try testing.expectEqual(true, bare.free_tier.?);
     try testing.expectEqual(@as(f64, 10), parseKeyInfo(arena, "{\"data\":{\"limit\":10}}").?.limit_usd.?);
@@ -615,19 +619,21 @@ test "the manage page is the origin's key page under the key's SHA-256" {
 test "the signed-in line says what the provider said about the key, and nothing it did not" {
     var buffer: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buffer);
-    try writeSignedIn(&w, "OpenRouter", .{ .obtained = .browser_sign_in, .described = true, .label = "metacodes" });
-    try testing.expectEqualStrings("Signed in to OpenRouter · key \"metacodes\" on your account · no spending limit · never expires", w.buffered());
+    try writeSignedIn(&w, "OpenRouter", .{ .obtained = .browser_sign_in, .described = true, .label = "sk-or-v1-0e6...1c96" });
+    try testing.expectEqualStrings("Signed in to OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires", w.buffered());
+    // The short form is not a name: no quotes make it look like one.
+    try testing.expect(std.mem.indexOfScalar(u8, w.buffered(), '"') == null);
     w = .fixed(&buffer);
-    try writeSignedIn(&w, "OpenRouter", .{ .described = true, .label = "metacodes", .limit_usd = 25, .expires_at = "2027-02-16T00:00:00Z" });
-    try testing.expectEqualStrings("Signed in to OpenRouter · key \"metacodes\" on your account · spending limit $25.00 · expires 2027-02-16", w.buffered());
+    try writeSignedIn(&w, "OpenRouter", .{ .described = true, .label = "sk-or-v1-0e6...1c96", .limit_usd = 25, .expires_at = "2027-02-16T00:00:00Z" });
+    try testing.expectEqualStrings("Signed in to OpenRouter · key sk-or-v1-0e6...1c96 on your account · spending limit $25.00 · expires 2027-02-16", w.buffered());
     // Not described: no claim about limits either way.
     w = .fixed(&buffer);
     try writeSignedIn(&w, "OpenRouter", .{ .obtained = .browser_sign_in });
     try testing.expectEqualStrings("Signed in to OpenRouter", w.buffered());
     // A pasted key, described the same way.
     w = .fixed(&buffer);
-    try writeStored(&w, "OpenRouter", .{ .obtained = .pasted, .described = true, .label = "work", .limit_usd = 5 });
-    try testing.expectEqualStrings("Stored the key for OpenRouter · key \"work\" on your account · spending limit $5.00 · never expires", w.buffered());
+    try writeStored(&w, "OpenRouter", .{ .obtained = .pasted, .described = true, .label = "sk-or-v1-4a2...07fe", .limit_usd = 5 });
+    try testing.expectEqualStrings("Stored the key for OpenRouter · key sk-or-v1-4a2...07fe on your account · spending limit $5.00 · never expires", w.buffered());
 
     w = .fixed(&buffer);
     try writeAfterSignIn(&w, "OpenRouter", "https://openrouter.ai", .{ .described = true, .free_tier = true }, "https://openrouter.ai/keys/aa", "https://openrouter.ai/keys/bb");
@@ -651,7 +657,7 @@ test "login status says where a stored key came from, when, and what the provide
         .allocator = testing.allocator,
         .kind = .api_key,
         .secret = &secret,
-        .meta = .{ .obtained = .browser_sign_in, .described = true, .label = "metacodes" },
+        .meta = .{ .obtained = .browser_sign_in, .described = true, .label = "sk-or-v1-0e6...1c96" },
         .stored_at = 1_795_000_000,
     };
     var buffer: [512]u8 = undefined;

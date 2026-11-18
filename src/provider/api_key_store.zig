@@ -15,7 +15,7 @@
 //!
 //! ```json
 //! {"schema_version":1,"kind":"api_key","key":"…","obtained":"browser_sign_in","described":true,
-//!  "label":"metacodes","limit_usd":null,"expires_at":null,"free_tier":false,"stored_at":1795000000}
+//!  "label":"sk-or-v1-0e6...1c96","limit_usd":null,"expires_at":null,"free_tier":false,"stored_at":1795000000}
 //! ```
 //!
 //! A build that predates these fields reads such a file the same way: `load`
@@ -50,7 +50,9 @@ pub const Meta = struct {
     /// answered: a null `limit_usd` or `expires_at` then means "none", not
     /// "unknown".
     described: bool = false,
-    /// The key's name on the provider's site.
+    /// What the provider calls the key: for OpenRouter, the short form of
+    /// the key (`sk-or-v1-0e6...1c96`), the line under the key's name on its
+    /// keys page. The name itself is not given.
     label: ?[]const u8 = null,
     /// Its spending limit in US dollars.
     limit_usd: ?f64 = null,

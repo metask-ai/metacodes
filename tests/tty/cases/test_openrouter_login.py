@@ -33,7 +33,7 @@ LISTING = {"data": [
     {"id": "some/no-tools", "name": "No Tools", "supported_parameters": ["temperature"],
      "endpoints": ["/api/v1/chat/completions"]},
 ]}
-DESCRIBED = {"data": {"label": "metacodes", "limit": None, "expires_at": None, "is_free_tier": False}}
+DESCRIBED = {"data": {"label": "sk-or-v1-0e6...1c96", "limit": None, "expires_at": None, "is_free_tier": False}}
 
 VENDOR_KEYS = ["OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODE_API_KEY",
                "ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
@@ -176,7 +176,7 @@ def test_login_openrouter_asks_which_way_and_signs_in_with_the_browser(bin_path)
             a._fail("the other device should be offered")
         if not a.screens_with('OpenRouter shows this sign-in as "localhost:'):
             a._fail("the dialog should say how OpenRouter names the sign-in")
-        a.assert_prose_contains('Signed in to OpenRouter · key "metacodes" on your account · no spending limit · never expires · /model to choose a model')
+        a.assert_prose_contains('Signed in to OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires · /model to choose a model')
         # The exchange: the browser's code, S256, a verifier.
         exchanges = case.seen("POST", "/api/v1/auth/keys")
         assert len(exchanges) == 1, case.server.seen
@@ -226,7 +226,7 @@ def test_login_openrouter_takes_a_key_the_user_already_has(bin_path):
                   "key:enter", wait_for("Stored the key for OpenRouter", WAIT_S)]
         raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
         a, _ = _screen(raw, 40, 140)
-        a.assert_prose_contains('Stored the key for OpenRouter · key "metacodes" on your account · no spending limit · never expires · /model to choose a model')
+        a.assert_prose_contains('Stored the key for OpenRouter · key sk-or-v1-0e6...1c96 on your account · no spending limit · never expires · /model to choose a model')
         assert PASTED_KEY.encode() not in raw, "the pasted key was echoed"
         assert [entry[2] for entry in case.seen("GET", "/api/v1/key")] == [f"Bearer {PASTED_KEY}"], case.server.seen
         assert case.seen("POST", "/api/v1/auth/keys") == [], "a pasted key needs no exchange"

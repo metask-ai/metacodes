@@ -37,7 +37,7 @@ const App = cc.app_module.App;
 const OPENROUTER = Slug.lit("openrouter");
 const KEY = "sk-or-v1-0e6f44a47a05f1dad2ad7e88c4c1d6b7";
 const EXCHANGED = "{\"key\":\"" ++ KEY ++ "\",\"user_id\":\"user_2yOPcMpKoQhcd4bVgSMlELRaIah\"}";
-const DESCRIBED = "{\"data\":{\"label\":\"metacodes\",\"limit\":null,\"limit_remaining\":null,\"expires_at\":null,\"is_free_tier\":false,\"usage\":0}}";
+const DESCRIBED = "{\"data\":{\"label\":\"sk-or-v1-0e6...1c96\",\"limit\":null,\"limit_remaining\":null,\"expires_at\":null,\"is_free_tier\":false,\"usage\":0}}";
 const OPENAI_SSE =
     "data: {\"id\":\"gen-1\",\"provider\":\"DeepInfra\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" ++
     "data: {\"id\":\"gen-1\",\"provider\":\"DeepInfra\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" ++
@@ -357,7 +357,7 @@ test "L2 OpenRouter: the browser sign-in takes only its own state back, trades c
     try testing.expectEqual(cc.provider_credential.CredentialKind.api_key, stored.kind);
     try testing.expectEqual(key_store.Obtained.browser_sign_in, stored.meta.obtained.?);
     try testing.expect(stored.meta.described);
-    try testing.expectEqualStrings("metacodes", stored.meta.label.?);
+    try testing.expectEqualStrings("sk-or-v1-0e6...1c96", stored.meta.label.?);
     try testing.expect(stored.meta.limit_usd == null and stored.meta.expires_at == null);
     // Nothing the user was shown carries the key or the verifier.
     const shown = instructions.snapshot();
@@ -510,7 +510,7 @@ test "L2 OpenRouter: a pasted key is checked at /api/v1/key, stored as pasted wi
     try testing.expectEqualStrings(KEY, stored.secret);
     try testing.expectEqual(key_store.Obtained.pasted, stored.meta.obtained.?);
     try testing.expect(stored.meta.described);
-    try testing.expectEqualStrings("metacodes", stored.meta.label.?);
+    try testing.expectEqualStrings("sk-or-v1-0e6...1c96", stored.meta.label.?);
     try testing.expectEqualStrings("keys", stored.page.?);
 }
 
