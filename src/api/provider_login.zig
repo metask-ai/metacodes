@@ -183,7 +183,15 @@ pub const MetaskPrepared = struct {
             allocator.free(token_json);
         }
         const metask = provider_ids.Slug.lit("metask");
+        // The session this one replaces (#560), revoked once it is stored,
+        // bounded as the TUI's `/logout`.
+        var replaced = metask_oauth.Replaced.capture(allocator, self.options.state_root);
+        defer replaced.deinit();
         try importTokenResponse(allocator, self.options.state_root, metask, token_json, null, diagnostic);
+        if (metask_oauth.replacedNote(replaced.revoke(token_json, metask_oauth.siteUrl(), 3000))) |note| {
+            var line: [256]u8 = undefined;
+            notify.say(std.fmt.bufPrint(&line, "{s}\n", .{note.text}) catch note.text);
+        }
         return .{ .provider_id = metask, .client_id_source = .declared };
     }
 

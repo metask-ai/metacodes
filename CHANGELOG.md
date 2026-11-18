@@ -521,6 +521,18 @@ status, compatibility boundaries, and entry points are defined by
   and still spawns `/bin/sleep` by that name; the second hashes an
   executable it writes into a temporary directory. Product code is
   unchanged.
+- **Signing in to Metask again revokes the sign-in it replaces** (#560).
+  `/login`, `/login metask`, `metacodes login` and `metacodes login
+  --provider metask` overwrote `oauth/metask.json` and left the session they
+  replaced valid at Metask, where nothing on this machine could end it any
+  more: `/logout` revokes only the session stored now. Once the new session
+  is stored (and, in the TUI, bound), the replaced one is revoked at
+  `$METASK_SITE_URL/api/oauth/revoke`, bounded as sign-out (3 s in the TUI,
+  5 s on the command line). A refusal or no answer never fails the sign-in;
+  one line says the previous sign-in stays valid there until it expires. A
+  sign-in that fails, cannot bind or is cancelled revokes nothing; the same
+  session imported again is not revoked, and a replaced session whose
+  gateway is not the site's origin is not sent there.
 
 ### Security
 
