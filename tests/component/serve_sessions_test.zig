@@ -26,6 +26,7 @@ const cc = @import("cc");
 const pnet = @import("platform").net;
 const psync = @import("platform").sync;
 const ppaths = @import("platform").paths;
+const pfs = @import("platform").fs;
 
 const MultiDaemon = cc.daemon_serve_multi.MultiDaemon;
 const SessionId = cc.session_id.SessionId;
@@ -91,6 +92,9 @@ const Fixture = struct {
     md: *MultiDaemon,
     uds_path: ?[]const u8,
     token: ?[]const u8,
+    /// What `md` was started with, for `restartDaemon`.
+    config: cc.types_mod.Config,
+    daemon_options: cc.daemon_serve_multi.Options,
 
     const Setup = struct {
         responses: []const []const u8 = &.{textSse("hello from the provider")},
@@ -104,6 +108,8 @@ const Fixture = struct {
         uds: bool = false,
         /// `--agent-teams`: sessions offer TeamCreate/SendMessage.
         agent_teams: bool = false,
+        /// `--permission`: `default` makes a Write ask the frontend.
+        permission: [*:0]const u8 = "bypassPermissions",
     };
 
     /// In place: `self` must be at its final address.
@@ -136,7 +142,7 @@ const Fixture = struct {
             try harness.MockServer.startCassette(options.responses, 0);
         errdefer self.provider.stop();
         const url = try arena.dupeZ(u8, try self.provider.urlOwned(arena));
-        const base_argv = [_][*:0]const u8{ "metacodes", "serve", "0", "--base-url", url.ptr, "--model", "test-model", "--permission", "bypassPermissions", "--no-lsp" };
+        const base_argv = [_][*:0]const u8{ "metacodes", "serve", "0", "--base-url", url.ptr, "--model", "test-model", "--permission", options.permission, "--no-lsp" };
         const teams_argv = base_argv ++ [_][*:0]const u8{"--agent-teams"};
         var config = cc.parseArgsForTest(if (options.agent_teams) &teams_argv else &base_argv, arena);
         try std.testing.expect(config.parse_error == null);
@@ -149,12 +155,25 @@ const Fixture = struct {
             self.uds_path = try std.fmt.allocPrint(arena, "/tmp/mc-{s}.sock", .{&self.tmp.sub_path});
         }
         self.token = options.token;
-        self.md = try MultiDaemon.start(std.heap.c_allocator, null, config, "test-key", .{
+        self.config = config;
+        self.daemon_options = .{
             .initial = options.initial,
             .max_sessions = options.max_sessions,
             .surface = .{ .version = VERSION, .token = options.token },
             .uds_path = self.uds_path,
-        });
+        };
+        self.md = try MultiDaemon.start(std.heap.c_allocator, null, self.config, "test-key", self.daemon_options);
+    }
+
+    /// Stop the daemon as SIGINT does and start it again on the same state
+    /// root and provider: its sessions are gone until restored.
+    fn restartDaemon(self: *Fixture) !void {
+        self.md.stop();
+        // Freed only once the next one runs: if it does not start, `deinit`
+        // stops the old one again (a no-op) and frees it.
+        const restarted = try MultiDaemon.start(std.heap.c_allocator, null, self.config, "test-key", self.daemon_options);
+        self.md.destroy();
+        self.md = restarted;
     }
 
     fn deinit(self: *Fixture) void {
@@ -1111,6 +1130,102 @@ test "#277 an idle daemon lead takes a teammate's reply as its next turn, withou
 }
 
 const swarm_lead_poll_ms: u64 = @intCast(cc.session_service.LeadMail.POLL_MS);
+
+// ── an answer from before a restart never reaches a newer request ───────────
+
+/// A provider turn that calls Write on `path` as `tool_id` (caller frees).
+fn writeTurn(a: std.mem.Allocator, tool_id: []const u8, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":7,\"output_tokens\":0}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"Write\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file_path\\\":\\\"{s}\\\",\\\"content\\\":\\\"written\\\"}}\"}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":3}}}}\n\n" ++
+        "data: {{\"type\":\"message_stop\"}}\n\n", .{ tool_id, path });
+}
+
+/// Where a Write of this test lands: a fresh file under the system temporary
+/// directory, outside the repository, with forward slashes so it sits in JSON
+/// as is. Caller frees.
+fn writeTarget(a: std.mem.Allocator, name: []const u8) ![:0]u8 {
+    var nonce: [6]u8 = undefined;
+    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/mc-restart-{s}-{s}.txt", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/\\"), name, &std.fmt.bytesToHex(nonce, .lower) }, 0);
+    for (path) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return path;
+}
+
+test "an answer to a request from before a daemon restart is refused: it never approves the restored session's newer request" {
+    const a = std.testing.allocator;
+    const first_path = try writeTarget(a, "first");
+    defer a.free(first_path);
+    defer pfs.unlinkPath(first_path.ptr) catch {};
+    const second_path = try writeTarget(a, "second");
+    defer a.free(second_path);
+    defer pfs.unlinkPath(second_path.ptr) catch {};
+    const first_turn = try writeTurn(a, "tu_first", first_path);
+    defer a.free(first_turn);
+    const second_turn = try writeTurn(a, "tu_second", second_path);
+    defer a.free(second_turn);
+
+    var fx: Fixture = undefined;
+    try fx.setup(.{ .permission = "default", .responses = &.{ first_turn, textSse("first written"), second_turn, textSse("second declined") } });
+    defer fx.deinit();
+    const id = try fx.create("{}");
+    var path_buffer: [96]u8 = undefined;
+    const announce_key = "\"type\":\"ui_request\",\"id\":";
+
+    // Before the restart: the Write asks, and alice allows it.
+    var alice_buffer: [128]u8 = undefined;
+    var alice: []const u8 = undefined;
+    {
+        const sse = try Stream.openSse(&fx, id);
+        defer sse.destroy();
+        try fx.message(id, "write the first file");
+        try sse.waitFor(announce_key);
+        alice = try std.fmt.bufPrint(&alice_buffer, "{{\"id\":{d},\"choice\":\"allow_once\",\"by\":\"alice@example.com\"}}", .{try sse.idAfter(announce_key)});
+        try std.testing.expectEqual(@as(u16, 200), try fx.status("POST", Fixture.sessionPath(&path_buffer, id, "/respond"), alice));
+        try sse.waitFor("\"run_done\"");
+    }
+    try std.testing.expect(pfs.exists(first_path.ptr));
+
+    // The daemon restarts, and the session is restored.
+    try fx.restartDaemon();
+    var restore_buffer: [96]u8 = undefined;
+    const restored = try fx.create(try std.fmt.bufPrint(&restore_buffer, "{{\"session_id\":\"{s}\",\"resume\":true}}", .{id.asSlice()}));
+    try std.testing.expectEqualStrings(id.asSlice(), restored.asSlice());
+
+    // Another Write asks. Alice's answer arrives again, as from a webhook
+    // that retries or a client that reconnects: it is refused, and the new
+    // request stays open.
+    const sse = try Stream.openSse(&fx, id);
+    defer sse.destroy();
+    try fx.message(id, "write the second file");
+    try sse.waitFor(announce_key);
+    const second_id = try sse.idAfter(announce_key);
+    {
+        const response = try fx.call("POST", Fixture.sessionPath(&path_buffer, id, "/respond"), alice);
+        defer a.free(response);
+        try expectStatus(response, "409");
+    }
+    {
+        const response = try fx.call("GET", Fixture.sessionPath(&path_buffer, id, "/state"), "");
+        defer a.free(response);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, bodyOf(response), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(second_id)), parsed.value.object.get("pending_request_id").?.integer);
+    }
+    try std.testing.expect(!pfs.exists(second_path.ptr));
+
+    // The request's own answer closes it; alice is recorded nowhere here.
+    var deny_buffer: [64]u8 = undefined;
+    const deny = try std.fmt.bufPrint(&deny_buffer, "{{\"id\":{d},\"choice\":\"deny_once\"}}", .{second_id});
+    try std.testing.expectEqual(@as(u16, 200), try fx.status("POST", Fixture.sessionPath(&path_buffer, id, "/respond"), deny));
+    try sse.waitFor("\"run_done\"");
+    try std.testing.expect(!pfs.exists(second_path.ptr));
+    try std.testing.expect(!sse.contains("alice@example.com"));
+}
 
 // ── the UDS binding answers UI requests and takes capability frames ──────────
 
