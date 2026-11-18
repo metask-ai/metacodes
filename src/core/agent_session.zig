@@ -68,7 +68,7 @@ pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_part
 /// internal web service/provider. It is an ordinary function tool, not a
 /// provider-specific server-tool descriptor; AgentSession owns its
 /// implementation and the Host does not register an executor callback.
-pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ [_][]const u8{"AskUserQuestion"};
+pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ first_party_plugins.PREVIEW_TOOLS ++ [_][]const u8{"AskUserQuestion"};
 
 /// Issue #277: the team tools, admissible only when the Runtime enables teams
 /// (`RuntimeConfig.enable_teams`). Unlike Task they are Session-owned — their
@@ -210,7 +210,7 @@ test "default AgentRuntime preserves the coding tool surface through first-party
     const inventory = try runtime.describePlugins(std.testing.allocator);
     defer std.testing.allocator.free(inventory);
     try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":10") != null);
 }
 
 test "Runtime creation refuses Glob/Grep when their ripgrep dependency is unresolvable" {
@@ -263,6 +263,8 @@ test "minimal and none core profiles retain the mandatory artifact recovery kern
 }
 
 pub const RuntimeConfig = struct {
+    /// Explicit Host opt-in. Profiles remain stable when false.
+    preview: bool = false,
     /// Null selects the first-party `core_profile`. A non-null slice is the
     /// source-compatible explicit/legacy override used by older embedding
     /// adapters and tests; first-party packs are then omitted, while any
@@ -351,6 +353,7 @@ const SessionCreateHooks = struct {
 
 pub const AgentRuntime = struct {
     allocator: std.mem.Allocator,
+    preview: bool,
     plugin_snapshot: *plugin_runtime.Snapshot,
     catalog: tool_catalog.Catalog,
     mutex: sync.Mutex = .{},
@@ -407,6 +410,11 @@ pub const AgentRuntime = struct {
             }
         }
         try builtin_tools.appendSlice(allocator, plugin_snapshot.builtin_tools);
+        if (config.preview) {
+            for (first_party_plugins.PREVIEW_TOOLS) |name| {
+                if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
+            }
+        }
         if (config.enable_teams) {
             for (TEAM_BUILTIN_TOOLS) |name| {
                 if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
@@ -418,6 +426,10 @@ pub const AgentRuntime = struct {
             }
         }
         for (builtin_tools.items) |name| {
+            if (!config.preview) {
+                const builtin = @import("../tools.zig").getTool(name) orelse return error.UnsupportedBuiltinTool;
+                if (builtin.preview_gated) return error.PreviewFeatureDisabled;
+            }
             if (config.enable_cron and isCronBuiltin(name)) continue;
             if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
         }
@@ -428,7 +440,7 @@ pub const AgentRuntime = struct {
             plugin_snapshot.host_stream_tools,
             plugin_snapshot.process_tools,
         );
-        self.* = .{ .allocator = allocator, .plugin_snapshot = plugin_snapshot, .catalog = catalog };
+        self.* = .{ .allocator = allocator, .preview = config.preview, .plugin_snapshot = plugin_snapshot, .catalog = catalog };
         return self;
     }
 
@@ -1916,6 +1928,7 @@ pub const AgentSession = struct {
         else
             null;
         errdefer if (swarm_ctx) |*s| s.deinit();
+        if (swarm_ctx) |*s| s.preview = runtime.preview;
 
         self.* = .{
             .allocator = allocator,
@@ -3302,6 +3315,7 @@ pub const AgentSession = struct {
         };
 
         const run_options: agent_loop.Options = .{
+            .preview = self.runtime.preview,
             .max_turns = max_turns,
             .retractable_stream_retries = stream_retry_budget,
             .model_error_out = &self.last_model_error,

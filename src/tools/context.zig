@@ -416,6 +416,8 @@ pub const ToolSetExecutionPolicy = struct {
 };
 
 pub const ToolContext = struct {
+    /// Resolved Host opt-in; model input and plugins cannot enable it.
+    preview: bool = false,
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
     /// TinyKG 客户端(记忆/计划/DAG 真相源;设计 KG_DESIGN v3-final)。

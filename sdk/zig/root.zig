@@ -597,7 +597,7 @@ test "Revision 28 SDK rejects Revision 13 through 27 and stale reference roots" 
     // short of the rewind slot, and a Revision 27 root, whose RunOptionsV1
     // has no stream retry budget, included) or, carrying 28, at its missing
     // tables.
-    for ([_]u32{ 13, 23, 24, 25, 26, 27, types.ABI_REVISION }) |revision| {
+    for ([_]u32{ 13, 23, 24, 25, 26, 27, 28, types.ABI_REVISION }) |revision| {
         var stale_reference: types.ApiV1 align(@alignOf(types.ApiV1)) = std.mem.zeroes(types.ApiV1);
         stale_reference.struct_size = @sizeOf(types.ApiV1);
         stale_reference.abi_version = types.ABI_VERSION_V1;

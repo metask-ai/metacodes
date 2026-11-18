@@ -317,6 +317,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         defer if (teammate_worktree_path) |path| ctx.allocator.free(path);
         if (teammate_worktree != null) worktree_moved = true; // spawnTeammate consume-on-call
         const entry = reg.spawnTeammate(.{
+            .preview = ctx.preview,
             .name = name,
             .team = sw.team_sanitized,
             .prompt = prompt,
@@ -379,6 +380,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .dyn_registry = ctx.dyn_registry,
             .skills = ctx.skills,
             .agent_depth = ctx.agent_depth + 1,
+            .preview = ctx.preview,
             .max_turns = max_turns,
             .model_override = model_override,
             .model_tiers = ctx.model_tiers,
@@ -508,6 +510,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .session = ctx.session,
             .system_prompt = sys_prompt,
             .agent_depth = ctx.agent_depth + 1,
+            .preview = ctx.preview,
             .dyn_registry = ctx.dyn_registry,
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .execution_policy = child_execution_policy,

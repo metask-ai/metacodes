@@ -50,7 +50,6 @@ pub const CODING_TOOLS = [_][]const u8{
     "Bash",
     "BashOutput",
     "KillShell",
-    "ExecuteCode",
     "WebSearch",
     "WebFetch",
 };
@@ -70,8 +69,9 @@ pub const OFFLINE_CODING_TOOLS = [_][]const u8{
     "Bash",
     "BashOutput",
     "KillShell",
-    "ExecuteCode",
 };
+
+pub const PREVIEW_TOOLS = [_][]const u8{"ExecuteCode"};
 
 pub const INTERACTION_TOOLS = [_][]const u8{"AskUserQuestion"};
 /// Mandatory recovery plane. Unlike profile tools, this capability is part of

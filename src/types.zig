@@ -154,6 +154,7 @@ pub const Config = struct {
     disallowed_tools: ?[]const u8 = null,
     /// Experimental, opt-in progress checkpoint for coding evaluations. Kept
     /// out of the default product path until measured on fixed benchmarks.
+    preview: @import("preview.zig").Setting = .inherit,
     verification_checkpoint: bool = false,
     verification_final_gate: bool = false,
     requirement_ledger: bool = false,

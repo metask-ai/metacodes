@@ -136,6 +136,7 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "CodeTimeout", .code = .timeout, .category = .system_error, .recoverable = true },
     .{ .name = "CodeToolUnavailable", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "CodeExecutionUnavailable", .code = .capability_unsupported, .category = .user_error, .recoverable = true },
+    .{ .name = "PreviewFeatureDisabled", .code = .capability_unsupported, .category = .user_error, .recoverable = false },
     .{ .name = "CodeSuspendUnsupported", .code = .capability_unsupported, .category = .user_error, .recoverable = true },
     .{ .name = "NotRead", .code = .not_read, .category = .user_error, .recoverable = true },
     .{ .name = "StaleFile", .code = .stale_file, .category = .user_error, .recoverable = true },

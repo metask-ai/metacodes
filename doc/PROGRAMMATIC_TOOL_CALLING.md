@@ -1,7 +1,14 @@
 # JavaScript 工具编排协议
 
-状态：已实现。本文是 ExecuteCode 的规范。Meta Code 主程序、权限与工具实现仍为
+状态：已实现，Preview。本文是 ExecuteCode 的规范。Meta Code 主程序、权限与工具实现仍为
 Zig；嵌入的 QuickJS 只负责执行模型编写的 JavaScript，不直接执行 TypeScript。
+
+默认关闭。使用 `metacodes --preview`，或在 `<state root>/config.json` 根对象中保存
+`"preview": true`；`--no-preview` 可覆盖已保存的开启设置。子 agent 继承该设置。
+关闭时工具菜单不包含 ExecuteCode，猜测名称直接调用也会在创建 VM 前被拒绝。
+SDK 使用 Python `Runtime(preview=True)`、Node.js `new Runtime({preview: true})`，
+或 AgentCore ABI revision 29 的 `RuntimeConfigV1.preview = 1`。仅按名称选择工具
+不能开启 preview；Session 工具选择、权限、sandbox 和预算检查仍然有效。
 
 ## 调用与返回
 

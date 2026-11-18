@@ -3,6 +3,7 @@ const std = @import("std");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    if (!ctx.preview) return error.PreviewFeatureDisabled;
     const parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArgs;

@@ -21,7 +21,7 @@ helper contract and the current network-policy limits.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 28 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 29 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
 | Node package | `require('metacodes')` ([sdk/node](../sdk/node/README.md)) | experimental, unpublished; macOS and Linux | same exact-revision rule; the addon is rebuilt per platform |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -34,6 +34,22 @@ Beyond the endpoints and access rules of
 general HTTP service API promise yet. The Web and daemon hosts are product
 surfaces built over the same core protocols.
 
+## Preview features
+
+Preview features default to disabled. Start with `metacodes --preview` to
+enable them, or save `"preview": true` at the root of the installation's
+`config.json` (`<state root>/config.json`). `--no-preview` disables them for
+one start, including when the saved setting is true. Command-line flags
+override the saved value; the last preview flag wins. Only a root JSON boolean
+is accepted. Child agents inherit the resolved setting. A feature's own
+selection and permission rules still apply after preview is enabled.
+
+Source embedders set `AgentRuntime.RuntimeConfig.preview = true`. AgentCore
+ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default 0);
+Python uses `Runtime(preview=True)` and Node.js uses
+`new Runtime({ preview: true })`. The SDKs include `ExecuteCode` when enabled.
+Selecting a preview built-in by name while preview is disabled is rejected.
+
 ## JavaScript tool orchestration
 
 `ExecuteCode({code, timeout_ms?})` runs JavaScript in a per-session QuickJS
@@ -41,9 +57,10 @@ context. `await tools.Read(args)` and the equivalent interfaces for selected
 built-in, Host and process tools enter the kernel's ordinary tool admission
 and execution pipeline. Meta Code and its tools remain implemented in Zig.
 The result contains the last expression, explicit logs and the inner call count;
-intermediate tool results stay outside provider messages. Coding and offline
-coding profiles include this tool; SDK Hosts may select `ExecuteCode` explicitly.
-No C ABI layout changes are involved. The normative behavior, limits and reset
+intermediate tool results stay outside provider messages. This is a preview
+feature: it is absent from the tool menu by default, and a guessed invocation
+is rejected before creating a VM. Enabling preview admits it to the catalog;
+Session tool selection and ordinary admission still apply. The normative behavior, limits and reset
 rules are in [PROGRAMMATIC_TOOL_CALLING.md](PROGRAMMATIC_TOOL_CALLING.md).
 
 ## Provider selection surface
@@ -897,7 +914,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 28 does not carry them.
+AgentCore revision 29 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -1509,7 +1526,7 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 28,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 29,
 the exact 80-byte root, all seven mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.

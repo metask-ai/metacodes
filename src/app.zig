@@ -756,13 +756,22 @@ pub const App = struct {
     ) !*App {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
+        var active_config = config;
+        if (active_config.preview == .inherit) {
+            const saved = if (config.state_root.len > 0)
+                try @import("app/config.zig").loadFromHome(allocator, config.state_root)
+            else
+                @import("app/config.zig").FileConfig{};
+            defer saved.deinit(allocator);
+            active_config.preview = active_config.preview.resolve(saved.preview);
+        }
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,
         // 最后 toToolDefinitionsWithDyn 一次性构造给 API 的 tool 清单。
         app.* = .{
             .allocator = allocator,
-            .config = config,
+            .config = active_config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
@@ -1157,6 +1166,7 @@ pub const App = struct {
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
         app.swarm = .{
             .allocator = allocator,
+            .preview = app.config.preview.isEnabled(),
             .session = app.session_id,
             .state_root = app.stateRoot(),
             .api_key = app.api_key,
@@ -5200,6 +5210,7 @@ pub const App = struct {
         // `--agent-teams` would leave them out of "Using your tools").
         const defs_allocator = app.tool_defs_arena.allocator();
         const probe_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .agent_teams = app.config.agent_teams,
             .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
         };
@@ -5208,6 +5219,7 @@ pub const App = struct {
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
 
         const prompt_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .permission_mode = app.config.permission_mode,
             .enabled_tool_names = enabled_names,
             .agent_type = "", // 主对话

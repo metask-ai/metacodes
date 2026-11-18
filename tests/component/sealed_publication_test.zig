@@ -193,6 +193,7 @@ fn runLoop(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const u
         &permission,
         .{
             .max_turns = 5,
+            .preview = true,
             .tool_dispatcher = dispatcher.asDispatcher(),
             .artifact_root = fixture.root(),
             .tool_result_metrics = &run.metrics,

@@ -95,6 +95,7 @@ pub fn captureTranscript(allocator: std.mem.Allocator, messages: []const msg.Mes
 }
 
 pub const SpawnOptions = struct {
+    preview: bool = false,
     max_turns: u32 = 20,
     /// `agent_loop.Options.retractable_stream_retries` of the child, for a
     /// child that is itself the Run (an AgentCore Skill invocation in its own
@@ -299,6 +300,7 @@ pub fn spawnAgentSink(
         ctx_to_use,
         .{
             .max_turns = opts.max_turns,
+            .preview = opts.preview,
             .retractable_stream_retries = opts.retractable_stream_retries,
             .model_error_out = opts.model_error_out,
             .cost_budget_usd = opts.cost_budget_usd,

@@ -207,6 +207,10 @@ class PythonSdkTest(unittest.TestCase):
                 result = session.run("read notes.txt")
         self.assertIn("the secret is 42", result.text)
 
+    def test_preview_disabled_rejects_explicit_preview_tool_selection(self) -> None:
+        with self.assertRaisesRegex(metacodes.AgentCoreError, "PreviewFeatureDisabled"):
+            metacodes.Runtime(tools=["ExecuteCode"])
+
     def test_execute_code_calls_python_tools_and_keeps_intermediates_local(self) -> None:
         calls = []
 
@@ -221,7 +225,7 @@ class PythonSdkTest(unittest.TestCase):
             ("echo",),
         ]
         with MockProvider(script) as provider:
-            with metacodes.Runtime(tools=["ExecuteCode"], host_tools=[lookup]) as runtime:
+            with metacodes.Runtime(tools=[], host_tools=[lookup], preview=True) as runtime:
                 session = self.session(runtime, provider, permission_mode="full_access")
                 result = session.run("compute using the JavaScript bridge")
         self.assertEqual(calls, [{"key": "a"}])

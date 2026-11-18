@@ -42,6 +42,12 @@ const Capture = struct {
 };
 
 fn run(conversation: *cc.conversation.Conversation, scripts: []const Script, permission: *cc.permission.PermissionContext, options: cc.agent_loop.Options) !Evidence {
+    var preview_options = options;
+    preview_options.preview = true;
+    return runWithOptions(conversation, scripts, permission, preview_options);
+}
+
+fn runWithOptions(conversation: *cc.conversation.Conversation, scripts: []const Script, permission: *cc.permission.PermissionContext, options: cc.agent_loop.Options) !Evidence {
     const gpa = conversation.allocator;
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
@@ -66,8 +72,7 @@ fn run(conversation: *cc.conversation.Conversation, scripts: []const Script, per
     defer io.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(gpa, io.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
-    const defs = try cc.tools.toToolDefinitions(gpa);
-    defer gpa.free(defs);
+    const defs = try cc.tools.toToolDefinitionsFull(arena, null, &.{ .preview = options.preview });
     var opts = options;
     opts.max_turns = 12;
     opts.colorize = false;
@@ -95,6 +100,27 @@ fn expectContains(bytes: []const u8, needle: []const u8) !void {
         std.debug.print("expected {s} in {s}\n", .{ needle, bytes });
         return error.MissingExpectedContent;
     }
+}
+
+test "ExecuteCode preview defaults off and rejects a guessed invocation before creating a VM" {
+    const gpa = std.testing.allocator;
+    var conversation = cc.conversation.Conversation.init(gpa);
+    defer conversation.deinit();
+    var permission = cc.permission.createContext(.bypass_permissions, gpa);
+    const disabled = try runWithOptions(&conversation, &.{.{ .code = "42" }}, &permission, .{});
+    defer disabled.deinit(gpa);
+    try std.testing.expect(conversation.code_runtime == null);
+    try std.testing.expect((try resultAt(&conversation, 0)).is_error);
+    try expectContains((try resultAt(&conversation, 0)).content, "PreviewFeatureDisabled");
+    const request = try std.json.parseFromSlice(std.json.Value, gpa, disabled.request, .{});
+    defer request.deinit();
+    for (request.value.object.get("tools").?.array.items) |tool| {
+        try std.testing.expect(!std.mem.eql(u8, tool.object.get("name").?.string, "ExecuteCode"));
+    }
+    const enabled = try run(&conversation, &.{.{ .code = "42" }}, &permission, .{});
+    defer enabled.deinit(gpa);
+    try std.testing.expect(conversation.code_runtime != null);
+    try expectContains((try resultAt(&conversation, 1)).content, "\"value\":42");
 }
 
 test "ExecuteCode L2 persists globals across turns and Runs, isolates conversations" {

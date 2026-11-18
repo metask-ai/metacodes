@@ -322,7 +322,11 @@ class Runtime:
         tools: Sequence[str] = DEFAULT_TOOLS,
         host_tools: Sequence[Tool] = (),
         library: Optional[str] = None,
+        preview: bool = False,
     ) -> None:
+        if not isinstance(preview, bool):
+            raise TypeError("preview must be a boolean")
+        tools = tuple(dict.fromkeys((*tools, "ExecuteCode"))) if preview else tools
         unknown = [name for name in tools if name not in n.BUILTIN_TOOLS]
         if unknown:
             raise ValueError("unknown built-in tools: %s" % ", ".join(unknown))
@@ -353,6 +357,7 @@ class Runtime:
             )
         builtin, builtin_count = self._arena.views(self.tools)
         config = n.RuntimeConfig(struct_size=ctypes.sizeof(n.RuntimeConfig))
+        config.preview = int(preview)
         if builtin_count:
             config.builtin_tools = builtin
             config.builtin_tool_count = builtin_count

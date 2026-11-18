@@ -375,6 +375,7 @@ pub const JobWaitOptions = struct {
 };
 
 pub const Options = struct {
+    preview: bool = false,
     /// Where to leave the structured detail of this Run's model failure (issue
     /// #408), owned by the caller. Set to a value exactly when the Run stops
     /// with `api_error` or `max_tokens_exhausted`, and to null otherwise, so a
@@ -2910,6 +2911,7 @@ fn runCounted(
         // 弹询问,且 tool_start 卡尚未 emit)、hooks(经 pc_prefetch 剥离,PreToolUse 可 ModifyInput)、session/agent_ident(UiRequest 路由/kg
         // claim 身份,并发安全工具不用)。**维护约束**:base_ctx 新增字段若被并发安全工具读,须同步这里。
         var prefetch_ctx = tools_mod.ToolContext{
+            .preview = opts.preview,
             .allocator = allocator,
             .abort = opts.abort,
             .read_state = opts.read_state,
@@ -4559,7 +4561,8 @@ fn runCounted(
         base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
         base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
         base_ctx.kg_agent_ident = opts.kg_agent_ident;
-        base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
+        base_ctx.preview = opts.preview;
+        if (opts.preview) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop

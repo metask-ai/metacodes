@@ -4072,7 +4072,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 28), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 29), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -4603,6 +4603,15 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
         api.runtime().create()(&excessive_runtime_config, null, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    api.bufferRelease()(&diagnostic);
+
+    var invalid_preview = runtime_config;
+    invalid_preview.preview = 2;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.runtime().create()(&invalid_preview, null, &runtime, &diagnostic),
     );
     try std.testing.expect(runtime == null);
     api.bufferRelease()(&diagnostic);

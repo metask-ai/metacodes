@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Preview features require opt-in.** `--preview` enables them; `--no-preview`
+  overrides a saved root `"preview": true` in the installation's `config.json`.
+  ExecuteCode JavaScript orchestration is a preview feature and is hidden and
+  refused by default. Child agents inherit the setting. Python and Node.js
+  expose a Runtime `preview` option; AgentCore ABI revision 29 consumes a
+  reserved RuntimeConfig word for the boolean, with unchanged struct sizes.
+
 - **Every request names metacodes as its User-Agent.** Provider, sign-in,
   key-check, catalog, MCP and service requests used to go out as std's
   `zig/0.16.0 (std.http)`; they now say `metacodes/<version>`
