@@ -641,6 +641,17 @@ status, compatibility boundaries, and entry points are defined by
   sign-in that fails, cannot bind or is cancelled revokes nothing; the same
   session imported again is not revoked, and a replaced session whose
   gateway is not the site's origin is not sent there.
+- **`/login <provider>` takes effect in a session already on that provider**
+  (#566). A route takes its credential when it is chosen, so a key `/login`
+  stored afterwards (say, to replace one the provider stopped accepting) was
+  never sent: every request still carried the previous key, and failed the
+  same way, until `/model` chose the route again. Once `/login <provider>`
+  stores a key or a sign-in, a session running on that provider is bound
+  again, on the same model, channel and scope, and its next request carries
+  what was stored. After a sign-in (OAuth) the process also drops the tokens
+  it held from the login replaced: it kept presenting them, even after a
+  `/model` pick, and a refresh of them was written over the new login. A
+  session on another provider, or on no route, is left as it is.
 
 ### Security
 

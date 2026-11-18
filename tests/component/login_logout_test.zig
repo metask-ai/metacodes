@@ -16,6 +16,9 @@
 //!   sent at all;
 //! - `forgetProviderKey` (`/logout <provider>`) removes the stored key and
 //!   leaves a session that ran on it without a credential;
+//! - `adoptProviderLogin` (`/login <provider>` once it stored a key or a
+//!   sign-in, #566) moves a session running on that provider onto it, on the
+//!   same route, and leaves any other session where it is;
 //! - `applyMetaskSession` (`/login`) revokes the session it replaced, once
 //!   the new one is stored and bound, and never when it fails (#560).
 //!
@@ -1111,6 +1114,215 @@ test "/logout <provider>: the stored key goes, and a session that ran on it hold
     defer reminder.deinit();
     try app.writeUnboundReminder(&reminder.writer);
     try expectContains(reminder.written(), "No model is set up: House relay has no key.\n  Put " ++ RELAY_ENV ++ " in your shell, or in ");
+}
+
+// ── /login <provider> while a session runs on it (#566) ─────────────────────
+
+const HOUSE = cc.provider_ids.Slug.lit("house-relay");
+const SPARE = cc.provider_ids.Slug.lit("spare-relay");
+const OAUTH_RELAY = cc.provider_ids.Slug.lit("oauth-relay");
+/// The keys `/login house-relay` stores, one after the other.
+const SAVED_KEY = "sk-relay-saved-one";
+const NEW_SAVED_KEY = "sk-relay-saved-two";
+const SPARE_KEY = "sk-spare-saved";
+
+/// `relayConfig`'s provider, and a second one, `spare-relay`, at `spare`.
+fn twoRelaysConfig(a: std.mem.Allocator, origin: []const u8, spare: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{
+        \\ "house-relay": {{
+        \\  "display_name": "House relay",
+        \\  "credential_kinds": ["api_key"],
+        \\  "env_aliases": [{{"name": "{s}", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/relay/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "relay-model", "display_name": "Relay model"}}]}},
+        \\ "spare-relay": {{
+        \\  "display_name": "Spare relay",
+        \\  "credential_kinds": ["api_key"],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/spare/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "spare-model", "display_name": "Spare model"}}]}}}}}}
+    , .{ RELAY_ENV, origin, spare });
+}
+
+/// A provider that signs in (`openai_oauth`), at `origin`. Its token
+/// endpoint is a dead port: nothing here refreshes, so the token a request
+/// carries is one a login stored.
+fn oauthRelayConfig(a: std.mem.Allocator, origin: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{"oauth-relay": {{
+        \\  "display_name": "OAuth relay",
+        \\  "credential_kinds": ["openai_oauth"],
+        \\  "oauth": {{"token_url": "http://127.0.0.1:9/token", "client_id": "relay-cli"}},
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/oauth/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "oauth-model", "display_name": "OAuth model"}}]}}}}}}
+    , .{origin});
+}
+
+/// Store `key` for `provider` as `/login <provider>` stores a pasted key:
+/// the step the dialog's worker runs (`ApiKeyPrepared.run`). A configured
+/// provider has no key page, so the case builds what `prepareApiKey` hands
+/// the worker; the check before storing is `provider_key_login_test`'s.
+fn storeKeyAsLogin(case: *Case, io: std.Io, provider: cc.provider_ids.Slug, key: []const u8) !void {
+    const prepared: cc.api_provider_login.ApiKeyPrepared = .{
+        .options = .{ .state_root = case.state },
+        .provider_id = provider,
+        .provider_label = provider.slice(),
+        .kind = .api_key,
+        .page = .{ .id = cc.provider_ids.Slug.lit("keys"), .label = "Keys", .url = "https://keys.invalid/" },
+        .secret = key,
+        .check = false,
+    };
+    _ = try prepared.run(testing.allocator, io, cc.api_oauth_login.stderrNotify(), null);
+}
+
+/// Store a sign-in to `oauth-relay` as `/login oauth-relay` stores one: the
+/// import its grant ends in.
+fn storeRelaySignIn(case: *Case, access: []const u8) !void {
+    const token_json = try std.fmt.allocPrint(case.arena(),
+        \\{{"access_token":"{s}","refresh_token":"rt-{s}","token_type":"bearer","expires_in":3600}}
+    , .{ access, access });
+    try cc.api_provider_login.importTokenResponse(testing.allocator, case.state, OAUTH_RELAY, token_json, "relay-cli", null);
+}
+
+/// A session started on no route, put on `model` the way a `/model` pick
+/// puts it.
+fn sessionOn(case: *Case, io: std.Io, model: []const u8) !*App {
+    var config = cc.parseArgsForTest(&.{"metacodes"}, case.arena());
+    config.state_root = case.state;
+    const app = try App.initWithOptions(testing.allocator, io, config, "", .{ .route_state = .{ .unbound = .nothing_configured } });
+    errdefer app.deinit();
+    try testing.expect(cc.repl_picker_host.useSelector(app, model) == .switched);
+    return app;
+}
+
+test "/login <provider> stores a new key while the session runs on its saved key: the next turn sends the new key, on the same route (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, SAVED_KEY);
+    const app = try sessionOn(&case, io_runtime.io(), "relay-model");
+    defer app.deinit();
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ SAVED_KEY, headerValue(relay.lastRequest().?, "authorization").?);
+
+    // The provider stopped taking that key (deleted on its site, say):
+    // `/login house-relay` stores another, and the session goes on with it.
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, NEW_SAVED_KEY);
+    try testing.expect(app.adoptProviderLogin(HOUSE));
+    try sendOneTurn(app);
+    const captured = relay.lastRequest().?;
+    try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /relay/v1/chat/completions "));
+    try testing.expectEqualStrings("Bearer " ++ NEW_SAVED_KEY, headerValue(captured, "authorization").?);
+    try testing.expectEqual(@as(usize, 2), relay.requestCount());
+    // Only the key moved: the route, its model and the pick's scope stay.
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("house-relay"));
+    try testing.expectEqualStrings("relay-model", current.request_model_id);
+    const host = try app.providerHost();
+    try testing.expectEqual(cc.provider_selection.Scope.session, host.kernel.effectiveSelection().?.scope);
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("relay-model · saved key", app.bannerModelLine(&line_buf));
+}
+
+test "/login <provider> for a provider the session is not on leaves the session as it is (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var spare = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer spare.stop();
+    try case.write("state/config.json", try twoRelaysConfig(a, try originOf(a, relay), try originOf(a, spare)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, SAVED_KEY);
+    const app = try sessionOn(&case, io_runtime.io(), "relay-model");
+    defer app.deinit();
+    const bound = app.api_key;
+
+    try storeKeyAsLogin(&case, io_runtime.io(), SPARE, SPARE_KEY);
+    try testing.expect(!app.adoptProviderLogin(SPARE));
+    // Not bound again: the session holds the very bytes it held, not a copy.
+    try testing.expect(app.api_key.ptr == bound.ptr);
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("house-relay"));
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ SAVED_KEY, headerValue(relay.lastRequest().?, "authorization").?);
+    try testing.expectEqual(@as(usize, 0), spare.requestCount());
+    try expectNeverSent(relay, SPARE_KEY);
+}
+
+test "/login <provider> signs in again while the session runs on its sign-in: the session sends the new token, not the one the process held (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    try case.write("state/config.json", try oauthRelayConfig(a, try originOf(a, relay)));
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    try storeRelaySignIn(&case, "at-relay-one");
+    const app = try sessionOn(&case, io_runtime.io(), "oauth-model");
+    defer app.deinit();
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("oauth-model · signed in", app.bannerModelLine(&line_buf));
+    // Each turn starts as the REPL starts it, with the token refresh.
+    _ = try app.refreshRouteCredential();
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer at-relay-one", headerValue(relay.lastRequest().?, "authorization").?);
+
+    // `/login oauth-relay` again (another account, say). The process held
+    // the first login's tokens; the session moves onto the new one at once,
+    // and the turn's refresh keeps it there.
+    try storeRelaySignIn(&case, "at-relay-two");
+    try testing.expect(app.adoptProviderLogin(OAUTH_RELAY));
+    try testing.expectEqualStrings("at-relay-two", app.api_key);
+    try testing.expect(!(try app.refreshRouteCredential()));
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer at-relay-two", headerValue(relay.lastRequest().?, "authorization").?);
+    try testing.expectEqualStrings("oauth-model · signed in", app.bannerModelLine(&line_buf));
+}
+
+test "/login <provider> leaves a session running elsewhere where it is, though the stored default is on that provider (#566)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    try case.write("state/config.json", try relayConfig(a, try originOf(a, relay)));
+    try storeDefault(&case, "house-relay", "relay-model");
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    // The default had no key at the start, so the session went on the
+    // Metask sign-in; the kernel still names the default as current.
+    const app = try signedInApp(&case, io_runtime.io(), try originOf(a, gateway), null);
+    defer app.deinit();
+    const named = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(named.provider_id.eqlText("house-relay"));
+
+    // A key for the default: the session does not move onto it.
+    try storeKeyAsLogin(&case, io_runtime.io(), HOUSE, SAVED_KEY);
+    try testing.expect(!app.adoptProviderLogin(HOUSE));
+    try testing.expectEqualStrings(METASK_KEY, app.api_key);
+    try sendOneTurn(app);
+    try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(gateway.lastRequest().?, "authorization").?);
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
 }
 
 // ── through the real CLI ─────────────────────────────────────────────────────

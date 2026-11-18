@@ -2019,6 +2019,47 @@ pub const App = struct {
         return result;
     }
 
+    /// `/login <provider>` stored a key or a sign-in (#566): a session running
+    /// on that provider moves onto it, on the same route (model, channel,
+    /// scope). A commit takes its credential once (`bindCommittedSelection`),
+    /// so the session kept sending the replaced one until `/model` committed
+    /// again. The route is bound again the way `/model` binds it; the selection
+    /// itself does not change, so it is neither validated nor stored again. A
+    /// session on another provider, or on no route, is left as it is. True
+    /// when the session moved; a binding that fails is logged and leaves the
+    /// previous one in force.
+    pub fn adoptProviderLogin(app: *App, provider_id: provider_ids_mod.Slug) bool {
+        // Metask's sign-in moves the session itself (`applyMetaskSession`),
+        // onto the gateway the new session names.
+        if (provider_id.eqlText("metask")) return false;
+        // The process holds one OAuth session (single flight), which read its
+        // tokens before this sign-in stored new ones. It goes, so the next
+        // token request (the binding below, a turn's refresh, a later
+        // `/model`) loads the login just stored, not the one it replaced.
+        if (app.oauth_session_provider) |id| if (id.eql(provider_id)) {
+            if (app.oauth_session) |*held| held.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        const host = app.providerHost() catch return false;
+        const selection = host.kernel.effectiveSelection() orelse return false;
+        const resolution = provider_selection_mod.resolve(host.kernel.catalogSnapshot(), selection) catch return false;
+        const offer = resolution.primary();
+        if (!offer.provider_id.eql(provider_id)) return false;
+        // Only the route the session runs on. The kernel can name another: a
+        // stored default passed over at the start for want of a credential
+        // (the session went on Metask), or the offer of a `--base-url` start,
+        // which runs at another endpoint. Binding that would move the session
+        // to another provider or endpoint, which a login must not do.
+        if (!std.mem.eql(u8, offer.endpoint_ref, app.config.base_url orelse "") or
+            !std.mem.eql(u8, offer.request_model_id, app.activeModel())) return false;
+        app.bindCommittedSelection(host, selection) catch |err| {
+            @import("util/log.zig").warn("provider", "/login {s}: the session keeps its previous credential ({s})", .{ provider_id.slice(), @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+
     /// Drop the Metask material this process holds, for `/logout`: the
     /// device session, the key route and the account's key list, the key
     /// picked in `/models`, and `--api-key` when it was Metask's. From here
