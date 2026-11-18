@@ -379,10 +379,12 @@ does.
 ## Which one a start uses
 
 A start takes the first of these that applies: a provider named by
-`--provider` or `METACODES_PROVIDER`; the default you stored in `/model`
-(press Tab there for "every future session"); a Metask sign-in; the provider
-`<state root>/.env` configures; otherwise none, and the terminal UI opens
-without a model. A provider you defined is chosen the same ways
-(`metacodes --provider my-relay`, or in `/model`). The full order is in
+`--provider` or `METACODES_PROVIDER`; a preset named by `--preset` or
+`METACODES_PRESET`; the preset the working directory remembers; the default
+you stored in `/model` (press Tab there for "every future session"); a Metask
+sign-in; what `<state root>/.env` chooses; otherwise none, and the terminal
+UI opens without a model. A provider you defined is chosen the same ways
+(`metacodes --provider my-relay`, a preset that names one of its models, or
+in `/model`). The full order is in
 [LOCAL_CONFIG.md](LOCAL_CONFIG.md#which-provider-and-model-are-used), and
 `metacodes login status` shows it for your install.
