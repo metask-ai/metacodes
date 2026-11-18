@@ -479,13 +479,13 @@ pub const HttpTransport = struct {
             const exchange = try self.open(extra.items);
             if (exchange.exchangeHead(json, &redirect)) |_| break exchange else |err| {
                 const written = exchange.body_written;
-                // This connection cannot carry another request either.
-                if (exchange.request.connection) |connection| connection.closing = true;
-                exchange.destroy(self);
                 // Closed before a single response byte: most likely the server
                 // dropped an idle connection we reused and never read this
                 // request. Most likely is enough only for what may be repeated.
-                const stale = err == error.HttpConnectionClosing or err == error.WriteFailed;
+                const stale = exchange.closedBeforeResponse(err);
+                // This connection cannot carry another request either.
+                if (exchange.request.connection) |connection| connection.closing = true;
+                exchange.destroy(self);
                 const safe = !written or repeatable(meta);
                 if (reusing and stale and safe and stale_retries < MAX_STALE_RETRIES and !self.interrupted()) {
                     stale_retries += 1;
@@ -617,6 +617,25 @@ const Exchange = struct {
         self.body_written = true;
         self.response = try self.request.receiveHead(redirect);
         self.has_response = true;
+    }
+
+    /// `exchangeHead` failed with `err` because the server had closed the
+    /// connection before sending a single response byte: the send failed, or
+    /// the read found the end of the stream or a reset. A request written to
+    /// a socket the server already closed draws a reset, which macOS reports
+    /// in place of the queued end of stream once it arrives before the read
+    /// (a loaded client); it says no more about delivery than that end does.
+    fn closedBeforeResponse(self: *Exchange, err: anyerror) bool {
+        return switch (err) {
+            error.HttpConnectionClosing, error.WriteFailed => true,
+            error.ReadFailed => {
+                if (self.request.reader.in.buffered().len != 0) return false;
+                const connection = self.request.connection orelse return false;
+                const read_err = connection.getReadError() orelse return false;
+                return read_err == error.ConnectionResetByPeer;
+            },
+            else => false,
+        };
     }
 
     /// Read a 202/204 answer's body when it is framed, so the connection is
