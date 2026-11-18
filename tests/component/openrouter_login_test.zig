@@ -261,9 +261,24 @@ const FlowRun = struct {
     io: std.Io,
     notify: oauth_login.Notify,
     result: ?anyerror!provider_login.Outcome = null,
+    done: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *FlowRun) void {
         self.result = self.prepared.run(testing.allocator, self.io, self.notify, null);
+        self.done.store(true, .release);
+    }
+
+    /// Join the flow if it ends within five seconds; otherwise end it through
+    /// `abort` and say so, rather than hang the run on a wait that never ends.
+    fn finish(self: *FlowRun, thread: std.Thread, abort: *cc.util_abort.AbortSignal) !void {
+        var spins: usize = 0;
+        while (spins < 500 and !self.done.load(.acquire)) : (spins += 1) cc.util_time.sleepMs(10);
+        if (!self.done.load(.acquire)) {
+            abort.abort(.user_interrupt);
+            thread.join();
+            return error.FlowDidNotEnd;
+        }
+        thread.join();
     }
 };
 
@@ -314,8 +329,8 @@ test "L2 OpenRouter: the browser sign-in takes only its own state back, trades c
     try testing.expectEqual(@as(usize, 0), server.requestCount());
 
     try deliverCallback(port, try std.fmt.allocPrint(a, "code=auth-code-42&state={s}", .{state}));
-    thread.join();
     joined = true;
+    try run.finish(thread, &abort);
     _ = try (run.result orelse return error.FlowDidNotRun);
 
     // The exchange: JSON, the code, S256, and the verifier the page's
@@ -326,7 +341,7 @@ test "L2 OpenRouter: the browser sign-in takes only its own state back, trades c
     try testing.expectEqualStrings("application/json", headerValue(exchange, "content-type").?);
     try testing.expectEqualStrings("auth-code-42", jsonString(&exchange, "code").?);
     try testing.expectEqualStrings("S256", jsonString(&exchange, "code_challenge_method").?);
-    const verifier = jsonString(&exchange, "code_verifier").?;
+    const verifier = jsonString(&exchange, "code_verifier") orelse return error.NoVerifierInExchange;
     var challenge_buf: [64]u8 = undefined;
     try testing.expectEqualStrings(challenge, challengeOf(&challenge_buf, verifier));
     try testing.expect(headerValue(exchange, "authorization") == null);
@@ -364,14 +379,18 @@ test "L2 OpenRouter: a refusal ends the sign-in at once, with or without a state
     for ([_]bool{ false, true }) |with_state| {
         var instructions = Instructions{ .allocator = testing.allocator };
         defer instructions.deinit();
+        var abort = cc.util_abort.AbortSignal.init();
         var run = FlowRun{ .prepared = try prepared(&case), .io = io_runtime.io(), .notify = instructions.notify() };
+        run.prepared.options.abort_signal = &abort;
         var thread = try std.Thread.spawn(.{}, FlowRun.run, .{&run});
         if (!instructions.wait()) {
+            abort.abort(.user_interrupt);
             thread.join();
             return error.FlowNeverPublishedInstructions;
         }
         const said = try a.dupe(u8, instructions.snapshot());
         const page = pageIn(said, origin) orelse {
+            abort.abort(.user_interrupt);
             thread.join();
             return error.PageNotOnTheMock;
         };
@@ -381,7 +400,9 @@ test "L2 OpenRouter: a refusal ends the sign-in at once, with or without a state
         else
             "error=access_denied";
         try deliverCallback(port, query);
-        thread.join();
+        // A refusal ends the wait at once; one that left it waiting is a
+        // failure here, not a hung run.
+        try run.finish(thread, &abort);
         try testing.expectError(error.KeyGrantDeclined, run.result.?);
     }
     try testing.expectEqual(@as(usize, 0), server.requestCount());
@@ -440,7 +461,7 @@ test "L2 OpenRouter: on another device the page shows the code; the code pasted 
     // Whitespace a paste carries is not part of the code.
     try testing.expectEqualStrings("shown-code-7", jsonString(&exchange, "code").?);
     var challenge_buf: [64]u8 = undefined;
-    try testing.expectEqualStrings(paramIn(pending.url, "code_challenge").?, challengeOf(&challenge_buf, jsonString(&exchange, "code_verifier").?));
+    try testing.expectEqualStrings(paramIn(pending.url, "code_challenge").?, challengeOf(&challenge_buf, jsonString(&exchange, "code_verifier") orelse return error.NoVerifierInExchange));
     var stored = (try key_store.load(testing.allocator, case.root, OPENROUTER)).?;
     defer stored.deinit();
     try testing.expectEqualStrings(KEY, stored.secret);
@@ -728,7 +749,9 @@ test "L2 OpenRouter: /model lists the account's models; switching to and from th
     defer relay.stop();
     const relay_url = try relay.urlOwned(a);
     try case.tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = try relayConfig(a, relay_url[0 .. relay_url.len - "/v1/messages".len]) });
-    try case.setEnv("HOUSE_RELAY_TOKEN", "relay-key-77");
+    // Both keys stored, each in its provider's own file: a lookup that did not
+    // keep to the provider being bound would hand one the other's.
+    try key_store.save(testing.allocator, case.root, Slug.lit("house-relay"), .api_key, "relay-key-77", null, 1);
     try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
 
     var io_runtime = @import("platform").signal.threadedIo(a, .{});
@@ -748,13 +771,13 @@ test "L2 OpenRouter: /model lists the account's models; switching to and from th
     try sendHi(app);
     const chat = openrouter.lastRequest().?;
     try testing.expectEqualStrings("POST /api/v1/chat/completions HTTP/1.1", requestLine(chat));
-    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(chat, "authorization").?);
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(chat, "authorization") orelse "");
     try testing.expectEqualStrings("\"deepseek/deepseek-v4.1-flash\"", chat.jsonField("model").?);
     // Who is calling, as OpenRouter's app attribution asks: the project's
     // address, its name, a terminal coding agent. Nothing about the user.
-    try testing.expectEqualStrings("https://github.com/metask-ai/metacodes", headerValue(chat, "http-referer").?);
-    try testing.expectEqualStrings("metacodes", headerValue(chat, "x-openrouter-title").?);
-    try testing.expectEqualStrings("cli-agent", headerValue(chat, "x-openrouter-categories").?);
+    try testing.expectEqualStrings("https://github.com/metask-ai/metacodes", headerValue(chat, "http-referer") orelse "");
+    try testing.expectEqualStrings("metacodes", headerValue(chat, "x-openrouter-title") orelse "");
+    try testing.expectEqualStrings("cli-agent", headerValue(chat, "x-openrouter-categories") orelse "");
     try testing.expect(headerValue(chat, "x-openrouter-app-visibility") == null);
     try testing.expectEqualStrings("metacodes/" ++ cc.VERSION, headerValue(chat, "user-agent") orelse "");
 
@@ -763,7 +786,7 @@ test "L2 OpenRouter: /model lists the account's models; switching to and from th
     try testing.expectEqualStrings("relay-key-77", app.api_key);
     try sendHi(app);
     try testing.expectEqual(@as(usize, 1), relay.requestCount());
-    try testing.expectEqualStrings("Bearer relay-key-77", headerValue(relay.lastRequest().?, "authorization").?);
+    try testing.expectEqualStrings("Bearer relay-key-77", headerValue(relay.lastRequest().?, "authorization") orelse "");
     // OpenRouter's attribution is OpenRouter's: another provider gets none.
     try testing.expect(headerValue(relay.lastRequest().?, "http-referer") == null);
     try testing.expect(headerValue(relay.lastRequest().?, "x-openrouter-title") == null);
