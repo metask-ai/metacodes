@@ -12,6 +12,40 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The CLI no longer consults a built-in System-One advisor** (#474). Until
+  now every host built on the CLI (the TUI, `-p`, `--web`, `serve`) fell back
+  to the team's `metask-jev-4b` at `http://58.211.6.133:10420` whenever
+  `config.json` and `METACODES_JEV_*` named no service, so a session whose
+  TinyKG store held a matching memory sent the first 400 bytes of the request
+  and up to eight 480-byte memory excerpts over plain HTTP to a public IP
+  address nobody had been asked about. The advisor is now on only where a
+  service is named, by the `jev` object of `<state root>/config.json` or by
+  `METACODES_JEV_URL`; with neither, `metacodes doctor` reports
+  `jev_advisor off url=- source=none`. `"jev": false` and
+  `METACODES_JEV_URL=off` still mean off, and a service named in either place
+  behaves as before. **This changes behavior for anyone who relied on the
+  default** (it replaces the 0.3.0 default below): a machine that wants the
+  team's service names it once, in `<state root>/config.json`
+
+  ```json
+  "jev": {"url": "http://58.211.6.133:10420", "mode": "advisory",
+          "model": "metask-jev-4b", "decisions": ["scoped_recall"]}
+  ```
+
+  or in the environment with `METACODES_JEV_URL`, `METACODES_JEV_MODE=advisory`,
+  `METACODES_JEV_MODEL=metask-jev-4b` and
+  `METACODES_JEV_DECISIONS=scoped_recall` (these four are what the default
+  carried; a `url` alone starts from `shadow` and every surface). That address
+  is still plain HTTP; serving it over https on a hostname, and asking once on
+  first run, are tracked in #474. A library host that sets
+  `Config.jev_builtin_default` still gets the built-in service, and the CLI's
+  choice is one constant that the session and `doctor` both read
+  (`jev.CLI_USES_BUILTIN_DEFAULT`). `zig build test:builtin-egress`, part of
+  `gate:pr`, now fails when a built-in destination that is on by default is a
+  non-loopback `http://` URL, and the memory-agent runtime smoke runs its
+  System-One arm in the build: an evaluation arm that uses the advisor reaches
+  it through the service its own environment names.
+
 - **Every request names metacodes as its User-Agent.** Provider, sign-in,
   key-check, catalog, MCP and service requests used to go out as std's
   `zig/0.16.0 (std.http)`; they now say `metacodes/<version>`
