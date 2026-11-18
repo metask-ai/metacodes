@@ -287,7 +287,7 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
             writePadded(w, offer.provider_id.slice(), 20);
             const setup = picker.setupFor(offer.provider_id);
             if (setup.sign_in) {
-                w.writeAll("/login") catch {};
+                writeSignIn(w, &setup);
             } else if (setup.variable) |variable| {
                 w.print("{s} in .env", .{clip(variable, layout.cols -| 40)}) catch {};
             }
@@ -437,6 +437,16 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, under: ?Row) u16 
 }
 
 /// Where a provider that is not configured gets its credential, in place of
+/// `/login` for Metask, whose sign-in is `/login` alone; `/login <id>` for
+/// a provider that signs in on its own site (OpenRouter).
+fn writeSignIn(w: *std.Io.Writer, setup: *const picker_mod.Setup) void {
+    if (setup.provider.eqlText("metask")) {
+        w.writeAll("/login") catch {};
+    } else {
+        w.print("/login {s}", .{setup.provider.slice()}) catch {};
+    }
+}
+
 /// the list (#488): the variable, this install's `.env` and the guide; for a
 /// provider one signs in to (Metask), `/login` first. Nothing to choose and
 /// nothing to type, so the only keys named are the ones that leave.
@@ -446,7 +456,11 @@ fn setupBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u
         const path = if (picker.local_config_path_len > 0) picker.localConfigPath() else ".env";
         var text_buf: [picker_mod.MAX_LOCAL_CONFIG_PATH + 512]u8 = undefined;
         var text: std.Io.Writer = .fixed(&text_buf);
-        if (setup.sign_in) text.writeAll("Sign in: /login\n") catch {};
+        if (setup.sign_in) {
+            text.writeAll("Sign in: ") catch {};
+            writeSignIn(&text, &setup);
+            text.writeAll("\n") catch {};
+        }
         if (setup.variable) |variable| {
             text.print("{s}et {s} in {s}, then restart\n", .{ if (setup.sign_in) "Or s" else "S", variable, path }) catch {};
         }

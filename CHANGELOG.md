@@ -315,6 +315,20 @@ status, compatibility boundaries, and entry points are defined by
   `METACODES_OPENROUTER_URL` (https, or plain http to a loopback host) moves
   every OpenRouter address, requests included, for development and tests.
 
+- **`/model` lists the OpenRouter models the account can use.** After a
+  sign-in or a pasted key, and on `/providers refresh`, the account's own
+  listing (`GET /api/v1/models/user`, which applies its provider
+  preferences, privacy settings and guardrails) gives one route per model
+  that takes tools over chat completions, all on OpenRouter's router channel:
+  OpenRouter picks the upstream (its default routing — price, speed, uptime,
+  fallbacks), and the price shown is the model's listed one. The listing is
+  kept trimmed in `<state root>/cache/models/` (no key in it); a start reads
+  it whatever its age, so a stored `/model` default on an OpenRouter model
+  resolves without a request, and the REPL fetches it again in the
+  background when none is kept or it is a day old and a key is set (as with
+  a key in `.env`). An OpenRouter that is not set up says `/login openrouter`
+  in `/model`'s setup, as Metask's says `/login`.
+
 - **A configuration entry that names a built-in provider is passed over
   alone.** `custom_providers.<built-in id>` used to fail the whole
   `custom_providers` section; it is now skipped by itself, said once, and the

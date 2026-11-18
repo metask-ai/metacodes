@@ -405,6 +405,13 @@ pub const App = struct {
     /// The background `/v1/models` fetch a cache-served start runs, until the
     /// REPL takes its answer (`adoptModelCatalogRefresh`) or the App ends.
     models_refresh: ?*models_cache_mod.Refresh = null,
+    /// A background fetch of OpenRouter's listing, for a start that found
+    /// none kept or a day-old one (`api/openrouter_catalog.zig`); the REPL
+    /// takes it at the idle points it takes `models_refresh` at.
+    openrouter_refresh: ?*@import("api/openrouter_catalog.zig").Refresh = null,
+    /// The REPL hosts this App: catalogs may refresh in the background
+    /// (`InitOptions.models_cache`).
+    background_catalogs: bool = false,
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
     model_switch_owned: ?[]u8 = null,
@@ -1086,6 +1093,7 @@ pub const App = struct {
                 // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
                 app.api_key_catalog_load = .deferred;
                 app.loadModelCatalog(options.models_cache);
+                app.background_catalogs = options.models_cache;
             } else {
                 @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
             }
@@ -2180,6 +2188,7 @@ pub const App = struct {
         app.api_key_catalog.deinit();
         // A refresh still in flight finishes (and frees itself) on its own thread.
         if (app.models_refresh) |refresh| refresh.release();
+        if (app.openrouter_refresh) |refresh| refresh.release();
         if (app.metask_key_route) |*route| route.deinit(app.allocator);
         for (&app.parked_login_workers) |*slot| if (slot.*) |worker| {
             worker.cancel();
@@ -2369,6 +2378,7 @@ pub const App = struct {
     /// session has since left (a key picked in `/models`, another route) is
     /// dropped; the answer it would replace was fetched for the current one.
     pub fn adoptModelCatalogRefresh(app: *App) void {
+        app.adoptOpenRouterRefresh();
         const refresh = app.models_refresh orelse return;
         if (!refresh.finished()) return;
         app.models_refresh = null;
@@ -2504,9 +2514,78 @@ pub const App = struct {
         var shadowed_buf: [256]u8 = undefined;
         if (host.shadowedNotice(&shadowed_buf)) |notice| @import("util/log.zig").warn("provider", "{s}", .{notice});
         app.applyMetaskKeyCatalog(host);
+        app.adoptOpenRouterListing(host);
         app.seedStartupSelection(host);
         app.provider_host = host;
         return host;
+    }
+
+    /// The built-in OpenRouter's models: the kept listing, whatever its age;
+    /// in the REPL, with none kept or a day-old one and a key set, a fetch in
+    /// the background, taken at an idle point (`adoptOpenRouterRefresh`).
+    fn adoptOpenRouterListing(app: *App, host: *provider_host_mod.Host) void {
+        const openrouter_catalog = @import("api/openrouter_catalog.zig");
+        const kept = openrouter_catalog.adoptKept(host, app.allocator, app.stateRoot());
+        if (kept == .fresh or !app.background_catalogs or app.openrouter_refresh != null) return;
+        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return;
+        defer {
+            std.crypto.secureZero(u8, key);
+            app.allocator.free(key);
+        }
+        app.openrouter_refresh = openrouter_catalog.Refresh.start(key, app.stateRoot()) catch |err| blk: {
+            @import("util/log.zig").debug("catalog", "OpenRouter listing refresh not started: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    /// Take a finished background fetch of OpenRouter's listing into the
+    /// live catalog. Called where the REPL takes `models_refresh`.
+    pub fn adoptOpenRouterRefresh(app: *App) void {
+        const refresh = app.openrouter_refresh orelse return;
+        if (!refresh.finished()) return;
+        app.openrouter_refresh = null;
+        const kept = refresh.kept();
+        refresh.release();
+        if (!kept) return;
+        const host = app.provider_host orelse return;
+        if (@import("api/openrouter_catalog.zig").adoptKept(host, app.allocator, app.stateRoot()) == .none) return;
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+    }
+
+    /// Fetch OpenRouter's listing now with the key OpenRouter's requests
+    /// would use (a sign-in, `/providers refresh`), keep it, and take it.
+    /// Returns how many models it lists; null when no key is set.
+    pub fn refreshOpenRouterListing(app: *App) !?usize {
+        const host = try app.providerHost();
+        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return null;
+        defer {
+            std.crypto.secureZero(u8, key);
+            app.allocator.free(key);
+        }
+        const count = try @import("api/openrouter_catalog.zig").refresh(app.allocator, app.io, app.stateRoot(), key, host);
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+        return count;
+    }
+
+    const openrouter_profile_id = provider_ids_mod.Slug.lit("openrouter");
+
+    /// The key a request to `provider_id` would carry, as startup resolves
+    /// it: the environment, `<state root>/.env`, then the stored key. Owned;
+    /// the caller zeroes it. Null when none is set.
+    fn providerSecretIn(app: *App, host: *provider_host_mod.Host, provider_id: provider_ids_mod.Slug) ?[]u8 {
+        const profile = host.registry.findById(provider_id) orelse return null;
+        var stored = StoredKey.load(app, provider_id, .quiet);
+        defer stored.deinit();
+        var reference: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+        const resolved = provider_credential_mod.resolve(.{
+            .provider_id = profile.id,
+            .accepted_kinds = profile.accepted_credential_kinds,
+            .env_aliases = profile.env_aliases,
+            .stored_api_key = stored.entry(),
+            .env = provider_credential_mod.EnvLookup.process(),
+            .env_fallback = app.credentialEnvFallback(),
+        }, &reference) catch return null;
+        return app.allocator.dupe(u8, resolved.secret) catch null;
     }
 
     /// Tell the kernel which route this session actually started on.
@@ -2846,7 +2925,9 @@ pub const App = struct {
         return .{
             .provider = profile.id,
             .variable = variable,
-            .sign_in = profile.id.eqlText("metask"),
+            // Metask, and a provider whose site creates the key (OpenRouter):
+            // `/login` is the way in, a variable the other.
+            .sign_in = profile.id.eqlText("metask") or profile.key_grant != null,
         };
     }
 
@@ -4102,6 +4183,19 @@ pub const App = struct {
     ///
     /// Returns the number of providers refreshed.
     pub fn refreshProviderCatalogs(app: *App) !usize {
+        app.last_catalog_refresh_error = null;
+        var refreshed: usize = 0;
+        // The built-in OpenRouter's own listing, when a key is set for it.
+        if (app.refreshOpenRouterListing()) |listed| {
+            if (listed != null) refreshed += 1;
+        } else |err| {
+            app.last_catalog_refresh_error = @errorName(err);
+        }
+        return refreshed + try app.refreshConfiguredCatalogs();
+    }
+
+    /// The catalogs `provider_catalogs` names by URL.
+    fn refreshConfiguredCatalogs(app: *App) !usize {
         var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return 0;
         defer store.deinit();
         const text = store.readText() catch return 0;
@@ -4118,7 +4212,6 @@ pub const App = struct {
         const host = try app.providerHost();
         const io = app.api_client.http_client.io;
         var refreshed: usize = 0;
-        app.last_catalog_refresh_error = null;
 
         var it = section.object.iterator();
         while (it.next()) |pair| {

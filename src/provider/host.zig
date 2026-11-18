@@ -19,6 +19,7 @@ const config_store = @import("config_store.zig");
 const custom_provider = @import("custom_provider.zig");
 const config_doc = @import("config_doc.zig");
 const openrouter = @import("openrouter.zig");
+const openrouter_profile = @import("profiles/openrouter.zig");
 const bedrock_catalog = @import("bedrock_catalog.zig");
 const offer_mod = @import("offer.zig");
 const profile_mod = @import("profile.zig");
@@ -267,6 +268,45 @@ pub const Host = struct {
         // notice on its own.
         self.kernel.notePricingUpdated(provider_id);
         self.kernel.noteProviderHealth(provider_id, worst);
+    }
+
+    /// Replace the built-in OpenRouter profile's models with an account's
+    /// listing (`GET /api/v1/models/user`): one offer per model that takes
+    /// tools, all on the profile's router channel (`auto`), at the address
+    /// the channel has now (the development override may have moved it,
+    /// `rebaseOrigin`). Returns how many models it took. A listing with none
+    /// is refused and the previous models stay: a stale list is a far better
+    /// answer than an empty one, and offer ids are derived from the stable
+    /// binding, so a stored pin resolves again after a refresh.
+    pub fn ingestOpenRouterBuiltin(self: *Host, models_json: []const u8) IngestError!usize {
+        const current = self.registry.findById(openrouter_profile.PROFILE.id) orelse return error.InvalidDocument;
+        if (current.channels.len == 0) return error.InvalidDocument;
+
+        var parsed = try openrouter.parseModels(self.allocator, models_json);
+        defer parsed.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const entries = try openrouter.routerEntries(scratch, parsed.models.items);
+        if (entries.len == 0) return error.InvalidDocument;
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = current.channels[0];
+        channels[0].base_url = try scratch.dupe(u8, current.channels[0].base_url);
+        channels[0].models = &.{};
+        var built = current.*;
+        built.channels = channels;
+        built.models = entries;
+        try self.registry.checkReplace(built);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.replaceAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+        self.kernel.notePricingUpdated(built.id);
+        return entries.len;
     }
 
     /// Which wire protocols an ingested Metask inventory offers.
@@ -1612,6 +1652,51 @@ test "built OpenRouter channels copy every string the parse results held" {
     try std.testing.expectEqualStrings("high", control.allowed_values[1]);
     try std.testing.expectEqualStrings("slower", control.cost_latency_warning.?);
     try std.testing.expectEqualStrings("{\"x\":1}", control.extension_data.?);
+}
+
+test "the built-in OpenRouter takes an account's listing: one router offer per model with tools, stable across a refresh" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const listing =
+        \\{"data": [
+        \\  {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek: DeepSeek V4.1 Flash", "context_length": 1048576,
+        \\   "top_provider": {"max_completion_tokens": 65536},
+        \\   "pricing": {"prompt": "0.0000001", "completion": "0.0000004"},
+        \\   "supported_parameters": ["tools", "reasoning"]},
+        \\  {"id": "openrouter/auto", "name": "Auto Router", "pricing": {"prompt": "-1", "completion": "-1"},
+        \\   "supported_parameters": ["tools"]},
+        \\  {"id": "some/chat-only", "name": "No tools", "supported_parameters": ["temperature"]}
+        \\]}
+    ;
+    try std.testing.expectEqual(@as(usize, 2), try host.ingestOpenRouterBuiltin(listing));
+    var first: ?ids.OfferId = null;
+    var count: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        count += 1;
+        try std.testing.expect(item.channel_id.eqlText("auto"));
+        try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", item.endpoint_ref);
+        try std.testing.expect(!std.mem.eql(u8, item.request_model_id, "some/chat-only"));
+        if (std.mem.eql(u8, item.request_model_id, "deepseek/deepseek-v4.1-flash")) first = item.offer_id;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // A refresh reproduces the offer: a pin on it resolves again.
+    _ = try host.ingestOpenRouterBuiltin(listing);
+    try std.testing.expect(host.kernel.catalogSnapshot().find(first.?) != null);
+
+    // A listing with nothing usable is refused, and the models stay.
+    try std.testing.expectError(error.InvalidDocument, host.ingestOpenRouterBuiltin("{\"data\": [{\"id\": \"x/y\", \"supported_parameters\": []}]}"));
+    try std.testing.expect(host.kernel.catalogSnapshot().find(first.?) != null);
+
+    // The development origin moves the listing's route with it.
+    try host.rebaseOrigin(Slug.lit("openrouter"), "https://openrouter.ai", "http://127.0.0.1:9");
+    _ = try host.ingestOpenRouterBuiltin(listing);
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        try std.testing.expectEqualStrings("http://127.0.0.1:9/api/v1/chat/completions", item.endpoint_ref);
+    }
 }
 
 test "two models served by one endpoint ingest as one channel holding both" {

@@ -612,3 +612,165 @@ test "L2 OpenRouter: the stored key starts an OpenRouter session and reaches its
     try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(captured, "authorization").?);
     try testing.expectEqualStrings("\"openrouter/auto\"", captured.jsonField("model").?);
 }
+
+// ── the account's models in /model ─────────────────────────────────────────
+
+const LISTING =
+    \\{"data": [
+    \\  {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek: DeepSeek V4.1 Flash", "context_length": 1048576,
+    \\   "top_provider": {"max_completion_tokens": 65536},
+    \\   "pricing": {"prompt": "0.0000001", "completion": "0.0000004"},
+    \\   "supported_parameters": ["tools", "reasoning"], "endpoints": ["/api/v1/chat/completions"]},
+    \\  {"id": "moonshotai/kimi-k3", "name": "MoonshotAI: Kimi K3",
+    \\   "pricing": {"prompt": "0.0000006", "completion": "0.0000025"},
+    \\   "supported_parameters": ["tools"], "endpoints": ["/api/v1/chat/completions"]},
+    \\  {"id": "openai/gpt-6.2-sol:batch", "supported_parameters": ["tools"], "endpoints": ["/api/v1/batches"]},
+    \\  {"id": "some/no-tools", "supported_parameters": ["temperature"], "endpoints": ["/api/v1/chat/completions"]}
+    \\]}
+;
+
+fn openRouterOffers(host: *cc.provider_host.Host) usize {
+    var count: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openrouter")) count += 1;
+    }
+    return count;
+}
+
+test "L2 OpenRouter: the account's listing is fetched with the key, kept, and a start lists it without a request" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.start(LISTING, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    const host = try cc.provider_host.Host.create(testing.allocator);
+    defer host.destroy();
+    openrouter_login.applyOriginOverride(host);
+    // Before: only the compiled router model.
+    try testing.expectEqual(@as(usize, 1), openRouterOffers(host));
+    const listing_url = try cc.api_openrouter_catalog.listingUrl(a);
+    try testing.expect(std.mem.startsWith(u8, listing_url, origin));
+    try testing.expectEqual(@as(usize, 2), try cc.api_openrouter_catalog.refresh(testing.allocator, io_runtime.io(), case.root, KEY, host));
+    const fetched = server.lastRequest().?;
+    try testing.expectEqualStrings("GET /api/v1/models/user HTTP/1.1", requestLine(fetched));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(fetched, "authorization").?);
+    // The batch-only and the tool-less models are left out.
+    try testing.expectEqual(@as(usize, 2), openRouterOffers(host));
+    var pinned: ?cc.provider_ids.OfferId = null;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        try testing.expect(item.channel_id.eqlText("auto"));
+        try testing.expect(std.mem.startsWith(u8, item.endpoint_ref, origin));
+        if (std.mem.eql(u8, item.request_model_id, "deepseek/deepseek-v4.1-flash")) pinned = item.offer_id;
+    }
+
+    // A later start: the kept copy, no request, the same offer ids.
+    const later = try cc.provider_host.Host.create(testing.allocator);
+    defer later.destroy();
+    openrouter_login.applyOriginOverride(later);
+    try testing.expectEqual(cc.api_openrouter_catalog.Kept.fresh, cc.api_openrouter_catalog.adoptKept(later, testing.allocator, case.root));
+    try testing.expectEqual(@as(usize, 1), server.requestCount());
+    try testing.expectEqual(@as(usize, 2), openRouterOffers(later));
+    try testing.expect(later.kernel.catalogSnapshot().find(pinned.?) != null);
+}
+
+/// A provider of the user's own on the OpenAI wire, at `origin`.
+fn relayConfig(a: std.mem.Allocator, origin: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{"house-relay": {{
+        \\  "display_name": "House relay",
+        \\  "credential_kinds": ["api_key"],
+        \\  "env_aliases": [{{"name": "HOUSE_RELAY_TOKEN", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/relay/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "relay-model", "display_name": "Relay model"}}]}}}}}}
+    , .{origin});
+}
+
+fn sendHi(app: *App) !void {
+    const messages = [_]cc.types_mod.ApiMessage{
+        .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+    };
+    var handle = try app.provider().sendStream(&messages, null, null, null, null, null, "");
+    while (try handle.next()) |event| switch (event) {
+        .text, .thinking, .reasoning_item, .web_search_query => |bytes| app.allocator.free(bytes),
+        else => {},
+    };
+    handle.deinit();
+}
+
+/// Pick, in `/model`, the first offer whose name contains `typed`, of
+/// `provider`, for this session.
+fn pick(app: *App, typed: []const u8, provider: []const u8) !void {
+    const picker_host = cc.repl_picker_host;
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    for (typed) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    const focused = app.model_picker.focusedOffer() orelse return error.NothingToPick;
+    try testing.expect(focused.provider_id.eqlText(provider));
+    try testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
+}
+
+test "L2 OpenRouter: /model lists the account's models; switching to and from them takes each provider's own key and no other" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    // OpenRouter's mock answers the listing, then the chats.
+    var openrouter = try harness.MockServer.startCassette(&.{ LISTING, OPENAI_SSE, OPENAI_SSE }, 0);
+    defer openrouter.stop();
+    _ = try case.openRouterAt(openrouter);
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    const relay_url = try relay.urlOwned(a);
+    try case.tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = try relayConfig(a, relay_url[0 .. relay_url.len - "/v1/messages".len]) });
+    try case.setEnv("HOUSE_RELAY_TOKEN", "relay-key-77");
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const argv = [_][*:0]const u8{"metacodes"};
+    const app = try App.init(testing.allocator, io_runtime.io(), try case.config(&argv), "metask-key");
+    defer app.deinit();
+
+    // What `/login openrouter` does once the key is stored.
+    try testing.expectEqual(@as(?usize, 2), try app.refreshOpenRouterListing());
+    try testing.expectEqualStrings("GET /api/v1/models/user HTTP/1.1", requestLine(openrouter.requestAt(0).?));
+
+    // Pick an OpenRouter model: its route, its key.
+    try pick(app, "deepseek-v4.1", "openrouter");
+    try testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", app.activeModel());
+    try testing.expectEqualStrings(KEY, app.api_key);
+    try sendHi(app);
+    const chat = openrouter.lastRequest().?;
+    try testing.expectEqualStrings("POST /api/v1/chat/completions HTTP/1.1", requestLine(chat));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(chat, "authorization").?);
+    try testing.expectEqualStrings("\"deepseek/deepseek-v4.1-flash\"", chat.jsonField("model").?);
+
+    // Away to the user's relay: its key, and OpenRouter's stays behind.
+    try pick(app, "relay-model", "house-relay");
+    try testing.expectEqualStrings("relay-key-77", app.api_key);
+    try sendHi(app);
+    try testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try testing.expectEqualStrings("Bearer relay-key-77", headerValue(relay.lastRequest().?, "authorization").?);
+
+    // And back: OpenRouter's key again, never the relay's.
+    try pick(app, "kimi-k3", "openrouter");
+    try testing.expectEqualStrings(KEY, app.api_key);
+    try sendHi(app);
+    try testing.expectEqual(@as(usize, 3), openrouter.requestCount());
+    for (0..openrouter.requestCount()) |index| {
+        const seen = openrouter.requestAt(index).?;
+        try testing.expect(std.mem.indexOf(u8, seen.raw, "relay-key-77") == null);
+        try testing.expect(std.mem.indexOf(u8, seen.raw, "metask-key") == null);
+    }
+    for (0..relay.requestCount()) |index| {
+        const seen = relay.requestAt(index).?;
+        try testing.expect(std.mem.indexOf(u8, seen.raw, KEY) == null);
+        try testing.expect(std.mem.indexOf(u8, seen.raw, "metask-key") == null);
+    }
+}

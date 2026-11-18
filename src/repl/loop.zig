@@ -3291,6 +3291,10 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     if (app.storedKeyShadowNotice(profile, &notice_buf)) |notice| {
         cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
     }
+    // The account's own models, so /model lists them now.
+    _ = app.refreshOpenRouterListing() catch |err| {
+        cmd_output.print("{s}{s}'s model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, profile.display_name, @errorName(err), th.reset });
+    };
 }
 
 /// Offer one provider in `/login`'s list. The one `/login <id>` named is

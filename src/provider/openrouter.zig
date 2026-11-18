@@ -290,6 +290,38 @@ pub fn buildChannels(
     return out;
 }
 
+/// The models of a listing that a coding session can use through OpenRouter's
+/// own routing, as entries of one router channel (the built-in profile's
+/// `auto`, `Host.ingestOpenRouterBuiltin`): one per model that takes tools,
+/// each requested by its id, with the model-level limits, capabilities,
+/// price and controls the listing declares. A model whose tool support is
+/// not declared is left out rather than offered on a guess. Every byte is
+/// copied into `arena`.
+pub fn routerEntries(arena: std.mem.Allocator, models: []const CatalogModel) AdapterError![]const profile_mod.ModelEntry {
+    var out: std.ArrayList(profile_mod.ModelEntry) = .empty;
+    for (models) |model| {
+        if (model.capabilities.get(.tools) != .supported) continue;
+        const id = try dupe(arena, model.id);
+        out.append(arena, .{
+            .request_model_id = id,
+            .display_name = try dupe(arena, model.display_name),
+            .canonical_model_id = id,
+            .limits = .{
+                .context_window = model.context_length,
+                .max_output_tokens = model.max_output_tokens,
+                .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
+                .provenance = offer.Provenance.known(.provider_catalog, null),
+            },
+            .capabilities = model.capabilities,
+            // The model's declared price: what OpenRouter lists for it. The
+            // upstream its routing picks may charge otherwise.
+            .quote = model.quote,
+            .controls = try dupeControls(arena, model.controls),
+        }) catch return error.OutOfMemory;
+    }
+    return out.items;
+}
+
 /// Deep copy of a control list: the specs, and every string and vocabulary
 /// slice they point at, all into `arena`.
 fn dupeControls(

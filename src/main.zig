@@ -14,6 +14,7 @@ const api_keys_mod = @import("api/api_keys.zig");
 const oauth_login = @import("api/oauth_login.zig");
 const provider_login = @import("api/provider_login.zig");
 const openrouter_login = @import("api/openrouter_login.zig");
+const openrouter_catalog = @import("api/openrouter_catalog.zig");
 const metask_oauth_mod = @import("api/metask_oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const catalog_mod = @import("api/catalog.zig");
@@ -113,6 +114,7 @@ pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
 pub const api_provider_login = @import("api/provider_login.zig");
 pub const api_openrouter_login = @import("api/openrouter_login.zig");
+pub const api_openrouter_catalog = @import("api/openrouter_catalog.zig");
 pub const api_login_worker = @import("api/login_worker.zig");
 pub const api_metask_sign_in = @import("api/metask_sign_in.zig"); // `/login`'s browser sign-in on a worker (#485)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
@@ -3102,6 +3104,16 @@ fn loginMessagesUrl() []const u8 {
     return client.ANTHROPIC_API_URL;
 }
 
+/// Fetch and keep OpenRouter's listing with a key just stored, so the next
+/// start lists the account's models. A failure costs the list, not the key.
+fn fetchOpenRouterListing(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, key: []const u8) void {
+    const count = openrouter_catalog.refresh(allocator, io, state_dir, key, null) catch |err| {
+        std.debug.print("warning: OpenRouter's model list could not be fetched ({s}); `/providers refresh` fetches it again\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("{d} OpenRouter models take tools; /model lists them.\n", .{count});
+}
+
 /// Whether `name` is a provider that declares a key grant
 /// (`ProviderProfile.key_grant`).
 fn providerDeclaresKeyGrant(allocator: std.mem.Allocator, name: []const u8) bool {
@@ -3209,6 +3221,7 @@ fn runProviderKeyGrantLogin(allocator: std.mem.Allocator, io: std.Io, state_dir:
     const key_path = provider_api_key_store.pathFor(allocator, state_dir, profile.id) catch null;
     defer if (key_path) |path| allocator.free(path);
     std.debug.print("The key is stored in {s}.\n", .{key_path orelse "the state root"});
+    if (stored) |value| fetchOpenRouterListing(allocator, io, state_dir, value.secret);
     var local_config = loadLocalConfig(allocator, allocator, state_dir);
     defer local_config.deinit();
     if (provider_login.keyShadowedBy(profile, provider_credential.EnvLookup.process(), local_config.lookup())) |shadow| {
@@ -3370,16 +3383,19 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
     if (profile.key_grant != null) {
         var stored = provider_api_key_store.load(allocator, state_dir, profile.id) catch null;
         defer if (stored) |*value| value.deinit();
-        if (stored) |value| if (value.meta.described) {
-            var line_buf: [512]u8 = undefined;
-            var line: std.Io.Writer = .fixed(&line_buf);
-            openrouter_login.writeStored(&line, profile.display_name, value.meta) catch {};
-            std.debug.print("{s}\n", .{line.buffered()});
-            var notes_buf: [512]u8 = undefined;
-            var notes: std.Io.Writer = .fixed(&notes_buf);
-            openrouter_login.writeAfterSignIn(&notes, profile.display_name, openrouter_login.origin(profile.key_grant.?), value.meta, null, null) catch {};
-            std.debug.print("{s}", .{notes.buffered()});
-        };
+        if (stored) |value| {
+            if (value.meta.described) {
+                var line_buf: [512]u8 = undefined;
+                var line: std.Io.Writer = .fixed(&line_buf);
+                openrouter_login.writeStored(&line, profile.display_name, value.meta) catch {};
+                std.debug.print("{s}\n", .{line.buffered()});
+                var notes_buf: [512]u8 = undefined;
+                var notes: std.Io.Writer = .fixed(&notes_buf);
+                openrouter_login.writeAfterSignIn(&notes, profile.display_name, openrouter_login.origin(profile.key_grant.?), value.meta, null, null) catch {};
+                std.debug.print("{s}", .{notes.buffered()});
+            }
+            if (request.check) fetchOpenRouterListing(allocator, io, state_dir, value.secret);
+        }
     }
     // A key variable for this provider in the shell or in `.env` is read
     // before the stored key (`credential.resolve`): say so, by name, rather
@@ -4281,6 +4297,9 @@ fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
     // `METACODES_OPENROUTER_URL` (development, tests) moves every OpenRouter
     // address, its requests included.
     openrouter_login.applyOriginOverride(host);
+    // OpenRouter's models: the listing the last sign-in or refresh kept,
+    // whatever its age (no request here).
+    _ = openrouter_catalog.adoptKept(host, allocator, hostRoot());
     var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return host;
     defer store.deinit();
     host.adoptDurableState(&store);
@@ -5632,6 +5651,7 @@ test {
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/openrouter_login.zig");
+    _ = &@import("api/openrouter_catalog.zig");
     _ = &@import("api/provider_login.zig");
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("api/models_pages.zig");
