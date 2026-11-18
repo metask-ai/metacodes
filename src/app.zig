@@ -1587,6 +1587,8 @@ pub const App = struct {
         /// Why the stored default could not be forgotten: the next start
         /// may still use it.
         default_error: ?anyerror = null,
+        /// What revoking the Metask session the sign-in replaced did (#560).
+        replaced: metask_oauth_mod.ReplacedOutcome = .nothing_replaced,
     };
 
     /// `/login`, once `auth.json` holds the sign-in: move this session onto
@@ -1724,9 +1726,10 @@ pub const App = struct {
 
     /// `/login`'s durable and live sign-in as one transaction (#527). A
     /// failure before or during the route switch restores the previous
-    /// session and `auth.json`; the default is forgotten only after the
-    /// switch commits. Thus the current process and the next start never
-    /// disagree about which login the previous route should use.
+    /// session and `auth.json`; the default is forgotten, and the previous
+    /// session revoked at Metask (#560), only after the switch commits. Thus
+    /// the current process and the next start never disagree about which
+    /// login the previous route should use.
     pub fn applyMetaskSession(
         app: *App,
         sign_in: MetaskSession,
@@ -1793,6 +1796,11 @@ pub const App = struct {
         } else |err| {
             applied.default_error = err;
         }
+        // Stored and bound: the session the snapshot holds, which a rollback
+        // would have put back, is revoked at Metask now (#560), bounded as
+        // `/logout`. Left alone it would stay valid there, with nothing
+        // here that could end it.
+        applied.replaced = metask_oauth_mod.revokeReplaced(app.allocator, snapshot.contents, token_json, metask_oauth_mod.siteUrl(), 3000);
         return applied;
     }
 

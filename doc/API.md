@@ -49,6 +49,17 @@ surfaces built over the same core protocols.
   `gateway_url`, `models_url`, and `client_name` in
   `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
 
+Every Metask sign-in that replaces a stored session (this one, `metacodes
+login`, `/login`, `/login metask`) revokes the replaced one at
+`$METASK_SITE_URL/api/oauth/revoke`, as `metacodes logout` revokes the current
+one (#560): only once the new session is stored (and, in the TUI, bound), so a
+sign-in that fails, cannot bind or is cancelled revokes nothing; bounded (3 s
+in the TUI, 5 s on the command line), and a refusal or no answer is reported
+in one line without failing the sign-in. The same session stored again is not
+revoked, and a replaced session whose `gateway_url` is not the origin of
+`$METASK_SITE_URL` is not sent there: it stays valid until it expires, and the
+sign-in says so.
+
 The refresh grant sends only `grant_type=refresh_token` and the stored refresh
 token. Metask rotates refresh tokens; persistence happens before the new access
 token is used, and an `invalid_grant` is actionable as “log in again”. The
@@ -122,7 +133,9 @@ Once both are chosen it stores the token response as the Metask session
 (`oauth/metask.json`) and the choice in `auth.json`, as `metacodes login`
 does, moves the session onto that gateway with the session's token at once,
 and forgets a stored `global_selection`, so the next start is on the sign-in
-too (#485, #527). `/logout` revokes the Metask session at Metask, removes
+too (#485, #527); a Metask session it replaced is then revoked at Metask
+(#560, see [Metask device OAuth and gateway](#metask-device-oauth-and-gateway)).
+`/logout` revokes the Metask session at Metask, removes
 both Metask sign-ins (`auth.json` and the session `oauth/metask.json`) and a
 Metask key
 stored with `login --provider metask`, forgets a stored default that resolves

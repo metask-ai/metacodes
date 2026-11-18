@@ -2936,8 +2936,9 @@ fn printLoginHelp() void {
 /// token response is stored as the Metask session (`oauth/metask.json`), and
 /// the choice in `auth.json`, replacing a key or an older sign-in there (left
 /// there they would outrank the session at the next start). A stored `/model`
-/// default is forgotten, as `/login` does. Prints `done` (no full stop),
-/// the account it signed in as when the server says, on success.
+/// default is forgotten, and a Metask session it replaced revoked (#560), as
+/// `/login` does. Prints `done` (no full stop), the account it signed in as
+/// when the server says, on success.
 fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, token_json: []const u8, done: []const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2969,6 +2970,9 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         return 1;
     };
 
+    // The session this one replaces (#560), revoked once the sign-in is stored.
+    var replaced = metask_oauth_mod.Replaced.capture(allocator, state_dir);
+    defer replaced.deinit();
     var diagnostic: provider_login.ImportDiagnostic = .{};
     provider_login.importTokenResponse(allocator, state_dir, provider_ids_mod.Slug.lit("metask"), token_json, null, &diagnostic) catch |err| {
         std.debug.print("The sign-in was not stored: {s}\n", .{@errorName(diagnostic.cause orelse err)});
@@ -2994,8 +2998,15 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         catalog.entries.items[choice.model].model_id,
         choice.effort.name(),
     });
+    printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     forgetDefaultForSignIn(allocator, state_dir);
     return 0;
+}
+
+/// What a sign-in says about the Metask session it replaced (#560).
+fn printReplacedNote(outcome: metask_oauth_mod.ReplacedOutcome) void {
+    const note = metask_oauth_mod.replacedNote(outcome) orelse return;
+    std.debug.print("{s}{s}\n", .{ if (note.warn) "warning: " else "", note.text });
 }
 
 const ModelChoice = struct { model: usize, effort: types.ReasoningEffort };
@@ -3890,11 +3901,15 @@ fn runMetaskDeviceLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []c
         std.debug.print("error: could not initialize the Metask OAuth store ({s})\n", .{@errorName(err)});
         return 2;
     };
+    // The session this one replaces (#560), revoked once it is stored.
+    var replaced = metask_oauth_mod.Replaced.capture(allocator, hostRoot());
+    defer replaced.deinit();
     session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
         std.debug.print("error: could not store the Metask OAuth session ({s})\n", .{@errorName(err)});
         return 2;
     };
     std.debug.print("Stored Metask OAuth session. No secret was printed.\n", .{});
+    printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     std.debug.print("No model was chosen (not at a terminal): start with --model <id>, or choose one with /model.\n", .{});
     return 0;
 }
@@ -3993,6 +4008,9 @@ fn importProviderTokenResponse(
     token_json: []const u8,
     client_id: ?[]const u8,
 ) u8 {
+    // A Metask session this replaces (#560), revoked once it is stored.
+    var replaced = if (provider_id.eqlText("metask")) metask_oauth_mod.Replaced.capture(allocator, hostRoot()) else metask_oauth_mod.Replaced.none;
+    defer replaced.deinit();
     var diagnostic: provider_login.ImportDiagnostic = .{};
     provider_login.importTokenResponse(allocator, hostRoot(), provider_id, token_json, client_id, &diagnostic) catch |err|
         return reportImportFailure(err, diagnostic);
@@ -4000,6 +4018,7 @@ fn importProviderTokenResponse(
         "Stored an OAuth login for provider '{s}'. No secret was printed.\n",
         .{provider_id.slice()},
     );
+    printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     return 0;
 }
 

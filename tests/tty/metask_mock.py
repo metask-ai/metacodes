@@ -21,6 +21,13 @@ request:
 
 The `$BROWSER` stub plays the user's browser: it reads the authorize URL it is
 handed and requests the redirect URI with a code and the same `state`.
+
+Every sign-in gets the same tokens (`ACCESS_TOKEN`, `REFRESH_TOKEN`) unless
+`distinct_sessions` is set: then each one gets its own, `session_tokens(n)`
+for the n-th (the first is the same pair), as a second sign-in at Metask is a
+second authorization (#560). `revoke_answers` scripts the revocations: the
+n-th is answered with that status, or held unanswered for None; the ones past
+the list get 200.
 """
 import http.server
 import json
@@ -41,6 +48,11 @@ ACCOUNT_NAME = "Mock User"
 # tokens, as if it had been confirmed already.
 DEVICE_CODE = "mk-device-tty-0001"
 USER_CODE = "MOCK-4711"
+
+
+def session_tokens(n):
+    """The (access, refresh) tokens of the n-th sign-in, with `distinct_sessions`."""
+    return f"mk-access-tty-{n:04d}", f"mk-refresh-tty-{n:04d}"
 
 _BROWSER_STUB = r'''#!{python}
 import sys, urllib.parse, urllib.request
@@ -91,7 +103,8 @@ DEFAULT_MODELS = [
 
 
 class MetaskMock:
-    def __init__(self, keys=None, reply="METASK_MOCK_REPLY", models=None, userinfo_stalls=False):
+    def __init__(self, keys=None, reply="METASK_MOCK_REPLY", models=None, userinfo_stalls=False,
+                 distinct_sessions=False, revoke_answers=()):
         # [(name, secret)]: the keys an older sign-in's key route lists.
         self.keys = [("dev key", KEY_SECRET), ("ops key", OTHER_KEY_SECRET)] if keys is None else keys
         self.models = DEFAULT_MODELS if models is None else models
@@ -103,6 +116,22 @@ class MetaskMock:
         # A userinfo request is held, unanswered, until the mock closes.
         self.userinfo_stalls = userinfo_stalls
         self._unstall = threading.Event()
+        # Each sign-in its own tokens (`session_tokens`); the pairs issued so far.
+        self.distinct_sessions = distinct_sessions
+        self.sessions = []
+        # The status each revocation in turn is answered with (None: held).
+        self.revoke_answers = list(revoke_answers)
+
+    def _issue(self):
+        """The tokens a sign-in (a code or a device code) is answered with."""
+        if not self.distinct_sessions:
+            return ACCESS_TOKEN, REFRESH_TOKEN
+        pair = session_tokens(len(self.sessions) + 1)
+        self.sessions.append(pair)
+        return pair
+
+    def _access_tokens(self):
+        return {ACCESS_TOKEN} | {access for access, _ in self.sessions}
 
     def __enter__(self):
         outer = self
@@ -136,13 +165,14 @@ class MetaskMock:
                     if outer.userinfo_stalls:
                         outer._unstall.wait(60)
                         return
-                    if auth != f"Bearer {ACCESS_TOKEN}":
+                    if auth not in {f"Bearer {token}" for token in outer._access_tokens()}:
                         return self._send(401, b'{"error":"invalid_token"}')
                     info = {"sub": "mock-user-1", "name": ACCOUNT_NAME, "email": "mock@example.invalid",
                             "client_id": "metacodes", "authorization_id": "auth-1"}
                     return self._send(200, json.dumps(info).encode())
                 if self.path.startswith("/v1/models"):
-                    allowed = [f"Bearer {ACCESS_TOKEN}"] + [f"Bearer {secret}" for _, secret in outer.keys]
+                    allowed = ([f"Bearer {token}" for token in outer._access_tokens()]
+                               + [f"Bearer {secret}" for _, secret in outer.keys])
                     if auth not in allowed:
                         return self._send(401, b'{"error":{"code":"invalid_api_key"}}')
                     return self._send(200, json.dumps({"object": "list", "data": outer.models}).encode())
@@ -154,7 +184,11 @@ class MetaskMock:
                 body = self.rfile.read(length)
                 if self.path.startswith("/api/oauth/revoke"):
                     outer.revocations.append(body.decode("utf-8", "replace"))
-                    return self._send(200, b"")
+                    status = outer.revoke_answers.pop(0) if outer.revoke_answers else 200
+                    if status is None:
+                        outer._unstall.wait(60)
+                        return
+                    return self._send(status, b"" if status == 200 else b'{"error":"server_error"}')
                 if self.path.startswith("/api/oauth/device/code"):
                     outer.device_requests.append(body.decode("utf-8", "replace"))
                     grant = {"device_code": DEVICE_CODE, "user_code": USER_CODE,
@@ -163,12 +197,16 @@ class MetaskMock:
                              "expires_in": 600, "interval": 1}
                     return self._send(200, json.dumps(grant).encode())
                 if self.path.startswith("/api/oauth/token") or self.path.startswith("/oauth/token"):
-                    if (b"tty-code-0001" not in body and REFRESH_TOKEN.encode() not in body
-                            and DEVICE_CODE.encode() not in body):
+                    signs_in = b"tty-code-0001" in body or DEVICE_CODE.encode() in body
+                    refreshes = [pair for pair in outer.sessions if pair[1].encode() in body]
+                    if not signs_in and not refreshes and REFRESH_TOKEN.encode() not in body:
                         return self._send(400, b'{"error":"invalid_grant"}')
                     if b"client_id=metacodes" not in body and b'"client_id":"metacodes"' not in body:
                         return self._send(401, b'{"error":"invalid_client"}')
-                    token = {"access_token": ACCESS_TOKEN, "refresh_token": REFRESH_TOKEN,
+                    # A sign-in is a new authorization; a refresh keeps its own.
+                    access, refresh = (outer._issue() if signs_in
+                                       else refreshes[0] if refreshes else (ACCESS_TOKEN, REFRESH_TOKEN))
+                    token = {"access_token": access, "refresh_token": refresh,
                              "token_type": "bearer", "expires_in": 3600,
                              "gateway_url": outer.origin, "models_url": f"{outer.origin}/v1/models",
                              "client_name": "metacodes", "scope": "read model:invoke"}
