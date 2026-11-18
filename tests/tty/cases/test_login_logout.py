@@ -34,6 +34,7 @@ from asserts import TTYAssert  # noqa: E402
 from e2e_helpers import SkipTest  # noqa: E402
 from metask_mock import (  # noqa: E402
     ACCOUNT_NAME, DEFAULT_MODELS, DEVICE_CODE, KEY_SECRET, MODEL, USER_CODE, MetaskMock, ACCESS_TOKEN, REFRESH_TOKEN,
+    session_tokens,
 )
 from test_unbound import KEY_VARIABLES  # noqa: E402
 from test_key_login import _cli  # noqa: E402
@@ -426,6 +427,125 @@ def test_login_cancelled_with_esc_changes_nothing(bin_path):
         assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
         assert mock.messages == []
         assert not any("/oauth/token" in p for _, p, _ in mock.requests)
+
+
+# `/login` in the TUI, through the model and reasoning level.
+_TUI_SIGN_IN = [
+    "type:/login", "key:enter",
+    wait_for("Select a model", 20), "key:enter",
+    wait_for("Select a reasoning level", 10), "key:enter",
+]
+
+
+def _revocation_of(pair):
+    """What the revocation of the session with these (access, refresh) tokens sends."""
+    return f"token={pair[1]}&token_type_hint=refresh_token&client_id=metacodes"
+
+
+def _stored_refresh_token(state):
+    with open(os.path.join(state, "oauth", "metask.json")) as f:
+        return json.load(f)["refresh_token"]
+
+
+def test_signing_in_again_revokes_the_session_it_replaced_once_each_time(bin_path):
+    # #560: a sign-in that replaces the stored Metask session revokes that
+    # one at Metask once the new one is stored and bound, as /logout would;
+    # left alone it would stay valid there with nothing here that could end
+    # it. Twice with /login, once with `metacodes login`, once with the
+    # device code. Each sign-in is its own authorization (`distinct_sessions`).
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock(distinct_sessions=True) as mock:
+        home, state, env = _case(mock)
+        work = case_tmpdir("cc-tty-relogin-work-")
+        first, second, third, fourth = (session_tokens(n) for n in range(1, 5))
+        raw = run(bin_path, [READY] + _TUI_SIGN_IN + [wait_for("Signed in to Metask", 10)]
+                  + [READY] + _TUI_SIGN_IN + [wait_for("Metask revoked the previous sign-in.", 15)]
+                  + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(40, 140))
+        screen = _screen(TTYAssert(raw, rows=40, cols=140))
+        # The first /login replaced nothing; the second revoked the first, once,
+        # after its own token response, and said so.
+        assert mock.revocations == [_revocation_of(first)], mock.revocations
+        assert screen.count("Metask revoked the previous sign-in.") == 1, screen
+        paths = [path for _, path, _ in mock.requests]
+        grants = [i for i, path in enumerate(paths) if path.startswith("/api/oauth/token")]
+        assert len(grants) == 2 and paths.index("/api/oauth/revoke") > grants[1], paths
+        # The session went on with the second sign-in.
+        assert mock.messages == [(f"Bearer {second[0]}", MODEL)], mock.messages
+        assert _stored_refresh_token(state) == second[1]
+
+        # `metacodes login` replaces the second ...
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "1\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert text.count("Metask revoked the previous sign-in.") == 1, text
+        assert mock.revocations == [_revocation_of(first), _revocation_of(second)], mock.revocations
+        assert _stored_refresh_token(state) == third[1]
+
+        # ... and the device code the third.
+        code, device_out = _cli(os.path.abspath(bin_path), ["login", "--provider", "metask", "--no-browser"], _cli_env(env), [
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "1\r"),
+        ])
+        text = device_out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert text.count("Metask revoked the previous sign-in.") == 1, text
+        assert mock.revocations == [_revocation_of(pair) for pair in (first, second, third)], mock.revocations
+        assert _stored_refresh_token(state) == fourth[1]
+        for secret in [token for pair in (first, second, third, fourth) for token in pair]:
+            assert secret.encode() not in raw + out + device_out, f"{secret} reached the terminal"
+
+
+def test_a_revocation_refused_or_not_answered_leaves_the_login_done_and_says_so(bin_path):
+    # #560: revoking the replaced session is best effort and bounded: a refusal
+    # or no answer within the wait never fails the sign-in, and the line says
+    # what stays valid, in /logout's words.
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock(distinct_sessions=True, revoke_answers=[500, None]) as mock:
+        home, state, env = _case(mock)
+        work = case_tmpdir("cc-tty-relogin-work-")
+        first, second, third = (session_tokens(n) for n in range(1, 4))
+        raw = run(bin_path, [READY] + _TUI_SIGN_IN + [wait_for("Signed in to Metask", 10)]
+                  + [READY] + _TUI_SIGN_IN + [wait_for("could not revoke the previous sign-in", 15)]
+                  # The TUI waits 3 seconds for the answer that never comes.
+                  + [READY] + _TUI_SIGN_IN + [wait_for("did not answer the revocation", 20)]
+                  + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(40, 140))
+        screen = _screen(TTYAssert(raw, rows=40, cols=140))
+        assert "Metask could not revoke the previous sign-in; it stays valid there until it expires." in screen, screen
+        assert ("Metask did not answer the revocation of the previous sign-in in time; "
+                "it may stay valid there until it expires.") in screen, screen
+        assert mock.revocations == [_revocation_of(first), _revocation_of(second)], mock.revocations
+        # Both sign-ins stood: the session went on with the third.
+        assert mock.messages == [(f"Bearer {third[0]}", MODEL)], mock.messages
+        assert _stored_refresh_token(state) == third[1]
+
+
+def test_a_login_cancelled_with_esc_revokes_nothing_and_keeps_the_stored_session(bin_path):
+    # #560: nothing is revoked before the new session is stored and bound. Esc
+    # stores nothing, so the session that was there stays, unrevoked and in use.
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, {"BROWSER": "true"})
+        session = mock.write_session(state)
+        with open(session) as f:
+            before = f.read()
+        raw = run(bin_path, [
+            READY,
+            "type:/login",
+            "key:enter",
+            wait_for("Open this URL", 15),
+            "key:esc",
+            wait_for("nothing was changed", 10),
+        ] + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, term_size=(30, 140))
+        a = TTYAssert(raw, rows=30, cols=140, autowrap=True)
+        assert "Login interrupted · nothing was changed" in _screen(a)
+        assert mock.revocations == [], mock.revocations
+        with open(session) as f:
+            assert f.read() == before
+        assert mock.messages == [(f"Bearer {ACCESS_TOKEN}", MODEL)], mock.messages
 
 
 def test_login_with_no_chat_model_says_so_and_stores_nothing(bin_path):

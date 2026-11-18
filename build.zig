@@ -43,6 +43,7 @@ fn addHlWithProjectHarnessActuation(
         g_code_mod = code;
     }
     mod.addImport("code_runtime", g_code_mod.?);
+    mod.addImport("bench_assets", b.createModule(.{ .root_source_file = b.path("scripts/bench_assets.zig") }));
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
     const project_harness_options = b.addOptions();
     project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
@@ -819,11 +820,12 @@ fn addCoreSuiteRun(
 
 pub fn build(b: *std.Build) void {
     validateAggregateTestInventory(b);
-    // The CLI consults the built-in System-One advisor service when nothing
-    // configures one. Every step this build runs — test binaries, the
-    // product they spawn, the Python suites — must not: its answers would
-    // steer recall from a machine outside the test, and the test's state would
-    // leave it. Run steps without their own environment use this map, and
+    // The System-One advisor is on only where a service is named (#474: the CLI
+    // no longer takes a built-in one), and a developer's shell may name one.
+    // Every step this build runs — test binaries, the product they spawn, the
+    // Python suites — must not consult it: its answers would steer recall from
+    // a machine outside the test, and the test's state would leave it. Run
+    // steps without their own environment use this map, and
     // setEnvironmentVariable starts from a copy of it, so one entry covers
     // all; set before any step copies it.
     // `off`, not an empty value: Windows cannot be relied on to pass one.
@@ -1127,6 +1129,21 @@ pub fn build(b: *std.Build) void {
         "release:stage",
         "Install the release layout (bin/metacodes, bin/rg, libexec/metacodes kernels, vendor/tinykg CLI + daemon, share/licenses); requires -Drelease-layout=true, a Lean toolchain and pinned kernel digests, and fails closed for a target without vendored runtime assets",
     );
+    // Shared file-copy steps: the docs gate exercises exactly the release's
+    // documents, without depending on install, executables or Lean kernels.
+    const release_documents = parseJsonFile(b, struct {
+        schema: []const u8,
+        files: []const struct { source: []const u8, destination: []const u8 },
+    }, "release/documents.json");
+    if (!std.mem.eql(u8, release_documents.schema, "metacodes.release-documents/v1"))
+        @panic("unsupported release documents manifest");
+    const release_docs_step = b.step("release:docs", "Stage only release documents and licences, without compiling the product");
+    for (release_documents.files) |document| {
+        const destination = std.mem.replaceOwned(u8, b.allocator, document.destination, "{version}", manifest.version) catch @panic("OOM");
+        const install_document = b.addInstallFileWithDir(b.path(document.source), .prefix, destination);
+        release_docs_step.dependOn(&install_document.step);
+    }
+    release_stage_step.dependOn(release_docs_step);
     release_stage_step.dependOn(b.getInstallStep());
     if (!release_layout) {
         release_stage_step.dependOn(&b.addFail(
@@ -1173,26 +1190,6 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&stage_ripgrep.step);
         b.getInstallStep().dependOn(&install_ripgrep_license.step);
-        // The release unit also carries its own licence, TinyKG's, the
-        // rendered notices and the operator docs (release/LAYOUT.md, #80);
-        // a development install does not.
-        const release_extras = [_]struct { source: []const u8, dir: []const u8, name: []const u8 }{
-            .{ .source = "LICENSE", .dir = "share/licenses", .name = "metacodes-LICENSE" },
-            .{ .source = "vendor/tinykg/LICENSE", .dir = "share/licenses", .name = "tinykg-LICENSE" },
-            .{ .source = "THIRD_PARTY_NOTICES.md", .dir = "share/licenses", .name = "THIRD_PARTY_NOTICES.md" },
-            .{ .source = "vendor/lean-runtime/lean4-LICENSE", .dir = "share/licenses", .name = "lean4-LICENSE" },
-            .{ .source = "vendor/lean-runtime/gmp-COPYING.LESSERv3", .dir = "share/licenses", .name = "gmp-COPYING.LESSERv3" },
-            .{ .source = "vendor/lean-runtime/gmp-COPYINGv3", .dir = "share/licenses", .name = "gmp-COPYINGv3" },
-            .{ .source = "vendor/lean-runtime/gmp-COPYINGv2", .dir = "share/licenses", .name = "gmp-COPYINGv2" },
-            .{ .source = "vendor/lean-runtime/libuv-LICENSE", .dir = "share/licenses", .name = "libuv-LICENSE" },
-            .{ .source = "vendor/lean-runtime/libuv-LICENSE-extra", .dir = "share/licenses", .name = "libuv-LICENSE-extra" },
-            .{ .source = "README.md", .dir = "share/doc", .name = "README.md" },
-            .{ .source = "CHANGELOG.md", .dir = "share/doc", .name = b.fmt("CHANGELOG-{s}.md", .{manifest.version}) },
-        };
-        for (release_extras) |extra| {
-            const install_extra = b.addInstallFileWithDir(b.path(extra.source), .{ .custom = extra.dir }, extra.name);
-            release_stage_step.dependOn(&install_extra.step);
-        }
     } else {
         std.log.warn(
             "no vendored ripgrep for {s}: the install carries no bin/rg and Grep/Glob resolve it from PATH (#86)",
@@ -2590,10 +2587,41 @@ pub fn build(b: *std.Build) void {
     doc_check_step.dependOn(&doc_check_cmd.step);
     doc_check_step.dependOn(&doc_facts_cmd.step);
     doc_check_step.dependOn(&version_state_cmd.step);
+    const doc_references_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/eval/plugin_release_gate.py",
+        "--validate-only",
+    });
+    const doc_references_step = b.step("doc:references", "Validate protocol paths and pins without running the product or providers");
+    doc_references_step.dependOn(&doc_references_cmd.step);
+    doc_check_step.dependOn(doc_references_step);
+    const release_docs_sources_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_release_docs.py",
+    });
+    doc_check_step.dependOn(&release_docs_sources_cmd.step);
     const notices_cmd = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/gen_third_party_notices.py", "--check" });
     const notices_step = b.step("release:notices", "Check generated third-party notices");
     notices_step.dependOn(&notices_cmd.step);
     doc_check_step.dependOn(notices_step);
+    const release_docs_check_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/check_release_docs.py",
+        "--prefix",
+        b.getInstallPath(.prefix, ""),
+    });
+    release_docs_check_cmd.step.dependOn(release_docs_step);
+    release_docs_check_cmd.step.dependOn(notices_step);
+    const release_docs_check_step = b.step("release:docs:check", "Stage and verify only release documents, licences and generated notices");
+    release_docs_check_step.dependOn(&release_docs_check_cmd.step);
+    const release_docs_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_check_release_docs",
+        "-v",
+    });
+    units_test_step.dependOn(&release_docs_test_cmd.step);
     const doc_facts_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2653,6 +2681,19 @@ pub fn build(b: *std.Build) void {
     const scrollback_test_step = b.step("test:scrollback", "Test that only the TUI Renderer erases the screen and writes the scrollback");
     scrollback_test_step.dependOn(&scrollback_test_cmd.step);
     units_test_step.dependOn(&scrollback_test_cmd.step);
+    // No built-in destination that is on by default is cleartext to a public
+    // host (#474): the product's `http://` literals name loopback only, except
+    // the Jev default no host takes, and the CLI's decision stays off.
+    const builtin_egress_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_builtin_egress_discipline",
+        "-v",
+    });
+    const builtin_egress_test_step = b.step("test:builtin-egress", "Test that no default-on built-in destination is cleartext to a public host");
+    builtin_egress_test_step.dependOn(&builtin_egress_test_cmd.step);
+    units_test_step.dependOn(&builtin_egress_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2793,6 +2834,10 @@ pub fn build(b: *std.Build) void {
         target.result.os.tag == @import("builtin").os.tag and
         target.result.cpu.arch == @import("builtin").cpu.arch;
     if (runtime_tests_can_execute_target) {
+        const bench_cli_smoke = b.addSystemCommand(&.{ eval_python_exe, "scripts/eval/bench_cli_smoke.py", "--binary" });
+        bench_cli_smoke.addArtifactArg(exe);
+        eval_test_step.dependOn(&bench_cli_smoke.step);
+        product_test_step.dependOn(&bench_cli_smoke.step);
         if (staged_tinykg) |tinykg| {
             // Native Python cases discover the installed TinyKG by path.  On
             // a clean checkout they must wait for installation; otherwise
@@ -2847,10 +2892,16 @@ pub fn build(b: *std.Build) void {
             // number, so the smoke is POSIX-only until that hand-off gets a
             // Windows handle design (the Python suite marks the same mechanism
             // "anonymous inherited descriptor requires POSIX").
+            //
+            // The System-One arm runs too (#474): the CLI no longer falls back
+            // to a built-in advisor, so an arm that uses one reaches it only
+            // through the service its own environment names (the runner's
+            // loopback judge), and this is what fails when it stops doing so.
             if (@import("builtin").os.tag != .windows) {
                 const memory_runtime_smoke = b.addSystemCommand(&.{
                     eval_python_exe,
                     "scripts/eval/memory_agent_runtime_smoke.py",
+                    "--include-jev-arm",
                     "--binary",
                 });
                 memory_runtime_smoke.addArtifactArg(exe);

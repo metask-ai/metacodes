@@ -260,6 +260,17 @@ another, applying the answer as before.
 {"v":1,"type":"ui_request_closed","id":1,"outcome":"answered","by":"alice@example.com"}
 ```
 
+**Ids across restarts.** An answer names its request by id alone, so an id
+must not come back. `--web` and `serve` never hand one out twice, across
+their restarts and across a session destroyed and restored. An answer to an
+earlier request, delivered again (a webhook that retries, a client that
+reconnects), is refused as stale (409, or the UDS `no pending request with
+this id`). It never answers a newer request. Their ids come from one counter
+per process that stays above the wall clock in milliseconds. They are large
+integers (about 1.8×10¹² in 2026, far below 2⁵³), which a frontend copies back
+as given. `SessionHost` keeps its ids across restarts under `.suspend`
+(below), and not yet under `.block`, its default.
+
 **Expiry** (`SessionHost.Options.ui_request_expiry`, with
 `ui_request_timeout_ms`). Every policy closes a request with an outcome v1
 already has: `cancel` (the default, as before) closes it `"cancelled"` and

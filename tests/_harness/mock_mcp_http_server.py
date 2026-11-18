@@ -17,8 +17,10 @@ Paths select the server:
               own, and whose "toolerror" answers with isError.
   /dropcall   /keepalive that reads a tools/call and closes the connection
               without answering: the call executed, and nothing says so.
-  /idleclose  /keepalive whose connections close 50 ms after each response,
-            the way a server ends an idle keep-alive connection.
+  /idleclose  /keepalive whose connections stay open until GET /closeidle
+            closes every one of them, the way a server ends idle keep-alive
+            connections. The test asks for it between two requests, so no
+            close can land inside an exchange.
 Every observation records the client port (`conn`: one TCP connection each)
 and the request's `Connection` header.
 GET /log returns every observation as JSON lines (for assertions).
@@ -27,12 +29,13 @@ import json
 import socket
 import sys
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = []
 LOCK = threading.Lock()
 PENDING = {}
+# Client port -> socket of every /idleclose connection still open.
+IDLECLOSE = {}
 
 
 def record(**fields):
@@ -66,6 +69,19 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/closeidle":
+            with LOCK:
+                connections = list(IDLECLOSE.values())
+                IDLECLOSE.clear()
+            for connection in connections:
+                # Synchronously, before this answer: the handler blocked
+                # reading the next request sees EOF and closes its socket, and
+                # anything the client sends after it is never read.
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            return self.reply(200, {"closed": len(connections)})
         self.reply(405)
 
     def do_DELETE(self):
@@ -82,6 +98,9 @@ class Handler(BaseHTTPRequestHandler):
         params = message.get("params") or {}
         record(path=self.path, method=method, id=rid, headers=headers, has_meta="_meta" in params,
                conn=self.client_address[1], connection=headers.get("connection"))
+        if mode == "idleclose":
+            with LOCK:
+                IDLECLOSE[self.client_address[1]] = self.connection
         if mode == "dropcall" and method == "tools/call":
             self.close_connection = True
             return
@@ -163,18 +182,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(data), data))
         self.wfile.flush()
 
-    def close_soon(self):
-        connection = self.connection
-
-        def later():
-            time.sleep(0.05)
-            try:
-                connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-        threading.Thread(target=later, daemon=True).start()
-
     def keepalive(self, mode, method, rid):
         if (self.headers.get("Connection") or "").lower() == "close":
             # Vercel drops these intermittently; here always, so a client that
@@ -194,8 +201,6 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "kept-call"}]}})
         else:
             self.reply(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
-        if mode == "idleclose":
-            self.close_soon()
 
     def modern(self, method, rid, params, headers):
         meta = params.get("_meta") or {}

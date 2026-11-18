@@ -49,10 +49,15 @@ const Mock = struct {
     }
 
     fn log(self: *const Mock, allocator: std.mem.Allocator) ![]u8 {
+        return self.get(allocator, "log");
+    }
+
+    /// GET `path` on a connection of its own; returns the body.
+    fn get(self: *const Mock, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
         defer client.deinit();
         var buffer: [128]u8 = undefined;
-        const target = try self.url(&buffer, "log");
+        const target = try self.url(&buffer, path);
         var body: std.Io.Writer.Allocating = .init(allocator);
         defer body.deinit();
         _ = try client.fetch(.{ .location = .{ .url = target }, .response_writer = &body.writer });
@@ -212,9 +217,11 @@ test "MCP HTTP: a pooled connection the server closed is replaced, the request s
             .url = try mock.url(&buffer, "idleclose"),
         }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
         defer client.close();
-        // The server closes each connection 50 ms after answering; the pooled
-        // one is dead by now.
-        cc.util_time.sleepMs(300);
+        // The server closes the handshake's connection while it idles in the
+        // pool, and only then: never inside an exchange.
+        const closed = try mock.get(a, "closeidle");
+        defer a.free(closed);
+        try std.testing.expect(!std.mem.eql(u8, closed, "{\"closed\": 0}"));
         const tools = try client.listTools();
         defer a.free(tools);
         try std.testing.expect(std.mem.indexOf(u8, tools, "\"kept\"") != null);
@@ -227,6 +234,9 @@ test "MCP HTTP: a pooled connection the server closed is replaced, the request s
     var lists: usize = 0;
     for (seen) |request| lists += @intFromBool(std.mem.eql(u8, request.method, "tools/list"));
     try std.testing.expectEqual(@as(usize, 1), lists);
+    // It went out on a new connection; the closed one never delivered it.
+    try std.testing.expectEqualStrings("tools/list", seen[seen.len - 1].method);
+    try std.testing.expect(seen[0].conn != seen[seen.len - 1].conn);
 }
 
 test "MCP HTTP: a connection idle past the reuse window is not reused" {
