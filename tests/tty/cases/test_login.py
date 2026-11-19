@@ -14,7 +14,7 @@ notice; Esc ends it before anything is sent.
 import re
 import socket
 
-from tty_driver import run, submit, READY, wait_for
+from tty_driver import run, runs_alone, submit, READY, wait_for
 from asserts import TTYAssert
 from e2e_helpers import SkipTest
 
@@ -58,6 +58,10 @@ def test_login_unknown_provider(bin_path):
 _ANSI = re.compile(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>78]")
 _CODEX_PARAMS = ("id_token_add_organizations=true", "codex_cli_simplified_flow=true", "originator=metacodes")
 _CODEX_NOTICE = "ChatGPT (Codex): This sign-in is unofficial and may stop working at any time."
+# Every browser sign-in waits on 1455 first, then 1457 (src/core/auth.zig); Codex's
+# client registered those two only. A sign-in running beside these cases would take
+# the port they assert on, so `run_tty_tests.py --jobs` runs them alone.
+_CALLBACK_PORTS = "the fixed OAuth callback ports 1455 and 1457"
 
 
 def _hold(port):
@@ -84,6 +88,7 @@ def _codex_sign_in(bin_path):
     return text, urls[-1]
 
 
+@runs_alone(_CALLBACK_PORTS)
 def test_login_chatgpt_codex_waits_on_its_registered_port_with_the_codex_parameters(bin_path):
     # The dialog signs in on a worker thread, from the worker's copy of the
     # profile (src/api/login_worker.zig). A copy that dropped the fields added
@@ -101,6 +106,7 @@ def test_login_chatgpt_codex_waits_on_its_registered_port_with_the_codex_paramet
         assert param in url, f"{param} not in {url}"
 
 
+@runs_alone(_CALLBACK_PORTS)
 def test_login_chatgpt_codex_takes_1457_when_1455_is_held_and_sends_it_nothing(bin_path):
     # The client registered 1455 and 1457 only: with 1455 held the sign-in
     # waits on 1457, and whatever holds 1455 (another sign-in, perhaps) is

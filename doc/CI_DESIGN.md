@@ -256,8 +256,15 @@ The rules that keep the split from dropping coverage:
 - **The TTY shards partition the cases.** `run_tty_tests.py --shard K/N`
   (or `TTY_SHARD`) runs the cases whose index in the sorted list is `K-1`
   modulo `N`; a TTY case checks that the shards cover the list exactly once.
-  Shards run on separate runners, not concurrently on one, because the
-  cases assert pty timing.
+  In CI, shards run on separate runners, not concurrently on one, because
+  the cases assert pty timing. Locally, `run_tty_tests.py --jobs N` runs N
+  of these shards at once on one machine and merges their results (#588):
+  the cases mostly wait for the screen to go quiet, so the wall time drops
+  with the shard count. A case that holds a fixed host resource (the OAuth
+  callback ports of `test_login`) is marked `tty_driver.runs_alone` and runs
+  by itself after the shards; every case has a time limit there, so one
+  hang (#569) fails that case instead of stalling the run
+  ([tests/tty/README.md](../tests/tty/README.md)).
 
 What it costs:
 
@@ -301,7 +308,7 @@ ones that land nowhere:
 | A Zig test in an existing root (`src/**`, `tests/component`, the integration inventory) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
 | A new test binary or build step | `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
-| A case under `tests/tty/cases/` | Nothing to wire | A TTY shard | The TTY case `test_runner_shards` |
+| A case under `tests/tty/cases/` | Nothing to wire, unless it holds a fixed host resource (a fixed port or path) that another case also uses: then mark it `tty_driver.runs_alone`, and local `--jobs` runs it by itself | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |
 | A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps and `gate:static` carry no flag, and every flag is set by a leg |
 | A check that only reads the source (a guard, a `*_discipline` scan) | `gate:static` in `build.zig`, as well as the `test:*` part that runs it | First on every leg, and first in the checklist | `test_gate_manifest.py`: every `*_discipline` scan is in `gate:static`; `test_ci_scope.py`: it runs before every other build step |
