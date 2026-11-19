@@ -290,7 +290,7 @@ async function renderBatch(id) {
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('进度', `${b.progress.done} / ${b.progress.planned}`, `${BATCH_STATUS[b.status] || b.status} · ${dur(b.wall_s)}`),
     metric('评测集', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
-    metric('平均 reward', s.mean_reward === null || s.mean_reward === undefined ? '—' : s.mean_reward.toFixed(2), '只算有效 trial'));
+    metric('无效', String(s.counts.invalid), '基础设施原因，不计入通过率'));
 
   const stop = batchActive(b) && b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
     event.currentTarget.disabled = true;
