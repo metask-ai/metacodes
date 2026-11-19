@@ -13,6 +13,8 @@ const auth = @import("core/auth.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const oauth_login = @import("api/oauth_login.zig");
 const provider_login = @import("api/provider_login.zig");
+const openrouter_login = @import("api/openrouter_login.zig");
+const openrouter_catalog = @import("api/openrouter_catalog.zig");
 const metask_oauth_mod = @import("api/metask_oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
 const catalog_mod = @import("api/catalog.zig");
@@ -112,6 +114,8 @@ pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
 pub const api_oauth_revoke = @import("api/oauth_revoke.zig"); // L2 reads a provider sign-out's revocation outcome
 pub const api_provider_login = @import("api/provider_login.zig");
+pub const api_openrouter_login = @import("api/openrouter_login.zig");
+pub const api_openrouter_catalog = @import("api/openrouter_catalog.zig");
 pub const api_login_worker = @import("api/login_worker.zig");
 pub const api_metask_sign_in = @import("api/metask_sign_in.zig"); // `/login`'s browser sign-in on a worker (#485)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
@@ -2780,6 +2784,19 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     }
 
     if (provider_name) |name| {
+        // A provider whose own site hands out a key (OpenRouter's key grant)
+        // signs in there unless a key is given: in the browser, or with
+        // `--device-code` on another device.
+        if (mode == .browser and key_page == null and !key_from_stdin and check_key and providerDeclaresKeyGrant(allocator, name)) {
+            if (client_id != null) {
+                std.debug.print("error: that provider signs in without an OAuth client; drop --client-id\n", .{});
+                return 2;
+            }
+            return runProviderKeyGrantLogin(allocator, init.io, state_dir, name, .{
+                .open_browser = open_browser,
+                .other_device = login_method == .device_code,
+            });
+        }
         // A provider without an OAuth grant but with a page to create a key on
         // signs in with a pasted key (`ProviderProfile.api_key_setup`).
         if (providerTakesPastedKey(allocator, name, client_id, login_method) or key_page != null or key_from_stdin or !check_key) {
@@ -2933,6 +2950,14 @@ fn printLoginHelp() void {
         \\<state root>/keys/<provider>.json (0600). --key-page picks the page
         \\(cn-personal, cn-team, global-personal, global-team), --no-check stores
         \\the key unchecked, and `logout --provider <id>` removes it.
+        \\
+        \\A provider whose site creates the key (OpenRouter) signs in there: the
+        \\browser on this machine, or with --device-code on another device, whose
+        \\page shows a code to paste back here (the way over SSH, which is taken
+        \\unasked there unless --no-browser keeps the browser). The key is your
+        \\own account's and is stored like a pasted one; `logout --provider <id>`
+        \\removes it from this machine and names the page where you delete it.
+        \\--api-key-stdin stores a key you created yourself instead.
         \\
         \\`login status` says which credential a plain start here uses and why:
         \\the step of the startup order that decides, and what each step holds
@@ -3099,6 +3124,136 @@ fn loginMessagesUrl() []const u8 {
     return client.ANTHROPIC_API_URL;
 }
 
+/// Fetch and keep OpenRouter's listing with a key just stored, so the next
+/// start lists the account's models. A failure costs the list, not the key.
+fn fetchOpenRouterListing(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, key: []const u8) void {
+    const count = openrouter_catalog.refresh(allocator, io, state_dir, key, null) catch |err| {
+        std.debug.print("warning: OpenRouter's model list could not be fetched ({s}); `/providers refresh` fetches it again\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("{d} OpenRouter models take tools; /model lists them.\n", .{count});
+}
+
+/// Whether `name` is a provider that declares a key grant
+/// (`ProviderProfile.key_grant`).
+fn providerDeclaresKeyGrant(allocator: std.mem.Allocator, name: []const u8) bool {
+    const host = buildProviderHost(allocator) orelse return false;
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return false;
+    return profile.key_grant != null;
+}
+
+const KeyGrantRequest = struct {
+    open_browser: bool = true,
+    /// `--device-code`: the page is opened on another device and shows a
+    /// code to paste here.
+    other_device: bool = false,
+};
+
+/// `metacodes login --provider <id>` for a provider whose site creates a key
+/// of the user's own account (OpenRouter): the browser here, or another
+/// device and a pasted code. The key ends in the provider's key file, as a
+/// pasted one does.
+fn runProviderKeyGrantLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, name: []const u8, request: KeyGrantRequest) u8 {
+    const host = buildProviderHost(allocator) orelse {
+        std.debug.print("error: the provider registry is unavailable\n", .{});
+        return 1;
+    };
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse {
+        std.debug.print("error: unknown provider '{s}'\n", .{name});
+        return 2;
+    };
+    var prepared = provider_login.prepareKeyGrant(profile, .{
+        .state_root = state_dir,
+        .open_browser = request.open_browser,
+    }) orelse {
+        std.debug.print("error: {s} declares no sign-in that creates a key\n", .{profile.display_name});
+        return 2;
+    };
+    var other_device = request.other_device;
+    // Over SSH a loopback redirect lands on this machine, and the browser
+    // that would follow it is on another one.
+    if (!other_device and request.open_browser and openrouter_login.sshSession()) {
+        std.debug.print("This looks like an SSH session: sign in on another device instead. (--no-browser keeps the browser sign-in.)\n", .{});
+        other_device = true;
+    }
+    const previous = openrouter_login.storedKeyManageUrl(allocator, state_dir, profile.id, prepared.origin, prepared.grant);
+    defer if (previous) |url| allocator.free(url);
+    var retry_buf: [160]u8 = undefined;
+    const retry = std.fmt.bufPrint(&retry_buf, "`{s} login --provider {s}`", .{ invokedCommand(allocator), profile.id.slice() }) catch "the login";
+
+    var code_buf: [provider_login.MAX_KEY_LEN]u8 = undefined;
+    defer std.crypto.secureZero(u8, &code_buf);
+    var pending: ?openrouter_login.Pending = null;
+    defer if (pending) |*value| value.deinit();
+    if (other_device) {
+        requireInteractiveLogin() catch {
+            std.debug.print("error: no terminal to paste the code into; pass a key you created at {s}/keys with --api-key-stdin\n", .{prepared.origin});
+            return 2;
+        };
+        pending = openrouter_login.Pending.begin(allocator, prepared.origin, prepared.grant) catch |err| {
+            std.debug.print("error: the sign-in could not start ({s})\n", .{@errorName(err)});
+            return 1;
+        };
+        std.debug.print("Open this URL on any device and approve the new API key:\n{s}\n\n", .{pending.?.url});
+        var prompt_buf: [160]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&prompt_buf, "Paste the code {s} shows (it is not echoed) and press Enter: ", .{profile.display_name}) catch "Paste the code and press Enter: ";
+        const code_len = readSecretLine(prompt, &code_buf) catch |err| {
+            std.debug.print("\n", .{});
+            if (err == error.Interrupted) {
+                std.debug.print("Login interrupted; nothing was stored.\n", .{});
+                return 130;
+            }
+            std.debug.print("error: the code could not be read ({s})\n", .{@errorName(err)});
+            return 1;
+        };
+        std.debug.print("\n", .{});
+        if (std.mem.trim(u8, code_buf[0..code_len], " \t\r\n").len == 0) {
+            std.debug.print("No code was entered; nothing was stored.\n", .{});
+            return 2;
+        }
+        prepared.pasted = .{ .code = code_buf[0..code_len], .verifier = pending.?.verifier() };
+    }
+    _ = prepared.run(allocator, io, oauth_login.stderrNotify(), null) catch |err| {
+        if (err == error.Aborted) {
+            std.debug.print("Login interrupted; nothing was stored.\n", .{});
+            return 130;
+        }
+        var line_buf: [320]u8 = undefined;
+        std.debug.print("{s}\n", .{openrouter_login.failureLine(&line_buf, err, profile.display_name, retry)});
+        return 1;
+    };
+
+    var stored = provider_api_key_store.load(allocator, state_dir, profile.id) catch null;
+    defer if (stored) |*value| value.deinit();
+    const meta: provider_api_key_store.Meta = if (stored) |value| value.meta else .{};
+    var line_buf: [512]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buf);
+    openrouter_login.writeSignedIn(&line, profile.display_name, meta) catch {};
+    std.debug.print("{s}\n", .{line.buffered()});
+    const current = if (stored) |value| openrouter_login.manageUrl(allocator, prepared.origin, prepared.grant, value.secret) catch null else null;
+    defer if (current) |url| allocator.free(url);
+    var notes_buf: [1024]u8 = undefined;
+    var notes: std.Io.Writer = .fixed(&notes_buf);
+    openrouter_login.writeAfterSignIn(&notes, profile.display_name, prepared.origin, meta, previous, current) catch {};
+    std.debug.print("{s}", .{notes.buffered()});
+    const key_path = provider_api_key_store.pathFor(allocator, state_dir, profile.id) catch null;
+    defer if (key_path) |path| allocator.free(path);
+    std.debug.print("The key is stored in {s}.\n", .{key_path orelse "the state root"});
+    if (stored) |value| fetchOpenRouterListing(allocator, io, state_dir, value.secret);
+    var local_config = loadLocalConfig(allocator, allocator, state_dir);
+    defer local_config.deinit();
+    if (provider_login.keyShadowedBy(profile, provider_credential.EnvLookup.process(), local_config.lookup())) |shadow| {
+        var notice_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+        var notice: std.Io.Writer = .fixed(&notice_buf);
+        provider_login.writeKeyShadowNotice(&notice, shadow, local_config.path) catch {};
+        std.debug.print("warning: {s}\n", .{notice.buffered()});
+    }
+    std.debug.print("No secret was printed.\n", .{});
+    return 0;
+}
+
 const KeyLoginRequest = struct {
     /// `--api-key <key>`.
     key: ?[]const u8 = null,
@@ -3244,6 +3399,24 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
         }
         return 1;
     };
+    // What a provider whose site creates keys (OpenRouter) said about it.
+    if (profile.key_grant != null) {
+        var stored = provider_api_key_store.load(allocator, state_dir, profile.id) catch null;
+        defer if (stored) |*value| value.deinit();
+        if (stored) |value| {
+            if (value.meta.described) {
+                var line_buf: [512]u8 = undefined;
+                var line: std.Io.Writer = .fixed(&line_buf);
+                openrouter_login.writeStored(&line, profile.display_name, value.meta) catch {};
+                std.debug.print("{s}\n", .{line.buffered()});
+                var notes_buf: [512]u8 = undefined;
+                var notes: std.Io.Writer = .fixed(&notes_buf);
+                openrouter_login.writeAfterSignIn(&notes, profile.display_name, openrouter_login.origin(profile.key_grant.?), value.meta, null, null) catch {};
+                std.debug.print("{s}", .{notes.buffered()});
+            }
+            if (request.check) fetchOpenRouterListing(allocator, io, state_dir, value.secret);
+        }
+    }
     // A key variable for this provider in the shell or in `.env` is read
     // before the stored key (`credential.resolve`): say so, by name, rather
     // than promise that new sessions use the key just stored.
@@ -3406,6 +3579,14 @@ pub fn logoutProviderProfile(
     revoke_wait_ms: u64,
 ) u8 {
     const oauth_revoke = @import("api/oauth_revoke.zig");
+    // A key a provider's site created (OpenRouter) outlives this file: only
+    // its owner can delete it there, so its page is named before the file,
+    // which holds the key it is computed from, goes.
+    const manage = if (profile.key_grant) |grant|
+        openrouter_login.storedKeyManageUrl(allocator, state_dir, profile.id, openrouter_login.origin(grant), grant)
+    else
+        null;
+    defer if (manage) |url| allocator.free(url);
     const removed = provider_api_key_store.remove(allocator, state_dir, profile.id) catch |err| {
         std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
         return 1;
@@ -3423,7 +3604,10 @@ pub fn logoutProviderProfile(
             .timed_out => std.debug.print("{s} did not answer the revocation in time; it may stay valid there until it expires.\n", .{profile.display_name}),
         }
     }
-    if (removed) {
+    if (removed and profile.key_grant != null) {
+        std.debug.print("Removed the {s} key stored on this machine.\n", .{profile.display_name});
+        if (manage) |url| std.debug.print("It still works on {s} until you delete it there: {s}\n", .{ profile.display_name, url });
+    } else if (removed) {
         std.debug.print("Removed the stored key for {s}.\n", .{profile.display_name});
     } else if (!sign_in.removed) {
         std.debug.print("{s} is stored for {s}.\n", .{ provider_login.nothingStoredText(profile), profile.display_name });
@@ -3649,6 +3833,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
         },
         else => null,
     };
+    if (chosen_provider) |name| printKeyGrantKeyStatus(arena, state_dir, name, &local_config);
     const shell_keys = shellOnlyKeys(arena, chosen_provider);
     if (shell_keys.len > 0) std.debug.print("Keys in the shell choose no provider: {s}. To use one: --provider <id>, or put it in {s}.\n", .{ shell_keys, env_path });
     std.debug.print("No secret was printed.\n", .{});
@@ -3672,6 +3857,40 @@ fn presetMissing(arena: std.mem.Allocator, facts: *const presets_mod.Facts) []co
     else
         std.fmt.allocPrint(arena, "which {s} does not define (presets: {s})", .{ path, std.mem.join(arena, ", ", facts.defined) catch "" }) catch "";
     return std.fmt.allocPrint(arena, "{s}: passed over by the TUI, -p and the rest stop", .{why}) catch why;
+}
+
+/// `login status` for a provider whose site created its key (OpenRouter),
+/// when it is the one this start uses: the stored key's file, how and when it
+/// came, what the provider said about it then, where to manage it, and a
+/// variable that is read before it. Names, paths and dates only.
+fn printKeyGrantKeyStatus(arena: std.mem.Allocator, state_dir: []const u8, name: []const u8, local_config: anytype) void {
+    const host = buildProviderHost(arena) orelse return;
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return;
+    const grant = profile.key_grant orelse return;
+    var stored = (provider_api_key_store.load(arena, state_dir, profile.id) catch |err| {
+        std.debug.print("{s}: its stored key cannot be read ({s})\n", .{ profile.display_name, @errorName(err) });
+        return;
+    }) orelse {
+        std.debug.print("{s}: no key is stored (`{s} login --provider {s}`)\n", .{ profile.display_name, invokedCommand(arena), profile.id.slice() });
+        return;
+    };
+    defer stored.deinit();
+    const path = provider_api_key_store.pathFor(arena, state_dir, profile.id) catch "";
+    var line_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buf);
+    openrouter_login.writeKeyStatus(&line, path, &stored) catch {};
+    std.debug.print("{s}: {s}\n", .{ profile.display_name, line.buffered() });
+    if (openrouter_login.manageUrl(arena, openrouter_login.origin(grant), grant, stored.secret)) |url| {
+        std.debug.print("      manage it on {s}: {s}\n", .{ profile.display_name, url });
+    } else |_| {}
+    if (provider_login.keyShadowedBy(profile, provider_credential.EnvLookup.process(), local_config.lookup())) |shadow| {
+        if (shadow.in_local_config) {
+            std.debug.print("      {s} in {s} is used before it\n", .{ shadow.name, local_config.path });
+        } else {
+            std.debug.print("      {s} in the shell is used before it\n", .{shadow.name});
+        }
+    }
 }
 
 /// What signs Metask in on the historical path, in the order it reads them
@@ -4122,6 +4341,12 @@ var startup_warning_reported: bool = false;
 /// happily listed. The caller destroys it.
 fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
     const host = provider_host.Host.create(allocator) catch return null;
+    // `METACODES_OPENROUTER_URL` (development, tests) moves every OpenRouter
+    // address, its requests included.
+    openrouter_login.applyOriginOverride(host);
+    // OpenRouter's models: the listing the last sign-in or refresh kept,
+    // whatever its age (no request here).
+    _ = openrouter_catalog.adoptKept(host, allocator, hostRoot());
     var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return host;
     defer store.deinit();
     host.adoptDurableState(&store);
@@ -4141,8 +4366,19 @@ fn buildProviderHost(allocator: std.mem.Allocator) ?*provider_host.Host {
             );
         }
     }
+    var shadowed_buf: [256]u8 = undefined;
+    if (host.shadowedNotice(&shadowed_buf)) |notice| {
+        if (!shadowed_notice_reported) {
+            shadowed_notice_reported = true;
+            std.debug.print("warning: {s}\n", .{notice});
+        }
+    }
     return host;
 }
+
+/// Set once the notice about a configuration entry that names a built-in
+/// provider has been shown.
+var shadowed_notice_reported: bool = false;
 
 /// `--check-providers`: validate the configuration and print every route it
 /// produces, without any network I/O. This is the dry run — it answers "would
@@ -4173,6 +4409,8 @@ pub fn checkProviders(allocator: std.mem.Allocator) u8 {
                 std.debug.print("provider_catalogs: NOT INGESTED ({s})\n", .{@errorName(err)});
                 status = 2;
             };
+            var shadowed_buf: [256]u8 = undefined;
+            if (host.shadowedNotice(&shadowed_buf)) |notice| std.debug.print("note: {s}\n", .{notice});
             if (value.load()) |loaded| {
                 var document = loaded;
                 defer document.deinit();
@@ -5555,6 +5793,9 @@ test {
     _ = &@import("kg/provider_audit.zig");
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
+    _ = &@import("api/openrouter_login.zig");
+    _ = &@import("api/openrouter_catalog.zig");
+    _ = &@import("api/provider_login.zig");
     _ = &@import("api/oauth_revoke.zig");
     _ = &@import("api/codex_usage.zig");
     _ = &@import("api/catalog_fetch.zig");
