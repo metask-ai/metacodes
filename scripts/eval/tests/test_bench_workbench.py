@@ -915,19 +915,85 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertEqual(final['status'], 'failed')
         self.assertIn('源码仓库', final['error'])
 
-    def test_checkout_fetches_a_commit_only_a_custom_ref_names(self):
+    def checkout(self, mirror, commit, tags, probe):
+        """The builder's checkout step, run as this (non-root) user."""
         import subprocess
+        return subprocess.run(['bash', '-c', builds.BUILD_SCRIPT + probe], capture_output=True, text=True,
+                              env={**os.environ, 'MIRROR': str(mirror), 'COMMIT': commit,
+                                   'TAGS': ' '.join(tags), 'TMPDIR': str(self.root)})
+
+    def test_commit_only_a_foreign_ref_names_is_never_built_or_run(self):
         self.git('commit', '-q', '--allow-empty', '-m', 'candidate')
         candidate = self.git('rev-parse', 'HEAD')
-        self.git('update-ref', 'refs/bench/candidate', candidate)
+        self.git('update-ref', 'refs/pull/7/head', candidate)
         self.git('reset', '-q', '--hard', 'HEAD~1')
+        for ref in (candidate, 'refs/pull/7/head'):
+            with self.subTest(ref=ref):
+                run, final = self.launch(ref=ref)
+                self.assertEqual(final['status'], 'failed')
+                self.assertIn('不在源码仓库的任何分支或 tag 上', final['error'])
+                self.assertFalse((self.manager.jobs_dir / run['name']).exists())
+        self.assertEqual(self.docker_runs(), [])
+        # Once the repository publishes it on a branch, it builds; the checkout
+        # fetches it by id even though no fetched branch head is that commit.
+        self.git('branch', 'published', candidate)
         mirror, commit = builds.resolve(candidate, self.root / 'cache', str(self.repo))
-        self.assertEqual(commit, candidate)
-        # The builder's checkout step, run as this (non-root) user.
-        result = subprocess.run(['bash', '-c', builds.BUILD_SCRIPT + 'git rev-parse HEAD'], capture_output=True, text=True,
-                                env={**os.environ, 'MIRROR': str(mirror), 'COMMIT': commit, 'TMPDIR': str(self.root)})
+        self.git('branch', '-D', 'published')
+        result = self.checkout(mirror, commit, [], 'git rev-parse HEAD')
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, candidate), result.stderr)
+
+    def test_release_tag_reaches_the_checkout_and_tag_or_sha_share_one_build(self):
+        commit = self.git('rev-parse', 'HEAD')
+        self.git('tag', '-a', '-m', 'release', '0.0.1')
+        self.git('tag', 'other-name')
+        mirror, _ = builds.resolve('0.0.1', self.root / 'cache', str(self.repo))
+        tags = builds.tags_at(mirror, commit)
+        self.assertEqual(sorted(tags), ['0.0.1', 'other-name'])
+        result = self.checkout(mirror, commit, tags, 'git describe --tags --exact-match --match 0.0.1 HEAD')
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, '0.0.1'), result.stderr)
+        run, final = self.launch(ref='0.0.1')
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertIn('TAGS=0.0.1 other-name', self.docker_runs()[0])
+        again, final = self.launch(ref=commit)
+        self.assertEqual((final['status'], self.bundle_of(again)), ('finished', self.bundle_of(run)))
+        self.assertEqual(len(self.docker_runs()), 1)
+
+    def test_interrupted_toolchain_install_is_redone_not_reused(self):
+        import io, subprocess, tarfile
+        stub = self.root / 'stub'
+        stub.mkdir()
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w:xz') as tar:
+            for name, body in (('zig-x/zig', b'#!/bin/sh\n'), ('zig-x/lib/std.zig', b'complete')):
+                info = tarfile.TarInfo(name)
+                info.size, info.mode = len(body), 0o755
+                tar.addfile(info, io.BytesIO(body))
+        (stub / 'zig.tar.xz').write_bytes(archive.getvalue())
+        import hashlib
+        index = {'0.16.0': {os.uname().machine + '-linux': {'tarball': 'https://example.invalid/zig.tar.xz',
+                                                              'shasum': hashlib.sha256(archive.getvalue()).hexdigest()}}}
+        (stub / 'index.json').write_text(json.dumps(index))
+        curl = stub / 'curl'
+        curl.write_text('#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift;; *) url=$1;; esac; shift; done\n'
+                        'case "$url" in *index.json) cat "%s/index.json";; *) cp "%s/zig.tar.xz" "$out";; esac\n' % (stub, stub))
+        curl.chmod(0o755)
+        toolchains = self.root / 'toolchains'
+        # A copy cancelled after the executable landed, and a stale staging area.
+        (toolchains / 'zig' / '0.16.0').mkdir(parents=True)
+        (toolchains / 'zig' / '0.16.0' / 'zig').write_text('half')
+        (toolchains / '.staging-old').mkdir()
+        lean = toolchains / 'lean' / 'leanprover-lean4-v4.14.0'
+        lean.mkdir(parents=True)
+        (lean / '.bench-complete').touch()
+        result = subprocess.run(['bash', '-c', builds.TOOLCHAIN_SCRIPT], capture_output=True, text=True,
+                                env={**os.environ, 'PATH': str(stub) + os.pathsep + os.environ['PATH'],
+                                     'TOOLCHAINS': str(toolchains), 'ZIG_VERSION': '0.16.0',
+                                     'LEAN_TOOLCHAIN': 'leanprover/lean4:v4.14.0', 'LEAN_DIR': lean.name})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), candidate)
+        zig = toolchains / 'zig' / '0.16.0'
+        self.assertTrue((zig / '.bench-complete').is_file())
+        self.assertEqual((zig / 'lib' / 'std.zig').read_text(), 'complete')
+        self.assertEqual(list(toolchains.glob('.staging-*')), [])
 
     def test_cancel_while_fetching_source_ends_the_run_and_frees_the_workbench(self):
         hit = threading.Event()

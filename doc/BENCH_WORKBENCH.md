@@ -102,7 +102,11 @@ Each launch runs one of three metacodes sources, chosen in the page's
 always means its current head. A full commit id that is already built is used
 without contacting the repository. When a branch and a tag share a name but
 point to different commits, the run fails and asks for `refs/heads/<name>` or
-`refs/tags/<name>`. A commit that has no unit yet is built the way
+`refs/tags/<name>`. Because the built binary runs with the execution
+machine's model credential, only commits on one of the source repository's
+branches or tags are built. A commit reachable only from a pull-request or
+other foreign ref is refused until it is pushed to a branch of that
+repository. A commit that has no unit yet is built the way
 `release.yml` builds one: `kernels:stage` for both Lean kernels, their pins,
 then `release:verify` for `<arch>-linux-gnu.2.31`, where `<arch>` is the
 execution machine's (task containers share it). The Lean kernels only build
@@ -111,11 +115,14 @@ caller's user, in two steps. First, a script owned by the workbench (not the
 revision) installs the Zig version named by the revision's `build.zig.zon`,
 checked against ziglang.org's published SHA-256, and the Lean toolchain named
 by its `control-plane/lean/lean-toolchain`, through a SHA-256-pinned elan.
-Both are cached in `git/toolchains/`. Then the revision's build runs with those
+Both are cached in `git/toolchains/`, staged on that same filesystem and
+renamed into place, marked complete, only when whole, so an interrupted
+install is redone rather than reused. Then the revision's build runs with those
 toolchains mounted read-only and its checkout, Zig cache and home in a fresh
 temporary directory, so no revision can alter what another is built with. The
-checkout fetches the resolved commit by id, so commits reachable only from
-pull-request or other custom refs build too. The first
+checkout fetches the resolved commit by id together with the tags that point
+at it, so a stable version's manifest finds its release tag; a tag name and
+its full commit id share one build. The first
 build downloads these toolchains and takes several minutes; the build output
 goes to the run's execution log. Later launches of the same commit, by any
 name, reuse the unit. Revisions older than the Lean-kernel release layout

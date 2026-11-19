@@ -56,27 +56,35 @@ ELAN_SHA256 = {
     "aarch64": "05febd124d84ebf994b2e7479922a5650b1e950c17ae3bd1ddd776b65bb72bf9",
 }
 
-# Step 1, trusted: install $ZIG_VERSION and $LEAN_TOOLCHAIN into /toolchains.
+# Step 1, trusted: install $ZIG_VERSION and $LEAN_TOOLCHAIN into $TOOLCHAINS.
 # Zig is checked against ziglang.org's published SHA-256, elan against the pin
-# above. Each toolchain is staged and renamed into place only when complete.
+# above. Everything is staged on the toolchain cache's own filesystem and
+# renamed into place, marked complete, only once whole: an install cancelled
+# halfway leaves only a staging directory, which the next install removes.
 TOOLCHAIN_SCRIPT = r"""
 set -euo pipefail
+root=${TOOLCHAINS:-/toolchains}
 arch=$(uname -m)
-tmp=$(mktemp -d)
-zig_dir=/toolchains/zig/$ZIG_VERSION
-if [ ! -x "$zig_dir/zig" ]; then
+mkdir -p "$root/zig" "$root/lean"
+# One build runs at a time, so any staging directory is an interrupted one.
+rm -rf "$root"/.staging-*
+tmp=$(mktemp -d "$root/.staging-XXXXXX")
+zig_dir=$root/zig/$ZIG_VERSION
+if [ ! -f "$zig_dir/.bench-complete" ]; then
   read -r url sum < <(curl -fsSL https://ziglang.org/download/index.json | python3 -c '
 import json, sys
 entry = json.load(sys.stdin)[sys.argv[1]][sys.argv[2] + "-linux"]
 print(entry["tarball"], entry["shasum"])' "$ZIG_VERSION" "$arch")
   curl -fsSL "$url" -o "$tmp/zig.tar.xz"
   echo "$sum  $tmp/zig.tar.xz" | sha256sum -c -
-  mkdir -p "$tmp/zig" /toolchains/zig
+  mkdir "$tmp/zig"
   tar -xJf "$tmp/zig.tar.xz" -C "$tmp/zig" --strip-components=1
+  [ -x "$tmp/zig/zig" ]
+  touch "$tmp/zig/.bench-complete"
   rm -rf "$zig_dir" && mv "$tmp/zig" "$zig_dir"
 fi
-lean_dir=/toolchains/lean/$LEAN_DIR
-if [ ! -x "$lean_dir/bin/lake" ]; then
+lean_dir=$root/lean/$LEAN_DIR
+if [ ! -f "$lean_dir/.bench-complete" ]; then
   case "$arch" in x86_64) sum=$ELAN_SHA256_X86_64 ;; aarch64) sum=$ELAN_SHA256_AARCH64 ;; *) exit 1 ;; esac
   curl -fsSL "https://github.com/leanprover/elan/releases/download/v$ELAN_VERSION/elan-$arch-unknown-linux-gnu.tar.gz" -o "$tmp/elan.tar.gz"
   echo "$sum  $tmp/elan.tar.gz" | sha256sum -c -
@@ -86,15 +94,16 @@ if [ ! -x "$lean_dir/bin/lake" ]; then
   "$ELAN_HOME/bin/elan" toolchain install "$LEAN_TOOLCHAIN"
   set -- "$ELAN_HOME"/toolchains/*/
   [ "$#" -eq 1 ] && [ -x "$1/bin/lake" ]
-  mkdir -p /toolchains/lean
+  touch "$1/.bench-complete"
   rm -rf "$lean_dir" && mv "$1" "$lean_dir"
 fi
 rm -rf "$tmp"
 """
 
 # Step 2: the revision's build, as the caller's uid. The checkout and every
-# writable cache live in a fresh temporary directory; the commit is fetched
-# by id, so a commit only a custom or pull-request ref names is found too.
+# writable cache live in a fresh temporary directory. The commit is fetched by
+# id, with the tags that point at it ($TAGS): a stable version's release
+# manifest requires HEAD to carry its version tag.
 BUILD_SCRIPT = r"""
 set -euo pipefail
 work=$(mktemp -d)
@@ -102,7 +111,9 @@ export HOME=$work/home ZIG_GLOBAL_CACHE_DIR=$work/zig-cache
 mkdir -p "$HOME"
 git init -q "$work/src"
 cd "$work/src"
-git fetch -q --no-tags "$MIRROR" "$COMMIT"
+refspecs=()
+for tag in $TAGS; do refspecs+=("refs/tags/$tag:refs/tags/$tag"); done
+git fetch -q --no-tags "$MIRROR" "$COMMIT" ${refspecs[@]+"${refspecs[@]}"}
 git checkout -q --detach "$COMMIT"
 """
 
@@ -231,7 +242,20 @@ def resolve(ref, cache_dir, repo=None, cancelled=lambda: False):
         commit = named.pop() if named else _commit(mirror, ref)
     if not commit:
         raise BuildError("源码仓库中找不到 git 版本 " + ref)
+    # The built binary runs with the execution machine's model credential, so
+    # only commits the repository itself publishes, on a branch or a tag, are
+    # built: not code that only a pull-request or other foreign ref names.
+    _, trusted = _git("for-each-ref", "--count=1", "--contains", commit, "refs/heads", "refs/tags", cwd=mirror)
+    if not trusted:
+        raise BuildError(f"提交 {commit[:12]} 不在源码仓库的任何分支或 tag 上（例如外部 PR），"
+                         "不会用执行机凭证运行它；请先推送到该仓库的分支")
     return mirror, commit
+
+
+def tags_at(mirror, commit):
+    """The tag names that point at `commit`, for its release manifest."""
+    _, names = _git("tag", "--points-at", commit, cwd=mirror)
+    return [name for name in names.split() if REF.fullmatch(name)]
 
 
 def _docker(*args):
@@ -292,7 +316,8 @@ def bundle(ref, cache_dir, repo=None, target=None, cancelled=lambda: False):
             "-v", f"{mirror.resolve()}:/mirror:ro", "-v", f"{out.resolve()}:/out",
             "-v", f"{toolchains / 'zig' / zig}:/opt/zig:ro",
             "-v", f"{toolchains / 'lean' / lean_dir}:/opt/lean:ro",
-            "-e", "MIRROR=/mirror", "-e", "COMMIT=" + commit]
+            "-e", "MIRROR=/mirror", "-e", "COMMIT=" + commit,
+            "-e", "TAGS=" + " ".join(tags_at(mirror, commit))]
     try:
         if _run(argv + [image(), "bash", "-c", BUILD_SCRIPT + RELEASE_SCRIPT], cancelled, name=name)[0]:
             raise BuildError(f"git 版本 {ref}（{commit[:12]}）编译失败，详见执行日志")

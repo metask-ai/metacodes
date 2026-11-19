@@ -234,7 +234,7 @@ async function renderNewRun() {
     h('option', { value: 'version' }, '发布版本'));
   const version = h('input', { name: 'version', autocomplete: 'off' });
   const builds = h('datalist', { id: 'metacodes-builds' },
-    (mc.builds || []).map((b) => h('option', { value: b.commit.slice(0, 12) }, `${b.ref} · ${b.version}`)));
+    (mc.builds || []).map((b) => h('option', { value: b.commit }, `${b.ref} · ${b.commit.slice(0, 12)} · ${b.version}`)));
   const releases = h('datalist', { id: 'metacodes-releases' }, (mc.cached_versions || []).map((v) => h('option', { value: v })));
   const hint = h('small');
   const sync = () => {
