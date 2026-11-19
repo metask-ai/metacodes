@@ -141,7 +141,7 @@ def _older(table: str, target_row: Sequence[Any], source_row: Sequence[Any], sta
     """Whether the target's row is an earlier version of the source's."""
     columns = schema.COLUMNS[table]
     mine, theirs = dict(zip(columns, target_row)), dict(zip(columns, source_row))
-    if table in ("jobs", "trials", "runs"):
+    if table in ("jobs", "trials", "runs", "batches"):
         before, after = _when(mine["ingested_at"]), _when(theirs["ingested_at"])
         return before is not None and after is not None and before < after
     if table == "files":

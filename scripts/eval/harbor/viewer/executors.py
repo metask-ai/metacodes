@@ -646,8 +646,12 @@ def _cached_registry(final: Path, ref: str, expected) -> Optional[Path]:
     return dataset
 
 
+REGISTRY_ATTEMPTS = 3
+REGISTRY_BACKOFF = (5, 20)  # seconds before the 2nd and 3rd attempt
+
+
 def registry_dataset(ref: str, cache_root: Path, harbor: Optional[str], expected=None, log=print,
-                     runner=subprocess.run, timeout=REGISTRY_TIMEOUT) -> Path:
+                     runner=subprocess.run, timeout=REGISTRY_TIMEOUT, sleep=None) -> Path:
     """A Harbor registry dataset downloaded on this (the workbench) machine.
 
     `harbor download REF -o DIR` exports `DIR/<dataset name>/<task>/`; the
@@ -666,19 +670,30 @@ def registry_dataset(ref: str, cache_root: Path, harbor: Optional[str], expected
     cache_root.mkdir(parents=True, exist_ok=True)
     work = cache_root / (final.name + ".tmp-" + uuid.uuid4().hex[:8])
     argv = [harbor, "download", ref, "-o", str(work)]
-    log("$ " + display(argv))
+    sleep = sleep or time.sleep
     try:
-        try:
-            done = runner(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise ValueError(f"工作台下载注册表数据集 {ref} 超时") from None
-        except OSError as exc:
-            raise ValueError(f"无法运行工作台的 Harbor：{exc}") from None
-        output = ((done.stdout or "") + (done.stderr or "")).strip()
-        if output:
-            log(output[-2000:])
-        if done.returncode != 0:
-            raise ValueError(f"工作台下载注册表数据集 {ref} 失败（harbor download 退出码 {done.returncode}）")
+        # Harbor clones the registry's git repository; GitHub clones fail
+        # transiently often enough that one failure must not fail the run.
+        for attempt in range(1, REGISTRY_ATTEMPTS + 1):
+            log("$ " + display(argv) + (f"（第 {attempt} 次）" if attempt > 1 else ""))
+            shutil.rmtree(work, ignore_errors=True)
+            try:
+                done = runner(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise ValueError(f"工作台下载注册表数据集 {ref} 超时") from None
+            except OSError as exc:
+                raise ValueError(f"无法运行工作台的 Harbor：{exc}") from None
+            output = ((done.stdout or "") + (done.stderr or "")).strip()
+            if output:
+                # Keep the head too: the cause (e.g. git's own message) is
+                # often above a long traceback.
+                log(output if len(output) <= 3000 else output[:1000] + "\n…\n" + output[-2000:])
+            if done.returncode == 0:
+                break
+            if attempt == REGISTRY_ATTEMPTS:
+                raise ValueError(f"工作台下载注册表数据集 {ref} 失败（harbor download 退出码 {done.returncode}，"
+                                 f"已重试 {REGISTRY_ATTEMPTS} 次）")
+            sleep(REGISTRY_BACKOFF[attempt - 1])
         # Export layout: <work>/<dataset name>/<task>/; accept tasks at the top too.
         children = [c for c in sorted(work.iterdir()) if c.is_dir() and not c.name.startswith(".")] \
             if work.is_dir() else []

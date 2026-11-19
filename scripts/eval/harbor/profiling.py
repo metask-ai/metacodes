@@ -5,8 +5,9 @@ The task container holds only a run-scoped placeholder token; the relay
 accepts exactly that placeholder and forwards each request upstream with the
 current real credential, which it reads from a credential source (a fixed
 key, a refreshing Metask session, or tokens pushed over the SSH channel).
-With metrics enabled it also records numeric timing/usage, never bodies or
-keys. One job owns a relay and each trial uses a distinct URL prefix. HTTP
+With metrics enabled it also records numeric timing/usage and the byte size
+of each part of the request context (system, tools, messages), never bodies
+or keys. One job owns a relay and each trial uses a distinct URL prefix. HTTP
 payloads are forwarded unchanged; request clocks exclude task/tool execution.
 The loopback/Docker hop is part of the benchmark harness, not a provider SLA.
 """
@@ -59,6 +60,77 @@ def usage_values(usage):
     output = count(usage.get("output_tokens", usage.get("completion_tokens")))
     return {k: v for k, v in {"input_tokens": prompt, "output_tokens": output,
                              "cache_tokens": cached, "cache_creation_tokens": created}.items() if v is not None}
+
+
+# Parts of a model request's input context, as the page names them.
+CONTEXT_PARTS = ("system", "tools", "user", "assistant", "tool_results")
+
+
+def _size(value):
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8", "surrogatepass"))
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass"))
+
+
+def request_composition(body):
+    """Byte counts of each part of a model request's context, or None.
+
+    Only sizes leave this function, never content: system prompt, tool
+    definitions, user/task messages, the model's own earlier output, and tool
+    results, for the Anthropic Messages, OpenAI Chat and Responses shapes.
+    The page apportions the measured input tokens by these shares."""
+    try:
+        request = json.loads(body) if body else None
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    if not isinstance(request, dict):
+        return None
+    parts = dict.fromkeys(CONTEXT_PARTS, 0)
+    tools = request.get("tools")
+    parts["tools"] = _size(tools)
+    parts["system"] = _size(request.get("system")) + _size(request.get("instructions"))
+    messages = request.get("messages")
+    items = request.get("input")
+    count = 0
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            count += 1
+            role, content = message.get("role"), message.get("content")
+            if role in ("system", "developer"):
+                parts["system"] += _size(content)
+            elif role == "assistant":
+                parts["assistant"] += _size(content) + _size(message.get("tool_calls"))
+            elif role == "tool":
+                parts["tool_results"] += _size(content)
+            elif isinstance(content, list):  # Anthropic user turn: tool results ride here
+                for block in content:
+                    key = "tool_results" if isinstance(block, dict) and block.get("type") == "tool_result" else "user"
+                    parts[key] += _size(block)
+            else:
+                parts["user"] += _size(content)
+    elif isinstance(items, str):
+        parts["user"] += _size(items)
+    elif isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            count += 1
+            kind, role = item.get("type", "message"), item.get("role")
+            if kind in ("function_call_output", "custom_tool_call_output"):
+                parts["tool_results"] += _size(item.get("output"))
+            elif kind in ("function_call", "custom_tool_call", "reasoning") or role == "assistant":
+                parts["assistant"] += _size(item)
+            elif role in ("system", "developer"):
+                parts["system"] += _size(item.get("content"))
+            else:
+                parts["user"] += _size(item.get("content"))
+    else:
+        return None
+    return {**parts, "messages": count, "tool_count": len(tools) if isinstance(tools, list) else 0}
 
 
 class StreamMetrics:
@@ -346,6 +418,7 @@ class TimingRelay:
                     return
                 status, complete = 0, False
                 measured = measured and owner.recording
+                shape = request_composition(body) if measured and suffix != "/v1/models" else None
                 try:
                     headers = {k: v for k, v in self.headers.items()
                                if k.lower() not in HOP and k.lower() != auth_header.lower()}
@@ -383,7 +456,8 @@ class TimingRelay:
                     self.close_connection = True
                 finally:
                     if measured:
-                        owner.record(parts[1], {"request": sequence, "started_at": started_at, **metric.finish(status, complete)})
+                        owner.record(parts[1], {"request": sequence, "started_at": started_at, **metric.finish(status, complete),
+                                                **({"composition": shape} if shape else {})})
 
             def exchange(self, upstream_path, body, headers, secret):
                 while True:

@@ -403,9 +403,11 @@ class RootResult:
     root: str
     jobs: List[JobResult] = field(default_factory=list)
     runs_written: int = 0
+    batches_written: int = 0
 
     def to_json(self) -> Dict[str, Any]:
-        return {"root": self.root, "jobs": [job.to_json() for job in self.jobs], "runs_written": self.runs_written}
+        return {"root": self.root, "jobs": [job.to_json() for job in self.jobs], "runs_written": self.runs_written,
+                "batches_written": self.batches_written}
 
 
 def _stored_files(tx: Tx, job: str) -> Dict[str, StoredFile]:
@@ -717,6 +719,38 @@ def ingest_run(store: Store, records_dir: Path, record: Dict[str, Any]) -> int:
     return 1
 
 
+BATCHES_DIR = ".bench-batches"
+
+
+def ingest_batches(store: Store, batches_dir: Path) -> int:
+    """Workbench batch records under `.bench-batches` (one JSON each)."""
+    written = 0
+    try:
+        paths = sorted(p for p in Path(batches_dir).glob("*.json") if p.is_file() and not p.is_symlink())
+    except OSError:
+        return 0
+    for path in paths:
+        record = data.read_json(path)
+        if not isinstance(record, dict) or record.get("id") != path.stem or not safe_name(record.get("id")):
+            continue
+        if record.get("status") not in schema.BATCH_STATUSES:
+            continue
+        record_json = _json(record)
+        with store.read() as tx:
+            existing = tx.one("SELECT record_json FROM batches WHERE id = ?", (record["id"],))
+        if existing is not None and existing[0] == record_json:
+            continue
+        metacodes = record.get("metacodes") if isinstance(record.get("metacodes"), dict) else {}
+        values = {"id": record["id"], "status": record["status"], "name": _text(record.get("name")),
+                  "model": _text(record.get("model")), "metacodes_digest": _text(metacodes.get("digest")),
+                  "created_at": _text(record.get("created_at")), "finished_at": _text(record.get("finished_at")),
+                  "record_json": record_json, "source_dir": str(Path(batches_dir).resolve()), "ingested_at": now()}
+        with store.transaction() as tx:
+            tx.execute(_upsert_sql("batches", ("id",)), tuple(values[c] for c in schema.COLUMNS["batches"]))
+        written += 1
+    return written
+
+
 def ingest_root(store: Store, root: Path, *, verify: bool = False,
                 log: Callable[[str], None] = lambda message: None) -> RootResult:
     """Every job directory and launch record under one Harbor jobs directory."""
@@ -735,6 +769,7 @@ def ingest_root(store: Store, root: Path, *, verify: bool = False,
             log(f"bench store: ingesting {child.name} failed: {type(exc).__name__}: {exc}")
             result.jobs.append(JobResult(child.name, "skipped", reason=type(exc).__name__))
     result.runs_written = ingest_runs(store, root / ".bench-runs")
+    result.batches_written = ingest_batches(store, root / BATCHES_DIR)
     return result
 
 

@@ -152,5 +152,23 @@ class StoreLibrary:
             row = tx.one("SELECT record_json FROM runs WHERE name = ?", (name,))
         return json.loads(row[0]) if row else None
 
+    def batch_records(self) -> List[Dict[str, Any]]:
+        with self.store.read() as tx:
+            rows = tx.query("SELECT record_json FROM batches")
+        return [json.loads(row[0]) for row in rows]
+
+    def run_records(self) -> List[Dict[str, Any]]:
+        with self.store.read() as tx:
+            rows = tx.query("SELECT record_json FROM runs")
+        return [json.loads(row[0]) for row in rows]
+
+    def replace_store(self, store: Store) -> Store:
+        """Serve from `store` from now on; returns the previous store, which
+        the caller closes. A sync in flight finishes on the old one first."""
+        with self._sync_lock:
+            previous, self.store = self.store, store
+            self._last_sync = None
+        return previous
+
     def storage(self) -> Dict[str, Any]:
         return {"jobs_dirs": [str(root) for root in self.roots], "database": self.store.describe()}

@@ -1545,3 +1545,45 @@ class NetworkSetupTest(SetupFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistryDownloadRetryTest(unittest.TestCase):
+    """A transient `git clone` failure inside `harbor download` must not fail
+    the run: on a real workbench one GitHub hiccup did exactly that."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def runner_failing(self, failures):
+        calls = []
+
+        def run(argv, **_kwargs):
+            calls.append(list(argv))
+            if len(calls) <= failures:
+                return subprocess.CompletedProcess(argv, 1, "", "fatal: unable to access 'https://github.com/': timeout")
+            out = Path(argv[argv.index("-o") + 1]) / "aime"
+            for task in ("aime_60", "aime_i-1"):
+                (out / task).mkdir(parents=True)
+                (out / task / "task.toml").write_text("")
+            return subprocess.CompletedProcess(argv, 0, "Successfully downloaded 2 task(s)", "")
+        return run, calls
+
+    def test_two_failures_then_success(self):
+        run, calls = self.runner_failing(2)
+        slept, logs = [], []
+        dataset = executors.registry_dataset("aime@1.0", self.root / "cache", "/bin/harbor",
+                                             expected=["aime_60"], log=logs.append, runner=run, sleep=slept.append)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(slept, list(executors.REGISTRY_BACKOFF))
+        self.assertEqual(sorted(p.name for p in dataset.iterdir() if p.is_dir()), ["aime_60", "aime_i-1"])
+        self.assertTrue(any("fatal: unable to access" in line for line in logs))
+
+    def test_every_attempt_failing_reports_the_retries(self):
+        run, calls = self.runner_failing(99)
+        with self.assertRaisesRegex(ValueError, "已重试 3 次"):
+            executors.registry_dataset("aime@1.0", self.root / "cache", "/bin/harbor", expected=["aime_60"],
+                                       log=lambda _line: None, runner=run, sleep=lambda _s: None)
+        self.assertEqual(len(calls), executors.REGISTRY_ATTEMPTS)
+        self.assertEqual([p.name for p in (self.root / "cache").iterdir()], [])

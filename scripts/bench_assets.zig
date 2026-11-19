@@ -29,6 +29,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/viewer/data.py", .bytes = @embedFile("eval/harbor/viewer/data.py") },
     .{ .path = "scripts/eval/harbor/viewer/server.py", .bytes = @embedFile("eval/harbor/viewer/server.py") },
     .{ .path = "scripts/eval/harbor/viewer/runner.py", .bytes = @embedFile("eval/harbor/viewer/runner.py") },
+    .{ .path = "scripts/eval/harbor/viewer/batches.py", .bytes = @embedFile("eval/harbor/viewer/batches.py") },
     .{ .path = "scripts/eval/harbor/viewer/worker.py", .bytes = @embedFile("eval/harbor/viewer/worker.py") },
     .{ .path = "scripts/eval/harbor/viewer/executors.py", .bytes = @embedFile("eval/harbor/viewer/executors.py") },
     .{ .path = "scripts/eval/harbor/viewer/egress.py", .bytes = @embedFile("eval/harbor/viewer/egress.py") },

@@ -207,8 +207,9 @@ class EquivalenceTest(StoreCase):
                 return response.read()
 
         def labelled(view):
-            # The service adds suite/category display fields (bench-suites).
-            return {**view, **suites.label(suites.infer(view.get("dataset")))}
+            # The service adds suite/category display fields (bench-suites)
+            # and the batch and metacodes version of the launch (none here).
+            return {**view, **suites.label(suites.infer(view.get("dataset"))), "batch": None, "metacodes": None}
 
         jobs = json.loads(get("/api/jobs"))
         self.assertEqual(jobs["jobs"], [labelled(view) for view in expected["overview"]])
