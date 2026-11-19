@@ -124,8 +124,9 @@ python3 scripts/check_doc_facts.py
 ```
 
 `zig build gate:static` runs the checks that only read the source, in seconds
-with a warm cache: `zig fmt --check build.zig src tests`, `http-status:gate`,
-`subsystem:boundary`, the `scripts/tests/test_*_discipline.py` scans and
+with a warm cache: `zig fmt --check build.zig src tests`, the scans of
+`http-status:gate` and `subsystem:boundary` (their self-tests run in
+`test:units`), the `scripts/tests/test_*_discipline.py` scans and
 `git diff --check`. Run it first: `zig build` has no fail-fast, so inside a
 longer build a failed guard is reported only after every other step (#587).
 `zig build gate:pr` runs this list: the core suite always in ReleaseSafe, the

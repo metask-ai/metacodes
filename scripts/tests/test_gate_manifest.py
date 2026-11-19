@@ -129,13 +129,16 @@ class GateManifestTest(unittest.TestCase):
         the whole gate again."""
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         wired = set(re.findall(r"\bgate_static_step\.dependOn\(&?(\w+?)(?:\.step)?\);", build))
-        self.assertLessEqual({"gate_fmt", "http_status_gate_step", "subsystem_boundary_step", "gate_diff_check"}, wired)
+        self.assertLessEqual({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "gate_diff_check"}, wired)
         self.assertIn("gate_static_step", re.findall(r"\bgate_pr_step\.dependOn\((\w+)\)", build))
         for path in sorted((ROOT / "scripts" / "tests").glob("test_*_discipline.py")):
             with self.subTest(scan=path.stem):
                 command = re.search(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*"scripts\.tests\.%s"' % path.stem, build)
                 self.assertTrue(command, "%s has no build.zig command" % path.stem)
                 self.assertIn(command.group(1), wired, "gate:static does not run %s" % path.stem)
+        # Source-only: nothing it runs is a test binary, which would build and
+        # install the fs-helper (`addTestRunArtifact`).
+        self.assertFalse(wired & {"http_status_gate_step", "subsystem_boundary_step"}, wired)
 
     def test_the_checklist_starts_with_the_source_only_checks(self):
         self.assertEqual(checklist_commands()[0], "zig build gate:static")

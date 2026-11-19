@@ -217,8 +217,10 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 
 Before any flag's steps, every gate leg runs `zig build gate:static`, the
 checks that only read the source: `zig fmt --check build.zig src tests`,
-`http-status:gate`, `subsystem:boundary`, the
-`scripts/tests/test_*_discipline.py` scans and `git diff --check`. Inside the
+the scans of `http-status:gate` and `subsystem:boundary`, the
+`scripts/tests/test_*_discipline.py` scans and `git diff --check`. It
+compiles only the two small scanners: the guards' self-tests are test
+binaries, which install the fs-helper, so they stay in `test:units`. Inside the
 suites they are dependencies of the big steps, and `zig build` has no
 fail-fast: a guard that fails in seconds was reported only in the Build
 Summary at the end of the leg, about eight minutes later (#587). First, it

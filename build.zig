@@ -2734,8 +2734,11 @@ pub fn build(b: *std.Build) void {
     // depend on it: that would hold every compile back behind it.
     const gate_static_step = b.step("gate:static", "Run the source-only checks first: fmt, source guards, discipline scans, git diff --check");
     gate_static_step.dependOn(&gate_fmt.step);
-    gate_static_step.dependOn(http_status_gate_step);
-    gate_static_step.dependOn(subsystem_boundary_step);
+    // The two guards' scans only: their self-tests are test binaries, which
+    // bring in the fs-helper install (`addTestRunArtifact`), and run in
+    // `test:units` with the rest of the suite.
+    gate_static_step.dependOn(&http_status_gate_run.step);
+    gate_static_step.dependOn(&subsystem_boundary_run.step);
     gate_static_step.dependOn(&io_threaded_test_cmd.step);
     gate_static_step.dependOn(&thread_stack_test_cmd.step);
     gate_static_step.dependOn(&terminal_io_test_cmd.step);
