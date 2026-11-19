@@ -9,11 +9,18 @@ provider's own key file. A server that needs no key gets the placeholder
 `none` in its place, so it starts. A local mock stands in for the relay;
 nothing goes anywhere else. The non-terminal paths are covered by
 tests/component/custom_providers_cli_test.zig.
+
+`_cli`, which runs the CLI on a pty here, is checked on its own against
+small Python children: the exit code it reports is the child's, also when
+the pty closes before the child exits, and a child still running at the
+deadline fails the call.
 """
 import http.server
 import json
 import os
+import re
 import select
+import signal
 import stat
 import sys
 import threading
@@ -142,7 +149,15 @@ class _Case:
 
 
 def _cli(bin_path, args, env, answers, timeout=WAIT_S):
-    """Run `metacodes <args>` on a pty; answer each (prompt, reply) in turn."""
+    """Run `metacodes <args>` on a pty; answer each (prompt, reply) in turn.
+
+    Returns (exit code, output). The exit code is the child's own: it comes
+    only from a waitpid that returned this child's pid (a WNOHANG waitpid on
+    a running child returns pid 0 and status 0, which reads as "exited 0").
+    EOF on the pty says only that the output closed; the child is still
+    reaped in the time left. One still running at the deadline is killed and
+    reaped, and the call fails: a timeout is never an exit code.
+    """
     import pty  # POSIX only
 
     pid, fd = pty.fork()
@@ -153,39 +168,58 @@ def _cli(bin_path, args, env, answers, timeout=WAIT_S):
     out = b""
     pending = list(answers)
     deadline = time.monotonic() + timeout
-    status = None
-    while time.monotonic() < deadline:
-        if pending and pending[0][0].encode() in out:
-            os.write(fd, pending.pop(0)[1].encode())
-        r, _, _ = select.select([fd], [], [], 0.1)
-        if r:
-            try:
-                chunk = os.read(fd, 4096)
-            except OSError:
-                chunk = b""
+    status = None  # set only once the child is reaped
+    killed = False
+    output_open = True
+    try:
+        while True:
+            reaped, raw = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                status = raw
+                break
+            if time.monotonic() >= deadline:
+                os.kill(pid, signal.SIGKILL)
+                killed = True
+                _, status = os.waitpid(pid, 0)
+                break
+            if not output_open:
+                time.sleep(0.05)
+                continue
+            if pending and pending[0][0].encode() in out:
+                os.write(fd, pending.pop(0)[1].encode())
+            chunk = _read_pty(fd, 0.1)
+            if chunk:
+                out += chunk
+            elif chunk == b"":
+                output_open = False
+        # Reaped; on Linux its last lines can still be in the pty buffer.
+        while output_open:
+            chunk = _read_pty(fd, 0.5)
             if not chunk:
                 break
             out += chunk
-        done, status = os.waitpid(pid, os.WNOHANG)
-        if done:
-            break
-    else:
-        os.kill(pid, 9)
-    if status is None or not os.WIFEXITED(status):
-        _, status = os.waitpid(pid, 0)
-    while True:
-        r, _, _ = select.select([fd], [], [], 0.5)
-        if not r:
-            break
-        try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        out += chunk
-    os.close(fd)
+    finally:
+        if status is None:  # an error above: leave nothing running
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        os.close(fd)
+    if killed:
+        raise AssertionError(f"still running after {timeout}s, killed: {args}\n{out.decode('utf-8', 'replace')}")
     return os.waitstatus_to_exitcode(status), out
+
+
+def _read_pty(fd, wait):
+    """What the pty has within `wait` seconds: None if nothing came, b"" at EOF."""
+    r, _, _ = select.select([fd], [], [], wait)
+    if not r:
+        return None
+    try:
+        return os.read(fd, 4096)
+    except OSError:  # Linux: EIO once the child's side is closed
+        return b""
 
 
 def test_add_asks_for_each_part_then_probes_and_stores_the_pasted_key(bin_path):
@@ -341,3 +375,76 @@ def test_login_dialog_goes_straight_to_the_paste_for_a_provider_of_ones_own(bin_
         assert GOOD_KEY.encode() not in raw, "the pasted key was echoed to the terminal"
         assert case.checks() == [f"Bearer {GOOD_KEY}"], case.checks()
         case.assert_stored(GOOD_KEY)
+
+
+# ── _cli itself: the exit code it reports is the child's ─────────────────────
+# Small Python children stand in for metacodes, so these need no binary.
+
+def _python(code):
+    """`_cli`'s first three arguments for a Python child that runs `code`."""
+    return sys.executable, ["-I", "-c", code], {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+
+def _helper_pid(data):
+    found = re.search(rb"helper-pid (\d+)", data)
+    assert found, f"the child did not print its pid: {data!r}"
+    return int(found.group(1))
+
+
+def test_cli_helper_reports_an_exit_0_with_the_whole_output(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("_cli drives a POSIX pty")
+    code, out = _cli(*_python("print('helper says ok')"), [])
+    assert code == 0, f"exit {code}: {out!r}"
+    assert b"helper says ok" in out, out
+
+
+def test_cli_helper_reports_a_nonzero_exit_that_comes_after_the_last_line(bin_path):
+    # What the refused placeholder case does: the last line, then the exit a
+    # moment later, with the pty's EOF ahead of any waitpid that sees it.
+    if IS_WINDOWS:
+        raise SkipTest("_cli drives a POSIX pty")
+    code, out = _cli(*_python("import sys, time\nprint('helper fails', flush=True)\ntime.sleep(0.3)\nsys.exit(7)"), [])
+    assert code == 7, f"exit {code}: {out!r}"
+    assert b"helper fails" in out, out
+
+
+def test_cli_helper_reaps_a_child_that_outlives_its_pty(bin_path):
+    # EOF says only that the output closed: the child runs on and its exit
+    # decides the code.
+    if IS_WINDOWS:
+        raise SkipTest("_cli drives a POSIX pty")
+    code, out = _cli(*_python(
+        "import os, time\n"
+        "print('closing the pty', flush=True)\n"
+        "time.sleep(0.3)\n"
+        "for fd in (0, 1, 2):\n"
+        "    os.close(fd)\n"
+        "time.sleep(1.0)\n"
+        "os._exit(3)\n"), [])
+    assert code == 3, f"exit {code}: {out!r}"
+    assert b"closing the pty" in out, out
+
+
+def test_cli_helper_fails_a_child_still_running_at_the_deadline_and_reaps_it(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("_cli drives a POSIX pty")
+    started = time.monotonic()
+    try:
+        code, out = _cli(*_python("import os, time\nprint('helper-pid', os.getpid(), flush=True)\ntime.sleep(60)"), [], timeout=2.0)
+    except AssertionError as failure:
+        message = str(failure)
+    else:
+        try:
+            os.waitpid(_helper_pid(out), 0)
+        except (AssertionError, OSError):
+            pass
+        raise AssertionError(f"a child still running at the deadline came back as exit {code}: {out!r}")
+    assert time.monotonic() - started < 10, "the deadline did not end the wait"
+    assert "still running after 2.0s, killed" in message, message
+    # Killed and reaped: nothing is left of it, not even a zombie.
+    try:
+        left = os.waitpid(_helper_pid(message.encode()), os.WNOHANG)
+    except ChildProcessError:
+        left = None
+    assert left is None, f"the killed child was not reaped: waitpid gave {left}"
