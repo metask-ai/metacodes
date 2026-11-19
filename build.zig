@@ -2723,13 +2723,29 @@ pub fn build(b: *std.Build) void {
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
     units_test_step.dependOn(&rule_control_test_cmd.step);
     const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
+    // `git diff --check` ends the pre-submit checks; `gate:static` runs it.
+    const gate_diff_check = b.addSystemCommand(&.{ "git", "diff", "--check" });
+    // gate:static —— the checks that only read the source: no product
+    // compile, no test binary. Inside `gate:pr` they are dependencies of the
+    // big steps, and `zig build` reports a failure only after every step that
+    // does not depend on it has run (it has no fail-fast), so a guard that
+    // fails in seconds surfaced after the whole gate (#587). The checklist and
+    // every CI gate leg run this first. The compile and test steps do not
+    // depend on it: that would hold every compile back behind it.
+    const gate_static_step = b.step("gate:static", "Run the source-only checks first: fmt, source guards, discipline scans, git diff --check");
+    gate_static_step.dependOn(&gate_fmt.step);
+    gate_static_step.dependOn(http_status_gate_step);
+    gate_static_step.dependOn(subsystem_boundary_step);
+    gate_static_step.dependOn(&io_threaded_test_cmd.step);
+    gate_static_step.dependOn(&thread_stack_test_cmd.step);
+    gate_static_step.dependOn(&terminal_io_test_cmd.step);
+    gate_static_step.dependOn(&scrollback_test_cmd.step);
+    gate_static_step.dependOn(&builtin_egress_test_cmd.step);
+    gate_static_step.dependOn(&gate_diff_check.step);
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
     else
         b.addSystemCommand(&.{"scripts/test_coverage_audit.sh"});
-    // The checklist ends with `git diff --check`; the aggregate gate runs it too,
-    // so the one advertised command really is the whole list.
-    const gate_diff_check = b.addSystemCommand(&.{ "git", "diff", "--check" });
     // The checklist runs `zig build test` and `zig build test:lib
     // -Doptimize=ReleaseSafe`, but one invocation has one -Doptimize. So the
     // full suite runs at the invocation's (Debug by default) while the gate owns
@@ -2744,12 +2760,11 @@ pub fn build(b: *std.Build) void {
         staged_lean_kernels,
     );
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
-    gate_pr_step.dependOn(&gate_fmt.step);
+    gate_pr_step.dependOn(gate_static_step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
-    gate_pr_step.dependOn(&gate_diff_check.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)

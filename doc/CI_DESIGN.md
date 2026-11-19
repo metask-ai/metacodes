@@ -213,7 +213,18 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `integration` | Windows only: `zig build test:integration`, whose integration suite waits five minutes for the ReleaseSmall app there |
 | `product` | `zig build test:product` (the smokes, and the evaluation suite as three shards), with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
 | `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on macOS also its native ARM64 executable built for the release target and held to it (`scripts/check_binary_baseline.py`); on Windows also the version state gate and the Windows script suites |
-| `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
+| `checks` | The version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` (which also runs on a documentation-only change) |
+
+Before any flag's steps, every gate leg runs `zig build gate:static`, the
+checks that only read the source: `zig fmt --check build.zig src tests`,
+`http-status:gate`, `subsystem:boundary`, the
+`scripts/tests/test_*_discipline.py` scans and `git diff --check`. Inside the
+suites they are dependencies of the big steps, and `zig build` has no
+fail-fast: a guard that fails in seconds was reported only in the Build
+Summary at the end of the leg, about eight minutes later (#587). First, it
+ends the leg in seconds. The suites do not depend on `gate:static`, which
+would hold every compile back behind it; they still run the guards
+themselves, so `zig build test` alone stays complete.
 
 The rules that keep the split from dropping coverage:
 
@@ -231,7 +242,8 @@ The rules that keep the split from dropping coverage:
 - **Every step a flag gates runs on some runner.** A step without a flag is
   environment setup (the checkout, Zig, Lean, ripgrep, bubblewrap, the
   Python dependencies) and runs on every leg, so each leg sees the
-  environment the single job had. `scripts/tests/test_ci_scope.py` checks
+  environment the single job had; the one other unflagged step is
+  `gate:static`, first on every leg. `scripts/tests/test_ci_scope.py` checks
   that every flag a step reads on a platform is set by one of its legs, and
   that both POSIX jobs run one step list (a YAML alias).
 - **A result job passes only when every leg did.** `Gates (Linux)` and the
@@ -289,7 +301,8 @@ ones that land nowhere:
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |
-| A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
+| A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps and `gate:static` carry no flag, and every flag is set by a leg |
+| A check that only reads the source (a guard, a `*_discipline` scan) | `gate:static` in `build.zig`, as well as the `test:*` part that runs it | First on every leg, and first in the checklist | `test_gate_manifest.py`: every `*_discipline` scan is in `gate:static`; `test_ci_scope.py`: it runs before every other build step |
 | A smoke or another long command in `test:product` | Captured output (`expectExitCode(0)`) when it should overlap the rest; inheriting the terminal, it waits for every other such command | The product legs | Build Summary durations |
 
 When a part outgrows its legs, the Build Summary of the slowest leg says

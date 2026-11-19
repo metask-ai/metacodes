@@ -123,6 +123,23 @@ class GateManifestTest(unittest.TestCase):
         self.assertEqual({step for steps, _ in parts for step in steps}, set(TEST_PARTS))
         self.assertEqual(len({tuple(options) for _, options in parts}), 1, parts)
 
+    def test_gate_static_runs_every_source_only_check(self):
+        """`gate:static` runs first on every leg and in the checklist (#587):
+        a discipline scan or a source guard it misses is reported only after
+        the whole gate again."""
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        wired = set(re.findall(r"\bgate_static_step\.dependOn\(&?(\w+?)(?:\.step)?\);", build))
+        self.assertLessEqual({"gate_fmt", "http_status_gate_step", "subsystem_boundary_step", "gate_diff_check"}, wired)
+        self.assertIn("gate_static_step", re.findall(r"\bgate_pr_step\.dependOn\((\w+)\)", build))
+        for path in sorted((ROOT / "scripts" / "tests").glob("test_*_discipline.py")):
+            with self.subTest(scan=path.stem):
+                command = re.search(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*"scripts\.tests\.%s"' % path.stem, build)
+                self.assertTrue(command, "%s has no build.zig command" % path.stem)
+                self.assertIn(command.group(1), wired, "gate:static does not run %s" % path.stem)
+
+    def test_the_checklist_starts_with_the_source_only_checks(self):
+        self.assertEqual(checklist_commands()[0], "zig build gate:static")
+
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn('const units_test_step = b.step("test:units",', build)
