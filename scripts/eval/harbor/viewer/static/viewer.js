@@ -228,12 +228,29 @@ async function renderNewRun() {
     c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
     c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null));
   const mc = c.metacodes || {};
-  const version = h('input', { name: 'version', list: 'metacodes-versions', autocomplete: 'off',
-    required: !mc.bundle,
-    placeholder: mc.bundle ? '默认：' + (mc.bundle_version || '已配置的发行包') : '例如 0.12.0' });
-  form.append(h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), version,
-    h('datalist', { id: 'metacodes-versions' }, (mc.cached_versions || []).map((v) => h('option', { value: v }))),
-    h('small', { text: '填写发布版本号时，执行机器首次使用会从 GitHub Releases 下载对应 Linux 发行包并校验 SHA-256；留空使用 --bundle 配置的发行包。' })));
+  const source = h('select', { name: 'source' },
+    mc.bundle ? h('option', { value: 'bundle' }, '默认发行包' + (mc.bundle_version ? '（' + mc.bundle_version + '）' : '')) : null,
+    h('option', { value: 'ref' }, 'Git 版本（提交 / 分支 / tag）'),
+    h('option', { value: 'version' }, '发布版本'));
+  const version = h('input', { name: 'version', autocomplete: 'off' });
+  const builds = h('datalist', { id: 'metacodes-builds' },
+    (mc.builds || []).map((b) => h('option', { value: b.commit.slice(0, 12) }, `${b.ref} · ${b.version}`)));
+  const releases = h('datalist', { id: 'metacodes-releases' }, (mc.cached_versions || []).map((v) => h('option', { value: v })));
+  const hint = h('small');
+  const sync = () => {
+    const kind = source.value;
+    version.hidden = kind === 'bundle';
+    version.required = kind !== 'bundle';
+    version.setAttribute('list', kind === 'ref' ? 'metacodes-builds' : 'metacodes-releases');
+    version.placeholder = kind === 'ref' ? '例如 main、54a7a632 或 0.12.0' : '例如 0.12.0';
+    hint.textContent = kind === 'ref'
+      ? '首次使用某个提交时，执行机器在 Docker 中编译该版本的 Linux 发行包（需几分钟），之后按提交缓存复用。'
+      : kind === 'version' ? '首次使用时从 GitHub Releases 下载对应 Linux 发行包并校验 SHA-256，之后缓存复用。'
+        : '使用 metacodes bench --bundle 配置的发行包。';
+  };
+  source.addEventListener('change', sync);
+  sync();
+  form.append(h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), source, version, builds, releases, hint));
   const checks = (c.tasks || []).map((name) => h('label', { class: 'task-option' },
     h('input', { type: 'checkbox', value: name, name: 'task' }), h('span', { class: 'mono', text: name })));
   form.append(h('fieldset', {}, h('legend', { text: '试跑任务' }),
@@ -256,7 +273,7 @@ async function renderNewRun() {
     try {
       const request = { model: model.value, tasks: [...new Set(tasks)],
         attempts: Number(attempts.value), concurrency: Number(concurrency.value) };
-      if (version.value.trim()) request.version = version.value.trim();
+      if (source.value !== 'bundle' && version.value.trim()) request[source.value] = version.value.trim();
       const record = await api('/api/runs', request);
       location.hash = '#/run/' + record.name;
     } catch (error) {

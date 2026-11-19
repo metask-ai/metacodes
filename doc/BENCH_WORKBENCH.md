@@ -15,6 +15,7 @@ metacodes bench list --json             # previous jobs and results
 metacodes bench stop                    # stop HTTP service; workers continue
 metacodes bench run --task fix-git --task cancel-async-tasks --wait
 metacodes bench run --version 0.12.0 --task fix-git --wait
+metacodes bench run --ref main --task fix-git --wait    # any commit/branch/tag
 ```
 
 `run --wait` waits for the worker, returns its exit status (0 on successful
@@ -87,20 +88,44 @@ metacodes bench --bundle /path/to/linux-release \
 
 ### Choose a metacodes version
 
-Each launch runs the bundle configured with `--bundle` unless it names a
-published release: the page's "metacodes 版本" field, `bench run --version
-X.Y.Z`, or `"version"` in an `api/runs` request. The worker then downloads
-`metacodes-<version>-<arch>-linux-gnu.tar.gz` for the execution machine's
-architecture from GitHub Releases, checks it against the release's
-`SHA256SUMS`, and keeps the unpacked unit under `<state root>/bench/releases/`.
-Later launches of the same version reuse it without downloading. A version
-that is malformed is refused before any worker starts; one that is missing,
-fails its checksum, or contains links or paths outside the unit fails the run
-with that reason, and nothing is cached. Without `--bundle`, every launch must
-name a version. `bench info` lists the default and already downloaded
-versions; each run records the version it used. Set `release_base` in
+Each launch runs one of three metacodes sources, chosen in the page's
+"metacodes 版本" field, on `bench run`, or in an `api/runs` request:
+
+| Source | Choose it with | First use | Cached in `<state root>/bench/` |
+|---|---|---|---|
+| Configured bundle | nothing (default) | — | — |
+| Git revision: commit, branch or tag | `--ref <ref>` / `"ref"` | builds the Linux release unit in Docker | `git/builds/`, one unit per commit |
+| Published release | `--version X.Y.Z` / `"version"` | downloads the Linux archive from GitHub Releases | `releases/`, one unit per version |
+
+**Git revisions.** The worker keeps a mirror of the source repository in
+`git/source.git`, fetches it, and resolves the ref to a commit, so a branch
+always means its current head. A commit that has no unit yet is built the way
+`release.yml` builds one: `kernels:stage` for both Lean kernels, their pins,
+then `release:verify` for `<arch>-linux-gnu.2.31`, where `<arch>` is the
+execution machine's (task containers share it). The Lean kernels only build
+natively, so this runs in a `debian:bookworm-slim` builder container as the
+caller's user. It uses the Zig version the revision's `build.zig.zon` asks
+for, checked against ziglang.org's published SHA-256, and the revision's own
+pinned elan installer. Toolchains are cached in `git/toolchains/`. The first
+build downloads these toolchains and takes several minutes; the build output
+goes to the run's execution log. Later launches of the same commit, by any
+name, reuse the unit. Revisions older than the Lean-kernel release layout
+cannot be built this way. Set `source_repo` in `workbench.json` to build from
+another clone or fork.
+
+**Releases.** The worker downloads `metacodes-<version>-<arch>-linux-gnu.tar.gz`
+and checks it against the release's `SHA256SUMS`. Set `release_base` in
 `workbench.json` or `METACODES_RELEASE_BASE` to use a mirror with the same
 `download/<tag>/<asset>` layout.
+
+A malformed ref or version, or both at once, is refused before any worker
+starts. A ref that does not resolve, a failed build, a missing release, a
+checksum mismatch, or an archive with links or paths outside the unit fails
+the run with that reason, and nothing is cached. Cancelling a run during a
+build stops the builder container. Without `--bundle`, every launch must name
+a ref or version. `bench info` lists the default bundle, the downloaded
+releases and the built revisions; each run records the metacodes version (and
+commit) it used.
 
 `--provider-config` is a native metacodes configuration with
 `custom_providers`; see [the Harbor adapter](../scripts/eval/harbor/README.md).

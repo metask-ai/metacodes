@@ -12,7 +12,7 @@ from pathlib import Path
 
 from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.viewer.account import Account
-from scripts.eval.harbor.viewer import releases
+from scripts.eval.harbor.viewer import builds, releases
 from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
 
 
@@ -42,6 +42,12 @@ def prepare(spec, env):
     if spec.get("version"):
         bundle = releases.bundle(spec["version"], spec["release_cache"], spec.get("release_base"))
         spec = {**spec, "bundle": str(bundle)}
+    elif spec.get("ref"):
+        cancel = Path(spec["jobs_dir"]) / ".bench-runs" / (spec["name"] + ".cancel")
+        bundle, info = builds.bundle(spec["ref"], spec["build_cache"], spec.get("source_repo"),
+                                     cancelled=cancel.exists)
+        spec = {**spec, "bundle": str(bundle),
+                "metacodes_version": f"{info['version']} (git {spec['ref']} @ {info['commit'][:12]})"}
     if spec.get("auth_mode") == "metask":
         # Resolve the key belonging to this model's group, without
         # changing the interactive CLI selection or forwarding OAuth.
@@ -88,6 +94,8 @@ def main(argv=None):
                     last_write = time.monotonic()
                 concurrent.futures.wait([preparing], timeout=0.25)
         spec, relay = preparing.result()
+        if spec.get("metacodes_version"):
+            record["metacodes_version"] = spec["metacodes_version"]
         if spec_path.with_suffix(".cancel").exists():
             record.update(status="cancelled", finished_at=now())
             return 1
@@ -117,8 +125,11 @@ def main(argv=None):
             time.sleep(0.25)
         record.update(status="cancelled" if cancelled else ("finished" if process.returncode == 0 else "failed"),
                       exit_code=process.returncode, finished_at=now())
-    except releases.ReleaseError as exc:
-        record.update(status="failed", error=str(exc), finished_at=now())
+    except (releases.ReleaseError, builds.BuildError) as exc:
+        if spec_path.with_suffix(".cancel").exists():
+            record.update(status="cancelled", finished_at=now())
+        else:
+            record.update(status="failed", error=str(exc), finished_at=now())
     except Exception as exc:
         record.update(status="failed", error=type(exc).__name__, finished_at=now())
     finally:

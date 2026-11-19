@@ -13,6 +13,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/metacodes_agent.py", .bytes = @embedFile("eval/harbor/metacodes_agent.py") },
     .{ .path = "scripts/eval/harbor/viewer/__init__.py", .bytes = @embedFile("eval/harbor/viewer/__init__.py") },
     .{ .path = "scripts/eval/harbor/viewer/account.py", .bytes = @embedFile("eval/harbor/viewer/account.py") },
+    .{ .path = "scripts/eval/harbor/viewer/builds.py", .bytes = @embedFile("eval/harbor/viewer/builds.py") },
     .{ .path = "scripts/eval/harbor/viewer/data.py", .bytes = @embedFile("eval/harbor/viewer/data.py") },
     .{ .path = "scripts/eval/harbor/viewer/server.py", .bytes = @embedFile("eval/harbor/viewer/server.py") },
     .{ .path = "scripts/eval/harbor/viewer/releases.py", .bytes = @embedFile("eval/harbor/viewer/releases.py") },

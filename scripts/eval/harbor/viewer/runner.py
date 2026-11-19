@@ -1,8 +1,9 @@
 """Durable, shell-free launch requests for the Bench workbench.
 
 Only server-configured bundles, published metacodes releases and provider
-configurations can run. Browser requests select a model, task names and
-optionally a release version; credentials stay in the server's
+configurations can run, or metacodes built from a git ref. Browser requests
+select a model, task names and optionally a release version or git ref;
+credentials stay in the server's
 environment. Each launch has its own worker so HTTP restarts do not stop jobs.
 """
 from __future__ import annotations
@@ -20,7 +21,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor.command import check_bundle
-from scripts.eval.harbor.viewer import data, releases
+from scripts.eval.harbor.viewer import builds, data, releases
 from scripts.eval.harbor.viewer.account import Account
 
 DATASET = "terminal-bench/terminal-bench-2-1"
@@ -72,6 +73,7 @@ class RunManager:
         self.config_path = Path(config_path).expanduser().resolve()
         self.records = self.jobs_dir / ".bench-runs"
         self.release_cache = self.config_path.parent / "releases"
+        self.build_cache = self.config_path.parent / "git"
         self.lock = threading.Lock()
         self.account_lock = threading.Lock()
         self.account_cache = None
@@ -141,7 +143,8 @@ class RunManager:
                 "warnings": warnings, "account_summary": account_summary,
                 "account_groups": account_groups,
                 "metacodes": {"bundle": bundle_ready, "bundle_version": bundle_version,
-                              "cached_versions": releases.cached(self.release_cache)},
+                              "cached_versions": releases.cached(self.release_cache),
+                              "builds": builds.cached(self.build_cache)},
                 "defaults": {"attempts": 1, "concurrency": 1}, "runs": self.runs()}
 
     def runs(self):
@@ -156,9 +159,9 @@ class RunManager:
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
     def launch(self, request):
-        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "version"}
+        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "version", "ref"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 model、tasks、attempts、concurrency、dataset、version")
+            raise ValueError("只接受 model、tasks、attempts、concurrency、dataset、version、ref")
         catalog = self.catalog()
         if not catalog["ready"]:
             raise ValueError("；".join(catalog["reasons"]))
@@ -177,11 +180,15 @@ class RunManager:
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, 3)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
-        version = request.get("version") or None
+        version, ref = request.get("version") or None, request.get("ref") or None
+        if version is not None and ref is not None:
+            raise ValueError("发布版本和 git 版本只能选一个")
         if version is not None:
             releases.check_version(version)
+        elif ref is not None:
+            builds.check_ref(ref)
         elif not catalog["metacodes"]["bundle"]:
-            raise ValueError("请指定 metacodes 版本，或用 metacodes bench --bundle <Linux发行包目录> 配置默认版本")
+            raise ValueError("请指定 metacodes 发布版本或 git 版本，或用 metacodes bench --bundle <Linux发行包目录> 配置默认版本")
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
@@ -192,14 +199,16 @@ class RunManager:
                 raise ValueError("账号模型目录已变化，请刷新后重试")
             name = "bench-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
             record = {"name": name, "status": "queued", "created_at": now(), "model": model,
-                      "metacodes_version": version or catalog["metacodes"]["bundle_version"],
+                      "metacodes_version": version or ("git " + ref if ref else catalog["metacodes"]["bundle_version"]),
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
-            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": None if version else cfg["bundle"],
+            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": None if version or ref else cfg["bundle"],
                     "version": version, "release_cache": str(self.release_cache),
                     "release_base": cfg.get("release_base"),
+                    "ref": ref, "build_cache": str(self.build_cache),
+                    "source_repo": cfg.get("source_repo"),
                     "auth_mode": mode, "account_state_dir": cfg.get("account_state_dir") if mode == "metask" else None,
                     "account_gateway": cfg.get("account_gateway") if mode == "metask" else None,
                     "account_key_id": account_key_id,

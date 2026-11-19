@@ -139,6 +139,7 @@ def main(argv=None):
     parser.add_argument("--no-open", action="store_true", help="仅输出链接，不打开浏览器")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--version", dest="metacodes_version", help="bench run 使用的 metacodes 发布版本（如 0.12.0）；默认用 --bundle 配置的发行包")
+    parser.add_argument("--ref", help="bench run 使用从该 git 版本（提交、分支或 tag）编译的 metacodes；首次使用时在 Docker 中编译并缓存")
     parser.add_argument("--task", action="append", default=[], help="运行的任务名，可重复")
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
@@ -203,6 +204,8 @@ def main(argv=None):
                     print("默认 metacodes：" + (metacodes.get("bundle_version") or ("已配置发行包" if metacodes.get("bundle") else "未配置，运行时用 --version 指定")))
                     if metacodes.get("cached_versions"):
                         print("已下载版本：" + "、".join(metacodes["cached_versions"]))
+                    for build in metacodes.get("builds") or []:
+                        print(f"已编译 git 版本：{build['ref']} @ {build['commit'][:12]}（{build['version']}）")
             else:
                 value = client.request("api/jobs") if client else {"jobs": data.Library([jobs_dir]).overview()}
                 if not args.json:
@@ -223,6 +226,8 @@ def main(argv=None):
                        "attempts": args.attempts, "concurrency": args.concurrency}
             if args.metacodes_version:
                 payload["version"] = args.metacodes_version
+            if args.ref:
+                payload["ref"] = args.ref
             record = client.request("api/runs", payload)
             url = client.url + "#/run/" + record["name"]
             if args.wait:

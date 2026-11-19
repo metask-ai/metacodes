@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
-from scripts.eval.harbor.viewer import data, releases, server
+from scripts.eval.harbor.viewer import builds, data, releases, server
 from scripts.eval.harbor.viewer.account import Account
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
@@ -753,6 +753,121 @@ class ReleaseVersionTest(unittest.TestCase):
                     releases._extract(archive, self.root / 'out')
                 self.assertFalse((self.root / 'escape').exists())
 
+
+FAKE_DOCKER = """#!{python}
+import json, os, pathlib, sys, time
+args = sys.argv[1:]
+log = pathlib.Path(os.environ['FAKE_DOCKER_LOG'])
+with log.open('a') as f: f.write(json.dumps(args) + chr(10))
+if args[0] != 'run': sys.exit(0)
+out = next(pathlib.Path(a.split(':')[0]) for a in args if a.endswith(':/out'))
+commit = next(a.split('=', 1)[1] for a in args if a.startswith('COMMIT='))
+time.sleep(float(os.environ.get('FAKE_BUILD_DELAY', '0')))
+if os.environ.get('FAKE_BUILD_FAIL'): sys.exit(3)
+for rel in {executables!r}:
+    (out / rel).parent.mkdir(parents=True, exist_ok=True)
+    (out / rel).write_text(commit)
+(out / 'manifest.json').write_text(json.dumps({{'target': {{'os': 'linux'}}, 'release': {{'version': '0.0.0-dev+' + commit[:12]}}}}))
+"""
+
+
+@unittest.skipUnless(POSIX, 'fake executable and worker signal test are POSIX')
+class GitRefBuildTest(unittest.TestCase):
+    setUp_service = WorkbenchTest.setUp
+    request = WorkbenchTest.request
+
+    def setUp(self):
+        self.setUp_service()
+        import subprocess
+        self.git_env = patch.dict(os.environ, {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com',
+                                               'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com',
+                                               'FAKE_DOCKER_LOG': str(self.root / 'docker.log')})
+        self.git_env.start()
+        self.addCleanup(self.git_env.stop)
+        self.repo = self.root / 'source'
+        self.repo.mkdir()
+        self.git = lambda *a: subprocess.run(['git', '-C', str(self.repo), *a], check=True,
+                                             capture_output=True, text=True).stdout.strip()
+        self.git('init', '-q', '-b', 'main')
+        self.git('commit', '-q', '--allow-empty', '-m', 'one')
+        docker = Path(os.environ['PATH'].split(os.pathsep)[0]) / 'docker'
+        docker.write_text(FAKE_DOCKER.format(python=sys.executable, executables=list(BUNDLE_EXECUTABLES)))
+        cfg = json.loads(self.manager.config_path.read_text())
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': str(self.repo)})
+
+    def docker_runs(self):
+        path = self.root / 'docker.log'
+        calls = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        return [c for c in calls if c[0] == 'run']
+
+    def launch(self, **request):
+        run = self.client.request('api/runs', {**self.request(), **request})
+        return run, wait_run(self.manager, run['name'])
+
+    def bundle_of(self, run):
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        return Path(argv[argv.index('--ak') + 1].removeprefix('bundle='))
+
+    def test_ref_is_built_once_per_commit_and_reaches_harbor(self):
+        first = self.git('rev-parse', 'HEAD')
+        run, final = self.launch(ref='main')
+        self.assertEqual(run['metacodes_version'], 'git main')
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertIn(first[:12], final['metacodes_version'])
+        bundle = self.bundle_of(run)
+        self.assertEqual(bundle.parent, self.manager.build_cache / 'builds')
+        self.assertEqual((bundle / 'bin' / 'metacodes').read_text(), first)
+        call = self.docker_runs()[0]
+        self.assertIn('COMMIT=' + first, call)
+        self.assertIn(builds.image(), call)
+        self.assertTrue(any(a.endswith(':/mirror:ro') for a in call))
+        # The same commit by another name reuses the cached unit.
+        run, final = self.launch(ref=first[:8])
+        self.assertEqual((final['status'], self.bundle_of(run)), ('finished', bundle))
+        self.assertEqual(len(self.docker_runs()), 1)
+        catalog = self.client.request('api/workbench')
+        self.assertEqual([b['commit'] for b in catalog['metacodes']['builds']], [first])
+        # A new commit on the branch is fetched and built.
+        self.git('commit', '-q', '--allow-empty', '-m', 'two')
+        second = self.git('rev-parse', 'HEAD')
+        run, final = self.launch(ref='main')
+        self.assertEqual((self.bundle_of(run) / 'bin' / 'metacodes').read_text(), second)
+        self.assertEqual(len(self.docker_runs()), 2)
+
+    def test_failed_build_fails_the_run_with_a_reason_and_caches_nothing(self):
+        with patch.dict(os.environ, {'FAKE_BUILD_FAIL': '1'}):
+            run, final = self.launch(ref='main')
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('编译失败', final['error'])
+        self.assertFalse((self.manager.jobs_dir / run['name']).exists())
+        self.assertEqual(builds.cached(self.manager.build_cache), [])
+        self.assertEqual(list((self.manager.build_cache / 'builds').iterdir()), [])
+
+    def test_unknown_ref_fails_the_run_with_a_reason(self):
+        _, final = self.launch(ref='no-such-branch')
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('no-such-branch', final['error'])
+        self.assertEqual(self.docker_runs(), [])
+
+    def test_cancel_during_build_stops_the_builder(self):
+        with patch.dict(os.environ, {'FAKE_BUILD_DELAY': '10'}):
+            run = self.client.request('api/runs', {**self.request(), 'ref': 'main'})
+            deadline = time.monotonic() + 10
+            while not self.docker_runs() and time.monotonic() < deadline:
+                time.sleep(.05)
+            self.client.request('api/cancel', {'name': run['name']})
+            final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'cancelled')
+        log = [json.loads(line) for line in (self.root / 'docker.log').read_text().splitlines()]
+        self.assertTrue(any(c[0] == 'kill' for c in log))
+        self.assertFalse((self.manager.jobs_dir / run['name']).exists())
+
+    def test_malformed_refs_and_two_sources_are_refused_before_spawn(self):
+        for request in ({'ref': '--upload-pack=touch /tmp/x'}, {'ref': 'a..b'}, {'ref': 'main@{1}'},
+                        {'ref': 'x y'}, {'ref': 7}, {'ref': 'main', 'version': '0.12.0'}):
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                self.client.request('api/runs', {**self.request(), **request})
+        self.assertEqual(self.manager.runs(), [])
 
 if __name__ == '__main__':
     unittest.main()
