@@ -429,17 +429,19 @@ guard is who gets there, in two places:
   contributor"). It never decides by fork: most members open pull requests
   from their own forks.
 - **The runner**, whatever a pull request's own `ci.yml` asks for: a hook
-  before every job lets through only organization members and collaborators
-  with write access and fails any other job. That is the boundary, since a
+  before every job lets through only the authors on the host's allowlist,
+  which holds the organization's members, and fails any other job, outside
+  collaborators included whatever their access. That is the boundary, since a
   pull request runs its own copy of this plan; the plan only keeps external
   pull requests from turning red there. Outside contributors' fork pull
   requests also wait for a maintainer's approval before any workflow runs.
 
 `COLLABORATOR` counts because GitHub reports a member whose membership is
-private that way when they have direct access to the repository, as the
-runner's hook does for collaborators with write access. The repository has no
-outside collaborators (checked 2026-11-19); adding one with write access
-would let their pull requests use the runner too. A private member without
+private that way when they have direct access to the repository. The
+repository has no outside collaborators (checked 2026-11-19); the plan would
+send one's pull request to the runner and the hook would fail it, so an
+outside collaborator's gates turn red there until they join the allowlist.
+The same holds for a new member until the allowlist is updated. A private member without
 direct access shows as `CONTRIBUTOR` and stays on hosted runners until they
 make the membership public. The single-use VM pools
 ([VM_POOLS.md](VM_POOLS.md)) are kept for AIPC or a later host and would
