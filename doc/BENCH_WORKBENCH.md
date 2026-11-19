@@ -71,13 +71,59 @@ AIME ids are `aime_60`…`aime_89` (2024), `aime_i-1`…`aime_i-15` (2025-I) and
 is in neither registry, so `gaia2-cli` runs a locally generated dataset with
 `-p`. Its tasks reach the agent's tools through an MCP sidecar
 (`[[environment.mcp_servers]]`), which the metacodes Harbor agent writes into
-the trial's `mcpServers`; its verifier is an LLM judge that needs
-`OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL`, default OpenRouter, and
-`JUDGE_MODEL`) in the execution service's environment. `bench prepare
---suite gaia2-cli` runs Harbor's adapter from a Harbor source checkout named
-by `METACODES_BENCH_HARBOR_SOURCE` (`uv` and the Hugging Face `datasets`
-package; the dataset is public), or register an existing directory with
-`metacodes bench --dataset gaia2-cli=<dir>`.
+the trial's `mcpServers`.
+
+`bench prepare --suite gaia2-cli` needs no manual steps on the workbench
+machine: it fetches Harbor v0.26.0 at its pinned commit
+(`3cb627394b95d3ae605f31e0d694edf508cf4b7b`, a shallow fetch of exactly
+that commit with HEAD verified) into `<state root>/bench/sources/harbor-<commit>`,
+reused afterwards, and runs Harbor's `adapters/gaia2/run_adapter.py --cli`
+there with the workbench's `uv` (`uv run --frozen --no-dev --extra
+huggingface`) against the public Hugging Face dataset
+`meta-agents-research-environments/gaia2` at a pinned revision. It needs
+`git`, `uv` and access to Hugging Face (`HF_ENDPOINT` selects a mirror);
+readiness names whichever is missing. A top-level `pypi_index` in
+`workbench.json` makes uv resolve from that mirror (`UV_DEFAULT_INDEX`,
+without `--frozen`, since the lock names pypi.org files).
+`METACODES_BENCH_HARBOR_SOURCE` still selects an existing Harbor checkout,
+and `metacodes bench --dataset gaia2-cli=<dir>` registers a directory
+generated elsewhere. The full set is 800 tasks (160 per config:
+`execution`, `search`, `adaptability`, `time`, `ambiguity`), named
+`gaia2-<config>-<row>-<scenario id>`, about 2.1 GB (2.5–2.7 MB per task,
+mostly `environment/scenario.json`); generation takes about 100 seconds
+once the dataset is cached. `"prepare": {"gaia2-cli": {"configs": [...],
+"limit": N}}` in `workbench.json` narrows it (the adapter's `--configs` and
+`--limit`). A prepared dataset carries a marker and is not regenerated while
+its options and task trees match. The default sample is the first scenario
+of each config.
+
+GAIA2's verifier is an LLM judge (Harbor's `tests/llm_judge.py`, OpenAI
+Chat Completions through the `openai` SDK). With Metask authentication it
+goes through the run's credential relay, like the agent: Harbor passes the
+verifier (`--ve`) `OPENAI_BASE_URL=<relay>/bench-judge/v1`,
+`OPENAI_API_KEY=${METACODES_BENCH_JUDGE_TOKEN}` (a run-scoped judge
+placeholder in Harbor's environment, distinct from the agent's),
+`JUDGE_MODEL=<model>` and `SSL_CERT_FILE=/usr/local/share/metacodes-bench/ca-bundle.pem`,
+the system CA bundle plus the relay's ephemeral CA that the metacodes agent
+writes when it installs (the verifier runs in the same `main` container; the
+SDK's httpx client trusts certifi only, unless `SSL_CERT_FILE` names a
+bundle). The relay accepts the judge placeholder only on that route and
+only for `POST /v1/chat/completions`, refuses the agent's placeholder there,
+forwards to the Metask gateway with the real, refreshing credential, and
+does not record judge requests as agent metrics. `OPENAI_API_KEY`,
+`OPENAI_BASE_URL` and `JUDGE_MODEL` of the service environment are removed
+from Harbor's environment for such a run, so no real key reaches the task.
+The model is `"judges": {"gaia2-cli": {"model": "<id>"}}` in
+`workbench.json`, default `glm-5.3-flash` (the gateway's bare model id; a
+`metask/` prefix is dropped); a launch is refused when the account's model
+directory does not list it. The run record and the job view show the judge
+(`judge: {"model", "via": "metask"}`). Scores judged this way are not
+directly comparable with Harbor's published GAIA2 CLI numbers, which use
+`openai/gpt-4o-mini`. With provider authentication the judge keeps the
+external route: `OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL`, default
+OpenRouter, and `JUDGE_MODEL`, default `openai/gpt-4o-mini`) in the
+execution service's environment, forwarded to SSH executors as `HOST_ENV`;
+readiness requires `OPENAI_API_KEY` only in that mode.
 
 The harbor-local adapters download pinned sources (verified by hash) into
 `<dataset>/.cache/` on `bench prepare --suite <id>` and write Harbor task
@@ -97,8 +143,11 @@ SUITE_ID = "humaneval"                                 # the catalog id
 SUITE = {"name": "HumanEval", "description": "…", "default_tasks": [...],
          "max_tasks": 164, "max_concurrency": 16, "arch": "amd64, arm64"}  # all optional
 HOST_ENV = ("OPENAI_API_KEY",)        # optional: verifier env, forwarded to SSH executors
+JUDGE = {"default_model": "glm-5.3-flash",            # optional: an OpenAI-compatible LLM
+         "env": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL",   # judge, routed
+                 "model": "JUDGE_MODEL", "ca_file": "SSL_CERT_FILE"}}  # through the relay (Metask)
 
-def prepare(dest: Path) -> Path:
+def prepare(dest: Path) -> Path:      # or prepare(dest, ctx): ctx.cfg, ctx.root (bench state)
     """Write Harbor task dirs (<dest>/<task-id>/task.toml, …); return the dataset dir."""
 
 def check(ctx) -> list[str]:          # optional extra readiness reasons
@@ -447,8 +496,14 @@ directory is generated on the workbench's machine (`bench prepare`, or
 `--dataset SUITE=DIR`) and shipped like the bundle, into
 `<state_dir>/datasets/<digest>`, once per content digest; Harbor's `-p` then
 names that copy. Execution-host variables a suite's verifier reads (GAIA2's
-`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `JUDGE_MODEL`, declared by the adapter's
-`HOST_ENV`) travel with the credential on the SSH channel's stdin. WorkBuddy
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `JUDGE_MODEL` with provider
+authentication, declared by the adapter's `HOST_ENV`) travel with the
+credential on the SSH channel's stdin. With Metask authentication GAIA2's
+judge uses the executor's relay instead: only its placeholder travels on
+stdin (beside the agent's), the remote driver adds the `--ve` arguments once
+its relay listens, and the session login's pushed token serves the judge
+too (a legacy group key for the judge model, when it differs from the run's,
+is sent once on the same line). WorkBuddy
 suites drive the workbench machine's own checkout and Docker, so they run on
 the `local` executor only; readiness on an SSH executor says so and the
 launch is refused.

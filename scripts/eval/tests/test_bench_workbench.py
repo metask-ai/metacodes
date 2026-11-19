@@ -70,6 +70,30 @@ if os.environ.get('FAKE_PROFILE_REQUEST'):
  ca = next(args[i + 1].removeprefix('metrics_ca=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_ca='))
  req = urllib.request.Request(relay + '/fix-git__fake/v1/messages', data=json.dumps({{'model':arg('-m').split('/',1)[1]}}).encode(), headers={{'Authorization':'Bearer ' + os.environ['METASK_API_KEY'], 'Content-Type':'application/json'}})
  with urllib.request.urlopen(req,timeout=5,context=ssl.create_default_context(cafile=ca)) as response: response.read()
+if os.environ.get('FAKE_JUDGE_REQUEST'):
+ # Harbor's verifier: `--ve` values (templates resolved from Harbor's own
+ # environment, as harbor.utils.env.resolve_env_vars does) become the test
+ # script's environment; the judge then calls Chat Completions like the
+ # openai SDK (base_url + /chat/completions). The CA is the host's copy of
+ # the bundle the container reads from SSL_CERT_FILE.
+ import ssl, urllib.error, urllib.request
+ ca = next(args[i + 1].removeprefix('metrics_ca=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_ca='))
+ ve = {{}}
+ for i, a in enumerate(args):
+  if a == '--ve':
+   k, v = args[i + 1].split('=', 1)
+   ve[k] = os.environ[v[2:-1]] if v.startswith('${{') and v.endswith('}}') else v
+ (root / 'verifier-env.json').write_text(json.dumps(ve))
+ body = json.dumps({{'model': ve['JUDGE_MODEL'], 'messages': [{{'role': 'user', 'content': 'grade'}}]}}).encode()
+ statuses = {{}}
+ for label, token in (('judge', ve['OPENAI_API_KEY']), ('agent-token', os.environ[key_env])):
+  req = urllib.request.Request(ve['OPENAI_BASE_URL'] + '/chat/completions', data=body, headers={{'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}})
+  try:
+   with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context(cafile=ca)) as response:
+    statuses[label] = [response.status, json.loads(response.read())['choices'][0]['message']['content']]
+  except urllib.error.HTTPError as exc:
+   statuses[label] = [exc.code, None]; exc.close()
+ (root / 'judge-statuses.json').write_text(json.dumps(statuses))
 if os.environ.get('FAKE_RELAY_REQUESTS'):
  import ssl, urllib.error, urllib.request
  relay = next(args[i + 1].removeprefix('metrics_proxy=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_proxy='))
@@ -128,6 +152,14 @@ def fixture(root):
                          'harbor': str(harbor), 'model': 'tokenjoy/test-model',
                          'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False, 'metrics_bind': '127.0.0.1'})
     return config, binary_dir
+
+
+def gaia2_dataset(root):
+    """A prepared gaia2-cli dataset directory (one task)."""
+    dataset = root / 'gaia2-dataset'
+    (dataset / 'gaia2-search-0000-abc').mkdir(parents=True)
+    (dataset / 'gaia2-search-0000-abc' / 'task.toml').write_text('[task]\n')
+    return dataset
 
 
 def wait_run(manager, name, timeout=15):
@@ -253,6 +285,13 @@ def session_fixture(root, *, expired=True):
                     self.reply({}, 400)
                     return
                 self.reply({'access_token': 'session-access', 'refresh_token': 'session-rotated', 'expires_in': 3600})
+            elif self.path == '/v1/chat/completions':
+                # An LLM judge (OpenAI Chat Completions) on the same bearer.
+                calls.append(('judge-request', self.headers.get('Authorization'), body))
+                if self.headers.get('Authorization') != 'Bearer session-access':
+                    self.reply({}, 401)
+                    return
+                self.reply({'choices': [{'message': {'role': 'assistant', 'content': 'GRADE: yes'}}]})
             elif self.path == '/v1/messages':
                 calls.append(('model-request', self.headers.get('Authorization'), body))
                 if self.headers.get('Authorization') != 'Bearer session-access':
@@ -277,7 +316,10 @@ def session_fixture(root, *, expired=True):
             elif self.headers.get('Authorization') not in ('Bearer session-access', 'Bearer replacement-access'):
                 self.reply({}, 401)
             else:
+                # glm-5.3-flash: a Chat Completions judge, not offered for
+                # Messages, so it is no agent model in the catalog.
                 self.reply({'data': [{'id': 'session-model'}, {'id': 'video-model', 'capabilities': {
+                    'endpoints': {'messages': {'supported': False}}}}, {'id': 'glm-5.3-flash', 'capabilities': {
                     'endpoints': {'messages': {'supported': False}}}}]})
 
         def log_message(self, *_args):
@@ -685,6 +727,92 @@ class WorkbenchTest(unittest.TestCase):
         public = json.dumps(catalog) + ''.join(p.read_text() for p in self.manager.records.iterdir())
         for secret in ('session-access', 'session-refresh', 'session-rotated', 'replacement-access'):
             self.assertNotIn(secret, public)
+
+    def test_gaia2_judge_goes_through_the_relay_with_its_own_placeholder(self):
+        """GAIA2's verifier gets the relay route, a judge-only placeholder, the
+        configured model and the CA path; the relay forwards to the gateway's
+        /v1/chat/completions with the real session token."""
+        state, upstream, calls = session_fixture(self.root)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        dataset = gaia2_dataset(self.root)
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode='metask', account_state_dir=str(state), metrics_enabled=True, metrics_bind='127.0.0.1',
+                   datasets={'gaia2-cli': str(dataset)})
+        atomic_json(self.manager.config_path, cfg)
+        # A judge key in the service environment must not reach Harbor.
+        with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}',
+                                     'FAKE_JUDGE_REQUEST': '1', 'OPENAI_API_KEY': 'real-openai-key',
+                                     'OPENAI_BASE_URL': 'https://openrouter.invalid/api/v1'}):
+            catalog = self.client.request('api/workbench')
+            entry = next(s for s in catalog['suites'] if s['id'] == 'gaia2-cli')
+            # Metask authentication: no OPENAI_API_KEY requirement.
+            self.assertTrue(entry['ready'], entry['reasons'])
+            self.assertEqual(entry['judge'], {'model': 'glm-5.3-flash', 'via': 'metask'})
+            run = self.client.request('api/runs', {'suite': 'gaia2-cli', 'model': 'metask/session-model',
+                                                   'tasks': ['gaia2-search-0000-abc'], 'attempts': 1, 'concurrency': 1})
+            final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual(final['judge'], {'model': 'glm-5.3-flash', 'via': 'metask'})
+        job = self.manager.jobs_dir / run['name']
+        argv = json.loads((job / 'argv.json').read_text())
+        relay = next(a.removeprefix('metrics_proxy=') for a in argv if a.startswith('metrics_proxy='))
+        self.assertIn('OPENAI_API_KEY=${METACODES_BENCH_JUDGE_TOKEN}', argv)
+        verifier = json.loads((job / 'verifier-env.json').read_text())
+        agent = json.loads((job / 'container-env.json').read_text())['METASK_API_KEY']
+        self.assertEqual(verifier['OPENAI_BASE_URL'], relay + '/bench-judge/v1')
+        self.assertEqual(verifier['JUDGE_MODEL'], 'glm-5.3-flash')
+        self.assertEqual(verifier['SSL_CERT_FILE'], '/usr/local/share/metacodes-bench/ca-bundle.pem')
+        self.assertTrue(verifier['OPENAI_API_KEY'].startswith('mcb-'), verifier)
+        self.assertNotEqual(verifier['OPENAI_API_KEY'], agent)
+        # The judge got its answer; the agent's placeholder is refused there.
+        statuses = json.loads((job / 'judge-statuses.json').read_text())
+        self.assertEqual(statuses, {'judge': [200, 'GRADE: yes'], 'agent-token': [403, None]})
+        judged = [c for c in calls if c[0] == 'judge-request']
+        self.assertEqual(judged, [('judge-request', 'Bearer session-access',
+                                   {'model': 'glm-5.3-flash', 'messages': [{'role': 'user', 'content': 'grade'}]})])
+        self.assertFalse(any(isinstance(c[1], str) and 'mcb-' in c[1] for c in calls), calls)
+        harbor_env = json.loads((job / 'harbor-env.json').read_text())
+        self.assertNotIn('OPENAI_API_KEY', harbor_env)
+        self.assertNotIn('OPENAI_BASE_URL', harbor_env)
+        self.assertEqual(harbor_env['METACODES_BENCH_JUDGE_TOKEN'], verifier['OPENAI_API_KEY'])
+        # Judge requests are not agent metrics.
+        self.assertFalse((job / '.bench-metrics' / 'bench-judge.jsonl').exists())
+        files = [p for p in job.rglob('*') if p.is_file()] + list(self.manager.records.iterdir())
+        public = b''.join(p.read_bytes() for p in files) + json.dumps(argv).encode()
+        for secret in (b'session-access', b'session-refresh', b'session-rotated', b'real-openai-key'):
+            self.assertNotIn(secret, public)
+        view = self.client.request('api/job?name=' + run['name'])
+        self.assertEqual(view['judge'], {'model': 'glm-5.3-flash', 'via': 'metask'})
+
+    def test_gaia2_judge_model_is_configurable_and_must_be_in_the_account(self):
+        state, upstream, calls = session_fixture(self.root)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode='metask', account_state_dir=str(state), metrics_bind='127.0.0.1',
+                   datasets={'gaia2-cli': str(gaia2_dataset(self.root))},
+                   judges={'gaia2-cli': {'model': 'metask/video-model'}})
+        atomic_json(self.manager.config_path, cfg)
+        request = {'suite': 'gaia2-cli', 'model': 'metask/session-model', 'tasks': ['gaia2-search-0000-abc']}
+        with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}',
+                                     'FAKE_JUDGE_REQUEST': '1'}):
+            run = self.client.request('api/runs', request)
+            final = wait_run(self.manager, run['name'])
+            self.assertEqual(final['status'], 'finished', final)
+            verifier = json.loads((self.manager.jobs_dir / run['name'] / 'verifier-env.json').read_text())
+            self.assertEqual(verifier['JUDGE_MODEL'], 'video-model')  # the gateway's bare id
+            cfg['judges'] = {'gaia2-cli': {'model': 'no-such-judge'}}
+            atomic_json(self.manager.config_path, cfg)
+            run = self.client.request('api/runs', request)
+            final = wait_run(self.manager, run['name'])
+            self.assertEqual(final['status'], 'failed')
+            self.assertIn('评委模型 no-such-judge 不在当前 Metask 账号的模型目录中', final['error'])
+            self.assertFalse((self.manager.jobs_dir / run['name']).exists())  # Harbor never started
+            cfg['judges'] = {'gaia2-cli': {'model': 'bad model'}}
+            atomic_json(self.manager.config_path, cfg)
+            entry = next(s for s in self.client.request('api/workbench')['suites'] if s['id'] == 'gaia2-cli')
+            self.assertIn('judges.gaia2-cli.model 无效', ' '.join(entry['reasons']))
 
     def test_disabled_metrics_still_proxy_auth_and_record_nothing(self):
         state, upstream, calls = session_fixture(self.root)

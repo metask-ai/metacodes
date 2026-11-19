@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -202,23 +203,46 @@ class CatalogTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 suites.validate_tasks(suite, self.ctx, ["humaneval-0", "humaneval-1", "humaneval-2"])
 
-    def test_gaia2_cli_lists_generated_dirs_and_needs_the_judge_key(self):
+    def test_gaia2_cli_lists_generated_dirs_and_needs_a_judge_key_only_for_providers(self):
         dataset = self.root / "gaia2-cli"
         for name in ("gaia2-search-0001-abc", "gaia2-time-0002-def"):
             (dataset / name).mkdir(parents=True)
             (dataset / name / "task.toml").write_text("[task]\n")
         suite = suites.resolved(suites.get("gaia2-cli"))
+        # A small default sample: one scenario per config.
+        self.assertEqual(sorted(t.split("-")[1] for t in suite.default_tasks), sorted(gaia2_cli.CONFIGS))
+        self.assertTrue(all(suites.TASK.fullmatch(t) for t in suite.default_tasks))
+        # Metask authentication: the judge goes through the run's relay.
         ctx = suites.Context({"datasets": {"gaia2-cli": str(dataset)}}, self.root, env={})
         self.assertEqual(suites.task_ids(suite, ctx), ["gaia2-search-0001-abc", "gaia2-time-0002-def"])
+        self.assertEqual(suites.readiness(suite, ctx), [])
+        # Provider authentication keeps the external judge key (HOST_ENV).
+        ctx.cfg = {**ctx.cfg, "auth_mode": "provider"}
         self.assertIn("OPENAI_API_KEY", " ".join(suites.readiness(suite, ctx)))
         ctx.env = {"OPENAI_API_KEY": "judge"}
         self.assertEqual(suites.readiness(suite, ctx), [])
         self.assertEqual(suites.harbor_dataset_args(suite, ctx), ["-p", str(dataset.resolve())])
         source = self.root / "harbor"
         self.assertEqual(gaia2_cli.adapter_command(source, self.root / "out", "uv"),
-                         ["uv", "run", "--project", str(source), "python",
-                          str(source / "adapters/gaia2/run_adapter.py"), "--cli", "--output-dir",
-                          str(self.root / "out"), "--overwrite"])
+                         ["uv", "run", "--frozen", "--no-dev", "--extra", "huggingface", "--project", str(source),
+                          "python", str(source / "adapters/gaia2/run_adapter.py"), "--cli", "--output-dir",
+                          str(self.root / "out"), "--overwrite", "--revision", gaia2_cli.HF_REVISION])
+
+    def test_gaia2_judge_follows_authentication_and_configuration(self):
+        suite = suites.resolved(suites.get("gaia2-cli"))
+        env = {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL", "model": "JUDGE_MODEL",
+               "ca_file": "SSL_CERT_FILE"}
+        self.assertEqual(suites.judge(suite, {}), {"model": "glm-5.3-flash", "env": env})
+        self.assertEqual(suites.judge(suite, {"judges": {"gaia2-cli": {"model": "metask/glm-9"}}})["model"], "glm-9")
+        self.assertIsNone(suites.judge(suite, {"auth_mode": "provider"}))
+        self.assertIsNone(suites.judge(suites.get("aime"), {}))
+        for bad in ({"model": "x y"}, {"model": 3}, {"model": "m", "key": "k"}, "glm"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                suites.judge(suite, {"judges": {"gaia2-cli": bad}})
+        self.assertEqual(suites.judge_label(suite, {"auth_mode": "provider"}, env={}),
+                         {"model": "openai/gpt-4o-mini", "via": "host_env"})
+        self.assertEqual(suites.judge_label(suite, {"auth_mode": "provider"}, env={"JUDGE_MODEL": "x/y"}),
+                         {"model": "x/y", "via": "host_env"})
 
     def test_old_jobs_infer_their_suite(self):
         self.assertEqual(suites.infer("terminal-bench/terminal-bench-2-1"), "terminal-bench-2.1")
@@ -240,6 +264,182 @@ class CatalogTest(unittest.TestCase):
                                            capture_output=True, text=True).stdout)
         missing = [p for p in (Path(f).resolve().relative_to(REPO).as_posix() for f in loaded) if p not in assets]
         self.assertEqual(missing, [])
+
+
+FAKE_GIT = '''#!{python}
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_TOOL_LOG"], "a") as log:
+    log.write(json.dumps(["git", args]) + "\\n")
+if args[:1] == ["init"]:
+    pathlib.Path(args[-1], ".git").mkdir(parents=True)
+    sys.exit(0)
+repo = pathlib.Path(args[1])
+rest = args[2:]
+if rest[:1] == ["fetch"]:
+    if os.environ.get("FAKE_GIT_FAIL"):
+        print("fatal: unable to access", file=sys.stderr); sys.exit(128)
+    (repo / ".git" / "FETCH").write_text(rest[-1])
+elif "checkout" in rest:
+    commit = (repo / ".git" / "FETCH").read_text()
+    (repo / ".git" / "HEAD_SHA").write_text(os.environ.get("FAKE_GIT_HEAD", commit))
+    (repo / "adapters" / "gaia2").mkdir(parents=True)
+    (repo / "adapters" / "gaia2" / "run_adapter.py").write_text("# Harbor's adapter\\n")
+elif rest == ["rev-parse", "HEAD"]:
+    print((repo / ".git" / "HEAD_SHA").read_text())
+'''
+
+# Harbor's run_adapter.py as uv would run it: one task per config (or
+# `--limit` tasks), written into --output-dir.
+FAKE_ADAPTER_UV = '''#!{python}
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_TOOL_LOG"], "a") as log:
+    log.write(json.dumps(["uv", args, os.getcwd(), os.environ.get("UV_DEFAULT_INDEX")]) + "\\n")
+out = pathlib.Path(args[args.index("--output-dir") + 1])
+configs = ["execution", "search", "adaptability", "time", "ambiguity"]
+if "--configs" in args:
+    configs = [a for a in args[args.index("--configs") + 1:] if not a.startswith("--")]
+names = ["gaia2-%s-%04d-abc" % (config, n) for config in configs for n in range(2)]
+if "--limit" in args:
+    names = names[:int(args[args.index("--limit") + 1])]
+for name in names:
+    (out / name / "tests").mkdir(parents=True)
+    (out / name / "task.toml").write_text("[task]\\n")
+    (out / name / "tests" / "test-cli.sh").write_text("exit 0\\n")
+'''
+
+
+@unittest.skipUnless(POSIX, "fake git and uv are POSIX executables")
+class Gaia2PrepareTest(unittest.TestCase):
+    """`bench prepare --suite gaia2-cli` with no manual steps: Harbor at the
+    pinned commit, its adapter through uv, reused once complete."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        for name, body in (("git", FAKE_GIT), ("uv", FAKE_ADAPTER_UV)):
+            (self.bin / name).write_text(body.format(python=sys.executable))
+            (self.bin / name).chmod(0o755)
+        self.log = self.root / "tools.log"
+        env = patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                                      "METACODES_BENCH_EXTRA_PATH": "", "FAKE_TOOL_LOG": str(self.log)})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(gaia2_cli.SOURCE_ENV, None)
+        probe = patch.object(gaia2_cli, "hf_reachable", lambda timeout=10: None)
+        probe.start()
+        self.addCleanup(probe.stop)
+        self.state = self.root / "state"
+
+    def calls(self, tool):
+        if not self.log.exists():
+            return []
+        return [row for row in map(json.loads, self.log.read_text().splitlines()) if row[0] == tool]
+
+    def prepare(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cli.main(["prepare", "--state-root", str(self.state), "--suite", "gaia2-cli", "--json"])
+        self.assertEqual(code, 0, err.getvalue())
+        return json.loads(out.getvalue()), err.getvalue()
+
+    def test_prepare_fetches_the_pinned_harbor_runs_the_adapter_once_and_reuses_both(self):
+        prepared, _ = self.prepare()
+        source = (self.state / "bench" / "sources" / ("harbor-" + gaia2_cli.HARBOR_COMMIT)).resolve()
+        dataset = (self.state / "bench" / "datasets" / "gaia2-cli").resolve()
+        self.assertEqual(prepared, {"suite": "gaia2-cli", "dataset": str(dataset), "task_count": 10})
+        fetches = [args for _, args in self.calls("git") if "fetch" in args]
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0][-3:], ["1", gaia2_cli.HARBOR_REPO, gaia2_cli.HARBOR_COMMIT])  # --depth 1
+        self.assertTrue((source / "adapters/gaia2/run_adapter.py").is_file())
+        [(_, argv, cwd, index)] = self.calls("uv")
+        self.assertEqual(Path(cwd).resolve(), source)
+        self.assertIsNone(index)
+        self.assertEqual(argv[:9], ["run", "--frozen", "--no-dev", "--extra", "huggingface", "--project",
+                                    str(source), "python", str(source / "adapters/gaia2/run_adapter.py")])
+        self.assertIn("--cli", argv)
+        self.assertEqual(argv[argv.index("--revision") + 1], gaia2_cli.HF_REVISION)
+        self.assertNotIn("--limit", argv)  # the full set by default
+        # The catalog lists the generated tasks; the default sample exists.
+        ctx = suites.Context({}, self.state / "bench", env={})
+        suite = suites.resolved(suites.get("gaia2-cli"))
+        self.assertEqual(len(suites.task_ids(suite, ctx)), 10)
+        self.assertEqual(suites.readiness(suite, ctx), [])
+        # Again: the checkout and the dataset are reused, nothing runs.
+        prepared_again, log = self.prepare()
+        self.assertEqual(prepared_again, prepared)
+        self.assertIn("GAIA2 数据集已是最新", log)
+        self.assertEqual(len([a for _, a in self.calls("git") if "fetch" in a]), 1)
+        self.assertEqual(len(self.calls("uv")), 1)
+        # A damaged dataset is rebuilt from the same checkout (no new fetch).
+        shutil.rmtree(dataset / "gaia2-time-0000-abc")
+        self.prepare()
+        self.assertEqual(len(self.calls("uv")), 2)
+        self.assertEqual(len([a for _, a in self.calls("git") if "fetch" in a]), 1)
+
+    def test_configured_subset_and_pypi_mirror_reach_the_adapter(self):
+        config = self.state / "bench" / "workbench.json"
+        atomic_json(config, {"prepare": {"gaia2-cli": {"configs": ["time", "search"], "limit": 3}},
+                             "pypi_index": "https://pypi.mirror.invalid/simple"})
+        prepared, _ = self.prepare()
+        self.assertEqual(prepared["task_count"], 3)
+        [(_, argv, _, index)] = self.calls("uv")
+        self.assertEqual(index, "https://pypi.mirror.invalid/simple")
+        self.assertNotIn("--frozen", argv)  # the lock names pypi.org files
+        self.assertEqual(argv[argv.index("--configs") + 1:argv.index("--configs") + 3], ["search", "time"])
+        self.assertEqual(argv[argv.index("--limit") + 1], "3")
+        # Changing the options regenerates.
+        atomic_json(config, {"prepare": {"gaia2-cli": {"configs": ["time"]}}})
+        self.assertEqual(self.prepare()[0]["task_count"], 2)
+        self.assertEqual(len(self.calls("uv")), 2)
+        atomic_json(config, {"prepare": {"gaia2-cli": {"configs": ["nope"]}}})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(cli.main(["prepare", "--state-root", str(self.state), "--suite", "gaia2-cli"]), 1)
+        self.assertIn("prepare.gaia2-cli.configs", err.getvalue())
+
+    def test_a_wrong_checkout_or_failed_fetch_is_refused_and_nothing_is_kept(self):
+        for env, message in (({"FAKE_GIT_HEAD": "0" * 40}, "版本不符"), ({"FAKE_GIT_FAIL": "1"}, "拉取 Harbor 源码失败")):
+            with self.subTest(env=env), patch.dict(os.environ, env):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                    code = cli.main(["prepare", "--state-root", str(self.state), "--suite", "gaia2-cli"])
+                self.assertEqual(code, 1)
+                self.assertIn(message, err.getvalue())
+                self.assertEqual(list((self.state / "bench" / "sources").iterdir()), [])
+                self.assertEqual(self.calls("uv"), [])
+
+    def test_readiness_explains_what_preparing_needs(self):
+        suite = suites.resolved(suites.get("gaia2-cli"))
+        ctx = suites.Context({}, self.root / "empty", env={})
+        with patch.object(gaia2_cli, "tool", lambda name: None), \
+                patch.object(gaia2_cli, "cached_hf_problem", lambda: "无法连接 Hugging Face（https://huggingface.co）"):
+            reasons = suites.readiness(suite, ctx)
+        text = " ".join(reasons)
+        self.assertIn("metacodes bench prepare --suite gaia2-cli", reasons[0])
+        self.assertIn("需要 uv、git", text)
+        self.assertIn("Hugging Face", text)
+        self.assertIn("HF_ENDPOINT", text)
+        # A configured Harbor checkout needs no git.
+        with patch.dict(os.environ, {gaia2_cli.SOURCE_ENV: str(self.root)}), \
+                patch.object(gaia2_cli, "tool", lambda name: None if name == "uv" else "/usr/bin/" + name), \
+                patch.object(gaia2_cli, "cached_hf_problem", lambda: None):
+            self.assertIn("需要 uv（", " ".join(suites.readiness(suite, ctx)))
+        # Preparing without uv says so before anything is fetched.
+        with patch.object(gaia2_cli, "tool", lambda name: None if name == "uv" else shutil.which(name)):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cli.main(["prepare", "--state-root", str(self.state), "--suite", "gaia2-cli"])
+        self.assertEqual(code, 1)
+        self.assertIn("需要 uv", err.getvalue())
+        self.assertEqual(self.calls("git"), [])
+        # Hugging Face unreachable: refused before cloning, with the reason.
+        with patch.object(gaia2_cli, "hf_reachable", lambda timeout=10: "无法连接 Hugging Face（x）"):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cli.main(["prepare", "--state-root", str(self.state), "--suite", "gaia2-cli"])
+        self.assertEqual(code, 1)
+        self.assertIn("Hugging Face", err.getvalue())
+        self.assertEqual(self.calls("git"), [])
 
 
 class McpForwardingTest(unittest.TestCase):

@@ -184,7 +184,15 @@ def prepare_suite(args, root, config, cfg):
     if module is None:
         raise ValueError(suite.name + " 适配器尚未接入")
     dest = root / "datasets" / suite.id
-    produced = Path(module.prepare(dest)).resolve()
+    import inspect
+    try:
+        takes_ctx = "ctx" in inspect.signature(module.prepare).parameters
+    except (TypeError, ValueError):
+        takes_ctx = False
+    # Adapters that need the workbench settings (mirrors, options) or its
+    # state root (source checkouts) take the suite Context as `ctx`.
+    produced = Path(module.prepare(dest, ctx=suites.Context(cfg, root)) if takes_ctx
+                    else module.prepare(dest)).resolve()
     if produced != dest.resolve():
         cfg.setdefault("datasets", {})[suite.id] = str(produced)
         atomic_json(config, cfg)

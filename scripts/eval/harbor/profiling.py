@@ -135,6 +135,42 @@ class StreamMetrics:
 
 PLACEHOLDER_PREFIX = "mcb-"
 
+# An LLM-judged suite's verifier reaches the relay at `<relay>/JUDGE_ROUTE/v1`
+# with a placeholder of its own (Harbor resolves `${JUDGE_TOKEN_ENV}` from its
+# environment when the verifier starts). That token is good for this route and
+# POST /v1/chat/completions only; the agent's placeholder is refused there.
+JUDGE_ROUTE = "bench-judge"
+JUDGE_TOKEN_ENV = "METACODES_BENCH_JUDGE_TOKEN"
+# Inside the task container: the system CA bundle plus the relay's CA, copied
+# by MetacodesAgent.install. Python's openai/httpx client trusts certifi, not
+# the system bundle, unless SSL_CERT_FILE names a bundle.
+TRUST_BUNDLE = "/usr/local/share/metacodes-bench/ca-bundle.pem"
+JUDGE_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+JUDGE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
+
+def judge_argv(judge, relay_url):
+    """Harbor `--ve` arguments pointing a suite's LLM judge at the relay.
+
+    `judge` is the launch spec's {"model", "env": {"api_key", "base_url",
+    "model", "ca_file"?}}. The values are the judge placeholder's *name*
+    (a template Harbor resolves), the relay route, the bare gateway model id
+    and the in-container CA bundle: nothing secret reaches Harbor's argv."""
+    env = judge["env"]
+    if not isinstance(judge.get("model"), str) or not JUDGE_MODEL.fullmatch(judge["model"]):
+        raise ValueError("invalid judge model")
+    values = {env["api_key"]: "${" + JUDGE_TOKEN_ENV + "}",
+              env["base_url"]: relay_url.rstrip("/") + "/" + JUDGE_ROUTE + "/v1",
+              env["model"]: judge["model"]}
+    if env.get("ca_file"):
+        values[env["ca_file"]] = TRUST_BUNDLE
+    argv = []
+    for name, value in values.items():
+        if not isinstance(name, str) or not JUDGE_ENV_NAME.fullmatch(name):
+            raise ValueError("invalid judge environment name")
+        argv += ["--ve", name + "=" + value]
+    return argv
+
 
 def placeholder(run):
     """A random run-scoped stand-in for the credential inside containers."""
@@ -210,11 +246,13 @@ def subject_alt_names(*hosts):
 class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
                  auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None,
-                 token=None, record=True):
+                 token=None, record=True, judge_token=None, judge_credential=None):
         # `credential` is the real upstream credential (a string or a source
         # with current()/refresh(stale)); `token` is the placeholder the
         # containers present (a fresh one when omitted). `record=False`
-        # proxies auth without writing metrics.
+        # proxies auth without writing metrics. `judge_token` opens
+        # JUDGE_ROUTE for a verifier's chat completions, forwarded with
+        # `judge_credential` (default `credential`) and never recorded.
         # `public_host` is the address containers dial when it differs from
         # the bind address: Colima's VM reaches the Mac's loopback through
         # its user-mode gateway (host.lima.internal, 192.168.5.2).
@@ -225,6 +263,12 @@ class TimingRelay:
         self.origin = origin
         self.credential = StaticCredential(credential) if isinstance(credential, str) else credential
         self.token = token or placeholder("relay")
+        if judge_token is not None and (not judge_token or judge_token == self.token):
+            raise ValueError("the judge placeholder must differ from the agent's")
+        self.judge_token = judge_token
+        if isinstance(judge_credential, str):
+            judge_credential = StaticCredential(judge_credential)
+        self.judge_credential = judge_credential or self.credential
         self.recording = record
         self.metrics_dir = Path(metrics_dir)
         self.lock = threading.Lock()
@@ -267,8 +311,19 @@ class TimingRelay:
                 if suffix not in ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1/models"):
                     self.send_error(404)
                     return
-                if not same_secret(self.headers.get(auth_header, ""), auth_prefix + owner.token):
+                presented = self.headers.get(auth_header, "")
+                credential = owner.credential
+                if owner.judge_token and same_secret(presented, auth_prefix + owner.judge_token):
+                    # The verifier's judge: one route, one endpoint, no metrics.
+                    if parts[1] != JUDGE_ROUTE or suffix != "/v1/chat/completions" or not measured:
+                        self.send_error(403)
+                        return
+                    credential, measured = owner.judge_credential, False
+                elif not same_secret(presented, auth_prefix + owner.token):
                     self.send_error(401)
+                    return
+                elif parts[1] == JUDGE_ROUTE:
+                    self.send_error(403)  # the agent's token never reaches the judge route
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -284,7 +339,7 @@ class TimingRelay:
                 with owner.lock:
                     owner.sequence += 1
                     sequence = owner.sequence
-                secret = owner.credential.current()
+                secret = credential.current()
                 if not secret:
                     # The run's login can no longer be refreshed.
                     self.send_error(401)
@@ -300,7 +355,7 @@ class TimingRelay:
                     if response.status == 401:
                         # Nothing has reached the container yet: refresh the
                         # credential once and repeat the request.
-                        fresh = owner.credential.refresh(secret)
+                        fresh = credential.refresh(secret)
                         if fresh and fresh != secret:
                             response.read()
                             response = self.exchange(upstream_path, body, headers, fresh)

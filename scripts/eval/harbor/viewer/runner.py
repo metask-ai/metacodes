@@ -306,11 +306,17 @@ class RunManager:
             account_key_id = self.account_catalog(cfg)["routes"].get(model) if mode == "metask" else None
             if mode == "metask" and account_key_id is None:
                 raise ValueError("账号模型目录已变化，请刷新后重试")
+            # An LLM-judged suite in Metask authentication: its verifier goes
+            # through the run's relay with a judge-only placeholder.
+            judge = suites.judge(suite, cfg)
             name = "bench-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
             record = {"name": name, "status": "queued", "created_at": now(), "model": model,
                       **suites.label(suite.id), "runner": suite.runner, "executor": executor.name,
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
+            shown_judge = suites.judge_label(suite, cfg)
+            if shown_judge:
+                record["judge"] = shown_judge  # model id and route only
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
             spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": cfg.get("bundle"),
@@ -334,8 +340,11 @@ class RunManager:
                             dataset_args=suites.harbor_dataset_args(suite, ctx),
                             task_filters=suites.task_filters(suite, tasks),
                             # Names only: an SSH executor receives these
-                            # values over the run's stdin channel.
-                            forward_env=list(suites.host_env(suite)))
+                            # values over the run's stdin channel. A judge
+                            # routed through the relay needs none of them.
+                            forward_env=[] if judge else list(suites.host_env(suite)))
+                if judge:
+                    spec["judge"] = judge
                 if suite.runner == suites.HARBOR_LOCAL and executor.kind == "ssh":
                     # Shipped to the executor, addressed by content digest.
                     spec["local_dataset"] = str(ctx.dataset_dir(suite).resolve())

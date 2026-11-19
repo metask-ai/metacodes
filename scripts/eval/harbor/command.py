@@ -95,6 +95,25 @@ def ca_bundle_check() -> str:
     return " || ".join(f"test -s {shlex.quote(path)}" for path in CA_BUNDLE_PATHS)
 
 
+def trust_relay_ca(ca_path: str, trust_bundle: str, bundles=CA_BUNDLE_PATHS) -> str:
+    """Shell that trusts the run's relay CA in a disposable task image.
+
+    The CA is appended to every system bundle present (metacodes reads those
+    paths), and the first non-empty result is copied to `trust_bundle`, one
+    fixed, world-readable path for clients that read no system bundle, such
+    as an LLM judge's httpx (SSL_CERT_FILE). Exits non-zero when no bundle
+    exists or a write fails."""
+    paths = " ".join(shlex.quote(p) for p in bundles)
+    trust = shlex.quote(trust_bundle)
+    parent = shlex.quote(trust_bundle.rsplit("/", 1)[0] or "/")
+    return (f"for bundle in {paths}; do "
+            f'if [ -f "$bundle" ]; then printf "\\n" >> "$bundle"; '
+            f'cat {shlex.quote(ca_path)} >> "$bundle" || exit 1; fi; done; '
+            f"mkdir -p {parent} || exit 1; "
+            f'for bundle in {paths}; do if [ -s "$bundle" ]; then '
+            f'cat "$bundle" > {trust} && chmod 0644 {trust} && exit 0; exit 1; fi; done; exit 1')
+
+
 class BundleError(ValueError):
     """The path given as the metacodes bundle is not a Linux release prefix."""
 

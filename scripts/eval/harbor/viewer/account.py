@@ -288,7 +288,9 @@ class Account:
         result.sort(key=lambda key: key["secret"] != login.get("api_key"))
         return result
 
-    def model_directory(self, key):
+    def model_directory(self, key, any_endpoint=False):
+        """The models a key serves; Anthropic Messages capable ones unless
+        `any_endpoint` (an LLM judge calls Chat Completions)."""
         try:
             document = self.request("/v1/models", key["secret"])
         except AccountHTTPError as exc:
@@ -303,14 +305,15 @@ class Account:
             for name in ("capabilities", "endpoints", "messages"):
                 value = value.get(name) if isinstance(value, dict) else None
             return not isinstance(value, dict) or value.get("supported") is not False
-        return [m for m in rows if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"] and messages_supported(m)]
+        return [m for m in rows if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]
+                and (any_endpoint or messages_supported(m))]
 
-    def credential(self, model=None, key_id=None):
+    def credential(self, model=None, key_id=None, any_endpoint=False):
         for key in self.keys():
             if key_id is not None and key["id"] != key_id:
                 continue
             name = model.removeprefix("metask/") if model else None
-            if name is None or any(m["id"] == name for m in self.model_directory(key)):
+            if name is None or any(m["id"] == name for m in self.model_directory(key, any_endpoint)):
                 return self.oauth_bearer() if self.session else key["secret"]
         raise ValueError("所选模型的账号 Key 已不可用，请刷新模型目录后重试")
 

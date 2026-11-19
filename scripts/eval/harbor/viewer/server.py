@@ -66,6 +66,10 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
         run = run or library.run_record(name)
         # Suite/category: the launch record, else inferred from Harbor's dataset.
         view.update(suites.label((run or {}).get("suite")) or suites.label(suites.infer(view.get("dataset"))))
+        judge = (run or {}).get("judge")
+        if isinstance(judge, dict) and isinstance(judge.get("model"), str):
+            # Which LLM judge scored the run (model id and route, no secret).
+            view["judge"] = {"model": judge["model"], "via": judge.get("via")}
         if run and run["status"] in {"failed", "cancelled", "interrupted"} and view["running"]:
             # Harbor may be interrupted before it writes a final result.
             # Preserve those files, and display the durable worker outcome.

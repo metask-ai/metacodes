@@ -49,7 +49,7 @@ from harbor.models.trajectories import (
 )
 
 from scripts.eval.harbor import command as cmd
-from scripts.eval.harbor.profiling import routed_config
+from scripts.eval.harbor.profiling import TRUST_BUNDLE, routed_config
 
 # Set instead of `--ak bundle=...` when every trial of a job uses one bundle.
 BUNDLE_ENV = "METACODES_HARBOR_BUNDLE"
@@ -156,12 +156,7 @@ class MetacodesAgent(BaseInstalledAgent):
             # endpoint-policy checks remain enabled.
             destination = "/tmp/metacodes-bench-relay-ca.pem"
             await environment.upload_file(self._metrics_ca, destination)
-            bundles = " ".join(shlex.quote(p) for p in cmd.CA_BUNDLE_PATHS)
-            await self.exec_as_root(environment, command=(
-                f"for bundle in {bundles}; do "
-                f'if [ -f "$bundle" ]; then printf "\\n" >> "$bundle"; '
-                f'cat {shlex.quote(destination)} >> "$bundle" || exit 1; fi; done'
-            ))
+            await self.exec_as_root(environment, command=cmd.trust_relay_ca(destination, TRUST_BUNDLE))
 
     async def _ensure_ca_bundle(self, environment: BaseEnvironment) -> None:
         """Install the system CA bundle when the image has none.

@@ -188,6 +188,56 @@ class RelayTest(unittest.TestCase):
             self.assertEqual(seen, [('real-provider-key', None)])
             self.assertFalse((Path(temp) / 'metrics').exists())
 
+    def test_judge_placeholder_reaches_only_chat_completions_on_its_route(self):
+        seen = []
+
+        class Gateway(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers['Authorization'],
+                             json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                body = json.dumps({'choices': [{'message': {'content': 'yes'}}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with self.assertRaises(ValueError):
+            TimingRelay('http://127.0.0.1:1', 'k', '/nonexistent', bind='127.0.0.1', token='mcb-same',
+                        judge_token='mcb-same')
+        with tempfile.TemporaryDirectory() as temp, TimingRelay(
+                f'http://127.0.0.1:{upstream.server_port}', 'agent-key', temp, bind='127.0.0.1',
+                token='mcb-agent', judge_token='mcb-judge', judge_credential='judge-group-key') as relay:
+            def post(path, token):
+                request = urllib.request.Request(relay.url + path, data=b'{"model":"glm-5.3-flash"}',
+                                                 headers={'Authorization': 'Bearer ' + token})
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        response.read()
+                        return response.status
+                except urllib.error.HTTPError as exc:
+                    exc.close()
+                    return exc.code
+            self.assertEqual(post('/bench-judge/v1/chat/completions', 'mcb-judge'), 200)
+            # The judge's token is for its route and endpoint only; the
+            # agent's token never reaches the judge route.
+            self.assertEqual(post('/bench-judge/v1/messages', 'mcb-judge'), 403)
+            self.assertEqual(post('/task__one/v1/chat/completions', 'mcb-judge'), 403)
+            self.assertEqual(post('/bench-judge/v1/chat/completions', 'mcb-agent'), 403)
+            self.assertEqual(post('/bench-judge/v1/chat/completions', 'judge-group-key'), 401)
+            self.assertEqual(post('/task__one/v1/chat/completions', 'mcb-agent'), 200)
+            self.assertEqual(seen, [('/v1/chat/completions', 'Bearer judge-group-key', {'model': 'glm-5.3-flash'}),
+                                    ('/v1/chat/completions', 'Bearer agent-key', {'model': 'glm-5.3-flash'})])
+            # Only the agent's request is a metric sample.
+            time.sleep(.1)
+            self.assertEqual(sorted(p.name for p in Path(temp).iterdir()), ['task__one.jsonl'])
+
 
 class RouteTest(unittest.TestCase):
     def test_only_routes_the_relay_can_forward_are_launchable(self):

@@ -170,3 +170,22 @@ def for_run(spec, env):
     if not secret:
         raise ValueError("执行服务缺少环境变量 " + spec["key_env"])
     return StaticCredential(secret), None
+
+
+def for_judge(spec, source):
+    """The upstream credential of the run's LLM judge (Metask only).
+
+    None means the run's own source serves it (a session login covers every
+    model, and so does a group key whose directory lists the judge); else
+    the fixed key of the account group that lists the judge model. Raises
+    a user-facing ValueError when no group of the account lists it."""
+    model = spec["judge"]["model"]
+    account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
+    try:
+        secret = account.credential(model, any_endpoint=True)
+    except ValueError as exc:
+        raise ValueError(f"评委模型 {model} 不在当前 Metask 账号的模型目录中（{exc}）；"
+                         f"请在 workbench.json 的 judges.{spec.get('suite') or '<评测集>'}.model 换成可用模型") from None
+    if account.session or secret == source.current():
+        return None
+    return secret

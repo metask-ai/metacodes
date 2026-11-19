@@ -13,7 +13,8 @@ from pathlib import Path
 
 from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.viewer.account import Account
-from scripts.eval.harbor.profiling import TimingRelay, auth_for, placeholder, route_problem, upstream_for
+from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_for, judge_argv, placeholder,
+                                           route_problem, upstream_for)
 from scripts.eval.harbor.viewer import credentials
 from scripts.eval.harbor.store.ingest import WorkerSync
 from scripts.eval.harbor.viewer.executors import RemoteRun
@@ -37,6 +38,9 @@ def command(spec):
         argv += ["--ak", "metrics_proxy=" + spec["metrics_proxy"]]
     if spec.get("metrics_ca"):
         argv += ["--ak", "metrics_ca=" + spec["metrics_ca"]]
+    if spec.get("judge") and spec.get("metrics_proxy"):
+        # The verifier's LLM judge: relay route, placeholder *name*, model.
+        argv += judge_argv(spec["judge"], spec["metrics_proxy"])
     filters = spec.get("task_filters") or ["terminal-bench/" + task for task in spec["tasks"]]
     for pattern in filters:
         argv += ["-i", pattern]
@@ -85,11 +89,21 @@ def prepare(spec, env):
     upstream, auth = upstream_for(spec), auth_for(spec)
     token = placeholder(spec["name"])
     env[spec["key_env"]] = token  # the only credential Harbor ever sees
+    judge_token, judge_secret = None, None
+    if spec.get("judge"):
+        judge_secret = judge_credential(spec, source)
+        judge_token = placeholder(spec["name"] + "judge")
+        # Harbor resolves `${JUDGE_TOKEN_ENV}` for the verifier; a real
+        # judge key in the service environment never reaches Harbor.
+        for role in ("api_key", "base_url", "model"):
+            env.pop(spec["judge"]["env"][role], None)
+        env[JUDGE_TOKEN_ENV] = judge_token
     record = bool(spec.get("metrics_enabled", True))
     if (spec.get("executor") or {}).get("kind") == "ssh":
         # The relay must sit beside the Docker daemon that runs the trials,
         # so the remote driver starts it; here only files are staged.
         remote = RemoteRun(spec)
+        remote.judge_credential = judge_secret  # a fixed key over stdin, or None
         try:
             remote.stage()
         except ValueError as exc:  # staging messages are user-facing, secret-free
@@ -101,9 +115,21 @@ def prepare(spec, env):
                         bind=spec.get("metrics_bind") or "172.17.0.1",
                         public_host=spec.get("metrics_host"),
                         auth_header=auth[0], auth_prefix=auth[1], tls=True,
-                        token=token, record=record).__enter__()
+                        token=token, record=record, judge_token=judge_token,
+                        judge_credential=judge_secret).__enter__()
     spec = {**spec, "metrics_proxy": relay.url, "metrics_ca": str(relay.ca_path)}
     return spec, relay, source
+
+
+def judge_credential(spec, source):
+    """The fixed key the judge's requests carry upstream, or None to use the
+    run's own credential (a session login serves every model).
+
+    Refuses the launch when the account's model directory lacks the judge."""
+    try:
+        return credentials.for_judge(spec, source)
+    except ValueError as exc:  # account messages are user-facing, secret-free
+        raise LaunchRefused(str(exc)) from None
 
 
 def credential_failed(source):
@@ -127,6 +153,8 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     # all over the SSH channel's stdin.
     secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
     secret_env[spec["key_env"]] = env[spec["key_env"]]  # the placeholder
+    if spec.get("judge"):
+        secret_env[JUDGE_TOKEN_ENV] = env[JUDGE_TOKEN_ENV]  # the judge's placeholder
     # The real access token goes beside it for the remote relay only; a
     # refreshed one follows on the same channel. The refresh token stays here.
     if getattr(source, "refreshing", False):

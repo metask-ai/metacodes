@@ -79,6 +79,9 @@ def run(spec_path):
         real = message.get("credential")
         if real is not None and not (isinstance(real, str) and real):
             raise ValueError
+        judge_real = message.get("judge_credential")
+        if judge_real is not None and not (isinstance(judge_real, str) and judge_real):
+            raise ValueError
     except (ValueError, KeyError, TypeError, AttributeError):
         emit("error", message="missing credential line")
         return 2
@@ -106,15 +109,27 @@ def run(spec_path):
     try:
         if spec.get("relay"):
             sys.path.insert(0, runtime)
-            from scripts.eval.harbor.profiling import PushedCredential, TimingRelay
+            from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
             token = secret_env[spec["key_env"]]
             credential = PushedCredential(real or token)
+            judge = options.get("judge")
+            # The verifier's judge: its own placeholder (in Harbor's env from
+            # the stdin line), the run's pushed token unless a fixed key came.
+            judge_token = secret_env.get(JUDGE_TOKEN_ENV) if judge else None
+            if judge and not judge_token:
+                emit("error", message="missing judge placeholder")
+                return 2
             relay = TimingRelay(options["upstream"], credential, absolute(options["metrics_dir"]),
                                 bind=options.get("bind") or "172.17.0.1", auth_header=options["auth_header"],
                                 auth_prefix=options["auth_prefix"], tls=True, token=token,
-                                record=options.get("record", True)).__enter__()
+                                record=options.get("record", True), judge_token=judge_token,
+                                judge_credential=judge_real).__enter__()
             argv += ["--ak", "metrics_proxy=" + relay.url, "--ak", "metrics_ca=" + str(relay.ca_path)]
+            if judge:
+                argv += judge_argv(judge, relay.url)
+                for role in ("api_key", "base_url", "model"):
+                    env.pop(judge["env"][role], None)  # the executor's own judge settings
         if spec.get("egress") or spec.get("ghcr_mirror"):
             if runtime not in sys.path:
                 sys.path.insert(0, runtime)

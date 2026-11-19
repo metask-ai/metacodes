@@ -34,7 +34,8 @@ from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
 from scripts.eval.harbor.viewer import data, executors, server, setup
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import FAKE_HARBOR, RotatingGateway, session_fixture, wait_run
+from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, RotatingGateway, gaia2_dataset, session_fixture,
+                                                     wait_run)
 
 FAKES = r'''
 import json, os, shutil, subprocess, sys, time
@@ -140,7 +141,7 @@ elif name == "ssh":
               "FAKE_DOCKER_DAEMON": env.get("FAKE_REMOTE_DOCKER_DAEMON", "")}
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
-                "FAKE_EGRESS_FETCH"):
+                "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -1010,6 +1011,44 @@ class SuiteOnExecutorTest(SetupFixture):
         spec = json.loads((manager.records / (names[0] + ".spec")).read_text())
         self.assertEqual(spec["forward_env"], ["FAKE_JUDGE_KEY"])
         self.assertEqual(spec["local_dataset"], str(dataset.resolve()))
+
+    def test_gaia2_judge_on_ssh_executor_uses_the_remote_relay_and_placeholders_only(self):
+        manager, client, calls = self.prepare_remote()
+        dataset = gaia2_dataset(self.root)
+        cfg = self.cfg()
+        cfg["datasets"] = {"gaia2-cli": str(dataset)}
+        atomic_json(self.config, cfg)
+        # A judge key on the workbench stays there: the relay route replaces it.
+        os.environ.update(FAKE_JUDGE_REQUEST="1", OPENAI_API_KEY="real-openai-key")
+        run = client.request("api/runs", {"suite": "gaia2-cli", "model": "metask/session-model",
+                                          "tasks": ["gaia2-search-0000-abc"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"])
+        self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+        self.assertEqual(final["judge"], {"model": "glm-5.3-flash", "via": "metask"})
+        local = manager.jobs_dir / run["name"]
+        argv = json.loads((local / "argv.json").read_text())
+        relay = next(a.removeprefix("metrics_proxy=") for a in argv if a.startswith("metrics_proxy="))
+        verifier = json.loads((local / "verifier-env.json").read_text())
+        self.assertEqual(verifier["OPENAI_BASE_URL"], relay + "/bench-judge/v1")
+        self.assertEqual((verifier["JUDGE_MODEL"], verifier["SSL_CERT_FILE"]),
+                         ("glm-5.3-flash", "/usr/local/share/metacodes-bench/ca-bundle.pem"))
+        self.assertTrue(verifier["OPENAI_API_KEY"].startswith("mcb-"))
+        self.assertNotEqual(verifier["OPENAI_API_KEY"], json.loads((local / "container-env.json").read_text())["METASK_API_KEY"])
+        self.assertEqual(json.loads((local / "judge-statuses.json").read_text()),
+                         {"judge": [200, "GRADE: yes"], "agent-token": [403, None]})
+        self.assertIn(("judge-request", "Bearer session-access",
+                       {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "grade"}]}), calls)
+        self.assertFalse(any(isinstance(c[1], str) and "mcb-" in c[1] for c in calls), calls)
+        spec = json.loads((manager.records / (run["name"] + ".spec")).read_text())
+        self.assertEqual(spec["forward_env"], [])  # no judge key travels
+        for row in self.calls("ssh"):
+            self.assertNotIn("session-access", json.dumps(row))
+            self.assertNotIn("real-openai-key", json.dumps(row))
+        for path in [p for p in self.remote_home.rglob("*") if p.is_file()] + list(manager.records.iterdir()) \
+                + [p for p in local.rglob("*") if p.is_file()]:
+            content = path.read_bytes()
+            self.assertNotIn(b"session-access", content, path)
+            self.assertNotIn(b"real-openai-key", content, path)
 
     def test_real_adapter_suites_ship_their_tasks_but_not_the_download_cache(self):
         from scripts.eval.harbor.viewer.runner import settings

@@ -138,6 +138,28 @@ class CaBundleTest(unittest.TestCase):
         has_bundle = any(os.path.getsize(p) > 0 for p in cmd.CA_BUNDLE_PATHS if os.path.isfile(p))
         self.assertEqual(done.returncode == 0, has_bundle)
 
+    @unittest.skipIf(BASH is None or not POSIX, "needs a POSIX shell")
+    def test_relay_ca_reaches_system_bundles_and_one_fixed_trust_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ca = root / "relay-ca.pem"
+            ca.write_text("RELAY CA\n")
+            present, absent = root / "etc/ssl/certs/ca-certificates.crt", root / "etc/pki/tls/certs/ca-bundle.crt"
+            present.parent.mkdir(parents=True)
+            present.write_text("PUBLIC CAS\n")
+            trust = root / "usr/local/share/metacodes-bench/ca-bundle.pem"
+            script = cmd.trust_relay_ca(str(ca), str(trust), bundles=(str(absent), str(present)))
+            done = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(present.read_text(), "PUBLIC CAS\n\nRELAY CA\n")
+            self.assertFalse(absent.exists())
+            # SSL_CERT_FILE for the judge: public CAs (pip, PyPI) plus the relay.
+            self.assertEqual(trust.read_text(), present.read_text())
+            self.assertEqual(stat.S_IMODE(trust.stat().st_mode), 0o644)
+            # No bundle at all: the install fails instead of leaving no trust file.
+            done = subprocess.run([BASH, "-c", cmd.trust_relay_ca(str(ca), str(root / "t.pem"), bundles=(str(absent),))])
+            self.assertNotEqual(done.returncode, 0)
+
 
 # A stand-in metacodes: records argv, stdin and environment, writes a session
 # transcript under --state-dir, emits one NDJSON result and a line on stderr,

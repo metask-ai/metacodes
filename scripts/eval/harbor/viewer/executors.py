@@ -928,6 +928,7 @@ class RemoteRun:
         self.stdin_lock = threading.Lock()
         self.credential_pushes = 0
         self.pending_credential = None
+        self.judge_credential = None
         self.events: List[Dict] = []
         self.last_event = time.monotonic()
         self.sync_state = None
@@ -991,6 +992,9 @@ class RemoteRun:
             relay = {"upstream": upstream, "bind": self.executor.metrics_bind, "auth_header": auth[0],
                      "auth_prefix": auth[1], "metrics_dir": self.remote_job_dir + "/.bench-metrics",
                      "record": bool(record)}
+        if relay and self.spec.get("judge"):
+            # The driver appends the judge's `--ve` once its relay listens.
+            relay["judge"] = self.spec["judge"]
         return {"schema_version": 1, "name": self.spec["name"], "argv": command(remote),
                 "key_env": self.spec["key_env"], "relay": relay, "runtime": self.runtime,
                 "egress": self.egress_spec(), "ghcr_mirror": self.executor.ghcr_mirror}
@@ -1056,6 +1060,10 @@ class RemoteRun:
             credential = self.pending_credential or credential
             if credential:
                 first["credential"] = credential
+            if self.judge_credential:
+                # A fixed account key for the judge model (legacy group
+                # keys); a session login's pushed token serves both.
+                first["judge_credential"] = self.judge_credential
             self.process.stdin.write((json.dumps(first) + "\n").encode())
             self.process.stdin.flush()
         threading.Thread(target=self.read_events, daemon=True).start()

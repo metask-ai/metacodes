@@ -228,6 +228,8 @@ const RUN_STATUS = { queued: '等待启动', starting: '准备环境', running: 
   cancelling: '正在停止', cancelled: '已停止', finished: '运行完成', failed: '执行失败', interrupted: '执行中断' };
 
 const RUNNERS = { 'harbor-registry': 'Harbor 注册表', 'harbor-local': '本地生成数据集', workbuddy: 'WorkBuddy' };
+// The LLM judge that scores a suite/run: model id and how it is reached.
+const judgeText = (j) => '评委 ' + j.model + (j.via === 'metask' ? '（Metask 网关）' : j.via === 'host_env' ? '（执行机器环境变量）' : '');
 
 async function renderNewRun() {
   state.live = false;
@@ -289,6 +291,7 @@ async function renderNewRun() {
     if (!s) return;
     const shown = new Set(setupReasons(s));
     const reasons = comboReasons(s).filter((text) => !shown.has(text));
+    if (s.judge) reasons.push(judgeText(s.judge) + '；分数与使用其他评委（如官方 openai/gpt-4o-mini）的结果不可直接比较');
     suiteNotes.hidden = !reasons.length;
     suiteNotes.replaceChildren(...reasons.map((text) => h('p', { text })));
   }
@@ -497,7 +500,7 @@ async function renderRun(name) {
     catch (_) { event.currentTarget.textContent = '请复制下方链接'; }
   } }, '复制结果链接');
   const summary = h('div', { class: 'panel-body run-state' },
-    h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}` }),
+    h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}${run.judge ? ' · ' + judgeText(run.judge) : ''}` }),
     h('p', { class: 'muted', text: run.error || (state.live ? '运行中，页面每 10 秒更新。' : '执行已结束，逐题结果和轨迹已保留。') }),
     h('a', { class: 'mono', href: url, text: url }));
   const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
@@ -540,7 +543,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
-    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}`),
+    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
   const filters = h('div', { class: 'filters' }, ['all', ...ORDER].map((key) => h('button', {

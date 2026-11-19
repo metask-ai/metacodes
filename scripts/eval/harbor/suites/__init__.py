@@ -32,9 +32,10 @@ carries it. The module exposes::
         "max_concurrency": 4,      # <= MAX_CONCURRENCY
     }
 
-    def prepare(dest: Path) -> Path:
-        '''Write Harbor task directories (<dest>/<task-id>/task.toml, ...)
-        and return the dataset directory (normally ``dest``).'''
+    def prepare(dest: Path) -> Path:      # or prepare(dest, ctx): the
+        '''Write Harbor task directories   # Context (cfg, bench root)
+        (<dest>/<task-id>/task.toml, ...) and return the dataset directory
+        (normally ``dest``).'''
 
     # optional
     def check(ctx) -> list[str]:   # extra readiness reasons (Chinese), [] if ready;
@@ -44,6 +45,11 @@ carries it. The module exposes::
                                    # executor receives these values over the
                                    # run's SSH stdin, never argv or a file
     def tasks(dataset: Path) -> list[str]:   # default: sorted dirs with task.toml
+    JUDGE = {                      # an OpenAI-compatible LLM judge in the
+        "default_model": "...",    # verifier; in Metask authentication it is
+        "env": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL",
+                "model": "JUDGE_MODEL", "ca_file": "SSL_CERT_FILE"},
+    }                              # routed through the run's relay (judge())
 
 Task ids must match ``TASK`` (no glob characters: Harbor's ``-i`` is an
 fnmatch pattern). ``metacodes bench prepare --suite <id>`` runs ``prepare``
@@ -240,6 +246,15 @@ class Context:
         configured = (self.cfg.get("datasets") or {}).get(suite.id)
         return Path(configured) if configured else self.root / "datasets" / suite.id
 
+    def auth_mode(self) -> str:
+        return auth_mode(self.cfg)
+
+
+def auth_mode(cfg) -> str:
+    """The workbench's authentication: `metask` (account login) or `provider`."""
+    cfg = cfg or {}
+    return cfg.get("auth_mode") or ("provider" if cfg.get("provider_config") else "metask")
+
 
 def get(suite_id) -> Suite:
     suite = BY_ID.get(suite_id) if isinstance(suite_id, str) else None
@@ -312,6 +327,10 @@ def readiness(suite: Suite, ctx: Context) -> List[str]:
         module = adapter_module(suite)
         if module is not None and hasattr(module, "check"):
             reasons += [str(r) for r in module.check(ctx)]
+        try:
+            judge(suite, ctx.cfg)
+        except ValueError as exc:
+            reasons.append(str(exc))
     elif suite.runner == WORKBUDDY:
         from scripts.eval.harbor.suites import workbuddy
         reasons += workbuddy.readiness(suite, ctx)
@@ -358,6 +377,50 @@ def host_env(suite: Suite) -> Tuple[str, ...]:
     return tuple(n for n in names if isinstance(n, str) and ENV_NAME.fullmatch(n))
 
 
+def judge(suite: Suite, cfg) -> Optional[Dict]:
+    """The suite's LLM judge routed through the run's credential relay, or
+    None (no judge, or provider authentication: the verifier then reads
+    HOST_ENV on the execution host).
+
+    {"model": bare gateway model id, "env": the verifier's variable names}.
+    The model is `judges.<suite id>.model` in workbench.json, else the
+    adapter's default; a `metask/` prefix (the catalog's spelling) is
+    dropped, since the gateway names models without it."""
+    if suite.runner != HARBOR_LOCAL or auth_mode(cfg) != "metask":
+        return None
+    declared = getattr(adapter_module(suite), "JUDGE", None)
+    if not isinstance(declared, dict):
+        return None
+    entry = ((cfg or {}).get("judges") or {}).get(suite.id) or {}
+    if not isinstance(entry, dict) or set(entry) - {"model"}:
+        raise ValueError(f"workbench.json 的 judges.{suite.id} 只接受 model")
+    model = entry.get("model", declared["default_model"])
+    if isinstance(model, str):
+        model = model.removeprefix("metask/")
+    from scripts.eval.harbor.profiling import JUDGE_ENV_NAME, JUDGE_MODEL
+    if not isinstance(model, str) or not JUDGE_MODEL.fullmatch(model):
+        raise ValueError(f"judges.{suite.id}.model 无效：{str(model)[:80]}")
+    env = dict(declared["env"])
+    if set(env) - {"api_key", "base_url", "model", "ca_file"} or \
+            not all(k in env for k in ("api_key", "base_url", "model")) or \
+            not all(isinstance(v, str) and JUDGE_ENV_NAME.fullmatch(v) for v in env.values()):
+        raise ValueError(suite.id + " 适配器的 JUDGE.env 无效")
+    return {"model": model, "env": env}
+
+
+def judge_label(suite: Suite, cfg, env=None) -> Optional[Dict]:
+    """The run record's (non-secret) view of the suite's judge, or None."""
+    routed = judge(suite, cfg)
+    if routed:
+        return {"model": routed["model"], "via": "metask"}
+    declared = getattr(adapter_module(suite), "JUDGE", None) if suite.runner == HARBOR_LOCAL else None
+    if not isinstance(declared, dict):
+        return None
+    env = os.environ if env is None else env
+    model = env.get(declared["env"]["model"]) or declared.get("upstream_default")
+    return {"model": model, "via": "host_env"} if model else None
+
+
 def task_filters(suite: Suite, tasks: List[str]) -> List[str]:
     """Harbor `-i` patterns: exact names (TASK excludes glob characters)."""
     return [suite.filter_prefix + task for task in tasks]
@@ -391,7 +454,12 @@ def public(suite: Suite, ctx: Context, common_reasons=()) -> dict:
         count = len(task_ids(suite, ctx))
     except Unavailable:
         count = None
+    try:
+        shown_judge = judge_label(suite, ctx.cfg, ctx.env)
+    except ValueError:
+        shown_judge = None  # the readiness reasons say why
     return {"id": suite.id, "category": suite.category, "name": suite.name,
+            "judge": shown_judge,
             "description": suite.description, "runner": suite.runner,
             "dataset": suite.dataset or None, "task_count": count,
             "default_tasks": list(suite.default_tasks), "max_tasks": suite.max_tasks,
