@@ -38,10 +38,15 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --jobs 3
 ```
 
+- 只用于离线跑法:不设 `TTY_SKIP_MODEL=1` 时 `--jobs` 报错退出(2)。真模型用例共用用户的一份
+  OAuth 凭证(复制进各自的 HOME、用完写回),并行会让两个用例拿同一枚轮换的 refresh token 各自刷新。
 - 每个用例有时限(`--case-timeout 秒`,默认 120,最慢的用例约 30s)。超时的用例判失败(结果行标
-  `(超时)`),它所在的 worker 被杀掉、换新的接着跑,一个卡死的用例(#569)拖不住整轮。
-- 让 metacodes 在固定端口(1455/1457)等登录回调的用例(`run_tty_tests.EXCLUSIVE_MODULES`)同一
-  时刻只跑一个;新加这类用例要登记进去。其余用例各用自己的临时 HOME、工作目录和随机端口,可以并行。
+  `(超时)`),它所在的 worker 连同进程组(用例起的 mock/replay server)和它独占的临时目录
+  (worker 的 `TMPDIR`,用例的临时 HOME 都在里面)一起回收,换新的接着跑,一个卡死的用例(#569)
+  拖不住整轮。
+- 让 metacodes 在固定端口(1455/1457)等登录回调的用例同一时刻只跑一个:整个模块登记在
+  `run_tty_tests.EXCLUSIVE_MODULES`,别的模块里提交裸 `/login` 的单个用例登记在 `EXCLUSIVE_CASES`;
+  新加这类用例要登记进去。其余用例各用自己的临时 HOME、工作目录和随机端口,可以并行。
 - 可以和 `--shard`、`-k` 一起用:先选出用例,再并行跑。不加 `--jobs` 时行为不变(逐个跑、无时限)。
 - CI 仍按分片放在多台 runner 上,不在一台上并行。
 

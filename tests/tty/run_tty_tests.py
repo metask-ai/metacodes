@@ -12,11 +12,12 @@
 排序后用例表里下标 `i % N == K-1` 的那些:N 个分片恰好覆盖全表、互不重叠,且慢用例按模块聚集,
 轮转能把它们摊到各片。CI 的 TTY job 按分片在多台 runner 上并行(doc/CI_DESIGN.md §4)。
 
-**本机并行**:`--jobs N` 起 N 个 worker 子进程(本脚本 `--worker` 模式),从同一个待跑队列里
+**本机并行**:`--jobs N`(只用于离线跑法 `TTY_SKIP_MODEL=1`)起 N 个 worker 子进程(本脚本 `--worker` 模式),从同一个待跑队列里
 取用例,结果按用例汇总成一份,退出码同上。套件的耗时几乎都在等屏幕安静(#588),所以 N 个
 job 大致把耗时除以 N。并行时每个用例有时限(`--case-timeout`,默认 120s,最慢的用例约 30s):
-超时就杀掉它所在的 worker、判该用例失败、换一个新 worker 接着跑,一个卡死的用例(#569)拖不住
-整轮。会让 metacodes 在固定端口等登录回调的用例(EXCLUSIVE_MODULES)同一时刻只跑一个。
+超时就杀掉它所在的 worker(连同它的进程组和临时目录)、判该用例失败、换一个新 worker 接着跑,
+一个卡死的用例(#569)拖不住整轮。会让 metacodes 在固定端口等登录回调的用例(EXCLUSIVE_MODULES、
+EXCLUSIVE_CASES)同一时刻只跑一个。真模型用例共用一份凭证,不能并行,所以 --jobs 要求 TTY_SKIP_MODEL=1。
 `--shard` 先选出本片,`--jobs` 再并行跑这一片。不加 `--jobs` 时仍在本进程里逐个跑,没有时限。
 
 用法:
@@ -27,6 +28,9 @@ import os
 import sys
 import time
 import json
+import math
+import shutil
+import tempfile
 import queue
 import subprocess
 import threading
@@ -57,9 +61,11 @@ def _emit(line, *, newline=True):
     sys.stdout.flush()
 
 
-# 让 metacodes 在固定端口(1455,占用时 1457,src/core/auth.zig)等登录回调的用例模块。两个这样的
-# 用例同时跑会抢端口:后起的落到别的端口,断言端口的用例失败或跳过。--jobs 下同一时刻只跑一个。
+# 让 metacodes 在固定端口(1455,占用时 1457,src/core/auth.zig)等登录回调的用例:整个模块,或
+# 别的模块里提交裸 `/login`(Metask 浏览器登录先绑端口再开浏览器)的单个用例。两个这样的用例
+# 同时跑会抢端口:后起的落到别的端口,断言端口的用例失败或跳过。--jobs 下同一时刻只跑一个。
 EXCLUSIVE_MODULES = frozenset({"test_login", "test_login_logout", "test_openrouter_login"})
+EXCLUSIVE_CASES = frozenset({"test_key_login.test_login_dialog_lists_kimi_code_as_an_api_key_provider"})
 DEFAULT_CASE_TIMEOUT = 120.0
 
 
@@ -96,7 +102,7 @@ def select_shard(cases, index, count):
 
 
 def is_exclusive(name):
-    return name.split(".", 1)[0] in EXCLUSIVE_MODULES
+    return name.split(".", 1)[0] in EXCLUSIVE_MODULES or name in EXCLUSIVE_CASES
 
 
 def next_case(pending, exclusive_running):
@@ -182,12 +188,23 @@ def worker_main(bin_path, cases_dir):
 
 
 class _Worker:
+    """一个 worker 进程,连同它的临时目录根和进程组:超时杀掉时一并回收。
+
+    worker 的 TMPDIR(TEMP/TMP)指向它独占的目录,用例的临时 HOME、工作目录(tempfile、
+    case_tmpdir)都落在里面;worker 自成进程组,用例起的辅助进程(mock/replay server)
+    都在组里。正常结束时这些由用例自己清理;被杀时 finally 不会跑,由这里收尾。
+    """
+
     def __init__(self, slot, bin_path, cases_dir, events):
         argv = [sys.executable, os.path.abspath(__file__), "--worker", "--bin", bin_path]
         if cases_dir:
             argv += ["--cases-dir", cases_dir]
+        self.tmp = tempfile.mkdtemp(prefix="tty-w")
+        env = dict(os.environ, TMPDIR=self.tmp, TEMP=self.tmp, TMP=self.tmp)
+        group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                 else {"start_new_session": True})
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     encoding="utf-8", errors="replace")
+                                     encoding="utf-8", errors="replace", env=env, **group)
         self.case = None
         self.started = 0.0
         threading.Thread(target=self._read, args=(slot, events), daemon=True).start()
@@ -210,10 +227,23 @@ class _Worker:
             pass
 
     def kill(self):
-        # 子进程 metacodes 在自己的会话里(pty.fork 会 setsid);worker 一死 pty 主端关闭,
-        # 它收到 SIGHUP 退出。
+        # 杀整个进程组(Windows 杀进程树)。metacodes 在自己的会话里(pty.fork 会 setsid),
+        # 不在组里:worker 一死 pty 主端关闭,它收到 SIGHUP 退出。
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            import signal
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
         self.proc.kill()
         self.proc.wait()
+        self.release()
+
+    def release(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 def run_parallel(bin_path, cases, jobs, case_timeout, cases_dir):
@@ -281,6 +311,7 @@ def run_parallel(bin_path, cases, jobs, case_timeout, cases_dir):
             if w:
                 try:
                     w.proc.wait(timeout=30)
+                    w.release()
                 except subprocess.TimeoutExpired:
                     w.kill()
 
@@ -312,11 +343,14 @@ def main():
         elif args[i] == "--shard":
             shard_text = args[i + 1]
             i += 2
-        elif args[i] == "--jobs":
-            jobs_text = args[i + 1]
-            i += 2
-        elif args[i] == "--case-timeout":
-            timeout_text = args[i + 1]
+        elif args[i] in ("--jobs", "--case-timeout"):
+            if i + 1 >= len(args):
+                print(f"[ERROR] {args[i]} 缺少取值", file=sys.stderr)
+                return 2
+            if args[i] == "--jobs":
+                jobs_text = args[i + 1]
+            else:
+                timeout_text = args[i + 1]
             i += 2
         elif args[i] == "--cases-dir":  # runner 自测用:换一个用例目录
             cases_dir = args[i + 1]
@@ -352,9 +386,16 @@ def main():
             case_timeout = float(timeout_text)
         except ValueError:
             case_timeout = 0
-        if not case_timeout > 0:
+        if not (case_timeout > 0 and math.isfinite(case_timeout)):
             print(f"[ERROR] --case-timeout 须为正数(秒): {timeout_text}", file=sys.stderr)
             return 2
+
+    if jobs is not None and os.environ.get("TTY_SKIP_MODEL") != "1":
+        # 真模型用例共用用户的一份 OAuth 凭证(e2e_helpers 把它复制进各自的 HOME、用完写回),
+        # 并行会让两个用例拿同一枚 refresh token 各自刷新。--jobs 只用于离线跑法。
+        print("[ERROR] --jobs 只能和 TTY_SKIP_MODEL=1 一起用(真模型用例共用一份凭证,只能逐个跑)",
+              file=sys.stderr)
+        return 2
 
     if not os.access(bin_path, os.X_OK):
         print(f"[ERROR] 二进制不存在/不可执行: {bin_path}", file=sys.stderr)
