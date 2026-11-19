@@ -2743,13 +2743,27 @@ pub fn build(b: *std.Build) void {
         core_shard_reporter,
         staged_lean_kernels,
     );
+    // gate:static —— the guards that only read the source (#587). Inside
+    // gate:pr they ran beside every compile and test step, and the build
+    // runner has no fail-fast, so a guard that fails in seconds on its own was
+    // reported only at the end of the whole gate. The checklist and every CI
+    // gate leg run this first; gate:pr still includes it.
+    const gate_static_step = b.step("gate:static", "Run the source-level guards alone: fmt, the boundary gates, the discipline scans, git diff --check");
+    gate_static_step.dependOn(&gate_fmt.step);
+    gate_static_step.dependOn(http_status_gate_step);
+    gate_static_step.dependOn(subsystem_boundary_step);
+    gate_static_step.dependOn(&io_threaded_test_cmd.step);
+    gate_static_step.dependOn(&thread_stack_test_cmd.step);
+    gate_static_step.dependOn(&terminal_io_test_cmd.step);
+    gate_static_step.dependOn(&scrollback_test_cmd.step);
+    gate_static_step.dependOn(&builtin_egress_test_cmd.step);
+    gate_static_step.dependOn(&gate_diff_check.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
-    gate_pr_step.dependOn(&gate_fmt.step);
+    gate_pr_step.dependOn(gate_static_step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
-    gate_pr_step.dependOn(&gate_diff_check.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)

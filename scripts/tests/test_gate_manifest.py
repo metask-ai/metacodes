@@ -123,6 +123,21 @@ class GateManifestTest(unittest.TestCase):
         self.assertEqual({step for steps, _ in parts for step in steps}, set(TEST_PARTS))
         self.assertEqual(len({tuple(options) for _, options in parts}), 1, parts)
 
+    def test_the_source_level_guards_run_first(self):
+        """`gate:static` holds the guards that only read the source, and the
+        checklist runs it first: the build runner has no fail-fast, so inside
+        `gate:pr` a failed guard surfaces only at the end (#587)."""
+        self.assertEqual(checklist_commands()[0], "zig build gate:static")
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn('const gate_static_step = b.step("gate:static",', build)
+        deps = set(re.findall(r"\bgate_static_step\.dependOn\(&?([\w.]+?)(?:\.step)?\)", build))
+        self.assertTrue({"gate_fmt", "http_status_gate_step", "subsystem_boundary_step", "gate_diff_check"} <= deps, deps)
+        scans = re.findall(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*?"scripts\.tests\.test_\w+_discipline"', build, re.S)
+        self.assertTrue(scans)
+        for scan in scans:
+            self.assertIn(scan, deps, "a discipline scan is missing from gate:static")
+        self.assertIn("gate_pr_step.dependOn(gate_static_step);", build)
+
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn('const units_test_step = b.step("test:units",', build)

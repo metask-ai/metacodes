@@ -260,9 +260,13 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
           restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
-      - name: Zig format check
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
-        run: zig fmt --check build.zig src tests
+      # The source-level guards (fmt, the boundary gates, the discipline
+      # scans, git diff --check) take seconds, and the build runner has no
+      # fail-fast: inside a suite step a failed guard is reported only when
+      # the whole leg has finished. So every leg runs them first (#587).
+      - name: Source-level guards
+        if: (matrix.units || matrix.product || matrix.release || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: zig build gate:static
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
       # (restore-keys) and Lake hash-verifies what it restores; a stale or
@@ -1035,6 +1039,11 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
+      # As in `gates-linux`: the source-level guards first, on every leg.
+      - name: Source-level guards
+        if: (matrix.units || matrix.integration || matrix.product || matrix.release) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: cmd
+        run: zig build gate:static
       # PyYAML for the Python suites that `zig build test` runs; see
       # `gates-linux`.
       - name: Install Python development dependencies

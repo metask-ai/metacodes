@@ -115,7 +115,7 @@ not accepted.
 Before submitting:
 
 ```sh
-zig fmt --check build.zig src tests
+zig build gate:static
 zig build test:lib -Doptimize=ReleaseSafe
 zig build test
 scripts/test_coverage_audit.sh
@@ -123,6 +123,14 @@ python3 scripts/check_doc_links.py
 python3 scripts/check_doc_facts.py
 git diff --check
 ```
+
+`zig build gate:static` runs only the guards that read the source:
+`zig fmt --check build.zig src tests`, `http-status:gate`,
+`subsystem:boundary`, the `scripts/tests/test_*_discipline.py` scans and
+`git diff --check`. It takes seconds, and it comes first because the build
+runner has no fail-fast: inside the full gate a failed guard is reported
+only when everything else has finished (#587). Every CI gate leg runs it
+first too.
 
 `zig build gate:pr` runs this list: the core suite always in ReleaseSafe, the
 full suite at `-Doptimize` (Debug by default). CI runs the same commands (the
