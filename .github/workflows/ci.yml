@@ -35,10 +35,9 @@ env:
 # public repositories off the self-hosted fleet). The exceptions are the
 # macOS and Windows gates of organization members' pull requests (and main's
 # warm run): they try a self-hosted runner first whenever
-# .github/runner-pools.json switches it on, for now the persistent runners on
-# the Mac Studio and on AIPC in the unsafe mode, later the single-use VM
-# pools; the hosted legs take over when a runner is off, busy or not taking
-# jobs (doc/CI_DESIGN.md §6, doc/VM_POOLS.md).
+# .github/runner-pools.json switches it on (macOS: a runner on the Mac
+# Studio's `ci-host` account; Windows: off); the hosted legs take over when a
+# runner is off, busy or not taking jobs (doc/CI_DESIGN.md §6).
 # Each platform's hosted gates are split into legs that run in parallel on
 # separate runners, and the TTY suites into shards; a small result job per
 # platform reports the leg or shard results under the name the ruleset
@@ -700,10 +699,10 @@ jobs:
   # The macOS gates as one job on the self-hosted runner (doc/CI_DESIGN.md
   # §6): it has the cores and memory a hosted runner lacks, so one job runs
   # what the hosted legs split, without their repeated checkout, setup and
-  # compilation. For now that is the Mac Studio's persistent runner in the
-  # unsafe mode: jobs share the machine and nothing isolates one from the
-  # next, so only organization members' pull requests are sent to it. The
-  # single-use VM pool (doc/VM_POOLS.md) replaces it later.
+  # compilation. It is the runner on the Mac Studio's `ci-host` account: jobs
+  # share the host and nothing isolates one from the next, so only
+  # organization members' pull requests are sent to it, and the runner's own
+  # pre-job hook fails any other author's job.
   # FAST_PATH is left to the stand-down step.
   gates-macos-vm:
     name: Gates (macOS) / ${{ matrix.leg }}
@@ -1191,8 +1190,8 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # The Windows gates as one job on AIPC's self-hosted runner
-  # (doc/CI_DESIGN.md §6), as `gates-macos-vm` is for macOS: the hosted legs'
+  # The Windows gates as one job on a self-hosted runner, switched off until
+  # AIPC has one (doc/CI_DESIGN.md §6), as `gates-macos-vm` is for macOS: the hosted legs'
   # steps with every flag set. FAST_PATH is left to the stand-down step.
   windows-gates-vm:
     name: Gates (Windows) / ${{ matrix.leg }}

@@ -5,9 +5,9 @@ runner first, GitHub-hosted runners when it is off, full or not taking jobs
 (and main's warm run) may use a self-hosted runner.
 
 A self-hosted runner runs a platform's gates as one job, `Gates (<OS>) /
-all`: for now the organization's persistent runners (the Mac Studio and
-AIPC) in the unsafe mode, later fresh VMs (doc/VM_POOLS.md). Hosted runners
-run the gates as that platform's legs. Every
+all`: on macOS the runner on the Mac Studio's `ci-host` account
+(doc/CI_DESIGN.md §6); Windows stays hosted until AIPC has one. Hosted
+runners run the gates as that platform's legs. Every
 command here runs with the run's own read-only GITHUB_TOKEN (`actions:
 read`), which a fork's pull request gets too; vars and secrets it does not
 get, so the switch is a file in the tree: `.github/runner-pools.json`, one
@@ -199,8 +199,8 @@ def decide(switch: Optional[Switch], *, fast_path: str, suites: str, warm_cache:
     if warm_cache == "true":
         return "both", "both: main's warm run fills the pool's and the hosted legs' cache lines"
     if not member_pr:
-        return "hosted", (f"hosted: only organization members' pull requests use the self-hosted runner "
-                          f"({author or 'not a pull request'})")
+        return "hosted", (f"hosted: external contributor; only organization members' pull requests use "
+                          f"the self-hosted runner ({author or 'not a pull request'})")
     if pool is None:
         return "hosted", f"hosted: the pool's occupancy is unknown ({doubt})"
     if pool.running + pool.waiting >= switch.slots:

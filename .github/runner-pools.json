@@ -8,7 +8,7 @@
     "timeout_minutes": 60
   },
   "windows": {
-    "self_hosted": true,
+    "self_hosted": false,
     "label": "metacodes-windows-vm",
     "slots": 1,
     "pickup_timeout_minutes": 5,

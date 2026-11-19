@@ -1,11 +1,11 @@
 # The VM pools
 
-> **Not in use yet.** Since 2026-11-19 the gates' self-hosted runners are the
-> persistent `AppledeMac-Studio` and `AIPC`, carrying this document's labels,
-> in the unsafe mode: only organization members' pull requests reach them
-> ([CI_DESIGN.md](CI_DESIGN.md) §6). Nothing below protects them; `check`
-> reports them as not retired. The pools replace them when a host passes
-> `check` and `verify`.
+> **Not in use.** Since 2026-11-19 the macOS gates' self-hosted runner is
+> `MacStudio-metacodes`, directly on the Mac Studio's `ci-host` account with
+> the label `metacodes-macos-vm`, for organization members' pull requests
+> only ([CI_DESIGN.md](CI_DESIGN.md) §6): an idle macOS VM took all 32 GB of
+> the host. Windows stays on hosted runners. Nothing below protects that
+> runner; this document is kept for a pool on AIPC or a later host.
 
 CI's macOS and Windows gates run first on pools of single-use VMs, macOS on
 the organization's Mac Studio and Windows on AIPC, and on GitHub-hosted

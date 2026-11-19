@@ -299,7 +299,7 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(api.seen, [])
                 got = self.outputs()
                 self.assertEqual((got["macos_mode"], got["windows_mode"]), ("hosted", "hosted"))
-                self.assertIn("only organization members' pull requests", got["macos_reason"])
+                self.assertIn("external contributor", got["macos_reason"])
                 self.output.unlink()
         self.plan(FakeAPI({}), env={"AUTHOR_ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "stranger"})
         self.assertIn("stranger is CONTRIBUTOR", self.outputs()["macos_reason"])
