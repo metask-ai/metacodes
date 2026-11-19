@@ -499,6 +499,9 @@ pub const OpenAIClient = struct {
             // req_ptr.* 未初始化, errdefer destroy 即可
             return client_mod.requestSetupFailure("openai", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);

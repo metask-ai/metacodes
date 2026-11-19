@@ -9,6 +9,7 @@ const api_stream = @import("api/stream.zig");
 const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
 const no_redirects = @import("api/http_status.zig").no_redirects;
 const copyRedirectLocation = @import("api/http_status.zig").copyRedirectLocation;
+const answerHasBody = @import("api/http_status.zig").answerHasBody;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
 const model_error = @import("api/model_error.zig");
@@ -569,6 +570,10 @@ pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_ob
 /// apart) had each later piece decoded onto the front of `dest`, over what had
 /// already been read, and came out scrambled (#565).
 pub fn readErrorBody(request: *http.Client.Request, head: http.Client.Response.Head, dest: []u8) []const u8 {
+    // A 1xx, 204 or 304 answer has no body, but std 0.16 reads one to the end
+    // of the connection, and a server asked to keep it open (#573) leaves it
+    // open: the read would last until the idle monitor fires.
+    if (!answerHasBody(&head)) return dest[0..0];
     var transfer_buf: [8192]u8 = undefined;
     const body_reader = request.reader.bodyReader(&transfer_buf, head.transfer_encoding, head.content_length);
     const n = body_reader.readSliceShort(dest) catch 0;
@@ -1310,6 +1315,9 @@ pub const Client = struct {
         };
         // errdefer 销毁顺序：先 req.deinit()（释放连接/缓冲），再 destroy 槽位。
         errdefer req_ptr.deinit();
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         // 总是登记:abort 路由(有 signal 时)+ 空闲监视(idle limit > 0 时)。收头阶段的等待也
         // 由同一只表计时——请求发出后对端一个字节都不回同样是 stall。
         try client.abort_registry.registerMonitored(
@@ -1544,6 +1552,9 @@ fn getModelsPage(
         },
     }) catch return error.RequestFailed;
     defer req.deinit();
+    // As the stream request (#573): std does not check a `content-length`
+    // body for a cut, so a list the proxy cut short read as a complete one.
+    http_connection.keepServerOpen(&req);
 
     http_connection.sendBodiless(&req) catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
