@@ -1,6 +1,6 @@
 #!/bin/bash
-# Prepares the macOS VM pool's golden image (doc/MACOS_VM_POOL.md, "The
-# golden image"). Run it inside a VM cloned from a Cirrus Labs macOS base
+# Prepares the macOS VM pool's golden image (doc/VM_POOLS.md, "The Mac
+# Studio"). Run it inside a VM cloned from a Cirrus Labs macOS base
 # image, as that image's admin user, with the pool host's SSH public key:
 #
 #   ssh admin@<vm> 'bash -s -- "<public key>"' < scripts/ci/macos_vm_provision.sh
@@ -10,7 +10,7 @@
 # runner configuration the pool hands it. Idempotent; run it again to refresh
 # an image (the runner version below is the one GitHub's hosted macOS images
 # ran on 2026-11-18; keep it current, a stale runner updates itself on every
-# job). Tested by scripts/tests/test_macos_vm_pool.py.
+# job). Tested by scripts/tests/test_vm_pool.py.
 set -euo pipefail
 
 PUBLIC_KEY=${1:?usage: macos_vm_provision.sh "<the pool host's SSH public key>"}

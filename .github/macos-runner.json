@@ -1,8 +1,0 @@
-{
-  "self_hosted": false,
-  "label": "metacodes-macos-vm",
-  "slots": 2,
-  "pickup_timeout_minutes": 5,
-  "zig_build_jobs": 8,
-  "timeout_minutes": 60
-}

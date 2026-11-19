@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
-"""Where CI's macOS gates run: the self-hosted VM pool first, GitHub-hosted
-runners when the pool is off, full or not taking jobs (doc/CI_DESIGN.md §6).
+"""Where CI's macOS and Windows gates run: each platform's self-hosted VM
+pool first, GitHub-hosted runners when the pool is off, full or not taking
+jobs (doc/CI_DESIGN.md §6).
 
-The pool (doc/MACOS_VM_POOL.md) runs the gates as one job, `Gates (macOS) /
-all`, on a fresh VM; hosted runners run them as the `gates-macos` legs.
-Every command here runs with the run's own read-only GITHUB_TOKEN
-(`actions: read`), which a fork's pull request gets too; vars and secrets it
-does not get, so the switch is a file in the tree: `.github/macos-runner.json`.
+A pool (doc/VM_POOLS.md) runs a platform's gates as one job, `Gates (<OS>) /
+all`, on a fresh VM; hosted runners run them as that platform's legs. Every
+command here runs with the run's own read-only GITHUB_TOKEN (`actions:
+read`), which a fork's pull request gets too; vars and secrets it does not
+get, so the switch is a file in the tree: `.github/runner-pools.json`, one
+entry per platform.
 
 Commands, one per ci.yml job:
 
-- `plan` (`macos-plan`): reads the switch and this repository's queued and
-  running CI jobs, and writes `mode` (`self-hosted`, `hosted` or `both`) plus
-  the pool's label, build jobs and limits. Any doubt is `hosted`; it always
-  exits 0.
-- `watch` (`gates-macos-watch`): follows the pool job of this run. A VM that
-  takes it within the pickup timeout is followed to the end (`vm_result`);
-  otherwise `fallback=true` hands the gates to the hosted legs.
-- `stand-down` (the pool job's step after checkout): if the watch already
-  finished, the hosted legs took over and the pool job reached a VM late, so
-  it sets FAST_PATH=true and every later step skips; otherwise it carries the
-  release fast path decision into FAST_PATH.
-- `verdict` (`gates-macos-result`, the required `Gates (macOS)` check): passes
-  when the gates passed where they ran. It never waits for the pool job, which
-  a pool that is down would keep queued for GitHub's 24 hours.
+- `plan` (`runner-plan`): reads the switch and this repository's queued and
+  running CI jobs, and writes, per platform, `<platform>_mode`
+  (`self-hosted`, `hosted` or `both`) plus the pool's label, build jobs and
+  limits. Any doubt is `hosted`; it always exits 0.
+- `watch --platform P` (`<P> pool watch`): follows the run's pool job. A VM
+  that takes it within the pickup timeout is followed to the end
+  (`vm_result`); otherwise `fallback=true` hands the gates to the hosted legs.
+- `stand-down --platform P` (the pool job's step after checkout): if the
+  watch already finished, the hosted legs took over and the pool job reached
+  a VM late, so it sets FAST_PATH=true and every later step skips;
+  otherwise it carries the release fast path decision into FAST_PATH.
+- `verdict --platform P` (the required `Gates (<OS>)` check): passes when the
+  gates passed where they ran. It never waits for the pool job, which a pool
+  that is down would keep queued for GitHub's 24 hours.
 
-Python 3.9, stdlib only. Tests: scripts/tests/test_ci_macos_plan.py.
+Python 3.9, stdlib only. Tests: scripts/tests/test_ci_pool_plan.py.
 """
 from __future__ import annotations
 
@@ -43,10 +45,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
-SWITCH = ".github/macos-runner.json"
-POOL_JOB = "Gates (macOS) / all"
-WATCH_JOB = "macOS pool watch"
-# Labels every runner of a kind carries: a pool label must single the pool out.
+SWITCH = ".github/runner-pools.json"
+PLAN_JOB = "runner-plan"
+# Labels every runner of a kind carries: a pool label must single its pool out.
 GENERIC_LABELS = {"self-hosted", "macos", "linux", "windows", "x64", "arm64", "arm"}
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # A job of another run that holds or waits for a pool VM.
@@ -55,6 +56,23 @@ WAITING = {"queued", "pending", "requested"}
 MODES = ("self-hosted", "hosted", "both")
 POLL_SECONDS = 20
 API_ERRORS_BEFORE_FALLBACK = 6
+
+
+@dataclass(frozen=True)
+class Platform:
+    name: str
+    pool_job: str     # the pool job's check name
+    watch_job: str    # the watch job's check name
+    watch_id: str     # the watch job's id in ci.yml
+    hosted_id: str    # the hosted legs' job id in ci.yml
+    max_slots: int    # macOS: two guests per Mac (Virtualization.framework)
+
+
+PLATFORMS: Dict[str, Platform] = {
+    "macos": Platform("macos", "Gates (macOS) / all", "macOS pool watch", "gates-macos-watch", "gates-macos", 2),
+    "windows": Platform("windows", "Gates (Windows) / all", "Windows pool watch", "windows-gates-watch",
+                        "windows-gates", 8),
+}
 
 
 @dataclass(frozen=True)
@@ -77,32 +95,46 @@ SWITCH_FIELDS = {
 }
 
 
-def parse_switch(value: object) -> Switch:
-    """The switch file's object, every field present, typed and in range."""
+def parse_switch(value: object, platform: Platform) -> Switch:
+    """One platform's entry, every field present, typed and in range."""
     if not isinstance(value, dict):
-        raise ValueError("the switch is not a JSON object")
+        raise ValueError(f"{platform.name}: the switch is not a JSON object")
     if set(value) != set(SWITCH_FIELDS):
         missing = sorted(set(SWITCH_FIELDS) - set(value))
         extra = sorted(set(value) - set(SWITCH_FIELDS))
-        raise ValueError(f"switch fields differ: missing {missing}, unknown {extra}")
+        raise ValueError(f"{platform.name}: switch fields differ: missing {missing}, unknown {extra}")
     for name, (kind, bounds) in SWITCH_FIELDS.items():
         field = value[name]
         # bool is an int subclass: a number field must not accept true.
         if not isinstance(field, kind) or (kind is int and isinstance(field, bool)):
-            raise ValueError(f"{name} must be a {kind.__name__}")
+            raise ValueError(f"{platform.name}: {name} must be a {kind.__name__}")
         if bounds and not bounds[0] <= field <= bounds[1]:
-            raise ValueError(f"{name} must be within {bounds[0]}..{bounds[1]}")
+            raise ValueError(f"{platform.name}: {name} must be within {bounds[0]}..{bounds[1]}")
+    if value["slots"] > platform.max_slots:
+        raise ValueError(f"{platform.name}: at most {platform.max_slots} slots")
     if not LABEL_RE.match(value["label"]) or value["label"].lower() in GENERIC_LABELS:
-        raise ValueError(f"label {value['label']!r} must be a dedicated runner label")
+        raise ValueError(f"{platform.name}: label {value['label']!r} must be a dedicated runner label")
     return Switch(**value)
 
 
-def load_switch(path: Path) -> Switch:
-    return parse_switch(json.loads(path.read_text(encoding="utf-8")))
+def parse_switches(value: object) -> Dict[str, Switch]:
+    """Every platform's entry; one pool's label never selects the other's."""
+    if not isinstance(value, dict) or set(value) != set(PLATFORMS):
+        raise ValueError(f"the switch must hold exactly {sorted(PLATFORMS)}")
+    switches = {name: parse_switch(value[name], platform) for name, platform in PLATFORMS.items()}
+    if len({switch.label for switch in switches.values()}) != len(switches):
+        raise ValueError("each pool needs a label of its own")
+    return switches
 
 
-FALLBACK_LIMITS = Switch(self_hosted=False, label="metacodes-macos-vm", slots=2, pickup_timeout_minutes=5,
-                         zig_build_jobs=12, timeout_minutes=60)
+def load_switches(path: Path) -> Dict[str, Switch]:
+    return parse_switches(json.loads(path.read_text(encoding="utf-8")))
+
+
+FALLBACK_LIMITS = {
+    "macos": Switch(False, "metacodes-macos-vm", 2, 5, 8, 60),
+    "windows": Switch(False, "metacodes-windows-vm", 2, 5, 8, 75),
+}
 
 
 @dataclass(frozen=True)
@@ -162,7 +194,7 @@ def decide(switch: Optional[Switch], *, fast_path: str, suites: str, warm_cache:
 
 
 def watch_step(jobs: Sequence[dict], since: float, now: float, timeout_seconds: float,
-               name: str = POOL_JOB) -> Tuple[str, str]:
+               name: str) -> Tuple[str, str]:
     """One look at this run's pool job: ("wait" | "done" | "fallback", detail).
     A job a VM took is followed to its end; one that waited past the pickup
     timeout, or never appeared, falls back."""
@@ -180,21 +212,22 @@ def watch_step(jobs: Sequence[dict], since: float, now: float, timeout_seconds: 
     return "wait", "queued"
 
 
-def should_stand_down(jobs: Sequence[dict], watch: str = WATCH_JOB) -> bool:
+def should_stand_down(jobs: Sequence[dict], watch: str) -> bool:
     """The watch finishes before the pool job starts only when it fell back."""
     return any(job.get("name") == watch and job.get("status") == "completed" for job in jobs)
 
 
-def verdict(needs: Dict[str, dict]) -> Tuple[bool, str]:
-    """The required `Gates (macOS)` check over the plan, the watch and the
+def verdict(needs: Dict[str, dict], platform: Platform) -> Tuple[bool, str]:
+    """The required `Gates (<OS>)` check over the plan, the watch and the
     hosted legs (never the pool job itself)."""
-    plan = needs.get("macos-plan") or {}
-    mode = (plan.get("outputs") or {}).get("mode", "") if plan.get("result") == "success" else ""
-    hosted = (needs.get("gates-macos") or {}).get("result", "")
-    watch = needs.get("gates-macos-watch") or {}
-    outputs = watch.get("outputs") or {}
-    fallback = outputs.get("fallback") == "true"
-    vm = outputs.get("vm_result", "")
+    plan = needs.get(PLAN_JOB) or {}
+    outputs = plan.get("outputs") or {}
+    mode = outputs.get(f"{platform.name}_mode", "") if plan.get("result") == "success" else ""
+    hosted = (needs.get(platform.hosted_id) or {}).get("result", "")
+    watch = needs.get(platform.watch_id) or {}
+    watched = watch.get("outputs") or {}
+    fallback = watched.get("fallback") == "true"
+    vm = watched.get("vm_result", "")
     if mode == "self-hosted":
         if fallback:
             return hosted == "success", f"self-hosted, fell back to the hosted legs: {hosted or 'none'}"
@@ -254,34 +287,41 @@ def write_lines(path: Optional[str], values: Dict[str, str]) -> None:
 
 
 def cmd_plan(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], float]) -> int:
-    switch: Optional[Switch] = None
-    pool: Optional[Occupancy] = None
+    switches: Dict[str, Switch] = {}
+    jobs: Optional[List[dict]] = None
     doubt = ""
     try:
-        switch = load_switch(Path(args.switch))
-        if switch.self_hosted:
+        switches = load_switches(Path(args.switch))
+        if any(switch.self_hosted for switch in switches.values()):
             jobs = github_from_env(env).other_runs_jobs(env["GITHUB_RUN_ID"], args.workflow_path)
-            pool = occupancy(jobs, switch.label, now())
     except Exception as exc:  # any doubt is hosted, never a red job
         doubt = f"{type(exc).__name__}: {exc}"
-    mode, reason = decide(switch, fast_path=env.get("FAST_PATH", ""), suites=env.get("SUITES", ""),
-                          warm_cache=env.get("WARM_CACHE", ""), pool=pool, doubt=doubt)
-    # Without a usable switch the mode is hosted and the pool job never runs;
-    # the defaults only keep every output defined.
-    limits = switch or FALLBACK_LIMITS
-    values = {"mode": mode, "reason": reason, "label": limits.label,
-              "zig_build_jobs": str(limits.zig_build_jobs), "timeout_minutes": str(limits.timeout_minutes),
-              "pickup_timeout_minutes": str(limits.pickup_timeout_minutes)}
-    print(reason)
+    values: Dict[str, str] = {}
+    summary = ["### Runner plan", ""]
+    for name in PLATFORMS:
+        switch = switches.get(name)
+        pool = occupancy(jobs, switch.label, now()) if switch is not None and jobs is not None else None
+        mode, reason = decide(switch, fast_path=env.get("FAST_PATH", ""), suites=env.get("SUITES", ""),
+                              warm_cache=env.get("WARM_CACHE", ""), pool=pool, doubt=doubt)
+        # Without a usable switch the mode is hosted and the pool job never
+        # runs; the defaults only keep every output defined.
+        limits = switch or FALLBACK_LIMITS[name]
+        values.update({f"{name}_mode": mode, f"{name}_reason": reason, f"{name}_label": limits.label,
+                       f"{name}_zig_build_jobs": str(limits.zig_build_jobs),
+                       f"{name}_timeout_minutes": str(limits.timeout_minutes),
+                       f"{name}_pickup_timeout_minutes": str(limits.pickup_timeout_minutes)})
+        print(f"{name}: {reason}")
+        summary.append(f"- **{name}**: {mode}. {reason}")
     write_lines(args.github_output, values)
     if args.github_summary:
         with open(args.github_summary, "a", encoding="utf-8") as handle:
-            handle.write(f"### macOS runner plan\n\nMode: **{mode}**\n\n{reason}\n")
+            handle.write("\n".join(summary) + "\n")
     return 0
 
 
 def cmd_watch(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], float],
               sleep: Callable[[float], None]) -> int:
+    platform = PLATFORMS[args.platform]
     github = github_from_env(env)
     since, errors = now(), 0
     timeout = args.pickup_timeout_minutes * 60
@@ -298,7 +338,7 @@ def cmd_watch(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], f
                 return 0
             sleep(POLL_SECONDS)
             continue
-        state, detail = watch_step(jobs, since, now(), timeout, args.job)
+        state, detail = watch_step(jobs, since, now(), timeout, platform.pool_job)
         if detail:
             print(f"watch: {state}: {detail}")
         if state == "done":
@@ -311,10 +351,11 @@ def cmd_watch(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], f
 
 
 def cmd_stand_down(args: argparse.Namespace, env: Dict[str, str]) -> int:
+    platform = PLATFORMS[args.platform]
     release_fast_path = env.get("RELEASE_FAST_PATH", "")
     try:
         jobs = github_from_env(env).this_attempt_jobs(env["GITHUB_RUN_ID"], env.get("GITHUB_RUN_ATTEMPT", "1"))
-        stand_down = should_stand_down(jobs, args.watch)
+        stand_down = should_stand_down(jobs, platform.watch_job)
     except Exception as exc:  # unknown: do the work; the verdict decides what counts
         print(f"stand-down: could not read this run's jobs ({exc}); running the gates")
         stand_down = False
@@ -324,8 +365,8 @@ def cmd_stand_down(args: argparse.Namespace, env: Dict[str, str]) -> int:
     return 0
 
 
-def cmd_verdict(env: Dict[str, str]) -> int:
-    passed, reason = verdict(json.loads(env.get("NEEDS") or "{}"))
+def cmd_verdict(args: argparse.Namespace, env: Dict[str, str]) -> int:
+    passed, reason = verdict(json.loads(env.get("NEEDS") or "{}"), PLATFORMS[args.platform])
     print(("pass: " if passed else "fail: ") + reason)
     return 0 if passed else 1
 
@@ -340,13 +381,14 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Dict[str, str]] = N
     plan.add_argument("--github-output")
     plan.add_argument("--github-summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     watch = commands.add_parser("watch")
-    watch.add_argument("--job", default=POOL_JOB)
+    watch.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
     watch.add_argument("--pickup-timeout-minutes", type=int, required=True)
     watch.add_argument("--github-output")
     stand = commands.add_parser("stand-down")
-    stand.add_argument("--watch", default=WATCH_JOB)
+    stand.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
     stand.add_argument("--github-env", required=True)
-    commands.add_parser("verdict")
+    judge = commands.add_parser("verdict")
+    judge.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
     args = parser.parse_args(argv)
     env = dict(os.environ if env is None else env)
     if args.command == "plan":
@@ -355,7 +397,7 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Dict[str, str]] = N
         return cmd_watch(args, env, now, sleep)
     if args.command == "stand-down":
         return cmd_stand_down(args, env)
-    return cmd_verdict(env)
+    return cmd_verdict(args, env)
 
 
 if __name__ == "__main__":

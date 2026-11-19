@@ -6,8 +6,9 @@ which of that work a change has to pay for (§2), how approved PRs
 land after validation against current main (§3), and how one
 platform's work is spread over several runners so that a run takes about as
 long as its longest leg rather than the sum of a platform's steps (§4),
-which run writes the caches the others read (§5), and where the macOS gates
-run: a self-hosted VM pool first, the hosted legs as the fallback (§6).
+which run writes the caches the others read (§5), and where the macOS and
+Windows gates run: a self-hosted VM pool first, the hosted legs as the
+fallback (§6).
 
 ## 1. Required checks and how a job skips work
 
@@ -152,7 +153,8 @@ ordering checks; it is not the normal delivery path.
 ### Reusable full-CI evidence
 
 `Full PR evidence` waits for every CI suite, including SDK and Windows TTY,
-to succeed; macOS through `Gates (macOS)`, wherever the gates ran (§6). Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
+to succeed; macOS and Windows through `Gates (macOS)` and `Gates (Windows)`,
+wherever the gates ran (§6). Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
 the tested merge commit/tree, head/base, repository, run ID and attempt.
 The release fast path finds a merged PR for the exact base commit, requires
 a successful run of `ci.yml`, and compares downloaded evidence with the base's
@@ -198,6 +200,7 @@ over its platform's share:
 | `gates-macos` | `units-checks`, `product`, `release` | `units` and `checks` on one; one flag each on the others |
 | `gates-macos-vm` | `all`, on a pool VM (§6) | Every flag of the `gates-macos` legs in one job |
 | `windows-gates` | `units`, `integration`, `product`, `release` | One flag each |
+| `windows-gates-vm` | `all`, on a pool VM (§6) | Every flag of the `windows-gates` legs in one job |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
 | `tty-windows` | eight shards | Every eighth case, under ConPTY |
 
@@ -383,32 +386,40 @@ the warm run saves; each restore key is its save key without the run ID, and
 both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
 scheduled or dispatched run.
 
-## 6. The macOS gates: the VM pool first, hosted legs as the fallback
+## 6. The macOS and Windows gates: a VM pool first, hosted legs as the fallback
+
+Each of the two platforms has a pool of single-use VMs for this repository:
+macOS on the organization's Mac Studio, Windows on AIPC
+([VM_POOLS.md](VM_POOLS.md): security model, hosts and operation). The gates
+try their pool first.
 
 Hosted macOS is the bottleneck: five jobs at once for the organization, three
 cores and 7 GB each. On 2026-11-17/18 a macOS job waited a median 7.5 minutes
 for a runner (p90 27.8) while Linux and Windows waited seconds, and macOS
-finished last in 38 of 39 runs. The organization's Mac Studio therefore
-hosts a pool of single-use VMs for this repository
-([MACOS_VM_POOL.md](MACOS_VM_POOL.md): security model, host and operation),
-and the gates try it first.
+finished last in 38 of 39 runs. Hosted Windows does not queue (median 0.1
+minutes; the legs ran a median 7.2 minutes); its pool can win only on a job's
+own speed, so each platform has its own switch and its own measurements.
 
 **One job on a VM, legs on hosted runners.** A pool VM has the cores and
-memory a hosted runner lacks, so `gates-macos-vm` runs every flag of the
-hosted legs in one job (`Gates (macOS) / all`, the shared step list, its own
-cache line `gates-all`), without their repeated checkout, setup and
-compilation. The hosted runners keep the split legs of §4.
+memory a hosted runner lacks, so `gates-macos-vm` and `windows-gates-vm` run
+every flag of their hosted legs in one job (`Gates (macOS) / all`, `Gates
+(Windows) / all`, the platform's shared step list, its own cache line
+`gates-all`), without the legs' repeated checkout, setup and compilation.
+Hosted runners keep the split legs of §4. TTY (Windows), the SDK jobs and
+AgentCore Windows stay on hosted runners.
 
-**The switch.** `.github/macos-runner.json` holds `self_hosted` (on or off),
-the pool's `label`, its `slots`, the `pickup_timeout_minutes`, the pool job's
-`zig_build_jobs` and `timeout_minutes`. A file, not a repository variable:
-vars and secrets do not reach a fork's pull request, which most pull
-requests here are, while every pull request's merge commit carries `main`'s
-switch. Switching off is a pull request whose own run already obeys it.
+**The switch.** `.github/runner-pools.json` holds, per platform, `self_hosted`
+(on or off), the pool's `label`, its `slots`, the `pickup_timeout_minutes`,
+the pool job's `zig_build_jobs` and `timeout_minutes`. A file, not a
+repository variable: vars and secrets do not reach a fork's pull request,
+which most pull requests here are, while every pull request's merge commit
+carries `main`'s switch. Switching a pool off is a pull request whose own run
+already obeys it.
 
-**Where a run goes** (`macos-plan`, `scripts/ci_macos_plan.py plan`). With
-the run's read-only token it counts this repository's other CI jobs that hold
-or wait for a pool VM, then decides, first match wins:
+**Where a run goes** (`runner-plan`, `scripts/ci_pool_plan.py plan`). With the
+run's read-only token it lists this repository's other CI jobs once, counts
+per platform those that hold or wait for one of its pool's VMs, and decides
+each platform, first match wins:
 
 | Situation | Mode |
 |---|---|
@@ -421,19 +432,19 @@ or wait for a pool VM, then decides, first match wins:
 | Any error reading GitHub | `hosted` |
 
 **Falling back after dispatch.** Two runs can see the same free slot, and a
-pool can fail after a run chose it. `gates-macos-watch` (`macOS pool watch`,
-`… watch`) follows the run's pool job: a VM that takes it within the pickup
-timeout is followed to the end and its conclusion reported; otherwise
-`fallback=true`, and the hosted legs, which wait for the watch on
-`self-hosted`, run. If a VM takes the pool job after that, its stand-down
-step sees the finished watch and sets `FAST_PATH=true`, so every later step
-skips (the pool job's env leaves `FAST_PATH` to that step).
+pool can fail after a run chose it. `gates-macos-watch` and
+`windows-gates-watch` (`… watch`) follow their run's pool job: a VM that
+takes it within the pickup timeout is followed to the end and its conclusion
+reported; otherwise `fallback=true`, and the hosted legs, which wait for the
+watch on `self-hosted`, run. If a VM takes the pool job after that, its
+stand-down step sees the finished watch and sets `FAST_PATH=true`, so every
+later step skips (the pool job's env leaves `FAST_PATH` to that step).
 
-**The required check** (`gates-macos-result`, `… verdict`) never needs the
-pool job: a pool that is down would keep it queued for GitHub's 24 hours. It
-reads the plan, the watch and the hosted legs:
+**The required checks** (`gates-macos-result`, `gates-windows-result`, `…
+verdict`) never need a pool job: a pool that is down would keep it queued for
+GitHub's 24 hours. Each reads its platform's plan, watch and hosted legs:
 
-| Mode | `Gates (macOS)` passes when |
+| Mode | `Gates (macOS)` / `Gates (Windows)` passes when |
 |---|---|
 | `hosted`, or no plan | the hosted legs succeeded |
 | `self-hosted` | the watch reports the pool job succeeded; after a fallback, the hosted legs succeeded |
@@ -441,14 +452,14 @@ reads the plan, the watch and the hosted legs:
 
 A pool job that fails (a test, or its VM) is a failure, not a fallback;
 rerunning the run decides again. Costs: the plan adds a few seconds before
-the macOS gates; a run on the pool keeps an ubuntu watch job beside it; a
-fallback after dispatch costs the pickup timeout; on the nightly `both` run
-the hosted legs start after the pool job ends, since they wait for the
-watch; a pool job no VM ever takes
-stays queued in its run until a VM takes it (and stands down) or GitHub's
-24 hours pass, without affecting the required check.
+the macOS and Windows gates; a run on a pool keeps an ubuntu watch job beside
+it; a fallback after dispatch costs the pickup timeout; on the nightly `both`
+run the hosted legs start after the pool job ends, since they wait for the
+watch; a pool job no VM ever takes stays queued in its run until a VM takes
+it (and stands down) or GitHub's 24 hours pass, without affecting the
+required check.
 
-`scripts/tests/test_ci_macos_plan.py` pins the decisions, the watch, the
-stand-down and the verdict, and the wiring: the pool job is every hosted leg
-in one, the required check never needs it, and only it uses the pool's label
-(no workflow uses `self-hosted`).
+`scripts/tests/test_ci_pool_plan.py` pins the decisions, the watch, the
+stand-down and the verdict for both platforms, and the wiring: each pool job
+is every hosted leg of its platform in one, the required checks never need
+them, and only they use the pools' labels (no workflow uses `self-hosted`).

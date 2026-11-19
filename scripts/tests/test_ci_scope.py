@@ -54,14 +54,14 @@ ECHO_STEPS = {"Release fast path", "Change scope"}
 # The jobs that do the work, one runner per leg or shard (doc/CI_DESIGN.md §4),
 # and the switch each one's steps read.
 LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("gates-macos-vm", "SUITES"),
-            ("windows-gates", "SUITES"), ("tty-linux", "TTY"), ("tty-windows", "TTY"))
+            ("windows-gates", "SUITES"), ("windows-gates-vm", "SUITES"), ("tty-linux", "TTY"), ("tty-windows", "TTY"))
 # The checks the `Protect main` ruleset requires, plus TTY (Windows), and the
-# job whose legs or shards each one reports. Gates (macOS) reports where the
-# gates ran, the pool or the hosted legs: test_ci_macos_plan.py.
+# job whose legs or shards each one reports. Gates (macOS) and Gates (Windows)
+# report where the gates ran, a pool or the hosted legs: test_ci_pool_plan.py.
 RESULT_JOBS = {
     "Gates (Linux)": "gates-linux",
-    "Gates (macOS)": ["macos-plan", "gates-macos-watch", "gates-macos"],
-    "Gates (Windows)": "windows-gates",
+    "Gates (macOS)": ["runner-plan", "gates-macos-watch", "gates-macos"],
+    "Gates (Windows)": ["runner-plan", "windows-gates-watch", "windows-gates"],
     "TTY (Linux)": "tty-linux",
     "TTY (Windows)": "tty-windows",
 }
@@ -71,7 +71,8 @@ LEG_FLAGS = {"units", "integration", "product", "release", "cross", "checks"}
 GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "checks"}),
              ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
              ("gates-macos-vm", "macOS", {"units", "product", "release", "checks"}),
-             ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
+             ("windows-gates", "Windows", {"units", "integration", "product", "release"}),
+             ("windows-gates-vm", "Windows", {"units", "integration", "product", "release"}))
 TEST_PARTS = {"test:units", "test:integration", "test:product"}
 # The gate steps without a leg flag: environment setup, which runs on every
 # leg. A new step names the leg it belongs to; added here instead, it runs on
@@ -88,6 +89,7 @@ SETUP_STEPS = {
         "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
         "Restore the Zig cache main saved", "Save the Zig cache for pull requests",
         "Normalize line endings of the checkout", "Install Python development dependencies",
+        "Stand down if the hosted legs took over",
         "Restore Lean toolchain and build products", "Install pinned elan",
     },
 }
@@ -393,9 +395,9 @@ class WorkflowTest(unittest.TestCase):
 
     def test_full_evidence_requires_all_suites_and_excludes_scope_fast_paths(self) -> None:
         job = self.jobs["full-pr-evidence"]
-        # macOS through its result job: the pool job or the hosted legs.
+        # macOS and Windows through their result jobs: a pool job or the hosted legs.
         self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos-result",
-                                            "windows-gates", "tty-linux", "tty-windows", "sdk-bindings"})
+                                            "gates-windows-result", "tty-linux", "tty-windows", "sdk-bindings"})
         self.assertIn("needs.scope.outputs.scope == 'full'", job["if"])
         self.assertIn("needs.release-fast-path.outputs.fast == 'false'", job["if"])
         self.assertIn("github.event_name == 'pull_request'", job["if"])
@@ -406,7 +408,7 @@ class WorkflowTest(unittest.TestCase):
         for job, var in LEG_JOBS:
             with self.subTest(job=job):
                 spec = self.jobs[job]
-                # The macOS jobs also wait for where they run (test_ci_macos_plan.py).
+                # The macOS and Windows jobs also wait for where they run (test_ci_pool_plan.py).
                 self.assertLessEqual({"release-fast-path", "scope"}, set(spec["needs"]))
                 self.assertTrue(spec["if"].startswith("${{ !cancelled()"), spec["if"])
                 self.assertEqual(spec["env"][var], "${{ needs.scope.outputs.%s }}" % var.lower())
@@ -481,7 +483,7 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(spec["needs"], legs)
                 # Never skipped: a skipped job passes a required check.
                 self.assertEqual(spec["if"], "${{ always() }}")
-                if name != "Gates (macOS)":
+                if name not in ("Gates (macOS)", "Gates (Windows)"):
                     self.assertEqual(spec["steps"], self.jobs["gates-linux-result"]["steps"])
 
     @unittest.skipIf(os.name == "nt", "bash and jq")
@@ -526,10 +528,12 @@ class WorkflowTest(unittest.TestCase):
         for job, _, _ in GATE_JOBS:
             with self.subTest(job=job):
                 spec = self.jobs[job]
-                if job == "gates-macos-vm":
-                    # Sized to the VM in .github/macos-runner.json, a positive
-                    # integer (test_ci_macos_plan.py).
-                    self.assertEqual(spec["env"]["ZIG_BUILD_JOBS"], "${{ needs.macos-plan.outputs.zig_build_jobs }}")
+                if job.endswith("-vm"):
+                    # Sized to the VM in .github/runner-pools.json, a positive
+                    # integer (test_ci_pool_plan.py).
+                    platform = "macos" if job.startswith("gates-macos") else "windows"
+                    self.assertEqual(spec["env"]["ZIG_BUILD_JOBS"],
+                                     "${{ needs.runner-plan.outputs.%s_zig_build_jobs }}" % platform)
                 else:
                     self.assertRegex(str(spec["env"].get("ZIG_BUILD_JOBS", "")), r"^[1-9][0-9]*$")
                 uses = [step for step in spec["steps"] if "ZIG_BUILD_JOBS" in step.get("run", "")]
@@ -565,6 +569,7 @@ class WorkflowTest(unittest.TestCase):
     def test_both_posix_gates_and_both_tty_platforms_run_one_step_list(self) -> None:
         self.assertEqual(self.jobs["gates-macos"]["steps"], self.jobs["gates-linux"]["steps"])
         self.assertEqual(self.jobs["gates-macos-vm"]["steps"], self.jobs["gates-linux"]["steps"])
+        self.assertEqual(self.jobs["windows-gates-vm"]["steps"], self.jobs["windows-gates"]["steps"])
         self.assertEqual(self.jobs["tty-windows"]["steps"], self.jobs["tty-linux"]["steps"])
 
     def test_the_tty_shards_cover_the_suite(self) -> None:
