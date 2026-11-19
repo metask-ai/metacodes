@@ -13,9 +13,13 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 
 | View | Answers |
 |---|---|
-| 总览 `#/` | every job: model, progress, outcome mix, valid pass rate, invalid count, tokens, estimated cost, wall time |
+| 看板 `#/` | metrics scoped to one batch (or all / unbatched jobs), initial context composition, batches, jobs |
+| 批次 `#/batch/<id>` | frozen metacodes version, each dataset's job, every task with its attempts |
+| 任务 `#/batch/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task |
+| 新建 `#/new` | a batch: metacodes version, several suites and their tasks, model, attempts, concurrency |
+| 数据库 `#/settings` | the active store; test, switch and migrate to another SQLite file or PostgreSQL |
 | 作业 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
-| trial `#/job/<job>/<trial>` | verifier tests with messages, tool usage, the whole trajectory (calls and results), verifier output and metacodes stderr |
+| trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |
 | 对比 `#/compare/<job>,<job>` | the same tasks across jobs (models), the pass rate on tasks every job scored |
 
 Outcomes follow [doc/BENCHMARKS.md](../../../../doc/BENCHMARKS.md): `invalid`
@@ -36,7 +40,7 @@ Historical timings remain unknown; new workbench runs capture numeric
 request metrics through the host streaming relay.
 
 `data.py` is the projection (applied to the stored bytes by `../store/ingest.py`),
-`runner.py` validates selections, and `worker.py` owns one durable execution
+`runner.py` validates selections, `batches.py` freezes a bundle and runs a batch's datasets in order, and `worker.py` owns one durable execution
 and ingests its job. HTTP launch/cancel routes require the workbench
 capability. The benchmark catalog (suites, categories, adapters, WorkBuddy
 runner) is `scripts/eval/harbor/suites/`. `executors.py` (this machine or
@@ -44,4 +48,4 @@ SSH hosts), `remote.py` (the driver on an SSH host) and `setup.py`
 (`bench setup`, page sign-in) let a launch run on any configured executor
 through the same worker. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
-`test_bench_store.py`, `test_bench_suites.py` and `test_bench_setup.py`.
+`test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py` and `test_bench_batches.py`.

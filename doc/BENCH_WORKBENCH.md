@@ -652,6 +652,59 @@ restart.
 
 ## Using the page
 
+The rail opens on the dashboard (看板), then 新建 (new batch), 对比 (compare)
+and 数据库 (the evaluation database). The dashboard's 数据范围 selector
+scopes every headline metric to one batch (the newest by default), to all
+jobs, or to jobs launched outside a batch.
+
+### Batches
+
+A batch evaluates one frozen metacodes version on several datasets. The
+新建 page picks the version (the configured Linux bundle by default, or any
+valid bundle under `<state root>/bench/bundles/`), several suites with their
+tasks, the model, attempts and concurrency (capped per suite). Creating the
+batch validates every dataset first, then copies the bundle, once per content
+digest, to `<state root>/bench/bundles/frozen/<digest>/` with its files made
+read-only. Every dataset of the batch runs that copy, so rebuilding the
+configured bundle in place or switching `workbench.json` to another version
+never changes a batch already created; before each launch the copy is checked
+against its digest, and a modified copy fails the dataset instead of running.
+
+The datasets run one after another, each as an ordinary workbench run (one
+Harbor job) whose record names the batch and its frozen version. The durable
+state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
+advances what that file says, so a restarted service resumes a batch where it
+stopped. While a batch owns the executor, a single launch (`POST /api/runs`)
+is refused. Stopping a batch cancels its running dataset and skips the rest.
+Batch records are ingested into the `batches` table of the evaluation
+database (schema v3).
+
+The batch page lists each dataset's job and every task across them; a task's
+page shows its attempts side by side, then the selected attempt's detail:
+
+- **Token distribution**: one column per model request, its input context
+  split by part (or by cached / uncached input when no composition was
+  recorded), and its output tokens; a per-request table with start offset,
+  duration, TTFT and usage.
+- **Context composition**: the relay records, per request, the byte size of
+  the system prompt, tool definitions, user/task messages, the model's
+  earlier output and tool results (sizes only, never content). The page
+  apportions the request's measured input tokens by those shares; the
+  initial-token metric shows the first request's composition, averaged over
+  trials. Runs recorded before this existed show `未采集`.
+- **Time**: Harbor's phases, and the agent phase split into waiting on the
+  model (request durations), running tools (each call's measured execution
+  from the metacodes event stream) and the rest; a per-tool timing table.
+- **Trajectory**: every step, with each tool call's execution time.
+
+The 数据库 page shows the active store and its contents. With the workbench
+capability it tests a SQLite path or a PostgreSQL DSN (no password in the
+DSN; `password_env` names the variable), and switches the service to it,
+optionally migrating and verifying the current data first (the same copy as
+`metacodes bench db migrate`). The new `store` is written to `workbench.json`
+and takes effect immediately; switching is refused while a run or batch is
+active.
+
 ### Metric definitions
 
 | Metric | Calculation |
@@ -665,7 +718,7 @@ restart.
 | Estimated cost | The metacodes binary's catalog estimate, including cache pricing. It is not the provider's settlement. Missing/zero unknown prices are shown as unknown with coverage counts |
 
 The credential relay runs on the execution host and forwards streaming
-payloads unchanged; with metrics enabled it also times them. It stores numeric timing/usage records only, under
+payloads unchanged; with metrics enabled it also times them. It stores numeric timing/usage records and per-request context part sizes only, under
 `<jobs-dir>/<job>/.bench-metrics/<trial>.jsonl`. Its local Docker hop and HTTP
 forwarding are part of the measured harness; these numbers are not provider
 SLAs. The relay supports configured Bearer, API-key-header, and
@@ -695,6 +748,7 @@ there into the evaluation database):
 ```text
 <jobs-dir>/
   .bench-runs/                     # launch receipts, specs, worker logs
+  .bench-batches/<id>.json         # batches: frozen version, datasets, state
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage
