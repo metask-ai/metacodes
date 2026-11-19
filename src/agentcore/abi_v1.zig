@@ -9026,7 +9026,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 28), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 29), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
     try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
     try std.testing.expect(api.session.?.update_credential != null);
