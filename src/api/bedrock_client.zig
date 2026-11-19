@@ -796,7 +796,7 @@ const BedrockStream = struct {
                     client_mod.reportStreamIncomplete("bedrock", self.id);
                     return error.StreamIncomplete;
                 }
-                log.warnId("bedrock", self.id, "event stream read failed: {s}", .{@errorName(err)});
+                log.warnId("bedrock", self.id, "event stream read failed: {s} ({f})", .{ @errorName(err), client_mod.ReadFailure.of(self.request, &self.response.head) });
                 return api_stream.midStreamReadError(err);
             } orelse {
                 self.done = true;
