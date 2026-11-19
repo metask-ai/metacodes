@@ -608,9 +608,8 @@ async function renderNewBatch() {
     let login = null;
     if (c.login?.available) { try { login = await api('/api/login'); } catch (_) { login = null; } }
     const parts = [];
-    // The device code matters only while a sign-in waits for approval, or
-    // when one this service started ended without signing in. Once the
-    // account is signed in (the catalog has its models) it is stale.
+    // The device code matters only while the sign-in waits for approval, or
+    // when it ended without signing in; once signed in it is stale.
     if (login && (login.running || (login.verification_uri && !login.signed_in && !c.login?.signed_in))) {
       parts.push(panel('Metask 登录', login.running ? '等待确认' : '未完成，请重新登录',
         h('div', { class: 'panel-body run-state' },
