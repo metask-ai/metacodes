@@ -509,6 +509,25 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Behind a proxy, the end of a model's answer is no longer lost, and the
+  turn is no longer sent again for it** (#573). Every request to a model
+  provider said `connection: close`, so the server closed the connection
+  right after the last byte, and behind a transparent proxy that close could
+  overtake bytes the proxy had not forwarded yet. On the Responses wire the
+  last event is the largest (it echoes the instructions and tools, over
+  100 KB), so it was the one cut: the stream counted as incomplete, and the
+  turn was sent again and charged again, twice in the TUI and up to four
+  times with `-p`. On one proxied route on 2026-11-18 this hit 3% to 23% of
+  real streams, and 74% of a large page fetched with `connection: close`
+  against none with keep-alive. The Messages, OpenAI-compatible (Chat
+  Completions and Responses), Gemini and Bedrock requests, and the Messages
+  `/v1/models` list, now say `connection: keep-alive`: the server leaves the
+  connection open, and the client closes it once it has read what it needs,
+  still without reusing it. A `/v1/models` list cut short no longer reads as
+  a complete, shorter one. A stream that ends without its stop report still
+  counts as incomplete. A `204` or `304` error answer is reported at once
+  instead of being read to the end of the connection. Other requests (MCP,
+  TinyKG, sealed skills, the System-One advisor, OTLP export) are unchanged.
 - **`/login` names the providers it cannot list.** Its list holds twelve, and
   the ones past them were dropped without a word; `/login <id>` for one of
   them then showed the list without it. The list now ends with `N more not
