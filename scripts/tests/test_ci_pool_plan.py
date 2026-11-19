@@ -40,7 +40,7 @@ def job(status: str, created: float = NOW - 30, labels=(LABEL,), name: str = MAC
 
 
 def decide(pool=plan.Occupancy(0, 0, 0.0), switch=ON, **kwargs):
-    values = dict(fast_path="false", suites="true", warm_cache="false", pool=pool)
+    values = dict(fast_path="false", suites="true", warm_cache="false", pool=pool, member_pr=True)
     values.update(kwargs)
     return plan.decide(switch, **values)
 
@@ -97,7 +97,9 @@ class DecideTest(unittest.TestCase):
     def test_every_doubt_and_every_cheap_run_is_hosted(self) -> None:
         cases = {
             "switched off": decide(switch=plan.FALLBACK_LIMITS["macos"]),
-            "no switch": plan.decide(None, fast_path="", suites="", warm_cache="", pool=None, doubt="bad json"),
+            "no switch": plan.decide(None, fast_path="", suites="", warm_cache="", pool=None, member_pr=True,
+                                     doubt="bad json"),
+            "not a member's pull request": decide(member_pr=False, author="someone is CONTRIBUTOR"),
             "release fast path": decide(fast_path="true"),
             "documentation only": decide(suites="false"),
             "unknown occupancy": decide(pool=None, doubt="HTTP 500"),
@@ -118,6 +120,24 @@ class DecideTest(unittest.TestCase):
     def test_mains_warm_run_fills_both_cache_lines(self) -> None:
         self.assertEqual(decide(warm_cache="true", pool=None)[0], "both")
         self.assertEqual(decide(warm_cache="true", switch=plan.FALLBACK_LIMITS["macos"])[0], "hosted")
+        self.assertEqual(decide(warm_cache="true", pool=None, member_pr=False)[0], "both")
+
+    def test_only_organization_members_pull_requests_go_self_hosted(self) -> None:
+        for event, association, member in (("pull_request", "MEMBER", True),
+                                           ("pull_request", "OWNER", True),
+                                           ("pull_request", "COLLABORATOR", True),  # a private member
+                                           ("pull_request", "CONTRIBUTOR", False),
+                                           ("pull_request", "FIRST_TIME_CONTRIBUTOR", False),
+                                           ("pull_request", "NONE", False),
+                                           ("pull_request", "", False),
+                                           ("pull_request_target", "MEMBER", False),
+                                           ("merge_group", "", False),
+                                           ("workflow_dispatch", "", False)):
+            with self.subTest(event=event, association=association):
+                self.assertEqual(plan.is_member_pr(event, association), member)
+        mode, reason = decide(member_pr=False, author="stranger is CONTRIBUTOR")
+        self.assertEqual(mode, "hosted")
+        self.assertIn("stranger is CONTRIBUTOR", reason)
 
 
 class WatchTest(unittest.TestCase):
@@ -208,7 +228,8 @@ class FakeAPI:
 
 
 ENV = {"GH_TOKEN": "t", "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "2",
-       "GITHUB_API_URL": "https://api.example"}
+       "GITHUB_API_URL": "https://api.example", "GITHUB_EVENT_NAME": "pull_request",
+       "AUTHOR_ASSOCIATION": "MEMBER", "PR_AUTHOR": "member"}
 ATTEMPT_JOBS = "actions/runs/99/attempts/2/jobs?per_page=100"
 
 
@@ -267,6 +288,21 @@ class CommandTest(unittest.TestCase):
         self.plan(api)
         self.assertEqual(api.seen, [])
         self.assertEqual((self.outputs()["macos_mode"], self.outputs()["windows_mode"]), ("hosted", "hosted"))
+
+    def test_plan_keeps_other_authors_and_events_on_hosted_runners_without_reading_github(self) -> None:
+        for env in ({"AUTHOR_ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "stranger"},
+                    {"AUTHOR_ASSOCIATION": "NONE"},
+                    {"GITHUB_EVENT_NAME": "merge_group", "AUTHOR_ASSOCIATION": ""}):
+            with self.subTest(env=env):
+                api = FakeAPI({})
+                self.plan(api, env={"FAST_PATH": "false", "SUITES": "true", **env})
+                self.assertEqual(api.seen, [])
+                got = self.outputs()
+                self.assertEqual((got["macos_mode"], got["windows_mode"]), ("hosted", "hosted"))
+                self.assertIn("external contributor", got["macos_reason"])
+                self.output.unlink()
+        self.plan(FakeAPI({}), env={"AUTHOR_ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "stranger"})
+        self.assertIn("stranger is CONTRIBUTOR", self.outputs()["macos_reason"])
 
     def test_plan_falls_back_to_hosted_on_a_full_pool_or_any_doubt(self) -> None:
         self.plan(FakeAPI(self.plan_routes([job("in_progress"), job("in_progress")])))
@@ -343,6 +379,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(step["run"].startswith("python3 scripts/ci_pool_plan.py plan "))
         self.assertEqual(step["env"]["FAST_PATH"], "${{ needs.release-fast-path.outputs.fast }}")
         self.assertEqual(step["env"]["SUITES"], "${{ needs.scope.outputs.suites }}")
+        self.assertEqual(step["env"]["AUTHOR_ASSOCIATION"], "${{ github.event.pull_request.author_association }}")
         for platform in plan.PLATFORMS:
             for name in ("mode", "label", "zig_build_jobs", "timeout_minutes", "pickup_timeout_minutes", "reason"):
                 key = f"{platform}_{name}"
