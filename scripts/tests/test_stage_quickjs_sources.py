@@ -2,8 +2,10 @@
 
 The checked-in tree must verify and stage. A synthetic vendor directory then
 proves each fail-closed path: a drifted upstream file, an undeclared file, a
-patch that no longer applies exactly, a patched-digest drift, and an archive
-that does not match the manifest.
+required file dropped from both manifest and directory, a patch that no longer
+applies exactly or whose header lies, a patched-digest drift, an archive that
+does not match the manifest, and an output directory that is not ours to
+replace.
 """
 
 from __future__ import annotations
@@ -20,7 +22,15 @@ from pathlib import Path
 
 from scripts import stage_quickjs_sources as stage_mod
 from scripts import verify_quickjs_sources as verify_mod
-from scripts.stage_quickjs_sources import QuickJsSources, StageError, apply_hunks, build_tree, parse_patch, stage
+from scripts.stage_quickjs_sources import (
+    STAGE_RECORD,
+    QuickJsSources,
+    StageError,
+    apply_hunks,
+    build_tree,
+    parse_patch,
+    stage,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 VENDOR = ROOT / "vendor" / "quickjs"
@@ -114,9 +124,23 @@ class CheckedInTreeTest(unittest.TestCase):
             code, _, err = _run(stage_mod.main, ["--out", str(out)])
             self.assertEqual(0, code, err)
             sources = QuickJsSources.load(VENDOR / "manifest.json")
-            self.assertEqual(sorted(item.path for item in sources.files), sorted(p.name for p in out.iterdir()))
+            self.assertEqual(
+                sorted([item.path for item in sources.files] + [STAGE_RECORD]),
+                sorted(p.name for p in out.iterdir()),
+            )
             patched = {item.path: item.sha256 for item in sources.patched}
             self.assertEqual(patched["quickjs.c"], _sha((out / "quickjs.c").read_bytes()))
+
+    def test_a_header_dropped_from_manifest_and_directory_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vendor = Path(directory) / "quickjs"
+            shutil.copytree(VENDOR, vendor)
+            (vendor / "cutils.h").unlink()
+            manifest = json.loads((vendor / "manifest.json").read_text(encoding="utf-8"))
+            manifest["files"] = [item for item in manifest["files"] if item["path"] != "cutils.h"]
+            _write(vendor / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+            with self.assertRaisesRegex(StageError, "includes cutils.h, which the manifest does not pin"):
+                build_tree(vendor, QuickJsSources.load(vendor / "manifest.json"))
 
     def test_gitattributes_keep_upstream_bytes(self) -> None:
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
@@ -128,16 +152,64 @@ class FailClosedTest(unittest.TestCase):
     def setUp(self) -> None:
         self._dir = tempfile.TemporaryDirectory()
         self.root = Path(self._dir.name)
+        self._required = stage_mod.REQUIRED_FILES
+        stage_mod.REQUIRED_FILES = ("LICENSE", "engine.c")
 
     def tearDown(self) -> None:
+        stage_mod.REQUIRED_FILES = self._required
         self._dir.cleanup()
+
+    def test_a_required_file_dropped_from_manifest_and_directory_fails(self) -> None:
+        stage_mod.REQUIRED_FILES = ("LICENSE", "engine.c", "other.c")
+        vendor = _fixture(self.root)
+        with self.assertRaisesRegex(StageError, r"lacks required engine files: \['other.c'\]"):
+            stage(vendor, self.root / "out")
+
+    def test_output_overlapping_the_vendor_tree_is_refused_and_nothing_is_deleted(self) -> None:
+        vendor = _fixture(self.root)
+        before = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*"))
+        for out in (vendor, vendor / "patches", self.root, vendor / "new"):
+            with self.subTest(out=out):
+                with self.assertRaisesRegex(StageError, "overlaps the vendor tree"):
+                    stage(vendor, out)
+        self.assertEqual(before, sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*")))
+
+    def test_a_foreign_non_empty_directory_is_refused_and_kept(self) -> None:
+        vendor = _fixture(self.root)
+        shared = self.root / "build"
+        _write(shared / "other-artifact.o", "keep me\n")
+        _write(shared / "engine.c", "someone else's file\n")
+        with self.assertRaisesRegex(StageError, "not written by this script"):
+            stage(vendor, shared)
+        self.assertEqual("keep me\n", (shared / "other-artifact.o").read_text(encoding="utf-8"))
+        self.assertEqual("someone else's file\n", (shared / "engine.c").read_text(encoding="utf-8"))
+
+    def test_restaging_replaces_only_what_it_wrote(self) -> None:
+        vendor = _fixture(self.root)
+        out = self.root / "out"
+        stage(vendor, out)
+        stage(vendor, out)
+        self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
+        _write(out / "added-later.txt", "not staged\n")
+        with self.assertRaisesRegex(StageError, r"did not write: \['added-later.txt'\]"):
+            stage(vendor, out)
+        self.assertTrue((out / "added-later.txt").is_file())
+        self.assertTrue((out / "engine.c").is_file())
+
+    def test_an_empty_existing_directory_is_accepted(self) -> None:
+        vendor = _fixture(self.root)
+        out = self.root / "empty"
+        out.mkdir()
+        stage(vendor, out)
+        self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
 
     def test_fixture_stages_the_patched_file(self) -> None:
         vendor = _fixture(self.root)
         out = self.root / "out"
         stage(vendor, out)
         self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
-        self.assertEqual(["LICENSE", "engine.c"], sorted(p.name for p in out.iterdir()))
+        self.assertEqual([STAGE_RECORD, "LICENSE", "engine.c"], sorted(p.name for p in out.iterdir()))
+        self.assertEqual(["LICENSE", "engine.c"], json.loads((out / STAGE_RECORD).read_text(encoding="utf-8")))
 
     def test_an_edited_upstream_file_fails(self) -> None:
         vendor = _fixture(self.root)
@@ -203,6 +275,21 @@ class PatchFormatTest(unittest.TestCase):
     def test_a_renaming_patch_is_rejected(self) -> None:
         with self.assertRaisesRegex(StageError, "in place"):
             parse_patch(PATCH.replace("+++ b/engine.c", "+++ b/other.c"))
+
+    def test_a_new_start_that_disagrees_with_the_old_start_is_rejected(self) -> None:
+        [(name, hunks)] = parse_patch(PATCH.replace("@@ -6,4 +6,4 @@", "@@ -6,4 +7,4 @@"))
+        with self.assertRaisesRegex(StageError, "new start 7"):
+            apply_hunks(name, UPSTREAM_C.encode(), hunks)
+
+    def test_an_insertion_past_the_end_of_the_file_is_rejected(self) -> None:
+        patch = "--- a/engine.c\n+++ b/engine.c\n@@ -20,0 +21,1 @@\n+int three(void);\n"
+        [(name, hunks)] = parse_patch(patch)
+        with self.assertRaisesRegex(StageError, "past the end of the file"):
+            apply_hunks(name, UPSTREAM_C.encode(), hunks)
+        # The same insertion right after the last line is fine.
+        last = len(UPSTREAM_C.splitlines())
+        [(name, hunks)] = parse_patch(patch.replace("-20,0 +21,1", "-%d,0 +%d,1" % (last, last + 1)))
+        self.assertTrue(apply_hunks(name, UPSTREAM_C.encode(), hunks).endswith(b"int three(void);\n"))
 
     def test_a_hunk_with_wrong_counts_is_rejected(self) -> None:
         with self.assertRaises(StageError):

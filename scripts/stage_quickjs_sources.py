@@ -8,7 +8,9 @@ byte, pinned by SHA-256 in `vendor/quickjs/manifest.json`. Local changes live in
 files. This script verifies the pristine files, applies the patches in
 manifest order with no fuzz and no offset, checks every patched file against
 its pinned digest, and writes the result into an output directory that the
-build compiles.
+build compiles. The output directory must be new, empty, or one this script
+staged before, and may not overlap the vendor tree; only files a previous
+stage recorded writing are ever deleted.
 
     python3 scripts/stage_quickjs_sources.py --out DIR
 """
@@ -21,7 +23,6 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import sys
 from typing import Dict, List, Tuple
 
@@ -33,6 +34,15 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 #: Repository-owned files in the vendor directory besides the upstream files
 #: and the patches.
 LOCAL_FILES = ("README.md", "manifest.json")
+#: What the build compiles, plus the license it must ship. Every header these
+#: reach through `#include "..."` must be pinned too (`validate_closure`), so a
+#: manifest and a directory that both drop a file still fail here, not in the
+#: C compiler.
+REQUIRED_FILES = ("LICENSE", "cutils.c", "dtoa.c", "libregexp.c", "libunicode.c", "quickjs.c")
+LOCAL_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
+#: `stage` records what it wrote here, and only ever replaces a directory that
+#: holds exactly that record and those files.
+STAGE_RECORD = ".stage_quickjs_sources.json"
 
 
 class StageError(RuntimeError):
@@ -163,14 +173,31 @@ def validate_inventory(vendor_dir: Path, sources: QuickJsSources) -> None:
         raise StageError(f"inventory drift: undeclared={extras or 'none'} missing={missing or 'none'}")
 
 
-def parse_patch(text: str) -> List[Tuple[str, List[Tuple[int, List[str], List[str]]]]]:
-    """Unified diff -> [(file, [(old_start, old_lines, new_lines)])].
+Hunk = Tuple[int, int, List[str], List[str]]
+
+
+def validate_closure(tree: Dict[str, bytes]) -> None:
+    """The compiled sources and every header they include are in the tree."""
+    missing = sorted(name for name in REQUIRED_FILES if name not in tree)
+    if missing:
+        raise StageError(f"manifest lacks required engine files: {missing}")
+    for name, data in sorted(tree.items()):
+        if not name.endswith((".c", ".h")):
+            continue
+        for include in LOCAL_INCLUDE_RE.findall(data):
+            header = include.decode("utf-8")
+            if header not in tree:
+                raise StageError(f"{name} includes {header}, which the manifest does not pin")
+
+
+def parse_patch(text: str) -> List[Tuple[str, List[Hunk]]]:
+    """Unified diff -> [(file, [(old_start, new_start, old_lines, new_lines)])].
 
     Text before the first `---` header is the patch description. Line endings
     are kept on each line so that applying is byte exact.
     """
     lines = text.splitlines(keepends=True)
-    files: List[Tuple[str, List[Tuple[int, List[str], List[str]]]]] = []
+    files: List[Tuple[str, List[Hunk]]] = []
     index = 0
     while index < len(lines) and not lines[index].startswith("--- "):
         index += 1
@@ -185,13 +212,14 @@ def parse_patch(text: str) -> List[Tuple[str, List[Tuple[int, List[str], List[st
         if not old_name.startswith("a/") or new_name != "b/" + old_name[2:]:
             raise StageError(f"patch must modify one file in place: {old_name} -> {new_name}")
         index += 2
-        hunks: List[Tuple[int, List[str], List[str]]] = []
+        hunks: List[Hunk] = []
         while index < len(lines) and lines[index].startswith("@@ "):
             match = HUNK_RE.match(lines[index])
             if not match:
                 raise StageError(f"malformed hunk header at line {index + 1}")
             old_start = int(match.group(1))
             old_count = int(match.group(2) or "1")
+            new_start = int(match.group(3))
             new_count = int(match.group(4) or "1")
             index += 1
             old: List[str] = []
@@ -215,22 +243,36 @@ def parse_patch(text: str) -> List[Tuple[str, List[Tuple[int, List[str], List[st
                 raise StageError(f"hunk line counts disagree with its header near line {index}")
             if index < len(lines) and lines[index].startswith("\\"):
                 raise StageError("patches must not touch a file's final newline")
-            hunks.append((old_start, old, new))
+            hunks.append((old_start, new_start, old, new))
         if not hunks:
             raise StageError(f"patch for {old_name} has no hunks")
         files.append((old_name[2:], hunks))
     return files
 
 
-def apply_hunks(name: str, data: bytes, hunks: List[Tuple[int, List[str], List[str]]]) -> bytes:
-    """Apply hunks exactly where their headers say; any mismatch fails."""
+def _position(start: int, lines: List[str]) -> int:
+    """0-based index a hunk side begins at; an empty side names the line before."""
+    return start - 1 if lines else start
+
+
+def apply_hunks(name: str, data: bytes, hunks: List[Hunk]) -> bytes:
+    """Apply hunks exactly where their headers say; any mismatch fails.
+
+    Both sides of every header must agree with the line-count change of the
+    hunks before it, and no hunk may start past the end of the file.
+    """
     lines = data.decode("utf-8").splitlines(keepends=True)
     shift = 0
     last_end = 0
-    for old_start, old, new in hunks:
-        start = old_start - 1 + shift if old else old_start + shift
+    for old_start, new_start, old, new in hunks:
+        old_pos = _position(old_start, old)
+        if _position(new_start, new) != old_pos + shift:
+            raise StageError(f"{name}: hunk at line {old_start} has new start {new_start}, expected the old start shifted by {shift}")
+        start = old_pos + shift
         if start < last_end:
             raise StageError(f"{name}: hunks overlap or are out of order")
+        if start > len(lines):
+            raise StageError(f"{name}: hunk at line {old_start} starts past the end of the file")
         if lines[start:start + len(old)] != old:
             raise StageError(f"{name}: hunk at line {old_start} does not apply exactly")
         lines[start:start + len(old)] = new
@@ -261,17 +303,61 @@ def build_tree(vendor_dir: Path, sources: QuickJsSources) -> Dict[str, bytes]:
         actual = sha256_bytes(tree[name])
         if actual != digest:
             raise StageError(f"patched {name} sha256 drift: expected {digest}, got {actual}")
+    validate_closure(tree)
     return tree
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
+
+
+def _prepare_out_dir(vendor_dir: Path, out_dir: Path) -> None:
+    """Make `out_dir` an empty directory without deleting anything not ours.
+
+    The output may not be the vendor tree, inside it, or one of its parents
+    (which include the repository root). An existing directory is accepted
+    only when it is empty or holds exactly what a previous `stage` recorded
+    writing, and then only those files are removed.
+    """
+    vendor = vendor_dir.resolve()
+    if _overlaps(out_dir.resolve(), vendor):
+        raise StageError(f"refusing output directory {out_dir}: it overlaps the vendor tree {vendor}")
+    if out_dir.is_symlink() or (out_dir.exists() and not out_dir.is_dir()):
+        raise StageError(f"refusing output directory {out_dir}: not a plain directory")
+    if not out_dir.exists():
+        out_dir.mkdir(parents=True)
+        return
+    entries = {entry.name: entry for entry in out_dir.iterdir()}
+    if not entries:
+        return
+    record = entries.get(STAGE_RECORD)
+    try:
+        written = json.loads(record.read_text(encoding="utf-8")) if record is not None else None
+    except (OSError, ValueError):
+        written = None
+    if not isinstance(written, list) or not all(isinstance(name, str) for name in written):
+        raise StageError(f"refusing output directory {out_dir}: not empty and not written by this script")
+    foreign = sorted(set(entries) - set(written) - {STAGE_RECORD})
+    if foreign:
+        raise StageError(f"refusing output directory {out_dir}: it holds files this script did not write: {foreign}")
+    for name in written:
+        entry = entries.get(name)
+        if entry is None:
+            continue
+        if entry.is_symlink() or not entry.is_file():
+            raise StageError(f"refusing output directory {out_dir}: {name} is not a regular file")
+        entry.unlink()
+    record.unlink()
 
 
 def stage(vendor_dir: Path, out_dir: Path) -> QuickJsSources:
     sources = QuickJsSources.load(vendor_dir / "manifest.json")
     tree = build_tree(vendor_dir, sources)
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True)
+    _prepare_out_dir(vendor_dir, out_dir)
     for name, data in sorted(tree.items()):
         (out_dir / name).write_bytes(data)
+    record = json.dumps(sorted(tree), indent=2) + "\n"
+    (out_dir / STAGE_RECORD).write_text(record, encoding="utf-8")
     return sources
 
 

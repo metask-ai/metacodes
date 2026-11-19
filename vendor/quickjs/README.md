@@ -45,7 +45,8 @@ python3 scripts/verify_quickjs_sources.py
 
 This runs in `zig build test:units`, and therefore in `zig build test` and
 `gate:pr`. It checks file and patch hashes, that the directory holds exactly the
-declared files, that the patches apply exactly, and the patched digests.
+declared files, that the compiled sources and every header they include are
+pinned, that the patches apply exactly, and the patched digests.
 To prove provenance against the official archive (offline, nothing
 downloaded):
 
