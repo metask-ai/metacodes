@@ -21,6 +21,10 @@ import urllib.request
 from typing import Dict, List, Optional
 
 BASE = os.environ.get("ALFWORLD_URL", "http://alfworld-env:8080").rstrip("/")
+# The environment is a sibling service on the task's own Docker network. A
+# proxy injected into the container (HTTP_PROXY) cannot resolve its service
+# name, so this client never uses one.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def call(method: str, path: str, payload: Optional[Dict[str, object]] = None, attempts: int = 30) -> Dict[str, object]:
@@ -29,7 +33,7 @@ def call(method: str, path: str, payload: Optional[Dict[str, object]] = None, at
     for _ in range(attempts):
         request = urllib.request.Request(BASE + path, data=data, method=method, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            with OPENER.open(request, timeout=600) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             body = json.loads(error.read().decode("utf-8") or "{}")

@@ -889,6 +889,18 @@ class AlfworldTest(TaskChecks):
         spec_path.write_text(json.dumps(spec))
         return self.grader.grade(spec_path, self.tmp / "var/result.json")[0]
 
+    def test_cli_reaches_the_sidecar_with_a_container_proxy_set(self) -> None:
+        # Docker injects HTTP_PROXY into task containers when the executor
+        # routes egress through a proxy; the proxy cannot resolve the
+        # sidecar's service name and answered HTTP 500 to every call.
+        spec = {"task_id": "alfworld-demo", "game_sha256": "ab" * 32, "max_steps": 5}
+        _episode, base = self._serve(spec, "secret")
+        dead = "http://127.0.0.1:9"
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": dead, "http_proxy": dead, "NO_PROXY": "", "no_proxy": ""}):
+            code, out = self._cli(base, "look")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Your task is to: open the door.", out)
+
     def test_agent_play_through_cli_and_verifier(self) -> None:
         spec = {"task_id": "alfworld-demo", "game_sha256": "ab" * 32, "max_steps": 5}
         episode, base = self._serve(spec, "secret")
