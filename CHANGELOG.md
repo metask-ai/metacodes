@@ -337,10 +337,14 @@ status, compatibility boundaries, and entry points are defined by
   `/v1beta/models`; the standard `data` array or an enriched `models` map), at
   a terminal lets you pick, and writes the limits it reports; `providers
   probe` lists without storing. With no arguments at a terminal, `add` asks
-  for each part. `--replace` changes an existing one and keeps what was
-  written by hand. `providers remove` takes the definition, its settings, its
-  stored key and login, and a default on one of its models. Each change
-  applies from the next start, and the commands say so.
+  for each part. A server on this machine that needs no key (Ollama, vLLM)
+  gets the placeholder `none` stored as its key when you answer "none" (or
+  press Enter at `--probe`'s key prompt): a provider with no key does not
+  start, and such a server ignores it. `--replace` changes an existing one
+  and keeps what was written by hand. `providers remove` takes the
+  definition, its settings, its stored key and login, and a default on one of
+  its models. Each change applies from the next start, and the commands say
+  so.
 
 - **A provider of your own takes a pasted key.** `/login <id>` and `metacodes
   login --provider <id>` now work for a provider defined in

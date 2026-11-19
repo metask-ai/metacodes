@@ -6,7 +6,9 @@
 //! - is checked at its default channel's model listing, sent the way its
 //!   requests send it (an Anthropic listing gets `anthropic-version`), stored
 //!   in `keys/<id>.json` with no page, and carried by its next request; a
-//!   refused key stores nothing.
+//!   refused key stores nothing;
+//! - a start on one with no key says to store one with `login --provider`,
+//!   with no page to open, and that a server that needs none takes `none`.
 //!
 //! `metacodes providers add|probe|list|remove`:
 //! - `add` writes the definition a person would write into
@@ -325,6 +327,23 @@ test "a key for an Anthropic-speaking provider is checked at its listing with th
     try testing.expect(case.exists("state/keys/claude-relay.json"));
 }
 
+test "a start on a provider of one's own with no key says how to store one, with no page to open" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    // Nothing listens there: the start stops before any request.
+    try defineByHand(&case, "lan",
+        \\{"channels":[{"id":"openai","base_url":"http://127.0.0.1:9/v1","protocol":"openai_chat"}],"models":[{"request_model_id":"m1"}]}
+    );
+    const started = try case.run(&.{}, &.{ "--provider", "lan", "--model", "m1", "-p", "hi" });
+    try started.expectExit(1);
+    try expectContains(started.stderr, "Authentication required for provider 'lan'.");
+    // Its key comes from whoever runs it, and a server that needs none
+    // takes the placeholder `providers add` stores for one.
+    try expectContains(started.stderr, "login --provider lan   (stores a key you paste; for a server that needs none, paste `none`)");
+    try expectAbsent(started.stderr, "opens the page");
+}
+
 // ── metacodes providers ──────────────────────────────────────────────────────
 
 test "providers add writes what a person would write, keeps the rest of config.json, and --check-providers routes it" {
@@ -342,8 +361,10 @@ test "providers add writes what a person would write, keeps the rest of config.j
     const added = try case.run(&.{}, &.{ "providers", "add", "relay", "--base-url", "https://relay.example.com/v1/", "--protocol", "openai_chat", "--model", "glm-4.6", "--model", "kimi-k2", "--display-name", "House relay" });
     try added.expectExit(0);
     try expectContains(added.stderr, "Added relay in ");
-    try expectContains(added.stderr, "This takes effect at the next start");
+    // No key yet: a start on it, and /model, wait for one.
+    try expectContains(added.stderr, "This takes effect at the next start, once it has a key");
     try expectContains(added.stderr, "login --provider relay");
+    try expectContains(added.stderr, "For a server on this machine that needs none, paste `none`.");
 
     const relay = try case.defined("relay");
     try testing.expectEqualStrings("House relay", try stringAt(relay, "display_name"));

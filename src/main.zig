@@ -4237,7 +4237,16 @@ fn printProviderCredentialHelp(
                 .{profile.id.slice()},
             );
             if (profile.api_key_setup) |setup| {
-                std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
+                // A provider the user defined has no page: its key comes from
+                // whoever runs it (`KeyPage.url`).
+                const opens_page = for (setup.pages) |page| {
+                    if (page.url != null) break true;
+                } else false;
+                if (opens_page) {
+                    std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
+                } else {
+                    std.debug.print("  {s} login --provider {s}   (stores a key you paste; for a server that needs none, paste `{s}`)\n", .{ command, profile.id.slice(), @import("app/providers_cli.zig").no_key_placeholder });
+                }
                 if (setup.note) |note| std.debug.print("  {s}\n", .{note});
             }
             for (profile.accepted_credential_kinds) |kind| {

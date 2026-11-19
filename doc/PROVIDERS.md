@@ -195,7 +195,7 @@ every metacodes write does).
 
 **The change applies from the next start.** A running session read its
 providers when it started; start metacodes again to see the new one in
-`/model`.
+`/model`, which lists a provider once it has a key ([below](#its-key)).
 
 What `add` writes is what you would write by hand (the full schema, with
 prices, limits, controls and endpoint policies, is in
@@ -238,7 +238,11 @@ Three ways, depending on the endpoint:
    provider reads (`OPENAI_API_KEY`, say) is refused, because a key there
    would then go to both.
 3. **None**, for a server on this machine that wants no key (Ollama, vLLM
-   without `--api-key`).
+   without `--api-key`). metacodes sends a key with every request, and a
+   provider with none does not start, so the placeholder `none` is stored in
+   its place; such a server ignores it. Choose "none" when `add` asks for each
+   part, or press Enter when `add --probe` asks for the key. Afterwards,
+   `metacodes login --provider <id>` and paste `none`.
 
 `--auth` says how the key is sent: `bearer` (the default: `Authorization:
 Bearer <key>`; a provider that speaks only `gemini_generate_content` defaults
@@ -311,7 +315,9 @@ metacodes providers add my-relay --display-name "My relay" \
 metacodes login --provider my-relay
 ```
 
-**Ollama on this machine.** No key; plain `http` to `127.0.0.1` is allowed.
+**Ollama on this machine.** It wants no key: press Enter when the probe asks
+for one, and the placeholder `none` is stored in its place. Plain `http` to
+`127.0.0.1` is allowed.
 
 ```sh
 metacodes providers add ollama --base-url http://127.0.0.1:11434/v1 --protocol openai_chat --probe
@@ -374,7 +380,7 @@ does.
 | `… could not be reached (RequestFailed)` | The address is wrong, the server is not running, or the network blocks it. |
 | `a key is stored for '<id>' (…), and it would now go to <address>.` | `--replace` was given a new host. `metacodes logout --provider <id>` first, then replace. |
 | `warning: part of <state root>/config.json did not apply (…)` at start, then `unknown provider '<id>'` | A definition you edited by hand does not load. `metacodes --check-providers` names the reason. |
-| The provider is not in `/model` | It was added while the session was running: start metacodes again. |
+| The provider is not in `/model` | It has no key yet: `/model` lists a provider once it has one ([Its key](#its-key); a server that needs none takes `none`). Or it was added while the session was running: start metacodes again. |
 
 ## Which one a start uses
 

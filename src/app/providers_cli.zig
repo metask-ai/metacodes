@@ -76,8 +76,9 @@ const HELP = USAGE ++
     \\                  addresses work with or without their /v1 or /v1beta.
     \\  --model         A model to offer; repeat it.
     \\  --probe         Ask the endpoint which models it serves. At a terminal you pick
-    \\                  from the list (and paste the key, if it wants one); elsewhere
-    \\                  give --model and the probe checks the ids.
+    \\                  from the list (and paste the key; Enter, for a server on this
+    \\                  machine that needs none, stores the placeholder `none`);
+    \\                  elsewhere give --model and the probe checks the ids.
     \\  --display-name  What /model calls it (the id otherwise).
     \\  --key-env       The variable its key is read from, in your shell or in
     \\                  <state root>/.env. Or store the key with
@@ -165,10 +166,20 @@ const AddArgs = struct {
     subscription_plan: bool = false,
     /// A key pasted at a terminal: for the probe, then stored.
     pasted_key: ?[]const u8 = null,
+    /// The server needs no key: the step-by-step `add`'s "none", or Enter at
+    /// the probe's key prompt. `no_key_placeholder` goes in its place, to the
+    /// probe and into the key file.
+    no_key: bool = false,
     /// The key question was answered already (the step-by-step `add`): the
     /// probe asks no second time, even when the answer was "none".
     key_answered: bool = false,
 };
+
+/// What a provider whose server needs no key (Ollama, vLLM started without
+/// `--api-key`) stores as its key. A request is bound only with a credential,
+/// so a provider without one does not start and `/model` does not list it;
+/// such a server ignores the `Authorization` header this is sent in.
+pub const no_key_placeholder = "none";
 
 /// The channel id of the channel speaking `wire`. One per wire, named by it,
 /// so adding a second protocol later never renames the first channel (offer
@@ -449,7 +460,9 @@ const Cli = struct {
                     std.debug.print("{s} lists {d} model(s).\n", .{ result.url.?, listing.models.len + listing.dropped });
                 },
                 .refused => |status| {
-                    if (key != null) {
+                    if (args.no_key) {
+                        std.debug.print("error: {s} answered {d}: it wants a real key (it refused the placeholder `{s}`); nothing was written. Paste its key, or give it with --key-env <VAR>.\n", .{ result.url.?, status, no_key_placeholder });
+                    } else if (key != null) {
                         std.debug.print("error: {s} answered {d}: it refused the key; nothing was written. Check the key, and how it is sent ({s}; --auth changes it).\n", .{ result.url.?, status, authText(arena, sent_with) });
                     } else {
                         std.debug.print("error: {s} answered {d}: it wants a key; nothing was written. Give it with --key-env <VAR>, or run this at a terminal to paste it.\n", .{ result.url.?, status });
@@ -536,7 +549,16 @@ const Cli = struct {
 
         // A key pasted for the probe was checked by it; it is stored only now
         // that the definition it belongs to exists.
-        if (args.pasted_key) |key| {
+        var keyless = false;
+        if (args.no_key) {
+            // Nothing secret to confirm: the placeholder is stored whether or
+            // not a probe ran, or the provider would not start.
+            api_key_store.save(self.gpa, self.state_root, id, .api_key, no_key_placeholder, null, time.nowUnix()) catch |err| {
+                std.debug.print("warning: the placeholder key was not stored ({s}); store `{s}` with `{s} login --provider {s}`\n", .{ @errorName(err), no_key_placeholder, self.command, id_text });
+                return 1;
+            };
+            std.debug.print("Stored the placeholder `{s}` as its key in {s}: metacodes sends a key with every request, and a server that needs none ignores it.\n", .{ no_key_placeholder, self.keyPath(id) });
+        } else if (args.pasted_key) |key| {
             if (listed == null) {
                 std.debug.print("The pasted key was not stored: the endpoint did not confirm it. Store it with `{s} login --provider {s}`.\n", .{ self.command, id_text });
             } else {
@@ -549,9 +571,10 @@ const Cli = struct {
         } else if (args.key_env) |name| {
             std.debug.print("Its key is read from {s}: in your shell, or in {s}.\n", .{ name, self.envPath() });
         } else if (existing == null and !self.storedKeyExists(id)) {
-            std.debug.print("It has no key yet: `{s} login --provider {s}` stores one (or add --key-env <VAR> with --replace). A local server may need none.\n", .{ self.command, id_text });
+            keyless = true;
+            std.debug.print("It has no key yet: `{s} login --provider {s}` stores one (or add --key-env <VAR> with --replace). For a server on this machine that needs none, paste `{s}`.\n", .{ self.command, id_text, no_key_placeholder });
         }
-        std.debug.print("This takes effect at the next start: `{s} --provider {s}`, or choose it in /model. `{s} --check-providers` lists its routes without a request.\n", .{ self.command, id_text, self.command });
+        std.debug.print("This takes effect at the next start{s}: `{s} --provider {s}`, or choose it in /model. `{s} --check-providers` lists its routes without a request.\n", .{ if (keyless) ", once it has a key" else "", self.command, id_text, self.command });
         return 0;
     }
 
@@ -560,6 +583,7 @@ const Cli = struct {
     /// terminal one the user pastes. Null asks without one.
     fn probeKey(self: Cli, args: *AddArgs, existing: ?*const profile_mod.ProviderProfile) !?ResolvedKey {
         if (args.pasted_key) |key| return .{ .secret = key, .from = "the pasted key" };
+        if (args.no_key) return placeholderKey();
         if (args.key_env) |name| {
             if (self.variable(name)) |found| return found;
             std.debug.print("warning: {s} is not set in your shell or in {s}; the probe goes without a key\n", .{ name, self.envPath() });
@@ -575,10 +599,18 @@ const Cli = struct {
         };
         std.debug.print("\n", .{});
         const key = std.mem.trim(u8, buffer[0..len], " \t\r\n");
-        if (key.len == 0) return null;
+        if (key.len == 0) {
+            args.no_key = true;
+            std.debug.print("No key, then: the placeholder `{s}` stands in for one (a server that needs none ignores it).\n", .{no_key_placeholder});
+            return placeholderKey();
+        }
         const owned = try self.arena.dupe(u8, key);
         args.pasted_key = owned;
         return .{ .secret = owned, .from = "the pasted key" };
+    }
+
+    fn placeholderKey() ResolvedKey {
+        return .{ .secret = no_key_placeholder, .from = "the placeholder " ++ no_key_placeholder };
     }
 
     // ── probe ────────────────────────────────────────────────────────────
@@ -803,7 +835,7 @@ const Cli = struct {
             parts.print(arena, "{s}stored in {s}{s}", .{ if (parts.items.len > 0) "; " else "", self.keyPath(profile.id), if (used) " (not used while a variable is set)" else ", used" }) catch {};
             used = true;
         }
-        if (parts.items.len == 0) return std.fmt.allocPrint(arena, "none (`{s} login --provider {s}` stores one; a local server may need none)", .{ self.command, profile.id.slice() }) catch "none";
+        if (parts.items.len == 0) return std.fmt.allocPrint(arena, "none (`{s} login --provider {s}` stores one; for a server that needs none, paste `{s}`)", .{ self.command, profile.id.slice(), no_key_placeholder }) catch "none";
         return parts.items;
     }
 
@@ -890,7 +922,7 @@ const Cli = struct {
             }
             if (!ok) args.channels.clearRetainingCapacity();
         }
-        std.debug.print("Key:\n  1. paste it now (stored in {s}/keys/{s}.json)\n  2. read it from a variable (in your shell, or in {s})\n  3. none (a server on this machine that needs none)\n", .{ self.state_root, args.id.?, self.envPath() });
+        std.debug.print("Key:\n  1. paste it now (stored in {s}/keys/{s}.json)\n  2. read it from a variable (in your shell, or in {s})\n  3. none (a server on this machine that needs none; the placeholder `{s}` is stored in its place)\n", .{ self.state_root, args.id.?, self.envPath(), no_key_placeholder });
         var key_choice: usize = 0;
         while (key_choice == 0) {
             const answer = ask(arena, "Choose [1-3]: ") orelse return 130;
@@ -922,7 +954,7 @@ const Cli = struct {
                 args.key_env = chosen;
                 break;
             },
-            else => {},
+            else => args.no_key = true,
         }
         args.key_answered = true;
         const probe_answer = ask(arena, "Ask the endpoint which models it serves? [Y/n]: ") orelse return 130;
@@ -1110,7 +1142,7 @@ pub fn isDefined(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) bool 
 }
 
 const ResolvedKey = struct {
-    /// In the command's arena.
+    /// In the command's arena, or `no_key_placeholder`.
     secret: []const u8,
     /// Where it came from, for the line that says what the probe sent.
     from: []const u8,

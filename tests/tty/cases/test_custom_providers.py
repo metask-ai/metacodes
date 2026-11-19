@@ -5,8 +5,9 @@
 models it serves and lets the user pick. `/login <id>` and
 `metacodes login --provider <id>` take a pasted key for it with no page to
 open, check it at the endpoint's model listing, and store it in the
-provider's own key file. A local mock stands in for the relay; nothing goes
-anywhere else. The non-terminal paths are covered by
+provider's own key file. A server that needs no key gets the placeholder
+`none` in its place, so it starts. A local mock stands in for the relay;
+nothing goes anywhere else. The non-terminal paths are covered by
 tests/component/custom_providers_cli_test.zig.
 """
 import http.server
@@ -29,6 +30,11 @@ MODELS = {"object": "list", "data": [
     {"id": "kimi-k2", "name": "Kimi K2"},
     {"id": "qwen3-coder-plus"},
 ]}
+CHAT_SSE = (
+    'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"KEYLESS_REPLY"},"finish_reason":null}]}\n\n'
+    'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
+    'data: [DONE]\n\n'
+).encode()
 
 
 class _Relay(http.server.BaseHTTPRequestHandler):
@@ -40,7 +46,8 @@ class _Relay(http.server.BaseHTTPRequestHandler):
         if not self.path.startswith("/v1/models"):
             self.send_error(404)
             return
-        ok = self.headers.get("authorization") == f"Bearer {GOOD_KEY}"
+        # A server that needs no key (Ollama) answers whatever comes.
+        ok = self.server.keyless or self.headers.get("authorization") == f"Bearer {GOOD_KEY}"
         body = json.dumps(MODELS if ok else {"error": {"message": "invalid key"}}).encode("utf-8")
         self.send_response(200 if ok else 401)
         self.send_header("content-type", "application/json")
@@ -48,6 +55,20 @@ class _Relay(http.server.BaseHTTPRequestHandler):
         self.send_header("connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("content-length") or 0)
+        self.rfile.read(length)
+        self.server.seen.append((self.path, self.headers.get("authorization")))
+        if not (self.server.keyless and self.path.startswith("/v1/chat/completions")):
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(CHAT_SSE)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(CHAT_SSE)
 
 
 class _Case:
@@ -59,6 +80,7 @@ class _Case:
         os.makedirs(self.state, exist_ok=True)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Relay)
         self.server.seen = []
+        self.server.keyless = False
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         return self
 
@@ -97,6 +119,18 @@ class _Case:
             assert mode == 0o600, f"key file mode {oct(mode)}, expected 0o600"
         with open(os.path.join(self.state, "config.json")) as f:
             assert key not in f.read(), "the key leaked into config.json"
+
+    def assert_placeholder_stored(self):
+        """The key file holds the placeholder a server that needs no key gets."""
+        path = os.path.join(self.state, "keys", "relay.json")
+        assert os.path.exists(path), f"no key file at {path}"
+        with open(path) as f:
+            document = json.load(f)
+        assert document["key"] == "none" and document["kind"] == "api_key", document
+        assert "page" not in document, "the placeholder names no page"
+
+    def chats(self):
+        return [auth for path, auth in self.server.seen if path.startswith("/v1/chat/completions")]
 
     def env(self):
         env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
@@ -199,6 +233,78 @@ def test_add_with_probe_at_a_terminal_takes_the_key_and_the_pick(bin_path):
         # Enter takes every listed model.
         assert [m["request_model_id"] for m in case.definition()["models"]] == ["glm-4.6", "kimi-k2", "qwen3-coder-plus"]
         case.assert_stored(GOOD_KEY)
+
+
+def test_add_for_a_server_that_needs_no_key_stores_the_placeholder_and_the_provider_starts(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI prompts are driven over a POSIX pty here")
+    with _Case() as case:
+        case.server.keyless = True
+        code, out = _cli(os.path.abspath(bin_path), ["--state-dir", case.state, "providers", "add"], case.env(), [
+            ("Id (lowercase, e.g. my-relay): ", "relay\r"),
+            ("Display name (Enter: relay): ", "House relay\r"),
+            ("Base URL (https://", case.base() + "\r"),
+            ("Choose (several: 1,3): ", "1\r"),
+            ("Choose [1-3]: ", "3\r"),
+            ("Ask the endpoint which models it serves? [Y/n]: ", "\r"),
+            ("Add which?", "1\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "Stored the placeholder `none` as its key" in text, text
+        assert "It has no key yet" not in text, text
+        # The probe sent the placeholder the way every request will.
+        assert case.checks() == ["Bearer none"], case.checks()
+        case.assert_placeholder_stored()
+        # And a start on it runs: with no key it stopped at
+        # "Authentication required for provider 'relay'".
+        code, out = _cli(os.path.abspath(bin_path), [
+            "--state-dir", case.state, "--provider", "relay", "--model", "glm-4.6", "-p", "hi",
+        ], case.env(), [])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "KEYLESS_REPLY" in text, text
+        assert case.chats() == ["Bearer none"], case.server.seen
+
+
+def test_enter_at_the_probe_key_prompt_sends_and_stores_the_placeholder(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI prompts are driven over a POSIX pty here")
+    with _Case() as case:
+        case.server.keyless = True
+        code, out = _cli(os.path.abspath(bin_path), [
+            "--state-dir", case.state, "providers", "add", "relay",
+            "--base-url", case.base(), "--protocol", "openai_chat", "--probe",
+        ], case.env(), [
+            ("Enter if it needs none): ", "\r"),
+            ("Add which?", "\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "the placeholder `none` stands in for one" in text, text
+        assert case.checks() == ["Bearer none"], case.checks()
+        case.assert_placeholder_stored()
+
+
+def test_a_relay_that_wants_a_key_refuses_the_placeholder_and_nothing_is_written(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI prompts are driven over a POSIX pty here")
+    with _Case() as case:
+        code, out = _cli(os.path.abspath(bin_path), [
+            "--state-dir", case.state, "providers", "add", "relay",
+            "--base-url", case.base(), "--protocol", "openai_chat", "--probe",
+        ], case.env(), [
+            ("Enter if it needs none): ", "\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert "it wants a real key (it refused the placeholder `none`); nothing was written" in text, text
+        assert case.checks() == ["Bearer none"], case.checks()
+        assert not os.path.exists(os.path.join(case.state, "keys", "relay.json")), "a refused placeholder was stored"
+        config = os.path.join(case.state, "config.json")
+        if os.path.exists(config):
+            with open(config) as f:
+                assert "relay" not in json.load(f).get("custom_providers", {}), "a refused add wrote its definition"
 
 
 def test_cli_login_takes_a_pasted_key_for_a_provider_of_ones_own(bin_path):
