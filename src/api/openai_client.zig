@@ -388,7 +388,14 @@ pub const OpenAIClient = struct {
             const callback = self.refresh_fn orelse return error.Unauthorized;
             const ctx = self.refresh_ctx orelse return error.Unauthorized;
             const stale = self.credential.lendable() orelse return error.Unauthorized;
+            // As in `Client.refreshExpiredToken`: a token refreshed while the
+            // route moved is for the route the request was sent on, not this one.
+            const sent_to = self.base_url orelse "";
             const token = callback(ctx, stale) catch return error.Unauthorized;
+            if (self.refresh_fn == null or !std.mem.eql(u8, sent_to, self.base_url orelse "")) {
+                secureFree(self.allocator, token);
+                return error.Unauthorized;
+            }
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
                 return error.Unauthorized;
@@ -492,6 +499,9 @@ pub const OpenAIClient = struct {
             // req_ptr.* 未初始化, errdefer destroy 即可
             return client_mod.requestSetupFailure("openai", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);
