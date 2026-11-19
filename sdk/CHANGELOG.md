@@ -124,6 +124,13 @@ empty `### Migration`.
   effort. `kimi-for-coding-highspeed` and the Moonshot open platform's
   models send the bytes they did. No ABI change.
 
+### Migration
+
+- Pin the revision-29 library, manifest, header and SDK together. Initialize
+  `RuntimeConfigV1.preview` to 0 for stable behavior, or 1 to admit preview
+  features. The remaining `reserved[2]` must stay zero; a revision-28 binary
+  cannot consume this setting despite the unchanged struct size.
+
 ## 0.15.0 — 2026-11-13
 
 ### Added
@@ -200,11 +207,6 @@ empty `### Migration`.
   of a `model_error` after a resend that succeeds are unchanged. No ABI change.
 
 ### Migration
-
-- Pin the revision-29 library, manifest, header and SDK together. Initialize
-  `RuntimeConfigV1.preview` to 0 for stable behavior, or 1 to admit preview
-  features. The remaining `reserved[2]` must stay zero; a revision-28 binary
-  cannot consume this setting despite the unchanged struct size.
 
 - ABI revision 27. The Session Control table grows from 80 to 88 bytes with
   `rewind_to_user_message` as its last slot, and discovery requires it, so a
