@@ -1,7 +1,8 @@
 """Durable, shell-free launch requests for the Bench workbench.
 
-Only server-configured bundles and provider configurations can run. Browser
-requests select a model and task names; credentials stay in the server's
+Only server-configured bundles, published metacodes releases and provider
+configurations can run. Browser requests select a model, task names and
+optionally a release version; credentials stay in the server's
 environment. Each launch has its own worker so HTTP restarts do not stop jobs.
 """
 from __future__ import annotations
@@ -19,7 +20,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor.command import check_bundle
-from scripts.eval.harbor.viewer import data
+from scripts.eval.harbor.viewer import data, releases
 from scripts.eval.harbor.viewer.account import Account
 
 DATASET = "terminal-bench/terminal-bench-2-1"
@@ -70,6 +71,7 @@ class RunManager:
         self.jobs_dir = Path(jobs_dir).expanduser().resolve()
         self.config_path = Path(config_path).expanduser().resolve()
         self.records = self.jobs_dir / ".bench-runs"
+        self.release_cache = self.config_path.parent / "releases"
         self.lock = threading.Lock()
         self.account_lock = threading.Lock()
         self.account_cache = None
@@ -121,10 +123,12 @@ class RunManager:
             reasons.append("未找到 Harbor，请在执行机器安装：uv tool install harbor==0.26.0")
         if not shutil.which("docker"):
             reasons.append("未找到 Docker；Harbor 任务需要 Docker 环境")
+        # Without a configured bundle, launches must name a release version.
         try:
-            check_bundle(Path(cfg.get("bundle") or "/nonexistent-metacodes-bundle"))
+            bundle_version = releases.bundle_version(check_bundle(Path(cfg.get("bundle") or "/nonexistent-metacodes-bundle")))
+            bundle_ready = True
         except ValueError:
-            reasons.append("请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本")
+            bundle_version, bundle_ready = None, False
         if not models and mode == "provider":
             reasons.append("请配置 --model，第三方网关同时设置 --provider-config")
         return {"service": "metacodes-bench", "schema_version": 1,
@@ -136,6 +140,8 @@ class RunManager:
                 "reasoning_effort": effort,
                 "warnings": warnings, "account_summary": account_summary,
                 "account_groups": account_groups,
+                "metacodes": {"bundle": bundle_ready, "bundle_version": bundle_version,
+                              "cached_versions": releases.cached(self.release_cache)},
                 "defaults": {"attempts": 1, "concurrency": 1}, "runs": self.runs()}
 
     def runs(self):
@@ -150,9 +156,9 @@ class RunManager:
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
     def launch(self, request):
-        allowed = {"model", "tasks", "attempts", "concurrency", "dataset"}
+        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "version"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 model、tasks、attempts、concurrency、dataset")
+            raise ValueError("只接受 model、tasks、attempts、concurrency、dataset、version")
         catalog = self.catalog()
         if not catalog["ready"]:
             raise ValueError("；".join(catalog["reasons"]))
@@ -171,6 +177,11 @@ class RunManager:
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, 3)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
+        version = request.get("version") or None
+        if version is not None:
+            releases.check_version(version)
+        elif not catalog["metacodes"]["bundle"]:
+            raise ValueError("请指定 metacodes 版本，或用 metacodes bench --bundle <Linux发行包目录> 配置默认版本")
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
@@ -181,11 +192,14 @@ class RunManager:
                 raise ValueError("账号模型目录已变化，请刷新后重试")
             name = "bench-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
             record = {"name": name, "status": "queued", "created_at": now(), "model": model,
+                      "metacodes_version": version or catalog["metacodes"]["bundle_version"],
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
-            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": cfg["bundle"],
+            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": None if version else cfg["bundle"],
+                    "version": version, "release_cache": str(self.release_cache),
+                    "release_base": cfg.get("release_base"),
                     "auth_mode": mode, "account_state_dir": cfg.get("account_state_dir") if mode == "metask" else None,
                     "account_gateway": cfg.get("account_gateway") if mode == "metask" else None,
                     "account_key_id": account_key_id,

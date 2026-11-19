@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
-from scripts.eval.harbor.viewer import data, server
+from scripts.eval.harbor.viewer import data, releases, server
 from scripts.eval.harbor.viewer.account import Account
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
@@ -639,6 +639,119 @@ class AccountInventoryTest(unittest.TestCase):
         catalog = account.catalog()
         self.assertEqual(catalog['account_summary'], {'groups': 3, 'available_groups': 2, 'models': 3})
         self.assertEqual(len(catalog['warnings']), 1)
+
+
+def release_server(root, version, *, corrupt=False):
+    """A local stand-in for GitHub Releases serving one Linux unit."""
+    import hashlib, io, tarfile
+    target = releases.linux_target()
+    name = f'metacodes-{version}-{target}.tar.gz'
+    unit = f'metacodes-{version}-{target}/'
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w:gz') as tar:
+        files = {rel: b'fake' for rel in BUNDLE_EXECUTABLES}
+        files['manifest.json'] = json.dumps({'target': {'os': 'linux'}, 'release': {'version': version}}).encode()
+        for rel, body in files.items():
+            info = tarfile.TarInfo(unit + rel)
+            info.size, info.mode = len(body), 0o755
+            tar.addfile(info, io.BytesIO(body))
+    archive = buffer.getvalue()
+    digest = hashlib.sha256(b'other' if corrupt else archive).hexdigest()
+    assets = {f'/download/{version}/{name}': archive,
+              f'/download/{version}/metacodes-{version}-SHA256SUMS': f'{digest}  {name}\n'.encode()}
+    hits = []
+
+    class Releases(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            body = assets.get(self.path)
+            self.send_response(200 if body is not None else 404)
+            self.send_header('Content-Length', str(len(body or b'')))
+            self.end_headers()
+            self.wfile.write(body or b'')
+
+        def log_message(self, *_args):
+            pass
+
+    http = ThreadingHTTPServer(('127.0.0.1', 0), Releases)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    return f'http://127.0.0.1:{http.server_address[1]}', http, hits
+
+
+@unittest.skipUnless(POSIX, 'fake executable and worker signal test are POSIX')
+class ReleaseVersionTest(unittest.TestCase):
+    # The same live service as WorkbenchTest, without rerunning its tests.
+    setUp = WorkbenchTest.setUp
+    request = WorkbenchTest.request
+
+    def use_release(self, version, **kwargs):
+        base, http, hits = release_server(self.root, version, **kwargs)
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        cfg = json.loads(self.manager.config_path.read_text())
+        atomic_json(self.manager.config_path, {**cfg, 'release_base': base})
+        return hits
+
+    def test_named_version_is_downloaded_verified_cached_and_reaches_harbor(self):
+        hits = self.use_release('9.8.7')
+        for _ in range(2):
+            run = self.client.request('api/runs', {**self.request(), 'version': '9.8.7'})
+            self.assertEqual(run['metacodes_version'], '9.8.7')
+            final = wait_run(self.manager, run['name'])
+            self.assertEqual(final['status'], 'finished', final)
+            argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+            bundle = Path(argv[argv.index('--ak') + 1].removeprefix('bundle='))
+            self.assertEqual(bundle, self.manager.release_cache / f'metacodes-9.8.7-{releases.linux_target()}')
+            self.assertTrue(os.access(bundle / 'bin' / 'metacodes', os.X_OK))
+        self.assertEqual(len([h for h in hits if h.endswith('.tar.gz')]), 1)
+        catalog = self.client.request('api/workbench')
+        self.assertEqual(catalog['metacodes']['cached_versions'], ['9.8.7'])
+        self.assertTrue(catalog['metacodes']['bundle'])
+
+    def test_checksum_mismatch_fails_the_run_with_a_reason_and_caches_nothing(self):
+        self.use_release('9.8.7', corrupt=True)
+        run = self.client.request('api/runs', {**self.request(), 'version': '9.8.7'})
+        final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('SHA-256', final['error'])
+        self.assertFalse((self.manager.jobs_dir / run['name']).exists())
+        self.assertEqual(releases.cached(self.manager.release_cache), [])
+
+    def test_missing_version_fails_the_run_with_a_reason(self):
+        self.use_release('9.8.7')
+        run = self.client.request('api/runs', {**self.request(), 'version': '1.2.3'})
+        final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('1.2.3', final['error'])
+
+    def test_malformed_versions_are_refused_before_spawn(self):
+        for version in ('../0.12.0', '0.12', '0.12.0;rm -rf /', '0.12.0/x', 12):
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, '版本'):
+                self.client.request('api/runs', {**self.request(), 'version': version})
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_without_a_bundle_a_launch_must_name_a_version(self):
+        cfg = json.loads(self.manager.config_path.read_text())
+        atomic_json(self.manager.config_path, {**cfg, 'bundle': None})
+        catalog = self.client.request('api/workbench')
+        self.assertTrue(catalog['ready'], catalog['reasons'])
+        self.assertFalse(catalog['metacodes']['bundle'])
+        with self.assertRaisesRegex(ValueError, '版本'):
+            self.client.request('api/runs', self.request())
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_archive_links_and_escaping_paths_are_refused(self):
+        import io, tarfile
+        for name, kind in (('../escape', tarfile.REGTYPE), ('/abs', tarfile.REGTYPE), ('unit/link', tarfile.SYMTYPE)):
+            with self.subTest(name=name):
+                archive = self.root / 'bad.tar.gz'
+                with tarfile.open(archive, 'w:gz') as tar:
+                    info = tarfile.TarInfo(name)
+                    info.type, info.linkname = kind, '/etc/passwd'
+                    tar.addfile(info, io.BytesIO(b''))
+                with self.assertRaisesRegex(ValueError, '不安全'):
+                    releases._extract(archive, self.root / 'out')
+                self.assertFalse((self.root / 'escape').exists())
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ metacodes bench info                    # dependencies, models and readiness
 metacodes bench list --json             # previous jobs and results
 metacodes bench stop                    # stop HTTP service; workers continue
 metacodes bench run --task fix-git --task cancel-async-tasks --wait
+metacodes bench run --version 0.12.0 --task fix-git --wait
 ```
 
 `run --wait` waits for the worker, returns its exit status (0 on successful
@@ -83,6 +84,23 @@ metacodes bench --bundle /path/to/linux-release \
   --provider-config /path/to/config.json \
   --model tokenjoy/GLM5.3-Flash --key-env TOKENJOY_API_KEY
 ```
+
+### Choose a metacodes version
+
+Each launch runs the bundle configured with `--bundle` unless it names a
+published release: the page's "metacodes 版本" field, `bench run --version
+X.Y.Z`, or `"version"` in an `api/runs` request. The worker then downloads
+`metacodes-<version>-<arch>-linux-gnu.tar.gz` for the execution machine's
+architecture from GitHub Releases, checks it against the release's
+`SHA256SUMS`, and keeps the unpacked unit under `<state root>/bench/releases/`.
+Later launches of the same version reuse it without downloading. A version
+that is malformed is refused before any worker starts; one that is missing,
+fails its checksum, or contains links or paths outside the unit fails the run
+with that reason, and nothing is cached. Without `--bundle`, every launch must
+name a version. `bench info` lists the default and already downloaded
+versions; each run records the version it used. Set `release_base` in
+`workbench.json` or `METACODES_RELEASE_BASE` to use a mirror with the same
+`download/<tag>/<asset>` layout.
 
 `--provider-config` is a native metacodes configuration with
 `custom_providers`; see [the Harbor adapter](../scripts/eval/harbor/README.md).

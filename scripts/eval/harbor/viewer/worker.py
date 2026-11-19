@@ -12,6 +12,7 @@ from pathlib import Path
 
 from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.viewer.account import Account
+from scripts.eval.harbor.viewer import releases
 from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
 
 
@@ -37,7 +38,10 @@ def command(spec):
 
 
 def prepare(spec, env):
-    """Resolve the account key and start the timing relay for one launch."""
+    """Resolve the bundle and account key, then start the timing relay."""
+    if spec.get("version"):
+        bundle = releases.bundle(spec["version"], spec["release_cache"], spec.get("release_base"))
+        spec = {**spec, "bundle": str(bundle)}
     if spec.get("auth_mode") == "metask":
         # Resolve the key belonging to this model's group, without
         # changing the interactive CLI selection or forwarding OAuth.
@@ -113,6 +117,8 @@ def main(argv=None):
             time.sleep(0.25)
         record.update(status="cancelled" if cancelled else ("finished" if process.returncode == 0 else "failed"),
                       exit_code=process.returncode, finished_at=now())
+    except releases.ReleaseError as exc:
+        record.update(status="failed", error=str(exc), finished_at=now())
     except Exception as exc:
         record.update(status="failed", error=type(exc).__name__, finished_at=now())
     finally:

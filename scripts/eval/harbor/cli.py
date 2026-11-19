@@ -138,6 +138,7 @@ def main(argv=None):
     parser.add_argument("--public-url", help="输出的工作台地址（用于 devbox 网络访问）")
     parser.add_argument("--no-open", action="store_true", help="仅输出链接，不打开浏览器")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--version", dest="metacodes_version", help="bench run 使用的 metacodes 发布版本（如 0.12.0）；默认用 --bundle 配置的发行包")
     parser.add_argument("--task", action="append", default=[], help="运行的任务名，可重复")
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
@@ -198,6 +199,10 @@ def main(argv=None):
                         print("  " + reason)
                     for model in value.get("models", []):
                         print("模型：" + model["id"])
+                    metacodes = value.get("metacodes") or {}
+                    print("默认 metacodes：" + (metacodes.get("bundle_version") or ("已配置发行包" if metacodes.get("bundle") else "未配置，运行时用 --version 指定")))
+                    if metacodes.get("cached_versions"):
+                        print("已下载版本：" + "、".join(metacodes["cached_versions"]))
             else:
                 value = client.request("api/jobs") if client else {"jobs": data.Library([jobs_dir]).overview()}
                 if not args.json:
@@ -214,8 +219,11 @@ def main(argv=None):
             if not args.task:
                 parser.error("bench run 需要 --task，可重复选择几道题")
             model = args.model or client.request("api/workbench").get("default_model")
-            record = client.request("api/runs", {"model": model, "tasks": args.task,
-                                    "attempts": args.attempts, "concurrency": args.concurrency})
+            payload = {"model": model, "tasks": args.task,
+                       "attempts": args.attempts, "concurrency": args.concurrency}
+            if args.metacodes_version:
+                payload["version"] = args.metacodes_version
+            record = client.request("api/runs", payload)
             url = client.url + "#/run/" + record["name"]
             if args.wait:
                 while record["status"] in ("queued", "starting", "running", "cancelling"):

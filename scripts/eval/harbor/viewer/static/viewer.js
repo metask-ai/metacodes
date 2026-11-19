@@ -227,6 +227,13 @@ async function renderNewRun() {
     h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
     c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
     c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null));
+  const mc = c.metacodes || {};
+  const version = h('input', { name: 'version', list: 'metacodes-versions', autocomplete: 'off',
+    required: !mc.bundle,
+    placeholder: mc.bundle ? '默认：' + (mc.bundle_version || '已配置的发行包') : '例如 0.12.0' });
+  form.append(h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), version,
+    h('datalist', { id: 'metacodes-versions' }, (mc.cached_versions || []).map((v) => h('option', { value: v }))),
+    h('small', { text: '填写发布版本号时，执行机器首次使用会从 GitHub Releases 下载对应 Linux 发行包并校验 SHA-256；留空使用 --bundle 配置的发行包。' })));
   const checks = (c.tasks || []).map((name) => h('label', { class: 'task-option' },
     h('input', { type: 'checkbox', value: name, name: 'task' }), h('span', { class: 'mono', text: name })));
   form.append(h('fieldset', {}, h('legend', { text: '试跑任务' }),
@@ -247,8 +254,10 @@ async function renderNewRun() {
     submit.disabled = true;
     feedback.textContent = '正在启动…';
     try {
-      const record = await api('/api/runs', { model: model.value, tasks: [...new Set(tasks)],
-        attempts: Number(attempts.value), concurrency: Number(concurrency.value) });
+      const request = { model: model.value, tasks: [...new Set(tasks)],
+        attempts: Number(attempts.value), concurrency: Number(concurrency.value) };
+      if (version.value.trim()) request.version = version.value.trim();
+      const record = await api('/api/runs', request);
       location.hash = '#/run/' + record.name;
     } catch (error) {
       feedback.textContent = error.message;
@@ -288,7 +297,7 @@ async function renderRun(name) {
     catch (_) { event.currentTarget.textContent = '请复制下方链接'; }
   } }, '复制结果链接');
   const summary = h('div', { class: 'panel-body run-state' },
-    h('p', { text: `${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}` }),
+    h('p', { text: `${run.model} · metacodes ${run.metacodes_version || '—'} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}` }),
     h('p', { class: 'muted', text: run.error || (state.live ? '运行中，页面每 10 秒更新。' : '执行已结束，逐题结果和轨迹已保留。') }),
     h('a', { class: 'mono', href: url, text: url }));
   const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
