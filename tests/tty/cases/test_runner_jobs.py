@@ -13,6 +13,8 @@ from run_tty_tests import is_exclusive, next_case  # noqa: E402
 from tty_driver import case_tmpdir  # noqa: E402
 
 RUNNER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run_tty_tests.py")
+# CI 用 TTY_SHARD 给本套件分片;被测的 runner 会继承它,只跑假用例表里的一片。
+_ENV = {k: v for k, v in os.environ.items() if k != "TTY_SHARD"}
 
 _HEADER = """\
 import os
@@ -32,7 +34,7 @@ def _cases_dir(body):
 def _run(bin_path, cases_dir, *extra):
     p = subprocess.run([sys.executable, RUNNER, "--bin", bin_path, "--cases-dir", cases_dir, *extra],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8",
-                       errors="replace", timeout=120)
+                       errors="replace", timeout=120, env=_ENV)
     summary = re.search(r"=== 结果:(\d+) passed / (\d+) failed(?: / (\d+) skipped)?", p.stdout)
     assert summary, p.stdout
     counts = tuple(int(g or 0) for g in summary.groups())
@@ -79,7 +81,7 @@ def test_bad_jobs_values_are_environment_errors(bin_path):
     d = _cases_dir("def test_ok(bin_path):\n    pass\n")
     for extra in (["--jobs", "0"], ["--jobs", "x"], ["--jobs", "2", "--case-timeout", "0"]):
         p = subprocess.run([sys.executable, RUNNER, "--bin", bin_path, "--cases-dir", d, *extra],
-                           capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=60, env=_ENV)
         assert p.returncode == 2, (extra, p.stdout, p.stderr)
 
 
