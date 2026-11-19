@@ -26,6 +26,11 @@ pub const SlashCmd = struct {
     /// A Skill's tier (`user`, `project`, `plugin`, …), shown after its
     /// description as Claude Code does; empty when unknown.
     source: []const u8 = "",
+    /// The command this row spells out with an argument (`/login` for
+    /// `/login openrouter`): offered once that command is typed in full, and
+    /// only by prefix, so a word inside the argument does not bring it up
+    /// under other commands.
+    arg_of: []const u8 = "",
 };
 
 /// `/` 菜单与 Tab 补全的命令源:内建命令在前,可由用户调用的 skill 在后。
@@ -144,6 +149,8 @@ pub fn closestCommand(catalog: SlashCatalog, query: []const u8) ?[]const u8 {
     var best: ?[]const u8 = null;
     var best_distance: usize = 3;
     for (catalog.entries) |cmd| {
+        // A row with its argument spelled out is not a command name to suggest.
+        if (cmd.arg_of.len > 0) continue;
         const distance = editDistance(needle, cmd.name[1..]) orelse continue;
         if (distance == 0 or distance >= best_distance or distance >= needle.len) continue;
         best = cmd.name;
@@ -218,6 +225,10 @@ fn slashQuery(line: []const u8) ?[]const u8 {
 
 /// 匹配分档(对齐 cc 的命令联想:先前缀,再名字内子串)。0 = 不匹配。
 fn matchTier(cmd: SlashCmd, query: []const u8) u2 {
+    if (cmd.arg_of.len > 0) {
+        const typed_in_full = std.mem.startsWith(u8, query, cmd.arg_of);
+        return if (typed_in_full and std.mem.startsWith(u8, cmd.name, query)) 1 else 0;
+    }
     if (std.mem.startsWith(u8, cmd.name, query)) return 1;
     const needle = query[1..]; // 去掉 `/`
     if (needle.len >= 2 and containsIgnoreCase(cmd.name[1..], needle)) return 2;
@@ -566,6 +577,26 @@ test "slash catalog: skills join the built-ins, collisions and model-only skills
     try testing.expect(!slashNthMatch(catalog, "/地址库", 0).?.takes_args);
     // A space closes the menu (arguments are being typed).
     try testing.expect(!slashMenuOpen(catalog, "/deploy prod"));
+}
+
+test "slash completion: a row with its argument is offered once its command is typed in full" {
+    const entries = [_]SlashCmd{
+        .{ .name = "/login", .desc = "Sign in" },
+        .{ .name = "/logout", .desc = "Sign out" },
+        .{ .name = "/login openrouter", .desc = "OpenRouter", .arg_of = "/login" },
+        .{ .name = "/logout openrouter", .desc = "OpenRouter", .arg_of = "/logout" },
+    };
+    const catalog: SlashCatalog = .{ .entries = &entries };
+    // `/login` typed in full: the command, then what can follow it.
+    try testing.expectEqualStrings("/login", slashNthMatch(catalog, "/login", 0).?.name);
+    try testing.expectEqualStrings("/login openrouter", slashNthMatch(catalog, "/login", 1).?.name);
+    try testing.expect(slashNthMatch(catalog, "/login", 2) == null);
+    // Not yet typed in full, or a word from inside the argument: not offered.
+    try testing.expectEqualStrings("/logout", slashNthMatch(catalog, "/lo", 1).?.name);
+    try testing.expect(slashNthMatch(catalog, "/lo", 2) == null);
+    try testing.expect(slashNthMatch(catalog, "/rout", 0) == null);
+    // Never a typo suggestion.
+    try testing.expect(closestCommand(catalog, "/openroutr") == null);
 }
 
 test "closestCommand: suggests the nearest command within two edits" {

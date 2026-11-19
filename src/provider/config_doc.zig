@@ -403,6 +403,13 @@ pub const Document = struct {
     /// Serialize the control-plane keys into `original`, preserving every key
     /// this module does not own.
     pub fn merge(self: *const Document, original: []const u8) DocumentError![]u8 {
+        return self.mergeWith(original, &.{});
+    }
+
+    /// `merge`, with `members` applied in the same write: members of objects
+    /// this module does not model (`custom_providers.<id>`), owned by the
+    /// caller that names them.
+    pub fn mergeWith(self: *const Document, original: []const u8, members: []const json_merge.MemberField) DocumentError![]u8 {
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const arena = scratch.allocator();
@@ -433,7 +440,7 @@ pub const Document = struct {
             operations = buffer.items;
         }
 
-        return json_merge.mergeObjectFields(self.allocator, original, &.{
+        return json_merge.mergeFields(self.allocator, original, &.{
             .{ .key = "schema_version", .json = schema },
             .{ .key = "config_revision", .json = revision },
             .{ .key = "providers", .json = providers },
@@ -443,7 +450,7 @@ pub const Document = struct {
             .{ .key = "presets", .json = presets },
             .{ .key = "directory_presets", .json = directory_presets },
             .{ .key = "recent_operation_ids", .json = operations },
-        }) catch |err| switch (err) {
+        }, members) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidDocument,
         };
@@ -628,6 +635,19 @@ pub fn renderSelection(arena: std.mem.Allocator, value: RuntimeSelection) Docume
         .{value.catalog_revision.value()},
     ));
     return out.items;
+}
+
+/// Whether two selections are the same stored selection: whether
+/// `renderSelection` writes the same text for both. The slots of a control or
+/// channel list past its `len` are undefined, and so are the bytes of a text
+/// past its end, so two copies of one selection need not be equal byte for
+/// byte; `std.meta.eql` reads those bytes, and in a build that checks union
+/// tags it panics on an undefined one.
+pub fn sameSelection(gpa: std.mem.Allocator, a: RuntimeSelection, b: RuntimeSelection) DocumentError!bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    return std.mem.eql(u8, try renderSelection(arena, a), try renderSelection(arena, b));
 }
 
 fn renderPolicy(
@@ -1391,6 +1411,48 @@ test "a pinned global selection round-trips with its resolved offer" {
     try std.testing.expect(restored.target.pinned_offer.offer_id.eql(offer_id));
     try std.testing.expectEqual(@as(OfferRevision, 3), restored.target.pinned_offer.offer_revision);
     try std.testing.expect(restored.resolved_offer_id.?.eql(offer_id));
+}
+
+test "sameSelection compares what is written, not the bytes past a list's or a text's end" {
+    const a = std.testing.allocator;
+    var policy = RoutePolicy{ .fallback_allowed = true, .region = try selection_mod.RegionText.parse("eu") };
+    policy.only_channels = try ChannelList.of(&.{Slug.lit("relay")});
+    var left = try RuntimeSelection.auto("relay/glm-4.6", policy, .global);
+    try left.controls.set("reasoning_effort", try controls_mod.Value.fromText("high"));
+    var right = left;
+
+    // Unequal bytes where nothing is stored. On one side a control and a
+    // channel left behind `len`, the way `remove` and a shortened list leave
+    // them, and text past the selector's and the region's end; on the other
+    // a fill no slot ever holds.
+    try right.controls.set("stale", .{ .number = 7 });
+    try std.testing.expect(right.controls.remove("stale"));
+    const right_route = &right.target.auto_route;
+    try right_route.policy.only_channels.append(Slug.lit("backup"));
+    right_route.policy.only_channels.len -= 1;
+    right_route.selector.bytes[right_route.selector.len] = 'x';
+    right_route.policy.region.?.bytes[2] = 'x';
+    const left_route = &left.target.auto_route;
+    @memset(std.mem.sliceAsBytes(left.controls.entries[left.controls.len..]), 0x55);
+    @memset(std.mem.sliceAsBytes(left_route.policy.only_channels.entries[left_route.policy.only_channels.len..]), 0x55);
+    try std.testing.expect(try sameSelection(a, left, right));
+    try std.testing.expect(try sameSelection(a, right, left));
+
+    // What is written still counts.
+    var changed = right;
+    try changed.controls.set("reasoning_effort", try controls_mod.Value.fromText("low"));
+    try std.testing.expect(!try sameSelection(a, left, changed));
+    changed = right;
+    changed.scope = .session;
+    try std.testing.expect(!try sameSelection(a, left, changed));
+    changed = right;
+    try changed.target.auto_route.policy.ignore_channels.append(Slug.lit("backup"));
+    try std.testing.expect(!try sameSelection(a, left, changed));
+    changed = right;
+    changed.target.auto_route.selector.len -= 1;
+    try std.testing.expect(!try sameSelection(a, left, changed));
+    const pinned = RuntimeSelection.pinned(.{ .digest = @splat(0x5a) }, 1, .global);
+    try std.testing.expect(!try sameSelection(a, left, pinned));
 }
 
 test "legacy documents without a control plane load as empty, not as an error" {

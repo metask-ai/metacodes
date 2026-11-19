@@ -396,18 +396,33 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, applies: bool) u1
     return 2;
 }
 
+/// The command that signs in to `setup`'s provider: `/login` alone for
+/// Metask, whose sign-in it is; `/login <id>` for a provider that signs in
+/// on its own site (OpenRouter).
+fn writeSignIn(w: *std.Io.Writer, setup: *const picker_mod.Setup) void {
+    if (setup.provider.eqlText("metask")) {
+        w.writeAll("/login") catch {};
+    } else {
+        w.print("/login {s}", .{setup.provider.slice()}) catch {};
+    }
+}
+
 /// Where the provider of a route a commit found no credential for gets one,
 /// in place of the list (#483, #488): the variable, this install's `.env`
-/// and the guide; for a provider one signs in to (Metask), `/login` first.
-/// Nothing to choose and nothing to type, so the only keys named are the
-/// ones that leave.
+/// and the guide; for a provider one signs in to (Metask, OpenRouter), its
+/// `/login` first. Nothing to choose and nothing to type, so the only keys
+/// named are the ones that leave.
 fn setupBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     var rows: u16 = 0;
     if (picker.setup) |setup| {
         const path = if (picker.local_config_path_len > 0) picker.localConfigPath() else ".env";
         var text_buf: [picker_mod.MAX_LOCAL_CONFIG_PATH + 512]u8 = undefined;
         var text: std.Io.Writer = .fixed(&text_buf);
-        if (setup.sign_in) text.writeAll("Sign in: /login\n") catch {};
+        if (setup.sign_in) {
+            text.writeAll("Sign in: ") catch {};
+            writeSignIn(&text, &setup);
+            text.writeAll("\n") catch {};
+        }
         if (setup.variable) |variable| {
             text.print("{s}et {s} in {s}, then restart\n", .{ if (setup.sign_in) "Or s" else "S", variable, path }) catch {};
         }
@@ -958,6 +973,24 @@ test "the setup stage shows the variable, this install's .env and the guide, and
     try testing.expect(std.mem.indexOf(u8, text, "Set MOONSHOT_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart") != null);
     try testing.expect(std.mem.indexOf(u8, text, "How to: https://example.invalid/guide") != null);
     try testing.expect(std.mem.indexOf(u8, text, "esc back · q close") != null);
+}
+
+test "the setup stage of a provider that signs in on its own site names /login <id>, then its variable" {
+    // /model lists no provider without a credential (#568), so this stage is
+    // where an OpenRouter route a commit found no key for is told the way in.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{offerOf("openrouter", "auto", "deepseek/deepseek-v4.1-flash", "openai_chat")};
+    try seed(&picker, &offers, null);
+    picker.setLocalConfig("/home/u/.local/opt/metacodes/state/.env", "");
+    picker.enterSetup(.{ .provider = ids.Slug.lit("openrouter"), .variable = "OPENROUTER_API_KEY", .sign_in = true });
+    const text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "openrouter not signed in") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Sign in: /login openrouter") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Or set OPENROUTER_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart") != null);
 }
 
 test "a filter lists the matches flat, each naming its provider" {

@@ -32,6 +32,9 @@ pub const FetchError = error{
     TooLarge,
 };
 
+/// `Request.extra_headers` a GET carries at most.
+pub const MAX_EXTRA_HEADERS = 2;
+
 /// Documents above this are refused. OpenRouter's full `/models` is a few
 /// hundred kilobytes; 8 MB is generous and still bounded.
 pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -46,6 +49,9 @@ pub const Request = struct {
     /// Gemini's `x-goog-api-key`, a relay's `x-api-key`. The alternative to
     /// `bearer` (set one of the two); like it, it stops redirects.
     credential: ?Credential = null,
+    /// Headers the endpoint needs besides the credential: an Anthropic model
+    /// listing's `anthropic-version` (`provider/model_listing.zig`).
+    extra_headers: []const std.http.Header = &.{},
 
     /// The credential the request carries, whichever field holds it.
     fn carried(self: Request) ?Credential {
@@ -112,10 +118,15 @@ pub fn fetchAnswer(
         std.crypto.secureZero(u8, header.value);
         allocator.free(header.value);
     };
-    var headers: [2]std.http.Header = undefined;
+    if (request.extra_headers.len > MAX_EXTRA_HEADERS) return error.RequestFailed;
+    var headers: [2 + MAX_EXTRA_HEADERS]std.http.Header = undefined;
     var header_count: usize = 0;
     headers[header_count] = .{ .name = "accept", .value = "application/json" };
     header_count += 1;
+    for (request.extra_headers) |header| {
+        headers[header_count] = header;
+        header_count += 1;
+    }
     if (credential) |value| {
         authorization = auth_header.build(allocator, value.scheme, value.secret) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -179,7 +190,7 @@ pub fn fetchModelPages(
         defer allocator.free(cursor);
         const url = try models_pages.continuationUrl(allocator, request.url, cursor);
         defer allocator.free(url);
-        const next = fetch(allocator, io, .{ .url = url, .bearer = request.bearer, .credential = request.credential }) catch break;
+        const next = fetch(allocator, io, .{ .url = url, .bearer = request.bearer, .credential = request.credential, .extra_headers = request.extra_headers }) catch break;
         pages.append(allocator, next.body) catch {
             allocator.free(next.body);
             return error.OutOfMemory;

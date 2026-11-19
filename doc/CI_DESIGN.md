@@ -5,7 +5,10 @@ offline TTY suites. This document covers how a required job skips work (§1),
 which of that work a change has to pay for (§2), how approved PRs
 land after validation against current main (§3), and how one
 platform's work is spread over several runners so that a run takes about as
-long as its longest leg rather than the sum of a platform's steps (§4).
+long as its longest leg rather than the sum of a platform's steps (§4),
+which run writes the caches the others read (§5), and where the macOS and
+Windows gates run: a self-hosted VM pool first, the hosted legs as the
+fallback (§6).
 
 ## 1. Required checks and how a job skips work
 
@@ -55,8 +58,9 @@ inputs; moving into a code/input tree takes the wider scope.
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
-Manual runs are always `full`, and so are an empty diff and any error.
-Neither CI workflow runs on ordinary pushes to main.
+Manual and scheduled runs are always `full`, and so are an empty diff and
+any error. Neither CI workflow runs on ordinary pushes to main; their nightly
+run on main is a full run that saves the caches (§5).
 
 The scope step writes a **CI change attribution** job summary: the base,
 event, effective scope, reason, planned checks and a status/path/scope table.
@@ -149,7 +153,8 @@ ordering checks; it is not the normal delivery path.
 ### Reusable full-CI evidence
 
 `Full PR evidence` waits for every CI suite, including SDK and Windows TTY,
-to succeed. Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
+to succeed; macOS and Windows through `Gates (macOS)` and `Gates (Windows)`,
+wherever the gates ran (§6). Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
 the tested merge commit/tree, head/base, repository, run ID and attempt.
 The release fast path finds a merged PR for the exact base commit, requires
 a successful run of `ci.yml`, and compares downloaded evidence with the base's
@@ -193,7 +198,9 @@ over its platform's share:
 |---|---|---|
 | `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
 | `gates-macos` | `units-checks`, `product`, `release` | `units` and `checks` on one; one flag each on the others |
+| `gates-macos-vm` | `all`, on a pool VM (§6) | Every flag of the `gates-macos` legs in one job |
 | `windows-gates` | `units`, `integration`, `product`, `release` | One flag each |
+| `windows-gates-vm` | `all`, on a pool VM (§6) | Every flag of the `windows-gates` legs in one job |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
 | `tty-windows` | eight shards | Every eighth case, under ConPTY |
 
@@ -248,10 +255,11 @@ What it costs:
   macOS jobs at once. A run uses about thirty jobs, four of them on macOS
   (three gate legs and `SDK bindings (macOS)`), so macOS groups the flags
   instead of giving each its own runner. Runs that overlap can still queue
-  macOS jobs.
-- **Cache lines.** Each gate leg keeps its own setup-zig cache
-  (`cache-key: ${{ matrix.leg }}`), since each builds a different share of
-  the graph. The TTY shards build the same binaries and share one.
+  macOS jobs; the self-hosted pool (§6), when it is on, takes the gates off
+  that limit.
+- **Cache lines.** Each gate leg keeps its own Zig cache line
+  (`gates-<leg>`, §5), since each builds a different share of the graph. The
+  TTY shards build the same binaries and share one.
 - **Build runner jobs.** The suite steps pass `-j$ZIG_BUILD_JOBS`: 8 on the
   four-core Linux and Windows runners, 6 on the three-core macOS one, whose
   7 GB cannot hold more overlapping LLVM builds. The build runner runs that
@@ -316,3 +324,142 @@ product (8.2), Gates (macOS) / product (7.2) and Gates (Linux) / units
 (7.1). The organization's job limits bound what more legs can buy: a run
 uses about thirty-five jobs, so two overlapping runs already reach the limit
 of 60, and four macOS jobs leave one of the five for every other run.
+
+## 5. Caches: main writes, pull requests read
+
+Every runner starts empty, so a job compiles only what it cannot restore.
+Until November 2026 every run both restored and saved, through setup-zig's
+`use-cache` and `actions/cache`, and two things went wrong (measured
+2026-11-18):
+
+- **The first run of every pull request compiled cold.** A run can restore
+  what its own ref saved and what its base branch saved, never another pull
+  request's caches. Pull requests saved only to their own ref, and since main
+  pushes stopped running CI (§3) nothing saved to `main`: it held three
+  entries, a macOS Lean cache, one 92 MB Zig cache and the Zig tarball.
+- **Pull requests crowded each other out.** Cache keys are immutable, so
+  every run saved a new copy of every line: 2 to 2.9 GB per run of a pull
+  request. The repository held 12.3 GB against GitHub's 10 GB, and GitHub
+  evicts the least recently used entries, so a pull request's entries could
+  be gone before it pushed again.
+
+So one run writes and every other run reads:
+
+| Run | `WARM_CACHE` | Zig cache | Lean toolchain and products |
+|---|---|---|---|
+| `main`'s `schedule` run (19:00 UTC nightly) or a `workflow_dispatch` on `main` | `true` | Starts empty; each line saves what it built under `zig-0.16.0-<os>-<arch>-<line>-run-<run id>-<attempt>` | Restores; the `units` leg saves when no entry holds this hash of the Lean sources |
+| Everything else: pull requests, a legacy merge group, a dispatch on another branch | `false` | Restores the newest entry `main` saved for its line (that key without the run ID, matched as a prefix); saves nothing | Restores; saves nothing |
+
+A line is a gate leg (`gates-<leg>`), a platform's TTY shards (`tty`, saved
+by shard 1), a platform's SDK job (`sdk`) or the AgentCore Windows gate
+(`agentcore-gate`, `agentcore-windows.yml`). setup-zig still points
+`ZIG_GLOBAL_CACHE_DIR` and `ZIG_LOCAL_CACHE_DIR` at `.zig-cache`, with its own
+cache off because it saves on every run; `actions/cache` (restore, then save
+at the end of the job) gave way to `actions/cache/restore` and
+`actions/cache/save` for the same reason. setup-zig still caches the Zig
+tarball itself (about 50 MB) under an exact key and saves it only on a miss,
+so once `main`'s warm run holds it a pull request only reads it.
+
+**Why nightly, not after every merge.** Zig 0.16's build runner cannot
+compile tests without running them, so warming a line means running it. A
+run after every merge would bring back the post-merge full run §3 removed,
+and take macOS jobs during the working day. A cache a few hours old costs
+little: Zig recompiles every artifact whose sources changed, so a pull
+request that changes `src/` rebuilds the app and the large test binaries
+from either cache. What `main`'s cache saves is what changes rarely: Zig's
+runtime libraries, the Lean products, TinyKG staging, the tools, and test
+binaries the change does not reach. Dispatch `CI` on `main` to warm at once,
+for example after a Zig or Lean toolchain bump.
+
+**What it costs.** One full CI run a night, about thirty jobs and four on
+macOS, which also reports `main`'s health. A pull request's second push
+restores `main`'s cache, not its own first run's; it recompiles what its
+change reaches either way. The warm run starts each Zig line empty, so an
+entry holds only what the current tree builds and does not grow night after
+night (setup-zig's `cache-size-limit` guarded against that growth before);
+earlier nights' entries are no longer read and are evicted first.
+`rule-control.yml` (dispatch only) and `release.yml` (no Zig cache) keep
+their own settings.
+
+`scripts/tests/test_ci_scope.py` (`CacheTest`) pins the wiring: nothing but
+the warm run saves; each restore key is its save key without the run ID, and
+both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
+scheduled or dispatched run.
+
+## 6. The macOS and Windows gates: a VM pool first, hosted legs as the fallback
+
+Each of the two platforms has a pool of single-use VMs for this repository:
+macOS on the organization's Mac Studio, Windows on AIPC
+([VM_POOLS.md](VM_POOLS.md): security model, hosts and operation). The gates
+try their pool first.
+
+Hosted macOS is the bottleneck: five jobs at once for the organization, three
+cores and 7 GB each. On 2026-11-17/18 a macOS job waited a median 7.5 minutes
+for a runner (p90 27.8) while Linux and Windows waited seconds, and macOS
+finished last in 38 of 39 runs. Hosted Windows does not queue (median 0.1
+minutes; the legs ran a median 7.2 minutes); its pool can win only on a job's
+own speed, so each platform has its own switch and its own measurements.
+
+**One job on a VM, legs on hosted runners.** A pool VM has the cores and
+memory a hosted runner lacks, so `gates-macos-vm` and `windows-gates-vm` run
+every flag of their hosted legs in one job (`Gates (macOS) / all`, `Gates
+(Windows) / all`, the platform's shared step list, its own cache line
+`gates-all`), without the legs' repeated checkout, setup and compilation.
+Hosted runners keep the split legs of §4. TTY (Windows), the SDK jobs and
+AgentCore Windows stay on hosted runners.
+
+**The switch.** `.github/runner-pools.json` holds, per platform, `self_hosted`
+(on or off), the pool's `label`, its `slots`, the `pickup_timeout_minutes`,
+the pool job's `zig_build_jobs` and `timeout_minutes`. A file, not a
+repository variable: vars and secrets do not reach a fork's pull request,
+which most pull requests here are, while every pull request's merge commit
+carries `main`'s switch. Switching a pool off is a pull request whose own run
+already obeys it.
+
+**Where a run goes** (`runner-plan`, `scripts/ci_pool_plan.py plan`). With the
+run's read-only token it lists this repository's other CI jobs once, counts
+per platform those that hold or wait for one of its pool's VMs, and decides
+each platform, first match wins:
+
+| Situation | Mode |
+|---|---|
+| Switch off, unreadable or invalid | `hosted` |
+| Release fast path, or a documentation-only change | `hosted` (the gates only check out) |
+| `main`'s warm run (§5) | `both`, so both cache lines stay warm |
+| Running plus waiting pool jobs fill the slots | `hosted` |
+| A pool job has waited longer than the pickup timeout | `hosted`: the pool may be down |
+| Otherwise | `self-hosted` |
+| Any error reading GitHub | `hosted` |
+
+**Falling back after dispatch.** Two runs can see the same free slot, and a
+pool can fail after a run chose it. `gates-macos-watch` and
+`windows-gates-watch` (`… watch`) follow their run's pool job: a VM that
+takes it within the pickup timeout is followed to the end and its conclusion
+reported; otherwise `fallback=true`, and the hosted legs, which wait for the
+watch on `self-hosted`, run. If a VM takes the pool job after that, its
+stand-down step sees the finished watch and sets `FAST_PATH=true`, so every
+later step skips (the pool job's env leaves `FAST_PATH` to that step).
+
+**The required checks** (`gates-macos-result`, `gates-windows-result`, `…
+verdict`) never need a pool job: a pool that is down would keep it queued for
+GitHub's 24 hours. Each reads its platform's plan, watch and hosted legs:
+
+| Mode | `Gates (macOS)` / `Gates (Windows)` passes when |
+|---|---|
+| `hosted`, or no plan | the hosted legs succeeded |
+| `self-hosted` | the watch reports the pool job succeeded; after a fallback, the hosted legs succeeded |
+| `both` | the hosted legs succeeded, and the pool job succeeded or no VM took it |
+
+A pool job that fails (a test, or its VM) is a failure, not a fallback;
+rerunning the run decides again. Costs: the plan adds a few seconds before
+the macOS and Windows gates; a run on a pool keeps an ubuntu watch job beside
+it; a fallback after dispatch costs the pickup timeout; on the nightly `both`
+run the hosted legs start after the pool job ends, since they wait for the
+watch; a pool job no VM ever takes stays queued in its run until a VM takes
+it (and stands down) or GitHub's 24 hours pass, without affecting the
+required check.
+
+`scripts/tests/test_ci_pool_plan.py` pins the decisions, the watch, the
+stand-down and the verdict for both platforms, and the wiring: each pool job
+is every hosted leg of its platform in one, the required checks never need
+them, and only they use the pools' labels (no workflow uses `self-hosted`).
