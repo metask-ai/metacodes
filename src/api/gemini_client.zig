@@ -410,6 +410,9 @@ pub const GeminiClient = struct {
             // errdefer destroy(req_ptr);req_ptr.* 未初始化, 无需 deinit
             return client_mod.requestSetupFailure("gemini", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);

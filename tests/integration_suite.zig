@@ -16,6 +16,7 @@ test {
     _ = @import("integration/agents_e2e_test.zig");
     _ = @import("component/provider_offer_test.zig");
     _ = @import("component/metask_api_key_picker_test.zig");
+    _ = @import("component/credential_route_scope_test.zig");
     _ = @import("component/provider_cli_key_scope_test.zig");
     _ = @import("component/vendor_dialect_test.zig");
     _ = @import("component/bedrock_converse_test.zig");
@@ -24,10 +25,12 @@ test {
     _ = @import("component/provider_oauth_login_test.zig");
     _ = @import("component/chatgpt_codex_test.zig");
     _ = @import("component/provider_key_login_test.zig");
+    _ = @import("component/custom_providers_cli_test.zig");
     _ = @import("component/openrouter_login_test.zig");
     _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
     _ = @import("component/http_send_failure_test.zig");
+    _ = @import("component/connection_keepalive_test.zig");
     _ = @import("component/subagent_model_test.zig");
     _ = @import("component/subagent_agentdef_fields_test.zig");
     _ = @import("component/web_search_test.zig");

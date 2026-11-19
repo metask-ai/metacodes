@@ -26,6 +26,15 @@ pub const ResponseStatus = struct {
     }
 };
 
+/// Whether the answer with this head carries a body. A 1xx, 204 or 304 one
+/// never does (RFC 9110 §15.2, §15.3.5, §15.4.5), yet std 0.16's
+/// `receiveHead` returns it without marking its body empty, and a body reader
+/// for it reads to the end of the connection (#573).
+pub fn answerHasBody(head: *const std.http.Client.Response.Head) bool {
+    const status = head.status;
+    return !(status.class() == .informational or status == .no_content or status == .not_modified);
+}
+
 /// The redirect policy of every request that carries a credential or a body:
 /// none. A 3xx comes back as the response and is reported like any other
 /// non-2xx answer.
@@ -78,5 +87,22 @@ test "ResponseStatus conversion is total across the HTTP response range" {
         const status = ResponseStatus.fromStd(@enumFromInt(code));
         try std.testing.expectEqual(code, status.code);
         try std.testing.expect(status.name.len > 0);
+    }
+}
+
+test "answerHasBody: a 1xx, 204 or 304 answer has none" {
+    const cases = [_]struct { head: []const u8, has_body: bool }{
+        .{ .head = "HTTP/1.1 204 No Content\r\n\r\n", .has_body = false },
+        .{ .head = "HTTP/1.1 304 Not Modified\r\n\r\n", .has_body = false },
+        .{ .head = "HTTP/1.1 100 Continue\r\n\r\n", .has_body = false },
+        .{ .head = "HTTP/1.1 103 Early Hints\r\n\r\n", .has_body = false },
+        .{ .head = "HTTP/1.1 200 OK\r\n\r\n", .has_body = true },
+        .{ .head = "HTTP/1.1 404 Not Found\r\n\r\n", .has_body = true },
+        .{ .head = "HTTP/1.1 500 Internal Server Error\r\n\r\n", .has_body = true },
+        .{ .head = "HTTP/1.1 599 Unnamed\r\n\r\n", .has_body = true },
+    };
+    for (cases) |case| {
+        const head = try std.http.Client.Response.Head.parse(case.head);
+        try std.testing.expectEqual(case.has_body, answerHasBody(&head));
     }
 }

@@ -180,7 +180,7 @@ test "minimax profile: each platform's key page checks against that platform's m
     try std.testing.expectEqualStrings("cn", default.id.slice());
     try std.testing.expectEqualStrings("https://api.minimax.cn/v1/models", default.check_url.?);
     const global = PROFILE.defaultKeyPage(Slug.lit("global-anthropic")).?;
-    try std.testing.expectEqualStrings("https://platform.minimax.io/console/keys", global.url);
+    try std.testing.expectEqualStrings("https://platform.minimax.io/console/keys", global.url.?);
     try std.testing.expectEqualStrings("https://api.minimax.io/v1/models", global.check_url.?);
     for (CHANNELS) |channel| {
         try std.testing.expectEqualStrings(channel.region.?, PROFILE.defaultKeyPage(channel.id).?.region.?);
