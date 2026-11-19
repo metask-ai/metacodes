@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env
+from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env, settings
 from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.bench import builds, releases
 from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
@@ -40,11 +40,11 @@ def command(spec):
 def prepare(spec, env):
     """Resolve the bundle and account key, then start the timing relay."""
     if spec.get("version"):
-        bundle = releases.bundle(spec["version"], spec["release_cache"], spec.get("release_base"))
+        bundle = releases.bundle(spec["version"], spec["release_cache"], settings(spec["config"]).get("release_base"))
         spec = {**spec, "bundle": str(bundle)}
     elif spec.get("ref"):
         cancel = Path(spec["jobs_dir"]) / ".bench-runs" / (spec["name"] + ".cancel")
-        bundle, info = builds.bundle(spec["ref"], spec["build_cache"], spec.get("source_repo"),
+        bundle, info = builds.bundle(spec["ref"], spec["build_cache"], settings(spec["config"]).get("source_repo"),
                                      cancelled=cancel.exists)
         spec = {**spec, "bundle": str(bundle),
                 "metacodes_version": f"{info['version']} (git {spec['ref']} @ {info['commit'][:12]})"}

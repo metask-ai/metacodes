@@ -995,6 +995,44 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertEqual(self.info_of(commit)[1]['trust_policy'], builds.TRUST_POLICY)
         self.assertEqual(len(self.docker_runs()), 2)
 
+    def test_record_relabelled_by_the_round_four_format_is_rebuilt(self):
+        commit = self.git('rev-parse', 'HEAD')
+        self.launch(ref='main')
+        path, info = self.info_of(commit)
+        # 11ac5e5f relabelled units of unknown origin with the raw URL and a
+        # rule version, without building them: that is not provenance.
+        path.write_text(json.dumps({**{k: info[k] for k in builds.PUBLIC},
+                                    'source_repo': str(self.repo), 'trust_policy': 1}))
+        unit = self.manager.build_cache / 'builds' / path.name.removesuffix('.json')
+        (unit / 'bin' / 'metacodes').write_text('planted')
+        run, final = self.launch(ref=commit)
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual((self.bundle_of(run) / 'bin' / 'metacodes').read_text(), commit)
+        self.assertEqual(self.info_of(commit)[1]['source_id'], builds.source_id(str(self.repo)))
+        self.assertEqual(len(self.docker_runs()), 2)
+
+    def test_shareable_job_specs_never_hold_repository_or_mirror_urls(self):
+        secret = 's3cret-token'
+        cfg = json.loads(self.manager.config_path.read_text())
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': str(self.repo),
+                                               'release_base': f'http://bench:{secret}@127.0.0.1:9/releases'})
+        # The worker still builds from the configured repository.
+        _, final = self.launch(ref='main')
+        self.assertEqual(final['status'], 'finished', final)
+        atomic_json(self.manager.config_path, {**json.loads(self.manager.config_path.read_text()),
+                                               'source_repo': f'http://bench:{secret}@127.0.0.1:9/private.git'})
+        for request in ({}, {'version': '9.8.7'}, {'ref': 'main'}):
+            with self.subTest(request=request):
+                self.launch(**request)
+        specs = sorted((self.manager.jobs_dir / '.bench-runs').glob('*.spec'))
+        self.assertEqual(len(specs), 4)
+        for spec in specs:
+            text = spec.read_text()
+            self.assertNotIn(secret, text)
+            self.assertNotIn(str(self.repo), text)
+        for path in (self.manager.jobs_dir / '.bench-runs').iterdir():
+            self.assertNotIn(secret, path.read_text(errors='replace'), path.name)
+
     def test_failed_origin_switch_never_verifies_or_records_against_the_old_one(self):
         commit = self.git('rev-parse', 'HEAD')
         builds.resolve('main', self.manager.build_cache, str(self.repo))

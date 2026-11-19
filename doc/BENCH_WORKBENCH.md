@@ -107,7 +107,10 @@ repository first, and a unit without a trust record from this builder is
 rebuilt. If the mirror cannot be pointed at the configured repository, the
 run fails rather than checking the old one. Build records identify the
 repository only by a digest of its URL, and git errors shown in a run have
-URL credentials removed, so a token in `source_repo` never reaches readers. Fetching, toolchain installs, builds and publishing hold a
+URL credentials removed, so a token in `source_repo` never reaches readers. Launch specs in the
+jobs directory name only the private settings file; the worker reads
+`source_repo` and `release_base` from it, so sharing or backing up the jobs
+directory exposes neither. Fetching, toolchain installs, builds and publishing hold a
 lock on the cache, so workbench services sharing one state root take turns. When a branch and a tag share a name but
 point to different commits, the run fails and asks for `refs/heads/<name>` or
 `refs/tags/<name>`. Because the built binary runs with the execution

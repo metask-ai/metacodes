@@ -47,6 +47,7 @@ COMMIT = re.compile(r"^[0-9a-f]{40}$")
 # Bump when the rule deciding which commits may run with credentials changes:
 # cached units checked under an older rule are re-verified before reuse.
 TRUST_POLICY = 1
+SOURCE_ID = re.compile(r"^[0-9a-f]{64}$")
 ZIG_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 LEAN_TOOLCHAIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:+-]{0,99}$")
 
@@ -352,11 +353,13 @@ def _build(ref, cache_dir, repo, target, cancelled):
     mirror, commit = resolve(ref, cache_dir, repo, cancelled)
     destination = _destination(cache_dir, commit, target)
     info = build_info(destination)
-    # A unit this builder made (it carries a trust record) is the commit's own
+    # A unit this builder made (its trust record has a rule version and a
+    # source digest; records from before digests are not proof) is the commit's own
     # tree, whichever repository it was verified for; the commit has now been
     # verified against this one, so record that. A unit without that
     # provenance is rebuilt rather than trusted on its layout alone.
-    if info and info["commit"] == commit and info["trust_policy"] is not None:
+    if info and info["commit"] == commit and info["trust_policy"] is not None \
+            and isinstance(info["source_id"], str) and SOURCE_ID.fullmatch(info["source_id"]):
         if not _trusted_for(info, commit, repo):
             info = {**info, "source_id": source_id(repo), "trust_policy": TRUST_POLICY}
             _info_path(destination).write_text(json.dumps(info), encoding="utf-8")

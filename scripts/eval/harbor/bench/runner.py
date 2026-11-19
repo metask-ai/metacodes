@@ -208,9 +208,11 @@ class RunManager:
             atomic_json(self.records / (name + ".json"), record)
             spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": None if version or ref else cfg["bundle"],
                     "version": version, "release_cache": str(self.release_cache),
-                    "release_base": cfg.get("release_base"),
                     "ref": ref, "build_cache": str(self.build_cache),
-                    "source_repo": cfg.get("source_repo"),
+                    # Repository and mirror URLs may carry tokens; the worker
+                    # reads them from the private state root, never the
+                    # shareable jobs directory this spec lives in.
+                    "config": str(self.config_path),
                     "auth_mode": mode, "account_state_dir": cfg.get("account_state_dir") if mode == "metask" else None,
                     "account_gateway": cfg.get("account_gateway") if mode == "metask" else None,
                     "account_key_id": account_key_id,
