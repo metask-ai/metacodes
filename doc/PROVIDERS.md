@@ -7,7 +7,7 @@ to check it, and what the common errors mean.
 | Source | Who bills you | How you set it up |
 |---|---|---|
 | [A Metask account](#a-metask-account) | Metask | `metacodes login`, or `/login` in the terminal UI |
-| [A built-in vendor](#a-built-in-vendor) (DeepSeek, OpenAI, Gemini, Qwen, …) | that vendor: a pay-as-you-go key, or a coding plan | `metacodes login --provider <id>` (or `/login <id>`) to paste a key, or a key in `<state root>/.env` |
+| [A built-in vendor](#a-built-in-vendor) (DeepSeek, OpenAI, Gemini, Qwen, …) | that vendor: a pay-as-you-go key, or a coding plan | `metacodes login --provider <id>` (or `/login <id>`) to paste a key (`openrouter` and `chatgpt-codex` sign in), or a key in `<state root>/.env` |
 | [A model API of your own](#a-model-api-of-your-own) (a relay, a company gateway, Ollama or vLLM on this machine, a vendor's coding-plan address) | whoever runs it | `metacodes providers add …`, or `config.json` by hand |
 
 Three commands, one job each:
@@ -77,6 +77,16 @@ right-hand column, or from a key you stored with `login`:
 | `kimi-code` | Kimi Code subscription | `KIMI_CODE_API_KEY`, `KIMI_API_KEY` |
 | `zai-coding-plan` | Z.AI GLM Coding Plan | `ZAI_API_KEY`, `GLM_API_KEY`, `Z_AI_API_KEY` |
 | `bedrock` | Amazon Bedrock | `AWS_BEARER_TOKEN_BEDROCK` |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` |
+
+**Two sign in instead.** `metacodes login --provider openrouter` (or `/login
+openrouter`) signs in on OpenRouter in the browser (`--device-code`: on
+another device), which creates a key on your account and stores it; a key
+you already have can still be pasted there. `chatgpt-codex` (ChatGPT
+(Codex)) reaches a ChatGPT plan's Codex quota the way the Codex CLI does:
+`metacodes login --provider chatgpt-codex` signs in with the Codex CLI's
+client, takes no key and no variable, and is unofficial — it may stop
+working at any time.
 
 **Paste a key.**
 
@@ -116,8 +126,8 @@ model, endpoint — without sending a request.
 **Forget it.** `metacodes logout --provider <id>` (or `/logout <id>`) removes
 the stored key.
 
-**Coding plans.** `kimi-code` and `zai-coding-plan` are subscriptions licensed
-for a person working in a coding tool. A start with nobody at the keyboard
+**Coding plans.** `kimi-code`, `zai-coding-plan` and `chatgpt-codex` are
+subscriptions licensed for a person working in a coding tool. A start with nobody at the keyboard
 (`-p`, `serve`, a piped REPL) on one of them prints a one-line warning; it does
 not refuse. Use a pay-as-you-go key for automation.
 

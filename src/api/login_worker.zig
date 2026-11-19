@@ -45,8 +45,9 @@ pub const LoginWorker = struct {
     transcript: [TRANSCRIPT_CAPACITY]u8 = undefined,
     transcript_len: usize = 0,
     transcript_truncated: bool = false,
-    /// The pasted key now points into `owned` (set by `ownFlow`); only then
-    /// is it this worker's to zero.
+    /// The pasted key (or a key grant's pasted code and its verifier) now
+    /// points into `owned` (set by `ownFlow`); only then is it this worker's
+    /// to zero.
     owns_secret: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, prepared: provider_login.Prepared) LoginWorker {
@@ -85,6 +86,22 @@ pub const LoginWorker = struct {
                     } },
                     .signed_adapter => |adapter| .{ .signed_adapter = try a.dupe(u8, adapter) },
                 };
+            },
+            .key_grant => |*prepared| {
+                prepared.provider_label = try a.dupe(u8, prepared.provider_label);
+                prepared.origin = try a.dupe(u8, prepared.origin);
+                const grant = &prepared.grant;
+                grant.origin = try a.dupe(u8, grant.origin);
+                grant.authorize_path = try a.dupe(u8, grant.authorize_path);
+                grant.exchange_path = try a.dupe(u8, grant.exchange_path);
+                grant.key_info_path = try a.dupe(u8, grant.key_info_path);
+                grant.manage_path = try a.dupe(u8, grant.manage_path);
+                grant.key_label = try a.dupe(u8, grant.key_label);
+                if (prepared.pasted) |*pasted| {
+                    pasted.code = try a.dupe(u8, pasted.code);
+                    pasted.verifier = try a.dupe(u8, pasted.verifier);
+                    self.owns_secret = true;
+                }
             },
             .oauth => |*prepared| {
                 const source = prepared.profile;
@@ -193,6 +210,11 @@ pub const LoginWorker = struct {
         if (!self.owns_secret) return;
         switch (self.flow) {
             .api_key => |prepared| std.crypto.secureZero(u8, @constCast(prepared.secret)),
+            // The code is good for one exchange, and only with this verifier.
+            .key_grant => |prepared| if (prepared.pasted) |pasted| {
+                std.crypto.secureZero(u8, @constCast(pasted.code));
+                std.crypto.secureZero(u8, @constCast(pasted.verifier));
+            },
             else => {},
         }
         self.owns_secret = false;
@@ -427,6 +449,7 @@ test "login worker: a sign-in runs on the profile it was given, every field, wit
         .kind = chatgpt_codex.PROFILE.accepted_credential_kinds[0],
         .pages = &.{.{ .id = Slug.lit("worker"), .label = "Worker test", .url = "http://127.0.0.1:1/keys" }},
     };
+    source.key_grant = @import("../provider/profiles/openrouter.zig").KEY_GRANT;
     const fields = @typeInfo(provider_profile.ProviderProfile).@"struct".fields;
     // A field ProviderProfile gains fails here until this profile sets it, so
     // the check below covers it too.

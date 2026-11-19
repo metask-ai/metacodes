@@ -93,6 +93,7 @@ first one is the one to use; the others are accepted too):
 | Alibaba Qwen (`qwen`) | `DASHSCOPE_API_KEY` |
 | MiniMax (`minimax`) | `MINIMAX_API_KEY` |
 | Amazon Bedrock (`bedrock`) | `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) |
+| OpenRouter (`openrouter`) | `OPENROUTER_API_KEY` (`/login openrouter` signs in on OpenRouter instead and stores the key it creates) |
 | Metask (`metask`) | `METASK_API_KEY` (see [the order below](#which-provider-and-model-are-used): it counts as a Metask sign-in unless the file names another provider) |
 
 A provider you define in `config.json` (`custom_providers`: written by
