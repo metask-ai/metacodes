@@ -3281,6 +3281,8 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             app.refreshModelPicker() catch |err| {
                 cmd_output.print("{s}The model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, @errorName(err), th.reset });
             };
+            // A session on this provider sends what was just stored (#566).
+            _ = app.adoptProviderLogin(dialog.chosenProfile().id);
         },
     }
 }
@@ -3604,6 +3606,8 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     app.refreshModelPicker() catch |err| {
         cmd_output.print("\x1b[33mThe model list did not refresh ({s}); /providers refresh retries\x1b[0m\n", .{@errorName(err)});
     };
+    // A session on this provider sends what was just stored (#566).
+    _ = app.adoptProviderLogin(outcome.provider_id);
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {

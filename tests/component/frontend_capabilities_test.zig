@@ -214,8 +214,10 @@ test "L2 web: custom kinds reach the frontend only as declared, by exact version
     // exactly as before the exchange existed.
     var legacy = CustomAsk{ .requester = wb.requester(), .kind = "video_timeline" };
     try legacy.start();
-    try waitFor(&journal, "\"type\":\"ui_request\",\"id\":1,\"kind\":\"custom\"", 1);
-    const legacy_reply = try request(a, port, "POST", "/respond", "{\"id\":1,\"result\":{\"cut\":[0,4]}}", null);
+    try waitFor(&journal, "\"kind\":\"custom\",\"request\":{\"kind\":\"video_timeline\"", 1);
+    const legacy_id = try newestRequestId(&journal);
+    var legacy_body: [96]u8 = undefined;
+    const legacy_reply = try request(a, port, "POST", "/respond", try std.fmt.bufPrint(&legacy_body, "{{\"id\":{d},\"result\":{{\"cut\":[0,4]}}}}", .{legacy_id}), null);
     defer a.free(legacy_reply);
     try std.testing.expect(std.mem.indexOf(u8, legacy_reply, "200 OK") != null);
     const legacy_answer = try legacy.join();
@@ -270,11 +272,14 @@ test "L2 web: custom kinds reach the frontend only as declared, by exact version
     try std.testing.expectEqual(@as(usize, 1), try countLines(&journal, "\"type\":\"ui_request\","));
     try std.testing.expectEqual(@as(u64, 0), wb.pendingId());
 
-    // The declared kind is announced, takes the next id and is answered.
+    // The declared kind is announced, takes a later id and is answered.
     var declared = CustomAsk{ .requester = wb.requester(), .kind = "video_timeline@1" };
     try declared.start();
-    try waitFor(&journal, "\"type\":\"ui_request\",\"id\":2,\"kind\":\"custom\",\"request\":{\"kind\":\"video_timeline@1\"", 1);
-    const reply = try request(a, port, "POST", "/respond", "{\"id\":2,\"result\":{\"cut\":[1,3]}}", null);
+    try waitFor(&journal, "\"kind\":\"custom\",\"request\":{\"kind\":\"video_timeline@1\"", 1);
+    const declared_id = try newestRequestId(&journal);
+    try std.testing.expect(declared_id > legacy_id);
+    var declared_body: [96]u8 = undefined;
+    const reply = try request(a, port, "POST", "/respond", try std.fmt.bufPrint(&declared_body, "{{\"id\":{d},\"result\":{{\"cut\":[1,3]}}}}", .{declared_id}), null);
     defer a.free(reply);
     try std.testing.expect(std.mem.indexOf(u8, reply, "200 OK") != null);
     const answer = try declared.join();

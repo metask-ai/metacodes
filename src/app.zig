@@ -2070,6 +2070,47 @@ pub const App = struct {
         return result;
     }
 
+    /// `/login <provider>` stored a key or a sign-in (#566): a session running
+    /// on that provider moves onto it, on the same route (model, channel,
+    /// scope). A commit takes its credential once (`bindCommittedSelection`),
+    /// so the session kept sending the replaced one until `/model` committed
+    /// again. The route is bound again the way `/model` binds it; the selection
+    /// itself does not change, so it is neither validated nor stored again. A
+    /// session on another provider, or on no route, is left as it is. True
+    /// when the session moved; a binding that fails is logged and leaves the
+    /// previous one in force.
+    pub fn adoptProviderLogin(app: *App, provider_id: provider_ids_mod.Slug) bool {
+        // Metask's sign-in moves the session itself (`applyMetaskSession`),
+        // onto the gateway the new session names.
+        if (provider_id.eqlText("metask")) return false;
+        // The process holds one OAuth session (single flight), which read its
+        // tokens before this sign-in stored new ones. It goes, so the next
+        // token request (the binding below, a turn's refresh, a later
+        // `/model`) loads the login just stored, not the one it replaced.
+        if (app.oauth_session_provider) |id| if (id.eql(provider_id)) {
+            if (app.oauth_session) |*held| held.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        const host = app.providerHost() catch return false;
+        const selection = host.kernel.effectiveSelection() orelse return false;
+        const resolution = provider_selection_mod.resolve(host.kernel.catalogSnapshot(), selection) catch return false;
+        const offer = resolution.primary();
+        if (!offer.provider_id.eql(provider_id)) return false;
+        // Only the route the session runs on. The kernel can name another: a
+        // stored default passed over at the start for want of a credential
+        // (the session went on Metask), or the offer of a `--base-url` start,
+        // which runs at another endpoint. Binding that would move the session
+        // to another provider or endpoint, which a login must not do.
+        if (!std.mem.eql(u8, offer.endpoint_ref, app.config.base_url orelse "") or
+            !std.mem.eql(u8, offer.request_model_id, app.activeModel())) return false;
+        app.bindCommittedSelection(host, selection) catch |err| {
+            @import("util/log.zig").warn("provider", "/login {s}: the session keeps its previous credential ({s})", .{ provider_id.slice(), @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+
     /// Drop the Metask material this process holds, for `/logout`: the
     /// device session, the key route and the account's key list, the key
     /// picked in `/models`, and `--api-key` when it was Metask's. From here
@@ -2843,8 +2884,6 @@ pub const App = struct {
         current: ?provider_control_plane.OfferId = null,
         /// Per offer of `page`: a commit could bind it now (#488).
         ready: std.ArrayList(bool) = .empty,
-        /// Where each provider with no ready offer gets its credential.
-        setups: std.ArrayList(model_picker_mod.Setup) = .empty,
         /// What each provider with a ready offer says in its heading: its
         /// name, and where the credential a commit would use comes from.
         notes: std.ArrayList(model_picker_mod.ProviderNote) = .empty,
@@ -2852,7 +2891,6 @@ pub const App = struct {
         pub fn deinit(listing: *ModelListing, allocator: std.mem.Allocator) void {
             listing.page.deinit(allocator);
             listing.ready.deinit(allocator);
-            listing.setups.deinit(allocator);
             listing.notes.deinit(allocator);
         }
     };
@@ -2873,16 +2911,16 @@ pub const App = struct {
     pub fn adoptModelListing(app: *App, listing: *const ModelListing) !void {
         const listed = listing.listed orelse return app.model_picker.markFailed();
         try app.model_picker.adopt(listed, listing.current);
-        try app.model_picker.setReadiness(listing.ready.items, listing.setups.items, listing.notes.items);
+        try app.model_picker.setReadiness(listing.ready.items, listing.notes.items);
     }
 
     /// Which offers of `listing` a commit could bind now (#488): for each, the
     /// binding `bindCommittedSelection` runs, from the same credential
     /// material (`credentialSources`), without a request. The one difference
     /// is the OAuth token a commit refreshes first: here a stored login
-    /// stands for it (`oauthLoginStored`). Every provider none of whose
-    /// offers is ready gets its setup. Reads files (the pool's config.json,
-    /// stored keys and logins), once per provider.
+    /// stands for it (`oauthLoginStored`). The picker does not list a
+    /// provider none of whose offers is ready. Reads files (the pool's
+    /// config.json, stored keys and logins), once per provider.
     fn judgeReadiness(app: *App, host: *provider_host_mod.Host, listing: *ModelListing) !void {
         const offers = listing.page.items;
         try listing.ready.resize(app.allocator, offers.len);
@@ -2913,11 +2951,11 @@ pub const App = struct {
                 if (!candidate.provider_id.eql(provider_id)) continue;
                 const offer = snapshot.find(candidate.offer_id) orelse continue;
                 var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
-                // Only a missing credential makes a route not configured. Any
+                // Only a missing credential takes a route off the list. Any
                 // other refusal (two names of its key that disagree, a kind
                 // the provider does not take, a wire it cannot drive) is not
-                // cured by setting the variable the setup would name, so the
-                // route stays listed and a commit reports why, as before.
+                // cured by setting its key, so the route stays listed and a
+                // commit reports why, as before.
                 if (provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false)) |binding| {
                     // The first route that binds says where the provider's
                     // credential comes from, for its heading in the picker.
@@ -2929,18 +2967,16 @@ pub const App = struct {
                 listing.ready.items[index] = true;
                 any_ready = true;
             }
-            if (!any_ready) {
-                try listing.setups.append(app.allocator, providerSetup(host, provider_id));
-            } else {
+            if (any_ready) {
                 const name = if (profile) |built| built.display_name else provider_id.slice();
                 try listing.notes.append(app.allocator, model_picker_mod.ProviderNote.init(provider_id, name, origin));
             }
         }
     }
 
-    /// Where `provider` gets its credential, for the picker's setup (#488):
-    /// the variable its key is read from (the canonical alias, else the
-    /// first), and, for Metask, `/login`.
+    /// Where `provider` gets its credential, for the setup the picker shows
+    /// when a commit finds none (#483, #488): the variable its key is read
+    /// from (the canonical alias, else the first), and, for Metask, `/login`.
     pub fn providerSetup(host: *provider_host_mod.Host, provider_id: provider_ids_mod.Slug) model_picker_mod.Setup {
         const profile = host.registry.findById(provider_id) orelse return .{ .provider = provider_id };
         const variable: ?[]const u8 = for (profile.env_aliases) |alias| {

@@ -93,7 +93,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/v1/messages":
             self.send_error(404)
             return
-        if self.headers.get("x-api-key") != SMOKE_CREDENTIAL:
+        server: SmokeServer = self.server  # type: ignore[assignment]
+        authorized = self.headers.get("Authorization") == "Bearer " + SMOKE_CREDENTIAL if server.bearer else self.headers.get("x-api-key") == SMOKE_CREDENTIAL
+        if not authorized:
             self.send_error(401)
             return
         try:
@@ -147,11 +149,12 @@ class SmokeServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, *, bearer: bool = False):
         super().__init__((host, port), _Handler)
         self.lock = threading.Lock()
         self.requests: List[dict] = []
         self.errors: List[str] = []
+        self.bearer = bearer
 
     def server_bind(self) -> None:
         # Skip HTTPServer's reverse DNS lookup of the bind address.

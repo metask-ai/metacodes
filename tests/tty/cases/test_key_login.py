@@ -4,7 +4,7 @@ Z.AI offers no third-party sign-in, so `/login zai-coding-plan` and
 `metacodes login --provider zai-coding-plan` show the plan pages a key is
 created on, take the pasted key without showing it, check it with a GET the
 provider does not bill, and store it in that provider's own key file. The
-`/model` picker takes no key (#488): it only says where one goes.
+`/model` picker takes no key (#488), and does not list a provider without one.
 
 The check is pointed at a local mock with METACODES_KEY_CHECK_URL; the page a
 key is created on is "opened" through a $BROWSER recorder. The kernel flow and
@@ -184,24 +184,21 @@ def test_login_dialog_refused_key_stores_nothing_and_says_why(bin_path):
         assert not os.path.exists(case.key_file()), "a refused key was stored"
 
 
-def test_model_takes_no_key_and_shows_where_it_goes(bin_path):
-    # #488: /model no longer opens a key field. Without a key a filter finds the
-    # plan's models dimmed ("not configured"); choosing one shows the variable, this
-    # install's .env and the guide. It checks nothing, opens nothing, stores
-    # nothing: `/login zai-coding-plan` (above) is where a key is pasted.
+def test_model_takes_no_key_and_does_not_list_a_provider_without_one(bin_path):
+    # #488: /model no longer opens a key field, and a provider without a key is
+    # not listed: typing the plan's name finds nothing, and Enter there starts
+    # nothing. It checks nothing, opens nothing, stores nothing:
+    # `/login zai-coding-plan` (above) is where a key is pasted.
     with _Case() as case:
         events = [READY, "type:/model", "key:enter", wait_for("apply to", 10),
-                  "type:zai", wait_for("not configured", 10), "key:enter",
-                  wait_for("ZAI_API_KEY", 10), f"type:{GOOD_KEY}", "key:enter", "sleep:0.8"]
+                  "type:zai", wait_for("nothing matches", 10), "key:enter", "sleep:0.8"]
         raw = run(bin_path, events, term_size=(40, 120), env=case.env(), per_key_drain=0.05)
         a, text = _screen(raw, 40, 120)
-        env_file = os.path.join(case.home, ".metacodes", ".env")
-        assert f"Set ZAI_API_KEY in {env_file}, then restart" in text, text
-        assert "LOCAL_CONFIG.md" in text, text
+        assert "nothing matches this filter" in text, text
+        for gone in ("ZAI_API_KEY", "not configured", "Not configured", "switched to"):
+            assert gone not in text, f"{gone!r} should not be on screen:\n" + text
         if a.screens_with("paste it"):
             a._fail("/model should not offer a key field")
-        # The characters typed in the setup were not taken as a key.
-        assert GOOD_KEY.encode() not in raw, "the typed key was echoed to the terminal"
         assert case.checks() == [], case.checks()
         assert case.opened_urls() == [], case.opened_urls()
         assert not os.path.exists(case.key_file()), "a key was stored from /model"

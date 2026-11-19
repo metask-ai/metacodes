@@ -15,7 +15,6 @@
 //!      glm-5.3                          200K   2 routes
 //!   DeepSeek · key from .env · billed to your DeepSeek account
 //!      DeepSeek V4 Pro                    1M   2 routes
-//!   Not configured · openai, gemini
 //!   Reasoning effort   default  low  medium  [high]  max          ←/→
 //! ```
 //!
@@ -32,11 +31,14 @@
 //!   effort) are a line under the list, changed with ←/→ from any row. The
 //!   value is remembered as the one wanted, and each model shows and commits
 //!   the nearest value its vocabulary has, so moving the cursor never drops it.
+//!   With nothing wanted, a control that declares its provider's default
+//!   (DeepSeek's reasoning effort: `high`) shows and commits that value, and
+//!   has no unnamed default before it.
 //! - Every route the list offers can be applied as it is (#488). The host
 //!   says, per offer, whether a commit would find a credential for it now
-//!   (`setReadiness`); a provider with none of its offers ready is not listed
-//!   but counted on one "Not configured" line at the bottom. Enter there lists
-//!   those providers, and Enter on one shows where its credential goes
+//!   (`setReadiness`); a provider with none of its offers ready is not
+//!   listed, and a filter does not find its models. A commit that finds the
+//!   credential gone since the list was drawn shows where it goes
 //!   (`Stage.setup`) and nothing else: no sign-in, no key field, no request.
 
 const std = @import("std");
@@ -63,14 +65,13 @@ pub const MAX_PROVIDER_NAME: usize = 64;
 pub const Stage = enum {
     /// Every configured provider's models, on one screen.
     list,
-    /// The providers no commit could bind now, by name (#488).
-    unconfigured,
-    /// Where one of them gets its credential (#488).
+    /// Where the provider of a route gets its credential, after a commit
+    /// found none for it (#488).
     setup,
 };
 
-/// Where a provider that is not configured gets its credential, as the setup
-/// stage shows it (#488). The host derives it from the provider's profile.
+/// Where a provider gets its credential, as the setup stage shows it (#488).
+/// The host derives it from the provider's profile.
 pub const Setup = struct {
     provider: Slug,
     /// The variable its key is read from (the canonical alias, else the
@@ -143,15 +144,11 @@ pub const Group = struct {
     /// (the one Enter applies). Detail the renderer needs (limits, price,
     /// protocol) is read from the snapshot through this index.
     offer_index: usize,
-    /// How many offers this row stands for: a model's routes, a provider's
-    /// offers.
+    /// How many offers this row stands for: the model's routes.
     offer_count: usize,
     label: []const u8,
     /// True when the committed selection is one of the offers behind this row.
     is_current: bool,
-    /// False for a model or provider none of whose offers a commit could bind
-    /// now: Enter on it shows where its credential goes (#488).
-    ready: bool = true,
 };
 
 pub const Row = union(enum) {
@@ -161,10 +158,6 @@ pub const Row = union(enum) {
     /// One route of the model above it, listed while the cursor is on that
     /// model or one of its routes.
     route: struct { offer_index: usize, is_current: bool, preferred: bool, last: bool },
-    /// The "Not configured" line: how many providers it stands for.
-    unconfigured: struct { count: usize },
-    /// A provider in the "Not configured" list.
-    provider: Group,
 
     pub fn focusable(self: Row) bool {
         return self != .heading;
@@ -196,7 +189,7 @@ pub const Key = union(enum) {
     home,
     end,
     /// The previous / next value of the focused route's first control (the
-    /// reasoning effort); on the "Not configured" line → lists them.
+    /// reasoning effort).
     left,
     right,
     enter,
@@ -211,7 +204,7 @@ pub const Key = union(enum) {
 
 /// Which row the cursor is on, by identity rather than position: listing a
 /// model's routes under it moves the rows below, and a refresh can reorder
-/// them, but the cursor stays on the same model, route or line.
+/// them, but the cursor stays on the same model or route.
 const RowId = struct {
     kind: Kind = .none,
     provider: ?Slug = null,
@@ -219,7 +212,7 @@ const RowId = struct {
     key_len: usize = 0,
     offer: ?OfferId = null,
 
-    const Kind = enum { none, model, route, unconfigured, provider };
+    const Kind = enum { none, model, route };
 
     fn key(self: *const RowId) []const u8 {
         return self.key_buffer[0..self.key_len];
@@ -228,10 +221,9 @@ const RowId = struct {
     fn eql(self: *const RowId, other: *const RowId) bool {
         if (self.kind != other.kind) return false;
         return switch (self.kind) {
-            .none, .unconfigured => true,
+            .none => true,
             .model => sameSlug(self.provider, other.provider) and std.mem.eql(u8, self.key(), other.key()),
             .route => if (self.offer) |mine| (if (other.offer) |theirs| mine.eql(theirs) else false) else false,
-            .provider => sameSlug(self.provider, other.provider),
         };
     }
 };
@@ -270,18 +262,16 @@ pub const Picker = struct {
     /// its end counts as ready, so a snapshot no verdict came with hides
     /// nothing (`adopt` empties it; `setReadiness` fills it).
     ready: std.ArrayList(bool) = .empty,
-    /// Where each provider with no ready offer gets its credential.
-    setups: std.ArrayList(Setup) = .empty,
     /// What each configured provider's heading says.
     notes: std.ArrayList(ProviderNote) = .empty,
     /// What the setup stage shows.
     setup: ?Setup = null,
-    /// Where Esc leaves the setup stage for: the stage and row it was opened
-    /// from.
-    setup_return_stage: Stage = .list,
+    /// Where Esc leaves the setup stage for: the row of the list it was
+    /// opened from.
     setup_return_row: RowId = .{},
     /// This install's `<state root>/.env` and the guide to it, for the setup
-    /// stage; the host sets both when it opens the picker.
+    /// stage and for a list no provider is configured for; the host sets
+    /// both when it opens the picker.
     local_config_path_buffer: [MAX_LOCAL_CONFIG_PATH]u8 = undefined,
     local_config_path_len: usize = 0,
     guide_url: []const u8 = "",
@@ -309,7 +299,6 @@ pub const Picker = struct {
     pub fn deinit(self: *Picker) void {
         self.offers.deinit(self.allocator);
         self.ready.deinit(self.allocator);
-        self.setups.deinit(self.allocator);
         self.notes.deinit(self.allocator);
         self.* = undefined;
     }
@@ -353,7 +342,6 @@ pub const Picker = struct {
         try self.offers.appendSlice(self.allocator, page.offers);
         // The verdicts were about the previous snapshot.
         self.ready.clearRetainingCapacity();
-        self.setups.clearRetainingCapacity();
         self.notes.clearRetainingCapacity();
         self.catalog_revision = page.meta.catalog_revision;
         self.config_revision = page.meta.config_revision;
@@ -363,21 +351,18 @@ pub const Picker = struct {
     }
 
     /// Which offers of the snapshot a commit could bind now (`ready`, in
-    /// snapshot order), where each provider with none of them gets its
-    /// credential (#488), and what each configured provider's heading says.
-    /// The host calls it right after `adopt`, under the same lock.
+    /// snapshot order; the others are not listed, #488), and what each
+    /// configured provider's heading says. The host calls it right after
+    /// `adopt`, under the same lock.
     pub fn setReadiness(
         self: *Picker,
         ready: []const bool,
-        setups: []const Setup,
         notes: []const ProviderNote,
     ) error{OutOfMemory}!void {
         const keep = self.cursorRow();
         self.ready.clearRetainingCapacity();
-        self.setups.clearRetainingCapacity();
         self.notes.clearRetainingCapacity();
         try self.ready.appendSlice(self.allocator, ready[0..@min(ready.len, self.offers.items.len)]);
-        try self.setups.appendSlice(self.allocator, setups);
         try self.notes.appendSlice(self.allocator, notes);
         self.refocus(keep);
     }
@@ -385,23 +370,6 @@ pub const Picker = struct {
     /// Whether a commit could bind the offer at `index` now.
     pub fn isReady(self: *const Picker, index: usize) bool {
         return index >= self.ready.items.len or self.ready.items[index];
-    }
-
-    /// Whether any offer of `provider` is ready.
-    pub fn providerReady(self: *const Picker, provider: Slug) bool {
-        for (self.offers.items, 0..) |offer, index| {
-            if (offer.provider_id.eql(provider) and self.isReady(index)) return true;
-        }
-        return false;
-    }
-
-    /// Where `provider` gets its credential, as the host described it; just
-    /// the provider when the host said nothing about it.
-    pub fn setupFor(self: *const Picker, provider: Slug) Setup {
-        for (self.setups.items) |entry| {
-            if (entry.provider.eql(provider)) return entry;
-        }
-        return .{ .provider = provider };
     }
 
     /// What `provider`'s heading says, as the host described it; null when
@@ -415,7 +383,8 @@ pub const Picker = struct {
 
     /// This install's `<state root>/.env` (copied, cut at
     /// `MAX_LOCAL_CONFIG_PATH`) and the guide to it (borrowed; a static
-    /// string), for the setup stage.
+    /// string), for the setup stage and for a list no provider is
+    /// configured for.
     pub fn setLocalConfig(self: *Picker, path: []const u8, guide: []const u8) void {
         const len = @min(path.len, MAX_LOCAL_CONFIG_PATH);
         @memcpy(self.local_config_path_buffer[0..len], path[0..len]);
@@ -427,21 +396,18 @@ pub const Picker = struct {
         return self.local_config_path_buffer[0..self.local_config_path_len];
     }
 
-    /// Show where `setup.provider` gets its credential in place of the list:
-    /// Enter on a provider no commit could bind, or a commit the host found
-    /// no credential for (#488). Esc goes back to where the user was, filter
-    /// and row included.
+    /// Show where `setup.provider` gets its credential in place of the list,
+    /// after a commit the host found no credential for: the list showed the
+    /// route, so the credential went away since (#483, #488). Esc goes back
+    /// to where the user was, filter and row included.
     pub fn enterSetup(self: *Picker, setup: Setup) void {
-        if (self.stage != .setup) {
-            self.setup_return_stage = self.stage;
-            self.setup_return_row = self.cursorRow();
-        }
+        if (self.stage != .setup) self.setup_return_row = self.cursorRow();
         self.setup = setup;
         self.stage = .setup;
     }
 
     fn leaveSetup(self: *Picker) void {
-        self.stage = self.setup_return_stage;
+        self.stage = .list;
         self.setup = null;
         self.notice_len = 0;
         // A refresh while the setup was shown may have taken the row away.
@@ -471,7 +437,6 @@ pub const Picker = struct {
         self.intents = .{};
         self.scope = .session;
         self.setup = null;
-        self.setup_return_stage = .list;
         self.setup_return_row = .{};
         self.focus_current = true;
         self.refocus(.{});
@@ -536,31 +501,22 @@ pub const Picker = struct {
                     for (providers.items) |first| {
                         const start = buffer.list.items.len;
                         try buffer.list.append(buffer.gpa, .{ .heading = .{ .offer_index = first } });
-                        try self.modelRows(buffer, self.offers.items[first].provider_id, true, null);
+                        try self.modelRows(buffer, self.offers.items[first].provider_id, null);
                         // A heading over no model is dropped with it.
                         if (buffer.list.items.len == start + 1) buffer.list.shrinkRetainingCapacity(start);
                     }
-                    const count = self.unconfiguredCount();
-                    if (count > 0) try buffer.list.append(buffer.gpa, .{ .unconfigured = .{ .count = count } });
                 } else {
-                    // Flat. What matches among the providers not configured
-                    // is listed too, dim: someone looking for GLM should not
-                    // have to know it lives behind `zai-coding-plan`, nor
-                    // that it has no key yet. The models that hold the typed
-                    // text whole come first, the ones that only hold its
-                    // letters in order after them: `glm` lists GLM-5.3 before
-                    // `google/gemini-…`. Within each, the configured
-                    // providers first, in the list's order.
-                    var unready: std.ArrayList(usize) = .empty;
-                    defer unready.deinit(buffer.gpa);
-                    try self.unconfiguredProviders(buffer.gpa, &unready);
+                    // Flat, across the configured providers: someone looking
+                    // for GLM should not have to know it lives behind
+                    // `zai-coding-plan`. The models that hold the typed text
+                    // whole come first, the ones that only hold its letters
+                    // in order after them: `glm` lists GLM-5.3 before
+                    // `google/gemini-…`. Within each, in the list's order.
                     for ([_]Match{ .whole, .scattered }) |tier| {
-                        for (providers.items) |first| try self.modelRows(buffer, self.offers.items[first].provider_id, true, tier);
-                        for (unready.items) |first| try self.modelRows(buffer, self.offers.items[first].provider_id, false, tier);
+                        for (providers.items) |first| try self.modelRows(buffer, self.offers.items[first].provider_id, tier);
                     }
                 }
             },
-            .unconfigured => try self.providerRows(buffer),
             .setup => {},
         }
         return buffer.list.items;
@@ -592,40 +548,16 @@ pub const Picker = struct {
         }
     }
 
-    /// The first offer of each provider with no ready offer, in catalog order.
-    fn unconfiguredProviders(self: *const Picker, gpa: std.mem.Allocator, out: *std.ArrayList(usize)) error{OutOfMemory}!void {
-        for (self.offers.items, 0..) |offer, index| {
-            if (self.providerReady(offer.provider_id)) continue;
-            const seen = for (out.items) |first| {
-                if (self.offers.items[first].provider_id.eql(offer.provider_id)) break true;
-            } else false;
-            if (!seen) try out.append(gpa, index);
-        }
-    }
-
-    fn unconfiguredCount(self: *const Picker) usize {
-        var count: usize = 0;
-        for (self.offers.items, 0..) |offer, index| {
-            if (self.providerReady(offer.provider_id)) continue;
-            const first = for (self.offers.items[0..index]) |earlier| {
-                if (earlier.provider_id.eql(offer.provider_id)) break false;
-            } else true;
-            if (first) count += 1;
-        }
-        return count;
-    }
-
-    /// The models of `provider` that match the filter, a row each in catalog
-    /// order: its ready ones (`ready`), or, for a provider not configured, all
-    /// of them, dim. With a `tier`, only the models the filter matches that
+    /// The ready models of `provider` that match the filter, a row each in
+    /// catalog order. With a `tier`, only the models the filter matches that
     /// well. The routes of the expanded model follow it.
-    fn modelRows(self: *const Picker, buffer: *RowBuffer, provider: Slug, ready: bool, tier: ?Match) error{OutOfMemory}!void {
+    fn modelRows(self: *const Picker, buffer: *RowBuffer, provider: Slug, tier: ?Match) error{OutOfMemory}!void {
         const start = buffer.list.items.len;
         // By pointer: the label of a model row is read from the offer, and a
         // by-value capture would leave it pointing into the loop variable.
         for (self.offers.items, 0..) |*offer, index| {
             if (!offer.provider_id.eql(provider)) continue;
-            if (ready and !self.isReady(index)) continue;
+            if (!self.isReady(index)) continue;
             if (!self.matchesOffer(offer)) continue;
             const key = canonicalKey(offer.*);
             if (tier) |wanted| if (self.modelMatch(provider, key) != wanted) continue;
@@ -643,10 +575,8 @@ pub const Picker = struct {
                 .offer_count = 1,
                 .label = key,
                 .is_current = current,
-                .ready = ready,
             } });
         }
-        if (!ready) return;
         const expanded = self.expanded_provider orelse return;
         if (!expanded.eql(provider)) return;
         const at = findModel(buffer.list.items[start..], self.expandedKey()) orelse return;
@@ -665,34 +595,6 @@ pub const Picker = struct {
                 .last = listed == group.offer_count,
             } });
             insert_at += 1;
-        }
-    }
-
-    /// The providers no commit could bind now, a row each, matching the
-    /// filter by name or by what they serve.
-    fn providerRows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}!void {
-        for (self.offers.items, 0..) |*offer, index| {
-            if (self.providerReady(offer.provider_id)) continue;
-            if (!self.matchesOffer(offer)) continue;
-            // By pointer: a provider id is an inline `Slug`, so the label of a
-            // by-value capture points into the loop variable. Every stored
-            // label then read the offer being visited, and providers whose ids
-            // had the same length (metask, openai, gemini) folded into one.
-            const label = offer.provider_id.slice();
-            const existing = for (buffer.list.items, 0..) |row, at| {
-                if (std.mem.eql(u8, row.provider.label, label)) break at;
-            } else null;
-            if (existing) |at| {
-                buffer.list.items[at].provider.offer_count += 1;
-                continue;
-            }
-            try buffer.list.append(buffer.gpa, .{ .provider = .{
-                .offer_index = index,
-                .offer_count = 1,
-                .label = label,
-                .is_current = false,
-                .ready = false,
-            } });
         }
     }
 
@@ -749,11 +651,6 @@ pub const Picker = struct {
             .route => |route| {
                 id.kind = .route;
                 id.offer = self.offers.items[route.offer_index].offer_id;
-            },
-            .unconfigured => id.kind = .unconfigured,
-            .provider => |group| {
-                id.kind = .provider;
-                id.provider = self.offers.items[group.offer_index].provider_id;
             },
         }
         return id;
@@ -812,10 +709,6 @@ pub const Picker = struct {
     /// just opened, else the row the cursor was on.
     fn refocus(self: *Picker, keep: RowId) void {
         if (self.stage == .setup) return;
-        if (self.stage == .unconfigured and self.unconfiguredCount() == 0) {
-            self.stage = .list;
-            self.filter_len = 0;
-        }
         if (self.focus_current) {
             if (self.currentIndex()) |current| {
                 const offer = self.offers.items[current];
@@ -857,17 +750,25 @@ pub const Picker = struct {
         const list = self.rows(&buffer) catch return null;
         if (list.len == 0) return null;
         return switch (list[@min(self.cursor, list.len - 1)]) {
-            .model => |group| if (group.ready) &self.offers.items[group.offer_index] else null,
+            .model => |group| &self.offers.items[group.offer_index],
             .route => |route| &self.offers.items[route.offer_index],
-            else => null,
+            .heading => null,
         };
     }
 
     /// The value `spec` takes on the focused route: the value wanted when the
     /// vocabulary has it; for the reasoning effort, the nearest level it has
-    /// (`nearestLevel`); null for unset, the provider's own default.
+    /// (`nearestLevel`). With nothing wanted, or nothing that fits, the
+    /// default the provider declares (`declaredDefault`); null for unset, the
+    /// provider's own default, unnamed.
     pub fn effectiveValue(self: *const Picker, spec: controls_mod.ControlSpec) ?[]const u8 {
         if (spec.kind != .enumeration or spec.allowed_values.len == 0) return null;
+        return self.wantedValue(spec) orelse declaredDefault(spec);
+    }
+
+    /// The value wanted as `spec`'s vocabulary has it, or, for the reasoning
+    /// effort, its nearest level; null when nothing is wanted or nothing fits.
+    fn wantedValue(self: *const Picker, spec: controls_mod.ControlSpec) ?[]const u8 {
         const wanted = self.intents.get(spec.id) orelse return null;
         if (wanted != .text) return null;
         const text = wanted.text.slice();
@@ -916,13 +817,7 @@ pub const Picker = struct {
             .page_down => return self.pageMove(visible, true),
             .home => return self.jump(visible, false),
             .end => return self.jump(visible, true),
-            .left, .right => {
-                if (visible.len == 0) return .ignored;
-                const row = visible[@min(self.cursor, visible.len - 1)];
-                // → on the "Not configured" line lists them, as Enter does.
-                if (row == .unconfigured) return if (key == .right) self.advance(visible) else .ignored;
-                return self.adjust(key == .right);
-            },
+            .left, .right => return self.adjust(key == .right),
             .cycle_scope => {
                 self.scope = switch (self.scope) {
                     .session => .global,
@@ -1049,53 +944,23 @@ pub const Picker = struct {
             self.focus(keep);
             return .redraw;
         }
-        switch (self.stage) {
-            .list => return .closed,
-            .unconfigured => {
-                self.stage = .list;
-                self.focus(.{ .kind = .unconfigured });
-                return .redraw;
-            },
-            .setup => unreachable, // handled above
-        }
+        return .closed;
     }
 
     fn advance(self: *Picker, visible: []const Row) Outcome {
         if (visible.len == 0) return .ignored;
-        switch (visible[@min(self.cursor, visible.len - 1)]) {
-            .heading => return .ignored,
-            .model => |group| {
-                if (!group.ready) {
-                    // Not configured: where its credential goes, and nothing
-                    // more (#488).
-                    self.enterSetup(self.setupFor(self.offers.items[group.offer_index].provider_id));
-                    return .redraw;
-                }
-                return self.commitNow();
-            },
-            .route => return self.commitNow(),
-            .unconfigured => {
-                self.stage = .unconfigured;
-                self.filter_len = 0;
-                self.window_top = 0;
-                self.collapse();
-                self.cursor = 0;
-                var buffer = RowBuffer.init(self.allocator);
-                defer buffer.deinit();
-                if (self.rows(&buffer)) |list| self.scrollTo(list) else |_| {}
-                return .redraw;
-            },
-            .provider => |group| {
-                self.enterSetup(self.setupFor(self.offers.items[group.offer_index].provider_id));
-                return .redraw;
-            },
-        }
+        return switch (visible[@min(self.cursor, visible.len - 1)]) {
+            .heading => .ignored,
+            .model, .route => self.commitNow(),
+        };
     }
 
     /// ←/→: the previous / next value of the focused route's first control,
     /// from the one it shows. Unset (the provider's default) sits before the
-    /// first value; the ends do not wrap, like a slider. Nothing here invents
-    /// a value: a control with no `allowed_values` cannot be changed here.
+    /// first value, unless the control declares its default: that default is
+    /// then a value of the vocabulary, and nothing sits before the first. The
+    /// ends do not wrap, like a slider. Nothing here invents a value: a
+    /// control with no `allowed_values` cannot be changed here.
     fn adjust(self: *Picker, forward: bool) Outcome {
         const offer = self.focusedOffer() orelse return .ignored;
         const spec = firstEnumeration(offer.controls) orelse return .ignored;
@@ -1107,10 +972,13 @@ pub const Picker = struct {
             }
         }
         const last = spec.allowed_values.len - 1;
+        const unset_first = declaredDefault(spec) == null;
         const next: ?usize = if (forward)
             (if (position) |at| @min(at + 1, last) else 0)
+        else if (position) |at|
+            (if (at > 0) at - 1 else if (unset_first) null else at)
         else
-            (if (position) |at| (if (at == 0) null else at - 1) else null);
+            null;
         if (next == null and position == null) return .ignored;
         if (next != null and position != null and next.? == position.?) return .ignored;
         if (next) |index| {
@@ -1178,6 +1046,18 @@ fn focusableNear(list: []const Row, from: usize, backward: bool) ?usize {
 pub fn firstEnumeration(specs: []const controls_mod.ControlSpec) ?controls_mod.ControlSpec {
     for (specs) |spec| {
         if (spec.kind == .enumeration and spec.allowed_values.len > 0) return spec;
+    }
+    return null;
+}
+
+/// The default `spec` declares for its provider, as its vocabulary spells
+/// it; null when it declares none, or one the vocabulary lacks (a value the
+/// picker could not show among the others, nor the kernel accept).
+pub fn declaredDefault(spec: controls_mod.ControlSpec) ?[]const u8 {
+    const declared = spec.default_value orelse return null;
+    if (declared != .text) return null;
+    for (spec.allowed_values) |candidate| {
+        if (std.ascii.eqlIgnoreCase(candidate, declared.text.slice())) return candidate;
     }
     return null;
 }
@@ -1312,8 +1192,6 @@ fn shape(picker: *const Picker, out: []u8) ![]const u8 {
         .heading => 'H',
         .model => 'M',
         .route => 'R',
-        .unconfigured => 'U',
-        .provider => 'P',
     };
     return out[0..list.len];
 }
@@ -1695,6 +1573,83 @@ test "the level wanted is kept across models, each showing the nearest it takes"
     try testing.expectEqualStrings("low", picker.effectiveValue(REASONING_SHORT[0]).?);
 }
 
+/// DeepSeek's vocabulary, and the default it declares.
+const REASONING_DECLARED = [_]controls_mod.ControlSpec{.{
+    .id = "reasoning_effort",
+    .label = "Reasoning effort",
+    .kind = .enumeration,
+    .allowed_values = &.{ "none", "low", "high", "max" },
+    .default_value = .{ .text = controls_mod.ControlText.parse("high") catch unreachable },
+}};
+
+fn declaredFixture(picker: *Picker) !void {
+    var offer = fixtureOffer("deepseek", "default", "DeepSeek V4 Pro", null, "deepseek-v4-pro", "openai_chat");
+    offer.controls = &REASONING_DECLARED;
+    try loadFixture(picker, &.{offer}, null);
+    picker.restart();
+}
+
+test "a declared default starts selected and is committed by name, and nothing sits before the first value" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try declaredFixture(&picker);
+    const spec = REASONING_DECLARED[0];
+    // Nothing wanted: the provider's default, by name.
+    try testing.expectEqualStrings("high", picker.effectiveValue(spec).?);
+    try testing.expect(picker.wantedInstead(spec) == null);
+    const first = picker.onKey(.enter).commit.controls.get("reasoning_effort").?;
+    try testing.expect(first.text.eqlText("high"));
+    // ← walks down to the first value and stops: no unset slot to step
+    // into, from which the default would come back.
+    _ = picker.onKey(.left);
+    try testing.expectEqualStrings("low", picker.effectiveValue(spec).?);
+    _ = picker.onKey(.left);
+    try testing.expectEqualStrings("none", picker.effectiveValue(spec).?);
+    try testing.expect(picker.onKey(.left) == .ignored);
+    try testing.expectEqualStrings("none", picker.effectiveValue(spec).?);
+    const off = picker.onKey(.enter).commit.controls.get("reasoning_effort").?;
+    try testing.expect(off.text.eqlText("none"));
+}
+
+test "a level the session runs with wins over the declared default, none included" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try declaredFixture(&picker);
+    const spec = REASONING_DECLARED[0];
+    for ([_][]const u8{ "none", "low", "max" }) |level| {
+        picker.restart();
+        picker.presetControl("reasoning_effort", level);
+        try testing.expectEqualStrings(level, picker.effectiveValue(spec).?);
+        const sent = picker.onKey(.enter).commit.controls.get("reasoning_effort").?;
+        try testing.expect(sent.text.eqlText(level));
+    }
+    // A level the vocabulary lacks takes the nearest one it has, as on any
+    // route: the default stands in only when nothing is wanted.
+    picker.restart();
+    picker.presetControl("reasoning_effort", "medium");
+    try testing.expectEqualStrings("low", picker.effectiveValue(spec).?);
+    try testing.expectEqualStrings("medium", picker.wantedInstead(spec).?);
+}
+
+test "a declared default the vocabulary lacks is not shown, and unset stays the default" {
+    const odd = [_]controls_mod.ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Reasoning effort",
+        .kind = .enumeration,
+        .allowed_values = &.{ "low", "high" },
+        .default_value = .{ .text = controls_mod.ControlText.parse("turbo") catch unreachable },
+    }};
+    try testing.expect(declaredDefault(odd[0]) == null);
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offer = fixtureOffer("metask", "default", "M", null, "m", "anthropic_messages");
+    offer.controls = &odd;
+    try loadFixture(&picker, &.{offer}, null);
+    picker.restart();
+    try testing.expect(picker.effectiveValue(odd[0]) == null);
+    try testing.expect(picker.onKey(.enter).commit.controls.get("reasoning_effort") == null);
+}
+
 test "a control the provider did not enumerate cannot be changed from the picker" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
@@ -1740,7 +1695,7 @@ test "a refresh that keeps the focused model leaves the cursor on it" {
     try testing.expect(picker.onKey(.enter).commit.offer_id.eql(offers[1].offer_id));
 }
 
-test "providers with no ready offer are one line at the bottom; Enter lists them, Enter on one shows its setup, Esc walks back (#488)" {
+test "a provider with no ready offer is not listed, and no row leads to its setup (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]OfferSummary{
@@ -1749,36 +1704,25 @@ test "providers with no ready offer are one line at the bottom; Enter lists them
         fixtureOffer("gemini", "default", "Gemini", null, "gemini-2.5-pro", "gemini_generate"),
     };
     try loadFixture(&picker, &offers, null);
-    const setups = [_]Setup{.{ .provider = Slug.lit("openai"), .variable = "OPENAI_API_KEY" }};
-    try picker.setReadiness(&.{ false, true, false }, &setups, &.{});
+    try picker.setReadiness(&.{ false, true, false }, &.{});
     picker.restart();
     var letters: [16]u8 = undefined;
-    try testing.expectEqualStrings("HMU", try shape(&picker, &letters));
+    // DeepSeek's heading and model, and nothing below them.
+    try testing.expectEqualStrings("HM", try shape(&picker, &letters));
     var buffer = Picker.RowBuffer.init(testing.allocator);
     defer buffer.deinit();
-    try testing.expectEqual(@as(usize, 2), (try rowAt(&picker, &buffer, 2)).unconfigured.count);
+    const heading = (try rowAt(&picker, &buffer, 0)).heading;
+    try testing.expectEqualStrings("deepseek", picker.offers.items[heading.offer_index].provider_id.slice());
+    // End and ↓ stay on that model, and Enter applies it.
+    _ = picker.onKey(.end);
     _ = picker.onKey(.down);
-    try testing.expectEqual(@as(usize, 2), picker.cursor);
-    // Nothing to apply there.
-    try testing.expect(picker.focusedOffer() == null);
-    _ = picker.onKey(.enter);
-    try testing.expectEqual(Stage.unconfigured, picker.stage);
-    try testing.expectEqualStrings("PP", try shape(&picker, &letters));
-    try testing.expectEqualStrings("openai", (try rowAt(&picker, &buffer, 0)).provider.label);
-    try testing.expect(picker.onKey(.enter) == .redraw);
-    try testing.expectEqual(Stage.setup, picker.stage);
-    try testing.expectEqualStrings("OPENAI_API_KEY", picker.setup.?.variable.?);
-    // Typing does nothing there; Esc returns to the same row.
-    try testing.expect(picker.onKey(.{ .char = 'x' }) == .ignored);
-    _ = picker.onKey(.escape);
-    try testing.expectEqual(Stage.unconfigured, picker.stage);
-    try testing.expectEqual(@as(usize, 0), picker.cursor);
-    _ = picker.onKey(.escape);
+    try testing.expectEqual(@as(usize, 1), picker.cursor);
+    const outcome = picker.onKey(.enter);
+    try testing.expect(outcome.commit.offer_id.eql(offers[1].offer_id));
     try testing.expectEqual(Stage.list, picker.stage);
-    try testing.expectEqual(@as(usize, 2), picker.cursor);
 }
 
-test "a filter finds models of providers not configured too, dim, and Enter shows where their credential goes" {
+test "a filter does not find the models of a provider with no ready offer (#488)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]OfferSummary{
@@ -1786,23 +1730,21 @@ test "a filter finds models of providers not configured too, dim, and Enter show
         fixtureOffer("zai-coding-plan", "default", "GLM-4.6", null, "glm-4.6", "anthropic_messages"),
     };
     try loadFixture(&picker, &offers, null);
-    try picker.setReadiness(&.{ true, false }, &.{}, &.{});
+    try picker.setReadiness(&.{ true, false }, &.{});
     picker.restart();
+    // `glm` matches both models; only the configured one is listed.
     for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
-    var buffer = Picker.RowBuffer.init(testing.allocator);
-    defer buffer.deinit();
-    const list = try picker.rows(&buffer);
-    try testing.expectEqual(@as(usize, 2), list.len);
-    try testing.expect(list[0].model.ready);
-    try testing.expect(!list[1].model.ready);
-    _ = picker.onKey(.down);
-    try testing.expect(picker.onKey(.enter) == .redraw);
-    try testing.expectEqual(Stage.setup, picker.stage);
-    try testing.expectEqualStrings("zai-coding-plan", picker.setup.?.provider.slice());
-    // Esc returns to the filtered list, on that row.
-    _ = picker.onKey(.escape);
-    try testing.expectEqualStrings("glm", picker.filter());
-    try testing.expectEqual(@as(usize, 1), picker.cursor);
+    var letters: [16]u8 = undefined;
+    try testing.expectEqualStrings("M", try shape(&picker, &letters));
+    try testing.expectEqualStrings("glm-5.3", picker.focusedOffer().?.request_model_id);
+    // What only the other provider matches lists nothing, and Enter there
+    // neither commits nor shows a setup.
+    picker.restart();
+    for ("zai") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqual(@as(usize, 0), picker.rowCount());
+    try testing.expect(picker.onKey(.enter) == .ignored);
+    try testing.expectEqual(Stage.list, picker.stage);
+    try testing.expect(picker.setup == null);
 }
 
 test "a commit the host found no credential for shows the setup, and Esc returns to the same model (#488)" {
@@ -1823,7 +1765,7 @@ test "a commit the host found no credential for shows the setup, and Esc returns
     try testing.expectEqual(@as(usize, 2), picker.cursor);
 }
 
-test "a refresh that takes every credential away folds the providers into the Not configured line" {
+test "a refresh that takes every credential away leaves no row and nothing to apply" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]OfferSummary{
@@ -1832,11 +1774,18 @@ test "a refresh that takes every credential away folds the providers into the No
     };
     try loadFixture(&picker, &offers, null);
     picker.restart();
-    try picker.setReadiness(&.{ false, false }, &.{}, &.{});
-    var letters: [16]u8 = undefined;
-    try testing.expectEqualStrings("U", try shape(&picker, &letters));
+    try picker.setReadiness(&.{ false, false }, &.{});
+    try testing.expectEqual(@as(usize, 0), picker.rowCount());
     try testing.expectEqual(@as(usize, 0), picker.cursor);
     try testing.expect(picker.focusedOffer() == null);
+    for ([_]Key{ .enter, .right, .down, .end }) |key| {
+        try testing.expect(picker.onKey(key) == .ignored);
+    }
+    try testing.expectEqual(Stage.list, picker.stage);
+    // The credentials come back, and so do the rows.
+    try picker.setReadiness(&.{ true, true }, &.{});
+    var letters: [16]u8 = undefined;
+    try testing.expectEqualStrings("HMHM", try shape(&picker, &letters));
 }
 
 test "fuzzy matching is case-insensitive and an empty needle hides nothing" {

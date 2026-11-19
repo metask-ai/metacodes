@@ -7,6 +7,10 @@ on:
   # under the old rules (doc/CI_DESIGN.md §3).
   merge_group:
   workflow_dispatch:
+  # main's nightly run: the one run that saves the caches every pull request
+  # restores (doc/CI_DESIGN.md §5). 19:00 UTC is 03:00 in Beijing.
+  schedule:
+    - cron: "0 19 * * *"
 
 permissions:
   contents: read
@@ -16,6 +20,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # 'true' only on main's scheduled or dispatched run, which builds from empty
+  # Zig caches and saves them. Every other run, pull requests included,
+  # restores what main saved and saves nothing (doc/CI_DESIGN.md §5).
+  WARM_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+
 # Topology: GitHub-hosted runners only (the repository is public;
 # organization policy keeps public repositories off the self-hosted fleet, and
 # hosted standard runners are free for public repositories). Each platform's
@@ -23,8 +33,8 @@ concurrency:
 # TTY suites into shards; a small result job per platform reports the leg or
 # shard results under the name the ruleset requires (doc/CI_DESIGN.md §4).
 # Within a leg, steps run cheapest-first for fail-fast. Every runner is
-# ephemeral: nothing persists between runs except what actions/cache and
-# setup-zig restore explicitly.
+# ephemeral: nothing persists between runs except the caches main's nightly
+# run saves and the other runs restore (doc/CI_DESIGN.md §5).
 jobs:
   # A release or reopen PR adds only what scripts/release_cut.py generates.
   # When that is proven against the merge commit, and the base commit already
@@ -171,32 +181,41 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      # use-cache: setup-zig points both Zig cache env vars at one directory
-      # and restores/saves it through actions/cache keyed by OS and Zig
-      # version. Zig's cache is content-addressed and folds the compiler
-      # version into every hash, so a restored directory is always safe; test
-      # execution is not affected because test Run steps are has_side_effects
-      # in build.zig. cache-size-limit: the directory is dropped instead of
-      # saved once it exceeds this many MiB (the default 2 GiB is below what
-      # one full run of these gates produces). cache-key: each leg builds a
-      # different share of the graph, so each keeps its own cache line.
+      # setup-zig points ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR at
+      # .zig-cache. Its own cache stays off, since it saves on every run; the
+      # steps below restore and save explicitly (doc/CI_DESIGN.md §5). Zig's
+      # cache is content-addressed and folds the compiler version into every
+      # hash, so a restored directory is always safe; test execution is not
+      # affected because test Run steps are has_side_effects in build.zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
-          cache-key: ${{ matrix.leg }}
+          use-cache: false
+      # Every run but main's warm one restores the newest Zig cache main saved
+      # for this leg. A pull request can read its base branch's caches, never
+      # another pull request's, and saves none of its own. The key is the
+      # prefix of what main saves (its run ID follows), so the newest wins.
+      # Each leg builds a different share of the graph and keeps its own line.
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
       - name: Zig format check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig fmt --check build.zig src tests
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
       # (restore-keys) and Lake hash-verifies what it restores; a stale or
-      # torn copy self-heals into a rebuild rather than wrong results.
+      # torn copy self-heals into a rebuild rather than wrong results. Every
+      # run restores; only main's warm run saves (after the kernel build).
       - name: Restore Lean toolchain and build products
+        id: lean
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.elan
@@ -229,6 +248,16 @@ jobs:
           # stage itself. One line: test_gate_manifest.py shlex-splits every
           # line of this block on its own.
           LAKE="$(command -v lake)" bash scripts/build-project-harness-kernel.sh "$RUNNER_TEMP/metacodes-project-kernel"
+      # One leg saves, once per state of the Lean sources (the key is their
+      # hash): an exact hit means main already holds this state.
+      - name: Save Lean toolchain and build products
+        if: env.WARM_CACHE == 'true' && matrix.units && steps.lean.outputs.cache-hit != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: ${{ steps.lean.outputs.cache-primary-key }}
       - name: Install ripgrep
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
@@ -557,6 +586,16 @@ jobs:
       - name: Diff whitespace check
         if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
+      # main's warm run saves what this leg built from an empty cache, so the
+      # entry holds only what the current tree needs and does not grow night
+      # after night. A failed leg saves nothing and the previous night's entry
+      # stays. Cache keys are immutable, hence the run ID in each.
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
   # The same steps (the YAML alias of `gates-linux`'s list) on two macOS
   # runners: units and integration with the checks, product, and release. Each
@@ -628,12 +667,19 @@ jobs:
         run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: env.SDK != 'false'
+      # Caches as in `gates-linux` (doc/CI_DESIGN.md §5).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.SDK != 'false'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.SDK != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-sdk-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-sdk-run-
       - name: Build the AgentCore bundle
         if: env.SDK != 'false'
         run: |
@@ -674,6 +720,12 @@ jobs:
       - name: Rehearse a formal AgentCore release
         if: env.SDK != 'false'
         run: python3 scripts/agentcore_release.py rehearse --target ${{ matrix.target }} --work "$RUNNER_TEMP/rehearsal"
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && env.SDK != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-sdk-run-${{ github.run_id }}-${{ github.run_attempt }}
 
   # The offline TTY suite (tests/tty) drives the debug binary in a pseudo
   # terminal and asserts the screen a person would see. No workflow ran it
@@ -728,14 +780,20 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
-      # See `gates-linux` for the cache semantics. Every shard builds the same
-      # binaries, so they share one cache line.
+      # See `gates-linux` for the caches. Every shard builds the same
+      # binaries, so they share one cache line, which shard 1 saves.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.TTY != 'false'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && env.TTY != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-tty-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-tty-run-
       - name: Offline TTY suite (POSIX pty)
         if: runner.os != 'Windows' && env.FAST_PATH != 'true' && env.TTY != 'false'
         env:
@@ -751,6 +809,12 @@ jobs:
         run: |
           python -m pip install pywinpty==3.0.5 || exit /b 1
           zig build windows:tty -Dtarget=x86_64-windows-gnu
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && matrix.shard == 1 && env.FAST_PATH != 'true' && env.TTY != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-tty-run-${{ github.run_id }}-${{ github.run_attempt }}
 
   tty-windows:
     name: TTY (Windows) / ${{ matrix.shard }} of ${{ strategy.job-total }}
@@ -817,14 +881,19 @@ jobs:
           # fingerprint tests resolve historical commits with `git rev-parse`,
           # which a depth-1 checkout cannot (5 errors on the first full run).
           fetch-depth: 0
-      # See `gates-linux` for the cache semantics.
+      # See `gates-linux` for the caches.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
-          cache-key: ${{ matrix.leg }}
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
       # The hosted Windows image checks out with core.autocrlf=true, and
       # .gitattributes (`* text=auto eol=lf`) is the contract: @embedFile'd
       # templates and pinned fixtures hash by the byte. List what is wrong for
@@ -891,8 +960,9 @@ jobs:
       # Lean cache as `gates-linux`; the kernel scripts run under Git Bash
       # (kernels:stage invokes bash).
       - name: Restore Lean toolchain and build products
+        id: lean
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.elan
@@ -972,6 +1042,23 @@ jobs:
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)
           exit /b 0
+      # As in `gates-linux`: main's warm run saves, pull requests never do. The
+      # suite builds the Lean kernels here, so the Lean products are saved
+      # after it.
+      - name: Save Lean toolchain and build products
+        if: env.WARM_CACHE == 'true' && matrix.units && steps.lean.outputs.cache-hit != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: ${{ steps.lean.outputs.cache-primary-key }}
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
   # The checks the `Protect main` ruleset requires: Gates (Linux), Gates
   # (macOS), Gates (Windows) and TTY (Linux) (doc/CI_DESIGN.md §1, §4). Each
