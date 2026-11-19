@@ -25,6 +25,8 @@
 
 const std = @import("std");
 
+pub const RequestProfile = @import("request_profile.zig").RequestProfile;
+
 pub const Vendor = enum {
     /// OpenAI's own models (GPT, o-series) and the generic OpenAI-compatible
     /// fallback.
@@ -65,9 +67,15 @@ pub const Vendor = enum {
 /// from the bound model's `ModelEntry.dialect` (a gateway serving several
 /// vendors' models over one wire) and covers that model only. Both null infers
 /// the dialect from the model name.
+///
+/// `request_profile` comes from `ProtocolRoute.request_profile`: what the
+/// route's endpoint requires of every request beyond the dialect
+/// (`request_profile.zig`). It is the route's, so it covers every model on the
+/// route and survives `rebind`.
 pub const Declaration = struct {
     route: ?Vendor = null,
     model: ?Vendor = null,
+    request_profile: ?RequestProfile = null,
 
     /// The bound model's own declaration: the entry's, else the route's.
     pub fn bound(self: Declaration) ?Vendor {
@@ -86,7 +94,7 @@ pub const Declaration = struct {
     /// `bound_model` on the same route.
     pub fn rebind(self: Declaration, bound_model: []const u8, model: []const u8) Declaration {
         if (std.mem.eql(u8, bound_model, model)) return self;
-        return .{ .route = self.route };
+        return .{ .route = self.route, .request_profile = self.request_profile };
     }
 };
 
@@ -103,6 +111,13 @@ test "Declaration: a model entry's dialect covers its model only, the route's ev
     try std.testing.expectEqual(Vendor.deepseek, relay.vendorFor("m", "other").?);
     try std.testing.expectEqual(Vendor.deepseek, relay.rebind("m", "other").bound().?);
     try std.testing.expect((Declaration{}).bound() == null);
+}
+
+test "Declaration: a route's request profile covers every model on it" {
+    const codex = Declaration{ .route = .openai, .model = .openai, .request_profile = .chatgpt_codex };
+    try std.testing.expectEqual(RequestProfile.chatgpt_codex, codex.rebind("gpt-6-sol", "gpt-6-luna").request_profile.?);
+    try std.testing.expectEqual(RequestProfile.chatgpt_codex, codex.rebind("gpt-6-sol", "gpt-6-sol").request_profile.?);
+    try std.testing.expect((Declaration{ .route = .openai }).rebind("a", "b").request_profile == null);
 }
 
 test "Vendor.parse accepts exactly the tag names" {

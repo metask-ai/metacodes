@@ -22,6 +22,16 @@ pub const MergeError = error{
     OutOfMemory,
 };
 
+/// One member of an object that is itself a top-level value:
+/// `object_key.member_key` (`custom_providers.my-relay`). A writer that owns
+/// one member, not the whole object, replaces exactly that member.
+pub const MemberField = struct {
+    object_key: []const u8,
+    member_key: []const u8,
+    /// Raw JSON text for the member's new value, or null to delete it.
+    json: ?[]const u8,
+};
+
 /// Return `original` with `fields` applied.
 ///
 /// Existing keys keep their position; new keys are appended in the order given.
@@ -30,6 +40,21 @@ pub fn mergeObjectFields(
     allocator: std.mem.Allocator,
     original: []const u8,
     fields: []const Field,
+) MergeError![]u8 {
+    return mergeFields(allocator, original, fields, &.{});
+}
+
+/// `mergeObjectFields`, then each of `members` inside its object, in the
+/// same pass. A member keeps its position when replaced and is appended when
+/// new; the object is created for a member put into one that is absent, and a
+/// delete from an absent object is a no-op. An `object_key` that holds
+/// anything but an object is `NotAnObject`: replacing it would destroy data
+/// this call was never asked about.
+pub fn mergeFields(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    fields: []const Field,
+    members: []const MemberField,
 ) MergeError![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -57,6 +82,26 @@ pub fn mergeObjectFields(
             try parsed.object.put(scratch, field.key, value);
         } else {
             _ = parsed.object.orderedRemove(field.key);
+        }
+    }
+
+    for (members) |member| {
+        const holder = parsed.object.getPtr(member.object_key) orelse holder: {
+            if (member.json == null) continue;
+            try parsed.object.put(scratch, member.object_key, .{ .object = .empty });
+            break :holder parsed.object.getPtr(member.object_key).?;
+        };
+        if (holder.* != .object) return error.NotAnObject;
+        if (member.json) |raw| {
+            const value = std.json.parseFromSliceLeaky(
+                std.json.Value,
+                scratch,
+                raw,
+                .{},
+            ) catch return error.InvalidFieldJson;
+            try holder.object.put(scratch, member.member_key, value);
+        } else {
+            _ = holder.object.orderedRemove(member.member_key);
         }
     }
 
@@ -119,6 +164,62 @@ test "merge rejects malformed input instead of overwriting it" {
     try std.testing.expectError(error.NotAnObject, mergeObjectFields(a, "[1,2]", &.{}));
     try std.testing.expectError(error.InvalidFieldJson, mergeObjectFields(a, "{}", &.{
         .{ .key = "x", .json = "{oops" },
+    }));
+}
+
+fn expectKeys(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "a member edit replaces one member in place and leaves its siblings and the rest alone" {
+    const a = std.testing.allocator;
+    const original =
+        \\{"theme":"dark","custom_providers":{"a":{"x":1},"b":{"y":2},"c":{"z":3}},"tail":true}
+    ;
+    const merged = try mergeFields(a, original, &.{}, &.{
+        .{ .object_key = "custom_providers", .member_key = "b", .json = "{\"y\":20}" },
+        .{ .object_key = "custom_providers", .member_key = "d", .json = "{\"w\":4}" },
+    });
+    defer a.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, merged, .{});
+    defer parsed.deinit();
+    const section = parsed.value.object.get("custom_providers").?.object;
+    // Replaced in place, appended at the end, the others untouched.
+    try expectKeys(&.{ "a", "b", "c", "d" }, section.keys());
+    try std.testing.expectEqual(@as(i64, 20), section.get("b").?.object.get("y").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), section.get("a").?.object.get("x").?.integer);
+    try expectKeys(&.{ "theme", "custom_providers", "tail" }, parsed.value.object.keys());
+}
+
+test "a member edit deletes one member, creates the object it needs, and refuses a non-object" {
+    const a = std.testing.allocator;
+    const removed = try mergeFields(a, "{\"custom_providers\":{\"a\":{},\"b\":{}}}", &.{}, &.{
+        .{ .object_key = "custom_providers", .member_key = "a", .json = null },
+    });
+    defer a.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"a\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"b\"") != null);
+
+    // Deleting from an absent object changes nothing and adds nothing.
+    const untouched = try mergeFields(a, "{\"k\":1}", &.{}, &.{
+        .{ .object_key = "custom_providers", .member_key = "a", .json = null },
+    });
+    defer a.free(untouched);
+    try std.testing.expect(std.mem.indexOf(u8, untouched, "custom_providers") == null);
+
+    const created = try mergeFields(a, "", &.{}, &.{
+        .{ .object_key = "custom_providers", .member_key = "a", .json = "{\"x\":1}" },
+    });
+    defer a.free(created);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"custom_providers\"") != null);
+
+    // A section that is not an object is not overwritten.
+    try std.testing.expectError(error.NotAnObject, mergeFields(a, "{\"custom_providers\":[1]}", &.{}, &.{
+        .{ .object_key = "custom_providers", .member_key = "a", .json = "{}" },
+    }));
+    try std.testing.expectError(error.InvalidFieldJson, mergeFields(a, "{}", &.{}, &.{
+        .{ .object_key = "custom_providers", .member_key = "a", .json = "{oops" },
     }));
 }
 

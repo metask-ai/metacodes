@@ -27,6 +27,8 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const api_key_store = @import("../provider/api_key_store.zig");
 const provider_credential = @import("../provider/credential.zig");
 const catalog_fetch = @import("catalog_fetch.zig");
+const model_probe = @import("model_probe.zig");
+const openrouter_login = @import("openrouter_login.zig");
 
 pub const Method = oauth_login.Method;
 
@@ -37,6 +39,10 @@ pub const Options = struct {
     /// profile declares none; the refresh grant then presents it too.
     client_id: ?[]const u8 = null,
     port: u16 = oauth_login.DEFAULT_CALLBACK_PORT,
+    /// Replaces the ports the profile registered for its redirect
+    /// (`ProviderProfile.oauth_callback_ports`). For a test, which must not
+    /// take a port a real sign-in on the same machine may be waiting on.
+    callback_ports: []const u16 = &.{},
     timeout_seconds: u32 = 300,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
@@ -83,6 +89,19 @@ pub fn refusalText(err: FlowError, method: Method) []const u8 {
         error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in <state root>/config.json",
         error.ClientIdFixed => "that provider signs in with its own client; drop --client-id",
     };
+}
+
+/// What a sign-out finds for a provider it has nothing of, by what the
+/// provider takes: `No key`, `No sign-in`, or `No key or sign-in`.
+pub fn nothingStoredText(profile: *const provider_profile.ProviderProfile) []const u8 {
+    var key = false;
+    var sign_in = false;
+    for (profile.accepted_credential_kinds) |kind| {
+        if (provider_oauth.servesKind(kind)) sign_in = true else key = true;
+    }
+    if (sign_in and !key) return "No sign-in";
+    if (sign_in and key) return "No key or sign-in";
+    return "No key";
 }
 
 /// Why the durable import refused a token response. When a step failed rather
@@ -133,6 +152,12 @@ pub const Prepared = struct {
         diagnostic: ?*ImportDiagnostic,
     ) !Outcome {
         const provider_id = self.profile.id;
+        // Said before anything opens, so it is read before the browser takes
+        // the screen (plan §3.1).
+        if (self.profile.oauth_support == .unofficial) {
+            var line: [256]u8 = undefined;
+            notify.say(std.fmt.bufPrint(&line, "{s}: {s}\n", .{ self.profile.display_name, provider_profile.UNOFFICIAL_SIGN_IN_NOTICE }) catch provider_profile.UNOFFICIAL_SIGN_IN_NOTICE ++ "\n");
+        }
         const token_json = try oauth_login.acquireFirstToken(allocator, io, .{
             // Checked by `prepare`; unwrapped here so the flow gets a plain URL.
             .token_url = self.profile.oauth_token_url.?,
@@ -140,10 +165,15 @@ pub const Prepared = struct {
             .device_authorization_url = self.profile.oauth_device_authorization_url,
             .client_id = self.client_id,
             .scope = self.profile.oauth_scope,
+            .redirect_host = self.profile.oauth_redirect_host,
+            .authorize_params = self.profile.oauth_authorize_params,
         }, .{
             .method = self.options.method,
             .open_browser = self.options.open_browser,
             .port = self.options.port,
+            // A client that registered its redirect ports takes no other;
+            // `options.callback_ports` (a test's free ports) stands in for them.
+            .callback_ports = if (self.options.callback_ports.len > 0) self.options.callback_ports else self.profile.oauth_callback_ports,
             .timeout_seconds = self.options.timeout_seconds,
             .abort_signal = self.options.abort_signal,
             .notify = notify,
@@ -239,6 +269,10 @@ pub const ApiKeyPrepared = struct {
     classify_error: provider_profile.ClassifyFn = provider_profile.defaultClassifyError,
     /// False stores the key without the check (`login --no-check`).
     check: bool = true,
+    /// The check is the provider's key description (`KeyGrant.key_info_path`:
+    /// OpenRouter's `/api/v1/key`): what it says about the key is stored
+    /// beside it, as a sign-in stores it, and the key is marked pasted.
+    describes: bool = false,
 
     pub fn run(
         self: ApiKeyPrepared,
@@ -248,28 +282,44 @@ pub const ApiKeyPrepared = struct {
         diagnostic: ?*ImportDiagnostic,
     ) !Outcome {
         _ = diagnostic;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        var meta: api_key_store.Meta = .{ .obtained = if (self.describes) .pasted else null };
         if (self.check) if (keyCheckOverride() orelse self.page.check_url) |url| {
             var line: [512]u8 = undefined;
             notify.say(std.fmt.bufPrint(&line, "Checking the key with {s}\n", .{url}) catch "Checking the key\n");
             if (self.aborted()) return error.Aborted;
+            // An Anthropic model listing answers 400 without its version
+            // header, which would read as a check that learned nothing.
+            var extra: [1]std.http.Header = undefined;
             const answer = catalog_fetch.fetchAnswer(allocator, io, .{
                 .url = url,
                 .credential = .{ .scheme = self.auth, .secret = self.secret },
+                .extra_headers = model_probe.headersFor(self.page.check_wire, &extra),
             }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.KeyCheckFailed,
             };
             defer allocator.free(answer.body);
             try keyCheckVerdict(allocator, answer, self.classify_error);
+            if (self.describes) if (openrouter_login.parseKeyInfo(arena_state.allocator(), answer.body)) |info| {
+                meta.described = true;
+                meta.label = info.label;
+                meta.limit_usd = info.limit_usd;
+                meta.expires_at = info.expires_at;
+                meta.free_tier = info.free_tier;
+            };
             if (self.aborted()) return error.Aborted;
         };
-        try api_key_store.save(
+        try api_key_store.saveWithMeta(
             allocator,
             self.options.state_root,
             self.provider_id,
             self.kind,
             self.secret,
-            self.page.id.slice(),
+            // A configured provider's key was pasted, not made on a page.
+            if (self.page.url != null) self.page.id.slice() else null,
+            meta,
             time.nowUnix(),
         );
         var line: [256]u8 = undefined;
@@ -493,22 +543,99 @@ pub fn prepareApiKey(
         .secret = key,
         .auth = profile.auth,
         .classify_error = profile.classify_error,
+        // A provider whose site creates keys checks a pasted one against its
+        // key description; the same answer then describes it.
+        .describes = profile.key_grant != null,
+    };
+}
+
+/// A sign-in on the provider's site that hands back an API key of the user's
+/// own account (`ProviderProfile.key_grant`, OpenRouter). Two ways: the
+/// browser on this machine (loopback redirect), or another device, whose page
+/// shows a code the user pastes back (`pasted`). Every string is borrowed;
+/// the login worker copies them (`LoginWorker.ownFlow`).
+pub const KeyGrantPrepared = struct {
+    options: Options,
+    provider_id: provider_ids.Slug,
+    provider_label: []const u8,
+    /// The key setup's kind: the key is stored as a pasted one would be.
+    kind: provider_profile.CredentialKind,
+    grant: provider_profile.KeyGrant,
+    /// `grant.origin`, or the development override (`openrouter_login.origin`).
+    origin: []const u8,
+    /// The other-device way, once the user pasted the code. Null runs the
+    /// loopback way.
+    pasted: ?Pasted = null,
+
+    pub const Pasted = struct {
+        code: []const u8,
+        /// The verifier the page address was made with (`openrouter_login.Pending`).
+        verifier: []const u8,
+    };
+
+    pub fn run(
+        self: KeyGrantPrepared,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        notify: oauth_login.Notify,
+        diagnostic: ?*ImportDiagnostic,
+    ) !Outcome {
+        _ = diagnostic;
+        const target: openrouter_login.Target = .{
+            .provider_id = self.provider_id,
+            .provider_label = self.provider_label,
+            .kind = self.kind,
+            .state_root = self.options.state_root,
+        };
+        if (self.pasted) |pasted| {
+            try openrouter_login.finish(allocator, io, self.origin, self.grant, target, pasted.code, pasted.verifier, self.options.abort_signal);
+        } else {
+            try openrouter_login.signInWithBrowser(
+                allocator,
+                io,
+                self.origin,
+                self.grant,
+                target,
+                self.options.open_browser,
+                self.options.port,
+                self.options.abort_signal,
+                notify,
+            );
+        }
+        return .{ .provider_id = self.provider_id, .client_id_source = .declared };
+    }
+};
+
+/// The key grant `profile` declares, ready to run the loopback way; null when
+/// it declares none.
+pub fn prepareKeyGrant(profile: *const provider_profile.ProviderProfile, options: Options) ?KeyGrantPrepared {
+    const grant = profile.key_grant orelse return null;
+    const setup = profile.api_key_setup orelse return null;
+    return .{
+        .options = options,
+        .provider_id = profile.id,
+        .provider_label = profile.display_name,
+        .kind = setup.kind,
+        .grant = grant,
+        .origin = openrouter_login.origin(grant),
     };
 }
 
 /// A sign-in that passed every refusal check: the generic OAuth grant for a
-/// profile, Metask's own device grant, or a pasted API key. The TUI's login
-/// worker runs any of them.
+/// profile, Metask's own device grant, a provider's key grant, or a pasted
+/// API key. The TUI's login worker runs any of them.
 pub const Flow = union(enum) {
     oauth: Prepared,
     metask: MetaskPrepared,
     api_key: ApiKeyPrepared,
+    key_grant: KeyGrantPrepared,
 
     pub fn options(self: *Flow) *Options {
         return switch (self.*) {
             .oauth => |*prepared| &prepared.options,
             .metask => |*prepared| &prepared.options,
             .api_key => |*prepared| &prepared.options,
+            .key_grant => |*prepared| &prepared.options,
         };
     }
 
@@ -523,17 +650,23 @@ pub const Flow = union(enum) {
             .oauth => |prepared| prepared.run(allocator, io, notify, diagnostic),
             .metask => |prepared| prepared.run(allocator, io, notify, diagnostic),
             .api_key => |prepared| prepared.run(allocator, io, notify, diagnostic),
+            .key_grant => |prepared| prepared.run(allocator, io, notify, diagnostic),
         };
     }
 };
 
-/// The flow `/login` runs for `profile`: Metask's own grant, or the generic
-/// one when the profile passes `prepareProfileWith`.
+/// The flow `/login` runs for `profile`: Metask's own grant, the provider's
+/// key grant, or the generic one when the profile passes `prepareProfileWith`.
 pub fn prepareFlow(profile: *const provider_profile.ProviderProfile, options: Options, configured: ?[]const u8) FlowError!Flow {
     if (profile.id.eqlText("metask")) {
         try requireOAuthCapable(profile);
         if (options.client_id != null) return error.ClientIdFixed;
         return .{ .metask = .{ .options = options } };
+    }
+    if (prepareKeyGrant(profile, options)) |prepared| {
+        // The grant presents no client: an OAuth client id has nothing to do.
+        if (options.client_id != null) return error.ClientIdFixed;
+        return .{ .key_grant = prepared };
     }
     return .{ .oauth = try prepareProfileWith(profile, options, configured) };
 }
@@ -676,6 +809,16 @@ test "the client id precedence is explicit, then configured, then declared" {
     const declared = try prepareProfileWith(&undeclared, .{ .state_root = "" }, null);
     try std.testing.expectEqual(ClientIdSource.declared, declared.client_id_source);
     try std.testing.expectEqualStrings("declared-client", declared.client_id);
+}
+
+test "prepareFlow: a provider with a key grant runs it, from the profile's origin, and refuses a client id" {
+    const openrouter = @import("../provider/profiles/openrouter.zig").PROFILE;
+    const flow = try prepareFlow(&openrouter, .{ .state_root = "/state", .open_browser = false }, null);
+    try std.testing.expect(flow == .key_grant);
+    try std.testing.expectEqualStrings("https://openrouter.ai", flow.key_grant.origin);
+    try std.testing.expectEqual(provider_profile.CredentialKind.api_key, flow.key_grant.kind);
+    try std.testing.expect(flow.key_grant.pasted == null);
+    try std.testing.expectError(error.ClientIdFixed, prepareFlow(&openrouter, .{ .state_root = "/state", .client_id = "x" }, null));
 }
 
 test "prepareFlow: Metask runs its own grant and refuses a client id it would ignore" {

@@ -31,6 +31,7 @@ pub const ControlSpec = controls_mod.ControlSpec;
 pub const AuthScheme = credential.AuthScheme;
 pub const Vendor = @import("vendor.zig").Vendor;
 pub const DialectDeclaration = @import("vendor.zig").Declaration;
+pub const RequestProfile = @import("request_profile.zig").RequestProfile;
 pub const CredentialKind = credential.CredentialKind;
 pub const EnvAlias = credential.EnvAlias;
 
@@ -260,6 +261,10 @@ pub const ProtocolRoute = struct {
     /// expects inside it (`vendor.zig`). Null infers it from the model name,
     /// which is what every route did before routes could say.
     dialect: ?Vendor = null,
+    /// What this route's endpoint requires of every request beyond the
+    /// dialect (`request_profile.zig`): headers and body fields another
+    /// endpoint of the same wire must not get. Null requires nothing more.
+    request_profile: ?RequestProfile = null,
 
     pub fn suffix(self: ProtocolRoute) []const u8 {
         return self.path_suffix orelse self.protocol.pathSuffix();
@@ -447,6 +452,28 @@ pub const ProviderProfile = struct {
     /// headless or SSH session cannot open a browser and a loopback redirect
     /// has nowhere to land; a provider that supports neither keeps both null.
     oauth_device_authorization_url: ?[]const u8 = null,
+    /// The host of the loopback redirect URI. The listener is always on the
+    /// IPv4 loopback address; what differs is the name the authorization
+    /// server sends the browser back to, which must match the client's
+    /// registration byte for byte (`localhost` for the Codex client,
+    /// `127.0.0.1` for others).
+    oauth_redirect_host: []const u8 = "localhost",
+    /// The loopback ports the client registered for its redirect, tried in
+    /// this order. Empty: any port will do (1456, then 1457, then one the
+    /// kernel picks). Otherwise only these, because a redirect to any other
+    /// port is refused; all of them taken fails the sign-in with a message
+    /// naming them. Nothing is sent to whatever holds one: it may be another
+    /// program's own sign-in.
+    oauth_callback_ports: []const u16 = &.{},
+    /// Parameters the authorization request carries after the standard ones
+    /// (`response_type`, `client_id`, `redirect_uri`, `scope`, PKCE, `state`).
+    oauth_authorize_params: []const OAuthParam = &.{},
+    /// Where signing out revokes the refresh token before the local login is
+    /// deleted. Null: nothing to revoke at, and the login is only deleted.
+    oauth_revocation: ?OAuthRevocation = null,
+    /// How far the vendor stands behind this profile's OAuth sign-in (plan
+    /// §3.1). An `unofficial` one is said before the browser opens.
+    oauth_support: SupportLevel = .documented,
     /// The registered OAuth client this installation presents. Both the
     /// interactive grant and the refresh grant send it, so a wrong value
     /// surfaces as `invalid_client` on the very first exchange rather than as
@@ -461,6 +488,10 @@ pub const ProviderProfile = struct {
     /// `login --provider` setup of a provider without an OAuth grant. Null
     /// means the provider documents no such page.
     api_key_setup: ?ApiKeySetup = null,
+    /// A sign-in on the provider's site that hands back an API key of the
+    /// user's own account (OpenRouter's PKCE key grant), rather than OAuth
+    /// tokens. Null means the provider offers none.
+    key_grant: ?KeyGrant = null,
     /// A subscription plan: a coding plan billed by the month rather than by
     /// the token. The vendors license these for a person working in a coding
     /// tool (Kimi Code: personal, interactive use; the GLM Coding Plan: the
@@ -487,6 +518,17 @@ pub const ProviderProfile = struct {
             if (page.id.eqlText(id)) return page;
         }
         return null;
+    }
+
+    /// Whether a key can authenticate this provider at all: some credential
+    /// kind it accepts is not an OAuth token. One that only signs in
+    /// (`chatgpt-codex`) takes none, so it has no key page, no key variable
+    /// and no `--api-key` to offer.
+    pub fn takesApiKey(self: ProviderProfile) bool {
+        for (self.accepted_credential_kinds) |kind| {
+            if (!kind.isOAuth()) return true;
+        }
+        return false;
     }
 
     /// True when this profile can obtain a first token without the user
@@ -533,20 +575,82 @@ pub const ProviderProfile = struct {
     }
 };
 
+/// One parameter of an authorization request (`oauth_authorize_params`).
+pub const OAuthParam = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// RFC 7009 token revocation, as a provider takes it (`oauth_revocation`).
+/// The request carries the refresh token, hinted as one, and the client it
+/// was issued to.
+pub const OAuthRevocation = struct {
+    url: []const u8,
+    body: Body = .form,
+
+    /// `{"token","token_type_hint","client_id"}` as JSON, or the same three
+    /// fields as an HTML form (RFC 7009 §2.1).
+    pub const Body = enum { json, form };
+};
+
+/// How far a vendor stands behind a way of signing in (plan §3.1).
+pub const SupportLevel = enum {
+    /// The vendor's documentation says a third-party client may use it.
+    documented,
+    /// No promise at all: it reuses another client's sign-in, can stop
+    /// working at any time, and is said to be so before it starts.
+    unofficial,
+};
+
+/// What an `unofficial` sign-in says before it starts.
+pub const UNOFFICIAL_SIGN_IN_NOTICE = "This sign-in is unofficial and may stop working at any time.";
+
 /// One place a user creates an API key for a provider.
 pub const KeyPage = struct {
     /// What the CLI names (`--key-page cn-personal`).
     id: Slug,
     /// What the user reads, e.g. "China · Personal Coding Plan".
     label: []const u8,
-    url: []const u8,
+    /// The page the key is created on. Null for a provider the user
+    /// configured (a relay, a local server): the key comes from whoever runs
+    /// it, and is only pasted here.
+    url: ?[]const u8,
     /// A GET the provider does not bill, carrying the key where the
     /// provider's requests do (`ProviderProfile.auth`): 200 means it accepts
     /// the key; 401/403, or a status `classify_error` reads as an invalid key
     /// or a denial, that it refuses it. Null: keys are stored unchecked.
     check_url: ?[]const u8 = null,
+    /// The wire whose model listing `check_url` is (`model_listing.zig`),
+    /// when it is one: an Anthropic listing also needs `anthropic-version`.
+    check_wire: ?Protocol.Wire = null,
     /// Matched against `ChannelDescriptor.region` to pick the default page.
     region: ?[]const u8 = null,
+};
+
+/// A sign-in that ends in an API key of the user's own account
+/// (`ProviderProfile.key_grant`): OpenRouter's PKCE flow. It is not OAuth as
+/// the rest of this module knows it — no client id, no token endpoint, no
+/// refresh — so it declares where it runs instead of reusing the OAuth fields.
+///
+/// - The browser goes to `<origin><authorize_path>` with a PKCE challenge
+///   (S256) and either a loopback `callback_url` or, for a machine without a
+///   browser, none: the page then shows the code to paste back.
+/// - `POST <origin><exchange_path>` trades the code and the verifier for the
+///   key, which is stored like a pasted one (`api_key_setup.kind`).
+/// - `GET <origin><key_info_path>` with the key says its label, spending limit
+///   and expiry, and is not billed.
+/// - Nothing here can delete the key: `<origin><manage_path><sha256 hex of the
+///   key>` is the page its owner deletes it on.
+pub const KeyGrant = struct {
+    /// `https://<host>`, no path. Every address hangs off it, so one override
+    /// moves them all (the api layer reads it, never this kernel).
+    origin: []const u8,
+    authorize_path: []const u8,
+    exchange_path: []const u8,
+    key_info_path: []const u8,
+    manage_path: []const u8,
+    /// What the key is called on the provider's site, prefilled.
+    key_label: []const u8,
 };
 
 /// The guided API-key setup a profile declares (`ProviderProfile.api_key_setup`).
@@ -563,6 +667,11 @@ pub const ApiKeySetup = struct {
 /// free of "can this even be routed?" defensive code.
 pub const ProfileError = error{
     InvalidKeySetup,
+    InvalidKeyGrant,
+    /// A redirect host the loopback listener cannot answer for, a port 0
+    /// among the registered ones, or a revocation endpoint a refresh token
+    /// would reach in the clear.
+    InvalidOAuthSignIn,
     NoChannels,
     NoRoutes,
     DuplicateChannelId,
@@ -614,21 +723,50 @@ pub fn validateProfile(profile: ProviderProfile) ProfileError!void {
         if (profile.channel(id) == null) return error.UnknownDefaultChannel;
     }
 
+    // The listener is on 127.0.0.1 (`net.listenLoopback`): a redirect to any
+    // other name would never reach it.
+    if (!std.mem.eql(u8, profile.oauth_redirect_host, "localhost") and
+        !std.mem.eql(u8, profile.oauth_redirect_host, "127.0.0.1")) return error.InvalidOAuthSignIn;
+    for (profile.oauth_callback_ports) |port| if (port == 0) return error.InvalidOAuthSignIn;
+    if (profile.oauth_revocation) |revocation| {
+        if (!std.mem.startsWith(u8, revocation.url, "https://")) return error.InvalidOAuthSignIn;
+    }
+
     if (profile.api_key_setup) |setup| {
         var accepted = false;
         for (profile.accepted_credential_kinds) |kind| {
             if (kind == setup.kind) accepted = true;
         }
-        // A page a user is sent to, or a check a key is sent to, over plain
-        // HTTP would hand the key to anyone on the path.
         if (!accepted or setup.pages.len == 0) return error.InvalidKeySetup;
         for (setup.pages, 0..) |page, index| {
-            if (!std.mem.startsWith(u8, page.url, "https://")) return error.InvalidKeySetup;
-            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidKeySetup;
+            // A page a user is sent to over plain HTTP could be anyone's.
+            if (page.url) |url| if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidKeySetup;
+            // A check carries the key, so it goes only where the provider's
+            // own requests may: https, or plain HTTP that the endpoint policy
+            // admits (a loopback server, where a key grant's development
+            // origin moves it, `Host.rebaseOrigin`; or a definition that
+            // turned TLS off for its own endpoint) — the key travels there
+            // with every request anyway.
+            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) {
+                profile.endpoint_policy.validate(url) catch return error.InvalidKeySetup;
+            };
             for (setup.pages[index + 1 ..]) |other| {
                 if (page.id.eql(other.id)) return error.InvalidKeySetup;
             }
         }
+    }
+
+    if (profile.key_grant) |grant| {
+        // The key it hands back is stored as the key setup's kind, so a grant
+        // without one would store a key nothing resolves. Its exchange carries
+        // the code and the verifier, and its answer the key: https only.
+        if (profile.api_key_setup == null) return error.InvalidKeyGrant;
+        if (!std.mem.startsWith(u8, grant.origin, "https://")) return error.InvalidKeyGrant;
+        if (std.mem.indexOfScalar(u8, grant.origin["https://".len..], '/') != null) return error.InvalidKeyGrant;
+        for ([_][]const u8{ grant.authorize_path, grant.exchange_path, grant.key_info_path, grant.manage_path }) |path| {
+            if (!std.mem.startsWith(u8, path, "/")) return error.InvalidKeyGrant;
+        }
+        if (grant.key_label.len == 0) return error.InvalidKeyGrant;
     }
 }
 
@@ -985,4 +1123,46 @@ test "a key setup is admitted only with an accepted kind and https pages of dist
     };
     profile.api_key_setup = .{ .kind = .api_key, .pages = &twice };
     try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+
+    // A configured provider's setup: no page to send anyone to, and a check
+    // on the loopback server its requests go to — plain HTTP the endpoint
+    // policy admits there, and nowhere else.
+    const local = [_]KeyPage{.{ .id = Slug.lit("key"), .label = "Local", .url = null, .check_url = "http://127.0.0.1:8000/v1/models", .check_wire = .openai_chat }};
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &local };
+    try validateProfile(profile);
+    for ([_][]const u8{ "http://relay.example.test/v1/models", "http://user:pw@127.0.0.1:8000/v1/models", "http://127.0.0.1:8000/v1%2fmodels" }) |check| {
+        const refused = [_]KeyPage{.{ .id = Slug.lit("key"), .label = "Local", .url = null, .check_url = check }};
+        profile.api_key_setup = .{ .kind = .api_key, .pages = &refused };
+        try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+    }
+    // A definition that turned TLS off for its own endpoint may check there.
+    profile.endpoint_policy = .{ .require_tls = false };
+    const docker = [_]KeyPage{.{ .id = Slug.lit("key"), .label = "Docker", .url = null, .check_url = "http://host.docker.internal:3456/v1/models" }};
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &docker };
+    try validateProfile(profile);
+}
+
+test "a sign-in's redirect host, ports and revocation are checked at registration" {
+    const one_route = [_]ProtocolRoute{.{ .protocol = .openai_responses }};
+    const channels = [_]ChannelDescriptor{
+        .{ .id = Slug.lit("default"), .display_name = "Default", .base_url = "https://example.test/v1", .routes = &one_route },
+    };
+    var profile = testProfile(&channels, .{});
+    profile.oauth_redirect_host = "127.0.0.1";
+    profile.oauth_callback_ports = &.{ 1455, 1457 };
+    profile.oauth_revocation = .{ .url = "https://auth.example.test/oauth/revoke", .body = .json };
+    try validateProfile(profile);
+    // The listener is on 127.0.0.1: a redirect to any other name never reaches it.
+    profile.oauth_redirect_host = "[::1]";
+    try std.testing.expectError(error.InvalidOAuthSignIn, validateProfile(profile));
+    profile.oauth_redirect_host = "example.test";
+    try std.testing.expectError(error.InvalidOAuthSignIn, validateProfile(profile));
+    profile.oauth_redirect_host = "localhost";
+    // Port 0 is "any port", which a registered redirect cannot be.
+    profile.oauth_callback_ports = &.{ 1455, 0 };
+    try std.testing.expectError(error.InvalidOAuthSignIn, validateProfile(profile));
+    profile.oauth_callback_ports = &.{1455};
+    // A refresh token is never sent in the clear.
+    profile.oauth_revocation = .{ .url = "http://auth.example.test/oauth/revoke" };
+    try std.testing.expectError(error.InvalidOAuthSignIn, validateProfile(profile));
 }
