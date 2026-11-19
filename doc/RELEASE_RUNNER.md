@@ -6,7 +6,9 @@ GitHub-hosted runners: `ubuntu-latest` (x86_64), `macos-latest` (arm64) and
 this document used to design is no longer planned: the repository is public,
 hosted standard runners are free for public repositories, and organization
 policy keeps public repositories off the organization's self-hosted fleet
-(2026-09-21).
+(2026-09-21). The one exception, the pool of single-use VMs that CI's macOS
+gates try first ([MACOS_VM_POOL.md](MACOS_VM_POOL.md)), never runs a release
+job.
 
 ## Why hosted runners give the isolation the pool was for
 

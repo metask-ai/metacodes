@@ -102,6 +102,9 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [CI design](CI_DESIGN.md) — required checks, the change scope that skips
   suites a change cannot affect, and the merge queue that tests a batch of
   PRs once.
+- [The macOS VM pool](MACOS_VM_POOL.md) — the single-use VMs on the Mac
+  Studio that CI's macOS gates try first: security model, host controller,
+  setup and operation.
 - [Release automation](RELEASE_AUTOMATION_DESIGN.md) — version bumping,
   cutting, tagging, publishing, and the CI fast path for release PRs.
 - [`metacodes update`](UPDATE_DESIGN.md) — bring an install up to date from

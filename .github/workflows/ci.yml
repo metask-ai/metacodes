@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
   pull-requests: read # the version state gate reads the PR's current labels
+  # The macOS pool's plan, watch and stand-down read this repository's own
+  # runs and jobs (scripts/ci_macos_plan.py); read-only, which a fork's pull
+  # request gets too.
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -26,12 +30,17 @@ env:
   # restores what main saved and saves nothing (doc/CI_DESIGN.md §5).
   WARM_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
 
-# Topology: GitHub-hosted runners only (the repository is public;
-# organization policy keeps public repositories off the self-hosted fleet, and
-# hosted standard runners are free for public repositories). Each platform's
-# gates are split into legs that run in parallel on separate runners, and the
-# TTY suites into shards; a small result job per platform reports the leg or
-# shard results under the name the ruleset requires (doc/CI_DESIGN.md §4).
+# Topology: GitHub-hosted runners (the repository is public, hosted standard
+# runners are free for public repositories, and organization policy keeps
+# public repositories off the self-hosted fleet). The one exception, decided
+# 2026-11-18, is the macOS gates' pool of single-use VMs on the Mac Studio,
+# which serves this repository alone and is tried first whenever
+# .github/macos-runner.json switches it on; the hosted legs take over when it
+# is off, full or not taking jobs (doc/CI_DESIGN.md §6, doc/MACOS_VM_POOL.md).
+# Each platform's hosted gates are split into legs that run in parallel on
+# separate runners, and the TTY suites into shards; a small result job per
+# platform reports the leg or shard results under the name the ruleset
+# requires (doc/CI_DESIGN.md §4).
 # Within a leg, steps run cheapest-first for fail-fast. Every runner is
 # ephemeral: nothing persists between runs except the caches main's nightly
 # run saves and the other runs restore (doc/CI_DESIGN.md §5).
@@ -124,6 +133,36 @@ jobs:
           esac
           python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT"
 
+  # Where the macOS gates run (scripts/ci_macos_plan.py plan, doc/CI_DESIGN.md
+  # §6): the pool when .github/macos-runner.json switches it on and a slot is
+  # free, the hosted legs otherwise, both on main's warm run. It reads the
+  # pool's occupancy from this repository's own runs with the run's read-only
+  # token, which a fork's pull request gets too (vars and secrets it does
+  # not). It never fails: every doubt is `hosted`, and an empty plan runs the
+  # hosted legs.
+  macos-plan:
+    name: macOS runner plan
+    needs: [release-fast-path, scope]
+    if: ${{ !cancelled() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      label: ${{ steps.plan.outputs.label }}
+      zig_build_jobs: ${{ steps.plan.outputs.zig_build_jobs }}
+      timeout_minutes: ${{ steps.plan.outputs.timeout_minutes }}
+      pickup_timeout_minutes: ${{ steps.plan.outputs.pickup_timeout_minutes }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Decide
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+          SUITES: ${{ needs.scope.outputs.suites }}
+        run: python3 scripts/ci_macos_plan.py plan --github-output "$GITHUB_OUTPUT"
+
   # The POSIX gates, one leg per runner (doc/CI_DESIGN.md §4). The legs'
   # steps together are a superset of the AGENTS.md "Before submitting"
   # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
@@ -132,8 +171,8 @@ jobs:
   # drift apart silently. Each step names the legs it belongs to through the
   # matrix flags `units`, `product`, `release` and `checks`; a step
   # without one is environment setup and runs on every leg. Linux has a runner
-  # per flag. macOS has three, since an
-  # organization runs at most five macOS jobs at once.
+  # per flag. Hosted macOS has three, since an organization runs at most
+  # five macOS jobs at once; the pool runs them as one (`gates-macos-vm`).
   # 45 minutes: a cold hosted runner compiles a leg's share of the tree and
   # the Lean kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
   gates-linux:
@@ -181,6 +220,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      # The pool job only (POOL_JOB): its env leaves FAST_PATH unset and this
+      # step sets it. If the watch already finished, the hosted legs took over
+      # before a VM took this job, so FAST_PATH=true and every later step
+      # skips; otherwise it carries the release fast path decision
+      # (scripts/ci_macos_plan.py stand-down, doc/CI_DESIGN.md §6).
+      - name: Stand down if the hosted legs took over
+        if: env.POOL_JOB == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_macos_plan.py stand-down --github-env "$GITHUB_ENV"
       # setup-zig points ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR at
       # .zig-cache. Its own cache stays off, since it saves on every run; the
       # steps below restore and save explicitly (doc/CI_DESIGN.md §5). Zig's
@@ -583,6 +632,9 @@ jobs:
       - name: AgentCore release unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_agentcore_release -v
+      - name: macOS runner plan and VM pool unit tests
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_ci_macos_plan scripts.tests.test_macos_vm_pool -v
       - name: Diff whitespace check
         if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
@@ -597,12 +649,15 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # The same steps (the YAML alias of `gates-linux`'s list) on two macOS
-  # runners: units and integration with the checks, product, and release. Each
-  # waits on its own LLVM builds (the integration suite on the ReleaseSmall
-  # app, the evaluation suite on two ReleaseSafe drivers, the release layout
-  # on two more ReleaseSmall builds), which a three-core runner cannot overlap
-  # with the rest. A leg's flags are what its steps read, not its name.
+  # The same steps (the YAML alias of `gates-linux`'s list) on three hosted
+  # macOS runners: units and integration with the checks, product, and
+  # release. Each waits on its own LLVM builds (the integration suite on the
+  # ReleaseSmall app, the evaluation suite on two ReleaseSafe drivers, the
+  # release layout on two more ReleaseSmall builds), which a three-core runner
+  # cannot overlap with the rest. A leg's flags are what its steps read, not
+  # its name. They run unless the plan sent the gates to the pool and a VM
+  # took them: at once on `hosted` or an empty plan, beside the pool job on
+  # `both`, and on `self-hosted` only when the watch fell back (§6).
   gates-macos:
     name: Gates (macOS) / ${{ matrix.leg }}
     timeout-minutes: 45
@@ -618,8 +673,8 @@ jobs:
           - leg: release
             release: true
     runs-on: macos-latest
-    needs: [release-fast-path, scope]
-    if: ${{ !cancelled() }}
+    needs: [release-fast-path, scope, macos-plan, gates-macos-watch]
+    if: ${{ !cancelled() && (needs.macos-plan.outputs.mode != 'self-hosted' || needs.gates-macos-watch.outputs.fallback == 'true') }}
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       SUITES: ${{ needs.scope.outputs.suites }}
@@ -629,6 +684,60 @@ jobs:
       # runner's 7 GB hold (the app and the drivers peak at 1 to 2 GB each).
       ZIG_BUILD_JOBS: "6"
     steps: *gates-steps
+
+  # The macOS gates as one job on a pool VM (doc/CI_DESIGN.md §6): a VM has
+  # the cores and memory a hosted runner lacks, so one job runs what the
+  # hosted legs split, without their repeated checkout, setup and
+  # compilation. Every VM is fresh and destroyed after its job; the pool's
+  # isolation, not this file, is the security boundary (doc/MACOS_VM_POOL.md).
+  # FAST_PATH is left to the stand-down step.
+  gates-macos-vm:
+    name: Gates (macOS) / ${{ matrix.leg }}
+    needs: [release-fast-path, scope, macos-plan]
+    if: ${{ !cancelled() && (needs.macos-plan.outputs.mode == 'self-hosted' || needs.macos-plan.outputs.mode == 'both') }}
+    timeout-minutes: ${{ fromJSON(needs.macos-plan.outputs.timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: all
+            units: true
+            checks: true
+            product: true
+            release: true
+    runs-on: ${{ needs.macos-plan.outputs.label }}
+    env:
+      POOL_JOB: "true"
+      RELEASE_FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+      SUITES: ${{ needs.scope.outputs.suites }}
+      DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
+      RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
+      # .github/macos-runner.json, sized to the VM.
+      ZIG_BUILD_JOBS: ${{ needs.macos-plan.outputs.zig_build_jobs }}
+    steps: *gates-steps
+
+  # Follows the pool job of this run (scripts/ci_macos_plan.py watch): a VM
+  # that takes it within the pickup timeout is followed to the end; otherwise
+  # `fallback=true` hands the gates to the hosted legs. The required check
+  # reads this job's outputs instead of waiting for the pool job, which a pool
+  # that is down would keep queued for GitHub's 24 hours.
+  gates-macos-watch:
+    name: macOS pool watch
+    needs: [macos-plan]
+    if: ${{ !cancelled() && (needs.macos-plan.outputs.mode == 'self-hosted' || needs.macos-plan.outputs.mode == 'both') }}
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    outputs:
+      fallback: ${{ steps.watch.outputs.fallback }}
+      vm_result: ${{ steps.watch.outputs.vm_result }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Wait for a VM to take the pool job
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PICKUP_TIMEOUT_MINUTES: ${{ needs.macos-plan.outputs.pickup_timeout_minutes }}
+        run: python3 scripts/ci_macos_plan.py watch --job "Gates (macOS) / all" --pickup-timeout-minutes "$PICKUP_TIMEOUT_MINUTES" --github-output "$GITHUB_OUTPUT"
 
   # The Python and Node packages over the AgentCore shared library (sdk/python,
   # sdk/node). Not a required check yet: it builds a ReleaseSafe bundle, which
@@ -1081,13 +1190,21 @@ jobs:
           echo "$NEEDS" | jq -c 'map_values(.result)'
           echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
 
+  # Gates (macOS) passes when the gates passed where they ran: the pool job
+  # (through the watch), or the hosted legs (scripts/ci_macos_plan.py
+  # verdict). It never needs the pool job itself.
   gates-macos-result:
     name: Gates (macOS)
-    needs: gates-macos
+    needs: [macos-plan, gates-macos-watch, gates-macos]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: *result-steps
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The gates passed where they ran
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_macos_plan.py verdict
 
   gates-windows-result:
     name: Gates (Windows)
@@ -1115,7 +1232,9 @@ jobs:
 
   full-pr-evidence:
     name: Full PR evidence
-    needs: [release-fast-path, scope, gates-linux, gates-macos, windows-gates, tty-linux, tty-windows, sdk-bindings]
+    # macOS through its result job: the pool job or the hosted legs, wherever
+    # the gates ran (§6).
+    needs: [release-fast-path, scope, gates-linux, gates-macos-result, windows-gates, tty-linux, tty-windows, sdk-bindings]
     if: ${{ always() && github.event_name == 'pull_request' && needs.scope.outputs.scope == 'full' && needs.release-fast-path.outputs.fast == 'false' }}
     timeout-minutes: 5
     runs-on: ubuntu-latest

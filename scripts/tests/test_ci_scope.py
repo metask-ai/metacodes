@@ -46,17 +46,21 @@ DOC_STEPS = {
     "Release document check unit tests",
     "Third-party notices check",
     "Third-party notices unit tests",
+    # The macOS pool job's own switch: it decides FAST_PATH for that job and
+    # does nothing elsewhere (doc/CI_DESIGN.md §6).
+    "Stand down if the hosted legs took over",
 }
 ECHO_STEPS = {"Release fast path", "Change scope"}
 # The jobs that do the work, one runner per leg or shard (doc/CI_DESIGN.md §4),
 # and the switch each one's steps read.
-LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("windows-gates", "SUITES"),
-            ("tty-linux", "TTY"), ("tty-windows", "TTY"))
+LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("gates-macos-vm", "SUITES"),
+            ("windows-gates", "SUITES"), ("tty-linux", "TTY"), ("tty-windows", "TTY"))
 # The checks the `Protect main` ruleset requires, plus TTY (Windows), and the
-# job whose legs or shards each one reports.
+# job whose legs or shards each one reports. Gates (macOS) reports where the
+# gates ran, the pool or the hosted legs: test_ci_macos_plan.py.
 RESULT_JOBS = {
     "Gates (Linux)": "gates-linux",
-    "Gates (macOS)": "gates-macos",
+    "Gates (macOS)": ["macos-plan", "gates-macos-watch", "gates-macos"],
     "Gates (Windows)": "windows-gates",
     "TTY (Linux)": "tty-linux",
     "TTY (Windows)": "tty-windows",
@@ -66,6 +70,7 @@ LEG_FLAGS = {"units", "integration", "product", "release", "cross", "checks"}
 # Each gate job, its runner OS and the flags its steps read there.
 GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "checks"}),
              ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
+             ("gates-macos-vm", "macOS", {"units", "product", "release", "checks"}),
              ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
 TEST_PARTS = {"test:units", "test:integration", "test:product"}
 # The gate steps without a leg flag: environment setup, which runs on every
@@ -76,6 +81,7 @@ SETUP_STEPS = {
         "Release fast path", "Change scope", CHECKOUT,
         "Restore Lean toolchain and build products", "Install pinned elan", "Build pinned Lean kernel",
         "Install ripgrep", "Install bubblewrap", "Install Python development dependencies",
+        "Stand down if the hosted legs took over",
     },
     "windows-gates": {
         "Release fast path", "Change scope", CHECKOUT,
@@ -387,7 +393,8 @@ class WorkflowTest(unittest.TestCase):
 
     def test_full_evidence_requires_all_suites_and_excludes_scope_fast_paths(self) -> None:
         job = self.jobs["full-pr-evidence"]
-        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos",
+        # macOS through its result job: the pool job or the hosted legs.
+        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos-result",
                                             "windows-gates", "tty-linux", "tty-windows", "sdk-bindings"})
         self.assertIn("needs.scope.outputs.scope == 'full'", job["if"])
         self.assertIn("needs.release-fast-path.outputs.fast == 'false'", job["if"])
@@ -399,8 +406,9 @@ class WorkflowTest(unittest.TestCase):
         for job, var in LEG_JOBS:
             with self.subTest(job=job):
                 spec = self.jobs[job]
-                self.assertEqual(sorted(spec["needs"]), ["release-fast-path", "scope"])
-                self.assertEqual(spec["if"], "${{ !cancelled() }}")
+                # The macOS jobs also wait for where they run (test_ci_macos_plan.py).
+                self.assertLessEqual({"release-fast-path", "scope"}, set(spec["needs"]))
+                self.assertTrue(spec["if"].startswith("${{ !cancelled()"), spec["if"])
                 self.assertEqual(spec["env"][var], "${{ needs.scope.outputs.%s }}" % var.lower())
 
     def test_only_the_documentation_checks_run_on_a_docs_change(self) -> None:
@@ -473,7 +481,8 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(spec["needs"], legs)
                 # Never skipped: a skipped job passes a required check.
                 self.assertEqual(spec["if"], "${{ always() }}")
-                self.assertEqual(spec["steps"], self.jobs["gates-linux-result"]["steps"])
+                if name != "Gates (macOS)":
+                    self.assertEqual(spec["steps"], self.jobs["gates-linux-result"]["steps"])
 
     @unittest.skipIf(os.name == "nt", "bash and jq")
     def test_a_result_job_passes_only_when_every_leg_succeeded(self) -> None:
@@ -517,7 +526,12 @@ class WorkflowTest(unittest.TestCase):
         for job, _, _ in GATE_JOBS:
             with self.subTest(job=job):
                 spec = self.jobs[job]
-                self.assertRegex(str(spec["env"].get("ZIG_BUILD_JOBS", "")), r"^[1-9][0-9]*$")
+                if job == "gates-macos-vm":
+                    # Sized to the VM in .github/macos-runner.json, a positive
+                    # integer (test_ci_macos_plan.py).
+                    self.assertEqual(spec["env"]["ZIG_BUILD_JOBS"], "${{ needs.macos-plan.outputs.zig_build_jobs }}")
+                else:
+                    self.assertRegex(str(spec["env"].get("ZIG_BUILD_JOBS", "")), r"^[1-9][0-9]*$")
                 uses = [step for step in spec["steps"] if "ZIG_BUILD_JOBS" in step.get("run", "")]
                 self.assertTrue(uses)
                 for step in uses:
@@ -550,6 +564,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_both_posix_gates_and_both_tty_platforms_run_one_step_list(self) -> None:
         self.assertEqual(self.jobs["gates-macos"]["steps"], self.jobs["gates-linux"]["steps"])
+        self.assertEqual(self.jobs["gates-macos-vm"]["steps"], self.jobs["gates-linux"]["steps"])
         self.assertEqual(self.jobs["tty-windows"]["steps"], self.jobs["tty-linux"]["steps"])
 
     def test_the_tty_shards_cover_the_suite(self) -> None:
