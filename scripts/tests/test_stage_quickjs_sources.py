@@ -4,8 +4,9 @@ The checked-in tree must verify and stage. A synthetic vendor directory then
 proves each fail-closed path: a drifted upstream file, an undeclared file, a
 required file dropped from both manifest and directory, a patch that no longer
 applies exactly or whose header lies, a patched-digest drift, an archive that
-does not match the manifest, and an output directory that is not ours to
-replace.
+does not match the manifest, and an output that is not a missing or empty
+directory. Staging never deletes anything outside its private temporary
+directory, whatever happens to the output while it runs.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
 import tarfile
 import tempfile
@@ -23,7 +25,6 @@ from pathlib import Path
 from scripts import stage_quickjs_sources as stage_mod
 from scripts import verify_quickjs_sources as verify_mod
 from scripts.stage_quickjs_sources import (
-    STAGE_RECORD,
     QuickJsSources,
     StageError,
     apply_hunks,
@@ -125,7 +126,7 @@ class CheckedInTreeTest(unittest.TestCase):
             self.assertEqual(0, code, err)
             sources = QuickJsSources.load(VENDOR / "manifest.json")
             self.assertEqual(
-                sorted([item.path for item in sources.files] + [STAGE_RECORD]),
+                sorted(item.path for item in sources.files),
                 sorted(p.name for p in out.iterdir()),
             )
             patched = {item.path: item.sha256 for item in sources.patched}
@@ -179,22 +180,10 @@ class FailClosedTest(unittest.TestCase):
         shared = self.root / "build"
         _write(shared / "other-artifact.o", "keep me\n")
         _write(shared / "engine.c", "someone else's file\n")
-        with self.assertRaisesRegex(StageError, "not written by this script"):
+        with self.assertRaisesRegex(StageError, "it is not empty"):
             stage(vendor, shared)
         self.assertEqual("keep me\n", (shared / "other-artifact.o").read_text(encoding="utf-8"))
         self.assertEqual("someone else's file\n", (shared / "engine.c").read_text(encoding="utf-8"))
-
-    def test_restaging_replaces_only_what_it_wrote(self) -> None:
-        vendor = _fixture(self.root)
-        out = self.root / "out"
-        stage(vendor, out)
-        stage(vendor, out)
-        self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
-        _write(out / "added-later.txt", "not staged\n")
-        with self.assertRaisesRegex(StageError, "did not write: added-later.txt"):
-            stage(vendor, out)
-        self.assertTrue((out / "added-later.txt").is_file())
-        self.assertTrue((out / "engine.c").is_file())
 
     def _snapshot(self, directory: Path) -> dict:
         return {
@@ -202,32 +191,41 @@ class FailClosedTest(unittest.TestCase):
             for p in sorted(directory.rglob("*"))
         }
 
-    def test_a_replaced_staged_file_is_refused_and_kept(self) -> None:
+    def test_a_staged_output_is_never_restaged_in_place(self) -> None:
         vendor = _fixture(self.root)
         out = self.root / "out"
         stage(vendor, out)
         _write(out / "engine.c", "a local edit to keep\n")
-        before = self._snapshot(out)
-        with self.assertRaisesRegex(StageError, "engine.c changed since it was staged"):
+        before = self._snapshot(self.root)
+        with self.assertRaisesRegex(StageError, "it is not empty"):
             stage(vendor, out)
-        self.assertEqual(before, self._snapshot(out))
+        self.assertEqual(before, self._snapshot(self.root))
 
-    def test_a_staged_name_turned_directory_is_refused_before_any_deletion(self) -> None:
+    def test_a_file_saved_into_the_output_while_staging_is_kept(self) -> None:
+        """The reviewer's race: another process writes into the output after
+        the emptiness check, while the tree is being generated."""
         vendor = _fixture(self.root)
         out = self.root / "out"
-        stage(vendor, out)
-        (out / "engine.c").unlink()
-        _write(out / "engine.c" / "inner.txt", "keep\n")
-        before = self._snapshot(out)
-        with self.assertRaisesRegex(StageError, "engine.c is not a regular file"):
-            stage(vendor, out)
-        self.assertEqual(before, self._snapshot(out))
+        out.mkdir()
+        real = stage_mod._write_tree
 
-    def test_an_interrupted_write_keeps_the_old_output_and_a_retry_succeeds(self) -> None:
+        def concurrent_writer(directory: Path, tree: dict) -> None:
+            real(directory, tree)
+            _write(out / "quickjs.h", "saved by someone else\n")
+
+        stage_mod._write_tree = concurrent_writer
+        try:
+            with self.assertRaisesRegex(StageError, "it is not empty"):
+                stage(vendor, out)
+        finally:
+            stage_mod._write_tree = real
+        self.assertEqual({"quickjs.h": b"saved by someone else\n"}, self._snapshot(out))
+        self.assertEqual(["out", "vendor"], sorted(p.name for p in self.root.iterdir()), "no staging leftovers")
+
+    def test_an_interrupted_write_leaves_the_output_as_it_was_and_a_retry_succeeds(self) -> None:
         vendor = _fixture(self.root)
         out = self.root / "out"
-        stage(vendor, out)
-        before = self._snapshot(out)
+        out.mkdir()
         real = stage_mod._write_tree
 
         def disk_full(directory: Path, tree: dict) -> None:
@@ -240,11 +238,56 @@ class FailClosedTest(unittest.TestCase):
                 stage(vendor, out)
         finally:
             stage_mod._write_tree = real
-        self.assertEqual(before, self._snapshot(out))
+        self.assertEqual({}, self._snapshot(out))
         self.assertEqual(["out", "vendor"], sorted(p.name for p in self.root.iterdir()), "no staging leftovers")
         stage(vendor, out)
-        self.assertEqual(before, self._snapshot(out))
-        self.assertEqual(["out", "vendor"], sorted(p.name for p in self.root.iterdir()))
+        self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
+
+    def test_a_failed_publish_restores_the_empty_output_and_a_retry_succeeds(self) -> None:
+        vendor = _fixture(self.root)
+        for existed in (True, False):
+            with self.subTest(existed=existed):
+                out = self.root / ("empty" if existed else "missing")
+                if existed:
+                    out.mkdir()
+                real = stage_mod.os.rename
+
+                def failing_rename(src, dst):
+                    raise OSError(5, "Input/output error")
+
+                stage_mod.os.rename = failing_rename
+                try:
+                    with self.assertRaisesRegex(StageError, "cannot publish"):
+                        stage(vendor, out)
+                finally:
+                    stage_mod.os.rename = real
+                self.assertEqual(existed, out.is_dir())
+                if existed:
+                    self.assertEqual({}, self._snapshot(out))
+                leftovers = [p.name for p in self.root.iterdir() if "staging" in p.name]
+                self.assertEqual([], leftovers)
+                stage(vendor, out)
+                self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
+
+    def test_the_working_directory_is_refused_and_left_empty(self) -> None:
+        vendor = _fixture(self.root)
+        build = self.root / "build"
+        build.mkdir()
+        previous = os.getcwd()
+        os.chdir(build)
+        try:
+            for out in (Path("."), Path(".."), build):
+                with self.subTest(out=out):
+                    code, _, err = _run(stage_mod.main, ["--out", str(out), "--vendor-dir", str(vendor)])
+                    self.assertEqual(1, code)
+                    # `..` is also a parent of the vendor tree, refused for that first.
+                    self.assertIn("refusing output directory", err)
+                    if out != Path(".."):
+                        self.assertIn("working directory", err)
+        finally:
+            os.chdir(previous)
+        self.assertEqual([], list(build.iterdir()))
+        self.assertEqual(["build", "vendor"], sorted(p.name for p in self.root.iterdir()))
 
     def test_a_case_alias_inside_the_vendor_tree_is_refused(self) -> None:
         vendor = _fixture(self.root)
@@ -270,9 +313,7 @@ class FailClosedTest(unittest.TestCase):
         out = self.root / "out"
         stage(vendor, out)
         self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
-        self.assertEqual([STAGE_RECORD, "LICENSE", "engine.c"], sorted(p.name for p in out.iterdir()))
-        record = json.loads((out / STAGE_RECORD).read_text(encoding="utf-8"))
-        self.assertEqual({"LICENSE": _sha(b"MIT\n"), "engine.c": _sha(PATCHED_C.encode())}, record["files"])
+        self.assertEqual(["LICENSE", "engine.c"], sorted(p.name for p in out.iterdir()))
 
     def test_an_edited_upstream_file_fails(self) -> None:
         vendor = _fixture(self.root)

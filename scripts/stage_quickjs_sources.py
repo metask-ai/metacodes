@@ -8,9 +8,9 @@ byte, pinned by SHA-256 in `vendor/quickjs/manifest.json`. Local changes live in
 files. This script verifies the pristine files, applies the patches in
 manifest order with no fuzz and no offset, checks every patched file against
 its pinned digest, and writes the result into an output directory that the
-build compiles. The output directory must be new, empty, or one this script
-staged before, and may not overlap the vendor tree; only files a previous
-stage recorded writing are ever deleted.
+build compiles. The output must be a missing or empty directory outside the
+vendor tree; the script never deletes anything but its own private temporary
+directory.
 
     python3 scripts/stage_quickjs_sources.py --out DIR
 """
@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import sys
 import tempfile
 from typing import Dict, List, Tuple
@@ -42,10 +43,6 @@ LOCAL_FILES = ("README.md", "manifest.json")
 #: C compiler.
 REQUIRED_FILES = ("LICENSE", "cutils.c", "dtoa.c", "libregexp.c", "libunicode.c", "quickjs.c")
 LOCAL_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
-#: `stage` records what it wrote here, and only ever replaces a directory that
-#: holds exactly that record and those files.
-STAGE_RECORD = ".stage_quickjs_sources.json"
-STAGE_RECORD_SCHEMA = "metacodes.quickjs-stage-record/v1"
 
 
 class StageError(RuntimeError):
@@ -334,83 +331,69 @@ def _overlaps_vendor(out_dir: Path, vendor_dir: Path) -> bool:
     return any(_same(ancestor, vendor) for ancestor in [out, *out.parents] if ancestor.exists())
 
 
-def _owned_entries(out_dir: Path) -> List[Path]:
-    """Every entry of an existing output, after proving all of them are ours.
-
-    Nothing is modified here. The directory is ours when it is empty, or when
-    it holds a stage record and every entry is a regular file the record names
-    with the SHA-256 it records. Any other state is refused as a whole.
-    """
-    entries = sorted(out_dir.iterdir())
-    if not entries:
-        return []
-    names = {entry.name: entry for entry in entries}
-    record = names.get(STAGE_RECORD)
-    try:
-        written = json.loads(record.read_text(encoding="utf-8")) if record is not None and record.is_file() else None
-    except (OSError, ValueError):
-        written = None
-    files = written.get("files") if isinstance(written, dict) and written.get("schema") == STAGE_RECORD_SCHEMA else None
-    if not isinstance(files, dict):
-        raise StageError(f"refusing output directory {out_dir}: not empty and not written by this script")
-    for name, entry in names.items():
-        if entry.is_symlink() or not entry.is_file():
-            raise StageError(f"refusing output directory {out_dir}: {name} is not a regular file")
-        if name == STAGE_RECORD:
-            continue
-        digest = files.get(name)
-        if digest is None:
-            raise StageError(f"refusing output directory {out_dir}: it holds a file this script did not write: {name}")
-        if sha256_bytes(entry.read_bytes()) != digest:
-            raise StageError(f"refusing output directory {out_dir}: {name} changed since it was staged")
-    return entries
-
-
 def _write_tree(directory: Path, tree: Dict[str, bytes]) -> None:
     for name, data in sorted(tree.items()):
         (directory / name).write_bytes(data)
-    record = {"schema": STAGE_RECORD_SCHEMA, "files": {name: sha256_bytes(data) for name, data in sorted(tree.items())}}
-    (directory / STAGE_RECORD).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
-def _remove_owned(directory: Path, entries: List[Path]) -> None:
-    for entry in entries:
-        entry.unlink()
-    directory.rmdir()
+def _publish(fresh: Path, out_dir: Path) -> None:
+    """Move the finished tree to `out_dir`, which must be missing or empty.
+
+    `os.rmdir` removes only an empty directory and `os.rename` onto an
+    existing path fails unless it is an empty directory, so a file anyone
+    else writes into the output first makes publishing fail instead of being
+    replaced. If the rename fails after the empty output was removed, the
+    empty directory is put back.
+    """
+    existed = out_dir.exists()
+    if existed:
+        try:
+            os.rmdir(out_dir)
+        except OSError as error:
+            raise StageError(f"refusing output directory {out_dir}: it is not empty") from error
+    try:
+        os.rename(fresh, out_dir)
+    except OSError as error:
+        if existed and not out_dir.exists():
+            os.mkdir(out_dir)
+        raise StageError(f"cannot publish the staged tree at {out_dir}: {error}") from error
 
 
 def stage(vendor_dir: Path, out_dir: Path) -> QuickJsSources:
-    """Verify, then publish the patched tree at `out_dir` without losing data.
+    """Verify, then publish the patched tree at `out_dir`.
 
-    The output may not be the vendor tree, inside it, or one of its parents
-    (which include the repository root). An existing output must be empty or
-    exactly what a previous stage wrote, checked by content before anything is
-    touched. The new tree is written into a fresh sibling directory first and
-    swapped in by rename, so an interrupted write leaves the old output intact
-    and a retry succeeds.
+    The output must be a missing or empty directory. It may not be the vendor
+    tree, inside it, or one of its parents, nor the working directory or one
+    of its parents (a directory in use cannot be replaced). The tree is
+    written into a private directory beside the output (`tempfile.mkdtemp`,
+    mode 0700) and published with `_publish`; on any failure only that private
+    directory is removed and the output is left as it was, so a retry works.
+    Nothing else is ever deleted: re-staging needs a fresh directory.
     """
     sources = QuickJsSources.load(vendor_dir / "manifest.json")
     tree = build_tree(vendor_dir, sources)
-    if _overlaps_vendor(out_dir, vendor_dir):
+    out = Path(os.path.abspath(out_dir))
+    if _overlaps_vendor(out, vendor_dir):
         raise StageError(f"refusing output directory {out_dir}: it overlaps the vendor tree {vendor_dir.resolve()}")
-    if out_dir.is_symlink() or (out_dir.exists() and not out_dir.is_dir()):
+    cwd = Path.cwd()
+    if any(_same(out, ancestor) for ancestor in [cwd, *cwd.parents]) or out == cwd or out in cwd.parents:
+        raise StageError(f"refusing output directory {out_dir}: it is the working directory or one of its parents")
+    if out.is_symlink() or (out.exists() and not out.is_dir()):
         raise StageError(f"refusing output directory {out_dir}: not a plain directory")
-    old_entries = _owned_entries(out_dir) if out_dir.exists() else None
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
-    fresh = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.staging-", dir=out_dir.parent))
+    if out.exists() and any(out.iterdir()):
+        raise StageError(f"refusing output directory {out_dir}: it is not empty")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fresh = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
     try:
-        _write_tree(fresh, tree)
-    except OSError as error:
-        _remove_owned(fresh, sorted(fresh.iterdir()))
-        raise StageError(f"cannot write the staged tree: {error}") from error
-    if old_entries is not None:
-        retired = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.retired-", dir=out_dir.parent))
-        retired.rmdir()
-        os.rename(out_dir, retired)
-        os.rename(fresh, out_dir)
-        _remove_owned(retired, [retired / entry.name for entry in old_entries])
-    else:
-        os.rename(fresh, out_dir)
+        try:
+            _write_tree(fresh, tree)
+        except OSError as error:
+            raise StageError(f"cannot write the staged tree: {error}") from error
+        _publish(fresh, out)
+    except BaseException:
+        if fresh.exists():
+            shutil.rmtree(fresh)
+        raise
     return sources
 
 
@@ -421,7 +404,7 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         sources = stage(args.vendor_dir, args.out)
-    except StageError as error:
+    except (StageError, OSError) as error:
         print(f"stage_quickjs_sources: {error}", file=sys.stderr)
         return 1
     print(f"stage_quickjs_sources: ok release={sources.upstream_release} patches={len(sources.patches)}")
