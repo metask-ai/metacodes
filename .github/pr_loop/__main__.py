@@ -15,7 +15,7 @@ from .model import Binding, DEFAULT_REPO, LoopError, REPO
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Opt-in PR review, repair and upstream merge-queue controller")
+    parser = argparse.ArgumentParser(description="Opt-in PR review, repair and upstream merge controller")
     parser.add_argument("--state", type=Path, default=default_state(), help="local SQLite state, outside Git")
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("bind", "submit"):

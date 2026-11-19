@@ -192,6 +192,17 @@ pub const Config = struct {
     /// (`main.resolveLearningTurn`). Enforce wins when both are given.
     learning_turn: bool = false,
     learning_turn_observe: bool = false,
+    /// `--verifier` / `--verifier-observe` (print mode also
+    /// `METACODES_VERIFIER=enforce|observe`): after a green pinned check,
+    /// spawn the isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md); enforce
+    /// lets a reproduced FAIL continue the run, observe only records. Needs a
+    /// pinned check: the check gate, or in print mode the self-evolution host
+    /// check, whose outcome row then carries the verifier qualifier
+    /// (`main.resolveVerifier`). Enforce wins when both are given.
+    verifier: bool = false,
+    verifier_observe: bool = false,
+    /// `--verifier-model <model|tier>`: the verifier's model; null = the actor's.
+    verifier_model: ?[]const u8 = null,
     /// `--test-integrity` / `--test-integrity-observe`: compare the tests that
     /// existed when a run started with the end state; enforce sends one
     /// message when the model stops with them rewritten, deleted or disabled,
@@ -234,10 +245,12 @@ pub const Config = struct {
     /// as with a missing $HOME). Set by src/main.zig, never by core code.
     state_root: []const u8 = "",
     /// Fall back to the built-in System-One advisor service
-    /// (`jev/runtime.zig` `BUILTIN_DEFAULT`) when neither the state root's
-    /// config.json nor `METACODES_JEV_*` names one. The CLI sets it; an
-    /// embedder that leaves it off sends no session state anywhere unless it
-    /// configures the advisor itself.
+    /// (`jev/runtime.zig` `BUILTIN_DEFAULT`, plain HTTP to a public address)
+    /// when neither the state root's config.json nor `METACODES_JEV_*` names
+    /// one. No host in this repository sets it: the CLI stopped in #474
+    /// (`jev/runtime.zig` `CLI_USES_BUILTIN_DEFAULT`), so a host that leaves it
+    /// off sends no session state anywhere unless it configures the advisor
+    /// itself. An embedder may set it to choose the team's service.
     jev_builtin_default: bool = false,
     /// LLM 后端协议选择。默认 anthropic;`METACODES_PROVIDER=openai` 或 model 前缀
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
@@ -250,6 +263,9 @@ pub const Config = struct {
     provider_channel: ?[]const u8 = null,
     /// Exact offer id (`--offer`), which pins one reproducible route.
     provider_offer: ?[]const u8 = null,
+    /// A preset of config.json by name (`--preset`, #489). The host applies
+    /// it at start (`src/app/presets.zig`); nothing below the host reads it.
+    preset: ?[]const u8 = null,
     /// Offer id of the resolved startup route, rendered for display/logs.
     selected_offer_id: ?[]const u8 = null,
     /// Canonical `ProviderId` of the resolved startup route. Recorded once at

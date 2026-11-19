@@ -2,15 +2,21 @@ name: AgentCore Windows
 
 on:
   pull_request:
-  # The merge queue (doc/CI_DESIGN.md §3): a check that does not report on
-  # merge_group would hold every group if the ruleset ever requires it.
+  # Inert after the PR-only policy migration; supports landing the migration
+  # itself while main still requires a merge queue (doc/CI_DESIGN.md §3).
   merge_group:
-  push:
-    branches: [main]
   workflow_dispatch:
+  # main's nightly run saves the Zig cache pull requests restore, as in
+  # ci.yml (doc/CI_DESIGN.md §5).
+  schedule:
+    - cron: "0 19 * * *"
 
 permissions:
   contents: read
+
+env:
+  # As in ci.yml: 'true' only on main's scheduled or dispatched run.
+  WARM_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
   native-windows-gate:
@@ -23,8 +29,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # `native-windows-gate` is a required status check on main, so the job
-      # must report on every pull request; the old `on.pull_request.paths`
+      # The job reports on every pull request so that it can be required;
+      # the old `on.pull_request.paths`
       # filter left doc-only / evals-only PRs permanently BLOCKED (#134). The
       # expensive steps still run only when a path that can affect the native
       # gate changed; other PRs report success from this step alone. A merge
@@ -49,13 +55,20 @@ jobs:
             echo "no native-gate path changed; reporting success without building"
           fi
           printf 'changed files:\n%s\n' "$changed"
-      # See ci.yml `gates` for the cache semantics.
+      # See ci.yml `gates` for the caches: restored from what main's warm run
+      # saved, saved only by that run.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: steps.scope.outputs.relevant == 'true'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && steps.scope.outputs.relevant == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
       - name: Rust toolchain (Windows)
         if: steps.scope.outputs.relevant == 'true'
         shell: cmd
@@ -91,3 +104,9 @@ jobs:
         if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         run: zig build windows:gate -Dtarget=x86_64-windows-gnu --test-timeout 5m
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && steps.scope.outputs.relevant == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-${{ github.run_id }}-${{ github.run_attempt }}

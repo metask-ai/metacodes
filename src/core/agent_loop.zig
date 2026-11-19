@@ -42,6 +42,7 @@ const requirement_ledger_mod = @import("requirement_ledger.zig");
 const delivery_cadence_mod = @import("delivery_cadence.zig");
 const progress_updates_mod = @import("progress_updates.zig");
 const check_gate_mod = @import("check_gate.zig");
+const isolated_verifier_mod = @import("isolated_verifier.zig");
 const test_integrity_mod = @import("test_integrity.zig");
 const stall_gate_mod = @import("stall_gate.zig");
 const learning_turn_mod = @import("learning_turn.zig");
@@ -542,7 +543,7 @@ pub const Options = struct {
     session_id: []const u8 = "",
     project_dir: []const u8 = "",
     disable_shell_execution: bool = false,
-    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包 sandbox-exec。
+    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包平台沙箱(sandbox-exec / bwrap)。
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// cwd 绝对路径 + HOME(sandbox profile 用)。
     cwd_abs: []const u8 = "",
@@ -655,6 +656,17 @@ pub const Options = struct {
     /// so macro runs and embedders never run a check; the terminal
     /// `check_gate` observation record is emitted once per run when armed.
     check_gate: ?check_gate_mod.Options = null,
+    /// Isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md): when the check
+    /// gate's pinned check passes at depth 0, the host spawns a fresh,
+    /// read-only verifier on a git snapshot of the workspace. Enforce mode
+    /// turns a reproduced FAIL into a `failed` verdict with source `verifier`
+    /// (a continuation under the check gate's own budget) and answers an
+    /// UNVERIFIED with one read-only leads round; observe mode only records.
+    /// It can only demote: PASS, UNVERIFIED and `unavailable` leave the
+    /// pinned verdict as it was. Needs `check_gate`; root run only; canonical
+    /// buildRunOptions leaves it null; one terminal `isolated_verifier`
+    /// observation record per armed run.
+    isolated_verifier: ?isolated_verifier_mod.Options = null,
     /// Learning turn (doc/LEARNING_TURN_DESIGN.md): after the check gate's
     /// verdict ends the run, the same conversation distills conditioned
     /// lessons (`KgRemember` kind `lesson`) and reconciles them with the
@@ -1592,6 +1604,171 @@ noinline fn recordCheckGate(opts: *const Options, gate: check_gate_mod.Options, 
     }
 }
 
+noinline fn recordIsolatedVerifier(opts: *const Options, verifier: isolated_verifier_mod.Options, gate: *const isolated_verifier_mod.Gate) void {
+    const observer = opts.tool_observer orelse return;
+    const obs = tools_mod.tool_observation;
+    var verdicts: [2]obs.VerifierVerdict = .{ .not_run, .not_run };
+    var reasons: [2]obs.VerifierReason = .{ .none, .none };
+    var trees: [2][16]u8 = .{ [_]u8{'0'} ** 16, [_]u8{'0'} ** 16 };
+    for (gate.results, 0..) |maybe, i| {
+        const r = maybe orelse continue;
+        verdicts[i] = switch (r.verdict) {
+            .pass => .pass,
+            .fail => .fail,
+            .unverified => .unverified,
+            .unavailable => .unavailable,
+        };
+        reasons[i] = if (r.unavailable) |reason| switch (reason) {
+            inline else => |tag| @field(obs.VerifierReason, @tagName(tag)),
+        } else if (r.downgrade) |downgrade| switch (downgrade) {
+            inline else => |tag| @field(obs.VerifierReason, @tagName(tag)),
+        } else .none;
+        @memcpy(trees[i][0..r.tree_len], r.tree_sha_prefix[0..r.tree_len]);
+    }
+    _ = observer.emit(.{ .isolated_verifier = .{
+        .enforced = verifier.mode == .enforce,
+        .boundaries = gate.boundaries,
+        .spawns = gate.spawns,
+        .leads_rounds = gate.leads_rounds,
+        .verdict_1 = verdicts[0],
+        .reason_1 = reasons[0],
+        .tree_1 = trees[0],
+        .verdict_2 = verdicts[1],
+        .reason_2 = reasons[1],
+        .tree_2 = trees[1],
+        .charter_sha256 = isolated_verifier_mod.charterSha256Hex(),
+        .same_model = gate.same_model,
+        .turns = gate.turns,
+        .cost_microusd = gate.cost_microusd,
+        .wall_ms = gate.wall_ms,
+        .probes_cited = gate.probes_cited,
+        .probes_matched = gate.probes_matched,
+        .lead_probes = gate.lead_probes,
+        .cleanup_complete = gate.cleanup_complete,
+    } });
+}
+
+/// What the agent loop does after a verifier boundary's final spawn.
+const VerifierAction = union(enum) {
+    /// The verdict stands as the pinned check left it.
+    stand,
+    /// Enforce mode, a reproduced FAIL with budget left: continue the run
+    /// with this message (owned).
+    continue_run: []u8,
+    /// Enforce mode, a reproduced FAIL with no budget left: the run ends
+    /// `failed` (source verifier).
+    exhausted,
+};
+
+/// The verifier's dependencies, taken from the run's own options.
+fn verifierDeps(
+    opts: *const Options,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    sess: @import("session_id.zig").SessionId,
+) isolated_verifier_mod.Deps {
+    return .{
+        .provider = provider,
+        .anthropic_client = opts.api_client,
+        .tool_defs = tool_defs,
+        .permission_ctx = permission_ctx,
+        .abort = opts.abort,
+        .session = sess,
+        .state_root = opts.state_root,
+        .home_dir = opts.home_dir,
+        .sandbox = opts.sandbox,
+        .model_tiers = opts.model_tiers,
+        .artifact_root = opts.artifact_root,
+    };
+}
+
+/// One verifier spawn at the check gate's boundary, on the gate's snapshot
+/// (built here on the boundary's first spawn). Bounded by the run budget.
+fn verifierSpawn(
+    allocator: std.mem.Allocator,
+    gate: *isolated_verifier_mod.Gate,
+    verifier: isolated_verifier_mod.Options,
+    deps: isolated_verifier_mod.Deps,
+    root: []const u8,
+    pinned: isolated_verifier_mod.PinnedCheck,
+    leads: ?[]const u8,
+) !isolated_verifier_mod.VerifyResult {
+    if (!gate.budgetAllowsSpawn()) return isolated_verifier_mod.unavailableResult(allocator, .run_budget);
+    if (gate.snapshot == null) {
+        gate.snapshot = @import("../agents/isolation.zig").Snapshot.create(allocator, deps.state_root, root, gate.base_head, deps.abort) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            log.warn("verifier", "snapshot unavailable: {s}", .{@errorName(err)});
+            return isolated_verifier_mod.unavailableResult(allocator, .snapshot_failed);
+        };
+    }
+    const result = try isolated_verifier_mod.verify(allocator, deps, .{
+        .task_statement = gate.task_statement,
+        .workspace = .{ .snapshot = &gate.snapshot.? },
+        .pinned_check = pinned,
+        .model = verifier.model,
+        .prior_failing_probes = @ptrCast(gate.prior_probes.items),
+        .leads = leads,
+    });
+    gate.noteSpawn(&result);
+    return result;
+}
+
+/// Close a verifier boundary: record it, drop the snapshot, and turn a
+/// reproduced FAIL in enforce mode into the check gate's `failed` verdict.
+fn verifierConclude(
+    allocator: std.mem.Allocator,
+    gate: *isolated_verifier_mod.Gate,
+    verifier: isolated_verifier_mod.Options,
+    check: check_gate_mod.Options,
+    check_state: *check_gate_mod.State,
+    result: *const isolated_verifier_mod.VerifyResult,
+) !VerifierAction {
+    const index = gate.boundaries -| 1;
+    try gate.finishBoundary(allocator, index, result.outcome, result.record.tree);
+    gate.dropSnapshot();
+    if (verifier.mode != .enforce) return .stand;
+    const evidence = switch (result.outcome) {
+        .fail => |report| report.evidence,
+        else => return .stand,
+    };
+    check_state.noteVerifierFail(isolated_verifier_mod.failureFingerprint(evidence));
+    const decision = check_gate_mod.decide(.enforce, check.max_continuations, check_state.continuations, .failed);
+    check_state.noteDecision(decision);
+    if (decision != .continue_run) return .exhausted;
+    const left = check.max_continuations -| check_state.continuations;
+    return .{ .continue_run = try isolated_verifier_mod.renderFailContinuation(allocator, evidence, left) };
+}
+
+/// The second spawn of a boundary, after a leads round: a fresh verifier on
+/// the same snapshot T, with the round's reply as leads (at most
+/// `LEADS_MAX_BYTES`). Its verdict is final for the boundary.
+fn verifierAfterLeads(
+    allocator: std.mem.Allocator,
+    opts: *const Options,
+    gate: *isolated_verifier_mod.Gate,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    sess: @import("session_id.zig").SessionId,
+    check_state: *check_gate_mod.State,
+    leads_text: []const u8,
+) !VerifierAction {
+    const verifier = opts.isolated_verifier.?;
+    const check = opts.check_gate.?;
+    var result = if (gate.snapshot == null)
+        isolated_verifier_mod.unavailableResult(allocator, .snapshot_failed)
+    else
+        try verifierSpawn(allocator, gate, verifier, verifierDeps(opts, provider, tool_defs, permission_ctx, sess), gate.snapshot.?.repo, .{
+            .command = check.command,
+            .passed = check_state.last_passed,
+            .total = check_state.last_total,
+        }, leads_text);
+    defer result.deinit();
+    log.info("agent", "isolated verifier after leads result={s}", .{@tagName(result.outcome)});
+    return verifierConclude(allocator, gate, verifier, check, check_state, &result);
+}
+
 noinline fn recordRequirementLedger(
     opts: *const Options,
     state: *const requirement_ledger_mod.State,
@@ -1745,6 +1922,18 @@ fn runCounted(
     defer if (opts.test_integrity) |integrity| if (depth == 0) recordTestIntegrity(&opts, integrity, &test_integrity_state, allocator);
     var stop_hook_active = false;
     defer if (opts.check_gate) |gate| recordCheckGate(&opts, gate, &check_gate_state);
+    // Isolated verifier (isolated_verifier.zig): armed beside the check gate
+    // at depth 0. The task statement and the run-start HEAD are fixed here,
+    // before any work; the record is emitted once per armed run.
+    const verifier_armed = opts.isolated_verifier != null and opts.check_gate != null and depth == 0;
+    var verifier_gate = isolated_verifier_mod.Gate{};
+    defer verifier_gate.deinit(allocator);
+    defer if (verifier_armed) recordIsolatedVerifier(&opts, opts.isolated_verifier.?, &verifier_gate);
+    var verifier_borrowed_turns: u32 = 0;
+    if (verifier_armed) {
+        verifier_gate.task_statement = try allocator.dupe(u8, latestUserText(conversation));
+        verifier_gate.base_head = @import("../agents/isolation.zig").headOf(allocator, opts.cwd_abs, opts.abort);
+    }
     // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
     // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
     // 序列量化)。
@@ -1793,7 +1982,7 @@ fn runCounted(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns) : (turns += 1) {
+    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns +| verifier_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -1820,7 +2009,27 @@ fn runCounted(
         // post-execution gate must check it too. The phase only changes in
         // the end-turn branch, which leaves the iteration, so the value holds
         // for the whole iteration.
-        const in_learning_pass = learning_state.active();
+        // A verifier leads round (isolated_verifier.zig §6) is a host pass
+        // too: read-only, outside the attempt, so the same skips apply.
+        if (verifier_gate.leads == .active) {
+            verifier_gate.leads_turns += 1;
+            if (verifier_gate.leads_turns > isolated_verifier_mod.LEADS_MAX_TURNS) {
+                // The round kept calling tools: the second verifier gets no
+                // leads, and the boundary's verdict is final either way.
+                log.info("agent", "verifier leads round cut at {d} turns", .{isolated_verifier_mod.LEADS_MAX_TURNS});
+                verifier_gate.leads = .idle;
+                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, "")) {
+                    .continue_run => |text| {
+                        defer allocator.free(text);
+                        output_channel.final_sealed = false;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    },
+                    .stand, .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls }),
+                }
+            }
+        }
+        const in_learning_pass = learning_state.active() or verifier_gate.leads == .active;
 
         // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
         // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
@@ -3255,6 +3464,26 @@ fn runCounted(
         if (turn_stop_reason != .max_tokens or has_tool_use) continuation_streak = 0;
 
         if (!has_tool_use) {
+            // A verifier leads round ended (isolated_verifier.zig §6): its
+            // reply is the leads text (commentary; the answer before the
+            // round is already final). The fresh verifier on the same
+            // snapshot gives the boundary's final verdict.
+            var leads_just_ended = false;
+            if (verifier_gate.leads == .active) {
+                output_channel.close(.commentary, assistant_text.items);
+                verifier_gate.leads = .idle;
+                leads_just_ended = true;
+                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, assistant_text.items)) {
+                    .continue_run => |text| {
+                        defer allocator.free(text);
+                        output_channel.final_sealed = false;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    },
+                    .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }),
+                    .stand => {},
+                }
+            }
             // A learning pass ended (learning_turn.zig): after distill, go on
             // to reconcile when a lesson was accepted and stored lessons exist;
             // otherwise the run ends with the attempt's own stop reason. No
@@ -3618,6 +3847,50 @@ fn runCounted(
                     @tagName(outcome.verdict), outcome.passed, outcome.total, outcome.exit_code, @tagName(decision), check_gate_state.continuations, gate.max_continuations,
                 });
                 check_gate_state.noteDecision(decision);
+                // Isolated verifier: only after a green, untainted pinned
+                // check, at most MAX_VERIFIER_BOUNDARIES times per run.
+                if (verifier_armed and outcome.verdict == .passed and verifier_gate.canStartBoundary()) {
+                    const verifier = opts.isolated_verifier.?;
+                    verifier_gate.boundaries += 1;
+                    backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the isolated verifier" } });
+                    var vresult = try verifierSpawn(allocator, &verifier_gate, verifier, verifierDeps(&opts, provider, tool_defs, permission_ctx, sess), root, .{ .command = gate.command, .passed = outcome.passed, .total = outcome.total }, null);
+                    defer vresult.deinit();
+                    backend.emitEvent(sess, .clear_current_tool);
+                    log.infoId("agent", rid, "isolated verifier boundary={d} result={s}", .{ verifier_gate.boundaries, @tagName(vresult.outcome) });
+                    if (opts.abort) |a| if (a.isAborted()) {
+                        verifier_gate.dropSnapshot();
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    };
+                    const leads_round = verifier.mode == .enforce and vresult.outcome == .unverified and
+                        check_gate_state.continuations < gate.max_continuations;
+                    if (leads_round) {
+                        // One leads round (§6): it consumes a continuation
+                        // of the check gate's budget. The answer is final
+                        // now; the round's reply is commentary unless a
+                        // post-leads FAIL sends the run back to work.
+                        check_gate_state.noteDecision(.continue_run);
+                        verifier_gate.leads = .active;
+                        verifier_gate.leads_turns = 0;
+                        verifier_gate.leads_rounds += 1;
+                        verifier_borrowed_turns +|= isolated_verifier_mod.LEADS_MAX_TURNS + 1;
+                        const text = try isolated_verifier_mod.renderLeadsRequest(allocator, vresult.outcome.unverified.not_established);
+                        defer allocator.free(text);
+                        output_channel.close(.final, assistant_text.items);
+                        output_channel.final_sealed = true;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    }
+                    switch (try verifierConclude(allocator, &verifier_gate, verifier, gate, &check_gate_state, &vresult)) {
+                        .continue_run => |text| {
+                            defer allocator.free(text);
+                            output_channel.close(.commentary, assistant_text.items);
+                            try conversation.appendHostText(text);
+                            continue :outer_turn;
+                        },
+                        .stand, .exhausted => {},
+                    }
+                }
                 if (decision == .continue_run) {
                     const text = try check_gate_mod.renderContinuation(allocator, gate, &outcome, &check_gate_state);
                     defer allocator.free(text);
@@ -3652,7 +3925,7 @@ fn runCounted(
                 if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
             };
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
-            if (test_integrity_state.armed) test_integrity_state.noteFinalAnswer(assistant_text.items);
+            if (test_integrity_state.armed and !leads_just_ended) test_integrity_state.noteFinalAnswer(assistant_text.items);
             output_channel.close(.final, assistant_text.items);
             // Learning turn (learning_turn.zig): the answer is final; decide on
             // the verdict the check gate left at this workspace.
@@ -3776,6 +4049,30 @@ fn runCounted(
                 tu.name // dispatcher universe: exact-name policy, no repair
             else
                 tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
+            // Verifier leads round: only Read, Grep and Glob run, so the
+            // candidate stays the tree the verifier judged (T' = T is
+            // rechecked after the round anyway).
+            if (verifier_gate.leads == .active and !isolated_verifier_mod.allowedDuringLeads(canonical_name)) {
+                backend.emitEvent(sess, .{ .policy_decision = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .id = tu.id,
+                    .tool = tu.name,
+                    .decision = "deny",
+                    .source = "isolated_verifier",
+                    .allowed = false,
+                } });
+                var vslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
+                vslot.content = try tool_error.errorToJson(
+                    "VerifierLeadsToolUnavailable",
+                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
+                    .{tu.name},
+                    allocator,
+                );
+                vslot.is_error = true;
+                try slots.append(allocator, vslot);
+                continue;
+            }
             // Learning pass: only read tools and KgRemember run, so the workspace
             // the check judged is the workspace the run hands back.
             if (learning_state.active() and !learning_turn_mod.allowedDuringPass(canonical_name)) {

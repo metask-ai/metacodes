@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Optional browser smoke (Playwright): submit one fake trial in the real UI.
+
+    python3 scripts/eval/bench_ui_smoke.py --screenshot /tmp/bench-workbench.png
+
+Uses an isolated temporary jobs directory and the same fake Harbor as the
+HTTP contract tests. No real model requests, Docker tasks or user browser.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.eval.harbor.viewer import data, server  # noqa: E402
+from scripts.eval.harbor.viewer.runner import RunManager  # noqa: E402
+from scripts.eval.tests.test_bench_workbench import fixture, wait_run  # noqa: E402
+
+
+def main():
+    from playwright.sync_api import sync_playwright
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--screenshot', type=Path)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='bench-ui-') as temp:
+        root = Path(temp)
+        config, binary_dir = fixture(root)
+        manager = RunManager(root / 'jobs', config)
+        with patch.dict(os.environ, {'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
+                                     'TOKENJOY_API_KEY': 'private-ui-fixture'}):
+            http = server.make_server(data.Library([manager.jobs_dir]), '127.0.0.1', 0, manager, 'ui-fixture')
+            threading.Thread(target=http.serve_forever, daemon=True).start()
+            try:
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={'width': 1440, 'height': 1100})
+                    errors = []
+                    page.on('pageerror', lambda error: errors.append(str(error)))
+                    page.goto(f'http://127.0.0.1:{http.server_address[1]}/?token=ui-fixture#/new')
+                    page.get_by_role('checkbox', name='fix-git', exact=True).check()
+                    page.get_by_role('button', name='开始评测', exact=True).click()
+                    page.wait_for_url('**/#/run/*')
+                    name = page.url.split('/run/')[1]
+                    assert wait_run(manager, name)['status'] == 'finished'
+                    job = manager.jobs_dir / name
+                    trial = job / 'fix-git__fake'
+                    result = json.loads((trial / 'result.json').read_text())
+                    result['agent_result'] = {'n_input_tokens': 1920, 'n_output_tokens': 100, 'cost_usd': .01}
+                    (trial / 'result.json').write_text(json.dumps(result))
+                    (trial / 'agent').mkdir()
+                    (trial / 'agent/metacodes-output.jsonl').write_text(json.dumps(
+                        {'type': 'result', 'stop_reason': 'end_turn', 'text': 'done'}))
+                    (job / '.bench-metrics').mkdir()
+                    (job / '.bench-metrics/fix-git__fake.jsonl').write_text('\n'.join(json.dumps(r) for r in [
+                        {'request': 1, 'complete': True, 'input_tokens': 920, 'output_tokens': 10, 'ttft_ms': 100, 'generation_ms': 1000},
+                        {'request': 2, 'complete': True, 'input_tokens': 1000, 'output_tokens': 90, 'ttft_ms': 300, 'generation_ms': 3000}]))
+                    page.get_by_role('button', name='刷新', exact=True).click()
+                    page.get_by_role('heading', name='运行完成', exact=True).wait_for()
+                    page.get_by_text('1 通过 / 1 有效', exact=True).wait_for()
+                    for label in ('一次性完成率', '首轮满分率', '任务总 Token', '初始 Token（均值）', 'TPS（生成）', 'TTFT（均值）', '估算成本'):
+                        page.locator('.metric > span', has_text=label).first.wait_for()
+                    page.get_by_text('25.0 tok/s', exact=True).first.wait_for()
+                    page.get_by_text('0.20s', exact=True).first.wait_for()
+                    assert '#/run/' in page.locator('.run-state a').get_attribute('href')
+                    if args.screenshot:
+                        page.screenshot(path=str(args.screenshot), full_page=True)
+                    page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/')
+                    page.get_by_text(str(manager.jobs_dir), exact=True).wait_for()
+                    page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/job/{name}/fix-git__fake')
+                    page.get_by_text('920', exact=True).first.wait_for()
+                    page.get_by_text('2,020', exact=True).first.wait_for()
+                    page.set_viewport_size({'width': 390, 'height': 844})
+                    page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
+                    page.get_by_role('button', name='开始评测', exact=True).wait_for()
+                    assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'mobile overflow'
+                    assert not errors, errors
+                    browser.close()
+                    print('bench UI smoke: submit -> worker -> graded result + metrics/storage, desktop/mobile, no JS errors (paid=0)')
+            finally:
+                http.shutdown()
+                http.server_close()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

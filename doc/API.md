@@ -4,6 +4,16 @@ Metacodes exposes several host shapes over one kernel. The fixed AgentLoop,
 Conversation projection, permission/sandbox chain, budgets, formal verdicts,
 artifact store, and TinyKG admission are not replaceable extensions.
 
+Sandbox execution has two boundaries: native filesystem/command tools use
+confined executors, while external harness workers run as a whole confined
+process tree. Linux combines bubblewrap and seccomp; macOS uses Seatbelt.
+Deploy the bundled `bin/metacodes-fs-helper` beside an embedded Host or set
+`METACODES_SANDBOX_HELPER` to its absolute path. Enabled native file/worker
+sandboxes refuse unavailable backends rather than opening/running on the Host.
+The Zig `sandbox_exec` namespace exposes platform discovery; no C ABI fields
+or wire layouts change. See [sandbox execution](SANDBOX_DESIGN.md) for the
+helper contract and the current network-policy limits.
+
 ## Compatibility matrix
 
 | Interface | Entry point | Status | Compatibility rule |
@@ -26,6 +36,11 @@ surfaces built over the same core protocols.
 
 ## Provider selection surface
 
+The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
+launches Harbor trials. Its command, JSON output and HTTP launch contract are
+documented in [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
+AgentCore ABI and SDK layouts are unchanged.
+
 ### Metask device OAuth and gateway
 
 `metacodes login --provider metask` performs the Metask JSON device flow:
@@ -38,6 +53,17 @@ surfaces built over the same core protocols.
 * atomically storing `access_token`, `refresh_token`, `expires_at`,
   `gateway_url`, `models_url`, and `client_name` in
   `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
+
+Every Metask sign-in that replaces a stored session (this one, `metacodes
+login`, `/login`, `/login metask`) revokes the replaced one at
+`$METASK_SITE_URL/api/oauth/revoke`, as `metacodes logout` revokes the current
+one (#560): only once the new session is stored (and, in the TUI, bound), so a
+sign-in that fails, cannot bind or is cancelled revokes nothing; bounded (3 s
+in the TUI, 5 s on the command line), and a refusal or no answer is reported
+in one line without failing the sign-in. The same session stored again is not
+revoked, and a replaced session whose `gateway_url` is not the origin of
+`$METASK_SITE_URL` is not sent there: it stays valid until it expires, and the
+sign-in says so.
 
 The refresh grant sends only `grant_type=refresh_token` and the stored refresh
 token. Metask rotates refresh tokens; persistence happens before the new access
@@ -73,8 +99,9 @@ normative model; the entry points are:
 |---|---|
 | `--provider <id\|alias>` / `METACODES_PROVIDER` | resolve the route through the provider registry instead of inferring a transport from the model name |
 | `METACODES_MODEL` | the model, as `--model` gives it (the flag wins) |
-| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PROVIDER` (else the one provider whose key it holds) applies only when no flag or environment variable names a provider, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, a key or older sign-in in `auth.json`, the Metask session `oauth/metask.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
-| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` older than #527 with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER` or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
+| `--preset <name>` / `METACODES_PRESET` | a named setup from `config.json` `presets` (#489; [LOCAL_CONFIG.md](LOCAL_CONFIG.md#presets)), applied as the flags naming its route would: `--model`, `--channel` and `--reasoning-effort` replace one field for that run, `--provider`/`--offer` set it aside, nothing is written back. Below a preset named at start comes the one `directory_presets` remembers for the working directory (its git worktree root, else the directory), then the `/model` default. A name `config.json` does not define stops `-p`, `serve` and `--web` with exit 2, listing the presets; the TUI starts without it and says so under its banner |
+| `<state root>/.env` | the install's local configuration ([LOCAL_CONFIG.md](LOCAL_CONFIG.md)), read once at start and never `setenv`: a layer below the process environment for the names it may set — every registered profile's `env_aliases`, the variables `config.json` names (`providers.<id>.credentials[].env`, `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`, `METACODES_MODEL`, `METACODES_PRESET`; a provider's aliases are read from it only when the environment sets none of them. Request addresses (`METACODES_BASE_URL`, `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`, `METACODES_KG_URL`, any `*_URL`) are refused; other names are ignored with one warning listing them. Its `METACODES_PRESET`, else its `METACODES_PROVIDER` (else the one provider whose key it holds), applies only when no flag or environment variable names a provider or a preset, the working directory remembers no preset, no `global_selection` is stored and no Metask sign-in exists (`--api-key`, `METASK_API_KEY`, a key or older sign-in in `auth.json`, the Metask session `oauth/metask.json`); keys of several providers and no name choose none, and the run lists them. A `.env` anywhere else, the working directory included, is never read. `metacodes install` writes `<state root>/.env.example` on every install and upgrade and never touches `.env` |
+| no credential at all | the interactive TUI opens without a model (#484): its banner reads `not set — /login, or configure .env`; a prompt, `/retry`, `/edit <n>`, `/init`, `/commit`, `/review`, `/btw`, `/recap` and a Skill are refused with a note before any request is assembled; nothing is probed; no session directory is made until a route binds (`/model`, `/login`). A Metask sign-in in `auth.json` older than #527 with no key and model chosen opens it the same way, and so does a provider named by `--provider`, `--offer`, `METACODES_PROVIDER`, a preset or `.env` that has no credential: the note names that provider's variables, and no other provider is used in its place (#485). `-p`, `-`, `serve`, `--web` and a REPL whose input is a pipe exit non-zero with the sign-in hint (or the named provider's help) instead. The banner names where a bound route's credential came from (`· Metask`, `· from .env`, `· from shell`, `· saved key`, `· signed in`, `· --api-key`) |
 | stored default without a credential | a `global_selection` whose provider has no credential (a Metask one: no Metask session, no Metask key and no key in `auth.json`; a stored Metask route the session authenticates runs at the session's gateway, never at the compiled endpoint with the session's token, #527) is passed over for the levels below it, with one notice: `The default model, <provider> · <model>, has no key or sign-in; this session uses <model> · <origin>.` (under the TUI's banner, else on stderr) (#485) |
 | `metacodes logout` | revokes the Metask session at `$METASK_SITE_URL/api/oauth/revoke` (bounded; a failure is reported and the local sign-out goes on), removes both Metask sign-ins (`auth.json`, `oauth/metask.json` with its refresh token) and a key stored with `login --provider metask`, forgets a stored default that resolves to Metask, and says which it removed; `METASK_API_KEY` left in the shell or `.env` is named, never removed. `logout --provider metask` is the same (#499) |
 | `--channel <id>` | narrow to one endpoint/region/plan/account binding |
@@ -84,8 +111,9 @@ normative model; the entry points are:
 | `METACODES_STREAM_IDLE_TIMEOUT_MS` | stream liveness, **head phase**: a request whose connection stays open but delivers no byte before the response head for this long (default 120000; 0 disables liveness monitoring entirely) is shut down by the client's monitor and retried as a transient network error. Nothing in a blocked socket read notices an abort flag; this is what turns a silent gateway or proxy into a bounded failure instead of a frozen session. Progress is measured per SSE line, not per parsed event: a tool call's `input_json_delta` frames and unknown events keep the request alive, but keepalive lines (`event: ping`, `data: {"type":"ping"}`, `:` comments) do not — they prove the gateway connection is up, not that the model is producing (2026-09-23: a gateway pinged every 15 s for 55 minutes over an upstream that produced nothing) |
 | `METACODES_STREAM_BODY_IDLE_TIMEOUT_MS` | stream liveness, **body phase** (response head accepted): unset = automatic, `clamp(max_tokens × 100 ms, 600000, 1800000)` — a gateway may generate an entire tool call before writing a byte of it, so the tolerated silence scales with the response the request allows; an explicit value is a flat limit in ms; 0 disables body-phase monitoring. Past the limit the client shuts the connection down, the turn ends with `StreamStalled` and the TUI reports `正文空闲超时: <idle> ms 内无任何字节(上限 <limit> ms)` when the connection itself went silent, or `<idle> ms 内无模型输出,但网关 keepalive 仍在到达(最近字节 <n> ms 前)…` when a gateway kept the connection alive over a dead upstream — instead of the generic failure text. A user cancel (Ctrl+C/Esc) that wakes the blocked read is reported as an abort, never as an API error, and the streamed prefix is kept as partial text. A body-phase stall after visible output (text, thinking or a tool call) is not retried automatically in the TUI (the streamed prefix cannot be pretended away); a stall, a stream that ended without a stop report, or a dropped connection before any visible output is re-sent once (an in-stream server error, reported as `API 错误帧: …` on every wire, is not). Independently of this limit, once an endpoint has been seen to send keepalives mid-stream (three pings or SSE comments, each ending a silence of at least 2 s), a streamed body with no byte at all, keepalives included, for max(4 × the longest such interval, 2 minutes) is judged a dead connection and reported as `连接已断: <n> ms 内无任何字节,连 keepalive 也没有…`; 0 here disables that rule as well |
 | `metacodes login --provider <id> --oauth-token-json <file>` | import an OAuth token into that provider's own store; refresh, single flight, and rotated-refresh persistence then run themselves |
-| `metacodes login --provider <id> [--key-page <page>] [--api-key-stdin] [--no-check]` | for a provider that declares key pages instead of a sign-in (`zai-coding-plan`, `kimi-code`): open the plan page, read the pasted key with echo off (or from stdin), check it with a GET the provider does not bill, and store it in `<state root>/keys/<id>.json` (0600). Only that provider's resolution reads the file, after its environment aliases; `metacodes logout --provider <id>` removes it. `METACODES_KEY_CHECK_URL` (https, or http to a loopback host) replaces the check URL for a local mock |
-| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
+| `metacodes login --provider <id> [--key-page <page>] [--api-key-stdin] [--no-check]` | for a provider that declares key pages and no sign-in it can run — every built-in vendor but Metask: `openai`, `gemini`, `qwen`, `minimax`, `kimi`, `deepseek`, `zai-coding-plan`, `kimi-code`, `bedrock` (OpenAI's OAuth sign-in runs instead once an OAuth client is configured for it, or with `--client-id`): open the key page (the one for the default channel's region; `--key-page` picks another), read the pasted key with echo off (or from stdin, or `--api-key <key>`), check it with a GET the provider does not bill, the key placed where the provider's requests carry it (Gemini's `x-goog-api-key`), and store it in `<state root>/keys/<id>.json` (0600). A 401/403, or what the provider words as a wrong key (Gemini's 400 `API_KEY_INVALID`), refuses it; nothing is stored then. Only that provider's resolution reads the file, after its environment aliases: when one of them is set in the shell or in `.env`, the login says so by the variable's name (`warning: DASHSCOPE_API_KEY is set in your shell and is used before the stored key: …`; `/login` prints the same line); `metacodes logout --provider <id>` removes it. `METACODES_KEY_CHECK_URL` (https, or http to a loopback host) replaces the check URL for a local mock |
+| `metacodes login --provider openrouter [--device-code] [--no-browser]` | OpenRouter's own sign-in (`ProviderProfile.key_grant`, its PKCE flow): the browser goes to `https://openrouter.ai/auth` with an S256 challenge and a loopback callback on any free port (1456, else 1457, else one the system picks), taken only with its own `state`; a refusal ends it at once. `--device-code` (taken unasked in an SSH session unless `--no-browser`) prints a page without a callback, whose code is pasted back at a hidden prompt. `POST /api/v1/auth/keys` trades the code and the verifier for an API key of the user's own account, which is stored in `<state root>/keys/openrouter.json` like a pasted one, with what `GET /api/v1/key` said about it (label, spending limit, expiry, free tier); then the account's listing (`GET /api/v1/models/user`) is fetched and kept for `/model`. `--api-key-stdin` stores a key created on OpenRouter instead, checked and described by `GET /api/v1/key`. `logout --provider openrouter` removes the key from this machine and names `https://openrouter.ai/keys/<sha256 hex of the key>`, where its owner deletes it (only a management key could delete it from here). `METACODES_OPENROUTER_URL` (https, or http to a loopback host; process environment only) moves every OpenRouter address, requests included, for a local mock |
+| `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `presets` and `directory_presets` (#489), `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
@@ -111,7 +139,9 @@ Once both are chosen it stores the token response as the Metask session
 (`oauth/metask.json`) and the choice in `auth.json`, as `metacodes login`
 does, moves the session onto that gateway with the session's token at once,
 and forgets a stored `global_selection`, so the next start is on the sign-in
-too (#485, #527). `/logout` revokes the Metask session at Metask, removes
+too (#485, #527); a Metask session it replaced is then revoked at Metask
+(#560, see [Metask device OAuth and gateway](#metask-device-oauth-and-gateway)).
+`/logout` revokes the Metask session at Metask, removes
 both Metask sign-ins (`auth.json` and the session `oauth/metask.json`) and a
 Metask key
 stored with `login --provider metask`, forgets a stored default that resolves
@@ -132,7 +162,11 @@ only when neither the profile nor `providers.<id>.oauth_client_id` in
 `~/.metacodes/config.json` names the installation's registered client (#87). A
 provider that takes a pasted key instead (`zai-coding-plan`, `kimi-code`) is
 listed in `/login` as "API key": ↑/↓ picks the plan, its page opens, the key is
-typed masked, and Enter checks and stores it.
+typed masked, and Enter checks and stores it. A provider whose site creates
+the key (`openrouter`) is listed as "browser sign-in" and asks which way: the
+browser on this computer, another device (its page shows a code, typed here
+masked; offered first in an SSH session, and where `--device-code` starts), or
+a key the user already has.
 
 The picker lists only routes a commit can apply as they are (#488): a route is
 listed when a credential resolves for it now, by the same resolution a commit
@@ -337,16 +371,21 @@ placeholders rather than a claim of free work. Explicit numeric zero usage is
 
 A self-hosted Jev System-One judge can advise four memory decisions (scoped
 recall injection, `KgRecall` evidence, `KgRemember` relations, enumeration
-intent). It is configured by the `jev` object of the install's
-`<state root>/config.json`, each field overridable by its `METACODES_JEV_*`
-variable. A host that sets `Config.jev_builtin_default` (the CLI does) falls
-back to the built-in service — `metask-jev-4b` at `http://58.211.6.133:10420`
-in `advisory` mode, advising `scoped_recall` only, plain HTTP over the public
-network — when neither names a `url`; an embedder that leaves it off has no
-advisor unless one of them does. The default applies as a whole: a layer that
-names its own `url` starts from the plain defaults (`shadow`, no model pin,
-every surface), while one that only sets `mode`, `timeout_ms` or `decisions`
-tunes the default service. An `off` or empty `url` from any layer
+intent). It is off until a service is named: by the `jev` object of the
+install's `<state root>/config.json`, each field overridable by its
+`METACODES_JEV_*` variable. The CLI names none, so `metacodes doctor` of a fresh
+install reports `jev_advisor off … source=none` and nothing of a session
+reaches a Jev server (#474; until then the CLI fell back to the built-in
+service, plain HTTP to a public address). A host that sets
+`Config.jev_builtin_default` (no host in this repository does) falls back to
+that built-in service — `metask-jev-4b` at `http://58.211.6.133:10420` in
+`advisory` mode, advising `scoped_recall` only — when neither names a `url`.
+To use that service from the CLI, write its settings down once
+(doc/JEV_SYSTEM_ONE.md §7 has the object). The default applies as a whole: a
+layer that names its own `url` starts from the plain defaults (`shadow`, no
+model pin, every surface), while one that only sets `mode`, `timeout_ms` or
+`decisions` tunes the default service, or tunes nothing when the host takes no
+default. An `off` or empty `url` from any layer
 (`"jev": false`, `"jev": {"url": "off"}`, `METACODES_JEV_URL=off`) turns it
 off; the build exports `METACODES_JEV_URL=off` to every step it runs. It is
 evidence only: it never gates a tool, a permission, a budget, or a TinyKG
@@ -354,7 +393,7 @@ write. Design, failure semantics and evaluation: [JEV_SYSTEM_ONE.md](JEV_SYSTEM_
 
 | `jev` field | Override | Contract |
 |---|---|---|
-| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means the built-in default (CLI) or no advisor (embedders); `off` or blank disables the advisor |
+| `url` | `METACODES_JEV_URL` | judge origin (`http(s)://host[:port]`); absent everywhere means no advisor (the built-in default only for a host that sets `Config.jev_builtin_default`; the CLI does not); `off` or blank disables the advisor |
 | `mode` | `METACODES_JEV_MODE` | `shadow` (when unset: consult and journal, provider-visible bytes unchanged) or `advisory` (the built-in default; judgments change injections and annotate `KgRemember` results) |
 | `timeout_ms` (integer) | `METACODES_JEV_TIMEOUT_MS` | per-consultation deadline, default 2500, 100–30000; a miss falls back to the unadvised path with no retry |
 | `model` | `METACODES_JEV_MODEL` | expected model id; a response from any other model, or one that reports a priced tariff, is refused |
@@ -735,7 +774,7 @@ unless noted.
 | `GET /` | The bundled single-session browser UI; in the `/s/<id>/` daemon, a page listing the live session ids and these endpoints. |
 | `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
 | `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
-| `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. |
+| `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. Ids are never reused, also across restarts and a session destroyed and restored, so an answer to an earlier process's request is 409 and never answers a newer one ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#15-ui-requests-approvers-expiry-suspended-runs)). |
 | `POST /capabilities` | The frontend's [capability frame](WIRE_PROTOCOL.md#2-capability-exchange): `200` with the `capabilities_accepted` line (also journaled), `400` with `capabilities_refused` (nothing changes). From then on a UI request the frame leaves out is journaled as `ui_request_unavailable` and never announced. |
 | `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |
@@ -862,6 +901,11 @@ in one of five ways:
 | Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
 | Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
+
+Inherited permission decisions hold the lender lock and read a published rule
+header stored with that lock. Replacing the lead's own optional rule header
+does not change an in-progress decision; publication completes before the
+previous rule allocations are freed.
 | Identity | Session ID | Never; a restore reuses it. |
 
 `SessionConfig.reasoning_effort` is carried by every provider request and kept

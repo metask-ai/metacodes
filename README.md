@@ -6,7 +6,7 @@
 
 Benchmarked on WorkBuddy-Bench against CodeBuddy Code and Claude Code · a 5.5 MB native binary · a fixed kernel no plugin can bypass · graph memory · a C ABI for every host
 
-[![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml)
+[![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml?query=event%3Apull_request)
 [![Release](https://img.shields.io/github/v/release/metask-ai/metacodes)](https://github.com/metask-ai/metacodes/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig 0.16](https://img.shields.io/badge/zig-0.16-f7a41d.svg)](https://ziglang.org)
@@ -232,19 +232,21 @@ This is the research frontier of the project and an open invitation.
 - **Permissions.** Five modes; allow, ask and deny rules in the
   `Tool(specifier)` syntax Claude Code users know; protected paths (`.git`,
   `.env` files, `.ssh`, shell rc files and more) always ask.
-- **Sandbox.** An opt-in macOS Seatbelt sandbox. A Linux backend is wanted.
+- **Sandbox.** An opt-in Bash sandbox: Seatbelt on macOS, bubblewrap on Linux.
 - **Stall gate.** On by default in interactive sessions, it stops runs whose
   tool rounds keep returning nothing new.
 - **Observable output.** Every file change is an event with a bounded diff, and
   model output is classified as commentary, final, continued, partial or
   discarded.
 
-> **Privacy note.** By default the CLI consults Jev, Metask's small decision
-> model, to re-rank automatic memory recall. Each consult sends the current
-> request (at most 400 bytes) and up to eight redacted memory excerpts over
-> plain HTTP to a Metask-hosted server. Set `METACODES_JEV_URL=off` or
-> `"jev": false` in the config to turn it off. Embedded AgentCore runtimes do
-> not use it unless the host opts in. See
+> **Privacy note.** The CLI sends nothing to a Jev server unless you name
+> one. Jev is Metask's small decision model; it can re-rank automatic memory
+> recall. Once you set `"jev": {"url": "https://…"}` in the state root's
+> `config.json` (or `METACODES_JEV_URL`), each consult sends the current
+> request (at most 400 bytes) and up to eight redacted memory excerpts to that
+> service, over the scheme you wrote, so use `https://` or a loopback address.
+> `metacodes doctor` shows `jev_advisor off` until then. Embedded AgentCore
+> runtimes do not use it unless the host opts in. See
 > [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md).
 
 ## Quick start
@@ -322,7 +324,7 @@ ship for five targets with checksums.
 | TinyKG memory and task DAG | On by default in the CLI; not yet in AgentCore |
 | Lean project rules | Experimental; dormant until a project activates them |
 | Self-evolution, learning turn, check gate | Experimental, off by default |
-| Sandbox | macOS only, opt-in |
+| Sandbox | macOS (Seatbelt) and Linux (bubblewrap), opt-in |
 
 Milestones are tracked in [ROADMAP.md](ROADMAP.md) and launch readiness in
 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
@@ -345,7 +347,8 @@ We want contributors, and the most useful work right now is:
   fixtures for real failures.
 - **Memory research.** A Markdown-memory or vector-RAG comparison arm against
   TinyKG.
-- **Platforms.** A Linux sandbox backend (bubblewrap or Landlock).
+- **Platforms.** A Windows sandbox backend, and per-host network filtering for
+  the sandbox.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) maps each area to a starting point and
 explains how changes get accepted. Read [AGENTS.md](AGENTS.md) before your

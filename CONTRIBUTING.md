@@ -23,7 +23,7 @@ make-work list.
 | Memory and knowledge graphs | [doc/MEMORY_SYSTEM_DESIGN.md](doc/MEMORY_SYSTEM_DESIGN.md), [doc/TINYKG_INTEGRATION.md](doc/TINYKG_INTEGRATION.md) | Recall quality probes, a Markdown-memory or vector-RAG comparison arm, degraded-mode UX |
 | Models and providers | [doc/PROVIDER_OFFER_ARCHITECTURE.md](doc/PROVIDER_OFFER_ARCHITECTURE.md), `src/api/model_adapter.zig` | A model-family adapter, a local-model (Ollama, llama.cpp, vLLM) recipe, dialect conformance tests |
 | Plugins and tools | [doc/PLUGIN_ARCHITECTURE.md](doc/PLUGIN_ARCHITECTURE.md), [doc/PLUGIN_PROCESS_PROTOCOL.md](doc/PLUGIN_PROCESS_PROTOCOL.md) | A process plugin in any language, a plugin template, a sample Skill pack |
-| Sandboxing and security | `src/sandbox/`, `src/permission/`, [SECURITY.md](SECURITY.md) | A Linux sandbox backend (bubblewrap or Landlock), protected-path coverage, permission-rule fuzzing |
+| Sandboxing and security | `src/sandbox/`, `src/permission/`, [SECURITY.md](SECURITY.md) | A Windows sandbox backend, per-host network filtering, protected-path coverage, permission-rule fuzzing |
 | Docs and translation | [doc/README.md](doc/README.md) | Tutorials, diagrams, keeping [README.zh-CN.md](README.zh-CN.md) and the English README in step |
 
 Issues labelled
@@ -53,7 +53,7 @@ foreground process: closing the terminal, pressing Ctrl+C or shutting down
 the computer stops it. Restart it when you resume development; PR bindings
 and progress persist locally. This script lives under `.github/` and runs
 on your Mac. The loop polls registered PRs every sixty seconds; GitHub CI
-and the merge queue run on GitHub independently. Local review and repair
+runs on GitHub independently. Local review and repair
 pause while the watcher is stopped or your Mac is asleep or offline.
 
 For each task, push its branch and register the PR with its original worker
@@ -79,9 +79,12 @@ python3 .github/pr-loop.py bind --pr "$PR_NUMBER" \
 it. The watcher reviews each revision in an independent read-only Codex
 conversation, returns blocking findings or CI failures to the original
 worker, checkpoints repairs and validates them through `dx zig build gate:pr`
-on devbox before pushing. It repeats the review after a push, then requests
-admission to the existing merge queue when review and CI pass. Only registered
-PRs participate in this workflow.
+on devbox before pushing. It merges current main into a stale branch, validates
+and pushes that revision, and repeats review and PR CI. When both pass, it
+requests an exact-head merge under strict up-to-date branch protection.
+Only registered PRs participate. Ordinary main pushes do not repeat PR CI;
+Linux ARM64, Intel macOS and Windows ARM64 cross-build coverage runs at release
+time ([CI design](doc/CI_DESIGN.md#3-pr-only-validation-and-merge-policy)).
 
 When a decision or additional permission is needed, or a configured limit is
 reached, the loop pauses and notifies you locally. Check progress and answer:

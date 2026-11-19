@@ -73,12 +73,15 @@ def git(cwd, *args):
 
 
 class FixtureGitHub(GitHub):
-    """Exercise production snapshot/check/enqueue encoding, without the network."""
+    """Exercise production snapshot/check/merge encoding, without the network."""
     def __init__(self, bare, base):
         self.bare, self.base = bare, base
         self.calls = []
         self.queued = False
         self.merged = False
+        self.strict = True
+        self.require_queue = False
+        self.race_on_merge = False
         self.check_state = "success"
         self.external_app = False
         self.change_on_snapshot = None
@@ -100,14 +103,23 @@ class FixtureGitHub(GitHub):
                     "html_url": f"https://github.com/{DEFAULT_REPO}/pull/7", "state": "open",
                     "merged": self.merged, "draft": False, "mergeable": True, "merge_commit_sha": "a" * 40}
         if path == "graphql":
-            if "enqueuePullRequest" in payload["query"]:
-                if payload["variables"]["input"]["expectedHeadOid"] != head:
-                    raise LoopError("head moved")
-                self.queued = True
-                return {"data": {"enqueuePullRequest": {"mergeQueueEntry": {"id": "queue-7"}}}}
             return {"data": {"repository": {"pullRequest": {"reviewDecision": None,
                 "mergeQueueEntry": {"id": "queue-7"} if self.queued else None,
                 "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}}
+        if path.endswith("/rules/branches/main"):
+            rules = [{"type": "required_status_checks", "parameters": {
+                "strict_required_status_checks_policy": self.strict,
+                "required_status_checks": [{"context": name, "integration_id": 15368} for name in REQUIRED_CHECKS]}}]
+            return rules + ([{"type": "merge_queue"}] if self.require_queue else [])
+        if path.endswith("/pulls/7/merge"):
+            self.assert_merge = payload
+            if self.race_on_merge:
+                self.base = "b" * 40
+                raise LoopError("strict rules rejected stale base")
+            if payload != {"sha": head, "merge_method": "merge"}:
+                raise AssertionError(payload)
+            self.merged = True
+            return {"merged": True, "sha": "c" * 40}
         if "/check-runs?" in path:
             return {"check_runs": [{"id": i, "name": name, "app": {"id": 1 if self.external_app else 15368},
                 "status": "in_progress" if self.check_state == "pending" else "completed",
@@ -174,7 +186,7 @@ class LoopIntegrationTest(unittest.TestCase):
         messages = [json.loads(s) for s in self.trace.read_text().splitlines()] if self.trace.exists() else []
         return [m for m in messages if m.get("method") == method]
 
-    def test_review_repair_push_rereview_enqueue_and_observe_merge(self):
+    def test_review_repair_push_rereview_and_exact_head_merge(self):
         self.controller.once()
         fixed = git(self.bare, "rev-parse", "feature")
         self.assertNotEqual(fixed, self.head)
@@ -185,9 +197,9 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertIn("Incorrect result", worker_turn["input"][0]["text"])
         self.assertEqual(worker_turn["sandboxPolicy"]["type"], "workspaceWrite")
         self.controller.once()
-        self.assertEqual(self.row()["state"], "queued")
-        enqueue = [p for path, _, p in self.github.calls if path == "graphql" and "enqueuePullRequest" in p["query"]]
-        self.assertEqual(enqueue[0]["variables"]["input"], {"pullRequestId": "PR_7", "expectedHeadOid": fixed})
+        self.assertEqual(self.row()["state"], "merged")
+        merges = [p for path, _, p in self.github.calls if path.endswith("/pulls/7/merge")]
+        self.assertEqual(merges, [{"sha": fixed, "merge_method": "merge"}])
         self.assertTrue(any(f"commits/{fixed}/check-runs?" in path for path, _, _ in self.github.calls))
         self.assertFalse(worker_turn["sandboxPolicy"]["networkAccess"])
         self.assertEqual(len(self.requests("thread/start")), 2)  # independent reviewer each revision
@@ -205,14 +217,14 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertIn("local_gate_failure", self.requests("turn/start")[2]["params"]["input"][0]["text"])
         self.assertEqual(self.notifications, [])
 
-    def test_pending_checks_reuse_report_and_do_not_enqueue(self):
+    def test_pending_checks_reuse_report_and_do_not_merge(self):
         self.configure()
         self.github.check_state = "pending"
         self.controller.once()
         self.controller.once()
         self.assertEqual(self.row()["state"], "waiting")
         self.assertEqual(len(self.requests("turn/start")), 1)
-        self.assertFalse(self.github.queued)
+        self.assertFalse(self.github.merged)
 
     def test_unknown_app_cannot_satisfy_required_ci_checks(self):
         self.configure()
@@ -278,7 +290,64 @@ class LoopIntegrationTest(unittest.TestCase):
     def test_notifications_before_turn_start_response_are_retained(self):
         self.configure(early_notifications=True)
         self.controller.once()
-        self.assertEqual(self.row()["state"], "queued")
+        self.assertEqual(self.row()["state"], "merged")
+
+    def test_main_update_is_merged_gated_pushed_and_reviewed_again(self):
+        self.configure(reports=[PASS])
+        self.github.check_state = "pending"
+        self.controller.once()
+        git(self.work, "switch", "-q", "main")
+        (self.work / "upstream.txt").write_text("new main\n")
+        git(self.work, "add", ".")
+        git(self.work, "commit", "-qm", "advance main")
+        self.github.base = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "switch", "-q", "feature")
+        self.controller.gate = (sys.executable, "-c", "from pathlib import Path; assert Path('upstream.txt').read_text() == 'new main\\n'")
+        self.controller.once()
+        merged_head = git(self.bare, "rev-parse", "feature")
+        self.assertNotEqual(merged_head, self.head)
+        self.assertEqual(git(self.work, "merge-base", merged_head, self.github.base), self.github.base)
+        self.assertEqual(self.row()["state"], "pending")
+        self.assertIsNone(self.row()["report"])
+        self.assertEqual(self.requests("thread/resume"), [])
+        self.configure(reports=[PASS])
+        self.github.check_state = "success"
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "merged")
+        self.assertEqual(self.github.assert_merge["sha"], merged_head)
+        self.assertEqual(len(self.requests("thread/start")), 2)
+
+    def test_main_update_conflict_returns_prepared_merge_to_worker(self):
+        git(self.work, "switch", "-q", "main")
+        (self.work / "app.txt").write_text("upstream changed\n")
+        git(self.work, "commit", "-qam", "advance main")
+        self.github.base = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "switch", "-q", "feature")
+        self.configure(worker_texts=["fixed\n"])
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "pending")
+        self.assertIn("merge_conflict", self.requests("turn/start")[0]["params"]["input"][0]["text"])
+        self.assertEqual(git(self.work, "merge-base", "HEAD", self.github.base), self.github.base)
+
+    def test_loose_rules_or_old_queue_never_allow_direct_merge(self):
+        for field in ("strict", "require_queue"):
+            with self.subTest(field=field):
+                self.configure()
+                self.store.update(self.binding, State.PENDING, report=None)
+                self.github.strict = field != "strict"
+                self.github.require_queue = field == "require_queue"
+                self.controller.once()
+                self.assertEqual(self.row()["state"], "needs_decision")
+                self.assertFalse(self.github.merged)
+                self.assertFalse(any(path.endswith("/pulls/7/merge") for path, _, _ in self.github.calls))
+
+    def test_main_move_during_merge_retries_without_accepting_stale_checks(self):
+        self.configure()
+        self.github.race_on_merge = True
+        self.controller.once()
+        self.assertEqual(self.row()["state"], "pending")
+        self.assertIsNone(self.row()["report"])
+        self.assertFalse(self.github.merged)
 
     def test_second_watcher_cannot_own_the_same_database(self):
         second = Store(self.store.path)

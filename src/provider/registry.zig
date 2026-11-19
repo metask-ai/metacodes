@@ -39,6 +39,8 @@ pub const kimi_code = @import("profiles/kimi_code.zig");
 pub const qwen = @import("profiles/qwen.zig");
 pub const minimax = @import("profiles/minimax.zig");
 pub const bedrock = @import("profiles/bedrock.zig");
+pub const chatgpt_codex = @import("profiles/chatgpt_codex.zig");
+pub const openrouter = @import("profiles/openrouter.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
 /// point the requirement asks for. Each vendor's integration notes (dialect,
@@ -55,6 +57,8 @@ pub const BUILTIN_PROFILES = [_]ProviderProfile{
     qwen.PROFILE,
     minimax.PROFILE,
     bedrock.PROFILE,
+    chatgpt_codex.PROFILE,
+    openrouter.PROFILE,
 };
 
 // ── transport bridge ─────────────────────────────────────────────────────────
@@ -381,7 +385,7 @@ pub const OfferCatalog = struct {
                                 .upstream_model_id = entry.upstream_model_id,
                                 .protocol = route.protocol.id(),
                                 .wire = route.protocol.wire(),
-                                .dialect = .{ .route = route.dialect, .model = entry.dialect },
+                                .dialect = .{ .route = route.dialect, .model = entry.dialect, .request_profile = route.request_profile },
                                 .endpoint_ref = endpoint,
                                 .credential_ref = bound_credential,
                                 .display_name = entry.display_name,
@@ -516,11 +520,11 @@ test "built-in registry accepts every shipped profile" {
     try std.testing.expect(registry.find("nope") == null);
 }
 
-test "the coding plans, and only they, are subscription plans" {
+test "the coding plans and the ChatGPT plan, and only they, are subscription plans" {
     // A new subscription plan is a deliberate entry here: its unattended
     // starts get the stderr note `ProviderProfile.subscription_plan` documents.
     for (BUILTIN_PROFILES) |entry| {
-        const plan = entry.id.eqlText("kimi-code") or entry.id.eqlText("zai-coding-plan");
+        const plan = entry.id.eqlText("kimi-code") or entry.id.eqlText("zai-coding-plan") or entry.id.eqlText("chatgpt-codex");
         try std.testing.expectEqual(plan, entry.subscription_plan);
     }
 }
@@ -748,4 +752,40 @@ test "catalog offers survive the registry that produced them" {
         "https://napi.metask-ai.com/v1/messages",
         catalog.items()[0].endpoint_ref,
     );
+}
+
+test "every built-in vendor that takes a key, but Metask, declares a key page, and every page that checks one says where" {
+    // `/login <id>` and `login --provider <id>` take a pasted key for these
+    // (phase 2 of the provider plan); Metask signs in with its own grant. A
+    // vendor that only signs in (every credential kind it accepts is an OAuth
+    // token) takes no key, so it has no page to create one on and declares
+    // none; its sign-in is the only way in, so it must declare one.
+    for (BUILTIN_PROFILES) |entry| {
+        if (entry.id.eqlText("metask") or !entry.takesApiKey()) {
+            try std.testing.expect(entry.api_key_setup == null);
+            if (!entry.takesApiKey()) try std.testing.expect(entry.declaresInteractiveOAuth());
+            continue;
+        }
+        const setup = entry.api_key_setup orelse {
+            std.debug.print("{s} declares no key page\n", .{entry.id.slice()});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(setup.pages.len > 0);
+        // Bedrock alone stores its key unchecked: no unbilled endpoint is
+        // known to accept it.
+        for (setup.pages) |page| {
+            if (entry.id.eqlText("bedrock")) continue;
+            try std.testing.expect(std.mem.startsWith(u8, page.check_url orelse return error.TestUnexpectedResult, "https://"));
+        }
+        // Pages that name regions cover every region the channels name, so
+        // the default page follows the channel a session is on. A single
+        // page without one (Bedrock's documentation) serves them all.
+        const regional = for (setup.pages) |page| {
+            if (page.region != null) break true;
+        } else false;
+        if (regional) for (entry.channels) |channel| if (channel.region) |region| {
+            const page = entry.defaultKeyPage(channel.id).?;
+            try std.testing.expectEqualStrings(region, page.region orelse "");
+        };
+    }
 }

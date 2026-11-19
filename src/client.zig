@@ -556,6 +556,25 @@ pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_ob
     model_error.noteStreamError(err_obj);
 }
 
+/// The start of a non-2xx response body, read into `dest`: the whole body when
+/// it fits, else its first `dest.len` bytes. `dest.len` is the `read_bound` to
+/// pass to `reportHttpFailure`. Call it before the request is deinitialized,
+/// and after everything still needed from `head`'s bytes has been read: the
+/// body read may reuse them.
+///
+/// The body reader gets a transfer buffer of its own, as on the success paths.
+/// It keeps there what it has decoded and not handed out yet. When it was
+/// given `dest` for that as well, a body that took more than one read (the
+/// chunks of a chunked body, or a `content-length` body whose bytes came in
+/// apart) had each later piece decoded onto the front of `dest`, over what had
+/// already been read, and came out scrambled (#565).
+pub fn readErrorBody(request: *http.Client.Request, head: http.Client.Response.Head, dest: []u8) []const u8 {
+    var transfer_buf: [8192]u8 = undefined;
+    const body_reader = request.reader.bodyReader(&transfer_buf, head.transfer_encoding, head.content_length);
+    const n = body_reader.readSliceShort(dest) catch 0;
+    return dest[0..n];
+}
+
 /// A non-2xx answer the provider client has read the body of, for every sink
 /// that wants it. `read_bound` is the size of the buffer it was read into: a
 /// body that filled it may end in part of the credential. `credential` is the
@@ -1636,13 +1655,7 @@ fn logErrorBody(
     credential: []const u8,
 ) ErrorBodyInfo {
     var err_body: [2048]u8 = undefined;
-    const body_reader_tmp = req_ptr.reader.bodyReader(
-        err_body[0..],
-        http_response.head.transfer_encoding,
-        http_response.head.content_length,
-    );
-    const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
-    const preview = err_body[0..@min(n, err_body.len)];
+    const preview = readErrorBody(req_ptr, http_response.head, &err_body);
     reportHttpFailure("client", rid, status, preview, err_body.len, credential);
     return errorBodyInfo(status.code, preview);
 }

@@ -109,7 +109,7 @@ and `dialects/registry.zig` fails a test when one is missing.
 | Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
 | MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
 | Mistral | `src/api/dialects/mistral.zig` | — |
-| OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
+| OpenRouter | `src/api/dialects/openrouter.zig` | `openrouter`, and catalogs |
 | Amazon Bedrock (Converse wire) | `src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
 
 The OpenAI chat building blocks every compatible vendor shares are
@@ -270,8 +270,9 @@ for the GLM plan.
 ## Subscription plans
 
 `ProviderProfile.subscription_plan` marks a coding plan billed by the month
-rather than by the token: `kimi-code` and `zai-coding-plan` today, and a test
-in `provider/registry.zig` keeps a new one a deliberate entry. The vendors
+rather than by the token: `kimi-code`, `zai-coding-plan` and `chatgpt-codex`
+today, and a test in `provider/registry.zig` keeps a new one a deliberate
+entry. The vendors
 license these plans for a person working in a coding tool — Kimi Code's
 community guidelines name personal, interactive use, and the GLM Coding
 Plan's subscription agreement the tools Zhipu lists — so a start with nobody
@@ -289,6 +290,70 @@ caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
 tell coding tools apart by this header, some refuse a client they do not
 recognise, and their terms forbid a forged one; an honest name is the only
 one a vendor can be asked to admit.
+
+## ChatGPT (Codex)
+
+```text
+default   https://chatgpt.com/backend-api/codex   openai_responses   request profile chatgpt_codex
+```
+
+`chatgpt-codex` reaches a ChatGPT plan's Codex quota the way the Codex CLI
+does. OpenAI documents no third-party use of it: the sign-in reuses the Codex
+CLI's public client (`app_EMoamEEZ73f0CkXaXp7hrann`) and the requests go to
+the backend the Codex CLI talks to, as OpenCode, pi and KWWK do. Its OAuth
+sign-in is therefore declared `unofficial` (`ProviderProfile.oauth_support`),
+which the sign-in says before it starts, and the provider is one route that
+can stop working without touching any other.
+
+The sign-in is the authorization code with PKCE at `auth.openai.com`, scope
+`openid profile email offline_access`, with three parameters the profile
+declares after the standard ones (`oauth_authorize_params`):
+`id_token_add_organizations=true`, `codex_cli_simplified_flow=true` and
+`originator=metacodes`. The client registered its redirect at
+`http://localhost:1455` and `:1457` only (`oauth_redirect_host`,
+`oauth_callback_ports`); Metask's own sign-in listens on the same two, so two
+sign-ins cannot wait at once, and with both ports taken the sign-in stops and
+names them. Nothing is sent to whatever holds them: unlike the Codex CLI, which
+asks the holder to `/cancel`, a program here cannot know the holder is its
+own. The ChatGPT workspace the grant is for is read from the ID token's
+`https://api.openai.com/auth` claim, else from the access token
+(`provider/chatgpt_claims.zig`), and stored with the sign-in as `account_id`;
+the ID token is not kept. Signing out revokes the refresh token at
+`auth.openai.com/oauth/revoke` (JSON, `oauth_revocation`) before the sign-in
+is deleted.
+
+What the backend wants beyond the Responses wire is the route's **request
+profile** (`ProtocolRoute.request_profile`, `provider/request_profile.zig`):
+`originator: metacodes`, `chatgpt-account-id`, `accept: text/event-stream`,
+`include: ["reasoning.encrypted_content"]` (with `store:false`, the only
+value the backend takes, the server keeps no reasoning between turns and
+returns it encrypted only when asked) and `instructions` even when empty. A
+request profile is a reviewed, named value rather than configuration, since it
+decides which headers reach the network. It travels in the offer's dialect
+declaration (`vendor.Declaration.request_profile`), so every client built on
+the route carries it, subagents and teammates included, and it survives a
+model override on the route. The workspace header is read from the access
+token each request carries, so a refreshed token and its workspace always
+travel together. The `openai` provider's routes declare no request profile and
+send none of it.
+
+A used-up plan answers 429 `usage_limit_reached` with `resets_at`, and a plan
+without Codex 429 `usage_not_included` (`api/codex_usage.zig`). Neither is
+retried; the failure line says when the plan resets, in the local zone and as
+a wait, and the Run's failure detail carries the wait as `retry_after_ms`.
+
+It is a subscription plan (`subscription_plan`, above): a `-p` or `serve`
+start on it says so once on stderr.
+
+The ten models are a static list, GPT-6.2 Sol first: a start that names no
+model uses it. The backend lists what it serves at
+`/models?client_version=<version>`, filtered by each model's minimum client
+version; this client sends its own version, never the Codex CLI's, and on
+2026-11-18 that list was empty for 0.12.1. A model the list lacks still goes
+out under `--model <id>` or `/model use <id>`. Context windows are
+OpenCode's figures for ChatGPT-plan requests (272k; 500k from GPT-6.1 on);
+GPT-6.2's are the defaults OpenAI's model page gives for Codex (Sol 500k,
+Astra 272k). Quotes are `unknown`: the plan is a monthly fee.
 
 ## Credential pools
 
@@ -384,6 +449,15 @@ share a key:
 | `global` | `~/.metacodes/config.json` → `global_selection` | `applyPersistedGlobalSelection` at startup, before model-name inference |
 | `session` | `<session_dir>/runtime-selection.json` → `session_selection` | `App.restoreSessionSelection` on `/resume` |
 | `once` | nowhere | expires with the turn |
+
+Named selections are kept beside them (#489): `presets` maps a name to a
+selection in the `global_selection` shape, and `directory_presets` maps an
+absolute directory to a preset name, never to a route. A start applies at most
+one, chosen by `src/app/startup_order.zig` (`--preset`/`METACODES_PRESET`, then
+the working directory's), by lowering it into the fields the flags naming the
+same route would set (`src/app/presets.zig`); nothing is persisted by using
+one. A preset written by hand is written back as it was by every other commit
+(`config_doc.Preset.raw`).
 
 Session scope is narrower, so on resume it wins: a resumed session continues on
 the route it was using, not on whatever became global in the meantime. A stored
@@ -533,6 +607,65 @@ A profile that declares neither an authorization nor a device endpoint has no
 interactive flow, and says so at the entry point instead of failing later at a
 null URL.
 
+What a profile can say about its browser sign-in, beyond the endpoints and the
+client: the redirect host (`oauth_redirect_host`, `localhost` unless the
+client registered `127.0.0.1`; the listener is on the IPv4 loopback either
+way), the only ports the redirect may use (`oauth_callback_ports`, tried in
+order, all taken an error that names them; empty keeps 1456, then 1457, then
+any), parameters after the standard ones (`oauth_authorize_params`), where
+signing out revokes the refresh token (`oauth_revocation`, JSON or form), and
+how far the vendor stands behind the sign-in (`oauth_support`). A refusal that
+comes back with the right state ends the wait and says what the server said;
+one with another state is a stale tab and is answered and ignored.
+
+A start reads a provider's stored sign-in below every key
+(`main.providerSignInToken`), refreshing it first when it is at or past
+expiry, so `--provider <id>`, `-p` and a stored `/model` default on that
+provider run on it as a `/model` pick does. `metacodes logout --provider <id>`
+and `/logout <provider>` remove it, revoked first where the profile declares an
+endpoint (`api/oauth_revoke.zig`, bounded as Metask's revocation is).
+
+### A key grant: OpenRouter's sign-in
+
+OpenRouter signs a user in on its own site and hands back an API key of the
+user's own account (https://openrouter.ai/docs/guides/overview/auth/oauth,
+checked 2026-11-18). That is not OAuth as above — no client id, no token
+endpoint, nothing to refresh, a JSON exchange — so a profile declares it as
+`key_grant` (`provider/profile.zig`): the origin, the page, exchange, key
+description and manage paths, and the label the key is given. The key it
+hands back is stored as the profile's key setup kind, exactly as a pasted key
+is, and resolves the same way (below).
+
+`api/openrouter_login.zig` runs it two ways, on the `LoginWorker` like every
+other sign-in (`provider_login.Flow.key_grant`):
+
+- **The browser here.** The page address carries an S256 challenge, a state,
+  the prefilled label, and a loopback callback on any free port — OpenRouter
+  takes any, and names such a sign-in after it (`localhost:1456`). The callback
+  is taken only with its own state; a refusal, which OpenRouter sends back
+  without one, ends the wait at once (`CallbackServer.denied_body`) rather
+  than leaving a tab that says "State mismatch".
+- **Another device.** Without a callback the page shows the code, which the
+  user pastes back here; the verifier never leaves this machine. This is the
+  way over SSH, offered first there, and `--device-code` starts it: OpenRouter
+  has no device-code grant, and this is what it documents for a machine with
+  no browser.
+
+`POST /api/v1/auth/keys` trades the code and the verifier; `GET /api/v1/key`
+then describes the key (label, spending limit, expiry, free tier), and that
+description is stored beside it (`api_key_store.Meta`, never a secret) for
+`login status` and the sign-in's own line. Nothing here can delete the key on
+OpenRouter — that takes a management key — so signing out removes it from this
+machine and names the page its owner deletes it on (`<origin>/keys/<sha256
+hex of the key>`), and a sign-in that replaces a key names the old one's page.
+
+`METACODES_OPENROUTER_URL` (https, or plain http to a loopback host, read from
+the process environment only) replaces the origin, and `Host.rebaseOrigin`
+moves the profile's requests and key check onto it too: one variable moves
+every address, so a test pointed at a mock cannot reach the real site. Moving
+can only fail on a profile the check no longer admits, and then the process
+stops rather than send anything where the variable was set to keep it from.
+
 ### Stored API keys and the guided key login
 
 Some providers have a plan whose keys are created on a web page and offer no
@@ -550,12 +683,31 @@ Code Console twice, China and Global, each checked on its own host's
 `/coding/v1/models`; its note says a Moonshot open-platform key does not work
 there.
 
+Every other built-in vendor declares its key pages too, so `/login <id>` and
+`login --provider <id>` reach all of them; a test in `provider/registry.zig`
+holds every built-in profile but Metask to it. OpenAI (`platform.openai.com/
+api-keys`) and Gemini (`aistudio.google.com/apikey`) have one page; Qwen
+(the Model Studio console of Beijing and of Singapore), MiniMax
+(`platform.minimax.cn` and `platform.minimax.io`) and the Moonshot open
+platform (`platform.kimi.com` and `platform.kimi.ai`) have one per region,
+each checked against its own region's `/models`, because their keys do not
+cross regions. OpenAI also declares an OAuth grant but no client to present
+with it (see above): until an installation configures one, both front ends
+take a pasted key for it, as `/login` always did when `prepareFlow` refused.
+
 The login is a `provider_login.Flow` variant (`ApiKeyPrepared`), so the CLI,
 `/login` and the picker share it with the OAuth grants and run it on the same
 `LoginWorker`. `prepareApiKey` trims what a paste adds around the key; `run`
 checks the key with a GET of the page's `check_url` — the plan's
 `/models` list, which answers 401 without a valid key and is not a model call
-— and only then writes it. A 401/403 is `KeyRefused`. Any other failure is
+— and only then writes it. The GET carries the key the way the profile's
+requests do (`ProviderProfile.auth`, through `catalog_fetch.Request.credential`):
+Gemini reads `x-goog-api-key` and takes a bearer token for an OAuth token,
+answering 401 whatever the key. A 401/403 is `KeyRefused`, and so is any
+status the profile's `classify_error` reads as an invalid key or a denial:
+Gemini answers a wrong key with 400 `INVALID_ARGUMENT`, reason
+`API_KEY_INVALID` (a 400 for any other reason, an unsupported location say,
+is not about the key). Any other failure is
 `KeyCheckFailed`, and so is a 2xx that is not the provider answering — HTML
 from a captive portal, or the `"success": false` body Z.AI answers some
 failures with — and a redirect: a GET that carries a credential never follows
@@ -584,10 +736,13 @@ The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
 echo goes off before the prompt is written, so a paste that arrives early is
 not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
-`/login` lists such a provider as "API key" and walks plan page → paste. Both
+`/login` lists such a provider as "API key" and walks plan page → paste. Its
+list shows twelve providers; the pane neither scrolls nor filters, so the
+ones past them are named under the list by id (`N more not shown: /login
+<provider> (…)`), and `/login <id>` starts any of them directly. Both
 mask the key as a character count and draw the page URL whole so it can be
-copied. The picker takes no key (#488): it lists such a provider as not
-configured until a key resolves for it, and says where one goes.
+copied. The picker takes no key (#488): it does not list such a provider
+until a key resolves for it.
 
 ## Controls
 
@@ -600,6 +755,14 @@ Changing model, protocol, region, plan, or offer revalidates every control.
 Unsupported values are cleared or normalized according to the declared policy
 (`reject`/`clamp`/`map`), never carried over. Identity and controls commit
 atomically; a rejected combination leaves the old runtime active.
+
+A control may declare its provider's default (`ControlSpec.default_value`):
+the value the provider uses when a request names none. DeepSeek's
+`reasoning_effort` declares `high`, as its API documents. The kernel
+substitutes a declared default only under the `map` policy; the picker shows
+it as the value a route starts at when the session wants no level, commits it
+by name, and draws no separate `default` for that control. A level the
+session runs with, `none` included, is still the one wanted.
 
 Control values are bounded and copyable (8 controls, 48-byte ids, 192-byte
 values) because a selection is persisted, snapshotted per turn, and compared
@@ -646,7 +809,8 @@ store, and health plane land — see the deferred list.
 ## Persistence
 
 `~/.metacodes/config.json` gains `schema_version`, `config_revision`,
-`providers`, `aliases`, `global_selection`, and `last_operation_id`. The
+`providers`, `aliases`, `global_selection`, `presets`, `directory_presets`, and
+`last_operation_id`. The
 document is a provider *map*: several providers, accounts, regions, and relays
 coexist, and disabling one preserves its configuration and credential reference.
 
@@ -685,6 +849,10 @@ metacodes --provider zai-coding-plan --channel cn-anthropic --model glm-5.3
   model-name inference to registry route resolution.
 - `--channel <id>` narrows to one endpoint/region/plan binding.
 - `--offer <offer-id>` pins one exact reproducible route.
+- `--preset <name>` (or `METACODES_PRESET`) applies a named selection from
+  `config.json` `presets`; `--model`, `--channel` and `--reasoning-effort`
+  replace one of its fields for that run, `--provider` and `--offer` set it
+  aside ([LOCAL_CONFIG.md](LOCAL_CONFIG.md#presets)).
 - `--base-url <url>` is validated against the profile and route policy first.
   Without `--channel` it belongs to one channel: the default channel when all
   its routes accept the URL, otherwise the first channel whose routes do. A URL
@@ -788,6 +956,35 @@ unknown currency all fail before registration.
 
 ## Provider catalogs
 
+### The built-in OpenRouter
+
+The built-in `openrouter` profile is the router itself, the way Metask's
+profile is its gateway: one channel, `auto`, whose requests carry no
+`provider` object and leave the upstream to OpenRouter's default routing
+(price, speed, uptime, with fallbacks; a conversation stays with an upstream
+while its prompt cache is warm). That route is what a model offer of this
+profile is. Which upstream answered is OpenRouter's to report; recording it
+on the actual-route event is not implemented yet (see *Not implemented yet*).
+
+Its models are the account's own listing, `GET /api/v1/models/user`, which
+applies the account's provider preferences, privacy settings and guardrails.
+`api/openrouter_catalog.zig` keeps the models that take tools over chat
+completions, with the fields a route reads, and `Host.ingestOpenRouterBuiltin`
+makes them one `auto` offer each, priced at the model's listed price (the
+upstream OpenRouter picks may charge otherwise). The listing is fetched after
+a sign-in or a pasted key, on `/providers refresh`, and in the REPL's
+background when none is kept or it is a day old and a key is set; it is kept
+in `<state root>/cache/models/`, and every start reads the kept copy whatever
+its age, so a stored pin resolves without a request. Compiled in is only
+OpenRouter's router model, `openrouter/auto`, so the provider is listed before
+a sign-in and keeps a route if the listing cannot be fetched.
+
+Pinning one upstream — an offer per endpoint, its request naming the
+endpoint's tag in `provider.order` with `allow_fallbacks: false` — is the
+catalog path below, not the built-in profile's.
+
+### Catalog documents
+
 `src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
 worth adapting: it is a router, so it already separates the two things a
 metadata source must keep separate.
@@ -800,9 +997,14 @@ metadata source must keep separate.
 
 They are parsed separately and stay separate. A model with three endpoints
 becomes three offers; merging them would reproduce exactly the "a model name
-identifies the route" mistake this whole model corrects. Two endpoints from one
-upstream provider (different quantizations, say) get distinct channel slugs, so
-neither disappears.
+identifies the route" mistake this whole model corrects. An endpoint's channel
+is named by its routing tag (`deepinfra/fp8` → `deepinfra-fp8`), which names
+the same endpoint for every model it serves, so one channel holds them all;
+two endpoints from one upstream provider (different quantizations, say) have
+different tags and stay distinct. A request names the model by its id, never
+by the endpoint's display `name`. OpenRouter prices its router models at
+`"-1"` ("whatever the picked model costs"): that is an unknown price, not a
+reason to refuse the listing.
 
 Endpoint values win over model values, and only where the endpoint has one: an
 endpoint that omits pricing inherits the model's declared price with
@@ -868,7 +1070,6 @@ One screen, models first:
      glm-5.3                          200K   2 routes
   DeepSeek · key from .env · billed to your DeepSeek account
      DeepSeek V4 Pro                    1M   2 routes
-  Not configured · openai, gemini
   Reasoning effort   default  low  medium  [high]  max          ←/→
 ```
 
@@ -883,9 +1084,13 @@ API"), while the cursor is on it: Enter on the model takes its preferred route
 (the one in use, else the first), Enter on a route takes that one. The
 reasoning effort the focused route declares is a line under the list, changed
 with ←/→ from any row; the level wanted is remembered, and each model shows and
-commits the nearest one its vocabulary has. Providers no commit could bind now
-are one "Not configured" line at the bottom; Enter lists them, and Enter on one
-shows where its credential goes.
+commits the nearest one its vocabulary has. The level the session runs with,
+`none` and `minimal` included, is the one wanted when the picker opens; with
+nothing wanted, a route whose control declares its provider's default
+(DeepSeek: `high`) starts at that value. A provider no commit could bind now
+is not listed, and a filter does not find its models; when no provider is
+listed, the list says so and points to `/login` and to this install's `.env`,
+by its path.
 
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
@@ -971,16 +1176,16 @@ session's own key or the `auth.json` sign-in, `--api-key`, the environment and
 the `.env` layer below it) through `runtime_binding.bindOffer`, with one
 difference — a stored OAuth login stands for the token a commit would refresh
 first, so judging sends no request. The picker hides the offers that would
-not bind (`Picker.setReadiness`), and lists a provider none of whose offers
-would as a dimmed row under "Not configured", below the others. Choosing it
-enters `Stage.setup`, which shows the provider's `model_picker.Setup` — the
-variable its key is read from, `/login` for Metask — with this install's
-`.env` and `doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. A
-commit that still fails with `MissingCredentials` (the credential went away
-after the picker opened) shows the same setup. The picker never signs in or
-takes a key: the credential stage #67 put in it is gone, and `/login <id>` is
-where both happen. A commit that moves the session to another provider says,
-on a second line of its confirmation, who bills the session from then on.
+not bind (`Picker.setReadiness`), so a provider none of whose offers would is
+not listed at all. A commit that still fails with `MissingCredentials` (the
+credential went away after the picker opened) enters `Stage.setup`, which
+shows the provider's `model_picker.Setup` — the variable its key is read
+from, `/login` for Metask — with this install's `.env` and
+`doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. The picker
+never signs in or takes a key: the credential stage #67 put in it is gone,
+and `/login <id>` is where both happen. A commit that moves the session to
+another provider says, on a second line of its confirmation, who bills the
+session from then on.
 
 ## Module map
 
@@ -1003,9 +1208,14 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
-| `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/openrouter.zig` | model/endpoint catalogs, router entries, preferences → `RoutePolicy`, router metadata |
+| `src/provider/profiles/openrouter.zig` | the built-in OpenRouter: the `auto` router channel, the key grant, the key page |
+| `src/api/openrouter_login.zig` | OpenRouter's key grant: browser and other-device ways, the exchange, the key description, the manage page |
+| `src/api/openrouter_catalog.zig` | the account's listing for the built-in OpenRouter: trimmed, kept, refreshed in the background |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
+| `src/provider/request_profile.zig` | `RequestProfile`, what one endpoint requires of every request on a route |
+| `src/provider/chatgpt_claims.zig` | the ChatGPT workspace inside OpenAI's OAuth tokens |
 | `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
 | `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
 | `src/api/bedrock_client.zig` | Bedrock Converse transport |
@@ -1014,6 +1224,8 @@ on a second line of its confirmation, who bills the session from then on.
 | `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
+| `src/api/oauth_revoke.zig` | signing out of a provider's sign-in: revoke the refresh token, then delete |
+| `src/api/codex_usage.zig` | the Codex backend's usage refusals and their wording |
 | `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
 | `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
@@ -1051,6 +1263,14 @@ application.
 Listed rather than left silent. Each is a decision with a reason, not an
 omission — and none of them is an acceptance criterion of the issue.
 
+- **`chatgpt-codex`'s device-code sign-in, usage headers and compressed
+  bodies.** The Codex CLI has its own JSON device-code flow for SSH sessions
+  (`/api/accounts/deviceauth/*`), not RFC 8628, which is not written. The
+  backend's `x-codex-*` headers (used percent, reset time) are not read, and
+  request bodies are not zstd-compressed, which the backend wants above about
+  1 MiB. The model list is static, and a 401 is not answered with one refresh
+  and a replay as Metask's gateway is.
+
 - **Bedrock SigV4 and AWS profiles.** The Bedrock transport authenticates with
   a Bedrock API key only; access keys, session tokens and `~/.aws` profiles
   need request signing, which is not written.
@@ -1068,6 +1288,14 @@ omission — and none of them is an acceptance criterion of the issue.
   declarative schema covers relays, gateways, and self-hosted servers, which
   differ by path rather than by wire; anything else is rejected (`UnknownWire`)
   rather than guessed.
+
+- **The upstream OpenRouter picked, on the actual-route event.** Its answers
+  name the upstream (`provider`), and `openrouter.parseRouterMetadata` reads
+  it, but no production path records an actual route for any provider yet
+  (`Kernel.recordActualRoute` has no caller outside tests), and the event has
+  no field for an upstream. Recording it needs both, and belongs with pinning
+  an upstream from `/model` (an offer per endpoint of the built-in profile,
+  fetched for one model when asked): neither is built.
 
 - **Per-offer capacity.** Throughput stays `unknown`: OpenRouter's endpoint rows
   do not carry it, so `hard_min_throughput_tps` can only ever reject. Latency is

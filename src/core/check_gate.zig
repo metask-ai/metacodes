@@ -92,6 +92,12 @@ pub fn optionsFromFlags(command: ?[]const u8, enforce: bool, observe: bool, max:
 
 pub const Verdict = enum { passed, failed, tainted, unavailable };
 
+/// Where a verdict came from. `verifier`: the pinned check passed and the
+/// isolated verifier reproduced a failure (doc/ISOLATED_VERIFIER_DESIGN.md
+/// §3.4); it enters `decide` as `failed`, so its continuations are counted by
+/// the same budget. `Verdict` itself is unchanged.
+pub const Source = enum { pinned, verifier };
+
 pub const Decision = enum {
     finish_passed,
     finish_tainted,
@@ -160,6 +166,8 @@ pub const State = struct {
     streak: u8 = 0,
     last_fingerprint: u64 = 0,
     stop_hook_blocks: u8 = 0,
+    /// Source of `last_verdict`.
+    last_source: Source = .pinned,
     names: NameSet = .{},
     /// A file tool modified, deleted or moved an existing test file. Only the
     /// fallback for `tests_weakened`: it also counts appended tests.
@@ -225,17 +233,33 @@ pub const State = struct {
         self.dirty = false;
         self.checks +|= 1;
         self.last_verdict = outcome.verdict;
+        self.last_source = .pinned;
         self.last_passed = outcome.passed;
         self.last_total = outcome.total;
         if (outcome.verdict == .failed) {
-            self.streak = if (self.streak > 0 and self.last_fingerprint == outcome.fingerprint)
-                self.streak +| 1
-            else
-                1;
-            self.last_fingerprint = outcome.fingerprint;
+            self.noteFailureFingerprint(outcome.fingerprint);
         } else {
             self.streak = 0;
         }
+    }
+
+    /// The isolated verifier reproduced a failure after a green pinned check
+    /// at this boundary: the verdict becomes `failed` with source `verifier`.
+    /// No check ran, so `checks` and the dirty bit are left as they are; the
+    /// fingerprint hashes the failing `REQUIREMENT` lines, so a repeated
+    /// verifier failure advances the same streak.
+    pub fn noteVerifierFail(self: *State, fingerprint: u64) void {
+        self.last_verdict = .failed;
+        self.last_source = .verifier;
+        self.noteFailureFingerprint(fingerprint);
+    }
+
+    fn noteFailureFingerprint(self: *State, fingerprint: u64) void {
+        self.streak = if (self.streak > 0 and self.last_fingerprint == fingerprint)
+            self.streak +| 1
+        else
+            1;
+        self.last_fingerprint = fingerprint;
     }
 
     pub fn noteDecision(self: *State, decision: Decision) void {

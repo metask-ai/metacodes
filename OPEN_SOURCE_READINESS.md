@@ -54,7 +54,12 @@ The repository is currently public for review, but release readiness is **not ye
       machine and the fork-isolation `if:` guards were removed. Release builds
       and the `rule-control` gate run on ephemeral hosted runners too; the
       dedicated `metacodes-release` pool is no longer planned
-      (`doc/RELEASE_RUNNER.md`).
+      (`doc/RELEASE_RUNNER.md`). 2026-11-18: the macOS and Windows gates may
+      run on pools of single-use VMs that serve this repository alone, one
+      fresh VM per job on an isolated network (`doc/VM_POOLS.md`); they are
+      the exceptions to the policy, keep the approval rule, and still let no
+      PR code reach a persistent machine. The persistent runners
+      `AppledeMac-Studio` and `AIPC` were retired for them.
 - [x] Tag an immutable release and publish its checksums (2026-10-11, 0.5.0;
       0.1.0–0.4.0 before it). Planned as a `0.x.y-dev` pre-release; the
       release automation (`doc/RELEASE_AUTOMATION_DESIGN.md`) shipped stable

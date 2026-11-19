@@ -7,10 +7,16 @@ name starts that provider's sign-in directly; a typo'd flag fails closed
 before anything starts. The provider flows need an authorization server: the
 kernel flows are covered against mock servers by
 tests/component/provider_oauth_login_test.zig, and the dialog's states by the
-unit tests in src/repl/dialogs.zig.
+unit tests in src/repl/dialogs.zig. ChatGPT (Codex)'s sign-in is followed here
+up to the URL it would open: its registered port, its parameters and its
+notice; Esc ends it before anything is sent.
 """
+import re
+import socket
+
 from tty_driver import run, submit, READY, wait_for
 from asserts import TTYAssert
+from e2e_helpers import SkipTest
 
 
 def test_login_opens_the_metask_sign_in_and_esc_interrupts(bin_path):
@@ -47,3 +53,79 @@ def test_login_unknown_provider(bin_path):
     a = TTYAssert(raw)
     a.assert_prose_contains("Unknown provider 'nosuch'")
     assert b"Select a provider" not in raw
+
+
+_ANSI = re.compile(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>78]")
+_CODEX_PARAMS = ("id_token_add_organizations=true", "codex_cli_simplified_flow=true", "originator=metacodes")
+_CODEX_NOTICE = "ChatGPT (Codex): This sign-in is unofficial and may stop working at any time."
+
+
+def _hold(port):
+    """A listener on 127.0.0.1:`port`, or None when something else has it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        sock.close()
+        return None
+    sock.listen(1)
+    return sock
+
+
+def _codex_sign_in(bin_path):
+    """`/login chatgpt-codex` up to its authorize URL, then Esc. `--no-browser`:
+    nothing opens on any platform; the URL is in the pane."""
+    raw = run(bin_path, [READY, "type:/login chatgpt-codex --no-browser", "key:enter",
+                         wait_for("Waiting for the login callback", 15), "sleep:0.5",
+                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 200))
+    text = _ANSI.sub(b"", raw).decode("utf-8", "replace")
+    urls = re.findall(r"https://auth\.openai\.com/oauth/authorize\?\S+", text)
+    assert urls, text[-2000:]
+    return text, urls[-1]
+
+
+def test_login_chatgpt_codex_waits_on_its_registered_port_with_the_codex_parameters(bin_path):
+    # The dialog signs in on a worker thread, from the worker's copy of the
+    # profile (src/api/login_worker.zig). A copy that dropped the fields added
+    # after it was written sent the browser to port 1456 without the Codex
+    # client's parameters, and never said the sign-in is unofficial (#550).
+    free = _hold(1455)
+    if free is None:
+        raise SkipTest("port 1455 is in use on this machine")
+    free.close()
+    text, url = _codex_sign_in(bin_path)
+    assert _CODEX_NOTICE in text, text[-2000:]
+    assert "Waiting for the login callback on http://localhost:1455." in text, text[-2000:]
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&" in url, url
+    for param in _CODEX_PARAMS:
+        assert param in url, f"{param} not in {url}"
+
+
+def test_login_chatgpt_codex_takes_1457_when_1455_is_held_and_sends_it_nothing(bin_path):
+    # The client registered 1455 and 1457 only: with 1455 held the sign-in
+    # waits on 1457, and whatever holds 1455 (another sign-in, perhaps) is
+    # not connected to.
+    holder = _hold(1455)
+    if holder is None:
+        raise SkipTest("port 1455 is in use on this machine")
+    try:
+        free = _hold(1457)
+        if free is None:
+            raise SkipTest("port 1457 is in use on this machine")
+        free.close()
+        text, url = _codex_sign_in(bin_path)
+        holder.setblocking(False)
+        try:
+            conn, _ = holder.accept()
+        except BlockingIOError:
+            conn = None
+        if conn is not None:
+            conn.close()
+            raise AssertionError("the sign-in connected to what holds 1455")
+    finally:
+        holder.close()
+    assert _CODEX_NOTICE in text, text[-2000:]
+    assert "Waiting for the login callback on http://localhost:1457." in text, text[-2000:]
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A1457%2Fauth%2Fcallback&" in url, url
+    for param in _CODEX_PARAMS:
+        assert param in url, f"{param} not in {url}"

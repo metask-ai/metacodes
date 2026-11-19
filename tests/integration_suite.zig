@@ -23,7 +23,9 @@ test {
     _ = @import("component/picker_reasoning_test.zig");
     _ = @import("component/gemini_thought_signature_test.zig");
     _ = @import("component/provider_oauth_login_test.zig");
+    _ = @import("component/chatgpt_codex_test.zig");
     _ = @import("component/provider_key_login_test.zig");
+    _ = @import("component/openrouter_login_test.zig");
     _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
     _ = @import("component/http_send_failure_test.zig");
@@ -57,6 +59,7 @@ test {
     _ = @import("component/cli_help_test.zig");
     _ = @import("component/launcher_hint_test.zig");
     _ = @import("component/state_env_test.zig");
+    _ = @import("component/preset_test.zig");
     _ = @import("component/unbound_session_test.zig");
     _ = @import("component/login_logout_test.zig");
     _ = @import("component/next_step_test.zig");
@@ -68,6 +71,7 @@ test {
     _ = @import("component/requirement_ledger_test.zig");
     _ = @import("component/delivery_cadence_test.zig");
     _ = @import("component/check_gate_test.zig");
+    _ = @import("component/isolated_verifier_test.zig");
     _ = @import("component/learning_turn_test.zig");
     _ = @import("component/learning_end_of_run_test.zig");
     _ = @import("component/test_integrity_test.zig");

@@ -1,11 +1,14 @@
-# CI design: required checks, change scope, the merge queue and the legs
+# CI design: PR validation, release targets and the legs
 
 `ci.yml` runs the AGENTS.md pre-submit checklist on three platforms plus the
 offline TTY suites. This document covers how a required job skips work (§1),
-which of that work a change has to pay for (§2), how a batch of approved PRs
-lands without every PR merging `main` in and starting over (§3), and how one
+which of that work a change has to pay for (§2), how approved PRs
+land after validation against current main (§3), and how one
 platform's work is spread over several runners so that a run takes about as
-long as its longest leg rather than the sum of a platform's steps (§4).
+long as its longest leg rather than the sum of a platform's steps (§4),
+which run writes the caches the others read (§5), and where the macOS and
+Windows gates run: a self-hosted VM pool first, the hosted legs as the
+fallback (§6).
 
 ## 1. Required checks and how a job skips work
 
@@ -21,7 +24,7 @@ conditions, never by skipping a job, for two reasons:
 - A workflow `paths` filter leaves the check pending the same way, which is
   how doc-only PRs were blocked in #134.
 
-Three switches decide which steps run. Each one fails open: an empty value,
+The switches below decide which steps run. Each one fails open: an empty value,
 meaning its decision job failed, runs the step.
 
 | Switch | Decided by | Effect |
@@ -29,6 +32,8 @@ meaning its decision job failed, runs the step.
 | `FAST_PATH` | `Release fast path` job (`scripts/release_fast_path.py`) | `true` for a generated release or reopen bump over a green base: only the checkout and the version state gate run ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) §3). |
 | `SUITES` | `Change scope` job (`scripts/ci_scope.py`) | `false` for a documentation-only change: the POSIX `checks` legs run only the documentation, version-state and gate-manifest checks, the other gate legs only check out, and the Windows legs run nothing. |
 | `TTY` | `Change scope` job | `false` for a change confined to documentation and the evaluation harness: the TTY shards run nothing. The `SDK bindings` jobs read the same output as `SDK`. They are not required, but they report the same way, so they can become required without holding such PRs. Those jobs also rehearse a formal AgentCore release on the real build ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) §2a). |
+| `DOC_REFERENCES` | `Change scope` job | Runs protocol path/pin validation on the Linux checks leg when a protocol-listed path changes, or the protocol's documentation path list changes. |
+| `RELEASE_DOCS` | `Change scope` job | Runs documents-only release staging, byte/inventory verification and notices checks on the Linux checks leg when a source in `release/documents.json` changes. Only this leg installs Zig for a narrow release-document change; it builds no application or Lean kernel. |
 
 `scripts/tests/test_ci_scope.py` pins the wiring:
 
@@ -43,28 +48,59 @@ meaning its decision job failed, runs the step.
 
 `scripts/ci_scope.py` compares the changed paths against a base. On a pull
 request the base is `HEAD^1`, the first parent of the merge commit CI tests.
-In a merge queue group it is the group's `base_sha`. Renames count as a delete
-plus an add, so moving a file out of `doc/` is a code change.
+In a legacy merge queue group it is the group's `base_sha`. Renames count as a delete
+plus an add. A move remains documentation when both paths are document
+inputs; moving into a code/input tree takes the wider scope.
 
 | Scope | Every changed path is | What runs |
 |---|---|---|
-| `docs` | `doc/**`, or a top-level `*.md` other than the three the release layout installs, added or edited (not removed or changed in type) | Documentation link and fact checks, their unit tests, the gate-manifest test, the version state gate and the diff check |
+| `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
-Push and manual runs are always `full`, and so are an empty diff and any
-error.
+Manual and scheduled runs are always `full`, and so are an empty diff and
+any error. Neither CI workflow runs on ordinary pushes to main; their nightly
+run on main is a full run that saves the caches (§5).
 
-The boundaries are deliberately narrow:
+The scope step writes a **CI change attribution** job summary: the base,
+event, effective scope, reason, planned checks and a status/path/scope table.
+The decision considers every changed path; the table displays at most 200.
+A path's narrow scope does not override a wider scope required by another
+path or by unavailable attribution inputs. This is a plan, not test-result evidence.
 
-- **`README.md`, `CHANGELOG.md` and `THIRD_PARTY_NOTICES.md` are not
-  documentation for this purpose.** `build.zig` installs all three into the
-  release layout, and `gen_third_party_notices.py --check` regenerates the
-  notices. A test checks the list against `build.zig`.
-- **Removing or moving a documentation file is a code change.** Other files
-  pin doc paths: `evals/plugin-v1/protocol.json` lists some in
-  `implementation_paths`, which `zig build test` resolves. Adding or editing
-  a doc file is harmless, because that fingerprint is stale by design.
+`agentcore-windows.yml` keeps its native-gate path filter for pull requests
+and legacy merge groups. Required jobs
+continue reporting under their existing names; a missing scope output runs
+the expensive steps.
+
+The document checks have separate boundaries:
+
+- **Links and documented facts.** These existing cheap checks run on every
+  documentation change, including deletion and relocation, and catch broken
+  backlinks and fact registrations.
+- **Protocol references.** A change to a path named in
+  `evals/plugin-v1/protocol.json` runs
+  `python3 scripts/eval/plugin_release_gate.py --validate-only`
+  (`zig build doc:references`). This checks regular paths, schema and
+  candidate/scenario/evaluator pins without a product build or provider
+  request. The implementation fingerprint remains stale between freezes by
+  design. A protocol edit can stay in `docs` only when its parsed before/after
+  values differ solely in documentation entries of `implementation_paths`;
+  non-document paths, budgets, runtime pins and all other fields must retain
+  their values and types. Other protocol edits keep the evaluation suites.
+- **Release documents.** `release/documents.json` is shared by
+  `release:stage` and `release:docs`. The latter copies only those documents
+  and licences. `zig build release:docs:check --prefix <empty-directory>`
+  additionally checks generated notices and verifies that each installed byte
+  matches its source, the versioned changelog name is correct, and the prefix
+  contains exactly the document inventory. README, changelog, notices and
+  listed licence changes trigger this check without compiling binaries.
+- **Type changes and unknown metadata.** A file changed into a symlink, an
+  unreadable source manifest or an unclassifiable protocol edit takes the
+  full scope. The check scripts and manifest definitions themselves take the
+  full scope when changed.
+
+The remaining boundaries are deliberately narrow:
 - **Markdown outside `doc/` and the top level is an input.** Prompt templates
   are `@embedFile`'d, and agent and Skill fixtures are read by tests.
 - **The evaluation harness keeps the gates.** `zig build test` runs its suites
@@ -72,82 +108,73 @@ The boundaries are deliberately narrow:
   `scripts/eval/chained_memory_smoke.py`. It skips only the TTY suites, which
   drive the interactive binary and read neither tree.
 
-## 3. Merge queue
+## 3. PR-only validation and merge policy
 
-With the ruleset's "require branches to be up to date" policy, every merge to
-`main` invalidates the green checks of every other open PR. Each PR must then
-merge `main` in and run the full workflow again, and the PRs merge one after
-another. With N PRs ready, that is close to N²/2 runs in series.
+Run full primary-platform CI on `pull_request`, then merge the exact reviewed
+head. Ordinary pushes to `main` do not repeat that run. The four required
+check names and their GitHub Actions source stay unchanged. `Protect main`
+must require branches to be up to date and must not require a merge queue.
+If main advances, merge main into the PR branch and repeat review and CI.
+A busy main can therefore still require several updates.
 
-The merge queue removes the up-to-date requirement and tests what will
-actually land:
+The [local watcher](PR_AGENT_LOOP.md) makes an ordinary merge commit for a
+stale branch, validates it through `dx`, pushes it, and waits for fresh
+review and PR CI. Conflicts go to the original worker. Before merging it
+rechecks head/base and effective branch rules, then calls the merge API with
+the reviewed head SHA. Strict server-side checks close the race where main
+moves after that recheck. No deferred auto-merge or admin bypass is used.
 
-- An approved PR joins the queue. The queue builds a temporary branch for it,
-  `gh-readonly-queue/main/pr-<n>-<sha>`, with `main` plus every PR ahead of
-  it and the PR itself merged in order. The workflow runs on that branch
-  through the `merge_group` event.
-- Each entry is tested once, on top of the entries ahead of it. Up to the
-  build concurrency of these runs go in parallel. Up to that many queued PRs
-  therefore take about one run's wall time and one run each, instead of
-  runs in series plus a merge-`main`-and-rerun round for each PR still
-  waiting.
-- When an entry's run passes, the queue merges it together with the entries
-  ahead of it that passed, up to the maximum group size, and `main` becomes
-  exactly a tested tree. When it fails, the queue drops that PR and rebuilds
-  the entries behind it without it.
+### Policy migration
 
-`ci.yml` and `agentcore-windows.yml` run on `merge_group`. In a group:
+After deploying the workflow and watcher, a repository rules administrator
+previews and applies the migration from a checkout containing the tooling:
 
-- **Change scope** diffs the whole group against its `base_sha`, so a group
-  of documentation PRs still skips the suites.
-- **Release fast path** also diffs against `base_sha`. Only a group whose
-  whole diff is the generated bump takes the fast path, which in practice
-  means the bump queued alone.
-- **Version state gate.** The event carries no pull request. The group's ref
-  names the PR at its head, the newest entry, so the gate checks that PR's
-  head branch, title and labels. The release PR therefore passes only as its
-  group's head. A PR queued behind it sees the bare released version and is
-  dropped from the queue, exactly as it would be refused on `main`, until
-  the reopen PR has merged
-  ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) stage D).
-  This relies on every entry having to pass its own run. Under "only the
-  head must pass" (HEADGREEN), a PR queued just ahead of the reopen PR would
-  merge with it although its own run was refused.
+```sh
+python3 .github/pr-policy.py
+python3 .github/pr-policy.py --apply
+```
 
-### Switching it on
+The preview prints existing and proposed rules. The write fetches the current
+ruleset, removes only `merge_queue`, enables strict required status checks,
+and preserves every other protection, check source and bypass actor. It
+refuses inactive or broad rulesets and verifies effective main rules after
+the write. It refuses to write if GitHub hides the bypass-actor list, rather
+than replace a ruleset whose complete contents it cannot read. Restart local
+watchers from the updated checkout before cutover. A maintain role alone
+cannot apply it. The watcher refuses direct
+merges until this policy is active.
 
-The workflows above report on `merge_group` before the rule exists, so the
-ruleset can be switched in one edit. A maintainer makes it in `Protect main`:
+The workflows retain `merge_group` as migration compatibility, so this change
+can land under the old rules. After the queue rule is removed those events
+are not emitted. Existing queued PRs are left alone by an upgraded watcher.
+The legacy handler diffs against `base_sha` and retains release version
+ordering checks; it is not the normal delivery path.
 
-- **Required status checks:** keep the four checks, and turn off "require
-  branches to be up to date before merging"; the queue provides that
-  guarantee.
-- **Add "require merge queue"** with these settings:
-  - merge method: merge commit (the repository's history convention);
-  - build concurrency 5: up to five entries tested at once, about thirty
-    hosted jobs each, four of them on macOS (§4);
-  - maximum group size 5 and minimum 1. With a minimum of 1 the wait time
-    setting has no effect;
-  - only merge non-failing pull requests (ALLGREEN), which the release
-    ordering above relies on;
-  - status check timeout 120 minutes. The long pole is a version-bump entry:
-    `Release fast path` can wait up to 45 minutes for the base's push run
-    before the gates start, and then they run in full if that run was not
-    green.
+### Reusable full-CI evidence
 
-### What stays the same
+`Full PR evidence` waits for every CI suite, including SDK and Windows TTY,
+to succeed; macOS and Windows through `Gates (macOS)` and `Gates (Windows)`,
+wherever the gates ran (§6). Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
+the tested merge commit/tree, head/base, repository, run ID and attempt.
+The release fast path finds a merged PR for the exact base commit, requires
+a successful run of `ci.yml`, and compares downloaded evidence with the base's
+actual Git tree. Head-only checks, docs/eval/fast-path runs, unrelated trees,
+push runs and missing or expired artifacts do not prove full validation.
+Evidence expires after 90 days; expiration costs a full run.
 
-Pushes to `main` still run the full workflow. The release fast path needs
-that run, because its base check is the base commit's push run
-(`release_fast_path.py`). When merges land back to back, the concurrency
-group cancels the older push run. A release or reopen PR whose base run was
-cancelled then takes the full path, which costs one run and never coverage.
+### Platform allocation
 
-Once the queue merges every PR, the push run repeats an entry's run on the
-same tree. Replacing it, for instance with a nightly full run plus a
-fast-path base check that accepts the merge group run, is the next step and
-is not designed here. The per-PR `pull_request` run also stays full for now;
-with the queue as the final gate it could shrink to a subset.
+| Platform | PR CI | Release |
+|---|---|---|
+| Linux x86_64, macOS ARM64, Windows x86_64 | Full native suites, subject to scope rules in §2 | Native release suites and artifacts |
+| Linux ARM64 | No extra cross-stage leg | Native ARM64 release suite plus musl cross-stage check |
+| macOS x86_64 | No Intel cross-build | Native Intel release suite and executable baseline check |
+| Windows ARM64 GNU/MSVC | No cross-build | SDK cross-build and consumer link checks, required before drafting |
+
+Windows ARM64 is not a native runtime test or supported CLI release unit:
+there is no ARM64 Windows TinyKG bundle. Lightweight manifest and installer
+fixture tests stay in PR CI; they do not build every target. Formal release
+builds remain cold and tied to the release ref.
 
 ## 4. Legs, shards and result jobs
 
@@ -169,9 +196,11 @@ over its platform's share:
 
 | Job | Runners | What each one runs |
 |---|---|---|
-| `gates-linux` | `units`, `product`, `release`, `cross`, `checks` | One flag each, below |
+| `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
 | `gates-macos` | `units-checks`, `product`, `release` | `units` and `checks` on one; one flag each on the others |
+| `gates-macos-vm` | `all`, on a pool VM (§6) | Every flag of the `gates-macos` legs in one job |
 | `windows-gates` | `units`, `integration`, `product`, `release` | One flag each |
+| `windows-gates-vm` | `all`, on a pool VM (§6) | Every flag of the `windows-gates` legs in one job |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
 | `tty-windows` | eight shards | Every eighth case, under ConPTY |
 
@@ -183,8 +212,7 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `units` | `zig build test:units`, and on POSIX `test:integration` in the same build; the native platform modules (on `product` on Windows) |
 | `integration` | Windows only: `zig build test:integration`, whose integration suite waits five minutes for the ReleaseSmall app there |
 | `product` | `zig build test:product` (the smokes, and the evaluation suite as three shards), with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
-| `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on macOS also both macOS release executables built for their release targets and held to them (`scripts/check_binary_baseline.py`); on Windows also the version state gate and the Windows script suites |
-| `cross` | Linux only: the arm64 cross-stage, a third ReleaseSmall build |
+| `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on macOS also its native ARM64 executable built for the release target and held to it (`scripts/check_binary_baseline.py`); on Windows also the version state gate and the Windows script suites |
 | `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 The rules that keep the split from dropping coverage:
@@ -227,10 +255,11 @@ What it costs:
   macOS jobs at once. A run uses about thirty jobs, four of them on macOS
   (three gate legs and `SDK bindings (macOS)`), so macOS groups the flags
   instead of giving each its own runner. Runs that overlap can still queue
-  macOS jobs.
-- **Cache lines.** Each gate leg keeps its own setup-zig cache
-  (`cache-key: ${{ matrix.leg }}`), since each builds a different share of
-  the graph. The TTY shards build the same binaries and share one.
+  macOS jobs; the self-hosted pool (§6), when it is on, takes the gates off
+  that limit.
+- **Cache lines.** Each gate leg keeps its own Zig cache line
+  (`gates-<leg>`, §5), since each builds a different share of the graph. The
+  TTY shards build the same binaries and share one.
 - **Build runner jobs.** The suite steps pass `-j$ZIG_BUILD_JOBS`: 8 on the
   four-core Linux and Windows runners, 6 on the three-core macOS one, whose
   7 GB cannot hold more overlapping LLVM builds. The build runner runs that
@@ -260,7 +289,7 @@ ones that land nowhere:
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |
-| A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `cross`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
+| A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
 | A smoke or another long command in `test:product` | Captured output (`expectExitCode(0)`) when it should overlap the rest; inheriting the terminal, it waits for every other such command | The product legs | Build Summary durations |
 
 When a part outgrows its legs, the Build Summary of the slowest leg says
@@ -295,3 +324,142 @@ product (8.2), Gates (macOS) / product (7.2) and Gates (Linux) / units
 (7.1). The organization's job limits bound what more legs can buy: a run
 uses about thirty-five jobs, so two overlapping runs already reach the limit
 of 60, and four macOS jobs leave one of the five for every other run.
+
+## 5. Caches: main writes, pull requests read
+
+Every runner starts empty, so a job compiles only what it cannot restore.
+Until November 2026 every run both restored and saved, through setup-zig's
+`use-cache` and `actions/cache`, and two things went wrong (measured
+2026-11-18):
+
+- **The first run of every pull request compiled cold.** A run can restore
+  what its own ref saved and what its base branch saved, never another pull
+  request's caches. Pull requests saved only to their own ref, and since main
+  pushes stopped running CI (§3) nothing saved to `main`: it held three
+  entries, a macOS Lean cache, one 92 MB Zig cache and the Zig tarball.
+- **Pull requests crowded each other out.** Cache keys are immutable, so
+  every run saved a new copy of every line: 2 to 2.9 GB per run of a pull
+  request. The repository held 12.3 GB against GitHub's 10 GB, and GitHub
+  evicts the least recently used entries, so a pull request's entries could
+  be gone before it pushed again.
+
+So one run writes and every other run reads:
+
+| Run | `WARM_CACHE` | Zig cache | Lean toolchain and products |
+|---|---|---|---|
+| `main`'s `schedule` run (19:00 UTC nightly) or a `workflow_dispatch` on `main` | `true` | Starts empty; each line saves what it built under `zig-0.16.0-<os>-<arch>-<line>-run-<run id>-<attempt>` | Restores; the `units` leg saves when no entry holds this hash of the Lean sources |
+| Everything else: pull requests, a legacy merge group, a dispatch on another branch | `false` | Restores the newest entry `main` saved for its line (that key without the run ID, matched as a prefix); saves nothing | Restores; saves nothing |
+
+A line is a gate leg (`gates-<leg>`), a platform's TTY shards (`tty`, saved
+by shard 1), a platform's SDK job (`sdk`) or the AgentCore Windows gate
+(`agentcore-gate`, `agentcore-windows.yml`). setup-zig still points
+`ZIG_GLOBAL_CACHE_DIR` and `ZIG_LOCAL_CACHE_DIR` at `.zig-cache`, with its own
+cache off because it saves on every run; `actions/cache` (restore, then save
+at the end of the job) gave way to `actions/cache/restore` and
+`actions/cache/save` for the same reason. setup-zig still caches the Zig
+tarball itself (about 50 MB) under an exact key and saves it only on a miss,
+so once `main`'s warm run holds it a pull request only reads it.
+
+**Why nightly, not after every merge.** Zig 0.16's build runner cannot
+compile tests without running them, so warming a line means running it. A
+run after every merge would bring back the post-merge full run §3 removed,
+and take macOS jobs during the working day. A cache a few hours old costs
+little: Zig recompiles every artifact whose sources changed, so a pull
+request that changes `src/` rebuilds the app and the large test binaries
+from either cache. What `main`'s cache saves is what changes rarely: Zig's
+runtime libraries, the Lean products, TinyKG staging, the tools, and test
+binaries the change does not reach. Dispatch `CI` on `main` to warm at once,
+for example after a Zig or Lean toolchain bump.
+
+**What it costs.** One full CI run a night, about thirty jobs and four on
+macOS, which also reports `main`'s health. A pull request's second push
+restores `main`'s cache, not its own first run's; it recompiles what its
+change reaches either way. The warm run starts each Zig line empty, so an
+entry holds only what the current tree builds and does not grow night after
+night (setup-zig's `cache-size-limit` guarded against that growth before);
+earlier nights' entries are no longer read and are evicted first.
+`rule-control.yml` (dispatch only) and `release.yml` (no Zig cache) keep
+their own settings.
+
+`scripts/tests/test_ci_scope.py` (`CacheTest`) pins the wiring: nothing but
+the warm run saves; each restore key is its save key without the run ID, and
+both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
+scheduled or dispatched run.
+
+## 6. The macOS and Windows gates: a VM pool first, hosted legs as the fallback
+
+Each of the two platforms has a pool of single-use VMs for this repository:
+macOS on the organization's Mac Studio, Windows on AIPC
+([VM_POOLS.md](VM_POOLS.md): security model, hosts and operation). The gates
+try their pool first.
+
+Hosted macOS is the bottleneck: five jobs at once for the organization, three
+cores and 7 GB each. On 2026-11-17/18 a macOS job waited a median 7.5 minutes
+for a runner (p90 27.8) while Linux and Windows waited seconds, and macOS
+finished last in 38 of 39 runs. Hosted Windows does not queue (median 0.1
+minutes; the legs ran a median 7.2 minutes); its pool can win only on a job's
+own speed, so each platform has its own switch and its own measurements.
+
+**One job on a VM, legs on hosted runners.** A pool VM has the cores and
+memory a hosted runner lacks, so `gates-macos-vm` and `windows-gates-vm` run
+every flag of their hosted legs in one job (`Gates (macOS) / all`, `Gates
+(Windows) / all`, the platform's shared step list, its own cache line
+`gates-all`), without the legs' repeated checkout, setup and compilation.
+Hosted runners keep the split legs of §4. TTY (Windows), the SDK jobs and
+AgentCore Windows stay on hosted runners.
+
+**The switch.** `.github/runner-pools.json` holds, per platform, `self_hosted`
+(on or off), the pool's `label`, its `slots`, the `pickup_timeout_minutes`,
+the pool job's `zig_build_jobs` and `timeout_minutes`. A file, not a
+repository variable: vars and secrets do not reach a fork's pull request,
+which most pull requests here are, while every pull request's merge commit
+carries `main`'s switch. Switching a pool off is a pull request whose own run
+already obeys it.
+
+**Where a run goes** (`runner-plan`, `scripts/ci_pool_plan.py plan`). With the
+run's read-only token it lists this repository's other CI jobs once, counts
+per platform those that hold or wait for one of its pool's VMs, and decides
+each platform, first match wins:
+
+| Situation | Mode |
+|---|---|
+| Switch off, unreadable or invalid | `hosted` |
+| Release fast path, or a documentation-only change | `hosted` (the gates only check out) |
+| `main`'s warm run (§5) | `both`, so both cache lines stay warm |
+| Running plus waiting pool jobs fill the slots | `hosted` |
+| A pool job has waited longer than the pickup timeout | `hosted`: the pool may be down |
+| Otherwise | `self-hosted` |
+| Any error reading GitHub | `hosted` |
+
+**Falling back after dispatch.** Two runs can see the same free slot, and a
+pool can fail after a run chose it. `gates-macos-watch` and
+`windows-gates-watch` (`… watch`) follow their run's pool job: a VM that
+takes it within the pickup timeout is followed to the end and its conclusion
+reported; otherwise `fallback=true`, and the hosted legs, which wait for the
+watch on `self-hosted`, run. If a VM takes the pool job after that, its
+stand-down step sees the finished watch and sets `FAST_PATH=true`, so every
+later step skips (the pool job's env leaves `FAST_PATH` to that step).
+
+**The required checks** (`gates-macos-result`, `gates-windows-result`, `…
+verdict`) never need a pool job: a pool that is down would keep it queued for
+GitHub's 24 hours. Each reads its platform's plan, watch and hosted legs:
+
+| Mode | `Gates (macOS)` / `Gates (Windows)` passes when |
+|---|---|
+| `hosted`, or no plan | the hosted legs succeeded |
+| `self-hosted` | the watch reports the pool job succeeded; after a fallback, the hosted legs succeeded |
+| `both` | the hosted legs succeeded, and the pool job succeeded or no VM took it |
+
+A pool job that fails (a test, or its VM) is a failure, not a fallback;
+rerunning the run decides again. Costs: the plan adds a few seconds before
+the macOS and Windows gates; a run on a pool keeps an ubuntu watch job beside
+it; a fallback after dispatch costs the pickup timeout; on the nightly `both`
+run the hosted legs start after the pool job ends, since they wait for the
+watch; a pool job no VM ever takes stays queued in its run until a VM takes
+it (and stands down) or GitHub's 24 hours pass, without affecting the
+required check.
+
+`scripts/tests/test_ci_pool_plan.py` pins the decisions, the watch, the
+stand-down and the verdict for both platforms, and the wiring: each pool job
+is every hosted leg of its platform in one, the required checks never need
+them, and only they use the pools' labels (no workflow uses `self-hosted`).
