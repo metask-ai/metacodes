@@ -55,6 +55,7 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const openrouter_dialect = @import("dialects/openrouter.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
@@ -62,6 +63,10 @@ const credential_mod = @import("credential_cell.zig");
 const error_class = @import("error_class.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("model_context.zig");
+const RequestProfile = @import("../provider/request_profile.zig").RequestProfile;
+const chatgpt_claims = @import("../provider/chatgpt_claims.zig");
+const codex_usage = @import("codex_usage.zig");
+const last_error = @import("last_error.zig");
 
 const StreamEvent = api_stream.StreamEvent;
 const StreamHandle = api_stream.StreamHandle;
@@ -346,7 +351,7 @@ pub const OpenAIClient = struct {
         // wire 协议分派:chat/completions(默认)或 Responses API(typed SSE)。
         const body = switch (self.protocol) {
             .chat_completions => try serializeOpenAIRequestWithOverridesAndDialectReport(self.allocator, model, messages, system, tools, o, dialect, &report),
-            .responses => try serializeOpenAIResponsesRequestReport(self.allocator, model, messages, system, tools, o, dialect, &report),
+            .responses => try serializeOpenAIResponsesRequestProfiled(self.allocator, model, messages, system, tools, o, dialect, self.declared_dialect.request_profile, &report),
         };
         defer self.allocator.free(body);
         // Owned here until a stream takes it: every failed attempt leaves it
@@ -383,7 +388,14 @@ pub const OpenAIClient = struct {
             const callback = self.refresh_fn orelse return error.Unauthorized;
             const ctx = self.refresh_ctx orelse return error.Unauthorized;
             const stale = self.credential.lendable() orelse return error.Unauthorized;
+            // As in `Client.refreshExpiredToken`: a token refreshed while the
+            // route moved is for the route the request was sent on, not this one.
+            const sent_to = self.base_url orelse "";
             const token = callback(ctx, stale) catch return error.Unauthorized;
+            if (self.refresh_fn == null or !std.mem.eql(u8, sent_to, self.base_url orelse "")) {
+                secureFree(self.allocator, token);
+                return error.Unauthorized;
+            }
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
                 return error.Unauthorized;
@@ -395,6 +407,48 @@ pub const OpenAIClient = struct {
             return self.doStream(body, abort, dialect, content_chunks, image_placeholder_ids, 1, retry_hint) catch |replay_err|
                 return if (replay_err == error.TokenExpired) error.Unauthorized else replay_err;
         };
+    }
+
+    /// The most headers a request profile adds: its fixed ones and the
+    /// ChatGPT workspace.
+    const MAX_PROFILE_HEADERS = 4;
+
+    /// Content type, credential, OpenRouter's app attribution and what a
+    /// request profile adds.
+    const REQUEST_HEADERS_CAPACITY = 2 + openrouter_dialect.ATTRIBUTION_HEADERS.len + MAX_PROFILE_HEADERS;
+
+    /// The request's extra headers: content type and credential; on a route
+    /// in OpenRouter's dialect, who is calling (its app attribution, which no
+    /// other route carries); then what the route's request profile adds.
+    /// Slices borrow `auth`, the profile's static data and `scratch`.
+    fn requestHeaders(
+        self: *const OpenAIClient,
+        buffer: *[REQUEST_HEADERS_CAPACITY]http.Header,
+        auth: auth_header_mod.Header,
+        scratch: std.mem.Allocator,
+        rid: log.RequestId,
+    ) []const http.Header {
+        buffer[0] = .{ .name = "content-type", .value = "application/json" };
+        buffer[1] = .{ .name = auth.name, .value = auth.value };
+        var len: usize = 2;
+        if (self.declared_dialect.vendorFor(self.model, self.model) == .openrouter) {
+            const attribution = openrouter_dialect.ATTRIBUTION_HEADERS;
+            @memcpy(buffer[len..][0..attribution.len], &attribution);
+            len += attribution.len;
+        }
+        const profile = self.declared_dialect.request_profile orelse return buffer[0..len];
+        for (profile.headers()) |header| {
+            if (len == buffer.len) break;
+            buffer[len] = .{ .name = header.name, .value = header.value };
+            len += 1;
+        }
+        if (profile.sendsChatgptAccount() and len < buffer.len) {
+            if (chatgpt_claims.accountId(scratch, bearerToken(auth.value))) |account| {
+                buffer[len] = .{ .name = "chatgpt-account-id", .value = account };
+                len += 1;
+            } else log.warnId("openai", rid, "the access token names no ChatGPT workspace; sending without chatgpt-account-id", .{});
+        }
+        return buffer[0..len];
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
@@ -421,6 +475,15 @@ pub const OpenAIClient = struct {
             return credential_mod.requestError(err);
         };
         defer secureFree(self.allocator, auth.value);
+        // What the route's endpoint requires besides (`request_profile.zig`):
+        // fixed headers, and the ChatGPT workspace the token is for, read
+        // from the very token this request carries so a refresh can never
+        // pair one account's token with another's id; on a route in
+        // OpenRouter's dialect, its app attribution.
+        var headers_buffer: [REQUEST_HEADERS_CAPACITY]http.Header = undefined;
+        var account_scratch: [8 * 1024]u8 = undefined;
+        var account_fba = std.heap.FixedBufferAllocator.init(&account_scratch);
+        const extra_headers = self.requestHeaders(&headers_buffer, auth, account_fba.allocator(), rid);
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,
@@ -431,14 +494,14 @@ pub const OpenAIClient = struct {
             // takes the offer (DeepSeek, #467) sends bytes the SSE parser
             // cannot read.
             .headers = .{ .accept_encoding = .omit },
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json" },
-                .{ .name = auth.name, .value = auth.value },
-            },
+            .extra_headers = extra_headers,
         }) catch |err| {
             // req_ptr.* 未初始化, errdefer destroy 即可
             return client_mod.requestSetupFailure("openai", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);
@@ -492,6 +555,11 @@ pub const OpenAIClient = struct {
             // retried, an overflow is ContextWindowExceeded with its numbers kept.
             const info = client_mod.errorBodyInfo(status.code, preview);
             self.last_context_window_numbers = info.context_window_numbers;
+            if (self.declared_dialect.request_profile == .chatgpt_codex) if (noteCodexUsageRefusal(status.code, preview)) {
+                // A used-up plan or a plan without Codex: a retry seconds
+                // later only spends attempts, so it ends the request here.
+                return error.HttpError;
+            };
             return client_mod.httpFailureError(status.code, info);
         }
         client_mod.noteRequestAccepted();
@@ -1866,6 +1934,30 @@ fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t:
     try out.appendSlice(allocator, "}}");
 }
 
+/// The token of an `authorization: Bearer <token>` value; the value itself
+/// for any other scheme.
+fn bearerToken(header_value: []const u8) []const u8 {
+    const prefix = "Bearer ";
+    return if (std.mem.startsWith(u8, header_value, prefix)) header_value[prefix.len..] else header_value;
+}
+
+/// A Codex backend usage refusal (`codex_usage.zig`) in the words the failure
+/// line shows, with the wait in the Run's failure detail. False for any other
+/// failure, which keeps the generic classification.
+fn noteCodexUsageRefusal(status: u16, body: []const u8) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const refusal = codex_usage.parse(fba.allocator(), status, body) orelse return false;
+    const now = @import("../util/time.zig").nowUnix();
+    const zone = @import("../core/time_context.zig").systemZone(now);
+    var detail_buffer: [256]u8 = undefined;
+    const summary = codex_usage.summarize(refusal, now, zone.offset_minutes, &detail_buffer);
+    log.err("openai", "{s}: {s}", .{ summary.kind, summary.detail });
+    last_error.recordNamed(summary.kind, summary.detail);
+    if (codex_usage.waitMs(refusal, now)) |wait| model_error.noteRetryAfterInBody(wait);
+    return true;
+}
+
 /// 中立 Conversation/tools → OpenAI **Responses API** 请求 body(/v1/responses)。caller free。
 /// 与 chat/completions 的 wire 差异(本函数锁住的全部脏活):
 ///   - messages → `input` items:text-bearing user/assistant 是 {role,content};tool_use 是
@@ -1905,6 +1997,23 @@ pub fn serializeOpenAIResponsesRequestReport(
     dialect: dialect_mod.Dialect,
     report: *json_mod.SerializationReport,
 ) ![]u8 {
+    return serializeOpenAIResponsesRequestProfiled(allocator, model, messages, system, tools, overrides, dialect, null, report);
+}
+
+/// 同上,再按路由的请求档案(`request_profile.zig`)补上该端点要求的字段:
+/// Codex 后端要 `include:["reasoning.encrypted_content"]`(`store:false` 下推理只能
+/// 加密回传),且 `instructions` 必须出现(无 system 时发空串)。null = 不加任何东西。
+pub fn serializeOpenAIResponsesRequestProfiled(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    request_profile: ?RequestProfile,
+    report: *json_mod.SerializationReport,
+) ![]u8 {
     const profile = dialect.profileFor(.openai, model);
     const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
@@ -1935,7 +2044,19 @@ pub fn serializeOpenAIResponsesRequestReport(
         try util_json.serializeNumber(p, &out, allocator);
     }
     try out.appendSlice(allocator, ",\"stream\":true,\"store\":false");
-    // system → instructions。组装链与 chat 一致(dialect 注入 + 能力激活),非空才发。
+    if (request_profile) |route_profile| {
+        const include = route_profile.responsesInclude();
+        if (include.len > 0) {
+            try out.appendSlice(allocator, ",\"include\":[");
+            for (include, 0..) |entry, index| {
+                if (index > 0) try out.append(allocator, ',');
+                try util_json.serializeString(entry, &out, allocator);
+            }
+            try out.append(allocator, ']');
+        }
+    }
+    // system → instructions。组装链与 chat 一致(dialect 注入 + 能力激活),非空才发
+    // (请求档案要求时空串也发)。
     var sys_buf: std.ArrayList(u8) = .empty;
     defer sys_buf.deinit(allocator);
     if (system) |sys| try sys_buf.appendSlice(allocator, sys);
@@ -1946,7 +2067,8 @@ pub fn serializeOpenAIResponsesRequestReport(
         &sys_buf,
         allocator,
     );
-    if (sys_buf.items.len != 0) {
+    const instructions_required = if (request_profile) |route_profile| route_profile.requiresInstructions() else false;
+    if (sys_buf.items.len != 0 or instructions_required) {
         try out.appendSlice(allocator, ",\"instructions\":");
         try util_json.serializeString(sys_buf.items, &out, allocator);
     }

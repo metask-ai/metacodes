@@ -326,6 +326,9 @@ pub const BedrockClient = struct {
             // errdefer destroys req_ptr; req_ptr.* was never initialized.
             return client_mod.requestSetupFailure("bedrock", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);

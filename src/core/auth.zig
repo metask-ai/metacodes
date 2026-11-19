@@ -559,6 +559,22 @@ pub fn buildAuthorizeUrl(
     code_challenge: []const u8,
     state: []const u8,
 ) ![]u8 {
+    const none: []const struct { name: []const u8, value: []const u8 } = &.{};
+    return buildAuthorizeUrlWith(allocator, authorize_url, client_id, scope, redirect_uri, code_challenge, state, none);
+}
+
+/// `buildAuthorizeUrl`, then `extra` in order, each value URL-encoded:
+/// a slice of anything with `name` and `value` (`profile.OAuthParam`).
+pub fn buildAuthorizeUrlWith(
+    allocator: std.mem.Allocator,
+    authorize_url: []const u8,
+    client_id: []const u8,
+    scope: []const u8,
+    redirect_uri: []const u8,
+    code_challenge: []const u8,
+    state: []const u8,
+    extra: anytype,
+) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     try aw.writer.writeAll(authorize_url);
@@ -570,8 +586,46 @@ pub fn buildAuthorizeUrl(
     try appendFormField(&aw.writer, "code_challenge", code_challenge, false);
     try appendFormField(&aw.writer, "code_challenge_method", "S256", false);
     try appendFormField(&aw.writer, "state", state, false);
+    for (extra) |param| try appendFormField(&aw.writer, param.name, param.value, false);
     return try aw.toOwnedSlice();
 }
+
+/// What the authorization server sent the browser back with instead of a
+/// code (RFC 6749 §4.1.2.1): its `error` and `error_description`, decoded,
+/// flattened to printable ASCII and cut to fit. They come from the server and
+/// are shown to the user, never parsed further.
+pub const Refusal = struct {
+    code_buf: [64]u8 = undefined,
+    code_len: usize = 0,
+    description_buf: [256]u8 = undefined,
+    description_len: usize = 0,
+
+    pub fn code(self: *const Refusal) []const u8 {
+        return self.code_buf[0..self.code_len];
+    }
+
+    pub fn description(self: *const Refusal) []const u8 {
+        return self.description_buf[0..self.description_len];
+    }
+
+    fn fill(self: *Refusal, allocator: std.mem.Allocator, query: []const u8) void {
+        self.code_len = copyParam(allocator, query, "error", &self.code_buf);
+        self.description_len = copyParam(allocator, query, "error_description", &self.description_buf);
+    }
+
+    fn copyParam(allocator: std.mem.Allocator, query: []const u8, name: []const u8, out: []u8) usize {
+        const raw = findQueryParam(query, name) orelse return 0;
+        const decoded = percentDecode(allocator, raw) catch return 0;
+        defer allocator.free(decoded);
+        var len: usize = 0;
+        for (decoded) |byte| {
+            if (len == out.len) break;
+            out[len] = if (byte >= 0x20 and byte < 0x7f) byte else ' ';
+            len += 1;
+        }
+        return len;
+    }
+};
 
 pub const CallbackServer = struct {
     sock: net.Socket,
@@ -579,6 +633,19 @@ pub const CallbackServer = struct {
     /// The redirect URI's path. MCP logins use Claude Code's `/callback`,
     /// so a client registered for Claude Code's redirect works here too.
     path: []const u8 = "/auth/callback",
+    /// What the browser is told once the code has arrived.
+    success_body: []const u8 = "Metacodes login complete. You can close this tab.",
+    /// When set, a callback on `path` that carries an `error` ends the wait
+    /// with `error.OAuthAccessDenied` and this page, whether or not it
+    /// carries the state: OpenRouter sends a refusal back without one, and
+    /// the sign-in would otherwise wait on a tab that says "State mismatch".
+    /// Such a callback can only end the wait; a code still needs the state.
+    denied_body: ?[]const u8 = null,
+    /// When set, a callback that carries the expected state and an `error`
+    /// ends the wait with `error.OAuthAccessDenied`, what the server said
+    /// copied here. Null keeps waiting after answering it, as the Metask
+    /// sign-in always has. `denied_body`, when set, answers first.
+    refusal: ?*Refusal = null,
 
     /// Bound on each accepted connection's reads and writes: a client that
     /// connects and then stalls must not pin the wait (and with it Esc in the
@@ -590,6 +657,20 @@ pub const CallbackServer = struct {
             error.BindFailed => bindOnPort(FALLBACK_LOGIN_PORT) catch bindOnPort(0),
             else => return err,
         };
+    }
+
+    /// Bind the first of `ports` that is free, in order, and nothing else:
+    /// for a client whose redirect URIs name these ports only. All of them
+    /// taken is `error.CallbackPortsInUse`. Nothing is sent to whatever holds
+    /// one; it may be another program's own sign-in.
+    pub fn bindFirstFree(ports: []const u16) !CallbackServer {
+        for (ports) |port| {
+            return bindOnPort(port) catch |err| switch (err) {
+                error.BindFailed => continue,
+                else => return err,
+            };
+        }
+        return error.CallbackPortsInUse;
     }
 
     fn bindOnPort(port: u16) !CallbackServer {
@@ -617,7 +698,16 @@ pub const CallbackServer = struct {
                 continue;
             };
             defer allocator.free(req);
+            if (self.denied_body) |page| if (callbackCarriesError(req, self.path)) {
+                sendHttpResponse(conn_fd, 400, "Bad Request", page);
+                return error.OAuthAccessDenied;
+            };
             const parsed = parseCallbackRequestAt(allocator, req, self.path, expected_state) catch |err| {
+                if (err == error.OAuthDenied) if (self.refusal) |refusal| {
+                    refusal.fill(allocator, callbackQuery(req));
+                    sendHttpResponse(conn_fd, 400, "Bad Request", "The sign-in was refused. You can close this tab.");
+                    return error.OAuthAccessDenied;
+                };
                 const body = switch (err) {
                     error.NotCallback => "Not Found",
                     error.StateMismatch => "State mismatch",
@@ -630,11 +720,31 @@ pub const CallbackServer = struct {
                 sendHttpResponse(conn_fd, status, reason, body);
                 continue;
             };
-            sendHttpResponse(conn_fd, 200, "OK", "Metacodes login complete. You can close this tab.");
+            sendHttpResponse(conn_fd, 200, "OK", self.success_body);
             return parsed;
         }
     }
 };
+
+/// Whether `req` is a GET of `path` whose query names an `error`.
+fn callbackCarriesError(req: []const u8, path: []const u8) bool {
+    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return false;
+    const line = req[0..line_end];
+    if (!std.mem.startsWith(u8, line, "GET ")) return false;
+    const rest = line[4..];
+    const target = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse return false];
+    if (!std.mem.startsWith(u8, target, path)) return false;
+    const query_pos = std.mem.indexOfScalar(u8, target, '?') orelse return false;
+    return findQueryParam(target[query_pos + 1 ..], "error") != null;
+}
+
+test "a callback that names an error is recognized with or without a state" {
+    try std.testing.expect(callbackCarriesError("GET /auth/callback?error=access_denied HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(callbackCarriesError("GET /auth/callback?state=s&error=x HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(!callbackCarriesError("GET /auth/callback?code=c&state=s HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(!callbackCarriesError("GET /other?error=x HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(!callbackCarriesError("POST /auth/callback?error=x HTTP/1.1\r\n\r\n", "/auth/callback"));
+}
 
 fn readHttpRequest(allocator: std.mem.Allocator, fd: net.Socket) ![]u8 {
     var out = std.ArrayList(u8).empty;
@@ -689,6 +799,18 @@ fn parseCallbackRequestAt(allocator: std.mem.Allocator, req: []const u8, path: [
     errdefer secureFree(allocator, code);
     if (code.len == 0) return error.MissingCode;
     return code;
+}
+
+/// The query of a request line's target, empty when there is none. Only
+/// called on a request `parseCallbackRequestAt` already accepted the line of.
+fn callbackQuery(req: []const u8) []const u8 {
+    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return "";
+    const line = req[0..line_end];
+    const target_start = (std.mem.indexOfScalar(u8, line, ' ') orelse return "") + 1;
+    const target_end = std.mem.indexOfScalarPos(u8, line, target_start, ' ') orelse line.len;
+    const target = line[target_start..target_end];
+    const query_pos = std.mem.indexOfScalar(u8, target, '?') orelse return "";
+    return target[query_pos + 1 ..];
 }
 
 fn findQueryParam(query: []const u8, key: []const u8) ?[]const u8 {

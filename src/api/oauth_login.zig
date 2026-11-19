@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const auth = @import("../core/auth.zig");
+const provider_profile = @import("../provider/profile.zig");
 const http_status = @import("http_status.zig");
 const http_connection = @import("http_connection.zig");
 const util_time = @import("../util/time.zig");
@@ -54,6 +55,11 @@ pub const Endpoints = struct {
     device_authorization_url: ?[]const u8 = null,
     client_id: []const u8,
     scope: []const u8 = "",
+    /// The host of the loopback redirect URI (`ProviderProfile.oauth_redirect_host`).
+    redirect_host: []const u8 = "localhost",
+    /// Authorization request parameters after the standard ones
+    /// (`ProviderProfile.oauth_authorize_params`).
+    authorize_params: []const provider_profile.OAuthParam = &.{},
 };
 
 /// Human-facing instructions. A URL the user must open and a code they must
@@ -87,6 +93,10 @@ pub const Options = struct {
     /// Loopback callback port. Zero lets the kernel pick one, which is what a
     /// test wants so it cannot collide with a real login server.
     port: u16 = DEFAULT_CALLBACK_PORT,
+    /// The only ports the redirect may use, tried in order
+    /// (`ProviderProfile.oauth_callback_ports`); `port` is then ignored. Empty
+    /// uses `port`, falling back as `auth.CallbackServer.bind` does.
+    callback_ports: []const u16 = &.{},
     /// Bounds the device-code poll, together with the server's own expiry:
     /// whichever runs out first ends the flow. The loopback flow instead waits
     /// on the browser for as long as the user leaves it open — the same
@@ -106,6 +116,11 @@ pub const Error = error{
     OAuthFlowUnavailable,
     OAuthClientIdMissing,
     OAuthLoginTimedOut,
+    /// Every port the client's redirect may use is taken; the flow says which.
+    OAuthCallbackPortsInUse,
+    /// The authorization server sent the browser back with an `error`; the
+    /// flow said what it was.
+    OAuthAccessDenied,
     OAuthDeviceAccessDenied,
     OAuthDeviceCodeExpired,
     MalformedDeviceAuthorizationResponse,
@@ -142,17 +157,30 @@ fn acquireByLoopback(
         try auth.randomBase64Url(allocator, 32);
     defer auth.secureFree(allocator, state);
 
-    var server = try auth.CallbackServer.bind(options.port);
+    var server = if (options.callback_ports.len > 0)
+        auth.CallbackServer.bindFirstFree(options.callback_ports) catch |err| switch (err) {
+            error.CallbackPortsInUse => {
+                if (options.notify) |notify| sayPortsInUse(allocator, notify, options.callback_ports);
+                return Error.OAuthCallbackPortsInUse;
+            },
+            else => return err,
+        }
+    else
+        try auth.CallbackServer.bind(options.port);
     defer server.close();
+    // A refusal with the right state is the server's answer, not a stray tab:
+    // the flow ends with it instead of waiting on.
+    var refusal: auth.Refusal = .{};
+    server.refusal = &refusal;
 
     const redirect_uri = try std.fmt.allocPrint(
         allocator,
-        "http://localhost:{d}/auth/callback",
-        .{server.port},
+        "http://{s}:{d}/auth/callback",
+        .{ endpoints.redirect_host, server.port },
     );
     defer allocator.free(redirect_uri);
 
-    const url = try auth.buildAuthorizeUrl(
+    const url = try auth.buildAuthorizeUrlWith(
         allocator,
         authorize_url,
         endpoints.client_id,
@@ -160,14 +188,15 @@ fn acquireByLoopback(
         redirect_uri,
         pkce.code_challenge,
         state,
+        endpoints.authorize_params,
     );
     defer allocator.free(url);
 
     if (options.notify) |notify| {
         const text = try std.fmt.allocPrint(
             allocator,
-            "Waiting for the login callback on http://localhost:{d}.\nOpen this URL to authorize:\n\n{s}\n\n",
-            .{ server.port, url },
+            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n",
+            .{ endpoints.redirect_host, server.port, url },
         );
         defer allocator.free(text);
         notify.say(text);
@@ -184,7 +213,13 @@ fn acquireByLoopback(
         }
     };
 
-    const code = try server.waitForAuthorizationCode(allocator, state, options.abort_signal);
+    const code = server.waitForAuthorizationCode(allocator, state, options.abort_signal) catch |err| switch (err) {
+        error.OAuthAccessDenied => {
+            if (options.notify) |notify| sayRefusal(allocator, notify, &refusal);
+            return Error.OAuthAccessDenied;
+        },
+        else => return err,
+    };
     defer auth.secureFree(allocator, code);
 
     var body: std.Io.Writer.Allocating = .init(allocator);
@@ -195,6 +230,35 @@ fn acquireByLoopback(
     try auth.appendFormField(&body.writer, "redirect_uri", redirect_uri, false);
     try auth.appendFormField(&body.writer, "code_verifier", pkce.code_verifier, false);
     return postForm(allocator, io, endpoints.token_url, body.written());
+}
+
+/// Why the sign-in cannot start: every port the redirect may use is taken.
+fn sayPortsInUse(allocator: std.mem.Allocator, notify: Notify, ports: []const u16) void {
+    var list: std.Io.Writer.Allocating = .init(allocator);
+    defer list.deinit();
+    for (ports, 0..) |port, index| {
+        const separator: []const u8 = if (index == 0) "" else if (index + 1 == ports.len) " and " else ", ";
+        list.writer.print("{s}{d}", .{ separator, port }) catch return;
+    }
+    const text = std.fmt.allocPrint(
+        allocator,
+        "This sign-in can only receive its callback on port {s}, and every one of them is in use.\n" ++
+            "Another sign-in may be waiting there (a Metask login, the Codex CLI, OpenCode). Finish or close it, then try again.\n",
+        .{list.written()},
+    ) catch return;
+    defer allocator.free(text);
+    notify.say(text);
+}
+
+/// What the authorization server said when it refused.
+fn sayRefusal(allocator: std.mem.Allocator, notify: Notify, refusal: *const auth.Refusal) void {
+    const text = if (refusal.description().len > 0)
+        std.fmt.allocPrint(allocator, "The sign-in was refused: {s} ({s}).\n", .{ refusal.code(), refusal.description() })
+    else
+        std.fmt.allocPrint(allocator, "The sign-in was refused: {s}.\n", .{refusal.code()});
+    const line = text catch return;
+    defer allocator.free(line);
+    notify.say(line);
 }
 
 /// What the device authorization endpoint told us. Slices borrow the response

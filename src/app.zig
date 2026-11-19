@@ -116,11 +116,13 @@ const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
 const sign_out_mod = @import("app/sign_out.zig");
+const providers_cli_mod = @import("app/providers_cli.zig");
 const provider_startup_mod = @import("provider/startup.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
+const oauth_revoke_mod = @import("api/oauth_revoke.zig");
 const metask_oauth_mod = @import("api/metask_oauth.zig");
 const provider_mod = @import("api/provider.zig");
 const request_overrides = @import("api/request_overrides.zig");
@@ -283,6 +285,28 @@ pub const PendingOverlay = enum {
     transcript,
 };
 
+/// How the next `/model` picker opens, when something other than the user's
+/// own `/model` asked for it: a sign-in that goes on to choosing a model
+/// (`/login openrouter`) opens it applying `from now on`, and on the free
+/// models when the account has no credits. Taken once, by `picker_host.open`.
+pub const PickerPreset = struct {
+    scope: provider_selection_mod.Scope = .session,
+    filter_buffer: [16]u8 = @splat(0),
+    filter_len: u8 = 0,
+
+    pub fn withFilter(scope: provider_selection_mod.Scope, text: []const u8) PickerPreset {
+        var preset: PickerPreset = .{ .scope = scope };
+        const n: u8 = @intCast(@min(text.len, preset.filter_buffer.len));
+        @memcpy(preset.filter_buffer[0..n], text[0..n]);
+        preset.filter_len = n;
+        return preset;
+    }
+
+    pub fn filter(self: *const PickerPreset) []const u8 {
+        return self.filter_buffer[0..self.filter_len];
+    }
+};
+
 /// The TUI theme for this terminal: monochrome under `--no-theme`; otherwise
 /// the `theme` persisted in `<state root>/config.json`, else auto. Auto on a
 /// colour terminal asks the terminal for its background (OSC 11, a short
@@ -386,6 +410,14 @@ pub const MetaskKeyRoute = struct {
 };
 
 pub const App = struct {
+    /// Which provider's credential the live clients carry (`App.live_route`).
+    pub const LiveRoute = struct {
+        provider: provider_ids_mod.Slug,
+        /// The credential is that provider's OAuth access token: the one thing
+        /// the turn-boundary refresh may replace (`refreshRouteCredential`).
+        oauth: bool,
+    };
+
     allocator: std.mem.Allocator,
     config: types.Config,
     /// Owned `<$HOME>/.metacodes` when the host passed no `config.state_root`
@@ -393,10 +425,11 @@ pub const App = struct {
     state_root_default: ?[]u8 = null,
     api_key: []const u8,
     selected_api_key_owned: ?[]u8 = null,
-    /// The key `selected_api_key_owned` held before `/login` or `/logout`
-    /// replaced it (#485). A client may still borrow it (a `/models` key
-    /// switch points them straight at it), so it stays readable for one
-    /// more generation, as `route_strings` keeps a route's (`retireApiKey`).
+    /// The key `selected_api_key_owned` held before `/login`, `/logout` or a
+    /// `/models` pick replaced it (#485). A client may still borrow it (a
+    /// `/models` key switch points them straight at it), so it stays readable
+    /// for one more generation, as `route_strings` keeps a route's
+    /// (`retireApiKey`).
     retired_api_key: ?[]u8 = null,
     api_key_catalog: api_keys_mod.Catalog,
     /// When `api_key_catalog` is filled: never on this route, or once, the
@@ -405,6 +438,13 @@ pub const App = struct {
     /// The background `/v1/models` fetch a cache-served start runs, until the
     /// REPL takes its answer (`adoptModelCatalogRefresh`) or the App ends.
     models_refresh: ?*models_cache_mod.Refresh = null,
+    /// A background fetch of OpenRouter's listing, for a start that found
+    /// none kept or a day-old one (`api/openrouter_catalog.zig`); the REPL
+    /// takes it at the idle points it takes `models_refresh` at.
+    openrouter_refresh: ?*@import("api/openrouter_catalog.zig").Refresh = null,
+    /// The REPL hosts this App: catalogs may refresh in the background
+    /// (`InitOptions.models_cache`).
+    background_catalogs: bool = false,
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
     model_switch_owned: ?[]u8 = null,
@@ -451,6 +491,8 @@ pub const App = struct {
     /// after the input reader returns, so the request is parked here and the
     /// next read consumes it.
     pending_overlay: PendingOverlay = .none,
+    /// How that picker opens, when it is not the user's own `/model`.
+    pending_picker_preset: ?PickerPreset = null,
     /// One OAuth session per provider, kept for the process.
     ///
     /// Single flight is a property of a `Session` object, so a fresh one per
@@ -460,6 +502,12 @@ pub const App = struct {
     /// within one call.
     oauth_session: ?provider_oauth_mod.Session = null,
     oauth_session_provider: ?provider_ids_mod.Slug = null,
+    /// The route the live clients were last bound to (`bindCommittedSelection`),
+    /// or null before the first bind, when it is the one the session started
+    /// on (`liveRoute`). The kernel's effective selection can name another: a
+    /// commit to the global or once scope binds the clients while a narrower
+    /// scope still holds the previous route.
+    live_route: ?LiveRoute = null,
     /// Last control-plane event projected into the TinyKG audit plane. Events
     /// are recorded once; a restart starts from the journal's current head
     /// rather than replaying a ring that may already have evicted.
@@ -1086,6 +1134,7 @@ pub const App = struct {
                 // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
                 app.api_key_catalog_load = .deferred;
                 app.loadModelCatalog(options.models_cache);
+                app.background_catalogs = options.models_cache;
             } else {
                 @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
             }
@@ -1241,6 +1290,12 @@ pub const App = struct {
 
     fn refreshMetaskToken(ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8 {
         const app: *App = @ptrCast(@alignCast(ctx));
+        // Metask's sign-in only. A `/model` switch to another OAuth provider
+        // makes the process's session that provider's (`oauthAccessToken`):
+        // its refresh token is not Metask's to see, nor its token a Metask
+        // request's.
+        const owner = app.oauth_session_provider orelse return error.NoTokens;
+        if (!owner.eqlText("metask")) return error.NoTokens;
         const session = if (app.oauth_session) |*loaded| loaded else return error.NoTokens;
         var site_buf: [1024]u8 = undefined;
         const token_url = try metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf);
@@ -1250,6 +1305,23 @@ pub const App = struct {
             .token_url = token_url,
         };
         return session.refreshIfStale(@import("util/time.zig").nowUnix(), exchange.exchange(), stale_access_token);
+    }
+
+    /// Install `refreshMetaskToken` on the clients that can run the Metask
+    /// sign-in's route (as `initWithOptions` does when it starts on one), or
+    /// take it off them.
+    fn armMetaskRefresh(app: *App, armed: bool) void {
+        if (armed) {
+            app.api_client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+            if (app.openai_client) |*client| client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
+            return;
+        }
+        app.api_client.refresh_fn = null;
+        app.api_client.refresh_ctx = null;
+        if (app.openai_client) |*client| {
+            client.refresh_fn = null;
+            client.refresh_ctx = null;
+        }
     }
 
     /// 组装层选 Provider:据 config.provider_kind 返回对应后端的中立 Provider。
@@ -1979,13 +2051,26 @@ pub const App = struct {
     pub const ProviderKeyForgotten = struct {
         /// `<state root>/keys/<provider>.json` was there and is gone.
         removed: bool,
-        /// The session ran on that saved key and holds no credential now.
+        /// `<state root>/oauth/<provider>.json` (the provider's own OAuth
+        /// sign-in) was there and is gone, and whether the provider ended its
+        /// refresh token first (`api/oauth_revoke.zig`).
+        sign_in: oauth_revoke_mod.Forgotten = .{},
+        /// The session ran on that saved key or sign-in and holds no
+        /// credential now.
         unbound: bool = false,
         /// One of the provider's variables `.env` sets, which still supplies
         /// a key (a name, never a value).
         local_variable: ?[]const u8 = null,
         /// One the shell sets.
         shell_variable: ?[]const u8 = null,
+        /// A key the provider's site created (`ProviderProfile.key_grant`)
+        /// still works there after this: the page its owner deletes it on.
+        manage_url_buf: [256]u8 = undefined,
+        manage_url_len: usize = 0,
+
+        pub fn manageUrl(self: *const ProviderKeyForgotten) ?[]const u8 {
+            return if (self.manage_url_len == 0) null else self.manage_url_buf[0..self.manage_url_len];
+        }
     };
 
     /// `/logout <provider>` (#485, 第十节第 6 条): forget the key `/login
@@ -1993,15 +2078,37 @@ pub const App = struct {
     /// running on that key keeps nothing of it. `.env` and the shell are not
     /// edited; the result names what of them still holds a key.
     pub fn forgetProviderKey(app: *App, provider_id: provider_ids_mod.Slug) !ProviderKeyForgotten {
+        const host = try app.providerHost();
+        // Read before the file goes: the page is named after the key in it.
+        var manage_url: ?[]u8 = null;
+        defer if (manage_url) |url| app.allocator.free(url);
+        if (host.registry.findById(provider_id)) |found| if (found.key_grant) |grant| {
+            const openrouter_login = @import("api/openrouter_login.zig");
+            manage_url = openrouter_login.storedKeyManageUrl(app.allocator, app.stateRoot(), provider_id, openrouter_login.origin(grant), grant);
+        };
         const removed = try provider_api_key_store.remove(app.allocator, app.stateRoot(), provider_id);
         var result: ProviderKeyForgotten = .{ .removed = removed };
-        const host = try app.providerHost();
+        if (removed) if (manage_url) |url| if (url.len <= result.manage_url_buf.len) {
+            @memcpy(result.manage_url_buf[0..url.len], url);
+            result.manage_url_len = url.len;
+        };
         const profile = host.registry.findById(provider_id) orelse return result;
-        const on_saved_key = switch (app.route_state) {
-            .bound => |origin| origin == .saved_key,
+        // The provider's own OAuth sign-in goes too, revoked first where the
+        // profile says (#499's provider half). The process-scoped session
+        // holding it is dropped: a turn boundary must not refresh it back.
+        result.sign_in = try oauth_revoke_mod.forgetStoredLogin(app.allocator, app.stateRoot(), profile, oauth_revoke_mod.DEFAULT_WAIT_MS);
+        if (app.oauth_session_provider) |id| if (id.eql(provider_id) and !provider_id.eqlText("metask")) {
+            if (app.oauth_session) |*session| session.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        // The session ran on what was just removed: the saved key, or the
+        // sign-in.
+        const ran_on_removed = switch (app.route_state) {
+            .bound => |origin| (origin == .saved_key and removed) or (origin == .sign_in and result.sign_in.removed),
             .unbound => false,
         };
-        if (removed and on_saved_key) {
+        if (ran_on_removed) {
             const current = if (host.kernel.currentOfferId()) |id| host.kernel.catalogSnapshot().find(id) else null;
             if (current) |offer| if (offer.provider_id.eql(provider_id)) {
                 app.unbindRoute(.{ .missing_credential = provider_id });
@@ -2202,6 +2309,7 @@ pub const App = struct {
         app.api_key_catalog.deinit();
         // A refresh still in flight finishes (and frees itself) on its own thread.
         if (app.models_refresh) |refresh| refresh.release();
+        if (app.openrouter_refresh) |refresh| refresh.release();
         if (app.metask_key_route) |*route| route.deinit(app.allocator);
         for (&app.parked_login_workers) |*slot| if (slot.*) |worker| {
             worker.cancel();
@@ -2305,6 +2413,11 @@ pub const App = struct {
     /// to the key in use.
     pub fn ensureApiKeyCatalog(app: *App) void {
         if (app.api_key_catalog_load != .deferred) return;
+        // The list and the sign-in that asks for it are Metask's, and the
+        // request goes to the route's own address: on any other route it
+        // would carry the Metask token there. The menu says the list is
+        // unavailable, and loads it once the session is back.
+        if (!app.onMetaskKeyRoute()) return;
         app.api_key_catalog_load = .loaded;
         const log = @import("util/log.zig");
         const login_token = @import("core/auth.zig").resolveStoredOAuthBearer(app.allocator, app.stateRoot()) catch null;
@@ -2324,6 +2437,32 @@ pub const App = struct {
                 log.debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    /// Whether the session runs on its Metask API-key route now: it has one
+    /// (`metask_key_route`), it is on the Messages wire, and its requests go
+    /// to a Metask gateway: a Metask offer since the last commit, else the
+    /// route's own gateway. A `/model` switch to another provider moves the
+    /// clients, not the record.
+    pub fn onMetaskKeyRoute(app: *const App) bool {
+        const route = app.metask_key_route orelse return false;
+        if (app.config.provider_kind != .anthropic) return false;
+        // After a commit: a Metask offer, whichever Metask gateway it is at
+        // (the compiled one, or one a catalog named), with the session's key.
+        if (app.live_route) |live| return live.provider.eqlText("metask");
+        const origin = MetaskKeyRoute.gatewayOriginOf(app.api_client.base_url) orelse return false;
+        return std.mem.eql(u8, origin, route.gateway_origin);
+    }
+
+    /// Drop a loaded `/models` key list: it is the Metask account's, and the
+    /// session has left the Metask route. The menu loads it again when the
+    /// session is back (`ensureApiKeyCatalog`).
+    fn forgetApiKeyCatalog(app: *App) void {
+        if (app.api_key_catalog_load != .loaded) return;
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = .deferred;
+        app.models_picker_key_index = null;
+        app.models_picker_model_index = null;
     }
 
     /// Fill `api_client.catalog` from the route's `/v1/models`. With the cache
@@ -2391,6 +2530,7 @@ pub const App = struct {
     /// session has since left (a key picked in `/models`, another route) is
     /// dropped; the answer it would replace was fetched for the current one.
     pub fn adoptModelCatalogRefresh(app: *App) void {
+        app.adoptOpenRouterRefresh();
         const refresh = app.models_refresh orelse return;
         if (!refresh.finished()) return;
         app.models_refresh = null;
@@ -2501,6 +2641,9 @@ pub const App = struct {
         if (app.provider_host) |host| return host;
         const host = try provider_host_mod.Host.create(app.allocator);
         errdefer host.destroy();
+        // `METACODES_OPENROUTER_URL` (development, tests) moves every
+        // OpenRouter address, its requests included.
+        @import("api/openrouter_login.zig").applyOriginOverride(host);
         // Seed the durable revision and any previously committed global
         // selection, so `selection.commit` compares against the number the
         // store actually holds rather than an invented one.
@@ -2520,10 +2663,81 @@ pub const App = struct {
                 .{why},
             );
         }
+        var shadowed_buf: [256]u8 = undefined;
+        if (host.shadowedNotice(&shadowed_buf)) |notice| @import("util/log.zig").warn("provider", "{s}", .{notice});
         app.applyMetaskKeyCatalog(host);
+        app.adoptOpenRouterListing(host);
         app.seedStartupSelection(host);
         app.provider_host = host;
         return host;
+    }
+
+    /// The built-in OpenRouter's models: the kept listing, whatever its age;
+    /// in the REPL, with none kept or a day-old one and a key set, a fetch in
+    /// the background, taken at an idle point (`adoptOpenRouterRefresh`).
+    fn adoptOpenRouterListing(app: *App, host: *provider_host_mod.Host) void {
+        const openrouter_catalog = @import("api/openrouter_catalog.zig");
+        const kept = openrouter_catalog.adoptKept(host, app.allocator, app.stateRoot());
+        if (kept == .fresh or !app.background_catalogs or app.openrouter_refresh != null) return;
+        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return;
+        defer {
+            std.crypto.secureZero(u8, key);
+            app.allocator.free(key);
+        }
+        app.openrouter_refresh = openrouter_catalog.Refresh.start(key, app.stateRoot()) catch |err| blk: {
+            @import("util/log.zig").debug("catalog", "OpenRouter listing refresh not started: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    /// Take a finished background fetch of OpenRouter's listing into the
+    /// live catalog. Called where the REPL takes `models_refresh`.
+    pub fn adoptOpenRouterRefresh(app: *App) void {
+        const refresh = app.openrouter_refresh orelse return;
+        if (!refresh.finished()) return;
+        app.openrouter_refresh = null;
+        const kept = refresh.kept();
+        refresh.release();
+        if (!kept) return;
+        const host = app.provider_host orelse return;
+        if (@import("api/openrouter_catalog.zig").adoptKept(host, app.allocator, app.stateRoot()) == .none) return;
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+    }
+
+    /// Fetch OpenRouter's listing now with the key OpenRouter's requests
+    /// would use (a sign-in, `/providers refresh`), keep it, and take it.
+    /// Returns how many models it lists; null when no key is set.
+    pub fn refreshOpenRouterListing(app: *App) !?usize {
+        const host = try app.providerHost();
+        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return null;
+        defer {
+            std.crypto.secureZero(u8, key);
+            app.allocator.free(key);
+        }
+        const count = try @import("api/openrouter_catalog.zig").refresh(app.allocator, app.io, app.stateRoot(), key, host);
+        app.refreshModelPicker() catch app.model_picker.markFailed();
+        return count;
+    }
+
+    const openrouter_profile_id = provider_ids_mod.Slug.lit("openrouter");
+
+    /// The key a request to `provider_id` would carry, as startup resolves
+    /// it: the environment, `<state root>/.env`, then the stored key. Owned;
+    /// the caller zeroes it. Null when none is set.
+    fn providerSecretIn(app: *App, host: *provider_host_mod.Host, provider_id: provider_ids_mod.Slug) ?[]u8 {
+        const profile = host.registry.findById(provider_id) orelse return null;
+        var stored = StoredKey.load(app, provider_id, .quiet);
+        defer stored.deinit();
+        var reference: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
+        const resolved = provider_credential_mod.resolve(.{
+            .provider_id = profile.id,
+            .accepted_kinds = profile.accepted_credential_kinds,
+            .env_aliases = profile.env_aliases,
+            .stored_api_key = stored.entry(),
+            .env = provider_credential_mod.EnvLookup.process(),
+            .env_fallback = app.credentialEnvFallback(),
+        }, &reference) catch return null;
+        return app.allocator.dupe(u8, resolved.secret) catch null;
     }
 
     /// Tell the kernel which route this session actually started on.
@@ -2600,7 +2814,7 @@ pub const App = struct {
         return app.config.credential_env_fallback orelse provider_credential_mod.EnvLookup.empty();
     }
 
-    /// Materialize the configured credential pool.
+    /// Materialize `provider_id`'s configured credential pool.
     ///
     /// Takes the document by pointer and **does not own it**: the returned
     /// entries borrow the account label out of it, so a version of this that
@@ -2608,12 +2822,17 @@ pub const App = struct {
     /// slices. The caller keeps the document alive for as long as it uses the
     /// pool.
     ///
+    /// Only that provider's `providers.<id>.credentials[]`: a key is one
+    /// vendor's, and another provider's members would otherwise be offered
+    /// to this one's routes whenever its profile accepts their kind.
+    ///
     /// Secrets come from the named environment variables, never from the
     /// document: that document is read by several tools and is not mode 0600.
     /// A variable the process environment leaves unset is read from
     /// `env_fallback`, the host's layer below it (`<state root>/.env`, #486).
     pub fn credentialPoolFrom(
         document: *const provider_config_doc.Document,
+        provider_id: provider_ids_mod.Slug,
         buffer: []provider_credential_mod.PoolEntry,
         env_fallback: provider_credential_mod.EnvLookup,
     ) []const provider_credential_mod.PoolEntry {
@@ -2623,11 +2842,13 @@ pub const App = struct {
         // a loop-local copy that dies at the end of the iteration.
         for (document.providers.items) |*entry| {
             if (!entry.enabled) continue;
+            if (!entry.id.eql(provider_id)) continue;
             for (entry.credentials.items()) |*credential| {
                 if (len == buffer.len) break;
                 const secret = env.get(credential.env.slice()) orelse env_fallback.get(credential.env.slice()) orelse continue;
                 const kind = provider_credential_mod.parseCredentialKind(credential.kind.slice()) orelse continue;
                 buffer[len] = .{
+                    .provider_id = entry.id,
                     .id = credential.id,
                     .kind = kind,
                     .secret = secret,
@@ -2801,7 +3022,7 @@ pub const App = struct {
         const snapshot = host.kernel.catalogSnapshot();
         const now = @import("util/time.zig").nowUnix();
         var pool: CredentialPool = .{};
-        pool.load(app);
+        pool.load(app, null);
         defer pool.deinit();
         for (offers, 0..) |summary, first| {
             const provider_id = summary.provider_id;
@@ -2810,6 +3031,7 @@ pub const App = struct {
                 if (earlier.provider_id.eql(provider_id)) break true;
             } else false;
             if (seen) continue;
+            pool.scopeTo(app, provider_id);
             const profile = host.registry.findById(provider_id);
             var stored = StoredKey.load(app, provider_id, .quiet);
             defer stored.deinit();
@@ -2858,7 +3080,9 @@ pub const App = struct {
         return .{
             .provider = profile.id,
             .variable = variable,
-            .sign_in = profile.id.eqlText("metask"),
+            // Metask, and a provider whose site creates the key (OpenRouter):
+            // `/login` is the way in, a variable the other.
+            .sign_in = profile.id.eqlText("metask") or profile.key_grant != null,
         };
     }
 
@@ -2889,16 +3113,24 @@ pub const App = struct {
         return session.load() catch false;
     }
 
-    /// The configured credential pool as a binding reads it. The document
-    /// outlives the pool: its entries borrow their account labels from it.
+    /// The configured credential pool as a binding reads it: one provider's
+    /// members (`credentialPoolFrom`). The document outlives the pool: its
+    /// entries borrow their account labels from it.
     const CredentialPool = struct {
         document: ?provider_config_doc.Document = null,
         buffer: [provider_config_doc.MAX_POOL_CREDENTIALS]provider_credential_mod.PoolEntry = undefined,
         len: usize = 0,
 
-        fn load(pool: *CredentialPool, app: *App) void {
+        fn load(pool: *CredentialPool, app: *App, provider_id: ?provider_ids_mod.Slug) void {
             pool.document = app.loadConfigDocument();
-            if (pool.document) |*document| pool.len = credentialPoolFrom(document, &pool.buffer, app.credentialEnvFallback()).len;
+            pool.scopeTo(app, provider_id);
+        }
+
+        /// `provider_id`'s members of the loaded document; none for null.
+        fn scopeTo(pool: *CredentialPool, app: *const App, provider_id: ?provider_ids_mod.Slug) void {
+            pool.len = 0;
+            const id = provider_id orelse return;
+            if (pool.document) |*document| pool.len = credentialPoolFrom(document, id, &pool.buffer, app.credentialEnvFallback()).len;
         }
 
         fn entries(pool: *const CredentialPool) []const provider_credential_mod.PoolEntry {
@@ -3017,7 +3249,7 @@ pub const App = struct {
         }, candidate, commit.scope);
         switch (outcome) {
             .committed => |accepted| {
-                try app.bindCommittedSelection(host, accepted.selection);
+                try app.bindOrRevert(host, accepted);
                 app.applyCommittedReasoning(accepted.selection);
                 if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
                 // A session-scoped choice is durable *for this session*: it has
@@ -3034,6 +3266,45 @@ pub const App = struct {
             .rejected, .conflict => {},
         }
         return outcome;
+    }
+
+    /// Move the session onto a selection the kernel just committed, or undo
+    /// the commit. When the binding fails the session stays on its route, so
+    /// the kernel's selection goes back to it, and so does the process's
+    /// OAuth session, which `oauthAccessToken` may already have moved to the
+    /// committed provider. Left on the commit, the next turn's token refresh
+    /// (`refreshRouteCredential`), which reads both, would install that
+    /// provider's token in the clients still pointed at the previous route.
+    fn bindOrRevert(
+        app: *App,
+        host: *provider_host_mod.Host,
+        accepted: provider_control_plane.CommitOutcome.Committed,
+    ) !void {
+        const oauth_provider = app.oauth_session_provider;
+        app.bindCommittedSelection(host, accepted.selection) catch |err| {
+            host.kernel.revertCommit(accepted);
+            app.restoreOAuthSession(oauth_provider);
+            return err;
+        };
+    }
+
+    /// Make `owner`'s stored login the process's OAuth session again, or
+    /// none when null, if another provider's has taken its place.
+    fn restoreOAuthSession(app: *App, owner: ?provider_ids_mod.Slug) void {
+        if (app.oauth_session_provider) |current| {
+            if (owner) |wanted| if (current.eql(wanted)) return;
+        } else if (owner == null) return;
+        if (app.oauth_session) |*session| session.deinit();
+        app.oauth_session = null;
+        app.oauth_session_provider = null;
+        const id = owner orelse return;
+        var session = provider_oauth_mod.Session.initHome(app.allocator, app.stateRoot(), id) catch return;
+        if (!(session.load() catch false)) {
+            session.deinit();
+            return;
+        }
+        app.oauth_session = session;
+        app.oauth_session_provider = id;
     }
 
     /// A reasoning level chosen with the route (the picker's options step) is
@@ -3083,7 +3354,7 @@ pub const App = struct {
         const outcome = host.kernel.selectionCommit(.{}, selection, .session);
         switch (outcome) {
             .committed => |accepted| {
-                try app.bindCommittedSelection(host, accepted.selection);
+                try app.bindOrRevert(host, accepted);
                 return true;
             },
             // A stored session route that no longer resolves is reported by the
@@ -3173,7 +3444,7 @@ pub const App = struct {
         // answer for that provider). The picker judges readiness from the
         // same material (`judgeReadiness`).
         var pool: CredentialPool = .{};
-        pool.load(app);
+        pool.load(app, committed_provider);
         defer pool.deinit();
         var stored_key = StoredKey.load(app, committed_provider, .warn);
         defer stored_key.deinit();
@@ -3325,6 +3596,22 @@ pub const App = struct {
             client.auth_scheme = binding.auth_scheme;
             client.declared_dialect = binding.dialect;
         }
+        // A client whose route answers 401 `token_expired` asks
+        // `refreshMetaskToken` for a new token and sends the request again
+        // with it. Only a route the Metask sign-in authenticates may ask: on
+        // any other the answer would be the Metask token, sent to that
+        // route's endpoint.
+        app.armMetaskRefresh(oauth_token != null and binding.provider_id.eqlText("metask") and
+            binding.credential_ref.kind == .metask_oauth);
+        // What the turn-boundary refresh renews from now on: this provider's
+        // OAuth token when the binding chose it, nothing otherwise.
+        app.live_route = .{
+            .provider = binding.provider_id,
+            .oauth = if (oauth_token) |token| std.mem.eql(u8, binding.secret, token) else false,
+        };
+        // The `/models` key list is the Metask account's: off the Metask route
+        // it is dropped, and the menu loads it again once the session is back.
+        if (!app.onMetaskKeyRoute()) app.forgetApiKeyCatalog();
         // Every out-of-process UI learns the *route*, not just the model name: a
         // visible model name can come from several providers, channels,
         // protocols, and accounts, so broadcasting only the name would announce
@@ -3358,24 +3645,28 @@ pub const App = struct {
     }
 
     pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
+        // A key of the Metask account, for the Metask route: on another
+        // provider's route the clients and the `/v1/models` probe below would
+        // carry it to that provider.
+        if (!app.onMetaskKeyRoute()) return error.NotOnMetaskKeyRoute;
         if (idx >= app.api_key_catalog.entries.items.len) return error.InvalidApiKeySelection;
         const secret = app.api_key_catalog.entries.items[idx].secret;
         const owned = try app.allocator.dupe(u8, secret);
-        errdefer {
-            @memset(owned, 0);
-            app.allocator.free(owned);
+        {
+            // The App does not hold `owned` yet: on failure nothing points at it.
+            errdefer {
+                std.crypto.secureZero(u8, owned);
+                app.allocator.free(owned);
+            }
+            if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
         }
-        if (app.selected_api_key_owned) |old| {
-            @memset(old, 0);
-            app.allocator.free(old);
-        }
+        // Retired, not freed: a client may still be reading the previous key.
+        if (app.selected_api_key_owned) |old| app.retireApiKey(old);
         app.selected_api_key_owned = owned;
         app.api_key = owned;
+        // The route's own client. The others point at the endpoints of routes
+        // the session left; a commit gives them a key with their endpoint.
         app.api_client.credential = .{ .fixed = owned };
-        if (app.openai_client) |*oc| oc.credential = .{ .fixed = owned };
-        if (app.gemini_client) |*gc| gc.credential = .{ .fixed = owned };
-        if (app.bedrock_client) |*bc| bc.credential = .{ .fixed = owned };
-        if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
 
         app.api_client.catalog.deinit();
         app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
@@ -3943,6 +4234,26 @@ pub const App = struct {
         }
     }
 
+    /// The route the live clients carry a credential for: the last bind's, or
+    /// before any, the one the session started on. That is Metask on the
+    /// historical path, else the provider startup resolved (the owner rule of
+    /// `cliApiKey`), and its credential is an OAuth token on the Metask
+    /// device sign-in, or when startup bound the provider's own sign-in
+    /// (`route_state` says `.sign_in`); otherwise it is a key from the
+    /// provider's variables, `--api-key` or its stored key.
+    fn liveRoute(app: *const App) ?LiveRoute {
+        if (app.live_route) |route| return route;
+        const owner = if (app.config.provider_profile == null)
+            provider_ids_mod.Slug.lit("metask")
+        else
+            provider_ids_mod.Slug.parse(app.config.resolved_provider_id orelse return null) catch return null;
+        const signed_in = switch (app.route_state) {
+            .bound => |origin| origin == .sign_in,
+            .unbound => false,
+        };
+        return .{ .provider = owner, .oauth = app.config.metask_oauth_selected or signed_in };
+    }
+
     /// Refresh this session's OAuth access token if it is near expiry, and
     /// repoint every borrower at the new one.
     ///
@@ -3964,8 +4275,12 @@ pub const App = struct {
         // id and skips the work entirely.
         if (app.provider_host == null and app.config.selected_offer_id == null) return false;
         const host = try app.providerHost();
-        const selection = host.kernel.effectiveSelection() orelse return false;
-        const built = resolvedProfileFor(host, selection) orelse return false;
+        // The route the clients are bound to, not the kernel's effective
+        // selection, and only when that route's credential is its OAuth
+        // token: a key, or another account's credential, stays as bound.
+        const live = app.liveRoute() orelse return false;
+        if (!live.oauth) return false;
+        const built = host.registry.findById(live.provider) orelse return false;
         const token = (try app.oauthAccessToken(built, @import("util/time.zig").nowUnix())) orelse
             return false;
         errdefer {
@@ -4044,11 +4359,25 @@ pub const App = struct {
         return false;
     }
 
-    pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !void {
+    /// `/providers remove <id>`. A built-in provider loses its settings
+    /// (`providers.<id>`). One the user defined goes the way `metacodes
+    /// providers remove` takes it (`providers_cli.removeProvider`): its
+    /// definition, settings, stored key and login, and a default on one of
+    /// its models — so it does not come back at the next start. Its routes
+    /// stay in this session's catalog until then: the host reads definitions
+    /// once, when it starts.
+    pub fn removeProviderConfiguration(app: *App, id: provider_ids_mod.Slug) !providers_cli_mod.Removal {
         var store = try provider_config_store.Store.initHome(app.allocator, app.stateRoot());
         defer store.deinit();
+        if (providers_cli_mod.isDefined(app.allocator, app.stateRoot(), id)) {
+            const removed = try providers_cli_mod.removeProvider(app.allocator, app.stateRoot(), id);
+            if (removed.revision) |revision| try app.reapplyProviderConfiguration(&store, revision);
+            if (removed.default_forgotten) (try app.providerHost()).kernel.forgetGlobalSelection();
+            return removed;
+        }
         const result = try provider_config_store.removeProvider(&store, id, null);
         try app.reapplyProviderConfiguration(&store, result.config_revision);
+        return .{ .settings = true, .revision = result.config_revision };
     }
 
     fn reapplyProviderConfiguration(
@@ -4114,6 +4443,19 @@ pub const App = struct {
     ///
     /// Returns the number of providers refreshed.
     pub fn refreshProviderCatalogs(app: *App) !usize {
+        app.last_catalog_refresh_error = null;
+        var refreshed: usize = 0;
+        // The built-in OpenRouter's own listing, when a key is set for it.
+        if (app.refreshOpenRouterListing()) |listed| {
+            if (listed != null) refreshed += 1;
+        } else |err| {
+            app.last_catalog_refresh_error = @errorName(err);
+        }
+        return refreshed + try app.refreshConfiguredCatalogs();
+    }
+
+    /// The catalogs `provider_catalogs` names by URL.
+    fn refreshConfiguredCatalogs(app: *App) !usize {
         var store = provider_config_store.Store.initHome(app.allocator, app.stateRoot()) catch return 0;
         defer store.deinit();
         const text = store.readText() catch return 0;
@@ -4130,7 +4472,6 @@ pub const App = struct {
         const host = try app.providerHost();
         const io = app.api_client.http_client.io;
         var refreshed: usize = 0;
-        app.last_catalog_refresh_error = null;
 
         var it = section.object.iterator();
         while (it.next()) |pair| {
@@ -4138,6 +4479,9 @@ pub const App = struct {
             if (entry != .object) continue;
             const models_url = stringField(entry.object.get("models_url")) orelse continue;
             const provider_id = provider_ids_mod.Slug.parse(pair.key_ptr.*) catch continue;
+            // A built-in provider (OpenRouter) is not a configured catalog's
+            // to replace; the host says so once (`Host.shadowedNotice`).
+            if (host.isBuiltinId(provider_id)) continue;
             const bearer = if (stringField(entry.object.get("credential_env"))) |name|
                 provider_credential_mod.EnvLookup.process().get(name) orelse app.credentialEnvFallback().get(name)
             else

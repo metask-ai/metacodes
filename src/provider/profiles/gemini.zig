@@ -137,7 +137,7 @@ pub const PROFILE = profile.ProviderProfile{
 test "gemini profile: a pasted key is checked against the model listing, in x-goog-api-key" {
     try profile.validateProfile(PROFILE);
     const page = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
-    try std.testing.expectEqualStrings("https://aistudio.google.com/apikey", page.url);
+    try std.testing.expectEqualStrings("https://aistudio.google.com/apikey", page.url.?);
     try std.testing.expectEqualStrings("https://generativelanguage.googleapis.com/v1beta/models", page.check_url.?);
     try std.testing.expectEqualStrings("x-goog-api-key", PROFILE.auth.custom_header.name);
 }
