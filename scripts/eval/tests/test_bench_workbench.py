@@ -950,7 +950,7 @@ class GitRefBuildTest(unittest.TestCase):
         for commit in (forked, base):
             _, final = self.launch(ref=commit)
             self.assertEqual(final['status'], 'finished', final)
-        self.assertEqual(self.info_of(forked)[1]['source_repo'], str(fork))
+        self.assertEqual(self.info_of(forked)[1]['source_id'], builds.source_id(str(fork)))
         self.assertEqual(len(self.docker_runs()), 2)
         # Back on the official repository: the fork-only commit is not on any of
         # its branches, so its cached unit is refused, not run with credentials.
@@ -962,27 +962,71 @@ class GitRefBuildTest(unittest.TestCase):
         # A commit the official repository also publishes is re-verified and reused.
         run, final = self.launch(ref=base)
         self.assertEqual(final['status'], 'finished', final)
-        self.assertEqual(self.info_of(base)[1]['source_repo'], str(self.repo))
+        self.assertEqual(self.info_of(base)[1]['source_id'], builds.source_id(str(self.repo)))
         self.assertEqual(len(self.docker_runs()), 2)
 
-    def test_record_without_a_verified_source_is_checked_again_before_reuse(self):
+    def test_record_under_an_older_rule_is_verified_again_before_reuse(self):
         commit = self.git('rev-parse', 'HEAD')
         self.launch(ref='main')
         path, info = self.info_of(commit)
-        legacy = {k: v for k, v in info.items() if k not in ('source_repo', 'trust_policy')}
-        for record in (legacy, {**info, 'trust_policy': builds.TRUST_POLICY - 1}):
-            with self.subTest(record=record):
-                path.write_text(json.dumps(record))
-                moved = self.root / 'away'
-                self.repo.rename(moved)
-                _, final = self.launch(ref=commit)
-                self.assertEqual(final['status'], 'failed')
-                self.assertIn('源码仓库', final['error'])
-                moved.rename(self.repo)
-                _, final = self.launch(ref=commit)
-                self.assertEqual(final['status'], 'finished', final)
-                self.assertEqual(self.info_of(commit)[1]['trust_policy'], builds.TRUST_POLICY)
+        path.write_text(json.dumps({**info, 'trust_policy': builds.TRUST_POLICY - 1}))
+        moved = self.root / 'away'
+        self.repo.rename(moved)
+        _, final = self.launch(ref=commit)
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('源码仓库', final['error'])
+        moved.rename(self.repo)
+        _, final = self.launch(ref=commit)
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual(self.info_of(commit)[1]['trust_policy'], builds.TRUST_POLICY)
         self.assertEqual(len(self.docker_runs()), 1)
+
+    def test_unit_without_build_provenance_is_rebuilt_not_relabelled(self):
+        commit = self.git('rev-parse', 'HEAD')
+        self.launch(ref='main')
+        path, info = self.info_of(commit)
+        # A record from before trust records existed, beside a planted binary.
+        path.write_text(json.dumps({k: info[k] for k in builds.PUBLIC}))
+        unit = self.manager.build_cache / 'builds' / path.name.removesuffix('.json')
+        (unit / 'bin' / 'metacodes').write_text('planted')
+        run, final = self.launch(ref=commit)
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual((self.bundle_of(run) / 'bin' / 'metacodes').read_text(), commit)
+        self.assertEqual(self.info_of(commit)[1]['trust_policy'], builds.TRUST_POLICY)
+        self.assertEqual(len(self.docker_runs()), 2)
+
+    def test_failed_origin_switch_never_verifies_or_records_against_the_old_one(self):
+        commit = self.git('rev-parse', 'HEAD')
+        builds.resolve('main', self.manager.build_cache, str(self.repo))
+        stub = self.root / 'git-stub'
+        stub.mkdir()
+        real = shutil.which('git')
+        (stub / 'git').write_text('#!/bin/sh\n[ "$1 $2" = "remote set-url" ] && exit 5\nexec %s "$@"\n' % real)
+        (stub / 'git').chmod(0o755)
+        other = self.root / 'other-repo'
+        with patch.dict(os.environ, {'PATH': str(stub) + os.pathsep + os.environ['PATH']}):
+            with self.assertRaisesRegex(ValueError, '切换'):
+                builds.bundle(commit, self.manager.build_cache, str(other))
+        self.assertEqual(builds.cached(self.manager.build_cache), [])
+        self.assertEqual(self.docker_runs(), [])
+
+    def test_repository_url_and_its_credentials_never_reach_readers(self):
+        self.launch(ref='main')
+        anonymous = cli.Client(self.client.url)
+        catalog = json.dumps(anonymous.request('api/workbench'), ensure_ascii=False)
+        self.assertNotIn(str(self.repo), catalog)
+        build = anonymous.request('api/workbench')['metacodes']['builds'][0]
+        self.assertEqual(set(build), set(builds.PUBLIC))
+        record = self.info_of(self.git('rev-parse', 'HEAD'))[0].read_text()
+        self.assertNotIn(str(self.repo), record)
+        # A failing private URL: its token appears neither in the run nor the API.
+        cfg = json.loads(self.manager.config_path.read_text())
+        shutil.rmtree(self.manager.build_cache / 'source.git')
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': 'http://bench:s3cret-token@127.0.0.1:9/private.git'})
+        run, final = self.launch(ref='main')
+        self.assertEqual(final['status'], 'failed')
+        shown = json.dumps([final, anonymous.request('api/run?name=' + run['name'])], ensure_ascii=False)
+        self.assertNotIn('s3cret-token', shown)
 
     def test_overlapping_builds_on_one_cache_are_serialized_and_both_complete(self):
         self.git('commit', '-q', '--allow-empty', '-m', 'two')

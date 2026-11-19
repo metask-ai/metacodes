@@ -152,13 +152,16 @@ def image():
     return "metacodes-bench-builder:" + hashlib.sha256(DOCKERFILE.encode()).hexdigest()[:12]
 
 
+PUBLIC = ("ref", "commit", "version", "target", "built_at")
+
+
 def cached(cache_dir):
-    """Builds already in the cache, most recent first."""
+    """Builds already in the cache, most recent first: only what the page shows."""
     result = []
     for path in Path(cache_dir).glob("builds/metacodes-*"):
         info = build_info(path)
         if info:
-            result.append(info)
+            result.append({k: info[k] for k in PUBLIC})
     return sorted(result, key=lambda i: i.get("built_at", ""), reverse=True)
 
 
@@ -175,13 +178,23 @@ def build_info(path):
         return None
     if not isinstance(info, dict):
         return None
-    return {k: info.get(k) for k in ("ref", "commit", "version", "target", "built_at",
-                                     "source_repo", "trust_policy")}
+    return {k: info.get(k) for k in PUBLIC + ("source_id", "trust_policy")}
+
+
+def source_id(repo):
+    """The repository's identity in a build record: a digest, never the URL,
+    which may carry an access token."""
+    return hashlib.sha256(repo.encode()).hexdigest()
+
+
+def _redact(text, repo):
+    """Git messages without the repository URL or any URL credentials."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1***@", text.replace(repo, "<source_repo>"))
 
 
 def _trusted_for(info, commit, repo):
     """Whether a cached unit was verified for `commit` by this repository and rule."""
-    return bool(info) and info["commit"] == commit and info["source_repo"] == repo \
+    return bool(info) and info["commit"] == commit and info["source_id"] == source_id(repo) \
         and info["trust_policy"] == TRUST_POLICY
 
 
@@ -264,17 +277,20 @@ def resolve(ref, cache_dir, repo=None, cancelled=lambda: False):
         try:
             code, stderr = _run(["git", "clone", "-q", "--mirror", repo, str(staged)], cancelled, quiet=True)
             if code:
-                raise BuildError("无法获取源码仓库：" + (stderr.strip().splitlines() or ["?"])[-1])
+                raise BuildError("无法获取源码仓库：" + _redact((stderr.strip().splitlines() or ["?"])[-1], repo))
             # Builds fetch one resolved commit by id from this mirror.
             _git("config", "uploadpack.allowAnySHA1InWant", "true", cwd=staged)
             staged.rename(mirror)
         finally:
             shutil.rmtree(staged, ignore_errors=True)
     else:
-        _git("remote", "set-url", "origin", repo, cwd=mirror)
+        # Never verify against whatever origin was before: that result would be
+        # recorded under this repository's name.
+        if _git("remote", "set-url", "origin", repo, cwd=mirror)[0]:
+            raise BuildError("无法把源码镜像切换到配置的仓库")
         code, stderr = _run(["git", "fetch", "-q", "--prune", "origin"], cancelled, cwd=mirror, quiet=True)
         if code:
-            raise BuildError("无法更新源码仓库：" + (stderr.strip().splitlines() or ["?"])[-1])
+            raise BuildError("无法更新源码仓库：" + _redact((stderr.strip().splitlines() or ["?"])[-1], repo))
     if ref.startswith("refs/"):
         commit = _commit(mirror, ref)
     else:
@@ -336,11 +352,13 @@ def _build(ref, cache_dir, repo, target, cancelled):
     mirror, commit = resolve(ref, cache_dir, repo, cancelled)
     destination = _destination(cache_dir, commit, target)
     info = build_info(destination)
-    if info and info["commit"] == commit:
-        # The same commit is the same tree, whichever repository built it;
-        # it has now been verified against this one, so record that.
+    # A unit this builder made (it carries a trust record) is the commit's own
+    # tree, whichever repository it was verified for; the commit has now been
+    # verified against this one, so record that. A unit without that
+    # provenance is rebuilt rather than trusted on its layout alone.
+    if info and info["commit"] == commit and info["trust_policy"] is not None:
         if not _trusted_for(info, commit, repo):
-            info = {**info, "source_repo": repo, "trust_policy": TRUST_POLICY}
+            info = {**info, "source_id": source_id(repo), "trust_policy": TRUST_POLICY}
             _info_path(destination).write_text(json.dumps(info), encoding="utf-8")
         return destination, info
     if cancelled():
@@ -382,7 +400,7 @@ def _build(ref, cache_dir, repo, target, cancelled):
             raise BuildError(f"git 版本 {ref} 的产物不能用于 Bench：{exc}") from None
         info = {"ref": ref, "commit": commit, "version": version, "target": target,
                 "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "source_repo": repo, "trust_policy": TRUST_POLICY}
+                "source_id": source_id(repo), "trust_policy": TRUST_POLICY}
         if destination.exists():
             shutil.rmtree(destination)
         out.rename(destination)
