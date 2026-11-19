@@ -109,7 +109,7 @@ and `dialects/registry.zig` fails a test when one is missing.
 | Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
 | MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
 | Mistral | `src/api/dialects/mistral.zig` | — |
-| OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
+| OpenRouter | `src/api/dialects/openrouter.zig` | `openrouter`, and catalogs |
 | Amazon Bedrock (Converse wire) | `src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
 
 The OpenAI chat building blocks every compatible vendor shares are
@@ -280,7 +280,11 @@ at the keyboard (`-p`, `serve`, a resumed suspension, the REPL reading a pipe)
 prints one `warning:` line on stderr saying so. It never refuses and never
 changes the exit code: the terms are the vendor's to enforce. `--web` is a
 person in a browser and a teammate answers to its lead's session; neither
-prints it.
+prints it. A provider the user defines can say it is one too
+(`"subscription_plan": true` in `custom_providers`, written by
+`metacodes providers add --subscription-plan`): the coding plans of Alibaba
+Cloud Model Studio and Volcano Engine Ark are reached that way, and their
+terms limit the plan keys to interactive use in coding tools as well.
 
 ## User-Agent
 
@@ -612,14 +616,59 @@ provider run on it as a `/model` pick does. `metacodes logout --provider <id>`
 and `/logout <provider>` remove it, revoked first where the profile declares an
 endpoint (`api/oauth_revoke.zig`, bounded as Metask's revocation is).
 
+### A key grant: OpenRouter's sign-in
+
+OpenRouter signs a user in on its own site and hands back an API key of the
+user's own account (https://openrouter.ai/docs/guides/overview/auth/oauth,
+checked 2026-11-18). That is not OAuth as above — no client id, no token
+endpoint, nothing to refresh, a JSON exchange — so a profile declares it as
+`key_grant` (`provider/profile.zig`): the origin, the page, exchange, key
+description and manage paths, and the label the key is given. The key it
+hands back is stored as the profile's key setup kind, exactly as a pasted key
+is, and resolves the same way (below).
+
+`api/openrouter_login.zig` runs it two ways, on the `LoginWorker` like every
+other sign-in (`provider_login.Flow.key_grant`):
+
+- **The browser here.** The page address carries an S256 challenge, a state,
+  the prefilled label, and a loopback callback on any free port — OpenRouter
+  takes any, and names such a sign-in after it (`localhost:1456`). The callback
+  is taken only with its own state; a refusal, which OpenRouter sends back
+  without one, ends the wait at once (`CallbackServer.denied_body`) rather
+  than leaving a tab that says "State mismatch".
+- **Another device.** Without a callback the page shows the code, which the
+  user pastes back here; the verifier never leaves this machine. This is the
+  way over SSH, offered first there, and `--device-code` starts it: OpenRouter
+  has no device-code grant, and this is what it documents for a machine with
+  no browser.
+
+`POST /api/v1/auth/keys` trades the code and the verifier; `GET /api/v1/key`
+then describes the key (label, spending limit, expiry, free tier), and that
+description is stored beside it (`api_key_store.Meta`, never a secret) for
+`login status` and the sign-in's own line. Nothing here can delete the key on
+OpenRouter — that takes a management key — so signing out removes it from this
+machine and names the page its owner deletes it on (`<origin>/keys/<sha256
+hex of the key>`), and a sign-in that replaces a key names the old one's page.
+
+`METACODES_OPENROUTER_URL` (https, or plain http to a loopback host, read from
+the process environment only) replaces the origin, and `Host.rebaseOrigin`
+moves the profile's requests and key check onto it too: one variable moves
+every address, so a test pointed at a mock cannot reach the real site. Moving
+can only fail on a profile the check no longer admits, and then the process
+stops rather than send anything where the variable was set to keep it from.
+
 ### Stored API keys and the guided key login
 
 Some providers have a plan whose keys are created on a web page and offer no
 grant a third-party client could run; the GLM Coding Plan is the first. Such a
 profile declares `api_key_setup` (`provider/profile.zig`): the credential kind
 the key is, the pages it is created on (`KeyPage { id, label, url, check_url,
-region }`), and a note shown before the user picks one. Validation requires an
-accepted kind, at least one page, https URLs and unique ids. The Coding Plan
+check_wire, region }`), and a note shown before the user picks one. Validation
+requires an accepted kind, at least one page and unique ids; a page's `url` must
+be https, and so must its `check_url`, unless the profile's endpoint policy
+admits it (plain http to a loopback host, or a definition that turned TLS off
+for its own endpoint): the check carries the key, so it may go only where the
+provider's requests do. The Coding Plan
 declares four plan pages — China and Global, personal and team — and its note
 says why the standard API-key page is the wrong one: since 2026-10-16 a key
 from it bills the account balance even on the Coding Plan endpoints. The page
@@ -677,6 +726,19 @@ removes it.
 `METACODES_KEY_CHECK_URL` replaces every page's check URL — the local mock the
 tests use, as `METASK_GATEWAY_URL` is for Metask. Only https or plain http to
 an exact loopback host is accepted, because the check carries the key.
+
+A provider the user defined (`custom_providers`, below) gets a key setup too,
+built from its definition (`custom_provider.zig`, `pastedKeySetup`) whenever it
+accepts an API key: one page with no `url` — whoever runs a relay or a server
+hands its keys out, so there is nothing to open — labelled with its display
+name, and a `check_url` that is the model listing of its default channel
+(`provider/model_listing.zig`: `{base}/models`, `{root}/v1/models?limit=1000`
+with `anthropic-version`, which `check_wire` asks for, or
+`{root}/v1beta/models?pageSize=1000`). A `bedrock_converse` channel lists
+nothing, so its key is stored unchecked, like the built-in Bedrock's. The CLI
+then prompts `Paste the API key for <name>` without opening a page, `/login
+<id>` goes straight to the paste, and the key file records no page. A key that
+the endpoint cannot check (no listing) is stored with `--no-check`.
 
 The two front ends differ only in how the key is typed. The CLI prompts for
 the plan, prints the page whole, opens it, and reads the key with echo off;
@@ -883,7 +945,61 @@ instance, and `/providers remove <id>` deletes its configuration. Disabling
 preserves the instance's configuration and credential references — that is the
 whole difference from removing it — and excludes it from the *catalog*, so
 "disabled" is true in the picker, `model.list`, and `--provider` at once rather
-than being re-checked at three call sites.
+than being re-checked at three call sites. For a provider defined in
+`custom_providers`, removing takes the definition too (below): removing only
+its `providers.<id>` left the definition in the file, and the provider came
+back at the next start.
+
+`metacodes providers add|probe|list|remove` (`src/app/providers_cli.zig`;
+the user's guide is [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own))
+writes and reads the same section without hand-written JSON:
+
+- `add <id> --base-url <url> --protocol <wire> [--protocol <wire>[=<url>]]…
+  [--model <id>]… [--probe] [--display-name] [--dialect] [--key-env <VAR>]
+  [--auth bearer|header:<name>[:<prefix>]] [--subscription-plan] [--replace]`
+  renders the definition
+  (`custom_provider.renderDraft`: what a person would write, and nothing
+  more), one channel per wire with ids named after the wire (`openai`,
+  `responses`, `anthropic`, `gemini`, `bedrock`), so adding a second protocol
+  never renames the first channel and the offer ids derived from it. An
+  Anthropic or Gemini base is stored without the `/v1` or `/v1beta` its
+  transport appends (`model_listing.channelBase`). With no arguments at a
+  terminal it asks for each part; without a terminal a missing part is an
+  error. `--replace` patches an existing definition
+  (`custom_provider.patchEntry`): only what it is given changes, and a model
+  that stays keeps its object (price, limits, controls). The id never changes.
+- The write is `config_store.putCustomProvider`: a `CommitRequest` with a
+  `member_edits` entry (`json_merge.MemberField`, the one member
+  `custom_providers.<id>`) under the same lock, re-read and atomic rename as
+  every commit, and a `validate` hook that judges the complete document about
+  to be written — inside the lock, so no other writer can change it in
+  between. The CLI's hook runs the stages `--check-providers` runs
+  (`adoptCustomProviders`, `ingestConfiguredCatalogs`,
+  `applyProviderConfiguration`): the definitions must load after an `add`,
+  and no stage that loaded before may stop loading. A refusal is
+  `error.Rejected`, and nothing is written. Before it, the command refuses
+  what it can name: an endpoint the default policy refuses (plain http to
+  another host, userinfo, `%`-escapes), the id or alias of a built-in
+  profile, a taken id without `--replace`, a `--key-env` another provider
+  reads (a key there would go to both), and — with `--replace` — a new
+  origin while `keys/<id>.json` holds a key stored for the old one (the old
+  origins read from the definition as written, so one that does not load
+  cannot skip the check).
+- `probe <id> | --base-url <url> --protocol <wire>` asks the model listing
+  (`api/model_probe.zig` over `catalog_fetch`, so a request that carries a
+  key follows no redirect), with the key placed by the profile's auth
+  scheme, and stores nothing. `add --probe` writes the limits a listing
+  reports with each model it adds.
+- `remove <id>` is `providers_cli.removeProvider`, which `/providers remove`
+  calls for a defined provider too: one commit
+  (`config_store.removeCustomProvider`) drops `custom_providers.<id>`,
+  `providers.<id>` and a `global_selection` that resolved to it (only if it is
+  still the selection the command resolved), then `keys/<id>.json` and
+  `oauth/<id>.json` go.
+
+The host reads `custom_providers` once, when it is created, so every one of
+these applies from the next start, and each command says so; a running
+session keeps listing a removed provider until then.
 
 `metacodes --check-providers` is the dry run. It builds the provider runtime the
 same way a session does — built-ins, `custom_providers`, configured catalogs,
@@ -899,6 +1015,35 @@ unknown currency all fail before registration.
 
 ## Provider catalogs
 
+### The built-in OpenRouter
+
+The built-in `openrouter` profile is the router itself, the way Metask's
+profile is its gateway: one channel, `auto`, whose requests carry no
+`provider` object and leave the upstream to OpenRouter's default routing
+(price, speed, uptime, with fallbacks; a conversation stays with an upstream
+while its prompt cache is warm). That route is what a model offer of this
+profile is. Which upstream answered is OpenRouter's to report; recording it
+on the actual-route event is not implemented yet (see *Not implemented yet*).
+
+Its models are the account's own listing, `GET /api/v1/models/user`, which
+applies the account's provider preferences, privacy settings and guardrails.
+`api/openrouter_catalog.zig` keeps the models that take tools over chat
+completions, with the fields a route reads, and `Host.ingestOpenRouterBuiltin`
+makes them one `auto` offer each, priced at the model's listed price (the
+upstream OpenRouter picks may charge otherwise). The listing is fetched after
+a sign-in or a pasted key, on `/providers refresh`, and in the REPL's
+background when none is kept or it is a day old and a key is set; it is kept
+in `<state root>/cache/models/`, and every start reads the kept copy whatever
+its age, so a stored pin resolves without a request. Compiled in is only
+OpenRouter's router model, `openrouter/auto`, so the provider is listed before
+a sign-in and keeps a route if the listing cannot be fetched.
+
+Pinning one upstream — an offer per endpoint, its request naming the
+endpoint's tag in `provider.order` with `allow_fallbacks: false` — is the
+catalog path below, not the built-in profile's.
+
+### Catalog documents
+
 `src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
 worth adapting: it is a router, so it already separates the two things a
 metadata source must keep separate.
@@ -911,9 +1056,14 @@ metadata source must keep separate.
 
 They are parsed separately and stay separate. A model with three endpoints
 becomes three offers; merging them would reproduce exactly the "a model name
-identifies the route" mistake this whole model corrects. Two endpoints from one
-upstream provider (different quantizations, say) get distinct channel slugs, so
-neither disappears.
+identifies the route" mistake this whole model corrects. An endpoint's channel
+is named by its routing tag (`deepinfra/fp8` → `deepinfra-fp8`), which names
+the same endpoint for every model it serves, so one channel holds them all;
+two endpoints from one upstream provider (different quantizations, say) have
+different tags and stay distinct. A request names the model by its id, never
+by the endpoint's display `name`. OpenRouter prices its router models at
+`"-1"` ("whatever the picked model costs"): that is an unknown price, not a
+reason to refuse the listing.
 
 Endpoint values win over model values, and only where the endpoint has one: an
 endpoint that omits pricing inherits the model's declared price with
@@ -1116,8 +1266,14 @@ session from then on.
 | `src/provider/runtime_binding.zig` | selection → transport parameters |
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
-| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
-| `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization; rendering and patching a definition |
+| `src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
+| `src/api/model_probe.zig` | the model-listing GET (`providers probe`, `add --probe`) |
+| `src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`); the removal `/providers remove` shares |
+| `src/provider/openrouter.zig` | model/endpoint catalogs, router entries, preferences → `RoutePolicy`, router metadata |
+| `src/provider/profiles/openrouter.zig` | the built-in OpenRouter: the `auto` router channel, the key grant, the key page |
+| `src/api/openrouter_login.zig` | OpenRouter's key grant: browser and other-device ways, the exchange, the key description, the manage page |
+| `src/api/openrouter_catalog.zig` | the account's listing for the built-in OpenRouter: trimmed, kept, refreshed in the background |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
 | `src/provider/request_profile.zig` | `RequestProfile`, what one endpoint requires of every request on a route |
@@ -1189,11 +1345,25 @@ omission — and none of them is an acceptance criterion of the issue.
   and MiniMax on Bedrock think by their own defaults; only Claude and gpt-oss
   get fields in `additionalModelRequestFields`.
 
+- **Defined providers while a session runs.** The host reads
+  `custom_providers` once, when it starts; `metacodes providers` changes apply
+  from the next start, and `/providers refresh` re-reads only
+  `provider_catalogs`. Re-adopting definitions live would free strings a
+  running route may still borrow.
+
 - **Reviewed protocol extensions (P2).** A genuinely novel wire format needs a
   signed adapter reference, which needs review and signing infrastructure. The
   declarative schema covers relays, gateways, and self-hosted servers, which
   differ by path rather than by wire; anything else is rejected (`UnknownWire`)
   rather than guessed.
+
+- **The upstream OpenRouter picked, on the actual-route event.** Its answers
+  name the upstream (`provider`), and `openrouter.parseRouterMetadata` reads
+  it, but no production path records an actual route for any provider yet
+  (`Kernel.recordActualRoute` has no caller outside tests), and the event has
+  no field for an upstream. Recording it needs both, and belongs with pinning
+  an upstream from `/model` (an offer per endpoint of the built-in profile,
+  fetched for one model when asked): neither is built.
 
 - **Per-offer capacity.** Throughput stays `unknown`: OpenRouter's endpoint rows
   do not carry it, so `hard_min_throughput_tps` can only ever reject. Latency is

@@ -19,6 +19,7 @@ const catalog_mod = @import("../skills/runtime/catalog.zig");
 const overrides_mod = @import("../skills/overrides.zig");
 const provider_login = @import("../api/provider_login.zig");
 const login_worker_mod = @import("../api/login_worker.zig");
+const openrouter_login = @import("../api/openrouter_login.zig");
 const metask_sign_in = @import("../api/metask_sign_in.zig");
 const model_catalog = @import("../api/catalog.zig");
 const types = @import("../types.zig");
@@ -105,8 +106,14 @@ pub const HelpDialog = struct {
 
     fn count(self: *const HelpDialog, kind: complete.SlashKind) usize {
         var n: usize = 0;
-        for (self.catalog.entries) |cmd| n += @intFromBool(cmd.kind == kind);
+        for (self.catalog.entries) |cmd| n += @intFromBool(listed(cmd, kind));
         return n;
+    }
+
+    /// A command of `kind` as help lists it: once, by its own name, not again
+    /// for each argument the `/` menu spells out (`/login openrouter`).
+    fn listed(cmd: complete.SlashCmd, kind: complete.SlashKind) bool {
+        return cmd.kind == kind and cmd.arg_of.len == 0;
     }
 
     /// Each entry takes two rows (name, description).
@@ -127,7 +134,7 @@ pub const HelpDialog = struct {
         var index: usize = 0;
         var shown: usize = 0;
         for (self.catalog.entries) |cmd| {
-            if (cmd.kind != kind) continue;
+            if (!listed(cmd, kind)) continue;
             defer index += 1;
             if (index < self.top or shown >= visible) continue;
             shown += 1;
@@ -560,6 +567,28 @@ fn failureAdvice(buffer: []u8, name: []const u8, provider_id: []const u8) []cons
     return "Nothing was stored.";
 }
 
+/// What a key grant's failure means, by the flow's error name (the worker
+/// keeps names, and a cause in parentheses after one).
+fn keyGrantFailure(buffer: []u8, name: []const u8, provider_label: []const u8, retry: []const u8) []const u8 {
+    const own = [_]anyerror{ error.KeyGrantDeclined, error.KeyGrantCodeExpired, error.KeyGrantCodeRefused, error.KeyGrantExchangeFailed };
+    for (own) |err| {
+        if (std.mem.startsWith(u8, name, @errorName(err))) return openrouter_login.failureLine(buffer, err, provider_label, retry);
+    }
+    return std.fmt.bufPrint(buffer, "Could not reach {s} ({s}). Nothing was stored.", .{ provider_label, name }) catch "The sign-in failed. Nothing was stored.";
+}
+
+/// `count` bullets for a secret being typed, at most as many as fit `buffer`
+/// (each is three bytes).
+fn maskFor(buffer: []u8, count: usize) []const u8 {
+    var len: usize = 0;
+    for (0..@min(count, 24)) |_| {
+        if (len + 3 > buffer.len) break;
+        @memcpy(buffer[len..][0..3], "\u{2022}");
+        len += 3;
+    }
+    return buffer[0..len];
+}
+
 pub const LoginDialog = struct {
     /// Providers the list shows. The pane neither scrolls nor filters yet, so
     /// the ones past it are named under the list instead (`unlistedCount`),
@@ -582,7 +611,13 @@ pub const LoginDialog = struct {
         api_key,
     };
 
-    pub const Stage = enum { choose, key_page, key_entry, signing_in, failed };
+    /// `how` and `code_entry` are a key grant's (OpenRouter): which way to
+    /// sign in, and the code pasted back from another device.
+    pub const Stage = enum { choose, how, code_entry, key_page, key_entry, signing_in, failed };
+
+    /// Where a key grant starts: asking which way, or straight on another
+    /// device (`/login <provider> --device-code`).
+    pub const HowStart = enum { ask, other_device };
 
     pub const Outcome = union(enum) {
         interrupted,
@@ -620,6 +655,17 @@ pub const LoginDialog = struct {
     key_page: usize = 0,
     key_buffer: [MAX_KEY_LEN]u8 = undefined,
     key_len: usize = 0,
+    /// A key grant: the way chosen on `how`, whether that list starts on the
+    /// other device (an SSH session), and where it starts.
+    how_sel: usize = 0,
+    how_ssh: bool = false,
+    how_start: HowStart = .ask,
+    /// The key grant's third way was taken: a key the user already has is
+    /// pasted, as for a provider without a sign-in (`key_page`, `key_entry`).
+    pasting: bool = false,
+    /// The other-device way between showing its page and the pasted code:
+    /// the verifier stays here (zeroed on release), the page goes to the user.
+    pending: ?openrouter_login.Pending = null,
 
     /// Offer `choice`; past `CAPACITY` it is only counted (`dropped`).
     pub fn add(self: *LoginDialog, choice: Choice) void {
@@ -695,6 +741,7 @@ pub const LoginDialog = struct {
     /// Ends any sign-in still owned here, waiting for its thread.
     pub fn deinit(self: *LoginDialog) void {
         self.clearKey();
+        self.releasePending();
         if (self.detached) |worker| join(self.allocator, worker);
         self.detached = null;
         if (self.worker) |worker| {
@@ -732,7 +779,10 @@ pub const LoginDialog = struct {
 
     fn begin(self: *LoginDialog) void {
         switch (self.current().method) {
-            .flow => |flow| self.startFlow(flow),
+            .flow => |flow| switch (flow) {
+                .key_grant => self.enterHow(),
+                else => self.startFlow(flow),
+            },
             .api_key => {
                 // The key page for the region the user is most likely on.
                 const profile = self.current().profile;
@@ -745,7 +795,9 @@ pub const LoginDialog = struct {
                 }
                 self.clearKey();
                 self.failure_len = 0;
-                self.stage = .key_page;
+                // A provider the user configured has no page to choose or
+                // open: its key comes from whoever runs it.
+                self.stage = if (self.pageless()) .key_entry else .key_page;
             },
         }
     }
@@ -755,9 +807,101 @@ pub const LoginDialog = struct {
         return setup.pages;
     }
 
+    /// The key is only pasted: one page, and nowhere to create the key on
+    /// (`KeyPage.url`, a configured provider's).
+    fn pageless(self: *const LoginDialog) bool {
+        const pages = self.keyPages();
+        return pages.len == 1 and pages[0].url == null;
+    }
+
     fn clearKey(self: *LoginDialog) void {
         std.crypto.secureZero(u8, self.key_buffer[0..self.key_len]);
         self.key_len = 0;
+    }
+
+    /// The key grant the current choice runs, if it is one.
+    fn keyGrant(self: *const LoginDialog) ?provider_login.KeyGrantPrepared {
+        return switch (self.current().method) {
+            .flow => |flow| switch (flow) {
+                .key_grant => |prepared| prepared,
+                else => null,
+            },
+            .api_key => null,
+        };
+    }
+
+    /// The ways a key grant offers, in the order `how` lists them. A key
+    /// grant always has a key setup (`validateProfile`), so pasting a key is
+    /// always the last.
+    const HowWay = enum { browser, other_device, paste_key };
+    const HOW_WAYS = [_]HowWay{ .browser, .other_device, .paste_key };
+
+    fn howLabel(way: HowWay) []const u8 {
+        return switch (way) {
+            .browser => "Sign in with the browser on this computer",
+            .other_device => "Sign in on another device (SSH, no browser here)",
+            .paste_key => "Paste an API key you already have",
+        };
+    }
+
+    /// A key grant's first step: which way, or the other device at once.
+    fn enterHow(self: *LoginDialog) void {
+        self.releasePending();
+        self.clearKey();
+        self.failure_len = 0;
+        self.pasting = false;
+        if (self.how_start == .other_device) {
+            // Only the first start: a retry asks.
+            self.how_start = .ask;
+            return self.chooseHow(.other_device);
+        }
+        // In an SSH session the browser that would follow a loopback redirect
+        // is on another machine: the other device is the way that works.
+        self.how_sel = if (self.how_ssh) 1 else 0;
+        self.stage = .how;
+    }
+
+    fn chooseHow(self: *LoginDialog, way: HowWay) void {
+        const prepared = self.keyGrant() orelse return;
+        switch (way) {
+            .browser => self.startFlow(.{ .key_grant = prepared }),
+            .other_device => {
+                self.releasePending();
+                self.pending = openrouter_login.Pending.begin(self.allocator, prepared.origin, prepared.grant) catch |err| {
+                    self.setFailure(@errorName(err));
+                    return;
+                };
+                self.clearKey();
+                self.stage = .code_entry;
+            },
+            .paste_key => {
+                self.pasting = true;
+                self.key_page = 0;
+                self.clearKey();
+                // One page (OpenRouter's keys page): no plan to pick, so
+                // straight to the paste, which shows the page.
+                self.stage = if (self.keyPages().len > 1) .key_page else .key_entry;
+            },
+        }
+    }
+
+    /// Trade the pasted code on the worker. The worker copies the code and the
+    /// verifier when it starts, so both are wiped here right after.
+    fn submitCode(self: *LoginDialog) void {
+        var prepared = self.keyGrant() orelse return;
+        const pending = &(self.pending orelse return);
+        prepared.pasted = .{
+            .code = std.mem.trim(u8, self.key_buffer[0..self.key_len], " \t"),
+            .verifier = pending.verifier(),
+        };
+        self.startFlow(.{ .key_grant = prepared });
+        self.clearKey();
+        self.releasePending();
+    }
+
+    fn releasePending(self: *LoginDialog) void {
+        if (self.pending) |*pending| pending.deinit();
+        self.pending = null;
     }
 
     /// Check and store the pasted key on the worker thread. The worker copies
@@ -814,6 +958,7 @@ pub const LoginDialog = struct {
             .flow => |flow| switch (flow) {
                 .metask => "device code",
                 .api_key => "API key",
+                .key_grant => "browser sign-in",
                 .oauth => |prepared| switch (prepared.options.method) {
                     .loopback => "browser sign-in",
                     .device_code => "device code",
@@ -852,6 +997,44 @@ pub const LoginDialog = struct {
                 try p.blank();
                 try p.footer("↑/↓ to select · Enter to sign in · Esc to cancel");
             },
+            .how => {
+                const profile = self.current().profile;
+                var head_buf: [160]u8 = undefined;
+                try p.text(std.fmt.bufPrint(&head_buf, "Sign in to {s}", .{profile.display_name}) catch "Sign in");
+                try p.blank();
+                var about_buf: [256]u8 = undefined;
+                try p.paragraph("", std.fmt.bufPrint(&about_buf, "{s} creates an API key on your account; what you use is billed to your {s} credits.", .{ profile.display_name, profile.display_name }) catch "");
+                try p.blank();
+                for (HOW_WAYS, 0..) |way, i| {
+                    try p.option(i + 1, i == self.how_sel, howLabel(way), "");
+                }
+                if (self.how_ssh) {
+                    try p.blank();
+                    try p.paragraph(p.th.dim, "This looks like an SSH session: sign in on another device instead.");
+                }
+                try p.blank();
+                try p.footer("↑/↓ to select · Enter to continue · Esc to go back");
+            },
+            .code_entry => {
+                const profile = self.current().profile;
+                var head_buf: [160]u8 = undefined;
+                try p.text(std.fmt.bufPrint(&head_buf, "Sign in to {s} on another device", .{profile.display_name}) catch "Sign in on another device");
+                try p.blank();
+                try p.text("1. Open this URL on any device:");
+                if (self.pending) |*pending| try p.raw(pending.url);
+                var approve_buf: [160]u8 = undefined;
+                try p.text(std.fmt.bufPrint(&approve_buf, "2. Approve the new API key. {s} then shows a code.", .{profile.display_name}) catch "2. Approve the new API key.");
+                try p.text("3. Paste the code here (it works once, for 10 minutes):");
+                try p.blank();
+                var mask_buf: [64]u8 = undefined;
+                var code_line: [160]u8 = undefined;
+                try p.text(if (self.key_len == 0)
+                    "Code: (paste it; it is not shown)"
+                else
+                    std.fmt.bufPrint(&code_line, "Code: {s}  ({d} characters)", .{ maskFor(&mask_buf, self.key_len), self.key_len }) catch "Code: (entered)");
+                try p.blank();
+                try p.footer("Enter to finish · Esc to go back");
+            },
             .key_page => {
                 const profile = self.current().profile;
                 var head_buf: [160]u8 = undefined;
@@ -874,9 +1057,14 @@ pub const LoginDialog = struct {
             },
             .key_entry => {
                 const page = self.keyPages()[self.key_page];
-                try p.text("Create a key on this page, then paste it here:");
-                try p.blank();
-                try p.raw(page.url);
+                if (page.url) |url| {
+                    try p.text("Create a key on this page, then paste it here:");
+                    try p.blank();
+                    try p.raw(url);
+                } else {
+                    var head_buf: [160]u8 = undefined;
+                    try p.text(std.fmt.bufPrint(&head_buf, "Paste the API key for {s}:", .{self.current().profile.display_name}) catch "Paste the API key:");
+                }
                 try p.blank();
                 var mask_buf: [64]u8 = undefined;
                 const shown = @min(self.key_len, 24);
@@ -905,8 +1093,17 @@ pub const LoginDialog = struct {
             },
             .failed => {
                 const th = p.th;
+                if (!self.pasting) if (self.keyGrant()) |prepared| {
+                    var line_buf: [256]u8 = undefined;
+                    var retry_buf: [96]u8 = undefined;
+                    const retry = std.fmt.bufPrint(&retry_buf, "/login {s}", .{prepared.provider_id.slice()}) catch "/login";
+                    try p.line(th.danger, keyGrantFailure(&line_buf, self.failure[0..self.failure_len], prepared.provider_label, retry));
+                    try p.blank();
+                    try p.footer("Enter to retry · Esc to cancel");
+                    return;
+                };
                 var head_buf: [192]u8 = undefined;
-                const keyed = self.current().method == .api_key;
+                const keyed = self.current().method == .api_key or self.pasting;
                 const head_args = .{ label(self.current()), self.failure[0..self.failure_len] };
                 try p.line(th.danger, (if (keyed)
                     std.fmt.bufPrint(&head_buf, "The key for {s} was not stored: {s}", head_args)
@@ -981,9 +1178,82 @@ pub const LoginDialog = struct {
                 },
                 else => return .none,
             },
-            .key_page => switch (k) {
+            .how => switch (k) {
                 .esc => {
                     self.backToList();
+                    return .redraw;
+                },
+                .ctrl_c => {
+                    self.outcome = .interrupted;
+                    return .done;
+                },
+                .up => {
+                    self.how_sel = if (self.how_sel == 0) HOW_WAYS.len - 1 else self.how_sel - 1;
+                    return .redraw;
+                },
+                .down => {
+                    self.how_sel = (self.how_sel + 1) % HOW_WAYS.len;
+                    return .redraw;
+                },
+                .enter => {
+                    self.chooseHow(HOW_WAYS[self.how_sel]);
+                    return .redraw;
+                },
+                .char => |c| {
+                    if (c < '1' or c > '9') return .none;
+                    const index: usize = c - '1';
+                    if (index >= HOW_WAYS.len) return .none;
+                    self.how_sel = index;
+                    self.chooseHow(HOW_WAYS[index]);
+                    return .redraw;
+                },
+                else => return .none,
+            },
+            .code_entry => switch (k) {
+                .esc => {
+                    self.clearKey();
+                    self.releasePending();
+                    self.stage = .how;
+                    return .redraw;
+                },
+                .ctrl_c => {
+                    self.clearKey();
+                    self.releasePending();
+                    self.outcome = .interrupted;
+                    return .done;
+                },
+                .backspace => {
+                    if (self.key_len == 0) return .none;
+                    self.key_len -= 1;
+                    self.key_buffer[self.key_len] = 0;
+                    return .redraw;
+                },
+                .ctrl_u => {
+                    self.clearKey();
+                    return .redraw;
+                },
+                .enter => {
+                    if (std.mem.trim(u8, self.key_buffer[0..self.key_len], " \t").len == 0) return .none;
+                    self.submitCode();
+                    return .redraw;
+                },
+                .char => |c| {
+                    if (c <= ' ' or c == 0x7f) return .none;
+                    if (self.key_len == self.key_buffer.len) return .none;
+                    self.key_buffer[self.key_len] = c;
+                    self.key_len += 1;
+                    return .redraw;
+                },
+                else => return .none,
+            },
+            .key_page => switch (k) {
+                .esc => {
+                    if (self.pasting) {
+                        self.pasting = false;
+                        self.stage = .how;
+                    } else {
+                        self.backToList();
+                    }
                     return .redraw;
                 },
                 .ctrl_c => {
@@ -1004,10 +1274,10 @@ pub const LoginDialog = struct {
                 },
                 .enter => {
                     if (self.keyPages().len == 0) return .none;
-                    if (self.key_options.open_browser) {
+                    if (self.key_options.open_browser) if (self.keyPages()[self.key_page].url) |url| {
                         // Best effort: the page is also printed whole to copy.
-                        @import("../core/auth.zig").openBrowser(self.allocator, self.keyPages()[self.key_page].url) catch {};
-                    }
+                        @import("../core/auth.zig").openBrowser(self.allocator, url) catch {};
+                    };
                     self.stage = .key_entry;
                     return .redraw;
                 },
@@ -1023,7 +1293,17 @@ pub const LoginDialog = struct {
             .key_entry => switch (k) {
                 .esc => {
                     self.clearKey();
-                    self.stage = .key_page;
+                    // Back the way it came: a key grant's ways for a key
+                    // pasted from there with no plan to pick, the provider
+                    // list for a pasted key with no page, else the page list.
+                    if (self.pasting and self.keyPages().len <= 1) {
+                        self.pasting = false;
+                        self.stage = .how;
+                    } else if (self.pageless()) {
+                        self.backToList();
+                    } else {
+                        self.stage = .key_page;
+                    }
                     return .redraw;
                 },
                 .ctrl_c => {
@@ -1071,8 +1351,14 @@ pub const LoginDialog = struct {
                     return .done;
                 },
                 .enter => {
-                    // A refused key is re-pasted on the same page.
-                    if (self.current().method == .api_key) {
+                    // A key grant asks again which way; a refused key is
+                    // re-pasted on the same page.
+                    if (self.pasting) {
+                        self.clearKey();
+                        self.stage = .key_entry;
+                    } else if (self.keyGrant() != null) {
+                        self.enterHow();
+                    } else if (self.current().method == .api_key) {
                         self.clearKey();
                         self.stage = .key_entry;
                     } else {
@@ -1101,7 +1387,7 @@ pub const LoginDialog = struct {
             .idle, .running => return if (changed) .redraw else .none,
             .succeeded => {
                 self.stopWorker();
-                self.outcome = if (self.current().method == .api_key)
+                self.outcome = if (self.current().method == .api_key or self.pasting)
                     .{ .key_stored = label(self.current()) }
                 else
                     .{ .signed_in = label(self.current()) };
@@ -1860,6 +2146,164 @@ test "login: a key provider goes plan page → paste, and the key is never drawn
     try testing.expectEqual(Step.redraw, dialog.key(.enter));
     try testing.expectEqual(Step.done, dialog.key(.ctrl_c));
     try testing.expect(dialog.outcome == .interrupted);
+}
+
+test "login: a provider the user configured goes straight to the paste, with no page to open" {
+    const kinds = [_]provider_profile.CredentialKind{.api_key};
+    const pages = [_]provider_profile.KeyPage{.{
+        .id = @import("../provider/ids.zig").Slug.lit("key"),
+        .label = "House relay",
+        .url = null,
+        .check_url = "https://relay.example.com/v1/models",
+        .check_wire = .openai_chat,
+    }};
+    const profile = provider_profile.ProviderProfile{
+        .id = @import("../provider/ids.zig").Slug.lit("house-relay"),
+        .implementation_id = @import("../provider/ids.zig").Slug.lit("house-relay"),
+        .display_name = "House relay",
+        .channels = &.{},
+        .accepted_credential_kinds = &kinds,
+        .api_key_setup = .{ .kind = .api_key, .pages = &pages },
+    };
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    dialog.add(.{ .profile = &profile, .method = .api_key });
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.key_entry, dialog.stage);
+    for ("sk-relay-1") |c| _ = dialog.key(.{ .char = c });
+    const entry = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(entry);
+    try testing.expect(std.mem.indexOf(u8, entry, "Paste the API key for House relay:") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "Create a key on this page") == null);
+    try testing.expect(std.mem.indexOf(u8, entry, "(10 characters)") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "sk-relay") == null);
+    // Esc goes back to the providers, there being no page list to go back to.
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.choose, dialog.stage);
+    try testing.expectEqual(@as(usize, 0), dialog.key_len);
+}
+
+/// OpenRouter's sign-in, prepared the way `/login` prepares it.
+fn openrouterChoice(options: provider_login.Options) LoginDialog.Choice {
+    const openrouter = &@import("../provider/profiles/openrouter.zig").PROFILE;
+    const flow = provider_login.prepareFlow(openrouter, options, null) catch unreachable;
+    return .{ .profile = openrouter, .method = .{ .flow = flow } };
+}
+
+test "login: a key grant asks which way; the other device shows its page and takes a pasted code it never draws" {
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    dialog.add(openrouterChoice(.{ .state_root = "", .open_browser = false }));
+    const listed = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(listed);
+    try testing.expect(std.mem.indexOf(u8, listed, "OpenRouter · browser sign-in") != null);
+
+    // Enter asks which way, the browser here first; nothing runs yet.
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.how, dialog.stage);
+    try testing.expectEqual(@as(usize, 0), dialog.how_sel);
+    try testing.expect(dialog.worker == null);
+    const how = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(how);
+    try testing.expect(std.mem.indexOf(u8, how, "OpenRouter creates an API key on your account; what you use is billed to your OpenRouter credits.") != null);
+    try testing.expect(std.mem.indexOf(u8, how, "1. Sign in with the browser on this computer") != null);
+    try testing.expect(std.mem.indexOf(u8, how, "2. Sign in on another device (SSH, no browser here)") != null);
+    try testing.expect(std.mem.indexOf(u8, how, "SSH session") == null);
+
+    // The other device: its page carries no callback and no state, and the
+    // verifier stays in the dialog.
+    try testing.expectEqual(Step.redraw, dialog.key(.{ .char = '2' }));
+    try testing.expectEqual(LoginDialog.Stage.code_entry, dialog.stage);
+    const pending = dialog.pending orelse return error.NoPendingSignIn;
+    try testing.expect(std.mem.startsWith(u8, pending.url, "https://openrouter.ai/auth?code_challenge="));
+    try testing.expect(std.mem.indexOf(u8, pending.url, "callback_url") == null);
+    try testing.expect(std.mem.indexOf(u8, pending.url, "state=") == null);
+    try testing.expect(std.mem.indexOf(u8, pending.url, pending.verifier()) == null);
+    try testing.expectEqual(Step.none, dialog.key(.enter));
+    for (" code-123 ") |c| _ = dialog.key(.{ .char = c });
+    try testing.expectEqualStrings("code-123", dialog.key_buffer[0..dialog.key_len]);
+    const entry = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(entry);
+    try testing.expect(std.mem.indexOf(u8, entry, pending.url) != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "2. Approve the new API key. OpenRouter then shows a code.") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "3. Paste the code here (it works once, for 10 minutes):") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "(8 characters)") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "code-123") == null);
+
+    // Esc goes back to the ways, wiping the code and the verifier; Esc again
+    // goes back to the list.
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.how, dialog.stage);
+    try testing.expect(dialog.pending == null);
+    try testing.expectEqual(@as(usize, 0), dialog.key_len);
+    for (dialog.key_buffer[0..8]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.choose, dialog.stage);
+}
+
+test "login: a key grant's third way pastes a key the user already has, on OpenRouter's keys page" {
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    dialog.add(openrouterChoice(.{ .state_root = "", .open_browser = false }));
+    _ = dialog.key(.enter);
+    const how = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(how);
+    try testing.expect(std.mem.indexOf(u8, how, "3. Paste an API key you already have") != null);
+
+    // One page: no plan to pick, straight to the paste, which shows it.
+    try testing.expectEqual(Step.redraw, dialog.key(.{ .char = '3' }));
+    try testing.expectEqual(LoginDialog.Stage.key_entry, dialog.stage);
+    try testing.expect(dialog.pasting);
+    const entry = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(entry);
+    try testing.expect(std.mem.indexOf(u8, entry, "https://openrouter.ai/keys") != null);
+    for ("sk-or-v1-pasted") |c| _ = dialog.key(.{ .char = c });
+    const typed = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(typed);
+    try testing.expect(std.mem.indexOf(u8, typed, "sk-or-v1") == null);
+    try testing.expect(std.mem.indexOf(u8, typed, "(15 characters)") != null);
+
+    // A refused key is pasted again; the failure is a key's, not a sign-in's.
+    dialog.setFailure("KeyRefused");
+    const failed = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(failed);
+    try testing.expect(std.mem.indexOf(u8, failed, "The key for OpenRouter was not stored: KeyRefused") != null);
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.key_entry, dialog.stage);
+    try testing.expectEqual(@as(usize, 0), dialog.key_len);
+
+    // Esc goes back to the ways, not to a plan list it never showed.
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.how, dialog.stage);
+    try testing.expect(!dialog.pasting);
+}
+
+test "login: over SSH a key grant offers the other device first, and --device-code starts there" {
+    {
+        var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false }, .how_ssh = true };
+        defer dialog.deinit();
+        dialog.add(openrouterChoice(.{ .state_root = "", .open_browser = false }));
+        _ = dialog.key(.enter);
+        try testing.expectEqual(LoginDialog.Stage.how, dialog.stage);
+        try testing.expectEqual(@as(usize, 1), dialog.how_sel);
+        const how = try renderPlain(&dialog, 200);
+        defer testing.allocator.free(how);
+        try testing.expect(std.mem.indexOf(u8, how, "This looks like an SSH session: sign in on another device instead.") != null);
+    }
+    {
+        var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false }, .how_start = .other_device };
+        defer dialog.deinit();
+        dialog.startAt(dialog.addNamed(openrouterChoice(.{ .state_root = "", .open_browser = false })));
+        try testing.expectEqual(LoginDialog.Stage.code_entry, dialog.stage);
+        try testing.expect(dialog.pending != null);
+        // A retry asks which way.
+        dialog.setFailure("KeyGrantCodeExpired");
+        const failed = try renderPlain(&dialog, 200);
+        defer testing.allocator.free(failed);
+        try testing.expect(std.mem.indexOf(u8, failed, "That code expired (codes last 10 minutes). Run /login openrouter again.") != null);
+        try testing.expectEqual(Step.redraw, dialog.key(.enter));
+        try testing.expectEqual(LoginDialog.Stage.how, dialog.stage);
+    }
 }
 
 test "login: a key that was not stored says why and what to do, by provider" {

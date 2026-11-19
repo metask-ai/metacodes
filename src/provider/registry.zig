@@ -40,6 +40,7 @@ pub const qwen = @import("profiles/qwen.zig");
 pub const minimax = @import("profiles/minimax.zig");
 pub const bedrock = @import("profiles/bedrock.zig");
 pub const chatgpt_codex = @import("profiles/chatgpt_codex.zig");
+pub const openrouter = @import("profiles/openrouter.zig");
 
 /// The built-in profile table. One line per provider — this is the extension
 /// point the requirement asks for. Each vendor's integration notes (dialect,
@@ -57,6 +58,7 @@ pub const BUILTIN_PROFILES = [_]ProviderProfile{
     minimax.PROFILE,
     bedrock.PROFILE,
     chatgpt_codex.PROFILE,
+    openrouter.PROFILE,
 };
 
 // ── transport bridge ─────────────────────────────────────────────────────────
