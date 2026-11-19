@@ -2531,6 +2531,22 @@ pub fn build(b: *std.Build) void {
     tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
     units_test_step.dependOn(&tinykg_contract_test_cmd.step);
 
+    // QuickJS is upstream bytes plus patches/*.patch: the verifier fails on a
+    // drifted, undeclared or edited file and on a patch that no longer applies.
+    const quickjs_sources_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_stage_quickjs_sources",
+        "-v",
+    });
+    const quickjs_sources_test_step = b.step(
+        "test:quickjs-sources",
+        "Verify the vendored QuickJS sources, patches and manifest",
+    );
+    quickjs_sources_test_step.dependOn(&quickjs_sources_test_cmd.step);
+    units_test_step.dependOn(&quickjs_sources_test_cmd.step);
+
     // The trajectory audit itself only runs against a real ~/.metacodes, which
     // CI does not have - but its parsing does not need one, and two defects in
     // it were caught by these tests rather than by the real data (which

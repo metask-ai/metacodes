@@ -17,5 +17,12 @@ vendor/ripgrep/bin/* -text -diff
 # Upstream licence texts kept byte for byte (vendor/lean-runtime/manifest.json
 # pins their SHA-256), trailing blank lines included.
 vendor/lean-runtime/* -whitespace
+# Upstream QuickJS sources kept byte for byte (vendor/quickjs/manifest.json pins
+# their SHA-256); local changes are patches/*.patch, never in-place edits.
+vendor/quickjs/** -whitespace linguist-vendored
+# GitHub collapses only linguist-generated diffs; patches, README and manifest
+# stay expanded for review.
+vendor/quickjs/*.c linguist-generated
+vendor/quickjs/*.h linguist-generated
 
 sdk/rust/src/raw.rs text eol=lf
