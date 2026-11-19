@@ -8228,7 +8228,8 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .mcp_server_count = 0,
         .mcp_catalog_limits = null,
         .enable_teams = 0,
-        .reserved = [_]u64{0} ** 3,
+        .preview = 0,
+        .reserved = [_]u64{0} ** 2,
     };
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
