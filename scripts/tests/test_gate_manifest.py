@@ -123,25 +123,23 @@ class GateManifestTest(unittest.TestCase):
         self.assertEqual({step for steps, _ in parts for step in steps}, set(TEST_PARTS))
         self.assertEqual(len({tuple(options) for _, options in parts}), 1, parts)
 
-    def test_gate_static_runs_every_source_only_check(self):
-        """`gate:static` runs first on every leg and in the checklist (#587):
-        a discipline scan or a source guard it misses is reported only after
-        the whole gate again."""
-        build = (ROOT / "build.zig").read_text(encoding="utf-8")
-        wired = set(re.findall(r"\bgate_static_step\.dependOn\(&?(\w+?)(?:\.step)?\);", build))
-        self.assertLessEqual({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "gate_diff_check"}, wired)
-        self.assertIn("gate_static_step", re.findall(r"\bgate_pr_step\.dependOn\((\w+)\)", build))
-        for path in sorted((ROOT / "scripts" / "tests").glob("test_*_discipline.py")):
-            with self.subTest(scan=path.stem):
-                command = re.search(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*"scripts\.tests\.%s"' % path.stem, build)
-                self.assertTrue(command, "%s has no build.zig command" % path.stem)
-                self.assertIn(command.group(1), wired, "gate:static does not run %s" % path.stem)
-        # Source-only: nothing it runs is a test binary, which would build and
-        # install the fs-helper (`addTestRunArtifact`).
-        self.assertFalse(wired & {"http_status_gate_step", "subsystem_boundary_step"}, wired)
-
-    def test_the_checklist_starts_with_the_source_only_checks(self):
+    def test_the_source_level_guards_run_first(self):
+        """`gate:static` holds the guards that only read the source, and the
+        checklist runs it first: the build runner has no fail-fast, so inside
+        `gate:pr` a failed guard surfaces only at the end (#587)."""
         self.assertEqual(checklist_commands()[0], "zig build gate:static")
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn('const gate_static_step = b.step("gate:static",', build)
+        deps = set(re.findall(r"\bgate_static_step\.dependOn\(&?([\w.]+?)(?:\.step)?\)", build))
+        self.assertTrue({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "gate_diff_check"} <= deps, deps)
+        # Source-only: the boundary gates' full steps carry their self-tests,
+        # test binaries that build and install the fs-helper.
+        self.assertFalse(deps & {"http_status_gate_step", "subsystem_boundary_step"}, deps)
+        scans = re.findall(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*?"scripts\.tests\.test_\w+_discipline"', build, re.S)
+        self.assertTrue(scans)
+        for scan in scans:
+            self.assertIn(scan, deps, "a discipline scan is missing from gate:static")
+        self.assertIn("gate_pr_step.dependOn(gate_static_step);", build)
 
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
