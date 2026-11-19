@@ -21,7 +21,7 @@ from pathlib import Path
 
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json, runtime_env, settings
+from scripts.eval.harbor.viewer.runner import RunManager, atomic_json, configured_provider_ids, runtime_env, settings
 
 
 def read_env(path):
@@ -261,7 +261,7 @@ def provider_command(args, root):
         key = read_key(args)  # empty with --replace keeps the saved key
         if key:
             request["api_key"] = key
-        value = providers.add(request)
+        value = providers.add(request, reserved=configured_provider_ids(settings(root / "workbench.json")))
         if not args.json:
             print(f"已导入 Provider {value['id']}：{len(value['models'])} 个模型")
             for model in value["models"]:

@@ -67,6 +67,14 @@ def provider_models(config):
     return result
 
 
+def configured_provider_ids(cfg):
+    """Provider ids the catalog already lists models under (the
+    --provider-config setup); an imported provider may not reuse them."""
+    native = data.read_json(Path(cfg["provider_config"])) if cfg.get("provider_config") else None
+    providers = (native or {}).get("custom_providers") if isinstance(native, dict) else None
+    return set(providers) if isinstance(providers, dict) else set()
+
+
 class RunManager:
     # A worker rewrites its receipt every two seconds; one older than this
     # belongs to a worker that stopped.
@@ -229,7 +237,13 @@ class RunManager:
             reasons.append("auth_mode 必须是 metask 或 provider")
         signed_in = mode == "metask" and bool(models)
         known = {m["id"] for m in models}
-        models = models + [m for m in imported if m["id"] not in known]
+        # An import refuses these ids; a clash appears only when the
+        # --provider-config changes later. One id never names two routes.
+        shadowing = sorted({m["provider"] for m in imported if m["id"] in known})
+        for provider in shadowing:
+            warnings.append(f"导入的 Provider {provider} 与 --provider-config 中的同名 Provider 冲突，"
+                            "它的模型已隐藏；请删除后换一个标识重新导入")
+        models = models + [m for m in imported if m["provider"] not in shadowing]
         states, default_executor, problems = self.executor_states(cfg)
         reasons += problems
         global_reasons = list(reasons)
@@ -269,13 +283,16 @@ class RunManager:
                 "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
                 "bundles": [{k: v for k, v in b.items() if k != "source"} for b in bundle_choices(cfg, self.config_path)]}
 
-    def imported_route_problem(self, model):
+    def add_provider(self, request):
+        return self.providers.add(request, reserved=configured_provider_ids(settings(self.config_path)))
+
+    @staticmethod
+    def imported_route_problem(route):
         """route_problem for an imported provider's generated config."""
         import tempfile
         with tempfile.TemporaryDirectory(prefix="bench-provider-") as directory:
-            path = write_config(Path(directory) / "provider.json",
-                                self.providers.native_config(model.split("/", 1)[0]))
-            return route_problem({"auth_mode": "provider", "model": model, "provider_config": path})
+            path = write_config(Path(directory) / "provider.json", route["config"])
+            return route_problem({"auth_mode": "provider", "model": route["model"], "provider_config": path})
 
     def runs(self):
         result = []
@@ -322,9 +339,13 @@ class RunManager:
         if imported:
             if suite.runner == suites.WORKBUDDY:
                 raise ValueError("导入的 Provider 暂不支持 WorkBuddy 评测，请选择 Harbor 评测集")
+            # In Metask authentication the judge goes through the run's relay,
+            # which forwards to the imported upstream instead; in provider
+            # authentication it reads the execution host's variables, which
+            # do not depend on the agent's model, and stays allowed.
             if suites.judge(suite, settings(self.config_path)):
-                raise ValueError(suite.id + " 的 LLM 评委经 Metask 账号转发，导入的 Provider 暂不支持带评委的评测集")
-            problem = self.imported_route_problem(model)
+                raise ValueError(suite.id + " 的 LLM 评委经 Metask 账号转发，Metask 认证下导入的 Provider 不能运行带评委的评测集")
+            problem = self.imported_route_problem(self.providers.run_route(model))
             if problem:
                 raise ValueError(problem)
         elif catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
@@ -414,12 +435,16 @@ class RunManager:
                         "tasks": list(suite.tasks) if suite.tasks is not None else None,
                         "filters": list(tasks)}
             if imported:
-                # The run's own config (endpoint, model names, key variable);
-                # the worker reads the key from the private provider store.
-                spec.update(provider_config=write_config(self.records / (name + ".provider"),
-                                                         self.providers.native_config(imported)),
-                            key_env=PROVIDER_KEY_ENV, imported_provider=imported,
-                            providers_root=str(self.providers.root))
+                # The run's own config (endpoint, model names, key variable)
+                # and the revision it came from; the worker takes the key
+                # from the private store only while that revision is current.
+                route = self.providers.run_route(model)
+                problem = self.imported_route_problem(route)
+                if problem:
+                    raise ValueError(problem)
+                spec.update(provider_config=write_config(self.records / (name + ".provider"), route["config"]),
+                            model=route["model"], key_env=PROVIDER_KEY_ENV, imported_provider=imported,
+                            imported_revision=route["revision"], providers_root=str(self.providers.root))
             spec_path = self.records / (name + ".spec")
             atomic_json(spec_path, spec)
             try:

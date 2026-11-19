@@ -3,10 +3,17 @@
 Each entry is one OpenAI- or Anthropic-compatible endpoint with its key and
 model names. The models join the workbench catalog as `<provider>/<model>`
 next to the Metask account's. A run of such a model gets a generated native
-`custom_providers` config that holds no key; the key stays in this machine's
+`custom_providers` config that holds no key, under the internal provider id
+`bench-<provider>` (a configured provider may not take a built-in vendor's
+id, so `openai` stays importable). The key stays in this machine's
 private store (`<state root>/bench/providers.json`, mode 0600) and reaches
 upstream only through the run's credential relay, like a `--provider-config`
 key. Nothing here returns a key to the page, a spec, argv or a log.
+
+Every change of an entry's route (URL, protocol, auth or key) gives it a new
+`revision`. A run records the revision its config was generated from and its
+worker takes the key only from that same revision, so a run queued before an
+edit never pairs the old upstream with the new key.
 
 A probe sends one real request asking the model to echo a random string and
 passes only when the reply is that string.
@@ -34,6 +41,8 @@ AUTHS = {"bearer": "Authorization: Bearer", "x-api-key": "x-api-key"}
 PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 RESERVED = {"metask"}
+NATIVE_PREFIX = "bench-"
+ROUTE_FIELDS = ("base_url", "protocol", "auth", "api_key")
 MAX_PROVIDERS = 32
 MAX_MODELS = 64
 # The variable inside Harbor that holds the run's placeholder.
@@ -149,14 +158,19 @@ def reply_text(protocol, body):
 
 
 def echoed(reply, expected):
-    """Whether `reply` is exactly `expected`, ignoring surrounding
-    whitespace, quotes, backticks and a final period."""
-    if reply is None:
-        return False
-    value = reply.strip()
-    for _ in range(3):
-        value = value.strip().strip("`\"'“”‘’").rstrip("。.").strip()
-    return value == expected
+    """Whether the reply text is exactly `expected`. Only surrounding
+    whitespace (a trailing newline) is ignored; quotes, backticks or a
+    period mean the model did not echo verbatim."""
+    return reply is not None and reply.strip() == expected
+
+
+def origin(url):
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme, parts.netloc.lower()
+
+
+def native_id(provider_id):
+    return NATIVE_PREFIX + provider_id
 
 
 def probe_request(entry, model, expected):
@@ -227,8 +241,11 @@ class Providers:
             for model in entry.get("models") or []:
                 probe = (entry.get("probes") or {}).get(model) or {}
                 status = "" if not probe else " · 探测通过" if probe.get("ok") else " · 探测失败"
+                # Pass/fail only: replies and error bodies stay on the
+                # authorized provider page.
                 result.append({"id": entry["id"] + "/" + model, "label": (entry.get("name") or entry["id"]) + " / " + model + status,
-                               "source": "provider", "provider": entry["id"], "probe": probe or None})
+                               "source": "provider", "provider": entry["id"],
+                               "probe": {"ok": bool(probe.get("ok")), "at": probe.get("at")} if probe else None})
         return result
 
     def owner(self, model_id):
@@ -240,8 +257,11 @@ class Providers:
         return entry if entry and model in (entry.get("models") or []) else None
 
     # -------------------------------------------------------------- changes
-    def add(self, request):
-        """Import (or with `replace`, update) one provider; returns its public view."""
+    def add(self, request, reserved=()):
+        """Import (or with `replace`, update) one provider; returns its public view.
+
+        `reserved` are provider ids the workbench already lists models under
+        (a `--provider-config` setup); an import may not shadow them."""
         allowed = {"id", "name", "base_url", "api_key", "protocol", "auth", "models", "replace", "probe"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("只接受 " + "、".join(sorted(allowed - {"probe"})))
@@ -250,6 +270,8 @@ class Providers:
             raise ValueError("Provider 标识只能用小写字母、数字、- 和 _（1–32 个字符，字母或数字开头）")
         if provider_id in RESERVED:
             raise ValueError("Provider 标识 " + provider_id + " 已被 Metask 账号模型占用")
+        if provider_id in set(reserved):
+            raise ValueError("Provider 标识 " + provider_id + " 已被 --provider-config 中的 Provider 使用，请换一个标识")
         protocol = request.get("protocol") or "openai_chat"
         if protocol not in PROTOCOLS:
             raise ValueError("协议只能是 " + "、".join(PROTOCOLS))
@@ -268,6 +290,9 @@ class Providers:
         if key is None or key == "":
             if not existing:
                 raise ValueError("请填写 API Key")
+            # The saved key is only ever sent where it was given for.
+            if origin(existing["base_url"]) != origin(base_url):
+                raise ValueError("Base URL 换了主机或端口，请重新填写 API Key（不会把原 Key 发给新地址）")
             key = existing["api_key"]  # updating other fields keeps the saved key
         if not isinstance(key, str) or not key.strip() or len(key) > 4096 or any(c in key for c in "\r\n"):
             raise ValueError("API Key 无效")
@@ -278,9 +303,11 @@ class Providers:
         if not models:
             models = self.discover(entry)
         entry["models"] = models
-        keep = existing and all(existing.get(k) == entry[k] for k in ("base_url", "protocol", "auth", "api_key"))
-        # A probe describes this endpoint and key; changing either voids it.
+        keep = bool(existing) and existing.get("revision") and all(existing.get(k) == entry[k] for k in ROUTE_FIELDS)
+        # A probe describes this endpoint and key; changing either voids it,
+        # and so does a run queued against the old route (`revision`).
         entry["probes"] = {m: p for m, p in ((existing or {}).get("probes") or {}).items() if m in models} if keep else {}
+        entry["revision"] = existing["revision"] if keep else secrets.token_hex(8)
         entry["created_at"] = (existing or {}).get("created_at") or now()
         entry["updated_at"] = now()
 
@@ -348,26 +375,41 @@ class Providers:
         def update(entries):
             current = next((e for e in entries if e["id"] == provider_id), None)
             # Kept only while the probed endpoint and key are still the saved ones.
-            if current and model in (current.get("models") or []) and all(
-                    current.get(k) == entry.get(k) for k in ("base_url", "protocol", "auth", "api_key")):
+            if current and model in (current.get("models") or []) and current.get("revision") == entry.get("revision"):
                 current.setdefault("probes", {})[model] = result
         self.change(update)
         return {"provider": provider_id, **result}
 
     # -------------------------------------------------------------- runs
-    def native_config(self, provider_id):
-        """The run's `custom_providers` config: endpoint and model names, the
-        key only by variable name."""
+    def run_route(self, model_id):
+        """For a run of catalog id `<provider>/<model>`, from one read of the
+        store: the native config, the native model id and the revision the
+        worker must find again to take the key."""
+        provider_id, _, model = model_id.partition("/")
         entry = self.find(provider_id)
+        if model not in (entry.get("models") or []):
+            raise ValueError("Provider " + provider_id + " 没有模型 " + model[:80])
+        return {"config": self.native_config(entry), "model": native_id(provider_id) + "/" + model,
+                "revision": entry.get("revision")}
+
+    @staticmethod
+    def native_config(entry):
+        """A `custom_providers` config: endpoint and model names, the key
+        only by variable name."""
         auth = {"kind": "bearer"} if entry["auth"] == "bearer" else {"kind": "api_key_header", "header": "x-api-key"}
-        return {"schema_version": 1, "custom_providers": {entry["id"]: {
+        return {"schema_version": 1, "custom_providers": {native_id(entry["id"]): {
             "display_name": entry.get("name") or entry["id"], "auth": auth,
             "env_aliases": [{"name": KEY_ENV, "kind": "api_key", "canonical": True}],
             "channels": [{"id": "default", "base_url": entry["base_url"], "protocol": entry["protocol"]}],
             "models": [{"request_model_id": m} for m in entry.get("models") or []]}}}
 
-    def secret(self, provider_id):
-        return self.find(provider_id)["api_key"]
+    def secret(self, provider_id, revision):
+        """The key of `provider_id` as of `revision` (the one its run was
+        configured from); refuses once the route changed."""
+        entry = self.find(provider_id)
+        if not revision or entry.get("revision") != revision:
+            raise ValueError("Provider " + provider_id + " 在评测排队期间被修改（地址或 Key 已变），请重新发起评测")
+        return entry["api_key"]
 
 
 def write_config(path, document):

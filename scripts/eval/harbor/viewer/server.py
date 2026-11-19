@@ -264,7 +264,7 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                     self.send_json(logins.start(runtime_env()), 202)
                 elif path == "/api/providers":
                     probe = isinstance(payload, dict) and payload.get("probe") is True
-                    added = manager.providers.add(payload)
+                    added = manager.add_provider(payload)
                     if probe and added["models"]:
                         added["probe"] = manager.providers.probe(added["id"], added["models"][0]["name"])
                     self.send_json(added, 201)

@@ -167,9 +167,11 @@ def for_run(spec, env):
         source = SessionCredential(account) if account.session else StaticCredential(secret)
         return source, account.gateway
     if spec.get("imported_provider"):
-        # A provider imported by URL and key: the key is in the private store.
+        # A provider imported by URL and key: the key is in the private
+        # store, taken only from the revision the run's config came from.
         from scripts.eval.harbor.viewer.providers import Providers
-        return StaticCredential(Providers(spec["providers_root"]).secret(spec["imported_provider"])), None
+        store = Providers(spec["providers_root"])
+        return StaticCredential(store.secret(spec["imported_provider"], spec.get("imported_revision"))), None
     secret = env.get(spec["key_env"])
     if not secret:
         raise ValueError("执行服务缺少环境变量 " + spec["key_env"])

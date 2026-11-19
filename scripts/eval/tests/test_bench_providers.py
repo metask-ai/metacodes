@@ -31,7 +31,8 @@ KEY = 'imported-secret-key-1234'
 
 def fake_provider():
     """An OpenAI/Anthropic-compatible endpoint. Model `echo` repeats the
-    string it is asked for, `wrong` answers something else, `broken` fails."""
+    string it is asked for, `period` repeats it with a final period,
+    `wrong` answers something else, `broken` fails."""
     calls = []
 
     class Endpoint(BaseHTTPRequestHandler):
@@ -70,9 +71,9 @@ def fake_provider():
             if model == 'broken':
                 self.reply({'error': {'message': 'model overloaded'}}, 503)
                 return
-            text = expected if model == 'echo' else 'Sure! ' + expected[::-1]
+            text = {'echo': expected, 'period': expected + '.'}.get(model, 'Sure! ' + expected[::-1])
             if self.path == '/v1/chat/completions':
-                self.reply({'choices': [{'message': {'role': 'assistant', 'content': '"' + text + '"\n'}}]})
+                self.reply({'choices': [{'message': {'role': 'assistant', 'content': text + '\n'}}]})
             elif self.path == '/v1/messages':
                 self.reply({'content': [{'type': 'thinking', 'thinking': 'x'}, {'type': 'text', 'text': text}]})
             elif self.path == '/v1/responses':
@@ -101,8 +102,10 @@ class HelpersTest(unittest.TestCase):
 
     def test_echo_must_be_the_exact_string(self):
         self.assertTrue(echoed('mc-echo-ab12', 'mc-echo-ab12'))
-        self.assertTrue(echoed(' "mc-echo-ab12".\n', 'mc-echo-ab12'))
-        self.assertTrue(echoed('`mc-echo-ab12`', 'mc-echo-ab12'))
+        self.assertTrue(echoed(' mc-echo-ab12\n', 'mc-echo-ab12'))
+        for extra in ('"mc-echo-ab12"', 'mc-echo-ab12.', '`mc-echo-ab12`', 'mc-echo-ab12。', "'mc-echo-ab12'"):
+            with self.subTest(extra=extra):
+                self.assertFalse(echoed(extra, 'mc-echo-ab12'))
         self.assertFalse(echoed('Sure: mc-echo-ab12', 'mc-echo-ab12'))
         self.assertFalse(echoed('mc-echo-ab13', 'mc-echo-ab12'))
         self.assertFalse(echoed(None, 'mc-echo-ab12'))
@@ -133,22 +136,27 @@ class ProviderStoreTest(unittest.TestCase):
         self.assertNotIn(KEY, json.dumps(added))
         self.assertNotIn(KEY, json.dumps(self.store.listing()))
         self.assertNotIn(KEY, json.dumps(self.store.models()))
-        self.assertEqual(self.store.secret('gw'), KEY)
+        self.assertEqual(self.store.secret('gw', self.store.find('gw')['revision']), KEY)
         if POSIX:
             self.assertEqual(stat.S_IMODE(self.store.path.stat().st_mode), 0o600)
         # The run's config names the key's variable, never the key.
-        native = self.store.native_config('gw')
-        self.assertNotIn(KEY, json.dumps(native))
-        self.assertEqual(native['custom_providers']['gw']['env_aliases'][0]['name'], providers.KEY_ENV)
+        route = self.store.run_route('gw/echo')
+        self.assertNotIn(KEY, json.dumps(route))
+        self.assertEqual(route['model'], 'bench-gw/echo')
+        native = route['config']
+        self.assertEqual(native['custom_providers']['bench-gw']['env_aliases'][0]['name'], providers.KEY_ENV)
 
     def test_probe_passes_only_when_the_model_echoes_the_random_string(self):
-        self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['echo', 'wrong', 'broken']})
+        self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['echo', 'period', 'wrong', 'broken']})
         ok = self.store.probe('gw', 'echo')
         self.assertTrue(ok['ok'], ok)
         self.assertTrue(ok['expected'].startswith('mc-echo-'))
-        self.assertEqual(ok['reply'], '"' + ok['expected'] + '"')
+        self.assertEqual(ok['reply'], ok['expected'])
         sent = self.calls[-1][3]['messages'][0]['content']
         self.assertTrue(sent.endswith(ok['expected']))
+        period = self.store.probe('gw', 'period')
+        self.assertFalse(period['ok'], period)
+        self.assertEqual(period['reply'], period['expected'] + '.')
         wrong = self.store.probe('gw', 'wrong')
         self.assertFalse(wrong['ok'])
         self.assertIn('不一致', wrong['error'])
@@ -158,7 +166,11 @@ class ProviderStoreTest(unittest.TestCase):
         # A fresh string each time.
         self.assertNotEqual(self.store.probe('gw', 'echo')['expected'], ok['expected'])
         probes = {m['name']: m['probe'] for m in self.store.listing()['providers'][0]['models']}
-        self.assertEqual({k: v['ok'] for k, v in probes.items()}, {'echo': True, 'wrong': False, 'broken': False})
+        self.assertEqual({k: v['ok'] for k, v in probes.items()}, {'echo': True, 'period': False, 'wrong': False, 'broken': False})
+        # The catalog (readable without the capability) carries pass/fail only.
+        catalog = {m['id']: m for m in self.store.models()}
+        self.assertEqual(set(catalog['gw/broken']['probe']), {'ok', 'at'})
+        self.assertNotIn('overloaded', json.dumps(catalog))
         labels = {m['id']: m['label'] for m in self.store.models()}
         self.assertIn('探测通过', labels['gw/echo'])
         self.assertIn('探测失败', labels['gw/wrong'])
@@ -191,12 +203,44 @@ class ProviderStoreTest(unittest.TestCase):
         renamed = self.store.add({'id': 'gw', 'name': 'Renamed', 'base_url': self.url, 'models': ['echo'], 'replace': True})
         self.assertEqual(renamed['name'], 'Renamed')
         self.assertTrue(renamed['models'][0]['probe']['ok'])
-        self.assertEqual(self.store.secret('gw'), KEY)
+        revision = self.store.find('gw')['revision']
+        self.assertEqual(self.store.secret('gw', revision), KEY)
         rekeyed = self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': 'another-key-5678',
                                   'models': ['echo'], 'replace': True})
         self.assertIsNone(rekeyed['models'][0]['probe'])
+        # A run configured from the old revision does not get the new key.
+        with self.assertRaisesRegex(ValueError, '排队期间被修改'):
+            self.store.secret('gw', revision)
         self.store.remove('gw')
         self.assertEqual(self.store.listing()['providers'], [])
+
+    def test_a_saved_key_is_never_sent_to_a_new_origin(self):
+        self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']})
+        other, other_calls = fake_provider()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        moved = f'http://127.0.0.1:{other.server_port}/v1'
+        for models in ([], ['echo']):  # with discovery and without
+            with self.subTest(models=models), self.assertRaisesRegex(ValueError, '重新填写 API Key'):
+                self.store.add({'id': 'gw', 'base_url': moved, 'models': models, 'replace': True})
+        self.assertEqual(other_calls, [])
+        self.assertEqual(self.store.find('gw')['base_url'], self.url + '/v1')
+        # Same origin, another protocol: the key stays and the revision moves.
+        before = self.store.find('gw')['revision']
+        self.store.add({'id': 'gw', 'base_url': self.url, 'protocol': 'openai_responses', 'models': ['echo'], 'replace': True})
+        self.assertEqual(self.store.secret('gw', self.store.find('gw')['revision']), KEY)
+        self.assertNotEqual(self.store.find('gw')['revision'], before)
+        moved_entry = self.store.add({'id': 'gw', 'base_url': moved, 'api_key': 'new-key-for-new-host', 'models': ['echo'],
+                                      'replace': True})
+        self.assertEqual(moved_entry['base_url'], moved)
+
+    def test_builtin_vendor_ids_import_under_an_internal_native_id_and_configured_ids_are_reserved(self):
+        self.store.add({'id': 'openai', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']})
+        route = self.store.run_route('openai/echo')
+        self.assertEqual(list(route['config']['custom_providers']), ['bench-openai'])
+        with self.assertRaisesRegex(ValueError, '--provider-config'):
+            self.store.add({'id': 'tokenjoy', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']},
+                           reserved={'tokenjoy'})
 
     def test_invalid_requests_are_refused(self):
         for request in ({'id': 'Bad Id', 'base_url': self.url, 'api_key': KEY, 'models': ['m']},
@@ -213,8 +257,9 @@ class ProviderStoreTest(unittest.TestCase):
     def test_generated_config_routes_through_the_credential_relay(self):
         self.store.add({'id': 'claude', 'base_url': 'https://api.example.com/v1', 'api_key': KEY,
                         'protocol': 'anthropic_messages', 'models': ['m']})
-        path = providers.write_config(self.root / 'run.provider', self.store.native_config('claude'))
-        spec = {'auth_mode': 'provider', 'provider_config': path, 'model': 'claude/m'}
+        route = self.store.run_route('claude/m')
+        path = providers.write_config(self.root / 'run.provider', route['config'])
+        spec = {'auth_mode': 'provider', 'provider_config': path, 'model': route['model']}
         self.assertIsNone(route_problem(spec))
         self.assertEqual(upstream_for(spec), 'https://api.example.com')
         self.assertEqual(auth_for(spec), ('x-api-key', ''))
@@ -317,6 +362,9 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertEqual(json.loads((job / 'relay-statuses.json').read_text()), [200])
         argv = json.loads((job / 'argv.json').read_text())
         self.assertIn(providers.KEY_ENV + '=${' + providers.KEY_ENV + '}', argv)
+        # Harbor runs the internal native id; the run record keeps the catalog id.
+        self.assertEqual(argv[argv.index('-m') + 1], 'bench-local/echo')
+        self.assertEqual(final['model'], 'local/echo')
         container = json.loads((job / 'container-env.json').read_text())
         self.assertTrue(container[providers.KEY_ENV].startswith('mcb-'), container)
         config = next(a.removeprefix('config=') for a in argv if a.startswith('config='))
@@ -339,6 +387,39 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertTrue(catalog['ready'], catalog['reasons'])
         self.assertEqual([m['id'] for m in catalog['models']], ['local/echo'])
         self.assertTrue(any('TOKENJOY_API_KEY' in w for w in catalog['warnings']), catalog['warnings'])
+
+    def test_an_edit_after_launch_is_never_paired_with_the_old_route(self):
+        from scripts.eval.harbor.viewer import credentials
+        base = f'http://127.0.0.1:{self.upstream.server_port}'
+        self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
+        route = self.manager.providers.run_route('local/echo')
+        spec = {'auth_mode': 'provider', 'imported_provider': 'local', 'imported_revision': route['revision'],
+                'providers_root': str(self.manager.providers.root), 'key_env': providers.KEY_ENV}
+        self.assertEqual(credentials.for_run(spec, {})[0].current(), KEY)
+        # Same id moved to another gateway with another key while queued.
+        self.client.request('api/providers', {'id': 'local', 'base_url': 'http://127.0.0.2:9', 'api_key': 'other-key-0000',
+                                              'models': ['echo'], 'replace': True})
+        with self.assertRaisesRegex(ValueError, '排队期间被修改'):
+            credentials.for_run(spec, {})
+
+    def test_provider_config_ids_cannot_be_imported_and_a_later_clash_is_hidden(self):
+        base = f'http://127.0.0.1:{self.upstream.server_port}'
+        with self.assertRaisesRegex(ValueError, '--provider-config'):
+            self.client.request('api/providers', {'id': 'tokenjoy', 'base_url': base, 'api_key': KEY,
+                                                  'models': ['test-model', 'echo']})
+        # A clash that appears afterwards (the store written before the
+        # --provider-config changed) never routes the id to the import.
+        self.manager.providers.add({'id': 'tokenjoy', 'base_url': base, 'api_key': KEY, 'models': ['test-model', 'echo']})
+        catalog = self.client.request('api/workbench')
+        ids = [m['id'] for m in catalog['models']]
+        self.assertEqual(ids.count('tokenjoy/test-model'), 1)
+        self.assertNotIn('tokenjoy/echo', ids)
+        self.assertTrue(any('冲突' in w for w in catalog['warnings']), catalog['warnings'])
+        run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})
+        spec = json.loads((self.manager.records / (run['name'] + '.spec')).read_text())
+        self.assertNotIn('imported_provider', spec)
+        self.assertEqual(spec['provider_config'], json.loads(self.manager.config_path.read_text())['provider_config'])
+        wait_run(self.manager, run['name'])
 
     def test_judged_and_workbuddy_suites_refuse_imported_models(self):
         self.client.request('api/providers', {'id': 'local', 'base_url': f'http://127.0.0.1:{self.upstream.server_port}',
