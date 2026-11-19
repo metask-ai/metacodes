@@ -419,7 +419,7 @@ test "the Coding Plan key pages are plan pages, checked on the plan's own endpoi
     try std.testing.expectEqual(@as(usize, 4), setup.pages.len);
     for (setup.pages) |page| {
         // Never the standard API-key page, whose keys bill the balance.
-        try std.testing.expect(std.mem.indexOf(u8, page.url, "usercenter/proj-mgmt/apikeys") == null);
+        try std.testing.expect(std.mem.indexOf(u8, page.url.?, "usercenter/proj-mgmt/apikeys") == null);
         try std.testing.expect(std.mem.indexOf(u8, page.check_url.?, "/api/coding/paas/v4/models") != null);
     }
     // The default page follows the channel's region.

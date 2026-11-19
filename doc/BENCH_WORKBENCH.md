@@ -198,3 +198,19 @@ Harbor orchestration layer.
 Contract tests use real HTTP and a subprocess standing in for Harbor, proving
 that UI/CLI input reaches the child argv, creates a visible job, preserves
 exit status, and supports cancellation without making paid requests.
+
+## Code layout
+
+The runtime and its two presentations are separate packages under
+`scripts/eval/harbor/`:
+
+| Layer | Files | Owns |
+|---|---|---|
+| Runtime | `bench/` | job projection (`data.py`), account models and keys (`account.py`), launch validation (`runner.py`), the durable worker (`worker.py`), the `Workbench` facade both presentations read (`workbench.py`) and its HTTP client (`client.py`) |
+| Web page | `viewer/server.py`, `viewer/static/` | HTTP routes, authorization, the page |
+| CLI | `cli.py` | arguments, service startup, terminal output |
+
+The runtime imports neither presentation, and the two presentations do not
+import each other (`LayeringTest` in `scripts/eval/tests/test_bench_workbench.py`).
+A change to how runs execute or how results are classified goes in `bench/`;
+both the page and `metacodes bench list`/`info` pick it up.
