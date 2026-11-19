@@ -456,6 +456,26 @@ FileContent = Union[str, bytes]
 EXECUTABLE_NAMES = frozenset({"solve.sh", "test.sh"})
 
 
+# Bumped whenever the files a dataset writes change shape (including their
+# metadata), so prepared datasets are regenerated. 2: content-derived mtimes.
+LAYOUT_VERSION = 2
+# 2001-09-09; content-derived offsets stay well inside 32-bit time.
+_MTIME_BASE = 1_000_000_000
+
+
+def content_mtime(data: bytes) -> int:
+    """A stable modification time derived from the file's bytes.
+
+    BuildKit's incremental context transfer treats a file whose path, size and
+    mtime match an earlier build's as unchanged and reuses the old bytes. Tasks
+    generated in the same second have same-sized per-task files (e.g. a
+    33-byte ALFWorld oracle token), so a build could receive another task's
+    content. Deriving the mtime from the content makes different bytes differ
+    in mtime as well, while identical bytes keep identical metadata.
+    """
+    return _MTIME_BASE + int.from_bytes(hashlib.sha256(data).digest()[:4], "big") % (1 << 28)
+
+
 def write_task(task_dir: Path, files: Mapping[str, FileContent]) -> None:
     """Write one task directory; *.sh scripts Harbor runs are made executable."""
     for rel, content in sorted(files.items()):
@@ -467,6 +487,8 @@ def write_task(task_dir: Path, files: Mapping[str, FileContent]) -> None:
             path.chmod(0o755)
         else:
             path.chmod(0o644)
+        stamp = content_mtime(data)
+        os.utime(path, (stamp, stamp))
 
 
 def shell_heredoc_file(path: str, content: str) -> str:
@@ -599,7 +621,7 @@ def prepare_dataset(
 
 
 def fingerprint_of(*parts: object, files: Sequence[Path] = ()) -> str:
-    digest = hashlib.sha256(json.dumps(parts, sort_keys=True, default=_jsonable).encode("utf-8"))
+    digest = hashlib.sha256(json.dumps([LAYOUT_VERSION, *parts], sort_keys=True, default=_jsonable).encode("utf-8"))
     for path in files:
         digest.update(path.name.encode("utf-8") + b"\0" + path.read_bytes())
     return digest.hexdigest()

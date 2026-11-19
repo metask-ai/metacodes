@@ -822,6 +822,25 @@ class AlfworldTest(TaskChecks):
         alfworld.build({alfworld.PIN.name: self._archive()}, out)
         return out
 
+    def test_per_task_build_files_never_share_size_and_mtime(self) -> None:
+        # BuildKit reuses a context file whose path, size and mtime match an
+        # earlier build's; on a real host one task's sidecar got another
+        # task's 33-byte oracle token that way and the oracle scored 0.
+        out = self._build()
+        seen = {}
+        for task in alfworld.tasks(out):
+            for path in (out / task / "environment").rglob("*"):
+                if not path.is_file():
+                    continue
+                key = (path.relative_to(out / task).as_posix(), path.stat().st_size, int(path.stat().st_mtime))
+                if key in seen:
+                    self.assertEqual(seen[key], path.read_bytes(), key)
+                seen[key] = path.read_bytes()
+        tokens = [(out / t / "environment/alfworld-env/oracle_token") for t in alfworld.tasks(out)]
+        self.assertEqual(len({p.stat().st_size for p in tokens}), 1)
+        self.assertEqual(len({int(p.stat().st_mtime) for p in tokens}), len(tokens))
+        self.assertEqual(c.content_mtime(b"same"), c.content_mtime(b"same"))
+
     def test_generation_and_structure(self) -> None:
         out = self._build()
         ids = alfworld.tasks(out)
