@@ -31,6 +31,20 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 ```
 
+**本机并行**:全套逐个跑要近半小时,时间几乎都在等屏幕安静(#588)。`--jobs N` 起 N 个 worker
+子进程同时跑,结果汇总成一份,退出码同上:
+
+```bash
+TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --jobs 3
+```
+
+- 每个用例有时限(`--case-timeout 秒`,默认 120,最慢的用例约 30s)。超时的用例判失败(结果行标
+  `(超时)`),它所在的 worker 被杀掉、换新的接着跑,一个卡死的用例(#569)拖不住整轮。
+- 让 metacodes 在固定端口(1455/1457)等登录回调的用例(`run_tty_tests.EXCLUSIVE_MODULES`)同一
+  时刻只跑一个;新加这类用例要登记进去。其余用例各用自己的临时 HOME、工作目录和随机端口,可以并行。
+- 可以和 `--shard`、`-k` 一起用:先选出用例,再并行跑。不加 `--jobs` 时行为不变(逐个跑、无时限)。
+- CI 仍按分片放在多台 runner 上,不在一台上并行。
+
 ## 结构
 
 - `screen.py` —— 终端模拟器:最小 ANSI 解释器(CSI A/C/G/K/H/m + \r\n 底部上滚)
