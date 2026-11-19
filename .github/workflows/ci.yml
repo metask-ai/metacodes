@@ -263,13 +263,12 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
           restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
-      # First on every leg, before the Lean kernel and the suites: the checks
-      # that only read the source (`zig fmt --check`, the source guards, the
-      # discipline scans, `git diff --check`) end the leg in seconds. Inside
-      # the suites `zig build` reports a failed guard only after every other
-      # step has run (#587).
-      - name: Source-only checks
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+      # The source-level guards (fmt, the boundary gates, the discipline
+      # scans, git diff --check) take seconds, and the build runner has no
+      # fail-fast: inside a suite step a failed guard is reported only when
+      # the whole leg has finished. So every leg runs them first (#587).
+      - name: Source-level guards
+        if: (matrix.units || matrix.product || matrix.release || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build gate:static
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
@@ -1045,10 +1044,9 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
-      # As in `gates-linux`: first, on every leg. After the line endings are
-      # normalized, since `zig fmt --check` and the scans read the bytes.
-      - name: Source-only checks
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+      # As in `gates-linux`: the source-level guards first, on every leg.
+      - name: Source-level guards
+        if: (matrix.units || matrix.integration || matrix.product || matrix.release) && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: zig build gate:static
       # PyYAML for the Python suites that `zig build test` runs; see

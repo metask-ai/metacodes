@@ -608,7 +608,7 @@ const GeminiStream = struct {
                     client_mod.reportBodyStall("gemini", self.id, stall);
                     return error.StreamStalled;
                 }
-                log.warnId("gemini", self.id, "stream read failed: {s}", .{@errorName(err)});
+                log.warnId("gemini", self.id, "stream read failed: {s} ({f})", .{ @errorName(err), client_mod.ReadFailure.of(self.request, &self.response.head) });
                 return api_stream.midStreamReadError(err);
             };
             const line = line_opt orelse {
