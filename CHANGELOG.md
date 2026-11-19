@@ -400,6 +400,48 @@ status, compatibility boundaries, and entry points are defined by
   device-code sign-in, the `x-codex-*` usage headers and zstd request bodies
   are not done.
 
+- **`metacodes providers add|probe|list|remove`: a model API of your own
+  without writing JSON** (`doc/PROVIDERS.md`). `providers add <id> --base-url
+  <url> --protocol <wire> --model <id>` writes `custom_providers.<id>` in
+  `<state root>/config.json` — a relay, a company gateway, Ollama or vLLM on
+  this machine, a vendor's coding-plan address — after checking the whole file
+  the way `--check-providers` does, inside the lock that writes it; a
+  definition that would not load, an address the endpoint policy refuses
+  (plain http to another machine, a user name or password in the URL), a
+  built-in id and a key variable another provider reads are refused before
+  anything is written, and every other key of the file keeps its content and
+  order. A relay that serves several protocols is one provider with one
+  channel per `--protocol`. `--probe` asks the endpoint's model list (OpenAI
+  `/models`, Anthropic `/v1/models` with `anthropic-version`, Gemini
+  `/v1beta/models`; the standard `data` array or an enriched `models` map), at
+  a terminal lets you pick, and writes the limits it reports; `providers
+  probe` lists without storing. With no arguments at a terminal, `add` asks
+  for each part. A server on this machine that needs no key (Ollama, vLLM)
+  gets the placeholder `none` stored as its key when you answer "none" (or
+  press Enter at `--probe`'s key prompt): a provider with no key does not
+  start, and such a server ignores it. `--replace` changes an existing one
+  and keeps what was written by hand. `providers remove` takes the
+  definition, its settings, its stored key and login, and a default on one of
+  its models. Each change applies from the next start, and the commands say
+  so.
+
+- **A provider of your own takes a pasted key.** `/login <id>` and `metacodes
+  login --provider <id>` now work for a provider defined in
+  `custom_providers`: there is no page to open, so they go straight to the
+  paste, check the key against the provider's model list the way its requests
+  send it, and store it in `<state root>/keys/<id>.json`, which only that
+  provider reads. The check may be plain http to a server on this machine,
+  as the provider's own requests may.
+
+- **A coding plan of your own can say it is one.** `providers add
+  --subscription-plan` (or `"subscription_plan": true` in `custom_providers`)
+  marks a provider you define as a subscription plan, as `kimi-code` and
+  `zai-coding-plan` are: a `-p`, `serve`, resumed-suspension or piped start on
+  it prints the one-line warning that its terms may not cover them. The coding
+  plans of Alibaba Cloud Model Studio and Volcano Engine Ark, which
+  `doc/PROVIDERS.md` shows defined this way, limit their keys to interactive
+  use in coding tools.
+
 - **A Linux sandbox backend: bubblewrap.** With `sandbox.enabled`, Bash,
   Monitor, skill `!` lines, the teamwork reviewer's check command and the
   Claude Code seat's CLI now run on Linux in bwrap mount, pid and IPC
@@ -587,6 +629,14 @@ status, compatibility boundaries, and entry points are defined by
   state root is read from this release on.
 
 ### Fixed
+
+- **`/providers remove <id>` no longer leaves a defined provider behind.** For
+  a provider defined in `custom_providers` it removed only its settings
+  (`providers.<id>`), so the definition stayed in `config.json` and the
+  provider came back at the next start. It now removes it whole, as
+  `metacodes providers remove` does: the definition, its settings, its stored
+  key and login, and a default on one of its models. A built-in vendor still
+  loses only its settings.
 
 - **An OpenRouter catalog reads what OpenRouter's API answers today**
   (`src/provider/openrouter.zig`). Fed the live documents of 2026-11-18,
