@@ -146,7 +146,8 @@ class RunManager:
         known = set(tasks)
         return {"id": suite.id, "tasks": tasks, "default_tasks": [t for t in suite.default_tasks if t in known]}
 
-    def suite_entry(self, suite, ctx, global_reasons, harbor_reasons, states, default_executor):
+    def suite_entry(self, suite, ctx, global_reasons, harbor_reasons, states, default_executor,
+                    workbench_harbor="unknown"):
         """A suite's catalog entry with its readiness on every executor.
 
         `executors[name].reasons` is everything that keeps this suite from
@@ -164,6 +165,10 @@ class RunManager:
                     "不支持 SSH 执行机器 " + state["name"]]
             else:
                 combo = harbor_reasons + state["reasons"]
+                if suite.runner == suites.HARBOR_REGISTRY and state["kind"] == "ssh" and not workbench_harbor:
+                    combo = combo + [f"工作台本机缺少 Harbor：SSH 执行机器的注册表评测集（{suite.dataset}）"
+                                     "先在工作台用 harbor download 下载再发送到执行机器；请在工作台运行 "
+                                     "metacodes bench setup，或 uv tool install harbor==0.26.0"]
             problems = global_reasons + combo + own
             by_executor[state["name"]] = {"ready": not problems, "reasons": problems}
         default = by_executor.get(default_executor) or {"reasons": global_reasons + own}
@@ -220,8 +225,10 @@ class RunManager:
         except ValueError:
             harbor_reasons.append("请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本")
         ctx = self.suite_context(cfg)
-        catalog_suites = [self.suite_entry(s, ctx, global_reasons, harbor_reasons, states, default_executor)
-                          for s in suites.ALL]
+        # Registry suites on SSH executors are downloaded on this machine.
+        local_harbor = executors.workbench_harbor(cfg) if any(s["kind"] == "ssh" for s in states) else None
+        catalog_suites = [self.suite_entry(s, ctx, global_reasons, harbor_reasons, states, default_executor,
+                                           local_harbor) for s in suites.ALL]
         # Top-level readiness keeps its original meaning: the default suite
         # on the default executor.
         default_entry = next(e for e in catalog_suites if e["id"] == suites.DEFAULT_SUITE)
@@ -353,6 +360,14 @@ class RunManager:
                 if suite.runner == suites.HARBOR_LOCAL and executor.kind == "ssh":
                     # Shipped to the executor, addressed by content digest.
                     spec["local_dataset"] = str(ctx.dataset_dir(suite).resolve())
+                if suite.runner == suites.HARBOR_REGISTRY and executor.kind == "ssh":
+                    # Downloaded on this machine (cached per reference), then
+                    # shipped and run with `-p`, whose task names are bare.
+                    spec["registry_download"] = {
+                        "ref": suite.dataset, "cache": str(self.config_path.parent / "registry-cache"),
+                        "harbor": executors.workbench_harbor(cfg),
+                        "tasks": list(suite.tasks) if suite.tasks is not None else None,
+                        "filters": list(tasks)}
             spec_path = self.records / (name + ".spec")
             atomic_json(spec_path, spec)
             try:

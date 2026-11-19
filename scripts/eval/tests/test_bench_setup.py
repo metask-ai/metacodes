@@ -95,15 +95,37 @@ elif name == "docker":
         sys.exit(0 if running else 1)
     if args[:1] == ["run"] and "uname" in args:
         print("x86_64")
+    if args[:1] == ["run"] and "wget" in args:
+        # A container fetching a URL (setup's egress probe): really fetched.
+        import urllib.request
+        try:
+            with urllib.request.urlopen(args[-1], timeout=10) as response:
+                sys.stdout.write(response.read().decode())
+        except Exception as exc:
+            print("wget: " + str(exc), file=sys.stderr)
+            sys.exit(1)
+    images = state / "images"
+    if args[:2] == ["image", "inspect"]:
+        sys.exit(0 if (images / args[2].replace("/", "_")).exists() else 1)
+    if args[:1] == ["pull"]:
+        images.mkdir(exist_ok=True)
+        (images / args[1].replace("/", "_")).touch()
+    if args[:1] == ["tag"]:
+        images.mkdir(exist_ok=True)
+        (images / args[2].replace("/", "_")).touch()
+elif name == "systemctl":
+    pass
 elif name == "colima":
     if args[:1] == ["status"]:
         sys.exit(0 if (state / "colima-running").exists() else 1)
     if args[:1] == ["start"]:
         (state / "colima-running").touch()
 elif name == "ssh":
-    i = 0
+    i, reverse = 0, None
     while args[i].startswith("-"):
-        i += 2 if args[i] in ("-o", "-p", "-i") else 1
+        if args[i] == "-R":
+            reverse = args[i + 1]
+        i += 2 if args[i] in ("-o", "-p", "-i", "-R") else 1
     destination, command = args[i], " ".join(args[i + 1:])
     mode = env.get("FAKE_SSH_MODE", "ok")
     if mode == "deny":
@@ -117,7 +139,8 @@ elif name == "ssh":
               "FAKE_UNAME": "Linux", "FAKE_SUDO": env.get("FAKE_REMOTE_SUDO", ""),
               "FAKE_DOCKER_DAEMON": env.get("FAKE_REMOTE_DOCKER_DAEMON", "")}
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
-                "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL"):
+                "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
+                "FAKE_EGRESS_FETCH"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -127,6 +150,40 @@ elif name == "ssh":
             sys.exit(1)
         time.sleep(float(env.get("FAKE_SSH_PACK_DELAY") or 0))
     os.chdir(home)
+    if reverse:
+        # `-R 127.0.0.1:R:127.0.0.1:L`: the "executor" is this machine, so
+        # the remote end listens on loopback port R and relays to L, for the
+        # life of the session (ExitOnForwardFailure: a busy port fails it).
+        import socket, threading
+        _, rport, _, lport = reverse.split(":")
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", int(rport)))
+        except OSError:
+            print("Error: remote port forwarding failed for listen port " + rport, file=sys.stderr)
+            sys.exit(255)
+        listener.listen(16)
+        def one_way(a, b):
+            try:
+                while True:
+                    chunk = a.recv(65536)
+                    if not chunk:
+                        break
+                    b.sendall(chunk)
+            except OSError:
+                pass
+            try:
+                b.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        def serve():
+            while True:
+                conn, _ = listener.accept()
+                upstream = socket.create_connection(("127.0.0.1", int(lport)))
+                threading.Thread(target=one_way, args=(conn, upstream), daemon=True).start()
+                threading.Thread(target=one_way, args=(upstream, conn), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        sys.exit(subprocess.call(["/bin/sh", "-c", command], env=remote))
     os.execve("/bin/sh", ["sh", "-c", command], remote)
 elif name == "sysctl":
     print(env.get("FAKE_HV_SUPPORT", "1"))
@@ -142,7 +199,8 @@ elif name == "metacodes":
     print("Open https://example.invalid/device and enter the code ABCD-1234", file=sys.stderr, flush=True)
 '''
 
-SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig", "metacodes", "sysctl")
+SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig", "metacodes", "sysctl",
+          "systemctl")
 SYSTEM_TOOLS = ("sh", "env", "mkdir", "tar", "cp", "chmod", "rm", "mv", "mktemp", "touch", "cat", "python3",
                 "openssl", "grep", "sed", "ls", "id", "head", "tail", "dirname", "basename", "true", "false", "git")
 
@@ -198,7 +256,7 @@ class SetupFixture(unittest.TestCase):
         (self.templates / "harbor").write_text(FAKE_HARBOR.format(python=sys.executable))
         (self.templates / "harbor").chmod(0o755)
         os.symlink(self.templates / "brew", self.local_bin / "brew")  # Homebrew is present locally
-        for tool in ("uname", "curl", "sudo", "ssh", "zig", "sysctl"):
+        for tool in ("uname", "curl", "sudo", "ssh", "zig", "sysctl", "systemctl"):
             os.symlink(self.templates / tool, self.common / tool)
         # Only these host tools are visible: a host's own docker, brew, ip or
         # apt-get must not change which branch a step takes.
@@ -233,6 +291,15 @@ class SetupFixture(unittest.TestCase):
         self.addCleanup(self.release.server_close)
         self.addCleanup(self.release.shutdown)
         os.environ["METACODES_RELEASE_BASE"] = f"http://127.0.0.1:{self.release.server_port}"
+        # The network step never leaves this machine: every target answers
+        # (the release server), unless a test says otherwise. daemon.json
+        # is a file of the fixture.
+        self.reachable = f"http://127.0.0.1:{self.release.server_port}/"
+        self.daemon_json = root / "etc-docker" / "daemon.json"
+        for patcher in (patch.object(setup, "NETWORK_TARGETS", {k: self.reachable for k in setup.NETWORK_TARGETS}),
+                        patch.object(setup, "NETWORK_TIMEOUT", 2), patch.object(setup, "DAEMON_JSON", str(self.daemon_json))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.state = root / "bench-state"
         self.config = self.state / "bench" / "workbench.json"
         native = root / "provider.json"
@@ -518,6 +585,9 @@ class SshExecutorTest(SetupFixture):
     def test_remote_setup_installs_over_ssh_and_ships_runtime_once(self):
         self.add_ssh_executor()
         os.environ.update(FAKE_REMOTE_SUDO="1", FAKE_REMOTE_DOCKER_DAEMON="1")
+        # The workbench machine's own Harbor (registry suites are downloaded
+        # here) is installed with this machine's uv.
+        os.symlink(self.templates / "uv", self.local_bin / "uv")
         progress = setup.run_setup(self.config, "relay-4090")
         self.assertEqual(progress["status"], "ready", json.dumps(progress, ensure_ascii=False, indent=1))
         ssh_commands = [c[1][-1] for c in self.calls("ssh")]
@@ -839,21 +909,68 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertIn("[relay-4090] WorkBuddy 评测只能在本机执行器运行", text)
 
     def test_registry_suite_runs_on_ssh_executor_into_the_store(self):
+        """A registry suite on an SSH executor is downloaded on the workbench
+        machine (cached per reference), shipped by content digest and run
+        with `-p` and bare task names."""
         manager, client, _ = self.prepare_remote()
-        os.environ["FAKE_EXPECT_ACCOUNT_KEY"] = "session-access"
-        run = client.request("api/runs", {"suite": "aime-2025", "model": "metask/session-model",
-                                          "tasks": ["aime_i-1", "aime_ii-15"], "executor": "relay-4090"})
-        self.assertEqual((run["suite"], run["executor"]), ("aime-2025", "relay-4090"))
+        downloads = self.root / "downloads.log"
+        os.environ.update(FAKE_EXPECT_ACCOUNT_KEY="session-access", FAKE_HARBOR_DOWNLOAD_LOG=str(downloads))
+        remote_root = (self.remote_home / ".metacodes-bench").resolve()
+        cache = self.state / "bench" / "registry-cache" / executors.registry_cache_key("aime@1.0")
+        names = []
+        for suite_id, tasks in (("aime-2025", ["aime_i-1", "aime_ii-15"]), ("aime", ["aime_60"])):
+            run = client.request("api/runs", {"suite": suite_id, "model": "metask/session-model",
+                                              "tasks": tasks, "executor": "relay-4090"})
+            self.assertEqual((run["suite"], run["executor"]), (suite_id, "relay-4090"))
+            final = wait_run(manager, run["name"])
+            self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+            argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+            self.assertNotIn("-d", argv)
+            digest = executors.tree_digest(cache / "aime", executors.tree_files(cache / "aime"))
+            self.assertEqual(argv[argv.index("-p") + 1], str(remote_root / "datasets" / digest))
+            self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], tasks)
+            names.append(run["name"])
+        # Both suites share aime@1.0: one download, one shipped copy.
+        self.assertEqual(downloads.read_text().split(), ["aime@1.0"])
+        self.assertEqual(len(list((cache / "aime").iterdir())), 60)
+        self.assertEqual(len([p for p in (remote_root / "datasets").iterdir()]), 1)
+        log = data.tail(manager.records / (names[1] + ".log"))
+        self.assertIn("复用工作台已下载的注册表数据集 aime@1.0", log)
+        # Synced back, ingested by the worker: the store serves it without files.
+        shutil.rmtree(manager.jobs_dir / names[0])
+        view = client.request("api/job?name=" + names[0])
+        self.assertEqual((view["suite"], view["category_name"]), ("aime-2025", "竞赛数学"))
+        self.assertEqual(view["summary"]["counts"]["pass"], 1)
+
+    def test_hub_suite_on_ssh_executor_drops_the_org_prefix(self):
+        manager, client, _ = self.prepare_remote()
+        run = client.request("api/runs", {"model": "metask/session-model", "tasks": ["fix-git", "kv-store-grpc"],
+                                          "executor": "relay-4090"})
         final = wait_run(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
         argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
-        self.assertEqual(argv[argv.index("-d") + 1], "aime@1.0")
-        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], ["aime_i-1", "aime_ii-15"])
-        # Synced back, ingested by the worker: the store serves it without files.
-        shutil.rmtree(manager.jobs_dir / run["name"])
-        view = client.request("api/job?name=" + run["name"])
-        self.assertEqual((view["suite"], view["category_name"]), ("aime-2025", "竞赛数学"))
-        self.assertEqual(view["summary"]["counts"]["pass"], 1)
+        # `-d` matched `terminal-bench/fix-git`; the exported `-p` copy names it `fix-git`.
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], ["fix-git", "kv-store-grpc"])
+        shipped = Path(argv[argv.index("-p") + 1])
+        self.assertEqual(len([p for p in shipped.iterdir() if (p / "task.toml").is_file()]), 89)
+
+    def test_incomplete_download_or_missing_workbench_harbor_refuses_the_run(self):
+        manager, client, _ = self.prepare_remote()
+        os.environ["FAKE_HARBOR_DOWNLOAD_DROP"] = "1"
+        run = client.request("api/runs", {"suite": "aime", "model": "metask/session-model",
+                                          "tasks": ["aime_60"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"])
+        self.assertEqual(final["status"], "failed")
+        self.assertIn("有 59 道任务，缺少 1 道", final["error"])
+        self.assertFalse((self.remote_home / ".metacodes-bench/jobs" / run["name"]).exists())
+        self.assertEqual(list((self.state / "bench/registry-cache").iterdir()), [])  # nothing half-cached
+        # Without Harbor on the workbench machine, registry suites are not ready there.
+        cfg = self.cfg()
+        cfg.pop("harbor")
+        atomic_json(self.config, cfg)
+        catalog = client.request("api/workbench")
+        aime = next(s for s in catalog["suites"] if s["id"] == "aime")
+        self.assertTrue(any("工作台本机缺少 Harbor" in r for r in aime["executors"]["relay-4090"]["reasons"]))
 
     def test_harbor_local_suite_ships_its_dataset_to_the_ssh_executor(self):
         manager, client, _ = self.prepare_remote()
@@ -1030,6 +1147,355 @@ class SetupHttpTest(SetupFixture):
                          ["--state-dir", str(self.root / "account"), "login", "--provider", "metask", "--no-browser"])
         with self.assertRaisesRegex(ValueError, "授权"):
             cli.Client(self.url).request("api/login")
+
+
+def echo_server():
+    """A loopback TCP echo server: (port, close)."""
+    import socket
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+
+            def echo(c=conn):
+                with c:
+                    while True:
+                        chunk = c.recv(4096)
+                        if not chunk:
+                            return
+                        c.sendall(chunk)
+            threading.Thread(target=echo, daemon=True).start()
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1], listener.close
+
+
+def proxy_request(port, head, payload=b""):
+    """Send a raw request to the proxy; (first response line, socket)."""
+    import socket
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    sock.sendall(head.encode() + payload)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head_bytes, _, rest = data.partition(b"\r\n\r\n")
+    return head_bytes.split(b"\r\n")[0].decode(), sock, rest
+
+
+class EgressUnitTest(unittest.TestCase):
+    def test_forwarder_relays_bytes_end_to_end(self):
+        import socket
+        from scripts.eval.harbor.viewer import egress
+        port, close = echo_server()
+        self.addCleanup(close)
+        with egress.Forwarder("127.0.0.1", ("127.0.0.1", port)) as forwarder:
+            with socket.create_connection(forwarder.address, timeout=10) as sock:
+                payload = os.urandom(200 * 1024)
+                sender = threading.Thread(target=sock.sendall, args=(payload,))
+                sender.start()
+                received = b""
+                while len(received) < len(payload):
+                    received += sock.recv(65536)
+                sender.join()
+        self.assertEqual(received, payload)
+
+    def test_proxy_tunnels_allowed_ports_and_refuses_the_rest(self):
+        from scripts.eval.harbor.viewer import egress
+        port, close = echo_server()
+        self.addCleanup(close)
+        # A permissive address check, so the loopback echo server can stand
+        # in for a public host; ports are still enforced.
+        with egress.EgressProxy([port], allow=lambda _a: True) as proxy:
+            line, sock, _ = proxy_request(proxy.port, f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n")
+            self.assertEqual(line, "HTTP/1.1 200 Connection established")
+            sock.sendall(b"through the tunnel")
+            self.assertEqual(sock.recv(100), b"through the tunnel")
+            sock.close()
+            line, sock, _ = proxy_request(proxy.port, "CONNECT 127.0.0.1:22 HTTP/1.1\r\n\r\n")
+            sock.close()
+            self.assertTrue(line.startswith("HTTP/1.1 403"), line)
+            # A compose service name is refused at once, without a lookup.
+            def resolve(*_args):
+                raise AssertionError("single-label names are never resolved")
+            proxy.resolve = resolve
+            line, sock, rest = proxy_request(proxy.port, f"GET http://alfworld-env:{port}/step HTTP/1.1\r\n\r\n")
+            sock.close()
+            self.assertTrue(line.startswith("HTTP/1.1 502"), line)
+            self.assertIn(b"NO_PROXY", rest)
+            self.assertEqual(proxy.counts["connect"], 1)
+            self.assertEqual(proxy.counts["refused"], 2)
+        # The default policy: public unicast only, no exceptions.
+        for address in ("127.0.0.1", "10.126.126.2", "192.168.5.2", "172.17.0.1", "169.254.169.254",
+                        "100.64.0.1", "::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0", "224.0.0.1"):
+            self.assertFalse(egress.address_allowed(address), address)
+        self.assertTrue(egress.address_allowed("151.101.0.223"))
+        with egress.EgressProxy() as proxy:
+            for target, status in (("127.0.0.1:443", "403"), (f"127.0.0.1:{port}", "403"), ("[::1]:443", "403"),
+                                   ("localhost:443", "502")):
+                line, sock, _ = proxy_request(proxy.port, f"CONNECT {target} HTTP/1.1\r\n\r\n")
+                sock.close()
+                self.assertTrue(line.startswith("HTTP/1.1 " + status), (target, line))
+
+    def test_plain_http_is_forwarded_in_origin_form_without_proxy_credentials(self):
+        from http.server import BaseHTTPRequestHandler
+        from scripts.eval.harbor.viewer import egress
+        seen = []
+
+        class Origin(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, dict(self.headers)))
+                body = b"origin says hi"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        threading.Thread(target=origin.serve_forever, daemon=True).start()
+        self.addCleanup(origin.server_close)
+        self.addCleanup(origin.shutdown)
+        port = origin.server_address[1]
+        with egress.EgressProxy([port], allow=lambda _a: True) as proxy:
+            line, sock, rest = proxy_request(
+                proxy.port, f"GET http://127.0.0.1:{port}/simple/pip/?x=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                            "Proxy-Authorization: Basic c2VjcmV0\r\nProxy-Connection: keep-alive\r\n\r\n")
+            while not rest.endswith(b"origin says hi"):
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                rest += chunk
+            sock.close()
+        self.assertEqual((line, rest), ("HTTP/1.0 200 OK", b"origin says hi"))
+        path, headers = seen[0]
+        self.assertEqual(path, "/simple/pip/?x=1")
+        self.assertNotIn("Proxy-Authorization", headers)
+        self.assertEqual(headers.get("Connection"), "close")
+
+    def test_docker_config_holds_only_proxies_and_noproxy_names_relay_and_services(self):
+        from scripts.eval.harbor.viewer import egress
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        home = root / "home"
+        (home / ".docker/cli-plugins").mkdir(parents=True)
+        user_config = home / ".docker/config.json"
+        user_config.write_text('{"auths": {"ghcr.io": {"auth": "c3RhbGU="}}}')
+        before = user_config.read_bytes()
+        dataset = root / "dataset"
+        (dataset / "alfworld-1/environment").mkdir(parents=True)
+        (dataset / "alfworld-1/environment/docker-compose.yaml").write_text(
+            "services:\n  main:\n    build: .\n  alfworld-env:  # the sidecar\n    image: ghcr.io/x/alf:1\n"
+            "    environment:\n      PORT: 8080\nnetworks:\n  inner: {}\n")
+        (dataset / "alfworld-1/environment/Dockerfile").write_text(
+            "FROM --platform=linux/amd64 ghcr.io/laude-institute/base:2025 AS build\nFROM ubuntu:24.04\n")
+        (dataset / "other/environment").mkdir(parents=True)
+        (dataset / "other/environment/Dockerfile").write_text("FROM ghcr.io/not/selected:1\n")
+        self.assertEqual(egress.task_services(dataset, ["alfworld-1"]), ["main", "alfworld-env"])
+        self.assertEqual(egress.ghcr_images(dataset, ["alfworld-1"]),
+                         ["ghcr.io/laude-institute/base:2025", "ghcr.io/x/alf:1"])
+        run_dir = root / "run"
+        run_dir.mkdir()
+        session = egress.Session({"mode": "proxy", "url": "http://proxy.corp:3128", "no_proxy": ["172.17.0.1"]},
+                                 run_dir, ["10.0.0.5", *egress.task_services(dataset, ["alfworld-1"])], home=home)
+        written = json.loads((session.directory / "config.json").read_text())
+        self.assertEqual(set(written), {"proxies", "cliPluginsExtraDirs"})
+        self.assertEqual(written["cliPluginsExtraDirs"], [str(home / ".docker/cli-plugins")])
+        default = written["proxies"]["default"]
+        self.assertEqual((default["httpProxy"], default["httpsProxy"]), ("http://proxy.corp:3128",) * 2)
+        self.assertEqual(default["noProxy"].split(","),
+                         ["localhost", "127.0.0.1", "::1", "10.0.0.5", "main", "alfworld-env", "172.17.0.1"])
+        session.close()
+        self.assertFalse(session.directory.exists())
+        self.assertEqual(user_config.read_bytes(), before)
+
+
+class EgressRunTest(SetupFixture):
+    prepare_remote = SshRunTest.prepare_remote
+    harbor_local_suite = SuiteOnExecutorTest.harbor_local_suite
+
+    def egress_executor(self, **fields):
+        cfg = self.cfg()
+        entry = next(e for e in cfg["executors"] if e["name"] == "relay-4090")
+        entry.update(fields)
+        atomic_json(self.config, cfg)
+
+    def test_workbench_egress_carries_reverse_forward_and_run_scoped_docker_config(self):
+        manager, client, _ = self.prepare_remote()
+        dataset = self.harbor_local_suite()
+        (dataset / "humaneval-7/environment").mkdir()
+        (dataset / "humaneval-7/environment/docker-compose.yaml").write_text(
+            "services:\n  main:\n    build: .\n  judge-sidecar:\n    image: python:3.12\n")
+        self.egress_executor(egress="workbench")
+        # The shared user's own docker config on the executor (with a stale
+        # credential) is never read, copied or changed.
+        user_config = self.remote_home / ".docker/config.json"
+        user_config.parent.mkdir()
+        user_config.write_text('{"auths": {"ghcr.io": {"auth": "c3RhbGU="}}}')
+        before = user_config.read_bytes()
+        os.environ["FAKE_EGRESS_FETCH"] = "1"
+        run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
+                                          "tasks": ["humaneval-7"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"], timeout=60)
+        self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+        session = next(c[1] for c in self.calls("ssh") if ".remote run " in c[1][-1])
+        forward = session[session.index("-R") + 1]
+        self.assertRegex(forward, r"^127\.0\.0\.1:\d+:127\.0\.0\.1:\d+$")
+        self.assertIn("ExitOnForwardFailure=yes", session)
+        # Only the run session carries the forward.
+        self.assertEqual(len([c for c in self.calls("ssh") if "-R" in c[1]]), 1)
+        local = manager.jobs_dir / run["name"]
+        harbor_env = json.loads((local / "harbor-env.json").read_text())
+        docker_config = Path(harbor_env["DOCKER_CONFIG"])
+        self.assertEqual(docker_config.parent, (self.remote_home / ".metacodes-bench/runs" / run["name"]).resolve())
+        self.assertFalse(docker_config.exists())  # removed after the run
+        written = json.loads((local / "docker-config.json").read_text())
+        self.assertNotIn("auths", written)
+        default = written["proxies"]["default"]
+        self.assertRegex(default["httpProxy"], r"^http://127\.0\.0\.1:\d+$")  # the forwarder (metrics_bind fallback)
+        no_proxy = default["noProxy"].split(",")
+        for host in ("localhost", "127.0.0.1", "main", "judge-sidecar"):
+            self.assertIn(host, no_proxy)
+        # container -> forwarder -> ssh -R -> the workbench proxy, end to end.
+        self.assertEqual((local / "egress-probe.txt").read_bytes(), b"metacodes-bench-egress-ok")
+        self.assertEqual(user_config.read_bytes(), before)
+        self.assertFalse((self.home / ".docker/config.json").exists())
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertIn("出网代理已停止", log)
+
+    def test_ghcr_mirror_pulls_and_tags_only_ghcr_images_of_the_selected_tasks(self):
+        manager, client, _ = self.prepare_remote()
+        self.egress_executor(ghcr_mirror="ghcr.nju.edu.cn")
+        os.environ["FAKE_TASK_FROM"] = ("FROM --platform=linux/amd64 ghcr.io/laude-institute/t-bench/python-3-13:2025 AS b\n"
+                                        "FROM ubuntu:24.04\nFROM docker.io/library/alpine:3.20")
+        run = client.request("api/runs", {"suite": "aime", "model": "metask/session-model",
+                                          "tasks": ["aime_60"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"], timeout=60)
+        self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+        docker = [c[1] for c in self.calls("docker", "remote")]
+        self.assertIn(["pull", "ghcr.nju.edu.cn/laude-institute/t-bench/python-3-13:2025"], docker)
+        self.assertIn(["tag", "ghcr.nju.edu.cn/laude-institute/t-bench/python-3-13:2025",
+                       "ghcr.io/laude-institute/t-bench/python-3-13:2025"], docker)
+        self.assertEqual([c for c in docker if c[:1] == ["pull"]],
+                         [["pull", "ghcr.nju.edu.cn/laude-institute/t-bench/python-3-13:2025"]])
+        # Present now: a second run pulls nothing.
+        run = client.request("api/runs", {"suite": "aime", "model": "metask/session-model",
+                                          "tasks": ["aime_61"], "executor": "relay-4090"})
+        self.assertEqual(wait_run(manager, run["name"], timeout=60)["status"], "finished")
+        self.assertEqual(len([c for c in self.calls("docker", "remote") if c[1][:1] == ["pull"]]), 1)
+        self.assertFalse(any("DOCKER_CONFIG" in json.dumps(c) for c in self.calls("ssh")))
+
+
+class NetworkSetupTest(SetupFixture):
+    def closed_port_url(self):
+        import socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return f"http://127.0.0.1:{port}/"
+
+    def remote_docker(self):
+        os.symlink(self.templates / "docker", self.remote_bin / "docker")
+        os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
+
+    def test_blocked_registries_propose_mirrors_and_one_click_applies_them(self):
+        self.add_ssh_executor(metrics_bind="127.0.0.1")
+        self.remote_docker()
+        os.symlink(self.templates / "uv", self.local_bin / "uv")
+        blocked = self.closed_port_url()
+        targets = {"pypi": blocked, "dockerhub": blocked, "ghcr": blocked, "github": self.reachable}
+        self.daemon_json.parent.mkdir()
+        self.daemon_json.write_text('{"log-driver": "json-file", "registry-mirrors": ["https://mirror.corp"]}')
+        os.environ["FAKE_REMOTE_SUDO"] = "1"
+        with patch.object(setup, "NETWORK_TARGETS", targets):
+            before = self.config.read_bytes()
+            dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
+            network = self.step(dry, "network")
+            self.assertEqual(network["status"], "planned", network)
+            for text in ("pypi_index", "docker_mirrors", "ghcr_mirror", "egress"):
+                self.assertIn(text, network["detail"])
+            self.assertEqual(self.config.read_bytes(), before)
+            self.assertTrue(any("sudo -n systemctl reload docker" in c for c in self.mutations(dry)), self.mutations(dry))
+            self.assertEqual(self.step(dry, "egress")["status"], "planned")
+            self.assertFalse(self.daemon_json.read_text().count("daocloud"))
+            progress = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(progress["status"], "ready", json.dumps(progress, ensure_ascii=False, indent=1))
+        entry = next(e for e in self.cfg()["executors"] if e["name"] == "relay-4090")
+        self.assertEqual((entry["pypi_index"], entry["docker_mirrors"], entry["ghcr_mirror"], entry["egress"]),
+                         (setup.DEFAULT_PYPI_INDEX, setup.DEFAULT_DOCKER_MIRRORS, setup.DEFAULT_GHCR_MIRROR, "workbench"))
+        # pypi_index reaches the Harbor install as UV_DEFAULT_INDEX.
+        install = next(c[1][-1] for c in self.calls("ssh") if "uv tool install" in c[1][-1])
+        self.assertIn("env UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple uv tool install", install)
+        # daemon.json: merged, written through sudo, applied by reload only.
+        daemon = json.loads(self.daemon_json.read_text())
+        self.assertEqual(daemon["registry-mirrors"], ["https://mirror.corp"] + setup.DEFAULT_DOCKER_MIRRORS)
+        self.assertEqual(daemon["log-driver"], "json-file")
+        self.assertTrue(any(c[1][:3] == ["-n", "sh", "-c"] and str(self.daemon_json) in c[1][3]
+                            for c in self.calls("sudo", "remote")))
+        self.assertEqual([c[1] for c in self.calls("systemctl")], [["reload", "docker"]])
+        # The container egress probe went container -> forwarder -> ssh -R -> proxy.
+        egress_step = self.step(progress, "egress")
+        self.assertEqual(egress_step["status"], "ok", egress_step)
+        self.assertIn("ssh -R", egress_step["detail"])
+        self.assertTrue(any("-R" in c[1] for c in self.calls("ssh")))
+        self.assertTrue(any(c[1][:2] == ["network", "create"] for c in self.calls("docker", "remote")))
+        self.assertTrue(any(c[1][:2] == ["network", "rm"] for c in self.calls("docker", "remote")))
+        self.assertEqual(self.step(progress, "workbench_harbor")["status"], "done")
+        # Idempotent: nothing more to write or reload.
+        again = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(again, "docker_mirrors")["status"], "ok")
+        self.assertEqual(len(self.calls("systemctl")), 1)
+        self.assertFalse(any("restart" in json.dumps(c) for c in self.calls()))
+
+    def test_docker_mirrors_without_sudo_report_the_command_and_change_nothing(self):
+        self.add_ssh_executor(docker_mirrors=["https://docker.m.daocloud.io"])
+        self.remote_docker()
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "docker_mirrors")
+        self.assertEqual(step["status"], "manual", step)
+        self.assertIn("sudo tee " + str(self.daemon_json), step["command"])
+        self.assertTrue(step["command"].endswith("&& sudo systemctl reload docker"))
+        self.assertIn("https://docker.m.daocloud.io", step["command"])
+        self.assertFalse(self.daemon_json.exists())
+        self.assertEqual(self.calls("systemctl"), [])
+        # Mirrors only fill gaps: a configured value is never proposed over.
+        self.assertEqual(self.step(progress, "network")["status"], "ok")
+
+    def test_workbench_egress_probe_failure_is_explained(self):
+        self.add_ssh_executor(metrics_bind="127.0.0.1", egress="workbench")
+        self.remote_docker()
+        # A container cannot fetch (no route in this fixture's fake docker).
+        (self.remote_bin / "docker").unlink()
+        (self.remote_bin / "docker").write_text("#!/bin/sh\ncase \"$1\" in run) echo 'wget: timed out' >&2; exit 1;; esac\nexit 0\n")
+        (self.remote_bin / "docker").chmod(0o755)
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "egress")
+        self.assertEqual(step["status"], "failed", step)
+        self.assertIn("容器无法经执行机器的 Docker 网关", step["detail"])
+        self.assertIn("防火墙", step["detail"])
+
+    def test_egress_config_is_validated(self):
+        for bad in ({"egress": "tunnel"}, {"egress": {"proxy": "socks5://h:1"}}, {"egress_ports": [0]},
+                    {"pypi_index": "file:///etc"}, {"docker_mirrors": ["https://ok", "x; rm -rf /"]},
+                    {"ghcr_mirror": "-oProxy"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                executors.parse({"name": "r", "kind": "ssh", "host": "h", **bad})
+        relay = executors.parse({"name": "r", "kind": "ssh", "host": "h", "egress": {"proxy": "http://proxy:3128"}})
+        self.assertEqual((relay.egress, relay.egress_proxy), ("proxy", "http://proxy:3128"))
+        # The spec a worker receives parses back to the same executor.
+        self.assertEqual(executors.parse({k: v for k, v in relay.spec().items() if v is not None}), relay)
+        argv = executors.ssh_argv(relay, ["true"], reverse=(23456, 34567))
+        self.assertEqual(argv[argv.index("-R") + 1], "127.0.0.1:23456:127.0.0.1:34567")
+        self.assertNotIn("-R", executors.ssh_argv(relay, ["true"]))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,22 @@ FAKE_HARBOR = '''#!{python}
 import json, os, pathlib, sys, time
 args = sys.argv[1:]
 def arg(flag): return args[args.index(flag) + 1]
+if args[:1] == ['download']:
+    # `harbor download REF -o DIR`: the export layout, DIR/<dataset>/<task>/,
+    # with every task the catalog lists for REF.
+    ref, out = args[1], pathlib.Path(arg('-o'))
+    if os.environ.get('FAKE_HARBOR_DOWNLOAD_LOG'):
+        with open(os.environ['FAKE_HARBOR_DOWNLOAD_LOG'], 'a') as log: log.write(ref + '\\n')
+    from scripts.eval.harbor import suites
+    names = sorted({{t for s in suites.ALL if s.dataset == ref for t in (s.tasks or ())}})
+    names = names[int(os.environ.get('FAKE_HARBOR_DOWNLOAD_DROP', '0')):]
+    base = out / ref.split('@')[0].split('/')[-1]
+    for n in names:
+        (base / n / 'environment').mkdir(parents=True)
+        (base / n / 'task.toml').write_text('[task]\\n')
+        (base / n / 'environment' / 'Dockerfile').write_text(os.environ.get('FAKE_TASK_FROM', 'FROM ubuntu:24.04') + '\\n')
+    print('Successfully downloaded %d task(s)' % len(names))
+    sys.exit(0)
 root = pathlib.Path(arg('-o')) / arg('--job-name')
 root.mkdir(parents=True, exist_ok=True)
 (root / 'argv.json').write_text(json.dumps(args))
@@ -37,6 +53,15 @@ key_env = next((args[i + 1].split('=', 1)[0] for i, a in enumerate(args) if a ==
 # What Harbor would hand the task container (--ae values), and its own env.
 (root / 'container-env.json').write_text(json.dumps({{args[i + 1].split('=', 1)[0]: os.environ.get(args[i + 1].split('=', 1)[0]) for i, a in enumerate(args) if a == '--ae'}}))
 (root / 'harbor-env.json').write_text(json.dumps({{k: v for k, v in os.environ.items() if not k.startswith('FAKE_')}}))
+if os.environ.get('DOCKER_CONFIG'):
+    # What the docker CLI would read for this run's containers.
+    docker_config = json.loads((pathlib.Path(os.environ['DOCKER_CONFIG']) / 'config.json').read_text())
+    (root / 'docker-config.json').write_text(json.dumps(docker_config))
+    if os.environ.get('FAKE_EGRESS_FETCH'):
+        import urllib.request
+        proxy = docker_config['proxies']['default']['httpProxy']
+        with urllib.request.urlopen(proxy + '/metacodes-bench-egress-probe', timeout=10) as response:
+            (root / 'egress-probe.txt').write_bytes(response.read())
 (root / 'config.json').write_text(json.dumps({{'agents':[{{'model_name':arg('-m')}}], 'n_attempts':int(arg('-k'))}}))
 (root / 'result.json').write_text(json.dumps({{'started_at':'2026-11-16T00:00:00Z','finished_at':None, 'n_total_trials':1}}))
 if os.environ.get('FAKE_PROFILE_REQUEST'):
