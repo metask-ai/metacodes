@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -1282,6 +1283,33 @@ class EgressUnitTest(unittest.TestCase):
                         "100.64.0.1", "::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0", "224.0.0.1"):
             self.assertFalse(egress.address_allowed(address), address)
         self.assertTrue(egress.address_allowed("151.101.0.223"))
+        # A fake-IP resolver on the workbench machine (the real devbox-mac
+        # answers deb.debian.org with 198.18.3.108) must still reach the
+        # outside: the default policy adds 198.18.0.0/15 and nothing else.
+        policy = egress.allow_policy()
+        self.assertTrue(policy("198.18.3.108"))
+        self.assertTrue(policy("198.19.255.1"))
+        self.assertTrue(policy("151.101.0.223"))
+        for address in ("127.0.0.1", "10.126.126.2", "192.168.5.2", "172.17.0.1", "169.254.169.254", "::1"):
+            self.assertFalse(policy(address), address)
+        self.assertFalse(egress.allow_policy(())("198.18.3.108"))
+        self.assertFalse(egress.allow_policy(["127.0.0.0/8"])("127.0.0.1"))  # never loopback
+        with self.assertRaises(ValueError):
+            executors.parse({"name": "x", "kind": "ssh", "host": "h", "egress_allow": ["127.0.0.0/8"]})
+        parsed = executors.parse({"name": "x", "kind": "ssh", "host": "h", "egress": "workbench",
+                                  "egress_allow": ["198.18.0.0/15", "203.0.113.0/24"]})
+        self.assertEqual(parsed.egress_allow, ("198.18.0.0/15", "203.0.113.0/24"))
+        self.assertEqual(parsed.spec()["egress_allow"], ["198.18.0.0/15", "203.0.113.0/24"])
+        with egress.EgressProxy() as proxy:
+            proxy.resolve = lambda *_a: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.3.108", 80))]
+            try:
+                proxy.destination("deb.debian.org", 80).close()
+                refused = None
+            except egress.Refused as exc:
+                refused = str(exc)
+            except OSError:
+                refused = None  # allowed; nothing listens on that address in tests
+            self.assertIsNone(refused)
         with egress.EgressProxy() as proxy:
             for target, status in (("127.0.0.1:443", "403"), (f"127.0.0.1:{port}", "403"), ("[::1]:443", "403"),
                                    ("localhost:443", "502")):

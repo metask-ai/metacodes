@@ -935,7 +935,8 @@ def step_egress(s: Setup):
     if mode == "direct":
         raise Skip("egress = direct：任务容器直接使用执行机器的网络")
     options = ({"mode": "workbench", "tunnel_port": secrets.SystemRandom().randrange(20000, 60000),
-                "bind": s.executor.metrics_bind} if mode == "workbench" else {"mode": "proxy", "url": mode["proxy"]})
+                "bind": s.executor.metrics_bind, "external": EGRESS_EXTERNAL_PROBE}
+               if mode == "workbench" else {"mode": "proxy", "url": mode["proxy"]})
     runtime = s.executor.remote("runtime", "<digest>")
     proxy = None
     try:
@@ -944,8 +945,9 @@ def step_egress(s: Setup):
         reverse = None
         if mode == "workbench":
             if not s.dry_run:
-                from scripts.eval.harbor.viewer.egress import EgressProxy
-                proxy = EgressProxy(s.executor.egress_ports, log=s.log).start()
+                from scripts.eval.harbor.viewer.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
+                allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
+                proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
             reverse = (options["tunnel_port"], proxy.port if proxy else 0)
         argv = executors.ssh_argv(s.executor, ["env", "PYTHONPATH=" + runtime, s.executor.python, "-m",
                                                "scripts.eval.harbor.viewer.remote", "egress-probe",
@@ -964,7 +966,8 @@ def step_egress(s: Setup):
         result = {}
     if result.get("ok"):
         if mode == "workbench":
-            return "ok", f"容器经 {result.get('gateway')} 转发、ssh -R 到工作台代理可达"
+            return "ok", (f"容器经 {result.get('gateway')} 转发、ssh -R 到工作台代理可达，"
+                          f"并经代理访问外网成功（{result.get('external') or '探测页'}）")
         return "ok", "容器可连到站点代理 " + mode["proxy"]
     error = result.get("error") or ("SSH 反向转发失败（ExitOnForwardFailure）" if done.returncode == 255
                                     else f"探测退出码 {done.returncode}")
@@ -972,6 +975,10 @@ def step_egress(s: Setup):
         raise Failed(f"容器无法经执行机器的 Docker 网关（{result.get('gateway') or '未知'}）连到工作台代理：{error}。"
                      "请检查执行机器防火墙是否允许 Docker 网段访问网关地址，或把 egress 改为 direct")
     raise Failed(f"容器连不上站点代理 {mode['proxy']}：{error}")
+
+
+# A plain-HTTP page every Debian-based task image fetches during apt-get.
+EGRESS_EXTERNAL_PROBE = "http://deb.debian.org/debian/dists/bookworm/Release.gpg"
 
 
 def step_workbench_harbor(s: Setup):

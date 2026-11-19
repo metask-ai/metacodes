@@ -140,17 +140,46 @@ class _Listener:
 
 # ------------------------------------------------------------------ workbench proxy
 
-def address_allowed(address: str) -> bool:
-    """Whether the proxy may connect to `address`: globally routable unicast
-    only. There is deliberately no exception list."""
+# A fake-IP resolver (Clash/Surge-style transparent proxies, common on cloud
+# Macs) answers every public name with an address in the benchmarking range
+# 198.18.0.0/15 and forwards the connection itself. Allowed by default: no
+# ordinary internal host uses that range. `egress_allow` overrides it.
+DEFAULT_ALLOW_NETWORKS = ("198.18.0.0/15",)
+
+
+def _parse(address: str):
     try:
         ip = ipaddress.ip_address(address.split("%", 1)[0])
     except ValueError:
-        return False
+        return None
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
+    return ip
+
+
+def address_allowed(address: str) -> bool:
+    """Whether the proxy may connect to `address`: globally routable unicast
+    only (see allow_policy for the configured exceptions)."""
+    ip = _parse(address)
+    if ip is None:
+        return False
     return bool(ip.is_global and not (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast
                                       or ip.is_reserved or ip.is_unspecified))
+
+
+def allow_policy(networks: Sequence[str] = DEFAULT_ALLOW_NETWORKS) -> Callable[[str], bool]:
+    """address_allowed plus explicitly listed networks (never loopback,
+    link-local or unspecified, whatever is listed)."""
+    extra = tuple(ipaddress.ip_network(n, strict=False) for n in networks)
+
+    def allowed(address: str) -> bool:
+        if address_allowed(address):
+            return True
+        ip = _parse(address)
+        if ip is None or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+            return False
+        return any(ip.version == net.version and ip in net for net in extra)
+    return allowed
 
 
 def split_host_port(value: str, default_port: Optional[int] = None) -> Tuple[str, int]:
@@ -187,11 +216,11 @@ class EgressProxy(_Listener):
     permissive one to reach a loopback echo server)."""
 
     def __init__(self, ports: Sequence[int] = DEFAULT_PORTS, bind: str = "127.0.0.1",
-                 allow: Callable[[str], bool] = address_allowed, resolve=socket.getaddrinfo,
+                 allow: Optional[Callable[[str], bool]] = None, resolve=socket.getaddrinfo,
                  connect_timeout: float = 15.0, log: Optional[Callable[[str], None]] = None):
         super().__init__(bind, 0)
         self.ports = frozenset(int(p) for p in ports)
-        self.allow, self.resolve = allow, resolve
+        self.allow, self.resolve = allow or allow_policy(), resolve
         self.connect_timeout = connect_timeout
         self.log = log or (lambda _text: None)
         self.lock = threading.Lock()

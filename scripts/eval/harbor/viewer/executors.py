@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -126,6 +127,9 @@ class SshExecutor:
     egress: str = "direct"
     egress_proxy: Optional[str] = None
     egress_ports: Tuple[int, ...] = (443, 80)
+    # Networks the workbench proxy may connect to besides public addresses
+    # (default: the fake-IP range 198.18.0.0/15, see egress.DEFAULT_ALLOW_NETWORKS).
+    egress_allow: Optional[Tuple[str, ...]] = None
     # Mirrors: setup uses pypi_index and docker_mirrors, runs ghcr_mirror.
     pypi_index: Optional[str] = None
     docker_mirrors: Tuple[str, ...] = ()
@@ -146,7 +150,9 @@ class SshExecutor:
                 "identity_file": self.identity_file, "state_dir": self.state_dir, "harbor": self.harbor,
                 "python": self.python, "metrics_bind": self.metrics_bind,
                 "metrics_enabled": self.metrics_enabled, "egress": self.egress_value(),
-                "egress_ports": list(self.egress_ports), "pypi_index": self.pypi_index,
+                "egress_ports": list(self.egress_ports),
+                "egress_allow": list(self.egress_allow) if self.egress_allow is not None else None,
+                "pypi_index": self.pypi_index,
                 "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror}
 
     def egress_value(self):
@@ -175,7 +181,7 @@ def parse(entry) -> Executor:
     if kind != "ssh":
         raise ValueError(f"{name}: kind 必须是 local 或 ssh")
     allowed = {"name", "kind", "host", "user", "port", "identity_file", "state_dir", "harbor", "python",
-               "metrics_bind", "metrics_enabled", "egress", "egress_ports", "pypi_index", "docker_mirrors",
+               "metrics_bind", "metrics_enabled", "egress", "egress_ports", "egress_allow", "pypi_index", "docker_mirrors",
                "ghcr_mirror"}
     extra = set(entry) - allowed
     if extra:
@@ -232,6 +238,17 @@ def network_fields(name: str, entry: Dict) -> Dict:
                 not all(type(p) is int and 1 <= p <= 65535 for p in ports):
             raise ValueError(f"{name}: egress_ports 必须是 1–65535 的端口列表")
         values["egress_ports"] = tuple(dict.fromkeys(ports))
+    allow = entry.get("egress_allow")
+    if allow is not None:
+        try:
+            if not isinstance(allow, list) or len(allow) > 16:
+                raise ValueError
+            nets = [ipaddress.ip_network(n, strict=False) for n in allow if isinstance(n, str)]
+            if len(nets) != len(allow) or any(n.is_loopback or n.is_link_local or n.is_unspecified for n in nets):
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"{name}: egress_allow 必须是网段列表（如 198.18.0.0/15），不能含回环或链路本地地址") from None
+        values["egress_allow"] = tuple(str(n) for n in nets)
     index = entry.get("pypi_index")
     if index is not None:
         if not isinstance(index, str) or not MIRROR_URL.fullmatch(index):
@@ -1030,9 +1047,12 @@ class RemoteRun:
         the reverse forward the run session carries, or None."""
         if self.tunnel_port is None:
             return None
-        from scripts.eval.harbor.viewer.egress import EgressProxy
+        from scripts.eval.harbor.viewer.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
         if self.proxy is None:
-            self.proxy = EgressProxy(self.executor.egress_ports, log=self.log).start()
+            self.proxy = EgressProxy(self.executor.egress_ports, log=self.log,
+                                     allow=allow_policy(self.executor.egress_allow
+                                                        if self.executor.egress_allow is not None
+                                                        else DEFAULT_ALLOW_NETWORKS)).start()
             self.log(f"容器出网经工作台：代理 127.0.0.1:{self.proxy.port}，"
                      f"{self.executor.name} 回环端口 {self.tunnel_port}（ssh -R），"
                      f"允许端口 {', '.join(str(p) for p in sorted(self.executor.egress_ports))}")

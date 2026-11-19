@@ -560,8 +560,15 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
 - SSRF guard: the proxy connects only to globally routable unicast
   addresses. Loopback, private (RFC 1918, unique-local), link-local, CGNAT
   (100.64/10), multicast, reserved and unspecified addresses are refused
-  with 403, with no exception list, so containers cannot reach the workbench
-  machine's own services or its LAN (EasyTier included). A name is resolved
+  with 403, so containers cannot reach the workbench machine's own services
+  or its LAN (EasyTier included). One exception is on by default: the
+  benchmarking range `198.18.0.0/15`, which fake-IP resolvers (Clash- or
+  Surge-style transparent proxies, as on the devbox-mac network) hand out for
+  every public name. `egress_allow` on the executor replaces that list (`[]`
+  disables it); loopback, link-local and unspecified addresses are never
+  allowed. Setup's 容器出网 step fetches a real outside page
+  (`http://deb.debian.org/.../Release.gpg`) through the proxy, so a policy
+  or resolver problem shows up there and not mid-run. A name is resolved
   once; any non-public answer refuses it, and the vetted address is the one
   connected to. Single-label names (compose service names such as
   `alfworld-env`) are refused at once with a 502 that says to put them in

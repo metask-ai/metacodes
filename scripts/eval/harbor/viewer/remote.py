@@ -356,6 +356,20 @@ def egress_probe(options):
                                                  or body == egress.PROBE_BODY.decode())
         if not result["ok"]:
             result["error"] = (done.stderr.decode(errors="replace") or body).strip()[-300:]
+            return result
+        external = options.get("external")
+        if options["mode"] == "workbench" and external:
+            # The probe page proves the tunnel; a real outside fetch proves
+            # the proxy's own network and policy (e.g. a fake-IP resolver).
+            proxy = "http://%s:%d" % forwarder.address
+            fetched = subprocess.run(["docker", "run", "--rm", "--network", network, "-e", "http_proxy=" + proxy,
+                                      PROBE_IMAGE, "wget", "-q", "-T", "20", "-O", "/dev/null", external],
+                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+            result["external"] = external
+            if fetched.returncode != 0:
+                result["ok"] = False
+                result["error"] = "外网访问失败（" + external + "）：" + \
+                    (fetched.stderr.decode(errors="replace") or fetched.stdout.decode(errors="replace")).strip()[-300:]
         return result
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
