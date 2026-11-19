@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -481,7 +482,8 @@ class ExecutorConfigTest(unittest.TestCase):
         def runner(argv, **_kwargs):
             out = "0\n" if argv[0].endswith("sysctl") else ""
             return subprocess.CompletedProcess(argv, 0 if argv[0].endswith("sysctl") else 1, out, "Cannot connect")
-        with patch.object(executors.os, "uname", return_value=os.uname_result(("Darwin", "h", "", "", "arm64"))), \
+        with patch.object(executors.os, "uname", create=True,
+                          return_value=types.SimpleNamespace(sysname="Darwin", machine="arm64")), \
                 patch.object(executors.shutil, "which", side_effect=lambda name, path=None: "/opt/homebrew/bin/" + name):
             facts = executors.local_facts(executors.LocalExecutor(), runner=runner)
         self.assertEqual(facts["hypervisor"], "0")
@@ -1302,14 +1304,13 @@ class EgressUnitTest(unittest.TestCase):
         self.assertEqual(parsed.spec()["egress_allow"], ["198.18.0.0/15", "203.0.113.0/24"])
         with egress.EgressProxy() as proxy:
             proxy.resolve = lambda *_a: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.3.108", 80))]
+            proxy.connect_timeout = 0.2  # nothing listens there; only the policy is under test
             try:
                 proxy.destination("deb.debian.org", 80).close()
-                refused = None
+                refused = ""
             except egress.Refused as exc:
                 refused = str(exc)
-            except OSError:
-                refused = None  # allowed; nothing listens on that address in tests
-            self.assertIsNone(refused)
+            self.assertNotIn("non-public", refused)
         with egress.EgressProxy() as proxy:
             for target, status in (("127.0.0.1:443", "403"), (f"127.0.0.1:{port}", "403"), ("[::1]:443", "403"),
                                    ("localhost:443", "502")):
@@ -1433,7 +1434,10 @@ class EgressRunTest(SetupFixture):
         written = json.loads((local / "docker-config.json").read_text())
         self.assertNotIn("auths", written)
         default = written["proxies"]["default"]
-        self.assertRegex(default["httpProxy"], r"^http://127\.0\.0\.1:\d+$")  # the forwarder (metrics_bind fallback)
+        # The forwarder binds the host's docker0 gateway, else metrics_bind.
+        from scripts.eval.harbor.viewer import egress as egress_module
+        gateway = egress_module.docker_gateway() or "127.0.0.1"
+        self.assertRegex(default["httpProxy"], r"^http://" + re.escape(gateway) + r":\d+$")
         no_proxy = default["noProxy"].split(",")
         for host in ("localhost", "127.0.0.1", "main", "judge-sidecar"):
             self.assertIn(host, no_proxy)

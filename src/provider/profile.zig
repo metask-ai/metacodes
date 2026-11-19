@@ -488,6 +488,10 @@ pub const ProviderProfile = struct {
     /// `login --provider` setup of a provider without an OAuth grant. Null
     /// means the provider documents no such page.
     api_key_setup: ?ApiKeySetup = null,
+    /// A sign-in on the provider's site that hands back an API key of the
+    /// user's own account (OpenRouter's PKCE key grant), rather than OAuth
+    /// tokens. Null means the provider offers none.
+    key_grant: ?KeyGrant = null,
     /// A subscription plan: a coding plan billed by the month rather than by
     /// the token. The vendors license these for a person working in a coding
     /// tool (Kimi Code: personal, interactive use; the GLM Coding Plan: the
@@ -617,6 +621,32 @@ pub const KeyPage = struct {
     region: ?[]const u8 = null,
 };
 
+/// A sign-in that ends in an API key of the user's own account
+/// (`ProviderProfile.key_grant`): OpenRouter's PKCE flow. It is not OAuth as
+/// the rest of this module knows it — no client id, no token endpoint, no
+/// refresh — so it declares where it runs instead of reusing the OAuth fields.
+///
+/// - The browser goes to `<origin><authorize_path>` with a PKCE challenge
+///   (S256) and either a loopback `callback_url` or, for a machine without a
+///   browser, none: the page then shows the code to paste back.
+/// - `POST <origin><exchange_path>` trades the code and the verifier for the
+///   key, which is stored like a pasted one (`api_key_setup.kind`).
+/// - `GET <origin><key_info_path>` with the key says its label, spending limit
+///   and expiry, and is not billed.
+/// - Nothing here can delete the key: `<origin><manage_path><sha256 hex of the
+///   key>` is the page its owner deletes it on.
+pub const KeyGrant = struct {
+    /// `https://<host>`, no path. Every address hangs off it, so one override
+    /// moves them all (the api layer reads it, never this kernel).
+    origin: []const u8,
+    authorize_path: []const u8,
+    exchange_path: []const u8,
+    key_info_path: []const u8,
+    manage_path: []const u8,
+    /// What the key is called on the provider's site, prefilled.
+    key_label: []const u8,
+};
+
 /// The guided API-key setup a profile declares (`ProviderProfile.api_key_setup`).
 pub const ApiKeySetup = struct {
     /// The kind a pasted key is stored and resolved as.
@@ -631,6 +661,7 @@ pub const ApiKeySetup = struct {
 /// free of "can this even be routed?" defensive code.
 pub const ProfileError = error{
     InvalidKeySetup,
+    InvalidKeyGrant,
     /// A redirect host the loopback listener cannot answer for, a port 0
     /// among the registered ones, or a revocation endpoint a refresh token
     /// would reach in the clear.
@@ -705,11 +736,30 @@ pub fn validateProfile(profile: ProviderProfile) ProfileError!void {
         if (!accepted or setup.pages.len == 0) return error.InvalidKeySetup;
         for (setup.pages, 0..) |page, index| {
             if (!std.mem.startsWith(u8, page.url, "https://")) return error.InvalidKeySetup;
-            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidKeySetup;
+            // The check carries the key, so it goes only where the provider's
+            // own requests may: https, or the plain loopback the endpoint
+            // policy admits (a key grant's development origin moves it there,
+            // `Host.rebaseOrigin`).
+            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) {
+                profile.endpoint_policy.validate(url) catch return error.InvalidKeySetup;
+            };
             for (setup.pages[index + 1 ..]) |other| {
                 if (page.id.eql(other.id)) return error.InvalidKeySetup;
             }
         }
+    }
+
+    if (profile.key_grant) |grant| {
+        // The key it hands back is stored as the key setup's kind, so a grant
+        // without one would store a key nothing resolves. Its exchange carries
+        // the code and the verifier, and its answer the key: https only.
+        if (profile.api_key_setup == null) return error.InvalidKeyGrant;
+        if (!std.mem.startsWith(u8, grant.origin, "https://")) return error.InvalidKeyGrant;
+        if (std.mem.indexOfScalar(u8, grant.origin["https://".len..], '/') != null) return error.InvalidKeyGrant;
+        for ([_][]const u8{ grant.authorize_path, grant.exchange_path, grant.key_info_path, grant.manage_path }) |path| {
+            if (!std.mem.startsWith(u8, path, "/")) return error.InvalidKeyGrant;
+        }
+        if (grant.key_label.len == 0) return error.InvalidKeyGrant;
     }
 }
 

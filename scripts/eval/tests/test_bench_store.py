@@ -418,7 +418,7 @@ class IngestTest(StoreCase):
         atomic_json(records / "bench-live.json", {"name": "bench-live", "status": "finished", "model": "m",
                                                   "exit_code": 0})
         atomic_json(records / "bench-live.spec", {"name": "bench-live"})
-        (records / "bench-live.log").write_text("worker log\n")
+        (records / "bench-live.log").write_bytes(b"worker log\n")
         beats = []
         sync.finish(lambda: beats.append(1))
         sync.record("bench-live")

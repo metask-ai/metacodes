@@ -197,7 +197,7 @@ def parse(entry) -> Executor:
     if identity is not None:
         if not isinstance(identity, str) or not identity or identity.startswith("-"):
             raise ValueError(f"{name}: identity_file 无效")
-        identity = str(Path(identity).expanduser())
+        identity = os.path.expanduser(identity)
     values = {}
     for field in ("state_dir", "harbor", "python"):
         value = entry.get(field)
