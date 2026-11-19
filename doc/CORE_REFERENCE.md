@@ -346,7 +346,8 @@ Bash 观测没能覆盖)也照发一条空 `changes` 的事件,Run 账本同时�
 
 - **怎么观测**:内置 ripgrep 列出工作区文件(它的忽略规则;隐藏文件计入,`.git`/`.hg`/`.svn`/
   `.jj` 排除),逐个 lstat。路径的身份(dev/inode)、大小、mtime、ctime 任一变化即为修改;消失的
-  路径与新出现的、inode/大小/mtime 相同的路径配对成 `moved`。
+  路径与新出现的、inode/大小/mtime 相同的路径配对成 `moved`。Windows 上的 stat 不带文件身份
+  (没有 inode,也没有 ctime),只看大小与 mtime,改名报成一条 `deleted` 加一条 `created`。
 - **diff 从哪来**:新建文件读执行后的内容;修改/删除需要"执行前",git 工作区里执行前已与 index
   不同(或未跟踪)的文件预先复制(有上限),与 index 一致的文件事后从 index 取——**仅当命令没动过
   index**(`git add`/`stash`/`checkout` 会把执行后的内容放进 index),且 blob 大小与执行前一致

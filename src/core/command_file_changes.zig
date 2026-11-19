@@ -1007,7 +1007,10 @@ test "observation reports created, modified, deleted and moved files with diffs 
     defer got.deinit();
     obs.finish(null, got.sink(), false);
     try testing.expect(!got.incomplete);
-    try testing.expectEqual(@as(usize, 4), got.records.items.len);
+    // Windows stats carry no file identity (FindFirstFileW has no file ID), so
+    // there a rename is reported as the deletion and creation it looks like.
+    const renames_pair = builtin.os.tag != .windows;
+    try testing.expectEqual(@as(usize, if (renames_pair) 4 else 5), got.records.items.len);
 
     const created = try got.get("new.txt");
     try testing.expectEqual(file_change.Kind.created, created.kind);
@@ -1025,9 +1028,17 @@ test "observation reports created, modified, deleted and moved files with diffs 
     try testing.expectEqual(@as(u64, 0), deleted.after_bytes);
 
     const moved = try got.get("new_name.txt");
-    try testing.expectEqual(file_change.Kind.moved, moved.kind);
-    try testing.expectEqualStrings("old_name.txt", moved.from.?);
-    try testing.expectEqualStrings("", moved.diff orelse return error.TestExpectedDiff);
+    if (renames_pair) {
+        try testing.expectEqual(file_change.Kind.moved, moved.kind);
+        try testing.expectEqualStrings("old_name.txt", moved.from.?);
+        try testing.expectEqualStrings("", moved.diff orelse return error.TestExpectedDiff);
+        try testing.expect(got.find("old_name.txt") == null);
+    } else {
+        try testing.expectEqual(file_change.Kind.created, moved.kind);
+        try testing.expect(moved.from == null);
+        try testing.expectEqualStrings("--- a/new_name.txt\n+++ b/new_name.txt\n@@ -0,0 +1,1 @@\n+moved bytes\n", moved.diff orelse return error.TestExpectedDiff);
+        try testing.expectEqual(file_change.Kind.deleted, (try got.get("old_name.txt")).kind);
+    }
     try testing.expect(got.find("keep.txt") == null);
 }
 
