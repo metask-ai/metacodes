@@ -1,0 +1,19 @@
+Make CONFIG_ATOMICS opt-out with -DMETACODES_NO_ATOMICS.
+
+Atomics.wait blocks the calling thread and pulls in pthread on every target.
+The embedded engine runs one runtime per session thread and never shares a
+SharedArrayBuffer across threads, so metacodes builds without Atomics.
+Upstream defines CONFIG_ATOMICS unconditionally outside EMSCRIPTEN, so no
+compiler flag alone can turn it off.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -68,7 +68,7 @@
+ 
+ /* define to include Atomics.* operations which depend on the OS
+    threads */
+-#if !defined(EMSCRIPTEN)
++#if !defined(EMSCRIPTEN) && !defined(METACODES_NO_ATOMICS)
+ #define CONFIG_ATOMICS
+ #endif
+ 
