@@ -33,7 +33,10 @@ coverage. See [metric definitions and storage](../../../../doc/BENCH_WORKBENCH.m
 Historical timings remain unknown; new workbench runs capture numeric
 request metrics through the host streaming relay.
 
-`data.py` is the projection, `runner.py` validates selections, and `worker.py`
-owns one durable execution. HTTP launch/cancel routes require the workbench
-capability. Contract tests are `scripts/eval/tests/test_harbor_viewer.py` and
+This directory is only the web presentation: `server.py` maps routes onto the
+runtime's `Workbench` and `static/` is the page. The runtime lives in
+[`../bench/`](../bench/): `data.py` is the projection, `runner.py` validates
+selections, `worker.py` owns one durable execution, and `workbench.py` is the
+facade the page and the CLI both read. HTTP launch/cancel routes require the
+workbench capability. Contract tests are `scripts/eval/tests/test_harbor_viewer.py` and
 `scripts/eval/tests/test_bench_workbench.py`.

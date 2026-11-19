@@ -14,7 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from scripts.eval.harbor.profiling import StreamMetrics, TimingRelay, routed_config, usage_values
-from scripts.eval.harbor.viewer import data, server
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.viewer import server
 from scripts.eval.tests.test_harbor_viewer import _job, _trial, _write
 
 
@@ -204,7 +206,7 @@ class MetricProjectionTest(unittest.TestCase):
         self.assertEqual(row['ttft_p95_ms'], 290)
         self.assertEqual(summary['initial_input_tokens_mean'], 920)
         self.assertIn('initial_input_tokens', data.job_csv(view).splitlines()[0])
-        http = server.make_server(data.Library([self.root]), '127.0.0.1', 0)
+        http = server.make_server(Workbench(data.Library([self.root])), '127.0.0.1', 0)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
