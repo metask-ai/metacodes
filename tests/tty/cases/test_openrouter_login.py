@@ -282,17 +282,3 @@ def test_login_openrouter_takes_a_key_the_user_already_has(bin_path):
         assert case.seen("POST", "/api/v1/auth/keys") == [], "a pasted key needs no exchange"
         stored = case.stored()
         assert stored["key"] == PASTED_KEY and stored["obtained"] == "pasted", stored
-
-
-def test_model_names_login_openrouter_when_it_is_not_set_up(bin_path):
-    with _Case() as case:
-        events = [READY, "type:/model", "key:enter", wait_for("apply to", 10),
-                  "type:openrouter", wait_for("not signed in", 10), "key:enter",
-                  wait_for("Sign in: /login openrouter", 10), "key:esc"]
-        raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
-        a, text = _screen(raw, 40, 140)
-        if not a.screens_with("Sign in: /login openrouter"):
-            a._fail("an OpenRouter without a key should name /login openrouter")
-        if not a.screens_with("Or set OPENROUTER_API_KEY in"):
-            a._fail("and the variable it reads")
-        assert case.server.seen == [], "nothing was asked of OpenRouter"

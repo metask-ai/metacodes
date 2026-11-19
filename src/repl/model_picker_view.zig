@@ -975,6 +975,24 @@ test "the setup stage shows the variable, this install's .env and the guide, and
     try testing.expect(std.mem.indexOf(u8, text, "esc back · q close") != null);
 }
 
+test "the setup stage of a provider that signs in on its own site names /login <id>, then its variable" {
+    // /model lists no provider without a credential (#568), so this stage is
+    // where an OpenRouter route a commit found no key for is told the way in.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{offerOf("openrouter", "auto", "deepseek/deepseek-v4.1-flash", "openai_chat")};
+    try seed(&picker, &offers, null);
+    picker.setLocalConfig("/home/u/.local/opt/metacodes/state/.env", "");
+    picker.enterSetup(.{ .provider = ids.Slug.lit("openrouter"), .variable = "OPENROUTER_API_KEY", .sign_in = true });
+    const text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "openrouter not signed in") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Sign in: /login openrouter") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Or set OPENROUTER_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart") != null);
+}
+
 test "a filter lists the matches flat, each naming its provider" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
