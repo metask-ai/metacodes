@@ -27,6 +27,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -77,8 +78,16 @@ REMOTE_RUNTIME = (
     "scripts/eval/harbor/profiling.py",
     "scripts/eval/harbor/metacodes_agent.py",
     "scripts/eval/harbor/viewer/__init__.py",
+    "scripts/eval/harbor/viewer/egress.py",
     "scripts/eval/harbor/viewer/remote.py",
 )
+# `pypi_index`, `docker_mirrors` entries and `egress.proxy`: plain http(s)
+# URLs (they reach shell scripts and JSON files on the executor).
+MIRROR_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/+-]*)?$")
+# `ghcr_mirror`: a registry host (and optional port/path prefix).
+REGISTRY_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]{1,5})?(/[a-z0-9._-]+)*$")
+EGRESS_MODES = ("direct", "workbench")
+EGRESS_HELP = 'egress 只能是 "direct"、"workbench" 或 {"proxy": "http://主机:端口"}'
 
 
 def runtime_root() -> Path:
@@ -111,6 +120,16 @@ class SshExecutor:
     python: str = "python3"
     metrics_bind: str = "172.17.0.1"
     metrics_enabled: bool = True
+    # Container egress: "direct" (the executor's own network), "workbench"
+    # (through the workbench machine, see egress.py) or "proxy" (a site
+    # proxy, egress_proxy).
+    egress: str = "direct"
+    egress_proxy: Optional[str] = None
+    egress_ports: Tuple[int, ...] = (443, 80)
+    # Mirrors: setup uses pypi_index and docker_mirrors, runs ghcr_mirror.
+    pypi_index: Optional[str] = None
+    docker_mirrors: Tuple[str, ...] = ()
+    ghcr_mirror: Optional[str] = None
 
     kind = "ssh"
 
@@ -126,7 +145,13 @@ class SshExecutor:
         return {"name": self.name, "kind": "ssh", "host": self.host, "user": self.user, "port": self.port,
                 "identity_file": self.identity_file, "state_dir": self.state_dir, "harbor": self.harbor,
                 "python": self.python, "metrics_bind": self.metrics_bind,
-                "metrics_enabled": self.metrics_enabled}
+                "metrics_enabled": self.metrics_enabled, "egress": self.egress_value(),
+                "egress_ports": list(self.egress_ports), "pypi_index": self.pypi_index,
+                "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror}
+
+    def egress_value(self):
+        """The `egress` field as written in workbench.json."""
+        return {"proxy": self.egress_proxy} if self.egress == "proxy" else self.egress
 
     def remote(self, *parts: str) -> str:
         return str(PurePosixPath(self.state_dir, *parts))
@@ -150,7 +175,8 @@ def parse(entry) -> Executor:
     if kind != "ssh":
         raise ValueError(f"{name}: kind 必须是 local 或 ssh")
     allowed = {"name", "kind", "host", "user", "port", "identity_file", "state_dir", "harbor", "python",
-               "metrics_bind", "metrics_enabled"}
+               "metrics_bind", "metrics_enabled", "egress", "egress_ports", "pypi_index", "docker_mirrors",
+               "ghcr_mirror"}
     extra = set(entry) - allowed
     if extra:
         raise ValueError(f"{name}: 不支持的字段 {', '.join(sorted(extra))}")
@@ -180,8 +206,49 @@ def parse(entry) -> Executor:
     enabled = entry.get("metrics_enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{name}: metrics_enabled 必须是布尔值")
+    values.update(network_fields(name, entry))
     return SshExecutor(name=name, host=host, user=user, port=port, identity_file=identity,
                        metrics_bind=bind, metrics_enabled=enabled, **values)
+
+
+def network_fields(name: str, entry: Dict) -> Dict:
+    """egress / egress_ports / mirrors of an ssh entry, validated. `None`
+    stands for the default (spec() writes defaults that way)."""
+    values: Dict = {}
+    egress = entry.get("egress")
+    if isinstance(egress, dict):
+        proxy = egress.get("proxy")
+        if set(egress) != {"proxy"} or not isinstance(proxy, str) or not MIRROR_URL.fullmatch(proxy) \
+                or not proxy.startswith("http://"):
+            raise ValueError(f"{name}: {EGRESS_HELP}")
+        values.update(egress="proxy", egress_proxy=proxy.rstrip("/"))
+    elif egress is None or egress in EGRESS_MODES:
+        values["egress"] = egress or "direct"
+    else:
+        raise ValueError(f"{name}: {EGRESS_HELP}")
+    ports = entry.get("egress_ports")
+    if ports is not None:
+        if not isinstance(ports, list) or not ports or len(ports) > 16 or \
+                not all(type(p) is int and 1 <= p <= 65535 for p in ports):
+            raise ValueError(f"{name}: egress_ports 必须是 1–65535 的端口列表")
+        values["egress_ports"] = tuple(dict.fromkeys(ports))
+    index = entry.get("pypi_index")
+    if index is not None:
+        if not isinstance(index, str) or not MIRROR_URL.fullmatch(index):
+            raise ValueError(f"{name}: pypi_index 必须是 http(s) 地址")
+        values["pypi_index"] = index
+    mirrors = entry.get("docker_mirrors")
+    if mirrors is not None:
+        if not isinstance(mirrors, list) or len(mirrors) > 8 or \
+                not all(isinstance(m, str) and MIRROR_URL.fullmatch(m) for m in mirrors):
+            raise ValueError(f"{name}: docker_mirrors 必须是 http(s) 地址列表")
+        values["docker_mirrors"] = tuple(dict.fromkeys(mirrors))
+    ghcr = entry.get("ghcr_mirror")
+    if ghcr is not None:
+        if not isinstance(ghcr, str) or not REGISTRY_HOST.fullmatch(ghcr):
+            raise ValueError(f"{name}: ghcr_mirror 必须是镜像仓库主机名（如 ghcr.nju.edu.cn）")
+        values["ghcr_mirror"] = ghcr
+    return values
 
 
 def remote_path_ok(value, executable=False) -> bool:
@@ -239,14 +306,22 @@ def find(cfg, name: Optional[str]) -> Executor:
 
 # ------------------------------------------------------------------ commands
 
-def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=False) -> List[str]:
+def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=False,
+             reverse: Optional[Tuple[int, int]] = None) -> List[str]:
     """`ssh` argv for one remote command. The remote side receives one
-    shell-quoted string, so every argument stays a single word there."""
+    shell-quoted string, so every argument stays a single word there.
+
+    `reverse` = (executor port, local port) adds a reverse forward from the
+    executor's loopback to this machine's loopback; the session fails at
+    once if the forward cannot be set up (ExitOnForwardFailure)."""
     argv = [shutil.which("ssh") or "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
             "-o", "StrictHostKeyChecking=accept-new", "-p", str(executor.port)]
     if executor.identity_file:
         argv += ["-i", executor.identity_file, "-o", "IdentitiesOnly=yes"]
+    if reverse:
+        argv += ["-o", "ExitOnForwardFailure=yes",
+                 "-R", f"127.0.0.1:{int(reverse[0])}:127.0.0.1:{int(reverse[1])}"]
     argv.append("-tt" if tty else "-T")
     argv.append(executor.destination)
     if remote:
@@ -292,6 +367,9 @@ echo "tar=$(command -v tar 2>/dev/null)"
 echo "brew=$(command -v brew 2>/dev/null)"
 echo "colima=$(command -v colima 2>/dev/null)"
 if sudo -n true 2>/dev/null; then echo "sudo=1"; else echo "sudo=0"; fi
+if command -v ip >/dev/null 2>&1; then
+  echo "docker0=$(ip -4 -o addr show docker0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\).*/\1/p' | head -n 1)"
+fi
 '''
 
 
@@ -390,6 +468,13 @@ def reasons(executor: Executor, facts: Dict) -> List[str]:
             result.append(where + " 缺少 Python 3.9+（远程驱动需要）" + setup)
         if not facts.get("tar"):
             result.append(where + " 缺少 tar")
+        if executor.egress == "workbench" and "docker0" in facts and not facts["docker0"] \
+                and executor.metrics_bind.startswith("127."):
+            # The forwarder falls back to metrics_bind, which containers
+            # cannot reach when it is the host's loopback.
+            result.append(f"{where} 没有 docker0 网桥，且 metrics_bind 是回环地址 {executor.metrics_bind}："
+                          "容器无法连到“经工作台出网”的转发端口；请把 metrics_bind 设为容器可达的宿主机地址，"
+                          "或把 egress 改为 direct")
     else:
         result = []
         if facts.get("error"):
@@ -511,6 +596,107 @@ def ship_dataset(executor: SshExecutor, dataset: Path, log=print, **kwargs) -> s
     destination = executor.remote("datasets", tree_digest(dataset, names))
     ship(executor, dataset, names, destination, log=log, **kwargs)
     return destination
+
+
+# ------------------------------------------------------------------ registry datasets
+
+REGISTRY_MARKER = ".bench-registry.json"
+REGISTRY_TIMEOUT = 3600
+
+
+def workbench_harbor(cfg: Dict) -> Optional[str]:
+    """Harbor on the workbench machine itself (registry downloads for SSH
+    executors): the configured local Harbor, else one on the search path."""
+    candidates = [cfg.get("harbor")]
+    for entry in cfg.get("executors") or []:
+        if isinstance(entry, dict) and entry.get("kind") == "local":
+            candidates.append(entry.get("harbor"))
+    search = search_path()
+    for candidate in candidates + ["harbor"]:
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        found = shutil.which(candidate, path=search)
+        if found:
+            return found
+    return None
+
+
+def registry_cache_key(ref: str) -> str:
+    return hashlib.sha256(ref.encode()).hexdigest()[:16]
+
+
+def _task_dirs(directory: Path) -> List[str]:
+    from scripts.eval.harbor.suites import local_tasks
+    return local_tasks(directory)
+
+
+def _cached_registry(final: Path, ref: str, expected) -> Optional[Path]:
+    try:
+        marker = json.loads((final / REGISTRY_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, dict) or marker.get("ref") != ref or not isinstance(marker.get("dataset"), str):
+        return None
+    dataset = final / marker["dataset"] if marker["dataset"] else final
+    if final.resolve() not in dataset.resolve().parents and dataset.resolve() != final.resolve():
+        return None
+    tasks = set(_task_dirs(dataset))
+    if len(tasks) != marker.get("tasks") or (expected and not set(expected) <= tasks):
+        return None
+    return dataset
+
+
+def registry_dataset(ref: str, cache_root: Path, harbor: Optional[str], expected=None, log=print,
+                     runner=subprocess.run, timeout=REGISTRY_TIMEOUT) -> Path:
+    """A Harbor registry dataset downloaded on this (the workbench) machine.
+
+    `harbor download REF -o DIR` exports `DIR/<dataset name>/<task>/`; the
+    result is cached per reference under `cache_root/<sha256(ref)[:16]>`
+    and reused while its marker's task count still matches. `expected`
+    (the suite's task ids) must all be present, or the download is refused."""
+    cache_root = Path(cache_root)
+    final = cache_root / registry_cache_key(ref)
+    cached = _cached_registry(final, ref, expected)
+    if cached is not None:
+        log(f"复用工作台已下载的注册表数据集 {ref}：{cached}")
+        return cached
+    if not harbor:
+        raise ValueError("工作台本机缺少 Harbor，无法下载注册表评测集 " + ref +
+                         "；请运行 metacodes bench setup，或 uv tool install harbor==0.26.0")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    work = cache_root / (final.name + ".tmp-" + uuid.uuid4().hex[:8])
+    argv = [harbor, "download", ref, "-o", str(work)]
+    log("$ " + display(argv))
+    try:
+        try:
+            done = runner(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise ValueError(f"工作台下载注册表数据集 {ref} 超时") from None
+        except OSError as exc:
+            raise ValueError(f"无法运行工作台的 Harbor：{exc}") from None
+        output = ((done.stdout or "") + (done.stderr or "")).strip()
+        if output:
+            log(output[-2000:])
+        if done.returncode != 0:
+            raise ValueError(f"工作台下载注册表数据集 {ref} 失败（harbor download 退出码 {done.returncode}）")
+        # Export layout: <work>/<dataset name>/<task>/; accept tasks at the top too.
+        children = [c for c in sorted(work.iterdir()) if c.is_dir() and not c.name.startswith(".")] \
+            if work.is_dir() else []
+        dataset = children[0] if len(children) == 1 and _task_dirs(children[0]) else work
+        tasks = _task_dirs(dataset)
+        missing = sorted(set(expected or ()) - set(tasks))
+        if not tasks or missing:
+            raise ValueError(f"工作台下载的 {ref} 有 {len(tasks)} 道任务，缺少 {len(missing)} 道"
+                             + ("（" + "、".join(missing[:5]) + "）" if missing else ""))
+        relative = dataset.relative_to(work).as_posix() if dataset != work else ""
+        (work / REGISTRY_MARKER).write_text(json.dumps({"ref": ref, "dataset": relative, "tasks": len(tasks)}),
+                                            encoding="utf-8")
+        shutil.rmtree(final, ignore_errors=True)
+        work.replace(final)
+        log(f"工作台已下载注册表数据集 {ref}：{len(tasks)} 道任务")
+        return final / relative if relative else final
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ job sync
@@ -750,6 +936,11 @@ class RemoteRun:
         # How long the final copy may take before the run reports its
         # results as still on the executor (the environment can shorten it).
         self.final_timeout = float(os.environ.get("METACODES_BENCH_FINAL_SYNC_TIMEOUT") or self.FINAL_SYNC_TIMEOUT)
+        # egress "workbench": this run's proxy on the workbench loopback and
+        # the executor loopback port its `ssh -R` forward listens on.
+        self.proxy = None
+        self.tunnel_port = (secrets.SystemRandom().randrange(20000, 60000)
+                            if self.executor.egress == "workbench" else None)
 
     @property
     def remote_job_dir(self) -> str:
@@ -760,7 +951,14 @@ class RemoteRun:
         self.runtime = ship_runtime(self.executor, log=self.log, runner=self.runner, popen=self.popen)
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
-        if self.spec.get("local_dataset"):
+        registry = self.spec.get("registry_download")
+        if registry:
+            # harbor-registry suite: downloaded here (the executor may not
+            # reach GitHub or the Hub), then shipped like a local dataset.
+            local = registry_dataset(registry["ref"], Path(registry["cache"]), registry.get("harbor"),
+                                     expected=registry.get("tasks"), log=self.log)
+            self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
+        elif self.spec.get("local_dataset"):
             # harbor-local suite: `-p` names this host's prepared directory.
             self.dataset = ship_dataset(self.executor, Path(self.spec["local_dataset"]), log=self.log,
                                         runner=self.runner, popen=self.popen)
@@ -770,13 +968,19 @@ class RemoteRun:
         run_dir = self.executor.remote("runs", self.spec["name"])
         remote = {**self.spec, "harbor": self.spec.get("remote_harbor") or self.executor.harbor or ".local/bin/harbor",
                   "bundle": self.bundle, "jobs_dir": self.executor.remote("jobs")}
-        if self.dataset:
+        if self.spec.get("registry_download"):
+            # `-p` task names are the exported directory names: bare ids,
+            # without the Hub's `org/` prefix that `-d` matches.
+            remote["dataset_args"] = ["-p", self.dataset]
+            remote["task_filters"] = list(self.spec["registry_download"]["filters"])
+        elif self.dataset:
             args = list(remote.get("dataset_args") or [])
             if "-p" not in args:
                 raise ValueError("本地数据集运行缺少 -p 参数")
             args[args.index("-p") + 1] = self.dataset
             remote["dataset_args"] = args
         remote.pop("local_dataset", None)
+        remote.pop("registry_download", None)
         remote.pop("forward_env", None)
         remote.pop("metrics_proxy", None)
         remote.pop("metrics_ca", None)
@@ -788,7 +992,39 @@ class RemoteRun:
                      "auth_prefix": auth[1], "metrics_dir": self.remote_job_dir + "/.bench-metrics",
                      "record": bool(record)}
         return {"schema_version": 1, "name": self.spec["name"], "argv": command(remote),
-                "key_env": self.spec["key_env"], "relay": relay, "runtime": self.runtime}
+                "key_env": self.spec["key_env"], "relay": relay, "runtime": self.runtime,
+                "egress": self.egress_spec(), "ghcr_mirror": self.executor.ghcr_mirror}
+
+    def egress_spec(self) -> Optional[Dict]:
+        """What the remote driver needs for the containers' egress. Model
+        traffic to the relay (metrics_bind) always bypasses the proxy."""
+        executor = self.executor
+        if executor.egress == "workbench":
+            return {"mode": "workbench", "tunnel_port": self.tunnel_port, "bind": executor.metrics_bind,
+                    "no_proxy": [executor.metrics_bind]}
+        if executor.egress == "proxy":
+            return {"mode": "proxy", "url": executor.egress_proxy, "no_proxy": [executor.metrics_bind]}
+        return None
+
+    def start_egress(self) -> Optional[Tuple[int, int]]:
+        """Start this run's workbench proxy; (executor port, local port) of
+        the reverse forward the run session carries, or None."""
+        if self.tunnel_port is None:
+            return None
+        from scripts.eval.harbor.viewer.egress import EgressProxy
+        if self.proxy is None:
+            self.proxy = EgressProxy(self.executor.egress_ports, log=self.log).start()
+            self.log(f"容器出网经工作台：代理 127.0.0.1:{self.proxy.port}，"
+                     f"{self.executor.name} 回环端口 {self.tunnel_port}（ssh -R），"
+                     f"允许端口 {', '.join(str(p) for p in sorted(self.executor.egress_ports))}")
+        return self.tunnel_port, self.proxy.port
+
+    def close(self) -> None:
+        """Stop the run's workbench proxy (idempotent)."""
+        if self.proxy is not None:
+            self.proxy.close()
+            self.log("出网代理已停止：" + json.dumps(self.proxy.counts))
+            self.proxy = None
 
     def upload_run(self, remote_spec: Dict) -> str:
         """The run directory holds the remote spec and provider config only."""
@@ -807,7 +1043,7 @@ class RemoteRun:
     def start(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str] = None) -> None:
         argv = ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, "PYTHONUNBUFFERED=1",
                                         self.executor.python, "-m", "scripts.eval.harbor.viewer.remote",
-                                        "run", remote_spec_path])
+                                        "run", remote_spec_path], reverse=self.start_egress())
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
         # to Harbor (the placeholder, a judge key), `credential` to the relay.

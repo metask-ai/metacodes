@@ -20,6 +20,17 @@ Later stdin lines are control messages:
 - `cancel`, or the channel closing: interrupt Harbor (SIGINT, then SIGKILL
   after 20 s).
 
+With `"egress"` in the spec, the driver starts the run's egress
+(viewer/egress.py) before Harbor and removes it after: in workbench mode a
+forwarder on the Docker bridge's gateway to the session's `ssh -R` port, and
+in both modes a run-scoped DOCKER_CONFIG directory holding only the proxy
+settings (`egress` event). With `"ghcr_mirror"`, ghcr.io images the selected
+tasks name and that are missing locally are pulled through the mirror and
+tagged back first (`ghcr` event; heartbeats continue meanwhile).
+
+`egress-probe <json>` is setup's end-to-end check of that path from a
+container on a user-defined network.
+
 `pack` streams a PAX tar of the requested files. An item is a name, or
 `[name, offset, sha256]`: when the DELTA_CHECK_BYTES before `offset` still
 hash to `sha256`, only the bytes from `offset` on are sent and the member
@@ -38,6 +49,7 @@ import tarfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
 
@@ -88,19 +100,54 @@ def run(spec_path):
     env["PYTHONUNBUFFERED"] = "1"
     relay = None
     credential = None
-    if spec.get("relay"):
-        sys.path.insert(0, runtime)
-        from scripts.eval.harbor.profiling import PushedCredential, TimingRelay
-        options = spec["relay"]
-        token = secret_env[spec["key_env"]]
-        credential = PushedCredential(real or token)
-        relay = TimingRelay(options["upstream"], credential, absolute(options["metrics_dir"]),
-                            bind=options.get("bind") or "172.17.0.1", auth_header=options["auth_header"],
-                            auth_prefix=options["auth_prefix"], tls=True, token=token,
-                            record=options.get("record", True)).__enter__()
-        argv += ["--ak", "metrics_proxy=" + relay.url, "--ak", "metrics_ca=" + str(relay.ca_path)]
+    session = None
     stop = threading.Event()
     hung_up = threading.Event()
+    try:
+        if spec.get("relay"):
+            sys.path.insert(0, runtime)
+            from scripts.eval.harbor.profiling import PushedCredential, TimingRelay
+            options = spec["relay"]
+            token = secret_env[spec["key_env"]]
+            credential = PushedCredential(real or token)
+            relay = TimingRelay(options["upstream"], credential, absolute(options["metrics_dir"]),
+                                bind=options.get("bind") or "172.17.0.1", auth_header=options["auth_header"],
+                                auth_prefix=options["auth_prefix"], tls=True, token=token,
+                                record=options.get("record", True)).__enter__()
+            argv += ["--ak", "metrics_proxy=" + relay.url, "--ak", "metrics_ca=" + str(relay.ca_path)]
+        if spec.get("egress") or spec.get("ghcr_mirror"):
+            if runtime not in sys.path:
+                sys.path.insert(0, runtime)
+            from scripts.eval.harbor.viewer import egress
+        if spec.get("egress"):
+            # For this run only: the forwarder on the Docker bridge and a
+            # DOCKER_CONFIG that tells the docker CLI to give every container
+            # the proxy. Removed in `finally`, whatever happens.
+            relay_host = urlsplit(relay.url).hostname if relay else None
+            # Sidecars are addressed by compose service name: direct, never proxied.
+            dataset, patterns = dataset_selection(argv)
+            services = egress.task_services(Path(dataset), patterns) if dataset else list(egress.HARBOR_SERVICES)
+            session = egress.Session(spec["egress"], Path(spec_path).resolve().parent, [relay_host] + services,
+                                     env=env)
+            env["DOCKER_CONFIG"] = str(session.directory)
+            emit("egress", mode=spec["egress"]["mode"], proxy=session.proxy_url, no_proxy=session.no_proxy)
+        return supervise(spec, argv, env, credential, stop, hung_up,
+                         egress if spec.get("ghcr_mirror") else None)
+    finally:
+        if session is not None:
+            session.close()
+        if relay:
+            relay.__exit__(None, None, None)
+
+
+def dataset_selection(argv):
+    """(the `-p` dataset directory, the `-i` patterns) of a Harbor argv."""
+    dataset = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-p"), None)
+    return dataset, [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-i"]
+
+
+def supervise(spec, argv, env, credential, stop, hung_up, egress=None):
+    """Run Harbor: control channel, heartbeats, cancel; the exit code."""
 
     def control():
         for line in sys.stdin.buffer:
@@ -121,37 +168,63 @@ def run(spec_path):
         hung_up.set()
         stop.set()
 
-    try:
-        # Harbor's own output goes to stderr, which SSH carries to the local
-        # worker's log; stdout carries only events.
-        process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
-                                   start_new_session=True)
-        emit("started", pid=process.pid)
-        threading.Thread(target=control, daemon=True).start()
-        interrupted_at = None
-        last = 0.0
-        while process.poll() is None:
-            if stop.is_set() and interrupted_at is None:
-                interrupted_at = time.monotonic()
-                emit("cancelling", hung_up=hung_up.is_set())
-                os.killpg(process.pid, signal.SIGINT)
-            if interrupted_at and time.monotonic() - interrupted_at > 20:
-                os.killpg(process.pid, signal.SIGKILL)
-            if time.monotonic() - last > 2:
+    threading.Thread(target=control, daemon=True).start()
+    dataset, patterns = dataset_selection(argv)
+    if egress is not None and dataset:
+        images = egress.ghcr_images(Path(dataset), patterns)
+        if images:
+            # Pulls can outlast the worker's 90 s heartbeat window.
+            pulling = threading.Event()
+
+            def beat():
+                while not pulling.wait(2):
+                    try:
+                        emit("heartbeat", phase="ghcr")
+                    except (BrokenPipeError, OSError):
+                        stop.set()
+                        return
+            threading.Thread(target=beat, daemon=True).start()
+            try:
+                tagged = egress.ensure_ghcr(images, spec["ghcr_mirror"], env=env, stop=stop,
+                                            log=lambda text: print(text, file=sys.stderr, flush=True))
+            finally:
+                pulling.set()
+            try:
+                emit("ghcr", images=len(images), tagged=len(tagged))
+            except (BrokenPipeError, OSError):
+                stop.set()
+            if stop.is_set():  # cancelled (or the channel closed) while pulling
                 try:
-                    emit("heartbeat")
+                    emit("exit", code=130, cancelled=True)
                 except (BrokenPipeError, OSError):
-                    stop.set()
-                last = time.monotonic()
-            time.sleep(0.25)
-        try:
-            emit("exit", code=process.returncode, cancelled=interrupted_at is not None)
-        except (BrokenPipeError, OSError):
-            pass
-        return process.returncode
-    finally:
-        if relay:
-            relay.__exit__(None, None, None)
+                    pass
+                return 130
+    # Harbor's own output goes to stderr, which SSH carries to the local
+    # worker's log; stdout carries only events.
+    process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
+                               start_new_session=True)
+    emit("started", pid=process.pid)
+    interrupted_at = None
+    last = 0.0
+    while process.poll() is None:
+        if stop.is_set() and interrupted_at is None:
+            interrupted_at = time.monotonic()
+            emit("cancelling", hung_up=hung_up.is_set())
+            os.killpg(process.pid, signal.SIGINT)
+        if interrupted_at and time.monotonic() - interrupted_at > 20:
+            os.killpg(process.pid, signal.SIGKILL)
+        if time.monotonic() - last > 2:
+            try:
+                emit("heartbeat")
+            except (BrokenPipeError, OSError):
+                stop.set()
+            last = time.monotonic()
+        time.sleep(0.25)
+    try:
+        emit("exit", code=process.returncode, cancelled=interrupted_at is not None)
+    except (BrokenPipeError, OSError):
+        pass
+    return process.returncode
 
 
 def files(root):
@@ -229,10 +302,64 @@ def pack(root):
     return 0
 
 
+PROBE_IMAGE = "alpine:3.20"
+
+
+def egress_probe(options):
+    """Setup's check of the container egress path: a container on a fresh
+    user-defined network (as Harbor's compose projects use) fetches the
+    workbench proxy's probe page through the forwarder (workbench mode) or
+    reaches the site proxy (proxy mode). Prints one JSON line."""
+    from scripts.eval.harbor.viewer import egress
+    import uuid
+    network = "metacodes-bench-egress-" + uuid.uuid4().hex[:8]
+    result = {"ok": False}
+    forwarder = None
+    try:
+        if options["mode"] == "workbench":
+            gateway = egress.docker_gateway() or options.get("bind") or "172.17.0.1"
+            forwarder = egress.Forwarder(gateway, ("127.0.0.1", int(options["tunnel_port"]))).start()
+            url = "http://%s:%d%s" % (forwarder.address[0], forwarder.address[1], egress.PROBE_PATH)
+            result["gateway"] = gateway
+        else:
+            url = options["url"]
+        result["url"] = url
+        created = subprocess.run(["docker", "network", "create", network], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=60)
+        if created.returncode != 0:
+            result["error"] = "network: " + (created.stderr or created.stdout or "").strip()[-300:]
+            return result
+        if options["mode"] == "workbench":
+            command = ["wget", "-q", "-T", "10", "-O", "-", url]
+        else:  # a site proxy: its port must accept connections from containers
+            parts = urlsplit(url)
+            command = ["nc", "-z", "-w", "5", parts.hostname, str(parts.port or 80)]
+        done = subprocess.run(["docker", "run", "--rm", "--network", network, PROBE_IMAGE] + command,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+        body = done.stdout.decode(errors="replace").strip()
+        result["ok"] = done.returncode == 0 and (options["mode"] != "workbench"
+                                                 or body == egress.PROBE_BODY.decode())
+        if not result["ok"]:
+            result["error"] = (done.stderr.decode(errors="replace") or body).strip()[-300:]
+        return result
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    finally:
+        if forwarder is not None:
+            forwarder.close()
+        subprocess.run(["docker", "network", "rm", network], stdin=subprocess.DEVNULL, capture_output=True,
+                       timeout=60)
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) == 2 and args[0] == "egress-probe":
+        result = egress_probe(json.loads(args[1]))
+        print(json.dumps(result))
+        return 0 if result["ok"] else 1
     if len(args) != 2 or args[0] not in ("run", "manifest", "pack"):
-        print("usage: remote.py run <spec> | manifest <dir> | pack <dir>", file=sys.stderr)
+        print("usage: remote.py run <spec> | manifest <dir> | pack <dir> | egress-probe <json>", file=sys.stderr)
         return 2
     action, target = args
     if action == "run":

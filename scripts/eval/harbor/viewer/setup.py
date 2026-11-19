@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -90,6 +91,7 @@ class Setup:
         self.runner, self.popen = runner, popen
         self.options = options or {}
         self.facts: Dict[str, str] = {}
+        self.proposed: Dict = {}  # executor settings a dry run would write
         self.step: Optional[Dict] = None
         self.progress = {"schema_version": 1, "id": uuid.uuid4().hex[:12], "executor": self.executor.name,
                          "kind": self.executor.kind, "dry_run": dry_run, "status": "running",
@@ -161,6 +163,21 @@ class Setup:
         from scripts.eval.harbor.viewer.runner import atomic_json
         atomic_json(data_path, cfg)
         self.cfg = cfg
+        # Later steps see what earlier ones wrote (egress, mirrors).
+        self.executor = executors.find(cfg, self.executor.name)
+
+    def entry(self) -> Dict:
+        """The executor's own entry in workbench.json, as written."""
+        for entry in self.cfg.get("executors") or []:
+            if isinstance(entry, dict) and entry.get("name") == self.executor.name:
+                return entry
+        return {}
+
+    def effective(self, key):
+        """An executor setting, including a value a dry run only proposed."""
+        if key in self.proposed:
+            return self.proposed[key]
+        return self.executor.egress_value() if key == "egress" else getattr(self.executor, key)
 
     def set_executor_value(self, key, value):
         """Persist an executor-scoped value (local Harbor goes top level,
@@ -318,7 +335,12 @@ def step_harbor(s: Setup):
         return "ok", f"Harbor {version}（{path}）"
     if not s.found("uv") and not s.dry_run:
         raise Failed("需要先安装 uv")
-    s.sh(f"uv tool install --force --python {HARBOR_PYTHON} harbor=={HARBOR_VERSION}", mutate=True, check=True)
+    # An executor's pypi_index (e.g. a PyPI mirror where pypi.org is slow)
+    # serves this install only; nothing else on the host changes.
+    index = s.effective("pypi_index") if s.remote else None
+    prefix = f"env UV_DEFAULT_INDEX={shlex.quote(index)} " if index else ""
+    s.sh(f"{prefix}uv tool install --force --python {HARBOR_PYTHON} harbor=={HARBOR_VERSION}", mutate=True,
+         check=True)
     if s.dry_run:
         return "planned", (f"将把 Harbor {version} 换成 {HARBOR_VERSION}" if version else f"将安装 Harbor {HARBOR_VERSION}")
     path, version = harbor_state(s)
@@ -774,6 +796,207 @@ def step_remote_files(s: Setup):
     return "done", f"运行时 {runtime}，发行包 {remote_bundle}"
 
 
+# ----------------------------------------------------------------- network (ssh executors)
+
+# What the network step probes from the executor, and the mirror it proposes
+# for each when the answer is slow or missing (Chinese mainland defaults; a
+# value already in the executor entry always wins). Tests point these at
+# local servers.
+NETWORK_TARGETS = {
+    "pypi": "https://pypi.org/simple/pip/",
+    "dockerhub": "https://registry-1.docker.io/v2/",
+    "ghcr": "https://ghcr.io/v2/",
+    "github": "https://github.com/",
+}
+NETWORK_TIMEOUT = 8
+NETWORK_SLOW = 5.0
+DEFAULT_PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
+DEFAULT_DOCKER_MIRRORS = ["https://docker.m.daocloud.io", "https://dockerproxy.net"]
+DEFAULT_GHCR_MIRROR = "ghcr.nju.edu.cn"
+DAEMON_JSON = "/etc/docker/daemon.json"
+NETWORK_PROBE = r'''
+import json, sys, time, urllib.error, urllib.request
+targets, timeout = json.loads(sys.argv[1]), float(sys.argv[2])
+result = {}
+for key, url in targets.items():
+    start = time.monotonic()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "metacodes-bench-setup"}),
+                               timeout=timeout).close()
+        ok = True
+    except urllib.error.HTTPError:
+        ok = True  # the server answered (401 from a registry is expected)
+    except Exception as exc:
+        ok, error = False, type(exc).__name__
+    result[key] = {"ok": ok, "seconds": round(time.monotonic() - start, 2)}
+    if not ok:
+        result[key]["error"] = error
+print(json.dumps(result))
+'''
+NETWORK_LABELS = {"pypi": "pypi.org", "dockerhub": "registry-1.docker.io", "ghcr": "ghcr.io",
+                  "github": "github.com"}
+
+
+def network_state(s: Setup) -> Dict:
+    command = " ".join(shlex.quote(part) for part in (s.executor.python, "-c", NETWORK_PROBE,
+                                                       json.dumps(NETWORK_TARGETS), str(NETWORK_TIMEOUT)))
+    text = s.out(command)
+    try:
+        value = json.loads(text.splitlines()[-1]) if text else None
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        raise Failed("无法在执行机器上检查网络（Python 探测失败）")
+    return value
+
+
+def step_network(s: Setup):
+    """Probe the executor's reach to PyPI, Docker Hub, ghcr.io and GitHub
+    (short timeouts) and propose mirrors / egress for what is slow or
+    blocked. Values already in the executor's entry are never replaced."""
+    s.require_shell()
+    state = network_state(s)
+    bad = {key for key, value in state.items()
+           if not (isinstance(value, dict) and value.get("ok")) or (value.get("seconds") or 0) > NETWORK_SLOW}
+    for key, value in sorted(state.items()):
+        if isinstance(value, dict):
+            s.log(f"{NETWORK_LABELS.get(key, key)}：" + (f"{value.get('seconds')} 秒" if value.get("ok")
+                                                          else f"不可达（{value.get('error')}，{value.get('seconds')} 秒）"))
+    entry = s.entry()
+    proposals = []
+    if "pypi" in bad and "pypi_index" not in entry:
+        proposals.append(("pypi_index", DEFAULT_PYPI_INDEX, "安装 Harbor 用 PyPI 镜像"))
+    if "dockerhub" in bad and "docker_mirrors" not in entry:
+        proposals.append(("docker_mirrors", list(DEFAULT_DOCKER_MIRRORS), "Docker Hub 镜像加速"))
+    if "ghcr" in bad and "ghcr_mirror" not in entry:
+        proposals.append(("ghcr_mirror", DEFAULT_GHCR_MIRROR, "ghcr.io 镜像"))
+    if bad & {"github", "pypi"} and "egress" not in entry:
+        # Task verifiers download uv, Python and packages at test time.
+        proposals.append(("egress", "workbench", "任务容器经工作台出网"))
+    if not proposals:
+        slow = "、".join(NETWORK_LABELS.get(k, k) for k in sorted(bad))
+        return "ok", ("网络可达" if not bad else f"{slow} 较慢或不可达；executors 中已有对应配置，未做修改")
+    for key, value, _ in proposals:
+        s.proposed[key] = value
+        s.set_executor_value(key, value)
+    detail = "；".join(f"{why}：{key} = {json.dumps(value, ensure_ascii=False)}" for key, value, why in proposals)
+    blocked = "、".join(NETWORK_LABELS.get(k, k) for k in sorted(bad))
+    return ("planned" if s.dry_run else "done"), f"{blocked} 较慢或不可达，" + ("建议" if s.dry_run else "已设置") + detail
+
+
+def step_docker_mirrors(s: Setup):
+    """Add the executor's docker_mirrors to the daemon's registry-mirrors.
+    Root only through passwordless sudo; the daemon is reloaded (SIGHUP:
+    registry-mirrors is reloadable), never restarted, so running containers
+    are untouched."""
+    s.require_shell()
+    mirrors = list(s.effective("docker_mirrors") or ())
+    if not mirrors:
+        raise Skip("未配置 docker_mirrors")
+    text = s.out("cat " + shlex.quote(DAEMON_JSON) + " 2>/dev/null")
+    try:
+        current = json.loads(text) if text else {}
+    except ValueError:
+        raise Failed(DAEMON_JSON + " 不是有效 JSON，请手动修复后重试") from None
+    if not isinstance(current, dict):
+        raise Failed(DAEMON_JSON + " 不是 JSON 对象，请手动修复后重试")
+    existing = current.get("registry-mirrors") or []
+    if not isinstance(existing, list):
+        raise Failed(DAEMON_JSON + " 的 registry-mirrors 不是列表，请手动修复后重试")
+    merged = existing + [m for m in mirrors if m not in existing]
+    if merged == existing:
+        return "ok", "registry-mirrors 已包含 " + "、".join(mirrors)
+    content = json.dumps({**current, "registry-mirrors": merged}, indent=2) + "\n"
+    temporary = DAEMON_JSON + ".metacodes-bench.tmp"
+    manual = (f"printf '%s\\n' {shlex.quote(content.strip())} | sudo tee {shlex.quote(DAEMON_JSON)} >/dev/null"
+              " && sudo systemctl reload docker")
+    if not sudo_available(s):
+        raise Manual(f"写入 {DAEMON_JSON} 需要 root（无免密 sudo）；运行下面的命令后 reload（不重启）Docker", manual)
+    write = f"cat > {shlex.quote(temporary)} && mv {shlex.quote(temporary)} {shlex.quote(DAEMON_JSON)}"
+    s.sh("sudo -n sh -c " + shlex.quote(write), mutate=True, input=content, check=True)
+    s.sh("sudo -n systemctl reload docker", mutate=True, check=True)
+    if s.dry_run:
+        return "planned", "将加入 registry-mirrors：" + "、".join(m for m in mirrors if m not in existing)
+    after = s.out("cat " + shlex.quote(DAEMON_JSON) + " 2>/dev/null")
+    try:
+        written = json.loads(after).get("registry-mirrors") or []
+    except (ValueError, AttributeError):
+        written = []
+    if not set(mirrors) <= set(written):
+        raise Failed(DAEMON_JSON + " 写入后验证失败")
+    return "done", "registry-mirrors：" + "、".join(merged) + "（已 reload，未重启 Docker）"
+
+
+def step_egress(s: Setup):
+    """End to end: a container on a user-defined network reaches the egress
+    proxy (workbench mode: forwarder -> ssh -R -> this machine's proxy)."""
+    s.require_shell()
+    mode = s.effective("egress")
+    if mode == "direct":
+        raise Skip("egress = direct：任务容器直接使用执行机器的网络")
+    options = ({"mode": "workbench", "tunnel_port": secrets.SystemRandom().randrange(20000, 60000),
+                "bind": s.executor.metrics_bind} if mode == "workbench" else {"mode": "proxy", "url": mode["proxy"]})
+    runtime = s.executor.remote("runtime", "<digest>")
+    proxy = None
+    try:
+        if not s.dry_run:
+            runtime = executors.ship_runtime(s.executor, log=s.log, runner=s.runner, popen=s.popen)
+        reverse = None
+        if mode == "workbench":
+            if not s.dry_run:
+                from scripts.eval.harbor.viewer.egress import EgressProxy
+                proxy = EgressProxy(s.executor.egress_ports, log=s.log).start()
+            reverse = (options["tunnel_port"], proxy.port if proxy else 0)
+        argv = executors.ssh_argv(s.executor, ["env", "PYTHONPATH=" + runtime, s.executor.python, "-m",
+                                               "scripts.eval.harbor.viewer.remote", "egress-probe",
+                                               json.dumps(options)], reverse=reverse)
+        done = s.run(argv, mutate=True, timeout=600)
+    finally:
+        if proxy is not None:
+            proxy.close()
+    if s.dry_run:
+        return "planned", ("将验证：自定义网络中的容器经 docker0 网关转发、ssh -R 访问工作台代理" if mode == "workbench"
+                           else "将验证：自定义网络中的容器能连到站点代理 " + mode["proxy"])
+    lines = (done.stdout or "").strip().splitlines()
+    try:
+        result = json.loads(lines[-1]) if lines else {}
+    except ValueError:
+        result = {}
+    if result.get("ok"):
+        if mode == "workbench":
+            return "ok", f"容器经 {result.get('gateway')} 转发、ssh -R 到工作台代理可达"
+        return "ok", "容器可连到站点代理 " + mode["proxy"]
+    error = result.get("error") or ("SSH 反向转发失败（ExitOnForwardFailure）" if done.returncode == 255
+                                    else f"探测退出码 {done.returncode}")
+    if mode == "workbench":
+        raise Failed(f"容器无法经执行机器的 Docker 网关（{result.get('gateway') or '未知'}）连到工作台代理：{error}。"
+                     "请检查执行机器防火墙是否允许 Docker 网段访问网关地址，或把 egress 改为 direct")
+    raise Failed(f"容器连不上站点代理 {mode['proxy']}：{error}")
+
+
+def step_workbench_harbor(s: Setup):
+    """Harbor on the workbench machine: registry suites for SSH executors
+    are downloaded here (`harbor download`) and shipped."""
+    found = executors.workbench_harbor(s.cfg)
+    if found:
+        return "ok", found + "（SSH 执行机器的注册表评测集在工作台下载后发送）"
+    uv = shutil.which("uv", path=executors.search_path())
+    command = ["uv", "tool", "install", "--force", "--python", HARBOR_PYTHON, "harbor==" + HARBOR_VERSION]
+    if not uv:
+        raise Manual("工作台本机缺少 Harbor：SSH 执行机器的注册表评测集在工作台下载后发送", display(command))
+    s.run([uv] + command[1:], mutate=True, check=True)
+    if s.dry_run:
+        return "planned", f"将在工作台安装 Harbor {HARBOR_VERSION}"
+    found = executors.workbench_harbor(s.cfg)
+    if not found:
+        raise Failed("工作台 Harbor 安装后仍找不到")
+
+    def change(cfg):
+        cfg["harbor"] = found
+    s.update_config("harbor = " + found, change)
+    return "done", found
+
+
 def step_psycopg(s: Setup):
     store = s.cfg.get("store") or {}
     if not (isinstance(store, dict) and store.get("backend") == "postgres"):
@@ -805,12 +1028,17 @@ def step_login(s: Setup):
 def plan(s: Setup):
     steps = []
     if s.remote:
-        steps += [("ssh", "SSH 访问", step_ssh), ("python", "Python 3.9+", step_python)]
+        steps += [("ssh", "SSH 访问", step_ssh), ("python", "Python 3.9+", step_python),
+                  ("network", "网络与镜像", step_network)]
     steps += [("uv", "uv", step_uv), ("harbor", "Harbor " + HARBOR_VERSION, step_harbor),
-              ("docker", "Docker" + ("" if s.remote else "（macOS: Colima）"), step_docker),
-              ("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]
+              ("docker", "Docker" + ("" if s.remote else "（macOS: Colima）"), step_docker)]
     if s.remote:
-        steps.append(("remote_files", "复制运行时和发行包", step_remote_files))
+        steps.append(("docker_mirrors", "Docker 镜像加速", step_docker_mirrors))
+    steps += [("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]
+    if s.remote:
+        steps += [("remote_files", "复制运行时和发行包", step_remote_files),
+                  ("egress", "容器出网（经工作台）", step_egress),
+                  ("workbench_harbor", "工作台 Harbor（注册表评测集）", step_workbench_harbor)]
     steps += [("psycopg", "psycopg（PostgreSQL 存储）", step_psycopg), ("login", "Metask 登录", step_login)]
     return steps
 

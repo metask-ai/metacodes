@@ -159,12 +159,16 @@ that is not a dry run is in progress; the service checks both under one lock.
 |---|---|
 | SSH access (`ssh` executors) | Runs a probe over `ssh -o BatchMode=yes`; if the key cannot run commands, it stops here and says so |
 | Python 3.9+ (`ssh` executors) | Needed by the remote driver |
+| 网络与镜像 (`ssh` executors) | Probes `pypi.org`, `registry-1.docker.io`, `ghcr.io` and `github.com` from the executor (8 s timeout; over 5 s counts as slow) and fills in what is missing from the entry: `pypi_index`, `docker_mirrors`, `ghcr_mirror` and `"egress": "workbench"` (see [Network-restricted executors](#network-restricted-executors)). A value already in the entry is never replaced; a dry run lists the proposed changes |
 | uv | macOS: `brew install uv` when Homebrew exists; otherwise (and on Linux) the official installer pinned to uv 0.13.9 into `~/.local/bin` |
-| Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12); the resulting path is saved |
+| Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12; with an executor's `pypi_index`, prefixed by `env UV_DEFAULT_INDEX=<index>`); the resulting path is saved |
 | Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose plugin when needed |
+| Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | Copy runtime (`ssh` executors) | Ships the bench runtime and the bundle (below) |
+| 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy; a failure names the gateway and the firewall to check |
+| 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
 | Metask login | Never automated. The step names the command; the page's 登录 button runs `metacodes login --provider metask --no-browser` and shows its device-flow URL and code |
 
@@ -356,8 +360,10 @@ does the same):
 ```
 
 An `ssh` entry also accepts `harbor` (written by setup), `python`
-(default `python3`), `metrics_bind` (default `172.17.0.1`) and
-`metrics_enabled`. Names, hosts, users and paths are validated before any
+(default `python3`), `metrics_bind` (default `172.17.0.1`),
+`metrics_enabled`, and the network settings `egress`, `egress_ports`,
+`pypi_index`, `docker_mirrors` and `ghcr_mirror` (see
+[Network-restricted executors](#network-restricted-executors)). Names, hosts, users and paths are validated before any
 `ssh` argv is built; unknown fields are refused. `harbor` and `python` may
 contain spaces and `@` (a home directory can), since they only travel as one
 argv word; `state_dir` may not. Setup saves a Harbor path only when the entry
@@ -425,8 +431,18 @@ refreshing a session login, then
    `metacodes bench sync --run NAME` copies them later; a run whose Harbor
    exited 0 then becomes `finished`.
 
-Suites on an SSH executor: `harbor-registry` suites run there unchanged
-(the remote Harbor resolves `-d` itself). A `harbor-local` suite's dataset
+Suites on an SSH executor: a `harbor-registry` suite is always downloaded on
+the workbench machine (its own Harbor, `harbor download <ref> -o <dir>`), so
+the executor never needs to reach GitHub or the Harbor Hub. The download is
+cached per reference in `<state root>/bench/registry-cache/<sha256(ref)[:16]>/`
+(written atomically, with a marker of its task count; every task id the
+catalog lists for the suite must be present, otherwise the run is refused
+and nothing is cached), shipped like a local dataset into
+`<state_dir>/datasets/<digest>`, and run with `-p`. Harbor names a `-p`
+task by its directory name, which the export layout makes the bare task id,
+so the `-i` filters drop the Hub's `org/` prefix (`terminal-bench/fix-git`
+under `-d` becomes `fix-git`). Readiness of registry suites on SSH executors
+includes the workbench machine's Harbor. A `harbor-local` suite's dataset
 directory is generated on the workbench's machine (`bench prepare`, or
 `--dataset SUITE=DIR`) and shipped like the bundle, into
 `<state_dir>/datasets/<digest>`, once per content digest; Harbor's `-p` then
@@ -449,6 +465,74 @@ then SIGKILL after 20 seconds). A login that can no longer be refreshed
 cancels the same way and fails the run with the reason above. If the channel closes, or no heartbeat
 arrives for 90 seconds, the driver stops Harbor as well, so a lost connection
 never leaves trials running unsupervised.
+
+### Network-restricted executors
+
+An executor that cannot reach PyPI, Docker Hub, ghcr.io or GitHub (or only
+slowly) is configured per entry; `metacodes bench setup --executor NAME`
+proposes these when its network probe finds those hosts slow or blocked:
+
+```json
+{"name": "relay-4090", "kind": "ssh", "host": "10.126.126.1", "user": "bench",
+ "egress": "workbench", "egress_ports": [443, 80],
+ "pypi_index": "https://pypi.tuna.tsinghua.edu.cn/simple",
+ "docker_mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.net"],
+ "ghcr_mirror": "ghcr.nju.edu.cn"}
+```
+
+| Field | Effect |
+|---|---|
+| `egress` | `"direct"` (default): containers use the executor's network. `"workbench"`: containers use the workbench machine's network (below). `{"proxy": "http://host:port"}`: a site proxy the containers can reach, injected the same way, without a tunnel |
+| `egress_ports` | Destination ports the workbench proxy serves (default `[443, 80]`) |
+| `pypi_index` | `UV_DEFAULT_INDEX` for setup's Harbor install on the executor only; it does not reach runs or the bundle |
+| `docker_mirrors` | Added to the daemon's `registry-mirrors` by setup (sudo, reload, never restart). They cover Docker Hub images only |
+| `ghcr_mirror` | Before each run, ghcr.io images the selected tasks name (`FROM` lines of their Dockerfiles, `image:` of their compose files, `docker_image` in `task.toml`) that are missing locally are pulled as `<mirror>/<path>` and tagged back to their `ghcr.io/` name; other registries are left alone. A failed pull is logged and Harbor pulls from ghcr.io itself |
+
+`"egress": "workbench"` builds this path for each run, and only for it:
+
+```text
+task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (172.17.0.1:<ephemeral>)
+  --> 127.0.0.1:<tunnel port> on the executor (ssh -R of the run session)
+  --> proxy on the workbench machine (127.0.0.1:<ephemeral>) --> the destination
+```
+
+- The worker starts a stdlib-only CONNECT and plain-HTTP proxy on its own
+  loopback, on an ephemeral port, before the run session and stops it when
+  Harbor has exited. The run's SSH session (only that one) carries
+  `-o ExitOnForwardFailure=yes -R 127.0.0.1:<tunnel>:127.0.0.1:<proxy>`,
+  with a random tunnel port in 20000–59999; a port that is already taken
+  fails the session at once and the run says so.
+- SSRF guard: the proxy connects only to globally routable unicast
+  addresses. Loopback, private (RFC 1918, unique-local), link-local, CGNAT
+  (100.64/10), multicast, reserved and unspecified addresses are refused
+  with 403, with no exception list, so containers cannot reach the workbench
+  machine's own services or its LAN (EasyTier included). A name is resolved
+  once; any non-public answer refuses it, and the vetted address is the one
+  connected to. Single-label names (compose service names such as
+  `alfworld-env`) are refused at once with a 502 that says to put them in
+  `NO_PROXY`. Only `egress_ports` are served; the proxy needs no credentials
+  because only the run's tunnel reaches its loopback port. A workbench
+  machine that itself needs a proxy to reach the internet is not supported.
+- The remote driver starts a TCP forwarder bound only to the Docker bridge's
+  gateway (docker0's address, else `docker network inspect bridge`, else the
+  executor's `metrics_bind`), since containers cannot reach the host's
+  loopback and sshd's `GatewayPorts` stays untouched. Containers on Harbor's
+  own compose networks reach that address too. The forwarder lives exactly
+  as long as the driver's Harbor process.
+- The containers learn the proxy from a run-scoped Docker CLI configuration
+  directory under `<state_dir>/runs/<name>/docker-config-*`, created by the
+  driver, passed to Harbor as `DOCKER_CONFIG` and removed when Harbor exits.
+  It holds only `proxies.default` (`httpProxy`, `httpsProxy`, `noProxy`) and,
+  when it exists, `~/.docker/cli-plugins` as an extra plugin directory; the
+  docker CLI then injects the proxy variables into every container and build
+  of the run. Nothing is read or copied from the user's own
+  `~/.docker/config.json`, so other users of the account are unaffected and
+  stale registry credentials there do not apply. `noProxy` holds
+  `localhost`, `127.0.0.1`, `::1`, the gateway, the timing relay's host and
+  `metrics_bind` (model traffic goes straight to the relay), Harbor's `main`
+  and every compose service name of the selected tasks.
+- 一键配置's 容器出网（经工作台） step checks the whole path from a
+  container on a fresh user-defined network.
 
 ### Colima on Apple Silicon
 

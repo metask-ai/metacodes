@@ -90,7 +90,10 @@ def prepare(spec, env):
         # The relay must sit beside the Docker daemon that runs the trials,
         # so the remote driver starts it; here only files are staged.
         remote = RemoteRun(spec)
-        remote.stage()
+        try:
+            remote.stage()
+        except ValueError as exc:  # staging messages are user-facing, secret-free
+            raise LaunchRefused(str(exc)) from None
         record = record and spec["executor"].get("metrics_enabled", True)
         remote_spec = remote.remote_spec(upstream, auth, record=record)
         return {**spec, "remote_spec_path": remote.upload_run(remote_spec)}, remote, source
@@ -162,6 +165,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
             last_write = time.monotonic()
         time.sleep(0.25)
     remote.hang_up()
+    remote.close()  # the session (and its ssh -R) is over: stop the egress proxy
     stamp_credential(record, source)
     # Copy what is left beside the heartbeat; a cancel now stops the copy
     # (the results stay on the executor and the receipt says so). A lost
@@ -184,9 +188,13 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         complete = False
     code = remote.exit_code()
     if code is None:
+        lost = "SSH 连接中断"
+        if remote.tunnel_port is not None and not remote.events and remote.process.returncode == 255:
+            lost += (f"（会话带有 ssh -R 127.0.0.1:{remote.tunnel_port} 反向转发；"
+                     "若该端口在执行机器上已被占用，重新启动评测会换一个端口）")
         record.update(status="cancelled" if cancelled_at and not record.get("error") else "failed",
                       exit_code=remote.process.returncode, finished_at=now(),
-                      error=record.get("error") or ("SSH 连接中断" if not cancelled_at else None))
+                      error=record.get("error") or (lost if not cancelled_at else None))
     else:
         record.update(status="cancelled" if cancelled_at else ("finished" if code == 0 else "failed"),
                       exit_code=code, finished_at=now())
@@ -212,6 +220,7 @@ def main(argv=None):
     process = None
     relay = None
     source = None
+    remote = None
     # Ingests the job into the evaluation store while it runs and at the end.
     sync = WorkerSync(spec)
     sync.start()
@@ -237,7 +246,6 @@ def main(argv=None):
         if getattr(source, "refreshing", False):
             source.keep()
         stamp_credential(record, source)
-        remote = None
         if isinstance(relay, RemoteRun):
             # Not a context manager: nothing to close before it starts.
             remote, relay = relay, None
@@ -295,6 +303,8 @@ def main(argv=None):
         stamp_credential(record, source)
         if relay:
             relay.__exit__(None, None, None)
+        if remote is not None:
+            remote.close()  # the run's egress proxy, if any
         if spec.get("runner") == "workbuddy":
             from scripts.eval.harbor.suites import workbuddy
             try:
