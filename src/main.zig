@@ -112,6 +112,7 @@ pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
 pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
 pub const api_oauth_login = @import("api/oauth_login.zig");
+pub const api_oauth_revoke = @import("api/oauth_revoke.zig"); // L2 reads a provider sign-out's revocation outcome
 pub const api_provider_login = @import("api/provider_login.zig");
 pub const api_openrouter_login = @import("api/openrouter_login.zig");
 pub const api_openrouter_catalog = @import("api/openrouter_catalog.zig");
@@ -612,11 +613,8 @@ fn localTemplateNote(env_path: []const u8, buf: []u8) []const u8 {
 const StoredDefault = startup_order.StoredDefault;
 
 /// Whether the default stored by `/model` can serve this start: its route
-/// resolves and its provider has a credential. A Metask default needs a
-/// Metask device-code session or a Metask key (`metask_key_present`, the
-/// historical path's own sign-in): that is what a named Metask route
-/// authenticates with. Nothing is printed and nothing sent; the strings live
-/// in `arena`.
+/// resolves and its provider has a credential (`storedDefaultOn`). Nothing is
+/// printed and nothing sent; the strings live in `arena`.
 fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_present: bool) StoredDefault {
     var store = provider_config_store.Store.initHome(arena, hostRoot()) catch return .none;
     defer store.deinit();
@@ -625,12 +623,31 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
     const selection = document.global_selection orelse return .none;
     const host = buildProviderHost(arena) orelse return .{ .usable = .{} };
     defer host.destroy();
-    const outcome = provider_startup.resolveSelection(arena, &host.registry, selection) catch return .{ .usable = .{} };
+    return storedDefaultOn(arena, config, metask_key_present, &host.registry, selection);
+}
+
+/// `storedDefault` once the stored selection is read, judged against
+/// `registry`. A Metask default needs a Metask device-code session or a Metask
+/// key (`metask_key_present`, the historical path's own sign-in): that is what
+/// a named Metask route authenticates with. Another provider's needs a key, or
+/// its own sign-in, which counts by being stored (`providerSignInStored`), the
+/// way the Metask session does: refreshing it here would send a request from
+/// `login status` and pass the default over whenever the refresh failed. A
+/// start refreshes it when it uses it. Pub for the component test that gives
+/// the provider a token endpoint of its own.
+pub fn storedDefaultOn(
+    arena: std.mem.Allocator,
+    config: types.Config,
+    metask_key_present: bool,
+    registry: *const provider_registry.ProviderRegistry,
+    selection: provider_selection.RuntimeSelection,
+) StoredDefault {
+    const outcome = provider_startup.resolveSelection(arena, registry, selection) catch return .{ .usable = .{} };
     const route = switch (outcome) {
         .failure => return .{ .usable = .{} },
         .route => |value| value,
     };
-    const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
+    const provider_name = if (registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
     const label = std.fmt.allocPrint(arena, "{s} · {s}", .{ provider_name, route.request_model_id }) catch return .{ .usable = .{} };
     const usable: StoredDefault.Usable = .{
         .label = label,
@@ -650,11 +667,13 @@ fn storedDefault(arena: std.mem.Allocator, config: types.Config, metask_key_pres
         defer session.deinit();
         return if (session.load() catch false) .{ .usable = usable } else .{ .lacks_credential = label };
     }
-    if (resolveProviderScopedCredentialReporting(arena, config, route.provider_id.slice(), .quiet)) |found| {
+    const profile = registry.findById(route.provider_id) orelse return .{ .usable = usable };
+    if (resolveProfileCredential(arena, config, profile, .keys_only)) |found| {
         std.crypto.secureZero(u8, found.secret);
         arena.free(found.secret);
         return .{ .usable = usable };
-    } else |err| return if (err == error.MissingCredentials) .{ .lacks_credential = label } else .{ .usable = usable };
+    } else |err| if (err != error.MissingCredentials) return .{ .usable = usable };
+    return if (providerSignInStored(arena, config.state_root, profile)) .{ .usable = usable } else .{ .lacks_credential = label };
 }
 
 /// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
@@ -3535,7 +3554,9 @@ fn printRemainingMetaskKeys(allocator: std.mem.Allocator, state_dir: []const u8)
     }
 }
 
-/// `metacodes logout --provider <id>`: forget the API key stored for it.
+/// `metacodes logout --provider <id>`: forget the API key stored for it, and
+/// its own OAuth sign-in, revoked at the provider first where the profile
+/// says (`api/oauth_revoke.zig`).
 fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: []const u8) u8 {
     const host = buildProviderHost(allocator) orelse {
         std.debug.print("error: the provider registry is unavailable\n", .{});
@@ -3546,6 +3567,18 @@ fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: 
         std.debug.print("error: unknown provider '{s}'\n", .{name});
         return 2;
     };
+    return logoutProviderProfile(allocator, state_dir, profile, @import("api/oauth_revoke.zig").DEFAULT_WAIT_MS);
+}
+
+/// `logoutProviderKey` for a resolved profile; `revoke_wait_ms` bounds the
+/// revocation (a test points the profile's endpoint at its own mock).
+pub fn logoutProviderProfile(
+    allocator: std.mem.Allocator,
+    state_dir: []const u8,
+    profile: *const provider_profile.ProviderProfile,
+    revoke_wait_ms: u64,
+) u8 {
+    const oauth_revoke = @import("api/oauth_revoke.zig");
     // A key a provider's site created (OpenRouter) outlives this file: only
     // its owner can delete it there, so its page is named before the file,
     // which holds the key it is computed from, goes.
@@ -3558,13 +3591,26 @@ fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: 
         std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
         return 1;
     };
+    const sign_in = oauth_revoke.forgetStoredLogin(allocator, state_dir, profile, revoke_wait_ms) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    if (sign_in.removed) {
+        std.debug.print("Signed out of {s}: removed the sign-in and its refresh token.\n", .{profile.display_name});
+        switch (sign_in.revoke) {
+            .revoked => std.debug.print("{s} revoked it too.\n", .{profile.display_name}),
+            .nothing_stored, .not_offered => {},
+            .failed => std.debug.print("{s} could not revoke it; it stays valid there until it expires.\n", .{profile.display_name}),
+            .timed_out => std.debug.print("{s} did not answer the revocation in time; it may stay valid there until it expires.\n", .{profile.display_name}),
+        }
+    }
     if (removed and profile.key_grant != null) {
         std.debug.print("Removed the {s} key stored on this machine.\n", .{profile.display_name});
         if (manage) |url| std.debug.print("It still works on {s} until you delete it there: {s}\n", .{ profile.display_name, url });
     } else if (removed) {
         std.debug.print("Removed the stored key for {s}.\n", .{profile.display_name});
-    } else {
-        std.debug.print("No key is stored for {s}.\n", .{profile.display_name});
+    } else if (!sign_in.removed) {
+        std.debug.print("{s} is stored for {s}.\n", .{ provider_login.nothingStoredText(profile), profile.display_name });
     }
     return 0;
 }
@@ -4442,9 +4488,13 @@ pub fn resolveProviderScopedCredential(
     return resolveProviderScopedCredentialReporting(allocator, config, profile_name, .print_help);
 }
 
-/// Whether a failure prints the provider's credential help (`-p`, the CLI)
-/// or leaves saying it to the caller (the TUI's reminder, a dry check).
-const CredentialReport = enum { print_help, quiet };
+/// What a provider-scoped resolution says when it fails, and how far it goes.
+/// `print_help` (`-p`, the CLI) prints the provider's credential help;
+/// `quiet` (the TUI's reminder) leaves saying it to the caller. Both end
+/// with the provider's own sign-in, refreshed when it is due. `keys_only` (a
+/// dry check: the startup order, `login status`) is quiet and stops at the
+/// keys, so it never refreshes a sign-in and sends nothing.
+const CredentialReport = enum { print_help, quiet, keys_only };
 
 fn resolveProviderScopedCredentialReporting(
     allocator: std.mem.Allocator,
@@ -4452,11 +4502,21 @@ fn resolveProviderScopedCredentialReporting(
     profile_name: []const u8,
     report: CredentialReport,
 ) !ScopedCredential {
-    const credential_mod = provider_credential;
-    const provider_ids_local = provider_ids;
     const host = buildProviderHost(allocator) orelse return error.UnknownProviderProfile;
     defer host.destroy();
     const profile = host.registry.find(profile_name) orelse return error.UnknownProviderProfile;
+    return resolveProfileCredential(allocator, config, profile, report);
+}
+
+/// `resolveProviderScopedCredentialReporting` for a profile already found.
+fn resolveProfileCredential(
+    allocator: std.mem.Allocator,
+    config: types.Config,
+    profile: *const provider_profile.ProviderProfile,
+    report: CredentialReport,
+) !ScopedCredential {
+    const credential_mod = provider_credential;
+    const provider_ids_local = provider_ids;
 
     // The key `login --provider` stored for this provider, in its own file.
     var stored_key = provider_api_key_store.load(allocator, config.state_root, profile.id) catch |err| blk: {
@@ -4476,7 +4536,21 @@ fn resolveProviderScopedCredentialReporting(
         // `<state root>/.env` (#486), below the process environment.
         .env_fallback = config.credential_env_fallback orelse credential_mod.EnvLookup.empty(),
     }, &reference_buffer) catch |err| {
-        if (report == .quiet) return err;
+        // Below every key in the credential order: the provider's own OAuth
+        // sign-in (`login --provider`, `/login <provider>`), refreshed first
+        // when it expires within two minutes or already has.
+        if (err == error.MissingCredentials and report != .keys_only) {
+            if (providerSignInToken(allocator, config.state_root, profile)) |found| {
+                if (found) |token| return .{ .secret = token, .origin = .sign_in };
+            } else |sign_in_err| {
+                if (report == .print_help) std.debug.print(
+                    "error: the {s} sign-in could not be used ({s}); sign in again: {s} login --provider {s}\n",
+                    .{ profile.display_name, @errorName(sign_in_err), invokedCommand(allocator), profile.id.slice() },
+                );
+                return error.MissingCredentials;
+            }
+        }
+        if (report != .print_help) return err;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const local_path: []const u8 = if (config.state_root.len == 0) "" else std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{
             config.state_root, std.fs.path.sep, state_env_mod.file_name,
@@ -4493,6 +4567,68 @@ fn resolveProviderScopedCredentialReporting(
         .interactive, .unknown => .unknown,
     };
     return .{ .secret = try allocator.dupe(u8, resolved.secret), .origin = origin };
+}
+
+/// The access token of `profile`'s own OAuth sign-in
+/// (`<state root>/oauth/<provider>.json`), refreshed first when it expires
+/// within `provider_oauth_mod.REFRESH_MARGIN_SECONDS` (two minutes) or already
+/// has, the way a session's turn boundary refreshes it
+/// (`App.oauthAccessToken`). Owned; zero it before freeing. Null when the
+/// profile declares no OAuth lifecycle, when there is no state root, and
+/// when no sign-in is stored. Metask's is its own path
+/// (`resolveMetaskBearer`).
+pub fn providerSignInToken(
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    profile: *const provider_profile.ProviderProfile,
+) !?[]u8 {
+    if (!signInDeclared(profile)) return null;
+    const token_url = profile.oauth_token_url.?;
+    var session = provider_oauth_mod.Session.initHome(allocator, state_root, profile.id) catch |err| switch (err) {
+        // No state root (no `HOME`, `--state-dir` or `METACODES_HOME`): no
+        // sign-in can be stored, so there is none, and the credential help
+        // the caller prints for a missing key stands.
+        error.NoHome => return null,
+        else => return err,
+    };
+    defer session.deinit();
+    if (!(try session.load())) return null;
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    // The refresh grant presents the client the sign-in recorded.
+    var exchange = oauth_exchange_mod.HttpExchange{
+        .allocator = allocator,
+        .io = io_runtime.io(),
+        .endpoint = .{ .token_url = token_url, .client_id = session.clientIdFor(profile.oauth_client_id) },
+    };
+    return try session.accessToken(@import("util/time.zig").nowUnix(), exchange.exchange());
+}
+
+/// Whether a start reads `profile`'s own OAuth sign-in at all: it declares a
+/// token endpoint and accepts a credential kind an OAuth token serves.
+/// Metask's sign-in is its own path (`resolveMetaskBearer`).
+fn signInDeclared(profile: *const provider_profile.ProviderProfile) bool {
+    if (profile.id.eqlText("metask") or profile.oauth_token_url == null) return false;
+    for (profile.accepted_credential_kinds) |kind| {
+        if (provider_oauth_mod.servesKind(kind)) return true;
+    }
+    return false;
+}
+
+/// Whether `profile`'s own OAuth sign-in is stored, judged from the file
+/// alone: nothing is refreshed and nothing sent, so one at or past its expiry
+/// counts too (a start refreshes it, `providerSignInToken`). False wherever
+/// that finds none: no sign-in declared, none stored, one that does not
+/// parse, no state root.
+fn providerSignInStored(
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    profile: *const provider_profile.ProviderProfile,
+) bool {
+    if (!signInDeclared(profile)) return false;
+    var session = provider_oauth_mod.Session.initHome(allocator, state_root, profile.id) catch return false;
+    defer session.deinit();
+    return session.load() catch false;
 }
 
 /// `command` is the command the user ran (`invokedCommand`); `local_path`
@@ -4524,6 +4660,8 @@ fn printProviderCredentialHelp(
             if (profile.api_key_setup) |setup| {
                 std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
                 if (setup.note) |note| std.debug.print("  {s}\n", .{note});
+            } else if (profile.declaresInteractiveOAuth() and profile.oauth_client_id != null) {
+                std.debug.print("  {s} login --provider {s}   (signs in in the browser, then stores the sign-in)\n", .{ command, profile.id.slice() });
             }
             for (profile.accepted_credential_kinds) |kind| {
                 if (profile.canonicalEnvAlias(kind)) |canonical| {
@@ -4531,7 +4669,8 @@ fn printProviderCredentialHelp(
                     if (local_path.len > 0) std.debug.print("    or {s}=... in {s} (read when metacodes starts)\n", .{ canonical, local_path });
                 }
             }
-            std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
+            // A provider that signs in only (`chatgpt-codex`) takes no key.
+            if (profile.takesApiKey()) std.debug.print("  {s} --api-key <key> --provider {s} ...\n", .{ command, profile.id.slice() });
             std.debug.print("No token value was printed.\n", .{});
         },
     }
@@ -5657,6 +5796,8 @@ test {
     _ = &@import("api/openrouter_login.zig");
     _ = &@import("api/openrouter_catalog.zig");
     _ = &@import("api/provider_login.zig");
+    _ = &@import("api/oauth_revoke.zig");
+    _ = &@import("api/codex_usage.zig");
     _ = &@import("api/catalog_fetch.zig");
     _ = &@import("api/models_pages.zig");
     _ = &@import("api/gemini_signatures.zig");

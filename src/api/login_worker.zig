@@ -106,18 +106,31 @@ pub const LoginWorker = struct {
             .oauth => |*prepared| {
                 const source = prepared.profile;
                 const copy = try a.create(provider_profile.ProviderProfile);
-                copy.* = .{
-                    .id = source.id,
-                    .implementation_id = source.implementation_id,
-                    .display_name = try a.dupe(u8, source.display_name),
-                    .channels = &.{},
-                    .accepted_credential_kinds = try a.dupe(provider_profile.CredentialKind, source.accepted_credential_kinds),
-                    .oauth_token_url = if (source.oauth_token_url) |url| try a.dupe(u8, url) else null,
-                    .oauth_authorize_url = if (source.oauth_authorize_url) |url| try a.dupe(u8, url) else null,
-                    .oauth_device_authorization_url = if (source.oauth_device_authorization_url) |url| try a.dupe(u8, url) else null,
-                    .oauth_client_id = if (source.oauth_client_id) |id| try a.dupe(u8, id) else null,
-                    .oauth_scope = try a.dupe(u8, source.oauth_scope),
+                // The whole profile, so whatever it declares reaches the
+                // flow without being listed here. A list of fields left the
+                // ones added later at their defaults: ChatGPT (Codex) then
+                // waited on port 1456 instead of its registered 1455/1457,
+                // sent none of its authorization parameters, and never said
+                // its sign-in is unofficial (#550).
+                copy.* = source.*;
+                // What the flow reads on its thread moves into `owned`
+                // (`owned_profile_fields` in the tests). The rest is never
+                // read here and stays as the registry holds it.
+                copy.display_name = try a.dupe(u8, source.display_name);
+                copy.accepted_credential_kinds = try a.dupe(provider_profile.CredentialKind, source.accepted_credential_kinds);
+                copy.oauth_token_url = if (source.oauth_token_url) |url| try a.dupe(u8, url) else null;
+                copy.oauth_authorize_url = if (source.oauth_authorize_url) |url| try a.dupe(u8, url) else null;
+                copy.oauth_device_authorization_url = if (source.oauth_device_authorization_url) |url| try a.dupe(u8, url) else null;
+                copy.oauth_redirect_host = try a.dupe(u8, source.oauth_redirect_host);
+                copy.oauth_callback_ports = try a.dupe(u16, source.oauth_callback_ports);
+                const params = try a.alloc(provider_profile.OAuthParam, source.oauth_authorize_params.len);
+                for (params, source.oauth_authorize_params) |*param, declared| param.* = .{
+                    .name = try a.dupe(u8, declared.name),
+                    .value = try a.dupe(u8, declared.value),
                 };
+                copy.oauth_authorize_params = params;
+                copy.oauth_client_id = if (source.oauth_client_id) |id| try a.dupe(u8, id) else null;
+                copy.oauth_scope = try a.dupe(u8, source.oauth_scope);
                 prepared.profile = copy;
                 prepared.client_id = try a.dupe(u8, prepared.client_id);
             },
@@ -332,4 +345,150 @@ test "login worker: the transcript is bounded and says when it was cut" {
     try std.testing.expect(std.mem.startsWith(u8, text, "first line\n"));
     try std.testing.expect(worker.transcriptTruncated());
     try std.testing.expectEqual(State.idle, worker.currentState());
+}
+
+const chatgpt_codex = @import("../provider/profiles/chatgpt_codex.zig");
+
+/// The profile fields `ownFlow` moves into the worker's memory: the strings
+/// and lists the flow reads on its thread. Every other field of the copy is
+/// the source's own value.
+const owned_profile_fields = [_][]const u8{
+    "display_name",
+    "accepted_credential_kinds",
+    "oauth_token_url",
+    "oauth_authorize_url",
+    "oauth_device_authorization_url",
+    "oauth_redirect_host",
+    "oauth_callback_ports",
+    "oauth_authorize_params",
+    "oauth_client_id",
+    "oauth_scope",
+};
+
+fn isOwnedProfileField(comptime name: []const u8) bool {
+    // Evaluated at comptime once per profile field, every name compared.
+    @setEvalBranchQuota(20_000);
+    for (owned_profile_fields) |owned| {
+        if (std.mem.eql(u8, owned, name)) return true;
+    }
+    return false;
+}
+
+/// Equal by content, wherever it lives: how an owned field compares.
+fn sameContent(a: anytype, b: @TypeOf(a)) bool {
+    switch (@typeInfo(@TypeOf(a))) {
+        .optional => {
+            if (a == null or b == null) return a == null and b == null;
+            return sameContent(a.?, b.?);
+        },
+        .pointer => {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| if (!sameContent(x, y)) return false;
+            return true;
+        },
+        .@"struct" => |info| {
+            inline for (info.fields) |field| {
+                if (!sameContent(@field(a, field.name), @field(b, field.name))) return false;
+            }
+            return true;
+        },
+        else => return a == b,
+    }
+}
+
+/// The source's content, in memory of the copy's own.
+fn expectOwnedCopy(ours: anytype, theirs: @TypeOf(ours)) !void {
+    switch (@typeInfo(@TypeOf(ours))) {
+        .optional => {
+            try std.testing.expectEqual(theirs == null, ours == null);
+            if (theirs) |value| try expectOwnedCopy(ours.?, value);
+        },
+        .pointer => |pointer| {
+            try std.testing.expectEqual(theirs.len, ours.len);
+            if (theirs.len > 0) try std.testing.expect(ours.ptr != theirs.ptr);
+            if (pointer.child == provider_profile.OAuthParam) {
+                for (ours, theirs) |mine, declared| {
+                    try expectOwnedCopy(mine.name, declared.name);
+                    try expectOwnedCopy(mine.value, declared.value);
+                }
+            } else {
+                try std.testing.expectEqualSlices(pointer.child, theirs, ours);
+            }
+        },
+        else => @compileError("ownFlow moves strings and lists only, not " ++ @typeName(@TypeOf(ours))),
+    }
+}
+
+fn workerTestQuote(request_model_id: []const u8, channel_id: Slug, usage: provider_profile.Usage) provider_profile.Quote {
+    _ = request_model_id;
+    _ = channel_id;
+    _ = usage;
+    return .unknown;
+}
+
+test "login worker: a sign-in runs on the profile it was given, every field, with the strings and lists it reads its own" {
+    // Two comptime walks over every profile field, each naming the owned ones.
+    @setEvalBranchQuota(100_000);
+    const a = std.testing.allocator;
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    // ChatGPT (Codex), with every field moved off its default: a copy that
+    // left any field at its default, as the field list before #550 left the
+    // callback ports, the authorization parameters and the support level,
+    // differs from it below.
+    var source = chatgpt_codex.PROFILE;
+    source.aliases = &.{"codex-worker-test"};
+    source.env_aliases = &.{.{ .name = "CODEX_WORKER_TEST_TOKEN", .kind = chatgpt_codex.PROFILE.accepted_credential_kinds[0] }};
+    source.auth = .{ .api_key_header = "x-worker-test" };
+    source.endpoint_policy = .{ .require_tls = false };
+    source.quote_hook = workerTestQuote;
+    source.oauth_device_authorization_url = "http://127.0.0.1:1/device";
+    source.oauth_redirect_host = "127.0.0.1";
+    source.api_key_setup = .{
+        .kind = chatgpt_codex.PROFILE.accepted_credential_kinds[0],
+        .pages = &.{.{ .id = Slug.lit("worker"), .label = "Worker test", .url = "http://127.0.0.1:1/keys" }},
+    };
+    source.key_grant = @import("../provider/profiles/openrouter.zig").KEY_GRANT;
+    const fields = @typeInfo(provider_profile.ProviderProfile).@"struct".fields;
+    // A field ProviderProfile gains fails here until this profile sets it, so
+    // the check below covers it too.
+    inline for (fields) |field| {
+        const value = @field(source, field.name);
+        if (comptime field.defaultValue()) |default| {
+            const unchanged = if (comptime isOwnedProfileField(field.name)) sameContent(value, default) else std.meta.eql(value, default);
+            if (unchanged) {
+                std.debug.print("the test profile leaves `{s}` at its default: set it, so a copy that drops it fails here\n", .{field.name});
+                return error.TestUnexpectedResult;
+            }
+        } else if (comptime @typeInfo(field.type) == .pointer) {
+            try std.testing.expect(value.len > 0);
+        }
+    }
+
+    var worker = LoginWorker.init(a, io_runtime.io(), .{
+        .profile = &source,
+        .client_id = "worker-client",
+        .client_id_source = .explicit,
+        .options = .{ .open_browser = false, .state_root = "" },
+    });
+    defer worker.join();
+    try worker.ownFlow();
+
+    const copy = worker.flow.oauth.profile;
+    try std.testing.expect(copy != &source);
+    inline for (fields) |field| {
+        const ours = @field(copy.*, field.name);
+        const theirs = @field(source, field.name);
+        if (comptime isOwnedProfileField(field.name)) {
+            expectOwnedCopy(ours, theirs) catch |err| {
+                std.debug.print("the worker's copy of `{s}` is not the profile's, in memory of its own\n", .{field.name});
+                return err;
+            };
+        } else if (!std.meta.eql(ours, theirs)) {
+            std.debug.print("the worker's copy changed `{s}`\n", .{field.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqualStrings("worker-client", worker.flow.oauth.client_id);
 }

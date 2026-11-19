@@ -3522,13 +3522,24 @@ fn logoutProvider(app: *app_mod.App, profile: *const @import("../provider/profil
         cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
         return;
     };
+    // The provider's own sign-in, revoked at the provider first where it
+    // offers that (`api/oauth_revoke.zig`), in the words Metask's uses.
+    if (result.sign_in.removed) {
+        cmd_output.print("Signed out of {s}: removed the sign-in.\n", .{profile.display_name});
+        switch (result.sign_in.revoke) {
+            .revoked => cmd_output.print("{s}{s} revoked it too.{s}\n", .{ th.dim, profile.display_name, th.reset }),
+            .nothing_stored, .not_offered => {},
+            .failed => cmd_output.print("{s}{s} could not revoke it; it stays valid there until it expires.{s}\n", .{ th.warn, profile.display_name, th.reset }),
+            .timed_out => cmd_output.print("{s}{s} did not answer the revocation in time; it may stay valid there until it expires.{s}\n", .{ th.warn, profile.display_name, th.reset }),
+        }
+    }
     if (result.removed and profile.key_grant != null) {
         cmd_output.print("Removed the {s} key stored on this machine.\n", .{profile.display_name});
         if (result.manageUrl()) |url| cmd_output.print("It still works on {s} until you delete it there: {s}\n", .{ profile.display_name, url });
     } else if (result.removed) {
         cmd_output.print("Removed the stored key for {s}.\n", .{profile.display_name});
-    } else {
-        cmd_output.print("No key is stored for {s}.\n", .{profile.display_name});
+    } else if (!result.sign_in.removed) {
+        cmd_output.print("{s} is stored for {s}.\n", .{ provider_login.nothingStoredText(profile), profile.display_name });
     }
     if (result.unbound) cmd_output.print("{s}This session was using it: no model is set up now (/model, or /login {s}).{s}\n", .{ th.warn, profile.id.slice(), th.reset });
     if (result.local_variable) |name| {

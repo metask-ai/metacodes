@@ -27,6 +27,7 @@ const pfs = @import("platform").fs;
 const ids = @import("ids.zig");
 const profile_mod = @import("profile.zig");
 const json_util = @import("../util/json.zig");
+const chatgpt_claims = @import("chatgpt_claims.zig");
 
 pub const Slug = ids.Slug;
 
@@ -55,6 +56,9 @@ pub const TokenSet = struct {
     expires_at: i64,
     token_type: []u8,
     scope: ?[]u8 = null,
+    /// The account the tokens are for, when they name one: for an OpenAI
+    /// sign-in, the ChatGPT workspace (`chatgpt_claims.zig`). Not a secret;
+    /// kept across a refresh whose answer names none.
     account_id: ?[]u8 = null,
     /// Metask session metadata. Optional for backward-compatible stores.
     gateway_url: ?[]u8 = null,
@@ -88,6 +92,9 @@ pub const RefreshOutcome = struct {
     expires_in_seconds: i64,
     token_type: []const u8 = "Bearer",
     scope: ?[]const u8 = null,
+    /// The account the tokens are for (`TokenSet.account_id`). Absent keeps
+    /// the one already stored.
+    account_id: ?[]const u8 = null,
     gateway_url: ?[]const u8 = null,
     models_url: ?[]const u8 = null,
     client_name: ?[]const u8 = null,
@@ -493,7 +500,10 @@ fn own(
         (allocator.dupe(u8, value) catch return error.OutOfMemory)
     else
         null;
+    errdefer if (scope) |value| allocator.free(value);
 
+    const account_id = try ownOptional(allocator, outcome.account_id orelse if (previous) |p| p.account_id else null);
+    errdefer if (account_id) |value| allocator.free(value);
     const gateway_url = try ownOptional(allocator, outcome.gateway_url orelse if (previous) |p| p.gateway_url else null);
     errdefer if (gateway_url) |value| allocator.free(value);
     const models_url = try ownOptional(allocator, outcome.models_url orelse if (previous) |p| p.models_url else null);
@@ -507,6 +517,7 @@ fn own(
         .expires_at = now_seconds + outcome.expires_in_seconds,
         .token_type = token_type,
         .scope = scope,
+        .account_id = account_id,
         .gateway_url = gateway_url,
         .models_url = models_url,
         .client_name = client_name,
@@ -524,6 +535,12 @@ fn ownOptional(allocator: std.mem.Allocator, value: ?[]const u8) OAuthError!?[]u
 
 /// Parse a standard OAuth token response. Shared by the initial exchange and
 /// the refresh, because RFC 6749 makes them the same shape.
+///
+/// The account is the ChatGPT workspace an OpenAI grant names: in the
+/// OpenID `id_token`, else in the access token (`chatgpt_claims.zig`). Every
+/// other provider's tokens name none, and the field stays null. The ID token
+/// itself is not kept: it carries the user's email and name, and nothing
+/// here needs them.
 pub fn parseTokenResponse(arena: std.mem.Allocator, body: []const u8) OAuthError!RefreshOutcome {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch
         return error.MalformedTokenResponse;
@@ -541,6 +558,7 @@ pub fn parseTokenResponse(arena: std.mem.Allocator, body: []const u8) OAuthError
         .expires_in_seconds = expires,
         .token_type = stringOf(root.object.get("token_type")) orelse "Bearer",
         .scope = stringOf(root.object.get("scope")),
+        .account_id = chatgpt_claims.firstAccountId(arena, &.{ stringOf(root.object.get("id_token")), access }),
         .gateway_url = stringOf(root.object.get("gateway_url")),
         .models_url = stringOf(root.object.get("models_url")),
         .client_name = stringOf(root.object.get("client_name")),
@@ -578,6 +596,10 @@ fn renderStored(
     try out.appendSlice(allocator, expires);
     if (tokens.scope) |value| {
         try out.appendSlice(allocator, ",\"scope\":");
+        try writeJsonString(allocator, out, value);
+    }
+    if (tokens.account_id) |value| {
+        try out.appendSlice(allocator, ",\"account_id\":");
         try writeJsonString(allocator, out, value);
     }
     if (client_id) |value| {
@@ -633,6 +655,9 @@ pub fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!St
         (allocator.dupe(u8, value) catch return error.OutOfMemory)
     else
         null;
+    errdefer if (client_owned) |value| allocator.free(value);
+    const account_owned = try ownOptional(allocator, stringOf(root.object.get("account_id")));
+    errdefer if (account_owned) |value| allocator.free(value);
     const gateway_owned = try ownOptional(allocator, stringOf(root.object.get("gateway_url")));
     errdefer if (gateway_owned) |value| allocator.free(value);
     const models_owned = try ownOptional(allocator, stringOf(root.object.get("models_url")));
@@ -645,6 +670,7 @@ pub fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!St
             .refresh_token = refresh_owned,
             .expires_at = expires,
             .token_type = type_owned,
+            .account_id = account_owned,
             .gateway_url = gateway_owned,
             .models_url = models_owned,
             .client_name = client_name_owned,
@@ -1026,6 +1052,47 @@ test "Metask gateway metadata survives initial import and rotated refresh" {
     try testing.expectEqualStrings("http://localhost:9000/v1/models", reloaded.tokens.?.models_url.?);
     try testing.expectEqualStrings("MetaCode on host", reloaded.tokens.?.client_name.?);
     try testing.expectEqualStrings("refresh-1", reloaded.tokens.?.refresh_token);
+}
+
+test "the ChatGPT workspace a grant names is stored, and kept by a refresh that names none" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const id_token = try chatgpt_claims.testJwt(arena, "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc-from-id\"}}");
+    const access = try chatgpt_claims.testJwt(arena, "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc-from-access\"}}");
+    const body = try std.fmt.allocPrint(arena, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt-0\",\"id_token\":\"{s}\",\"expires_in\":3600}}", .{ access, id_token });
+    const outcome = try parseTokenResponse(arena, body);
+    // The ID token is read first, as the Codex CLI reads it.
+    try testing.expectEqualStrings("acc-from-id", outcome.account_id.?);
+    // Without an ID token the access token still names it.
+    const access_only = try std.fmt.allocPrint(arena, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt-0\",\"expires_in\":3600}}", .{access});
+    try testing.expectEqualStrings("acc-from-access", (try parseTokenResponse(arena, access_only)).account_id.?);
+    // An opaque token names nothing.
+    try testing.expect((try parseTokenResponse(arena, "{\"access_token\":\"opaque\",\"expires_in\":60}")).account_id == null);
+
+    var session = try tempSession(a, "account-id");
+    const path = try a.dupe(u8, session.path);
+    defer a.free(path);
+    defer removePath(path);
+    try session.importOutcome(outcome, 100);
+    // A refresh whose answer names no account keeps the stored one.
+    session.tokens.?.expires_at = 0;
+    var fake = FakeExchange{};
+    const token = try session.accessToken(1_000, fake.exchange());
+    a.free(token);
+    session.deinit();
+
+    var reloaded = try Session.init(a, Slug.lit("openai"), path);
+    defer reloaded.deinit();
+    try testing.expect(try reloaded.load());
+    try testing.expectEqualStrings("acc-from-id", reloaded.tokens.?.account_id.?);
+    try testing.expectEqualStrings("access-1", reloaded.tokens.?.access_token);
+    const stored = try readFile(a, path);
+    defer secureFree(a, stored);
+    try testing.expect(std.mem.indexOf(u8, stored, "\"account_id\":\"acc-from-id\"") != null);
+    // The ID token, which carries the user's email, is not written.
+    try testing.expect(std.mem.indexOf(u8, stored, "id_token") == null);
 }
 
 test "concurrent expiry performs exactly one refresh" {
