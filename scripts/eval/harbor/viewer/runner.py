@@ -19,6 +19,7 @@ from pathlib import Path
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
+from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.viewer import data, executors
 from scripts.eval.harbor.viewer.account import Account
@@ -197,6 +198,13 @@ class RunManager:
             reasons.append("auth_mode 必须是 metask 或 provider")
         if not models and mode == "provider":
             reasons.append("请配置 --model，第三方网关同时设置 --provider-config")
+        elif mode == "provider":
+            # Containers only ever hold a placeholder; a route the credential
+            # relay cannot forward is refused rather than given the key.
+            problem = route_problem({"auth_mode": mode, "provider_config": cfg.get("provider_config"),
+                                     "model": model or models[0]["id"]})
+            if problem:
+                reasons.append(problem)
         states, default_executor, problems = self.executor_states(cfg)
         reasons += problems
         global_reasons = list(reasons)
@@ -268,6 +276,11 @@ class RunManager:
         model = request.get("model")
         if model not in {m["id"] for m in catalog["models"]}:
             raise ValueError("请选择服务已配置的模型")
+        if catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
+            problem = route_problem({"auth_mode": "provider", "model": model,
+                                     "provider_config": settings(self.config_path).get("provider_config")})
+            if problem:
+                raise ValueError(problem)
         ctx = self.suite_context()
         tasks = suites.validate_tasks(suite, ctx, request.get("tasks"))
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)

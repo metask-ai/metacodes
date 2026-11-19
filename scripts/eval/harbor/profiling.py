@@ -1,8 +1,14 @@
-"""Streaming timing relay. Captures numeric metrics, never bodies or keys.
+"""Credential relay with optional streaming timing capture.
 
-One job owns a relay and each trial uses a distinct URL prefix. HTTP payloads
-are forwarded unchanged; request clocks exclude task/tool execution. The
-loopback/Docker hop is part of the benchmark harness, not a provider SLA.
+Every Harbor run's model traffic goes through one relay on the Docker host.
+The task container holds only a run-scoped placeholder token; the relay
+accepts exactly that placeholder and forwards each request upstream with the
+current real credential, which it reads from a credential source (a fixed
+key, a refreshing Metask session, or tokens pushed over the SSH channel).
+With metrics enabled it also records numeric timing/usage, never bodies or
+keys. One job owns a relay and each trial uses a distinct URL prefix. HTTP
+payloads are forwarded unchanged; request clocks exclude task/tool execution.
+The loopback/Docker hop is part of the benchmark harness, not a provider SLA.
 """
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ import ipaddress
 import json
 import math
 import re
+import secrets
 import ssl
 import subprocess
 import sys
@@ -126,6 +133,68 @@ class StreamMetrics:
                 **self.usage}
 
 
+PLACEHOLDER_PREFIX = "mcb-"
+
+
+def placeholder(run):
+    """A random run-scoped stand-in for the credential inside containers."""
+    label = re.sub(r"[^A-Za-z0-9]", "", run or "")[-24:] or "run"
+    return PLACEHOLDER_PREFIX + label + "-" + secrets.token_urlsafe(32)
+
+
+class StaticCredential:
+    """A key that does not expire (provider key, legacy account group key)."""
+    refreshing = False
+
+    def __init__(self, value):
+        if not value:
+            raise ValueError("missing credential")
+        self.value = value
+
+    def current(self):
+        return self.value
+
+    def refresh(self, stale):
+        return self.value
+
+    def status(self):
+        return {"refreshing": False}
+
+
+class PushedCredential:
+    """The remote half of a refreshing credential: the local worker owns the
+    refresh token and sends each new access token over the SSH channel.
+    Until a push arrives the previous token stays in use."""
+    refreshing = True
+
+    def __init__(self, value):
+        if not value:
+            raise ValueError("missing credential")
+        self.lock = threading.Lock()
+        self.value = value
+        self.pushes = 0
+
+    def set(self, value):
+        if isinstance(value, str) and value:
+            with self.lock:
+                self.value = value
+                self.pushes += 1
+
+    def current(self):
+        with self.lock:
+            return self.value
+
+    def refresh(self, stale):
+        return self.current()
+
+    def status(self):
+        return {"refreshing": True, "pushes": self.pushes}
+
+
+def same_secret(a, b):
+    return hmac.compare_digest(a.encode("utf-8", "surrogateescape"), b.encode("utf-8", "surrogateescape"))
+
+
 def subject_alt_names(*hosts):
     names = []
     for host in dict.fromkeys(hosts):
@@ -140,7 +209,12 @@ def subject_alt_names(*hosts):
 
 class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
-                 auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None):
+                 auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None,
+                 token=None, record=True):
+        # `credential` is the real upstream credential (a string or a source
+        # with current()/refresh(stale)); `token` is the placeholder the
+        # containers present (a fresh one when omitted). `record=False`
+        # proxies auth without writing metrics.
         # `public_host` is the address containers dial when it differs from
         # the bind address: Colima's VM reaches the Mac's loopback through
         # its user-mode gateway (host.lima.internal, 192.168.5.2).
@@ -149,7 +223,9 @@ class TimingRelay:
         if origin.scheme not in ("http", "https") or not origin.hostname or origin.username or origin.password or origin.query or origin.fragment:
             raise ValueError("invalid profiling upstream")
         self.origin = origin
-        self.credential = credential
+        self.credential = StaticCredential(credential) if isinstance(credential, str) else credential
+        self.token = token or placeholder("relay")
+        self.recording = record
         self.metrics_dir = Path(metrics_dir)
         self.lock = threading.Lock()
         self.sequence = 0
@@ -191,7 +267,7 @@ class TimingRelay:
                 if suffix not in ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1/models"):
                     self.send_error(404)
                     return
-                if not hmac.compare_digest(self.headers.get(auth_header, ""), auth_prefix + owner.credential):
+                if not same_secret(self.headers.get(auth_header, ""), auth_prefix + owner.token):
                     self.send_error(401)
                     return
                 try:
@@ -208,16 +284,26 @@ class TimingRelay:
                 with owner.lock:
                     owner.sequence += 1
                     sequence = owner.sequence
+                secret = owner.credential.current()
+                if not secret:
+                    # The run's login can no longer be refreshed.
+                    self.send_error(401)
+                    return
                 status, complete = 0, False
+                measured = measured and owner.recording
                 try:
-                    if self.upstream is None:
-                        cls = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
-                        self.upstream = cls(origin.hostname, origin.port, timeout=1800)
-                    headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+                    headers = {k: v for k, v in self.headers.items()
+                               if k.lower() not in HOP and k.lower() != auth_header.lower()}
                     headers["Accept-Encoding"] = "identity"
                     upstream_path = suffix + ("?" + path.query if path.query else "")
-                    self.upstream.request(self.command, upstream_path, body=body, headers=headers)
-                    response = self.upstream.getresponse()
+                    response = self.exchange(upstream_path, body, headers, secret)
+                    if response.status == 401:
+                        # Nothing has reached the container yet: refresh the
+                        # credential once and repeat the request.
+                        fresh = owner.credential.refresh(secret)
+                        if fresh and fresh != secret:
+                            response.read()
+                            response = self.exchange(upstream_path, body, headers, fresh)
                     status = response.status
                     self.send_response(status)
                     for name, value in response.getheaders():
@@ -243,6 +329,24 @@ class TimingRelay:
                 finally:
                     if measured:
                         owner.record(parts[1], {"request": sequence, "started_at": started_at, **metric.finish(status, complete)})
+
+            def exchange(self, upstream_path, body, headers, secret):
+                while True:
+                    reused = self.upstream is not None
+                    if not reused:
+                        cls = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
+                        self.upstream = cls(origin.hostname, origin.port, timeout=1800)
+                    try:
+                        self.upstream.request(self.command, upstream_path, body=body,
+                                              headers={**headers, auth_header: auth_prefix + secret})
+                        return self.upstream.getresponse()
+                    except (OSError, http.client.HTTPException):
+                        # Only a kept-alive connection the upstream closed
+                        # meanwhile is retried, on a new connection.
+                        self.upstream.close()
+                        self.upstream = None
+                        if not reused:
+                            raise
 
             def log_message(self, *_args):
                 pass  # URLs, headers and bodies are not diagnostic metrics
@@ -318,23 +422,56 @@ class TimingRelay:
             self.cert_dir.cleanup()
 
 
+def route_problem(spec):
+    """Why this run's model route cannot go through the relay, or None.
+
+    The relay forwards only `/v1/{messages,chat/completions,responses,models}`
+    of one upstream origin and injects the credential into one header, so
+    every channel of the provider must use such a protocol, a base URL whose
+    path is empty or `/v1`, the same origin, and a header credential. A route
+    that cannot be proxied is refused: the container never gets the key."""
+    if spec.get("auth_mode") == "metask":
+        return None
+    if not spec.get("provider_config"):
+        return "第三方 Provider 需要 --provider-config（带 channels 的 custom_providers），凭据只经代理转发"
+    provider = spec["model"].split("/", 1)[0]
+    try:
+        native = json.loads(Path(spec["provider_config"]).read_text(encoding="utf-8"))
+        config = native.get("custom_providers", {}).get(provider)
+    except (OSError, ValueError, AttributeError):
+        return "无法读取 --provider-config"
+    if not isinstance(config, dict):
+        return f"--provider-config 中没有 Provider {provider}"
+    if (config.get("auth") or {}).get("kind", "bearer") not in ("bearer", "api_key_header", "custom_header"):
+        return f"Provider {provider} 的认证方式无法由凭据代理注入"
+    channels = config.get("channels") or []
+    if not channels:
+        return f"Provider {provider} 没有配置 channels（base_url），无法经凭据代理转发"
+    origins = set()
+    for channel in channels:
+        if not isinstance(channel, dict):
+            return f"Provider {provider} 的 channels 格式无效"
+        if channel.get("protocol") not in ("anthropic_messages", "openai_chat", "openai_responses"):
+            return f"Provider {provider} 的协议 {channel.get('protocol')} 不受凭据代理支持"
+        parts = urlsplit(channel.get("base_url") or "")
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.path.rstrip("/") not in ("", "/v1"):
+            return f"Provider {provider} 的 base_url 必须是 http(s)://host 或 http(s)://host/v1，才能经凭据代理转发"
+        origins.add((parts.scheme, parts.netloc))
+    if len(origins) != 1:
+        return f"Provider {provider} 的 channels 指向不同的主机，凭据代理只能转发到一个上游"
+    return None
+
+
 def upstream_for(spec):
-    """Only explicitly configured HTTP streaming routes are profiled."""
+    """The upstream the relay forwards to, or None when it cannot."""
     if spec.get("auth_mode") == "metask":
         return spec.get("account_gateway") or "https://napi.metask-ai.com"
-    if not spec.get("provider_config"):
+    if route_problem(spec):
         return None
     provider = spec["model"].split("/", 1)[0]
-    native = json.loads(Path(spec["provider_config"]).read_text())
-    config = native.get("custom_providers", {}).get(provider, {})
-    if config.get("auth", {}).get("kind", "bearer") not in ("bearer", "api_key_header", "custom_header"):
-        return None
-    channels = config.get("channels") or []
-    channel = next((c for c in channels if c.get("id") == config.get("default_channel")), channels[0] if channels else {})
-    if channel.get("protocol") not in ("anthropic_messages", "openai_chat", "openai_responses"):
-        return None
-    base = channel.get("base_url")
-    return base if base and urlsplit(base).path.rstrip("/") in ("", "/v1") else None
+    config = json.loads(Path(spec["provider_config"]).read_text(encoding="utf-8"))["custom_providers"][provider]
+    channels = config["channels"]
+    return next((c for c in channels if c.get("id") == config.get("default_channel")), channels[0])["base_url"]
 
 
 def auth_for(spec):

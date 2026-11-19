@@ -456,7 +456,7 @@ def step_docker_macos(s: Setup):
     if arch.returncode != 0 or (arch.stdout or "").strip() != "x86_64":
         raise Failed("Colima 无法运行 linux/amd64 镜像（uname -m = " + (arch.stdout or "").strip() + "）")
     if not relay_reachable(s):
-        raise Failed(f"容器无法访问本机 {COLIMA_HOST}（计时 relay 的回连地址）")
+        raise Failed(f"容器无法访问本机 {COLIMA_HOST}（凭据 relay 的回连地址）")
 
     def relay(cfg):
         cfg["metrics_bind"] = "127.0.0.1"
@@ -496,7 +496,7 @@ def step_docker_linux(s: Setup):
         s.log("注意：执行机器是 " + arch + "，linux/amd64 镜像需要 binfmt 模拟")
     bind = s.executor.metrics_bind if s.remote else s.cfg.get("metrics_bind", "172.17.0.1")
     if s.found("ip") and bind not in s.out("ip -4 -o addr show 2>/dev/null"):
-        s.log(f"注意：本机没有 {bind}（Docker 网桥），计时 relay 无法绑定；请设置 metrics_bind")
+        s.log(f"注意：本机没有 {bind}（Docker 网桥），凭据 relay 无法绑定；请设置 metrics_bind")
     if s.dry_run:
         return ("planned" if changed else "ok"), "Docker（" + (arch or "?") + "）"
     if s.sh("docker info >/dev/null 2>&1").returncode != 0:
@@ -527,7 +527,7 @@ def step_openssl(s: Setup):
     elif s.found("apt-get") and sudo_available(s):
         s.sh("sudo -n apt-get install -y openssl", mutate=True, check=True)
     else:
-        raise Manual("需要 OpenSSL（计时 relay 用它生成临时证书）",
+        raise Manual("需要 OpenSSL（凭据 relay 用它生成临时证书）",
                      "brew install openssl@3" if s.os_name() == "Darwin" else "sudo apt-get install -y openssl")
     return verified(s, None if s.dry_run else s.sh(test), "OpenSSL")
 

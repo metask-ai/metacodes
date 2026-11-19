@@ -226,10 +226,11 @@ models; no keys are created and no model ids are guessed from group names.
 Model metadata is cached for one minute and invalidated when either login file
 changes. The default model and reasoning effort follow the saved login.
 Launching a model resolves the current session token or its legacy group's
-key, checks that it still provides that model, and passes it as `METASK_API_KEY` through Harbor's
-environment reference. The CLI's selected key/model remain unchanged. Only
-non-secret key ids enter run specs; API keys and OAuth refresh tokens never
-enter workbench settings, job specs, or the browser.
+key and checks that it still provides that model; the run then uses it
+through the credential relay described below. The CLI's selected key/model
+remain unchanged. Only non-secret key ids enter run specs; API keys, access
+tokens and OAuth refresh tokens never enter workbench settings, job specs,
+run records or the browser.
 
 The 0.12 account OAuth token is refreshed through its own token endpoint
 before expiry (or once after a rejected access token). Bench catalog reads
@@ -237,6 +238,69 @@ and workers serialize refreshes with a file lock and persist rotated tokens
 atomically with private permissions, preserving login preferences. A plain
 API-key login without account OAuth can list only that key's models; the page
 states this scope and suggests completing account login for all model groups.
+
+### Credential flow and token refresh
+
+Task containers run model-controlled agents, so they never receive a real
+credential. Each run gets a random run-scoped placeholder
+(`mcb-<run>-<32 random bytes, base64url>`), which Harbor passes as
+`METASK_API_KEY` (or the provider's `--key-env` variable) with `--ae
+NAME=${NAME}`. Every Harbor run has a credential relay on the Docker host;
+the agent's base URL points at it (HTTPS with an ephemeral CA, see
+[Metric definitions](#metric-definitions)). The relay accepts only that
+placeholder, compared in constant time; a missing or wrong one gets 401 and
+is never forwarded. It forwards each request upstream with the current real
+credential in the route's header and prefix (`Authorization: Bearer`, an API
+key header, or a custom header). Capturing timing metrics is optional on top:
+with `metrics_enabled: false` the relay still proxies authentication and
+records nothing.
+
+A route the relay cannot forward is refused at launch (and shown as a
+readiness reason) rather than handing the container the key: a third-party
+provider needs `--provider-config` whose `custom_providers` entry uses
+bearer, `api_key_header` or `custom_header` authentication, and whose
+channels all use `anthropic_messages`, `openai_chat` or `openai_responses`
+with one origin and a base path of `/` or `/v1`. WorkBuddy suites keep their
+own design: WorkBuddy's host proxy holds the account key, and its task
+containers receive only that proxy's route token.
+
+A current Metask session login (`oauth/metask.json`) has an access token of
+about an hour and rotating refresh tokens. The refresh token stays on the
+machine that logged in; the relay's credential is refreshed there:
+
+- proactively, once the access token has less than 15 minutes left (about
+  45 minutes into a one-hour token), by a background check every 30 seconds
+  and before any relay request;
+- on demand, when the gateway answers 401: the relay refreshes once and
+  repeats that request (nothing has been sent to the container yet).
+
+Refreshes take the state directory's lock, re-read the session file and
+persist the rotated pair atomically, so the CLI and catalog reads on the
+same state directory follow the rotation and a rotated refresh token is never
+reused. Legacy account group keys and provider keys do not expire: they are
+never refreshed, with the same placeholder isolation.
+
+The run record carries a secret-free `credential` object: `container:
+"placeholder"`, `refreshing`, and for a session `refresh_count`,
+`last_refresh_at`, `expires_at` and `error`. When the refresh endpoint rejects
+the login (for example after signing out elsewhere), or the token expires
+while the endpoint stays unreachable, the run stops at once instead of
+spending its remaining tasks on 401s: it ends `failed` with `error` (and
+`credential.error`) set to `Metask 登录已失效，请重新登录（metacodes login）后再运行评测`.
+A temporary refresh failure keeps the current token and retries after 30
+seconds.
+
+Two deployments keep the refresh token on a single machine:
+
+- **Option A — run the workbench on the Docker host.** Install `metacodes`
+  on the Linux machine that runs the trials, run `metacodes login` there and
+  start `metacodes bench` there (see [Devbox and remote access](#devbox-and-remote-access)
+  to reach its page). The local executor's relay refreshes from that
+  machine's own login.
+- **Option B — an SSH executor.** The workbench machine keeps the login and
+  refreshes it; the execution host receives only access tokens on the SSH
+  channel's stdin (see [How an SSH run works](#how-an-ssh-run-works)). Its
+  files, process arguments and environment never contain a token.
 
 For a workbench whose files live under a separate state directory, select
 the install that is already logged in explicitly:
@@ -259,9 +323,10 @@ metacodes bench --bundle /path/to/linux-release \
 `--provider-config` is a native metacodes configuration with
 `custom_providers`; see [the Harbor adapter](../scripts/eval/harbor/README.md).
 `--key-env` names the credential variable; the key is never accepted as a
-browser field or stored in a run specification. Execution uses Harbor's
-`${VARIABLE}` reference. The installed service inherits its startup
-environment, so restart the service after changing a credential.
+browser field or stored in a run specification. The relay holds the key;
+Harbor's `${VARIABLE}` reference carries only the run's placeholder. The
+installed service inherits its startup environment, so restart the service
+after changing a credential.
 
 Defaults and server configuration live in `<state root>/bench/workbench.json`.
 Jobs go to `<state root>/bench/jobs` unless `--jobs-dir` names an existing
@@ -314,7 +379,8 @@ usable. Readiness probes are cached for 15 seconds.
 ### How an SSH run works
 
 The local worker stays the durable owner of the run: it resolves the
-account (or provider) key exactly as for a local run, then
+account (or provider) credential exactly as for a local run, and keeps
+refreshing a session login, then
 
 1. ships the bench runtime and the Linux bundle as tar streams over SSH into
    `<state_dir>/runtime/<digest>` and `<state_dir>/bundles/<digest>`, once per
@@ -322,14 +388,23 @@ account (or provider) key exactly as for a local run, then
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
 3. starts `python3 -m scripts.eval.harbor.viewer.remote run …` over SSH and
-   writes the credential as the first line on the SSH channel's stdin. The
-   remote driver keeps it only in its own environment and Harbor's (`--ae
-   NAME=${NAME}` as locally): it is never in argv, in a file, or in the SSH
-   command line. `SendEnv` is not used because it needs the server's
-   `AcceptEnv`;
-4. the driver starts the timing relay next to the remote Docker daemon (on
-   the executor's `metrics_bind`), runs Harbor in its own process group and
-   prints heartbeats; Harbor's output reaches the local run log;
+   writes the secrets as the first line on the SSH channel's stdin:
+   `{"env": {"METASK_API_KEY": "<placeholder>", …}, "credential": "<access token or key>"}`.
+   `env` goes to Harbor's environment (`--ae NAME=${NAME}` as locally), so
+   Harbor and the containers hold only the placeholder; `credential` stays in
+   the driver's memory for its relay. Neither is in argv, in a file, or in
+   the SSH command line. `SendEnv` is not used because it needs the server's
+   `AcceptEnv`. Each refreshed access token follows as another line,
+   `{"credential": "<new access token>"}`; the remote relay swaps it in
+   atomically (and answers with a secret-free `{"event": "credential",
+   "pushes": N}`). If a push fails, the remote relay keeps the previous
+   token until it expires. The refresh token never leaves the workbench
+   machine;
+4. the driver starts the credential relay next to the remote Docker daemon
+   (on the executor's `metrics_bind`; the executor's `metrics_enabled:
+   false` turns off only the metrics capture), runs Harbor in its own
+   process group and prints heartbeats; Harbor's output reaches the local
+   run log;
 5. the worker copies the remote job directory into the local jobs directory
    on a background thread, every 10 seconds, transferring only files whose
    size or modification time changed. Each pass is bounded (128 MiB or 2000
@@ -368,7 +443,8 @@ plus `suite_reasons`; `ready`/`reasons` on the suite and at the top level
 are those of the default executor (the top level for the default suite).
 
 Cancel sends `cancel` on the channel: the driver interrupts Harbor (SIGINT,
-then SIGKILL after 20 seconds). If the channel closes, or no heartbeat
+then SIGKILL after 20 seconds). A login that can no longer be refreshed
+cancels the same way and fails the run with the reason above. If the channel closes, or no heartbeat
 arrives for 90 seconds, the driver stops Harbor as well, so a lost connection
 never leaves trials running unsupervised.
 
@@ -440,17 +516,19 @@ restart.
 | TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The global mean and P50/P95 pool request samples across jobs |
 | Estimated cost | The metacodes binary's catalog estimate, including cache pricing. It is not the provider's settlement. Missing/zero unknown prices are shown as unknown with coverage counts |
 
-The timing relay runs on the execution host and forwards streaming payloads
-unchanged. It stores numeric timing/usage records only, under
+The credential relay runs on the execution host and forwards streaming
+payloads unchanged; with metrics enabled it also times them. It stores numeric timing/usage records only, under
 `<jobs-dir>/<job>/.bench-metrics/<trial>.jsonl`. Its local Docker hop and HTTP
 forwarding are part of the measured harness; these numbers are not provider
-SLAs. The current relay supports configured Bearer, API-key-header, and
-custom-header Messages, Chat Completions, and Responses routes, with origin or `/v1` base paths.
-Other routes retain native execution and show missing timing coverage.
+SLAs. The relay supports configured Bearer, API-key-header, and
+custom-header Messages, Chat Completions, and Responses routes, with origin or
+`/v1` base paths; other routes are refused at launch (see
+[Credential flow and token refresh](#credential-flow-and-token-refresh)).
 Latency aggregates use complete successful requests; failed or interrupted
 requests do not become timing samples. The page reports sample coverage.
 The host bind defaults to Docker's `172.17.0.1`; server-owned settings can
-choose `metrics_bind`, or disable capture with `metrics_enabled: false`.
+choose `metrics_bind`, or disable capture with `metrics_enabled: false` (the
+relay still proxies authentication).
 The container-to-host relay uses HTTPS; its ephemeral CA is added to the
 disposable task image's CA bundles, and its private key stays on the host and
 is removed when the worker exits. Native certificate verification stays on.

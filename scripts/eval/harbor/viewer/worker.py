@@ -13,7 +13,8 @@ from pathlib import Path
 
 from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.viewer.account import Account
-from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
+from scripts.eval.harbor.profiling import TimingRelay, auth_for, placeholder, route_problem, upstream_for
+from scripts.eval.harbor.viewer import credentials
 from scripts.eval.harbor.store.ingest import WorkerSync
 from scripts.eval.harbor.viewer.executors import RemoteRun
 
@@ -50,39 +51,69 @@ def child_process(spec, env):
     return command(spec), None, env
 
 
+class LaunchRefused(ValueError):
+    """A launch refused for a reason the run record states."""
+
+
 def prepare(spec, env):
-    """Resolve the account key and start the timing relay for one launch."""
-    if spec.get("auth_mode") == "metask":
-        # Resolve the key belonging to this model's group, without
-        # changing the interactive CLI selection or forwarding OAuth.
-        account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
-        env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
-        spec = {**spec, "account_gateway": account.gateway}
-    relay = None
-    upstream = upstream_for(spec) if spec.get("metrics_enabled", True) else None
-    if (spec.get("executor") or {}).get("kind") == "ssh":
-        if spec.get("runner") == "workbuddy":
+    """Resolve the run's credential and start its relay.
+
+    Returns (spec, relay or RemoteRun or None, credential source or None).
+    Harbor and its task containers see only a random run-scoped placeholder
+    in `key_env`; the relay beside the Docker daemon accepts exactly that
+    placeholder and forwards upstream with the real, current credential."""
+    if spec.get("runner") == "workbuddy":
+        if (spec.get("executor") or {}).get("kind") == "ssh":
             # RunManager refuses this combination; never run it half-remote.
             raise ValueError("WorkBuddy 评测只能在本机执行器运行")
+        # WorkBuddy's own host proxy holds the key; its task containers get
+        # only that proxy's route token.
+        if spec.get("auth_mode") == "metask":
+            account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
+            env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
+            spec = {**spec, "account_gateway": account.gateway}
+        return spec, None, None
+    problem = route_problem(spec)
+    if problem:
+        raise LaunchRefused(problem)
+    try:
+        source, gateway = credentials.for_run(spec, env)
+    except ValueError as exc:  # account messages are user-facing, secret-free
+        raise LaunchRefused(str(exc)) from None
+    if gateway:
+        spec = {**spec, "account_gateway": gateway}
+    upstream, auth = upstream_for(spec), auth_for(spec)
+    token = placeholder(spec["name"])
+    env[spec["key_env"]] = token  # the only credential Harbor ever sees
+    record = bool(spec.get("metrics_enabled", True))
+    if (spec.get("executor") or {}).get("kind") == "ssh":
         # The relay must sit beside the Docker daemon that runs the trials,
         # so the remote driver starts it; here only files are staged.
         remote = RemoteRun(spec)
         remote.stage()
-        upstream = upstream if spec["executor"].get("metrics_enabled", True) else None
-        remote_spec = remote.remote_spec(upstream, auth_for(spec) if upstream else None)
-        return {**spec, "remote_spec_path": remote.upload_run(remote_spec)}, remote
-    if upstream:
-        header, prefix = auth_for(spec)
-        relay = TimingRelay(upstream, env[spec["key_env"]],
-                            Path(spec["jobs_dir"]) / spec["name"] / ".bench-metrics",
-                            bind=spec.get("metrics_bind") or "172.17.0.1",
-                            public_host=spec.get("metrics_host"),
-                            auth_header=header, auth_prefix=prefix, tls=True).__enter__()
-        spec = {**spec, "metrics_proxy": relay.url, "metrics_ca": str(relay.ca_path)}
-    return spec, relay
+        record = record and spec["executor"].get("metrics_enabled", True)
+        remote_spec = remote.remote_spec(upstream, auth, record=record)
+        return {**spec, "remote_spec_path": remote.upload_run(remote_spec)}, remote, source
+    relay = TimingRelay(upstream, source, Path(spec["jobs_dir"]) / spec["name"] / ".bench-metrics",
+                        bind=spec.get("metrics_bind") or "172.17.0.1",
+                        public_host=spec.get("metrics_host"),
+                        auth_header=auth[0], auth_prefix=auth[1], tls=True,
+                        token=token, record=record).__enter__()
+    spec = {**spec, "metrics_proxy": relay.url, "metrics_ca": str(relay.ca_path)}
+    return spec, relay, source
 
 
-def supervise_remote(remote, spec, env, spec_path, record_path, record):
+def credential_failed(source):
+    return bool(source is not None and getattr(source, "failed", False))
+
+
+def stamp_credential(record, source):
+    """The run record's non-secret view of its credential."""
+    if source is not None:
+        record["credential"] = {"container": "placeholder", **source.status()}
+
+
+def supervise_remote(remote, spec, env, spec_path, record_path, record, source=None):
     """Run Harbor on an SSH executor: heartbeat, cancel, background sync.
 
     The receipt is rewritten every two seconds whatever the copy-back is
@@ -92,15 +123,26 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record):
     # The run's key plus the suite's execution-host variables (a judge key),
     # all over the SSH channel's stdin.
     secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
-    secret_env[spec["key_env"]] = env[spec["key_env"]]
-    remote.start(secret_env, spec["remote_spec_path"])
+    secret_env[spec["key_env"]] = env[spec["key_env"]]  # the placeholder
+    # The real access token goes beside it for the remote relay only; a
+    # refreshed one follows on the same channel. The refresh token stays here.
+    if getattr(source, "refreshing", False):
+        source.subscribe(remote.push_credential)  # first: no refresh is missed
+    remote.start(secret_env, spec["remote_spec_path"], credential=source.current())
     record.update(status="running", executor=spec["executor"]["name"])
     remote.start_sync()
     cancel_path = spec_path.with_suffix(".cancel")
     cancelled_at = None
+    expired = False
     last_write = 0.0
     while remote.process.poll() is None:
         now_s = time.monotonic()
+        if credential_failed(source) and cancelled_at is None:
+            # Fail fast instead of burning the remaining tasks on 401s.
+            expired = True
+            record["error"] = source.error
+            cancelled_at = now_s
+            remote.cancel()
         if cancel_path.exists() and cancelled_at is None:
             cancelled_at = now_s
             record["status"] = "cancelling"
@@ -115,10 +157,12 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record):
             cancelled_at = now_s
             remote.hang_up()
         if now_s - last_write > 2:
+            stamp_credential(record, source)
             atomic_json(record_path, record)
             last_write = time.monotonic()
         time.sleep(0.25)
     remote.hang_up()
+    stamp_credential(record, source)
     # Copy what is left beside the heartbeat; a cancel now stops the copy
     # (the results stay on the executor and the receipt says so). A lost
     # channel (no exit event) tries briefly: the host is likely unreachable.
@@ -146,6 +190,8 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record):
     else:
         record.update(status="cancelled" if cancelled_at else ("finished" if code == 0 else "failed"),
                       exit_code=code, finished_at=now())
+    if expired:
+        record["status"] = "failed"
     if not complete:
         note = remote.results_note()
         message = (f"结果未能完整同步回本机，仍在执行机器 {note['executor']} 的 {note['path']}；"
@@ -165,6 +211,7 @@ def main(argv=None):
     atomic_json(record_path, record)
     process = None
     relay = None
+    source = None
     # Ingests the job into the evaluation store while it runs and at the end.
     sync = WorkerSync(spec)
     sync.start()
@@ -186,7 +233,10 @@ def main(argv=None):
                     atomic_json(record_path, record)
                     last_write = time.monotonic()
                 concurrent.futures.wait([preparing], timeout=0.25)
-        spec, relay = preparing.result()
+        spec, relay, source = preparing.result()
+        if getattr(source, "refreshing", False):
+            source.keep()
+        stamp_credential(record, source)
         remote = None
         if isinstance(relay, RemoteRun):
             # Not a context manager: nothing to close before it starts.
@@ -195,19 +245,28 @@ def main(argv=None):
             record.update(status="cancelled", finished_at=now())
             return 1
         if remote is not None:
-            supervise_remote(remote, spec, env, spec_path, record_path, record)
+            supervise_remote(remote, spec, env, spec_path, record_path, record, source)
             return 0 if record.get("status") == "finished" else 1
         argv, cwd, child_env = child_process(spec, env)
         process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
         record["status"] = "running"
         cancelled = False
+        expired = False
         last_write = 0.0
         stop_at = None
         while process.poll() is None:
-            if spec_path.with_suffix(".cancel").exists() and not cancelled:
+            stopping = None
+            if credential_failed(source) and not (cancelled or expired):
+                # Fail fast instead of burning the remaining tasks on 401s.
+                expired = True
+                record["error"] = source.error
+                stopping = "failed"
+            elif spec_path.with_suffix(".cancel").exists() and not (cancelled or expired):
                 cancelled = True
                 record["status"] = "cancelling"
+                stopping = "cancelling"
+            if stopping:
                 stop_at = time.monotonic()
                 if os.name == "nt":
                     process.terminate()
@@ -219,14 +278,21 @@ def main(argv=None):
                 else:
                     os.killpg(process.pid, signal.SIGKILL)
             if time.monotonic() - last_write > 2:
+                stamp_credential(record, source)
                 atomic_json(record_path, record)
                 last_write = time.monotonic()
             time.sleep(0.25)
-        record.update(status="cancelled" if cancelled else ("finished" if process.returncode == 0 else "failed"),
+        record.update(status="failed" if expired else "cancelled" if cancelled else
+                      ("finished" if process.returncode == 0 else "failed"),
                       exit_code=process.returncode, finished_at=now())
+    except LaunchRefused as exc:
+        record.update(status="failed", error=str(exc), finished_at=now())
     except Exception as exc:
         record.update(status="failed", error=type(exc).__name__, finished_at=now())
     finally:
+        if source is not None and hasattr(source, "stop"):
+            source.stop()
+        stamp_credential(record, source)
         if relay:
             relay.__exit__(None, None, None)
         if spec.get("runner") == "workbuddy":

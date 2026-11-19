@@ -4,13 +4,21 @@
     python3 -m scripts.eval.harbor.viewer.remote manifest <job-dir>
     python3 -m scripts.eval.harbor.viewer.remote pack <job-dir>   # JSON items on stdin
 
-`run` reads exactly one JSON line from stdin, `{"env": {NAME: value}}`: the
-run's credential, carried by the SSH channel instead of argv or a file. It
-starts the timing relay beside this host's Docker daemon (when the spec asks
-for one), runs Harbor in its own process group and prints JSON events on
-stdout (`started`, `heartbeat` every 2 s, `exit`). A later stdin line
-`cancel`, or the channel closing, interrupts Harbor (SIGINT, then SIGKILL
-after 20 s).
+`run` reads one JSON line from stdin first,
+`{"env": {NAME: value}, "credential": "<real token>"}`, carried by the SSH
+channel instead of argv or a file. `env` goes to Harbor's environment: the
+run's key variable there holds only the run-scoped placeholder the task
+containers present. `credential` stays in this process: the credential relay
+it starts beside this host's Docker daemon accepts the placeholder and
+forwards with this real token. It runs Harbor in its own process group and
+prints JSON events on stdout (`started`, `heartbeat` every 2 s, `exit`).
+Later stdin lines are control messages:
+
+- `{"credential": "<new token>"}`: a refreshed access token from the
+  workbench (which alone holds the refresh token); the relay swaps it in
+  atomically, and keeps the previous one if none arrives;
+- `cancel`, or the channel closing: interrupt Harbor (SIGINT, then SIGKILL
+  after 20 s).
 
 `pack` streams a PAX tar of the requested files. An item is a name, or
 `[name, offset, sha256]`: when the DELTA_CHECK_BYTES before `offset` still
@@ -34,9 +42,13 @@ from pathlib import Path, PurePosixPath
 DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
 
 
+EMIT_LOCK = threading.Lock()
+
+
 def emit(event, **fields):
-    sys.stdout.write(json.dumps({"event": event, **fields}) + "\n")
-    sys.stdout.flush()
+    with EMIT_LOCK:
+        sys.stdout.write(json.dumps({"event": event, **fields}) + "\n")
+        sys.stdout.flush()
 
 
 def absolute(value):
@@ -47,11 +59,15 @@ def run(spec_path):
     os.chdir(os.path.expanduser("~"))
     first = sys.stdin.buffer.readline()
     try:
-        secret_env = json.loads(first)["env"]
+        message = json.loads(first)
+        secret_env = message["env"]
         if not isinstance(secret_env, dict) or not all(isinstance(k, str) and isinstance(v, str)
                                                        for k, v in secret_env.items()):
             raise ValueError
-    except (ValueError, KeyError, TypeError):
+        real = message.get("credential")
+        if real is not None and not (isinstance(real, str) and real):
+            raise ValueError
+    except (ValueError, KeyError, TypeError, AttributeError):
         emit("error", message="missing credential line")
         return 2
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
@@ -71,21 +87,37 @@ def run(spec_path):
     env["PYTHONPATH"] = runtime
     env["PYTHONUNBUFFERED"] = "1"
     relay = None
+    credential = None
     if spec.get("relay"):
         sys.path.insert(0, runtime)
-        from scripts.eval.harbor.profiling import TimingRelay
+        from scripts.eval.harbor.profiling import PushedCredential, TimingRelay
         options = spec["relay"]
-        relay = TimingRelay(options["upstream"], secret_env[spec["key_env"]], absolute(options["metrics_dir"]),
+        token = secret_env[spec["key_env"]]
+        credential = PushedCredential(real or token)
+        relay = TimingRelay(options["upstream"], credential, absolute(options["metrics_dir"]),
                             bind=options.get("bind") or "172.17.0.1", auth_header=options["auth_header"],
-                            auth_prefix=options["auth_prefix"], tls=True).__enter__()
+                            auth_prefix=options["auth_prefix"], tls=True, token=token,
+                            record=options.get("record", True)).__enter__()
         argv += ["--ak", "metrics_proxy=" + relay.url, "--ak", "metrics_ca=" + str(relay.ca_path)]
     stop = threading.Event()
     hung_up = threading.Event()
 
     def control():
         for line in sys.stdin.buffer:
-            if line.strip() == b"cancel":
+            line = line.strip()
+            if line == b"cancel":
                 stop.set()
+            elif line.startswith(b"{"):
+                try:
+                    update = json.loads(line).get("credential")
+                except (ValueError, AttributeError):
+                    continue
+                if credential is not None:
+                    credential.set(update)
+                    try:
+                        emit("credential", pushes=credential.pushes)  # a count, never the token
+                    except (BrokenPipeError, OSError):
+                        pass
         hung_up.set()
         stop.set()
 

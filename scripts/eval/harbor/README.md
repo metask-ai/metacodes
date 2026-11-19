@@ -94,9 +94,9 @@ Agent options (`--ak name=value`):
 | `reasoning_effort` | the model's default | `--reasoning-effort`: `none` … `max` |
 | `max_tokens` | the model's default | `--max-tokens` |
 | `disallowed_tools` | `Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,EnterPlanMode,ExitPlanMode` | `--disallowed-tools`; an empty value enables every tool |
-| `metrics_proxy` | none | workbench-owned relay URL for request-level TTFT/TPS; payloads are forwarded unchanged |
+| `metrics_proxy` | none | workbench-owned credential relay URL: it swaps the run's placeholder key for the real credential and, when enabled, records request-level TTFT/TPS; payloads are forwarded unchanged |
 | `metrics_ca` | none | public relay CA file; trusted only inside the disposable task container |
-| `account_gateway` | none | account session's gateway origin; used by the Metask route when no timing relay is active |
+| `account_gateway` | none | account session's gateway origin; used by the Metask route when no relay is active (the workbench always sets one) |
 
 ### A third-party gateway
 

@@ -122,8 +122,10 @@ class RelayTest(unittest.TestCase):
         self.addCleanup(upstream.shutdown)
         with tempfile.TemporaryDirectory() as temp, TimingRelay(
                 f'http://127.0.0.1:{upstream.server_port}', 'private-key', temp, bind='127.0.0.1') as relay:
+            # The container presents only the relay's placeholder.
+            self.assertTrue(relay.token.startswith('mcb-'))
             request = urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{"private":"input"}',
-                                             headers={'Authorization': 'Bearer private-key', 'Content-Type': 'application/json'})
+                                             headers={'Authorization': 'Bearer ' + relay.token, 'Content-Type': 'application/json'})
             with urllib.request.urlopen(request, timeout=5) as response:
                 self.assertEqual(response.read(), b''.join(chunks))
             deadline = time.monotonic() + 2
@@ -142,13 +144,73 @@ class RelayTest(unittest.TestCase):
             self.assertEqual((metric['input_tokens'], metric['output_tokens']), (50, 20))
             self.assertEqual(seen, [('/v1/messages', 'Bearer private-key', b'{"private":"input"}')])
             text = path.read_text()
-            for secret in ('private-key', 'private-output', '"private"'):
+            for secret in ('private-key', 'private-output', '"private"', relay.token):
                 self.assertNotIn(secret, text)
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}'))
-            self.assertEqual(caught.exception.code, 401)
-            caught.exception.close()
+            # No header, the real key itself, or a wrong placeholder: refused
+            # by the relay, never forwarded.
+            for headers in ({}, {'Authorization': 'Bearer private-key'},
+                            {'Authorization': 'Bearer mcb-other-' + 'x' * 43}):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}',
+                                                                  headers=headers))
+                self.assertEqual(caught.exception.code, 401)
+                caught.exception.close()
             self.assertEqual(len(seen), 1)
+
+    def test_custom_header_route_replaces_the_placeholder_and_metrics_off_still_proxies(self):
+        seen = []
+
+        class Provider(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                seen.append((self.headers.get('x-api-key'), self.headers.get('Authorization')))
+                body = sse({'type': 'message_stop'})
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with tempfile.TemporaryDirectory() as temp, TimingRelay(
+                f'http://127.0.0.1:{upstream.server_port}', 'real-provider-key', Path(temp) / 'metrics',
+                bind='127.0.0.1', auth_header='x-api-key', auth_prefix='', token='mcb-run-placeholder',
+                record=False) as relay:
+            request = urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}',
+                                             headers={'x-api-key': 'mcb-run-placeholder'})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response.read()
+            self.assertEqual(seen, [('real-provider-key', None)])
+            self.assertFalse((Path(temp) / 'metrics').exists())
+
+
+class RouteTest(unittest.TestCase):
+    def test_only_routes_the_relay_can_forward_are_launchable(self):
+        from scripts.eval.harbor.profiling import route_problem, upstream_for
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'provider.json'
+
+            def problem(provider):
+                path.write_text(json.dumps({'custom_providers': {'p': provider}}))
+                return route_problem({'auth_mode': 'provider', 'model': 'p/m', 'provider_config': str(path)})
+
+            good = {'channels': [{'id': 'a', 'protocol': 'openai_chat', 'base_url': 'https://h.example/v1'}]}
+            self.assertIsNone(problem(good))
+            self.assertEqual(upstream_for({'auth_mode': 'provider', 'model': 'p/m', 'provider_config': str(path)}),
+                             'https://h.example/v1')
+            self.assertIn('channels', problem({}))
+            self.assertIn('base_url', problem({'channels': [{'protocol': 'openai_chat', 'base_url': 'https://h.example/api/v4'}]}))
+            self.assertIn('协议', problem({'channels': [{'protocol': 'gemini', 'base_url': 'https://h.example'}]}))
+            self.assertIn('认证', problem({**good, 'auth': {'kind': 'oauth'}}))
+            self.assertIn('不同的主机', problem({'channels': good['channels'] + [
+                {'protocol': 'openai_chat', 'base_url': 'https://other.example'}]}))
+            self.assertIn('provider-config', route_problem({'auth_mode': 'provider', 'model': 'p/m'}))
+            self.assertIsNone(route_problem({'auth_mode': 'metask', 'model': 'metask/x'}))
 
     def test_route_rewrite_preserves_model_protocol_and_original_configuration(self):
         original = {'custom_providers': {'p': {'channels': [{'protocol': 'openai_responses', 'base_url': 'https://provider.example/v1'}]}}}

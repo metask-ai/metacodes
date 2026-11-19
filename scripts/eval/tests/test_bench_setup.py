@@ -34,7 +34,7 @@ from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
 from scripts.eval.harbor.viewer import data, executors, server, setup
 from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import FAKE_HARBOR, session_fixture, wait_run
+from scripts.eval.tests.test_bench_workbench import FAKE_HARBOR, RotatingGateway, session_fixture, wait_run
 
 FAKES = r'''
 import json, os, shutil, subprocess, sys, time
@@ -117,7 +117,7 @@ elif name == "ssh":
               "FAKE_UNAME": "Linux", "FAKE_SUDO": env.get("FAKE_REMOTE_SUDO", ""),
               "FAKE_DOCKER_DAEMON": env.get("FAKE_REMOTE_DOCKER_DAEMON", "")}
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
-                "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX"):
+                "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -236,7 +236,9 @@ class SetupFixture(unittest.TestCase):
         self.state = root / "bench-state"
         self.config = self.state / "bench" / "workbench.json"
         native = root / "provider.json"
-        atomic_json(native, {"custom_providers": {"tokenjoy": {"models": [{"request_model_id": "test-model"}]}}})
+        atomic_json(native, {"custom_providers": {"tokenjoy": {
+            "channels": [{"id": "default", "protocol": "openai_chat", "base_url": "https://tokenjoy.invalid/v1"}],
+            "models": [{"request_model_id": "test-model"}]}}})
         atomic_json(self.config, {"auth_mode": "provider", "provider_config": str(native), "model": "tokenjoy/test-model",
                                   "key_env": "TOKENJOY_API_KEY", "jobs_dir": str(self.state / "bench/jobs"),
                                   "metacodes": {"binary": str(self.templates / "metacodes"), "version": "9.9.9"}})
@@ -541,11 +543,15 @@ class SshExecutorTest(SetupFixture):
 
 
 class SshRunTest(SetupFixture):
-    def prepare_remote(self, profile=False):
-        state, upstream, calls = session_fixture(self.root)
-        self.addCleanup(upstream.server_close)
-        self.addCleanup(upstream.shutdown)
-        os.environ["METASK_SITE_URL"] = f"http://127.0.0.1:{upstream.server_port}"
+    def prepare_remote(self, profile=False, gateway=None):
+        if gateway is None:
+            state, upstream, calls = session_fixture(self.root)
+            self.addCleanup(upstream.server_close)
+            self.addCleanup(upstream.shutdown)
+            os.environ["METASK_SITE_URL"] = f"http://127.0.0.1:{upstream.server_port}"
+        else:
+            state, calls = gateway.state, gateway.requests
+            os.environ["METASK_SITE_URL"] = gateway.url
         (self.remote_home / ".local/bin").mkdir(parents=True)
         harbor = self.remote_home / ".local/bin/harbor"
         harbor.write_text(FAKE_HARBOR.format(python=sys.executable))
@@ -590,8 +596,10 @@ class SshRunTest(SetupFixture):
         bundle_arg = next(a for a in argv if a.startswith("bundle="))
         self.assertTrue(bundle_arg.startswith("bundle=" + remote_root + "/bundles/"), bundle_arg)
         self.assertTrue(any(a.startswith("metrics_proxy=https://127.0.0.1:") for a in argv))
-        # The key reached the remote Harbor process; it is in no argv or file.
-        self.assertTrue(json.loads((local / "credential-check.json").read_text())["account_key_matches"])
+        # The remote Harbor process holds only the placeholder; the remote
+        # relay sent the real token, which is in no argv or file.
+        check = json.loads((local / "credential-check.json").read_text())
+        self.assertEqual((check["account_key_matches"], check["placeholder"]), (False, True))
         self.assertIn(("model-request", "Bearer session-access", {"model": "session-model"}), calls)
         for row in self.calls("ssh"):
             self.assertNotIn("session-access", json.dumps(row))
@@ -602,6 +610,41 @@ class SshRunTest(SetupFixture):
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
         self.assertEqual((view["rows"][0]["requests"], view["rows"][0]["total_tokens"]), (1, 70))
         self.assertTrue(list((local / ".bench-metrics").glob("*.jsonl")))
+
+    def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
+        gateway = RotatingGateway(self.root, lifetime=4)
+        self.addCleanup(gateway.close)
+        manager, client, _ = self.prepare_remote(profile=True, gateway=gateway)
+        os.environ.update(METACODES_BENCH_REFRESH_MARGIN="2", METACODES_BENCH_REFRESH_INTERVAL="0.2",
+                          FAKE_RELAY_REQUESTS="30", FAKE_RELAY_INTERVAL="0.3")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+        local = manager.jobs_dir / run["name"]
+        # Every request through the remote relay was authorized upstream,
+        # across 2.5 token lifetimes: the executor holds no refresh token, so
+        # the newer tokens it used can only have arrived over the channel.
+        self.assertEqual(json.loads((local / "relay-statuses.json").read_text()), [200] * 30)
+        self.assertEqual(len(gateway.requests), 30)
+        self.assertTrue(all(ok for _, ok, _ in gateway.requests), gateway.requests)
+        self.assertGreaterEqual(len({token for token, _, _ in gateway.requests}), 3)
+        self.assertTrue(all(left > 0 for left in gateway.refreshes), gateway.refreshes)
+        self.assertGreaterEqual(final["credential"]["refresh_count"], 2)
+        self.assertEqual(json.loads((gateway.state / "oauth/metask.json").read_text())["refresh_token"],
+                         gateway.refresh_token)
+        # Neither the access nor the refresh tokens are in the remote files
+        # (the synced job, harbor-env.json = the remote driver's environment
+        # plus what it handed Harbor), the SSH argv, or the local records.
+        container = json.loads((local / "container-env.json").read_text())
+        self.assertTrue(container["METASK_API_KEY"].startswith("mcb-"), container)
+        remote_files = [p for p in self.remote_home.rglob("*") if p.is_file()]
+        self.assertTrue(any(p.name == "harbor-env.json" for p in remote_files))
+        public = b"".join(p.read_bytes() for p in remote_files + list(manager.records.iterdir())
+                          + [p for p in local.rglob("*") if p.is_file()])
+        argv = json.dumps(self.calls("ssh"))
+        for secret in gateway.issued:
+            self.assertNotIn(secret.encode(), public, secret)
+            self.assertNotIn(secret, argv)
 
     def watch_until_done(self, manager, name, timeout=60):
         """Every status the page shows until the run ends."""

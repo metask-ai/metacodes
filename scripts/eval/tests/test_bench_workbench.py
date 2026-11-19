@@ -31,7 +31,12 @@ def arg(flag): return args[args.index(flag) + 1]
 root = pathlib.Path(arg('-o')) / arg('--job-name')
 root.mkdir(parents=True, exist_ok=True)
 (root / 'argv.json').write_text(json.dumps(args))
-(root / 'credential-check.json').write_text(json.dumps({{'account_key_matches': bool(os.environ.get('FAKE_EXPECT_ACCOUNT_KEY')) and os.environ.get('METASK_API_KEY') == os.environ.get('FAKE_EXPECT_ACCOUNT_KEY')}}))
+key_env = next((args[i + 1].split('=', 1)[0] for i, a in enumerate(args) if a == '--ae'), 'METASK_API_KEY')
+(root / 'credential-check.json').write_text(json.dumps({{'account_key_matches': bool(os.environ.get('FAKE_EXPECT_ACCOUNT_KEY')) and os.environ.get(key_env) == os.environ.get('FAKE_EXPECT_ACCOUNT_KEY'),
+    'placeholder': os.environ.get(key_env, '').startswith('mcb-')}}))
+# What Harbor would hand the task container (--ae values), and its own env.
+(root / 'container-env.json').write_text(json.dumps({{args[i + 1].split('=', 1)[0]: os.environ.get(args[i + 1].split('=', 1)[0]) for i, a in enumerate(args) if a == '--ae'}}))
+(root / 'harbor-env.json').write_text(json.dumps({{k: v for k, v in os.environ.items() if not k.startswith('FAKE_')}}))
 (root / 'config.json').write_text(json.dumps({{'agents':[{{'model_name':arg('-m')}}], 'n_attempts':int(arg('-k'))}}))
 (root / 'result.json').write_text(json.dumps({{'started_at':'2026-11-16T00:00:00Z','finished_at':None, 'n_total_trials':1}}))
 if os.environ.get('FAKE_PROFILE_REQUEST'):
@@ -40,6 +45,19 @@ if os.environ.get('FAKE_PROFILE_REQUEST'):
  ca = next(args[i + 1].removeprefix('metrics_ca=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_ca='))
  req = urllib.request.Request(relay + '/fix-git__fake/v1/messages', data=json.dumps({{'model':arg('-m').split('/',1)[1]}}).encode(), headers={{'Authorization':'Bearer ' + os.environ['METASK_API_KEY'], 'Content-Type':'application/json'}})
  with urllib.request.urlopen(req,timeout=5,context=ssl.create_default_context(cafile=ca)) as response: response.read()
+if os.environ.get('FAKE_RELAY_REQUESTS'):
+ import ssl, urllib.error, urllib.request
+ relay = next(args[i + 1].removeprefix('metrics_proxy=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_proxy='))
+ ca = next(args[i + 1].removeprefix('metrics_ca=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_ca='))
+ statuses = []
+ for n in range(int(os.environ['FAKE_RELAY_REQUESTS'])):
+  req = urllib.request.Request(relay + '/fix-git__fake/v1/messages', data=json.dumps({{'model':arg('-m').split('/',1)[1], 'n': n}}).encode(), headers={{'Authorization':'Bearer ' + os.environ[key_env], 'Content-Type':'application/json'}})
+  try:
+   with urllib.request.urlopen(req,timeout=10,context=ssl.create_default_context(cafile=ca)) as response: response.read(); statuses.append(response.status)
+  except urllib.error.HTTPError as exc:
+   statuses.append(exc.code); exc.close()
+  (root / 'relay-statuses.json').write_text(json.dumps(statuses))
+  time.sleep(float(os.environ.get('FAKE_RELAY_INTERVAL', '.3')))
 if os.environ.get('FAKE_ACCOUNT_REQUEST'):
  import urllib.request
  gateway = next(args[i + 1].removeprefix('account_gateway=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('account_gateway='))
@@ -70,6 +88,7 @@ def fixture(root):
     native = root / 'provider.json'
     atomic_json(native, {'custom_providers': {'tokenjoy': {
         'display_name': 'TokenJoy', 'env_aliases': [{'name': 'TOKENJOY_API_KEY'}],
+        'channels': [{'id': 'default', 'protocol': 'openai_chat', 'base_url': 'https://tokenjoy.invalid/v1'}],
         'models': [{'request_model_id': 'test-model'}]}}})
     binary_dir = root / 'bin'
     binary_dir.mkdir()
@@ -82,12 +101,12 @@ def fixture(root):
     config = root / 'workbench.json'
     atomic_json(config, {'bundle': str(bundle), 'provider_config': str(native),
                          'harbor': str(harbor), 'model': 'tokenjoy/test-model',
-                         'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False})
+                         'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False, 'metrics_bind': '127.0.0.1'})
     return config, binary_dir
 
 
-def wait_run(manager, name):
-    deadline = time.monotonic() + 15
+def wait_run(manager, name, timeout=15):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         run = next((r for r in manager.runs() if r['name'] == name), {})
         if run.get('status') in ('finished', 'failed', 'cancelled', 'interrupted'):
@@ -125,6 +144,7 @@ def account_fixture(root, *, expired=True, paginated=False, broken_group=False):
         def do_POST(self):
             if self.path == '/v1/messages':
                 self.rfile.read(int(self.headers['Content-Length']))
+                calls.append(('model-request', self.headers.get('Authorization')))
                 if self.headers.get('Authorization') != 'Bearer group-claude-secret':
                     self.reply({}, 401)
                     return
@@ -248,6 +268,123 @@ def session_fixture(root, *, expired=True):
     return state, http, calls
 
 
+class RotatingGateway:
+    """A Metask gateway and OAuth endpoint with short-lived tokens.
+
+    Access tokens live `lifetime` seconds; a model request with an expired,
+    revoked or unknown token gets 401. Each refresh rotates the refresh
+    token, and a reused (already rotated) refresh token is rejected with 400
+    `invalid_grant`, as the real endpoint does."""
+
+    def __init__(self, root, lifetime=4.0):
+        self.lifetime = lifetime
+        self.lock = threading.Lock()
+        self.serial = 0
+        self.expiry = {}
+        self.issued = []
+        self.revoked = set()
+        self.deny_refresh = False
+        self.refreshes = []   # seconds the replaced access token still had
+        self.rejected = []    # refresh tokens refused
+        self.requests = []    # (access token, accepted, seconds left)
+        self.current_access = self.issue()
+        self.refresh_token = 'live-refresh-0'
+        self.issued.append(self.refresh_token)
+        gateway = self
+
+        class Endpoint(BaseHTTPRequestHandler):
+            def reply(self, value, code=200):
+                body = json.dumps(value).encode()
+                self.send_response(code)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def bearer(self):
+                return (self.headers.get('Authorization') or '').removeprefix('Bearer ')
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])) or b'{}')
+                if self.path == '/api/oauth/token':
+                    self.reply(*gateway.refresh(body))
+                elif self.path == '/v1/messages':
+                    if not gateway.accept(self.bearer()):
+                        self.reply({'error': 'expired'}, 401)
+                        return
+                    payload = b''.join(b'data: ' + json.dumps(e).encode() + b'\n\n' for e in (
+                        {'type': 'message_start', 'message': {'usage': {'input_tokens': 5}}},
+                        {'type': 'content_block_delta', 'delta': {'text': 'ok'}},
+                        {'type': 'message_delta', 'usage': {'output_tokens': 2}}, {'type': 'message_stop'}))
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.reply({}, 404)
+
+            def do_GET(self):
+                if self.path != '/v1/models':
+                    self.reply({}, 404)
+                elif not gateway.valid(self.bearer()):
+                    self.reply({}, 401)
+                else:
+                    self.reply({'data': [{'id': 'session-model'}]})
+
+            def log_message(self, *_args):
+                pass
+
+        self.http = ThreadingHTTPServer(('127.0.0.1', 0), Endpoint)
+        self.url = f'http://127.0.0.1:{self.http.server_port}'
+        self.state = root / 'rotating-account'
+        self.state.mkdir()
+        atomic_json(self.state / 'auth.json', {'selected_model': 'session-model'})
+        atomic_json(self.state / 'oauth/metask.json', {
+            'schema_version': 1, 'access_token': self.current_access, 'refresh_token': self.refresh_token,
+            'token_type': 'Bearer', 'expires_at': int(self.expiry[self.current_access]),
+            'gateway_url': self.url, 'models_url': self.url + '/v1/models'})
+        threading.Thread(target=self.http.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.http.shutdown()
+        self.http.server_close()
+
+    def issue(self):
+        token = f'live-access-{self.serial}'
+        self.expiry[token] = time.time() + self.lifetime
+        self.issued.append(token)
+        return token
+
+    def valid(self, token):
+        with self.lock:
+            return token in self.expiry and token not in self.revoked and time.time() < self.expiry[token]
+
+    def accept(self, token):
+        with self.lock:
+            left = self.expiry.get(token, 0) - time.time()
+            ok = token in self.expiry and token not in self.revoked and left > 0
+            self.requests.append((token, ok, left))
+            return ok
+
+    def revoke(self, token):
+        with self.lock:
+            self.revoked.add(token)
+
+    def refresh(self, body):
+        with self.lock:
+            if (self.deny_refresh or body.get('client_id') != 'metacodes'
+                    or body.get('refresh_token') != self.refresh_token):
+                self.rejected.append(body.get('refresh_token'))
+                return {'error': 'invalid_grant'}, 400
+            self.refreshes.append(self.expiry[self.current_access] - time.time())
+            self.serial += 1
+            self.current_access = self.issue()
+            self.refresh_token = f'live-refresh-{self.serial}'
+            self.issued.append(self.refresh_token)
+            return {'access_token': self.current_access, 'refresh_token': self.refresh_token,
+                    'expires_in': int(self.lifetime), 'token_type': 'Bearer'}, 200
+
+
 def stalled_account_fixture(root):
     """A key login whose model directory, once armed, holds each lookup
     until released: a slow Metask credential lookup, with no provider."""
@@ -311,6 +448,12 @@ class WorkbenchTest(unittest.TestCase):
         self.assertEqual(argv[argv.index('-k') + 1], '2')
         self.assertIn('TOKENJOY_API_KEY=${TOKENJOY_API_KEY}', argv)
         self.assertNotIn('private-test-value', json.dumps(argv))
+        # Harbor (and so the task container) holds only the run's placeholder.
+        container = json.loads((self.manager.jobs_dir / run['name'] / 'container-env.json').read_text())
+        self.assertTrue(container['TOKENJOY_API_KEY'].startswith('mcb-'), container)
+        self.assertNotIn('private-test-value', (self.manager.jobs_dir / run['name'] / 'harbor-env.json').read_text())
+        self.assertTrue(any(a.startswith('metrics_proxy=https://127.0.0.1:') for a in argv))
+        self.assertEqual(final['credential'], {'container': 'placeholder', 'refreshing': False})
         job = self.client.request('api/job?name=' + run['name'])
         self.assertEqual(job['summary']['counts']['pass'], 1)
         self.assertIn(run['name'], final['url'])
@@ -366,6 +509,15 @@ class WorkbenchTest(unittest.TestCase):
         seen = []
 
         class Catalog(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                seen.append(('model-request', self.headers.get('Authorization')))
+                body = b'data: {"type": "message_stop"}\n\n'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 seen.append((self.path, self.headers.get('Authorization')))
                 body = json.dumps({'data': [{'id': 'glm-test', 'display_name': 'GLM Test'}, {'id': 'other-model'}]}).encode()
@@ -399,7 +551,8 @@ class WorkbenchTest(unittest.TestCase):
             # current credential, overriding any stale ambient account key.
             login['api_key'] = 'rotated-account-key'
             atomic_json(state / 'auth.json', login)
-            with patch.dict(os.environ, {'FAKE_EXPECT_ACCOUNT_KEY': 'rotated-account-key', 'METASK_API_KEY': 'wrong-ambient-key'}):
+            with patch.dict(os.environ, {'FAKE_EXPECT_ACCOUNT_KEY': 'rotated-account-key', 'METASK_API_KEY': 'wrong-ambient-key',
+                                         'FAKE_PROFILE_REQUEST': '1'}):
                 run = self.client.request('api/runs', {**self.request(), 'model': 'metask/glm-test'})
                 final = wait_run(self.manager, run['name'])
             self.assertEqual(final['status'], 'finished', final)
@@ -409,12 +562,15 @@ class WorkbenchTest(unittest.TestCase):
             self.assertIn('METASK_API_KEY=${METASK_API_KEY}', argv)
             self.assertIn('reasoning_effort=high', argv)
             self.assertFalse(any(arg.startswith('config=') for arg in argv))
-            self.assertTrue(json.loads((job / 'credential-check.json').read_text())['account_key_matches'])
-            for path in self.manager.records.iterdir():
+            # Harbor holds the placeholder; the relay sent the current key.
+            check = json.loads((job / 'credential-check.json').read_text())
+            self.assertEqual((check['account_key_matches'], check['placeholder']), (False, True))
+            self.assertEqual(seen[-1], ('model-request', 'Bearer rotated-account-key'))
+            self.assertEqual(seen[-2][1], 'Bearer rotated-account-key')
+            for path in list(self.manager.records.iterdir()) + [p for p in job.rglob('*') if p.is_file()]:
                 text = path.read_text()
                 for secret in ('account-test-key', 'rotated-account-key', 'never-forward-refresh'):
                     self.assertNotIn(secret, text)
-            self.assertEqual(seen[-1][1], 'Bearer rotated-account-key')
 
     def test_missing_account_login_blocks_launch_despite_tokenjoy_key(self):
         cfg = json.loads(self.manager.config_path.read_text())
@@ -439,16 +595,18 @@ class WorkbenchTest(unittest.TestCase):
         catalog = self.client.request('api/workbench')
         self.assertEqual({m['id'] for m in catalog['models']}, {'metask/glm-test', 'metask/shared', 'metask/claude-test'})
         self.assertEqual(catalog['account_summary']['groups'], 2)
-        with patch.dict(os.environ, {'FAKE_EXPECT_ACCOUNT_KEY': 'group-claude-secret'}):
+        with patch.dict(os.environ, {'FAKE_EXPECT_ACCOUNT_KEY': 'group-claude-secret', 'FAKE_PROFILE_REQUEST': '1'}):
             run = self.client.request('api/runs', {**self.request(), 'model': 'metask/claude-test'})
             final = wait_run(self.manager, run['name'])
         self.assertEqual(final['status'], 'finished', final)
         job = self.manager.jobs_dir / run['name']
-        self.assertTrue(json.loads((job / 'credential-check.json').read_text())['account_key_matches'])
+        self.assertTrue(json.loads((job / 'credential-check.json').read_text())['placeholder'])
+        self.assertEqual(calls[-1], ('model-request', 'Bearer group-claude-secret'))
         spec = json.loads((self.manager.records / (run['name'] + '.spec')).read_text())
         self.assertEqual(spec['account_key_id'], 'claude-key')
         self.assertEqual(json.loads((state / 'auth.json').read_text())['api_key'], 'group-glm-secret')
         public = json.dumps(catalog) + ''.join(p.read_text() for p in self.manager.records.iterdir())
+        public += ''.join(p.read_text() for p in job.rglob('*') if p.is_file())
         for secret in ('group-glm-secret', 'group-claude-secret', 'old-refresh', 'rotated-refresh', 'new-access'):
             self.assertNotIn(secret, public)
 
@@ -503,7 +661,7 @@ class WorkbenchTest(unittest.TestCase):
         for secret in ('session-access', 'session-refresh', 'session-rotated', 'replacement-access'):
             self.assertNotIn(secret, public)
 
-    def test_session_gateway_reaches_child_when_profiling_is_disabled(self):
+    def test_disabled_metrics_still_proxy_auth_and_record_nothing(self):
         state, upstream, calls = session_fixture(self.root)
         self.addCleanup(upstream.server_close)
         self.addCleanup(upstream.shutdown)
@@ -511,11 +669,26 @@ class WorkbenchTest(unittest.TestCase):
         cfg.update(auth_mode='metask', account_state_dir=str(state), metrics_enabled=False)
         atomic_json(self.manager.config_path, cfg)
         with patch.dict(os.environ, {'METASK_SITE_URL': f'http://127.0.0.1:{upstream.server_port}',
-                                     'FAKE_ACCOUNT_REQUEST': '1'}):
+                                     'FAKE_PROFILE_REQUEST': '1'}):
             run = self.client.request('api/runs', {**self.request(), 'model': 'metask/session-model'})
             final = wait_run(self.manager, run['name'])
         self.assertEqual(final['status'], 'finished', final)
+        # The container's placeholder became the session token at the relay.
         self.assertIn(('model-request', 'Bearer session-access', {'model': 'session-model'}), calls)
+        job = self.manager.jobs_dir / run['name']
+        self.assertTrue(json.loads((job / 'credential-check.json').read_text())['placeholder'])
+        self.assertFalse((job / '.bench-metrics').exists())
+
+    def test_unproxiable_provider_route_is_refused_instead_of_leaking_the_key(self):
+        native = json.loads(Path(json.loads(self.manager.config_path.read_text())['provider_config']).read_text())
+        native['custom_providers']['tokenjoy']['channels'][0]['base_url'] = 'https://tokenjoy.invalid/api/paas/v4'
+        atomic_json(Path(json.loads(self.manager.config_path.read_text())['provider_config']), native)
+        catalog = self.client.request('api/workbench')
+        self.assertFalse(catalog['ready'])
+        self.assertTrue(any('凭据代理' in r for r in catalog['reasons']), catalog['reasons'])
+        with self.assertRaisesRegex(ValueError, '凭据代理'):
+            self.client.request('api/runs', self.request())
+        self.assertEqual(self.manager.runs(), [])
 
     def start_stalled_preparation(self):
         """Launch a run whose worker is still resolving its account key."""
@@ -557,6 +730,157 @@ class WorkbenchTest(unittest.TestCase):
         final = wait_run(self.manager, run['name'])
         started = (self.manager.jobs_dir / run['name'] / 'argv.json').exists()
         self.assertEqual((shown, final['status'], final['exit_code'], started), ('cancelling', 'cancelled', None, False))
+
+
+@unittest.skipUnless(POSIX, 'fake executable and worker signal test are POSIX')
+class TokenRefreshRunTest(unittest.TestCase):
+    """A run longer than several access-token lifetimes (seconds here)."""
+    setUp = WorkbenchTest.setUp
+    request = WorkbenchTest.request
+
+    def gateway(self):
+        gateway = RotatingGateway(self.root, lifetime=4)
+        self.addCleanup(gateway.close)
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode='metask', account_state_dir=str(gateway.state), metrics_enabled=True)
+        atomic_json(self.manager.config_path, cfg)
+        env = patch.dict(os.environ, {'METASK_SITE_URL': gateway.url, 'METACODES_BENCH_REFRESH_MARGIN': '2',
+                                      'METACODES_BENCH_REFRESH_INTERVAL': '0.2'})
+        env.start()
+        self.addCleanup(env.stop)
+        return gateway
+
+    def test_long_run_refreshes_before_expiry_and_containers_hold_only_a_placeholder(self):
+        gateway = self.gateway()
+        with patch.dict(os.environ, {'FAKE_RELAY_REQUESTS': '30', 'FAKE_RELAY_INTERVAL': '0.3'}):
+            run = self.client.request('api/runs', {**self.request(), 'model': 'metask/session-model'})
+            final = wait_run(self.manager, run['name'], timeout=60)
+        self.assertEqual(final['status'], 'finished', final)
+        job = self.manager.jobs_dir / run['name']
+        # Every model request of the ~10 s run (2.5 lifetimes) was authorized
+        # upstream: no 401 reached the container and none was needed.
+        self.assertEqual(json.loads((job / 'relay-statuses.json').read_text()), [200] * 30)
+        model_requests = [r for r in gateway.requests]
+        self.assertEqual(len(model_requests), 30)
+        self.assertTrue(all(ok for _, ok, _ in model_requests), model_requests)
+        self.assertGreaterEqual(len({token for token, _, _ in model_requests}), 3)
+        # Each refresh replaced a token that was still valid: proactive.
+        self.assertTrue(gateway.refreshes and all(left > 0 for left in gateway.refreshes), gateway.refreshes)
+        self.assertEqual(gateway.rejected, [])
+        credential = final['credential']
+        self.assertEqual((credential['container'], credential['refreshing'], credential['error']),
+                         ('placeholder', True, None))
+        self.assertGreaterEqual(credential['refresh_count'], 2)
+        self.assertTrue(credential['last_refresh_at'])
+        # The rotated refresh token is persisted for the CLI and later runs.
+        saved = json.loads((gateway.state / 'oauth/metask.json').read_text())
+        self.assertEqual((saved['access_token'], saved['refresh_token']), (gateway.current_access, gateway.refresh_token))
+        # Harbor's --ae value (the container env) is the placeholder; no real
+        # token is in Harbor's env/argv, the trial dir, the run record or log.
+        container = json.loads((job / 'container-env.json').read_text())
+        self.assertTrue(container['METASK_API_KEY'].startswith('mcb-'), container)
+        files = [p for p in job.rglob('*') if p.is_file()] + list(self.manager.records.iterdir())
+        public = ''.join(p.read_text(errors='replace') for p in files)
+        for secret in gateway.issued:
+            self.assertNotIn(secret, public)
+        self.assertTrue(list((job / '.bench-metrics').glob('*.jsonl')))
+
+    def test_lost_login_fails_the_run_fast_with_a_clear_reason(self):
+        gateway = self.gateway()
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '30'}):
+            run = self.client.request('api/runs', {**self.request(), 'model': 'metask/session-model'})
+            deadline = time.monotonic() + 15
+            while not (self.manager.jobs_dir / run['name'] / 'argv.json').exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            gateway.deny_refresh = True  # e.g. signed out elsewhere
+            started = time.monotonic()
+            final = wait_run(self.manager, run['name'], timeout=30)
+        self.assertLess(time.monotonic() - started, 15)  # not the 30 s task
+        self.assertEqual(final['status'], 'failed', final)
+        self.assertIn('Metask 登录已失效，请重新登录', final['error'])
+        self.assertEqual(final['credential']['error'], final['error'])
+
+
+class CredentialRefreshTest(unittest.TestCase):
+    """The relay with a refreshing session source, without a worker."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.gateway = RotatingGateway(self.root, lifetime=60)
+        self.addCleanup(self.gateway.close)
+        env = patch.dict(os.environ, {'METASK_SITE_URL': self.gateway.url})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def post(self, relay, token):
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(relay.url + '/t__1/v1/messages', data=b'{}',
+                                         headers={'Authorization': 'Bearer ' + token})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response.read()
+                return response.status
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return exc.code
+
+    def test_margin_constant_is_fifteen_minutes(self):
+        from scripts.eval.harbor.viewer import credentials
+        self.assertEqual(credentials.REFRESH_MARGIN, 15 * 60)
+        with patch.dict(os.environ, {'METACODES_BENCH_REFRESH_MARGIN': ''}):
+            self.assertEqual(credentials.refresh_margin(), 900)
+        # A one-hour token is refreshed 45 minutes in, not before.
+        clock = [1000.0]
+        account = type('A', (), {'session_access': lambda self, stale=None, margin=0: ('t', 1000 + 3600)})()
+        source = credentials.SessionCredential(account, margin=900, clock=lambda: clock[0])
+        calls = []
+        account.session_access = lambda stale=None, margin=0: calls.append(margin) or ('t2', clock[0] + 3600)
+        clock[0] = 1000 + 44 * 60
+        self.assertEqual((source.current(), calls), ('t', []))
+        clock[0] = 1000 + 46 * 60
+        self.assertEqual((source.current(), calls), ('t2', [900]))
+        self.assertEqual(source.refresh_count, 1)
+
+    def test_rejected_token_is_refreshed_once_and_the_request_retried(self):
+        from scripts.eval.harbor.profiling import TimingRelay
+        from scripts.eval.harbor.viewer.credentials import SessionCredential
+        source = SessionCredential(Account(self.gateway.state), margin=2)
+        first = source.current()
+        with TimingRelay(self.gateway.url, source, self.root / 'metrics', bind='127.0.0.1',
+                         token='mcb-test-placeholder', record=False) as relay:
+            self.gateway.revoke(first)  # the gateway rejects a still-unexpired token
+            self.assertEqual(self.post(relay, 'mcb-test-placeholder'), 200)
+            tokens = [(token, ok) for token, ok, _ in self.gateway.requests]
+            self.assertEqual(tokens, [(first, False), (source.token, True)])
+            self.assertEqual(source.refresh_count, 1)
+            saved = json.loads((self.gateway.state / 'oauth/metask.json').read_text())
+            self.assertEqual(saved['refresh_token'], self.gateway.refresh_token)
+            # A wrong placeholder never reaches the gateway.
+            self.assertEqual(self.post(relay, 'mcb-test-wrong'), 401)
+            self.assertEqual(len(self.gateway.requests), 2)
+            # The CLI rotates the pair meanwhile; the relay's next refresh
+            # re-reads it under the lock instead of reusing the old refresh
+            # token (which the endpoint would reject).
+            Account(self.gateway.state).oauth_bearer(stale=source.token)
+            self.gateway.revoke(source.token)
+            self.assertEqual(self.post(relay, 'mcb-test-placeholder'), 200)
+            self.assertEqual(self.gateway.rejected, [])
+            self.assertEqual(source.token, self.gateway.current_access)
+            # The login is gone: the upstream 401 passes through once, then
+            # the relay refuses without calling upstream; the reason is set.
+            self.gateway.deny_refresh = True
+            self.gateway.revoke(source.token)
+            self.assertEqual(self.post(relay, 'mcb-test-placeholder'), 401)
+            count = len(self.gateway.requests)
+            self.assertEqual(self.post(relay, 'mcb-test-placeholder'), 401)
+            self.assertEqual(len(self.gateway.requests), count)
+            self.assertTrue(source.failed)
+            self.assertIn('请重新登录', source.status()['error'])
+        self.assertFalse((self.root / 'metrics').exists())
 
 
 class AccountTest(unittest.TestCase):

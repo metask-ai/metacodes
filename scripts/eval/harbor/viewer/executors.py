@@ -6,12 +6,15 @@ host as before. An `ssh` executor runs the Harbor command on the remote host:
 - the bench runtime (the Python files below) and the Linux release bundle are
   shipped over the SSH channel as tar streams into content-addressed
   directories under the executor's `state_dir`, once per digest;
-- the run's account key or provider key travels as the first line on the SSH
-  channel's stdin and lives only in the remote driver's process environment
-  and its Harbor child (never argv, never a file);
-- the remote driver (`viewer/remote.py`) owns the timing relay next to the
-  remote Docker daemon, reports heartbeats on stdout, cancels on request or
-  when the channel closes;
+- the run's real credential (account key, session access token or provider
+  key) travels as the first line on the SSH channel's stdin, beside the
+  run-scoped placeholder Harbor hands to the task containers; the real one
+  lives only in the remote driver's relay (never argv, never a file, never
+  Harbor's environment). A refreshed session access token follows on the
+  same channel; the refresh token never leaves the workbench machine;
+- the remote driver (`viewer/remote.py`) owns the credential relay next to
+  the remote Docker daemon, reports heartbeats on stdout, cancels on request
+  or when the channel closes;
 - the remote job directory is copied back incrementally into the local jobs
   directory, so the viewer and other local readers see ordinary job files.
 
@@ -404,7 +407,7 @@ def reasons(executor: Executor, facts: Dict) -> List[str]:
     elif facts.get("compose") != "1":
         result.append("缺少 docker compose 插件" + setup)
     if not facts.get("openssl"):
-        result.append("未找到 OpenSSL（计时 relay 需要）" + setup)
+        result.append("未找到 OpenSSL（凭据 relay 需要）" + setup)
     return result
 
 
@@ -736,6 +739,9 @@ class RemoteRun:
         self.bundle = None
         self.dataset = None
         self.process = None
+        self.stdin_lock = threading.Lock()
+        self.credential_pushes = 0
+        self.pending_credential = None
         self.events: List[Dict] = []
         self.last_event = time.monotonic()
         self.sync_state = None
@@ -759,7 +765,7 @@ class RemoteRun:
             self.dataset = ship_dataset(self.executor, Path(self.spec["local_dataset"]), log=self.log,
                                         runner=self.runner, popen=self.popen)
 
-    def remote_spec(self, upstream=None, auth=("Authorization", "Bearer ")) -> Dict:
+    def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.viewer.worker import command
         run_dir = self.executor.remote("runs", self.spec["name"])
         remote = {**self.spec, "harbor": self.spec.get("remote_harbor") or self.executor.harbor or ".local/bin/harbor",
@@ -779,7 +785,8 @@ class RemoteRun:
         relay = None
         if upstream:
             relay = {"upstream": upstream, "bind": self.executor.metrics_bind, "auth_header": auth[0],
-                     "auth_prefix": auth[1], "metrics_dir": self.remote_job_dir + "/.bench-metrics"}
+                     "auth_prefix": auth[1], "metrics_dir": self.remote_job_dir + "/.bench-metrics",
+                     "record": bool(record)}
         return {"schema_version": 1, "name": self.spec["name"], "argv": command(remote),
                 "key_env": self.spec["key_env"], "relay": relay, "runtime": self.runtime}
 
@@ -797,17 +804,24 @@ class RemoteRun:
             ship(self.executor, root, names, run_dir, log=self.log, runner=self.runner, popen=self.popen, force=True)
         return run_dir + "/spec.json"
 
-    def start(self, secret_env: Dict[str, str], remote_spec_path: str) -> None:
+    def start(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str] = None) -> None:
         argv = ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, "PYTHONUNBUFFERED=1",
                                         self.executor.python, "-m", "scripts.eval.harbor.viewer.remote",
                                         "run", remote_spec_path])
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
-        self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
-        self.last_event = time.monotonic()  # staging may have taken minutes
-        # The secret is the first line on the encrypted channel; the remote
-        # driver keeps it in its own and Harbor's environment only.
-        self.process.stdin.write((json.dumps({"env": secret_env}) + "\n").encode())
-        self.process.stdin.flush()
+        # The secrets are the first line on the encrypted channel: `env` goes
+        # to Harbor (the placeholder, a judge key), `credential` to the relay.
+        # Under the lock, so no pushed token can precede that line; a token
+        # pushed before the channel existed replaces the one given here.
+        with self.stdin_lock:
+            self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+            self.last_event = time.monotonic()  # staging may have taken minutes
+            first = {"env": secret_env}
+            credential = self.pending_credential or credential
+            if credential:
+                first["credential"] = credential
+            self.process.stdin.write((json.dumps(first) + "\n").encode())
+            self.process.stdin.flush()
         threading.Thread(target=self.read_events, daemon=True).start()
         self.sync_state = self.job_sync()
 
@@ -823,14 +837,32 @@ class RemoteRun:
 
     def cancel(self) -> None:
         try:
-            self.process.stdin.write(b"cancel\n")
-            self.process.stdin.flush()
+            with self.stdin_lock:
+                self.process.stdin.write(b"cancel\n")
+                self.process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
 
+    def push_credential(self, credential: str) -> bool:
+        """Send a refreshed access token to the remote relay. On failure the
+        relay keeps the previous token until it expires."""
+        try:
+            with self.stdin_lock:
+                if self.process is None:
+                    self.pending_credential = credential  # sent with the first line
+                    return True
+                self.process.stdin.write((json.dumps({"credential": credential}) + "\n").encode())
+                self.process.stdin.flush()
+            self.credential_pushes += 1
+            return True
+        except (AttributeError, BrokenPipeError, OSError, ValueError):
+            self.log("向远程凭据代理推送新令牌失败；它继续使用旧令牌直到过期")
+            return False
+
     def hang_up(self) -> None:
         try:
-            self.process.stdin.close()
+            with self.stdin_lock:
+                self.process.stdin.close()
         except (BrokenPipeError, OSError):
             pass
 

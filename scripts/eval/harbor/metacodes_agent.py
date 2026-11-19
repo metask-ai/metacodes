@@ -18,7 +18,9 @@ One trial:
 
 Credentials are not handled here: pass the provider key with Harbor's
 ``--ae NAME=value`` (e.g. ``--ae DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY``), which
-Harbor forwards to the agent's commands and redacts from its logs.
+Harbor forwards to the agent's commands and redacts from its logs. The Bench
+workbench passes only a run-scoped placeholder this way and routes the agent
+through its credential relay (``metrics_proxy``), which holds the real key.
 """
 
 from __future__ import annotations
