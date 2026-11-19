@@ -67,6 +67,19 @@ def provider_models(config):
     return result
 
 
+def ssh_loopback_problem(kind, executor_name, provider_id, base_url):
+    """Why an imported route cannot run on this executor, or None. The
+    workbench imported and probed the address; an SSH executor's relay
+    would read one that reaches the workbench itself (loopback, localhost,
+    an alias resolving there) as its own machine and send the requests and
+    the key to whatever listens there."""
+    if kind == "ssh" and loopback(base_url):
+        return (f"导入的 Provider {provider_id} 的地址指向工作台本机（回环地址或解析到回环的主机名），"
+                f"SSH 执行机器 {executor_name} 会把它当成自己的地址；请改用两台机器都能访问到同一网关的地址"
+                "重新导入，或选本机执行器")
+    return None
+
+
 def configured_provider_ids(cfg):
     """Provider ids the catalog already lists models under (the
     --provider-config setup); an imported provider may not reuse them."""
@@ -357,12 +370,10 @@ class RunManager:
             problem = self.imported_route_problem(self.providers.run_route(model))
             if problem:
                 raise ValueError(problem)
-            # The workbench imported and probed this address; an SSH
-            # executor's relay would read a loopback one as its own machine
-            # and send the requests and the key to whatever listens there.
-            if state["kind"] == "ssh" and loopback(self.providers.find(imported)["base_url"]):
-                raise ValueError(f"导入的 Provider {imported} 的地址是本机回环地址，SSH 执行机器 {state['name']} "
-                                 "会把它当成自己的地址；请改用两台机器都能访问到同一网关的地址重新导入，或选本机执行器")
+            problem = ssh_loopback_problem(state["kind"], state["name"], imported,
+                                           self.providers.find(imported)["base_url"])
+            if problem:
+                raise ValueError(problem)
         elif catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
             problem = route_problem({"auth_mode": "provider", "model": model,
                                      "provider_config": settings(self.config_path).get("provider_config")})
@@ -419,7 +430,10 @@ class RunManager:
                 route = self.providers.run_route(model)
                 if pinned is not None and route["revision"] != pinned.get("revision"):
                     raise ValueError(f"导入的 Provider {imported} 在批次创建后被修改，本项不再运行；请重新创建批次")
-                problem = self.imported_route_problem(route)
+                # Again on the snapshot the spec is written from, with the
+                # executor it names (both were read anew since validation).
+                problem = self.imported_route_problem(route) or ssh_loopback_problem(
+                    executor.kind, executor.name, imported, route["base_url"])
                 if problem:
                     raise ValueError(problem)
             self.records.mkdir(parents=True, exist_ok=True)

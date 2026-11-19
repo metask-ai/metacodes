@@ -21,7 +21,6 @@ passes only when the reply is that string.
 from __future__ import annotations
 
 import datetime as dt
-import ipaddress
 import json
 import re
 import secrets
@@ -176,15 +175,11 @@ def origin(url):
 
 
 def loopback(url):
-    """Whether `url` names this machine (a loopback literal or localhost),
-    which another machine would read as itself."""
-    host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_unspecified
-    except ValueError:
-        return False
+    """Whether `url` reaches the workbench machine itself, which another
+    machine would read as itself: localhost names, loopback or unspecified
+    addresses (IPv4-mapped too) and names that resolve to them here."""
+    from scripts.eval.harbor.viewer.egress import names_this_machine
+    return names_this_machine(urllib.parse.urlsplit(url).hostname or "")
 
 
 def native_id(provider_id):
@@ -435,7 +430,7 @@ class Providers:
         if model not in (entry.get("models") or []):
             raise ValueError("Provider " + provider_id + " 没有模型 " + model[:80])
         return {"config": self.native_config(entry), "model": native_id(provider_id) + "/" + model,
-                "revision": entry.get("revision")}
+                "revision": entry.get("revision"), "base_url": entry["base_url"]}
 
     @staticmethod
     def native_config(entry):

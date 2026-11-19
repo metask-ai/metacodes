@@ -157,6 +157,29 @@ def _parse(address: str):
     return ip
 
 
+def local_address(address: str) -> bool:
+    """Whether `address` (IPv4-mapped IPv6 normalized) is a loopback or
+    unspecified address: the machine that connects to it, whichever that is."""
+    ip = _parse(address)
+    return ip is not None and (ip.is_loopback or ip.is_unspecified)
+
+
+def names_this_machine(host: str, resolve=None) -> bool:
+    """Whether connecting to `host` from here reaches this machine: a
+    localhost name, a loopback/unspecified literal, or a name that resolves
+    to one (an /etc/hosts alias). An unresolvable name is not local here."""
+    host = (host or "").lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    if _parse(host) is not None:
+        return local_address(host)
+    try:
+        infos = (resolve or socket.getaddrinfo)(host, None)
+    except (OSError, UnicodeError):
+        return False
+    return any(local_address(str(info[4][0])) for info in infos)
+
+
 def address_allowed(address: str) -> bool:
     """Whether the proxy may connect to `address`: globally routable unicast
     only (see allow_policy for the configured exceptions)."""

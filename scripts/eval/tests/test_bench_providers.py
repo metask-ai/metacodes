@@ -264,6 +264,45 @@ class ProviderStoreTest(unittest.TestCase):
         self.assertEqual(updated['name'], 'Renamed')
         self.assertTrue(self.store.find('gw')['probes']['echo']['ok'])
 
+    def test_names_resolving_here_and_mapped_addresses_count_as_this_machine(self):
+        from scripts.eval.harbor.viewer import egress
+
+        def resolve(host, _port):
+            table = {'devbox-alias': '127.0.1.1', 'v6-alias': '::ffff:127.0.0.1', 'gw.example': '203.0.113.7'}
+            if host not in table:
+                raise OSError('unknown host')
+            return [(None, None, None, '', (table[host], 0))]
+        for host in ('devbox-alias', 'v6-alias', '::ffff:127.0.0.1', '::ffff:0.0.0.0', '::', 'LOCALHOST.'):
+            with self.subTest(host=host):
+                self.assertTrue(egress.names_this_machine(host, resolve=resolve))
+        for host in ('gw.example', 'unknown.example', '::ffff:203.0.113.7'):
+            with self.subTest(host=host):
+                self.assertFalse(egress.names_this_machine(host, resolve=resolve))
+        with patch.object(egress.socket, 'getaddrinfo', resolve):
+            self.assertTrue(providers.loopback('http://devbox-alias:8000/v1'))
+            self.assertTrue(providers.loopback('http://[::ffff:127.0.0.1]:8000'))
+            self.assertFalse(providers.loopback('https://gw.example/v1'))
+
+    def test_the_executor_refuses_an_imported_upstream_that_resolves_to_itself(self):
+        from scripts.eval.harbor.viewer import remote
+        runtime = str(Path(__file__).resolve().parents[3])
+        spec = {'argv': ['harbor', 'run'], 'key_env': providers.KEY_ENV, 'runtime': runtime,
+                'relay': {'upstream': 'http://127.0.0.1:9', 'bind': '127.0.0.1', 'auth_header': 'Authorization',
+                          'auth_prefix': 'Bearer ', 'metrics_dir': str(self.root / 'metrics'), 'record': False,
+                          'refuse_local_upstream': True}}
+        spec_path = self.root / 'spec.json'
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        spec_path.write_text(json.dumps(spec))
+        line = json.dumps({'env': {providers.KEY_ENV: 'mcb-placeholder'}, 'credential': KEY}) + '\n'
+        out = io.StringIO()
+        stdin = io.TextIOWrapper(io.BytesIO(line.encode()))
+        with patch.object(remote.os, 'chdir'), patch('sys.stdin', stdin), redirect_stdout(out), \
+                patch('scripts.eval.harbor.profiling.TimingRelay') as relay:
+            self.assertEqual(remote.run(str(spec_path)), 2)
+        relay.assert_not_called()
+        events = [json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertTrue(any(e['event'] == 'error' and '本机' in e['message'] for e in events), events)
+
     def test_loopback_addresses_are_recognized(self):
         for url in ('http://127.0.0.1:8000/v1', 'http://localhost:11434', 'http://[::1]:8000', 'http://0.0.0.0:1',
                     'http://127.1.2.3', 'http://api.localhost'):
@@ -526,6 +565,37 @@ class ImportedProviderRunTest(unittest.TestCase):
                                                     'concurrency': 1,
                                                     'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]})
         self.assertEqual(self.manager.runs(), [])
+
+    def test_the_final_route_snapshot_is_checked_against_the_ssh_executor(self):
+        from scripts.eval.harbor.viewer import egress, executors
+        self.client.request('api/providers', {'id': 'gw', 'base_url': 'http://gw.example:9', 'api_key': KEY,
+                                              'models': ['echo']})
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg['executors'] = [{'name': 'gpu', 'kind': 'ssh', 'host': 'gpu.example'}]
+        atomic_json(self.manager.config_path, cfg)
+        real_route = Providers.run_route
+        calls = []
+
+        def moved_to_loopback_after_validation(store, model_id):
+            calls.append(model_id)
+            if len(calls) == 3:  # validation passed; a direct launch has no pin
+                store.add({'id': 'gw', 'base_url': 'http://devbox-alias:9', 'api_key': 'other-key-2222',
+                           'models': ['echo'], 'replace': True})
+            return real_route(store, model_id)
+
+        def resolve(host, _port):
+            if host == 'devbox-alias':
+                return [(None, None, None, '', ('127.0.0.1', 0))]
+            raise OSError('unknown host')
+        with patch.object(executors, 'probe', return_value={}), patch.object(executors, 'reasons', return_value=[]), \
+                patch.object(executors, 'workbench_harbor', return_value='/usr/bin/harbor'), \
+                patch.object(egress.socket, 'getaddrinfo', resolve), \
+                patch.object(Providers, 'run_route', moved_to_loopback_after_validation):
+            with self.assertRaisesRegex(ValueError, '工作台本机'):
+                self.manager.launch({'model': 'gw/echo', 'tasks': ['fix-git']})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.manager.runs(), [])
+        self.assertEqual(list(self.manager.records.glob('*')) if self.manager.records.exists() else [], [])
 
     def test_a_refused_launch_leaves_no_queued_receipt(self):
         base = f'http://127.0.0.1:{self.upstream.server_port}'

@@ -1023,7 +1023,10 @@ class RemoteRun:
         if upstream:
             relay = {"upstream": upstream, "bind": self.executor.metrics_bind, "auth_header": auth[0],
                      "auth_prefix": auth[1], "metrics_dir": self.remote_job_dir + "/.bench-metrics",
-                     "record": bool(record)}
+                     "record": bool(record),
+                     # An imported provider was probed from the workbench; the
+                     # executor checks its own resolution before connecting.
+                     "refuse_local_upstream": bool(self.spec.get("imported_provider"))}
         if relay and self.spec.get("judge"):
             # The driver appends the judge's `--ve` once its relay listens.
             relay["judge"] = self.spec["judge"]

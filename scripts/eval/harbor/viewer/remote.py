@@ -111,6 +111,14 @@ def run(spec_path):
             sys.path.insert(0, runtime)
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
+            if options.get("refuse_local_upstream"):
+                from scripts.eval.harbor.viewer.egress import names_this_machine
+                if names_this_machine(urlsplit(options["upstream"]).hostname or ""):
+                    # This machine resolves the imported address to itself:
+                    # never send the key to whatever listens here.
+                    emit("error", message="导入的 Provider 地址在执行机器上解析为本机（回环地址），已拒绝连接；"
+                                          "请改用两台机器都能访问到同一网关的地址")
+                    return 2
             token = secret_env[spec["key_env"]]
             credential = PushedCredential(real or token)
             judge = options.get("judge")
