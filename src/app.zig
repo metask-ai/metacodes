@@ -122,6 +122,7 @@ const kg_provider_audit = @import("kg/provider_audit.zig");
 const provider_alias_mod = @import("provider/alias.zig");
 const provider_oauth_mod = @import("provider/oauth.zig");
 const oauth_exchange_mod = @import("api/oauth_exchange.zig");
+const oauth_revoke_mod = @import("api/oauth_revoke.zig");
 const metask_oauth_mod = @import("api/metask_oauth.zig");
 const provider_mod = @import("api/provider.zig");
 const request_overrides = @import("api/request_overrides.zig");
@@ -1980,7 +1981,12 @@ pub const App = struct {
     pub const ProviderKeyForgotten = struct {
         /// `<state root>/keys/<provider>.json` was there and is gone.
         removed: bool,
-        /// The session ran on that saved key and holds no credential now.
+        /// `<state root>/oauth/<provider>.json` (the provider's own OAuth
+        /// sign-in) was there and is gone, and whether the provider ended its
+        /// refresh token first (`api/oauth_revoke.zig`).
+        sign_in: oauth_revoke_mod.Forgotten = .{},
+        /// The session ran on that saved key or sign-in and holds no
+        /// credential now.
         unbound: bool = false,
         /// One of the provider's variables `.env` sets, which still supplies
         /// a key (a name, never a value).
@@ -1998,11 +2004,22 @@ pub const App = struct {
         var result: ProviderKeyForgotten = .{ .removed = removed };
         const host = try app.providerHost();
         const profile = host.registry.findById(provider_id) orelse return result;
-        const on_saved_key = switch (app.route_state) {
-            .bound => |origin| origin == .saved_key,
+        // The provider's own OAuth sign-in goes too, revoked first where the
+        // profile says (#499's provider half). The process-scoped session
+        // holding it is dropped: a turn boundary must not refresh it back.
+        result.sign_in = try oauth_revoke_mod.forgetStoredLogin(app.allocator, app.stateRoot(), profile, oauth_revoke_mod.DEFAULT_WAIT_MS);
+        if (app.oauth_session_provider) |id| if (id.eql(provider_id) and !provider_id.eqlText("metask")) {
+            if (app.oauth_session) |*session| session.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        // The session ran on what was just removed: the saved key, or the
+        // sign-in.
+        const ran_on_removed = switch (app.route_state) {
+            .bound => |origin| (origin == .saved_key and removed) or (origin == .sign_in and result.sign_in.removed),
             .unbound => false,
         };
-        if (removed and on_saved_key) {
+        if (ran_on_removed) {
             const current = if (host.kernel.currentOfferId()) |id| host.kernel.catalogSnapshot().find(id) else null;
             if (current) |offer| if (offer.provider_id.eql(provider_id)) {
                 app.unbindRoute(.{ .missing_credential = provider_id });

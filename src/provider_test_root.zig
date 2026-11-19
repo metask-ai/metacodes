@@ -35,6 +35,8 @@ pub const api_key_store = @import("provider/api_key_store.zig");
 pub const metask_catalog = @import("provider/metask_catalog.zig");
 pub const metask_ledger = @import("provider/metask_ledger.zig");
 pub const alias = @import("provider/alias.zig");
+pub const request_profile = @import("provider/request_profile.zig");
+pub const chatgpt_claims = @import("provider/chatgpt_claims.zig");
 pub const capability_matrix = @import("provider/capability_matrix_test.zig");
 
 test {
@@ -51,4 +53,5 @@ test {
     std.testing.refAllDecls(registry.qwen);
     std.testing.refAllDecls(registry.minimax);
     std.testing.refAllDecls(registry.bedrock);
+    std.testing.refAllDecls(registry.chatgpt_codex);
 }

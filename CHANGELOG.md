@@ -320,6 +320,34 @@ status, compatibility boundaries, and entry points are defined by
   check. `metacodes login --provider openai` takes a pasted key too while no
   OAuth client is configured for OpenAI; it used to start the browser sign-in
   and stop on the missing client id.
+- **`chatgpt-codex`: a ChatGPT plan's Codex quota, the way the Codex CLI
+  reaches it. Unofficial.** `/login chatgpt-codex` and `metacodes login
+  --provider chatgpt-codex` sign in at `auth.openai.com` in the browser with
+  the Codex CLI's public client (`app_EMoamEEZ73f0CkXaXp7hrann`), and say
+  first that the sign-in is unofficial and may stop working at any time
+  (`ProviderProfile.oauth_support`). The redirect can only land on the two
+  ports that client registered, 1455 then 1457, which Metask's own sign-in
+  also uses: with both taken the sign-in stops and names them, and nothing is
+  sent to whatever holds them. A refusal from the authorization server now
+  ends the wait and says what it said (`missing_codex_entitlement` is a
+  workspace without Codex), where it used to wait on. The sign-in is stored
+  as `oauth/chatgpt-codex.json` with the ChatGPT workspace the ID token names
+  (`account_id`; the ID token itself, which names the user, is not kept).
+  Turns go to `chatgpt.com/backend-api/codex/responses` with the route's
+  request profile (`provider/request_profile.zig`): `originator: metacodes`,
+  `chatgpt-account-id` read from the token the request carries, `accept:
+  text/event-stream`, `include: ["reasoning.encrypted_content"]` and
+  `instructions` always; the `openai` provider's requests are unchanged. A
+  used-up plan (`usage_limit_reached`) and a plan without Codex
+  (`usage_not_included`) are no longer retried: the failure says when the
+  plan resets, in local time and as a wait, or that it never will. Signing
+  out (`/logout chatgpt-codex`, `metacodes logout --provider chatgpt-codex`)
+  revokes the refresh token at `auth.openai.com/oauth/revoke` first, bounded,
+  then deletes the sign-in. It is a subscription plan: a `-p` or `serve`
+  start on it says so once. The ten models are a static list, GPT-6.2
+  Sol first (a start that names no model uses it); the
+  device-code sign-in, the `x-codex-*` usage headers and zstd request bodies
+  are not done.
 
 - **`metacodes providers add|probe|list|remove`: a model API of your own
   without writing JSON** (`doc/PROVIDERS.md`). `providers add <id> --base-url
@@ -563,6 +591,20 @@ status, compatibility boundaries, and entry points are defined by
   the ones past them were dropped without a word; `/login <id>` for one of
   them then showed the list without it. The list now ends with `N more not
   shown: /login <provider> (<ids>)`, and `/login <id>` starts any of them.
+- **A provider's own OAuth sign-in is used by a start, and signed out of by
+  `logout`.** A sign-in `login --provider <id>` stored in
+  `oauth/<provider>.json` reached a session only through a `/model` pick:
+  `--provider <id>`, `-p`, and a stored `/model` default on that provider
+  found no credential and asked for a key. A start now uses it below every
+  key, refreshing it first when it expires within two minutes, and says
+  `signed in`; judging a stored default (`login status`, the startup order)
+  only checks that the sign-in is stored, so it sends nothing and an expired
+  one still counts. `/logout <provider>` and `metacodes logout --provider
+  <id>` removed only a stored key; they now remove the sign-in too, revoked
+  first where the provider declares an endpoint for it (`oauth_revocation`).
+  The help a start prints for a provider that only signs in names `login
+  --provider <id>` and no longer offers `--api-key`, and a refused sign-in
+  is told to sign in again rather than to check a key.
 
 - **An MCP HTTP request on a kept-alive connection the server closed is sent
   again on macOS too** (#555). A request other than `tools/call` that found
