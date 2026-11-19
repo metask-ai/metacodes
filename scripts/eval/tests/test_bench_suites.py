@@ -456,6 +456,13 @@ class McpForwardingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             cmd.mcp_servers_config([{"name": "x", "transport": "streamable-http"}])
 
+    def test_agent_declares_mcp_server_support(self):
+        # Harbor 0.26 refuses a task with MCP servers (GAIA2 CLI mode) before
+        # setup unless the agent declares capabilities.mcp_servers; a real
+        # run on relay-4090 failed exactly so.
+        with stubbed_harbor() as agent_module:
+            self.assertTrue(agent_module.MetacodesAgent.capabilities.get("mcp_servers"))
+
     def test_agent_uploads_task_mcp_servers_in_the_trial_config(self):
         with stubbed_harbor() as agent_module:
             agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)

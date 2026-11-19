@@ -66,7 +66,10 @@ def _sha256(path: Path) -> str:
 class MetacodesAgent(BaseInstalledAgent):
     """Run a metacodes Linux release bundle as a Harbor installed agent."""
 
-    capabilities = AgentCapabilities(atif=True, native_config=True)
+    # mcp_servers: tasks such as GAIA2 (CLI mode) expose their tools through MCP
+    # servers, which the run config below forwards; Harbor refuses such tasks
+    # unless the agent declares it.
+    capabilities = AgentCapabilities(atif=True, native_config=True, mcp_servers=True)
 
     def __init__(
         self,
