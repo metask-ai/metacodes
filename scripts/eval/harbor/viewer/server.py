@@ -37,11 +37,9 @@ STATIC = {
 SECURITY_HEADERS = (
     ("Cache-Control", "no-store"),
     ("X-Content-Type-Options", "nosniff"),
-    (
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-    ),
+    ("X-Frame-Options", "DENY"),
+    # No Content-Security-Policy: the workbench runs on a private network, and a
+    # CSP blocks the browser annotation overlays (e.g. Codex desktop's selection).
     ("Referrer-Policy", "no-referrer"),
 )
 

@@ -633,10 +633,18 @@ pub const CallbackServer = struct {
     /// The redirect URI's path. MCP logins use Claude Code's `/callback`,
     /// so a client registered for Claude Code's redirect works here too.
     path: []const u8 = "/auth/callback",
+    /// What the browser is told once the code has arrived.
+    success_body: []const u8 = "Metacodes login complete. You can close this tab.",
+    /// When set, a callback on `path` that carries an `error` ends the wait
+    /// with `error.OAuthAccessDenied` and this page, whether or not it
+    /// carries the state: OpenRouter sends a refusal back without one, and
+    /// the sign-in would otherwise wait on a tab that says "State mismatch".
+    /// Such a callback can only end the wait; a code still needs the state.
+    denied_body: ?[]const u8 = null,
     /// When set, a callback that carries the expected state and an `error`
     /// ends the wait with `error.OAuthAccessDenied`, what the server said
     /// copied here. Null keeps waiting after answering it, as the Metask
-    /// sign-in always has.
+    /// sign-in always has. `denied_body`, when set, answers first.
     refusal: ?*Refusal = null,
 
     /// Bound on each accepted connection's reads and writes: a client that
@@ -690,6 +698,10 @@ pub const CallbackServer = struct {
                 continue;
             };
             defer allocator.free(req);
+            if (self.denied_body) |page| if (callbackCarriesError(req, self.path)) {
+                sendHttpResponse(conn_fd, 400, "Bad Request", page);
+                return error.OAuthAccessDenied;
+            };
             const parsed = parseCallbackRequestAt(allocator, req, self.path, expected_state) catch |err| {
                 if (err == error.OAuthDenied) if (self.refusal) |refusal| {
                     refusal.fill(allocator, callbackQuery(req));
@@ -708,11 +720,31 @@ pub const CallbackServer = struct {
                 sendHttpResponse(conn_fd, status, reason, body);
                 continue;
             };
-            sendHttpResponse(conn_fd, 200, "OK", "Metacodes login complete. You can close this tab.");
+            sendHttpResponse(conn_fd, 200, "OK", self.success_body);
             return parsed;
         }
     }
 };
+
+/// Whether `req` is a GET of `path` whose query names an `error`.
+fn callbackCarriesError(req: []const u8, path: []const u8) bool {
+    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return false;
+    const line = req[0..line_end];
+    if (!std.mem.startsWith(u8, line, "GET ")) return false;
+    const rest = line[4..];
+    const target = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse return false];
+    if (!std.mem.startsWith(u8, target, path)) return false;
+    const query_pos = std.mem.indexOfScalar(u8, target, '?') orelse return false;
+    return findQueryParam(target[query_pos + 1 ..], "error") != null;
+}
+
+test "a callback that names an error is recognized with or without a state" {
+    try std.testing.expect(callbackCarriesError("GET /auth/callback?error=access_denied HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(callbackCarriesError("GET /auth/callback?state=s&error=x HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(!callbackCarriesError("GET /auth/callback?code=c&state=s HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(!callbackCarriesError("GET /other?error=x HTTP/1.1\r\n\r\n", "/auth/callback"));
+    try std.testing.expect(!callbackCarriesError("POST /auth/callback?error=x HTTP/1.1\r\n\r\n", "/auth/callback"));
+}
 
 fn readHttpRequest(allocator: std.mem.Allocator, fd: net.Socket) ![]u8 {
     var out = std.ArrayList(u8).empty;

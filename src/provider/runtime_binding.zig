@@ -68,7 +68,8 @@ pub const CredentialSources = struct {
     now_seconds: i64 = 0,
     /// The provider's credential pool. When the offer names a `credential_ref`,
     /// *that* member is used — the reference is part of the route identity, so
-    /// resolving to a different account would make the offer id a lie.
+    /// resolving to a different account would make the offer id a lie. A
+    /// member of another provider's pool is never used.
     pool: []const credential.PoolEntry = &.{},
 };
 
@@ -158,6 +159,7 @@ pub fn bindOffer(
     const pinned_credential: ?credential.StoredEntry = blk: {
         const wanted = offer.credential_ref orelse break :blk null;
         for (sources.pool) |member| {
+            if (!member.provider_id.eql(profile.id)) continue;
             if (!member.id.eql(wanted)) continue;
             break :blk .{
                 .id = member.id,
@@ -169,7 +171,11 @@ pub fn bindOffer(
                 .cooldown_until = member.cooldown_until,
             };
         }
-        break :blk null;
+        // The account the route names has no member here: its variable is
+        // unset, say. Any other credential — another account's, the
+        // provider's own variable, a stored key — would bill an account the
+        // offer does not name, so the route has none.
+        return error.MissingCredentials;
     };
 
     const resolved_credential = try credential.resolve(.{
@@ -506,8 +512,8 @@ test "an offer that names a credential binds that one, not the pool's favourite"
     defer catalog.deinit();
 
     const pool = [_]credential.PoolEntry{
-        .{ .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-work", .priority = 0 },
-        .{ .id = Slug.lit("personal"), .kind = .api_key, .secret = "sk-personal", .priority = 1 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-work", .priority = 0 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("personal"), .kind = .api_key, .secret = "sk-personal", .priority = 1 },
     };
 
     var found_personal = false;
@@ -534,9 +540,67 @@ test "an offer with no credential binding still uses ordinary resolution" {
     defer catalog.deinit();
 
     const pool = [_]credential.PoolEntry{
-        .{ .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-work", .priority = 0 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-work", .priority = 0 },
     };
     var reference_buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
     const binding = try bindOffer(&registry, &catalog.items()[0], .{ .pool = &pool }, &reference_buffer, false);
     try std.testing.expectEqualStrings("sk-work", binding.secret);
+}
+
+test "another provider's pool member never binds, whatever kind it is" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    // Both providers name an account `work`; only OpenAI's is in the pool.
+    const bindings = [_]registry_mod.CredentialBinding{
+        .{ .provider_id = Slug.lit("deepseek"), .credential_ref = Slug.lit("work") },
+    };
+    var bound = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("deepseek"),
+        .credential_bindings = &bindings,
+    });
+    defer bound.deinit();
+    var unbound = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("deepseek") });
+    defer unbound.deinit();
+    const pool = [_]credential.PoolEntry{
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-openai-work" },
+    };
+    var reference_buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+
+    // DeepSeek accepts an API key, so the kind alone let OpenAI's key through:
+    // to a DeepSeek route that names `work`, and to one that names no account.
+    try std.testing.expectError(error.MissingCredentials, bindOffer(&registry, &bound.items()[0], .{ .pool = &pool }, &reference_buffer, false));
+    try std.testing.expectError(error.MissingCredentials, bindOffer(&registry, &unbound.items()[0], .{ .pool = &pool }, &reference_buffer, false));
+}
+
+test "a route that names an account binds that account or nothing" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    const bindings = [_]registry_mod.CredentialBinding{
+        .{ .provider_id = Slug.lit("openai"), .credential_ref = Slug.lit("work") },
+        .{ .provider_id = Slug.lit("openai"), .credential_ref = Slug.lit("personal") },
+    };
+    var catalog = try registry.buildCatalog(a, .{
+        .only_provider = Slug.lit("openai"),
+        .credential_bindings = &bindings,
+    });
+    defer catalog.deinit();
+    // `work`'s variable is unset, so the pool holds only `personal`; the
+    // provider's own variable is set as well.
+    const pool = [_]credential.PoolEntry{
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("personal"), .kind = .api_key, .secret = "sk-personal" },
+    };
+    var env = TestEnv{ .pairs = &.{.{ "OPENAI_API_KEY", "sk-default" }} };
+    var reference_buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+
+    var found_work = false;
+    for (catalog.items()) |*item| {
+        const ref = item.credential_ref orelse continue;
+        if (!ref.eqlText("work")) continue;
+        found_work = true;
+        // Neither the other account nor the default key stands in for it.
+        try std.testing.expectError(error.MissingCredentials, bindOffer(&registry, item, .{ .pool = &pool, .env = env.lookup() }, &reference_buffer, false));
+    }
+    try std.testing.expect(found_work);
 }

@@ -87,7 +87,7 @@ const cleared = [_][*:0]const u8{
     "KIMI_API_KEY",        "MOONSHOT_API_KEY",         "KIMI_CODE_API_KEY",     "DASHSCOPE_API_KEY",
     "MINIMAX_API_KEY",     "AWS_BEARER_TOKEN_BEDROCK", "METACODES_PROVIDER",    "METACODES_MODEL",
     "METACODES_BASE_URL",  "METASK_GATEWAY_URL",       "METACODES_CONFIG_FILE", "METACODES_AUTH_FILE",
-    "METACODES_OAUTH_DIR", "METASK_SITE_URL",          RELAY_ENV,
+    "METACODES_OAUTH_DIR", "METASK_SITE_URL",          "OPENROUTER_API_KEY",    RELAY_ENV,
 };
 
 /// A state root, a working directory and a home; keys cleared, no probe, no

@@ -55,6 +55,7 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const openrouter_dialect = @import("dialects/openrouter.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
@@ -387,7 +388,14 @@ pub const OpenAIClient = struct {
             const callback = self.refresh_fn orelse return error.Unauthorized;
             const ctx = self.refresh_ctx orelse return error.Unauthorized;
             const stale = self.credential.lendable() orelse return error.Unauthorized;
+            // As in `Client.refreshExpiredToken`: a token refreshed while the
+            // route moved is for the route the request was sent on, not this one.
+            const sent_to = self.base_url orelse "";
             const token = callback(ctx, stale) catch return error.Unauthorized;
+            if (self.refresh_fn == null or !std.mem.eql(u8, sent_to, self.base_url orelse "")) {
+                secureFree(self.allocator, token);
+                return error.Unauthorized;
+            }
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
                 return error.Unauthorized;
@@ -405,12 +413,17 @@ pub const OpenAIClient = struct {
     /// ChatGPT workspace.
     const MAX_PROFILE_HEADERS = 4;
 
-    /// The request's extra headers: content type and credential, then what
-    /// the route's request profile adds. Slices borrow `auth`, the profile's
-    /// static data and `scratch`.
+    /// Content type, credential, OpenRouter's app attribution and what a
+    /// request profile adds.
+    const REQUEST_HEADERS_CAPACITY = 2 + openrouter_dialect.ATTRIBUTION_HEADERS.len + MAX_PROFILE_HEADERS;
+
+    /// The request's extra headers: content type and credential; on a route
+    /// in OpenRouter's dialect, who is calling (its app attribution, which no
+    /// other route carries); then what the route's request profile adds.
+    /// Slices borrow `auth`, the profile's static data and `scratch`.
     fn requestHeaders(
         self: *const OpenAIClient,
-        buffer: *[2 + MAX_PROFILE_HEADERS]http.Header,
+        buffer: *[REQUEST_HEADERS_CAPACITY]http.Header,
         auth: auth_header_mod.Header,
         scratch: std.mem.Allocator,
         rid: log.RequestId,
@@ -418,6 +431,11 @@ pub const OpenAIClient = struct {
         buffer[0] = .{ .name = "content-type", .value = "application/json" };
         buffer[1] = .{ .name = auth.name, .value = auth.value };
         var len: usize = 2;
+        if (self.declared_dialect.vendorFor(self.model, self.model) == .openrouter) {
+            const attribution = openrouter_dialect.ATTRIBUTION_HEADERS;
+            @memcpy(buffer[len..][0..attribution.len], &attribution);
+            len += attribution.len;
+        }
         const profile = self.declared_dialect.request_profile orelse return buffer[0..len];
         for (profile.headers()) |header| {
             if (len == buffer.len) break;
@@ -460,8 +478,9 @@ pub const OpenAIClient = struct {
         // What the route's endpoint requires besides (`request_profile.zig`):
         // fixed headers, and the ChatGPT workspace the token is for, read
         // from the very token this request carries so a refresh can never
-        // pair one account's token with another's id.
-        var headers_buffer: [2 + MAX_PROFILE_HEADERS]http.Header = undefined;
+        // pair one account's token with another's id; on a route in
+        // OpenRouter's dialect, its app attribution.
+        var headers_buffer: [REQUEST_HEADERS_CAPACITY]http.Header = undefined;
         var account_scratch: [8 * 1024]u8 = undefined;
         var account_fba = std.heap.FixedBufferAllocator.init(&account_scratch);
         const extra_headers = self.requestHeaders(&headers_buffer, auth, account_fba.allocator(), rid);
