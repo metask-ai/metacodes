@@ -99,14 +99,23 @@ Each launch runs one of three metacodes sources, chosen in the page's
 
 **Git revisions.** The worker keeps a mirror of the source repository in
 `git/source.git`, fetches it, and resolves the ref to a commit, so a branch
-always means its current head. A commit that has no unit yet is built the way
+always means its current head. A full commit id that is already built is used
+without contacting the repository. When a branch and a tag share a name but
+point to different commits, the run fails and asks for `refs/heads/<name>` or
+`refs/tags/<name>`. A commit that has no unit yet is built the way
 `release.yml` builds one: `kernels:stage` for both Lean kernels, their pins,
 then `release:verify` for `<arch>-linux-gnu.2.31`, where `<arch>` is the
 execution machine's (task containers share it). The Lean kernels only build
 natively, so this runs in a `debian:bookworm-slim` builder container as the
-caller's user. It uses the Zig version the revision's `build.zig.zon` asks
-for, checked against ziglang.org's published SHA-256, and the revision's own
-pinned elan installer. Toolchains are cached in `git/toolchains/`. The first
+caller's user, in two steps. First, a script owned by the workbench (not the
+revision) installs the Zig version named by the revision's `build.zig.zon`,
+checked against ziglang.org's published SHA-256, and the Lean toolchain named
+by its `control-plane/lean/lean-toolchain`, through a SHA-256-pinned elan.
+Both are cached in `git/toolchains/`. Then the revision's build runs with those
+toolchains mounted read-only and its checkout, Zig cache and home in a fresh
+temporary directory, so no revision can alter what another is built with. The
+checkout fetches the resolved commit by id, so commits reachable only from
+pull-request or other custom refs build too. The first
 build downloads these toolchains and takes several minutes; the build output
 goes to the run's execution log. Later launches of the same commit, by any
 name, reuse the unit. Revisions older than the Lean-kernel release layout
@@ -118,11 +127,11 @@ and checks it against the release's `SHA256SUMS`. Set `release_base` in
 `workbench.json` or `METACODES_RELEASE_BASE` to use a mirror with the same
 `download/<tag>/<asset>` layout.
 
-A malformed ref or version, or both at once, is refused before any worker
-starts. A ref that does not resolve, a failed build, a missing release, a
+A malformed or empty ref or version, or both at once, is refused before any
+worker starts; an empty selection never falls back to the default bundle. A ref that does not resolve, a failed build, a missing release, a
 checksum mismatch, or an archive with links or paths outside the unit fails
-the run with that reason, and nothing is cached. Cancelling a run during a
-build stops the builder container. Without `--bundle`, every launch must name
+the run with that reason, and nothing is cached. Cancelling a run while the
+source is fetched or built stops git or the builder container at once. Without `--bundle`, every launch must name
 a ref or version. `bench info` lists the default bundle, the downloaded
 releases and the built revisions; each run records the metacodes version (and
 commit) it used.

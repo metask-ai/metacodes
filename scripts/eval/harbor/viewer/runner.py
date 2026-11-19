@@ -180,12 +180,14 @@ class RunManager:
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, 3)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
-        version, ref = request.get("version") or None, request.get("ref") or None
-        if version is not None and ref is not None:
+        # Presence, not truthiness, selects a source: an empty selection is
+        # refused rather than quietly running the default bundle.
+        version, ref = request.get("version"), request.get("ref")
+        if "version" in request and "ref" in request:
             raise ValueError("发布版本和 git 版本只能选一个")
-        if version is not None:
+        if "version" in request:
             releases.check_version(version)
-        elif ref is not None:
+        elif "ref" in request:
             builds.check_ref(ref)
         elif not catalog["metacodes"]["bundle"]:
             raise ValueError("请指定 metacodes 发布版本或 git 版本，或用 metacodes bench --bundle <Linux发行包目录> 配置默认版本")

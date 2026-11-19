@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import concurrent.futures
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -759,7 +760,7 @@ import json, os, pathlib, sys, time
 args = sys.argv[1:]
 log = pathlib.Path(os.environ['FAKE_DOCKER_LOG'])
 with log.open('a') as f: f.write(json.dumps(args) + chr(10))
-if args[0] != 'run': sys.exit(0)
+if args[0] != 'run' or not any(a.endswith(':/out') for a in args): sys.exit(0)
 out = next(pathlib.Path(a.split(':')[0]) for a in args if a.endswith(':/out'))
 commit = next(a.split('=', 1)[1] for a in args if a.startswith('COMMIT='))
 time.sleep(float(os.environ.get('FAKE_BUILD_DELAY', '0')))
@@ -789,7 +790,11 @@ class GitRefBuildTest(unittest.TestCase):
         self.git = lambda *a: subprocess.run(['git', '-C', str(self.repo), *a], check=True,
                                              capture_output=True, text=True).stdout.strip()
         self.git('init', '-q', '-b', 'main')
-        self.git('commit', '-q', '--allow-empty', '-m', 'one')
+        (self.repo / 'build.zig.zon').write_text('.{ .minimum_zig_version = "0.16.0" }')
+        (self.repo / 'control-plane' / 'lean').mkdir(parents=True)
+        (self.repo / 'control-plane' / 'lean' / 'lean-toolchain').write_text('leanprover/lean4:v4.14.0\n')
+        self.git('add', '.')
+        self.git('commit', '-q', '-m', 'one')
         docker = Path(os.environ['PATH'].split(os.pathsep)[0]) / 'docker'
         docker.write_text(FAKE_DOCKER.format(python=sys.executable, executables=list(BUNDLE_EXECUTABLES)))
         cfg = json.loads(self.manager.config_path.read_text())
@@ -798,7 +803,12 @@ class GitRefBuildTest(unittest.TestCase):
     def docker_runs(self):
         path = self.root / 'docker.log'
         calls = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-        return [c for c in calls if c[0] == 'run']
+        return [c for c in calls if c[0] == 'run' and any(a.endswith(':/out') for a in c)]
+
+    def toolchain_runs(self):
+        path = self.root / 'docker.log'
+        calls = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        return [c for c in calls if c[0] == 'run' and any(a.endswith(':/toolchains') for a in c)]
 
     def launch(self, **request):
         run = self.client.request('api/runs', {**self.request(), **request})
@@ -821,6 +831,15 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertIn('COMMIT=' + first, call)
         self.assertIn(builds.image(), call)
         self.assertTrue(any(a.endswith(':/mirror:ro') for a in call))
+        # The revision's build sees the toolchains read-only and nothing shared writable.
+        self.assertTrue(any(a.endswith('/zig/0.16.0:/opt/zig:ro') for a in call), call)
+        self.assertTrue(any(a.endswith('/lean/leanprover-lean4-v4.14.0:/opt/lean:ro') for a in call), call)
+        mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
+        self.assertEqual([m for m in mounts if not m.endswith(':ro')], [m for m in mounts if m.endswith(':/out')])
+        toolchain = self.toolchain_runs()[0]
+        self.assertIn('ZIG_VERSION=0.16.0', toolchain)
+        self.assertIn('LEAN_TOOLCHAIN=leanprover/lean4:v4.14.0', toolchain)
+        self.assertFalse(any(a.endswith(':/mirror:ro') or a.endswith(':/out') for a in toolchain))
         # The same commit by another name reuses the cached unit.
         run, final = self.launch(ref=first[:8])
         self.assertEqual((final['status'], self.bundle_of(run)), ('finished', bundle))
@@ -862,9 +881,86 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertTrue(any(c[0] == 'kill' for c in log))
         self.assertFalse((self.manager.jobs_dir / run['name']).exists())
 
+    def test_empty_cli_selection_is_refused_not_run_on_the_default_bundle(self):
+        with patch.dict(os.environ, {'METACODES_BENCH_TOKEN': 'test-capability'}):
+            for flag in ('--ref', '--version'):
+                with self.subTest(flag=flag):
+                    code = cli.main(['run', '--state-root', str(self.root / 'cli-state'), '--url', self.client.url,
+                                     '--model', 'tokenjoy/test-model', flag, '', '--task', 'fix-git'])
+                    self.assertEqual(code, 1)
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_branch_and_tag_of_one_name_on_different_commits_is_ambiguous(self):
+        old = self.git('rev-parse', 'HEAD')
+        self.git('tag', 'main')
+        self.git('commit', '-q', '--allow-empty', '-m', 'two')
+        new = self.git('rev-parse', 'HEAD')
+        _, final = self.launch(ref='main')
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('refs/heads/main', final['error'])
+        self.assertEqual(self.docker_runs(), [])
+        for ref, commit in (('refs/heads/main', new), ('refs/tags/main', old)):
+            run, final = self.launch(ref=ref)
+            self.assertEqual((self.bundle_of(run) / 'bin' / 'metacodes').read_text(), commit)
+
+    def test_cached_full_commit_needs_no_source_repository(self):
+        commit = self.git('rev-parse', 'HEAD')
+        self.launch(ref='main')
+        shutil.rmtree(self.repo)
+        run, final = self.launch(ref=commit)
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual((self.bundle_of(run) / 'bin' / 'metacodes').read_text(), commit)
+        # A branch still has to be refreshed, and says why it cannot be.
+        _, final = self.launch(ref='main')
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('源码仓库', final['error'])
+
+    def test_checkout_fetches_a_commit_only_a_custom_ref_names(self):
+        import subprocess
+        self.git('commit', '-q', '--allow-empty', '-m', 'candidate')
+        candidate = self.git('rev-parse', 'HEAD')
+        self.git('update-ref', 'refs/bench/candidate', candidate)
+        self.git('reset', '-q', '--hard', 'HEAD~1')
+        mirror, commit = builds.resolve(candidate, self.root / 'cache', str(self.repo))
+        self.assertEqual(commit, candidate)
+        # The builder's checkout step, run as this (non-root) user.
+        result = subprocess.run(['bash', '-c', builds.BUILD_SCRIPT + 'git rev-parse HEAD'], capture_output=True, text=True,
+                                env={**os.environ, 'MIRROR': str(mirror), 'COMMIT': commit, 'TMPDIR': str(self.root)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), candidate)
+
+    def test_cancel_while_fetching_source_ends_the_run_and_frees_the_workbench(self):
+        hit = threading.Event()
+
+        class Hang(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hit.set()
+                time.sleep(30)
+
+            def log_message(self, *_args):
+                pass
+
+        http = ThreadingHTTPServer(('127.0.0.1', 0), Hang)
+        http.daemon_threads = True
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        cfg = json.loads(self.manager.config_path.read_text())
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': f'http://127.0.0.1:{http.server_address[1]}/repo.git'})
+        run = self.client.request('api/runs', {**self.request(), 'ref': 'main'})
+        self.assertTrue(hit.wait(10))
+        started = time.monotonic()
+        self.client.request('api/cancel', {'name': run['name']})
+        self.assertEqual(wait_run(self.manager, run['name'])['status'], 'cancelled')
+        self.assertLess(time.monotonic() - started, 10)
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': str(self.repo)})
+        _, final = self.launch(ref='main')
+        self.assertEqual(final['status'], 'finished', final)
+
     def test_malformed_refs_and_two_sources_are_refused_before_spawn(self):
         for request in ({'ref': '--upload-pack=touch /tmp/x'}, {'ref': 'a..b'}, {'ref': 'main@{1}'},
-                        {'ref': 'x y'}, {'ref': 7}, {'ref': 'main', 'version': '0.12.0'}):
+                        {'ref': 'x y'}, {'ref': 7}, {'ref': 'main', 'version': '0.12.0'},
+                        {'ref': ''}, {'version': ''}, {'ref': None}, {'version': None}):
             with self.subTest(request=request), self.assertRaises(ValueError):
                 self.client.request('api/runs', {**self.request(), **request})
         self.assertEqual(self.manager.runs(), [])

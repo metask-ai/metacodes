@@ -273,7 +273,7 @@ async function renderNewRun() {
     try {
       const request = { model: model.value, tasks: [...new Set(tasks)],
         attempts: Number(attempts.value), concurrency: Number(concurrency.value) };
-      if (source.value !== 'bundle' && version.value.trim()) request[source.value] = version.value.trim();
+      if (source.value !== 'bundle') request[source.value] = version.value.trim();
       const record = await api('/api/runs', request);
       location.hash = '#/run/' + record.name;
     } catch (error) {

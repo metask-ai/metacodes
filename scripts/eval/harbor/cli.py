@@ -224,9 +224,9 @@ def main(argv=None):
             model = args.model or client.request("api/workbench").get("default_model")
             payload = {"model": model, "tasks": args.task,
                        "attempts": args.attempts, "concurrency": args.concurrency}
-            if args.metacodes_version:
+            if args.metacodes_version is not None:
                 payload["version"] = args.metacodes_version
-            if args.ref:
+            if args.ref is not None:
                 payload["ref"] = args.ref
             record = client.request("api/runs", payload)
             url = client.url + "#/run/" + record["name"]
