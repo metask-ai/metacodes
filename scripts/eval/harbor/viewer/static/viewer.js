@@ -437,7 +437,7 @@ async function renderNewRun() {
     const parts = [];
     // The device code matters only while the sign-in waits for approval, or
     // when it ended without signing in; once signed in it is stale.
-    if (login && (login.running || (login.verification_uri && !login.signed_in))) {
+    if (login && (login.running || (login.verification_uri && !login.signed_in && !c.login?.signed_in))) {
       parts.push(panel('Metask 登录', login.running ? '等待确认' : '未完成，请重新登录',
         h('div', { class: 'panel-body run-state' },
           login.verification_uri ? h('p', {}, '在自己的浏览器打开 ',

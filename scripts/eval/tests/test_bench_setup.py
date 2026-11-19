@@ -1147,6 +1147,12 @@ class SetupHttpTest(SetupFixture):
                          ["--state-dir", str(self.root / "account"), "login", "--provider", "metask", "--no-browser"])
         with self.assertRaisesRegex(ValueError, "授权"):
             cli.Client(self.url).request("api/login")
+        # A restarted service has no sign-in of its own: the earlier log's
+        # expired device code is not shown as an unfinished sign-in.
+        fresh = setup.LoginManager(self.config)
+        self.assertTrue(fresh.log_path.exists())
+        self.assertEqual(fresh.status(), {"running": False, "exit_code": None, "verification_uri": None,
+                                          "user_code": None, "signed_in": False})
 
 
 def echo_server():
