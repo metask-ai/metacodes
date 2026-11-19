@@ -924,6 +924,11 @@ class LoginManager:
         return self.status()
 
     def status(self):
+        if self.process is None:
+            # No sign-in started by this service: a device code left in the
+            # log by an earlier one is stale whether or not it completed.
+            return {"running": False, "exit_code": None, "verification_uri": None, "user_code": None,
+                    "signed_in": False}
         text = data.tail(self.log_path) if self.log_path.exists() else ""
         uri = re.findall(r"^METASK_VERIFICATION_URI=(https?://\S+)$", text, re.M)
         code = re.findall(r"^METASK_USER_CODE=([A-Za-z0-9-]{1,32})$", text, re.M)

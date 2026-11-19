@@ -29,7 +29,7 @@ def status(active: store_config.StoreConfig, as_json: bool) -> int:
     finally:
         store.close()
     lines = [f"数据库：{value['format']} {value['location']}（schema v{value['schema_version']}）",
-             "作业 {jobs}，单题 {trials}，请求 {requests}，文件 {files}，内容块 {blobs}，启动记录 {runs}".format(**counts)]
+             "批次 {batches}，作业 {jobs}，单题 {trials}，请求 {requests}，文件 {files}，内容块 {blobs}，启动记录 {runs}".format(**counts)]
     if latest:
         lines.append("最近导入：" + latest)
     _print(value, as_json, lines)

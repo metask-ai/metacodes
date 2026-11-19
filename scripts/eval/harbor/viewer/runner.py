@@ -85,6 +85,9 @@ class RunManager:
         # service replaces this with its own SetupManager's view. A launch
         # and such a setup exclude each other under self.lock.
         self.setup_running = SetupManager(self.config_path).mutating
+        # The id of the batch that owns the executor, or None; a BatchManager
+        # installs its view. A single launch waits for that batch to end.
+        self.batch_guard = lambda: None
 
     def executor_facts(self, executor):
         """Probe results per executor, reused for 15 s (an SSH probe is a
@@ -169,6 +172,7 @@ class RunManager:
         return entry
 
     def catalog(self):
+        from scripts.eval.harbor.viewer.batches import bundle_choices
         cfg = settings(self.config_path)
         mode = cfg.get("auth_mode") or ("provider" if cfg.get("provider_config") else "metask")
         reasons = []
@@ -238,7 +242,8 @@ class RunManager:
                 "reasoning_effort": effort,
                 "warnings": warnings, "account_summary": account_summary,
                 "account_groups": account_groups,
-                "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs()}
+                "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
+                "bundles": [{k: v for k, v in b.items() if k != "source"} for b in bundle_choices(cfg, self.config_path)]}
 
     def runs(self):
         result = []
@@ -251,7 +256,10 @@ class RunManager:
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
-    def launch(self, request):
+    def launch(self, request, *, dry_run=False, frozen=None, batch=None):
+        """Start one run. `dry_run` only validates (a batch checks every
+        dataset before it is created); `frozen` is a batch's frozen bundle,
+        which replaces the configured one, and `batch` names that batch."""
         allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor")
@@ -287,9 +295,15 @@ class RunManager:
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
+        if dry_run:
+            return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
+                    "executor": state["name"]}
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
+            owner = self.batch_guard() if batch is None else None
+            if owner:
+                raise ValueError("批次 " + owner + " 正在运行，请等它结束或先停止该批次")
             if self.setup_running():
                 raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
             cfg = settings(self.config_path)
@@ -304,9 +318,16 @@ class RunManager:
                       **suites.label(suite.id), "runner": suite.runner, "executor": executor.name,
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
+            from scripts.eval.harbor.viewer.batches import current_metacodes
+            metacodes = ({k: frozen.get(k) for k in ("label", "commit", "digest", "release", "frozen")}
+                         if frozen else current_metacodes(cfg))
+            if metacodes:
+                record["metacodes"] = metacodes
+            if batch:
+                record["batch"] = batch
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
-            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": cfg.get("bundle"),
+            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": frozen["bundle"] if frozen else cfg.get("bundle"),
                     "auth_mode": mode, "account_state_dir": cfg.get("account_state_dir") if mode == "metask" else None,
                     "account_gateway": cfg.get("account_gateway") if mode == "metask" else None,
                     "account_key_id": account_key_id,

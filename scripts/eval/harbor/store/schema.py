@@ -13,8 +13,9 @@ Layers:
 - raw: `blobs` (content-addressed bytes, sha256 of the uncompressed content)
   and `files` (every file of a Harbor job directory, keyed by its relative
   path; a file over the size limit keeps only a bounded tail) and `runs` (workbench
-  launch receipts with their spec and worker log). They alone can rebuild
-  everything else.
+  launch receipts with their spec and worker log) and `batches` (a frozen
+  metacodes version evaluated on several datasets; each dataset is one run,
+  whose record names the batch). They alone can rebuild everything else.
 - normalized: `jobs`, `trials`, `requests`, `usage_events`,
   `verifier_tests`, queryable with SQL. A trial is keyed by its directory
   relative to the job (`task__id`, or `workbuddy/<run>/task__id` for a
@@ -31,6 +32,7 @@ from typing import Dict, List, Tuple
 
 TRIAL_STATUSES = ("pass", "partial", "fail", "timeout", "invalid", "running")
 RUN_STATUSES = ("queued", "starting", "running", "cancelling", "finished", "failed", "cancelled", "interrupted")
+BATCH_STATUSES = ("queued", "running", "cancelling", "finished", "cancelled")
 FILE_KINDS = ("job_config", "job_result", "request_metrics", "trial_config", "trial_result",
               "trajectory", "agent_log", "verifier", "trial_other", "job_other")
 FILE_STATES = ("stored", "oversize")
@@ -199,10 +201,28 @@ V2 = [
     "CREATE INDEX files_tail_sha256 ON files (tail_sha256)",
 ]
 
+# A batch: one frozen metacodes bundle evaluated on several datasets. Runs
+# name their batch in record_json; the batch record lists its runs.
+V3 = [
+    f"""CREATE TABLE batches (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN {_enum(BATCH_STATUSES)}),
+        name TEXT,
+        model TEXT,
+        metacodes_digest TEXT,
+        created_at TEXT,
+        finished_at TEXT,
+        record_json TEXT NOT NULL,
+        source_dir TEXT NOT NULL,
+        ingested_at TEXT NOT NULL
+    )""",
+]
+
 # (version, description, statements). Append only.
 MIGRATIONS: List[Tuple[int, str, List[str]]] = [
     (1, "evaluation store: raw files, jobs, trials, requests, tests, runs", V1),
     (2, "bounded tail of oversize files", V2),
+    (3, "batches: a frozen metacodes version across datasets", V3),
 ]
 LATEST = MIGRATIONS[-1][0]
 
@@ -217,6 +237,7 @@ TABLES: List[Tuple[str, Tuple[str, ...]]] = [
     ("usage_events", ("job", "trial", "seq")),
     ("verifier_tests", ("job", "trial", "seq")),
     ("runs", ("name",)),
+    ("batches", ("id",)),
 ]
 COLUMNS: Dict[str, Tuple[str, ...]] = {
     "blobs": ("sha256", "size", "encoding", "content"),
@@ -236,6 +257,8 @@ COLUMNS: Dict[str, Tuple[str, ...]] = {
     "verifier_tests": ("job", "trial", "seq", "name", "status", "message"),
     "runs": ("name", "status", "model", "created_at", "started_at", "finished_at", "exit_code", "error",
              "record_json", "spec_sha256", "log_sha256", "log_size", "log_mtime_ns", "source_dir", "ingested_at"),
+    "batches": ("id", "status", "name", "model", "metacodes_digest", "created_at", "finished_at", "record_json",
+                "source_dir", "ingested_at"),
 }
 
 # SQLite returns BOOLEAN columns as 0/1; PostgreSQL requires real booleans.
