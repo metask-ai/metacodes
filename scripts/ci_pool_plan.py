@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Where CI's macOS and Windows gates run: each platform's self-hosted VM
-pool first, GitHub-hosted runners when the pool is off, full or not taking
-jobs (doc/CI_DESIGN.md §6).
+"""Where CI's macOS and Windows gates run: each platform's self-hosted
+runner first, GitHub-hosted runners when it is off, full or not taking jobs
+(doc/CI_DESIGN.md §6). Only pull requests opened by organization members
+(and main's warm run) may use a self-hosted runner.
 
-A pool (doc/VM_POOLS.md) runs a platform's gates as one job, `Gates (<OS>) /
-all`, on a fresh VM; hosted runners run them as that platform's legs. Every
+A self-hosted runner runs a platform's gates as one job, `Gates (<OS>) /
+all`: for now the organization's persistent runners (the Mac Studio and
+AIPC) in the unsafe mode, later fresh VMs (doc/VM_POOLS.md). Hosted runners
+run the gates as that platform's legs. Every
 command here runs with the run's own read-only GITHUB_TOKEN (`actions:
 read`), which a fork's pull request gets too; vars and secrets it does not
 get, so the switch is a file in the tree: `.github/runner-pools.json`, one
@@ -12,8 +15,8 @@ entry per platform.
 
 Commands, one per ci.yml job:
 
-- `plan` (`runner-plan`): reads the switch and this repository's queued and
-  running CI jobs, and writes, per platform, `<platform>_mode`
+- `plan` (`runner-plan`): reads the switch, the pull request author's
+  association and this repository's queued and running CI jobs, and writes, per platform, `<platform>_mode`
   (`self-hosted`, `hosted` or `both`) plus the pool's label, build jobs and
   limits. Any doubt is `hosted`; it always exits 0.
 - `watch --platform P` (`<P> pool watch`): follows the run's pool job. A VM
@@ -54,6 +57,10 @@ LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RUNNING = {"in_progress"}
 WAITING = {"queued", "pending", "requested"}
 MODES = ("self-hosted", "hosted", "both")
+# A pull request's `author_association` that may use a self-hosted runner:
+# organization members only; outside collaborators and strangers' forks stay
+# on hosted runners.
+MEMBER_ASSOCIATIONS = {"OWNER", "MEMBER"}
 POLL_SECONDS = 20
 API_ERRORS_BEFORE_FALLBACK = 6
 
@@ -168,8 +175,14 @@ def occupancy(jobs: Sequence[dict], label: str, now: float) -> Occupancy:
     return Occupancy(running, waiting, oldest)
 
 
+def is_member_pr(event: str, association: str) -> bool:
+    """A pull request opened by a member of the organization."""
+    return event == "pull_request" and association in MEMBER_ASSOCIATIONS
+
+
 def decide(switch: Optional[Switch], *, fast_path: str, suites: str, warm_cache: str,
-           pool: Optional[Occupancy], doubt: str = "") -> Tuple[str, str]:
+           pool: Optional[Occupancy], member_pr: bool, author: str = "",
+           doubt: str = "") -> Tuple[str, str]:
     """(mode, reason). Every doubt is `hosted`: hosted runners always exist."""
     if switch is None:
         return "hosted", f"hosted: no usable switch ({doubt})"
@@ -181,6 +194,9 @@ def decide(switch: Optional[Switch], *, fast_path: str, suites: str, warm_cache:
         return "hosted", "hosted: documentation-only change, the gates only check out"
     if warm_cache == "true":
         return "both", "both: main's warm run fills the pool's and the hosted legs' cache lines"
+    if not member_pr:
+        return "hosted", (f"hosted: only organization members' pull requests use the self-hosted runner "
+                          f"({author or 'not a pull request'})")
     if pool is None:
         return "hosted", f"hosted: the pool's occupancy is unknown ({doubt})"
     if pool.running + pool.waiting >= switch.slots:
@@ -290,9 +306,13 @@ def cmd_plan(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], fl
     switches: Dict[str, Switch] = {}
     jobs: Optional[List[dict]] = None
     doubt = ""
+    association = env.get("AUTHOR_ASSOCIATION", "")
+    member_pr = is_member_pr(env.get("GITHUB_EVENT_NAME", ""), association)
+    author = f"{env.get('PR_AUTHOR') or 'the author'} is {association}" if association else ""
     try:
         switches = load_switches(Path(args.switch))
-        if any(switch.self_hosted for switch in switches.values()):
+        # Nothing to read when no platform could go self-hosted.
+        if any(switch.self_hosted for switch in switches.values()) and (member_pr or env.get("WARM_CACHE") == "true"):
             jobs = github_from_env(env).other_runs_jobs(env["GITHUB_RUN_ID"], args.workflow_path)
     except Exception as exc:  # any doubt is hosted, never a red job
         doubt = f"{type(exc).__name__}: {exc}"
@@ -302,7 +322,8 @@ def cmd_plan(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], fl
         switch = switches.get(name)
         pool = occupancy(jobs, switch.label, now()) if switch is not None and jobs is not None else None
         mode, reason = decide(switch, fast_path=env.get("FAST_PATH", ""), suites=env.get("SUITES", ""),
-                              warm_cache=env.get("WARM_CACHE", ""), pool=pool, doubt=doubt)
+                              warm_cache=env.get("WARM_CACHE", ""), pool=pool, member_pr=member_pr,
+                              author=author, doubt=doubt)
         # Without a usable switch the mode is hosted and the pool job never
         # runs; the defaults only keep every output defined.
         limits = switch or FALLBACK_LIMITS[name]

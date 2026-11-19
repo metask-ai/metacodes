@@ -386,12 +386,23 @@ the warm run saves; each restore key is its save key without the run ID, and
 both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
 scheduled or dispatched run.
 
-## 6. The macOS and Windows gates: a VM pool first, hosted legs as the fallback
+## 6. The macOS and Windows gates: a self-hosted runner first, hosted legs as the fallback
 
-Each of the two platforms has a pool of single-use VMs for this repository:
-macOS on the organization's Mac Studio, Windows on AIPC
-([VM_POOLS.md](VM_POOLS.md): security model, hosts and operation). The gates
-try their pool first.
+Each of the two platforms has a self-hosted runner for this repository:
+macOS on the organization's Mac Studio, Windows on AIPC. The gates of an
+organization member's pull request try it first; every other pull request
+stays on hosted runners.
+
+**For now, the unsafe mode.** Since 2026-11-19 the runners are the two
+machines' persistent runners (`AppledeMac-Studio`, `AIPC`), carrying the
+labels below, one job at a time each (`slots: 1`). Nothing isolates one job
+from the next or from the machine, so the only guard is who gets there: the
+plan sends a pull request to them only when GitHub reports its author as an
+organization `MEMBER` or `OWNER`, and fork pull requests from outside
+contributors still wait for approval before any workflow runs. The
+single-use VM pools ([VM_POOLS.md](VM_POOLS.md): security model, hosts and
+operation) replace them later under the same labels and wiring. Below, "pool"
+means whichever runner serves a platform's label.
 
 Hosted macOS is the bottleneck: five jobs at once for the organization, three
 cores and 7 GB each. On 2026-11-17/18 a macOS job waited a median 7.5 minutes
@@ -426,6 +437,7 @@ each platform, first match wins:
 | Switch off, unreadable or invalid | `hosted` |
 | Release fast path, or a documentation-only change | `hosted` (the gates only check out) |
 | `main`'s warm run (§5) | `both`, so both cache lines stay warm |
+| Not a pull request, or its author is not an organization `MEMBER` or `OWNER` | `hosted` |
 | Running plus waiting pool jobs fill the slots | `hosted` |
 | A pool job has waited longer than the pickup timeout | `hosted`: the pool may be down |
 | Otherwise | `self-hosted` |

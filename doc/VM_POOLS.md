@@ -1,5 +1,12 @@
 # The VM pools
 
+> **Not in use yet.** Since 2026-11-19 the gates' self-hosted runners are the
+> persistent `AppledeMac-Studio` and `AIPC`, carrying this document's labels,
+> in the unsafe mode: only organization members' pull requests reach them
+> ([CI_DESIGN.md](CI_DESIGN.md) §6). Nothing below protects them; `check`
+> reports them as not retired. The pools replace them when a host passes
+> `check` and `verify`.
+
 CI's macOS and Windows gates run first on pools of single-use VMs, macOS on
 the organization's Mac Studio and Windows on AIPC, and on GitHub-hosted
 runners when a pool is off, full or not taking jobs
