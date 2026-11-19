@@ -23,7 +23,8 @@
 //!   provider's requests send it and stores nothing; `add --probe` with a
 //!   refused key writes nothing;
 //! - `remove` takes the definition, its settings, its stored key and a
-//!   default on one of its models;
+//!   default on one of its models, and its stored login, also one left
+//!   after the rest is gone; a login it cannot delete is reported;
 //! - `--replace` changes what it is given, keeps what was written by hand,
 //!   and refuses a new address while a key stored for the old one would
 //!   follow it — reading the old address from the file, so a definition
@@ -596,6 +597,53 @@ test "remove takes the definition, its settings, its stored key and a default on
     const shipped = try case.run(&.{}, &.{ "providers", "remove", "deepseek" });
     try shipped.expectExit(2);
     try expectContains(shipped.stderr, "a provider metacodes ships and cannot be removed");
+}
+
+test "remove takes a stored login that outlived the definition, the settings and the key" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    try case.write("state/oauth/relay.json", "{\"access_token\":\"at-relay\",\"refresh_token\":\"rt-relay\",\"expires_at\":4102444800}");
+
+    const removed = try case.run(&.{}, &.{ "providers", "remove", "relay" });
+    try removed.expectExit(0);
+    try expectContains(removed.stderr, "Removed its stored login (oauth/relay.json); it was not revoked at the server.");
+    try expectAbsent(removed.stderr, "nothing to remove");
+    try expectAbsent(removed.stderr, "Removed relay from ");
+    try expectAbsent(removed.stderr, "Removed its stored key");
+    try testing.expect(!case.exists("state/oauth/relay.json"));
+}
+
+test "remove with nothing stored for the id is still a no, whatever else oauth/ holds" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    const nothing = try case.run(&.{}, &.{ "providers", "remove", "relay" });
+    try nothing.expectExit(1);
+    try expectContains(nothing.stderr, "No provider 'relay' is configured here; nothing to remove.");
+
+    // Another provider's login is not this one's.
+    try case.write("state/oauth/other.json", "{\"access_token\":\"at-other\",\"refresh_token\":\"rt-other\"}");
+    const other = try case.run(&.{}, &.{ "providers", "remove", "relay" });
+    try other.expectExit(1);
+    try expectContains(other.stderr, "No provider 'relay' is configured here; nothing to remove.");
+    try testing.expect(case.exists("state/oauth/other.json"));
+}
+
+test "a stored login remove cannot delete is reported and stays, not passed over" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    // A directory where the login file goes: it is there, and unlink fails
+    // (EISDIR on Linux, EPERM on macOS; root included).
+    try case.write("state/oauth/relay.json/held", "");
+
+    const removed = try case.run(&.{}, &.{ "providers", "remove", "relay" });
+    try removed.expectExit(0);
+    try expectContains(removed.stderr, "warning: its stored login (oauth/relay.json) could not be removed");
+    try expectAbsent(removed.stderr, "Removed its stored login");
+    try expectAbsent(removed.stderr, "nothing to remove");
+    try testing.expect(case.exists("state/oauth/relay.json/held"));
 }
 
 test "--replace changes what it is given, keeps what was written by hand, and keeps a stored key at its address" {

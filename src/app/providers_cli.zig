@@ -1063,7 +1063,8 @@ pub const Removal = struct {
 };
 
 pub const RemoveError = error{
-    /// Neither a definition, nor settings, nor a stored key: nothing to do.
+    /// Neither a definition, nor settings, nor a stored key or login:
+    /// nothing to do.
     NotConfigured,
     /// Without it the rest of the file would not load (`Check`).
     Rejected,
@@ -1094,7 +1095,8 @@ pub fn removeProvider(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) 
     const settings = document.provider(id) != null;
     const key_path = api_key_store.pathFor(arena, state_root, id) catch return error.OutOfMemory;
     const stored_key = pfs.exists(arena.dupeZ(u8, key_path) catch return error.OutOfMemory);
-    if (!defined and !settings and !stored_key) return error.NotConfigured;
+    const stored_login = try storedLoginExists(arena, state_root, id);
+    if (!defined and !settings and !stored_key and !stored_login) return error.NotConfigured;
 
     // A stored default on one of its models would name a route the next
     // start cannot find; resolved now, in the catalog that still has it.
@@ -1127,6 +1129,18 @@ pub fn removeProvider(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) 
         out.login = gone;
     } else |_| out.login_left = true;
     return out;
+}
+
+/// Whether a login is stored for `id`, at the path `Session.removeStored`
+/// deletes (`oauth/<id>.json`, or under `METACODES_OAUTH_DIR`). The file is
+/// looked for, not read: no refresh, no request. A login that outlived the
+/// definition, the settings and the key is still there for `remove` to take.
+fn storedLoginExists(arena: std.mem.Allocator, state_root: []const u8, id: Slug) error{OutOfMemory}!bool {
+    const session = provider_oauth.Session.initHome(arena, state_root, id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return pfs.exists(try arena.dupeZ(u8, session.path));
 }
 
 /// Whether `<state root>/config.json` defines `id` under `custom_providers`.
