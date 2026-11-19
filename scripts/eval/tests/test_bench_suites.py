@@ -192,7 +192,7 @@ class CatalogTest(unittest.TestCase):
                                name="HumanEval+", default_tasks=["humaneval-1"], max_tasks=2, max_concurrency=99)
         with patch.dict(sys.modules, {adapter.__name__: adapter}):
             suite = suites.resolved(suites.get("humaneval"))
-            self.assertEqual((suite.name, suite.max_tasks, suite.max_concurrency), ("HumanEval+", 2, 8))
+            self.assertEqual((suite.name, suite.max_tasks, suite.max_concurrency), ("HumanEval+", 2, 16))
             self.assertIn("尚未准备", suites.readiness(suite, self.ctx)[0])
             adapter.prepare(self.ctx.dataset_dir(suite))
             self.assertEqual(suites.task_ids(suite, self.ctx), ["humaneval-0", "humaneval-1"])
@@ -391,7 +391,7 @@ class SuiteLaunchTest(unittest.TestCase):
         for override in ({"suite": "aime", "tasks": ["fix-git"]}, {"suite": "nope", "tasks": ["fix-git"]},
                          {"suite": "aime", "dataset": "terminal-bench/terminal-bench-2-1", "tasks": ["aime_60"]},
                          {"dataset": "aime@1.0", "tasks": ["aime_60"]},
-                         {"suite": "terminal-bench-2.1", "tasks": ["fix-git"], "concurrency": 4},
+                         {"suite": "terminal-bench-2.1", "tasks": ["fix-git"], "concurrency": 11},
                          {"suite": "aime-2025", "tasks": list(suites.AIME_2025) + ["aime_60"]},
                          {"suite": "humaneval", "tasks": ["humaneval-0"]},
                          {"suite": "workbuddy-code", "tasks": ["bug_fix-easy-alpha"]}):

@@ -59,7 +59,7 @@ SUITE = {
     "description": "OpenCompass LiveMathBench v202412 英文版（AMC/高考/CNMO/Putnam 四套竞赛题）：给出最终答案，按确定性规则（字符串/数值/集合/选项等价）判分。数据集需在 Hugging Face 同意条款并提供 HF_TOKEN。",
     "default_tasks": ["livemath-amc-1", "livemath-amc-20", "livemath-ccee-1", "livemath-cnmo-1", "livemath-wlpmc-1"],
     "max_tasks": 200,
-    "max_concurrency": 8,
+    "max_concurrency": 16,
     "arch": "amd64, arm64 (python:3.12-slim-bookworm multi-arch)",
 }
 

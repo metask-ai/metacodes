@@ -56,7 +56,7 @@ SUITE = {
     # The first five of the pinned order.
     "default_tasks": ["searchqa-124678", "searchqa-150794", "searchqa-41440", "searchqa-57769", "searchqa-152112"],
     "max_tasks": 200,
-    "max_concurrency": 8,
+    "max_concurrency": 16,
     "arch": "amd64, arm64 (python:3.12-slim-bookworm multi-arch)",
 }
 

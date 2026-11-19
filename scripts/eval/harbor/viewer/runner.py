@@ -238,7 +238,7 @@ class RunManager:
                 "reasoning_effort": effort,
                 "warnings": warnings, "account_summary": account_summary,
                 "account_groups": account_groups,
-                "defaults": {"attempts": 1, "concurrency": 1}, "runs": self.runs()}
+                "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs()}
 
     def runs(self):
         result = []

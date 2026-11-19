@@ -68,7 +68,7 @@ RUNNERS = (HARBOR_REGISTRY, HARBOR_LOCAL, WORKBUDDY)
 
 TASK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,160}$")
 MAX_TASKS = 200
-MAX_CONCURRENCY = 8
+MAX_CONCURRENCY = 16
 DEFAULT_SUITE = "terminal-bench-2.1"
 
 # Ordered as the picker shows them.
@@ -139,7 +139,7 @@ class Suite:
     tasks: Optional[Tuple[str, ...]] = None      # None: listed at runtime
     default_tasks: Tuple[str, ...] = ()
     max_tasks: int = 20
-    max_concurrency: int = 3
+    max_concurrency: int = 10
     # harbor-local: adapter module under scripts.eval.harbor.adapters.
     adapter: str = ""
     # workbuddy: dataset subset (code/web/office/sec) and whether the
@@ -164,28 +164,28 @@ SUITES: Tuple[Suite, ...] = (
     Suite("aime", "competition-math", "AIME 2024–2025",
           "60 道 AIME 竞赛题：2024 年 30 道，2025 年 I/II 卷各 15 道",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2024 + AIME_2025,
-          default_tasks=AIME_2024 + AIME_2025, max_tasks=60, max_concurrency=8),
+          default_tasks=AIME_2024 + AIME_2025, max_tasks=60, max_concurrency=16),
     Suite("aime-2025", "competition-math", "AIME 2025",
           "单独实验：只跑 2025 年 I/II 卷 30 道题（与 aime 数据集相同来源）",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2025,
-          default_tasks=AIME_2025, max_tasks=30, max_concurrency=8),
+          default_tasks=AIME_2025, max_tasks=30, max_concurrency=16),
 )
 
 # harbor-local suites. The id/category here are authoritative; the adapter
 # module may refine name, description, sample and caps.
 ADAPTER_SUITES: Tuple[Suite, ...] = (
     Suite("humaneval", "code-generation", "HumanEval", "根据函数描述写出实现，通过单元测试",
-          HARBOR_LOCAL, adapter="humaneval", max_tasks=164, max_concurrency=8),
+          HARBOR_LOCAL, adapter="humaneval", max_tasks=164, max_concurrency=16),
     Suite("mbpp", "basic-programming", "MBPP", "MBPP full 测试集 500 道 Python 编程任务",
-          HARBOR_LOCAL, adapter="mbpp", max_tasks=MAX_TASKS, max_concurrency=8),
+          HARBOR_LOCAL, adapter="mbpp", max_tasks=MAX_TASKS, max_concurrency=16),
     Suite("mbpp-sanitized", "basic-programming", "MBPP sanitized", "MBPP sanitized 测试集 257 道人工校对的 Python 编程任务",
-          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=MAX_TASKS, max_concurrency=8),
+          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=MAX_TASKS, max_concurrency=16),
     Suite("alfworld", "interactive-planning", "ALFWorld", "多步骤家庭任务的规划与执行",
           HARBOR_LOCAL, adapter="alfworld", max_tasks=134),
     Suite("searchqa", "question-answering", "SearchQA", "根据检索到的段落回答问题",
-          HARBOR_LOCAL, adapter="searchqa", max_tasks=MAX_TASKS, max_concurrency=8),
+          HARBOR_LOCAL, adapter="searchqa", max_tasks=MAX_TASKS, max_concurrency=16),
     Suite("livemath", "math-reasoning", "LiveMath", "数学问题求解",
-          HARBOR_LOCAL, adapter="livemath", max_tasks=MAX_TASKS, max_concurrency=8),
+          HARBOR_LOCAL, adapter="livemath", max_tasks=MAX_TASKS, max_concurrency=16),
     Suite("gaia2-cli", "general-agent", "GAIA2（CLI 模式）",
           "Meta GAIA2 的 Harbor CLI 变体：agent 通过 MCP 侧车调用 ARE 环境的 101 个工具完成动态场景任务",
           HARBOR_LOCAL, adapter="gaia2_cli", max_tasks=100),

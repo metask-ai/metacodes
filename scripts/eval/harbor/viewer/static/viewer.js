@@ -258,8 +258,12 @@ async function renderNewRun() {
   const taskBox = h('fieldset', {}, h('legend', { text: '任务' }), h('div', { class: 'empty', text: '读取任务列表…' }));
   const model = h('select', { name: 'model', required: true },
     (c.models || []).map((m) => h('option', { value: m.id, selected: m.id === c.default_model }, m.label)));
-  const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: 1, min: 1, max: 5, step: 1, required: true });
-  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: 1, min: 1, max: 3, step: 1, required: true });
+  const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
+  const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: runDefaults.attempts, min: 1, max: 5, step: 1, required: true });
+  // The default follows each suite's cap until the user types a value.
+  let concurrencyEdited = false;
+  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: runDefaults.concurrency, min: 1, max: 16, step: 1, required: true,
+    oninput: () => { concurrencyEdited = true; } });
   const suiteNotes = h('div', { class: 'callout', hidden: true });
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
   const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
@@ -305,7 +309,8 @@ async function renderNewRun() {
   function drawTasks(error) {
     const s = current();
     concurrency.max = String(s.max_concurrency);
-    if (Number(concurrency.value) > s.max_concurrency) concurrency.value = String(s.max_concurrency);
+    if (!concurrencyEdited) concurrency.value = String(Math.min(runDefaults.concurrency, s.max_concurrency));
+    else if (Number(concurrency.value) > s.max_concurrency) concurrency.value = String(s.max_concurrency);
     drawSuiteNotes();
     if (!tasks.length) {
       count = null;

@@ -81,7 +81,7 @@ SUITE = {
         "alfworld-pick_two_obj_and_place-00b4d8ba",
     ],
     "max_tasks": 134,
-    "max_concurrency": 3,
+    "max_concurrency": 10,
     "arch": "amd64 only for the environment sidecar (textworld has no linux/arm64 wheel; runs under emulation on ARM hosts)",
 }
 
