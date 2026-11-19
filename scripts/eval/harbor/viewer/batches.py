@@ -244,8 +244,10 @@ class BatchManager:
             except ValueError as exc:
                 raise ValueError(f"{suite.name}：{exc}") from None
             run_request.update(tasks=checked["tasks"], executor=checked["executor"])
+            # The model's route as of creation (source, imported revision);
+            # each item's launch must still resolve to it.
             planned.append({"suite": suite.id, **suites.label(suite.id), "tasks": checked["tasks"],
-                            "concurrency": run_request["concurrency"], "request": run_request,
+                            "concurrency": run_request["concurrency"], "request": run_request, "route": checked["route"],
                             "status": "pending", "run": None, "error": None, "started_at": None, "finished_at": None})
         cfg = settings(self.runs.config_path)
         choices = bundle_choices(cfg, self.runs.config_path)
@@ -330,7 +332,8 @@ class BatchManager:
         try:
             if frozen_digest(Path(record["metacodes"]["bundle"])) != record["metacodes"]["digest"]:
                 raise ValueError("冻结的 metacodes 发行包已被修改，批次不再运行")
-            launched = self.runs.launch(dict(pending["request"]), frozen=record["metacodes"], batch=record["id"])
+            launched = self.runs.launch(dict(pending["request"]), frozen=record["metacodes"], batch=record["id"],
+                                        pinned=pending.get("route"))
             pending.update(status="running", run=launched["name"], started_at=now())
             record["status"] = "running"
             record["started_at"] = record.get("started_at") or now()
@@ -364,4 +367,5 @@ def public(record: Dict[str, Any]) -> Dict[str, Any]:
     value = json.loads(json.dumps(record))
     for item in value.get("items") or []:
         item.pop("request", None)
+        item.pop("route", None)
     return value

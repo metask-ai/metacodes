@@ -305,10 +305,14 @@ class RunManager:
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
-    def launch(self, request, *, dry_run=False, frozen=None, batch=None):
+    def launch(self, request, *, dry_run=False, frozen=None, batch=None, pinned=None):
         """Start one run. `dry_run` only validates (a batch checks every
         dataset before it is created); `frozen` is a batch's frozen bundle,
-        which replaces the configured one, and `batch` names that batch."""
+        which replaces the configured one, and `batch` names that batch.
+        `pinned` is the model route a batch was created with (the `route`
+        of its dry run); a run whose model now resolves elsewhere — another
+        source, or an imported provider at another revision — is refused, so
+        one batch never records two upstreams under one model name."""
         allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor")
@@ -336,6 +340,11 @@ class RunManager:
             raise ValueError("请选择服务已配置的模型")
         # A model of a provider imported by URL and key: its own route.
         imported = chosen.get("provider") if chosen.get("source") == "provider" else None
+        route = ({"source": "imported", "provider": imported, "revision": self.providers.run_route(model)["revision"]}
+                 if imported else {"source": catalog["authentication"]["kind"]})
+        if pinned is not None and pinned != route:
+            raise ValueError(f"模型 {model} 的来源在批次创建后已变化（导入的 Provider 被修改、删除或与配置重名），"
+                             "本项不再运行；请重新创建批次")
         if imported:
             if suite.runner == suites.WORKBUDDY:
                 raise ValueError("导入的 Provider 暂不支持 WorkBuddy 评测，请选择 Harbor 评测集")
@@ -360,7 +369,7 @@ class RunManager:
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
         if dry_run:
-            return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
+            return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
                     "executor": state["name"]}
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
@@ -439,6 +448,8 @@ class RunManager:
                 # and the revision it came from; the worker takes the key
                 # from the private store only while that revision is current.
                 route = self.providers.run_route(model)
+                if pinned is not None and route["revision"] != pinned.get("revision"):
+                    raise ValueError(f"导入的 Provider {imported} 在批次创建后被修改，本项不再运行；请重新创建批次")
                 problem = self.imported_route_problem(route)
                 if problem:
                     raise ValueError(problem)

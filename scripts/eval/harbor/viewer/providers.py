@@ -158,10 +158,9 @@ def reply_text(protocol, body):
 
 
 def echoed(reply, expected):
-    """Whether the reply text is exactly `expected`. Only surrounding
-    whitespace (a trailing newline) is ignored; quotes, backticks or a
-    period mean the model did not echo verbatim."""
-    return reply is not None and reply.strip() == expected
+    """Whether the decoded reply text is exactly `expected`: any extra
+    character, whitespace included, means the model did not echo verbatim."""
+    return reply == expected
 
 
 def origin(url):
@@ -312,7 +311,15 @@ class Providers:
         entry["updated_at"] = now()
 
         def update(entries):
-            if any(e["id"] == provider_id for e in entries):
+            current = next((e for e in entries if e["id"] == provider_id), None)
+            # The entry was read before the lock (and before a slow model
+            # discovery). Another request that rotated the key, edited or
+            # removed it meanwhile wins; this one would restore a stale key
+            # and revive the old revision.
+            if (current is None) != (existing is None) or (
+                    current is not None and current.get("revision") != existing.get("revision")):
+                raise ValueError("Provider " + provider_id + " 在此期间被其他请求修改或删除，请刷新后重试")
+            if current is not None:
                 if not replace:
                     raise ValueError("Provider " + provider_id + " 已存在；要更新请勾选覆盖")
                 entries[:] = [entry if e["id"] == provider_id else e for e in entries]
@@ -381,11 +388,26 @@ class Providers:
         return {"provider": provider_id, **result}
 
     # -------------------------------------------------------------- runs
+    def upgrade(self):
+        """Give entries saved before revisions existed one, once, under the
+        store's lock (their runs could otherwise never take a key)."""
+        if all(e.get("revision") for e in self.entries()):
+            return
+
+        def update(entries):
+            for entry in entries:
+                entry.setdefault("revision", None)
+                if not entry["revision"]:
+                    entry["revision"] = secrets.token_hex(8)
+                    entry["probes"] = {}
+        self.change(update)
+
     def run_route(self, model_id):
         """For a run of catalog id `<provider>/<model>`, from one read of the
         store: the native config, the native model id and the revision the
         worker must find again to take the key."""
         provider_id, _, model = model_id.partition("/")
+        self.upgrade()
         entry = self.find(provider_id)
         if model not in (entry.get("models") or []):
             raise ValueError("Provider " + provider_id + " 没有模型 " + model[:80])

@@ -426,14 +426,18 @@ metacodes bench provider remove --id gw
   gives the entry a new revision. A run records the revision its config was
   generated from; if the entry changed before its worker starts, the run
   fails with a message instead of pairing the old upstream with a new key.
+  A batch pins each model's route (source and revision) when it is created;
+  a later item whose model now resolves elsewhere fails with a message. Two
+  concurrent edits of one entry (page and CLI) cannot undo each other: an
+  update based on a revision that changed meanwhile is refused.
 - **Ids**: `metask` and the provider ids of the workbench's
   `--provider-config` cannot be imported, so one model id never names two
   routes (a clash introduced later by changing `--provider-config` hides
   the imported models and shows a warning).
 - **Probe**: sends one real request asking the model to reply with a fresh
-  random string (`mc-echo-…`) and passes only when the reply text is
-  exactly that string (only surrounding whitespace is ignored; quotes,
-  backticks or a period fail). The result (reply, HTTP status, latency) is
+  random string (`mc-echo-…`) and passes only when the decoded reply text
+  is exactly that string (any extra character fails, whitespace and
+  newlines included). The result (reply, HTTP status, latency) is
   stored per model and shown on the 模型 tab; the model list shows only
   pass/fail. Changing the URL, protocol or key clears it. Probing is not
   required to run.

@@ -1148,7 +1148,7 @@ async function renderProviders() {
   });
   return h('div', {},
     panel('已导入的 Provider', `${(list.providers || []).length} 个`, h('div', { class: 'panel-body' },
-      h('p', { class: 'muted', text: '这些模型出现在新建批次的模型下拉框里，和 Metask 账号模型并列。探测会真实发送一次请求：让模型原样返回一个随机字符串，返回一致才算通过。导入的 Provider 暂不支持 WorkBuddy 和带 LLM 评委的评测集（GAIA2）。' }),
+      h('p', { class: 'muted', text: '这些模型出现在新建批次的模型下拉框里，和 Metask 账号模型并列。探测会真实发送一次请求：让模型原样返回一个随机字符串，返回一致才算通过。导入的 Provider 不支持 WorkBuddy；带 LLM 评委的评测集（GAIA2）在 Metask 认证下不可用（评委会被转发到导入的上游），在 --auth provider 下评委读取执行机器的环境变量，可以运行。' }),
       table, result)),
     panel('导入 Provider', 'URL + API Key', form));
 }

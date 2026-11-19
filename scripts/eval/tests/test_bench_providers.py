@@ -12,6 +12,7 @@ import os
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -73,7 +74,7 @@ def fake_provider():
                 return
             text = {'echo': expected, 'period': expected + '.'}.get(model, 'Sure! ' + expected[::-1])
             if self.path == '/v1/chat/completions':
-                self.reply({'choices': [{'message': {'role': 'assistant', 'content': text + '\n'}}]})
+                self.reply({'choices': [{'message': {'role': 'assistant', 'content': text}}]})
             elif self.path == '/v1/messages':
                 self.reply({'content': [{'type': 'thinking', 'thinking': 'x'}, {'type': 'text', 'text': text}]})
             elif self.path == '/v1/responses':
@@ -102,8 +103,8 @@ class HelpersTest(unittest.TestCase):
 
     def test_echo_must_be_the_exact_string(self):
         self.assertTrue(echoed('mc-echo-ab12', 'mc-echo-ab12'))
-        self.assertTrue(echoed(' mc-echo-ab12\n', 'mc-echo-ab12'))
-        for extra in ('"mc-echo-ab12"', 'mc-echo-ab12.', '`mc-echo-ab12`', 'mc-echo-ab12。', "'mc-echo-ab12'"):
+        for extra in ('"mc-echo-ab12"', 'mc-echo-ab12.', '`mc-echo-ab12`', 'mc-echo-ab12。', "'mc-echo-ab12'",
+                      '\tmc-echo-ab12', 'mc-echo-ab12 ', 'mc-echo-ab12\n', ' mc-echo-ab12'):
             with self.subTest(extra=extra):
                 self.assertFalse(echoed(extra, 'mc-echo-ab12'))
         self.assertFalse(echoed('Sure: mc-echo-ab12', 'mc-echo-ab12'))
@@ -241,6 +242,31 @@ class ProviderStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '--provider-config'):
             self.store.add({'id': 'tokenjoy', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']},
                            reserved={'tokenjoy'})
+
+    def test_a_concurrent_update_cannot_restore_a_rotated_key(self):
+        self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']})
+        other = Providers(self.root)  # the CLI, in another process
+        real_discover = Providers.discover
+
+        def slow_discover(store, entry):
+            # While the page's update discovers models, the CLI rotates the key.
+            other.add({'id': 'gw', 'base_url': self.url, 'api_key': 'rotated-key-9999', 'models': ['echo'],
+                       'replace': True})
+            return real_discover(store, entry)
+        with patch.object(Providers, 'discover', slow_discover):
+            with self.assertRaisesRegex(ValueError, '其他请求修改'):
+                self.store.add({'id': 'gw', 'name': 'Renamed', 'base_url': self.url, 'replace': True})
+        current = self.store.find('gw')
+        self.assertEqual(current['api_key'], 'rotated-key-9999')
+        self.assertEqual(self.store.secret('gw', current['revision']), 'rotated-key-9999')
+
+    def test_entries_saved_before_revisions_get_one_once(self):
+        self.store.save([{'id': 'old', 'name': 'old', 'base_url': self.url + '/v1', 'protocol': 'openai_chat',
+                          'auth': 'bearer', 'api_key': KEY, 'models': ['echo']}])
+        route = self.store.run_route('old/echo')
+        self.assertTrue(route['revision'])
+        self.assertEqual(self.store.run_route('old/echo')['revision'], route['revision'])
+        self.assertEqual(self.store.secret('old', route['revision']), KEY)
 
     def test_invalid_requests_are_refused(self):
         for request in ({'id': 'Bad Id', 'base_url': self.url, 'api_key': KEY, 'models': ['m']},
@@ -420,6 +446,53 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertNotIn('imported_provider', spec)
         self.assertEqual(spec['provider_config'], json.loads(self.manager.config_path.read_text())['provider_config'])
         wait_run(self.manager, run['name'])
+
+    def test_a_batch_never_switches_an_items_route_after_creation(self):
+        base = f'http://127.0.0.1:{self.upstream.server_port}'
+        self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
+        created = self.client.request('api/batches', {
+            'model': 'local/echo', 'attempts': 1, 'concurrency': 1,
+            'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']},
+                      {'suite': 'terminal-bench-2.0', 'tasks': ['fix-git']}]})
+        self.assertNotIn('route', json.dumps(created['items']))  # internal, like the launch request
+        stored = self.manager.batches.get(created['id'])
+        self.assertEqual(stored['items'][0]['route']['source'], 'imported')
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '2'}):
+            self.manager.batches.advance()  # first item starts on the original route
+            first = self.manager.batches.get(created['id'])['items'][0]
+            self.assertEqual(first['status'], 'running')
+            # Its worker has taken the key (Harbor is running) before the edit.
+            from scripts.eval.tests.test_bench_workbench import wait_status
+            self.assertEqual(wait_status(self.manager, first['run'], 'running'), 'running')
+            # The same id moves to another key before the second item.
+            self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': 'rotated-key-0000',
+                                                  'models': ['echo'], 'replace': True})
+            deadline = time.monotonic() + 30
+            while self.manager.batches.get(created['id'])['status'] not in ('finished', 'cancelled') \
+                    and time.monotonic() < deadline:
+                self.manager.batches.advance()
+                time.sleep(.1)
+        record = self.manager.batches.get(created['id'])
+        self.assertEqual(record['items'][0]['status'], 'finished')
+        self.assertEqual(record['items'][1]['status'], 'failed')
+        self.assertIn('批次创建后', record['items'][1]['error'])
+        self.assertEqual(len(self.manager.runs()), 1)
+
+    def test_a_pinned_launch_refuses_another_source(self):
+        base = f'http://127.0.0.1:{self.upstream.server_port}'
+        self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['test-model']})
+        request = {'model': 'local/test-model', 'tasks': ['fix-git']}
+        pinned = self.manager.launch(request, dry_run=True)['route']
+        self.client.request('api/providers/remove', {'id': 'local'})
+        with self.assertRaises(ValueError):
+            self.manager.launch(request, pinned=pinned)
+        # A configured model pinned as such stays launchable; pinned to an
+        # import, it is refused.
+        configured = self.manager.launch({'model': 'tokenjoy/test-model', 'tasks': ['fix-git']}, dry_run=True)['route']
+        self.assertEqual(configured, {'source': 'provider'})
+        with self.assertRaisesRegex(ValueError, '批次创建后'):
+            self.manager.launch({'model': 'tokenjoy/test-model', 'tasks': ['fix-git']}, pinned=pinned)
+        self.assertEqual(self.manager.runs(), [])
 
     def test_judged_and_workbuddy_suites_refuse_imported_models(self):
         self.client.request('api/providers', {'id': 'local', 'base_url': f'http://127.0.0.1:{self.upstream.server_port}',
