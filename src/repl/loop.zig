@@ -3682,11 +3682,24 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         }
         if (std.mem.eql(u8, verb, "remove")) {
             const in_use = app.isRoutedThrough(id);
-            app.removeProviderConfiguration(id) catch |err| {
+            const removed = app.removeProviderConfiguration(id) catch |err| {
                 cmd_output.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
                 return;
             };
-            cmd_output.print("Removed the configuration for '{s}'.\n", .{target});
+            if (removed.definition) {
+                // A provider the user defined goes whole, as `metacodes
+                // providers remove` takes it; this session read its
+                // definition at start and keeps listing it until the next.
+                cmd_output.print("Removed '{s}': its definition in config.json{s}{s}{s}. It is gone from the next start; this session still lists it.\n", .{
+                    target,
+                    if (removed.settings) ", its settings" else "",
+                    if (removed.key) ", its stored key" else "",
+                    if (removed.login) ", its stored login" else "",
+                });
+                if (removed.default_forgotten) cmd_output.print("The default model was one of its; it is forgotten.\n", .{});
+            } else {
+                cmd_output.print("Removed the configuration for '{s}'.\n", .{target});
+            }
             if (in_use) {
                 cmd_output.print("This session is still routed through it until you pick another route.\n", .{});
             }

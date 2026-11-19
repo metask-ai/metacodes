@@ -611,12 +611,18 @@ pub const KeyPage = struct {
     id: Slug,
     /// What the user reads, e.g. "China · Personal Coding Plan".
     label: []const u8,
-    url: []const u8,
+    /// The page the key is created on. Null for a provider the user
+    /// configured (a relay, a local server): the key comes from whoever runs
+    /// it, and is only pasted here.
+    url: ?[]const u8,
     /// A GET the provider does not bill, carrying the key where the
     /// provider's requests do (`ProviderProfile.auth`): 200 means it accepts
     /// the key; 401/403, or a status `classify_error` reads as an invalid key
     /// or a denial, that it refuses it. Null: keys are stored unchecked.
     check_url: ?[]const u8 = null,
+    /// The wire whose model listing `check_url` is (`model_listing.zig`),
+    /// when it is one: an Anthropic listing also needs `anthropic-version`.
+    check_wire: ?Protocol.Wire = null,
     /// Matched against `ChannelDescriptor.region` to pick the default page.
     region: ?[]const u8 = null,
 };
@@ -731,15 +737,16 @@ pub fn validateProfile(profile: ProviderProfile) ProfileError!void {
         for (profile.accepted_credential_kinds) |kind| {
             if (kind == setup.kind) accepted = true;
         }
-        // A page a user is sent to, or a check a key is sent to, over plain
-        // HTTP would hand the key to anyone on the path.
         if (!accepted or setup.pages.len == 0) return error.InvalidKeySetup;
         for (setup.pages, 0..) |page, index| {
-            if (!std.mem.startsWith(u8, page.url, "https://")) return error.InvalidKeySetup;
-            // The check carries the key, so it goes only where the provider's
-            // own requests may: https, or the plain loopback the endpoint
-            // policy admits (a key grant's development origin moves it there,
-            // `Host.rebaseOrigin`).
+            // A page a user is sent to over plain HTTP could be anyone's.
+            if (page.url) |url| if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidKeySetup;
+            // A check carries the key, so it goes only where the provider's
+            // own requests may: https, or plain HTTP that the endpoint policy
+            // admits (a loopback server, where a key grant's development
+            // origin moves it, `Host.rebaseOrigin`; or a definition that
+            // turned TLS off for its own endpoint) — the key travels there
+            // with every request anyway.
             if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) {
                 profile.endpoint_policy.validate(url) catch return error.InvalidKeySetup;
             };
@@ -1116,6 +1123,23 @@ test "a key setup is admitted only with an accepted kind and https pages of dist
     };
     profile.api_key_setup = .{ .kind = .api_key, .pages = &twice };
     try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+
+    // A configured provider's setup: no page to send anyone to, and a check
+    // on the loopback server its requests go to — plain HTTP the endpoint
+    // policy admits there, and nowhere else.
+    const local = [_]KeyPage{.{ .id = Slug.lit("key"), .label = "Local", .url = null, .check_url = "http://127.0.0.1:8000/v1/models", .check_wire = .openai_chat }};
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &local };
+    try validateProfile(profile);
+    for ([_][]const u8{ "http://relay.example.test/v1/models", "http://user:pw@127.0.0.1:8000/v1/models", "http://127.0.0.1:8000/v1%2fmodels" }) |check| {
+        const refused = [_]KeyPage{.{ .id = Slug.lit("key"), .label = "Local", .url = null, .check_url = check }};
+        profile.api_key_setup = .{ .kind = .api_key, .pages = &refused };
+        try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+    }
+    // A definition that turned TLS off for its own endpoint may check there.
+    profile.endpoint_policy = .{ .require_tls = false };
+    const docker = [_]KeyPage{.{ .id = Slug.lit("key"), .label = "Docker", .url = null, .check_url = "http://host.docker.internal:3456/v1/models" }};
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &docker };
+    try validateProfile(profile);
 }
 
 test "a sign-in's redirect host, ports and revocation are checked at registration" {

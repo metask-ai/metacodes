@@ -1771,7 +1771,7 @@ test "L2: a configured pool entry's account label outlives the read that produce
     var document = try store.load();
     defer document.deinit();
     var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
-    const pool = cc.app_module.App.credentialPoolFrom(&document, &buffer, cc.provider_credential.EnvLookup.empty());
+    const pool = cc.app_module.App.credentialPoolFrom(&document, Slug.lit("openai"), &buffer, cc.provider_credential.EnvLookup.empty());
     try std.testing.expectEqual(@as(usize, 1), pool.len);
 
     // Everything the entry borrows must still read correctly while the document
@@ -1810,15 +1810,15 @@ test "L2: a pool credential's variable is read from the state root's .env when t
 
     unsetEnvZ("METACODES_POOL_FILE_KEY");
     var buffer: [cc.provider_config_doc.MAX_POOL_CREDENTIALS]cc.provider_credential.PoolEntry = undefined;
-    const from_file = cc.app_module.App.credentialPoolFrom(&document, &buffer, layer.lookup());
+    const from_file = cc.app_module.App.credentialPoolFrom(&document, Slug.lit("openai"), &buffer, layer.lookup());
     try std.testing.expectEqual(@as(usize, 1), from_file.len);
     try std.testing.expectEqualStrings("sk-pool-from-file", from_file[0].secret);
     // Without the layer the member has no secret and is left out.
-    try std.testing.expectEqual(@as(usize, 0), cc.app_module.App.credentialPoolFrom(&document, &buffer, cc.provider_credential.EnvLookup.empty()).len);
+    try std.testing.expectEqual(@as(usize, 0), cc.app_module.App.credentialPoolFrom(&document, Slug.lit("openai"), &buffer, cc.provider_credential.EnvLookup.empty()).len);
 
     setEnvZ("METACODES_POOL_FILE_KEY", "sk-pool-from-env");
     defer unsetEnvZ("METACODES_POOL_FILE_KEY");
-    const from_env = cc.app_module.App.credentialPoolFrom(&document, &buffer, layer.lookup());
+    const from_env = cc.app_module.App.credentialPoolFrom(&document, Slug.lit("openai"), &buffer, layer.lookup());
     try std.testing.expectEqualStrings("sk-pool-from-env", from_env[0].secret);
 }
 

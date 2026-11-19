@@ -1,4 +1,4 @@
-"""Read-only projections of Harbor job directories for the bench viewer.
+"""Read-only projections of Harbor job directories for the Bench workbench.
 
 A Harbor jobs directory holds one directory per job (`config.json`,
 `result.json`) and, inside it, one directory per trial (`result.json`,

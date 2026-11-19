@@ -40,6 +40,23 @@
 //! Every request in `src/` sends through these two functions instead of the
 //! `Request` methods of the same names; a source guard in
 //! tests/component/http_send_failure_test.zig keeps it that way.
+//!
+//! Connection (#573). The model clients ask the server to keep the
+//! connection open, and close it themselves. They set `keep_alive = false`,
+//! so std closes the socket in `Request.deinit` and never pools it (a stale
+//! pooled connection is what that option avoids). At `.default`, though, std
+//! also writes `connection: close`, and a server told so closes right after
+//! the last byte. Behind a transparent proxy that close can overtake bytes the
+//! proxy has not forwarded yet: on 2026-11-18 it cut the end off 3% to 23% of
+//! real Responses streams, and the end was the terminal event, so the whole
+//! turn was sent again and charged again. `keepServerOpen` makes those
+//! requests say `connection: keep-alive` instead: the server leaves the
+//! connection open, the client reads what it needs (a stream's terminal event,
+//! or the end of a framed body) and closes it. Other requests are left as they
+//! are: std 0.16 reads the body of a 204 or 304 answer, which has none, to the
+//! end of the connection (`receiveHead` returns early without marking it
+//! empty), so a request that reads every answer's body would wait on a server
+//! that keeps the connection open after one.
 
 const std = @import("std");
 const version = @import("../version.zig");
@@ -73,6 +90,22 @@ pub fn sendBodiless(request: *Request) std.Io.Writer.Error!void {
     request.sendBodiless() catch |err| return dropConnection(request, err);
 }
 
+/// Make a request say `connection: keep-alive` while its `keep_alive = false`
+/// still closes the connection after one answer (see the module comment,
+/// #573). A caller's own `.omit` or `.override` stays as it is, and so does a
+/// `connection` line among its `extra_headers`: that line is then the only one.
+pub fn keepServerOpen(request: *Request) void {
+    request.headers.connection = connectionHeader(request.headers.connection, request.extra_headers);
+}
+
+fn connectionHeader(current: Request.Headers.Value, extra_headers: []const std.http.Header) Request.Headers.Value {
+    if (current != .default) return current;
+    for (extra_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) return .omit;
+    }
+    return .{ .override = "keep-alive" };
+}
+
 /// At `.default`, std writes `zig/<version> (std.http)`; name metacodes
 /// instead. A caller's `.omit` or `.override` stays as it is.
 fn identify(request: *Request) void {
@@ -92,4 +125,17 @@ fn acceptIdentityOnly(request: *Request) void {
 fn dropConnection(request: *Request, err: std.Io.Writer.Error) std.Io.Writer.Error {
     if (request.connection) |connection| connection.closing = true;
     return err;
+}
+
+test "keepServerOpen: a request whose caller names no connection says keep-alive" {
+    try std.testing.expectEqualStrings("keep-alive", connectionHeader(.default, &.{}).override);
+    const others = [_]std.http.Header{.{ .name = "content-type", .value = "application/json" }};
+    try std.testing.expectEqualStrings("keep-alive", connectionHeader(.default, &others).override);
+}
+
+test "keepServerOpen: a caller's own connection header stays the only one" {
+    try std.testing.expect(connectionHeader(.omit, &.{}) == .omit);
+    try std.testing.expectEqualStrings("close", connectionHeader(.{ .override = "close" }, &.{}).override);
+    const own = [_]std.http.Header{.{ .name = "Connection", .value = "close" }};
+    try std.testing.expect(connectionHeader(.default, &own) == .omit);
 }
