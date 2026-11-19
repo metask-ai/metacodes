@@ -93,10 +93,6 @@ SETUP_STEPS = {
         "Restore Lean toolchain and build products", "Install pinned elan",
     },
 }
-# Not setup, yet on every leg and before any other build or test step: the
-# source-only checks (`zig build gate:static`) end a leg in seconds when a
-# guard fails, where inside the suites it surfaced only at the end (#587).
-SOURCE_ONLY_CHECKS = "Source-only checks"
 # Caches (doc/CI_DESIGN.md §5): what main's warm run saves carries its run ID
 # after the prefix every other run restores.
 RUN_SUFFIX = "${{ github.run_id }}-${{ github.run_attempt }}"
@@ -549,22 +545,23 @@ class WorkflowTest(unittest.TestCase):
         for job, setup in SETUP_STEPS.items():
             with self.subTest(job=job):
                 unflagged = {step_label(step) for step in self.jobs[job]["steps"] if not leg_flags(step)}
-                self.assertEqual(unflagged, setup | {SOURCE_ONLY_CHECKS})
+                self.assertEqual(unflagged, setup)
 
-    def test_the_source_only_checks_run_first_on_every_leg(self) -> None:
-        for job, _, _ in GATE_JOBS:
+    def test_every_gate_leg_runs_the_source_level_guards_first(self) -> None:
+        # `zig build gate:static` takes seconds, and a failed guard inside a
+        # suite step is reported only when the step ends (#587): every leg
+        # runs it before anything else that builds.
+        for job, os_name, flags in GATE_JOBS:
             with self.subTest(job=job):
-                steps = self.jobs[job]["steps"]
-                labels = [step_label(step) for step in steps]
-                self.assertEqual(labels.count(SOURCE_ONLY_CHECKS), 1)
-                index = labels.index(SOURCE_ONLY_CHECKS)
-                self.assertEqual(steps[index]["run"], "zig build gate:static")
-                self.assertEqual(steps[index]["if"], "env.FAST_PATH != 'true' && env.SUITES != 'false'")
-                for step in steps[:index]:
+                steps = [step for step in self.jobs[job]["steps"] if runs_on(step, os_name)]
+                guards = [i for i, step in enumerate(steps) if step.get("run", "").strip() == "zig build gate:static"]
+                self.assertEqual(len(guards), 1)
+                guard = steps[guards[0]]
+                self.assertEqual(leg_flags(guard), flags)
+                self.assertNotIn("runner.os", guard["if"])
+                for step in steps[:guards[0]]:
                     run = step.get("run", "")
-                    self.assertNotIn("zig ", run, step_label(step))
-                    self.assertNotIn("unittest", run, step_label(step))
-                    self.assertNotIn("elan", run, step_label(step))
+                    self.assertNotRegex(run, r"\b(zig|lake) ", step_label(step))
 
     def test_every_platform_runs_every_part_of_the_suite(self) -> None:
         # `zig build test` is exactly its three parts (build.zig); each
