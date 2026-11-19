@@ -630,6 +630,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Token and cost totals no longer count part of a streamed response
+  twice.** A provider reports a response's usage as a running total:
+  Anthropic's `message_delta.usage` is cumulative and follows a
+  `message_start` that already counted the prompt and the first output
+  tokens, some OpenAI-compatible servers attach the usage so far to every
+  chunk, and Gemini repeats `usageMetadata`. Each report was added to the
+  totals as if it were an increment. On the streaming documentation's own
+  examples that is 16 output tokens for a response of 15, and 13361 input /
+  513 output for one of 10682 / 510, about 20% more cost. `/cost`, the token
+  and cost fields of `--json`, the cost budget, the goal meter and AgentCore
+  `usage` events all read those totals. Each provider stream (Messages,
+  Chat Completions, Responses, Gemini, Bedrock Converse) now hands on only
+  what a report adds to the highest count the response has reported so far,
+  so a response's `usage` events add up to the provider's totals however
+  many reports carried them. The per-request view behind the context anchor
+  and the prompt-cache diagnostics already took the highest report and does
+  not change.
+
 - **Behind a proxy, the end of a model's answer is no longer lost, and the
   turn is no longer sent again for it** (#573). Every request to a model
   provider said `connection: close`, so the server closed the connection

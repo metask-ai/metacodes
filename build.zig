@@ -3276,6 +3276,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/microcompact_test.zig",
         "tests/component/kg_task_projection_test.zig",
         "tests/component/goal_state_test.zig",
+        "tests/component/usage_report_test.zig",
         "tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",

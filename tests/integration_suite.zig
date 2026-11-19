@@ -127,6 +127,7 @@ test {
     _ = @import("component/formal_kernel_test.zig");
     _ = @import("component/memory_migration_adapter_test.zig");
     _ = @import("component/goal_state_test.zig");
+    _ = @import("component/usage_report_test.zig");
     _ = @import("component/auth_test.zig");
     _ = @import("component/schema_validation_test.zig");
     _ = @import("component/tool_schema_coverage_test.zig");
