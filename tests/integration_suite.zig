@@ -22,6 +22,7 @@ test {
     _ = @import("component/picker_reasoning_test.zig");
     _ = @import("component/gemini_thought_signature_test.zig");
     _ = @import("component/provider_oauth_login_test.zig");
+    _ = @import("component/chatgpt_codex_test.zig");
     _ = @import("component/provider_key_login_test.zig");
     _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
