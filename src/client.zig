@@ -556,6 +556,90 @@ pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_ob
     model_error.noteStreamError(err_obj);
 }
 
+/// What lies beneath a stream read that failed (#573). std folds every
+/// transport failure into `ReadFailed`, and the stream's log line named only
+/// that, so a drop the proxy caused looked like any other. This collects the
+/// layers it came from:
+/// - `body`: the HTTP body's own error, such as `HttpChunkTruncated` (a
+///   chunked body that ended before its terminating chunk);
+/// - `tls`: the TLS layer's, such as `TlsConnectionTruncated` (a record cut
+///   short), and `tls_ended`: whether TLS took the stream as ended. std.http
+///   lets an end of the TCP stream at a record boundary stand in for a
+///   close_notify, so `yes` is either, not proof that a close_notify came;
+///   null on a plain connection;
+/// - `socket`: the socket's, such as `ConnectionResetByPeer` for a reset;
+/// - how the answer was framed, and whether its head kept the connection
+///   alive (`no` when the server said it would close after the answer).
+pub const ReadFailure = struct {
+    body: ?anyerror = null,
+    tls: ?anyerror = null,
+    tls_ended: ?bool = null,
+    socket: ?anyerror = null,
+    framing: []const u8,
+    /// The response head's: false when the server said it would close.
+    head_keep_alive: bool,
+
+    /// Read from `request` after a body read failed. `head` is the response's:
+    /// only its framing and keep-alive are read, which the body reader leaves
+    /// valid.
+    pub fn of(request: *http.Client.Request, head: *const http.Client.Response.Head) ReadFailure {
+        var failure: ReadFailure = .{
+            .body = if (request.reader.body_err) |err| err else null,
+            .framing = if (head.transfer_encoding == .chunked)
+                "chunked"
+            else if (head.content_length != null)
+                "content-length"
+            else
+                "close-delimited",
+            .head_keep_alive = head.keep_alive,
+        };
+        const connection = request.connection orelse return failure;
+        failure.socket = if (connection.stream_reader.err) |err| err else null;
+        if (connection.protocol == .tls) {
+            // `Connection.getReadError` asserts that one of the two errors is
+            // set; a stream can fail with neither (a cut chunked body), so the
+            // TLS client is read directly.
+            const tls_client: *std.crypto.tls.Client = @alignCast(@fieldParentPtr("reader", connection.reader()));
+            failure.tls = if (tls_client.read_err) |err| err else null;
+            failure.tls_ended = tls_client.received_close_notify;
+        }
+        return failure;
+    }
+
+    pub fn format(self: ReadFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("body {s}, ", .{errorText(self.body)});
+        if (self.tls_ended) |ended| {
+            try writer.print("tls {s}, tls ended {s}, ", .{ errorText(self.tls), if (ended) "yes" else "no" });
+        } else {
+            try writer.writeAll("plain, ");
+        }
+        try writer.print("socket {s}; {s}, keep-alive {s}", .{ errorText(self.socket), self.framing, if (self.head_keep_alive) "yes" else "no" });
+    }
+
+    fn errorText(err: ?anyerror) []const u8 {
+        return if (err) |e| @errorName(e) else "none";
+    }
+};
+
+test "ReadFailure names each layer, and an unknown TLS end as an end" {
+    var buf: [256]u8 = undefined;
+    const cut_chunk: ReadFailure = .{ .body = error.HttpChunkTruncated, .framing = "chunked", .head_keep_alive = false };
+    try std.testing.expectEqualStrings(
+        "body HttpChunkTruncated, plain, socket none; chunked, keep-alive no",
+        try std.fmt.bufPrint(&buf, "{f}", .{cut_chunk}),
+    );
+    const cut_record: ReadFailure = .{ .tls = error.TlsConnectionTruncated, .tls_ended = false, .framing = "chunked", .head_keep_alive = true };
+    try std.testing.expectEqualStrings(
+        "body none, tls TlsConnectionTruncated, tls ended no, socket none; chunked, keep-alive yes",
+        try std.fmt.bufPrint(&buf, "{f}", .{cut_record}),
+    );
+    const reset: ReadFailure = .{ .tls_ended = false, .socket = error.ConnectionResetByPeer, .framing = "content-length", .head_keep_alive = true };
+    try std.testing.expectEqualStrings(
+        "body none, tls none, tls ended no, socket ConnectionResetByPeer; content-length, keep-alive yes",
+        try std.fmt.bufPrint(&buf, "{f}", .{reset}),
+    );
+}
+
 /// The start of a non-2xx response body, read into `dest`: the whole body when
 /// it fits, else its first `dest.len` bytes. `dest.len` is the `read_bound` to
 /// pass to `reportHttpFailure`. Call it before the request is deinitialized,
@@ -1918,7 +2002,7 @@ pub const StreamResponse = struct {
                     reportBodyStall("stream", self.id, stall);
                     return error.StreamStalled;
                 }
-                log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
+                log.warnId("stream", self.id, "event_iter.next failed: {s} ({f})", .{ @errorName(err), ReadFailure.of(self.stream_result.request, &self.stream_result.response.head) });
                 return error.RequestFailed;
             },
             error.ApiErrorEvent => {
