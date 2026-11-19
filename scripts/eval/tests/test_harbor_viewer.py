@@ -209,13 +209,20 @@ class ServerTest(unittest.TestCase):
             with urllib.request.urlopen(f'http://127.0.0.1:{http.server_port}/api/jobs', timeout=2) as response:
                 self.assertEqual(response.status, 200)
 
-    def test_page_and_assets_with_a_strict_policy(self):
-        for path, mime in (("/", "text/html"), ("/viewer.js", "text/javascript"), ("/viewer.css", "text/css")):
+    def test_page_and_assets_allow_annotation_overlays(self):
+        for path, mime in (
+            ("/", "text/html"),
+            ("/index.html", "text/html"),
+            ("/viewer.js", "text/javascript"),
+            ("/viewer.css", "text/css"),
+        ):
             with self.subTest(path=path):
                 status, headers, body = self.get(path)
                 self.assertEqual(status, 200)
                 self.assertTrue(headers["Content-Type"].startswith(mime))
-                self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+                self.assertNotIn("Content-Security-Policy", headers)
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(headers["X-Frame-Options"], "DENY")
                 self.assertTrue(body)
 
     def test_api(self):

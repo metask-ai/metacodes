@@ -23,9 +23,9 @@ Outcomes follow [doc/BENCHMARKS.md](../../../../doc/BENCHMARKS.md): `invalid`
 the pass rate; `agent 超时` counts as a failure. `空回复结束` marks a trial
 metacodes ended on a reply with no text and no tool call.
 
-Pages refresh every 10 s while a job runs. Analysis reads files only; names
-in requests are checked against the jobs on disk, and every value reaches
-the page as text (no markup from the data, `script-src 'self'`).
+Pages refresh every 10 s while a job runs. Analysis only reads files. The
+viewer checks names in requests against the jobs on disk and renders job
+data as plain text.
 
 The overview, job, trial and CSV views expose total/initial tokens, first-attempt
 full-score rate, request-weighted generation TPS, TTFT mean/P50/P95, and cost
