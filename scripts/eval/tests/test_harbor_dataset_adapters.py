@@ -822,6 +822,25 @@ class AlfworldTest(TaskChecks):
         alfworld.build({alfworld.PIN.name: self._archive()}, out)
         return out
 
+    def test_per_task_build_files_never_share_size_and_mtime(self) -> None:
+        # BuildKit reuses a context file whose path, size and mtime match an
+        # earlier build's; on a real host one task's sidecar got another
+        # task's 33-byte oracle token that way and the oracle scored 0.
+        out = self._build()
+        seen = {}
+        for task in alfworld.tasks(out):
+            for path in (out / task / "environment").rglob("*"):
+                if not path.is_file():
+                    continue
+                key = (path.relative_to(out / task).as_posix(), path.stat().st_size, int(path.stat().st_mtime))
+                if key in seen:
+                    self.assertEqual(seen[key], path.read_bytes(), key)
+                seen[key] = path.read_bytes()
+        tokens = [(out / t / "environment/alfworld-env/oracle_token") for t in alfworld.tasks(out)]
+        self.assertEqual(len({p.stat().st_size for p in tokens}), 1)
+        self.assertEqual(len({int(p.stat().st_mtime) for p in tokens}), len(tokens))
+        self.assertEqual(c.content_mtime(b"same"), c.content_mtime(b"same"))
+
     def test_generation_and_structure(self) -> None:
         out = self._build()
         ids = alfworld.tasks(out)
@@ -869,6 +888,18 @@ class AlfworldTest(TaskChecks):
         spec_path = self.tmp / "spec.json"
         spec_path.write_text(json.dumps(spec))
         return self.grader.grade(spec_path, self.tmp / "var/result.json")[0]
+
+    def test_cli_reaches_the_sidecar_with_a_container_proxy_set(self) -> None:
+        # Docker injects HTTP_PROXY into task containers when the executor
+        # routes egress through a proxy; the proxy cannot resolve the
+        # sidecar's service name and answered HTTP 500 to every call.
+        spec = {"task_id": "alfworld-demo", "game_sha256": "ab" * 32, "max_steps": 5}
+        _episode, base = self._serve(spec, "secret")
+        dead = "http://127.0.0.1:9"
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": dead, "http_proxy": dead, "NO_PROXY": "", "no_proxy": ""}):
+            code, out = self._cli(base, "look")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Your task is to: open the door.", out)
 
     def test_agent_play_through_cli_and_verifier(self) -> None:
         spec = {"task_id": "alfworld-demo", "game_sha256": "ab" * 32, "max_steps": 5}
