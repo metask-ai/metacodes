@@ -398,8 +398,14 @@ machines' persistent runners (`AppledeMac-Studio`, `AIPC`), carrying the
 labels below, one job at a time each (`slots: 1`). Nothing isolates one job
 from the next or from the machine, so the only guard is who gets there: the
 plan sends a pull request to them only when GitHub reports its author as an
-organization `MEMBER` or `OWNER`, and fork pull requests from outside
-contributors still wait for approval before any workflow runs. The
+organization `MEMBER` or `OWNER`, or as a `COLLABORATOR`, and fork pull
+requests from outside contributors still wait for approval before any
+workflow runs. `COLLABORATOR` counts because GitHub reports a member whose
+membership is private that way when they have direct access to the
+repository, and this repository has no outside collaborators (checked
+2026-11-19); adding one would send their pull requests to the runners too. A
+private member without direct access shows as `CONTRIBUTOR` and stays on
+hosted runners until they make the membership public. The
 single-use VM pools ([VM_POOLS.md](VM_POOLS.md): security model, hosts and
 operation) replace them later under the same labels and wiring. Below, "pool"
 means whichever runner serves a platform's label.
@@ -437,7 +443,7 @@ each platform, first match wins:
 | Switch off, unreadable or invalid | `hosted` |
 | Release fast path, or a documentation-only change | `hosted` (the gates only check out) |
 | `main`'s warm run (§5) | `both`, so both cache lines stay warm |
-| Not a pull request, or its author is not an organization `MEMBER` or `OWNER` | `hosted` |
+| Not a pull request, or its author is not an organization `MEMBER`, `OWNER` or `COLLABORATOR` | `hosted` |
 | Running plus waiting pool jobs fill the slots | `hosted` |
 | A pool job has waited longer than the pickup timeout | `hosted`: the pool may be down |
 | Otherwise | `self-hosted` |

@@ -125,7 +125,7 @@ class DecideTest(unittest.TestCase):
     def test_only_organization_members_pull_requests_go_self_hosted(self) -> None:
         for event, association, member in (("pull_request", "MEMBER", True),
                                            ("pull_request", "OWNER", True),
-                                           ("pull_request", "COLLABORATOR", False),
+                                           ("pull_request", "COLLABORATOR", True),  # a private member
                                            ("pull_request", "CONTRIBUTOR", False),
                                            ("pull_request", "FIRST_TIME_CONTRIBUTOR", False),
                                            ("pull_request", "NONE", False),
@@ -291,7 +291,7 @@ class CommandTest(unittest.TestCase):
 
     def test_plan_keeps_other_authors_and_events_on_hosted_runners_without_reading_github(self) -> None:
         for env in ({"AUTHOR_ASSOCIATION": "CONTRIBUTOR", "PR_AUTHOR": "stranger"},
-                    {"AUTHOR_ASSOCIATION": "COLLABORATOR"},
+                    {"AUTHOR_ASSOCIATION": "NONE"},
                     {"GITHUB_EVENT_NAME": "merge_group", "AUTHOR_ASSOCIATION": ""}):
             with self.subTest(env=env):
                 api = FakeAPI({})

@@ -58,9 +58,13 @@ RUNNING = {"in_progress"}
 WAITING = {"queued", "pending", "requested"}
 MODES = ("self-hosted", "hosted", "both")
 # A pull request's `author_association` that may use a self-hosted runner:
-# organization members only; outside collaborators and strangers' forks stay
-# on hosted runners.
-MEMBER_ASSOCIATIONS = {"OWNER", "MEMBER"}
+# organization members only. GitHub reports a member whose membership is
+# private as COLLABORATOR when they have direct access to the repository, and
+# this repository has no outside collaborators (doc/CI_DESIGN.md §6), so
+# COLLABORATOR counts as a member. A private member without direct access
+# shows as CONTRIBUTOR and stays on hosted runners until the membership is
+# made public.
+MEMBER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 POLL_SECONDS = 20
 API_ERRORS_BEFORE_FALLBACK = 6
 
