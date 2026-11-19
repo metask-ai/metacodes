@@ -405,12 +405,45 @@ the warm run saves; each restore key is its save key without the run ID, and
 both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
 scheduled or dispatched run.
 
-## 6. The macOS and Windows gates: a VM pool first, hosted legs as the fallback
+## 6. The macOS and Windows gates: a self-hosted runner first, hosted legs as the fallback
 
-Each of the two platforms has a pool of single-use VMs for this repository:
-macOS on the organization's Mac Studio, Windows on AIPC
-([VM_POOLS.md](VM_POOLS.md): security model, hosts and operation). The gates
-try their pool first.
+Each of the two platforms has a self-hosted runner for this repository:
+macOS on the organization's Mac Studio, Windows on AIPC. The gates of an
+organization member's pull request try it first; every other pull request
+stays on hosted runners.
+
+**For now, a runner on the host.** Since 2026-11-19 macOS uses
+`MacStudio-metacodes`, a runner on the Mac Studio's own `ci-host` account (no
+VM: an idle macOS guest took all 32 GB), in the runner group
+`metacodes-public-ephemeral` with the label `metacodes-macos-vm`, one job at
+a time (`slots: 1`). Windows stays switched off until AIPC has a runner.
+Nothing isolates one job from the next or from the host account, so the
+guard is who gets there, in two places:
+
+- **The plan** sends a pull request to the runner only when GitHub reports
+  its author as an organization `MEMBER` or `OWNER`, or as a `COLLABORATOR`;
+  everyone else, and an unknown association, goes `hosted` ("external
+  contributor"). It never decides by fork: most members open pull requests
+  from their own forks.
+- **The runner**, whatever a pull request's own `ci.yml` asks for: a hook
+  before every job lets through only the authors on the host's allowlist,
+  which holds the organization's members, and fails any other job, outside
+  collaborators included whatever their access. That is the boundary, since a
+  pull request runs its own copy of this plan; the plan only keeps external
+  pull requests from turning red there. Outside contributors' fork pull
+  requests also wait for a maintainer's approval before any workflow runs.
+
+`COLLABORATOR` counts because GitHub reports a member whose membership is
+private that way when they have direct access to the repository. The
+repository has no outside collaborators (checked 2026-11-19); the plan would
+send one's pull request to the runner and the hook would fail it, so an
+outside collaborator's gates turn red there until they join the allowlist.
+The same holds for a new member until the allowlist is updated. A private member without
+direct access shows as `CONTRIBUTOR` and stays on hosted runners until they
+make the membership public. The single-use VM pools
+([VM_POOLS.md](VM_POOLS.md)) are kept for AIPC or a later host and would
+serve the same labels and wiring. Below, "pool" means whichever runner
+serves a platform's label.
 
 Hosted macOS is the bottleneck: five jobs at once for the organization, three
 cores and 7 GB each. On 2026-11-17/18 a macOS job waited a median 7.5 minutes
@@ -445,6 +478,7 @@ each platform, first match wins:
 | Switch off, unreadable or invalid | `hosted` |
 | Release fast path, or a documentation-only change | `hosted` (the gates only check out) |
 | `main`'s warm run (§5) | `both`, so both cache lines stay warm |
+| Not a pull request, or its author is not an organization `MEMBER`, `OWNER` or `COLLABORATOR` | `hosted` |
 | Running plus waiting pool jobs fill the slots | `hosted` |
 | A pool job has waited longer than the pickup timeout | `hosted`: the pool may be down |
 | Otherwise | `self-hosted` |
