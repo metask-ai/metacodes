@@ -1057,8 +1057,8 @@ async function renderSettings() {
 // ------------------------------------------------------------ providers
 function probeText(p) {
   if (!p) return h('span', { class: 'na', text: '未探测' });
-  const detail = p.ok ? `${when(p.at)} · ${p.latency_ms} ms` : (p.error || '') + (p.reply !== undefined ? `（回复：${p.reply}）` : '');
-  return h('span', { class: p.ok ? 'probe ok' : 'probe bad', title: `发送 ${p.expected}` + (p.reply !== undefined ? `，回复 ${p.reply}` : '') },
+  const detail = p.ok ? `${when(p.at)} · ${p.latency_ms} ms` : (p.error || '') + (p.reply !== undefined ? `（回复：${JSON.stringify(p.reply)}）` : '');
+  return h('span', { class: p.ok ? 'probe ok' : 'probe bad', title: `发送 ${p.expected}` + (p.reply !== undefined ? `，回复 ${JSON.stringify(p.reply)}` : '') },
     p.ok ? '探测通过' : '探测失败', h('small', { text: ' ' + detail }));
 }
 
@@ -1081,7 +1081,7 @@ async function renderProviders() {
     try {
       const r = await api('/api/providers/probe', { id, model });
       show(r.ok, r.ok ? `探测通过：${id}/${model} 原样返回了 ${r.expected}（${r.latency_ms} ms）` :
-        `探测失败：${id}/${model}，${r.error}${r.reply !== undefined ? `\n发送 ${r.expected}，回复 ${r.reply}` : ''}`);
+        `探测失败：${id}/${model}，${r.error}${r.reply !== undefined ? `\n发送 ${r.expected}，回复 ${JSON.stringify(r.reply)}` : ''}`);
       setTimeout(render, 600);
     } catch (e) { show(false, e.message); button.disabled = false; }
   }
@@ -1142,7 +1142,7 @@ async function renderProviders() {
       key.value = '';
       const p = r.probe;
       show(!p || p.ok, `已导入 ${r.id}：${r.models.length} 个模型（${r.models.map((m) => m.name).join('、')}）` +
-        (p ? (p.ok ? `\n探测通过：${p.model} 原样返回了 ${p.expected}` : `\n探测失败：${p.model}，${p.error}`) : ''));
+        (p ? (p.ok ? `\n探测通过：${p.model} 原样返回了 ${p.expected}` : `\n探测失败：${p.model}，${p.error}${p.reply !== undefined ? `（回复 ${JSON.stringify(p.reply)}）` : ''}`) : ''));
       setTimeout(render, 1200);
     } catch (e) { show(false, e.message); } finally { submit.disabled = false; }
   });

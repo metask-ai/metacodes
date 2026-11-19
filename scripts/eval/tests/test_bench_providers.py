@@ -72,7 +72,7 @@ def fake_provider():
             if model == 'broken':
                 self.reply({'error': {'message': 'model overloaded'}}, 503)
                 return
-            text = {'echo': expected, 'period': expected + '.'}.get(model, 'Sure! ' + expected[::-1])
+            text = {'echo': expected, 'period': expected + '.', 'spaced': expected + ' '}.get(model, 'Sure! ' + expected[::-1])
             if self.path == '/v1/chat/completions':
                 self.reply({'choices': [{'message': {'role': 'assistant', 'content': text}}]})
             elif self.path == '/v1/messages':
@@ -242,6 +242,36 @@ class ProviderStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '--provider-config'):
             self.store.add({'id': 'tokenjoy', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']},
                            reserved={'tokenjoy'})
+
+    def test_a_reply_off_by_whitespace_fails_and_shows_the_whitespace(self):
+        self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['spaced']})
+        result = self.store.probe('gw', 'spaced')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['reply'], result['expected'] + ' ')
+        out = cli.probe_line(result)
+        self.assertIn(repr(result['expected'] + ' '), out)
+
+    def test_a_probe_finished_during_a_same_route_update_is_kept(self):
+        self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']})
+        other = Providers(self.root)
+        real_discover = Providers.discover
+
+        def probing_discover(store, entry):
+            other.probe('gw', 'echo')  # meanwhile, on the page
+            return real_discover(store, entry)
+        with patch.object(Providers, 'discover', probing_discover):
+            updated = self.store.add({'id': 'gw', 'name': 'Renamed', 'base_url': self.url, 'replace': True})
+        self.assertEqual(updated['name'], 'Renamed')
+        self.assertTrue(self.store.find('gw')['probes']['echo']['ok'])
+
+    def test_loopback_addresses_are_recognized(self):
+        for url in ('http://127.0.0.1:8000/v1', 'http://localhost:11434', 'http://[::1]:8000', 'http://0.0.0.0:1',
+                    'http://127.1.2.3', 'http://api.localhost'):
+            with self.subTest(url=url):
+                self.assertTrue(providers.loopback(url))
+        for url in ('https://api.example.com/v1', 'http://10.0.0.2:8000', 'http://192.168.1.5'):
+            with self.subTest(url=url):
+                self.assertFalse(providers.loopback(url))
 
     def test_a_concurrent_update_cannot_restore_a_rotated_key(self):
         self.store.add({'id': 'gw', 'base_url': self.url, 'api_key': KEY, 'models': ['echo']})
@@ -477,6 +507,45 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertEqual(record['items'][1]['status'], 'failed')
         self.assertIn('批次创建后', record['items'][1]['error'])
         self.assertEqual(len(self.manager.runs()), 1)
+
+    def test_a_loopback_import_is_refused_on_an_ssh_executor(self):
+        from scripts.eval.harbor.viewer import executors
+        base = f'http://127.0.0.1:{self.upstream.server_port}'
+        self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg['executors'] = [{'name': 'local', 'kind': 'local'}, {'name': 'gpu', 'kind': 'ssh', 'host': 'gpu.example'}]
+        atomic_json(self.manager.config_path, cfg)
+        with patch.object(executors, 'probe', return_value={}), patch.object(executors, 'reasons', return_value=[]), \
+                patch.object(executors, 'workbench_harbor', return_value='/usr/bin/harbor'):
+            request = {'model': 'local/echo', 'tasks': ['fix-git']}
+            self.assertEqual(self.manager.launch({**request, 'executor': 'local'}, dry_run=True)['executor'], 'local')
+            with self.assertRaisesRegex(ValueError, '回环地址'):
+                self.manager.launch({**request, 'executor': 'gpu'}, dry_run=True)
+            with self.assertRaisesRegex(ValueError, '回环地址'):
+                self.client.request('api/batches', {'model': 'local/echo', 'executor': 'gpu', 'attempts': 1,
+                                                    'concurrency': 1,
+                                                    'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]})
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_a_refused_launch_leaves_no_queued_receipt(self):
+        base = f'http://127.0.0.1:{self.upstream.server_port}'
+        self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
+        request = {'model': 'local/echo', 'tasks': ['fix-git']}
+        pinned = self.manager.launch(request, dry_run=True)['route']
+        real_route = Providers.run_route
+        calls = []
+
+        def edited_between_checks(store, model_id):
+            calls.append(model_id)
+            if len(calls) == 3:  # after validation, before the receipt
+                store.add({'id': 'local', 'base_url': base, 'api_key': 'rotated-key-1111', 'models': ['echo'],
+                           'replace': True})
+            return real_route(store, model_id)
+        with patch.object(Providers, 'run_route', edited_between_checks):
+            with self.assertRaisesRegex(ValueError, '批次创建后'):
+                self.manager.launch(request, pinned=pinned)
+        self.assertEqual(self.manager.runs(), [])
+        self.assertEqual(list(self.manager.records.glob('*')) if self.manager.records.exists() else [], [])
 
     def test_a_pinned_launch_refuses_another_source(self):
         base = f'http://127.0.0.1:{self.upstream.server_port}'

@@ -21,6 +21,7 @@ passes only when the reply is that string.
 from __future__ import annotations
 
 import datetime as dt
+import ipaddress
 import json
 import re
 import secrets
@@ -130,8 +131,14 @@ def call(entry, key, path, body=None, timeout=PROBE_TIMEOUT, opener=None):
 
 
 def redact(text, key):
+    """Error text for display: the key masked, whitespace collapsed."""
     text = (text or "").replace(key, "***") if key else (text or "")
     return " ".join(text.split())[:REPLY_LIMIT]
+
+
+def redact_reply(text, key):
+    """A probe reply as received (whitespace kept: it decides the probe)."""
+    return (text.replace(key, "***") if key else text)[:REPLY_LIMIT]
 
 
 def reply_text(protocol, body):
@@ -166,6 +173,18 @@ def echoed(reply, expected):
 def origin(url):
     parts = urllib.parse.urlsplit(url)
     return parts.scheme, parts.netloc.lower()
+
+
+def loopback(url):
+    """Whether `url` names this machine (a loopback literal or localhost),
+    which another machine would read as itself."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
 
 
 def native_id(provider_id):
@@ -322,6 +341,10 @@ class Providers:
             if current is not None:
                 if not replace:
                     raise ValueError("Provider " + provider_id + " 已存在；要更新请勾选覆盖")
+                if keep:
+                    # A probe that finished during discovery belongs to the
+                    # same route; keep the latest ones, not the snapshot's.
+                    entry["probes"] = {m: p for m, p in (current.get("probes") or {}).items() if m in models}
                 entries[:] = [entry if e["id"] == provider_id else e for e in entries]
             else:
                 if len(entries) >= MAX_PROVIDERS:
@@ -374,7 +397,7 @@ class Providers:
             elif reply is None:
                 result.update(ok=False, error="响应里没有文本回复：" + redact(text, entry["api_key"]))
             else:
-                result.update(ok=echoed(reply, expected), reply=redact(reply, entry["api_key"]))
+                result.update(ok=echoed(reply, expected), reply=redact_reply(reply, entry["api_key"]))
                 if not result["ok"]:
                     result["error"] = "回复与发送的字符串不一致"
         result["latency_ms"] = round((self.clock() - started) * 1000)

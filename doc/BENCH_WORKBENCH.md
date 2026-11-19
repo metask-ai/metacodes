@@ -442,7 +442,10 @@ metacodes bench provider remove --id gw
   pass/fail. Changing the URL, protocol or key clears it. Probing is not
   required to run.
 - **Limits**: imported models run Harbor suites on local and SSH
-  executors. WorkBuddy suites refuse them. A suite with an LLM judge (GAIA2)
+  executors. A loopback Base URL (`127.0.0.0/8`, `::1`, `localhost`) is
+  refused on SSH executors: the workbench probed it on its own machine, but
+  the executor's relay would read it as the executor itself. Import an
+  address both machines reach for the same gateway instead. WorkBuddy suites refuse them. A suite with an LLM judge (GAIA2)
   refuses them under Metask authentication, where the judge would go
   through the run's relay to the imported upstream; under `--auth provider`
   its judge reads the execution host's variables as for `--provider-config`

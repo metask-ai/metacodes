@@ -23,7 +23,7 @@ from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.viewer import data, executors
 from scripts.eval.harbor.viewer.account import Account
-from scripts.eval.harbor.viewer.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, write_config
+from scripts.eval.harbor.viewer.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, loopback, write_config
 
 # The launch API's original fixed dataset, still accepted as `dataset`.
 DATASET = suites.BY_ID[suites.DEFAULT_SUITE].dataset
@@ -357,6 +357,12 @@ class RunManager:
             problem = self.imported_route_problem(self.providers.run_route(model))
             if problem:
                 raise ValueError(problem)
+            # The workbench imported and probed this address; an SSH
+            # executor's relay would read a loopback one as its own machine
+            # and send the requests and the key to whatever listens there.
+            if state["kind"] == "ssh" and loopback(self.providers.find(imported)["base_url"]):
+                raise ValueError(f"导入的 Provider {imported} 的地址是本机回环地址，SSH 执行机器 {state['name']} "
+                                 "会把它当成自己的地址；请改用两台机器都能访问到同一网关的地址重新导入，或选本机执行器")
         elif catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
             problem = route_problem({"auth_mode": "provider", "model": model,
                                      "provider_config": settings(self.config_path).get("provider_config")})
@@ -404,6 +410,18 @@ class RunManager:
                 record["metacodes"] = metacodes
             if batch:
                 record["batch"] = batch
+            route = None
+            if imported:
+                # The run's own config (endpoint, model names, key variable)
+                # and the revision it came from; the worker takes the key
+                # from the private store only while that revision is current.
+                # Resolved before the receipt, so a refusal leaves no run.
+                route = self.providers.run_route(model)
+                if pinned is not None and route["revision"] != pinned.get("revision"):
+                    raise ValueError(f"导入的 Provider {imported} 在批次创建后被修改，本项不再运行；请重新创建批次")
+                problem = self.imported_route_problem(route)
+                if problem:
+                    raise ValueError(problem)
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
             spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": frozen["bundle"] if frozen else cfg.get("bundle"),
@@ -443,16 +461,7 @@ class RunManager:
                         "harbor": executors.workbench_harbor(cfg),
                         "tasks": list(suite.tasks) if suite.tasks is not None else None,
                         "filters": list(tasks)}
-            if imported:
-                # The run's own config (endpoint, model names, key variable)
-                # and the revision it came from; the worker takes the key
-                # from the private store only while that revision is current.
-                route = self.providers.run_route(model)
-                if pinned is not None and route["revision"] != pinned.get("revision"):
-                    raise ValueError(f"导入的 Provider {imported} 在批次创建后被修改，本项不再运行；请重新创建批次")
-                problem = self.imported_route_problem(route)
-                if problem:
-                    raise ValueError(problem)
+            if route:
                 spec.update(provider_config=write_config(self.records / (name + ".provider"), route["config"]),
                             model=route["model"], key_env=PROVIDER_KEY_ENV, imported_provider=imported,
                             imported_revision=route["revision"], providers_root=str(self.providers.root))
