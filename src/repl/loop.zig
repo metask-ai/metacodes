@@ -3215,6 +3215,8 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             app.refreshModelPicker() catch |err| {
                 cmd_output.print("{s}The model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, @errorName(err), th.reset });
             };
+            // A session on this provider sends what was just stored (#566).
+            _ = app.adoptProviderLogin(dialog.chosenProfile().id);
         },
     }
 }
@@ -3296,6 +3298,10 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
     cmd_output.print(" · {s}", .{app.activeModel()});
     if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
     cmd_output.print("\n", .{});
+    // The session this sign-in replaced, revoked at Metask (#560).
+    if (@import("../api/metask_oauth.zig").replacedNote(applied.replaced)) |note| {
+        cmd_output.print("{s}{s}{s}\n", .{ if (note.warn) th.warn else th.dim, note.text, th.reset });
+    }
     if (applied.default_error) |err| {
         cmd_output.print("{s}The stored default model could not be cleared ({s}); the next start may use it{s}\n", .{ th.warn, @errorName(err), th.reset });
     } else {
@@ -3457,6 +3463,8 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     app.refreshModelPicker() catch |err| {
         cmd_output.print("\x1b[33mThe model list did not refresh ({s}); /providers refresh retries\x1b[0m\n", .{@errorName(err)});
     };
+    // A session on this provider sends what was just stored (#566).
+    _ = app.adoptProviderLogin(outcome.provider_id);
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {

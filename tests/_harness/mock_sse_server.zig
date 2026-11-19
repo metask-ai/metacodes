@@ -59,6 +59,14 @@ pub const MockServer = struct {
     status_line: []const u8 = "HTTP/1.1 200 OK",
     /// Raw header lines, each ending in CRLF. Tests use this for Retry-After wiring.
     extra_response_headers: []const u8 = "",
+    /// A non-200 body goes out with `transfer-encoding: chunked`, this many
+    /// bytes to a chunk (the last one shorter), each chunk in its own write.
+    /// 0 = the whole body at once, with `content-length`.
+    status_body_chunk_bytes: usize = 0,
+    /// A non-200 body with `content-length` goes out in two writes this many ms
+    /// apart, split after `status_body_split_at` bytes. 0 = one write.
+    status_body_pause_ms: u32 = 0,
+    status_body_split_at: usize = 0,
     /// 有序、不可变的请求账本。每条仅保留实际读取长度；borrowed accessor slice
     /// 在 stop() 前稳定。写入和读取均由 capture_mutex 建立可见性。
     captured_requests: [MAX_CAPTURED_REQUESTS]?[]u8 =
@@ -166,6 +174,26 @@ pub const MockServer = struct {
             .extra_response_headers = extra_headers,
         };
         self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
+        return self;
+    }
+
+    /// `startRepeatingStatus` whose body goes out chunked, `chunk_bytes` to a
+    /// chunk: a provider or proxy that streams its error answer (#565).
+    pub fn startRepeatingStatusChunked(body: []const u8, status_line: []const u8, chunk_bytes: usize) !*MockServer {
+        if (chunk_bytes == 0) return error.InvalidChunkSize;
+        const self = try startRepeatingStatus(body, status_line, "");
+        self.status_body_chunk_bytes = chunk_bytes;
+        return self;
+    }
+
+    /// `startRepeatingStatus` whose body, still with `content-length`, goes
+    /// out in two writes `pause_ms` apart, split after `split_at` bytes: a body
+    /// that reaches the client in more than one read (#565).
+    pub fn startRepeatingStatusPaused(body: []const u8, status_line: []const u8, split_at: usize, pause_ms: u32) !*MockServer {
+        if (split_at == 0 or split_at >= body.len or pause_ms == 0) return error.InvalidSplit;
+        const self = try startRepeatingStatus(body, status_line, "");
+        self.status_body_split_at = split_at;
+        self.status_body_pause_ms = pause_ms;
         return self;
     }
 
@@ -625,11 +653,21 @@ pub const MockServer = struct {
         // 非 200:发纯 body(application/json,Content-Length),不走 chunked SSE。
         // 让客户端的 HTTP 错误分支(logErrorBody)能读到 body。
         if (std.mem.indexOf(u8, self.status_line, "200") == null) {
+            if (self.status_body_chunk_bytes > 0) {
+                sendStatusChunked(conn, self);
+                return;
+            }
             var hdr_buf: [256]u8 = undefined;
             const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n", .{ self.status_line, self.body.len }) catch return;
             sendAll(conn, hdr);
             sendAll(conn, self.extra_response_headers);
             sendAll(conn, "\r\n");
+            if (self.status_body_pause_ms > 0) {
+                sendAll(conn, self.body[0..self.status_body_split_at]);
+                psync.sleepMs(self.status_body_pause_ms);
+                sendAll(conn, self.body[self.status_body_split_at..]);
+                return;
+            }
             sendAll(conn, self.body);
             return;
         }
@@ -723,6 +761,23 @@ pub const MockServer = struct {
         sendAll(conn, self.extra_response_headers);
         sendAll(conn, "\r\n");
         if (!tryWriteChunk(conn, out.written())) return;
+        sendAll(conn, "0\r\n\r\n");
+    }
+
+    /// A non-200 answer whose body goes out chunked, `status_body_chunk_bytes`
+    /// to a chunk, then the terminating chunk.
+    fn sendStatusChunked(conn: net.Socket, self: *MockServer) void {
+        var hdr_buf: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n", .{self.status_line}) catch return;
+        sendAll(conn, hdr);
+        sendAll(conn, self.extra_response_headers);
+        sendAll(conn, "\r\n");
+        var cursor: usize = 0;
+        while (cursor < self.body.len) {
+            const end = @min(cursor + self.status_body_chunk_bytes, self.body.len);
+            if (!tryWriteChunk(conn, self.body[cursor..end])) return;
+            cursor = end;
+        }
         sendAll(conn, "0\r\n\r\n");
     }
 

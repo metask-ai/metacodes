@@ -12,6 +12,40 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The CLI no longer consults a built-in System-One advisor** (#474). Until
+  now every host built on the CLI (the TUI, `-p`, `--web`, `serve`) fell back
+  to the team's `metask-jev-4b` at `http://58.211.6.133:10420` whenever
+  `config.json` and `METACODES_JEV_*` named no service, so a session whose
+  TinyKG store held a matching memory sent the first 400 bytes of the request
+  and up to eight 480-byte memory excerpts over plain HTTP to a public IP
+  address nobody had been asked about. The advisor is now on only where a
+  service is named, by the `jev` object of `<state root>/config.json` or by
+  `METACODES_JEV_URL`; with neither, `metacodes doctor` reports
+  `jev_advisor off url=- source=none`. `"jev": false` and
+  `METACODES_JEV_URL=off` still mean off, and a service named in either place
+  behaves as before. **This changes behavior for anyone who relied on the
+  default** (it replaces the 0.3.0 default below): a machine that wants the
+  team's service names it once, in `<state root>/config.json`
+
+  ```json
+  "jev": {"url": "http://58.211.6.133:10420", "mode": "advisory",
+          "model": "metask-jev-4b", "decisions": ["scoped_recall"]}
+  ```
+
+  or in the environment with `METACODES_JEV_URL`, `METACODES_JEV_MODE=advisory`,
+  `METACODES_JEV_MODEL=metask-jev-4b` and
+  `METACODES_JEV_DECISIONS=scoped_recall` (these four are what the default
+  carried; a `url` alone starts from `shadow` and every surface). That address
+  is still plain HTTP; serving it over https on a hostname, and asking once on
+  first run, are tracked in #474. A library host that sets
+  `Config.jev_builtin_default` still gets the built-in service, and the CLI's
+  choice is one constant that the session and `doctor` both read
+  (`jev.CLI_USES_BUILTIN_DEFAULT`). `zig build test:builtin-egress`, part of
+  `gate:pr`, now fails when a built-in destination that is on by default is a
+  non-loopback `http://` URL, and the memory-agent runtime smoke runs its
+  System-One arm in the build: an evaluation arm that uses the advisor reaches
+  it through the service its own environment names.
+
 - **Every request names metacodes as its User-Agent.** Provider, sign-in,
   key-check, catalog, MCP and service requests used to go out as std's
   `zig/0.16.0 (std.http)`; they now say `metacodes/<version>`
@@ -30,7 +64,8 @@ status, compatibility boundaries, and entry points are defined by
 
 - **`metacodes login status` says which credential a plain start uses, and
   why** (#537). It names what a start with no flag would use,
-  the step of the startup order that decides (flags and the shell, the
+  the step of the startup order that decides (flags and the shell, a
+  preset named at start or remembered for the directory (#489), the
   default stored with `/model`, a Metask sign-in, `<state root>/.env`,
   nothing), and what each step holds: the session's path, gateway and
   expiry, `auth.json`'s model and level, where `METASK_API_KEY` is set, the
@@ -47,12 +82,27 @@ status, compatibility boundaries, and entry points are defined by
   route, Enter on a route takes that one. The reasoning level is a line under
   the list, changed with ←/→ from any row, and kept as the level wanted: each
   model shows and commits the nearest one it takes. The three scopes are named
-  in the header. Providers without a key are one "Not configured" line at the
-  bottom; Enter lists them. Closing the picker without a choice prints
-  `kept <model>`. On the Metask session, `/model` lists only the models the
-  gateway serves on `/v1/messages`, with the reasoning levels it names
-  (`capabilities.reasoning.efforts`); before, it listed the gateway's image
-  and video models too, and offered no level.
+  in the header. Providers without a key are not listed, and a filter does
+  not find their models; when none is listed, the picker says so and points
+  to `/login` and to this install's `.env`, by its path. Closing the picker
+  without a choice prints `kept <model>`. On the Metask session, `/model`
+  lists only the models the gateway serves on `/v1/messages`, with the
+  reasoning levels it names (`capabilities.reasoning.efforts`); before, it
+  listed the gateway's image and video models too, and offered no level.
+- **`/model` starts a DeepSeek model at `high`, and keeps a level the
+  session already runs with** (follow-up to #539). DeepSeek's
+  `reasoning_effort` control declares `high`, the level its API uses when a
+  request names none ("Thinking mode is enabled by default, with the default
+  effort being `high`", api-docs.deepseek.com/guides/thinking_mode). With no
+  level set, a DeepSeek model in `/model` shows `[high]` where it showed
+  `[default]`, and a pick sends it by name: the request that carried
+  `"thinking":{"type":"enabled"}` alone now also carries
+  `"reasoning_effort":"high"` (on the Anthropic wire,
+  `"output_config":{"effort":"high"}` and the same `thinking`). A route bound
+  without the picker (`--provider`, `.env`, `/model use`) still names no
+  level. When `/model` opens, the level the session runs with starts
+  selected even when it is `none` or `minimal` (before, only a level that
+  thinks did), so DeepSeek's default does not replace thinking turned off.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
@@ -200,10 +250,10 @@ status, compatibility boundaries, and entry points are defined by
   list: one refused for another reason (two names of its key that
   disagree, say) stays listed, and a pick says why. A provider with no such
   credential is no longer a row that leads to a sign-in or a key field: it
-  is listed dimmed under
-  "Not configured", below the others, and choosing it shows the variable to
-  set, this install's `.env` and `doc/LOCAL_CONFIG.md` (for Metask, `/login`
-  first), and starts nothing. The in-picker sign-in and key-paste stage of
+  is not listed. A pick whose credential went away after the picker listed
+  it shows the variable to set, this install's `.env` and
+  `doc/LOCAL_CONFIG.md` (for Metask, `/login` first), and starts nothing.
+  The in-picker sign-in and key-paste stage of
   #67 are gone; `/login <provider>` pastes a key or signs in, as before. A
   pick that moves the session to another provider says on a second line who
   bills it from then on (`from now on billed to your DeepSeek account`).
@@ -313,6 +363,27 @@ status, compatibility boundaries, and entry points are defined by
   filter). Teamwork seats on Linux get the sandbox too, so an implementer seat
   can build and test in its workspace instead of running read-only commands
   only.
+
+- **Named presets, and a preset a directory remembers** (part of #489).
+  `config.json` keeps named setups under `presets`, each in the shape
+  `global_selection` has (an `auto_route` selector or a `pinned_offer`, with
+  `controls` such as `reasoning_effort`), and `directory_presets` maps a
+  directory (its git worktree root, else the directory itself) to a preset by
+  name, so editing a preset changes every directory that uses it. A start
+  takes `--preset <name>` or `METACODES_PRESET` (from the shell, or from
+  `<state root>/.env`) and applies the preset as the flags naming the same
+  route would; `--model`, `--channel` and `--reasoning-effort` replace one
+  field for that run without editing it, and `--provider`/`--offer` set it
+  aside. The startup order gains two levels and has seven: flags, a preset
+  named at start, the directory's preset, the `/model` default, a Metask
+  sign-in, `.env` (its `METACODES_PRESET` before its `METACODES_PROVIDER`),
+  nothing; `metacodes login status` shows them. A preset `config.json` does
+  not define stops `-p`, `serve` and `--web` with exit code 2, listing the
+  presets; the TUI says so under its banner and starts without it. Nothing is
+  written into a project. Malformed entries fail to load with
+  `InvalidPreset`, `InvalidPresetName` or `InvalidDirectoryPreset`; saving a
+  preset or a directory's choice from `/model` comes with the TUI part of
+  #489, until then they are written by hand ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
 
 - **A `SessionHost` Session can move onto another provider route, journaled
   as `config_changed{route}`** (issue #16, part of #445). The CLI's `/model`
@@ -485,6 +556,28 @@ status, compatibility boundaries, and entry points are defined by
   --provider <id>` and no longer offers `--api-key`, and a refused sign-in
   is told to sign in again rather than to check a key.
 
+- **An MCP HTTP request on a kept-alive connection the server closed is sent
+  again on macOS too** (#555). A request other than `tools/call` that found
+  its pooled connection closed is sent once more on a new one; on macOS, when
+  the client read only after the server's reset arrived (a loaded machine),
+  the read reported `ConnectionResetByPeer` instead of the end of stream and
+  the request failed as `McpOutcomeIndeterminate`. A reset before any
+  response byte now counts as that close. A `tools/call` whose body went out
+  is still never sent twice.
+- **A provider's error answer is shown as it was sent, whatever pieces it
+  arrived in** (#565). A non-2xx body that reached metacodes in more than one
+  read (the chunks of a `Transfer-Encoding: chunked` body, or a
+  `Content-Length` body whose bytes came in apart) came out scrambled in the
+  TUI's `HTTP <status>: …` line, the `body=` log line and the failure detail:
+  each later piece landed on the start of what had been read, so the first
+  piece was lost and the end repeated. OpenRouter's 402 for an account without
+  credits was one, and with it went the provider's explanation; an upstream
+  error code or the numbers of a context-limit message could go the same way,
+  since the failure detail and the overflow check read that text. All four
+  provider clients (Anthropic Messages, OpenAI-compatible, Gemini, Bedrock)
+  now read the body through one function, `client.readErrorBody`, which gives
+  the HTTP reader a buffer of its own; how much of a body is kept (2 KiB on
+  Messages, 4 KiB on the others) is unchanged.
 - **Shift+Enter inserts a newline while a reply streams** (#456). In the
   terminal UI, Shift+Enter during a reply did what Enter does: the draft
   went into the pending queue, the input box was cleared, and when the reply
@@ -495,8 +588,8 @@ status, compatibility boundaries, and entry points are defined by
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these
   providers have neither a sign-in nor a key page the picker could open.
-  Such a provider is now listed under "Not configured" (#488), and a pick
-  whose key went away after the picker opened shows the same setup: the
+  Such a provider is no longer listed (#488), and a pick whose key went
+  away after the picker opened shows where it goes: the
   variable to set (the canonical one, e.g. `MOONSHOT_API_KEY`), this
   install's `<state root>/.env` and the guide (`doc/LOCAL_CONFIG.md`); the
   previous route stays active. A picker notice longer than the terminal is
@@ -607,9 +700,49 @@ status, compatibility boundaries, and entry points are defined by
   and still spawns `/bin/sleep` by that name; the second hashes an
   executable it writes into a temporary directory. Product code is
   unchanged.
+- **Signing in to Metask again revokes the sign-in it replaces** (#560).
+  `/login`, `/login metask`, `metacodes login` and `metacodes login
+  --provider metask` overwrote `oauth/metask.json` and left the session they
+  replaced valid at Metask, where nothing on this machine could end it any
+  more: `/logout` revokes only the session stored now. Once the new session
+  is stored (and, in the TUI, bound), the replaced one is revoked at
+  `$METASK_SITE_URL/api/oauth/revoke`, bounded as sign-out (3 s in the TUI,
+  5 s on the command line). A refusal or no answer never fails the sign-in;
+  one line says the previous sign-in stays valid there until it expires. A
+  sign-in that fails, cannot bind or is cancelled revokes nothing; the same
+  session imported again is not revoked, and a replaced session whose
+  gateway is not the site's origin is not sent there.
+- **`/login <provider>` takes effect in a session already on that provider**
+  (#566). A route takes its credential when it is chosen, so a key `/login`
+  stored afterwards (say, to replace one the provider stopped accepting) was
+  never sent: every request still carried the previous key, and failed the
+  same way, until `/model` chose the route again. Once `/login <provider>`
+  stores a key or a sign-in, a session running on that provider is bound
+  again, on the same model, channel and scope, and its next request carries
+  what was stored. After a sign-in (OAuth) the process also drops the tokens
+  it held from the login replaced: it kept presenting them, even after a
+  `/model` pick, and a refresh of them was written over the new login. A
+  session on another provider, or on no route, is left as it is.
 
 ### Security
 
+- **On `serve` and `--web`, an answer from before a restart no longer
+  answers a newer request** (#563). Both numbered UI requests from 1 in every
+  process, and again for every session they restored, and `POST /respond`
+  and the UDS `respond` op matched an answer by that number alone. So an
+  answer delivered a second time after a restart was applied to whichever
+  request held the same number then. That happened with a webhook that
+  retries, a client that reconnects, or an old card clicked again. One
+  Write's approval approved another Write, and the journal recorded the
+  original approver for it. Request ids now come from one counter per
+  process that stays above the wall clock in milliseconds, so they are never
+  reused, across restarts or for a session destroyed and restored. Such an
+  answer is refused as stale: 409, or the UDS `no pending request with this
+  id`. Ids are larger integers now, about 1.8×10¹² and below 2⁵³; a frontend
+  copies them back as before. `tests/component/serve_sessions_test.zig`
+  restarts the daemon between one granted Write and the next, then delivers
+  the first approval again; `src/web/backend.zig` checks the same across two
+  `WebBackend`s.
 - **An MCP tool asks before it runs on the CLI hosts, as on AgentCore**
   (#473). The TUI, `-p`, `--web` and `serve` permissioned a tool an MCP
   server contributes as a read, so `default`, `acceptEdits` and `auto` ran it

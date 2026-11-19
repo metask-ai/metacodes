@@ -623,12 +623,14 @@ fn renderStored(
 
 /// What one persisted login file holds. The client id is owned separately from
 /// the token set because it is configuration, not a secret.
-const StoredLogin = struct {
+pub const StoredLogin = struct {
     tokens: TokenSet,
     client_id: ?[]u8,
 };
 
-fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!StoredLogin {
+/// A persisted login file's bytes (what `load` reads, or a `StoredSnapshot`
+/// holds), owned by `allocator`.
+pub fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!StoredLogin {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch

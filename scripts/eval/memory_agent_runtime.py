@@ -1236,9 +1236,11 @@ class _ScriptedPlanner:
         return _text_sse("runtime-smoke", request_id)
 
 
-# The CLI falls back to a built-in System-One service when nothing configures
-# one, so an arm without the variables is not an arm without the advisor.
-# Every child starts from this; System-One arms replace it with their judge.
+# The CLI takes no built-in System-One service (#474): an arm that uses the
+# advisor reaches it only through the service its own environment names, and
+# one that does not has none. Every child still starts from `off`, so a service
+# a state root or a later default names cannot join an unadvised arm; System-One
+# arms replace it with their judge.
 SYSTEM_ONE_OFF_ENVIRONMENT: Mapping[str, str] = {"METACODES_JEV_URL": "off"}
 
 

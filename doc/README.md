@@ -85,6 +85,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 
 ## Benchmarks and evaluation
 
+- [Bench workbench](BENCH_WORKBENCH.md) — `metacodes bench`: launch the
+  browser workbench, run selected Harbor tasks, and inspect results.
 - [Benchmarks](BENCHMARKS.md) — performance gates, internal paired evidence,
   and the external WorkBuddy-Bench mainline with current ladder status.
 - [Plugin evaluation](PLUGIN_EVALUATION.md) — plugin kernel v1 evidence record.

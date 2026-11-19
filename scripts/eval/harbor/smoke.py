@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from scripts.eval.harbor import command as cmd
 from scripts.eval.harbor import smoke_provider as sp
+from scripts.eval.harbor.profiling import TimingRelay
 
 REPO = Path(__file__).resolve().parents[3]
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "smoke-task"
@@ -48,23 +49,32 @@ def harbor_command(
     config: Path,
     jobs_dir: Path,
     job_name: str,
+    metrics_proxy: Optional[str] = None,
+    metrics_ca: Optional[str] = None,
+    metask_route: bool = False,
 ) -> List[str]:
-    return [
+    argv = [
         harbor,
         "run",
         "--path", str(FIXTURE),
         "--agent", AGENT_IMPORT_PATH,
-        "--model", f"{sp.SMOKE_PROVIDER}/{sp.SMOKE_MODEL}",
+        "--model", f"{'metask' if metask_route else sp.SMOKE_PROVIDER}/{sp.SMOKE_MODEL}",
         "--ak", f"bundle={bundle}",
         "--ak", f"config={config}",
-        "--ae", f"{sp.SMOKE_KEY_ENV}={sp.SMOKE_CREDENTIAL}",
+        "--ae", f"{'METASK_API_KEY' if metask_route else sp.SMOKE_KEY_ENV}={sp.SMOKE_CREDENTIAL}",
         "--jobs-dir", str(jobs_dir),
         "--job-name", job_name,
         "--n-concurrent", "1",
         "--n-attempts", "1",
+        "--max-retries", "0",
         "--yes",
         "--quiet",
     ]
+    if metrics_proxy:
+        argv += ["--ak", "metrics_proxy=" + metrics_proxy]
+    if metrics_ca:
+        argv += ["--ak", "metrics_ca=" + metrics_ca]
+    return argv
 
 
 def _trial_dirs(job_dir: Path) -> List[Path]:
@@ -124,19 +134,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--harbor", default=shutil.which("harbor") or "harbor")
     parser.add_argument("--bind", default=DEFAULT_BIND, help="address the scripted endpoint listens on")
     parser.add_argument("--jobs-dir", type=Path, help="keep the job here (default: a temp dir)")
+    parser.add_argument("--profile", action="store_true", help="verify request-level timing capture")
+    parser.add_argument("--metask-route", action="store_true", help="test the built-in Metask route against the local mock (implies --profile)")
     args = parser.parse_args(argv)
+    if args.metask_route:
+        args.profile = True
+        sp.SMOKE_MODEL = "glm-5.3-flash"
 
     cmd.check_bundle(args.bundle)
-    server = sp.SmokeServer(args.bind, 0)
+    server = sp.SmokeServer(args.bind, 0, bearer=args.metask_route)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
     thread.start()
     scratch = Path(tempfile.mkdtemp(prefix="metacodes-harbor-smoke-"))
     problems: List[str] = ["the smoke did not finish"]
+    relay = None
     try:
         config = scratch / "config.json"
         sp.write_config(config, f"http://host.docker.internal:{server.server_port}")
         jobs_dir = (args.jobs_dir or scratch / "jobs").resolve()
         job_name = time.strftime("metacodes-smoke-%Y%m%d-%H%M%S")
+        if args.profile:
+            relay = TimingRelay(f"http://{args.bind}:{server.server_port}", sp.SMOKE_CREDENTIAL,
+                                jobs_dir / job_name / ".bench-metrics", bind=args.bind,
+                                auth_header="Authorization" if args.metask_route else "x-api-key",
+                                auth_prefix="Bearer " if args.metask_route else "", tls=True)
+            relay.__enter__()
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(
             [str(REPO)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
@@ -147,6 +169,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             config=config,
             jobs_dir=jobs_dir,
             job_name=job_name,
+            metrics_proxy=relay.url if relay else None,
+            metrics_ca=str(relay.ca_path) if relay else None,
+            metask_route=args.metask_route,
         )
         completed = subprocess.run(argv_run, cwd=REPO, env=env)
         problems = []
@@ -161,6 +186,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             problems.append(f"the scripted endpoint refused requests: {server.errors}")
         if len(server.requests) != 2:
             problems.append(f"the scripted endpoint saw {len(server.requests)} requests, expected 2")
+        if relay:
+            measurements = [json.loads(line) for path in (jobs_dir / job_name / ".bench-metrics").glob("*.jsonl") for line in path.read_text().splitlines()]
+            if len(measurements) != 2 or not all(m.get("complete") and m.get("ttft_ms") is not None and m.get("output_tokens", 0) > 0 for m in measurements):
+                problems.append("expected two complete measured model requests with TTFT and usage")
         receipt = {
             "schema_version": "metacodes-harbor-smoke-v1",
             "passed": not problems,
@@ -175,6 +204,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(receipt, indent=2))
         return 0 if not problems else 1
     finally:
+        if relay:
+            relay.__exit__(None, None, None)
         server.shutdown()
         server.server_close()
         (scratch / "config.json").unlink(missing_ok=True)

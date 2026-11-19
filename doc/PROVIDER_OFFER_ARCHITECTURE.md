@@ -443,6 +443,15 @@ share a key:
 | `session` | `<session_dir>/runtime-selection.json` → `session_selection` | `App.restoreSessionSelection` on `/resume` |
 | `once` | nowhere | expires with the turn |
 
+Named selections are kept beside them (#489): `presets` maps a name to a
+selection in the `global_selection` shape, and `directory_presets` maps an
+absolute directory to a preset name, never to a route. A start applies at most
+one, chosen by `src/app/startup_order.zig` (`--preset`/`METACODES_PRESET`, then
+the working directory's), by lowering it into the fields the flags naming the
+same route would set (`src/app/presets.zig`); nothing is persisted by using
+one. A preset written by hand is written back as it was by every other commit
+(`config_doc.Preset.raw`).
+
 Session scope is narrower, so on resume it wins: a resumed session continues on
 the route it was using, not on whatever became global in the meantime. A stored
 selection that no longer resolves is reported — as a startup error for global,
@@ -678,8 +687,8 @@ list shows twelve providers; the pane neither scrolls nor filters, so the
 ones past them are named under the list by id (`N more not shown: /login
 <provider> (…)`), and `/login <id>` starts any of them directly. Both
 mask the key as a character count and draw the page URL whole so it can be
-copied. The picker takes no key (#488): it lists such a provider as not
-configured until a key resolves for it, and says where one goes.
+copied. The picker takes no key (#488): it does not list such a provider
+until a key resolves for it.
 
 ## Controls
 
@@ -692,6 +701,14 @@ Changing model, protocol, region, plan, or offer revalidates every control.
 Unsupported values are cleared or normalized according to the declared policy
 (`reject`/`clamp`/`map`), never carried over. Identity and controls commit
 atomically; a rejected combination leaves the old runtime active.
+
+A control may declare its provider's default (`ControlSpec.default_value`):
+the value the provider uses when a request names none. DeepSeek's
+`reasoning_effort` declares `high`, as its API documents. The kernel
+substitutes a declared default only under the `map` policy; the picker shows
+it as the value a route starts at when the session wants no level, commits it
+by name, and draws no separate `default` for that control. A level the
+session runs with, `none` included, is still the one wanted.
 
 Control values are bounded and copyable (8 controls, 48-byte ids, 192-byte
 values) because a selection is persisted, snapshotted per turn, and compared
@@ -735,7 +752,8 @@ store, and health plane land — see the deferred list.
 ## Persistence
 
 `~/.metacodes/config.json` gains `schema_version`, `config_revision`,
-`providers`, `aliases`, `global_selection`, and `last_operation_id`. The
+`providers`, `aliases`, `global_selection`, `presets`, `directory_presets`, and
+`last_operation_id`. The
 document is a provider *map*: several providers, accounts, regions, and relays
 coexist, and disabling one preserves its configuration and credential reference.
 
@@ -774,6 +792,10 @@ metacodes --provider zai-coding-plan --channel cn-anthropic --model glm-5.3
   model-name inference to registry route resolution.
 - `--channel <id>` narrows to one endpoint/region/plan binding.
 - `--offer <offer-id>` pins one exact reproducible route.
+- `--preset <name>` (or `METACODES_PRESET`) applies a named selection from
+  `config.json` `presets`; `--model`, `--channel` and `--reasoning-effort`
+  replace one of its fields for that run, `--provider` and `--offer` set it
+  aside ([LOCAL_CONFIG.md](LOCAL_CONFIG.md#presets)).
 - `--base-url <url>` is validated against the profile and route policy first.
   Without `--channel` it belongs to one channel: the default channel when all
   its routes accept the URL, otherwise the first channel whose routes do. A URL
@@ -957,7 +979,6 @@ One screen, models first:
      glm-5.3                          200K   2 routes
   DeepSeek · key from .env · billed to your DeepSeek account
      DeepSeek V4 Pro                    1M   2 routes
-  Not configured · openai, gemini
   Reasoning effort   default  low  medium  [high]  max          ←/→
 ```
 
@@ -972,9 +993,13 @@ API"), while the cursor is on it: Enter on the model takes its preferred route
 (the one in use, else the first), Enter on a route takes that one. The
 reasoning effort the focused route declares is a line under the list, changed
 with ←/→ from any row; the level wanted is remembered, and each model shows and
-commits the nearest one its vocabulary has. Providers no commit could bind now
-are one "Not configured" line at the bottom; Enter lists them, and Enter on one
-shows where its credential goes.
+commits the nearest one its vocabulary has. The level the session runs with,
+`none` and `minimal` included, is the one wanted when the picker opens; with
+nothing wanted, a route whose control declares its provider's default
+(DeepSeek: `high`) starts at that value. A provider no commit could bind now
+is not listed, and a filter does not find its models; when no provider is
+listed, the list says so and points to `/login` and to this install's `.env`,
+by its path.
 
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
@@ -1060,16 +1085,16 @@ session's own key or the `auth.json` sign-in, `--api-key`, the environment and
 the `.env` layer below it) through `runtime_binding.bindOffer`, with one
 difference — a stored OAuth login stands for the token a commit would refresh
 first, so judging sends no request. The picker hides the offers that would
-not bind (`Picker.setReadiness`), and lists a provider none of whose offers
-would as a dimmed row under "Not configured", below the others. Choosing it
-enters `Stage.setup`, which shows the provider's `model_picker.Setup` — the
-variable its key is read from, `/login` for Metask — with this install's
-`.env` and `doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. A
-commit that still fails with `MissingCredentials` (the credential went away
-after the picker opened) shows the same setup. The picker never signs in or
-takes a key: the credential stage #67 put in it is gone, and `/login <id>` is
-where both happen. A commit that moves the session to another provider says,
-on a second line of its confirmation, who bills the session from then on.
+not bind (`Picker.setReadiness`), so a provider none of whose offers would is
+not listed at all. A commit that still fails with `MissingCredentials` (the
+credential went away after the picker opened) enters `Stage.setup`, which
+shows the provider's `model_picker.Setup` — the variable its key is read
+from, `/login` for Metask — with this install's `.env` and
+`doc/LOCAL_CONFIG.md`, and takes no other key than Esc and `q`. The picker
+never signs in or takes a key: the credential stage #67 put in it is gone,
+and `/login <id>` is where both happen. A commit that moves the session to
+another provider says, on a second line of its confirmation, who bills the
+session from then on.
 
 ## Module map
 

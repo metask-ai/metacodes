@@ -13,8 +13,9 @@
 //!   provider reads its key from (every registered profile's environment
 //!   aliases, built-in and `custom_providers`), the variables `config.json`
 //!   declares (`providers.<id>.credentials[].env`,
-//!   `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER` and
-//!   `METACODES_MODEL`. A name that moves a request (`METACODES_BASE_URL`,
+//!   `provider_catalogs.<id>.credential_env`), `METACODES_PROVIDER`,
+//!   `METACODES_MODEL` and `METACODES_PRESET` (a preset of config.json, #489).
+//!   A name that moves a request (`METACODES_BASE_URL`,
 //!   `METASK_GATEWAY_URL`, `METASK_SITE_URL`, `METACODES_KEY_CHECK_URL`,
 //!   `METACODES_KG_URL`, any `*_URL`) is refused even when an alias names it:
 //!   a custom endpoint belongs in `custom_providers`, where the endpoint
@@ -25,10 +26,12 @@
 //!   process environment (`credential.ResolveInput.env_fallback`, and
 //!   `METASK_API_KEY` through `auth.resolveRuntimeCredential`). A name the
 //!   process environment sets wins.
-//! - **The file's choice of provider ranks last.** `METACODES_PROVIDER` and
-//!   `METACODES_MODEL` here apply only when no flag or environment variable
-//!   names a provider, no `/model` default is stored, and no Metask sign-in
-//!   exists (`src/main.zig`). Without `METACODES_PROVIDER`, a file holding one
+//! - **The file's choice of provider ranks last.** `METACODES_PRESET`,
+//!   `METACODES_PROVIDER` and `METACODES_MODEL` here apply only when no flag
+//!   or environment variable names a provider or a preset, the working
+//!   directory remembers no preset, no `/model` default is stored, and no
+//!   Metask sign-in exists (`src/app/startup_order.zig`). The file's preset
+//!   comes before its provider. Without either, a file holding one
 //!   provider's key uses that provider (`Loaded.choice`); keys that merely
 //!   exist in the shell environment never select one.
 //! - **Host-only.** `src/main.zig` loads it once at startup and hands the
@@ -67,6 +70,9 @@ pub const file_name = ".env";
 pub const example_file_name = ".env.example";
 pub const provider_variable = "METACODES_PROVIDER";
 pub const model_variable = "METACODES_MODEL";
+/// A preset of config.json by name (#489); in the file it comes before the
+/// file's `METACODES_PROVIDER` (`src/app/startup_order.zig`, level 6).
+pub const preset_variable = "METACODES_PRESET";
 /// The how-to page every hint about the file links.
 pub const guide_url = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md";
 /// A configuration file of a few dozen lines; anything near this is not one.
@@ -235,7 +241,7 @@ pub fn isRequestAddress(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, "_URL");
 }
 
-/// The names the file may set besides the two selection variables.
+/// The names the file may set besides the selection variables.
 pub const Allowlist = struct {
     /// Names a provider profile reads its key from (its environment
     /// aliases), each with that provider's id: a key here can select that
@@ -251,7 +257,7 @@ pub const Allowlist = struct {
 
     pub fn accepts(self: Allowlist, name: []const u8) bool {
         if (isRequestAddress(name)) return false;
-        if (std.mem.eql(u8, name, provider_variable) or std.mem.eql(u8, name, model_variable)) return true;
+        if (std.mem.eql(u8, name, provider_variable) or std.mem.eql(u8, name, model_variable) or std.mem.eql(u8, name, preset_variable)) return true;
         for (self.keys) |key| if (std.mem.eql(u8, key.name, name)) return true;
         for (self.others) |other| if (std.mem.eql(u8, other, name)) return true;
         return false;
@@ -630,12 +636,12 @@ const example_header =
     \\# this template and never touch `.env`.
     \\#
     \\# One NAME=value per line; `#` starts a comment. Only the names below, the
-    \\# variables config.json declares and METACODES_PROVIDER / METACODES_MODEL
-    \\# are read; any other name is ignored with a warning. Request addresses
-    \\# (METACODES_BASE_URL and every other *_URL) are never read from here: a
-    \\# custom endpoint goes in config.json `custom_providers`. The shell
-    \\# environment wins over this file, and a Metask sign-in or a default
-    \\# chosen in /model comes before the provider it names.
+    \\# variables config.json declares and METACODES_PROVIDER, METACODES_MODEL
+    \\# and METACODES_PRESET are read; any other name is ignored with a warning.
+    \\# Request addresses (METACODES_BASE_URL and every other *_URL) are never
+    \\# read from here: a custom endpoint goes in config.json `custom_providers`.
+    \\# The shell environment wins over this file, and a Metask sign-in or a
+    \\# default chosen in /model comes before the provider or preset it names.
     \\#
     \\# Guide: https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md
     \\
@@ -643,6 +649,9 @@ const example_header =
     \\# file that holds one provider's key uses that provider.
     \\# METACODES_PROVIDER=deepseek
     \\# METACODES_MODEL=deepseek-v4-pro
+    \\
+    \\# Or one of the presets in config.json `presets`, which comes first.
+    \\# METACODES_PRESET=kimi
     \\
     \\# One key per provider:
     \\
@@ -777,7 +786,7 @@ test "request addresses are refused whatever names them" {
     try testing.expect(!allowlist.accepts("RELAY_URL"));
     try testing.expect(allowlist.accepts(provider_variable));
     try testing.expect(allowlist.accepts(model_variable));
-    try testing.expect(!allowlist.accepts("METACODES_PRESET"));
+    try testing.expect(allowlist.accepts(preset_variable));
 }
 
 const TestRoot = struct {
@@ -827,13 +836,14 @@ test "load: accepted names, ignored names without their values, and the choice" 
     try testing.expectEqualStrings("cat", loaded.get("CATALOG_TOKEN").?);
     try testing.expect(loaded.get("METACODES_BASE_URL") == null);
     try testing.expect(loaded.get("FOO") == null);
-    try testing.expectEqual(@as(usize, 4), loaded.ignored.len);
+    // A preset of config.json by name is read (#489).
+    try testing.expectEqualStrings("fast", loaded.get(preset_variable).?);
+    try testing.expectEqual(@as(usize, 3), loaded.ignored.len);
     try testing.expectEqualStrings("METACODES_BASE_URL", loaded.ignored[0].name);
     try testing.expectEqual(Ignored.Reason.request_address, loaded.ignored[0].reason);
     try testing.expectEqual(Ignored.Reason.request_address, loaded.ignored[1].reason);
     try testing.expectEqualStrings("FOO", loaded.ignored[2].name);
     try testing.expectEqual(Ignored.Reason.unknown, loaded.ignored[2].reason);
-    try testing.expectEqualStrings("METACODES_PRESET", loaded.ignored[3].name);
     try testing.expectEqualSlices(u32, &.{7}, loaded.malformed);
 
     const summary = (try loaded.ignoredSummary(testing.allocator)).?;
