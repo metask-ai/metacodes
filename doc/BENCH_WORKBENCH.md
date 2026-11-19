@@ -100,7 +100,11 @@ Each launch runs one of three metacodes sources, chosen in the page's
 **Git revisions.** The worker keeps a mirror of the source repository in
 `git/source.git`, fetches it, and resolves the ref to a commit, so a branch
 always means its current head. A full commit id that is already built is used
-without contacting the repository. When a branch and a tag share a name but
+without contacting the repository only when the configured `source_repo`
+verified it under the current trust rule; after switching repositories, or
+for a record without that proof, the commit is checked against the current
+repository first. Fetching, toolchain installs, builds and publishing hold a
+lock on the cache, so workbench services sharing one state root take turns. When a branch and a tag share a name but
 point to different commits, the run fails and asks for `refs/heads/<name>` or
 `refs/tags/<name>`. Because the built binary runs with the execution
 machine's model credential, only commits on one of the source repository's

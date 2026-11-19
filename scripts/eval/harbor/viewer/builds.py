@@ -17,6 +17,7 @@ compiler another revision is built with.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -30,6 +31,11 @@ import time
 import uuid
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows: Bench executes trials on POSIX hosts only.
+    fcntl = None
+
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.viewer import releases
 
@@ -38,6 +44,9 @@ DEFAULT_REPO = "https://github.com/metask-ai/metacodes.git"
 # reading as an option or a revision range.
 REF = re.compile(r"^(?!.*\.\.)(?!.*@\{)[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+# Bump when the rule deciding which commits may run with credentials changes:
+# cached units checked under an older rule are re-verified before reuse.
+TRUST_POLICY = 1
 ZIG_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 LEAN_TOOLCHAIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:+-]{0,99}$")
 
@@ -66,7 +75,9 @@ set -euo pipefail
 root=${TOOLCHAINS:-/toolchains}
 arch=$(uname -m)
 mkdir -p "$root/zig" "$root/lean"
-# One build runs at a time, so any staging directory is an interrupted one.
+# The host serializes installs on this cache; flock also guards a direct run.
+if command -v flock >/dev/null 2>&1; then exec 9>"$root/.install-lock" && flock 9; fi
+# Installs are serialized, so any staging directory is an interrupted one.
 rm -rf "$root"/.staging-*
 tmp=$(mktemp -d "$root/.staging-XXXXXX")
 zig_dir=$root/zig/$ZIG_VERSION
@@ -164,7 +175,39 @@ def build_info(path):
         return None
     if not isinstance(info, dict):
         return None
-    return {k: info.get(k) for k in ("ref", "commit", "version", "target", "built_at")}
+    return {k: info.get(k) for k in ("ref", "commit", "version", "target", "built_at",
+                                     "source_repo", "trust_policy")}
+
+
+def _trusted_for(info, commit, repo):
+    """Whether a cached unit was verified for `commit` by this repository and rule."""
+    return bool(info) and info["commit"] == commit and info["source_repo"] == repo \
+        and info["trust_policy"] == TRUST_POLICY
+
+
+@contextlib.contextmanager
+def _locked(cache_dir, cancelled):
+    """Serialize fetch, toolchain install, build and publish across processes.
+
+    Several workbench services (one per jobs directory) can share one state
+    root and so this cache. Waiting stays cancellable.
+    """
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    with open(Path(cache_dir) / ".lock", "a+") as handle:
+        if fcntl:
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if cancelled():
+                        raise BuildError("构建已取消") from None
+                    time.sleep(0.1)
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _destination(cache_dir, commit, target):
@@ -278,15 +321,27 @@ def bundle(ref, cache_dir, repo=None, target=None, cancelled=lambda: False):
     """The Linux unit built from `ref`, and its build record."""
     target = target or releases.linux_target()
     cache_dir = Path(cache_dir)
+    repo = repo or DEFAULT_REPO
     if COMMIT.fullmatch(ref):
-        # A full commit id names one unit forever: no fetch when it is cached.
+        # A full commit id names one unit forever: no fetch when this
+        # repository, under the current rule, already verified and built it.
         info = build_info(_destination(cache_dir, ref, target))
-        if info and info["commit"] == ref:
+        if _trusted_for(info, ref, repo):
             return _destination(cache_dir, ref, target), info
+    with _locked(cache_dir, cancelled):
+        return _build(ref, cache_dir, repo, target, cancelled)
+
+
+def _build(ref, cache_dir, repo, target, cancelled):
     mirror, commit = resolve(ref, cache_dir, repo, cancelled)
     destination = _destination(cache_dir, commit, target)
     info = build_info(destination)
     if info and info["commit"] == commit:
+        # The same commit is the same tree, whichever repository built it;
+        # it has now been verified against this one, so record that.
+        if not _trusted_for(info, commit, repo):
+            info = {**info, "source_repo": repo, "trust_policy": TRUST_POLICY}
+            _info_path(destination).write_text(json.dumps(info), encoding="utf-8")
         return destination, info
     if cancelled():
         raise BuildError("构建已取消")
@@ -326,7 +381,8 @@ def bundle(ref, cache_dir, repo=None, target=None, cancelled=lambda: False):
         except ValueError as exc:
             raise BuildError(f"git 版本 {ref} 的产物不能用于 Bench：{exc}") from None
         info = {"ref": ref, "commit": commit, "version": version, "target": target,
-                "built_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+                "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "source_repo": repo, "trust_policy": TRUST_POLICY}
         if destination.exists():
             shutil.rmtree(destination)
         out.rename(destination)

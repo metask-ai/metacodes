@@ -760,6 +760,14 @@ import json, os, pathlib, sys, time
 args = sys.argv[1:]
 log = pathlib.Path(os.environ['FAKE_DOCKER_LOG'])
 with log.open('a') as f: f.write(json.dumps(args) + chr(10))
+toolchains = next((pathlib.Path(a.split(':')[0]) for a in args if a.endswith(':/toolchains')), None)
+if args[0] == 'run' and toolchains is not None:
+    # Record any install that overlaps another on the same cache.
+    busy = toolchains / '.fake-busy'
+    if busy.exists(): (toolchains.parent / 'overlap').write_text('yes')
+    busy.write_text('1')
+    time.sleep(float(os.environ.get('FAKE_TOOLCHAIN_DELAY', '0')))
+    busy.unlink()
 if args[0] != 'run' or not any(a.endswith(':/out') for a in args): sys.exit(0)
 out = next(pathlib.Path(a.split(':')[0]) for a in args if a.endswith(':/out'))
 commit = next(a.split('=', 1)[1] for a in args if a.startswith('COMMIT='))
@@ -921,6 +929,81 @@ class GitRefBuildTest(unittest.TestCase):
         return subprocess.run(['bash', '-c', builds.BUILD_SCRIPT + probe], capture_output=True, text=True,
                               env={**os.environ, 'MIRROR': str(mirror), 'COMMIT': commit,
                                    'TAGS': ' '.join(tags), 'TMPDIR': str(self.root)})
+
+    def info_of(self, commit):
+        path = self.manager.build_cache / 'builds' / f'metacodes-{commit[:12]}-{releases.linux_target()}.json'
+        return path, json.loads(path.read_text())
+
+    def test_offline_reuse_is_bound_to_the_repository_and_rule_that_verified_it(self):
+        import subprocess
+        base = self.git('rev-parse', 'HEAD')
+        fork = self.root / 'fork'
+        subprocess.run(['git', 'clone', '-q', str(self.repo), str(fork)], check=True)
+        subprocess.run(['git', '-C', str(fork), 'commit', '-q', '--allow-empty', '-m', 'fork only'], check=True)
+        forked = subprocess.run(['git', '-C', str(fork), 'rev-parse', 'HEAD'], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        cfg = json.loads(self.manager.config_path.read_text())
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': str(fork)})
+        for commit in (forked, base):
+            _, final = self.launch(ref=commit)
+            self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual(self.info_of(forked)[1]['source_repo'], str(fork))
+        self.assertEqual(len(self.docker_runs()), 2)
+        # Back on the official repository: the fork-only commit is not on any of
+        # its branches, so its cached unit is refused, not run with credentials.
+        atomic_json(self.manager.config_path, {**cfg, 'source_repo': str(self.repo)})
+        run, final = self.launch(ref=forked)
+        self.assertEqual(final['status'], 'failed')
+        self.assertIn('不在源码仓库的任何分支或 tag 上', final['error'])
+        self.assertFalse((self.manager.jobs_dir / run['name']).exists())
+        # A commit the official repository also publishes is re-verified and reused.
+        run, final = self.launch(ref=base)
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual(self.info_of(base)[1]['source_repo'], str(self.repo))
+        self.assertEqual(len(self.docker_runs()), 2)
+
+    def test_record_without_a_verified_source_is_checked_again_before_reuse(self):
+        commit = self.git('rev-parse', 'HEAD')
+        self.launch(ref='main')
+        path, info = self.info_of(commit)
+        legacy = {k: v for k, v in info.items() if k not in ('source_repo', 'trust_policy')}
+        for record in (legacy, {**info, 'trust_policy': builds.TRUST_POLICY - 1}):
+            with self.subTest(record=record):
+                path.write_text(json.dumps(record))
+                moved = self.root / 'away'
+                self.repo.rename(moved)
+                _, final = self.launch(ref=commit)
+                self.assertEqual(final['status'], 'failed')
+                self.assertIn('源码仓库', final['error'])
+                moved.rename(self.repo)
+                _, final = self.launch(ref=commit)
+                self.assertEqual(final['status'], 'finished', final)
+                self.assertEqual(self.info_of(commit)[1]['trust_policy'], builds.TRUST_POLICY)
+        self.assertEqual(len(self.docker_runs()), 1)
+
+    def test_overlapping_builds_on_one_cache_are_serialized_and_both_complete(self):
+        self.git('commit', '-q', '--allow-empty', '-m', 'two')
+        self.git('branch', 'other', 'HEAD~1')
+        results = {}
+
+        def build(ref):
+            results[ref] = builds.bundle(ref, self.manager.build_cache, str(self.repo))
+
+        with patch.dict(os.environ, {'FAKE_TOOLCHAIN_DELAY': '.5', 'FAKE_BUILD_DELAY': '.3'}):
+            threads = [threading.Thread(target=build, args=(ref,)) for ref in ('main', 'other', 'main')]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(20)
+        self.assertEqual(set(results), {'main', 'other'})
+        self.assertFalse((self.manager.build_cache / 'overlap').exists())
+        self.assertEqual(len(self.docker_runs()), 2)
+        self.assertEqual(len(builds.cached(self.manager.build_cache)), 2)
+
+    def test_waiting_for_another_build_stays_cancellable(self):
+        with builds._locked(self.manager.build_cache, lambda: False):
+            with self.assertRaisesRegex(ValueError, '取消'):
+                builds.bundle('main', self.manager.build_cache, str(self.repo), cancelled=lambda: True)
 
     def test_commit_only_a_foreign_ref_names_is_never_built_or_run(self):
         self.git('commit', '-q', '--allow-empty', '-m', 'candidate')
