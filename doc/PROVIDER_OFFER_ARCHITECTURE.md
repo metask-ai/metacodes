@@ -109,7 +109,7 @@ and `dialects/registry.zig` fails a test when one is missing.
 | Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
 | MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
 | Mistral | `src/api/dialects/mistral.zig` | — |
-| OpenRouter | `src/api/dialects/openrouter.zig` | catalog only |
+| OpenRouter | `src/api/dialects/openrouter.zig` | `openrouter`, and catalogs |
 | Amazon Bedrock (Converse wire) | `src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
 
 The OpenAI chat building blocks every compatible vendor shares are
@@ -612,6 +612,47 @@ provider run on it as a `/model` pick does. `metacodes logout --provider <id>`
 and `/logout <provider>` remove it, revoked first where the profile declares an
 endpoint (`api/oauth_revoke.zig`, bounded as Metask's revocation is).
 
+### A key grant: OpenRouter's sign-in
+
+OpenRouter signs a user in on its own site and hands back an API key of the
+user's own account (https://openrouter.ai/docs/guides/overview/auth/oauth,
+checked 2026-11-18). That is not OAuth as above — no client id, no token
+endpoint, nothing to refresh, a JSON exchange — so a profile declares it as
+`key_grant` (`provider/profile.zig`): the origin, the page, exchange, key
+description and manage paths, and the label the key is given. The key it
+hands back is stored as the profile's key setup kind, exactly as a pasted key
+is, and resolves the same way (below).
+
+`api/openrouter_login.zig` runs it two ways, on the `LoginWorker` like every
+other sign-in (`provider_login.Flow.key_grant`):
+
+- **The browser here.** The page address carries an S256 challenge, a state,
+  the prefilled label, and a loopback callback on any free port — OpenRouter
+  takes any, and names such a sign-in after it (`localhost:1456`). The callback
+  is taken only with its own state; a refusal, which OpenRouter sends back
+  without one, ends the wait at once (`CallbackServer.denied_body`) rather
+  than leaving a tab that says "State mismatch".
+- **Another device.** Without a callback the page shows the code, which the
+  user pastes back here; the verifier never leaves this machine. This is the
+  way over SSH, offered first there, and `--device-code` starts it: OpenRouter
+  has no device-code grant, and this is what it documents for a machine with
+  no browser.
+
+`POST /api/v1/auth/keys` trades the code and the verifier; `GET /api/v1/key`
+then describes the key (label, spending limit, expiry, free tier), and that
+description is stored beside it (`api_key_store.Meta`, never a secret) for
+`login status` and the sign-in's own line. Nothing here can delete the key on
+OpenRouter — that takes a management key — so signing out removes it from this
+machine and names the page its owner deletes it on (`<origin>/keys/<sha256
+hex of the key>`), and a sign-in that replaces a key names the old one's page.
+
+`METACODES_OPENROUTER_URL` (https, or plain http to a loopback host, read from
+the process environment only) replaces the origin, and `Host.rebaseOrigin`
+moves the profile's requests and key check onto it too: one variable moves
+every address, so a test pointed at a mock cannot reach the real site. Moving
+can only fail on a profile the check no longer admits, and then the process
+stops rather than send anything where the variable was set to keep it from.
+
 ### Stored API keys and the guided key login
 
 Some providers have a plan whose keys are created on a web page and offer no
@@ -899,6 +940,35 @@ unknown currency all fail before registration.
 
 ## Provider catalogs
 
+### The built-in OpenRouter
+
+The built-in `openrouter` profile is the router itself, the way Metask's
+profile is its gateway: one channel, `auto`, whose requests carry no
+`provider` object and leave the upstream to OpenRouter's default routing
+(price, speed, uptime, with fallbacks; a conversation stays with an upstream
+while its prompt cache is warm). That route is what a model offer of this
+profile is. Which upstream answered is OpenRouter's to report; recording it
+on the actual-route event is not implemented yet (see *Not implemented yet*).
+
+Its models are the account's own listing, `GET /api/v1/models/user`, which
+applies the account's provider preferences, privacy settings and guardrails.
+`api/openrouter_catalog.zig` keeps the models that take tools over chat
+completions, with the fields a route reads, and `Host.ingestOpenRouterBuiltin`
+makes them one `auto` offer each, priced at the model's listed price (the
+upstream OpenRouter picks may charge otherwise). The listing is fetched after
+a sign-in or a pasted key, on `/providers refresh`, and in the REPL's
+background when none is kept or it is a day old and a key is set; it is kept
+in `<state root>/cache/models/`, and every start reads the kept copy whatever
+its age, so a stored pin resolves without a request. Compiled in is only
+OpenRouter's router model, `openrouter/auto`, so the provider is listed before
+a sign-in and keeps a route if the listing cannot be fetched.
+
+Pinning one upstream — an offer per endpoint, its request naming the
+endpoint's tag in `provider.order` with `allow_fallbacks: false` — is the
+catalog path below, not the built-in profile's.
+
+### Catalog documents
+
 `src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
 worth adapting: it is a router, so it already separates the two things a
 metadata source must keep separate.
@@ -911,9 +981,14 @@ metadata source must keep separate.
 
 They are parsed separately and stay separate. A model with three endpoints
 becomes three offers; merging them would reproduce exactly the "a model name
-identifies the route" mistake this whole model corrects. Two endpoints from one
-upstream provider (different quantizations, say) get distinct channel slugs, so
-neither disappears.
+identifies the route" mistake this whole model corrects. An endpoint's channel
+is named by its routing tag (`deepinfra/fp8` → `deepinfra-fp8`), which names
+the same endpoint for every model it serves, so one channel holds them all;
+two endpoints from one upstream provider (different quantizations, say) have
+different tags and stay distinct. A request names the model by its id, never
+by the endpoint's display `name`. OpenRouter prices its router models at
+`"-1"` ("whatever the picked model costs"): that is an unknown price, not a
+reason to refuse the listing.
 
 Endpoint values win over model values, and only where the endpoint has one: an
 endpoint that omits pricing inherits the model's declared price with
@@ -1117,7 +1192,10 @@ session from then on.
 | `src/provider/startup.zig` | CLI/bootstrap route resolution |
 | `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
-| `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
+| `src/provider/openrouter.zig` | model/endpoint catalogs, router entries, preferences → `RoutePolicy`, router metadata |
+| `src/provider/profiles/openrouter.zig` | the built-in OpenRouter: the `auto` router channel, the key grant, the key page |
+| `src/api/openrouter_login.zig` | OpenRouter's key grant: browser and other-device ways, the exchange, the key description, the manage page |
+| `src/api/openrouter_catalog.zig` | the account's listing for the built-in OpenRouter: trimmed, kept, refreshed in the background |
 | `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
 | `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
 | `src/provider/request_profile.zig` | `RequestProfile`, what one endpoint requires of every request on a route |
@@ -1194,6 +1272,14 @@ omission — and none of them is an acceptance criterion of the issue.
   declarative schema covers relays, gateways, and self-hosted servers, which
   differ by path rather than by wire; anything else is rejected (`UnknownWire`)
   rather than guessed.
+
+- **The upstream OpenRouter picked, on the actual-route event.** Its answers
+  name the upstream (`provider`), and `openrouter.parseRouterMetadata` reads
+  it, but no production path records an actual route for any provider yet
+  (`Kernel.recordActualRoute` has no caller outside tests), and the event has
+  no field for an upstream. Recording it needs both, and belongs with pinning
+  an upstream from `/model` (an offer per endpoint of the built-in profile,
+  fetched for one model when asked): neither is built.
 
 - **Per-offer capacity.** Throughput stays `unknown`: OpenRouter's endpoint rows
   do not carry it, so `hard_min_throughput_tps` can only ever reject. Latency is

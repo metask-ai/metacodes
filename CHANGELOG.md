@@ -307,6 +307,57 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **OpenRouter is built in, and `/login openrouter` signs in on OpenRouter's
+  own site.** OpenRouter's PKCE sign-in creates an API key on the user's own
+  account: `/login openrouter` and `metacodes login --provider openrouter` ask
+  which way — the browser on this machine (a loopback callback on any free
+  port, taken only with its own state), or another device (`--device-code`;
+  the page shows a code to paste back, the way over SSH, offered first there)
+  — trade the code and the verifier as JSON, and store the key in
+  `<state root>/keys/openrouter.json` like a pasted one, with what
+  `GET /api/v1/key` said about it then (label, spending limit, expiry, free
+  tier). The third way is a key the user already has (`/login openrouter`'s
+  last choice, or `--api-key-stdin`): checked against `GET /api/v1/key`,
+  which answers 401 without a valid key and is not billed, and described the
+  same way. Nothing here can delete the key on OpenRouter (that takes a
+  management key): `/logout openrouter` removes it from this machine and
+  names the page where its owner deletes it
+  (`https://openrouter.ai/keys/<sha256 of the key>`), and a new sign-in names
+  the key the previous one left. `login status` shows where the key came from
+  when OpenRouter is the provider a start uses. `OPENROUTER_API_KEY` is read
+  without a configured catalog. A 401 from OpenRouter says to sign in again; a
+  403 (a spent key limit, a guardrail) keeps OpenRouter's own words.
+  `METACODES_OPENROUTER_URL` (https, or plain http to a loopback host) moves
+  every OpenRouter address, requests included, for development and tests.
+
+- **`/model` lists the OpenRouter models the account can use.** After a
+  sign-in or a pasted key, and on `/providers refresh`, the account's own
+  listing (`GET /api/v1/models/user`, which applies its provider
+  preferences, privacy settings and guardrails) gives one route per model
+  that takes tools over chat completions, all on OpenRouter's router channel:
+  OpenRouter picks the upstream (its default routing — price, speed, uptime,
+  fallbacks), and the price shown is the model's listed one. The listing is
+  kept trimmed in `<state root>/cache/models/` (no key in it); a start reads
+  it whatever its age, so a stored `/model` default on an OpenRouter model
+  resolves without a request, and the REPL fetches it again in the
+  background when none is kept or it is a day old and a key is set (as with
+  a key in `.env`). An OpenRouter that is not set up says `/login openrouter`
+  in `/model`'s setup, as Metask's says `/login`.
+
+- **OpenRouter requests say who is calling.** Every request on a route in
+  OpenRouter's dialect carries OpenRouter's app attribution
+  (https://openrouter.ai/docs/app-attribution): `HTTP-Referer:
+  https://github.com/metask-ai/metacodes`, `X-OpenRouter-Title: metacodes`,
+  `X-OpenRouter-Categories: cli-agent`, and no visibility header, so the app
+  is listed in OpenRouter's rankings. Nothing in them is about the user, and
+  no other provider's requests carry them.
+
+- **A configuration entry that names a built-in provider is passed over
+  alone.** `custom_providers.<built-in id>` used to fail the whole
+  `custom_providers` section; it is now skipped by itself, said once, and the
+  user's other providers load. `provider_catalogs.openrouter` is passed over
+  the same way now that OpenRouter is built in.
+
 - **`/login <provider>` and `metacodes login --provider <provider>` reach every
   built-in vendor.** OpenAI, Google Gemini, Alibaba Qwen, MiniMax and the
   Moonshot Kimi open platform declare their key pages now, as DeepSeek, the
@@ -536,6 +587,20 @@ status, compatibility boundaries, and entry points are defined by
   state root is read from this release on.
 
 ### Fixed
+
+- **An OpenRouter catalog reads what OpenRouter's API answers today**
+  (`src/provider/openrouter.zig`). Fed the live documents of 2026-11-18,
+  three things failed: the whole `/models` listing was refused
+  (`MalformedPrice`), because OpenRouter prices its router models (such as
+  `openrouter/auto`) at `"-1"`, "whatever the model it picks costs" — now an
+  unknown price, while any other negative is still refused; an endpoint's
+  request named its display string ("Wafer | deepseek/…-20260910") as the
+  model, which no request can carry — now the model's own id; and two models
+  served by one upstream gave two channels one id (`DuplicateChannelId`), so
+  a catalog of more than one model never ingested — an endpoint's channel is
+  now named by its routing tag (`deepinfra/fp8` → `deepinfra-fp8`) and holds
+  every model it serves. The model bound grew from 512 (478 were listed) to
+  4096.
 
 - **`/login` names the providers it cannot list.** Its list holds twelve, and
   the ones past them were dropped without a word; `/login <id>` for one of

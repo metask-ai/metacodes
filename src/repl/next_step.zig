@@ -61,9 +61,13 @@ pub const Route = union(enum) {
         /// The canonical variable its key is read from; null when the profile
         /// declares none.
         key_variable: ?[]const u8,
-        /// The provider id `/login <id>` signs in to, for a provider that
-        /// takes an OAuth sign-in and no key; null for every other.
+        /// The provider id `/login <id>` signs in with, for a provider one
+        /// signs in to on its own site; null for every other.
         sign_in: ?[]const u8 = null,
+        /// That sign-in hands back a key of the user's own account
+        /// (`ProviderProfile.key_grant`: OpenRouter), refused like any key;
+        /// false for an OAuth sign-in with no key (`chatgpt-codex`).
+        key_grant: bool = false,
     };
 };
 
@@ -145,10 +149,25 @@ pub fn render(allocator: std.mem.Allocator, input: Input) error{OutOfMemory}!?[]
                 .interactive => try allocator.dupe(u8, "Your Metask sign-in is no longer valid. Sign in again: /login"),
                 .print => |command| try std.fmt.allocPrint(allocator, "Your Metask sign-in is no longer valid. Sign in again: {s} login", .{command}),
             },
-            .provider => |provider| if (provider.sign_in) |id| switch (input.surface) {
-                .interactive => try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: /login {s}", .{ provider.name, id }),
-                .print => |command| try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: {s} login --provider {s}", .{ provider.name, command, id }),
-            } else try keyRejected(allocator, provider, input.env_path),
+            .provider => |provider| rejected: {
+                const id = provider.sign_in orelse break :rejected try keyRejected(allocator, provider, input.env_path);
+                // The sign-in created a key, which the provider refuses like
+                // any key.
+                if (provider.key_grant) break :rejected switch (input.category) {
+                    // A 403 there is a spent limit, a guardrail or a refusal,
+                    // and the provider's own message says which: a new key
+                    // would not change it.
+                    .permission => null,
+                    else => switch (input.surface) {
+                        .interactive => try std.fmt.allocPrint(allocator, "{s} no longer accepts this key. Sign in again: /login {s}", .{ provider.name, id }),
+                        .print => |command| try std.fmt.allocPrint(allocator, "{s} no longer accepts this key. Sign in again: {s} login --provider {s}", .{ provider.name, command, id }),
+                    },
+                };
+                break :rejected switch (input.surface) {
+                    .interactive => try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: /login {s}", .{ provider.name, id }),
+                    .print => |command| try std.fmt.allocPrint(allocator, "Your {s} sign-in is no longer valid. Sign in again: {s} login --provider {s}", .{ provider.name, command, id }),
+                };
+            },
         },
         .usage_limit => blk: {
             const name = routeName(input.route);
@@ -227,12 +246,12 @@ pub fn forFailure(
 /// that provider is not in the registry.
 pub fn routeOf(app: *app_mod.App) ?Route {
     const host = app.providerHost() catch null;
-    if (host) |live| if (currentProfile(live)) |profile| return routeFor(profile.*);
+    if (host) |live| if (currentProfile(live)) |profile| return routeFor(profile);
     const name = app.config.resolved_provider_id orelse app.config.provider_profile orelse return .metask;
     if (std.ascii.eqlIgnoreCase(name, "metask")) return .metask;
     const live = host orelse return null;
     const profile = live.registry.find(name) orelse return null;
-    return routeFor(profile.*);
+    return routeFor(profile);
 }
 
 /// The profile of the offer the kernel has in force. The retired catalog is
@@ -245,15 +264,17 @@ fn currentProfile(host: *provider_host_mod.Host) ?*const profile_mod.ProviderPro
     return host.registry.findById(offer.provider_id);
 }
 
-pub fn routeFor(profile: profile_mod.ProviderProfile) Route {
+pub fn routeFor(profile: *const profile_mod.ProviderProfile) Route {
     if (profile.id.eqlText("metask")) return .metask;
-    const variable = keyVariable(profile);
+    const variable = keyVariable(profile.*);
     return .{
         .provider = .{
             .name = profile.display_name,
             .key_variable = variable,
-            // Signed in to, with no key to check instead (`chatgpt-codex`).
-            .sign_in = if (variable == null and profile.declaresInteractiveOAuth()) profile.id.slice() else null,
+            // Signed in to on the provider's own site: for the key it creates
+            // (OpenRouter), or with no key to check instead (`chatgpt-codex`).
+            .sign_in = if (profile.key_grant != null or (variable == null and profile.declaresInteractiveOAuth())) profile.id.slice() else null,
+            .key_grant = profile.key_grant != null,
         },
     };
 }
@@ -494,7 +515,7 @@ test "-p names the command that was run and --provider instead of the slash comm
 
 test "every built-in provider names its key's variable or its sign-in; Metask is the Metask route" {
     const registry = @import("../provider/registry.zig");
-    for (registry.BUILTIN_PROFILES) |profile| {
+    for (&registry.BUILTIN_PROFILES) |*profile| {
         switch (routeFor(profile)) {
             .metask => try testing.expect(profile.id.eqlText("metask")),
             .provider => |provider| {
@@ -506,12 +527,41 @@ test "every built-in provider names its key's variable or its sign-in; Metask is
             },
         }
     }
-    try testing.expectEqualStrings("chatgpt-codex", routeFor(registry.chatgpt_codex.PROFILE).provider.sign_in.?);
-    try testing.expect(routeFor(registry.openai.PROFILE).provider.sign_in == null);
+    try testing.expectEqualStrings("chatgpt-codex", routeFor(&registry.chatgpt_codex.PROFILE).provider.sign_in.?);
+    try testing.expect(!routeFor(&registry.chatgpt_codex.PROFILE).provider.key_grant);
+    try testing.expect(routeFor(&registry.openai.PROFILE).provider.sign_in == null);
     // The kind decides, not `.api_key`: Kimi Code's and the GLM plan's keys
     // are kinds of their own. OpenAI also takes OAuth kinds, which have none.
-    try testing.expectEqualStrings("DEEPSEEK_API_KEY", routeFor(registry.deepseek.PROFILE).provider.key_variable.?);
-    try testing.expectEqualStrings("KIMI_CODE_API_KEY", routeFor(registry.kimi_code.PROFILE).provider.key_variable.?);
-    try testing.expectEqualStrings("ZAI_API_KEY", routeFor(registry.zai_coding_plan.PROFILE).provider.key_variable.?);
-    try testing.expectEqualStrings("OPENAI_API_KEY", routeFor(registry.openai.PROFILE).provider.key_variable.?);
+    try testing.expectEqualStrings("DEEPSEEK_API_KEY", routeFor(&registry.deepseek.PROFILE).provider.key_variable.?);
+    try testing.expectEqualStrings("KIMI_CODE_API_KEY", routeFor(&registry.kimi_code.PROFILE).provider.key_variable.?);
+    try testing.expectEqualStrings("ZAI_API_KEY", routeFor(&registry.zai_coding_plan.PROFILE).provider.key_variable.?);
+    try testing.expectEqualStrings("OPENAI_API_KEY", routeFor(&registry.openai.PROFILE).provider.key_variable.?);
+}
+
+test "OpenRouter, whose site creates the key: a refused key signs in again; its 403 keeps the provider's own words" {
+    const registry = @import("../provider/registry.zig");
+    const openrouter = routeFor(&registry.openrouter.PROFILE);
+    try testing.expectEqualStrings("openrouter", openrouter.provider.sign_in.?);
+    try testing.expect(openrouter.provider.key_grant);
+    try expectLine("OpenRouter no longer accepts this key. Sign in again: /login openrouter", .{
+        .category = .authentication,
+        .route = openrouter,
+        .env_path = state_env_path,
+        .surface = .interactive,
+    });
+    try expectLine("OpenRouter no longer accepts this key. Sign in again: metacodes-dev login --provider openrouter", .{
+        .category = .authentication,
+        .route = openrouter,
+        .env_path = state_env_path,
+        .surface = .{ .print = "metacodes-dev" },
+    });
+    // A spent key limit, a guardrail: not a key to replace.
+    try expectLine("", .{ .category = .permission, .route = openrouter, .env_path = state_env_path, .surface = .interactive });
+    try expectLine("OpenRouter reports no balance or quota left. Top up with OpenRouter, or switch provider: /model", .{
+        .category = .payment_required,
+        .route = openrouter,
+        .surface = .interactive,
+    });
+    // A provider without a sign-in of its own keeps pointing at its variable.
+    try testing.expect(routeFor(&registry.deepseek.PROFILE).provider.sign_in == null);
 }
