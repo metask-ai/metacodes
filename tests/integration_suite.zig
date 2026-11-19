@@ -30,6 +30,7 @@ test {
     _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
     _ = @import("component/http_send_failure_test.zig");
+    _ = @import("component/connection_keepalive_test.zig");
     _ = @import("component/subagent_model_test.zig");
     _ = @import("component/subagent_agentdef_fields_test.zig");
     _ = @import("component/web_search_test.zig");

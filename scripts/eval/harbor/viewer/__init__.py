@@ -1,1 +1,1 @@
-"""Read-only web viewer for Harbor benchmark jobs (see README.md)."""
+"""Web presentation of the Bench workbench: HTTP routes and the static page."""

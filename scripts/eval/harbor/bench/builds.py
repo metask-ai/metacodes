@@ -37,7 +37,7 @@ except ImportError:  # Windows: Bench executes trials on POSIX hosts only.
     fcntl = None
 
 from scripts.eval.harbor.command import check_bundle
-from scripts.eval.harbor.viewer import releases
+from scripts.eval.harbor.bench import releases
 
 DEFAULT_REPO = "https://github.com/metask-ai/metacodes.git"
 # A ref is passed to git as one argv element; the pattern also keeps it from

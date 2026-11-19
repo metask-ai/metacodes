@@ -10,9 +10,9 @@ import sys
 import time
 from pathlib import Path
 
-from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
-from scripts.eval.harbor.viewer.account import Account
-from scripts.eval.harbor.viewer import builds, releases
+from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env
+from scripts.eval.harbor.bench.account import Account
+from scripts.eval.harbor.bench import builds, releases
 from scripts.eval.harbor.profiling import TimingRelay, auth_for, upstream_for
 
 
