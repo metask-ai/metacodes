@@ -30,10 +30,10 @@ class Workbench:
     def catalog(self) -> Dict[str, Any]:
         return self.manager.catalog() if self.manager else dict(READ_ONLY_CATALOG)
 
-    def job_view(self, path, with_rows=True) -> Dict[str, Any]:
+    def job_view(self, path, with_rows=True, runs=None) -> Dict[str, Any]:
         """A job as Harbor wrote it, corrected by its durable worker outcome."""
         view = data.job_view(path)
-        run = next((r for r in self.runs() if r["name"] == path.name), None)
+        run = next((r for r in (self.runs() if runs is None else runs) if r["name"] == path.name), None)
         if run and run["status"] in {"failed", "cancelled", "interrupted"} and view["running"]:
             # Harbor may be interrupted before it writes a final result.
             # Preserve those files, and display the durable worker outcome.
@@ -52,9 +52,10 @@ class Workbench:
         return view
 
     def jobs(self) -> Dict[str, Any]:
-        jobs = [self.job_view(p, False) for p in self.library.jobs().values()]
+        runs = self.runs()  # one scan of the run records for every job
+        jobs = [self.job_view(p, False, runs) for p in self.library.jobs().values()]
         jobs.sort(key=lambda view: view["started_at"] or "", reverse=True)
-        return {"jobs": jobs, "runs": self.runs(),
+        return {"jobs": jobs, "runs": runs,
                 "summary": data.merge_summaries(j["summary"] for j in jobs),
                 "storage": {"jobs_dirs": [str(root) for root in self.library.roots],
                             "records_dir": str(self.manager.records) if self.manager else None,

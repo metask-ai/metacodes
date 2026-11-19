@@ -644,19 +644,50 @@ class AccountInventoryTest(unittest.TestCase):
         self.assertEqual(len(catalog['warnings']), 1)
 
 
+class ServiceReuseTest(unittest.TestCase):
+    def test_directory_check_and_client_come_from_one_service_record(self):
+        # A second read would see another startup's service for directory B.
+        records = iter([{'url': 'http://127.0.0.1:1/', 'token': 'a', 'jobs_dir': '/jobs/a'},
+                        {'url': 'http://127.0.0.1:2/', 'token': 'b', 'jobs_dir': '/jobs/b'}])
+        with patch.object(cli, 'settings', side_effect=lambda _path: next(records)), \
+                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench'}):
+            client = cli.running_service(Path('/state/bench'), '/jobs/a')
+        self.assertEqual((client.url, client.token), ('http://127.0.0.1:1/', 'a'))
+
+    def test_service_for_another_directory_is_not_reused(self):
+        record = {'url': 'http://127.0.0.1:2/', 'token': 'b', 'jobs_dir': '/jobs/b'}
+        with patch.object(cli, 'settings', return_value=record), \
+                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench'}):
+            self.assertIsNone(cli.running_service(Path('/state/bench'), '/jobs/a'))
+
+
 class LayeringTest(unittest.TestCase):
     """The runtime (bench/) stands alone; the page and the CLI only present it."""
 
     HARBOR = Path(__file__).resolve().parents[1] / 'harbor'
 
     def imports(self, path):
+        """Every module or name a file imports, relative imports resolved."""
+        package = '.'.join(path.resolve().relative_to(self.HARBOR.parents[2]).parent.parts)
         names = set()
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             if isinstance(node, ast.Import):
                 names.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names.add(node.module)
+            elif isinstance(node, ast.ImportFrom):
+                base = package.split('.')
+                base = base[:len(base) - node.level + 1] if node.level else []
+                module = '.'.join(base + ([node.module] if node.module else []))
+                names.add(module)
+                names.update(module + '.' + alias.name for alias in node.names)
         return names
+
+    def test_imports_resolve_from_and_relative_forms(self):
+        with tempfile.TemporaryDirectory(dir=self.HARBOR / 'bench') as temp:
+            probe = Path(temp) / 'probe.py'
+            probe.write_text('from scripts.eval.harbor import cli\nfrom ... import viewer\n', encoding='utf-8')
+            names = self.imports(probe)
+        self.assertIn('scripts.eval.harbor.cli', names)
+        self.assertIn('scripts.eval.harbor.viewer', names)
 
     def test_runtime_imports_no_presentation(self):
         for path in sorted((self.HARBOR / 'bench').glob('*.py')):

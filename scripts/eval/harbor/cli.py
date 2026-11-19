@@ -46,16 +46,19 @@ def read_env(path):
             os.environ.setdefault(name.strip(), parts[0])
 
 
-def saved_client(root):
+def saved_client(root, jobs_dir=None):
+    """The client in one read of `service.json`; with `jobs_dir`, only that directory's."""
     saved = settings(root / "service.json")
-    return Client(saved["url"], saved.get("token", ""), saved.get("listen_url")) if saved.get("url") else None
+    if not saved.get("url") or (jobs_dir is not None and saved.get("jobs_dir") != str(jobs_dir)):
+        return None
+    return Client(saved["url"], saved.get("token", ""), saved.get("listen_url"))
 
 
 def running_service(root, jobs_dir):
     """The service this install started for `jobs_dir`, if it still answers."""
-    if settings(root / "service.json").get("jobs_dir") != str(jobs_dir):
-        return None
-    client = saved_client(root)
+    # Check the directory and build the client from the same record: another
+    # startup may publish a different directory's service between two reads.
+    client = saved_client(root, jobs_dir)
     try:
         if client and client.request("api/workbench").get("service") == "metacodes-bench":
             return client
