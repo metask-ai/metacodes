@@ -158,14 +158,18 @@ class SessionCredential:
 def for_run(spec, env):
     """(credential source, account gateway or None) for one launch.
 
-    A Metask session login refreshes; a legacy account group key and a
-    provider key do not expire and stay fixed."""
+    A Metask session login refreshes; a legacy account group key, a
+    provider key and an imported provider's key do not expire and stay fixed."""
     if spec.get("auth_mode") == "metask":
         account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
         # Checks that the chosen group still provides this model.
         secret = account.credential(spec["model"], key_id=spec.get("account_key_id"))
         source = SessionCredential(account) if account.session else StaticCredential(secret)
         return source, account.gateway
+    if spec.get("imported_provider"):
+        # A provider imported by URL and key: the key is in the private store.
+        from scripts.eval.harbor.viewer.providers import Providers
+        return StaticCredential(Providers(spec["providers_root"]).secret(spec["imported_provider"])), None
     secret = env.get(spec["key_env"])
     if not secret:
         raise ValueError("执行服务缺少环境变量 " + spec["key_env"])

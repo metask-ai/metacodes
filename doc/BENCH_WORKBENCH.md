@@ -377,11 +377,61 @@ metacodes bench --bundle /path/to/linux-release \
 
 `--provider-config` is a native metacodes configuration with
 `custom_providers`; see [the Harbor adapter](../scripts/eval/harbor/README.md).
-`--key-env` names the credential variable; the key is never accepted as a
-browser field or stored in a run specification. The relay holds the key;
+`--key-env` names the credential variable; that key is never accepted as a
+browser field or stored in a run specification (an imported provider's key
+is, once; see below). The relay holds the key;
 Harbor's `${VARIABLE}` reference carries only the run's placeholder. The
 installed service inherits its startup environment, so restart the service
 after changing a credential.
+
+### Imported providers (URL + API key)
+
+Any number of OpenAI- or Anthropic-compatible endpoints can be imported
+next to the Metask account (or a `--provider-config` setup) and used for
+runs. Their models appear in the model list as `<id>/<model>`. Import them
+on the page's 模型 tab or from the CLI on the workbench machine:
+
+```sh
+export GW_KEY=...                        # or omit --key-env and type it
+metacodes bench provider add --id gw --base-url https://api.example.com/v1 \
+  --protocol openai_chat --key-env GW_KEY --probe   # models from /models
+metacodes bench provider add --id claude --base-url https://api.example.com \
+  --protocol anthropic_messages --provider-model claude-opus-5-5 --key-env GW_KEY
+metacodes bench provider list
+metacodes bench provider probe --id gw --model gw/glm-5.3   # exit 1 on failure
+metacodes bench provider remove --id gw
+```
+
+- **Base URL**: `http(s)://host` or `http(s)://host/v1` (a pasted
+  `/chat/completions`, `/responses` or `/messages` URL is trimmed). Other
+  paths are refused because the run's credential relay forwards to one
+  origin. Protocols: `openai_chat`, `openai_responses`,
+  `anthropic_messages`; the key goes in `Authorization: Bearer` or
+  `x-api-key` (`--auth-header`; Anthropic defaults to `x-api-key`).
+- **Models**: `--provider-model` (repeatable) or, when omitted, the
+  endpoint's `/models` list.
+- **Key**: from `--key-env` or stdin, never argv. Kept only in
+  `<state root>/bench/providers.json` (mode 0600). The page accepts it once
+  in the import form and never shows it again (only its last four
+  characters). A run of an imported model gets a generated provider config
+  that names the variable `METACODES_BENCH_PROVIDER_KEY` but holds no key;
+  containers hold the run's placeholder and the relay sends the key
+  upstream, as with `--provider-config`. `--replace` updates an entry and
+  keeps the saved key when none is given.
+- **Probe**: sends one real request asking the model to reply with a fresh
+  random string (`mc-echo-…`) and passes only when the reply is exactly that
+  string (surrounding quotes, backticks or a final period are ignored). The
+  result (reply, HTTP status, latency) is stored per model and shown in the
+  model list; changing the URL, protocol or key clears it. Probing is not
+  required to run.
+- **Limits**: imported models run Harbor suites on local and SSH
+  executors. WorkBuddy suites and suites with an LLM judge (GAIA2) still
+  require the Metask account and refuse imported models.
+- HTTP (workbench capability required): `GET /api/providers`,
+  `POST /api/providers` (`id`, `base_url`, `api_key`, optional `name`,
+  `protocol`, `auth`, `models`, `replace`, `probe`),
+  `POST /api/providers/probe` (`id`, `model`), `POST /api/providers/remove`
+  (`id`). The running service sees CLI changes on its next page refresh.
 
 Defaults and server configuration live in `<state root>/bench/workbench.json`.
 Jobs go to `<state root>/bench/jobs` unless `--jobs-dir` names an existing

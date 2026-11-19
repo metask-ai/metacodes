@@ -116,6 +116,7 @@ function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   if (parts[0] === 'new') return { view: 'new' };
   if (parts[0] === 'settings') return { view: 'settings' };
+  if (parts[0] === 'providers') return { view: 'providers' };
   if (parts[0] === 'run' && parts[1]) return { view: 'run', name: parts[1] };
   if (parts[0] === 'batch' && parts[1] && parts[2] === 'task' && parts[3] && parts[4]) return { view: 'task', batch: parts[1], job: parts[3], task: parts[4], trial: parts[5] || null };
   if (parts[0] === 'batch' && parts[1]) return { view: 'batch', batch: parts[1] };
@@ -141,6 +142,7 @@ async function render() {
     let node;
     if (r.view === 'new') node = await renderNewBatch();
     else if (r.view === 'settings') node = await renderSettings();
+    else if (r.view === 'providers') node = await renderProviders();
     else if (r.view === 'run') node = await renderRun(r.name);
     else if (r.view === 'overview') node = await renderOverview();
     else if (r.view === 'batch') node = await renderBatch(r.batch);
@@ -549,6 +551,8 @@ async function renderNewBatch() {
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('label', { class: 'field' }, h('span', { text: '模型' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
+      h('small', {}, c.providers?.models ? `另有 ${c.providers.count} 个导入的 Provider · ${c.providers.models} 个模型 · ` : '',
+        link('#/providers', '用 URL + API Key 导入 Provider')),
       c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
@@ -1048,6 +1052,105 @@ async function renderSettings() {
     h('p', { class: 'muted', text: '有评测或批次运行时不能切换。切换后新数据写入新数据库；不勾选迁移时，作业目录仍会同步进新库，但只存在于旧库的数据不会出现。命令行等价操作：metacodes bench db migrate --to <目标> --switch' }))
     : h('div', { class: 'empty', text: '修改数据库需要用 metacodes bench 输出的授权链接打开工作台。' });
   return h('div', {}, current, panel('配置数据库', '工作台配置中的 store', form));
+}
+
+// ------------------------------------------------------------ providers
+function probeText(p) {
+  if (!p) return h('span', { class: 'na', text: '未探测' });
+  const detail = p.ok ? `${when(p.at)} · ${p.latency_ms} ms` : (p.error || '') + (p.reply !== undefined ? `（回复：${p.reply}）` : '');
+  return h('span', { class: p.ok ? 'probe ok' : 'probe bad', title: `发送 ${p.expected}` + (p.reply !== undefined ? `，回复 ${p.reply}` : '') },
+    p.ok ? '探测通过' : '探测失败', h('small', { text: ' ' + detail }));
+}
+
+async function renderProviders() {
+  state.live = false;
+  navCurrent('providers');
+  $('#title').textContent = '模型 Provider';
+  crumbs([{ text: '看板', href: '#/' }, { text: '用 URL + API Key 导入评测用的模型' }]);
+  let list;
+  try { list = await api('/api/providers'); } catch (e) {
+    return h('div', { class: 'empty', text: e.message || '管理 Provider 需要用 metacodes bench 输出的授权链接打开工作台。' });
+  }
+  const protocols = list.protocols || {};
+  const result = h('div', { class: 'result', role: 'status' });
+  const show = (ok, text) => { result.className = 'result ' + (ok ? 'ok' : 'bad'); result.textContent = text; };
+
+  async function probe(button, id, model) {
+    button.disabled = true;
+    show(true, `正在探测 ${id}/${model}：发送一个随机字符串，等模型原样返回…`);
+    try {
+      const r = await api('/api/providers/probe', { id, model });
+      show(r.ok, r.ok ? `探测通过：${id}/${model} 原样返回了 ${r.expected}（${r.latency_ms} ms）` :
+        `探测失败：${id}/${model}，${r.error}${r.reply !== undefined ? `\n发送 ${r.expected}，回复 ${r.reply}` : ''}`);
+      setTimeout(render, 600);
+    } catch (e) { show(false, e.message); button.disabled = false; }
+  }
+  async function remove(button, id) {
+    if (!confirm(`删除 Provider ${id}？已保存的 API Key 一并删除，已有评测结果不受影响。`)) return;
+    button.disabled = true;
+    try { await api('/api/providers/remove', { id }); render(); } catch (e) { show(false, e.message); button.disabled = false; }
+  }
+
+  const rows = (list.providers || []).flatMap((p) => p.models.map((m, i) => h('tr', {},
+    i ? h('td', {}) : h('td', {}, h('strong', { text: p.name }), h('div', { class: 'mono muted', text: p.id })),
+    i ? h('td', {}) : h('td', {}, h('div', { class: 'mono', text: p.base_url }), h('small', { class: 'muted', text: `${p.protocol_label} · ${p.auth} · Key ${p.key_hint}` })),
+    h('td', { class: 'mono', text: m.name }),
+    h('td', {}, probeText(m.probe)),
+    h('td', {}, h('button', { type: 'button', class: 'button', onclick: (e) => probe(e.currentTarget, p.id, m.name) }, '探测'),
+      i ? null : h('button', { type: 'button', class: 'button', onclick: (e) => remove(e.currentTarget, p.id) }, '删除')))));
+  const table = rows.length ? h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, h('th', {}, 'Provider'), h('th', {}, '地址'), h('th', {}, '模型'), h('th', {}, '探测'), h('th', {}, ''))),
+    h('tbody', {}, rows))) : h('div', { class: 'empty', text: '还没有导入 Provider。' });
+
+  const id = h('input', { type: 'text', required: true, maxlength: 32, pattern: '[a-z0-9][a-z0-9_\\-]{0,31}', placeholder: 'tokenjoy', 'aria-label': 'Provider 标识' });
+  const name = h('input', { type: 'text', maxlength: 80, placeholder: '例如：TokenJoy', 'aria-label': '显示名称' });
+  const baseUrl = h('input', { type: 'url', required: true, placeholder: 'https://api.example.com/v1', 'aria-label': 'Base URL' });
+  const protocol = h('select', { 'aria-label': '协议' }, Object.entries(protocols).map(([value, label]) => h('option', { value }, label)));
+  const auth = h('select', { 'aria-label': '认证' }, h('option', { value: '' }, '自动（Anthropic 用 x-api-key，其余 Bearer）'),
+    h('option', { value: 'bearer' }, 'Authorization: Bearer'), h('option', { value: 'x-api-key' }, 'x-api-key'));
+  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'sk-…', 'aria-label': 'API Key' });
+  const models = h('textarea', { rows: 3, placeholder: '每行一个，例如 glm-5.3\n留空则读取该地址的 /models', 'aria-label': '模型' });
+  const replace = h('input', { type: 'checkbox' });
+  const probeAfter = h('input', { type: 'checkbox' });
+  probeAfter.checked = true;
+  const submit = h('button', { type: 'submit', class: 'button primary' }, '导入');
+  const form = h('form', { class: 'settings-form' },
+    h('div', { class: 'form-row' },
+      h('label', { class: 'field' }, h('span', { text: 'Provider 标识' }), id, h('small', { text: '模型在下拉框里显示为 <标识>/<模型>。小写字母、数字、- 和 _。' })),
+      h('label', { class: 'field' }, h('span', { text: '显示名称（可选）' }), name)),
+    h('label', { class: 'field' }, h('span', { text: 'Base URL' }), baseUrl, h('small', { text: 'http(s)://主机 或 http(s)://主机/v1；粘贴完整的 /chat/completions 等地址也可以。' })),
+    h('div', { class: 'form-row' },
+      h('label', { class: 'field' }, h('span', { text: '协议' }), protocol),
+      h('label', { class: 'field' }, h('span', { text: '认证' }), auth)),
+    h('label', { class: 'field' }, h('span', { text: 'API Key' }), key, h('small', { text: '只保存在工作台机器的私有文件里（0600），页面和评测容器都拿不到；评测请求经凭据代理转发。覆盖已有 Provider 时留空沿用原 Key。' })),
+    h('label', { class: 'field' }, h('span', { text: '模型（可选）' }), models),
+    h('label', { class: 'check' }, replace, '覆盖同标识的 Provider'),
+    h('label', { class: 'check' }, probeAfter, '导入后立即探测第一个模型（真实发送一次请求）'),
+    h('div', { class: 'header-actions' }, submit));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    show(true, models.value.trim() ? '正在导入…' : '正在读取模型列表并导入…');
+    const request = { id: id.value.trim(), base_url: baseUrl.value.trim(), protocol: protocol.value,
+      models: models.value.split(/[\n,]/).map((m) => m.trim()).filter(Boolean), probe: probeAfter.checked };
+    if (name.value.trim()) request.name = name.value.trim();
+    if (auth.value) request.auth = auth.value;
+    if (key.value) request.api_key = key.value;
+    if (replace.checked) request.replace = true;
+    try {
+      const r = await api('/api/providers', request);
+      key.value = '';
+      const p = r.probe;
+      show(!p || p.ok, `已导入 ${r.id}：${r.models.length} 个模型（${r.models.map((m) => m.name).join('、')}）` +
+        (p ? (p.ok ? `\n探测通过：${p.model} 原样返回了 ${p.expected}` : `\n探测失败：${p.model}，${p.error}`) : ''));
+      setTimeout(render, 1200);
+    } catch (e) { show(false, e.message); } finally { submit.disabled = false; }
+  });
+  return h('div', {},
+    panel('已导入的 Provider', `${(list.providers || []).length} 个`, h('div', { class: 'panel-body' },
+      h('p', { class: 'muted', text: '这些模型出现在新建批次的模型下拉框里，和 Metask 账号模型并列。探测会真实发送一次请求：让模型原样返回一个随机字符串，返回一致才算通过。导入的 Provider 暂不支持 WorkBuddy 和带 LLM 评委的评测集（GAIA2）。' }),
+      table, result)),
+    panel('导入 Provider', 'URL + API Key', form));
 }
 
 // ------------------------------------------------------------ refresh loop

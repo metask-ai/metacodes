@@ -23,6 +23,7 @@ from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.viewer import data, executors
 from scripts.eval.harbor.viewer.account import Account
+from scripts.eval.harbor.viewer.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, write_config
 
 # The launch API's original fixed dataset, still accepted as `dataset`.
 DATASET = suites.BY_ID[suites.DEFAULT_SUITE].dataset
@@ -80,6 +81,8 @@ class RunManager:
         self.account_cache = None
         self.probe_lock = threading.Lock()
         self.probe_cache = {}
+        # Providers imported by URL and key (`bench provider`, the page).
+        self.providers = Providers(self.config_path.parent)
         from scripts.eval.harbor.viewer.setup import SetupManager
         # Whether a setup that may restart Docker or Colima is running; the
         # service replaces this with its own SetupManager's view. A launch
@@ -183,6 +186,7 @@ class RunManager:
         reasons = []
         effort = None
         warnings, account_summary, account_groups = [], None, []
+        imported = self.providers.models()
         if mode == "metask":
             models, model = [], ""
             try:
@@ -192,7 +196,8 @@ class RunManager:
                 warnings, account_summary = account["warnings"], account["account_summary"]
                 account_groups = account["account_groups"]
             except ValueError as exc:
-                reasons.append(str(exc))
+                # Imported providers still run without an account login.
+                (warnings if imported else reasons).append(str(exc))
             key_env = "METASK_API_KEY"
         elif mode == "provider":
             models = provider_models(cfg.get("provider_config"))
@@ -200,20 +205,31 @@ class RunManager:
             if model and not any(m["id"] == model for m in models):
                 models.append({"id": model, "label": model})
             key_env = cfg.get("key_env") or "TOKENJOY_API_KEY"
+            legacy = []
             if not ENV_NAME.fullmatch(key_env) or not os.environ.get(key_env):
-                reasons.append("执行服务缺少环境变量 " + key_env + "，设置后重启服务")
+                legacy.append("执行服务缺少环境变量 " + key_env + "，设置后重启服务")
+            if not models:
+                legacy.append("请配置 --model，第三方网关同时设置 --provider-config")
+            else:
+                # Containers only ever hold a placeholder; a route the credential
+                # relay cannot forward is refused rather than given the key.
+                problem = route_problem({"auth_mode": mode, "provider_config": cfg.get("provider_config"),
+                                         "model": model or models[0]["id"]})
+                if problem:
+                    legacy.append(problem)
+            if legacy and imported:
+                # Imported providers carry their own keys and routes; the
+                # broken --provider-config route is left out, not blocking.
+                warnings.extend(legacy)
+                models, model = [], ""
+            else:
+                reasons.extend(legacy)
         else:
             models, model, key_env = [], "", ""
             reasons.append("auth_mode 必须是 metask 或 provider")
-        if not models and mode == "provider":
-            reasons.append("请配置 --model，第三方网关同时设置 --provider-config")
-        elif mode == "provider":
-            # Containers only ever hold a placeholder; a route the credential
-            # relay cannot forward is refused rather than given the key.
-            problem = route_problem({"auth_mode": mode, "provider_config": cfg.get("provider_config"),
-                                     "model": model or models[0]["id"]})
-            if problem:
-                reasons.append(problem)
+        signed_in = mode == "metask" and bool(models)
+        known = {m["id"] for m in models}
+        models = models + [m for m in imported if m["id"] not in known]
         states, default_executor, problems = self.executor_states(cfg)
         reasons += problems
         global_reasons = list(reasons)
@@ -238,19 +254,28 @@ class RunManager:
                 "default_executor": default_executor, "global_reasons": global_reasons,
                 "harbor_reasons": harbor_reasons,
                 "login": {"available": mode == "metask" and bool((cfg.get("metacodes") or {}).get("binary")),
-                          "signed_in": mode == "metask" and bool(models)},
+                          "signed_in": signed_in},
                 "dataset": DATASET, "tasks": SAMPLE_TASKS,
                 "default_suite": suites.DEFAULT_SUITE, "categories": suites.categories(),
                 "suites": catalog_suites, "models": models,
                 "default_model": model or (models[0]["id"] if models else ""),
                 "key_env": key_env, "ready": not reasons, "reasons": reasons,
-                "authentication": {"kind": mode, "label": "Metask 账号（执行机器已登录）" if mode == "metask" and models else
+                "authentication": {"kind": mode, "label": "Metask 账号（执行机器已登录）" if signed_in else
                                    "Metask 账号（待登录）" if mode == "metask" else "第三方 Provider"},
                 "reasoning_effort": effort,
                 "warnings": warnings, "account_summary": account_summary,
                 "account_groups": account_groups,
+                "providers": {"count": len({m["provider"] for m in imported}), "models": len(imported)},
                 "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
                 "bundles": [{k: v for k, v in b.items() if k != "source"} for b in bundle_choices(cfg, self.config_path)]}
+
+    def imported_route_problem(self, model):
+        """route_problem for an imported provider's generated config."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="bench-provider-") as directory:
+            path = write_config(Path(directory) / "provider.json",
+                                self.providers.native_config(model.split("/", 1)[0]))
+            return route_problem({"auth_mode": "provider", "model": model, "provider_config": path})
 
     def runs(self):
         result = []
@@ -289,9 +314,20 @@ class RunManager:
         if problems:
             raise ValueError("；".join(problems))
         model = request.get("model")
-        if model not in {m["id"] for m in catalog["models"]}:
+        chosen = next((m for m in catalog["models"] if m["id"] == model), None)
+        if chosen is None:
             raise ValueError("请选择服务已配置的模型")
-        if catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
+        # A model of a provider imported by URL and key: its own route.
+        imported = chosen.get("provider") if chosen.get("source") == "provider" else None
+        if imported:
+            if suite.runner == suites.WORKBUDDY:
+                raise ValueError("导入的 Provider 暂不支持 WorkBuddy 评测，请选择 Harbor 评测集")
+            if suites.judge(suite, settings(self.config_path)):
+                raise ValueError(suite.id + " 的 LLM 评委经 Metask 账号转发，导入的 Provider 暂不支持带评委的评测集")
+            problem = self.imported_route_problem(model)
+            if problem:
+                raise ValueError(problem)
+        elif catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
             problem = route_problem({"auth_mode": "provider", "model": model,
                                      "provider_config": settings(self.config_path).get("provider_config")})
             if problem:
@@ -316,7 +352,7 @@ class RunManager:
             cfg = settings(self.config_path)
             executor = executors.find(cfg, state["name"])
             facts = self.executor_facts(executor)
-            mode = catalog["authentication"]["kind"]
+            mode = "provider" if imported else catalog["authentication"]["kind"]
             account_key_id = self.account_catalog(cfg)["routes"].get(model) if mode == "metask" else None
             if mode == "metask" and account_key_id is None:
                 raise ValueError("账号模型目录已变化，请刷新后重试")
@@ -377,6 +413,13 @@ class RunManager:
                         "harbor": executors.workbench_harbor(cfg),
                         "tasks": list(suite.tasks) if suite.tasks is not None else None,
                         "filters": list(tasks)}
+            if imported:
+                # The run's own config (endpoint, model names, key variable);
+                # the worker reads the key from the private provider store.
+                spec.update(provider_config=write_config(self.records / (name + ".provider"),
+                                                         self.providers.native_config(imported)),
+                            key_env=PROVIDER_KEY_ENV, imported_provider=imported,
+                            providers_root=str(self.providers.root))
             spec_path = self.records / (name + ".spec")
             atomic_json(spec_path, spec)
             try:

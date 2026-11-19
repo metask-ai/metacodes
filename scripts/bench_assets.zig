@@ -35,6 +35,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/viewer/egress.py", .bytes = @embedFile("eval/harbor/viewer/egress.py") },
     .{ .path = "scripts/eval/harbor/viewer/remote.py", .bytes = @embedFile("eval/harbor/viewer/remote.py") },
     .{ .path = "scripts/eval/harbor/viewer/setup.py", .bytes = @embedFile("eval/harbor/viewer/setup.py") },
+    .{ .path = "scripts/eval/harbor/viewer/providers.py", .bytes = @embedFile("eval/harbor/viewer/providers.py") },
     .{ .path = "scripts/eval/harbor/viewer/static/index.html", .bytes = @embedFile("eval/harbor/viewer/static/index.html") },
     .{ .path = "scripts/eval/harbor/viewer/static/viewer.css", .bytes = @embedFile("eval/harbor/viewer/static/viewer.css") },
     .{ .path = "scripts/eval/harbor/viewer/static/viewer.js", .bytes = @embedFile("eval/harbor/viewer/static/viewer.js") },

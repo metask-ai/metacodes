@@ -200,11 +200,87 @@ def prepare_suite(args, root, config, cfg):
     return {"suite": suite.id, "dataset": str(produced), "task_count": len(tasks)}
 
 
+PROVIDER_COMMANDS = ["add", "list", "remove", "probe"]
+
+
+def read_key(args):
+    """The API key from `--key-env` or stdin; never from argv (visible in
+    the process list)."""
+    if args.key_env:
+        key = os.environ.get(args.key_env)
+        if not key:
+            raise ValueError("环境变量 " + args.key_env + " 为空")
+        return key
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass("API Key（输入不显示" + ("，留空沿用已保存的" if args.replace else "") + "）：")
+    return sys.stdin.readline().strip()
+
+
+def probe_line(result):
+    head = ("探测通过" if result["ok"] else "探测失败") + f"：{result['provider']}/{result['model']}（{result['latency_ms']} ms）"
+    detail = "发送 " + result["expected"] + "，回复 " + repr(result["reply"]) if "reply" in result else ""
+    return "\n".join(x for x in (head, "  " + detail if detail else "", "  " + result["error"] if result.get("error") else "") if x)
+
+
+def provider_command(args, root):
+    from scripts.eval.harbor.viewer.providers import Providers
+    providers = Providers(root)
+    if args.db_command == "list":
+        value = providers.listing()
+        if not args.json:
+            for entry in value["providers"]:
+                print(f"{entry['id']}  {entry['name']}  {entry['base_url']}  {entry['protocol']}  Key {entry['key_hint']}")
+                for model in entry["models"]:
+                    probe = model["probe"]
+                    state = "未探测" if not probe else ("探测通过" if probe["ok"] else "探测失败") + " " + probe["at"]
+                    print(f"  {model['id']}  {state}")
+            if not value["providers"]:
+                print("还没有导入 Provider：metacodes bench provider add --id <标识> --base-url <地址> --key-env <变量名>")
+    elif not args.id:
+        raise ValueError("bench provider " + args.db_command + " 需要 --id")
+    elif args.db_command == "remove":
+        value = providers.remove(args.id)
+        if not args.json:
+            print("已删除 Provider " + args.id)
+    elif args.db_command == "probe":
+        model = args.model.split("/", 1)[1] if args.model and args.model.startswith(args.id + "/") else args.model
+        value = providers.probe(args.id, model)
+        if not args.json:
+            print(probe_line(value))
+        if args.json:
+            print(json.dumps(value, ensure_ascii=False))
+        return 0 if value["ok"] else 1
+    else:
+        request = {"id": args.id, "base_url": args.base_url, "models": args.provider_model}
+        for field, value in (("name", args.name), ("protocol", args.protocol), ("auth", args.auth_header)):
+            if value:
+                request[field] = value
+        if args.replace:
+            request["replace"] = True
+        key = read_key(args)  # empty with --replace keeps the saved key
+        if key:
+            request["api_key"] = key
+        value = providers.add(request)
+        if not args.json:
+            print(f"已导入 Provider {value['id']}：{len(value['models'])} 个模型")
+            for model in value["models"]:
+                print("  " + model["id"])
+        if args.probe and value["models"]:
+            value["probe"] = providers.probe(value["id"], value["models"][0]["name"])
+            if not args.json:
+                print(probe_line(value["probe"]))
+    if args.json:
+        print(json.dumps(value, ensure_ascii=False))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
-                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync"])
-    parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"], help="bench db 的子命令")
+                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync", "provider"])
+    parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"] + PROVIDER_COMMANDS,
+                        help="bench db 的子命令（status、import、migrate）或 bench provider 的子命令（add、list、remove、probe）")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--url", default=os.environ.get("METACODES_BENCH_URL"), help="连接已有工作台（例如 devbox）")
     parser.add_argument("--jobs-dir", type=Path)
@@ -240,11 +316,26 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
     parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
     parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
+    parser.add_argument("--id", help="provider：Provider 标识（小写字母、数字、-、_），模型以 <标识>/<模型> 出现")
+    parser.add_argument("--name", help="provider add：显示名称")
+    parser.add_argument("--base-url", help="provider add：http(s)://主机 或 http(s)://主机/v1")
+    parser.add_argument("--protocol", choices=["openai_chat", "openai_responses", "anthropic_messages"],
+                        help="provider add：接口协议（默认 openai_chat）")
+    parser.add_argument("--auth-header", choices=["bearer", "x-api-key"],
+                        help="provider add：Key 放在哪个请求头（默认 Anthropic 用 x-api-key，其余 bearer）")
+    parser.add_argument("--provider-model", action="append", default=[], metavar="MODEL",
+                        help="provider add：模型名，可重复；省略时读取该地址的 /models")
+    parser.add_argument("--replace", action="store_true", help="provider add：覆盖同名 Provider（不填 Key 时沿用已保存的）")
+    parser.add_argument("--probe", action="store_true", help="provider add：导入后立即探测第一个模型")
     parser.add_argument("--metacodes-binary", help=argparse.SUPPRESS)
     parser.add_argument("--metacodes-version", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if (args.db_command is None) != (args.action != "db"):
-        parser.error("bench db 需要子命令 status、import 或 migrate" if args.action == "db" else "多余的参数 " + args.db_command)
+    if args.action == "db" and args.db_command not in ("status", "import", "migrate"):
+        parser.error("bench db 需要子命令 status、import 或 migrate")
+    if args.action == "provider" and args.db_command not in PROVIDER_COMMANDS:
+        parser.error("bench provider 需要子命令 add、list、remove 或 probe")
+    if args.action not in ("db", "provider") and args.db_command is not None:
+        parser.error("多余的参数 " + args.db_command)
     if args.store_sqlite and args.store_postgres:
         parser.error("--store-sqlite 与 --store-postgres 只能选一个")
     if args.store_password_env and not args.store_postgres:
@@ -273,6 +364,10 @@ def main(argv=None):
             return commands.run(args.db_command, active=store, jobs_dirs=jobs_dirs, target=args.to,
                                 password_env=args.password_env, switch=args.switch, verify=args.verify,
                                 as_json=args.json, config_path=config, settings=cfg, save=atomic_json)
+        if args.action == "provider":
+            # Local to this machine's workbench state, like setup; a running
+            # service sees the change on its next catalog read.
+            return provider_command(args, root)
         for name in ("bundle", "provider_config", "jobs_dir", "account_state_dir", "workbuddy_checkout"):
             value = getattr(args, name)
             if value is not None:

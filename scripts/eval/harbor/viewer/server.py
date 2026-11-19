@@ -262,6 +262,16 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                     self.send_json(started, 202)
                 elif path == "/api/login" and payload == {}:
                     self.send_json(logins.start(runtime_env()), 202)
+                elif path == "/api/providers":
+                    probe = isinstance(payload, dict) and payload.get("probe") is True
+                    added = manager.providers.add(payload)
+                    if probe and added["models"]:
+                        added["probe"] = manager.providers.probe(added["id"], added["models"][0]["name"])
+                    self.send_json(added, 201)
+                elif path == "/api/providers/remove" and isinstance(payload, dict):
+                    self.send_json(manager.providers.remove(payload.get("id")))
+                elif path == "/api/providers/probe" and isinstance(payload, dict):
+                    self.send_json(manager.providers.probe(payload.get("id"), payload.get("model")))
                 elif path == "/api/cancel" and isinstance(payload, dict):
                     self.send_json(manager.cancel(payload.get("name")))
                 elif path == "/api/stop" and payload == {}:
@@ -306,10 +316,13 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                     self.send_json(manager.suite_tasks(query.get("id")))
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, 404)
-            elif path in ("/api/setup", "/api/login"):
-                # Setup logs and the device code are for the capability holder.
+            elif path in ("/api/setup", "/api/login", "/api/providers"):
+                # Setup logs, the device code and provider endpoints are for
+                # the capability holder.
                 if not self.authorized():
                     self.send_json({"error": "请使用 metacodes bench 输出的工作台授权链接"}, 403)
+                elif path == "/api/providers":
+                    self.send_json(manager.providers.listing())
                 elif path == "/api/setup":
                     self.send_json({"setup": setups.latest()})
                 else:
