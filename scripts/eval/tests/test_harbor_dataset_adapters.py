@@ -157,6 +157,10 @@ def run_solve(task_dir: Path, mapping: Dict[str, Path]) -> None:
 def run_grader(task_dir: Path, grader: str, flag: str, artifact: Path, scratch: Path) -> Tuple[int, Dict[str, object]]:
     reward = scratch / "reward.txt"
     details = scratch / "grade.json"
+    if os.name == "nt":
+        # The graders run only inside the Linux task containers (uid switches,
+        # pass_fds, POSIX process groups); a Windows host cannot run them.
+        raise unittest.SkipTest("graders run only in Linux task containers")
     for path in (reward, details):
         if path.exists():
             path.unlink()
