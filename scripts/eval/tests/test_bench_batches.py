@@ -227,6 +227,10 @@ class BatchTest(unittest.TestCase):
         self.assertIsNone(record['items'][1]['run'])
 
     def test_a_modified_frozen_bundle_is_refused(self):
+        # The server's scheduler would race the tampering below (create()
+        # wakes it); advance by hand instead (wait_batch does).
+        self.manager.batches.stop()
+        self.manager.batches._thread.join(5)
         created = self.client.request('api/batches', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
         target = Path(created['metacodes']['bundle']) / 'bin' / 'metacodes'
         target.chmod(0o755)
