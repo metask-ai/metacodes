@@ -541,6 +541,15 @@ jobs:
       - name: Gate manifest unit tests
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
+      - name: Install linters
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m pip install --break-system-packages -r requirements-lint.txt
+      - name: Lint
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 scripts/lint.py
+      - name: Lint unit tests
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_lint -v
       - name: Verify install prefix unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v

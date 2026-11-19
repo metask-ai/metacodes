@@ -481,7 +481,6 @@ def _set_child_canonical(pid):
     """What a job-control shell may leave behind while the child is stopped:
     canonical input with signals, but no echo (so a test cannot mistake the
     line discipline's own echo for the application's redraw)."""
-    import subprocess
     import termios
     name = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
                           capture_output=True, text=True, check=True).stdout.strip()

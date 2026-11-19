@@ -2743,8 +2743,15 @@ pub fn build(b: *std.Build) void {
         core_shard_reporter,
         staged_lean_kernels,
     );
+    const gate_lint = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/lint.py",
+    });
+    const lint_step = b.step("lint", "Lint Python, shell scripts and GitHub Actions workflows");
+    lint_step.dependOn(&gate_lint.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
     gate_pr_step.dependOn(&gate_fmt.step);
+    gate_pr_step.dependOn(&gate_lint.step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);

@@ -92,7 +92,7 @@ def rehearsable(root: Path, version: str, head_ref: str, env: Optional[Dict[str,
     if head_ref == f"release/{version}":
         if env.get("GITHUB_ACTIONS") != "true":
             return True
-        labels = [l.strip() for l in env.get("RELEASE_PR_LABELS", "").split(",") if l.strip()]
+        labels = [label.strip() for label in env.get("RELEASE_PR_LABELS", "").split(",") if label.strip()]
         return env.get("RELEASE_PR_TITLE", "") == f"release: {version}" and "release" in labels
     if env.get("GITHUB_ACTIONS") == "true" and env.get("GITHUB_EVENT_NAME") != "push":
         return False  # only main's push run may rely on the merge subject

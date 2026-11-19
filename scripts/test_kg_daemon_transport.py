@@ -332,7 +332,7 @@ def main() -> int:
         print("kg_daemon_transport=pass")
         print(f"shared_generation={ACTOR.generation}")
         print("metacodes_processes=2")
-        print(f"store_actor_instances=1")
+        print("store_actor_instances=1")
         print(f"generation_bound_sessions={len(ACTOR.sessions)}")
         print("shared_schema_pin=pass")
         print(f"markdown_uploads={len(ACTOR.markdown_uploads)}")

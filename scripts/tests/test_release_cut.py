@@ -137,7 +137,7 @@ class ChangelogTest(unittest.TestCase):
         self.assertLess(lines.index("## 0.2.0 — 2026-09-22"), lines.index("## 0.1.0 — 2026-08-29"))
         # the new Unreleased block is empty: nothing between it and the release heading
         between = lines[lines.index("## Unreleased") + 1: lines.index("## 0.2.0 — 2026-09-22")]
-        self.assertEqual([l for l in between if l.strip()], [])
+        self.assertEqual([line for line in between if line.strip()], [])
         # the released section is retrievable and identical
         self.assertEqual(rc.release_section(new, "0.2.0"), section)
 
@@ -171,7 +171,7 @@ class ChangelogTest(unittest.TestCase):
         # by design, so cut eligibility is tested on the fixture, not here.
         lines = (ROOT / rc.CHANGELOG).read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines.count(rc.UNRELEASED), 1)
-        releases = [l for l in lines if rc.RELEASE_HEADING_RE.match(l)]
+        releases = [line for line in lines if rc.RELEASE_HEADING_RE.match(line)]
         self.assertIn("## 0.1.0 — 2026-08-29", releases)
         self.assertLess(lines.index(rc.UNRELEASED), lines.index(releases[0]))
         start = lines.index(rc.UNRELEASED)

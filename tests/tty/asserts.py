@@ -268,7 +268,6 @@ class TTYAssert:
 
     def assert_cursor_on_content(self, text_before_cursor):
         """光标应在 ❯ 内容行,列 = 2(prefix) + 光标前文本显示宽。"""
-        cr = self.content_row()
         r, c = self.final.cursor()
         expected = 2 + str_width(text_before_cursor)
         if c != expected:

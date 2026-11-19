@@ -7,7 +7,8 @@
 故"Apple Terminal 线条不对"**不是** autowrap 根因(虚拟终端复现不出)——真因需真机原始字节定位。
 本用例锁住"strict 终端工作正常 + cc-zig 不触发 autowrap"两个事实,防回归。
 """
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from screen import Screen  # noqa: E402

@@ -50,6 +50,13 @@ These rules apply to the entire repository.
   is for a host that sets `Config.jev_builtin_default`, none here): name a
   service in `config.json` or the environment, or use https
   (`zig build test:builtin-egress` enforces it, #474).
+- Agents do not write comments, doc comments or docstrings. Let names, types
+  and structure carry the meaning, and put the reasoning behind a change in
+  its commit message or PR description. The exceptions are what this file or
+  a check requires (`// no EINTR: <reason>`, the stated reason for a listed
+  terminal write), tool directives (`# shellcheck disable=...`, `# noqa`,
+  `# type: ignore`) and shebangs. Leave existing comments alone unless the
+  code they describe changes; then correct or delete them.
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
@@ -116,6 +123,7 @@ Before submitting:
 
 ```sh
 zig fmt --check build.zig src tests
+python3 scripts/lint.py
 zig build test:lib -Doptimize=ReleaseSafe
 zig build test
 scripts/test_coverage_audit.sh
@@ -147,7 +155,10 @@ copy steps without compiling the product.
 The local `gate:pr` checklist above remains unchanged. Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
-The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
+The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`);
+`scripts/lint.py` needs the linters at the versions `requirements-lint.txt`
+pins (ruff for Python, shellcheck for shell scripts, actionlint for
+workflows) and fails when one is missing.
 
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.

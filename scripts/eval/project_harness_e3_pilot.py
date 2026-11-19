@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, List, Mapping, Sequence
 
 if __package__ in {None, ""}:
     import sys
@@ -72,7 +72,6 @@ if __package__ in {None, ""}:
     from scripts.eval.model import O_BINARY, stable_json  # type: ignore
     from scripts.eval.project_harness_e3_experiment import (  # type: ignore
         ANALYSIS_PLAN,
-        ARMS,
         E3_AUTO_MEMORY_POLICY,
         E3_LONG_HORIZON_ARM,
         E3_ALLOWED_TOOLS,
@@ -90,7 +89,7 @@ if __package__ in {None, ""}:
         validate_manifest,
     )
     from scripts.eval.project_harness_e3_templates import verify_templates  # type: ignore
-    from scripts.eval.project_harness_evolution import _read_json, _read_regular, _sha256_file  # type: ignore
+    from scripts.eval.project_harness_evolution import _read_json, _sha256_file  # type: ignore
 else:
     from .e2e_adapter import finalize_evaluation_fd, _native_trace_metrics
     from .memory_agent_runtime import (
@@ -140,7 +139,6 @@ else:
     from .model import O_BINARY, stable_json
     from .project_harness_e3_experiment import (
         ANALYSIS_PLAN,
-        ARMS,
         E3_AUTO_MEMORY_POLICY,
         E3_LONG_HORIZON_ARM,
         E3_ALLOWED_TOOLS,
@@ -158,7 +156,7 @@ else:
         validate_manifest,
     )
     from .project_harness_e3_templates import verify_templates
-    from .project_harness_evolution import _read_json, _read_regular, _sha256_file
+    from .project_harness_evolution import _read_json, _sha256_file
 
 
 CHECKPOINT_SCHEMA = "metacodes-project-harness-e3-checkpoint-v1"

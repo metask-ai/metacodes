@@ -101,8 +101,9 @@ incur its normal usage; the controller does not upload credentials to CI.
 ## Your first build
 
 You need Zig 0.16.0 (the version in `build.zig.zon`), Python 3.9 or newer with
-PyYAML (`python3 -m pip install -r requirements-dev.txt`), and Git. Lean
-(elan) is optional: without it the kernel-gated tests skip and say so.
+PyYAML (`python3 -m pip install -r requirements-dev.txt`), the pinned linters
+(`python3 -m pip install -r requirements-lint.txt`), and Git. Lean (elan) is
+optional: without it the kernel-gated tests skip and say so.
 
 ```sh
 git clone https://github.com/metask-ai/metacodes.git
@@ -110,6 +111,7 @@ cd metacodes
 zig build dev                                   # fastest edit loop: Debug app only
 ./zig-out/bin/metacodes --help
 zig build test:lib -Dtfilter="max_turns"        # iterate on the tests you touch
+python3 scripts/lint.py                         # ruff, shellcheck and actionlint
 zig build gate:pr                               # the full pre-submit gate
 ```
 

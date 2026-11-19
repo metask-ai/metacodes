@@ -767,7 +767,7 @@ class MetacodesAgent(BaseInstalledAgent):
         escaped_model = shlex.quote(self.model_name)
         escaped_model_display_name = shlex.quote(self._model_display_name)
         try:
-            escaped_proxy = anthropic_messages_endpoint(self._proxy_url)
+            anthropic_messages_endpoint(self._proxy_url)
         except TraceError as exc:
             raise ValueError(str(exc)) from exc
         # metacodes treats METACODES_BASE_URL as the complete Anthropic

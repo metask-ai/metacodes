@@ -82,7 +82,6 @@ def main():
     bin_path = "zig-out/bin/metacodes-debug"
     kfilter = None
     shard_text = os.environ.get("TTY_SHARD") or None
-    verbose = False
     i = 0
     while i < len(args):
         if args[i] == "--bin":
@@ -95,7 +94,6 @@ def main():
             shard_text = args[i + 1]
             i += 2
         elif args[i] == "-v":
-            verbose = True
             i += 1
         else:
             i += 1
@@ -147,7 +145,7 @@ def main():
             _emit(f"✗ FAIL ({dt:.1f}s)")
             _emit("    " + str(e).replace("\n", "\n    "))
             failed.append(name)
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             dt = time.monotonic() - t0
             _emit(f"✗ FAIL ({dt:.1f}s) (运行异常)")
             # 用 format_exc()(无参,全版本兼容);format_exception(e) 单参形态仅 3.10+,

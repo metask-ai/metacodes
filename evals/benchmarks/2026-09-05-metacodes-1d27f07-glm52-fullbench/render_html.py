@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Render the round's data/ into a self-contained HTML page (companion to report.md)."""
-import json, statistics, html
+import json
+import statistics
+import html
+from collections import defaultdict as _dd2
 from pathlib import Path
 
 R = Path(__file__).resolve().parent
@@ -14,7 +17,7 @@ ref = {}
 for f in sorted((D / "frontierchallenge" / "reference-2026-09-01").glob("*.json")):
     for r in json.loads(f.read_text())["rows"]:
         ref[r["task_id"]] = r
-attempted = [l.strip() for l in (D / "frontierchallenge" / "tasks_attempted.txt").read_text().splitlines() if l.strip()]
+attempted = [line.strip() for line in (D / "frontierchallenge" / "tasks_attempted.txt").read_text().splitlines() if line.strip()]
 graded = [r for r in rows.values() if r.get("evaluation_complete") == 1 and r.get("task_score") is not None]
 scores = sorted(r["task_score"] for r in graded)
 passed = sum(1 for r in graded if r.get("passed") == 1)
@@ -45,10 +48,13 @@ def wb_metrics():
         c["slugs"].append(p_["slug"])
     per = {}
     for p_ in plan:
-        slug = p_["slug"]; rws = wb_trials.get(slug, {}).get("trials", [])
-        if not rws and slug not in wb_receipts: continue
+        slug = p_["slug"]
+        rws = wb_trials.get(slug, {}).get("trials", [])
+        if not rws and slug not in wb_receipts:
+            continue
         bt = {}
-        for r in rws: bt[r["task"]] = r
+        for r in rws:
+            bt[r["task"]] = r
         rws = list(bt.values())
         g = [r for r in rws if r.get("reward") is not None]
         per[slug] = {"subset": p_["subset"], "cohort": p_["cohort"], "planned": p_["n"], "diag": bool(p_.get("diagnostic")),
@@ -60,17 +66,27 @@ def wb_metrics():
     for c in cohorts.values():
         merged = {}
         for slug in c["slugs"]:
-            for r in wb_trials.get(slug, {}).get("trials", []): merged[r["task"]] = r
-        rws = list(merged.values()); g = [r for r in rws if r.get("reward") is not None]
-        c["graded"] = len(g); c["reward_sum"] = sum(r["reward"] for r in g); c["full_pass"] = sum(1 for r in g if r["reward"]>=1.0)
-        c["cost"] = sum(r.get("cost_usd") or 0 for r in rws); c["out_tok"] = sum(r.get("output_tokens") or 0 for r in rws)
+            for r in wb_trials.get(slug, {}).get("trials", []):
+                merged[r["task"]] = r
+        rws = list(merged.values())
+        g = [r for r in rws if r.get("reward") is not None]
+        c["graded"] = len(g)
+        c["reward_sum"] = sum(r["reward"] for r in g)
+        c["full_pass"] = sum(1 for r in g if r["reward"]>=1.0)
+        c["cost"] = sum(r.get("cost_usd") or 0 for r in rws)
+        c["out_tok"] = sum(r.get("output_tokens") or 0 for r in rws)
     from collections import defaultdict as _dd
     bs = _dd(lambda: {"planned":0,"graded":0,"reward_sum":0.0,"full_pass":0,"cost":0.0,"out_tok":0,"excluded":0})
     bc = _dd(lambda: {"planned":0,"graded":0,"reward_sum":0.0,"full_pass":0})
     for c in cohorts.values():
         for agg in (bs[c["subset"]], bc[c["cohort"]]):
-            agg["planned"] += c["planned"] or 0; agg["graded"] += c["graded"]; agg["reward_sum"] += c["reward_sum"]; agg["full_pass"] += c["full_pass"]
-        bs[c["subset"]]["cost"] += c["cost"]; bs[c["subset"]]["out_tok"] += c["out_tok"]; bs[c["subset"]]["excluded"] += len(c["excluded"])
+            agg["planned"] += c["planned"] or 0
+            agg["graded"] += c["graded"]
+            agg["reward_sum"] += c["reward_sum"]
+            agg["full_pass"] += c["full_pass"]
+        bs[c["subset"]]["cost"] += c["cost"]
+        bs[c["subset"]]["out_tok"] += c["out_tok"]
+        bs[c["subset"]]["excluded"] += len(c["excluded"])
     return {"per": per, "cohorts": cohorts, "by_subset": dict(bs), "by_cohort": dict(bc)}
 
 WB = wb_metrics()
@@ -82,12 +98,12 @@ wb_pass_total = sum(v["full_pass"] for v in WB["by_subset"].values())
 wb_cost_total = sum(v["cost"] for v in WB["by_subset"].values())
 
 # ---- failure-analysis data (cohort-merged rows per subset; matches report.md) ----
-from collections import defaultdict as _dd2
 _subco = {pp["slug"]: (pp["subset"], pp["cohort"]) for pp in plan}
 _cohort_rows = _dd2(dict)
 for _slug, _v in wb_trials.items():
     _k = _subco.get(_slug)
-    if not _k: continue
+    if not _k:
+        continue
     for _r in _v.get("trials", []):
         _cohort_rows[_k][_r["task"]] = _r
 _SR = _dd2(list)
@@ -95,16 +111,21 @@ for _k, _d in _cohort_rows.items():
     _SR[_k[0]].extend(_d.values())
 
 def _bkt(x):
-    if x is None: return "err"
-    if x == 0: return "zero"
-    if x >= 1.0: return "full"
+    if x is None:
+        return "err"
+    if x == 0:
+        return "zero"
+    if x >= 1.0:
+        return "full"
     return "partial"
 
 def fa_dist_rows():
     tr = []
     for sub in ("code", "web", "office", "security"):
-        rr = _SR[sub]; b = {"zero":0,"partial":0,"full":0,"err":0}
-        for r in rr: b[_bkt(r.get("reward"))] += 1
+        rr = _SR[sub]
+        b = {"zero":0,"partial":0,"full":0,"err":0}
+        for r in rr:
+            b[_bkt(r.get("reward"))] += 1
         g = [r for r in rr if r.get("reward") is not None]
         m = sum(r["reward"] for r in g)/len(g) if g else 0
         tr.append(f'<tr><td><b>{sub}</b></td><td class="num">{len(g)}</td><td class="num">{b["zero"]}</td><td class="num">{b["partial"]}</td><td class="num">{b["full"]}</td><td class="num">{b["err"]}</td><td class="num">{m:.3f}</td></tr>')
@@ -112,20 +133,26 @@ def fa_dist_rows():
 
 def _seccat(t):
     t=t.split("/")[-1]
-    if t.startswith("bb-bin"): return "二进制 pwn"
-    if any(k in t for k in ["overflow","uaf","oob","safe-linking","parse-crash"]): return "内存破坏利用"
-    if any(k in t for k in ["ssrf","cache-","ssti","cms","host-header","deception","poisoning","2fa","-import"]): return "Web/应用漏洞利用"
-    if any(k in t for k in ["dll","loader","stealer","dropper","rat","sideload","rootkit","cryptominer","anti-analysis","rule-gen","yara","detect"]): return "恶意样本分析/检测"
+    if t.startswith("bb-bin"):
+        return "二进制 pwn"
+    if any(k in t for k in ["overflow","uaf","oob","safe-linking","parse-crash"]):
+        return "内存破坏利用"
+    if any(k in t for k in ["ssrf","cache-","ssti","cms","host-header","deception","poisoning","2fa","-import"]):
+        return "Web/应用漏洞利用"
+    if any(k in t for k in ["dll","loader","stealer","dropper","rat","sideload","rootkit","cryptominer","anti-analysis","rule-gen","yara","detect"]):
+        return "恶意样本分析/检测"
     return "其他"
 
 def fa_sec_rows():
     cat=_dd2(list)
     for r in _SR["security"]:
-        if r.get("reward") is not None: cat[_seccat(r["task"])].append(r["reward"])
+        if r.get("reward") is not None:
+            cat[_seccat(r["task"])].append(r["reward"])
     tr=[]
     for k in ("内存破坏利用","Web/应用漏洞利用","二进制 pwn","恶意样本分析/检测","其他"):
         vs=cat.get(k) or []
-        if not vs: continue
+        if not vs:
+            continue
         cls=' class="zero"' if sum(vs)/len(vs)==0 else ""
         tr.append(f'<tr{cls}><td>{k}</td><td class="num">{len(vs)}</td><td class="num">{sum(vs)/len(vs):.3f}</td><td class="num">{sum(1 for x in vs if x==0)}</td><td class="num">{sum(1 for x in vs if x>=1)}</td></tr>')
     return "".join(tr)
@@ -134,30 +161,39 @@ def fa_office_rows():
     import re as _re2
     lvl=_dd2(list)
     for r in _SR["office"]:
-        if r.get("reward") is None: continue
-        m=_re2.search(r"(L[234])", r["task"]); lvl[m.group(1) if m else "未标注"].append(r["reward"])
+        if r.get("reward") is None:
+            continue
+        m=_re2.search(r"(L[234])", r["task"])
+        lvl[m.group(1) if m else "未标注"].append(r["reward"])
     tr=[]
     for k in ("L2","L3","L4","未标注"):
         vs=lvl.get(k) or []
-        if vs: tr.append(f'<tr><td>{k}</td><td class="num">{len(vs)}</td><td class="num">{sum(vs)/len(vs):.3f}</td><td class="num">{sum(1 for x in vs if x>=1)}</td></tr>')
+        if vs:
+            tr.append(f'<tr><td>{k}</td><td class="num">{len(vs)}</td><td class="num">{sum(vs)/len(vs):.3f}</td><td class="num">{sum(1 for x in vs if x>=1)}</td></tr>')
     return "".join(tr)
 
 def fa_code_rows():
     cc=_dd2(list)
     for r in _SR["code"]:
-        if r.get("reward") is None: continue
+        if r.get("reward") is None:
+            continue
         cc[r["task"].split("/")[-1].split("-")[0]].append(r["reward"])
     ccs=sorted(((k,sum(v)/len(v),len(v),sum(1 for x in v if x>=1)) for k,v in cc.items() if len(v)>=3), key=lambda x:x[1])
-    weak=ccs[:5]; strong=ccs[::-1][:5]; tr=[]
+    weak=ccs[:5]
+    strong=ccs[::-1][:5]
+    tr=[]
     for i in range(min(5,len(weak))):
-        w=weak[i]; st=strong[i]
+        w=weak[i]
+        st=strong[i]
         tr.append(f'<tr><td class="mono">{w[0]}</td><td class="num">{w[2]}</td><td class="num">{w[1]:.3f}</td><td></td><td class="mono">{st[0]}</td><td class="num">{st[2]}</td><td class="num">{st[1]:.3f}</td></tr>')
     return "".join(tr)
 
 def fa_fc():
-    g=[r for r in graded]; b={"full":0,"mid":0,"low":0,"zero":0}
+    g=[r for r in graded]
+    b={"full":0,"mid":0,"low":0,"zero":0}
     for r in g:
-        sc=r["task_score"]; b["full" if sc>=1 else ("zero" if sc==0 else ("low" if sc<0.5 else "mid"))]+=1
+        sc=r["task_score"]
+        b["full" if sc>=1 else ("zero" if sc==0 else ("low" if sc<0.5 else "mid"))]+=1
     return b
 
 
@@ -223,7 +259,8 @@ def wb_subset_chart():
     items = [(sub, WB["by_subset"][sub]) for sub in SUBORDER if sub in WB["by_subset"]]
     W, rowh, pad_l, pad_t, pad_r = 560, 34, 74, 12, 54
     H = pad_t + rowh * len(items) + 26
-    x0 = pad_l; span = W - pad_l - pad_r
+    x0 = pad_l
+    span = W - pad_l - pad_r
     out = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="各子集 mean reward" class="chart">']
     for k in range(0, 6):
         x = x0 + span * k / 5
@@ -245,9 +282,9 @@ def wb_subset_rows():
     trs = []
     for sub in SUBORDER:
         v = WB["by_subset"].get(sub)
-        if not v: continue
+        if not v:
+            continue
         m = "—" if not v["graded"] else f'{v["reward_sum"]/v["graded"]:.3f}'
-        na = v["excluded"] + (70 - 0 if sub == "web" else 0)
         naw = "70(全域)" if sub == "web" else (str(v["excluded"]) if v["excluded"] else "0")
         trs.append(f'<tr><td><b>{esc(sub)}</b></td><td class="num">{v["planned"]}</td><td class="num">{v["graded"]}</td><td class="num">{naw}</td><td class="num">{m}</td><td class="num">{v["full_pass"]}</td><td class="num">{v["cost"]:.2f}</td></tr>')
     return "".join(trs)
@@ -260,9 +297,11 @@ def wb_cohort_rows():
         rc = v.get("receipt") or {}
         st = rc.get("state") or "no receipt"
         if st == "authorized_failure":
-            st = f'authorized_failure({rc.get("failure_stage") or "?"})'; badge = "fail"
+            st = f'authorized_failure({rc.get("failure_stage") or "?"})'
+            badge = "fail"
         elif st == "committed":
-            st = f'committed ${rc.get("actual_cost_usd"):.2f}' if rc.get("actual_cost_usd") is not None else "committed"; badge = "ok"
+            st = f'committed ${rc.get("actual_cost_usd"):.2f}' if rc.get("actual_cost_usd") is not None else "committed"
+            badge = "ok"
         else:
             badge = "idle"
         m = "—" if v["mean"] is None else f'{v["mean"]:.3f}'
