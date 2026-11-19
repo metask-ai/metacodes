@@ -36,6 +36,11 @@ surfaces built over the same core protocols.
 
 ## Provider selection surface
 
+The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
+launches Harbor trials. Its command, JSON output and HTTP launch contract are
+documented in [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
+AgentCore ABI and SDK layouts are unchanged.
+
 ### Metask device OAuth and gateway
 
 `metacodes login --provider metask` performs the Metask JSON device flow:
@@ -768,7 +773,7 @@ unless noted.
 | `GET /` | The bundled single-session browser UI; in the `/s/<id>/` daemon, a page listing the live session ids and these endpoints. |
 | `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
 | `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
-| `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. |
+| `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. Ids are never reused, also across restarts and a session destroyed and restored, so an answer to an earlier process's request is 409 and never answers a newer one ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#15-ui-requests-approvers-expiry-suspended-runs)). |
 | `POST /capabilities` | The frontend's [capability frame](WIRE_PROTOCOL.md#2-capability-exchange): `200` with the `capabilities_accepted` line (also journaled), `400` with `capabilities_refused` (nothing changes). From then on a UI request the frame leaves out is journaled as `ui_request_unavailable` and never announced. |
 | `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |

@@ -16,8 +16,9 @@
 //! file reads that judge which routes have a credential) run outside it.
 //!
 //! The picker starts no sign-in and takes no key (#488): `/login <provider>`
-//! is where that happens. A provider with no credential is listed only to say
-//! where its credential goes.
+//! is where that happens. A provider with no credential is not listed; a
+//! commit whose credential went away after the list was drawn says where it
+//! goes.
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
@@ -66,13 +67,14 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
     guard.lock();
     defer guard.unlock();
     app.model_picker.restart();
-    // What the setup of a provider with no credential points at (#488).
+    // Where a credential goes: for a commit that finds none, and for a list
+    // no provider is configured for (#488).
     app.model_picker.setLocalConfig(env_path, state_env.guide_url);
     // The level the session runs with starts selected on any route that
-    // offers it, so applying a route does not quietly drop it.
-    if (app.config.reasoning_effort) |effort| {
-        if (effort.active()) app.model_picker.presetControl("reasoning_effort", effort.name());
-    }
+    // offers it, so applying a route does not quietly drop it. `none` and
+    // `minimal` too: a level chosen to keep thinking off is a choice, and a
+    // route's declared default (DeepSeek's `high`) must not replace it.
+    if (app.config.reasoning_effort) |effort| app.model_picker.presetControl("reasoning_effort", effort.name());
     app.model_picker.page_rows = pageRowsFor(ui.rows);
     setOpen(ui, true);
 }
@@ -184,8 +186,8 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
     const outcome = app.commitModelSelection(commit) catch |err| {
         // issue #33: the route resolved; what is missing is a credential for
         // its provider. The picker listed it as ready, so the credential went
-        // away since it opened: show where it goes, as for a provider in the
-        // "Not configured" group (#483, #488). No sign-in starts here.
+        // away since it opened: show where it goes (#483, #488). No sign-in
+        // starts here.
         if (err == error.MissingCredentials) if (app.providerHost() catch null) |host| {
             if (host.kernel.catalogSnapshot().find(commit.offer_id)) |offer| {
                 const setup = app_mod.App.providerSetup(host, offer.provider_id);
