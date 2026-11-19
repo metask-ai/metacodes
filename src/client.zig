@@ -1154,7 +1154,16 @@ pub const Client = struct {
         // Refresh replaces fixed bytes the client owns; a Session's
         // replaceable credential is rotated by its Host instead.
         const stale = client.credential.lendable() orelse return error.Unauthorized;
+        // The route can move while the refresh runs: a `/model` commit from
+        // the reply's key thread rebinds the client and takes the callback
+        // off. The token is for the route the request was sent on; on any
+        // other it is neither installed nor sent.
+        const sent_to = client.base_url;
         const token = callback(ctx, stale) catch return error.Unauthorized;
+        if (client.refresh_fn == null or !std.mem.eql(u8, sent_to, client.base_url)) {
+            secureFree(client.allocator, token);
+            return error.Unauthorized;
+        }
         client.replaceRefreshToken(token) catch {
             secureFree(client.allocator, token);
             return error.Unauthorized;

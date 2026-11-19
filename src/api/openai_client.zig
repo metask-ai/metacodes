@@ -388,7 +388,14 @@ pub const OpenAIClient = struct {
             const callback = self.refresh_fn orelse return error.Unauthorized;
             const ctx = self.refresh_ctx orelse return error.Unauthorized;
             const stale = self.credential.lendable() orelse return error.Unauthorized;
+            // As in `Client.refreshExpiredToken`: a token refreshed while the
+            // route moved is for the route the request was sent on, not this one.
+            const sent_to = self.base_url orelse "";
             const token = callback(ctx, stale) catch return error.Unauthorized;
+            if (self.refresh_fn == null or !std.mem.eql(u8, sent_to, self.base_url orelse "")) {
+                secureFree(self.allocator, token);
+                return error.Unauthorized;
+            }
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
                 return error.Unauthorized;

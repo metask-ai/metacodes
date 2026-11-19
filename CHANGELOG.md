@@ -839,6 +839,68 @@ status, compatibility boundaries, and entry points are defined by
   `/model` pick, and a refresh of them was written over the new login. A
   session on another provider, or on no route, is left as it is.
 
+- **A credential pool member authenticates only its own provider's
+  routes.** `config.json`'s `providers.<id>.credentials[]` were read as one
+  list for every provider, and a member was chosen by kind alone: a provider
+  with no key of its own (DeepSeek, say) was given another provider's member
+  whenever its profile accepted that kind, and its requests carried it to
+  that provider's endpoint. A route that names an account fell back to
+  another credential when that account's variable was unset: another
+  account's, the provider's own variable, or a stored key. Each provider now
+  reads only its own pool, and a route that names an account uses that
+  account or fails with `MissingCredentials`.
+
+- **A `/model` switch that cannot be applied leaves the session's route
+  where it was.** The kernel recorded the new route before the session bound
+  it and kept it when binding failed (no credential, for instance), and the
+  process's OAuth session had already moved to the new provider. The next
+  turn's token refresh read both: once that provider's token endpoint
+  answered, its token went into the clients still pointed at the previous
+  route's endpoint. A failed bind now puts back the kernel's selection
+  (journalled as a failed switch, `binding_failed`) and the previous OAuth
+  session; a resumed session's stored route is restored the same way.
+
+- **The turn's token refresh renews only the credential the session's route
+  was bound with.** It refreshed the provider of the kernel's effective
+  selection and put that token in the clients, whatever route they were on.
+  After a `/model` pick in the global or once scope (Tab), a narrower scope
+  still named the previous route, so a Metask device session that picked a
+  relay that way sent the Metask token to the relay every turn; a route
+  bound to a pool account or to a key had it replaced by the provider's
+  OAuth token. The refresh now follows the route the clients were last bound
+  to (before any pick, the one the session started on) and replaces only an
+  OAuth token that route was bound with.
+
+- **The Metask token refresh runs only on a route the Metask device sign-in
+  authenticates.** The refresh a device-code session installs at startup
+  stayed on the clients after a `/model` switch to another provider, so an
+  endpoint that answered 401 with `"code":"token_expired"` received the
+  request again with the Metask access token. A route switch now installs or
+  removes it with the route, and it answers only while the process's OAuth
+  session is Metask's.
+
+- **A token refreshed while the route moved is not sent on the new route.**
+  When a 401 `token_expired` refresh finished after a `/model` commit (made
+  from the reply's key thread) had moved the client, the refreshed token was
+  installed and the request replayed at the new route. The client now drops
+  it, and the request fails as unauthorized.
+
+- **The `/models` key list is requested only on the Metask API-key route.**
+  It was requested with the Metask sign-in token from `auth.json`, at
+  `/api/v1/keys` under whatever endpoint the session was on: typing `/model`
+  after a switch to another Messages-wire provider, or in a session started
+  on one, sent that token there. Elsewhere the menu now shows the list as
+  unavailable; leaving the Metask route drops a loaded list, and coming back
+  loads it again. A Metask model picked at another Metask gateway (the
+  compiled default, say) is still the Metask route.
+
+- **A key picked in `/models` stays on the Metask route.** The pick was
+  installed in every client and in the background job registry, and its
+  `/v1/models` probe sent, whatever route the session was on. Off the Metask
+  API-key route it is now refused (`NotOnMetaskKeyRoute`), and on it only the
+  route's own client takes it. The key it replaces stays readable for one
+  more pick instead of being freed while a client may still read it.
+
 ### Security
 
 - **On `serve` and `--web`, an answer from before a restart no longer

@@ -16,6 +16,7 @@ test {
     _ = @import("integration/agents_e2e_test.zig");
     _ = @import("component/provider_offer_test.zig");
     _ = @import("component/metask_api_key_picker_test.zig");
+    _ = @import("component/credential_route_scope_test.zig");
     _ = @import("component/provider_cli_key_scope_test.zig");
     _ = @import("component/vendor_dialect_test.zig");
     _ = @import("component/bedrock_converse_test.zig");
