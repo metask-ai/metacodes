@@ -126,9 +126,14 @@ class _Case:
     def seen(self, method, path):
         return [entry for entry in self.server.seen if entry[0] == method and entry[1] == path]
 
-    def answer_the_browser(self):
+    def answer_the_browser(self, approve_after_s=2.0):
         """Play OpenRouter's page: once the dialog has sent the browser to the
-        mock's page, redirect to the callback it named, with its state."""
+        mock's page, redirect to the callback it named, with its state.
+
+        It waits first, as a person approving the key would: the browser is
+        opened before the dialog draws what it shows while waiting, and on a
+        fast machine (Linux CI) an immediate callback signed in before that
+        screen was ever drawn."""
 
         def play():
             deadline = time.monotonic() + WAIT_S
@@ -145,6 +150,7 @@ class _Case:
                         state = query["state"][0]
                         assert callback.startswith("http://localhost:"), callback
                         target = f"{callback}?code={BROWSER_CODE}&state={urllib.parse.quote(state)}"
+                        time.sleep(approve_after_s)
                         urllib.request.urlopen(target, timeout=5).read()
                         return
                 time.sleep(0.05)
