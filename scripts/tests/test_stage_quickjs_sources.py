@@ -191,10 +191,72 @@ class FailClosedTest(unittest.TestCase):
         stage(vendor, out)
         self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
         _write(out / "added-later.txt", "not staged\n")
-        with self.assertRaisesRegex(StageError, r"did not write: \['added-later.txt'\]"):
+        with self.assertRaisesRegex(StageError, "did not write: added-later.txt"):
             stage(vendor, out)
         self.assertTrue((out / "added-later.txt").is_file())
         self.assertTrue((out / "engine.c").is_file())
+
+    def _snapshot(self, directory: Path) -> dict:
+        return {
+            p.relative_to(directory).as_posix(): (p.read_bytes() if p.is_file() else None)
+            for p in sorted(directory.rglob("*"))
+        }
+
+    def test_a_replaced_staged_file_is_refused_and_kept(self) -> None:
+        vendor = _fixture(self.root)
+        out = self.root / "out"
+        stage(vendor, out)
+        _write(out / "engine.c", "a local edit to keep\n")
+        before = self._snapshot(out)
+        with self.assertRaisesRegex(StageError, "engine.c changed since it was staged"):
+            stage(vendor, out)
+        self.assertEqual(before, self._snapshot(out))
+
+    def test_a_staged_name_turned_directory_is_refused_before_any_deletion(self) -> None:
+        vendor = _fixture(self.root)
+        out = self.root / "out"
+        stage(vendor, out)
+        (out / "engine.c").unlink()
+        _write(out / "engine.c" / "inner.txt", "keep\n")
+        before = self._snapshot(out)
+        with self.assertRaisesRegex(StageError, "engine.c is not a regular file"):
+            stage(vendor, out)
+        self.assertEqual(before, self._snapshot(out))
+
+    def test_an_interrupted_write_keeps_the_old_output_and_a_retry_succeeds(self) -> None:
+        vendor = _fixture(self.root)
+        out = self.root / "out"
+        stage(vendor, out)
+        before = self._snapshot(out)
+        real = stage_mod._write_tree
+
+        def disk_full(directory: Path, tree: dict) -> None:
+            (directory / "LICENSE").write_bytes(tree["LICENSE"])
+            raise OSError(28, "No space left on device")
+
+        stage_mod._write_tree = disk_full
+        try:
+            with self.assertRaisesRegex(StageError, "No space left on device"):
+                stage(vendor, out)
+        finally:
+            stage_mod._write_tree = real
+        self.assertEqual(before, self._snapshot(out))
+        self.assertEqual(["out", "vendor"], sorted(p.name for p in self.root.iterdir()), "no staging leftovers")
+        stage(vendor, out)
+        self.assertEqual(before, self._snapshot(out))
+        self.assertEqual(["out", "vendor"], sorted(p.name for p in self.root.iterdir()))
+
+    def test_a_case_alias_inside_the_vendor_tree_is_refused(self) -> None:
+        vendor = _fixture(self.root)
+        alias = vendor.parent / vendor.name.upper()
+        if not alias.exists():
+            self.skipTest("case-sensitive file system")
+        before = self._snapshot(self.root)
+        for out in (alias / "new", alias, alias / "patches"):
+            with self.subTest(out=out):
+                with self.assertRaisesRegex(StageError, "overlaps the vendor tree"):
+                    stage(vendor, out)
+        self.assertEqual(before, self._snapshot(self.root))
 
     def test_an_empty_existing_directory_is_accepted(self) -> None:
         vendor = _fixture(self.root)
@@ -209,7 +271,8 @@ class FailClosedTest(unittest.TestCase):
         stage(vendor, out)
         self.assertEqual(PATCHED_C, (out / "engine.c").read_text(encoding="utf-8"))
         self.assertEqual([STAGE_RECORD, "LICENSE", "engine.c"], sorted(p.name for p in out.iterdir()))
-        self.assertEqual(["LICENSE", "engine.c"], json.loads((out / STAGE_RECORD).read_text(encoding="utf-8")))
+        record = json.loads((out / STAGE_RECORD).read_text(encoding="utf-8"))
+        self.assertEqual({"LICENSE": _sha(b"MIT\n"), "engine.c": _sha(PATCHED_C.encode())}, record["files"])
 
     def test_an_edited_upstream_file_fails(self) -> None:
         vendor = _fixture(self.root)

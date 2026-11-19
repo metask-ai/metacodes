@@ -21,9 +21,11 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import sys
+import tempfile
 from typing import Dict, List, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +45,7 @@ LOCAL_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
 #: `stage` records what it wrote here, and only ever replaces a directory that
 #: holds exactly that record and those files.
 STAGE_RECORD = ".stage_quickjs_sources.json"
+STAGE_RECORD_SCHEMA = "metacodes.quickjs-stage-record/v1"
 
 
 class StageError(RuntimeError):
@@ -307,57 +310,107 @@ def build_tree(vendor_dir: Path, sources: QuickJsSources) -> Dict[str, bytes]:
     return tree
 
 
-def _overlaps(a: Path, b: Path) -> bool:
-    return a == b or a in b.parents or b in a.parents
-
-
-def _prepare_out_dir(vendor_dir: Path, out_dir: Path) -> None:
-    """Make `out_dir` an empty directory without deleting anything not ours.
-
-    The output may not be the vendor tree, inside it, or one of its parents
-    (which include the repository root). An existing directory is accepted
-    only when it is empty or holds exactly what a previous `stage` recorded
-    writing, and then only those files are removed.
-    """
-    vendor = vendor_dir.resolve()
-    if _overlaps(out_dir.resolve(), vendor):
-        raise StageError(f"refusing output directory {out_dir}: it overlaps the vendor tree {vendor}")
-    if out_dir.is_symlink() or (out_dir.exists() and not out_dir.is_dir()):
-        raise StageError(f"refusing output directory {out_dir}: not a plain directory")
-    if not out_dir.exists():
-        out_dir.mkdir(parents=True)
-        return
-    entries = {entry.name: entry for entry in out_dir.iterdir()}
-    if not entries:
-        return
-    record = entries.get(STAGE_RECORD)
+def _same(a: Path, b: Path) -> bool:
+    """Same directory by filesystem identity, so case-insensitive aliases match."""
     try:
-        written = json.loads(record.read_text(encoding="utf-8")) if record is not None else None
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _overlaps_vendor(out_dir: Path, vendor_dir: Path) -> bool:
+    """`out_dir` is the vendor tree, inside it, or one of its parents.
+
+    Compared by path and by filesystem identity: on a case-insensitive volume
+    `Vendor/new` is inside `vendor` although the strings differ.
+    """
+    out = Path(os.path.abspath(out_dir))
+    vendor = vendor_dir.resolve()
+    lexical = out.resolve()
+    if lexical == vendor or vendor in lexical.parents or lexical in vendor.parents:
+        return True
+    if out.exists() and any(_same(out, outer) for outer in [vendor, *vendor.parents]):
+        return True
+    return any(_same(ancestor, vendor) for ancestor in [out, *out.parents] if ancestor.exists())
+
+
+def _owned_entries(out_dir: Path) -> List[Path]:
+    """Every entry of an existing output, after proving all of them are ours.
+
+    Nothing is modified here. The directory is ours when it is empty, or when
+    it holds a stage record and every entry is a regular file the record names
+    with the SHA-256 it records. Any other state is refused as a whole.
+    """
+    entries = sorted(out_dir.iterdir())
+    if not entries:
+        return []
+    names = {entry.name: entry for entry in entries}
+    record = names.get(STAGE_RECORD)
+    try:
+        written = json.loads(record.read_text(encoding="utf-8")) if record is not None and record.is_file() else None
     except (OSError, ValueError):
         written = None
-    if not isinstance(written, list) or not all(isinstance(name, str) for name in written):
+    files = written.get("files") if isinstance(written, dict) and written.get("schema") == STAGE_RECORD_SCHEMA else None
+    if not isinstance(files, dict):
         raise StageError(f"refusing output directory {out_dir}: not empty and not written by this script")
-    foreign = sorted(set(entries) - set(written) - {STAGE_RECORD})
-    if foreign:
-        raise StageError(f"refusing output directory {out_dir}: it holds files this script did not write: {foreign}")
-    for name in written:
-        entry = entries.get(name)
-        if entry is None:
-            continue
+    for name, entry in names.items():
         if entry.is_symlink() or not entry.is_file():
             raise StageError(f"refusing output directory {out_dir}: {name} is not a regular file")
+        if name == STAGE_RECORD:
+            continue
+        digest = files.get(name)
+        if digest is None:
+            raise StageError(f"refusing output directory {out_dir}: it holds a file this script did not write: {name}")
+        if sha256_bytes(entry.read_bytes()) != digest:
+            raise StageError(f"refusing output directory {out_dir}: {name} changed since it was staged")
+    return entries
+
+
+def _write_tree(directory: Path, tree: Dict[str, bytes]) -> None:
+    for name, data in sorted(tree.items()):
+        (directory / name).write_bytes(data)
+    record = {"schema": STAGE_RECORD_SCHEMA, "files": {name: sha256_bytes(data) for name, data in sorted(tree.items())}}
+    (directory / STAGE_RECORD).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+
+def _remove_owned(directory: Path, entries: List[Path]) -> None:
+    for entry in entries:
         entry.unlink()
-    record.unlink()
+    directory.rmdir()
 
 
 def stage(vendor_dir: Path, out_dir: Path) -> QuickJsSources:
+    """Verify, then publish the patched tree at `out_dir` without losing data.
+
+    The output may not be the vendor tree, inside it, or one of its parents
+    (which include the repository root). An existing output must be empty or
+    exactly what a previous stage wrote, checked by content before anything is
+    touched. The new tree is written into a fresh sibling directory first and
+    swapped in by rename, so an interrupted write leaves the old output intact
+    and a retry succeeds.
+    """
     sources = QuickJsSources.load(vendor_dir / "manifest.json")
     tree = build_tree(vendor_dir, sources)
-    _prepare_out_dir(vendor_dir, out_dir)
-    for name, data in sorted(tree.items()):
-        (out_dir / name).write_bytes(data)
-    record = json.dumps(sorted(tree), indent=2) + "\n"
-    (out_dir / STAGE_RECORD).write_text(record, encoding="utf-8")
+    if _overlaps_vendor(out_dir, vendor_dir):
+        raise StageError(f"refusing output directory {out_dir}: it overlaps the vendor tree {vendor_dir.resolve()}")
+    if out_dir.is_symlink() or (out_dir.exists() and not out_dir.is_dir()):
+        raise StageError(f"refusing output directory {out_dir}: not a plain directory")
+    old_entries = _owned_entries(out_dir) if out_dir.exists() else None
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    fresh = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.staging-", dir=out_dir.parent))
+    try:
+        _write_tree(fresh, tree)
+    except OSError as error:
+        _remove_owned(fresh, sorted(fresh.iterdir()))
+        raise StageError(f"cannot write the staged tree: {error}") from error
+    if old_entries is not None:
+        retired = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.retired-", dir=out_dir.parent))
+        retired.rmdir()
+        os.rename(out_dir, retired)
+        os.rename(fresh, out_dir)
+        _remove_owned(retired, [retired / entry.name for entry in old_entries])
+    else:
+        os.rename(fresh, out_dir)
     return sources
 
 
