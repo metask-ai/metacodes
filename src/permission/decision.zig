@@ -15,6 +15,7 @@ const SessionRules = @import("session_rules.zig").SessionRules;
 const rule_spec = @import("rule_spec.zig");
 const hooks_mod = @import("hooks.zig");
 const bash_readonly = @import("bash_readonly.zig");
+const credential_store = @import("credential_store.zig");
 const sandbox_config = @import("../sandbox/config.zig");
 const sandbox_exec = @import("../sandbox/exec.zig");
 const log = @import("../util/log.zig");
@@ -266,6 +267,10 @@ pub fn checkClassified(
         log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
         return resolveImported(ctx, tool_name, args, .core_safety_ask);
     }
+    if (bashReachesCredentialStore(ctx, tool_name, args)) {
+        log.debug("permission", "credential store read tool={s} -> ask", .{tool_name});
+        return resolveImported(ctx, tool_name, args, .core_safety_ask);
+    }
 
     if (ctx.decision_override) |override| {
         const imported_view: ImportedDecision = switch (imported) {
@@ -413,6 +418,51 @@ fn bashAutoAllowed(ctx: *const Context, args: []const u8) bool {
     if (sandbox_exec.plan(sb, command, sandbox_exec.escapeHatchHonored(sb, args)) != .sandboxed) return false;
     log.debug("permission", "autoAllowBashIfSandboxed -> allow", .{});
     return true;
+}
+
+fn bashReachesCredentialStore(ctx: *const Context, tool_name: []const u8, args: []const u8) bool {
+    if (!std.mem.eql(u8, tool_name, "Bash")) return false;
+    var fallback_buf: [bash_readonly.MAX_COMMAND_BYTES]u8 = undefined;
+    var fallback = std.heap.FixedBufferAllocator.init(&fallback_buf);
+    const scratch = ctx.path_check_allocator orelse fallback.allocator();
+    const command = bash_readonly.commandFromInput(scratch, args) orelse return credential_store.mentions(args);
+    defer scratch.free(command);
+    return credential_store.mentions(command);
+}
+
+test "a Bash command that reads a credential store asks, over an allow rule and in every mode" {
+    const alloc = std.testing.allocator;
+    const src = "{\"permissions\":{\"allow\":[\"Bash\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const keychain = "{\"command\":\"security find-generic-password -s \\\"Metacode MCP Credentials\\\" -w > /tmp/cred.json\"}";
+    const heredoc = "{\"command\":\"python3 << 'EOF'\\nimport subprocess\\nsubprocess.run(['security','find-generic-password','-a','suno','-w'])\\nEOF\"}";
+    for ([_]@import("mode.zig").Mode{ .default, .accept_edits, .auto, .bypass_permissions }) |mode| {
+        const allowed = Context{ .mode = mode, .settings = &ms, .path_check_allocator = alloc };
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", keychain));
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", heredoc));
+        try std.testing.expectEqual(Decision.allow, check(&allowed, "Bash", "{\"command\":\"make test\"}"));
+    }
+    const bare = Context{ .mode = .bypass_permissions };
+    try std.testing.expectEqual(Decision.ask, check(&bare, "Bash", keychain));
+    try std.testing.expectEqual(Decision.allow, check(&bare, "Bash", "{\"command\":\"make test\"}"));
+
+    const denied_src = "{\"permissions\":{\"deny\":[\"Bash\"]}}";
+    var denied_parsed = try std.json.parseFromSlice(std.json.Value, alloc, denied_src, .{});
+    defer denied_parsed.deinit();
+    const DL = try settings_mod.parseLayer(alloc, .user, denied_parsed.value);
+    const denied_layers = try alloc.alloc(settings_mod.Layer, 1);
+    denied_layers[0] = DL;
+    var denied_ms = settings_mod.MergedSettings{ .layers = denied_layers, .allocator = alloc };
+    defer denied_ms.deinit();
+    const denied = Context{ .mode = .default, .settings = &denied_ms };
+    try std.testing.expectEqual(Decision.deny, check(&denied, "Bash", keychain));
 }
 
 test "classified Host effect replaces legacy unknown-name read fallback" {
