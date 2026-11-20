@@ -150,7 +150,7 @@ def run_solve(task_dir: Path, mapping: Dict[str, Path]) -> None:
     """Run solution/solve.sh with its absolute paths mapped into a scratch dir."""
     script = (task_dir / "solution/solve.sh").read_text(encoding="utf-8")
     for container_path, host_path in mapping.items():
-        script = script.replace(container_path, str(host_path))
+        script = script.replace(container_path, str(host_path).replace("\\", "/"))
     subprocess.run([BASH, "-c", script], check=True, capture_output=True)
 
 
