@@ -1005,6 +1005,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Security
 
+- **If you used a relay or switched a session between providers, replace
+  your keys and sign in to Metask again.** Before this release a credential
+  could reach a provider it was not issued for: after a `/model` switch (a
+  relay counts as a provider), the Metask sign-in token, a key picked in
+  `/models` or another provider's sign-in token could be sent to the
+  endpoint the session was on, and with credentials for several providers
+  in `config.json` (`providers.<id>.credentials`) one provider's pooled key
+  could be sent to another. Each case is fixed; they are listed under Fixed.
+  Create new keys at the providers whose keys this machine held, delete the
+  old ones there, and sign in to Metask again with `/login` or
+  `metacodes login`, which now revokes the sign-in it replaces (#560).
 - **On `serve` and `--web`, an answer from before a restart no longer
   answers a newer request** (#563). Both numbered UI requests from 1 in every
   process, and again for every session they restored, and `POST /respond`
