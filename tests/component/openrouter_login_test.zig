@@ -718,7 +718,6 @@ fn pinOpenRouterDefault(case: *Case, io: std.Io, model: []const u8) !PinnedDefau
     }
     const pinned = found orelse return error.ModelNotListed;
     const config_path = try std.fs.path.join(a, &.{ case.root, "config.json" });
-    try case.setEnv(cc.provider_config_store.CONFIG_PATH_ENV, (try a.dupeZ(u8, config_path)).ptr);
     var store = try cc.provider_config_store.Store.initPath(testing.allocator, config_path);
     defer store.deinit();
     _ = try cc.provider_config_store.setGlobalSelection(

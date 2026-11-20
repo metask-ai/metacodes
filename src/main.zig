@@ -486,7 +486,7 @@ fn applyProviderRoute(
 /// than the one the user chose, which is the exact substitution the offer model
 /// exists to prevent.
 pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
-    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return false;
+    var store = provider_config_store.Store.initHome(allocator, config.state_root) catch return false;
     defer store.deinit();
 
     var document = store.load() catch |err| {
