@@ -647,7 +647,9 @@ class AccountInventoryTest(unittest.TestCase):
 
 def release_server(root, version, *, corrupt=False):
     """A local stand-in for GitHub Releases serving one Linux unit."""
-    import hashlib, io, tarfile
+    import hashlib
+    import io
+    import tarfile
     target = releases.linux_target()
     name = f'metacodes-{version}-{target}.tar.gz'
     unit = f'metacodes-{version}-{target}/'
@@ -745,7 +747,8 @@ class ReleaseVersionTest(unittest.TestCase):
         self.assertEqual(self.manager.runs(), [])
 
     def test_archive_links_and_escaping_paths_are_refused(self):
-        import io, tarfile
+        import io
+        import tarfile
         for name, kind in (('../escape', tarfile.REGTYPE), ('/abs', tarfile.REGTYPE), ('unit/link', tarfile.SYMTYPE)):
             with self.subTest(name=name):
                 archive = self.root / 'bad.tar.gz'
@@ -1127,7 +1130,9 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertEqual(len(self.docker_runs()), 1)
 
     def test_interrupted_toolchain_install_is_redone_not_reused(self):
-        import io, subprocess, tarfile
+        import io
+        import subprocess
+        import tarfile
         stub = self.root / 'stub'
         stub.mkdir()
         archive = io.BytesIO()
