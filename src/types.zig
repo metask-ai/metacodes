@@ -3,18 +3,136 @@ const std = @import("std");
 /// See `Config.mcp_connect`.
 pub const McpConnect = enum { app_init, first_request, disabled };
 
-/// Only configuration may inherit preview opt-in; execution receives a bool.
-pub const PreviewSetting = enum {
-    inherit,
-    disabled,
-    enabled,
+pub const PreviewFeature = enum {
+    execute_code,
+    teamwork,
+    comment_guard,
 
-    pub fn resolve(self: PreviewSetting, persisted: ?bool) PreviewSetting {
-        return if (self != .inherit) self else if (persisted orelse false) .enabled else .disabled;
+    pub fn parse(name: []const u8) ?PreviewFeature {
+        return std.meta.stringToEnum(PreviewFeature, name);
+    }
+};
+
+pub const PreviewFeatures = packed struct(u8) {
+    execute_code: bool = false,
+    teamwork: bool = false,
+    comment_guard: bool = false,
+    _unused: u5 = 0,
+
+    comptime {
+        for (@typeInfo(PreviewFeatures).@"struct".fields) |field| {
+            if (!std.mem.eql(u8, field.name, "_unused") and std.meta.stringToEnum(PreviewFeature, field.name) == null)
+                @compileError("PreviewFeatures." ++ field.name ++ " has no PreviewFeature");
+        }
     }
 
-    pub fn isEnabled(self: PreviewSetting) bool {
-        return self == .enabled;
+    pub const none: PreviewFeatures = .{};
+    pub const all: PreviewFeatures = blk: {
+        var features: PreviewFeatures = .{};
+        for (std.enums.values(PreviewFeature)) |feature| @field(features, @tagName(feature)) = true;
+        break :blk features;
+    };
+
+    pub fn has(self: PreviewFeatures, feature: PreviewFeature) bool {
+        return switch (feature) {
+            inline else => |tag| @field(self, @tagName(tag)),
+        };
+    }
+
+    pub fn with(self: PreviewFeatures, feature: PreviewFeature, on: bool) PreviewFeatures {
+        var out = self;
+        switch (feature) {
+            inline else => |tag| @field(out, @tagName(tag)) = on,
+        }
+        return out;
+    }
+
+    pub const max_arg_len = blk: {
+        var len = "--preview".len;
+        for (std.enums.values(PreviewFeature)) |feature| len += 1 + @tagName(feature).len;
+        break :blk len;
+    };
+
+    pub fn enableArg(self: PreviewFeatures, buf: *[max_arg_len]u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeAll("--preview") catch unreachable;
+        var separator: u8 = '=';
+        for (std.enums.values(PreviewFeature)) |feature| {
+            if (!self.has(feature)) continue;
+            w.writeByte(separator) catch unreachable;
+            w.writeAll(@tagName(feature)) catch unreachable;
+            separator = ',';
+        }
+        return w.buffered();
+    }
+
+    pub fn eql(self: PreviewFeatures, other: PreviewFeatures) bool {
+        return self.bits() == other.bits();
+    }
+
+    fn bits(self: PreviewFeatures) u8 {
+        return @bitCast(self);
+    }
+
+    fn fromBits(value: u8) PreviewFeatures {
+        return @bitCast(value & all.bits());
+    }
+};
+
+pub const PreviewSetting = struct {
+    chosen: PreviewFeatures = .none,
+    value: PreviewFeatures = .none,
+
+    pub const inherit: PreviewSetting = .{};
+    pub const enabled: PreviewSetting = .{ .chosen = .all, .value = .all };
+    pub const disabled: PreviewSetting = .{ .chosen = .all, .value = .none };
+
+    pub const ArgError = error{UnknownPreviewFeature};
+
+    pub fn set(self: *PreviewSetting, feature: PreviewFeature, on: bool) void {
+        self.chosen = self.chosen.with(feature, true);
+        self.value = self.value.with(feature, on);
+    }
+
+    pub fn applyArg(self: *PreviewSetting, arg: []const u8) ArgError!bool {
+        if (std.mem.eql(u8, arg, "--preview")) {
+            self.* = .enabled;
+        } else if (std.mem.eql(u8, arg, "--no-preview")) {
+            self.* = .disabled;
+        } else if (std.mem.startsWith(u8, arg, "--preview=")) {
+            try self.setList(arg["--preview=".len..], true);
+        } else if (std.mem.startsWith(u8, arg, "--no-preview=")) {
+            try self.setList(arg["--no-preview=".len..], false);
+        } else return false;
+        return true;
+    }
+
+    fn setList(self: *PreviewSetting, list: []const u8, on: bool) ArgError!void {
+        var next = self.*;
+        var names = std.mem.splitScalar(u8, list, ',');
+        while (names.next()) |name| next.set(PreviewFeature.parse(name) orelse return error.UnknownPreviewFeature, on);
+        self.* = next;
+    }
+
+    pub fn overlay(base: PreviewSetting, top: PreviewSetting) PreviewSetting {
+        const top_mask = top.chosen.bits();
+        return .{
+            .chosen = PreviewFeatures.fromBits(base.chosen.bits() | top_mask),
+            .value = PreviewFeatures.fromBits((base.value.bits() & ~top_mask) | (top.value.bits() & top_mask)),
+        };
+    }
+
+    pub fn isComplete(self: PreviewSetting) bool {
+        return self.chosen.eql(.all);
+    }
+
+    pub fn resolve(self: PreviewSetting, persisted: ?PreviewFeatures) PreviewSetting {
+        const saved: PreviewSetting = .{ .chosen = .all, .value = persisted orelse .none };
+        return saved.overlay(self);
+    }
+
+    pub fn features(self: PreviewSetting) PreviewFeatures {
+        return PreviewFeatures.fromBits(self.value.bits() & self.chosen.bits());
     }
 };
 
@@ -368,6 +486,44 @@ pub const LongHorizonArm = enum {
         };
     }
 };
+
+test "preview flags select features one by one and the last flag naming a feature wins" {
+    var setting: PreviewSetting = .inherit;
+    try std.testing.expect(try setting.applyArg("--preview=execute_code,teamwork"));
+    try std.testing.expect(try setting.applyArg("--no-preview=teamwork"));
+    try std.testing.expect(!try setting.applyArg("--previewx"));
+    try std.testing.expectError(error.UnknownPreviewFeature, setting.applyArg("--preview=execute_code,bogus"));
+    try std.testing.expect(setting.features().eql(.{ .execute_code = true }));
+    try std.testing.expect(!setting.isComplete());
+
+    const resolved = setting.resolve(.{ .teamwork = true, .comment_guard = true });
+    try std.testing.expect(resolved.isComplete());
+    try std.testing.expect(resolved.features().eql(.{ .execute_code = true, .comment_guard = true }));
+
+    try std.testing.expect(try setting.applyArg("--no-preview"));
+    try std.testing.expect(setting.resolve(.all).features().eql(.none));
+    try std.testing.expect(try setting.applyArg("--preview=comment_guard"));
+    try std.testing.expect(setting.resolve(.all).features().eql(.{ .comment_guard = true }));
+}
+
+test "preview all enables every feature and enableArg fits every feature" {
+    var buf: [PreviewFeatures.max_arg_len]u8 = undefined;
+    try std.testing.expectEqual(PreviewFeatures.max_arg_len, PreviewFeatures.all.enableArg(&buf).len);
+    for (std.enums.values(PreviewFeature)) |feature| {
+        try std.testing.expect(PreviewFeatures.all.has(feature));
+        try std.testing.expect(!PreviewFeatures.none.has(feature));
+        try std.testing.expect(PreviewFeatures.none.with(feature, true).has(feature));
+    }
+}
+
+test "preview enable argument round-trips through the parser" {
+    for ([_]PreviewFeatures{ .all, .{ .teamwork = true }, .{ .execute_code = true, .comment_guard = true } }) |features| {
+        var buf: [PreviewFeatures.max_arg_len]u8 = undefined;
+        var setting: PreviewSetting = .disabled;
+        try std.testing.expect(try setting.applyArg(features.enableArg(&buf)));
+        try std.testing.expect(setting.features().eql(features));
+    }
+}
 
 test "TinyKG arm respects an explicit auto-memory disable" {
     try std.testing.expect(LongHorizonArm.tinykg.usesAutoMemory(true));

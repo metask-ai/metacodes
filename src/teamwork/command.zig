@@ -17,6 +17,7 @@ const util_fs = @import("../util/fs.zig");
 const interview = @import("interview.zig");
 const merge_back = @import("merge_back.zig");
 const provider_factory = @import("../api/provider_factory.zig");
+const progress = @import("progress.zig");
 
 pub const RunId = types.RunId;
 
@@ -27,7 +28,9 @@ pub const help =
     \\       metacodes [--state-dir <dir>] teamwork mcp --request-file <file> --approve [options]
     \\
     \\Run options: --id <id> --budget-usd <dollars> --max-rounds <n>
-    \\             --preview | --no-preview (last flag wins; overrides saved preview)
+    \\             --events (run/resume: teamwork.snapshot and teamwork.event lines on stdout)
+    \\             --preview | --no-preview | --preview=teamwork,... | --no-preview=...
+    \\             (last flag wins per feature; overrides saved preview)
     \\             --check-command <command> --config-json <teamwork-object>
     \\Provider options: --provider <profile> --model <model> --base-url <url>
     \\                  --api-key <key> --verbose
@@ -36,7 +39,8 @@ pub const help =
     \\segments; seats apply to this run only. The rest of the request is approved as is.
     \\A positive dollar cap and explicit --approve are required. Approval covers
     \\the request, configured harnesses/check, spend up to the cap and merge-back.
-    \\Teamwork requires preview (off by default). --preview does not approve a task.
+    \\Teamwork requires the teamwork preview feature (off by default).
+    \\--preview does not approve a task.
     \\Status and cancellation of an existing handle remain available with preview off.
     \\Runs are synchronous. Resume uses the saved approved policy, never new overrides.
     \\Status always emits JSON and starts no provider. Exit: 0 done/status/help,
@@ -50,6 +54,7 @@ pub const Options = struct {
     id: ?types.RunId = null,
     request_file: ?[]const u8 = null,
     approve: bool = false,
+    events: bool = false,
     overrides: config.Layer = .{},
     has_overrides: bool = false,
     host_config: app_types.Config = .{ .prompt = "", .mcp_connect = .disabled },
@@ -64,12 +69,11 @@ pub fn parse(arena: std.mem.Allocator, args: anytype) !Options {
         out.id = try types.RunId.parse(args.next() orelse return error.RunIdMissing);
     }
     while (args.next()) |arg| {
-        if (eq(arg, "--preview")) {
-            out.host_config.preview = .enabled;
-        } else if (eq(arg, "--no-preview")) {
-            out.host_config.preview = .disabled;
-        } else if (eq(arg, "--approve")) {
+        if (try out.host_config.preview.applyArg(arg)) {} else if (eq(arg, "--approve")) {
             out.approve = true;
+        } else if (eq(arg, "--events")) {
+            if (out.action != .run and out.action != .@"resume") return error.UnknownOption;
+            out.events = true;
         } else if (eq(arg, "--json")) {
             if (out.action != .status) return error.UnknownOption;
         } else if (eq(arg, "--verbose")) {
@@ -124,13 +128,14 @@ pub const Prepared = struct {
     request: []const u8,
     source: runtime.RequestSource,
     workspace: []const u8,
+    events: bool = false,
 };
 
 /// Approval is checked before file reads, git, App startup or run creation.
 pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u8, workspace: []const u8) !Prepared {
     if (!options.approve) return error.ApprovalRequired;
     const preview = try @import("../app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
-    if (!preview.isEnabled()) return error.PreviewDisabled;
+    if (!preview.features().teamwork) return error.PreviewDisabled;
     if (options.action != .run and options.action != .@"resume" and options.action != .mcp) return error.UnknownCommand;
     const generated = @import("../core/session_id.zig").gen();
     const id = options.id orelse try types.RunId.parse(generated.asSlice());
@@ -165,7 +170,7 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
     // Git's toplevel is read-only. Do not let run state become an untracked
     // input of the workspace snapshot or a writable part of the worker tree.
     try requireExternalState(arena, state_root, repo);
-    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .source = source, .workspace = repo };
+    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .source = source, .workspace = repo, .events = options.events };
 }
 
 fn configuredLayer(arena: std.mem.Allocator, state_root: []const u8, repo: []const u8) !config.Layer {
@@ -280,7 +285,7 @@ pub const Host = struct {
         provider: @import("../api/provider.zig").Provider,
         anthropic_client: ?*@import("../client.zig").Client,
     ) !*Host {
-        if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
+        if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
         // Other embedders can supply an App with deferred MCP publication.
@@ -317,10 +322,10 @@ pub const Host = struct {
     pub fn deps(self: *Host) runtime.Deps {
         const app = self.app;
         return .{
-            .preview = app.config.preview.isEnabled(),
+            .preview = app.config.preview.features(),
             .seats = .{ .harness = .{
                 .metacodes = .{
-                    .preview = app.config.preview.isEnabled(),
+                    .preview = app.config.preview.features(),
                     .provider = self.provider,
                     .anthropic_client = self.anthropic_client,
                     .tool_defs = app.tool_defs,
@@ -389,7 +394,7 @@ pub fn execute(arena: std.mem.Allocator, app: *App, prepared: Prepared) !u8 {
 }
 
 pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, mcp: ?McpHost) !u8 {
-    if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
+    if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
     if (prepared.action == .mcp and mcp == null) return error.McpHostUnavailable;
     var cfg = prepared.cfg;
     if (prepared.action != .@"resume") pinInheritedModels(&cfg, app.activeModel());
@@ -397,6 +402,8 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     try checkClaudeState(arena, app, cfg, prepared.workspace);
     var deps = host.deps();
     deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
+    var lines: LineObserver = .{};
+    if (prepared.events) deps.observer = lines.observer();
     // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
         try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request, .source = prepared.source }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
@@ -404,6 +411,7 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
         try runtime.Run.reopen(app.allocator, deps, cfg, app.stateRoot(), prepared.id);
     defer run.destroy();
     std.debug.print("teamwork run {s}; status: metacodes teamwork status {s}\n", .{ prepared.id.slice(), prepared.id.slice() });
+    if (prepared.events) try lines.snapshot(arena, run.status());
     var stopped = std.atomic.Value(bool).init(false);
     const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &run.abort, &stopped });
     defer {
@@ -418,6 +426,25 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     try status(arena, app.stateRoot(), prepared.id);
     return if (state == .done) 0 else 1;
 }
+
+const LineObserver = struct {
+    fn observer(self: *LineObserver) progress.Observer {
+        return .{ .ctx = self, .notifyFn = notify };
+    }
+
+    fn snapshot(_: *LineObserver, arena: std.mem.Allocator, run: runtime.RunSnapshot) !void {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try progress.writeSnapshotLine(&out.writer, .ofRun(run));
+        if (!pfs.writeAll(1, out.written())) return error.WriteFailed;
+    }
+
+    fn notify(_: *anyopaque, event: *const progress.Event) void {
+        var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer out.deinit();
+        progress.writeEventLine(&out.writer, event) catch return;
+        _ = pfs.writeAll(1, out.written());
+    }
+};
 
 fn pinInheritedModels(cfg: *config.Config.Enabled, model: []const u8) void {
     for ([_]types.Role{ .implementer, .reviewer, .verifier }) |role| {
@@ -480,8 +507,8 @@ pub const Background = struct {
     }
 };
 
-pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prompter: interview.Prompter) !Interactive {
-    if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
+pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prompter: interview.Prompter, board: *progress.Board) !Interactive {
+    if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
     const generated = @import("../core/session_id.zig").gen();
     const job = try Background.create(try types.RunId.parse(generated.asSlice()));
     var started = false;
@@ -500,6 +527,7 @@ pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prom
     try checkClaudeState(arena, app, cfg, repo);
     var deps = host.deps();
     deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
+    deps.observer = board.observer();
     const options: runtime.StartOptions = .{ .state_root = app.stateRoot(), .run_id = job.id, .workspace = repo };
 
     const terms = try approvalTerms(arena, cfg, repo);
@@ -510,7 +538,9 @@ pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prom
         defer drafted.deinit(gpa);
         switch (drafted) {
             .text => |proposal| {
-                const decided = try interview.approve(proposal, .interview, terms, prompter) orelse break :blk null;
+                const decision = interview.approve(proposal, .interview, terms, prompter);
+                try interview.finishApproval(gpa, deps, cfg, options, segments.request);
+                const decided = try decision orelse break :blk null;
                 break :blk interview.Approved{ .text = try arena.dupe(u8, decided.text), .source = decided.source };
             },
             .failed => return .{ .interview_failed = job.id },
@@ -520,6 +550,7 @@ pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prom
     };
     const approved = verdict orelse return .{ .rejected = job.id };
     job.run = try runtime.Run.start(gpa, deps, .{ .text = approved.text, .source = approved.source }, cfg, options);
+    try board.publish(.ofRun(job.run.?.status()));
     job.thread = try platform.thread.spawn(.full, Background.drive, .{job});
     started = true;
     return .{ .started = job };

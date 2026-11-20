@@ -325,13 +325,13 @@ test "load: local higher priority than project" {
     defer tmp.cleanup();
     const dir = try tmpAbsPath(a, &tmp);
     defer a.free(dir);
-    try writeFileAt(dir, "CLAUDE.md", "PROJ");
-    try writeFileAt(dir, "CLAUDE.local.md", "LOCAL");
+    try writeFileAt(dir, "CLAUDE.md", "PROJECT-PRIORITY-MARK");
+    try writeFileAt(dir, "CLAUDE.local.md", "LOCAL-PRIORITY-MARK");
 
     const out = try load(a, .{ .cwd = dir, .home = "" });
     defer a.free(out);
-    const proj = std.mem.indexOf(u8, out, "PROJ").?;
-    const local = std.mem.indexOf(u8, out, "LOCAL").?;
+    const proj = std.mem.indexOf(u8, out, "PROJECT-PRIORITY-MARK").?;
+    const local = std.mem.indexOf(u8, out, "LOCAL-PRIORITY-MARK").?;
     try testing.expect(proj < local); // local 放后面 = 优先级高
     try testing.expect(std.mem.indexOf(u8, out, "not checked into git):") != null);
 }

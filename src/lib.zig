@@ -109,6 +109,7 @@ pub const teamwork_runtime = @import("teamwork/runtime.zig"); // run state machi
 pub const teamwork_swe_loop = @import("teamwork/swe_loop.zig"); // built-in deterministic manager (#514)
 pub const teamwork_verifier_auditor = @import("teamwork/verifier_auditor.zig"); // completion audit by the isolated verifier (#516)
 pub const teamwork_mcp_server = @import("teamwork/mcp_server.zig"); // approved runtime operations over MCP (#522)
+pub const teamwork_progress = @import("teamwork/progress.zig");
 pub const teamwork_interview = @import("teamwork/interview.zig"); // request segments, interviewer draft and approval (#518)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
@@ -284,6 +285,7 @@ test {
     _ = &@import("teamwork/drivers/drivers_test.zig");
     _ = &@import("teamwork/runtime_test.zig");
     _ = &@import("teamwork/interview.zig");
+    _ = &@import("teamwork/progress.zig");
     // Reached through the Bash tool, not re-exported: name it so its own tests run.
     _ = &@import("core/command_file_changes.zig");
 }

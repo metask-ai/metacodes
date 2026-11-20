@@ -219,18 +219,25 @@ fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
 
 test "preview: CLI flags and persisted config change the actual provider tool menu" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, enabled: bool }{
-        .{ .enabled = false },
-        .{ .flags = &.{"--preview"}, .enabled = true },
-        .{ .flags = &.{ "--preview", "--no-preview" }, .enabled = false },
-        .{ .flags = &.{ "--no-preview", "--preview" }, .enabled = true },
-        .{ .saved = "{\"preview\":true}", .enabled = true },
-        .{ .saved = "{\"preview\":true}", .flags = &.{"--no-preview"}, .enabled = false },
-        .{ .saved = "{\"preview\":false}", .flags = &.{"--preview"}, .enabled = true },
-        .{ .saved = "{\"nested\":{\"preview\":true}}", .enabled = false },
-        .{ .saved = "{\"preview\" : true}", .enabled = true },
-        .{ .saved = "{\"preview\":\"true\"}", .enabled = false },
-        .{ .saved = "{\"preview\":true,\"preview\":false}", .enabled = false },
+    const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, execute: bool = false, guard: bool = false, exit_code: i32 = 0 }{
+        .{},
+        .{ .flags = &.{"--preview"}, .execute = true, .guard = true },
+        .{ .flags = &.{ "--preview", "--no-preview" } },
+        .{ .flags = &.{ "--no-preview", "--preview" }, .execute = true, .guard = true },
+        .{ .saved = "{\"preview\":true}", .execute = true, .guard = true },
+        .{ .saved = "{\"preview\":true}", .flags = &.{"--no-preview"} },
+        .{ .saved = "{\"preview\":false}", .flags = &.{"--preview"}, .execute = true, .guard = true },
+        .{ .saved = "{\"nested\":{\"preview\":true}}" },
+        .{ .saved = "{\"preview\" : true}", .execute = true, .guard = true },
+        .{ .saved = "{\"preview\":\"true\"}" },
+        .{ .saved = "{\"preview\":true,\"preview\":false}" },
+        .{ .flags = &.{"--preview=execute_code"}, .execute = true },
+        .{ .flags = &.{"--preview=comment_guard"}, .guard = true },
+        .{ .flags = &.{ "--preview", "--no-preview=comment_guard" }, .execute = true },
+        .{ .saved = "{\"preview\":{\"execute_code\":true}}", .execute = true },
+        .{ .saved = "{\"preview\":{\"comment_guard\":true,\"execute_code\":false}}", .flags = &.{"--preview=execute_code"}, .execute = true, .guard = true },
+        .{ .saved = "{\"preview\":true}", .flags = &.{"--no-preview=execute_code"}, .guard = true },
+        .{ .flags = &.{"--preview=execute_code,bogus"}, .exit_code = 2 },
     };
     for (scenarios) |scenario| {
         var case: Case = undefined;
@@ -246,17 +253,21 @@ test "preview: CLI flags and persisted config change the actual provider tool me
         try args.appendSlice(arena, scenario.flags);
         const result = try case.run(&.{}, args.items);
         errdefer std.debug.print("preview CLI exit {d}: {s}\n", .{ result.exit_code, result.stderr });
-        try testing.expectEqual(@as(i32, 0), result.exit_code);
+        try testing.expectEqual(scenario.exit_code, result.exit_code);
+        if (scenario.exit_code != 0) {
+            try testing.expectEqual(@as(usize, 0), server.requestCount());
+            continue;
+        }
         try testing.expectEqual(@as(usize, 1), server.requestCount());
         const parsed = try std.json.parseFromSlice(std.json.Value, arena, server.lastRequest().?.body(), .{});
         var found = false;
         for (parsed.value.object.get("tools").?.array.items) |tool| {
             if (std.mem.eql(u8, tool.object.get("name").?.string, "ExecuteCode")) found = true;
         }
-        try testing.expectEqual(scenario.enabled, found);
+        try testing.expectEqual(scenario.execute, found);
         const request = server.lastRequest().?.body();
-        try testing.expectEqual(scenario.enabled, std.mem.indexOf(u8, request, "Do not add explanatory code comments.") != null);
-        try testing.expectEqual(!scenario.enabled, std.mem.indexOf(u8, request, "Only add comments where the logic isn't self-evident.") != null);
+        try testing.expectEqual(scenario.guard, std.mem.indexOf(u8, request, "Do not add explanatory code comments.") != null);
+        try testing.expectEqual(!scenario.guard, std.mem.indexOf(u8, request, "Only add comments where the logic isn't self-evident.") != null);
     }
 }
 

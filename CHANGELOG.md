@@ -10,7 +10,29 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **Teamwork progress.** A teamwork run reports every seat status change and
+  phase change with a snapshot of the run: the REPL draws a panel above the
+  input box (goal, `N/M done · $spent / $cap`, one line per seat with its
+  harness) and `/teamwork status` prints the same summary; the interviewer
+  shows `needs_you` while the approval prompt waits. `teamwork run|resume
+  --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
+  stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
+
+## 0.13.0 — 2026-11-20
+
 ### Changed
+
+- **Each preview feature has its own switch.** `execute_code`, `teamwork` and
+  `comment_guard` can be enabled one by one with `--preview=<list>` /
+  `--no-preview=<list>` or a root `"preview"` object in `config.json`, such as
+  `{"execute_code": true}`. `--preview`, `--no-preview` and `"preview": true`
+  still switch them all. HarnessMM and RSI no longer need `--preview`:
+  `--harnessmm` and `--rsi` alone select them. Zig embedders now set
+  `RuntimeConfig.preview` to a `preview.Features` value (`.all`, `.none` or
+  individual fields); the AgentCore ABI keeps `RuntimeConfigV1.preview` as
+  all-or-nothing.
 
 - **A Bench SSH executor is a `metacodes` node.** The workbench no longer
   copies a Python runtime to an SSH executor: `metacodes bench setup

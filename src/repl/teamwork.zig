@@ -4,6 +4,8 @@ const cmd_output = @import("cmd_output.zig");
 const command = @import("../teamwork/command.zig");
 const interview = @import("../teamwork/interview.zig");
 const types = @import("../teamwork/types.zig");
+const progress = @import("../teamwork/progress.zig");
+const agent_tree = @import("tui/widget/agent_tree.zig");
 
 pub const LineReader = struct {
     ctx: *anyopaque,
@@ -16,8 +18,10 @@ pub const LineReader = struct {
 
 pub const Session = struct {
     job: ?*command.Background = null,
+    board: progress.Board = .init(std.heap.c_allocator),
 
     pub fn deinit(self: *Session) void {
+        defer self.board.deinit();
         const job = self.job orelse return;
         self.job = null;
         if (!job.finished()) cmd_output.print("Teamwork run {s} was cancelled with this session. Continue it with: metacodes --preview teamwork resume {s} --approve (under the same permission mode and sandbox settings)\n", .{ job.id.slice(), job.id.slice() });
@@ -37,8 +41,8 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
         showStatus(app, allocator, session, std.mem.trim(u8, args["status".len..], " \t"));
         return;
     }
-    if (!app.config.preview.isEnabled()) {
-        cmd_output.print("{s}/teamwork is a preview feature and preview is off. Start metacodes with --preview or set \"preview\": true in config.json.{s}\n", .{ theme.danger, theme.reset });
+    if (!app.config.preview.features().teamwork) {
+        cmd_output.print("{s}/teamwork is a preview feature and it is off. Start metacodes with --preview=teamwork (or --preview), or set \"preview\": {{\"teamwork\": true}} in config.json.{s}\n", .{ theme.danger, theme.reset });
         return;
     }
     if (std.mem.trim(u8, args, " \t\r\n").len == 0) {
@@ -53,11 +57,13 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
         job.stop();
         session.job = null;
     }
+    session.board.clear();
     var prompter_state: Prompter = .{ .app = app, .allocator = allocator, .reader = reader };
     defer prompter_state.deinit();
     cmd_output.print("Preparing the teamwork run; unless the request says [skip-interview], the interviewer drafts the task first…\n", .{});
-    const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter());
+    const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter(), &session.board);
     app.abort.reset();
+    settleBoard(&session.board, result);
     const outcome = result catch |err| {
         cmd_output.print("{s}/teamwork failed: {s}{s}\n", .{ theme.danger, @errorName(err), theme.reset });
         return;
@@ -74,11 +80,19 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
     }
 }
 
+fn settleBoard(board: *progress.Board, result: anyerror!command.Interactive) void {
+    const outcome = result catch return board.clear();
+    if (outcome != .started) board.clear();
+}
+
 fn ended(app: *app_mod.App, what: []const u8, id: types.RunId) void {
     cmd_output.print("{s} Nothing was started. Any interview spend is recorded in {s}/teamwork/{s}/budget.jsonl.\n", .{ what, app.stateRoot(), id.slice() });
 }
 
-fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *const Session, explicit: []const u8) void {
+fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session, explicit: []const u8) void {
+    if (explicit.len == 0 and session.job != null) {
+        if (showProgress(app, allocator, &session.board)) return;
+    }
     const id = if (explicit.len != 0)
         types.RunId.parse(explicit) catch {
             cmd_output.print("{s}Invalid run id: {s}{s}\n", .{ app.theme.danger, explicit, app.theme.reset });
@@ -94,6 +108,15 @@ fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *const S
     command.status(arena_state.allocator(), app.stateRoot(), id) catch |err| {
         cmd_output.print("{s}/teamwork status {s}: {s}{s}\n", .{ app.theme.danger, id.slice(), @errorName(err), app.theme.reset });
     };
+}
+
+fn showProgress(app: *app_mod.App, allocator: std.mem.Allocator, board: *progress.Board) bool {
+    var copy = (board.read(allocator) catch return false) orelse return false;
+    defer copy.deinit();
+    const text = agent_tree.renderTeamwork(allocator, app.theme, copy.snapshot(), null) catch return false;
+    defer allocator.free(text);
+    cmd_output.print("{s}", .{text});
+    return true;
 }
 
 const Prompter = struct {
@@ -138,4 +161,32 @@ const Prompter = struct {
 fn eqlAny(text: []const u8, options: []const []const u8) bool {
     for (options) |option| if (std.ascii.eqlIgnoreCase(text, option)) return true;
     return false;
+}
+
+test "teamwork REPL: an interview that starts no run leaves no progress panel behind" {
+    const runtime = @import("../teamwork/runtime.zig");
+    var board = progress.Board.init(std.testing.allocator);
+    defer board.deinit();
+    const id = try types.RunId.parse("run-1");
+    const seats = [_]runtime.SeatSnapshot{.{ .id = types.seatIdFor(.interviewer, 1), .role = .interviewer, .harness = .metacodes, .status = .needs_you }};
+    const waiting: progress.Snapshot = .{
+        .run_id = id,
+        .goal = "add a feature",
+        .phase = .interviewing,
+        .seats = &seats,
+        .budget = .{ .cap_usd = 2, .spent_usd = 0.25, .remaining_usd = 1.75, .charges = 1 },
+        .audit = .{ .used = 0, .last = null },
+    };
+    const endings = [_]anyerror!command.Interactive{
+        .{ .rejected = id },
+        .{ .interview_failed = id },
+        .{ .budget_exhausted = id },
+        .{ .aborted = id },
+        error.RunExists,
+    };
+    for (endings) |ending| {
+        try board.publish(waiting);
+        settleBoard(&board, ending);
+        try std.testing.expect((try board.read(std.testing.allocator)) == null);
+    }
 }

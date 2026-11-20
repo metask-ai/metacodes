@@ -233,6 +233,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
 
     var teamwork_session: teamwork.Session = .{};
     defer teamwork_session.deinit();
+    if (tui_region) |*r| r.teamwork_board = &teamwork_session.board;
+    defer if (tui_region) |*r| {
+        r.teamwork_board = null;
+    };
     var teamwork_reader: TeamworkReader = .{ .host = &turn_host };
 
     while (true) {
@@ -1399,7 +1403,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
 
     // ② spawnBackground(prebuilt=copy)。consume 语义:成功转移给 job,失败它自己释放 copy。
     _ = try reg.spawnBackground(.{
-        .preview = app.config.preview.isEnabled(),
+        .preview = app.config.preview.features(),
         .harnessmm = app.config.harnessmm,
         .rsi = app.config.rsi,
         .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
@@ -1976,6 +1980,7 @@ fn readLineRaw(
                     redraw(region, &editor, app);
                 }
                 if (openRouterTick(app, region)) redraw(region, &editor, app);
+                if (region.teamworkChanged()) redraw(region, &editor, app);
             }
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
@@ -4742,7 +4747,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
         &app.permission_ctx,
         &app.abort,
         prompt,
-        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.isEnabled() }, // 单轮,无工具(纯回答)
+        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.features() }, // 单轮,无工具(纯回答)
     );
     defer result.deinit();
     return try allocator.dupe(u8, result.final_text);

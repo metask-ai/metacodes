@@ -143,6 +143,16 @@ test "teamwork command preview L2: default off and final opt-out precede App, MC
     const resumed_off = try c.cli(&.{ "resume", "old-checkpoint", "--approve", "--no-preview", "--api-key", "fixture-key", "--base-url", url });
     try testing.expectEqual(@as(i32, 2), resumed_off.exit_code);
     try testing.expect(std.mem.indexOf(u8, resumed_off.stderr, "PreviewDisabled") != null);
+    const feature_off = try c.cli(&.{ "run", "--request-file", try c.request(), "--approve", "--no-preview=teamwork", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expectEqual(@as(i32, 2), feature_off.exit_code);
+    try testing.expect(std.mem.indexOf(u8, feature_off.stderr, "PreviewDisabled") != null);
+    const leading_feature_off = try c.cliLeadingInput(&.{ "run", "--request-file", try c.request(), "--approve" }, &.{}, null, &.{"--no-preview=teamwork"});
+    try testing.expectEqual(@as(i32, 2), leading_feature_off.exit_code);
+    try testing.expect(std.mem.indexOf(u8, leading_feature_off.stderr, "PreviewDisabled") != null);
+    try c.write("state/config.json", "{\"preview\":false,\"teamwork\":{\"enabled\":true,\"budget_usd\":2}}");
+    const other_feature = try c.cli(&.{ "run", "--request-file", try c.request(), "--approve", "--preview=execute_code,comment_guard", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expectEqual(@as(i32, 2), other_feature.exit_code);
+    try testing.expect(std.mem.indexOf(u8, other_feature.stderr, "PreviewDisabled") != null);
     try testing.expectEqual(@as(usize, 0), server.requestCount());
     try testing.expect(!try c.exists("state/teamwork"));
     try testing.expect(!try c.exists("state/projects"));
@@ -352,7 +362,7 @@ fn externalSeatsCase(saved_preview: bool) !void {
     try c.write("repo/.metacodes/teamwork.json", "{\"budget_usd\":3,\"check_command\":\"/bin/sh check-fixture.sh && test -f feature.txt\",\"seats\":{\"implementer\":{\"model\":\"project-impl\"}}}");
     const shared_temp = try std.fmt.allocPrint(a, "TMPDIR={s}", .{c.root});
     const args = [_][]const u8{ "run", "--request-file", try c.request(), "--id", "r1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--config-json", "{\"seats\":{\"reviewer\":{\"model\":\"cli-review\",\"effort\":\"high\"}}}", "--api-key", "fixture-key", "--model", "fixture-host", "--base-url", url };
-    const out = if (saved_preview) try c.cliWithEnv(&args, &.{shared_temp}) else try c.cliLeadingInput(&args, &.{shared_temp}, null, &.{ "--no-preview", "--preview" });
+    const out = if (saved_preview) try c.cliWithEnv(&args, &.{shared_temp}) else try c.cliLeadingInput(&args, &.{shared_temp}, null, &.{ "--no-preview", "--preview=teamwork" });
     if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) {
         try testing.expectEqual(@as(i32, 1), out.exit_code);
         try testing.expect(!try c.exists("state/teamwork/r1"));
@@ -528,6 +538,54 @@ test "teamwork command: request segments skip the interview and override seats f
     try testing.expectEqualStrings("skip_interview", value.object.get("request_source").?.string);
 }
 
+test "teamwork command: --events streams the snapshot, then every seat and phase change, as wire lines" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    const text = start ++ "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"No handoff in this fixture\"}}\n\n" ++ stop;
+    var server = try harness.MockServer.startCassette(&.{text}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    const refused = try c.cliEnabled(&.{ "status", "ev1", "--events" });
+    try testing.expectEqual(@as(i32, 2), refused.exit_code);
+    try c.write("request.md", "[skip-interview] Add feature.txt containing feature.\n");
+    const out = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--id", "ev1", "--events", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--model", "fixture", "--api-key", "fixture-key", "--base-url", url });
+    if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) return;
+    try testing.expectEqual(@as(i32, 1), out.exit_code);
+    var transcript: std.Io.Writer.Allocating = .init(a);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.stdout, "\n"), '\n');
+    while (lines.next()) |line| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{});
+        const version = value.object.get("v") orelse {
+            try testing.expectEqualStrings("ev1", value.object.get("run_id").?.string);
+            try testing.expect(lines.next() == null);
+            break;
+        };
+        try testing.expectEqual(@as(i64, 1), version.integer);
+        const data = value.object.get("data").?.object;
+        const snapshot = if (data.get("snapshot")) |inner| inner.object else data;
+        try testing.expectEqualStrings("ev1", snapshot.get("run_id").?.string);
+        try testing.expectEqualStrings("Add feature.txt containing feature.", snapshot.get("goal").?.string);
+        const w = &transcript.writer;
+        try w.print("{s}", .{value.object.get("type").?.string});
+        if (data.get("change")) |change| {
+            const from = change.object.get("from").?;
+            try w.print(" {s} {s}>{s}", .{ if (change.object.get("seat")) |seat| seat.string else "phase", if (from == .string) from.string else "-", change.object.get("to").?.string });
+        }
+        try w.print(" @{s} {d}/{d}\n", .{ snapshot.get("phase").?.string, snapshot.get("done").?.integer, snapshot.get("total").?.integer });
+    }
+    try testing.expectEqualStrings(
+        \\teamwork.snapshot @approved 0/0
+        \\teamwork.event implementer-1 ->queued @approved 0/1
+        \\teamwork.event phase approved>implementing @implementing 0/1
+        \\teamwork.event implementer-1 queued>working @implementing 0/1
+        \\teamwork.event implementer-1 working>failed @implementing 0/1
+        \\teamwork.event phase implementing>failed @failed 0/1
+        \\
+    , transcript.written());
+}
+
 const fake_claude =
     \\#!/bin/sh
     \\case "$1" in
@@ -589,7 +647,7 @@ fn replCase(c: *Case) ![]const u8 {
     const binary = try std.fmt.allocPrintSentinel(a, "{s}/claude-fixture", .{c.root}, 0);
     try testing.expectEqual(@as(c_int, 0), pfs.chmod(binary, 0o755));
     const global = try std.fmt.allocPrint(a,
-        \\{{"preview":true,"teamwork":{{"budget_usd":2,"max_rounds":1,"seats":{{"interviewer":{{"harness":"claude_code","command":"{s}"}},"implementer":{{"harness":"claude_code","command":"{s}"}}}}}}}}
+        \\{{"preview":{{"teamwork":true}},"teamwork":{{"budget_usd":2,"max_rounds":1,"seats":{{"interviewer":{{"harness":"claude_code","command":"{s}"}},"implementer":{{"harness":"claude_code","command":"{s}"}}}}}}}}
     , .{ binary, binary });
     try c.write("state/config.json", global);
     return binary;
@@ -639,16 +697,16 @@ test "teamwork REPL L2: a rejected interview starts nothing; an edited approval 
     try testing.expectEqualStrings("skip_interview", direct_state.object.get("request_source").?.string);
 }
 
-test "teamwork REPL L2: with preview off /teamwork is refused and never becomes a model turn" {
+test "teamwork REPL L2: with the teamwork preview feature off /teamwork is refused and never becomes a model turn" {
     var c: Case = undefined;
     try c.init();
     defer c.deinit();
     var server = try harness.MockServer.startCassette(&.{}, 0);
     defer server.stop();
     const url = try server.urlOwned(c.arena.allocator());
-    try c.write("state/config.json", "{\"teamwork\":{\"budget_usd\":2}}");
+    try c.write("state/config.json", "{\"preview\":{\"execute_code\":true,\"comment_guard\":true},\"teamwork\":{\"budget_usd\":2}}");
     const out = try replSession(&c, url, "/teamwork Add feature.txt\n");
-    try testing.expect(std.mem.indexOf(u8, out.stderr, "/teamwork is a preview feature and preview is off") != null);
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "/teamwork is a preview feature and it is off. Start metacodes with --preview=teamwork") != null);
     try testing.expectEqual(@as(usize, 0), server.requestCount());
     try testing.expect(!try c.exists("state/teamwork"));
 }

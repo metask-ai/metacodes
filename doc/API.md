@@ -36,21 +36,36 @@ surfaces built over the same core protocols.
 
 ## Preview features
 
-Preview features default to disabled. Start with `metacodes --preview` to
-enable them, or save `"preview": true` at the root of the installation's
-`config.json` (`<state root>/config.json`). `--no-preview` disables them for
-one start, including when the saved setting is true. Command-line flags
-override the saved value; the last preview flag wins. Only a root JSON boolean
-is accepted. Child agents inherit the resolved setting. A feature's own
-selection and permission rules still apply after preview is enabled.
+Preview features default to disabled, and each has its own switch:
 
-Source embedders set `AgentRuntime.RuntimeConfig.preview = true`. AgentCore
-ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default 0);
-Python uses `Runtime(preview=True)` and Node.js uses
-`new Runtime({ preview: true })`. The SDKs include `ExecuteCode` when enabled.
-Selecting a preview built-in by name while preview is disabled is rejected.
+| Feature | Enables |
+|---|---|
+| `execute_code` | The `ExecuteCode` JavaScript orchestration tool |
+| `teamwork` | `metacodes teamwork` run, resume and Manager MCP execution |
+| `comment_guard` | The no-comment instruction and the editors' comment check |
 
-Preview also instructs agents to express intent in code and avoid adding
+`--preview` enables every feature and `--no-preview` disables every feature.
+`--preview=<list>` and `--no-preview=<list>` take comma-separated feature names
+and change only those, for example `metacodes --preview=execute_code,teamwork`.
+An unknown name is a usage error. Flags apply left to right, so the last flag
+naming a feature wins. Features no flag names come from the root `"preview"`
+of the installation's `config.json` (`<state root>/config.json`): `true`
+enables all, `false` disables all, and an object such as
+`{"execute_code": true, "comment_guard": false}` enables the features set to
+`true`. Child agents inherit the resolved features. A feature's own selection
+and permission rules still apply after it is enabled. HarnessMM and RSI are
+selected only by their own switches (`--harnessmm`, `--rsi`) and do not depend
+on this setting.
+
+Source embedders set `AgentRuntime.RuntimeConfig.preview`, a
+`preview.Features` value such as `.all` or `.{ .execute_code = true }`.
+AgentCore ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default
+0), where 1 enables every feature; Python uses `Runtime(preview=True)` and
+Node.js uses `new Runtime({ preview: true })`. The SDKs include `ExecuteCode`
+when enabled. Selecting a preview built-in by name while its feature is
+disabled is rejected.
+
+`comment_guard` instructs agents to express intent in code and avoid adding
 explanatory comments. Built-in Write, Edit, ApplyPatch and NotebookEdit check
 proposed edits before writing. For each recognized language they compare
 comment tokens, including repetitions, with the file or code cell being edited.
@@ -328,15 +343,16 @@ The state root must be outside the repository. All workers, pinned checks
 and verifier tools require Sandbox Foundations; an unavailable backend fails
 closed. Native and Claude Code implementer/reviewer seats are supported.
 
-Teamwork is a **preview feature**, disabled by default. It uses the same root
-`"preview": true` in `<state root>/config.json` and the same `--preview` /
-`--no-preview` flags as ExecuteCode. Flags may precede `teamwork` or follow
-the action; the last flag wins and overrides the saved value. CLI dispatch
+Teamwork is the `teamwork` **preview feature**, disabled by default. It uses
+the same root `"preview"` in `<state root>/config.json` and the same
+`--preview`, `--no-preview`, `--preview=teamwork` and `--no-preview=teamwork`
+flags as the other preview features. Flags may precede `teamwork` or follow
+the action; the last flag naming the feature wins and overrides the saved value. CLI dispatch
 before App initialization and App initialization share `app/config.zig`'s
 `resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
 selects the feature; it does not approve a task or authorize spend.
 
-With preview disabled, start/resume and Manager execution fail with
+With the feature disabled, start/resume and Manager execution fail with
 `PreviewDisabled` before App/provider startup, run creation or recovery,
 worker probes, budget admission, auditing or merge-back. A saved approval,
 checkpoint or MCP field cannot grant current preview authorization. Read-only
@@ -344,10 +360,10 @@ CLI status remains available without loading global configuration. Existing
 runtime/MCP handles retain status, cancellation and destruction/cleanup after
 host opt-out; only the host's abort signal is safe to change concurrently.
 
-Zig hosts explicitly supply `teamwork_runtime.Deps.preview` (default false),
+Zig hosts explicitly supply `teamwork_runtime.Deps.preview` (default `.none`),
 independently of the approved task configuration. `Run.start`, `reopen`,
-`dispatch` and `requestCompletion` enforce it. Production hosts project the
-resolved `app.config.preview.isEnabled()` and propagate that bool into native
+`dispatch` and `requestCompletion` require its `teamwork` feature. Production
+hosts project the resolved `app.config.preview.features()` and propagate it into native
 seat and verifier subagents and worker launch admission. Third-party Claude
 Code is gated before probing/launch; it is not passed metacodes-only flags.
 This increment adds no AgentCore ABI field: the shared revision-29 preview
@@ -383,7 +399,7 @@ unchanged) or `user_edited` (text the user edited, then approved). Runs
 saved before this field report `request_file`.
 
 In the REPL, `/teamwork <request>` accepts the same segments and the same
-configuration layers. With preview off it prints an error and sends nothing
+configuration layers. With the `teamwork` preview feature off it prints an error and sends nothing
 to the model. Otherwise the interviewer seat (either harness) reads a
 disposable snapshot of the workspace and drafts a task statement, charged to
 the run's budget ledger. The user answers `y` (approve), `e` (type a
@@ -396,8 +412,13 @@ seat fills the cap) and leaves the next message unaffected. No
 implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
 approval; the approved bytes are written to `ORIGINAL_REQUEST.md` unchanged,
 then the run continues on a background thread with its own provider client,
-and the REPL stays available. `/teamwork status [<id>]` prints the same JSON
-as `teamwork status`. One run per REPL session at a time; leaving the REPL
+and the REPL stays available. While a run is live, the TUI panel above the
+input box shows its goal, `N/M done · $spent / $cap · <phase>` and one line
+per seat with its harness and status (`queued`, `working`, `needs_you`,
+`waiting`, `done`, `failed`); the interviewer is `needs_you` while the
+approval prompt waits. `/teamwork status` prints that progress summary for
+the session's run; `/teamwork status <id>` prints the same JSON as
+`teamwork status`. One run per REPL session at a time; leaving the REPL
 cancels an unfinished run, which `teamwork resume <id> --approve` continues
 under the same permission mode and sandbox settings. `[skip-interview]` skips
 the interviewer: the same prompt shows the request text itself for approval.
@@ -422,6 +443,20 @@ credentials/endpoint can be supplied again. Resume also accepts the originally
 saved repository when invoked elsewhere. An OS lifetime lock permits one
 driver per run. Ctrl-C forwards cancellation to the run. Exit codes are 0 for
 done/status/help, 1 for runtime failure and 2 for invalid input/refusal.
+
+`teamwork run` and `teamwork resume` take `--events`: stdout then carries one
+`teamwork.snapshot` wire line once the run is open, a `teamwork.event` line
+for every seat status change and phase change, and finally the status JSON
+(which has no `v`). The lines are specified in
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#16-teamwork-progress-lines) and pinned by
+`tests/fixtures/wire/v1/teamwork.jsonl`. A Zig host gets the same events
+in-process by setting `teamwork_runtime.Deps.observer` to a
+`teamwork_progress.Observer`; each `Event` carries the change and the
+`Snapshot` after it, and `teamwork_progress.Board` keeps the latest snapshot
+for a host that renders from another thread (`publish`, `read`,
+`currentRevision`). `interview.draft` reports the interviewer seat the same
+way and `interview.finishApproval` moves it from `needs_you` to `done`. The
+AgentCore C ABI has no teamwork entry point, so it carries no teamwork events.
 
 `teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
 the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)
@@ -505,20 +540,20 @@ The flag surface is fail-closed: an unknown flag or positional argument exits wi
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
-Two independent preview features default to off and require the shared
-`--preview` opt-in (or saved `"preview": true`). `--harnessmm` / `--no-harnessmm`
+Two independent preview features default to off and are selected only by
+their own switches; the shared preview setting neither selects nor blocks them.
+`--harnessmm` / `--no-harnessmm`
 enables bounded runtime EDGs, guarded reuse of decisions through the native
 tool dispatcher, and durable callback-substitution certificates; the
 [HarnessMM protocol](HARNESSMM_PROTOCOL.md) defines supported guards and
 conservative fallback. `--rsi` / `--no-rsi`, with `--rsi-policy <file>`,
 enables the evolved procedural instruction and its own local ridge router
-together. With preview or RSI off, its policy is not opened or required; with
-preview or HarnessMM off, plans are not admitted and certificates are not read
-or written. Preview alone selects neither optimization. Neither runtime switch
+together. With RSI off, its policy is not opened or required; with HarnessMM
+off, plans are not admitted and certificates are not read or written. Neither runtime switch
 starts optimization. The [RSI protocol](SKILL_RSI_PROTOCOL.md) defines offline
 training, budgets, exact features, hash binding and host-origin injection.
 Zig consumers use `harnessmm`, `skill_rsi`, and `agent_loop.Options.harnessmm`,
-`rsi` / `rsi_policy` together with `agent_loop.Options.preview`. Explicit child
+`rsi` / `rsi_policy`. Explicit child
 selections use the matching `subagent.SpawnOptions` fields; fresh children
 default to no selection, while background root continuation retains it.
 The policy is borrowed for the run or job lifetime. Restoring a conversation

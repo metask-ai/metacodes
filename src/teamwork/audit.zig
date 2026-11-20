@@ -30,7 +30,7 @@ const TreeId = @import("reviewer.zig").TreeId;
 /// What an auditor is given. Every slice and pointer is borrowed for the
 /// call.
 pub const AuditRequest = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// `ORIGINAL_REQUEST.md`, byte for byte: the audit's baseline.
     original_request: []const u8,
     /// The implementer's worktree, holding exactly the tree the reviewer

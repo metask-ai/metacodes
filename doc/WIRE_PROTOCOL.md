@@ -336,6 +336,33 @@ Session whose request file the Host cannot read (corrupt, or written by a
 later version) keeps the file as it is and blocks instead of suspending,
 still under ids it never used before.
 
+### 1.6 Teamwork progress lines
+
+A teamwork run (`metacodes teamwork run|resume --events`, or a Zig host's
+`teamwork_progress` encoder) reports progress with two line types, added
+under §4's rule 1. They are not Session journal lines and carry no Run
+`run_id` or `seq`:
+
+```text
+{"v":1,"type":"teamwork.snapshot","data":<snapshot>}
+{"v":1,"type":"teamwork.event","data":{"change":<change>,"snapshot":<snapshot>}}
+```
+
+`<snapshot>` is `run_id` (the teamwork run id string), `goal` (the first line
+of the request, at most 200 bytes), `phase` (`interviewing` or a runtime
+phase: `approved`, `implementing`, `reviewing`, `review_approved`,
+`auditing`, `merging`, `done`, `failed`, `budget_exhausted`, `cancelled`),
+`done` and `total` (seats done, seats listed), `seats` (each `id`, `role`,
+`harness`, `status`; `status` is `queued`, `working`, `needs_you`,
+`waiting`, `done` or `failed`), `budget` (`cap_usd`, `spent_usd`) and
+`audit` (`used`, `max`, `last`: null or `pass`, `fail`, `unverified`,
+`unavailable`). `<change>` is `{"kind":"seat","seat":id,"from":status or
+null,"to":status}` (null `from` is a new seat) or
+`{"kind":"phase","from":phase,"to":phase}`; `snapshot` is the state after
+it. A snapshot line answers a query; event lines follow in the order the
+changes happened. `tests/fixtures/wire/v1/teamwork.jsonl` pins both,
+byte for byte (`tests/component/wire_contract_test.zig`).
+
 ## 2. Capability exchange
 
 A frontend states what it can render with one **capability frame**, the first

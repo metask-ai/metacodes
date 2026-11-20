@@ -9,6 +9,7 @@ const merge_back = @import("merge_back.zig");
 const runtime = @import("runtime.zig");
 const common = @import("drivers/common.zig");
 const factory = @import("drivers/factory.zig");
+const progress = @import("progress.zig");
 
 pub const RequestSource = runtime.RequestSource;
 
@@ -91,7 +92,7 @@ pub const interviewer_seat = "interviewer-1";
 pub const interview_worktree_dir = "interview";
 
 pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8, abort: *const types.AbortSignal) !Draft {
-    if (!deps.preview) return error.PreviewDisabled;
+    if (!deps.preview.teamwork) return error.PreviewDisabled;
     if (std.mem.trim(u8, request, " \t\r\n").len == 0) return error.EmptyRequest;
     const repo = try merge_back.toplevel(gpa, options.workspace, null);
     defer gpa.free(repo);
@@ -107,6 +108,8 @@ pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enab
     const digest = std.fmt.bytesToHex(charters.digest(.interviewer), .lower);
     var record: run_dir.SeatRecord = .{ .id = id, .role = .interviewer, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = digest };
     try dir.createSeat(record);
+    const reporter: Reporter = .{ .observer = deps.observer, .run_id = options.run_id, .goal = runtime.goalOf(request), .ledger = &ledger };
+    reporter.seat(record, null);
     const packet = try renderPacket(gpa, request);
     defer gpa.free(packet);
     try dir.writePacket(id, packet);
@@ -119,6 +122,7 @@ pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enab
 
     record.status = .working;
     try dir.writeSeatRecord(record);
+    reporter.seat(record, .queued);
     var packet_buf: run_dir.PathBuf = undefined;
     var handoff_buf: run_dir.PathBuf = undefined;
     const paths: types.SeatPaths = .{
@@ -138,9 +142,14 @@ pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enab
         .custom => |custom| try custom.driverFn(custom.ctx, spec, binding).run(gpa, spec, paths, abort),
     };
     defer outcome.deinit(gpa);
-    record.status = if (outcome == .finished) .done else .failed;
+    const exhausted = outcome != .aborted and ledger.isExhausted();
+    record.status = switch (outcome) {
+        .finished => if (exhausted) .done else .needs_you,
+        else => .failed,
+    };
     try dir.writeSeatRecord(record);
-    if (outcome != .aborted and ledger.isExhausted()) return .budget_exhausted;
+    reporter.seat(record, .working);
+    if (exhausted) return .budget_exhausted;
     return switch (outcome) {
         .finished => |handoff| .{ .text = try std.fmt.allocPrint(gpa, "{s}\n\n## Acceptance checks\n\n{s}\n", .{
             std.mem.trim(u8, handoff.conclusion, " \t\r\n"),
@@ -151,6 +160,44 @@ pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enab
         .aborted => .aborted,
     };
 }
+
+pub fn finishApproval(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8) !void {
+    var dir = try run_dir.RunDir.open(gpa, options.state_root, options.run_id);
+    defer dir.deinit(gpa);
+    var record = try dir.readSeatRecord(types.SeatId.parse(interviewer_seat) catch unreachable);
+    if (record.status != .needs_you) return;
+    record.status = .done;
+    try dir.writeSeatRecord(record);
+    var buf: run_dir.PathBuf = undefined;
+    var ledger = try ledger_mod.Ledger.load(gpa, try dir.path(&buf, .budget), cfg.budget_usd);
+    defer ledger.deinit(gpa);
+    const reporter: Reporter = .{ .observer = deps.observer, .run_id = options.run_id, .goal = runtime.goalOf(request), .ledger = &ledger };
+    reporter.seat(record, .needs_you);
+}
+
+const Reporter = struct {
+    observer: ?progress.Observer,
+    run_id: types.RunId,
+    goal: []const u8,
+    ledger: *const ledger_mod.Ledger,
+
+    fn seat(self: Reporter, record: run_dir.SeatRecord, from: ?types.SeatStatus) void {
+        const observer = self.observer orelse return;
+        const seats = [_]runtime.SeatSnapshot{.{ .id = record.id, .role = record.role, .harness = record.harness, .status = record.status, .charter_sha256 = record.charter_sha256 }};
+        const event: progress.Event = .{
+            .change = .{ .seat = .{ .id = record.id, .from = from, .to = record.status } },
+            .snapshot = .{
+                .run_id = self.run_id,
+                .goal = self.goal,
+                .phase = .interviewing,
+                .seats = &seats,
+                .budget = .{ .cap_usd = self.ledger.cap_usd, .spent_usd = self.ledger.spent_usd, .remaining_usd = self.ledger.remainingUsd(), .charges = self.ledger.entries },
+                .audit = .{ .used = 0, .last = null },
+            },
+        };
+        observer.notify(&event);
+    }
+};
 
 pub fn renderPacket(gpa: std.mem.Allocator, request: []const u8) error{OutOfMemory}![]u8 {
     return std.fmt.allocPrint(gpa,

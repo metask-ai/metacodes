@@ -61,7 +61,7 @@ test "L2 端到端: 序列化请求体里每个有 required 的工具 properties
     const a = std.testing.allocator;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    const defs = try tools.toToolDefinitionsFull(scratch.allocator(), null, &.{ .preview = true });
+    const defs = try tools.toToolDefinitionsFull(scratch.allocator(), null, &.{ .preview = .all });
 
     const types = cc.json_mod;
     const msg = cc.types_mod.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };

@@ -156,7 +156,7 @@ manager 的外部 harness 或 model/effort 配置明确拒绝。
 `[skip-interview]` 与 `[seats=<role>:<harness>[:<model>],...]`。`parseSegments` 去掉参数段,
 其余文本即待批准文本;没有前导 `[` 时原样使用。`seats` 是只对本次运行生效的配置层,位于
 项目配置之上、CLI 覆盖之下。未知、重复、未闭合或格式错误的参数段直接报错,不当作请求文本。
-REPL `/teamwork <请求>` 先检查 preview(关闭时明确报错,不退化成普通对话),再按同样的分层
+REPL `/teamwork <请求>` 先检查 `teamwork` preview 特性(关闭时明确报错,不退化成普通对话),再按同样的分层
 加载配置;未带 `[skip-interview]` 时由 `interview.draft` 在运行目录里以 `interviewer-1` 运行
 interviewer seat(任意 harness):工作目录是工作区快照的临时 worktree(`interview/`,结束即删),
 花费记入同一运行的预算账本,packet 只含固定文本与用户请求。草稿是 handoff 的 Conclusion 加
@@ -480,7 +480,7 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 `src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
 `teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)、
 `teamwork_runtime`、`teamwork_swe_loop`、`teamwork_audit`、`teamwork_merge_back`、
-`teamwork_verifier_auditor`、`teamwork_mcp_server` 与 `teamwork_interview`
+`teamwork_verifier_auditor`、`teamwork_mcp_server`、`teamwork_progress` 与 `teamwork_interview`
 (与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 
@@ -542,5 +542,5 @@ L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成�
 | #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS Seatbelt / Linux bubblewrap 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
 | #522 | Claude Code 作为 Manager(MCP) | stdio MCP 接口驱动用户预先批准的 Run,复用独立审计和预算规则。详见 [TEAMWORK_MCP.md](TEAMWORK_MCP.md)。 |
 | #523 | worktree 合回 | 审计通过后补丁合回,保留用户并发修改,冲突时保留两边内容(§10)。 |
-| #524 | 进度面板与 AgentCore 事件 | 待做 |
+| #524 | 进度面板与 AgentCore 事件 | 已做:runtime 每次 seat 状态或阶段变化都把变化和之后的快照发给 `Deps.observer`;interviewer 在等待批准时为 `needs_you`;REPL 用线程安全的 `progress.Board` 驱动输入框上方的面板与 `/teamwork status` 摘要;`teamwork run/resume --events` 输出 `teamwork.snapshot` / `teamwork.event` 线协议行(WIRE_PROTOCOL §1.6)。AgentCore C ABI 没有 teamwork 入口,不带这些事件。 |
 | #525 | 并行候选与择优 | 待做 |

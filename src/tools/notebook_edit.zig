@@ -310,7 +310,7 @@ test "comment preview checks notebook code and preserves markdown headings" {
     const path = tt.path(&path_buf, "comment-preview.ipynb");
     defer pfs.unlinkPath(path.ptr) catch {};
     try writeNb(path, SAMPLE_NB);
-    const ctx: ToolContext = .{ .allocator = a, .preview = true };
+    const ctx: ToolContext = .{ .allocator = a, .preview = .all };
     for ([_][]const u8{ "c1", "m1" }) |id| {
         const args = try std.json.Stringify.valueAlloc(a, .{ .notebook_path = path, .cell_id = id, .new_source = "# heading" }, .{});
         defer a.free(args);

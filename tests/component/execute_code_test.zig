@@ -43,7 +43,7 @@ const Capture = struct {
 
 fn run(conversation: *cc.conversation.Conversation, scripts: []const Script, permission: *cc.permission.PermissionContext, options: cc.agent_loop.Options) !Evidence {
     var preview_options = options;
-    preview_options.preview = true;
+    preview_options.preview = .all;
     return runWithOptions(conversation, scripts, permission, preview_options);
 }
 

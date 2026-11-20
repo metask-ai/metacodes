@@ -16,6 +16,17 @@ empty `### Migration`.
 
 ### Changed
 
+- No change a Host can see. The inputs moved for Teamwork progress (#524):
+  a Zig host's `teamwork_runtime.Deps.observer` gets every seat status and
+  phase change with a `teamwork_progress.Snapshot`, and `metacodes teamwork
+  run|resume --events` writes `teamwork.snapshot` / `teamwork.event` wire
+  lines. ABI revision 29 has no teamwork entry point and carries none of
+  these events.
+
+## 0.16.0 — 2026-11-20
+
+### Changed
+
 - The Teamwork CLI/Manager consumer fixture explicitly opts in with `--preview`;
   saved root `preview: true` is equivalent and `--no-preview` overrides it.
   Direct Zig Teamwork hosts supply current `Deps.preview` separately from saved

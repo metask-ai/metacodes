@@ -432,7 +432,7 @@ pub const VerifyRequest = struct {
 /// directory, dynamic registry, MCP sessions, host services or transcript:
 /// the verifier cannot receive what these fields would carry.
 pub const Deps = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     provider: provider_mod.Provider,
     anthropic_client: ?*client_mod.Client = null,
     /// The host's tool definitions; the verifier sees their intersection with
