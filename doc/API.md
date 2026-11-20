@@ -376,13 +376,54 @@ repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
 selects a path-safe run id; otherwise one is generated and printed to stderr.
 Provider options are `--provider`, `--model`, `--base-url`, `--api-key`, and
 `--verbose`. This CLI uses the deterministic manager and an already-written
-request; configured model/effort or external harnesses for manager/interviewer
-are rejected. The verifier must be native; explicit verifier effort and tier
-aliases are rejected until wired. No REPL interviewer is implied.
+request that `--approve` approves as is, so it runs no interviewer; configured
+model/effort or an external harness for the manager is rejected. The verifier
+must be native; explicit verifier effort and tier aliases are rejected until
+wired.
+
+The request may start with option segments, each in square brackets:
+`[skip-interview]` and `[seats=<role>:<harness>[:<model>],...]` (for example
+`[seats=reviewer:claude_code,implementer:metacodes:fast]`). Segments are
+removed from the request; the rest is the approved text. `seats` is a
+configuration layer for this run only, above `.metacodes/teamwork.json` and
+below the CLI options; a `claude_code` seat still takes its `command` from a
+lower layer. An unknown, duplicated, unterminated or malformed segment fails
+with `UnknownTeamworkSegment`, `DuplicateTeamworkSegment`,
+`UnterminatedTeamworkSegment` or `InvalidTeamworkSeats` before any state is
+created; a request without leading `[` is used byte for byte. A request file
+whose own text starts with `[` (such as `[WIP] ...`), which earlier versions
+accepted as is, is now refused; start it with any other character. `run.json` and
+`teamwork status` record `request_source`: `request_file` (a CLI request
+file), `skip_interview`, `interview` (the interviewer's draft approved
+unchanged) or `user_edited` (text the user edited, then approved). Runs
+saved before this field report `request_file`.
+
+In the REPL, `/teamwork <request>` accepts the same segments and the same
+configuration layers. With the `teamwork` preview feature off it prints an error and sends nothing
+to the model. Otherwise the interviewer seat (either harness) reads a
+disposable snapshot of the workspace and drafts a task statement, charged to
+the run's budget ledger. The user answers `y` (approve), `e` (type a
+replacement statement, shown again for approval) or `n` (reject). Each prompt
+also states what approval authorizes: the dollar cap and seats per role,
+every seat's harness and model, the pinned check, and merge-back into the
+repository as uncommitted changes. Ctrl+C while the interviewer drafts
+cancels that seat (as `aborted`, even when the unreported spend of a killed
+seat fills the cap) and leaves the next message unaffected. No
+implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
+approval; the approved bytes are written to `ORIGINAL_REQUEST.md` unchanged,
+then the run continues on a background thread with its own provider client,
+and the REPL stays available. `/teamwork status [<id>]` prints the same JSON
+as `teamwork status`. One run per REPL session at a time; leaving the REPL
+cancels an unfinished run, which `teamwork resume <id> --approve` continues
+under the same permission mode and sandbox settings. `[skip-interview]` skips
+the interviewer: the same prompt shows the request text itself for approval.
+After a rejected, failed or cancelled interview nothing has started; the run
+directory then holds only the interviewer seat and its `budget.jsonl`, which
+`teamwork status` does not read (it has no `run.json`).
 
 `metacodes [--state-dir <dir>] teamwork status <id> [--json]` prints JSON
 containing saved state/detail, repository, dispatch counts, audit results,
-merge-conflict count, seats and budget totals. It reads only run files: no
+merge-conflict count, request source, seats and budget totals. It reads only run files: no
 global provider configuration, credentials, startup, state rewrite or ledger
 repair. A missing budget ledger means no charges yet. A torn budget tail is
 reported and excluded from totals; `budget.pending` shows an outstanding

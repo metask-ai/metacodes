@@ -67,6 +67,7 @@ const model_command = @import("model_command.zig");
 const session_service = @import("../session_service.zig");
 const replay = @import("replay.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
+const teamwork = @import("teamwork.zig");
 
 fn hasPendingRunInput(ctx: *anyopaque) bool {
     const queue: *msg_queue_mod.MsgQueue = @ptrCast(@alignCast(ctx));
@@ -229,6 +230,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         .eval_execution_policy = eval_execution_policy,
         .spawn_tick = spawn_tick,
     };
+
+    var teamwork_session: teamwork.Session = .{};
+    defer teamwork_session.deinit();
+    var teamwork_reader: TeamworkReader = .{ .host = &turn_host };
 
     while (true) {
         // SIGTERM or SIGHUP stopped the last Run, which closed its journal on
@@ -658,6 +663,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
             try handleMcp(app);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/teamwork") or std.mem.startsWith(u8, trimmed, "/teamwork ") or std.mem.startsWith(u8, trimmed, "/teamwork\n")) {
+            teamwork.handle(app, allocator, &teamwork_session, std.mem.trim(u8, trimmed["/teamwork".len..], " \t\r\n"), teamwork_reader.reader());
             continue;
         }
         // /btw <question>:侧问,不进对话历史(用临时 conversation 跑一次)
@@ -1821,6 +1830,21 @@ fn printNotice(app: *const app_mod.App, color: []const u8, text: []const u8) voi
     const cols: usize = if (tui_term_root.getSize(1)) |size| size.cols else 80;
     cmd_output.notice(cols, marker, text);
 }
+
+const TeamworkReader = struct {
+    host: *const TurnHost,
+
+    fn reader(self: *TeamworkReader) teamwork.LineReader {
+        return .{ .ctx = self, .readFn = read };
+    }
+
+    fn read(ctx: *anyopaque) ?[]u8 {
+        const self: *TeamworkReader = @ptrCast(@alignCast(ctx));
+        const host = self.host;
+        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region) catch null;
+        return readLineBuffered(host.allocator, host.stdin_fd) catch null;
+    }
+};
 
 /// tty raw mode 下的行编辑器主循环：按键驱动 LineEditor，支持历史 ↑↓。
 /// 返回提交的行（owned，caller free）。Exit and clear keys follow Claude

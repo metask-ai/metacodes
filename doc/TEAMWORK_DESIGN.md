@@ -149,7 +149,26 @@ metacodes seat 根本没有放 `command` 的位置;`BudgetEnforcement.wallclock_
 `--config-json` 可覆盖 seat 的 harness/model/effort;`--max-rounds` 与
 `--check-command` 接入 runtime 的真实 dispatch cap / pinned check。
 
-CLI 使用确定性 SWE manager 和请求文件,不执行 interviewer;未接线的角色配置明确拒绝。
+CLI 使用确定性 SWE manager 和请求文件,`--approve` 直接批准请求文件,不执行 interviewer;
+manager 的外部 harness 或 model/effort 配置明确拒绝。
+
+**请求参数段与面试(#518)**:`src/teamwork/interview.zig`。请求开头可以有若干方括号参数段:
+`[skip-interview]` 与 `[seats=<role>:<harness>[:<model>],...]`。`parseSegments` 去掉参数段,
+其余文本即待批准文本;没有前导 `[` 时原样使用。`seats` 是只对本次运行生效的配置层,位于
+项目配置之上、CLI 覆盖之下。未知、重复、未闭合或格式错误的参数段直接报错,不当作请求文本。
+REPL `/teamwork <请求>` 先检查 `teamwork` preview 特性(关闭时明确报错,不退化成普通对话),再按同样的分层
+加载配置;未带 `[skip-interview]` 时由 `interview.draft` 在运行目录里以 `interviewer-1` 运行
+interviewer seat(任意 harness):工作目录是工作区快照的临时 worktree(`interview/`,结束即删),
+花费记入同一运行的预算账本,packet 只含固定文本与用户请求。草稿是 handoff 的 Conclusion 加
+Verification。REPL 把 `app.abort` 转发给面试(Ctrl+C 取消 interviewer,结束后复位,不影响下一条消息)。
+`interview.approve` 连同批准所授权的预算、seats、固定检查与合回目标一起展示,让用户批准、修改(替换全文后再次确认)
+或拒绝;`[skip-interview]` 同样经过这一步,只是展示的是原始请求;批准的字节
+原样交给 `Run.start` 写入 `ORIGINAL_REQUEST.md`,之后才派任何 implementer/reviewer。
+`ApprovedRequest.source`(`request_file` / `skip_interview` / `interview` / `user_edited`)
+写入 `run.json` 的 `request_source`,恢复时保留,`teamwork status` 一并输出。REPL 用
+`AgentJobRegistry.makeProvider` 给运行单独的 provider client,在后台线程驱动 SWE loop,
+提示用户“已开始,可随时用 `/teamwork status` 询问进度”;退出 REPL 会取消未结束的运行,
+可用 `teamwork resume` 继续。
 `command.Host` 向 worker、pinned check 和 verifier 提供强制沙箱,state root 必须在仓库外。
 `run.json` 在创建候选 worktree 前原子保存批准配置、继承模型和宿主权限指纹。`teamwork resume <id>
 --approve` 使用这份配置,拒绝权限和沙箱策略发生变化的恢复请求。`teamwork status <id> [--json]` 只读运行文件,缺失账本为空,
@@ -163,7 +182,8 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 
 ```
 <state_root>/teamwork/<run_id>/
-  ORIGINAL_REQUEST.md     只写一次;审计的基准
+  ORIGINAL_REQUEST.md     只写一次;审计的基准(用户批准后才写)
+  interview/              面试期间的临时快照 worktree,面试结束即删(#518)
   budget.jsonl            预算账本(§5)
   open_issues.json        评审发现台账(#517),初始为 []
   seats/<seat_id>/
@@ -192,9 +212,10 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 
 **缓存契约**:run id、时间戳和运行目录的绝对路径都不进入 metacodes 发给 provider 的字节。
 packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径(`seat_relative_original_request`
-= `../../ORIGINAL_REQUEST.md`、`seat_relative_open_issues`);seat 目录的绝对路径只作为环境事实
-交给 harness(§7.1),不进入宪章、bootstrap 或 Manager 的提示词。写入隔离(seat 只能写工作区和
-自己的 seat 目录)由执行策略、权限层和沙箱保证,不靠提示词(§7.3)。
+= `../../ORIGINAL_REQUEST.md`、`seat_relative_open_issues`);metacodes seat 只看到稳定别名
+`$WORKSPACE` 与 `$SEAT`,真实路径由工具准入层解析(§7.1),不进入宪章、首条消息或 Manager 的
+提示词。宿主日志、状态文件与诊断照常记录真实路径。写入隔离(seat 只能写工作区和自己的 seat
+目录)由执行策略、权限层和沙箱保证,不靠提示词(§7.3)。
 
 ## 5. 预算账本
 
@@ -330,10 +351,24 @@ pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Drive
   消息开头、Claude Code 的 `-p` 提示词)。它只用相对 seat 目录的文件名:读 `packet.md`,写
   `handoff.md`(五段)。没有 run id、路径、时间戳。
 - **seat 目录在哪是环境事实,不是指令**:Claude Code 经 `--add-dir <seat 目录>` 得知(由它自己的
-  环境段告诉模型);metacodes 子 agent 经首条用户消息里 bootstrap 之后的 `<seat-environment>` 块
-  (工作区与 seat 目录的绝对路径)——与 Claude Code `--exclude-dynamic-system-prompt-sections`
-  把机器相关段放进首条用户消息同一做法。所以宪章(系统提示词)和 bootstrap 跨 seat、跨运行
-  逐字节稳定;含 run id 的 seat 目录路径只出现在环境块里。
+  环境段告诉模型);metacodes 子 agent 经首条用户消息里 bootstrap 之后的 `<seat-environment>` 块,
+  块里只写别名 `$WORKSPACE`(工作区,也是当前目录)与 `$SEAT`(seat 目录),首条消息是编译期常量
+  `metacodes.first_message`。
+- **路径别名(#544)**:`spawnAgentSink` 的 `path_aliases` 进入 agent_loop。工具调用参数经
+  `canonicalizeArgsWithAliases` 准入时,顶层 `file_path`、`path`、`notebook_path` 若是 `$NAME` 或以
+  `$NAME/` 开头,就换成真实目录;`$SEATS/x`、`a/$SEAT`、嵌套对象和其他参数(如 Write 的
+  `content`)不动。PreToolUse hook、权限判定、执行策略、流式预取、工具本身和观测 sink 读的都是
+  这同一份参数,所以 `$SEAT/../<别的 seat>`、`$WORKSPACE/..`、经符号链接的路径和直接写真实路径
+  受到完全相同的检查。模型的 transcript 保留它写的别名。Bash 命令文本不改写,工具在命令前加
+  `export WORKSPACE='…' SEAT='…'`,沙箱照旧按物理路径限制写入;reviewer 证据比对的仍是模型
+  写的命令。隔离 verifier 的 packet 写 `path: $WORKSPACE`,`$WORKSPACE` 解析到候选快照。
+  于是同一请求、角色和文件内容,换 state root 与 run id 后,metacodes seat 的首个 provider 请求
+  (system、tools、首条 user message)逐字节相同(`drivers_test` 有断言)。
+- **外部 harness 的边界**:Claude Code seat 中 runtime 控制且跨运行稳定的输入是 `-p` 的
+  bootstrap、`--append-system-prompt` 的宪章,以及 argv 里除 `--add-dir` 取值以外的全部参数
+  (`drivers_test` 断言两次运行只有这一项不同)。seat 目录的真实路径和 cwd 由 CLI 自己写进它生成的
+  环境消息,再加上它自己的日期、git 状态等;这些内容和 CLI 的 transcript 由 Claude Code 生成,
+  runtime 不控制,也不保证它们跨运行稳定。
 - **宪章**(`charters.forRole(role)`):interviewer、implementer、manager 为原创文本;reviewer 即
   `reviewer.charter`(§6);verifier 是标明的占位,真正的宪章在 verifier 模块(#516)。
   两种 harness 都收到同一角色宪章(Claude Code 通过 `--append-system-prompt`)。
@@ -432,6 +467,11 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 - metacodes seat 写工作区/seat 目录之外(绝对路径、`../` 相对路径、`ORIGINAL_REQUEST.md`、别的
   seat 的 handoff)全部被拒且磁盘上不存在;系统提示词恰为宪章、一个空行和注释指导;首条用户消息以 bootstrap 开头,
   bootstrap 部分不含 run id 与状态路径。
+- 路径别名:两次运行换 state root 与 run id,metacodes seat 的首个 provider 请求序列化后逐字节相同;
+  经 `$SEAT/packet.md` 读 packet、经 `$WORKSPACE`/`$SEAT` 在 Bash 里跑检查并写输出、经 `$SEAT/handoff.md`
+  写 handoff,文件都落在真实目录;`$SEAT/../reviewer-1/…`(Write 与 Bash)、`$WORKSPACE/../…`、
+  `$SEAT/<指向外部的符号链接>/…` 都被拒且磁盘上不存在。Claude Code seat 两次运行的 argv 只有
+  `--add-dir` 的取值不同。
 - metacodes reviewer seat:系统提示词为 `reviewer.charter` 加注释指导,外接观测 sink 收到 Bash 分派,Write/Edit
   进不了工作区。
 
@@ -440,7 +480,7 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 `src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
 `teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)、
 `teamwork_runtime`、`teamwork_swe_loop`、`teamwork_audit`、`teamwork_merge_back`、
-`teamwork_verifier_auditor` 与 `teamwork_mcp_server`
+`teamwork_verifier_auditor`、`teamwork_mcp_server` 与 `teamwork_interview`
 (与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 
@@ -469,7 +509,7 @@ approved -> implementing -> reviewing -> review_approved -> auditing -> merging 
 每个角色最多派 `max_rounds` 个 seat(默认 3)。reviewer 的结论经过工具调用记录、台账与固定
 检查命令核验;批准绑定工作区树 id。审计前树变了就重新评审,审计后树变了就终止。
 `VerifierAuditor` 在与批准树一致的独立快照上执行固定检查,然后调用 `core/isolated_verifier.verify`。
-审计请求用相对工作目录标识,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
+审计请求用 `$WORKSPACE` 标识候选快照,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
 FAIL 第一次进入修复轮、第二次失败终止;
 UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预算账本。
 
@@ -495,8 +535,9 @@ L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成�
 | #515 | runtime / seat 分层、角色配置、worker 契约 | 类型、配置、驱动、runtime、确定性 SWE Manager 已接通(§7、§10)。 |
 | #516 | 独立 verifier / 完成审计 | `VerifierAuditor` 已接隔离 verifier,最多两次审计,失败反馈修复轮;只有 PASS 交付。UNVERIFIED 后的 leads 轮仍待做。 |
 | #517 | reviewer 角色与 open-issues 台账 | runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows `workspaceTree` 尚不支持。 |
-| #518 | `/teamwork` 命令、面试与批准 | CLI 显式批准入口、配置加载、状态和恢复。交互式面试与 REPL `/teamwork` 尚待做。 |
-| #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名仍待做。 |
+| #518 | `/teamwork` 命令、面试与批准 | 已完成:CLI 显式批准入口、配置加载、状态和恢复;请求参数段 `[skip-interview]` / `[seats=...]`(CLI 与 REPL);REPL `/teamwork` 的 interviewer 面试、批准/修改/拒绝与后台运行;`request_source` 记录批准来源(§3)。 |
+| #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名已由 #544 完成。 |
+| #544 | seat 稳定路径别名 | 已做(§7.1):`$WORKSPACE` / `$SEAT` 在工具准入层解析,隔离 verifier 的快照同样用 `$WORKSPACE`;metacodes seat 的首个 provider 请求跨运行逐字节相同;Claude Code seat 只有 `--add-dir` 取值随运行变化。 |
 | #520 | 运行级预算 | 付费调用前预留、退出记账、丢失报告/崩溃时消耗预留、恢复固定原策略、预算触顶停止且不合回。 |
 | #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS Seatbelt / Linux bubblewrap 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
 | #522 | Claude Code 作为 Manager(MCP) | stdio MCP 接口驱动用户预先批准的 Run,复用独立审计和预算规则。详见 [TEAMWORK_MCP.md](TEAMWORK_MCP.md)。 |

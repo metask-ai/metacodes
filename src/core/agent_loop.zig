@@ -558,6 +558,7 @@ pub const Options = struct {
     /// 相对工具路径是否以 cwd_abs 为基准解析。默认 false 保持 CLI 既有输出/路径语义；
     /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
     resolve_relative_paths: bool = false,
+    path_aliases: []const tools_common.PathAlias = &.{},
     home_dir: []const u8 = "",
     /// Host-injected state root (util/state_root.zig), propagated to every ToolContext.
     state_root: []const u8 = "",
@@ -1289,8 +1290,9 @@ const ArgsAdmission = union(enum) {
 fn admitToolArgs(
     allocator: std.mem.Allocator,
     input: []const u8,
+    path_aliases: []const tools_common.PathAlias,
 ) !ArgsAdmission {
-    const canonical = tools_common.canonicalizeArgs(allocator, input) catch |err| return .{ .rejected = switch (err) {
+    const canonical = tools_common.canonicalizeArgsWithAliases(allocator, input, path_aliases) catch |err| return .{ .rejected = switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DuplicateArgumentKey => try tool_error.errorToJson(
             "DuplicateArgumentKey",
@@ -1418,7 +1420,7 @@ const ToolAdmission = struct {
         }
         // Model calls and JS host requests share argument admission (#494).
         // The slot owns the canonical bytes seen by hooks, permissions and dispatch.
-        var eff_input = switch (try admitToolArgs(allocator, tu.input)) {
+        var eff_input = switch (try admitToolArgs(allocator, tu.input, opts.path_aliases)) {
             .admitted => |canonical| canonical,
             .rejected => |content| return .{
                 .decision = .denied,
@@ -1436,7 +1438,7 @@ const ToolAdmission = struct {
             if (pre.modified_input) |mi| {
                 allocator.free(eff_input);
                 eff_input = mi;
-                switch (try admitToolArgs(allocator, mi)) {
+                switch (try admitToolArgs(allocator, mi, opts.path_aliases)) {
                     .admitted => |canonical| {
                         allocator.free(eff_input);
                         eff_input = canonical;
@@ -3034,6 +3036,7 @@ fn runCounted(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
@@ -3494,7 +3497,7 @@ fn runCounted(
                             // The same argument admission as the authoritative path
                             // (issue #494): rejected arguments are not prefetched, and
                             // admitted ones run in their canonical spelling.
-                            const canonical = tools_common.canonicalizeArgs(allocator, tu.input_json) catch break :prefetch;
+                            const canonical = tools_common.canonicalizeArgsWithAliases(allocator, tu.input_json, opts.path_aliases) catch break :prefetch;
                             var canonical_owned = true;
                             defer if (canonical_owned) allocator.free(canonical);
                             if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
@@ -4611,6 +4614,7 @@ fn runCounted(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
