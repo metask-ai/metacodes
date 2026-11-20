@@ -253,6 +253,7 @@ pub const teamwork_command = @import("teamwork/command.zig");
 pub const teamwork_runtime = @import("teamwork/runtime.zig");
 pub const teamwork_config = @import("teamwork/config.zig");
 pub const teamwork_types = @import("teamwork/types.zig");
+pub const teamwork_progress = @import("teamwork/progress.zig");
 // Integration binds the MCP server here; all preparation and lifecycle
 // ownership remain in teamwork_command (stdin/stdout belong to the callback).
 pub const teamwork_mcp_server = @import("teamwork/mcp_server.zig");
@@ -5888,6 +5889,7 @@ test {
     _ = &@import("teamwork/verifier_auditor.zig");
     _ = &@import("teamwork/runtime_test.zig");
     _ = &@import("teamwork/interview.zig");
+    _ = &@import("teamwork/progress.zig");
     _ = &@import("repl/teamwork.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");

@@ -48,6 +48,7 @@ const merge_back = @import("merge_back.zig");
 const factory = @import("drivers/factory.zig");
 const common = @import("drivers/common.zig");
 const charters = @import("charters.zig");
+const progress = @import("progress.zig");
 
 const Role = types.Role;
 const SeatId = types.SeatId;
@@ -103,6 +104,7 @@ pub const Deps = struct {
     check_runner: reviewer.CheckRunner = .{},
     cli_approval: ?CliApproval = null,
     recheck_audited_tree: *const fn (std.mem.Allocator, []const u8, []const u8, ?*const types.AbortSignal) reviewer.TreeError!TreeId = reviewer.workspaceTree,
+    observer: ?progress.Observer = null,
 };
 
 /// A CLI host can reopen without loading mutable project configuration. The
@@ -616,6 +618,7 @@ pub const Run = struct {
         try self.dir.createSeat(.{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
         self.dispatched.set(role, ordinal);
         try self.seats.append(self.gpa, .{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
+        self.emit(.{ .seat = .{ .id = id, .from = null, .to = .queued } });
         const packet = try self.renderPacket(role, instructions);
         defer self.gpa.free(packet);
         try self.dir.writePacket(id, packet);
@@ -867,8 +870,10 @@ pub const Run = struct {
     fn setSeatStatus(self: *Run, id: SeatId, seat_status: types.SeatStatus) Error!void {
         for (self.seats.items) |*seat| {
             if (!seat.id.eql(id)) continue;
+            const previous = seat.status;
             seat.status = seat_status;
             try self.dir.writeSeatRecord(.{ .id = id, .role = seat.role, .harness = seat.harness, .status = seat_status, .charter_sha256 = seat.charter_sha256 });
+            if (previous != seat_status) self.emit(.{ .seat = .{ .id = id, .from = previous, .to = seat_status } });
             return;
         }
         return error.SeatNotFound;
@@ -1036,9 +1041,17 @@ pub const Run = struct {
             log.err("teamwork", "run {s}: illegal transition {s} -> {s}", .{ self.dir.run_id.slice(), @tagName(self.state.phase()), @tagName(next.phase()) });
             return error.IllegalTransition;
         }
+        const previous = self.state.phase();
         self.state = next;
         try self.persist();
         if (next.isTerminal()) self.releaseLease();
+        if (previous != next.phase()) self.emit(.{ .phase = .{ .from = .of(previous), .to = .of(next.phase()) } });
+    }
+
+    fn emit(self: *const Run, change: progress.Change) void {
+        const observer = self.deps.observer orelse return;
+        const event: progress.Event = .{ .change = change, .snapshot = .ofRun(self.status()) };
+        observer.notify(&event);
     }
 
     // ── run.json ────────────────────────────────────────────────────────────
@@ -1241,7 +1254,7 @@ fn parseSeatId(id: SeatId) ?struct { Role, u32 } {
 
 /// The first non-blank line of the request, at most `goal_max` bytes, cut
 /// on a UTF-8 boundary.
-fn goalOf(request: []const u8) []const u8 {
+pub fn goalOf(request: []const u8) []const u8 {
     var lines = std.mem.splitScalar(u8, request, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r#");
