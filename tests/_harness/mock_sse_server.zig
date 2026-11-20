@@ -842,6 +842,8 @@ pub const LossyProxy = struct {
     /// How long a connection is held open after an answer sent whole.
     pub const HOLD_MS: i64 = 5_000;
 
+    const CloseResult = error{ IncompleteResponse, FramingWriteFailed, ReadFailed, HoldExpired, ProxyStopped }!i64;
+
     listen_sock: net.Socket,
     port: u16,
     thread: std.Thread,
@@ -854,9 +856,7 @@ pub const LossyProxy = struct {
     accepted: usize = 0,
     reused: usize = 0,
     cut: usize = 0,
-    /// For each answer sent whole and held: ms from its last byte to the
-    /// client's close, or null when the hold ran out (or `stop`) first.
-    close_ms: [MAX_REQUESTS]?i64 = undefined,
+    close_results: [MAX_REQUESTS]CloseResult = undefined,
     close_count: usize = 0,
 
     pub fn start(body: []const u8, options: Options) !*LossyProxy {
@@ -933,17 +933,13 @@ pub const LossyProxy = struct {
         return self.cut;
     }
 
-    /// The close time recorded for the `index`th held answer (see `close_ms`):
-    /// null when none is recorded yet, or the hold ran out first.
-    pub fn closeLatencyMs(self: *LossyProxy, index: usize) ?i64 {
+    pub fn closeLatencyMs(self: *LossyProxy, index: usize) !i64 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (index >= self.close_count) return null;
-        return self.close_ms[index];
+        if (index >= self.close_count) return error.NoCloseRecorded;
+        return self.close_results[index];
     }
 
-    /// Waits until `n` held answers have an outcome (the client closed, or the
-    /// hold ran out), at most `timeout_ms`. False on timeout.
     pub fn waitForCloses(self: *LossyProxy, n: usize, timeout_ms: i64) bool {
         const io = std.Io.Threaded.global_single_threaded.io();
         const begun = std.Io.Timestamp.now(io, .awake);
@@ -1013,13 +1009,15 @@ pub const LossyProxy = struct {
                 self.cut += 1;
                 self.mutex.unlock();
                 // The proxy passed the server's close on before the last bytes.
-                _ = self.sendAnswer(conn, cut_at, true, true);
+                _ = self.sendPayload(conn, cut_at, true);
                 return;
             };
-            if (!self.sendAnswer(conn, self.body.len, false, asks_close)) return;
+            if (!self.sendPayload(conn, self.body.len, asks_close)) {
+                if (!asks_close) self.noteClose(error.IncompleteResponse);
+                return;
+            }
             answered += 1;
-            if (asks_close) return;
-            switch (self.hold(conn, buf)) {
+            switch (self.finishAnswer(conn, buf, asks_close)) {
                 .closed => return,
                 .next_request => |n| have = n,
             }
@@ -1028,30 +1026,49 @@ pub const LossyProxy = struct {
 
     const Hold = union(enum) { closed, next_request: usize };
 
-    /// Wait for the client's close, or its next request on this connection.
-    fn hold(self: *LossyProxy, conn: net.Socket, buf: []u8) Hold {
+    fn finishAnswer(self: *LossyProxy, conn: net.Socket, buf: []u8, asks_close: bool) Hold {
         const io = std.Io.Threaded.global_single_threaded.io();
         const sent = std.Io.Timestamp.now(io, .awake);
+        if (self.options.framing == .chunked) {
+            const end = if (self.body.len > 0) "\r\n0\r\n\r\n" else "0\r\n\r\n";
+            writeAll(conn, end) catch |err| {
+                if (!asks_close) self.noteClose(switch (err) {
+                    error.PeerClosed => sent.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds(),
+                    error.WriteFailed => error.FramingWriteFailed,
+                });
+                return .closed;
+            };
+        }
+        if (asks_close) return .closed;
         while (!self.closing.load(.acquire)) {
             const waited = sent.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
-            if (waited >= HOLD_MS) break;
+            if (waited >= HOLD_MS) {
+                self.noteClose(error.HoldExpired);
+                return .closed;
+            }
             if (!net.pollReadable(conn, 20)) continue;
             const n = net.recv(conn, buf);
             if (n > 0) return .{ .next_request = @intCast(n) };
-            // 0: the client closed; < 0: it reset the connection. Either way it
-            // let go of the connection, which is what is measured.
+            if (n < 0) switch (net.lastSocketFailure()) {
+                .interrupted => continue,
+                .peer_closed => {},
+                .other => {
+                    self.noteClose(error.ReadFailed);
+                    return .closed;
+                },
+            };
             self.noteClose(sent.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds());
             return .closed;
         }
-        self.noteClose(null);
+        self.noteClose(error.ProxyStopped);
         return .closed;
     }
 
-    fn noteClose(self: *LossyProxy, ms: ?i64) void {
+    fn noteClose(self: *LossyProxy, result: CloseResult) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.close_count == MAX_REQUESTS) return;
-        self.close_ms[self.close_count] = ms;
+        self.close_results[self.close_count] = result;
         self.close_count += 1;
     }
 
@@ -1068,10 +1085,7 @@ pub const LossyProxy = struct {
         self.request_count += 1;
     }
 
-    /// The head, then `sent` bytes of the body inside framing that announces
-    /// all of it; an answer not `cut` ends with the terminating chunk. False
-    /// when the client hung up first.
-    fn sendAnswer(self: *LossyProxy, conn: net.Socket, sent: usize, cut: bool, closes: bool) bool {
+    fn sendPayload(self: *LossyProxy, conn: net.Socket, sent: usize, closes: bool) bool {
         const connection = if (closes) "connection: close\r\n" else "";
         var head_buf: [512]u8 = undefined;
         const head = switch (self.options.framing) {
@@ -1080,21 +1094,13 @@ pub const LossyProxy = struct {
             .none => std.fmt.bufPrint(&head_buf, "{s}\r\n{s}\r\n", .{ self.options.status_line, connection }),
         } catch return false;
         if (!trySendAll(conn, head)) return false;
-        switch (self.options.framing) {
-            .chunked => {
-                if (self.body.len > 0) {
-                    var size_buf: [32]u8 = undefined;
-                    const size = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{self.body.len}) catch return false;
-                    if (!trySendAll(conn, size)) return false;
-                    if (!trySendAll(conn, self.body[0..sent])) return false;
-                    if (cut) return true;
-                    if (!trySendAll(conn, "\r\n")) return false;
-                }
-                return trySendAll(conn, "0\r\n\r\n");
-            },
-            .content_length => return trySendAll(conn, self.body[0..sent]),
-            .none => return true,
+        if (self.options.framing == .none) return true;
+        if (self.options.framing == .chunked and self.body.len > 0) {
+            var size_buf: [32]u8 = undefined;
+            const size = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{self.body.len}) catch return false;
+            if (!trySendAll(conn, size)) return false;
         }
+        return trySendAll(conn, self.body[0..sent]);
     }
 
     /// Reads one request (head, then a `content-length` body) into `buf`,
@@ -1120,6 +1126,56 @@ pub const LossyProxy = struct {
     }
 };
 
+test "LossyProxy #625 records a disconnect during the terminating chunk" {
+    const listener = try net.listenLoopback(0, 1);
+    defer net.closeSocket(listener.sock);
+    var proxy: LossyProxy = .{
+        .listen_sock = listener.sock,
+        .port = listener.port,
+        .thread = undefined,
+        .body = "data: [DONE]\n\n",
+        .options = .{},
+    };
+    const client = try net.connectLoopback(listener.port);
+    const conn = net.acceptConn(listener.sock) orelse {
+        net.closeSocket(client);
+        return error.AcceptFailed;
+    };
+    defer net.closeSocket(conn);
+    {
+        defer net.closeSocket(client);
+        try std.testing.expect(proxy.sendPayload(conn, proxy.body.len, false));
+        try readTestResponseThrough(client, "data: [DONE]\n");
+        try std.testing.expect(net.pollReadable(client, 1000));
+    }
+    try std.testing.expect(net.pollReadable(conn, 1000));
+    var buf: [128]u8 = undefined;
+    try std.testing.expect(proxy.finishAnswer(conn, &buf, false) == .closed);
+    try std.testing.expect(try proxy.closeLatencyMs(0) < 2000);
+    try std.testing.expectError(error.NoCloseRecorded, proxy.closeLatencyMs(1));
+}
+
+test "LossyProxy #625 reports an expired hold when the client keeps its connection open" {
+    var proxy = try LossyProxy.start("answer", .{});
+    defer proxy.stop();
+    const client = try net.connectLoopback(proxy.port);
+    defer net.closeSocket(client);
+    try writeAll(client, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try readTestResponseThrough(client, "6\r\nanswer\r\n0\r\n\r\n");
+    try std.testing.expect(proxy.waitForCloses(1, 2 * LossyProxy.HOLD_MS));
+    try std.testing.expectError(error.HoldExpired, proxy.closeLatencyMs(0));
+}
+
+fn readTestResponseThrough(client: net.Socket, suffix: []const u8) !void {
+    net.setRecvTimeoutMs(client, 4000);
+    var response: [256]u8 = undefined;
+    for (0..response.len) |i| {
+        if (net.recv(client, response[i..][0..1]) != 1) return error.IncompleteResponse;
+        if (std.mem.endsWith(u8, response[0 .. i + 1], suffix)) return;
+    }
+    return error.ResponseTooLong;
+}
+
 /// 发完整 buffer(send 可能部分写,循环补齐)。失败(对端断开)静默返回——mock 语境
 /// 下客户端提前断开是合法场景;只有逐事件滴流的循环要知道(trySendAll),好不再睡完余下的事件。
 fn sendAll(conn: net.Socket, bytes: []const u8) void {
@@ -1128,13 +1184,22 @@ fn sendAll(conn: net.Socket, bytes: []const u8) void {
 
 /// sendAll that says whether all of `bytes` was sent.
 fn trySendAll(conn: net.Socket, bytes: []const u8) bool {
+    writeAll(conn, bytes) catch return false;
+    return true;
+}
+
+fn writeAll(conn: net.Socket, bytes: []const u8) error{ PeerClosed, WriteFailed }!void {
     var off: usize = 0;
     while (off < bytes.len) {
         const n = net.send(conn, bytes[off..]);
-        if (n <= 0) return false;
+        if (n < 0) switch (net.lastSocketFailure()) {
+            .interrupted => continue,
+            .peer_closed => return error.PeerClosed,
+            .other => return error.WriteFailed,
+        };
+        if (n == 0) return error.WriteFailed;
         off += @intCast(n);
     }
-    return true;
 }
 
 /// 测试客户端:连 127.0.0.1:port,发 raw bytes,读响应直到 until 出现(null = 读到对端关闭)。
