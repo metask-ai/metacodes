@@ -1233,7 +1233,7 @@ test "uds respond: a pure-UDS frontend answers the pending ui_request; missing a
     if (builtin.os.tag == .windows) return error.SkipZigTest; // the UDS binding is POSIX-only
     const a = std.testing.allocator;
     var fx: Fixture = undefined;
-    try fx.setup(.{ .uds = true, .responses = &.{ ASK_SSE, textSse("thanks-red") } });
+    try fx.setup(.{ .uds = true, .responses = &.{ ASK_SSE, textSse("thanks-crimson") } });
     defer fx.deinit();
     const id = try fx.create("");
     const attach = try Stream.openAttach(fx.uds_path.?, id);
@@ -1261,17 +1261,20 @@ test "uds respond: a pure-UDS frontend answers the pending ui_request; missing a
     try std.testing.expect(std.mem.indexOf(u8, stale, "no pending request with this id") != null);
 
     // The answer itself: the op line carries the same fields POST /respond takes.
-    const answered = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"respond\",\"session\":\"{s}\",\"id\":{d},\"answers\":[\"Red\"]}}\n", .{ id.asSlice(), rid }));
+    // "Crimson" is not one of the offered options: the provider's next request
+    // replays the tool call with its options (Red, Blue), so only an answer from
+    // outside them shows below that this line became the tool's result.
+    const answered = try udsRequest(fx.uds_path.?, try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"respond\",\"session\":\"{s}\",\"id\":{d},\"answers\":[\"Crimson\"]}}\n", .{ id.asSlice(), rid }));
     defer a.free(answered);
     try std.testing.expect(std.mem.indexOf(u8, answered, "\"ok\":true") != null);
 
     try attach.waitFor("\"type\":\"ui_request_closed\"");
     try attach.waitFor("\"outcome\":\"answered\"");
-    try attach.waitFor("thanks-red");
+    try attach.waitFor("thanks-crimson");
     try attach.waitFor("\"run_done\"");
-    // L2: the chosen label reached the provider as the tool's result.
+    // L2: the answer reached the provider as the tool's result.
     const follow_up = (fx.provider.requestAt(1) orelse return error.MissingFollowUpRequest).body();
-    try std.testing.expect(std.mem.indexOf(u8, follow_up, "Red") != null);
+    try std.testing.expect(std.mem.indexOf(u8, follow_up, "Crimson") != null);
 }
 
 test "uds capabilities: a declaration over the socket is acknowledged, journaled, and routes the next ask unavailable" {
