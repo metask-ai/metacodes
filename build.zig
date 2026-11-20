@@ -32,17 +32,23 @@ fn addHlWithProjectHarnessActuation(
     mod.addImport("hl", g_hl_mod.?);
     if (g_code_mod == null) {
         const code = b.createModule(.{ .root_source_file = b.path("src/code/runtime.zig"), .link_libc = true });
-        code.addIncludePath(b.path("vendor/quickjs"));
+        // vendor/quickjs holds upstream bytes plus patches/*.patch; the engine
+        // is compiled from the verified, patched tree the stage script writes.
+        const quickjs = stageQuickJsSources(b);
+        code.addIncludePath(quickjs);
         code.addIncludePath(b.path("src/code"));
         // Searched after the libc headers: only fills <sys/time.h> where the
         // C runtime lacks it (Windows MSVC).
         code.addAfterIncludePath(b.path("src/code/compat"));
         // The embedded engine and bridge are private implementation details;
         // AgentCore shared libraries export only their declared public ABI.
+        const code_flags: []const []const u8 = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv", "-fvisibility=hidden", "-include", b.pathFromRoot("src/code/quickjs_port.h") };
         code.addCSourceFiles(.{
-            .files = &.{ "vendor/quickjs/quickjs.c", "vendor/quickjs/cutils.c", "vendor/quickjs/dtoa.c", "vendor/quickjs/libregexp.c", "vendor/quickjs/libunicode.c", "src/code/bridge.c" },
-            .flags = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv", "-fvisibility=hidden", "-include", b.pathFromRoot("src/code/quickjs_port.h") },
+            .root = quickjs,
+            .files = &.{ "quickjs.c", "cutils.c", "dtoa.c", "libregexp.c", "libunicode.c" },
+            .flags = code_flags,
         });
+        code.addCSourceFile(.{ .file = b.path("src/code/bridge.c"), .flags = code_flags });
         g_code_mod = code;
     }
     mod.addImport("code_runtime", g_code_mod.?);
@@ -316,6 +322,21 @@ fn tinyKgContractInfo(b: *std.Build) TinyKgContractInfo {
 /// Configure-time read of a repository JSON document into `T`; the strings
 /// stay alive in the build allocator. Unknown fields are ignored so a manifest
 /// can grow without touching the build identity.
+/// Verifies `vendor/quickjs` against its manifest and writes the patched engine
+/// tree (`scripts/stage_quickjs_sources.py`). Every manifest-pinned file is an
+/// input, so editing a source or a patch re-runs the stage.
+fn stageQuickJsSources(b: *std.Build) std.Build.LazyPath {
+    const Pinned = struct { path: []const u8 };
+    const pinned = parseJsonFile(b, struct { files: []const Pinned, patches: []const Pinned }, "vendor/quickjs/manifest.json");
+    const stage = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/stage_quickjs_sources.py", "--out" });
+    const out = stage.addOutputDirectoryArg("quickjs");
+    stage.addFileInput(b.path("scripts/stage_quickjs_sources.py"));
+    stage.addFileInput(b.path("vendor/quickjs/manifest.json"));
+    for (pinned.files) |item| stage.addFileInput(b.path(b.fmt("vendor/quickjs/{s}", .{item.path})));
+    for (pinned.patches) |item| stage.addFileInput(b.path(b.fmt("vendor/quickjs/{s}", .{item.path})));
+    return out;
+}
+
 fn parseJsonFile(b: *std.Build, comptime T: type, path: []const u8) T {
     const bytes = b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(1024 * 1024)) catch |err|
         std.debug.panic("cannot read {s}: {t}", .{ path, err });
