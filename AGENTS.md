@@ -74,9 +74,11 @@ new feature behind. Users pick features one by one with
 `config.json`, and `--preview` / `--no-preview` / `"preview": true` switch them
 all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
 
-- Add its name to `PreviewFeature` and a field to `PreviewFeatures` in
-  `src/types.zig`, and include it in `all`, `has`, `with` and `max_arg_len`.
-  The name is what users type, so use `snake_case`.
+- Add its name to `PreviewFeature` and a field of the same name to
+  `PreviewFeatures` in `src/types.zig`, shrinking `_unused` by one bit; `all`,
+  `has`, `with` and `max_arg_len` derive from the enum, and a field without a
+  matching name fails to compile. The name is what users type, so use
+  `snake_case`.
 - Gate the feature on its own field and nothing else: `opts.preview.<name>`,
   `ctx.preview.<name>`, or `.preview_feature = .<name>` on a tool's registry
   entry. Never gate on another feature's field, on "any feature enabled", or on

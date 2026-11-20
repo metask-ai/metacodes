@@ -19,28 +19,39 @@ pub const PreviewFeatures = packed struct(u8) {
     comment_guard: bool = false,
     _unused: u5 = 0,
 
+    comptime {
+        for (@typeInfo(PreviewFeatures).@"struct".fields) |field| {
+            if (!std.mem.eql(u8, field.name, "_unused") and std.meta.stringToEnum(PreviewFeature, field.name) == null)
+                @compileError("PreviewFeatures." ++ field.name ++ " has no PreviewFeature");
+        }
+    }
+
     pub const none: PreviewFeatures = .{};
-    pub const all: PreviewFeatures = .{ .execute_code = true, .teamwork = true, .comment_guard = true };
+    pub const all: PreviewFeatures = blk: {
+        var features: PreviewFeatures = .{};
+        for (std.enums.values(PreviewFeature)) |feature| @field(features, @tagName(feature)) = true;
+        break :blk features;
+    };
 
     pub fn has(self: PreviewFeatures, feature: PreviewFeature) bool {
         return switch (feature) {
-            .execute_code => self.execute_code,
-            .teamwork => self.teamwork,
-            .comment_guard => self.comment_guard,
+            inline else => |tag| @field(self, @tagName(tag)),
         };
     }
 
     pub fn with(self: PreviewFeatures, feature: PreviewFeature, on: bool) PreviewFeatures {
         var out = self;
         switch (feature) {
-            .execute_code => out.execute_code = on,
-            .teamwork => out.teamwork = on,
-            .comment_guard => out.comment_guard = on,
+            inline else => |tag| @field(out, @tagName(tag)) = on,
         }
         return out;
     }
 
-    pub const max_arg_len = "--preview=".len + "execute_code,teamwork,comment_guard".len;
+    pub const max_arg_len = blk: {
+        var len = "--preview".len;
+        for (std.enums.values(PreviewFeature)) |feature| len += 1 + @tagName(feature).len;
+        break :blk len;
+    };
 
     pub fn enableArg(self: PreviewFeatures, buf: *[max_arg_len]u8) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
@@ -493,6 +504,16 @@ test "preview flags select features one by one and the last flag naming a featur
     try std.testing.expect(setting.resolve(.all).features().eql(.none));
     try std.testing.expect(try setting.applyArg("--preview=comment_guard"));
     try std.testing.expect(setting.resolve(.all).features().eql(.{ .comment_guard = true }));
+}
+
+test "preview all enables every feature and enableArg fits every feature" {
+    var buf: [PreviewFeatures.max_arg_len]u8 = undefined;
+    try std.testing.expectEqual(PreviewFeatures.max_arg_len, PreviewFeatures.all.enableArg(&buf).len);
+    for (std.enums.values(PreviewFeature)) |feature| {
+        try std.testing.expect(PreviewFeatures.all.has(feature));
+        try std.testing.expect(!PreviewFeatures.none.has(feature));
+        try std.testing.expect(PreviewFeatures.none.with(feature, true).has(feature));
+    }
 }
 
 test "preview enable argument round-trips through the parser" {
