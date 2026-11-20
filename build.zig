@@ -329,6 +329,7 @@ fn stageQuickJsSources(b: *std.Build) std.Build.LazyPath {
     const Pinned = struct { path: []const u8 };
     const pinned = parseJsonFile(b, struct { files: []const Pinned, patches: []const Pinned }, "vendor/quickjs/manifest.json");
     const stage = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/stage_quickjs_sources.py", "--out" });
+    stage.setCwd(b.path("."));
     const out = stage.addOutputDirectoryArg("quickjs");
     stage.addFileInput(b.path("scripts/stage_quickjs_sources.py"));
     stage.addFileInput(b.path("vendor/quickjs/manifest.json"));
