@@ -5,7 +5,9 @@ and prints its URL. The executable carries the Python and frontend files, so
 it works outside a checkout. Python 3.9+ must be on PATH; set
 `METACODES_BENCH_PYTHON` to choose an interpreter. Harbor 0.26 and Docker are
 needed on the machine that executes trials. OpenSSL is also needed there for
-the job-local timing relay's ephemeral TLS certificate.
+the job-local timing relay's ephemeral TLS certificate. Another machine
+with `metacodes` installed can run the trials as a Bench node driven over
+SSH (see [Bench nodes](#bench-nodes)).
 
 ```sh
 metacodes bench                         # start/reuse service and open browser
@@ -21,6 +23,8 @@ metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
+metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
+metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
 ```
 
 Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
@@ -206,7 +210,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Step | What it does |
 |---|---|
 | SSH access (`ssh` executors) | Runs a probe over `ssh -o BatchMode=yes`; if the key cannot run commands, it stops here and says so |
-| Python 3.9+ (`ssh` executors) | Needed by the remote driver |
+| Python 3.9+ (`ssh` executors) | Needed by the executor's `metacodes bench` |
 | 网络与镜像 (`ssh` executors) | Probes `pypi.org`, `registry-1.docker.io`, `ghcr.io` and `github.com` from the executor (8 s timeout; over 5 s counts as slow) and fills in what is missing from the entry: `pypi_index`, `docker_mirrors`, `ghcr_mirror` and `"egress": "workbench"` (see [Network-restricted executors](#network-restricted-executors)). A value already in the entry is never replaced; a dry run lists the proposed changes |
 | uv | macOS: `brew install uv` when Homebrew exists; otherwise (and on Linux) the official installer pinned to uv 0.13.9 into `~/.local/bin` |
 | Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12; with an executor's `pypi_index`, prefixed by `env UV_DEFAULT_INDEX=<index>`); the resulting path is saved |
@@ -214,7 +218,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
-| Copy runtime (`ssh` executors) | Ships the bench runtime and the bundle (below) |
+| metacodes 节点 (`ssh` executors) | Ships the bundle (below) and installs its `metacodes` as `<state_dir>/bin/metacodes`, and as `~/.local/bin/metacodes` when that name is free; then runs `metacodes bench node info` there and fails when the node's protocol differs from the workbench's (see [Bench nodes](#bench-nodes)) |
 | 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy; a failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
@@ -572,18 +576,49 @@ usable. Readiness probes are cached for 15 seconds.
   and group changes need passwordless sudo, or the user runs the reported
   command.
 
+### Bench nodes
+
+Every machine with `metacodes` installed is a Bench node. A workbench drives
+an SSH executor the way an editor drives a remote host: it runs that host's
+own `metacodes` over SSH, `<state_dir>/bin/metacodes bench node …`, and talks
+to it on the channel's stdin and stdout. Nothing else runs on the executor;
+the bench runtime is the one its `metacodes` carries.
+
+- `node info --json` is the node describing itself: its version, the node
+  protocol, host name, OS and architecture, and the WorkBuddy suites
+  prepared on it (each suite's readiness there and its task ids). The
+  readiness probe asks for it on every check (cached 15 seconds), so the page
+  labels the executor with the node's version (`relay-4090（SSH …） ·
+  metacodes 0.12.1`). A node that is missing, or speaks another protocol, makes
+  the executor not ready, naming `metacodes bench setup --executor NAME`.
+- `--peer NAME` on `info` names the workbench asking; the node remembers it
+  in `<its state root>/bench/peers.json`. `node peers` lists both
+  directions: the SSH executors this node's own `workbench.json` drives and
+  the workbenches that drove it. Either side can therefore see the other,
+  even when only one of them can open an SSH connection.
+- `node run <spec>` executes one run on the node (below); `node manifest`,
+  `node pack` and `node egress-probe` are the job copy-back and setup's
+  container egress check.
+
+A node keeps its own state root (`~/.metacodes` by default) and
+`workbench.json`. What is prepared on the node itself is read from there:
+a WorkBuddy checkout set with `metacodes bench --workbuddy-checkout <dir>`
+on the node (or `METACODES_WORKBUDDY_CHECKOUT`) makes the WorkBuddy Code
+and Security suites ready on that executor, with the node's own task list.
+The credential always comes from the workbench driving the run.
+
 ### How an SSH run works
 
 The local worker stays the durable owner of the run: it resolves the
 account (or provider) credential exactly as for a local run, and keeps
 refreshing a session login, then
 
-1. ships the bench runtime and the Linux bundle as tar streams over SSH into
-   `<state_dir>/runtime/<digest>` and `<state_dir>/bundles/<digest>`, once per
-   content digest (complete directories are marked and reused);
+1. ships the Linux bundle the run evaluates as a tar stream over SSH into
+   `<state_dir>/bundles/<digest>`, once per content digest (complete
+   directories are marked and reused);
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
-3. starts `python3 -m scripts.eval.harbor.bench.remote run …` over SSH and
+3. starts `<state_dir>/bin/metacodes bench node run …` over SSH and
    writes the secrets as the first line on the SSH channel's stdin:
    `{"env": {"METASK_API_KEY": "<placeholder>", …}, "credential": "<access token or key>"}`.
    `env` goes to Harbor's environment (`--ae NAME=${NAME}` as locally), so
@@ -642,10 +677,12 @@ judge uses the executor's relay instead: only its placeholder travels on
 stdin (beside the agent's), the remote driver adds the `--ve` arguments once
 its relay listens, and the session login's pushed token serves the judge
 too (a legacy group key for the judge model, when it differs from the run's,
-is sent once on the same line). WorkBuddy
-suites drive the workbench machine's own checkout and Docker, so they run on
-the `local` executor only; readiness on an SSH executor says so and the
-launch is refused.
+is sent once on the same line). A WorkBuddy
+suite on an SSH executor runs on the node's own checkout: the workbench
+validates the tasks against the list the node reports, sends only the run's
+secret-free spec and the account key (as `credential` on the stdin line, for
+WorkBuddy's host proxy), and copies the job back like a Harbor run; the node
+removes its transient WorkBuddy configs afterwards.
 
 Readiness is per suite and executor: `GET /api/workbench` lists, for every
 suite, `executors.<name>.reasons` (service-wide reasons such as sign-in, the

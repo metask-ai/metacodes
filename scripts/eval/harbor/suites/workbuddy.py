@@ -183,10 +183,11 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
 
 
 def finish(spec):
-    """Mark the workbench job finished and remove the transient configs."""
+    """Mark the workbench job finished and remove the transient configs
+    (the node that ran it removes them when it ran on an SSH executor)."""
     from scripts.eval.harbor.bench import data
     from scripts.eval.harbor.bench.runner import atomic_json, now
-    for path in config_paths(spec):
+    for path in config_paths(spec) if "checkout" in spec["workbuddy"] else ():
         try:
             path.unlink()
         except FileNotFoundError:

@@ -136,8 +136,14 @@ class RunManager:
         for executor in configured:
             facts = self.executor_facts(executor)
             problems = executors.reasons(executor, facts)
-            states.append({**executor.public(), "ready": not problems, "reasons": problems,
-                           "default": executor.name == default, "harbor": facts.get("harbor") or None})
+            node = facts.get("node") if isinstance(facts.get("node"), dict) else None
+            public = executor.public()
+            if node:
+                public["label"] += f" · metacodes {node.get('version')}"
+            states.append({**public, "ready": not problems, "reasons": problems,
+                           "default": executor.name == default, "harbor": facts.get("harbor") or None,
+                           "node": {k: node.get(k) for k in ("version", "host")} if node else None,
+                           "node_workbuddy": (node or {}).get("workbuddy") or {}})
         # A malformed entry is shown, not ready, without hiding the others.
         for name, problem in invalid:
             states.append({"name": name, "kind": "invalid", "label": name + "（配置无效）", "ready": False,
@@ -161,10 +167,30 @@ class RunManager:
     def suite_context(self, cfg=None):
         return suites.Context(settings(self.config_path) if cfg is None else cfg, self.config_path.parent)
 
-    def suite_tasks(self, suite_id):
+    def node_tasks(self, suite, executor_name):
+        """A WorkBuddy suite's task ids on an SSH executor, as its node
+        reports them; None for this machine (or a Harbor suite)."""
+        if suite.runner != suites.WORKBUDDY:
+            return None
+        try:
+            executor = executors.find(settings(self.config_path), executor_name)
+        except ValueError:
+            return None
+        if executor.kind != "ssh":
+            return None
+        facts = self.executor_facts(executor)
+        entry = ((facts.get("node") or {}).get("workbuddy") or {}).get(suite.id) or {}
+        if not entry.get("tasks"):
+            reasons = entry.get("reasons") or [executors.node_problem(executor, facts) or "执行机器未报告任务"]
+            raise suites.Unavailable(f"{executor.name}：" + "；".join(reasons))
+        return list(entry["tasks"])
+
+    def suite_tasks(self, suite_id, executor=None):
         suite = suites.resolved(suites.get(suite_id))
         try:
-            tasks = suites.task_ids(suite, self.suite_context())
+            tasks = self.node_tasks(suite, executor)
+            if tasks is None:
+                tasks = suites.task_ids(suite, self.suite_context())
         except suites.Unavailable as exc:
             return {"id": suite.id, "tasks": [], "default_tasks": [], "error": str(exc)}
         known = set(tasks)
@@ -183,17 +209,21 @@ class RunManager:
         own = entry["reasons"]
         by_executor = {}
         for state in states:
+            here = own
             if suite.runner == suites.WORKBUDDY:
-                combo = [] if state["kind"] == "local" else [
-                    "WorkBuddy 评测只能在本机执行器运行（它驱动本机的 WorkBuddy checkout 和 Docker），"
-                    "不支持 SSH 执行机器 " + state["name"]]
+                combo = []
+                if state["kind"] == "ssh":
+                    # Prepared on the node itself: its own checkout, Docker
+                    # and task list; this machine adds only its sign-in mode.
+                    combo = state["reasons"] + (state["node_workbuddy"].get(suite.id) or {}).get("reasons", [])
+                    here = [] if ctx.auth_mode() == "metask" else ["WorkBuddy 评测目前只支持 Metask 账号模式（--auth metask）"]
             else:
                 combo = harbor_reasons + state["reasons"]
                 if suite.runner == suites.HARBOR_REGISTRY and state["kind"] == "ssh" and not workbench_harbor:
                     combo = combo + [f"工作台本机缺少 Harbor：SSH 执行机器的注册表评测集（{suite.dataset}）"
                                      "先在工作台用 harbor download 下载再发送到执行机器；请在工作台运行 "
                                      "metacodes bench setup，或 uv tool install harbor==0.26.0"]
-            problems = global_reasons + combo + own
+            problems = global_reasons + combo + here
             by_executor[state["name"]] = {"ready": not problems, "reasons": problems}
         default = by_executor.get(default_executor) or {"reasons": global_reasons + own}
         entry.update(suite_reasons=own, executors=by_executor,
@@ -275,7 +305,7 @@ class RunManager:
         default_entry = next(e for e in catalog_suites if e["id"] == suites.DEFAULT_SUITE)
         reasons = list(default_entry["reasons"])
         return {"service": "metacodes-bench", "schema_version": 1,
-                "executors": [{k: v for k, v in s.items() if k != "harbor"} for s in states],
+                "executors": [{k: v for k, v in s.items() if k not in ("harbor", "node_workbuddy")} for s in states],
                 "default_executor": default_executor, "global_reasons": global_reasons,
                 "harbor_reasons": harbor_reasons,
                 "login": {"available": mode == "metask" and bool((cfg.get("metacodes") or {}).get("binary")),
@@ -395,7 +425,7 @@ class RunManager:
             if problem:
                 raise ValueError(problem)
         ctx = self.suite_context()
-        tasks = suites.validate_tasks(suite, ctx, request.get("tasks"))
+        tasks = suites.validate_tasks(suite, ctx, request.get("tasks"), known=self.node_tasks(suite, state["name"]))
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
             if type(value) is not int or not 1 <= value <= limit:
@@ -476,7 +506,9 @@ class RunManager:
                     "store": store_config.for_workbench(cfg, self.config_path).to_json()}
             if suite.runner == suites.WORKBUDDY:
                 from scripts.eval.harbor.suites import workbuddy
-                spec["workbuddy"] = workbuddy.spec_fields(suite, ctx)
+                # On an SSH executor the node resolves its own checkout and tools.
+                spec["workbuddy"] = (workbuddy.spec_fields(suite, ctx) if executor.kind == "local"
+                                     else {"subset": suite.subset})
             else:
                 spec.update(harbor=facts.get("harbor") if executor.kind == "local" else None,
                             remote_harbor=facts.get("harbor") if executor.kind == "ssh" else None,

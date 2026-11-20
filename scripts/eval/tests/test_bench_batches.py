@@ -178,6 +178,7 @@ class BatchTest(unittest.TestCase):
         # Frozen files are read-only, and rebuilding the configured bundle
         # in place does not reach the batch.
         self.assertFalse(os.access(frozen / 'bin' / 'metacodes', os.W_OK))
+        built = (original / 'bin' / 'metacodes').read_bytes()
         (original / 'bin' / 'metacodes').write_bytes(b'rebuilt')
         record = self.wait_batch(created['id'])
         self.assertEqual(record['status'], 'finished')
@@ -209,7 +210,7 @@ class BatchTest(unittest.TestCase):
         store = self.client.request('api/store')
         self.assertEqual(store['counts']['batches'], 1)
         # A second batch of the same bundle reuses the frozen copy.
-        (original / 'bin' / 'metacodes').write_bytes(b'fake')
+        (original / 'bin' / 'metacodes').write_bytes(built)
         again = self.client.request('api/batches', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
         self.assertEqual(again['metacodes']['bundle'], str(frozen))
         self.wait_batch(again['id'])

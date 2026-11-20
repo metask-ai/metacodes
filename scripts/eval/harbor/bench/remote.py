@@ -1,8 +1,9 @@
-"""Remote side of an SSH Bench executor. Runs on the Linux execution host.
+"""Remote side of an SSH Bench executor. Runs on the Linux execution host,
+inside that host's own `metacodes` (node.py):
 
-    python3 -m scripts.eval.harbor.bench.remote run <spec.json>
-    python3 -m scripts.eval.harbor.bench.remote manifest <job-dir>
-    python3 -m scripts.eval.harbor.bench.remote pack <job-dir>   # JSON items on stdin
+    metacodes bench node run <spec.json>
+    metacodes bench node manifest <job-dir>
+    metacodes bench node pack <job-dir>   # JSON items on stdin
 
 `run` reads one JSON line from stdin first,
 `{"env": {NAME: value}, "credential": "<real token>"}`, carried by the SSH
@@ -98,8 +99,8 @@ def run(spec_path):
             argv[index] = absolute(value)
     env = dict(os.environ)
     env.update(secret_env)
-    runtime = absolute(spec.get("runtime") or ".")
-    env["PYTHONPATH"] = runtime
+    # Harbor imports the agent from this node's own runtime.
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
     env["PYTHONUNBUFFERED"] = "1"
     relay = None
     credential = None
@@ -108,7 +109,6 @@ def run(spec_path):
     hung_up = threading.Event()
     try:
         if spec.get("relay"):
-            sys.path.insert(0, runtime)
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
             connect = None
@@ -141,8 +141,6 @@ def run(spec_path):
                 for role in ("api_key", "base_url", "model"):
                     env.pop(judge["env"][role], None)  # the executor's own judge settings
         if spec.get("egress") or spec.get("ghcr_mirror"):
-            if runtime not in sys.path:
-                sys.path.insert(0, runtime)
             from scripts.eval.harbor.bench import egress
         if spec.get("egress"):
             # For this run only: the forwarder on the Docker bridge and a
@@ -171,7 +169,7 @@ def dataset_selection(argv):
     return dataset, [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-i"]
 
 
-def supervise(spec, argv, env, credential, stop, hung_up, egress=None):
+def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None):
     """Run Harbor: control channel, heartbeats, cancel; the exit code."""
 
     def control():
@@ -226,7 +224,7 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None):
                 return 130
     # Harbor's own output goes to stderr, which SSH carries to the local
     # worker's log; stdout carries only events.
-    process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
+    process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
                                start_new_session=True)
     emit("started", pid=process.pid)
     interrupted_at = None

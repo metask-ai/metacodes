@@ -341,8 +341,9 @@ def readiness(suite: Suite, ctx: Context) -> List[str]:
     return reasons
 
 
-def validate_tasks(suite: Suite, ctx: Context, tasks) -> List[str]:
-    """The requested ids, refused unless each is one of this suite's tasks."""
+def validate_tasks(suite: Suite, ctx: Context, tasks, known=None) -> List[str]:
+    """The requested ids, refused unless each is one of this suite's tasks
+    (`known`: the executor's own list, when another machine reports it)."""
     if not isinstance(tasks, list) or not 1 <= len(tasks) <= suite.max_tasks:
         raise ValueError(f"请选择 1–{suite.max_tasks} 道任务")
     if suite.filter_prefix:
@@ -350,7 +351,7 @@ def validate_tasks(suite: Suite, ctx: Context, tasks) -> List[str]:
                  for t in tasks]
     if any(not isinstance(t, str) or not TASK.fullmatch(t) for t in tasks) or len(set(tasks)) != len(tasks):
         raise ValueError("任务名无效或重复")
-    known = set(task_ids(suite, ctx))
+    known = set(task_ids(suite, ctx) if known is None else known)
     unknown = [t for t in tasks if t not in known]
     if unknown:
         raise ValueError(f"{suite.name} 中没有这些任务：" + "、".join(unknown[:5]))

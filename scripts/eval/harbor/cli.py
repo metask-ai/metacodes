@@ -384,7 +384,22 @@ def build_command(args, root, cfg):
     return 0
 
 
+def node_command(argv):
+    """`metacodes bench node ...` (node.py), or None for any other action."""
+    common = argparse.ArgumentParser(add_help=False)
+    for option in ("--state-root", "--metacodes-version", "--metacodes-binary"):
+        common.add_argument(option)
+    known, rest = common.parse_known_args(argv)
+    if rest[:1] != ["node"] or not known.state_root:
+        return None
+    from scripts.eval.harbor.bench import node
+    return node.main(rest[1:], Path(known.state_root).expanduser().resolve(), known.metacodes_version)
+
+
 def main(argv=None):
+    code = node_command(sys.argv[1:] if argv is None else argv)
+    if code is not None:
+        return code
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
                         choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync", "provider", "build"])

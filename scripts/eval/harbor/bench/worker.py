@@ -67,15 +67,16 @@ def prepare(spec, env):
     in `key_env`; the relay beside the Docker daemon accepts exactly that
     placeholder and forwards upstream with the real, current credential."""
     if spec.get("runner") == "workbuddy":
-        if (spec.get("executor") or {}).get("kind") == "ssh":
-            # RunManager refuses this combination; never run it half-remote.
-            raise ValueError("WorkBuddy 评测只能在本机执行器运行")
         # WorkBuddy's own host proxy holds the key; its task containers get
         # only that proxy's route token.
         if spec.get("auth_mode") == "metask":
             account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
             env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
             spec = {**spec, "account_gateway": account.gateway}
+        if (spec.get("executor") or {}).get("kind") == "ssh":
+            # The node runs its own WorkBuddy checkout; the key goes over stdin.
+            remote = RemoteRun(spec)
+            return {**spec, "remote_spec_path": remote.upload_run(remote.remote_spec())}, remote, None
         return spec, None, None
     problem = route_problem(spec)
     if problem:
@@ -149,17 +150,22 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     doing (RunManager shows a receipt older than 30 seconds as interrupted),
     and the run is `finished` only when the final copy was verified
     complete; otherwise the receipt says where the results still are."""
-    # The run's key plus the suite's execution-host variables (a judge key),
-    # all over the SSH channel's stdin.
-    secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
-    secret_env[spec["key_env"]] = env[spec["key_env"]]  # the placeholder
-    if spec.get("judge"):
-        secret_env[JUDGE_TOKEN_ENV] = env[JUDGE_TOKEN_ENV]  # the judge's placeholder
-    # The real access token goes beside it for the remote relay only; a
-    # refreshed one follows on the same channel. The refresh token stays here.
-    if getattr(source, "refreshing", False):
-        source.subscribe(remote.push_credential)  # first: no refresh is missed
-    remote.start(secret_env, spec["remote_spec_path"], credential=source.current())
+    if spec.get("runner") == "workbuddy":
+        # The account key for the node's WorkBuddy host proxy.
+        secret_env, credential = {}, env.pop("METASK_API_KEY", None)
+    else:
+        # The run's key plus the suite's execution-host variables (a judge
+        # key), all over the SSH channel's stdin.
+        secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
+        secret_env[spec["key_env"]] = env[spec["key_env"]]  # the placeholder
+        if spec.get("judge"):
+            secret_env[JUDGE_TOKEN_ENV] = env[JUDGE_TOKEN_ENV]  # the judge's placeholder
+        # The real access token goes beside it for the remote relay only; a
+        # refreshed one follows on the same channel. The refresh token stays here.
+        if getattr(source, "refreshing", False):
+            source.subscribe(remote.push_credential)  # first: no refresh is missed
+        credential = source.current()
+    remote.start(secret_env, spec["remote_spec_path"], credential=credential)
     record.update(status="running", executor=spec["executor"]["name"])
     remote.start_sync()
     cancel_path = spec_path.with_suffix(".cancel")

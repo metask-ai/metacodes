@@ -190,7 +190,7 @@ def make_handler(workbench: Workbench, public_url=None):
                 self.send_json({**workbench.catalog(), "can_run": self.authorized()})
             elif path == "/api/suite":
                 try:
-                    self.send_json(workbench.suite_tasks(query.get("id")))
+                    self.send_json(workbench.suite_tasks(query.get("id"), query.get("executor")))
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, 404)
             elif path in ("/api/setup", "/api/login", "/api/providers"):

@@ -135,12 +135,24 @@ t = root / 'fix-git__fake'; t.mkdir()
 '''
 
 
+REPO = Path(__file__).resolve().parents[3]
+
+
+def node_script() -> bytes:
+    """A bundle's `metacodes` as an SSH node runs it: `bench` from this checkout
+    (what bench_cli.zig does with the binary's embedded copy)."""
+    bootstrap = 'import sys; sys.path.insert(0, sys.argv.pop(1)); from scripts.eval.harbor.cli import main; sys.exit(main())'
+    return (f'#!/bin/sh\n[ "$1" = bench ] || exit 2\nshift\nexec {sys.executable} -c "{bootstrap}" {REPO} '
+            '--state-root "$HOME/.metacodes" --metacodes-version 9.9.9 "$@"\n').encode()
+
+
 def fixture(root):
     bundle = root / 'bundle'
     for file in BUNDLE_EXECUTABLES:
         path = bundle / file
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b'fake')
+        path.write_bytes(node_script() if file == 'bin/metacodes' else b'fake')
+        path.chmod(0o755)
     atomic_json(bundle / 'manifest.json', {'target': {'os': 'linux'}})
     native = root / 'provider.json'
     atomic_json(native, {'custom_providers': {'tokenjoy': {

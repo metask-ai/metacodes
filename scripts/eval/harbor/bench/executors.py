@@ -3,16 +3,19 @@
 `workbench.json` may list `executors`; without one the workbench runs on this
 host as before. An `ssh` executor runs the Harbor command on the remote host:
 
-- the bench runtime (the Python files below) and the Linux release bundle are
-  shipped over the SSH channel as tar streams into content-addressed
-  directories under the executor's `state_dir`, once per digest;
+- the executor is a Bench node: its own `metacodes` (installed by setup at
+  `<state_dir>/bin/metacodes`) answers `metacodes bench node ...` over SSH
+  (node.py), describes itself (`info`) and runs the trials;
+- the Linux release bundle the run evaluates is shipped over the SSH channel
+  as a tar stream into a content-addressed directory under the executor's
+  `state_dir`, once per digest;
 - the run's real credential (account key, session access token or provider
   key) travels as the first line on the SSH channel's stdin, beside the
   run-scoped placeholder Harbor hands to the task containers; the real one
   lives only in the remote driver's relay (never argv, never a file, never
   Harbor's environment). A refreshed session access token follows on the
   same channel; the refresh token never leaves the workbench machine;
-- the remote driver (`viewer/remote.py`) owns the credential relay next to
+- the node's driver (remote.py) owns the credential relay next to
   the remote Docker daemon, reports heartbeats on stdout, cancels on request
   or when the channel closes;
 - the remote job directory is copied back incrementally into the local jobs
@@ -23,7 +26,6 @@ Python 3.9, stdlib only. Every subprocess is spawned with an argv list.
 from __future__ import annotations
 
 import hashlib
-import io
 import ipaddress
 import json
 import os
@@ -31,6 +33,7 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -66,22 +69,6 @@ def extra_path() -> str:
 def path_prefix() -> str:
     return 'export PATH="$PATH:' + extra_path().replace('"', "") + '"; '
 
-# What the remote driver and Harbor's agent import on the executor
-# (all of them are also carried by the binary, see scripts/bench_assets.zig).
-REMOTE_RUNTIME = (
-    "scripts/__init__.py",
-    "scripts/eval/__init__.py",
-    "scripts/eval/model.py",
-    "scripts/eval/workbuddy/__init__.py",
-    "scripts/eval/workbuddy/trace.py",
-    "scripts/eval/harbor/__init__.py",
-    "scripts/eval/harbor/command.py",
-    "scripts/eval/harbor/profiling.py",
-    "scripts/eval/harbor/metacodes_agent.py",
-    "scripts/eval/harbor/bench/__init__.py",
-    "scripts/eval/harbor/bench/egress.py",
-    "scripts/eval/harbor/bench/remote.py",
-)
 # `pypi_index`, `docker_mirrors` entries and `egress.proxy`: plain http(s)
 # URLs (they reach shell scripts and JSON files on the executor).
 MIRROR_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/+-]*)?$")
@@ -89,10 +76,6 @@ MIRROR_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/
 REGISTRY_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]{1,5})?(/[a-z0-9._-]+)*$")
 EGRESS_MODES = ("direct", "workbench")
 EGRESS_HELP = 'egress 只能是 "direct"、"workbench" 或 {"proxy": "http://主机:端口"}'
-
-
-def runtime_root() -> Path:
-    return Path(__file__).resolve().parents[4]
 
 
 @dataclass(frozen=True)
@@ -161,6 +144,11 @@ class SshExecutor:
 
     def remote(self, *parts: str) -> str:
         return str(PurePosixPath(self.state_dir, *parts))
+
+    @property
+    def node(self) -> str:
+        """The executor's own `metacodes`, relative to its home directory."""
+        return self.remote("bin", "metacodes")
 
 
 Executor = Union[LocalExecutor, SshExecutor]
@@ -346,6 +334,11 @@ def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=F
     return argv
 
 
+def node_argv(executor: SshExecutor, *args: str, reverse: Optional[Tuple[int, int]] = None) -> List[str]:
+    """`ssh` argv running `metacodes bench node <args>` on the executor."""
+    return ssh_argv(executor, [executor.node, "bench", "node", *args], reverse=reverse)
+
+
 def shell_argv(executor: Executor, script: str) -> List[str]:
     """argv that runs a POSIX shell script on the executor."""
     if isinstance(executor, SshExecutor):
@@ -384,6 +377,8 @@ echo "tar=$(command -v tar 2>/dev/null)"
 echo "brew=$(command -v brew 2>/dev/null)"
 echo "colima=$(command -v colima 2>/dev/null)"
 if sudo -n true 2>/dev/null; then echo "sudo=1"; else echo "sudo=0"; fi
+n=NODE
+if [ -x "$n" ]; then echo "node=$("$n" bench node info --json --peer PEER 2>/dev/null)"; fi
 if command -v ip >/dev/null 2>&1; then
   echo "docker0=$(ip -4 -o addr show docker0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\).*/\1/p' | head -n 1)"
 fi
@@ -395,7 +390,15 @@ def probe_script(executor: Executor) -> str:
     candidates += ["harbor", "$HOME/.local/bin/harbor"]
     quoted = " ".join(shlex.quote(c) if not c.startswith("$HOME") else '"' + c + '"' for c in candidates)
     python = executor.python if isinstance(executor, SshExecutor) else "python3"
-    return PROBE.replace("HARBOR_CANDIDATES", quoted).replace("PYTHON", shlex.quote(python))
+    node = executor.node if isinstance(executor, SshExecutor) else ""
+    script = PROBE.replace("HARBOR_CANDIDATES", quoted).replace("PYTHON", shlex.quote(python))
+    return script.replace("NODE", shlex.quote(node)).replace("PEER", shlex.quote(workbench_name()))
+
+
+def workbench_name() -> str:
+    """How this machine introduces itself to the nodes it drives."""
+    name = socket.gethostname()
+    return name if HOST.fullmatch(name) else "workbench"
 
 
 def search_path() -> str:
@@ -459,7 +462,26 @@ def probe(executor: Executor, runner=subprocess.run, timeout=25) -> Dict:
         detail = (done.stderr or "").strip().splitlines()
         return {"error": "ssh" if done.returncode == 255 else "noshell", "code": done.returncode,
                 "detail": detail[-1] if detail else ""}
+    if "node" in facts:
+        try:
+            node = json.loads(facts["node"])
+        except ValueError:
+            node = None
+        facts["node"] = node if isinstance(node, dict) else {"error": "invalid"}
     return facts
+
+
+def node_problem(executor: SshExecutor, facts: Dict) -> Optional[str]:
+    """Why the executor's node cannot run this workbench's runs, or None."""
+    from scripts.eval.harbor.bench.node import PROTOCOL
+    where = f"{executor.name}（{executor.destination}:{executor.port}）"
+    node = facts.get("node")
+    if node is None:
+        return f"{where} 上还没有 metacodes 节点；运行 metacodes bench setup --executor {executor.name} 或点“一键配置”安装"
+    if node.get("protocol") != PROTOCOL:
+        return (f"{where} 上的 metacodes 节点（{node.get('version') or '版本未知'}，协议 {node.get('protocol')}）"
+                f"与工作台（协议 {PROTOCOL}）不兼容；运行 metacodes bench setup --executor {executor.name} 更新")
+    return None
 
 
 def reasons(executor: Executor, facts: Dict) -> List[str]:
@@ -485,6 +507,9 @@ def reasons(executor: Executor, facts: Dict) -> List[str]:
             result.append(where + " 缺少 Python 3.9+（远程驱动需要）" + setup)
         if not facts.get("tar"):
             result.append(where + " 缺少 tar")
+        problem = node_problem(executor, facts)
+        if problem:
+            result.append(problem)
         if executor.egress == "workbench" and "docker0" in facts and not facts["docker0"] \
                 and executor.metrics_bind.startswith("127."):
             # The forwarder falls back to metrics_bind, which containers
@@ -498,19 +523,24 @@ def reasons(executor: Executor, facts: Dict) -> List[str]:
             return ["无法检查本机执行环境"]
     if not facts.get("harbor"):
         result.append("未找到 Harbor，请在执行机器安装：uv tool install harbor==0.26.0" + setup)
-    if facts.get("hypervisor") == "0":
-        result.append("这台 Mac 本身是虚拟机，没有嵌套虚拟化，不能运行 Docker；请配置一台 Linux SSH 执行机器")
-    elif not facts.get("docker"):
-        result.append("未找到 Docker；Harbor 任务需要 Docker 环境" + setup)
-    elif facts.get("docker_daemon") == "permission":
-        result.append("当前用户无权访问 Docker daemon（需要加入 docker 组）" + setup)
-    elif facts.get("docker_daemon") != "ok":
-        result.append("Docker daemon 未运行或不可达" + setup)
-    elif facts.get("compose") != "1":
-        result.append("缺少 docker compose 插件" + setup)
+    result += docker_reasons(facts, setup)
     if not facts.get("openssl"):
         result.append("未找到 OpenSSL（凭据 relay 需要）" + setup)
     return result
+
+
+def docker_reasons(facts: Dict, setup: str) -> List[str]:
+    if facts.get("hypervisor") == "0":
+        return ["这台 Mac 本身是虚拟机，没有嵌套虚拟化，不能运行 Docker；请配置一台 Linux SSH 执行机器"]
+    if not facts.get("docker"):
+        return ["未找到 Docker；Harbor 任务需要 Docker 环境" + setup]
+    if facts.get("docker_daemon") == "permission":
+        return ["当前用户无权访问 Docker daemon（需要加入 docker 组）" + setup]
+    if facts.get("docker_daemon") != "ok":
+        return ["Docker daemon 未运行或不可达" + setup]
+    if facts.get("compose") != "1":
+        return ["缺少 docker compose 插件" + setup]
+    return []
 
 
 # ------------------------------------------------------------------ remote files
@@ -563,11 +593,6 @@ def ship(executor: SshExecutor, root: Path, names: List[str], destination: str, 
         with tarfile.open(fileobj=process.stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
             for name in names:
                 path = Path(root) / name
-                if not path.exists() and name == "scripts/__init__.py":
-                    info = tarfile.TarInfo(name)
-                    info.mode = 0o644
-                    archive.addfile(info, io.BytesIO(b""))
-                    continue
                 info = archive.gettarinfo(str(path), arcname=name)
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
@@ -580,18 +605,6 @@ def ship(executor: SshExecutor, root: Path, names: List[str], destination: str, 
     if process.wait() != 0:
         raise ValueError(f"复制到 {executor.name}:{destination} 失败：{stderr.strip()[-300:]}")
     return True
-
-
-def ship_runtime(executor: SshExecutor, log=print, **kwargs) -> str:
-    root = runtime_root()
-    names = [n for n in REMOTE_RUNTIME if (root / n).exists() or n == "scripts/__init__.py"]
-    digest = hashlib.sha256()
-    for name in names:
-        path = root / name
-        digest.update(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b"") + b"\0")
-    destination = executor.remote("runtime", digest.hexdigest()[:16])
-    ship(executor, root, names, destination, log=log, **kwargs)
-    return destination
 
 
 def ship_bundle(executor: SshExecutor, bundle: Path, log=print, **kwargs) -> str:
@@ -776,9 +789,9 @@ class JobSync:
     PASS_BYTES = 128 * 1024 * 1024
     PASS_FILES = 2000
 
-    def __init__(self, executor: SshExecutor, runtime: str, remote_dir: str, local_dir: Path,
+    def __init__(self, executor: SshExecutor, remote_dir: str, local_dir: Path,
                  runner=subprocess.run, log=print, popen=subprocess.Popen):
-        self.executor, self.runtime, self.remote_dir = executor, runtime, remote_dir
+        self.executor, self.remote_dir = executor, remote_dir
         self.local_dir = Path(local_dir)
         self.runner, self.log, self.popen = runner, log, popen
         self.seen: Dict[str, List[int]] = {}
@@ -786,12 +799,8 @@ class JobSync:
         self.bytes = 0  # tar stream bytes received
         self.pending = 0
 
-    def remote_python(self, *args: str) -> List[str]:
-        return ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, self.executor.python,
-                                        "-m", "scripts.eval.harbor.bench.remote", *args])
-
     def manifest(self) -> Dict[str, List[int]]:
-        listing = self.runner(self.remote_python("manifest", self.remote_dir), stdin=subprocess.DEVNULL,
+        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir), stdin=subprocess.DEVNULL,
                               capture_output=True, timeout=self.MANIFEST_TIMEOUT)
         if listing.returncode != 0:
             raise ValueError("读取远程作业目录失败")
@@ -850,7 +859,7 @@ class JobSync:
         import tempfile
         requested = {item if isinstance(item, str) else item[0] for item in items}
         with tempfile.TemporaryFile() as errors:
-            process = self.popen(self.remote_python("pack", self.remote_dir), stdin=subprocess.PIPE,
+            process = self.popen(node_argv(self.executor, "pack", self.remote_dir), stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=errors)
             stream = _Watched(process.stdout)
             done = threading.Event()
@@ -953,7 +962,6 @@ class RemoteRun:
         self.spec = spec
         self.runner, self.popen = runner, popen
         self.log = log or (lambda text: print(text, flush=True))
-        self.runtime = None
         self.bundle = None
         self.dataset = None
         self.process = None
@@ -980,8 +988,10 @@ class RemoteRun:
         return self.executor.remote("jobs", self.spec["name"])
 
     def stage(self) -> None:
-        """Ship runtime, bundle and the run's own (secret-free) spec."""
-        self.runtime = ship_runtime(self.executor, log=self.log, runner=self.runner, popen=self.popen)
+        """Ship the bundle and the run's dataset. A WorkBuddy run needs
+        neither: the node runs its own WorkBuddy checkout."""
+        if self.spec.get("runner") == "workbuddy":
+            return
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
         registry = self.spec.get("registry_download")
@@ -998,6 +1008,10 @@ class RemoteRun:
 
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
+        if self.spec.get("runner") == "workbuddy":
+            return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
+                    **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
+                                                     "reasoning_effort", "account_gateway")}}
         run_dir = self.executor.remote("runs", self.spec["name"])
         remote = {**self.spec, "harbor": self.spec.get("remote_harbor") or self.executor.harbor or ".local/bin/harbor",
                   "bundle": self.bundle, "jobs_dir": self.executor.remote("jobs")}
@@ -1031,7 +1045,7 @@ class RemoteRun:
             # The driver appends the judge's `--ve` once its relay listens.
             relay["judge"] = self.spec["judge"]
         return {"schema_version": 1, "name": self.spec["name"], "argv": command(remote),
-                "key_env": self.spec["key_env"], "relay": relay, "runtime": self.runtime,
+                "key_env": self.spec["key_env"], "relay": relay,
                 "egress": self.egress_spec(), "ghcr_mirror": self.executor.ghcr_mirror}
 
     def egress_spec(self) -> Optional[Dict]:
@@ -1083,9 +1097,7 @@ class RemoteRun:
         return run_dir + "/spec.json"
 
     def start(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str] = None) -> None:
-        argv = ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, "PYTHONUNBUFFERED=1",
-                                        self.executor.python, "-m", "scripts.eval.harbor.bench.remote",
-                                        "run", remote_spec_path], reverse=self.start_egress())
+        argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress())
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
         # to Harbor (the placeholder, a judge key), `credential` to the relay.
@@ -1164,8 +1176,8 @@ class RemoteRun:
     def local_job_dir(self) -> Path:
         return Path(self.spec["jobs_dir"]) / self.spec["name"]
 
-    def job_sync(self, runtime: Optional[str] = None) -> JobSync:
-        return JobSync(self.executor, runtime or self.runtime, self.remote_job_dir, self.local_job_dir,
+    def job_sync(self) -> JobSync:
+        return JobSync(self.executor, self.remote_job_dir, self.local_job_dir,
                        runner=self.runner, log=self.log, popen=self.popen)
 
     def sync(self) -> bool:
@@ -1240,7 +1252,7 @@ def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = No
     if record.get("status") in ACTIVE and fresh:
         raise ValueError(name + " 仍在运行；它结束时会自己同步结果")
     remote = RemoteRun(spec, log=log)
-    job = remote.job_sync(ship_runtime(remote.executor, log=log))
+    job = remote.job_sync()
     deadline = time.monotonic() + (RemoteRun.FINAL_SYNC_TIMEOUT if timeout is None else timeout)
     complete = False
     while time.monotonic() < deadline:
