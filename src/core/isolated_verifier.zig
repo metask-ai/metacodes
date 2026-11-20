@@ -28,6 +28,7 @@
 //! gate's boundary.
 
 const std = @import("std");
+const tools_common = @import("../tools/common.zig");
 const json_mod = @import("../json.zig");
 const provider_mod = @import("../api/provider.zig");
 const client_mod = @import("../client.zig");
@@ -416,7 +417,7 @@ pub const VerifyRequest = struct {
     /// The user message that started the run, verbatim.
     task_statement: []const u8,
     workspace: Workspace,
-    relative_workspace_packet: bool = false,
+    aliased_workspace_packet: bool = false,
     pinned_check: ?PinnedCheck = null,
     budget: Budget = .{},
     /// `--verifier-model`: a model name or a tier name; null = the actor's.
@@ -479,7 +480,7 @@ pub fn renderPacket(allocator: std.mem.Allocator, request: *const VerifyRequest,
     } else {
         try w.writeAll("PINNED CHECK: none was given.\n\n");
     }
-    try w.print("CANDIDATE SNAPSHOT\npath: {s} (your working directory)\nrefs: `base` is the state before the work, `candidate` is the work; `git diff base candidate` shows exactly what changed.\n", .{if (request.relative_workspace_packet) "." else snapshot.path});
+    try w.print("CANDIDATE SNAPSHOT\npath: {s} (your working directory)\nrefs: `base` is the state before the work, `candidate` is the work; `git diff base candidate` shows exactly what changed.\n", .{if (request.aliased_workspace_packet) "$" ++ tools_common.workspace_alias else snapshot.path});
     if (request.prior_failing_probes.len > 0) {
         try w.writeAll("\nPRIOR FAILING PROBES (from an earlier verifier; re-run each)\n");
         for (request.prior_failing_probes) |probe| try w.print("- {s}\n", .{probe});
@@ -555,6 +556,7 @@ fn runSpawn(
 
     const packet = renderPacket(gpa, request, snapshot) catch return error.OutOfMemory;
     defer gpa.free(packet);
+    const workspace_aliases = [_]tools_common.PathAlias{.{ .name = tools_common.workspace_alias, .target = snapshot.path }};
     const tool_defs = try verifierToolDefs(gpa, deps.tool_defs);
     defer gpa.free(tool_defs);
 
@@ -616,6 +618,7 @@ fn runSpawn(
             .cwd_abs = snapshot.path,
             .project_dir = snapshot.path,
             .resolve_relative_paths = true,
+            .path_aliases = if (request.aliased_workspace_packet) &workspace_aliases else &.{},
             .home_dir = deps.home_dir,
             .state_root = deps.state_root,
             .artifact_root = deps.artifact_root,

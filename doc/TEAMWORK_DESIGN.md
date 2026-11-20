@@ -192,9 +192,10 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 
 **缓存契约**:run id、时间戳和运行目录的绝对路径都不进入 metacodes 发给 provider 的字节。
 packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径(`seat_relative_original_request`
-= `../../ORIGINAL_REQUEST.md`、`seat_relative_open_issues`);seat 目录的绝对路径只作为环境事实
-交给 harness(§7.1),不进入宪章、bootstrap 或 Manager 的提示词。写入隔离(seat 只能写工作区和
-自己的 seat 目录)由执行策略、权限层和沙箱保证,不靠提示词(§7.3)。
+= `../../ORIGINAL_REQUEST.md`、`seat_relative_open_issues`);metacodes seat 只看到稳定别名
+`$WORKSPACE` 与 `$SEAT`,真实路径由工具准入层解析(§7.1),不进入宪章、首条消息或 Manager 的
+提示词。宿主日志、状态文件与诊断照常记录真实路径。写入隔离(seat 只能写工作区和自己的 seat
+目录)由执行策略、权限层和沙箱保证,不靠提示词(§7.3)。
 
 ## 5. 预算账本
 
@@ -330,10 +331,24 @@ pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Drive
   消息开头、Claude Code 的 `-p` 提示词)。它只用相对 seat 目录的文件名:读 `packet.md`,写
   `handoff.md`(五段)。没有 run id、路径、时间戳。
 - **seat 目录在哪是环境事实,不是指令**:Claude Code 经 `--add-dir <seat 目录>` 得知(由它自己的
-  环境段告诉模型);metacodes 子 agent 经首条用户消息里 bootstrap 之后的 `<seat-environment>` 块
-  (工作区与 seat 目录的绝对路径)——与 Claude Code `--exclude-dynamic-system-prompt-sections`
-  把机器相关段放进首条用户消息同一做法。所以宪章(系统提示词)和 bootstrap 跨 seat、跨运行
-  逐字节稳定;含 run id 的 seat 目录路径只出现在环境块里。
+  环境段告诉模型);metacodes 子 agent 经首条用户消息里 bootstrap 之后的 `<seat-environment>` 块,
+  块里只写别名 `$WORKSPACE`(工作区,也是当前目录)与 `$SEAT`(seat 目录),首条消息是编译期常量
+  `metacodes.first_message`。
+- **路径别名(#544)**:`spawnAgentSink` 的 `path_aliases` 进入 agent_loop。工具调用参数经
+  `canonicalizeArgsWithAliases` 准入时,顶层 `file_path`、`path`、`notebook_path` 若是 `$NAME` 或以
+  `$NAME/` 开头,就换成真实目录;`$SEATS/x`、`a/$SEAT`、嵌套对象和其他参数(如 Write 的
+  `content`)不动。PreToolUse hook、权限判定、执行策略、流式预取、工具本身和观测 sink 读的都是
+  这同一份参数,所以 `$SEAT/../<别的 seat>`、`$WORKSPACE/..`、经符号链接的路径和直接写真实路径
+  受到完全相同的检查。模型的 transcript 保留它写的别名。Bash 命令文本不改写,工具在命令前加
+  `export WORKSPACE='…' SEAT='…'`,沙箱照旧按物理路径限制写入;reviewer 证据比对的仍是模型
+  写的命令。隔离 verifier 的 packet 写 `path: $WORKSPACE`,`$WORKSPACE` 解析到候选快照。
+  于是同一请求、角色和文件内容,换 state root 与 run id 后,metacodes seat 的首个 provider 请求
+  (system、tools、首条 user message)逐字节相同(`drivers_test` 有断言)。
+- **外部 harness 的边界**:Claude Code seat 中 runtime 控制且跨运行稳定的输入是 `-p` 的
+  bootstrap、`--append-system-prompt` 的宪章,以及 argv 里除 `--add-dir` 取值以外的全部参数
+  (`drivers_test` 断言两次运行只有这一项不同)。seat 目录的真实路径和 cwd 由 CLI 自己写进它生成的
+  环境消息,再加上它自己的日期、git 状态等;这些内容和 CLI 的 transcript 由 Claude Code 生成,
+  runtime 不控制,也不保证它们跨运行稳定。
 - **宪章**(`charters.forRole(role)`):interviewer、implementer、manager 为原创文本;reviewer 即
   `reviewer.charter`(§6);verifier 是标明的占位,真正的宪章在 verifier 模块(#516)。
   两种 harness 都收到同一角色宪章(Claude Code 通过 `--append-system-prompt`)。
@@ -432,6 +447,11 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 - metacodes seat 写工作区/seat 目录之外(绝对路径、`../` 相对路径、`ORIGINAL_REQUEST.md`、别的
   seat 的 handoff)全部被拒且磁盘上不存在;系统提示词恰为宪章、一个空行和注释指导;首条用户消息以 bootstrap 开头,
   bootstrap 部分不含 run id 与状态路径。
+- 路径别名:两次运行换 state root 与 run id,metacodes seat 的首个 provider 请求序列化后逐字节相同;
+  经 `$SEAT/packet.md` 读 packet、经 `$WORKSPACE`/`$SEAT` 在 Bash 里跑检查并写输出、经 `$SEAT/handoff.md`
+  写 handoff,文件都落在真实目录;`$SEAT/../reviewer-1/…`(Write 与 Bash)、`$WORKSPACE/../…`、
+  `$SEAT/<指向外部的符号链接>/…` 都被拒且磁盘上不存在。Claude Code seat 两次运行的 argv 只有
+  `--add-dir` 的取值不同。
 - metacodes reviewer seat:系统提示词为 `reviewer.charter` 加注释指导,外接观测 sink 收到 Bash 分派,Write/Edit
   进不了工作区。
 
@@ -469,7 +489,7 @@ approved -> implementing -> reviewing -> review_approved -> auditing -> merging 
 每个角色最多派 `max_rounds` 个 seat(默认 3)。reviewer 的结论经过工具调用记录、台账与固定
 检查命令核验;批准绑定工作区树 id。审计前树变了就重新评审,审计后树变了就终止。
 `VerifierAuditor` 在与批准树一致的独立快照上执行固定检查,然后调用 `core/isolated_verifier.verify`。
-审计请求用相对工作目录标识,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
+审计请求用 `$WORKSPACE` 标识候选快照,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
 FAIL 第一次进入修复轮、第二次失败终止;
 UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预算账本。
 
@@ -496,7 +516,8 @@ L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成�
 | #516 | 独立 verifier / 完成审计 | `VerifierAuditor` 已接隔离 verifier,最多两次审计,失败反馈修复轮;只有 PASS 交付。UNVERIFIED 后的 leads 轮仍待做。 |
 | #517 | reviewer 角色与 open-issues 台账 | runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows `workspaceTree` 尚不支持。 |
 | #518 | `/teamwork` 命令、面试与批准 | CLI 显式批准入口、配置加载、状态和恢复。交互式面试与 REPL `/teamwork` 尚待做。 |
-| #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名仍待做。 |
+| #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名已由 #544 完成。 |
+| #544 | seat 稳定路径别名 | 已做(§7.1):`$WORKSPACE` / `$SEAT` 在工具准入层解析,隔离 verifier 的快照同样用 `$WORKSPACE`;metacodes seat 的首个 provider 请求跨运行逐字节相同;Claude Code seat 只有 `--add-dir` 取值随运行变化。 |
 | #520 | 运行级预算 | 付费调用前预留、退出记账、丢失报告/崩溃时消耗预留、恢复固定原策略、预算触顶停止且不合回。 |
 | #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS Seatbelt / Linux bubblewrap 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
 | #522 | Claude Code 作为 Manager(MCP) | stdio MCP 接口驱动用户预先批准的 Run,复用独立审计和预算规则。详见 [TEAMWORK_MCP.md](TEAMWORK_MCP.md)。 |
