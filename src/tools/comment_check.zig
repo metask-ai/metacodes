@@ -21,6 +21,8 @@ fn exempt(rule: *const hl.LangRule, source: []const u8, comment: []const u8) boo
     if (std.mem.eql(u8, rule.name, "zig")) {
         const start = if (std.mem.lastIndexOfScalar(u8, source[0..offset], '\n')) |newline| newline + 1 else 0;
         if (std.mem.startsWith(u8, std.mem.trimStart(u8, source[start..offset], " \t"), "\\\\")) return true;
+        const eintr_directive = "// no EINTR: ";
+        if (std.mem.startsWith(u8, comment, eintr_directive) and std.mem.trim(u8, comment[eintr_directive.len..], " \t\r").len > 0) return true;
     }
     if (std.mem.eql(u8, rule.name, "bash") and offset > 0 and
         std.mem.indexOfScalar(u8, " \t\r\n;&|()", source[offset - 1]) == null) return true;
@@ -78,6 +80,9 @@ test "comment preview compares comment tokens and their multiplicity" {
     try std.testing.expectError(error.AddedCodeComment, checkFile(&ctx, "main.c", "", "int x; /* a\nblock */"));
     try checkFile(&ctx, "readme.md", "", "# heading\n");
     try checkFile(&ctx, "example.zig", "", "const text =\n    \\\\// sample text\n;\n");
+    try checkFile(&ctx, "example.zig", "", "_ = pfs.read(fd, &raw); // no EINTR: regular file, not the terminal\n");
+    try std.testing.expectError(error.AddedCodeComment, checkFile(&ctx, "example.zig", "", "_ = pfs.read(fd, &raw); // read the config file\n"));
+    try std.testing.expectError(error.AddedCodeComment, checkFile(&ctx, "example.zig", "", "_ = pfs.read(fd, &raw); // no EINTR: \n"));
     try checkFile(&ctx, "example.sh", "", "echo ${#word}\n");
     try checkFile(&ctx, "example.sh", "", "cat <<'TEXT'\n# heading\nTEXT\n");
     try checkFile(&ctx, "config.yaml", "", "color: '#aa0000'\n");

@@ -58,7 +58,7 @@ A new token produces a recoverable tool error with the path and line.
 Shebangs and recognized tool directives are allowed. The lexical check covers
 text with a known baseline and up to 512 KiB on each side. It uses the bundled
 highlighter's string and comment rules, so language-specific constructs can be
-misclassified. It skips Bash sources containing `<<`. Writes by shell commands,
+misclassified. It skips Bash sources containing `<<`, and YAML and CSS files entirely. Writes by shell commands,
 external tools and edits to unsupported formats rely on the prompt guidance.
 
 ## JavaScript tool orchestration

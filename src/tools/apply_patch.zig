@@ -736,7 +736,7 @@ test "comment preview rejects the entire patch before the first file lands" {
     const second = tt.path(&buf2, "preview-second.py");
     defer pfs.unlinkPath(first.ptr) catch {};
     defer pfs.unlinkPath(second.ptr) catch {};
-    const patch = try std.fmt.allocPrint(a, "*** Begin Patch\n*** Add File: metacodes/{s}\n+x = 1\n*** Add File: metacodes/{s}\n+# note\n*** End Patch", .{ first, second });
+    const patch = try std.fmt.allocPrint(a, "*** Begin Patch\n*** Add File: {s}\n+x = 1\n*** Add File: {s}\n+# note\n*** End Patch", .{ first, second });
     defer a.free(patch);
     const args = try std.json.Stringify.valueAlloc(a, .{ .patch = patch }, .{});
     defer a.free(args);
