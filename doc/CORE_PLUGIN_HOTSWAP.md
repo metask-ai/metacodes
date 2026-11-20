@@ -29,12 +29,12 @@ metacodes 的 agent loop、形式化+本体论和基于证据自我迭代三条�
 |---|---|---|
 | `none` | 无 | 无 |
 | `minimal` | `metacodes.core.minimal@1.0.0` | Read, Glob, Grep |
-| `offline-coding` | `metacodes.core.offline-coding@1.0.0` | Read, Write, Edit, Glob, Grep, Bash, BashOutput, KillShell |
-| `coding` | `metacodes.core.coding@1.0.0` | 原默认十工具；在 offline-coding 上增加 WebSearch、WebFetch |
+| `offline-coding` | `metacodes.core.offline-coding@1.0.0` | ExecuteCode, Read, Write, Edit, Glob, Grep, Bash, BashOutput, KillShell |
+| `coding` | `metacodes.core.coding@1.0.0` | 在 offline-coding 上增加 WebSearch、WebFetch |
 | `coding-interactive` | coding + `metacodes.core.interaction@1.0.0` | coding 再增加 AskUserQuestion |
 
-`coding` 是默认值，所以既有 `AgentRuntime.create(allocator, .{})` 的 provider-visible
-工具顺序、原生 executor 和 permission category 不变。插件化只改变组合与生命周期，
+`coding` 是默认值。ExecuteCode 提供受内核控制的 JavaScript 编排入口；其余工具保留
+原生 executor 和 permission category。插件化只改变组合与生命周期，普通工具调用
 不在执行热路径增加 callback、进程或 JSON 中转。
 
 `RuntimeConfig.builtin_tools` 现在是兼容覆盖：

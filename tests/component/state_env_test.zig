@@ -217,6 +217,46 @@ fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
+test "preview: CLI flags and persisted config change the actual provider tool menu" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, enabled: bool }{
+        .{ .enabled = false },
+        .{ .flags = &.{"--preview"}, .enabled = true },
+        .{ .flags = &.{ "--preview", "--no-preview" }, .enabled = false },
+        .{ .flags = &.{ "--no-preview", "--preview" }, .enabled = true },
+        .{ .saved = "{\"preview\":true}", .enabled = true },
+        .{ .saved = "{\"preview\":true}", .flags = &.{"--no-preview"}, .enabled = false },
+        .{ .saved = "{\"preview\":false}", .flags = &.{"--preview"}, .enabled = true },
+        .{ .saved = "{\"nested\":{\"preview\":true}}", .enabled = false },
+        .{ .saved = "{\"preview\" : true}", .enabled = true },
+        .{ .saved = "{\"preview\":\"true\"}", .enabled = false },
+        .{ .saved = "{\"preview\":true,\"preview\":false}", .enabled = false },
+    };
+    for (scenarios) |scenario| {
+        var case: Case = undefined;
+        try case.init();
+        defer case.deinit();
+        const arena = case.arena();
+        if (scenario.saved) |saved| try case.write("state/config.json", saved);
+        var server = try harness.MockServer.start(ANTHROPIC_SSE, 0);
+        defer server.stop();
+        const url = try server.urlOwned(arena);
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(arena, &.{ "--provider", "anthropic", "--api-key", "test-key", "--base-url", url, "--no-lsp", "-p", "say ok" });
+        try args.appendSlice(arena, scenario.flags);
+        const result = try case.run(&.{}, args.items);
+        errdefer std.debug.print("preview CLI exit {d}: {s}\n", .{ result.exit_code, result.stderr });
+        try testing.expectEqual(@as(i32, 0), result.exit_code);
+        try testing.expectEqual(@as(usize, 1), server.requestCount());
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, server.lastRequest().?.body(), .{});
+        var found = false;
+        for (parsed.value.object.get("tools").?.array.items) |tool| {
+            if (std.mem.eql(u8, tool.object.get("name").?.string, "ExecuteCode")) found = true;
+        }
+        try testing.expectEqual(scenario.enabled, found);
+    }
+}
+
 test "state .env: its key and METACODES_PROVIDER reach the request; one provider's key alone selects it (#486)" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var case: Case = undefined;

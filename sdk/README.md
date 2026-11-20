@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 28:
+C ABI v1 revision 29:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -20,7 +20,7 @@ C ABI v1 revision 28:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
-seven mandatory typed tables, function slots, and reserved fields. Revision 28 is
+seven mandatory typed tables, function slots, and reserved fields. Revision 29 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -55,7 +55,7 @@ code; deciding "ask for funds" or "reauthenticate" from it is the Host's.
 Every model request is sent once more by itself when its stream broke off
 without an answer (a stall, a dropped connection, a stream that ended before
 its stop reason) and no tool call had started (#461);
-`RunOptionsV1.stream_retry_budget` (Revision 28, 0 to
+`RunOptionsV1.stream_retry_budget` (Revision 29, 0 to
 `MAX_STREAM_RETRY_BUDGET_V1` = 8, default 0) lets a Run send such a request
 again more times, after a started tool call too. A server's error and a local
 decode failure are never re-sent. Each re-issue of an attempt that showed

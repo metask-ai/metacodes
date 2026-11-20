@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Preview features require opt-in.** `--preview` enables them; `--no-preview`
+  overrides a saved root `"preview": true` in the installation's `config.json`.
+  ExecuteCode JavaScript orchestration is a preview feature and is hidden and
+  refused by default. Child agents inherit the setting. Python and Node.js
+  expose a Runtime `preview` option; AgentCore ABI revision 29 consumes a
+  reserved RuntimeConfig word for the boolean, with unchanged struct sizes.
+
 - **The CLI no longer consults a built-in System-One advisor** (#474). Until
   now every host built on the CLI (the TUI, `-p`, `--web`, `serve`) fell back
   to the team's `metask-jev-4b` at `http://58.211.6.133:10420` whenever

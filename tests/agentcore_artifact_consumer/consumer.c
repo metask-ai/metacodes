@@ -9,7 +9,7 @@
 #error "revision 28 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 28u || \
+#if METASK_AGENTCORE_ABI_REVISION != 29u || \
     METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 != 16384u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
@@ -65,7 +65,7 @@
     METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE != 32u || \
     METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED != 33u || \
     METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 != 8u
-#error "source-free Revision 23-28 codes must match the public contract"
+#error "source-free Revision 23-29 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
