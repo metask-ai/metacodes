@@ -1158,8 +1158,10 @@ typed text whole first: a reseller lists other providers' models under their
 names (OpenRouter's "DeepSeek: DeepSeek V4 Pro"), and only the heading says
 which route a match goes through and whose account it bills. A window scrolled
 into a group opens with that group's heading in place of its first row, the
-cursor kept below it, and a model's name takes the room the rest of its row
-leaves rather than a fixed share of the width. A model served on several
+cursor kept below it (the line names the model too when that row is the model
+whose routes are listed), so PgDn and PgUp move a row less than the window. A
+model's name takes the room the rest of its row leaves, in terminal columns,
+rather than a fixed share of the width. A model served on several
 routes lists them under it, in words ("OpenAI Chat API"), while the cursor is
 on it: Enter on the model takes its preferred route (the one in use, else the
 first), Enter on a route takes that one. The

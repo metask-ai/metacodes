@@ -11,6 +11,7 @@
 const std = @import("std");
 const ansi = @import("tui/ansi.zig");
 const theme_mod = @import("tui/theme.zig");
+const term = @import("tui/term.zig");
 const picker_mod = @import("model_picker.zig");
 const offer_mod = @import("../provider/offer.zig");
 const selection_mod = @import("../provider/selection.zig");
@@ -45,7 +46,7 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     const sticky = if (picker.cursor == top) null else stickyHeading(visible, top);
     const first = if (sticky != null) top + 1 else top;
     const layout = Layout.of(picker, visible[first..end], cols);
-    if (sticky) |heading| rows += drawRow(picker, w, th, layout, heading, false);
+    if (sticky) |heading| rows += drawSticky(picker, w, th, layout, heading, visible[top..end]);
     for (visible[first..end], first..) |row, index| {
         rows += drawRow(picker, w, th, layout, row, index == picker.cursor);
     }
@@ -74,6 +75,20 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     }
     if (picker.stage == .list) rows += controls(picker, w, th, cols);
     return rows + footer(picker, w, th, true);
+}
+
+fn drawSticky(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, heading: Row, window: []const Row) u16 {
+    const covered = window[0];
+    if (covered != .model or window.len < 2 or window[1] != .route) return drawRow(picker, w, th, layout, heading, false);
+    line(w);
+    const offer = &picker.offers.items[heading.heading.offer_index];
+    const name = if (picker.noteFor(offer.provider_id)) |note| note.name() else offer.provider_id.slice();
+    const room = layout.cols -| 3;
+    const shown = clip(name, room);
+    const model = picker.offers.items[covered.model.offer_index].display_name;
+    w.print("  {s}{s}{s}{s} · {s}{s}", .{ th.accent, shown, th.reset, th.dim, th.reset, clip(model, room -| textWidth(shown) -| 3) }) catch {};
+    newline(w);
+    return 1;
 }
 
 fn stickyHeading(visible: []const Row, top: usize) ?Row {
@@ -518,22 +533,23 @@ fn utf8Prefix(bytes: []const u8, limit: usize) usize {
     return @min(@as(usize, first), bytes.len);
 }
 
-/// `text` cut to at most `width` columns (a character each), at a character
-/// boundary.
+/// `text` cut to at most `width` terminal columns, at a character boundary.
 fn clip(text: []const u8, width: usize) []const u8 {
     var columns: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
-        if (columns == width) return text[0..index];
         const step = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-        index = @min(index + step, text.len);
-        columns += 1;
+        const next = @min(index + step, text.len);
+        const cell = term.displayWidth(text[index..next]);
+        if (columns + cell > width) return text[0..index];
+        columns += cell;
+        index = next;
     }
     return text;
 }
 
 fn textWidth(text: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(text) catch text.len;
+    return term.displayWidth(text);
 }
 
 fn writePadded(w: *std.Io.Writer, text: []const u8, width: usize) void {
@@ -1118,6 +1134,90 @@ test "a name is cut where its row ends, not at a third of the width (#600)" {
     try testing.expectEqual(@as(usize, 3), models);
 }
 
+test "consecutive pages show every model between them, down and back up (#600)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [36][8]u8 = undefined;
+    var offers: [36]control_plane.OfferSummary = undefined;
+    for (&offers, 0..) |*slot, index| {
+        const name = std.fmt.bufPrint(&names[index], "model-{d:0>2}", .{index}) catch unreachable;
+        slot.* = offerOf("openrouter", "auto", name, "openai_chat");
+    }
+    try seed(&picker, &offers, null);
+    picker.page_rows = 8;
+    for ([_]picker_mod.Key{ .page_down, .page_up }) |key| {
+        var seen = [_]bool{false} ** 36;
+        for (0..12) |_| {
+            const buffer = try arena.alloc(u8, 32 * 1024);
+            for (try visibleRows(arena, drawAt(&picker, buffer, 80))) |row| {
+                const at = std.mem.indexOf(u8, row, "model-") orelse continue;
+                const number = std.fmt.parseInt(usize, row[at + 6 .. at + 8], 10) catch continue;
+                seen[number] = true;
+            }
+            _ = picker.onKey(key);
+        }
+        for (seen) |shown| try testing.expect(shown);
+    }
+}
+
+test "a full-width name is measured in terminal columns, so its row stays inside the width (#600)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const wide = "全角" ** 17 ++ "名";
+    const offers = [_]control_plane.OfferSummary{
+        offerOf("openrouter", "auto", wide, "openai_chat"),
+        offerOf("openrouter", "auto", "ascii-model", "openai_chat"),
+    };
+    try seed(&picker, &offers, null);
+    for ([_]usize{ 80, 120 }) |cols| {
+        const buffer = try arena.alloc(u8, 32 * 1024);
+        const rows = try visibleRows(arena, drawAt(&picker, buffer, cols));
+        for (rows) |row| try testing.expect(term.displayWidth(row) < cols);
+        const named = for (rows) |row| {
+            if (std.mem.startsWith(u8, row, "  >  全角")) break row;
+        } else return error.NoWideRow;
+        try testing.expect(std.mem.endsWith(u8, named, "200K"));
+        try testing.expectEqual(cols >= 120, std.mem.indexOf(u8, named, wide) != null);
+    }
+}
+
+test "a heading drawn over the model whose routes are listed names that model too (#600)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{
+        offerOf("deepseek", "default", "DeepSeek V4 Pro", "openai_chat"),
+        offerOf("deepseek", "anthropic", "DeepSeek V4 Pro", "anthropic_messages"),
+        offerOf("deepseek", "default", "DeepSeek V4.1 Flash", "openai_chat"),
+    };
+    try seed(&picker, &offers, null);
+    const notes = [_]picker_mod.ProviderNote{
+        picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .environment),
+    };
+    try picker.setReadiness(&.{ true, true, true }, &notes);
+    picker.page_rows = 3;
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.down);
+    var buffer = try arena.alloc(u8, 32 * 1024);
+    var rows = try visibleRows(arena, drawAt(&picker, buffer, 80));
+    try testing.expectEqualStrings("  DeepSeek · DeepSeek V4 Pro", rows[1]);
+    try testing.expect(std.mem.indexOf(u8, rows[2], "default") != null);
+    try testing.expect(std.mem.startsWith(u8, rows[3], "  > ") and std.mem.indexOf(u8, rows[3], "anthropic") != null);
+    _ = picker.onKey(.down);
+    buffer = try arena.alloc(u8, 32 * 1024);
+    rows = try visibleRows(arena, drawAt(&picker, buffer, 80));
+    try testing.expectEqualStrings("  DeepSeek · key from shell · billed to your DeepSeek account", rows[1]);
+    try testing.expect(std.mem.startsWith(u8, rows[3], "  >  DeepSeek V4.1 Flash"));
+}
+
 test "a long list scrolls with a position indicator that counts models, not headings" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1251,7 +1351,8 @@ test "a notice of several lines is drawn a row per line, every row inside the wi
 test "a row too narrow for a character breaks after it, never inside it" {
     try testing.expectEqual(@as(usize, 3), utf8Prefix("你好", 1));
     try testing.expectEqual(@as(usize, 3), utf8Prefix("你好", 4));
-    try testing.expectEqualStrings("你", clip("你好", 1));
+    try testing.expectEqualStrings("", clip("你好", 1));
+    try testing.expectEqualStrings("你", clip("你好", 3));
 }
 
 test "an empty result explains itself instead of drawing a blank box" {

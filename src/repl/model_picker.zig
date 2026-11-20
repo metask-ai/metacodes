@@ -901,7 +901,7 @@ pub const Picker = struct {
     fn pageMove(self: *Picker, visible: []const Row, down: bool) Outcome {
         const count = visible.len;
         if (count == 0) return .ignored;
-        const step = @max(self.page_rows, 1);
+        const step = if (self.page_rows > 1) self.page_rows - 1 else 1;
         const target = if (down) @min(self.cursor + step, count - 1) else self.cursor -| step;
         const index = focusableNear(visible, target, !down) orelse focusableNear(visible, target, down) orelse return .ignored;
         self.cursor = index;
@@ -1585,6 +1585,8 @@ test "navigation wraps, skips headings, pages, and keeps the cursor inside the w
     // Past bravo's heading.
     try testing.expectEqual(@as(usize, 8), picker.cursor);
     try testing.expect(picker.cursor < picker.window_top + picker.page_rows);
+    _ = picker.onKey(.page_down);
+    try testing.expectEqual(@as(usize, 12), picker.cursor);
     _ = picker.onKey(.page_down);
     try testing.expectEqual(@as(usize, 13), picker.cursor);
     _ = picker.onKey(.down);

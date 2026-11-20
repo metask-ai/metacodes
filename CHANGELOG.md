@@ -119,10 +119,14 @@ status, compatibility boundaries, and entry points are defined by
   shell · billed to your OpenRouter account`), the providers with a model
   that holds the typed text whole first; the first row is the one it was.
   A list scrolled into a group opens with that group's heading in place of
-  its first row, filtered or not, the cursor kept below it. A model's name
-  takes the room the rest of its row leaves instead of a third of the
-  width: at 80 columns that cut 116 of OpenRouter's 324 names, 46 of them to
-  the same text as another, a free model and its paid one among them.
+  its first row, filtered or not, the cursor kept below it; when that row
+  is the model whose routes are listed, the line names the model too.
+  PgDn and PgUp move a row less than the window, so no model is left
+  between two pages. A model's name takes the room the rest of its row
+  leaves instead of a third of the width, measured in terminal columns
+  (a full-width character takes two): at 80 columns the third cut 116 of
+  OpenRouter's 324 names, 46 of them to the same text as another, a free
+  model and its paid one among them.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
