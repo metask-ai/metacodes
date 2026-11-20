@@ -510,9 +510,11 @@ def step_docker_linux(s: Setup):
                 s.log("已加入 docker 组：新的登录会话生效（SSH 执行机器下次连接即生效）")
             else:
                 root("systemctl enable --now docker", "Docker daemon 未运行，需要 root 启动")
-        if s.sh("docker compose version >/dev/null 2>&1").returncode != 0:
-            installer = "apt-get install -y docker-compose-plugin" if s.found("apt-get") else "dnf install -y docker-compose-plugin"
-            root(installer, "缺少 docker compose 插件")
+        for plugin in ("compose", "buildx"):  # buildx: WorkBuddy's mount image
+            if s.sh(f"docker {plugin} version >/dev/null 2>&1").returncode != 0:
+                package = f"docker-{plugin}-plugin"
+                installer = f"apt-get install -y {package}" if s.found("apt-get") else f"dnf install -y {package}"
+                root(installer, f"缺少 docker {plugin} 插件")
     arch = s.out("uname -m")
     if arch not in ("x86_64", "amd64"):
         s.log("注意：执行机器是 " + arch + "，linux/amd64 镜像需要 binfmt 模拟")

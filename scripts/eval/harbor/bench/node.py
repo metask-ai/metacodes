@@ -62,6 +62,18 @@ class Node:
         facts = executors.local_facts(executors.LocalExecutor(executors.DEFAULT_LOCAL, self.cfg.get("harbor")))
         return executors.docker_reasons(facts, "；在这台机器上运行 metacodes bench setup")
 
+    def buildx_reasons(self):
+        # WorkBuddy runs here build their mount image with `docker buildx`.
+        try:
+            done = subprocess.run(["docker", "buildx", "version"], stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=10)
+            if done.returncode == 0:
+                return []
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return ["缺少 docker buildx 插件（WorkBuddy 构建挂载镜像需要）；在这台机器上运行 metacodes bench setup，"
+                "或由工作台对它运行 metacodes bench setup --executor <名称>"]
+
     def workbuddy(self):
         ctx, docker = self.context(), self.docker_reasons()
         result = {}
@@ -70,7 +82,8 @@ class Node:
                 tasks = suites.task_ids(suite, ctx)
             except suites.Unavailable:
                 tasks = []
-            result[suite.id] = {"reasons": docker + suites.readiness(suite, ctx), "tasks": tasks}
+            result[suite.id] = {"reasons": docker + self.buildx_reasons() + suites.readiness(suite, ctx),
+                                "tasks": tasks}
         return result
 
     def info(self):
@@ -119,41 +132,48 @@ class Node:
         suite = suites.get(spec.get("suite"))
         problems = self.workbuddy().get(suite.id, {}).get("reasons") or []
         if spec.get("executables") is not None:
-            # The trials mount HARNESS_IMAGE: rebuilt from what is staged
-            # now, which must be the run's bundle, executable by executable.
+            # What is staged now must be the run's bundle, executable by executable.
             different = workbuddy.executable_mismatch(workbuddy.staged_executables(self.context()),
                                                       spec["executables"])
             if different:
                 problems.append("WorkBuddy 暂存的制品不是本次运行的 metacodes 版本：" + "、".join(different))
-            else:
-                try:
-                    workbuddy.build_harness_image(workbuddy.checkout(self.context()))
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    problems.append(str(exc))
         if problems:
             remote.emit("error", message=f"{socket.gethostname()}：" + "；".join(problems))
             return 2
         jobs_dir = remote.absolute(spec["jobs_dir"])
         token = placeholder(spec["name"])
-        relay = TimingRelay(spec["account_gateway"], credential, Path(jobs_dir) / spec["name"] / ".bench-metrics",
-                            bind="127.0.0.1", token=token, record=False).__enter__()
-        spec = {**spec, "jobs_dir": jobs_dir, "account_gateway": relay.url + "/workbuddy",
-                "workbuddy": workbuddy.spec_fields(suite, self.context())}
+        # The trials mount an image of this run's own tag, built from what was
+        # just checked: run.sh reuses whatever an existing tag holds, and
+        # another workbench on this Docker daemon may move the shared one.
+        tag = workbuddy.run_image_tag(spec["name"])
+        repo = workbuddy.checkout(self.context())
+        spec = {**spec, "jobs_dir": jobs_dir,
+                "workbuddy": {**workbuddy.spec_fields(suite, self.context()), "harness_image": tag}}
         env = dict(os.environ)
         env["METASK_API_KEY"] = token
+        relay = None
+
+        def prepare(stop):
+            nonlocal relay
+            try:
+                if not workbuddy.build_harness_image(repo, tag, stop):
+                    return None
+                relay = TimingRelay(spec["account_gateway"], credential,
+                                    Path(jobs_dir) / spec["name"] / ".bench-metrics",
+                                    bind="127.0.0.1", token=token, record=False).__enter__()
+                argv, cwd, child_env = workbuddy.launch({**spec, "account_gateway": relay.url + "/workbuddy"}, env)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ValueError(f"WorkBuddy 启动失败：{exc}") from None
+            return argv, child_env, cwd
+
         try:
-            try:
-                argv, cwd, child_env = workbuddy.launch(spec, env)
-            except (OSError, ValueError) as exc:
-                remote.emit("error", message=f"WorkBuddy 启动失败：{exc}")
-                return 2
-            try:
-                return remote.supervise(spec, argv, child_env, credential, threading.Event(), threading.Event(),
-                                        cwd=cwd)
-            finally:
-                workbuddy.finish(spec)
+            return remote.supervise(spec, None, None, credential, threading.Event(), threading.Event(),
+                                    prepare=prepare)
         finally:
-            relay.__exit__(None, None, None)
+            workbuddy.finish(spec)
+            subprocess.run(["docker", "image", "rm", tag], stdin=subprocess.DEVNULL, capture_output=True)
+            if relay is not None:
+                relay.__exit__(None, None, None)
 
 
 def main(argv, state_root, version) -> int:

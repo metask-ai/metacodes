@@ -214,7 +214,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | 网络与镜像 (`ssh` executors) | Probes `pypi.org`, `registry-1.docker.io`, `ghcr.io` and `github.com` from the executor (8 s timeout; over 5 s counts as slow) and fills in what is missing from the entry: `pypi_index`, `docker_mirrors`, `ghcr_mirror` and `"egress": "workbench"` (see [Network-restricted executors](#network-restricted-executors)). A value already in the entry is never replaced; a dry run lists the proposed changes |
 | uv | macOS: `brew install uv` when Homebrew exists; otherwise (and on Linux) the official installer pinned to uv 0.13.9 into `~/.local/bin` |
 | Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12; with an executor's `pypi_index`, prefixed by `env UV_DEFAULT_INDEX=<index>`); the resulting path is saved |
-| Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose plugin when needed |
+| Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose and buildx plugins when needed |
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
@@ -685,14 +685,19 @@ suite on an SSH executor runs on the node's own checkout: the workbench
 validates the tasks against the list the node reports and copies the job
 back like a Harbor run. Its readiness there is reaching a compatible node,
 Metask authentication and what the node reports for the suite (an executor
-without the Harbor CLI still runs WorkBuddy, which brings its own). Every
-executable the node staged for WorkBuddy (`metacodes`, TinyKG, the formal
-kernel, and ripgrep and the project kernel when staged; `node info` reports
-their sha256) must be the run's bundle's: otherwise the launch is refused.
-The node checks again before it starts and then rebuilds the split-mount
-image `workbuddy-bench/harness/metacodes:0.1.0` from the staged context
-(WorkBuddy's `run.sh` reuses that tag whenever it exists), so the trials
-mount what was checked and a record never names a version that did not run. WorkBuddy's host proxy is given a run-scoped placeholder and a
+without the Harbor CLI still runs WorkBuddy, which brings its own, but it
+needs `docker buildx`). Every executable the node staged for WorkBuddy
+(`metacodes`, TinyKG, the formal kernel and ripgrep, and the project kernel
+when staged; `node info` reports their sha256) must be the run's bundle's:
+otherwise the launch is refused. The node checks again before it starts,
+then builds the split-mount image from the staged context under a tag of
+the run's own (`workbuddy-bench/harness/metacodes:metacodes-<run>`) and
+names it in a transient harness version (the pinned `0.1.0.yaml` plus
+`mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
+`run.sh` would otherwise reuse, and another workbench on the same Docker
+daemon could move, never reaches the trials; the run's tag and version file
+are removed afterwards. The build sends heartbeats like a running Harbor,
+and a cancel (or a closed channel) kills it and ends the run. WorkBuddy's host proxy is given a run-scoped placeholder and a
 loopback relay on the node; the relay forwards with the access token from
 the stdin line and swaps in each refreshed one, as for Harbor runs. The node
 removes its transient WorkBuddy configs afterwards.

@@ -538,11 +538,12 @@ async function renderNewBatch() {
     boxes.replaceChildren(...(state.batchPick.size ? [...state.batchPick.entries()].map(([id, entry]) => suiteBox(byId.get(id), entry))
       : [h('div', { class: 'empty', text: '在上面点选一个或多个评测集加入批次。' })]));
   }
-  const taskRequests = new Map();
   async function loadTasks(id) {
     const wanted = state.executor;
-    const ticket = (taskRequests.get(id) || 0) + 1;
-    taskRequests.set(id, ticket);
+    // Beside the shared task lists, so a form drawn again keeps counting.
+    state.taskTickets = state.taskTickets || new Map();
+    const ticket = (state.taskTickets.get(id) || 0) + 1;
+    state.taskTickets.set(id, ticket);
     let entry = { tasks: [], defaults: [], selected: new Set(), error: null };
     try {
       const body = await api('/api/suite?id=' + encodeURIComponent(id) + '&executor=' + encodeURIComponent(wanted || ''));
@@ -550,7 +551,7 @@ async function renderNewBatch() {
     } catch (e) { entry.error = e.message; }
     // Only the suite's latest request counts: an older one may be for another
     // executor, or for this one before a switch away and back.
-    if (state.batchPick.has(id) && taskRequests.get(id) === ticket) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
+    if (state.batchPick.has(id) && state.taskTickets.get(id) === ticket) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
   }
   attempts.addEventListener('input', syncSubmit);
 

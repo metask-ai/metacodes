@@ -169,8 +169,39 @@ def dataset_selection(argv):
     return dataset, [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-i"]
 
 
-def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None):
-    """Run Harbor: control channel, heartbeats, cancel; the exit code."""
+def beating(phase, stop, work):
+    """work() with a heartbeat every 2 s: preparation can outlast the
+    worker's 90 s heartbeat window. A closed channel sets `stop`."""
+    done = threading.Event()
+
+    def beat():
+        while not done.wait(2):
+            try:
+                emit("heartbeat", phase=phase)
+            except (BrokenPipeError, OSError):
+                stop.set()
+                return
+    threading.Thread(target=beat, daemon=True).start()
+    try:
+        return work()
+    finally:
+        done.set()
+
+
+def cancelled_exit():
+    try:
+        emit("exit", code=130, cancelled=True)
+    except (BrokenPipeError, OSError):
+        pass
+    return 130
+
+
+def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None):
+    """Run Harbor: control channel, heartbeats, cancel; the exit code.
+
+    `prepare(stop)`, when given, runs first under heartbeats and with cancel
+    already handled; it returns (argv, env, cwd), or None once `stop` is set,
+    and raises ValueError with a user-facing reason."""
 
     def control():
         for line in sys.stdin.buffer:
@@ -192,36 +223,28 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None)
         stop.set()
 
     threading.Thread(target=control, daemon=True).start()
+    if prepare is not None:
+        try:
+            prepared = beating("prepare", stop, lambda: prepare(stop))
+        except ValueError as exc:
+            emit("error", message=str(exc))
+            return 2
+        if prepared is None or stop.is_set():
+            return cancelled_exit()
+        argv, env, cwd = prepared
     dataset, patterns = dataset_selection(argv)
     if egress is not None and dataset:
         images = egress.ghcr_images(Path(dataset), patterns)
         if images:
-            # Pulls can outlast the worker's 90 s heartbeat window.
-            pulling = threading.Event()
-
-            def beat():
-                while not pulling.wait(2):
-                    try:
-                        emit("heartbeat", phase="ghcr")
-                    except (BrokenPipeError, OSError):
-                        stop.set()
-                        return
-            threading.Thread(target=beat, daemon=True).start()
-            try:
-                tagged = egress.ensure_ghcr(images, spec["ghcr_mirror"], env=env, stop=stop,
-                                            log=lambda text: print(text, file=sys.stderr, flush=True))
-            finally:
-                pulling.set()
+            tagged = beating("ghcr", stop, lambda: egress.ensure_ghcr(
+                images, spec["ghcr_mirror"], env=env, stop=stop,
+                log=lambda text: print(text, file=sys.stderr, flush=True)))
             try:
                 emit("ghcr", images=len(images), tagged=len(tagged))
             except (BrokenPipeError, OSError):
                 stop.set()
             if stop.is_set():  # cancelled (or the channel closed) while pulling
-                try:
-                    emit("exit", code=130, cancelled=True)
-                except (BrokenPipeError, OSError):
-                    pass
-                return 130
+                return cancelled_exit()
     # Harbor's own output goes to stderr, which SSH carries to the local
     # worker's log; stdout carries only events.
     process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
