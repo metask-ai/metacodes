@@ -17,6 +17,7 @@ import os
 import socketserver
 import sys
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -164,6 +165,9 @@ def make_handler(workbench: Workbench, public_url=None):
                 self.send_json({"error": str(exc)}, 400)
             except BrokenPipeError:
                 pass
+            except Exception:
+                traceback.print_exc()
+                self.send_json({"error": "工作台内部错误，详见 service.log"}, 500)
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
             url = urlsplit(self.path)

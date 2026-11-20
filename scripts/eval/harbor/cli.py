@@ -148,8 +148,10 @@ def stop_service(client):
 def ensure_service(args, root, config, jobs_dir, store):
     ready = root / "service.json"
     saved = settings(ready)
+    temporary = root / "tmp"
     client = receipt_client(saved, config) if saved.get("jobs_dir") == str(jobs_dir) else None
-    if client and same_service(saved, jobs_dir, store) and not client.legacy_token:
+    reusable = same_service(saved, jobs_dir, store) and saved.get("tmpdir") == str(temporary)
+    if client and reusable and not client.legacy_token:
         return client
     # A running service whose store changed (or that predates it), or that
     # still requires its login link, is replaced on the same entry. Its
@@ -167,8 +169,10 @@ def ensure_service(args, root, config, jobs_dir, store):
                "--ready-file", str(handshake)]
     if public_url:
         command += ["--public-url", public_url]
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    env = {**runtime_env(), "TMPDIR": str(temporary)}
     with (root / "service.log").open("ab") as log:
-        process = subprocess.Popen(command, env=runtime_env(), cwd=str(Path(__file__).resolve().parents[3]),
+        process = subprocess.Popen(command, env=env, cwd=str(Path(__file__).resolve().parents[3]),
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -178,7 +182,7 @@ def ensure_service(args, root, config, jobs_dir, store):
             client = Client(value["url"], value.get("listen_url"))
             try:
                 client.request("api/workbench")
-                atomic_json(ready, value)
+                atomic_json(ready, {**value, "tmpdir": str(temporary)})
                 ready.chmod(0o600)
                 handshake.unlink(missing_ok=True)
                 threading.Thread(target=process.wait, daemon=True).start()
