@@ -398,3 +398,306 @@ test "MCP HTTP: a tool's isError reaches the model as a tool error through the r
     try std.testing.expect(body == .structured_error);
     try std.testing.expect(std.mem.indexOf(u8, body.structured_error.encoded, "tool said no") != null);
 }
+
+test "MCP HTTP: server requests with string ids are answered with those ids, on both call paths" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "strid"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        const called = try client.callTool("kept", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "strid:answered:refused") != null);
+
+        var body = try client.callToolBodyAbortable("kept", "{}", root, .{}, null);
+        defer body.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "strid:answered:refused") != null);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/strid");
+    var replies: usize = 0;
+    for (seen) |request| replies += @intFromBool(request.method.len == 0);
+    try std.testing.expectEqual(@as(usize, 4), replies);
+}
+
+const Request = struct { method: []const u8, session: ?[]const u8 };
+
+fn requestsOn(arena: std.mem.Allocator, log: []const u8, path: []const u8) ![]Request {
+    var out: std.ArrayList(Request) = .empty;
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+        const entry_path = value.object.get("path") orelse continue;
+        if (entry_path != .string or !std.mem.eql(u8, entry_path.string, path)) continue;
+        const headers = value.object.get("headers") orelse continue;
+        const method = value.object.get("method") orelse continue;
+        const session = headers.object.get("mcp-session-id");
+        try out.append(arena, .{
+            .method = if (method == .string) method.string else "",
+            .session = if (session) |s| s.string else null,
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "MCP HTTP: a 404 for an expired session starts a new one and sends the request again, once" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "expire"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        const tools = try client.listTools();
+        defer a.free(tools);
+
+        a.free(try mock.get(a, "forget"));
+        const called = try client.callTool("ask", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "expire:s2") != null);
+
+        a.free(try mock.get(a, "forget"));
+        var body = try client.callToolBodyAbortable("ask", "{}", root, .{}, null);
+        defer body.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "expire:s3") != null);
+
+        a.free(try mock.get(a, "refusecalls"));
+        try std.testing.expectError(error.McpSessionExpired, client.callTool("ask", "{}"));
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try requestsOn(arena.allocator(), log, "/expire");
+    const expected = [_]Request{
+        .{ .method = "server/discover", .session = null },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "notifications/initialized", .session = "s1" },
+        .{ .method = "tools/list", .session = "s1" },
+        .{ .method = "tools/call", .session = "s1" },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "notifications/initialized", .session = "s2" },
+        .{ .method = "tools/call", .session = "s2" },
+        .{ .method = "tools/call", .session = "s2" },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "notifications/initialized", .session = "s3" },
+        .{ .method = "tools/call", .session = "s3" },
+        .{ .method = "tools/call", .session = "s3" },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "notifications/initialized", .session = "s4" },
+        .{ .method = "tools/call", .session = "s4" },
+    };
+    try std.testing.expectEqual(expected.len, seen.len);
+    for (expected, seen) |want, got| {
+        try std.testing.expectEqualStrings(want.method, got.method);
+        if (want.session) |session| {
+            try std.testing.expectEqualStrings(session, got.session.?);
+        } else try std.testing.expect(got.session == null);
+    }
+}
+
+fn declaredOn(arena: std.mem.Allocator, log: []const u8, path: []const u8) ![]std.json.Value {
+    var out: std.ArrayList(std.json.Value) = .empty;
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+        const entry_path = value.object.get("path") orelse continue;
+        if (entry_path != .string or !std.mem.eql(u8, entry_path.string, path)) continue;
+        try out.append(arena, value.object.get("declared") orelse continue);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn answerWho(ctx: *anyopaque, params_json: []const u8, alloc: std.mem.Allocator) ?[]u8 {
+    const seen: *bool = @ptrCast(@alignCast(ctx));
+    seen.* = std.mem.indexOf(u8, params_json, "who are you") != null;
+    return alloc.dupe(u8, "{\"name\":\"metacodes\"}") catch null;
+}
+
+test "MCP HTTP: elicitation is declared exactly when the connection has a handler to answer it" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "elicit"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        const called = try client.callTool("ask", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "elicit:undeclared") != null);
+    }
+    var seen = false;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "elicit"),
+        }, .{
+            .spawn = undefined,
+            .startup_timeout_ms = 10_000,
+            .request_timeout_ms = 10_000,
+            .elicit = .{ .ctx = @ptrCast(&seen), .handleFn = answerWho },
+        });
+        defer client.close();
+        const called = try client.callTool("ask", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "elicit:accept:metacodes") != null);
+    }
+    try std.testing.expect(seen);
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "modern"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+        defer client.close();
+        try std.testing.expect(client.modern);
+        const tools = try client.listTools();
+        defer a.free(tools);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const classic = try declaredOn(arena.allocator(), log, "/elicit");
+    try std.testing.expectEqual(@as(usize, 2), classic.len);
+    try std.testing.expectEqual(@as(usize, 0), classic[0].object.count());
+    try std.testing.expectEqual(@as(usize, 1), classic[1].object.count());
+    try std.testing.expect(classic[1].object.get("elicitation") != null);
+    const modern = try declaredOn(arena.allocator(), log, "/modern");
+    try std.testing.expect(modern.len >= 2);
+    for (modern) |declared| try std.testing.expectEqual(@as(usize, 0), declared.object.count());
+}
+
+test "MCP HTTP: an SSE response that polls with fresh priming events is resumed until it answers" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "poll"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        const called = try client.callTool("kept", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "poll:done") != null);
+
+        var body = try client.callToolBodyAbortable("kept", "{}", root, .{}, null);
+        defer body.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, body.@"inline".bytes, "poll:done") != null);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/poll");
+    var resumed: usize = 0;
+    for (seen) |request| resumed += @intFromBool(std.mem.eql(u8, request.method, "GET"));
+    try std.testing.expectEqual(@as(usize, 10), resumed);
+}
+
+test "MCP HTTP: resumed SSE streams that bring no new event id give up after three attempts" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "pollstuck"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        try std.testing.expectError(error.McpServerCrashed, client.callTool("kept", "{}"));
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/pollstuck");
+    var resumed: usize = 0;
+    for (seen) |request| resumed += @intFromBool(std.mem.eql(u8, request.method, "GET"));
+    try std.testing.expectEqual(@as(usize, 3), resumed);
+}
+
+test "MCP HTTP: a session that could not be renewed is renewed before the next request" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "expire"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        a.free(try mock.get(a, "forget"));
+        a.free(try mock.get(a, "failinit"));
+        const outcome = client.invokeTool(a, .{
+            .name = "ask",
+            .arguments_json = "{}",
+            .artifact_root = root,
+            .budget = .{},
+        });
+        try std.testing.expect(outcome == .failed);
+        try std.testing.expectEqual(error.McpSessionExpired, outcome.failed.err);
+        try std.testing.expect(outcome.failed.disposition == .not_delivered);
+
+        const called = try client.callTool("ask", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "expire:s2") != null);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try requestsOn(arena.allocator(), log, "/expire");
+    const expected = [_]Request{
+        .{ .method = "server/discover", .session = null },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "notifications/initialized", .session = "s1" },
+        .{ .method = "tools/call", .session = "s1" },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "initialize", .session = null },
+        .{ .method = "notifications/initialized", .session = "s2" },
+        .{ .method = "tools/call", .session = "s2" },
+    };
+    try std.testing.expectEqual(expected.len, seen.len);
+    for (expected, seen) |want, got| {
+        try std.testing.expectEqualStrings(want.method, got.method);
+        if (want.session) |session| {
+            try std.testing.expectEqualStrings(session, got.session.?);
+        } else try std.testing.expect(got.session == null);
+    }
+}

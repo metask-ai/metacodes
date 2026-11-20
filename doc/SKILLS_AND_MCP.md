@@ -334,26 +334,33 @@ the handshake revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   Over stdio, a server that exits or stays silent on the probe is restarted for
   the handshake. Over HTTP, a timeout, a network failure or 401/403 is an error,
   not a reason to fall back.
-- The handshake answers server `ping`s and form-mode elicitation requests;
-  undeclared requests get `method_not_found`. `tools/list` follows
-  `nextCursor` (an empty string is a cursor too).
+- The handshake answers server `ping`s and form-mode elicitation requests,
+  echoing the request's id whether it is a number or a string; undeclared
+  requests get `method_not_found`. Elicitation is declared only when the
+  connection was given a handler: the CLI has no elicitation UI yet, so it
+  declares none and declines an elicitation a server sends anyway.
+  `tools/list` follows `nextCursor` (an empty string is a cursor too).
 - Streamable HTTP POSTs every message with `Accept: application/json,
   text/event-stream`, reads JSON or SSE responses (a mid-stream server request
   is answered on its own POST), keeps the handshake's `MCP-Session-Id` and
-  `MCP-Protocol-Version` (DELETE on close), and sends `Mcp-Method`, `Mcp-Name`
+  `MCP-Protocol-Version` (DELETE on close; a 404 to a request carrying the
+  session id means the server ended the session, so the client sends a new
+  `initialize` without it and repeats the request once in the new session), and sends `Mcp-Method`, `Mcp-Name`
   and `Mcp-Param-*` (from `x-mcp-header`; a tool with an invalid annotation is
   dropped) on 2026-07-28. An SSE response that ends before its answer is
   resumed when the server numbered its events: after the stream's `retry`
   delay (1 s by default, 10 s at most), a GET with `Last-Event-ID` (the id of
   the last event received whole) and the session headers reopens it and the server replays the rest (2025-03-26
-  through 2025-11-25; at most 3 attempts that bring nothing new). On
+  through 2025-11-25; at most 3 consecutive attempts that bring no new event
+  id, so a polling server whose every stream opens with a fresh priming event
+  keeps the call open until it answers or the request times out). On
   2026-07-28 the answer is lost instead, and the client reports the call as
   indeterminate rather than sending it again.
 - A `tools/call` is sent once. A failure after the request left (a timeout, a
   dropped connection, a server exit) tells the model that the call may have
   executed and to check its effect before repeating it. A POST whose body was
-  never fully written, or that a 401 refused, is known not to have run and is
-  retried. A `tools/call` does not reuse an HTTP connection idle for more than
+  never fully written, that a 401 refused, or that a 404 refused for an
+  expired session, is known not to have run and is retried. A `tools/call` does not reuse an HTTP connection idle for more than
   a second, since the race with a server closing it could not be retried.
 - **HTTP+SSE** (`type: "sse"`, revision 2024-11-05, which many hosted
   servers still offer at an `/sse` URL): a long-lived `GET <url>`
