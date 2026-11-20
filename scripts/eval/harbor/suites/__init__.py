@@ -200,7 +200,7 @@ SUITES: Tuple[Suite, ...] = (
           HARBOR_REGISTRY, dataset="frontier-harness-eval/frontier-harness-eval@v1.1.0",
           filter_prefix="terminal-bench/", tasks=FRONTIER_HARNESS_EVAL_1_1,
           default_tasks=FRONTIER_HARNESS_EVAL_SAMPLE, max_tasks=62),
-    Suite("aime","competition-math", "AIME 2024–2025",
+    Suite("aime", "competition-math", "AIME 2024–2025",
           "60 道 AIME 竞赛题：2024 年 30 道，2025 年 I/II 卷各 15 道",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2024 + AIME_2025,
           default_tasks=AIME_2024 + AIME_2025, max_tasks=60, max_concurrency=16),
