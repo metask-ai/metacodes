@@ -280,11 +280,12 @@ test "L2: lead LSP and preview settings reach the teammate process" {
     var home_buf: [256]u8 = undefined;
     const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-nolsp");
     defer cc.util_fs.testing.rmrfBestEffort(home);
-    for ([_]struct { lsp: bool, preview: bool }{
-        .{ .lsp = true, .preview = false },
-        .{ .lsp = true, .preview = true },
-        .{ .lsp = false, .preview = false },
-        .{ .lsp = false, .preview = true },
+    const Features = cc.types_mod.PreviewFeatures;
+    for ([_]struct { lsp: bool, preview: Features, flag: ?[]const u8 }{
+        .{ .lsp = true, .preview = .none, .flag = null },
+        .{ .lsp = true, .preview = .all, .flag = "--preview=execute_code,teamwork,comment_guard" },
+        .{ .lsp = false, .preview = .none, .flag = null },
+        .{ .lsp = false, .preview = .{ .comment_guard = true }, .flag = "--preview=comment_guard" },
     }) |scenario| {
         // 每轮重建:lead 的 sw.deinit() 会做 orphan 清理删掉整个 team 目录。
         var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -302,8 +303,9 @@ test "L2: lead LSP and preview settings reach the teammate process" {
         _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, scenario.lsp);
         // 两侧都断言:开着时不得平白多塞 flag,关着时必须带上。
         try std.testing.expectEqual(!scenario.lsp, mockSawFlag("--no-lsp"));
-        try std.testing.expectEqual(scenario.preview, mockSawFlag("--preview"));
-        try std.testing.expectEqual(!scenario.preview, mockSawFlag("--no-preview"));
+        try std.testing.expect(mockSawFlag("--no-preview"));
+        if (scenario.flag) |flag| try std.testing.expect(mockSawFlag(flag));
+        try std.testing.expectEqual(@as(usize, if (scenario.lsp) 1 else 2) + @intFromBool(scenario.flag != null), g_mock_flags_len);
     }
 }
 
@@ -316,7 +318,7 @@ test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 
         .team = "proj",
         .cwd = "/tmp/wt",
         .state_root = "/srv/lead-state",
-        .extra_flags = &.{ "--no-lsp", "--preview" },
+        .extra_flags = &.{ "--no-lsp", "--no-preview", "--preview=execute_code" },
     });
     defer tp.freeArgv(a, argv);
 
@@ -337,7 +339,8 @@ test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 
     const config = cc.parseArgsForTest(parse_argv.items, arena.allocator());
     try std.testing.expect(config.parse_error == null); // 整条命令行合法
     try std.testing.expect(!config.lsp_enabled); // 且真的关掉了
-    try std.testing.expect(config.preview.isEnabled());
+    try std.testing.expect(config.preview.isComplete());
+    try std.testing.expect(config.preview.features().eql(.{ .execute_code = true }));
     try std.testing.expectEqualStrings("bob", config.teammate_name); // 身份没被挤掉
     // The child resolves the lead's state root, not its own default.
     try std.testing.expectEqualStrings("/srv/lead-state", config.state_dir.?);

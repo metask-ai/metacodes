@@ -95,7 +95,7 @@ pub fn captureTranscript(allocator: std.mem.Allocator, messages: []const msg.Mes
 }
 
 pub const SpawnOptions = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// Explicit host selections, also used when continuing a prebuilt root
     /// conversation. Fresh child calls leave them disabled by default.
     harnessmm: bool = false,

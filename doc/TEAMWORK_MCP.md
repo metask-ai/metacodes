@@ -14,13 +14,14 @@ not part of this stdio adapter.
 
 ## Host authorization and ownership
 
-Teamwork uses the shared preview setting and defaults off. The host must
-resolve current preview authorization and supply `runtime.Deps.preview = true`
-before starting or reopening a run. The CLI accepts `--preview` or saved root
-`preview: true`; its final `--no-preview` overrides the saved value. Enabling
-preview is separate from approving the task, configured permissions and spend.
+Teamwork is the `teamwork` preview feature and defaults off. The host must
+resolve current preview authorization and supply a `runtime.Deps.preview` with
+`teamwork` set before starting or reopening a run. The CLI accepts `--preview`,
+`--preview=teamwork`, saved root `preview: true` or `preview: {"teamwork": true}`;
+a later `--no-preview` or `--no-preview=teamwork` overrides the saved value.
+Enabling preview is separate from approving the task, configured permissions and spend.
 
-The runtime checks preview again for dispatch and completion. Disabling it on
+The runtime checks the `teamwork` feature again for dispatch and completion. Disabling it on
 an existing host handle leaves initialize/ping, status, cancellation and
 cleanup available, but execution tools return `isError: true` with
 `error: "PreviewDisabled"` and perform no seat, check, audit or merge action.

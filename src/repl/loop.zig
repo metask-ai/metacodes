@@ -1390,7 +1390,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
 
     // ② spawnBackground(prebuilt=copy)。consume 语义:成功转移给 job,失败它自己释放 copy。
     _ = try reg.spawnBackground(.{
-        .preview = app.config.preview.isEnabled(),
+        .preview = app.config.preview.features(),
         .harnessmm = app.config.harnessmm,
         .rsi = app.config.rsi,
         .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
@@ -4718,7 +4718,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
         &app.permission_ctx,
         &app.abort,
         prompt,
-        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.isEnabled() }, // 单轮,无工具(纯回答)
+        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.features() }, // 单轮,无工具(纯回答)
     );
     defer result.deinit();
     return try allocator.dupe(u8, result.final_text);

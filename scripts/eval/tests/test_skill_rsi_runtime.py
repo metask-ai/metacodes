@@ -89,9 +89,9 @@ class SkillRSIRuntimeTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(requests, [])
 
-    def test_preview_off_skips_policy_io_even_when_rsi_is_selected(self):
+    def test_rsi_off_skips_policy_io_even_when_preview_is_on(self):
         for path in (self.root / "missing.json", self.root):
-            for flags in (["--rsi"], ["--preview", "--rsi", "--no-preview"]):
+            for flags in (["--preview"], ["--preview", "--rsi", "--no-rsi"]):
                 with self.subTest(path=path, flags=flags):
                     result, requests = self.invoke("read before editing", flags, policy_path=path, preview=False)
                     self.assertEqual(result.returncode, 0, result.stderr)

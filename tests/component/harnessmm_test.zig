@@ -48,7 +48,7 @@ fn policy(hash: []const u8) cc.skill_rsi.Policy {
 
 const Route = enum { root, child, background };
 
-fn checkPreviewRoute(route: Route, preview: bool) !void {
+fn checkPreviewRoute(route: Route, selected: bool) !void {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX fixture commands
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -78,19 +78,18 @@ fn checkPreviewRoute(route: Route, preview: bool) !void {
     const frozen = policy(&hash);
     try frozen.validate();
     // Disabled runs deliberately have neither usable policy nor artifact root.
-    const selected_policy: ?*const cc.skill_rsi.Policy = if (preview) &frozen else null;
-    const artifact_root = if (preview or route == .root) root else "";
-    if (!preview and route == .root) try tmp.dir.writeFile(std.testing.io, .{
+    const selected_policy: ?*const cc.skill_rsi.Policy = if (selected) &frozen else null;
+    const artifact_root = if (selected or route == .root) root else "";
+    if (!selected and route == .root) try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = cc.harnessmm.JOURNAL_NAME,
         .data = "existing journal stays untouched\n",
     });
-    const expected_calls: u32 = if (preview) 2 else 1;
+    const expected_calls: u32 = if (selected) 2 else 1;
     switch (route) {
         .root => {
             const result = try cc.agent_loop.run(&conversation, client.provider(), defs, &permission, .{
-                .preview = preview,
-                .harnessmm = true,
-                .rsi = true,
+                .harnessmm = selected,
+                .rsi = selected,
                 .rsi_policy = selected_policy,
                 .max_turns = 2,
                 .cwd_abs = root,
@@ -101,9 +100,8 @@ fn checkPreviewRoute(route: Route, preview: bool) !void {
         },
         .child => {
             const result = try cc.core_subagent.spawnAgentSink(a, client.provider(), &client, defs, &permission, null, "read before editing", .{
-                .preview = preview,
-                .harnessmm = true,
-                .rsi = true,
+                .harnessmm = selected,
+                .rsi = selected,
                 .rsi_policy = selected_policy,
                 .session = cc.session_id.SessionId.single,
                 .agent_depth = 1,
@@ -119,9 +117,8 @@ fn checkPreviewRoute(route: Route, preview: bool) !void {
             var registry = try cc.agent_job_registry.AgentJobRegistry.init(a, "test-key", url, MODEL, .anthropic);
             defer registry.deinit();
             const id = try registry.spawnBackground(.{
-                .preview = preview,
-                .harnessmm = true,
-                .rsi = true,
+                .harnessmm = selected,
+                .rsi = selected,
                 .rsi_policy = selected_policy,
                 .prompt = "",
                 .system_prompt = "",
@@ -152,11 +149,11 @@ fn checkPreviewRoute(route: Route, preview: bool) !void {
             try std.testing.expectEqual(expected_calls, calls);
         },
     }
-    try std.testing.expectEqual(@as(usize, if (preview) 1 else 2), server.requestCount());
+    try std.testing.expectEqual(@as(usize, if (selected) 1 else 2), server.requestCount());
     const first = server.requestAt(0) orelse return error.MissingRequest;
-    try std.testing.expectEqual(preview, std.mem.indexOf(u8, first.body(), cc.harnessmm.AUTHOR_MARKER) != null);
-    try std.testing.expectEqual(preview, std.mem.indexOf(u8, first.body(), INSTRUCTION) != null);
-    if (preview) {
+    try std.testing.expectEqual(selected, std.mem.indexOf(u8, first.body(), cc.harnessmm.AUTHOR_MARKER) != null);
+    try std.testing.expectEqual(selected, std.mem.indexOf(u8, first.body(), INSTRUCTION) != null);
+    if (selected) {
         const journal = try tmp.dir.readFileAlloc(std.testing.io, cc.harnessmm.JOURNAL_NAME, a, .limited(65536));
         defer a.free(journal);
         try std.testing.expect(std.mem.indexOf(u8, journal, "\"decision_id\":\"A\"") != null);
@@ -173,27 +170,27 @@ test "L2 HarnessMM preview: kernel opt-out skips RSI policy and certificate I/O"
     try checkPreviewRoute(.root, false);
 }
 
-test "L2 HarnessMM preview: explicit child selections require inherited preview" {
+test "L2 HarnessMM preview: child selections apply without the preview umbrella" {
     try checkPreviewRoute(.child, false);
     try checkPreviewRoute(.child, true);
 }
 
-test "L2 HarnessMM preview: background handoff preserves preview and explicit selections" {
+test "L2 HarnessMM preview: background handoff preserves explicit selections" {
     try checkPreviewRoute(.background, false);
     try checkPreviewRoute(.background, true);
 }
 
 test "L2 HarnessMM preview: resume filters inactive host notes and never replays a historical graph" {
     const a = std.testing.allocator;
-    const Selection = struct { preview: bool, harnessmm: bool, rsi: bool };
+    const Selection = struct { preview: cc.types_mod.PreviewFeatures, harnessmm: bool, rsi: bool };
     for ([_]Selection{
-        .{ .preview = false, .harnessmm = true, .rsi = true },
-        .{ .preview = true, .harnessmm = false, .rsi = true },
-        .{ .preview = true, .harnessmm = true, .rsi = false },
-        .{ .preview = true, .harnessmm = true, .rsi = true },
+        .{ .preview = .all, .harnessmm = false, .rsi = false },
+        .{ .preview = .none, .harnessmm = false, .rsi = true },
+        .{ .preview = .none, .harnessmm = true, .rsi = false },
+        .{ .preview = .none, .harnessmm = true, .rsi = true },
     }) |selection| {
-        const reuse = selection.preview and selection.harnessmm;
-        const rsi = selection.preview and selection.rsi;
+        const reuse = selection.harnessmm;
+        const rsi = selection.rsi;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -278,7 +275,7 @@ test "L2 HarnessMM: fast native calls consume turns and stop before the next EDG
     var render = cc.writer_backend.WriterBackend.initNull();
     const backend = render.backend();
     const result = try cc.agent_loop.run(&conversation, client.provider(), defs, &permission, .{
-        .preview = true,
+        .preview = .all,
         .harnessmm = true,
         .max_turns = 2,
         .cwd_abs = root,

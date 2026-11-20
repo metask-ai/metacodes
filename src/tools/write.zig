@@ -353,15 +353,15 @@ test "comment preview checks Write and Edit before touching the file" {
     const io = std.testing.io;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = tt.normalizeSlashes(buf[0..try tmp.dir.realPath(io, &buf)]);
-    var ctx: ToolContext = .{ .allocator = a, .cwd_abs = root, .resolve_relative_paths = true, .preview = true };
+    var ctx: ToolContext = .{ .allocator = a, .cwd_abs = root, .resolve_relative_paths = true, .preview = .all };
     const args =
         \\{"path":"code.py","content":"x = 1  # existing\n"}
     ;
     try std.testing.expectError(error.AddedCodeComment, execute(&ctx, args));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "code.py", .{}));
-    ctx.preview = false;
+    ctx.preview = .none;
     a.free(try execute(&ctx, args));
-    ctx.preview = true;
+    ctx.preview = .all;
     const edit = @import("edit.zig").execute;
     a.free(try edit(&ctx,
         \\{"file_path":"code.py","old_string":"x = 1","new_string":"x = 2"}

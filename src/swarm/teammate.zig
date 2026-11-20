@@ -248,7 +248,7 @@ pub const TeammateEntry = struct {
 
 /// spawn 参数(borrowed;registry 内部 dupe)。
 pub const SpawnTeammateParams = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// 未清洗的期望名(内部 sanitize;重名由调用方[SW2 工具层]先做后缀去重)。
     name: []const u8,
     /// 已清洗 team 名(config.json 必须已存在——TeamCreate 先行)。
@@ -292,7 +292,7 @@ pub const SpawnTeammateParams = struct {
 /// 线程拥有的输入(dupe 自 params;线程结束自行 cleanup)。
 const TeammateInput = struct {
     allocator: std.mem.Allocator,
-    preview: bool,
+    preview: @import("../preview.zig").Features,
     entry: *TeammateEntry,
     prompt: []u8,
     session: session_id_mod.SessionId,
