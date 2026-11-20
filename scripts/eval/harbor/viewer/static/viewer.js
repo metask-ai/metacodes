@@ -299,6 +299,13 @@ async function renderBatch(id) {
     try { await api('/api/batch/cancel', { id: b.id }); state.countdown = 1; }
     catch (error) { event.currentTarget.disabled = false; setConnection(false, error.message); }
   } }, '停止批次') : null;
+  const remove = !batchActive(b) && b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
+    const button = event.currentTarget;
+    if (!confirm(`删除批次 ${batchName(b)}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+    button.disabled = true;
+    try { await api('/api/batch/delete', { id: b.id }); location.hash = '#/'; }
+    catch (error) { button.disabled = false; setConnection(false, error.message); }
+  } }, '删除批次') : null;
   const m = b.metacodes || {};
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
     h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
@@ -363,7 +370,7 @@ async function renderBatch(id) {
   const tasks = panel('逐任务', `${b.tasks.length} 道 · 点开看每次尝试的轨迹、Token 分布和耗时`, h('div', {}, chips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '各次结局', '通过 / 有效', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 3 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('批次信息', BATCH_STATUS[b.status] || b.status, info, stop), compositionPanel(s, '本批次均值'), items, tasks);
+  return h('div', {}, metrics, panel('批次信息', BATCH_STATUS[b.status] || b.status, info, stop || remove), compositionPanel(s, '本批次均值'), items, tasks);
 }
 
 async function renderBatchTask(batchId, jobName, taskName, trialName) {

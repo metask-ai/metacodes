@@ -1236,9 +1236,15 @@ def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = No
     """`metacodes bench sync --run NAME`: copy an SSH run's job directory
     back after its worker could not, and clear the receipt's note. A run
     whose Harbor exited 0 becomes `finished` once its copy is complete."""
-    from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
+    from scripts.eval.harbor.store.ingest import root_lock
     if not isinstance(name, str) or not RUN_NAME.fullmatch(name):
         raise ValueError("运行名称无效")
+    with root_lock(Path(jobs_dir)):
+        return _sync_run(Path(jobs_dir), name, log, timeout)
+
+
+def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
+    from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
     records = Path(jobs_dir) / ".bench-runs"
     record_path, spec_path = records / (name + ".json"), records / (name + ".spec")
     try:

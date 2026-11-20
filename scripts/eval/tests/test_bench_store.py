@@ -417,13 +417,11 @@ class IngestTest(StoreCase):
         _trial(job, "b__2", reward=0.0)
         _job(jobs, "bench-live", "m", planned=2, finished=True)
         records = jobs / ".bench-runs"
-        atomic_json(records / "bench-live.json", {"name": "bench-live", "status": "finished", "model": "m",
-                                                  "exit_code": 0})
+        atomic_json(records / "bench-live.json", {"name": "bench-live", "status": "running", "model": "m"})
         atomic_json(records / "bench-live.spec", {"name": "bench-live"})
         (records / "bench-live.log").write_bytes(b"worker log\n")
         beats = []
-        sync.finish(lambda: beats.append(1))
-        sync.record("bench-live")
+        sync.finish(lambda: beats.append(1), {"name": "bench-live", "status": "finished", "model": "m", "exit_code": 0})
         view = library.job_view("bench-live")
         self.assertFalse(view["running"])
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
@@ -437,8 +435,7 @@ class IngestTest(StoreCase):
                                   "store": {"backend": "sqlite", "path": str(self.temp / "dir-not-file")}})
         (self.temp / "dir-not-file").mkdir()
         _job(self.temp, "x", "m", planned=1)
-        sync.finish(lambda: None)
-        sync.record("x")
+        sync.finish(lambda: None, {"name": "x", "status": "failed"})
         self.assertTrue(sync.failed)
 
 
