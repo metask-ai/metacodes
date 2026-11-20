@@ -75,6 +75,8 @@ TOOLCHAIN_SCRIPT = r"""
 set -euo pipefail
 root=${TOOLCHAINS:-/toolchains}
 arch=$(uname -m)
+# Slow or flaky links drop transfers midway; retry like scripts/ci/install-elan.sh.
+fetch() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors "$@"; }
 mkdir -p "$root/zig" "$root/lean"
 # The host serializes installs on this cache; flock also guards a direct run.
 if command -v flock >/dev/null 2>&1; then exec 9>"$root/.install-lock" && flock 9; fi
@@ -83,11 +85,11 @@ rm -rf "$root"/.staging-*
 tmp=$(mktemp -d "$root/.staging-XXXXXX")
 zig_dir=$root/zig/$ZIG_VERSION
 if [ ! -f "$zig_dir/.bench-complete" ]; then
-  read -r url sum < <(curl -fsSL https://ziglang.org/download/index.json | python3 -c '
+  read -r url sum < <(fetch https://ziglang.org/download/index.json | python3 -c '
 import json, sys
 entry = json.load(sys.stdin)[sys.argv[1]][sys.argv[2] + "-linux"]
 print(entry["tarball"], entry["shasum"])' "$ZIG_VERSION" "$arch")
-  curl -fsSL "$url" -o "$tmp/zig.tar.xz"
+  fetch "$url" -o "$tmp/zig.tar.xz"
   echo "$sum  $tmp/zig.tar.xz" | sha256sum -c -
   mkdir "$tmp/zig"
   tar -xJf "$tmp/zig.tar.xz" -C "$tmp/zig" --strip-components=1
@@ -98,12 +100,16 @@ fi
 lean_dir=$root/lean/$LEAN_DIR
 if [ ! -f "$lean_dir/.bench-complete" ]; then
   case "$arch" in x86_64) sum=$ELAN_SHA256_X86_64 ;; aarch64) sum=$ELAN_SHA256_AARCH64 ;; *) exit 1 ;; esac
-  curl -fsSL "https://github.com/leanprover/elan/releases/download/v$ELAN_VERSION/elan-$arch-unknown-linux-gnu.tar.gz" -o "$tmp/elan.tar.gz"
+  fetch "https://github.com/leanprover/elan/releases/download/v$ELAN_VERSION/elan-$arch-unknown-linux-gnu.tar.gz" -o "$tmp/elan.tar.gz"
   echo "$sum  $tmp/elan.tar.gz" | sha256sum -c -
   tar -xzf "$tmp/elan.tar.gz" -C "$tmp"
   export ELAN_HOME=$tmp/elan
   "$tmp/elan-init" -y --no-modify-path --default-toolchain none >/dev/null
-  "$ELAN_HOME/bin/elan" toolchain install "$LEAN_TOOLCHAIN"
+  for attempt in 1 2 3 4 5; do
+    "$ELAN_HOME/bin/elan" toolchain install "$LEAN_TOOLCHAIN" && break
+    [ "$attempt" -lt 5 ] || exit 1
+    sleep 5
+  done
   set -- "$ELAN_HOME"/toolchains/*/
   [ "$#" -eq 1 ] && [ -x "$1/bin/lake" ]
   touch "$1/.bench-complete"
@@ -256,6 +262,16 @@ def _run(argv, cancelled, name=None, input_text=None, cwd=None, quiet=False):
         return process.returncode, errors.read().decode(errors="replace")
 
 
+def _network(argv, cancelled, cwd=None, attempts=3, reset=lambda: None):
+    """A git transfer, retried: flaky links drop TLS connections midway."""
+    for attempt in range(attempts):
+        reset()
+        code, stderr = _run(argv, cancelled, cwd=cwd, quiet=True)
+        if code == 0 or attempt == attempts - 1:
+            return code, stderr
+        time.sleep(3)
+
+
 def _git(*args, cwd=None):
     result = subprocess.run(["git", *args], cwd=cwd, stdin=subprocess.DEVNULL,
                             capture_output=True, text=True)
@@ -276,7 +292,8 @@ def resolve(ref, cache_dir, repo=None, cancelled=lambda: False):
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         staged = Path(cache_dir) / (".source-" + uuid.uuid4().hex)
         try:
-            code, stderr = _run(["git", "clone", "-q", "--mirror", repo, str(staged)], cancelled, quiet=True)
+            code, stderr = _network(["git", "clone", "-q", "--mirror", repo, str(staged)], cancelled,
+                                    reset=lambda: shutil.rmtree(staged, ignore_errors=True))
             if code:
                 raise BuildError("无法获取源码仓库：" + _redact((stderr.strip().splitlines() or ["?"])[-1], repo))
             # Builds fetch one resolved commit by id from this mirror.
@@ -289,7 +306,7 @@ def resolve(ref, cache_dir, repo=None, cancelled=lambda: False):
         # recorded under this repository's name.
         if _git("remote", "set-url", "origin", repo, cwd=mirror)[0]:
             raise BuildError("无法把源码镜像切换到配置的仓库")
-        code, stderr = _run(["git", "fetch", "-q", "--prune", "origin"], cancelled, cwd=mirror, quiet=True)
+        code, stderr = _network(["git", "fetch", "-q", "--prune", "origin"], cancelled, cwd=mirror)
         if code:
             raise BuildError("无法更新源码仓库：" + _redact((stderr.strip().splitlines() or ["?"])[-1], repo))
     if ref.startswith("refs/"):
