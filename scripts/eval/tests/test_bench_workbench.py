@@ -9,6 +9,7 @@ import argparse
 import ast
 import json
 import concurrent.futures
+import io
 import os
 import socket
 import sys
@@ -19,6 +20,7 @@ import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
 from scripts.eval.harbor import cli
@@ -626,6 +628,11 @@ class WorkbenchTest(unittest.TestCase):
         gone = f'http://127.0.0.1:{closed.getsockname()[1]}/'
         closed.close()
         self.assertIsNone(cli.receipt_client({'url': gone}, self.manager.config_path))
+
+    def test_an_unexpected_failure_answers_instead_of_dropping_the_connection(self):
+        with patch.object(Workbench, 'create_batch', side_effect=FileNotFoundError('/tmp/gone/bench-provider-x')):
+            with self.assertRaisesRegex(ValueError, '内部错误'), redirect_stderr(io.StringIO()):
+                self.client.request('api/batches', {})
 
     def test_a_login_era_service_is_known_by_its_receipt_capability(self):
         legacy = {'url': 'http://127.0.0.1:1/', 'token': 'capability'}
@@ -1253,6 +1260,27 @@ class ServiceReuseTest(unittest.TestCase):
                 patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}):
             client = cli.running_service(Path('/state/bench'), self.CONFIG, '/jobs/a', self.store())
         self.assertEqual(client.url, 'http://127.0.0.1:1/')
+
+    def test_service_runs_on_its_own_temporary_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = str(root / 'jobs')
+            started = {'url': 'http://127.0.0.1:1/', 'listen_url': 'http://127.0.0.1:1/', 'bind': '127.0.0.1',
+                       'jobs_dir': jobs, 'store': self.STORE}
+            earlier = dict(started)
+            atomic_json(root / 'service.json', earlier)
+            catalog = {'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}
+            with patch.object(cli.Client, 'request', return_value=catalog), \
+                    patch.object(cli, 'stop_service') as stop, \
+                    patch.object(cli, 'settings', side_effect=[earlier, started]), \
+                    patch.object(cli.subprocess, 'Popen') as popen:
+                cli.ensure_service(argparse.Namespace(bind=None, port=None, public_url=None),
+                                   root, self.CONFIG, jobs, self.store())
+            stop.assert_called_once()
+            self.assertEqual(popen.call_args.kwargs['env']['TMPDIR'], str(root / 'tmp'))
+            self.assertTrue((root / 'tmp').is_dir())
+            receipt = json.loads((root / 'service.json').read_text())
+            self.assertEqual(receipt, {**started, 'tmpdir': str(root / 'tmp')})
 
     def test_service_for_another_directory_is_not_reused(self):
         record = {'url': 'http://127.0.0.1:2/', 'jobs_dir': '/jobs/b', 'store': self.STORE}
