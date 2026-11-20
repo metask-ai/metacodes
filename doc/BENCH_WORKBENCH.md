@@ -280,11 +280,17 @@ renamed into place only when complete, so an interrupted install is redone.
 Downloads and git transfers are retried. The revision's own build then runs
 with those toolchains mounted read-only and its checkout and caches in a fresh
 temporary directory: `kernels:stage`, the kernel pins, and `release:verify`
-for `x86_64-linux-gnu.2.31`. The commit is fetched by id with the tags that
-point at it, so a stable version's manifest finds its release tag.
+for `x86_64-linux-gnu.2.31`. The container never sees the mirror or its
+remote URL: the host exports the commit and the tags that point at it as a
+`git bundle`, mounted read-only, so a stable version's manifest finds its
+release tag and a token in `source_repo` stays on the host.
 
 The unit is published as `<state root>/bench/bundles/metacodes-git-<commit>-x86_64-linux-gnu/`,
-where the 新建 page offers it as a batch version like any other bundle. A
+where the 新建 page offers it as a batch version like any other bundle, but
+only while the configured `source_repo` is the repository that verified it
+under the current trust rule: after switching repositories, a unit appears
+again once `bench build` has re-verified its commit, and a batch cannot be
+created from one that is not listed. A
 build record beside it names the commit and identifies the repository only by
 a digest of its URL; git errors are printed with URL credentials removed. A
 full commit id that the configured repository already verified is reused
@@ -292,7 +298,8 @@ without contacting it; after switching `source_repo`, or for a record
 without that proof, the commit is checked again, and a unit without a record
 from this builder is rebuilt. Fetching, installing, building and publishing
 hold a lock on `<state root>/bench/git/`, so services sharing a state root
-take turns. Ctrl-C stops git or the build container. The first build
+take turns. Ctrl-C stops git or the build container. Progress and build logs go to
+stderr, so `--json` prints a single JSON document on stdout. The first build
 downloads both toolchains (Lean is about 250 MB); later builds of the same
 toolchain versions reuse them.
 

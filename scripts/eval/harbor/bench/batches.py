@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.store.ingest import BATCHES_DIR
-from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, now, settings
 
 MAX_ITEMS = 16
@@ -82,6 +82,8 @@ def bundle_choices(cfg: Dict[str, Any], config_path: Path) -> List[Dict[str, Any
         try:
             manifest = check_bundle(resolved)
         except ValueError:
+            return
+        if not builds.selectable(resolved, cfg.get("source_repo")):
             return
         seen.add(resolved)
         choices.append({"id": resolved.name, "path": str(resolved), "current": current,

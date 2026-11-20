@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -97,9 +98,7 @@ export HOME=$work/home ZIG_GLOBAL_CACHE_DIR=$work/zig-cache
 mkdir -p "$HOME"
 git init -q "$work/src"
 cd "$work/src"
-refspecs=()
-for tag in $TAGS; do refspecs+=("refs/tags/$tag:refs/tags/$tag"); done
-git fetch -q --no-tags "$MIRROR" "$COMMIT" ${refspecs[@]+"${refspecs[@]}"}
+git fetch -q "$SOURCE" "refs/*:refs/*"
 git checkout -q --detach "$COMMIT"
 """
 
@@ -158,6 +157,23 @@ def _verified_by(info, commit, repo):
         and info["trust_policy"] == TRUST_POLICY
 
 
+def is_git_unit(path):
+    return Path(path).name.startswith("metacodes-git-")
+
+
+def selectable(path, repo=None):
+    unit = Path(path)
+    if not is_git_unit(unit):
+        return True
+    info = build_info(unit)
+    if not info or unit != unit_path(unit.parent.parent, info["commit"] or ""):
+        return False
+    source = check_bundle(unit).get("source")
+    if not isinstance(source, dict) or source.get("commit") != info["commit"]:
+        return False
+    return _verified_by(info, info["commit"], repo or DEFAULT_REPO)
+
+
 def _redact(text, repo):
     return re.sub(r"(://)[^/@\s]+@", r"\1***@", text.replace(repo, "<source_repo>"))
 
@@ -193,8 +209,8 @@ def _docker(*args):
 def _run(argv, cancelled, name=None, input_text=None, cwd=None, quiet=False):
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL if quiet else None,
-                                   stderr=errors if quiet else None, start_new_session=True)
+                                   stdout=subprocess.DEVNULL if quiet else sys.stderr,
+                                   stderr=errors if quiet else sys.stderr, start_new_session=True)
         if input_text is not None:
             process.stdin.write(input_text.encode())
             process.stdin.close()
@@ -283,6 +299,19 @@ def tags_at(mirror, commit):
     return [name for name in names.split() if REF.fullmatch(name)]
 
 
+def source_bundle(mirror, commit, path):
+    ref = "refs/bench-build/" + uuid.uuid4().hex
+    _git("update-ref", ref, commit, cwd=mirror)
+    try:
+        code, _ = _git("bundle", "create", str(path), ref, *("refs/tags/" + tag for tag in tags_at(mirror, commit)),
+                       cwd=mirror)
+    finally:
+        _git("update-ref", "-d", ref, cwd=mirror)
+    if code:
+        raise BuildError(f"无法导出提交 {commit[:12]} 的源码")
+    return path
+
+
 def toolchain_versions(mirror, commit):
     _, zon = _git("show", commit + ":build.zig.zon", cwd=mirror)
     match = re.search(r'minimum_zig_version\s*=\s*"([^"]*)"', zon)
@@ -320,7 +349,8 @@ def _build(ref, bench_dir, cache_dir, repo, cancelled):
         raise BuildError("构建 git 版本需要这台机器上的 Docker")
     zig, lean = toolchain_versions(mirror, commit)
     lean_dir = re.sub(r"[^A-Za-z0-9._-]", "-", lean)
-    print(f"bench: building metacodes {ref} ({commit[:12]}) for {TARGET} with Zig {zig}, {lean}", flush=True)
+    print(f"bench: building metacodes {ref} ({commit[:12]}) for {TARGET} with Zig {zig}, {lean}",
+          file=sys.stderr, flush=True)
     if _docker("image", "inspect", image()):
         if _run(["docker", "build", "-q", "--platform", PLATFORM, "-t", image(), "-"], cancelled,
                 input_text=DOCKERFILE)[0]:
@@ -339,13 +369,13 @@ def _build(ref, bench_dir, cache_dir, repo, cancelled):
     out = work / "unit"
     out.mkdir(parents=True)
     name = "metacodes-bench-build-" + uuid.uuid4().hex[:12]
-    argv = ["docker", "run", "--rm", "--platform", PLATFORM, "--name", name, *user,
-            "-v", f"{mirror.resolve()}:/mirror:ro", "-v", f"{out.resolve()}:/out",
-            "-v", f"{toolchains / 'zig' / zig}:/opt/zig:ro",
-            "-v", f"{toolchains / 'lean' / lean_dir}:/opt/lean:ro",
-            "-e", "MIRROR=/mirror", "-e", "COMMIT=" + commit,
-            "-e", "TAGS=" + " ".join(tags_at(mirror, commit))]
     try:
+        source = source_bundle(mirror, commit, work / "source.bundle").resolve()
+        argv = ["docker", "run", "--rm", "--platform", PLATFORM, "--name", name, *user,
+                "-v", f"{source}:/source.bundle:ro", "-v", f"{out.resolve()}:/out",
+                "-v", f"{toolchains / 'zig' / zig}:/opt/zig:ro",
+                "-v", f"{toolchains / 'lean' / lean_dir}:/opt/lean:ro",
+                "-e", "SOURCE=/source.bundle", "-e", "COMMIT=" + commit]
         if _run(argv + [image(), "bash", "-c", CHECKOUT_SCRIPT + RELEASE_SCRIPT], cancelled, name=name)[0]:
             raise BuildError(f"git 版本 {ref}（{commit[:12]}）编译失败，详见上方日志")
         try:

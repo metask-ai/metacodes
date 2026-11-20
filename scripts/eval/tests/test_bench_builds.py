@@ -100,10 +100,10 @@ class GitRefBuildTest(unittest.TestCase):
         path = builds.unit_path(self.bench, commit)
         return path.parent / (path.name + '.json')
 
-    def checkout(self, mirror, commit, tags, probe):
+    def checkout(self, mirror, commit, probe):
+        source = builds.source_bundle(mirror, commit, self.root / (commit + '.bundle'))
         return subprocess.run(['bash', '-c', builds.CHECKOUT_SCRIPT + probe], capture_output=True, text=True,
-                              env={**os.environ, 'MIRROR': str(mirror), 'COMMIT': commit,
-                                   'TAGS': ' '.join(tags), 'TMPDIR': str(self.root)})
+                              env={**os.environ, 'SOURCE': str(source), 'COMMIT': commit, 'TMPDIR': str(self.root)})
 
     def test_ref_builds_once_per_commit_into_a_batch_choice(self):
         first = self.git('rev-parse', 'HEAD')
@@ -117,12 +117,15 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertEqual(build[build.index('--platform') + 1], 'linux/amd64')
         mounts = [build[i + 1] for i, a in enumerate(build) if a == '-v']
         self.assertEqual([m for m in mounts if not m.endswith(':ro')], [m for m in mounts if m.endswith(':/out')])
+        self.assertTrue(any(m.endswith('/source.bundle:/source.bundle:ro') for m in mounts))
+        self.assertFalse(any('source.git' in m for c in self.calls() for m in c))
         self.assertTrue(any(m.endswith('/zig/0.16.0:/opt/zig:ro') for m in mounts))
         self.assertTrue(any(m.endswith('/lean/leanprover-lean4-v4.14.0:/opt/lean:ro') for m in mounts))
         toolchain = self.toolchain_runs()[0]
         self.assertIn('ZIG_VERSION=0.16.0', toolchain)
         self.assertFalse(any(a.endswith(':/mirror:ro') or a.endswith(':/out') for a in toolchain))
-        choices = bundle_choices({}, self.bench / 'workbench.json')
+        self.assertEqual(bundle_choices({}, self.bench / 'workbench.json'), [])
+        choices = bundle_choices({'source_repo': str(self.repo)}, self.bench / 'workbench.json')
         self.assertEqual([(c['id'], c['commit']) for c in choices], [(unit.name, first)])
         self.assertNotIn('source', json.dumps([{k: v for k, v in c.items() if k != 'source'} for c in choices]))
         self.assertEqual(self.build(first[:8])[0], unit)
@@ -135,11 +138,12 @@ class GitRefBuildTest(unittest.TestCase):
     def test_cli_build_prints_the_bundle_and_refuses_an_empty_ref(self):
         state = self.bench.parent
         (self.bench / 'workbench.json').write_text(json.dumps({'source_repo': str(self.repo)}))
-        output = io.StringIO()
-        with patch('sys.stdout', output):
-            self.assertEqual(cli.main(['build', '--state-root', str(state), '--ref', 'main', '--json']), 0)
-        value = json.loads(output.getvalue().strip().splitlines()[-1])
-        self.assertEqual(value['bundle'], builds.unit_path(self.bench, value['commit']).name)
+        for _ in range(2):
+            output = io.StringIO()
+            with patch('sys.stdout', output):
+                self.assertEqual(cli.main(['build', '--state-root', str(state), '--ref', 'main', '--json']), 0)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value['bundle'], builds.unit_path(self.bench, value['commit']).name)
         with patch('sys.stderr', io.StringIO()):
             self.assertEqual(cli.main(['build', '--state-root', str(state), '--ref', '']), 1)
             with self.assertRaises(SystemExit):
@@ -191,7 +195,7 @@ class GitRefBuildTest(unittest.TestCase):
         self.git('branch', 'published', candidate)
         mirror, commit = builds.resolve(candidate, self.root / 'cache', str(self.repo))
         self.git('branch', '-D', 'published')
-        result = self.checkout(mirror, commit, [], 'git rev-parse HEAD')
+        result = self.checkout(mirror, commit, 'git rev-parse HEAD')
         self.assertEqual((result.returncode, result.stdout.strip()), (0, candidate), result.stderr)
 
     def test_release_tag_reaches_the_checkout_and_tag_or_sha_share_one_build(self):
@@ -199,10 +203,9 @@ class GitRefBuildTest(unittest.TestCase):
         self.git('tag', '-a', '-m', 'release', '0.0.1')
         mirror, _ = builds.resolve('0.0.1', self.root / 'cache', str(self.repo))
         self.assertEqual(builds.tags_at(mirror, commit), ['0.0.1'])
-        result = self.checkout(mirror, commit, ['0.0.1'], 'git describe --tags --exact-match HEAD')
+        result = self.checkout(mirror, commit, 'git describe --tags --exact-match HEAD')
         self.assertEqual((result.returncode, result.stdout.strip()), (0, '0.0.1'), result.stderr)
         unit = self.build('0.0.1')[0]
-        self.assertIn('TAGS=0.0.1', self.builds_run()[0])
         self.assertEqual(self.build(commit)[0], unit)
         self.assertEqual(len(self.builds_run()), 1)
 
@@ -214,9 +217,17 @@ class GitRefBuildTest(unittest.TestCase):
         forked = self.git('rev-parse', 'HEAD', repo=fork)
         self.build(forked, repo=fork)
         self.build(commit, repo=fork)
+        official = {'source_repo': str(self.repo)}
+
+        def listed(cfg):
+            return {c['commit'] for c in bundle_choices(cfg, self.bench / 'workbench.json')}
+
+        self.assertEqual(listed({'source_repo': str(fork)}), {forked, commit})
+        self.assertEqual(listed(official), set())
         with self.assertRaisesRegex(ValueError, '不在源码仓库的任何分支或 tag 上'):
             self.build(forked)
         self.assertEqual(self.build(commit)[1]['source_id'], builds.source_id(str(self.repo)))
+        self.assertEqual(listed(official), {commit})
         self.assertEqual(len(self.builds_run()), 2)
         moved = self.root / 'away'
         self.repo.rename(moved)

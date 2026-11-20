@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -240,6 +241,34 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(record['items'][0]['status'], 'failed')
         self.assertIn('已被修改', record['items'][0]['error'])
         self.assertEqual(self.manager.runs(), [])
+
+    def git_unit(self, commit, repo):
+        from scripts.eval.harbor.bench import builds
+        unit = builds.unit_path(self.root, commit)
+        shutil.copytree(self.root / 'bundle', unit)
+        atomic_json(unit / 'manifest.json', {'target': {'os': 'linux'}, 'source': {'commit': commit, 'dirty': False}})
+        atomic_json(unit.parent / (unit.name + '.json'),
+                    {'ref': 'main', 'commit': commit, 'version': '0.0.0-dev', 'built_at': 'now',
+                     'source_id': builds.source_id(repo), 'trust_policy': builds.TRUST_POLICY})
+        return unit.name
+
+    def test_git_bundle_is_offered_only_while_its_repository_is_configured(self):
+        unit = self.git_unit('a' * 40, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+
+        def listed():
+            return [b['id'] for b in self.client.request('api/workbench')['bundles']]
+
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        self.assertIn(unit, listed())
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/official.git'})
+        self.assertNotIn(unit, listed())
+        with self.assertRaisesRegex(ValueError, '版本'):
+            self.client.request('api/batches', self.request(bundle=unit))
+        self.assertFalse((self.root / 'bundles' / 'frozen').exists())
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        self.assertEqual(Path(created['metacodes']['bundle']).parent, self.root / 'bundles' / 'frozen')
 
     def test_invalid_batches_are_refused_before_anything_is_written(self):
         for override in ({'items': []}, {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}] * 2},
