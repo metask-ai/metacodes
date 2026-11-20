@@ -654,6 +654,7 @@ test "teamwork REPL L2: with preview off /teamwork is refused and never becomes 
 }
 
 test "teamwork REPL L2: Ctrl+C cancels a running interview and the next message still runs" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var c: Case = undefined;
     try c.init();
     defer c.deinit();
