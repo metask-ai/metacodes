@@ -713,9 +713,14 @@ metacodes bench info --url http://devbox:18766/
 The workbench is meant for a trusted internal network and has no login:
 anyone who can open the address can configure it (providers and their API
 keys, database, setup) and launch or cancel runs. Bind it only to an
-internal address. Requests that another site's page sends from a browser
-(a foreign `Origin`) are still refused. A service started without
-`--config` (a plain results viewer) is read-only. The service receipt is
+internal address. It serves only its own entries: the `--public-url`
+address, `localhost` and IP literals on the listening port. A request whose
+`Host` names anything else (for example a foreign name rebound to the
+service's address) is refused, and a browser's `Origin` must be exactly the
+entry it used (scheme, host and port); clients without an `Origin` (the
+CLI) only need a trusted entry. Open it by IP, `localhost` or the
+`--public-url` name. A service started without `--config` (a plain results
+viewer) is read-only. The service receipt is
 `<state root>/bench/service.json` (mode 0600 on POSIX).
 
 After upgrading the binary, a running workbench keeps serving the previous
@@ -723,7 +728,10 @@ version. On the service host, use the existing state directory for both
 commands. Run `metacodes bench stop` and wait for the old listener to stop
 responding, then rerun `metacodes bench` with the same jobs directory and any
 bind, port, and public URL options. Active benchmark workers continue through the
-restart.
+restart. A service from before the login was dropped still requires its
+link: `metacodes bench stop` and `metacodes bench` stop it with the
+capability from this machine's receipt (the only use of it left), and
+`metacodes bench` then starts the login-free service.
 
 ## Using the page
 
@@ -948,7 +956,7 @@ psycopg 3 in the Python that runs bench
 PostgreSQL store is configured; SQLite needs only the standard library.
 Keep the database (or the jobs directory) when moving or backing up the
 workbench. The state root's `bench/` directory also holds service settings
-and the private authorization receipt.
+and the private service receipt.
 
 - **新建评测:** choose a suite by category, then its tasks (search, default
   sample, all, or a random N) and a configured model; caps are per suite.

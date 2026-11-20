@@ -44,15 +44,20 @@ def read_env(path):
 
 
 class Client:
-    def __init__(self, url, api_url=None):
+    def __init__(self, url, api_url=None, legacy_token=""):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
             raise ValueError("工作台地址必须是 http(s) URL")
         self.url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
         self.api_url = api_url or self.url
+        # Only for a service started before the login was dropped, read from
+        # this machine's private receipt: it is needed to stop that service.
+        self.legacy_token = legacy_token
 
     def request(self, path, payload=None):
         headers = {"Accept": "application/json"}
+        if self.legacy_token:
+            headers["Authorization"] = "Bearer " + self.legacy_token
         body = None
         if payload is not None:
             body = json.dumps(payload).encode()
@@ -74,6 +79,12 @@ class Client:
         return self.url
 
 
+def local_client(saved):
+    """A client for the service in this machine's receipt. A receipt with a
+    `token` belongs to a service from before the login was dropped."""
+    return Client(saved["url"], saved.get("listen_url"), legacy_token=saved.get("token") or "")
+
+
 def same_service(saved, jobs_dir, store):
     return bool(saved.get("url")) and saved.get("jobs_dir") == str(jobs_dir) and saved.get("store") == store.describe()
 
@@ -82,13 +93,16 @@ def ensure_service(args, root, config, jobs_dir, store):
     ready = root / "service.json"
     saved = settings(ready)
     if saved.get("url") and saved.get("jobs_dir") == str(jobs_dir):
-        client = Client(saved["url"], saved.get("listen_url"))
+        client = local_client(saved)
         try:
             if client.request("api/workbench").get("service") == "metacodes-bench":
-                if same_service(saved, jobs_dir, store):
+                if same_service(saved, jobs_dir, store) and not client.legacy_token:
                     return client
-                # The store changed (or the service predates it): replace
-                # the service so it does not keep writing the old store.
+                # The store changed (or the service predates it), or the
+                # service still requires its login link: replace it. Its
+                # workers keep running; the new service picks them up.
+                if client.legacy_token:
+                    print("bench: 停止需要授权链接的旧版工作台，改用免登录版本", file=sys.stderr)
                 client.request("api/stop", {})
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
@@ -394,7 +408,7 @@ def main(argv=None):
         if client is None and args.action in ("info", "list"):
             saved = settings(root / "service.json")
             if same_service(saved, jobs_dir, store):
-                existing = Client(saved["url"], saved.get("listen_url"))
+                existing = local_client(saved)
                 try:
                     if existing.request("api/workbench").get("service") == "metacodes-bench":
                         client = existing
@@ -418,7 +432,7 @@ def main(argv=None):
         if args.action == "stop":
             saved = settings(root / "service.json")
             if client is None and saved.get("url"):
-                client = Client(saved["url"], saved.get("listen_url"))
+                client = local_client(saved)
             if client is None:
                 value = {"stopped": True, "message": "工作台未启动"}
             else:

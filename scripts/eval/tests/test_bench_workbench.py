@@ -540,6 +540,59 @@ class WorkbenchTest(unittest.TestCase):
         caught.exception.close()
         self.assertEqual(self.manager.runs(), [])
 
+    def raw(self, method, path, host=None, origin=None, body=None):
+        """(status, error) of one request with chosen Host and Origin headers."""
+        import http.client
+        port = self.http.server_address[1]
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        headers = {'Host': host or f'127.0.0.1:{port}'}
+        if origin is not None:
+            headers['Origin'] = origin
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
+        try:
+            connection.request(method, path, body=json.dumps(body).encode() if body is not None else None,
+                               headers=headers)
+            response = connection.getresponse()
+            return response.status, (json.loads(response.read() or b'{}') or {}).get('error')
+        finally:
+            connection.close()
+
+    def test_only_the_workbench_entries_are_served_and_origins_must_match_exactly(self):
+        port = self.http.server_address[1]
+        cancel = {'name': 'bench-20260101-000000-abcdef'}  # passes the checks, then "运行不存在"
+        # A DNS-rebound foreign name reaches the service with that name in Host.
+        for method, body in (('GET', None), ('POST', cancel)):
+            path = '/api/workbench' if method == 'GET' else '/api/cancel'
+            with self.subTest(method=method):
+                self.assertEqual(self.raw(method, path, host=f'evil.example:{port}',
+                                          origin=f'http://evil.example:{port}' if body else None, body=body)[0], 403)
+        # Trusted entries: IP literals and localhost on the listening port.
+        for host in (f'127.0.0.1:{port}', f'localhost:{port}'):
+            with self.subTest(host=host):
+                self.assertEqual(self.raw('GET', '/api/workbench', host=host)[0], 200)
+                self.assertEqual(self.raw('POST', '/api/cancel', host=host, origin='http://' + host, body=cancel)[0], 400)
+        # The CLI sends no Origin.
+        self.assertEqual(self.raw('POST', '/api/cancel', body=cancel)[0], 400)
+        # The browser Origin must be that entry exactly: scheme, host, port.
+        for origin in (f'https://127.0.0.1:{port}', f'http://127.0.0.1:{port + 1}', 'http://127.0.0.1',
+                       f'http://localhost:{port}', 'null', f'http://evil.example:{port}'):
+            with self.subTest(origin=origin):
+                self.assertEqual(self.raw('POST', '/api/cancel', origin=origin, body=cancel)[0], 403)
+        self.assertEqual(self.raw('GET', '/api/workbench', host=f'127.0.0.1:{port + 1}')[0], 403)
+
+    def test_a_configured_public_url_is_a_trusted_entry(self):
+        self.assertEqual(server.trusted_origin('devbox:18766', 18766, 'http://devbox:18766/'), ('http', 'devbox', 18766))
+        self.assertEqual(server.trusted_origin('bench.example', 18766, 'https://bench.example/'),
+                         ('https', 'bench.example', 443))
+        self.assertIsNone(server.trusted_origin('other:18766', 18766, 'http://devbox:18766/'))
+        self.assertIsNone(server.trusted_origin('evil.example:18766', 18766, None))
+        self.assertEqual(server.trusted_origin('[::1]:18766', 18766), ('http', '::1', 18766))
+        trusted = server.trusted_origin('bench.example', 18766, 'https://bench.example/')
+        self.assertTrue(server.same_origin('https://bench.example', trusted))
+        self.assertTrue(server.same_origin('https://bench.example:443', trusted))
+        self.assertFalse(server.same_origin('http://bench.example', trusted))
+
     def test_unknown_models_shell_fragments_and_bad_ranges_are_refused_before_spawn(self):
         for override in ({'tasks': ['--path /etc']}, {'tasks': ['fix-git;touch /tmp/x']},
                          {'concurrency': True}, {'attempts': 0}, {'model': 'unknown'},
