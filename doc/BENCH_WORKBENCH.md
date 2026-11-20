@@ -250,6 +250,52 @@ release's. `--bundle-version X.Y.Z` picks a published unit instead, and
 `metacodes bench --bundle <dir>` still sets one by hand. `METACODES_RELEASE_BASE`
 points the download at a mirror of the releases page.
 
+### Building any git revision
+
+The overlay above keeps a release's Lean kernels. To evaluate an exact
+revision with its own kernels, build its full release unit:
+
+```sh
+metacodes bench build --ref main          # a branch, tag or commit
+metacodes bench build --ref 54a7a632 --json
+```
+
+It needs Docker on the machine whose `<state root>` keeps the bundle. The ref
+is resolved in a mirror of `source_repo` (in `workbench.json`; default the
+GitHub repository) kept at `<state root>/bench/git/source.git`, and a branch
+always means its current head. A branch and a tag of one name on different
+commits are refused; write `refs/heads/<name>` or `refs/tags/<name>`. Only a
+commit on one of that repository's branches or tags is built, because the
+binary later runs with the execution machine's model credential: code that
+only a pull-request or other foreign ref names is refused until it is pushed
+to a branch.
+
+The build runs as the caller's user in `linux/amd64` containers, in two
+steps, the way `release.yml` does. A script owned by the workbench first
+installs the Zig version the revision's `build.zig.zon` names, checked against
+ziglang.org's SHA-256, and the Lean toolchain its
+`control-plane/lean/lean-toolchain` names, through a SHA-256-pinned elan, into
+`<state root>/bench/git/toolchains/`; each is staged on that filesystem and
+renamed into place only when complete, so an interrupted install is redone.
+Downloads and git transfers are retried. The revision's own build then runs
+with those toolchains mounted read-only and its checkout and caches in a fresh
+temporary directory: `kernels:stage`, the kernel pins, and `release:verify`
+for `x86_64-linux-gnu.2.31`. The commit is fetched by id with the tags that
+point at it, so a stable version's manifest finds its release tag.
+
+The unit is published as `<state root>/bench/bundles/metacodes-git-<commit>-x86_64-linux-gnu/`,
+where the 新建 page offers it as a batch version like any other bundle. A
+build record beside it names the commit and identifies the repository only by
+a digest of its URL; git errors are printed with URL credentials removed. A
+full commit id that the configured repository already verified is reused
+without contacting it; after switching `source_repo`, or for a record
+without that proof, the commit is checked again, and a unit without a record
+from this builder is rebuilt. Fetching, installing, building and publishing
+hold a lock on `<state root>/bench/git/`, so services sharing a state root
+take turns. Ctrl-C stops git or the build container. The first build
+downloads both toolchains (Lean is about 250 MB); later builds of the same
+toolchain versions reuse them.
+
 ### Manual configuration
 
 The equivalent manual steps on an execution machine are:
@@ -738,7 +784,8 @@ jobs, or to jobs launched outside a batch.
 
 A batch evaluates one frozen metacodes version on several datasets. The
 新建 page picks the version (the configured Linux bundle by default, or any
-valid bundle under `<state root>/bench/bundles/`), several suites with their
+valid bundle under `<state root>/bench/bundles/`, including those
+`metacodes bench build --ref` builds), several suites with their
 tasks, the model, attempts and concurrency (capped per suite). Creating the
 batch validates every dataset first, then copies the bundle, once per content
 digest, to `<state root>/bench/bundles/frozen/<digest>/` with its files made
