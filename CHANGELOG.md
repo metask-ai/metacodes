@@ -654,6 +654,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A stored default on an OpenRouter model starts when OpenRouter's model
+  list is not on this machine** (#622). A model picked in `/model` for
+  `from now on` is stored as a pin to its offer, and a start resolves that
+  pin against the listing kept in `<state root>/cache/models/`. With no
+  listing kept (the cache deleted, `config.json` copied without it), every
+  start exited 2 with `the stored selection pins offer …`, and only the REPL
+  that could not start would download the listing. Now a start whose pin
+  does not resolve, with an OpenRouter key set and no listing kept, says
+  `Downloading OpenRouter's model list for the stored default model…`,
+  downloads it (30 s at most), keeps it and resolves the pin again. A pin
+  is still never remapped: when the download fails, the start exits 2 and
+  says why, with `--provider openrouter` to start without that model, or
+  `login --provider openrouter` when OpenRouter refused the key. With
+  `METACODES_NO_PROBE` set nothing is downloaded, as before.
+
 - **`/login openrouter` no longer stops the TUI while the account's model
   list downloads, and `/model` says how the download goes** (#572). The list
   (`GET /api/v1/models/user`, about 0.8 MB) was fetched on the REPL's thread
