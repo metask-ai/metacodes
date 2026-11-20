@@ -142,10 +142,14 @@ pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enab
         .custom => |custom| try custom.driverFn(custom.ctx, spec, binding).run(gpa, spec, paths, abort),
     };
     defer outcome.deinit(gpa);
-    record.status = if (outcome == .finished) .needs_you else .failed;
+    const exhausted = outcome != .aborted and ledger.isExhausted();
+    record.status = switch (outcome) {
+        .finished => if (exhausted) .done else .needs_you,
+        else => .failed,
+    };
     try dir.writeSeatRecord(record);
     reporter.seat(record, .working);
-    if (outcome != .aborted and ledger.isExhausted()) return .budget_exhausted;
+    if (exhausted) return .budget_exhausted;
     return switch (outcome) {
         .finished => |handoff| .{ .text = try std.fmt.allocPrint(gpa, "{s}\n\n## Acceptance checks\n\n{s}\n", .{
             std.mem.trim(u8, handoff.conclusion, " \t\r\n"),

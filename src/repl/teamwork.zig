@@ -63,6 +63,7 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
     cmd_output.print("Preparing the teamwork run; unless the request says [skip-interview], the interviewer drafts the task first…\n", .{});
     const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter(), &session.board);
     app.abort.reset();
+    settleBoard(&session.board, result);
     const outcome = result catch |err| {
         cmd_output.print("{s}/teamwork failed: {s}{s}\n", .{ theme.danger, @errorName(err), theme.reset });
         return;
@@ -77,6 +78,11 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
         .budget_exhausted => |id| ended(app, "The budget ran out during the interview.", id),
         .aborted => |id| ended(app, "The interview was cancelled.", id),
     }
+}
+
+fn settleBoard(board: *progress.Board, result: anyerror!command.Interactive) void {
+    const outcome = result catch return board.clear();
+    if (outcome != .started) board.clear();
 }
 
 fn ended(app: *app_mod.App, what: []const u8, id: types.RunId) void {
@@ -155,4 +161,32 @@ const Prompter = struct {
 fn eqlAny(text: []const u8, options: []const []const u8) bool {
     for (options) |option| if (std.ascii.eqlIgnoreCase(text, option)) return true;
     return false;
+}
+
+test "teamwork REPL: an interview that starts no run leaves no progress panel behind" {
+    const runtime = @import("../teamwork/runtime.zig");
+    var board = progress.Board.init(std.testing.allocator);
+    defer board.deinit();
+    const id = try types.RunId.parse("run-1");
+    const seats = [_]runtime.SeatSnapshot{.{ .id = types.seatIdFor(.interviewer, 1), .role = .interviewer, .harness = .metacodes, .status = .needs_you }};
+    const waiting: progress.Snapshot = .{
+        .run_id = id,
+        .goal = "add a feature",
+        .phase = .interviewing,
+        .seats = &seats,
+        .budget = .{ .cap_usd = 2, .spent_usd = 0.25, .remaining_usd = 1.75, .charges = 1 },
+        .audit = .{ .used = 0, .last = null },
+    };
+    const endings = [_]anyerror!command.Interactive{
+        .{ .rejected = id },
+        .{ .interview_failed = id },
+        .{ .budget_exhausted = id },
+        .{ .aborted = id },
+        error.RunExists,
+    };
+    for (endings) |ending| {
+        try board.publish(waiting);
+        settleBoard(&board, ending);
+        try std.testing.expect((try board.read(std.testing.allocator)) == null);
+    }
 }

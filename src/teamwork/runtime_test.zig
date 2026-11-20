@@ -1549,3 +1549,27 @@ test "teamwork progress L2: the host observer gets every seat and phase change, 
     try testing.expectEqual(@as(f64, 0.75), final.snapshot().budget.spent_usd);
     try testing.expectEqualStrings("Add feature.txt.", final.snapshot().goal);
 }
+
+test "teamwork progress L2: an interview that spends the budget never leaves its seat waiting on the user" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-progress-budget");
+    defer fx.deinit();
+    const plans = [_]Plan{.{ .seat = "interviewer-1", .charge_usd = 1 }};
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.StubAuditor = .{ .script = &.{}, .gpa = testing.allocator };
+    defer auditor.deinit();
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    const cfg = try fx.cfg(",\"budget_usd\":1");
+    var abort = types.AbortSignal.init();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor(), .observer = recorder.observer() };
+    var drafted = try interview.draft(testing.allocator, deps, cfg, fx.options(), "add a feature\n", &abort);
+    defer drafted.deinit(testing.allocator);
+    try testing.expect(drafted == .budget_exhausted);
+    var dir = try run_dir.RunDir.open(testing.allocator, fx.state(), fx.options().run_id);
+    defer dir.deinit(testing.allocator);
+    try testing.expectEqual(types.SeatStatus.done, (try dir.readSeatRecord(types.SeatId.parse(interview.interviewer_seat) catch unreachable)).status);
+    try testing.expect(std.mem.indexOf(u8, recorder.text.items, "needs_you") == null);
+}

@@ -157,20 +157,42 @@ fn harnessLabel(harness: teamwork_types.Harness) []const u8 {
 fn appendGoal(alloc: std.mem.Allocator, out: *std.ArrayList(u8), goal: []const u8, max_cols: ?usize) !void {
     const ellipsis = "…";
     const limit = max_cols orelse std.math.maxInt(usize);
-    const fits = term.displayWidth(goal) <= limit;
+    const fits = goalWidth(goal) <= limit;
     var cols: usize = 0;
     var i: usize = 0;
     while (i < goal.len) {
-        const len = @min(std.unicode.utf8ByteSequenceLength(goal[i]) catch 1, goal.len - i);
+        const len = goalCharLen(goal, i);
         const char = goal[i .. i + len];
-        const printable = !(len == 1 and (char[0] < 0x20 or char[0] == 0x7f));
-        const width = if (printable) term.displayWidth(char) else 1;
+        const width = goalCharWidth(char);
         if (!fits and cols + width + 1 > limit) break;
-        if (printable) try out.appendSlice(alloc, char) else try out.append(alloc, ' ');
+        if (isControl(char)) try out.append(alloc, ' ') else try out.appendSlice(alloc, char);
         cols += width;
         i += len;
     }
     if (!fits and limit > 0) try out.appendSlice(alloc, ellipsis);
+}
+
+fn goalWidth(goal: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < goal.len) {
+        const len = goalCharLen(goal, i);
+        cols += goalCharWidth(goal[i .. i + len]);
+        i += len;
+    }
+    return cols;
+}
+
+fn goalCharLen(goal: []const u8, i: usize) usize {
+    return @min(std.unicode.utf8ByteSequenceLength(goal[i]) catch 1, goal.len - i);
+}
+
+fn goalCharWidth(char: []const u8) usize {
+    return if (isControl(char)) 1 else term.displayWidth(char);
+}
+
+fn isControl(char: []const u8) bool {
+    return char.len == 1 and (char[0] < 0x20 or char[0] == 0x7f);
 }
 
 /// token 数格式化:17300 → "17.3k";<1000 原样。
@@ -469,4 +491,17 @@ test "agent_tree teamwork: the goal is cut to the width and never carries contro
     const unbounded = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], "Ship the 全角 feature now"), null);
     defer testing.allocator.free(unbounded);
     try capture.expectContains(unbounded, "* Teamwork · Ship the 全角 feature now\n");
+}
+
+test "agent_tree teamwork: control bytes count as the spaces they become when fitting the goal" {
+    const seats = teamworkSeats();
+    const goal = "ab\x01\x02\x03\x04";
+    const exact = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], goal), 13 + 6);
+    defer testing.allocator.free(exact);
+    try capture.expectContains(exact, "* Teamwork · ab    \n");
+    const narrow = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], goal), 13 + 5);
+    defer testing.allocator.free(narrow);
+    const title = narrow[0..std.mem.indexOfScalar(u8, narrow, '\n').?];
+    try testing.expectEqualStrings("* Teamwork · ab  …", title);
+    try testing.expect(term.displayWidth(title) <= 13 + 5);
 }
