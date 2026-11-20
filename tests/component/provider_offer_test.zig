@@ -1229,8 +1229,9 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     var scratch = picker_mod.Picker.RowBuffer.init(a);
     defer scratch.deinit();
     const rows = try picker.rows(&scratch);
-    try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expect(picker.offers.items[rows[0].model.offer_index].provider_id.eqlText("house-relay"));
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expect(picker.offers.items[rows[0].heading.offer_index].provider_id.eqlText("house-relay"));
+    try std.testing.expect(picker.offers.items[rows[1].model.offer_index].provider_id.eqlText("house-relay"));
 
     // Token admission uses the declared limit, so a prompt that cannot fit is
     // rejected before any request exists.

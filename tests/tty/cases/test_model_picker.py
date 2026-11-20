@@ -95,7 +95,7 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
         per_key_drain=0.08,
     )
     _, text = _screen(raw)
-    # The flat list names each match's provider: the plan, by its name.
+    # The match is listed under its provider's heading: the plan, by its name.
     assert "Z.AI GLM Coding Plan" in text, "过滤未生效:\n" + text
     assert "metask" not in text, "过滤后仍显示不匹配项:\n" + text
     assert "explain this" in text, "picker 吃掉了输入框里的草稿:\n" + text
@@ -167,17 +167,16 @@ def test_picker_opens_during_generation_without_alt_screen(bin_path):
 
 def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     # #220:生成期里筛到一半的浏览状态(过滤词)在回复结束后原样还在,而且 picker
-    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量(厂商标题回来),picker 仍开着。
+    # 仍接收按键:回复结束后按 Esc 清掉过滤,列表回到全量,picker 仍开着。
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
     with SlowMockServer([slow_text_then_end(n_chunks=10, delay=0.4)]) as srv:
         raw = run(
             bin_path,
             # 回复结束后先等空闲输入框再按 Esc(生成结束到下次读输入之间的键会被 TCSAFLUSH
-            # 丢掉);过滤期间没有标题,Esc 清掉过滤后标题回来,以它为末态标志。光标留在
-            # 过滤时所在的 GLM-5.3 上,窗口跟着它,Metask 的标题可能滚出窗口,所以不认哪一家。
+            # 丢掉);Esc 清掉过滤后页脚回到 esc cancel,以它为末态标志。
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
-             wait_for(OPEN), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("billed to your")],
+             wait_for(OPEN), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("esc cancel")],
             base_url=srv.url,
             env={"ZAI_API_KEY": "tty-dummy-zai-key"},
             startup_drain=0.8,
@@ -186,9 +185,10 @@ def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     a, text = _screen(raw)
     kept = [sc for sc in _frames(a)
             if "tok9" in sc and "esc to interrupt" not in sc
-            and "Z.AI GLM Coding Plan" in sc and "billed to your" not in sc]
+            and "Z.AI GLM Coding Plan" in sc and "Model  /zai" in sc]
     assert kept, "回复结束后过滤状态丢了(#220):\n" + text
-    assert OPEN in text and "billed to your" in text, "回复结束后 picker 不再接收按键:\n" + text
+    assert OPEN in text and "Model  /zai" not in text and "esc cancel" in text, \
+        "回复结束后 picker 不再接收按键:\n" + text
 
 
 STORED_KEY = "tty-stored-gateway-key"
@@ -283,7 +283,8 @@ def test_picker_on_the_api_key_route_offers_the_gateway_models(bin_path):
 
     a, text = _screen(raw)
     # The list before the filter is typed: the gateway's models under Metask's heading.
-    listings = [sc for sc in _frames(a) if "Kimi K3" in sc and "billed to your Metask account" in sc]
+    listings = [sc for sc in _frames(a) if "Kimi K3" in sc and "billed to your Metask account" in sc
+                and "Model  /" not in sc]
     assert listings, "picker 没列出网关模型:\n" + text
     listing = listings[-1]
     assert re.search(r"\*\s*glm-5\.3-flash", listing), "当前模型 glm-5.3-flash 未标 *:\n" + listing
@@ -476,24 +477,30 @@ def test_picker_filter_does_not_find_a_provider_without_a_key(bin_path):
 
 def test_picker_filter_lists_whole_matches_before_scattered_ones(bin_path):
     # The filter also matches letters in order, so `glm` matches
-    # `google/gemini-…` (g…l…m) as well as GLM-5.3. The models that hold the
-    # typed text whole come first, and the cursor starts on one of them. Both
-    # providers get a placeholder key: a filter finds only configured ones.
+    # `google/gemini-…` (g…l…m) as well as GLM-5.3. The provider whose models
+    # hold the typed text whole comes first, and the cursor starts on one of
+    # them. Both providers get a placeholder key: a filter finds only
+    # configured ones.
     raw = run(
         bin_path,
-        submit("/model", OPEN) + ["type:glm", wait_for("GLM-5.3"), "sleep:0.3"],
+        submit("/model", OPEN) + ["type:glm", wait_for("GLM-5.3"), "sleep:0.3", "key:end", "sleep:0.5"],
         term_size=(30, 160),
         env=_no_vendor_keys(HOME=case_tmpdir("cc-tty-rank-home-"), ZAI_API_KEY="tty-dummy-zai-key",
                             GEMINI_API_KEY="tty-dummy-gemini-key"),
         per_key_drain=0.1,
     )
-    _, text = _screen(raw, rows=30, cols=160)
-    rows = [line for line in text.split("\n") if re.match(r"^  [> ][* ] \S", line)]
-    names = [("glm" if "GLM" in row else "gemini" if "Gemini" in row else "other") for row in rows]
-    assert "glm" in names and "gemini" in names, "expected GLM and Gemini matches:\n" + text
-    assert names.index("gemini") > len(names) - 1 - names[::-1].index("glm"), \
-        "a scattered match (Gemini) is listed before a whole one (GLM):\n" + text
-    assert rows[0].startswith("  >") and "GLM" in rows[0], "the cursor should start on a GLM model:\n" + text
+    a, text = _screen(raw, rows=30, cols=160)
+    first = [sc for sc in _frames(a) if "Model  /glm" in sc and "[1/" in sc]
+    assert first, "no frame of the filter's first page:\n" + text
+    page = first[-1]
+    assert _headings(page)[:2] == ["Z.AI GLM Coding Plan", "Google Gemini"], \
+        "a scattered match's provider (Gemini) is listed before a whole one's (GLM):\n" + page
+    rows = [line for line in page.split("\n") if re.match(r"^  [> ][* ] \S", line)]
+    assert rows and rows[0].startswith("  >") and "GLM" in rows[0], "the cursor should start on a GLM model:\n" + page
+    tail = [line for line in text.split("\n") if re.match(r"^  [> ][* ] \S", line)]
+    names = [("glm" if "GLM" in line else "gemini" if "Gemini" in line else "other") for line in tail]
+    assert names and names[-1] == "gemini", "the scattered matches should come last:\n" + text
+    assert "glm" not in names[names.index("gemini"):], "a whole match is listed after a scattered one:\n" + text
 
 
 class _DeviceGatewayMock(http.server.BaseHTTPRequestHandler):
@@ -605,3 +612,73 @@ def test_picker_on_the_session_lists_only_chat_models_with_the_gateways_reasonin
         assert "switched to glm-5 for this session · reasoning high" in flat, text
         # The level reached the gateway with the session's own token.
         assert mock.messages == [] or all(auth == f"Bearer {ACCESS_TOKEN}" for auth, _ in mock.messages)
+
+
+RESOLD = [
+    {"id": "deepseek/deepseek-v4.1-flash-1017", "name": "DeepSeek: DeepSeek V4.1 Flash 1017"},
+    {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek: DeepSeek V4.1 Flash"},
+] + [
+    {"id": f"deepseek/deepseek-v4-flash-{n:02d}", "name": f"DeepSeek: DeepSeek V4 Flash {n:02d}"} for n in range(1, 13)
+] + [{"id": "qwen/qwen4-max", "name": "Qwen: Qwen4 Max"}]
+OPENROUTER_KEY = "sk-or-v1-tty600" + "0" * 40
+
+
+class _OpenRouterListing(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # noqa: D401
+        return
+
+    def do_GET(self):  # noqa: N802
+        if self.path != "/api/v1/models/user" or self.headers.get("authorization") != f"Bearer {OPENROUTER_KEY}":
+            self.send_error(404)
+            return
+        body = json.dumps({"data": [
+            dict(model, context_length=1048576, supported_parameters=["tools"],
+                 endpoints=["/api/v1/chat/completions"], pricing={"prompt": "0.00000005", "completion": "0.00000045"})
+            for model in RESOLD
+        ]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_picker_search_keeps_each_match_under_the_provider_that_bills_it(bin_path):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OpenRouterListing)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        raw = run(
+            bin_path,
+            submit("/providers refresh", "provider catalog") + submit("/model", OPEN) + [
+                "type:deepseek", wait_for("Model  /deepseek"), "sleep:0.4", "key:end", "sleep:0.6"],
+            env=_no_vendor_keys(HOME=case_tmpdir("cc-tty-600-home-"), METASK_API_KEY=None,
+                                OPENROUTER_API_KEY=OPENROUTER_KEY, DEEPSEEK_API_KEY="tty-dummy-deepseek-key",
+                                METACODES_OPENROUTER_URL=f"http://127.0.0.1:{server.server_port}"),
+            per_key_drain=0.08,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    a, text = _screen(raw)
+    searched = [sc for sc in _frames(a) if "Model  /deepseek" in sc]
+    assert searched, "the search was never drawn:\n" + text
+    first_page = [sc for sc in searched if "[1/" in sc]
+    assert first_page, "no frame of the search's first page:\n" + text
+    page = first_page[-1]
+    headings = set()
+    for sc in searched:
+        headings.update(_headings(sc))
+    assert {"DeepSeek", "OpenRouter"} <= headings, f"a provider's heading is missing while searching: {headings}\n" + page
+    assert "DeepSeek: DeepSeek V4.1 Flash 1017" in page, "the name is cut at 80 columns:\n" + page
+    assert re.search(r"DeepSeek: DeepSeek V4\.1 Flash {2,}", page), "the name is cut at 80 columns:\n" + page
+    for sc in searched:
+        for line in sc.split("\n"):
+            if re.match(r"^  [> ][* ] \S", line):
+                assert not line.rstrip().endswith(("OpenRouter", "DeepSeek")), "a row still ends in its provider:\n" + sc
+    lines = text.split("\n")
+    header = next((i for i, line in enumerate(lines) if line.startswith("  Model  /deepseek")), None)
+    assert header is not None, "the search is gone after End:\n" + text
+    listed = [line for line in lines[header + 1:] if _headings(line) or re.match(r"^  [> ][* ] \S", line)]
+    assert listed and _headings(listed[0]) == ["OpenRouter"], "the scrolled window does not open with its heading:\n" + text
+    assert any(line.startswith("  > ") for line in listed[1:]), "the cursor is not in the window:\n" + text
