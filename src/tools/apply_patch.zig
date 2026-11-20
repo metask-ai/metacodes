@@ -529,6 +529,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 本阶段**非原子、无回滚**(见文件头)。因此每个文件在自己落盘后立刻上报稳定文件修改契约:
     // 中途失败时,前面的文件如实报 applied、失败那个报 partial(短写可能已改动 inode)、
     // 后面没碰过的报 rejected。批级"部分完成"由这组逐文件真相表达,而不是一个含糊的整批状态。
+    for (plans.items) |pl| try @import("comment_check.zig").checkFile(ctx, pl.path, pl.old_content, pl.new_content);
     phase2_started = true;
     for (plans.items, 0..) |*pl, plan_index| {
         const landed = applyOnePlan(ctx, arena, pl);
@@ -725,6 +726,23 @@ const testing = std.testing;
 
 fn parseOnly(arena: std.mem.Allocator, text: []const u8) !std.ArrayList(Hunk) {
     return Parser.parse(arena, text);
+}
+
+test "comment preview rejects the entire patch before the first file lands" {
+    const a = testing.allocator;
+    var buf1: [512]u8 = undefined;
+    var buf2: [512]u8 = undefined;
+    const first = tt.path(&buf1, "preview-first.py");
+    const second = tt.path(&buf2, "preview-second.py");
+    defer pfs.unlinkPath(first.ptr) catch {};
+    defer pfs.unlinkPath(second.ptr) catch {};
+    const patch = try std.fmt.allocPrint(a, "*** Begin Patch\n*** Add File: {s}\n+x = 1\n*** Add File: {s}\n+# note\n*** End Patch", .{ first, second });
+    defer a.free(patch);
+    const args = try std.json.Stringify.valueAlloc(a, .{ .patch = patch }, .{});
+    defer a.free(args);
+    try testing.expectError(error.AddedCodeComment, execute(&.{ .allocator = a, .preview = true }, args));
+    try testing.expect(!pfs.exists(first.ptr));
+    try testing.expect(!pfs.exists(second.ptr));
 }
 
 test "parse: add file" {

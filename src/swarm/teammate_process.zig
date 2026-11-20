@@ -212,37 +212,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{
-                .session = parent_session,
-                .abort = &app.abort,
-                .api_client = app.anthropicClientOrNull(),
-                .tool_defs = app.tool_defs,
-                .system_prompt = app.system_prompt,
-                .swarm = &sw,
-                .tasks = &app.tasks,
-                .kg = if (app.kg) |*k| k else null,
-                .kg_projects_dir = app.kg_projects_dir,
-                .dyn_registry = &app.dyn_registry,
-                .agents = &app.agents,
-                .parent_model = app.activeModel(),
-                .project_dir = app.project_dir_or_empty(),
-                // task#12(Linus review 第五处):进程外 teammate 的 Bash 也须套 sandbox。此前只传
-                // cwd_abs/home_dir/additional_dirs,漏 .sandbox → ctx.sandbox=null → wrapCommand 被跳过,
-                // Bash 脱管("共享 App 就以为共享沙箱"的假设缺口)。App 已从 settings 载 sandbox,直接接上。
-                .sandbox = app.sandboxPtr(),
-                .cwd_abs = app.cwdAbs(),
-                .additional_dirs = app.additionalDirs(),
-                .home_dir = app.homeDir(),
-                .state_root = app.stateRoot(),
-                .artifact_root = app.sessionDir() orelse "",
-                .tool_result_metrics = &app.tool_result_metrics,
-                // agent_ident 仍是进程自己的 24-hex session id，用于通用
-                // agent-loop 身份。TinyKG 租约单独使用 name@team，保证宿主自领与
-                // 模型后续 TaskUpdate/TaskStop 共用完全相同的 holder 字符串。
-                .agent_ident = agent_ident,
-                .kg_agent_ident = agent_id,
-                .colorize = false,
-            },
+            loopOptions(app, &sw, parent_session, agent_ident, agent_id),
             &backend,
             allocator,
         ) catch |err| {
@@ -571,6 +541,41 @@ pub fn removeWorktreeStrict(a: std.mem.Allocator, wt_path: []const u8, repo: []c
     const path_z = try a.dupeZ(u8, wt_path);
     defer a.free(path_z);
     if (pfs.exists(path_z.ptr)) return error.WorktreeStillExists;
+}
+
+pub fn loopOptions(app: *app_mod.App, sw: *swarm_ctx.SwarmContext, parent_session: SessionId, agent_ident: SessionId, agent_id: []const u8) agent_loop.Options {
+    return .{
+        .session = parent_session,
+        .abort = &app.abort,
+        .api_client = app.anthropicClientOrNull(),
+        .tool_defs = app.tool_defs,
+        .system_prompt = app.system_prompt,
+        .preview = app.config.preview.isEnabled(),
+        .swarm = sw,
+        .tasks = &app.tasks,
+        .kg = if (app.kg) |*k| k else null,
+        .kg_projects_dir = app.kg_projects_dir,
+        .dyn_registry = &app.dyn_registry,
+        .agents = &app.agents,
+        .parent_model = app.activeModel(),
+        .project_dir = app.project_dir_or_empty(),
+        // task#12(Linus review 第五处):进程外 teammate 的 Bash 也须套 sandbox。此前只传
+        // cwd_abs/home_dir/additional_dirs,漏 .sandbox → ctx.sandbox=null → wrapCommand 被跳过,
+        // Bash 脱管("共享 App 就以为共享沙箱"的假设缺口)。App 已从 settings 载 sandbox,直接接上。
+        .sandbox = app.sandboxPtr(),
+        .cwd_abs = app.cwdAbs(),
+        .additional_dirs = app.additionalDirs(),
+        .home_dir = app.homeDir(),
+        .state_root = app.stateRoot(),
+        .artifact_root = app.sessionDir() orelse "",
+        .tool_result_metrics = &app.tool_result_metrics,
+        // agent_ident 仍是进程自己的 24-hex session id，用于通用
+        // agent-loop 身份。TinyKG 租约单独使用 name@team，保证宿主自领与
+        // 模型后续 TaskUpdate/TaskStop 共用完全相同的 holder 字符串。
+        .agent_ident = agent_ident,
+        .kg_agent_ident = agent_id,
+        .colorize = false,
+    };
 }
 
 /// spawn 函数签名(DI):生产 = forkExecTeammate;测试注入 mock(不真 fork)验证接线。
