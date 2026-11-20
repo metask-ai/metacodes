@@ -440,7 +440,7 @@ class RunManager:
                 record["judge"] = shown_judge  # model id and route only
             from scripts.eval.harbor.bench.batches import current_metacodes
             metacodes = ({k: frozen.get(k) for k in ("label", "commit", "digest", "release", "frozen")}
-                         if frozen else current_metacodes(cfg))
+                         if frozen else current_metacodes(cfg, used_bundle))
             if metacodes:
                 record["metacodes"] = metacodes
             if batch:

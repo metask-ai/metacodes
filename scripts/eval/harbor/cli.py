@@ -408,11 +408,12 @@ def main(argv=None):
             # Local to this machine's workbench state, like setup; a running
             # service sees the change on its next catalog read.
             return provider_command(args, root)
+        previous_bundle = Path(cfg["bundle"]).expanduser().resolve() if cfg.get("bundle") else None
         for name in ("bundle", "provider_config", "jobs_dir", "account_state_dir", "workbuddy_checkout"):
             value = getattr(args, name)
             if value is not None:
                 cfg[name] = str(value.expanduser().resolve())
-        if args.bundle is not None:
+        if args.bundle is not None and Path(cfg["bundle"]) != previous_bundle:
             cfg.pop("bundle_source", None)
         for name in ("model", "key_env", "harbor"):
             value = getattr(args, name)

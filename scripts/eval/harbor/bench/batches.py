@@ -107,18 +107,19 @@ def bundle_choices(cfg: Dict[str, Any], config_path: Path) -> List[Dict[str, Any
     return choices
 
 
-def current_metacodes(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The configured bundle, unfrozen, as a run record names it."""
-    path = cfg.get("bundle")
+def current_metacodes(cfg: Dict[str, Any], used: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The bundle a run uses, unfrozen, as its record names it."""
+    path = used or cfg.get("bundle")
     if not path:
         return None
+    resolved = Path(path).expanduser().resolve()
     try:
-        manifest = check_bundle(Path(path))
+        manifest = check_bundle(resolved)
     except ValueError:
         return None
-    source = None if builds.is_git_unit(Path(path).expanduser().resolve()) else cfg.get("bundle_source")
-    return {"label": bundle_label(Path(path), manifest, source), "commit": bundle_commit(Path(path), manifest, source),
-            "bundle": str(path), "frozen": False}
+    source = None if builds.is_git_unit(resolved) else cfg.get("bundle_source")
+    return {"label": bundle_label(resolved, manifest, source), "commit": bundle_commit(resolved, manifest, source),
+            "bundle": str(resolved), "frozen": False}
 
 
 def bundle_files(root: Path) -> List[str]:

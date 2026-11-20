@@ -347,6 +347,23 @@ class BatchTest(unittest.TestCase):
         created = self.client.request('api/batches', self.request())
         self.assertEqual((created['metacodes']['commit'], created['metacodes']['git']['commit']), (new, new))
 
+    def test_run_record_names_the_bundle_the_worker_uses(self):
+        new = '2' * 40
+        unit = self.root / 'bundles' / self.git_unit(new, 'https://example.com/fork.git')
+        link = self.root / ('metacodes-dev-' + '0' * 12 + '-overlay')
+        link.symlink_to(unit)
+        cfg = json.loads(self.config.read_text())
+        run = {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}
+        with patch.dict(os.environ, {'HOME': str(self.root)}):
+            for default in (str(link), '~/bundles/' + unit.name):
+                with self.subTest(default=default):
+                    atomic_json(self.config, {**cfg, 'bundle': default, 'source_repo': 'https://example.com/fork.git'})
+                    record = self.client.request('api/runs', run)
+                    self.assertEqual((record['metacodes']['commit'], record['metacodes']['bundle']), (new, str(unit)))
+                    spec = json.loads((self.manager.jobs_dir / '.bench-runs' / (record['name'] + '.spec')).read_text())
+                    self.assertEqual(spec['bundle'], str(unit))
+                    wait_run(self.manager, record['name'])
+
     def test_bundle_flag_drops_the_previous_bundle_source(self):
         state = self.root / 'cli-state'
         (state / 'bench').mkdir(parents=True)
@@ -357,6 +374,11 @@ class BatchTest(unittest.TestCase):
         saved = json.loads((state / 'bench' / 'workbench.json').read_text())
         self.assertEqual(saved['bundle'], str((self.root / 'bundle').resolve()))
         self.assertNotIn('bundle_source', saved)
+        source = {'kind': 'checkout-overlay', 'commit': 'worktree', 'base_release': '0.12.0'}
+        atomic_json(state / 'bench' / 'workbench.json', {**saved, 'bundle_source': source})
+        with patch('sys.stdout', io.StringIO()):
+            cli.main(['info', '--state-root', str(state), '--bundle', str(self.root / 'bundle'), '--json'])
+        self.assertEqual(json.loads((state / 'bench' / 'workbench.json').read_text())['bundle_source'], source)
 
     def test_invalid_batches_are_refused_before_anything_is_written(self):
         for override in ({'items': []}, {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}] * 2},
