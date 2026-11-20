@@ -308,9 +308,6 @@ jobs:
           zig build kernels:stage -Dlean-kernels=on -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" || exit /b 1
           for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RUNNER_TEMP%\release"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
           findstr /B KERNEL_PINS= "%GITHUB_ENV%" || exit /b 1
-      - name: Full suite in release configuration
-        shell: cmd
-        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: The working tree is still clean before staging
         shell: bash
         run: |
@@ -362,6 +359,9 @@ jobs:
       - name: Archives are reproducible
         shell: cmd
         run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Dtarget=x86_64-windows-gnu -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
+      - name: Full suite in release configuration
+        shell: cmd
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archives-Windows-X64
