@@ -830,12 +830,14 @@ class WorkerSync:
         self.thread = threading.Thread(target=loop, name="bench-store-sync", daemon=True)
         self.thread.start()
 
-    def finish(self, heartbeat: Callable[[], None]) -> None:
-        """Final verified ingestion; `heartbeat` keeps the run visibly alive."""
+    def finish(self, heartbeat: Callable[[], None], record: Dict[str, Any]) -> None:
+        """Final verified ingestion of the job, then the run's final record;
+        `heartbeat` keeps the run visibly alive."""
         if self.config is None:
             return
         self.stop.set()
-        final = threading.Thread(target=lambda: (self.thread.join() if self.thread else None, self.once(verify=True)),
+        final = threading.Thread(target=lambda: (self.thread.join() if self.thread else None, self.once(verify=True),
+                                                 self.record(record)),
                                  name="bench-store-final", daemon=True)
         final.start()
         while final.is_alive():
@@ -843,14 +845,11 @@ class WorkerSync:
             if final.is_alive():
                 heartbeat()
 
-    def record(self, name: str) -> None:
-        """Store the run's final receipt, spec and worker log."""
+    def record(self, record: Dict[str, Any]) -> None:
+        """Store the run's final record, spec and worker log."""
         try:
             store = self._open()
-            if store is None:
-                return
-            record = data.read_json(self.records_dir / (name + ".json"))
-            if isinstance(record, dict) and record.get("status") in schema.RUN_STATUSES and record.get("name") == name:
+            if store is not None:
                 ingest_run(store, self.records_dir, record)
         except Exception as exc:
             stderr_log(f"bench store: recording run failed: {type(exc).__name__}: {exc}")

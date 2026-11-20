@@ -836,6 +836,9 @@ Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
 page) removes its record, its runs' records and logs, their job directories
 and their rows in the evaluation database; the frozen bundle copy stays, since
 other batches may share it. A batch still running must be stopped first.
+Only a batch recorded in this service's jobs directory is deleted; one ingested
+from another jobs directory sharing the database is refused. When a file
+cannot be removed, the request fails and the batch stays for a retry.
 Batch records are ingested into the `batches` table of the evaluation
 database (schema v3).
 

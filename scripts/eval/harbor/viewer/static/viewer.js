@@ -300,10 +300,11 @@ async function renderBatch(id) {
     catch (error) { event.currentTarget.disabled = false; setConnection(false, error.message); }
   } }, '停止批次') : null;
   const remove = !batchActive(b) && b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
+    const button = event.currentTarget;
     if (!confirm(`删除批次 ${batchName(b)}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
-    event.currentTarget.disabled = true;
+    button.disabled = true;
     try { await api('/api/batch/delete', { id: b.id }); location.hash = '#/'; }
-    catch (error) { event.currentTarget.disabled = false; setConnection(false, error.message); }
+    catch (error) { button.disabled = false; setConnection(false, error.message); }
   } }, '删除批次') : null;
   const m = b.metacodes || {};
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },

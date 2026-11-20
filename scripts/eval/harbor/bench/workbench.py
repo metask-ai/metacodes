@@ -277,25 +277,36 @@ class Workbench:
         manager = self.manager
         if not manager:
             raise ValueError(READ_ONLY)
+        if not isinstance(batch_id, str) or not data.NAME.fullmatch(batch_id):
+            raise ValueError("批次不存在")
         with self.batches.lock, manager.lock:
             record = next((r for r in self.batch_records() if r["id"] == batch_id), None)
             if record is None:
                 raise ValueError("批次不存在")
-            runs = [item["run"] for item in record["items"] if data.NAME.fullmatch(item.get("run") or "")]
-            running = {r["name"] for r in manager.runs() if r.get("status") in ACTIVE}
+            receipts = manager.runs()
+            names = {item.get("run") for item in record["items"]} | set(self.library.batch_runs(batch_id))
+            names |= {r["name"] for r in receipts if r.get("batch") == batch_id}
+            runs = sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
+            running = {r["name"] for r in receipts if r.get("status") in ACTIVE}
             if record["status"] in BATCH_ACTIVE or running.intersection(runs):
                 raise ValueError("批次还在运行，请先取消，结束后再删除")
-
-            def remove_files():
-                self.batches.path(batch_id).unlink(missing_ok=True)
-                for run in runs:
-                    for path in manager.records.glob(run + ".*"):
-                        if path.stem == run:
-                            path.unlink()
-                    shutil.rmtree(manager.jobs_dir / run, ignore_errors=True)
-
-            self.library.delete_batch(batch_id, runs, remove_files)
+            self.library.delete_batch(batch_id, runs, manager.jobs_dir, lambda: self._remove_batch_files(batch_id, runs))
         return {"id": batch_id, "deleted": True, "runs": runs}
+
+    def _remove_batch_files(self, batch_id, runs) -> None:
+        manager = self.manager
+        try:
+            for run in runs:
+                try:
+                    shutil.rmtree(manager.jobs_dir / run)
+                except FileNotFoundError:
+                    pass
+                for path in manager.records.glob(run + ".*"):
+                    if path.stem == run:
+                        path.unlink(missing_ok=True)
+            self.batches.path(batch_id).unlink(missing_ok=True)
+        except OSError as exc:
+            raise ValueError(f"删除文件失败（{exc}），批次已保留，处理后可以重试") from None
 
     def start_setup(self, request) -> Dict[str, Any]:
         if not self.manager:

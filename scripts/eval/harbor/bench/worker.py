@@ -339,13 +339,13 @@ def main(argv=None):
                 workbuddy.finish(spec)
             except OSError:
                 record["error"] = record.get("error") or "WorkBuddy 临时配置清理失败"
-        # The final ingest precedes the terminal receipt (and follows the
-        # WorkBuddy job's finished_at stamp), so a finished run's results are
-        # already in the store; touching the receipt keeps the worker visibly
+        # The final ingest, run row included, precedes the terminal receipt
+        # (and follows the WorkBuddy job's finished_at stamp), so a finished
+        # run's results are already in the store and nothing writes them once
+        # the run has ended; touching the receipt keeps the worker visibly
         # alive meanwhile.
-        sync.finish(lambda: os.utime(record_path))
+        sync.finish(lambda: os.utime(record_path), record)
         atomic_json(record_path, record)
-        sync.record(record["name"])
     return 0 if record.get("status") == "finished" else 1
 
 

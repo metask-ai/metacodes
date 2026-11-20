@@ -162,14 +162,35 @@ class StoreLibrary:
             rows = tx.query("SELECT record_json FROM runs")
         return [json.loads(row[0]) for row in rows]
 
-    def delete_batch(self, batch_id: str, jobs: List[str], remove_files: Callable[[], None]) -> None:
+    def batch_runs(self, batch_id: str) -> List[str]:
+        with self.store.read() as tx:
+            rows = tx.query("SELECT name, record_json FROM runs")
+        return [name for name, record_json in rows if json.loads(record_json).get("batch") == batch_id]
+
+    def delete_batch(self, batch_id: str, jobs: List[str], jobs_dir: Path,
+                     remove_files: Callable[[], None]) -> None:
+        jobs_dir = Path(jobs_dir).resolve()
+        owners = [("batches", "id", batch_id, jobs_dir / ingest.BATCHES_DIR)]
+        for job in jobs:
+            owners += [("runs", "name", job, jobs_dir / ".bench-runs"), ("jobs", "name", job, jobs_dir / job)]
         with self._sync_lock:
+            with self.store.read() as tx:
+                for table, key, value, source in owners:
+                    row = tx.one(f"SELECT source_dir FROM {table} WHERE {key} = ?", (value,))
+                    if row and row[0] != str(source):
+                        raise ValueError(f"批次 {batch_id} 的数据来自 {Path(row[0]).parent}，请在那个 jobs 目录的工作台删除")
             remove_files()
             with self.store.transaction() as tx:
+                digests: List[str] = []
                 for job in jobs:
+                    digests += [d for row in tx.query("SELECT sha256, tail_sha256 FROM files WHERE job = ?", (job,))
+                                for d in row]
+                    digests += [d for row in tx.query("SELECT spec_sha256, log_sha256 FROM runs WHERE name = ?", (job,))
+                                for d in row]
                     tx.execute("DELETE FROM runs WHERE name = ?", (job,))
                     tx.execute("DELETE FROM jobs WHERE name = ?", (job,))
                 tx.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+                ingest.collect_garbage(tx, digests)
 
     def replace_store(self, store: Store) -> Store:
         """Serve from `store` from now on; returns the previous store, which
