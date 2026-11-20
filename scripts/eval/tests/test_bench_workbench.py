@@ -5,6 +5,7 @@ separately. No provider or Docker calls are made by these tests.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import concurrent.futures
 import os
@@ -592,6 +593,29 @@ class WorkbenchTest(unittest.TestCase):
         self.assertTrue(server.same_origin('https://bench.example', trusted))
         self.assertTrue(server.same_origin('https://bench.example:443', trusted))
         self.assertFalse(server.same_origin('http://bench.example', trusted))
+
+    def test_a_receipt_names_its_service_only_while_it_serves_this_workbench(self):
+        url = f'http://127.0.0.1:{self.http.server_address[1]}/'
+        saved = {'url': url, 'listen_url': url}
+        self.assertIsNotNone(cli.receipt_client(saved, self.manager.config_path))
+        # The port now belongs to a workbench of another state directory.
+        self.assertIsNone(cli.receipt_client(saved, self.root / 'other' / 'workbench.json'))
+        self.assertIsNone(cli.receipt_client({}, self.manager.config_path))
+
+    def test_replacing_a_running_service_keeps_its_entry(self):
+        def args(**given):
+            return argparse.Namespace(**{'bind': None, 'port': None, 'public_url': None, **given})
+        self.assertEqual(cli.service_entry(args(), {}), ('127.0.0.1', 0, None))
+        shared = {'url': 'http://10.0.0.2:18766/', 'listen_url': 'http://127.0.0.1:18766/'}
+        self.assertEqual(cli.service_entry(args(), {**shared, 'bind': '0.0.0.0'}),
+                         ('0.0.0.0', 18766, 'http://10.0.0.2:18766/'))
+        # An older receipt has no bind, and 127.0.0.1 may have been 0.0.0.0.
+        with self.assertRaisesRegex(ValueError, '--bind'):
+            cli.service_entry(args(), shared)
+        self.assertEqual(cli.service_entry(args(bind='0.0.0.0'), shared), ('0.0.0.0', 18766, 'http://10.0.0.2:18766/'))
+        direct = {'url': 'http://10.0.0.2:18766/', 'listen_url': 'http://10.0.0.2:18766/'}
+        self.assertEqual(cli.service_entry(args(), direct), ('10.0.0.2', 18766, None))
+        self.assertEqual(cli.service_entry(args(port=9000), direct), ('10.0.0.2', 9000, None))
 
     def test_unknown_models_shell_fragments_and_bad_ranges_are_refused_before_spawn(self):
         for override in ({'tasks': ['--path /etc']}, {'tasks': ['fix-git;touch /tmp/x']},

@@ -733,6 +733,15 @@ link: `metacodes bench stop` and `metacodes bench` stop it with the
 capability from this machine's receipt (the only use of it left), and
 `metacodes bench` then starts the login-free service.
 
+When `metacodes bench` replaces a running service (a store change or the
+login-free upgrade), the new service keeps the old bind, port and public
+URL unless the command gives them. A receipt from before this release does
+not record the bind, so when the old service listens on 127.0.0.1 (or
+0.0.0.0) the command leaves it running and asks for `--bind`. The CLI acts
+on the receipt's service only while that service still serves this state
+directory's workbench; if another workbench took the port, the receipt is
+treated as stale.
+
 ## Using the page
 
 The rail opens on the dashboard (看板), then 新建 (new batch), 对比 (compare)

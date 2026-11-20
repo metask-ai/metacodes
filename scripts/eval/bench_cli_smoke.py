@@ -47,7 +47,9 @@ def legacy_handler(*args, **kwargs):
 
 
 def receipt(path, value):
-    base_json(path, {**value, 'token': TOKEN} if 'pid' in value else value)
+    if 'pid' in value:
+        value = {**{k: v for k, v in value.items() if k != 'bind'}, 'token': TOKEN}
+    base_json(path, value)
 
 
 server.make_handler, server.atomic_json = legacy_handler, receipt
@@ -130,10 +132,14 @@ def main():
             # `bench stop` stops it with the capability from the local receipt.
             assert json.loads(invoke(['stop', '--json']))['stopped']
             assert legacy.wait(timeout=10) == 0
-            # Opening the workbench while an old service runs replaces it.
+            # Opening the workbench while an old service runs replaces it on
+            # the same entry. Its receipt cannot tell 127.0.0.1 from 0.0.0.0,
+            # so it is kept until the bind is given.
             legacy = start_legacy(port)
             assert json.loads(ready.read_text())['token'] == LEGACY_TOKEN
-            started = json.loads(invoke(['--no-open', '--json', '--port', port,
+            invoke(['--no-open', '--json'], expected=1)
+            assert legacy.poll() is None, 'an old service whose entry is unknown must keep running'
+            started = json.loads(invoke(['--no-open', '--json', '--bind', '127.0.0.1',
                                         '--bundle', config['bundle'], '--provider-config', config['provider_config'],
                                         '--model', config['model'], '--harbor', config['harbor']]))
             assert started['url'] == old_url, started

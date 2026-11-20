@@ -543,12 +543,12 @@ def main(argv=None) -> int:
     server = make_server(library, args.bind, args.port, manager, args.public_url)
     # Historical imports can take a while; serve meanwhile.
     library.start_background()
-    host = "127.0.0.1" if args.bind == "0.0.0.0" else args.bind
-    url = args.public_url or f"http://{host}:{server.server_address[1]}/"
-    url = url.rstrip("/") + "/"
+    address, port = server.server_address[:2]
+    listen_url = f"http://{'127.0.0.1' if address == '0.0.0.0' else address}:{port}/"
+    url = (args.public_url or listen_url).rstrip("/") + "/"
     if args.ready_file:
-        atomic_json(args.ready_file, {"url": url, "pid": os.getpid(),
-                                    "listen_url": f"http://{host}:{server.server_address[1]}/",
+        atomic_json(args.ready_file, {"url": url, "pid": os.getpid(), "bind": args.bind,
+                                    "listen_url": listen_url,
                                     "jobs_dir": str(args.jobs_dir[0].resolve()),
                                     "store": library.store.config.describe()})
         args.ready_file.chmod(0o600)

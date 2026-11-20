@@ -89,25 +89,61 @@ def same_service(saved, jobs_dir, store):
     return bool(saved.get("url")) and saved.get("jobs_dir") == str(jobs_dir) and saved.get("store") == store.describe()
 
 
+def receipt_client(saved, config):
+    """A client for the receipt's service while that service still serves
+    this workbench. Another workbench may have taken the port since."""
+    if not saved.get("url"):
+        return None
+    client = local_client(saved)
+    try:
+        if client.request("api/store").get("config_path") == str(Path(config).resolve()):
+            return client
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def previous_entry(saved):
+    """The bind, port and public URL the receipt's service listens on. The
+    bind is None when the receipt cannot tell 127.0.0.1 from 0.0.0.0."""
+    listen_url = saved.get("listen_url") or saved["url"]
+    listen = urllib.parse.urlsplit(listen_url)
+    bind = saved.get("bind") or (None if listen.hostname == "127.0.0.1" else listen.hostname)
+    public_url = saved["url"] if saved["url"] != listen_url else None
+    return bind, listen.port, public_url
+
+
+def service_entry(args, saved):
+    if not saved:
+        return args.bind or "127.0.0.1", args.port or 0, args.public_url
+    bind, port, public_url = previous_entry(saved)
+    bind = args.bind or bind
+    if bind is None:
+        raise ValueError("正在运行的工作台 " + saved["url"] + " 由旧版启动，无法确定它监听 127.0.0.1 还是 0.0.0.0，"
+                         "因此没有替换它。请按原来的启动参数重新运行，例如 metacodes bench --bind 0.0.0.0")
+    return (bind, port if args.port is None else args.port,
+            public_url if args.public_url is None else args.public_url)
+
+
 def ensure_service(args, root, config, jobs_dir, store):
     ready = root / "service.json"
     saved = settings(ready)
-    if saved.get("url") and saved.get("jobs_dir") == str(jobs_dir):
-        client = local_client(saved)
+    client = receipt_client(saved, config) if saved.get("jobs_dir") == str(jobs_dir) else None
+    if client and same_service(saved, jobs_dir, store) and not client.legacy_token:
+        return client
+    # A running service whose store changed (or that predates it), or that
+    # still requires its login link, is replaced on the same entry. Its
+    # workers keep running; the new service picks them up.
+    bind, port, public_url = service_entry(args, saved if client else {})
+    if client:
+        if client.legacy_token:
+            print("bench: 停止需要授权链接的旧版工作台，改用免登录版本", file=sys.stderr)
         try:
-            if client.request("api/workbench").get("service") == "metacodes-bench":
-                if same_service(saved, jobs_dir, store) and not client.legacy_token:
-                    return client
-                # The store changed (or the service predates it), or the
-                # service still requires its login link: replace it. Its
-                # workers keep running; the new service picks them up.
-                if client.legacy_token:
-                    print("bench: 停止需要授权链接的旧版工作台，改用免登录版本", file=sys.stderr)
-                client.request("api/stop", {})
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    client.request("api/workbench")
-                    time.sleep(0.1)
+            client.request("api/stop", {})
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                client.request("api/workbench")
+                time.sleep(0.1)
         except (OSError, ValueError):
             pass
     # The CLI reserves a separate ready file per startup. A crashed or slow
@@ -115,10 +151,10 @@ def ensure_service(args, root, config, jobs_dir, store):
     import uuid
     handshake = root / ("ready-" + uuid.uuid4().hex + ".json")
     command = [sys.executable, "-m", "scripts.eval.harbor.viewer.server", "--jobs-dir", str(jobs_dir),
-               "--config", str(config), "--bind", args.bind, "--port", str(args.port),
+               "--config", str(config), "--bind", bind, "--port", str(port),
                "--ready-file", str(handshake)]
-    if args.public_url:
-        command += ["--public-url", args.public_url]
+    if public_url:
+        command += ["--public-url", public_url]
     with (root / "service.log").open("ab") as log:
         process = subprocess.Popen(command, env=runtime_env(), cwd=str(Path(__file__).resolve().parents[3]),
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
@@ -302,8 +338,8 @@ def main(argv=None):
     parser.add_argument("--model", help="provider/model")
     parser.add_argument("--key-env", help="API Key 的环境变量名；不传 Key 本身")
     parser.add_argument("--harbor", help="Harbor 可执行文件")
-    parser.add_argument("--bind", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0, help="服务端口（默认自动选择）")
+    parser.add_argument("--bind", help="监听地址（默认 127.0.0.1；替换运行中的工作台时沿用它的）")
+    parser.add_argument("--port", type=int, help="服务端口（默认自动选择；替换运行中的工作台时沿用它的）")
     parser.add_argument("--public-url", help="输出的工作台地址（用于 devbox 网络访问）")
     parser.add_argument("--no-open", action="store_true", help="仅输出链接，不打开浏览器")
     parser.add_argument("--json", action="store_true")
@@ -408,12 +444,7 @@ def main(argv=None):
         if client is None and args.action in ("info", "list"):
             saved = settings(root / "service.json")
             if same_service(saved, jobs_dir, store):
-                existing = local_client(saved)
-                try:
-                    if existing.request("api/workbench").get("service") == "metacodes-bench":
-                        client = existing
-                except (OSError, ValueError):
-                    pass
+                client = receipt_client(saved, config)
         if args.action == "prepare":
             if args.url or not args.suite:
                 parser.error("bench prepare 需要 --suite，并在执行机器本地运行")
@@ -430,9 +461,8 @@ def main(argv=None):
                   f"{value['name']}：已同步 {value['files']} 个文件到 {value['local_dir']}（{value['status']}）")
             return 0
         if args.action == "stop":
-            saved = settings(root / "service.json")
-            if client is None and saved.get("url"):
-                client = local_client(saved)
+            if client is None:
+                client = receipt_client(settings(root / "service.json"), config)
             if client is None:
                 value = {"stopped": True, "message": "工作台未启动"}
             else:
