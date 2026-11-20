@@ -310,6 +310,8 @@ class BatchTest(unittest.TestCase):
         self.assertEqual([i['status'] for i in final['items']], ['finished', 'finished'])
 
     def test_frozen_git_bundle_is_refused_after_a_repository_switch(self):
+        self.manager.batches.stop()
+        self.manager.batches._thread.join(5)
         unit = self.git_unit('e' * 40, 'https://example.com/fork.git')
         cfg = json.loads(self.config.read_text())
         atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
