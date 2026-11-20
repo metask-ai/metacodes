@@ -270,6 +270,31 @@ class BatchTest(unittest.TestCase):
         created = self.client.request('api/batches', self.request(bundle=unit))
         self.assertEqual(Path(created['metacodes']['bundle']).parent, self.root / 'bundles' / 'frozen')
 
+    def test_default_git_bundle_is_checked_before_a_single_run_is_recorded(self):
+        unit = self.git_unit('b' * 40, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'bundle': str(self.root / 'bundles' / unit),
+                                  'source_repo': 'https://example.com/official.git'})
+        run = {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}
+        with self.assertRaisesRegex(ValueError, 'source_repo 没有验证'):
+            self.client.request('api/runs', run)
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_a_verified_git_bundle_alone_runs_a_batch(self):
+        unit = self.git_unit('c' * 40, 'https://example.com/fork.git')
+        cfg = {k: v for k, v in json.loads(self.config.read_text()).items() if k != 'bundle'}
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        catalog = self.client.request('api/workbench')
+        self.assertEqual(catalog['harbor_reasons'], [])
+        self.assertEqual([b['id'] for b in catalog['bundles']], [unit])
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        final = self.wait_batch(created['id'])
+        self.assertEqual(final['status'], 'finished', final)
+        frozen = created['metacodes']['bundle']
+        for item in final['items']:
+            spec = json.loads((self.manager.jobs_dir / '.bench-runs' / (item['run'] + '.spec')).read_text())
+            self.assertEqual(spec['bundle'], frozen)
+
     def test_invalid_batches_are_refused_before_anything_is_written(self):
         for override in ({'items': []}, {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}] * 2},
                          {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git;rm -rf /']}]},

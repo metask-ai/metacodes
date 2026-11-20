@@ -290,7 +290,11 @@ where the 新建 page offers it as a batch version like any other bundle, but
 only while the configured `source_repo` is the repository that verified it
 under the current trust rule: after switching repositories, a unit appears
 again once `bench build` has re-verified its commit, and a batch cannot be
-created from one that is not listed. A
+created from one that is not listed. The same check covers the bundle a run
+actually uses: a single run (`bench run`) refuses a configured default
+bundle that is such an unverified unit before recording anything, and a batch
+validates its datasets against the bundle it selected, so a workbench whose
+only versions are verified git builds can run batches without a default. A
 build record beside it names the commit and identifies the repository only by
 a digest of its URL; git errors are printed with URL credentials removed. A
 full commit id that the configured repository already verified is reused

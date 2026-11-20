@@ -21,7 +21,7 @@ from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
-from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.bench.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, loopback, write_config
 
@@ -262,11 +262,8 @@ class RunManager:
         global_reasons = list(reasons)
         # Harbor suites need the Linux bundle; WorkBuddy brings its own
         # Harbor and staged artifacts and checks its own prerequisites.
-        harbor_reasons = []
-        try:
-            check_bundle(Path(cfg.get("bundle") or "/nonexistent-metacodes-bundle"))
-        except ValueError:
-            harbor_reasons.append("请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本")
+        choices = bundle_choices(cfg, self.config_path)
+        harbor_reasons = [] if choices else [self.bundle_problem(cfg.get("bundle"), cfg)]
         ctx = self.suite_context(cfg)
         # Registry suites on SSH executors are downloaded on this machine.
         local_harbor = executors.workbench_harbor(cfg) if any(s["kind"] == "ssh" for s in states) else None
@@ -294,7 +291,7 @@ class RunManager:
                 "account_groups": account_groups,
                 "providers": {"count": len({m["provider"] for m in imported}), "models": len(imported)},
                 "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
-                "bundles": [{k: v for k, v in b.items() if k != "source"} for b in bundle_choices(cfg, self.config_path)]}
+                "bundles": [{k: v for k, v in b.items() if k != "source"} for b in choices]}
 
     def add_provider(self, request):
         return self.providers.add(request, reserved=configured_provider_ids(settings(self.config_path)))
@@ -318,7 +315,17 @@ class RunManager:
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
-    def launch(self, request, *, dry_run=False, frozen=None, batch=None, pinned=None):
+    def bundle_problem(self, path, cfg):
+        try:
+            check_bundle(Path(path or "/nonexistent-metacodes-bundle"))
+        except ValueError:
+            return "请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本"
+        if not builds.selectable(path, cfg.get("source_repo")):
+            return (f"metacodes 包 {Path(path).name} 由 Git 构建，当前 source_repo 没有验证它；"
+                    "请用 metacodes bench build --ref 重新验证，或换一个版本")
+        return None
+
+    def launch(self, request, *, dry_run=False, frozen=None, batch=None, pinned=None, bundle=None):
         """Start one run. `dry_run` only validates (a batch checks every
         dataset before it is created); `frozen` is a batch's frozen bundle,
         which replaces the configured one, and `batch` names that batch.
@@ -385,6 +392,11 @@ class RunManager:
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
+        if suite.runner != suites.WORKBUDDY:
+            cfg = settings(self.config_path)
+            problem = self.bundle_problem(frozen["bundle"] if frozen else bundle or cfg.get("bundle"), cfg)
+            if problem:
+                raise ValueError(problem)
         if dry_run:
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
                     "executor": state["name"]}
