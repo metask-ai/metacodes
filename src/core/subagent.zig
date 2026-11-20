@@ -96,6 +96,12 @@ pub fn captureTranscript(allocator: std.mem.Allocator, messages: []const msg.Mes
 
 pub const SpawnOptions = struct {
     preview: bool = false,
+    /// Explicit host selections, also used when continuing a prebuilt root
+    /// conversation. Fresh child calls leave them disabled by default.
+    harnessmm: bool = false,
+    rsi: bool = false,
+    /// Borrowed for the synchronous child run.
+    rsi_policy: ?*const @import("../skills/rsi.zig").Policy = null,
     max_turns: u32 = 20,
     /// `agent_loop.Options.retractable_stream_retries` of the child, for a
     /// child that is itself the Run (an AgentCore Skill invocation in its own
@@ -301,6 +307,9 @@ pub fn spawnAgentSink(
         .{
             .max_turns = opts.max_turns,
             .preview = opts.preview,
+            .harnessmm = opts.harnessmm,
+            .rsi = opts.rsi,
+            .rsi_policy = opts.rsi_policy,
             .retractable_stream_retries = opts.retractable_stream_retries,
             .model_error_out = opts.model_error_out,
             .cost_budget_usd = opts.cost_budget_usd,

@@ -60,6 +60,7 @@ const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 const job_notification_mod = @import("job_notification.zig");
 const run_input_mod = @import("run_input.zig");
+const harnessmm_mod = @import("harnessmm.zig");
 
 /// `stalled`: the stall gate stopped a run whose tool rounds kept returning
 /// nothing new (stall_gate.zig). A controlled stop like `tool_loop`, with its
@@ -423,6 +424,12 @@ pub const Options = struct {
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
     system_prompt: ?[]const u8 = null,
+    /// Frozen, host-owned procedural skill. Requires preview and RSI; fresh
+    /// children do not inherit this selection implicitly.
+    rsi_policy: ?*const @import("../skills/rsi.zig").Policy = null,
+    rsi: bool = false,
+    /// EDG / GDR / CCS selection, effective only when preview is also enabled.
+    harnessmm: bool = false,
     /// 首条 user-context message(对齐 cc prependUserContext):CLAUDE.md 链 + AutoMem +
     /// currentDate,`<system-reminder>` 包裹。仅主 session 传(subagent 走 preload 自己的链)。
     /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
@@ -1743,6 +1750,32 @@ pub fn run(
     return result;
 }
 
+fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
+    if (!opts.preview or !opts.rsi) return;
+    const policy = opts.rsi_policy orelse return error.SkillPolicyRequired;
+    const rsi = @import("../skills/rsi.zig");
+    // One persisted host note per participant task. Retrying/resuming does not
+    // append another note or rewrite any earlier provider-visible bytes.
+    var i = conversation.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const message = conversation.messages.items[i];
+        if (conversation_mod.isUserPrompt(message)) break;
+        if (message.origin == .host) for (message.blocks) |block| {
+            if (block == .text and std.mem.startsWith(u8, block.text, rsi.PREFIX)) return;
+        };
+    }
+    const decision = policy.decide(.{ .evolution = true, .routing = true }, model, latestUserText(conversation));
+    switch (decision) {
+        .apply => |instruction| {
+            const note = try std.mem.concat(gpa, u8, &.{ rsi.PREFIX, instruction, rsi.SUFFIX });
+            defer gpa.free(note);
+            try conversation.appendHostText(note);
+        },
+        else => log.debug("skill.rsi", "instruction abstained: {s}", .{@tagName(decision)}),
+    }
+}
+
 fn runCaptured(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1760,6 +1793,7 @@ fn runCaptured(
     // catalog already rejects them; WebSearch keeps its server tool inside its
     // own isolated sub-request.
     try refuseServerTools(tool_defs, opts);
+    try injectProceduralSkill(conversation, opts, opts.model_override orelse provider.model(), allocator);
     // Run-wide counters that every return path reports. They live here rather
     // than in each of the loop's many result literals, so no exit can forget one.
     var counters: RunCounters = .{};
@@ -2216,6 +2250,27 @@ fn runCounted(
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
+    const harnessmm_enabled = opts.preview and opts.harnessmm;
+    var harnessmm = harnessmm_mod.State.init(allocator);
+    defer harnessmm.deinit();
+    var harnessmm_journal: ?harnessmm_mod.Journal = if (harnessmm_enabled)
+        try harnessmm_mod.Journal.open(allocator, opts.artifact_root)
+    else
+        null;
+    defer if (harnessmm_journal) |*journal| journal.deinit();
+    if (harnessmm_enabled) {
+        var present = false;
+        var index = conversation.messages.items.len;
+        while (index > 0) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (conversation_mod.isUserPrompt(message)) break;
+            if (message.origin == .host) for (message.blocks) |block| {
+                if (block == .text and std.mem.startsWith(u8, block.text, harnessmm_mod.AUTHOR_MARKER)) present = true;
+            };
+        }
+        if (!present) try conversation.appendHostText(harnessmm_mod.AUTHOR_PROMPT);
+    }
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
     // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
@@ -2569,6 +2624,29 @@ fn runCounted(
             !conversationHasSuccessfulRequiredFirst(conversation, route)
         else
             false;
+        // A retained decision may only cross an ordinary native receipt
+        // boundary. New input, notices and required activations need the actor.
+        // Provider-response observers admit actual Provider responses; hosts
+        // with that extra boundary conservatively retain the slow callback.
+        const hooks_allow_reuse = if (permission_ctx.hooks) |hooks| !hooks.hasPre() else true;
+        const fast_action: ?msg.ToolUse = if (harnessmm_enabled and hooks_allow_reuse and
+            opts.response_observer == null and !required_first_pending and
+            !in_learning_pass and verifier_gate.leads != .active and conversation.messages.items.len > 0)
+        blk: {
+            const action = harnessmm.next(conversation.messages.items[conversation.messages.items.len - 1], gated_tool_defs) orelse break :blk null;
+            // A repeated actor root ID must not reuse a historical native
+            // call ID, even if it authors the same graph again.
+            for (conversation.messages.items) |message| for (message.blocks) |block| {
+                if (block == .tool_use and std.mem.eql(u8, block.tool_use.id, action.id)) {
+                    harnessmm.clear();
+                    break :blk null;
+                }
+            };
+            break :blk action;
+        } else blk: {
+            harnessmm.clear();
+            break :blk null;
+        };
         // The full native Conversation deliberately outlives its compacted
         // provider window. Preserve that Host fact in a turn-local shallow
         // copy so serializers do not re-force activation after the paired
@@ -2654,7 +2732,7 @@ fn runCounted(
         const synthetic_user_input = if (turns == 0) opts.synthetic_user_input else null;
         const model_switch_compact = if (turns == 0) opts.model_switch_compact else null;
         var previous_model_compact_outcome: AutoCompactOutcome = .not_needed;
-        if (model_switch_compact) |msc| {
+        if (fast_action == null) if (model_switch_compact) |msc| {
             if (!std.mem.eql(u8, msc.previous_model, provider.model()) and msc.previous_context_window > msc.current_context_window) {
                 previous_model_compact_outcome = try runAutoCompactControlled(
                     conversation,
@@ -2689,8 +2767,8 @@ fn runCounted(
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
                 }
             }
-        }
-        if (previous_model_compact_outcome != .skipped_no_savings) {
+        };
+        if (fast_action == null and previous_model_compact_outcome != .skipped_no_savings) {
             const pre_sampling_compact = try runAutoCompactControlled(
                 conversation,
                 provider,
@@ -2841,7 +2919,7 @@ fn runCounted(
         // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
         // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
         var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
-        model_error.beginRequest();
+        if (fast_action == null) model_error.beginRequest();
         // Re-issues of this model request under `STREAM_RETRIES_PER_REQUEST`
         // (#461): a fresh allowance for every request, so an earlier turn's
         // re-issue cannot use it up.
@@ -2976,6 +3054,17 @@ fn runCounted(
         };
 
         request_recovery: while (true) {
+            if (fast_action) |action| {
+                // No provider attempt, usage sample or response-observer event
+                // is fabricated. The exact action enters the common native
+                // slot/permission/sandbox/formal/budget dispatch below.
+                const block = try (msg.Block{ .tool_use = action }).dupe(allocator);
+                errdefer block.deinit(allocator);
+                try assistant_blocks.append(allocator, block);
+                rid_for_turn = .{ .bytes = action.id[4..16].* };
+                turn_stop_reason = .tool_use;
+                break :request_recovery;
+            }
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
             // Images bypass the byte budgets (charged at IMAGE_TOKEN_ESTIMATE), but
@@ -2992,7 +3081,10 @@ fn runCounted(
                 // dropping one; the provider's own limit decides the request.
                 log.warn("agent", "image wire cap exceeded by non-trimmable images: over_by={d} cap={d}", .{ image_trim.remaining_over_cap, opts.image_request_bytes_cap });
             }
-            var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
+            var api_messages = try buildApiMessagesWithFeatures(conversation, allocator, opts.inject_user_context, synthetic_user_input, .{
+                .harnessmm = harnessmm_enabled,
+                .rsi = opts.preview and opts.rsi,
+            });
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
                 const max_input_tokens = serializedRequestInputTokenReserve(
@@ -3752,7 +3844,7 @@ fn runCounted(
         // 投影"与"token 估算"就此分叉,估算单调虚高、误触发 auto-compact。何况一个
         // 什么都没产出的回合,它的推理状态也没有可续的下文。这条不变式让
         // buildApiMessages 的 n_substantive 守卫在本进程内不可能被触发。
-        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0;
+        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0 or assistant_blocks.items.len > 0;
         if (!turn_has_content) {
             for (reasoning_items.items) |item| allocator.free(item);
             reasoning_items.clearRetainingCapacity();
@@ -3813,7 +3905,7 @@ fn runCounted(
 
         if (assistant_blocks.items.len > 0) {
             const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
-            try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
+            try conversation.append(.{ .role = .assistant, .blocks = blocks_slice, .origin = if (fast_action != null) .host else .participant });
             settleCandidate(opts.response_observer, &candidate_open, candidate, .committed);
         } else {
             // 空响应，避免 deinit 释放已归还的 slice
@@ -3828,6 +3920,7 @@ fn runCounted(
 
         // 5. 如果这一轮没有 tool_use，整个请求结束
         const last_msg = &conversation.messages.items[conversation.messages.items.len - 1];
+        if (harnessmm_enabled and fast_action == null) try harnessmm.admit(last_msg.*);
         var has_tool_use = false;
         for (last_msg.blocks) |b| if (@as(std.meta.Tag(msg.Block), b) == .tool_use) {
             has_tool_use = true;
@@ -5038,6 +5131,11 @@ fn runCounted(
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
+        if (harnessmm_enabled) {
+            var certificate = try harnessmm.observe(conversation.messages.items[conversation.messages.items.len - 1], turns + 1);
+            defer if (certificate) |*value| value.deinit();
+            if (certificate) |*value| try harnessmm_journal.?.append(allocator, value);
+        }
         // The round's results are now the last message, one block per slot:
         // the stall gate anchors each key to the block the model will see.
         if (!in_learning_pass) if (stall_state) |state| state.anchorRound(conversation.messages.items);
@@ -5295,6 +5393,20 @@ fn buildApiMessages(
     inject_user_context: ?[]const u8,
     synthetic_user_input: ?[]const u8,
 ) !std.ArrayList(types.ApiMessage) {
+    // Estimates conservatively include historical notes. Actual requests use
+    // the resolved run selections below, without rewriting durable history.
+    return buildApiMessagesWithFeatures(conversation, allocator, inject_user_context, synthetic_user_input, .{ .harnessmm = true, .rsi = true });
+}
+
+const OptimizationNotes = struct { harnessmm: bool, rsi: bool };
+
+fn buildApiMessagesWithFeatures(
+    conversation: *const Conversation,
+    allocator: std.mem.Allocator,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    notes: OptimizationNotes,
+) !std.ArrayList(types.ApiMessage) {
     var out = std.ArrayList(types.ApiMessage).empty;
     errdefer {
         freeApiMessages(&out, allocator);
@@ -5323,6 +5435,14 @@ fn buildApiMessages(
     }
 
     for (conversation.activeMessages()) |m| {
+        // A restored host instruction cannot reactivate a disabled feature.
+        // Keep message positions, native calls/results and transcript bytes;
+        // only omit our standalone guidance from this provider projection.
+        if (m.origin == .host and m.blocks.len == 1 and m.blocks[0] == .text) {
+            const text = m.blocks[0].text;
+            if ((!notes.harnessmm and std.mem.startsWith(u8, text, harnessmm_mod.AUTHOR_MARKER)) or
+                (!notes.rsi and std.mem.startsWith(u8, text, @import("../skills/rsi.zig").PREFIX))) continue;
+        }
         // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
         // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
         // 它和 reasoning_item 一样**不足以**撑起一条消息。

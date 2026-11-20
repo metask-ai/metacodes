@@ -158,6 +158,7 @@ test {
     _ = @import("component/openai_responses_test.zig");
     _ = @import("component/gemini_provider_test.zig");
     _ = @import("component/background_main_test.zig");
+    _ = @import("component/harnessmm_test.zig");
     _ = @import("component/suspend_resume_test.zig");
     _ = @import("component/permission_unanswered_test.zig");
     _ = @import("component/diff_highlight_test.zig");

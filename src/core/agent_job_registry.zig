@@ -326,6 +326,10 @@ fn dupeUtf8Preview(a: std.mem.Allocator, bytes: []const u8, max: usize) ![]u8 {
 /// 由 registry 内部 dupe 进堆分配的 JobInput。
 pub const SpawnParams = struct {
     preview: bool = false,
+    harnessmm: bool = false,
+    rsi: bool = false,
+    /// Borrowed from the App, which joins background jobs before freeing it.
+    rsi_policy: ?*const @import("../skills/rsi.zig").Policy = null,
     prompt: []const u8,
     system_prompt: []const u8,
     session: SessionId,
@@ -399,6 +403,9 @@ const JobInput = struct {
     perm_override: ?@import("../types.zig").PermissionMode,
     agent_depth: u8,
     preview: bool,
+    harnessmm: bool,
+    rsi: bool,
+    rsi_policy: ?*const @import("../skills/rsi.zig").Policy,
     max_turns: u32,
     // 借用(App 生命周期):
     agents: ?*const AgentSet,
@@ -919,6 +926,9 @@ pub const AgentJobRegistry = struct {
             .perm_override = p.perm_override,
             .agent_depth = p.agent_depth,
             .preview = p.preview,
+            .harnessmm = p.harnessmm,
+            .rsi = p.rsi,
+            .rsi_policy = p.rsi_policy,
             .max_turns = p.max_turns,
             .agents = p.agents,
             .dyn_registry = p.dyn_registry,
@@ -1720,6 +1730,9 @@ fn jobThreadMain(input: *JobInput) void {
         .system_prompt = if (input.system_prompt.len > 0) input.system_prompt else null,
         .agent_depth = input.agent_depth,
         .preview = input.preview,
+        .harnessmm = input.harnessmm,
+        .rsi = input.rsi,
+        .rsi_policy = input.rsi_policy,
         .dyn_registry = input.dyn_registry,
         .tool_defs_override = input.tool_defs_owned,
         .execution_policy = child_tool_policy.executionPolicy(),

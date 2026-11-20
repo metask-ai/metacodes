@@ -163,6 +163,8 @@ pub const conversation = @import("core/conversation.zig");
 pub const message = @import("core/message.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
+pub const harnessmm = @import("core/harnessmm.zig");
+pub const skill_rsi = @import("skills/rsi.zig");
 pub const agent_session = @import("core/agent_session.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
 pub const response_candidate = @import("core/response_candidate.zig");
@@ -4788,6 +4790,24 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.check_gate_observe = true;
         } else if (std.mem.eql(u8, arg, "--learning-turn")) {
             config.learning_turn = true;
+        } else if (std.mem.eql(u8, arg, "--harnessmm")) {
+            config.harnessmm = true;
+        } else if (std.mem.eql(u8, arg, "--no-harnessmm")) {
+            config.harnessmm = false;
+        } else if (std.mem.eql(u8, arg, "--rsi")) {
+            config.rsi = true;
+        } else if (std.mem.eql(u8, arg, "--no-rsi")) {
+            config.rsi = false;
+        } else if (std.mem.eql(u8, arg, "--rsi-policy")) {
+            const path = args.next() orelse {
+                setParseError(config, allocator, "missing value for --rsi-policy", .{});
+                return;
+            };
+            if (path.len == 0 or std.mem.startsWith(u8, path, "--")) {
+                setParseError(config, allocator, "invalid value for --rsi-policy", .{});
+                return;
+            }
+            config.rsi_policy_path = allocator.dupe(u8, path) catch path;
         } else if (std.mem.eql(u8, arg, "--learning-turn-observe")) {
             config.learning_turn_observe = true;
         } else if (std.mem.eql(u8, arg, "--verifier")) {
@@ -5431,6 +5451,9 @@ fn printHelp() void {
         \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
         \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
         \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
+        \\  --harnessmm / --no-harnessmm  Preview: guarded decision reuse and callback certificates (requires --preview, default off)
+        \\  --rsi / --no-rsi     Preview: evolved skills and learned routers (requires --preview, default off)
+        \\  --rsi-policy <file>  Frozen RSI policy (doc/SKILL_RSI_PROTOCOL.md)
         \\  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
         \\                        for the next attempt (needs --check-gate[-observe], or in print mode
         \\                        METACODES_HOST_CHECK under METACODES_SELF_EVOLUTION with METACODES_TASK_HINT)

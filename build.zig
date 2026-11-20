@@ -3346,6 +3346,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/openai_provider_test.zig",
         "tests/component/gemini_provider_test.zig",
         "tests/component/background_main_test.zig",
+        "tests/component/harnessmm_test.zig",
         "tests/component/suspend_resume_test.zig",
         "tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",

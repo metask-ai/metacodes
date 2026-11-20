@@ -355,6 +355,26 @@ The flag surface is fail-closed: an unknown flag or positional argument exits wi
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
+Two independent preview features default to off and require the shared
+`--preview` opt-in (or saved `"preview": true`). `--harnessmm` / `--no-harnessmm`
+enables bounded runtime EDGs, guarded reuse of decisions through the native
+tool dispatcher, and durable callback-substitution certificates; the
+[HarnessMM protocol](HARNESSMM_PROTOCOL.md) defines supported guards and
+conservative fallback. `--rsi` / `--no-rsi`, with `--rsi-policy <file>`,
+enables the evolved procedural instruction and its own local ridge router
+together. With preview or RSI off, its policy is not opened or required; with
+preview or HarnessMM off, plans are not admitted and certificates are not read
+or written. Preview alone selects neither optimization. Neither runtime switch
+starts optimization. The [RSI protocol](SKILL_RSI_PROTOCOL.md) defines offline
+training, budgets, exact features, hash binding and host-origin injection.
+Zig consumers use `harnessmm`, `skill_rsi`, and `agent_loop.Options.harnessmm`,
+`rsi` / `rsi_policy` together with `agent_loop.Options.preview`. Explicit child
+selections use the matching `subagent.SpawnOptions` fields; fresh children
+default to no selection, while background root continuation retains it.
+The policy is borrowed for the run or job lifetime. Restoring a conversation
+does not restore feature permission or execute historical graphs; inactive
+host guidance is omitted only from provider projection. C ABI layouts are
+unchanged by these selections and AgentCore Sessions do not implicitly inherit CLI features.
 `metacodes update [--check] [--version X.Y.Z] [--release-base <url>] [--pull]
 [--allow-downgrade] [--no-sdk] [--ignore-running] [--json]` brings the install
 the executable belongs to up to date from the source its install record names
