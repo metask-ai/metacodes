@@ -32,12 +32,12 @@ env:
 
 # Topology: GitHub-hosted runners (the repository is public, hosted standard
 # runners are free for public repositories, and organization policy keeps
-# public repositories off the self-hosted fleet). The exceptions, decided
-# 2026-11-18, are the macOS and Windows gates' pools of single-use VMs (on
-# the Mac Studio and on AIPC), which serve this repository alone and are
-# tried first whenever .github/runner-pools.json switches them on; the hosted
-# legs take over when a pool is off, full or not taking jobs
-# (doc/CI_DESIGN.md §6, doc/VM_POOLS.md).
+# public repositories off the self-hosted fleet). The exceptions are the
+# macOS and Windows gates of organization members' pull requests (and main's
+# warm run): they try a self-hosted runner first whenever
+# .github/runner-pools.json switches it on (macOS: a runner on the Mac
+# Studio's `ci-host` account; Windows: off); the hosted legs take over when a
+# runner is off, busy or not taking jobs (doc/CI_DESIGN.md §6).
 # Each platform's hosted gates are split into legs that run in parallel on
 # separate runners, and the TTY suites into shards; a small result job per
 # platform reports the leg or shard results under the name the ruleset
@@ -136,8 +136,8 @@ jobs:
 
   # Where the macOS and Windows gates run (scripts/ci_pool_plan.py plan,
   # doc/CI_DESIGN.md §6): a platform's pool when .github/runner-pools.json
-  # switches it on and a slot is free, the hosted legs otherwise, both on
-  # main's warm run. It reads the pools' occupancy from this repository's own
+  # switches it on, the pull request's author is an organization member and a
+  # slot is free, the hosted legs otherwise, both on main's warm run. It reads the pools' occupancy from this repository's own
   # runs with the run's read-only token, which a fork's pull request gets too
   # (vars and secrets it does not). It never fails: every doubt is `hosted`,
   # and an empty plan runs the hosted legs.
@@ -168,6 +168,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
           SUITES: ${{ needs.scope.outputs.suites }}
+          # Only organization members' pull requests use a self-hosted runner.
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: python3 scripts/ci_pool_plan.py plan --github-output "$GITHUB_OUTPUT"
 
   # The POSIX gates, one leg per runner (doc/CI_DESIGN.md §4). The legs'
@@ -260,9 +263,13 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
           restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
-      - name: Zig format check
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
-        run: zig fmt --check build.zig src tests
+      # The source-level guards (fmt, the boundary gates, the discipline
+      # scans, git diff --check) take seconds, and the build runner has no
+      # fail-fast: inside a suite step a failed guard is reported only when
+      # the whole leg has finished. So every leg runs them first (#587).
+      - name: Source-level guards
+        if: (matrix.units || matrix.product || matrix.release || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: zig build gate:static
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
       # (restore-keys) and Lake hash-verifies what it restores; a stale or
@@ -597,6 +604,15 @@ jobs:
       - name: Gate manifest unit tests
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
+      - name: Install linters
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m pip install --break-system-packages -r requirements-lint.txt
+      - name: Lint
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 scripts/lint.py
+      - name: Lint unit tests
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_lint -v
       - name: Verify install prefix unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
@@ -693,11 +709,13 @@ jobs:
       ZIG_BUILD_JOBS: "6"
     steps: *gates-steps
 
-  # The macOS gates as one job on a pool VM (doc/CI_DESIGN.md §6): a VM has
-  # the cores and memory a hosted runner lacks, so one job runs what the
-  # hosted legs split, without their repeated checkout, setup and
-  # compilation. Every VM is fresh and destroyed after its job; the pool's
-  # isolation, not this file, is the security boundary (doc/VM_POOLS.md).
+  # The macOS gates as one job on the self-hosted runner (doc/CI_DESIGN.md
+  # §6): it has the cores and memory a hosted runner lacks, so one job runs
+  # what the hosted legs split, without their repeated checkout, setup and
+  # compilation. It is the runner on the Mac Studio's `ci-host` account: jobs
+  # share the host and nothing isolates one from the next, so only
+  # organization members' pull requests are sent to it, and the runner's own
+  # pre-job hook fails any other author's job.
   # FAST_PATH is left to the stand-down step.
   gates-macos-vm:
     name: Gates (macOS) / ${{ matrix.leg }}
@@ -720,7 +738,7 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
-      # .github/runner-pools.json, sized to the VM.
+      # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.macos_zig_build_jobs }}
     steps: *gates-steps
 
@@ -1035,6 +1053,11 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
+      # As in `gates-linux`: the source-level guards first, on every leg.
+      - name: Source-level guards
+        if: (matrix.units || matrix.integration || matrix.product || matrix.release) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: cmd
+        run: zig build gate:static
       # PyYAML for the Python suites that `zig build test` runs; see
       # `gates-linux`.
       - name: Install Python development dependencies
@@ -1185,8 +1208,8 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # The Windows gates as one job on a pool VM on AIPC (doc/CI_DESIGN.md §6,
-  # doc/VM_POOLS.md), as `gates-macos-vm` is for macOS: the hosted legs'
+  # The Windows gates as one job on a self-hosted runner, switched off until
+  # AIPC has one (doc/CI_DESIGN.md §6), as `gates-macos-vm` is for macOS: the hosted legs'
   # steps with every flag set. FAST_PATH is left to the stand-down step.
   windows-gates-vm:
     name: Gates (Windows) / ${{ matrix.leg }}
@@ -1207,7 +1230,7 @@ jobs:
       POOL_JOB: "true"
       RELEASE_FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       SUITES: ${{ needs.scope.outputs.suites }}
-      # .github/runner-pools.json, sized to the VM.
+      # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.windows_zig_build_jobs }}
     steps: *windows-gates-steps
 

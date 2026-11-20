@@ -32,8 +32,10 @@ with tempfile.TemporaryDirectory(prefix='wb-security-matcher-') as temp:
         tests = dataset / 'tasks' / task / 'tests'
         assert hashlib.sha256((tests / 'verify_findings.py').read_bytes()).hexdigest() == scorer_sha
         case = root / label
-        work = case / 'work'; logs = case / 'logs'
-        work.mkdir(parents=True); logs.mkdir()
+        work = case / 'work'
+        logs = case / 'logs'
+        work.mkdir(parents=True)
+        logs.mkdir()
         (work / 'findings.json').write_text(json.dumps(document), encoding='utf-8')
         run = subprocess.run([
             'docker', 'run', '--rm', '--pull', 'never', '--network', 'none',

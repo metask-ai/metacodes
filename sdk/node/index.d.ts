@@ -125,7 +125,7 @@ export class Session {
 }
 
 export class Runtime {
-  constructor(options?: { tools?: string[]; hostTools?: Tool<any>[]; library?: string });
+  constructor(options?: { tools?: string[]; hostTools?: Tool<any>[]; library?: string; preview?: boolean });
   readonly tools: string[];
   readonly hostTools: Tool<any>[];
   session(model: string, options?: SessionOptions): Session;

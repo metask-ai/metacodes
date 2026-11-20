@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import tempfile
 import threading
 import time
@@ -19,9 +18,11 @@ from unittest.mock import patch
 from scripts.eval.harbor import cli, profiling
 from scripts.eval.harbor.store.backend import Store
 from scripts.eval.harbor.store import config as store_config
-from scripts.eval.harbor.viewer import batches, data, server
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
-from scripts.eval.harbor.viewer.setup import LoginManager
+from scripts.eval.harbor.bench import batches, data
+from scripts.eval.harbor.viewer import server
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.setup import LoginManager
+from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run
 
@@ -142,8 +143,8 @@ class BatchTest(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.manager = RunManager(self.root / 'jobs', self.config)
-        self.http = server.make_server(data.Library([self.manager.jobs_dir]), '127.0.0.1', 0,
-                                       self.manager)
+        self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager),
+                                       '127.0.0.1', 0)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)

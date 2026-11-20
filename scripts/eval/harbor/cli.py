@@ -1,5 +1,9 @@
 """Implementation of `metacodes bench`; extracted with the binary's assets.
 
+The terminal presentation of the Bench runtime: it parses arguments, asks a
+local `Workbench` or a running service (`Client`) and prints the answer.
+Running trials belongs to `scripts.eval.harbor.bench`, the page to `viewer`.
+
 Python 3.9+ suffices to open/read the workbench. Harbor and Docker are needed
 only on the machine executing trials. No repository checkout is required.
 """
@@ -13,15 +17,16 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+import uuid
 import webbrowser
 from pathlib import Path
 
-from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json, configured_provider_ids, runtime_env, settings
+from scripts.eval.harbor.bench.client import Client
+from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json, configured_provider_ids, runtime_env, settings
+from scripts.eval.harbor.bench.workbench import open_local
+from scripts.eval.harbor.store import config as store_config
 
 
 def read_env(path):
@@ -41,42 +46,6 @@ def read_env(path):
             continue
         if len(parts) == 1:
             os.environ.setdefault(name.strip(), parts[0])
-
-
-class Client:
-    def __init__(self, url, api_url=None, legacy_token=""):
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
-            raise ValueError("工作台地址必须是 http(s) URL")
-        self.url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
-        self.api_url = api_url or self.url
-        # Only for a service started before the login was dropped, read from
-        # this machine's private receipt: it is needed to stop that service.
-        self.legacy_token = legacy_token
-
-    def request(self, path, payload=None):
-        headers = {"Accept": "application/json"}
-        if self.legacy_token:
-            headers["Authorization"] = "Bearer " + self.legacy_token
-        body = None
-        if payload is not None:
-            body = json.dumps(payload).encode()
-            headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(urllib.parse.urljoin(self.api_url, path), data=body, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
-            try:
-                message = json.load(exc).get("error", str(exc.code))
-            except (ValueError, AttributeError):
-                message = str(exc.code)
-            finally:
-                exc.close()
-            raise ValueError(message) from None
-
-    def open_url(self):
-        return self.url
 
 
 def local_client(saved):
@@ -103,6 +72,14 @@ def receipt_client(saved, config):
     return None
 
 
+def running_service(root, config, jobs_dir, store):
+    """The service this install started for `jobs_dir` and `store`, if it still serves this workbench."""
+    # Check the directory and build the client from the same record: another
+    # startup may publish a different directory's service between two reads.
+    saved = settings(root / "service.json")
+    return receipt_client(saved, config) if same_service(saved, jobs_dir, store) else None
+
+
 def previous_entry(saved):
     """The bind, port and public URL the receipt's service listens on. The
     bind is None when the receipt cannot tell 127.0.0.1 from 0.0.0.0."""
@@ -125,6 +102,18 @@ def service_entry(args, saved):
             public_url if args.public_url is None else args.public_url)
 
 
+def stop_service(client):
+    """Stop a service and wait (briefly) until it no longer answers."""
+    try:
+        client.request("api/stop", {})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            client.request("api/workbench")
+            time.sleep(0.1)
+    except (OSError, ValueError):
+        pass
+
+
 def ensure_service(args, root, config, jobs_dir, store):
     ready = root / "service.json"
     saved = settings(ready)
@@ -138,17 +127,9 @@ def ensure_service(args, root, config, jobs_dir, store):
     if client:
         if client.legacy_token:
             print("bench: 停止需要授权链接的旧版工作台，改用免登录版本", file=sys.stderr)
-        try:
-            client.request("api/stop", {})
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                client.request("api/workbench")
-                time.sleep(0.1)
-        except (OSError, ValueError):
-            pass
+        stop_service(client)
     # The CLI reserves a separate ready file per startup. A crashed or slow
     # old process cannot publish into the current startup's handshake.
-    import uuid
     handshake = root / ("ready-" + uuid.uuid4().hex + ".json")
     command = [sys.executable, "-m", "scripts.eval.harbor.viewer.server", "--jobs-dir", str(jobs_dir),
                "--config", str(config), "--bind", bind, "--port", str(port),
@@ -178,19 +159,6 @@ def ensure_service(args, root, config, jobs_dir, store):
         time.sleep(0.1)
     process.terminate()
     raise ValueError("工作台未在 15 秒内就绪，请查看 " + str(root / "service.log"))
-
-
-def local_overview(store, jobs_dir):
-    """Jobs from the store after bringing it up to date with the jobs directory."""
-    from scripts.eval.harbor.store.backend import Store
-    from scripts.eval.harbor.store.library import StoreLibrary
-
-    library = StoreLibrary(Store(store), [jobs_dir] if jobs_dir.is_dir() else [], owns_store=True)
-    try:
-        library.sync()
-        return library.overview()
-    finally:
-        library.close()
 
 
 def print_suites(value):
@@ -271,7 +239,7 @@ def probe_line(result):
 
 
 def provider_command(args, root):
-    from scripts.eval.harbor.viewer.providers import Providers
+    from scripts.eval.harbor.bench.providers import Providers
     providers = Providers(root)
     if args.db_command == "list":
         value = providers.listing()
@@ -320,6 +288,49 @@ def provider_command(args, root):
     if args.json:
         print(json.dumps(value, ensure_ascii=False))
     return 0
+
+
+def render_stop(_value):
+    print("Bench 工作台已停止；评测 worker 继续运行。")
+
+
+def render_info(value, url):
+    print("Bench 工作台：" + (url or "运行 metacodes bench 启动"))
+    print("执行环境：" + ("已就绪" if value.get("ready") else "待配置"))
+    for reason in value.get("global_reasons", value.get("reasons", [])) + value.get("harbor_reasons", []):
+        print("  " + reason)
+    for executor in value.get("executors", []):
+        print("执行机器：" + executor["label"] + ("（默认）" if executor.get("default") else "") + "：" +
+              ("已就绪" if executor["ready"] else "待配置"))
+        for reason in executor["reasons"]:
+            print("    " + reason)
+    for model in value.get("models", []):
+        print("模型：" + model["id"])
+    print_suites(value)
+
+
+def render_list(value):
+    for job in value["jobs"]:
+        summary = job["summary"]
+        print(f"{job['name']}  {job.get('model') or ''}  通过 {summary['counts']['pass']}/{summary['valid']}  无效 {summary['counts']['invalid']}")
+    if not value["jobs"]:
+        print("暂无评测，运行 metacodes bench 打开工作台。")
+
+
+def render_run(record):
+    print("评测 " + record["name"] + "：" + record["status"])
+    print("Bench 工作台：" + record["url"])
+
+
+def render_open(value):
+    print("Bench 工作台：" + value["url"])
+
+
+def show(value, as_json, render, *extra):
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False))
+    else:
+        render(value, *extra)
 
 
 def main(argv=None):
@@ -441,10 +452,6 @@ def main(argv=None):
         cfg["jobs_dir"] = str(jobs_dir)
         atomic_json(config, cfg)
         client = Client(args.url) if args.url else None
-        if client is None and args.action in ("info", "list"):
-            saved = settings(root / "service.json")
-            if same_service(saved, jobs_dir, store):
-                client = receipt_client(saved, config)
         if args.action == "prepare":
             if args.url or not args.suite:
                 parser.error("bench prepare 需要 --suite，并在执行机器本地运行")
@@ -455,24 +462,20 @@ def main(argv=None):
         if args.action == "sync":
             if not args.run:
                 parser.error("bench sync 需要 --run NAME")
-            from scripts.eval.harbor.viewer import executors
+            from scripts.eval.harbor.bench import executors
             value = executors.sync_run(jobs_dir, args.run, log=lambda text: print(text, file=sys.stderr, flush=True))
             print(json.dumps(value, ensure_ascii=False) if args.json else
                   f"{value['name']}：已同步 {value['files']} 个文件到 {value['local_dir']}（{value['status']}）")
             return 0
         if args.action == "stop":
-            if client is None:
-                client = receipt_client(settings(root / "service.json"), config)
-            if client is None:
-                value = {"stopped": True, "message": "工作台未启动"}
-            else:
-                value = client.request("api/stop", {})
-            print(json.dumps(value, ensure_ascii=False) if args.json else "Bench 工作台已停止；评测 worker 继续运行。")
+            client = client or receipt_client(settings(root / "service.json"), config)
+            value = client.request("api/stop", {}) if client else {"stopped": True, "message": "工作台未启动"}
+            show(value, args.json, render_stop)
             return 0
         if args.action == "setup":
-            from scripts.eval.harbor.viewer import setup
+            from scripts.eval.harbor.bench import setup
 
-            def show(progress, seen=set()):
+            def report(progress, seen=set()):
                 if args.json:
                     return
                 for step in progress["steps"]:
@@ -482,35 +485,23 @@ def main(argv=None):
                         print(f"  {step['title']}: {step['status']} {step['detail']}", file=sys.stderr, flush=True)
             options = {"bundle_version": args.bundle_version,
                        "source": str(args.source.expanduser().resolve()) if args.source else None}
-            progress = setup.run_setup(config, args.executor, dry_run=args.dry_run, on_change=show, options=options)
+            progress = setup.run_setup(config, args.executor, dry_run=args.dry_run, on_change=report, options=options)
             print(json.dumps(progress, ensure_ascii=False) if args.json else setup.format_progress(progress))
             return 0 if progress["status"] in ("ready", "planned") else 1
         if args.action in ("info", "list"):
+            client = client or running_service(root, config, jobs_dir, store)
             if args.action == "info":
                 value = client.request("api/workbench") if client else RunManager(jobs_dir, config).catalog()
-                if not args.json:
-                    print("Bench 工作台：" + (client.url if client else "运行 metacodes bench 启动"))
-                    print("执行环境：" + ("已就绪" if value.get("ready") else "待配置"))
-                    for reason in value.get("global_reasons", value.get("reasons", [])) + value.get("harbor_reasons", []):
-                        print("  " + reason)
-                    for executor in value.get("executors", []):
-                        print("执行机器：" + executor["label"] + ("（默认）" if executor.get("default") else "") + "：" +
-                              ("已就绪" if executor["ready"] else "待配置"))
-                        for reason in executor["reasons"]:
-                            print("    " + reason)
-                    for model in value.get("models", []):
-                        print("模型：" + model["id"])
-                    print_suites(value)
+                show(value, args.json, render_info, client.url if client else None)
+            elif client:
+                show(client.request("api/jobs"), args.json, render_list)
             else:
-                value = client.request("api/jobs") if client else {"jobs": local_overview(store, jobs_dir)}
-                if not args.json:
-                    for job in value["jobs"]:
-                        summary = job["summary"]
-                        print(f"{job['name']}  {job.get('model') or ''}  通过 {summary['counts']['pass']}/{summary['valid']}  无效 {summary['counts']['invalid']}")
-                    if not value["jobs"]:
-                        print("暂无评测，运行 metacodes bench 打开工作台。")
-            if args.json:
-                print(json.dumps(value, ensure_ascii=False))
+                # Without a service, the runtime answers from this machine's store.
+                local = open_local(store, jobs_dir)
+                try:
+                    show({"jobs": local.overview()}, args.json, render_list)
+                finally:
+                    local.close()
             return 0
         client = client or ensure_service(args, root, config, jobs_dir, store)
         if args.action == "run":
@@ -528,21 +519,13 @@ def main(argv=None):
             if args.executor:
                 payload["executor"] = args.executor
             record = client.request("api/runs", payload)
-            url = client.url + "#/run/" + record["name"]
             if args.wait:
-                while record["status"] in ("queued", "starting", "running", "cancelling"):
+                while record["status"] in ACTIVE:
                     time.sleep(1)
                     record = client.request("api/run?name=" + record["name"])
-            if args.json:
-                print(json.dumps({**record, "url": url}, ensure_ascii=False))
-            else:
-                print("评测 " + record["name"] + "：" + record["status"])
-                print("Bench 工作台：" + url)
+            show({**record, "url": client.url + "#/run/" + record["name"]}, args.json, render_run)
             return 1 if record["status"] in ("failed", "interrupted", "cancelled") else 0
-        if args.json:
-            print(json.dumps({"url": client.open_url(), "service": "metacodes-bench"}))
-        else:
-            print("Bench 工作台：" + client.open_url())
+        show({"url": client.open_url(), "service": "metacodes-bench"}, args.json, render_open)
         if not args.no_open and not args.json:
             webbrowser.open(client.open_url())
         return 0

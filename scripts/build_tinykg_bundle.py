@@ -22,14 +22,15 @@ import sys
 import tarfile
 from typing import Optional, Sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.stage_tinykg_binary import (
     BUNDLE_SCHEMA, COMMIT_RE, StageError, TinyKgBundle, TinyKgContract,
     _atomic_copy, _atomic_json, _atomic_text, inspect_binary, sha256_file,
     validate_bundle_bytes, validate_store_contract,
 )
 from scripts.verify_tinykg_binary import attest_native
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 TARGETS = (
     "aarch64-macos", "x86_64-macos", "x86_64-linux-musl",

@@ -9,6 +9,7 @@ const manifest = @import("build.zig.zon");
 // github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
 // optimize 编译;未用的 import 零成本)。tree-sitter 已于 2026-07-13 整体移除。
 var g_hl_mod: ?*std.Build.Module = null;
+var g_code_mod: ?*std.Build.Module = null;
 var g_formal_kernel_sha256: ?[]const u8 = null;
 var g_project_kernel_sha256: ?[]const u8 = null;
 var g_sandbox_helper_install: ?*std.Build.Step = null;
@@ -29,6 +30,28 @@ fn addHlWithProjectHarnessActuation(
         g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
     }
     mod.addImport("hl", g_hl_mod.?);
+    if (g_code_mod == null) {
+        const code = b.createModule(.{ .root_source_file = b.path("src/code/runtime.zig"), .link_libc = true });
+        // vendor/quickjs holds upstream bytes plus patches/*.patch; the engine
+        // is compiled from the verified, patched tree the stage script writes.
+        const quickjs = stageQuickJsSources(b);
+        code.addIncludePath(quickjs);
+        code.addIncludePath(b.path("src/code"));
+        // Searched after the libc headers: only fills <sys/time.h> where the
+        // C runtime lacks it (Windows MSVC).
+        code.addAfterIncludePath(b.path("src/code/compat"));
+        // The embedded engine and bridge are private implementation details;
+        // AgentCore shared libraries export only their declared public ABI.
+        const code_flags: []const []const u8 = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv", "-fvisibility=hidden", "-include", b.pathFromRoot("src/code/quickjs_port.h") };
+        code.addCSourceFiles(.{
+            .root = quickjs,
+            .files = &.{ "quickjs.c", "cutils.c", "dtoa.c", "libregexp.c", "libunicode.c" },
+            .flags = code_flags,
+        });
+        code.addCSourceFile(.{ .file = b.path("src/code/bridge.c"), .flags = code_flags });
+        g_code_mod = code;
+    }
+    mod.addImport("code_runtime", g_code_mod.?);
     mod.addImport("bench_assets", b.createModule(.{ .root_source_file = b.path("scripts/bench_assets.zig") }));
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
     const project_harness_options = b.addOptions();
@@ -299,6 +322,21 @@ fn tinyKgContractInfo(b: *std.Build) TinyKgContractInfo {
 /// Configure-time read of a repository JSON document into `T`; the strings
 /// stay alive in the build allocator. Unknown fields are ignored so a manifest
 /// can grow without touching the build identity.
+/// Verifies `vendor/quickjs` against its manifest and writes the patched engine
+/// tree (`scripts/stage_quickjs_sources.py`). Every manifest-pinned file is an
+/// input, so editing a source or a patch re-runs the stage.
+fn stageQuickJsSources(b: *std.Build) std.Build.LazyPath {
+    const Pinned = struct { path: []const u8 };
+    const pinned = parseJsonFile(b, struct { files: []const Pinned, patches: []const Pinned }, "vendor/quickjs/manifest.json");
+    const stage = b.addSystemCommand(&.{ if (@import("builtin").os.tag == .windows) "python" else "python3", "scripts/stage_quickjs_sources.py", "--out" });
+    const out = stage.addOutputDirectoryArg("quickjs");
+    stage.addFileInput(b.path("scripts/stage_quickjs_sources.py"));
+    stage.addFileInput(b.path("vendor/quickjs/manifest.json"));
+    for (pinned.files) |item| stage.addFileInput(b.path(b.fmt("vendor/quickjs/{s}", .{item.path})));
+    for (pinned.patches) |item| stage.addFileInput(b.path(b.fmt("vendor/quickjs/{s}", .{item.path})));
+    return out;
+}
+
 fn parseJsonFile(b: *std.Build, comptime T: type, path: []const u8) T {
     const bytes = b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(1024 * 1024)) catch |err|
         std.debug.panic("cannot read {s}: {t}", .{ path, err });
@@ -1882,6 +1920,12 @@ pub fn build(b: *std.Build) void {
     else
         b.addFail("AgentCore bundle requires explicit -Dtarget=<triple>");
     const manifest_cmd = b.addRunArtifact(agentcore_manifest_tool);
+    const install_agentcore_quickjs_license = b.addInstallFileWithDir(
+        b.path("vendor/quickjs/LICENSE"),
+        .prefix,
+        b.fmt("{s}/licenses/quickjs-LICENSE", .{agentcore_bundle_rel}),
+    );
+    manifest_cmd.step.dependOn(&install_agentcore_quickjs_license.step);
     manifest_cmd.addArgs(&.{
         agentcore_install_root,
         resolved_agentcore_target,
@@ -2531,6 +2575,22 @@ pub fn build(b: *std.Build) void {
     tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
     units_test_step.dependOn(&tinykg_contract_test_cmd.step);
 
+    // QuickJS is upstream bytes plus patches/*.patch: the verifier fails on a
+    // drifted, undeclared or edited file and on a patch that no longer applies.
+    const quickjs_sources_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_stage_quickjs_sources",
+        "-v",
+    });
+    const quickjs_sources_test_step = b.step(
+        "test:quickjs-sources",
+        "Verify the vendored QuickJS sources, patches and manifest",
+    );
+    quickjs_sources_test_step.dependOn(&quickjs_sources_test_cmd.step);
+    units_test_step.dependOn(&quickjs_sources_test_cmd.step);
+
     // The trajectory audit itself only runs against a real ~/.metacodes, which
     // CI does not have - but its parsing does not need one, and two defects in
     // it were caught by these tests rather than by the real data (which
@@ -2743,13 +2803,37 @@ pub fn build(b: *std.Build) void {
         core_shard_reporter,
         staged_lean_kernels,
     );
+    // gate:static —— the guards that only read the source (#587). Inside
+    // gate:pr they ran beside every compile and test step, and the build
+    // runner has no fail-fast, so a guard that fails in seconds on its own was
+    // reported only at the end of the whole gate. The checklist and every CI
+    // gate leg run this first; gate:pr still includes it.
+    const gate_static_step = b.step("gate:static", "Run the source-level guards alone: fmt, the boundary gates, the discipline scans, git diff --check");
+    gate_static_step.dependOn(&gate_fmt.step);
+    // The boundary gates' scans only: their self-tests are test binaries,
+    // which bring in the fs-helper install (`addTestRunArtifact`), and run
+    // in `test:units` with the rest of the suite.
+    gate_static_step.dependOn(&http_status_gate_run.step);
+    gate_static_step.dependOn(&subsystem_boundary_run.step);
+    gate_static_step.dependOn(&io_threaded_test_cmd.step);
+    gate_static_step.dependOn(&thread_stack_test_cmd.step);
+    gate_static_step.dependOn(&terminal_io_test_cmd.step);
+    gate_static_step.dependOn(&scrollback_test_cmd.step);
+    gate_static_step.dependOn(&builtin_egress_test_cmd.step);
+    gate_static_step.dependOn(&gate_diff_check.step);
+    const gate_lint = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/lint.py",
+    });
+    const lint_step = b.step("lint", "Lint Python, shell scripts and GitHub Actions workflows");
+    lint_step.dependOn(&gate_lint.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
-    gate_pr_step.dependOn(&gate_fmt.step);
+    gate_pr_step.dependOn(gate_static_step);
+    gate_pr_step.dependOn(&gate_lint.step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
-    gate_pr_step.dependOn(&gate_diff_check.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
@@ -3243,6 +3327,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/microcompact_test.zig",
         "tests/component/kg_task_projection_test.zig",
         "tests/component/goal_state_test.zig",
+        "tests/component/usage_report_test.zig",
         "tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",
@@ -3261,6 +3346,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/openai_provider_test.zig",
         "tests/component/gemini_provider_test.zig",
         "tests/component/background_main_test.zig",
+        "tests/component/harnessmm_test.zig",
         "tests/component/suspend_resume_test.zig",
         "tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",

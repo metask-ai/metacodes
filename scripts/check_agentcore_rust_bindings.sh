@@ -9,7 +9,7 @@ if [ "$ACTUAL" != "$EXPECTED" ]; then
     exit 1
 fi
 
-REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BINDGEN_INCLUDES="$REPO_ROOT/scripts/agentcore_bindgen_include"
 TMP_FILE=$(mktemp)
 TMP_NORMALIZED=$(mktemp)

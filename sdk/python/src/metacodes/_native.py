@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 ABI_V1 = 1
-ABI_REVISION = 28
+ABI_REVISION = 29
 
 # Status codes (METASK_AGENTCORE_STATUS_*).
 STATUS_NAMES = {
@@ -90,6 +90,7 @@ MAX_TURNS = 1000
 MAX_STREAM_RETRY_BUDGET = 8
 
 BUILTIN_TOOLS = (
+    "ExecuteCode",
     "Read",
     "Write",
     "Edit",
@@ -159,7 +160,8 @@ class RuntimeConfig(ctypes.Structure):
         ("mcp_server_count", ctypes.c_uint64),
         ("mcp_catalog_limits", ctypes.c_void_p),
         ("enable_teams", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 3),
+        ("preview", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 2),
     ]
 
 

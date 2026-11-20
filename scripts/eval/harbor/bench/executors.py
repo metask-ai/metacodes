@@ -78,9 +78,9 @@ REMOTE_RUNTIME = (
     "scripts/eval/harbor/command.py",
     "scripts/eval/harbor/profiling.py",
     "scripts/eval/harbor/metacodes_agent.py",
-    "scripts/eval/harbor/viewer/__init__.py",
-    "scripts/eval/harbor/viewer/egress.py",
-    "scripts/eval/harbor/viewer/remote.py",
+    "scripts/eval/harbor/bench/__init__.py",
+    "scripts/eval/harbor/bench/egress.py",
+    "scripts/eval/harbor/bench/remote.py",
 )
 # `pypi_index`, `docker_mirrors` entries and `egress.proxy`: plain http(s)
 # URLs (they reach shell scripts and JSON files on the executor).
@@ -788,7 +788,7 @@ class JobSync:
 
     def remote_python(self, *args: str) -> List[str]:
         return ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, self.executor.python,
-                                        "-m", "scripts.eval.harbor.viewer.remote", *args])
+                                        "-m", "scripts.eval.harbor.bench.remote", *args])
 
     def manifest(self) -> Dict[str, List[int]]:
         listing = self.runner(self.remote_python("manifest", self.remote_dir), stdin=subprocess.DEVNULL,
@@ -997,7 +997,7 @@ class RemoteRun:
                                         runner=self.runner, popen=self.popen)
 
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
-        from scripts.eval.harbor.viewer.worker import command
+        from scripts.eval.harbor.bench.worker import command
         run_dir = self.executor.remote("runs", self.spec["name"])
         remote = {**self.spec, "harbor": self.spec.get("remote_harbor") or self.executor.harbor or ".local/bin/harbor",
                   "bundle": self.bundle, "jobs_dir": self.executor.remote("jobs")}
@@ -1050,7 +1050,7 @@ class RemoteRun:
         the reverse forward the run session carries, or None."""
         if self.tunnel_port is None:
             return None
-        from scripts.eval.harbor.viewer.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
+        from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
         if self.proxy is None:
             self.proxy = EgressProxy(self.executor.egress_ports, log=self.log,
                                      allow=allow_policy(self.executor.egress_allow
@@ -1084,7 +1084,7 @@ class RemoteRun:
 
     def start(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str] = None) -> None:
         argv = ssh_argv(self.executor, ["env", "PYTHONPATH=" + self.runtime, "PYTHONUNBUFFERED=1",
-                                        self.executor.python, "-m", "scripts.eval.harbor.viewer.remote",
+                                        self.executor.python, "-m", "scripts.eval.harbor.bench.remote",
                                         "run", remote_spec_path], reverse=self.start_egress())
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
@@ -1218,7 +1218,7 @@ def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = No
     """`metacodes bench sync --run NAME`: copy an SSH run's job directory
     back after its worker could not, and clear the receipt's note. A run
     whose Harbor exited 0 becomes `finished` once its copy is complete."""
-    from scripts.eval.harbor.viewer.runner import ACTIVE, RunManager, atomic_json
+    from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
     if not isinstance(name, str) or not RUN_NAME.fullmatch(name):
         raise ValueError("运行名称无效")
     records = Path(jobs_dir) / ".bench-runs"

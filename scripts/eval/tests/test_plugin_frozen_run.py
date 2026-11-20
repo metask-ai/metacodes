@@ -51,7 +51,6 @@ from scripts.eval.plugin_pair_runner import (
     build_plan,
     freeze_run,
     frozen_run_fields,
-    load_user_authority,
     main,
     manifest_sha256_of,
     path_set_digest,
@@ -61,7 +60,6 @@ from scripts.eval.plugin_pair_runner import (
     write_rollouts,
 )
 from scripts.eval.plugin_release_gate import (
-    PluginGateError,
     load_protocol,
     refresh_implementation_fingerprint,
 )

@@ -21,9 +21,9 @@ from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
-from scripts.eval.harbor.viewer import data, executors
-from scripts.eval.harbor.viewer.account import Account
-from scripts.eval.harbor.viewer.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, loopback, write_config
+from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench.account import Account
+from scripts.eval.harbor.bench.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, loopback, write_config
 
 # The launch API's original fixed dataset, still accepted as `dataset`.
 DATASET = suites.BY_ID[suites.DEFAULT_SUITE].dataset
@@ -104,7 +104,7 @@ class RunManager:
         self.probe_cache = {}
         # Providers imported by URL and key (`bench provider`, the page).
         self.providers = Providers(self.config_path.parent)
-        from scripts.eval.harbor.viewer.setup import SetupManager
+        from scripts.eval.harbor.bench.setup import SetupManager
         # Whether a setup that may restart Docker or Colima is running; the
         # service replaces this with its own SetupManager's view. A launch
         # and such a setup exclude each other under self.lock.
@@ -201,7 +201,7 @@ class RunManager:
         return entry
 
     def catalog(self):
-        from scripts.eval.harbor.viewer.batches import bundle_choices
+        from scripts.eval.harbor.bench.batches import bundle_choices
         cfg = settings(self.config_path)
         mode = cfg.get("auth_mode") or ("provider" if cfg.get("provider_config") else "metask")
         reasons = []
@@ -414,7 +414,7 @@ class RunManager:
             shown_judge = suites.judge_label(suite, cfg)
             if shown_judge:
                 record["judge"] = shown_judge  # model id and route only
-            from scripts.eval.harbor.viewer.batches import current_metacodes
+            from scripts.eval.harbor.bench.batches import current_metacodes
             metacodes = ({k: frozen.get(k) for k in ("label", "commit", "digest", "release", "frozen")}
                          if frozen else current_metacodes(cfg))
             if metacodes:
@@ -483,7 +483,7 @@ class RunManager:
             atomic_json(spec_path, spec)
             try:
                 with (self.records / (name + ".log")).open("wb") as log:
-                    process = subprocess.Popen([sys.executable, "-m", "scripts.eval.harbor.viewer.worker", str(spec_path)],
+                    process = subprocess.Popen([sys.executable, "-m", "scripts.eval.harbor.bench.worker", str(spec_path)],
                                                cwd=str(Path(__file__).resolve().parents[4]), env=runtime_env(),
                                                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
                     threading.Thread(target=process.wait, daemon=True).start()

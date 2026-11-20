@@ -8,8 +8,7 @@ from pathlib import Path
 import platform
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.stage_tinykg_binary import (
     StageError,
     TinyKgBundle,
@@ -19,6 +18,8 @@ from scripts.stage_tinykg_binary import (
     validate_store_contract,
     TARGET_CONTRACTS,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def validate_bundle_inventory(manifest_path: Path, bundle: TinyKgBundle) -> None:

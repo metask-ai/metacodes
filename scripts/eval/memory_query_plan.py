@@ -370,7 +370,6 @@ def _parse_plan(tool_input: Mapping[str, Any], where: str) -> Mapping[str, Any]:
         if "type" in tool_input
         else None
     )
-    seed_kinds = {"exact", "alias"}
     seed_shape_rewrite = (
         schema_version == BATCH_LEXICAL_PLAN_SCHEMA_VERSION
         and stage in {"seed", "semantic_expansion"}

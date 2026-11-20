@@ -520,7 +520,7 @@ refreshing a session login, then
    content digest (complete directories are marked and reused);
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
-3. starts `python3 -m scripts.eval.harbor.viewer.remote run …` over SSH and
+3. starts `python3 -m scripts.eval.harbor.bench.remote run …` over SSH and
    writes the secrets as the first line on the SSH channel's stdin:
    `{"env": {"METASK_API_KEY": "<placeholder>", …}, "credential": "<access token or key>"}`.
    `env` goes to Harbor's environment (`--ae NAME=${NAME}` as locally), so
@@ -995,3 +995,19 @@ Harbor orchestration layer.
 Contract tests use real HTTP and a subprocess standing in for Harbor, proving
 that UI/CLI input reaches the child argv, creates a visible job, preserves
 exit status, and supports cancellation without making paid requests.
+
+## Code layout
+
+The runtime and its two presentations are separate packages under
+`scripts/eval/harbor/`:
+
+| Layer | Files | Owns |
+|---|---|---|
+| Runtime | `bench/` | job projection (`data.py`), account models and keys (`account.py`), launch validation (`runner.py`), the durable worker (`worker.py`), the `Workbench` facade both presentations read (`workbench.py`) and its HTTP client (`client.py`) |
+| Web page | `viewer/server.py`, `viewer/static/` | HTTP routes, authorization, the page |
+| CLI | `cli.py` | arguments, service startup, terminal output |
+
+The runtime imports neither presentation, and the two presentations do not
+import each other (`LayeringTest` in `scripts/eval/tests/test_bench_workbench.py`).
+A change to how runs execute or how results are classified goes in `bench/`;
+both the page and `metacodes bench list`/`info` pick it up.

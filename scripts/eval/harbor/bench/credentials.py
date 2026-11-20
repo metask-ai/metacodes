@@ -24,7 +24,7 @@ import threading
 import time
 
 from scripts.eval.harbor.profiling import StaticCredential
-from scripts.eval.harbor.viewer.account import Account, AccountHTTPError
+from scripts.eval.harbor.bench.account import Account, AccountHTTPError
 
 # Refresh once an access token has less than this left (~45 minutes into a
 # one-hour token). METACODES_BENCH_REFRESH_MARGIN overrides it (tests).
@@ -169,7 +169,7 @@ def for_run(spec, env):
     if spec.get("imported_provider"):
         # A provider imported by URL and key: the key is in the private
         # store, taken only from the revision the run's config came from.
-        from scripts.eval.harbor.viewer.providers import Providers
+        from scripts.eval.harbor.bench.providers import Providers
         store = Providers(spec["providers_root"])
         return StaticCredential(store.secret(spec["imported_provider"], spec.get("imported_revision"))), None
     secret = env.get(spec["key_env"])

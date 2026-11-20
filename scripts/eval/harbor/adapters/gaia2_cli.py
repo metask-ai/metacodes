@@ -128,7 +128,7 @@ def options(cfg) -> Dict:
 
 
 def pypi_index(cfg) -> Optional[str]:
-    from scripts.eval.harbor.viewer.executors import MIRROR_URL
+    from scripts.eval.harbor.bench.executors import MIRROR_URL
     value = (cfg or {}).get("pypi_index")
     if value is None:
         return None
@@ -138,7 +138,7 @@ def pypi_index(cfg) -> Optional[str]:
 
 
 def tool(name: str) -> Optional[str]:
-    from scripts.eval.harbor.viewer.executors import search_path
+    from scripts.eval.harbor.bench.executors import search_path
     return shutil.which(name, path=search_path())
 
 

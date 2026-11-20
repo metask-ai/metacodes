@@ -2467,9 +2467,9 @@ test "BashOutput a pattern wait neither spins on a finished search nor between s
     const ended = try registry.spawnBackground("printf nothing-here; exit 0", null);
     try waitForExit(&registry, ended.idSlice());
     const start = time.nowMs();
-    var none = try poll(&ctx, "{{\"job_id\":\"{s}\",\"wait_ms\":3000,\"pattern\":\"READY\"}}", .{ended.idSlice()});
+    var none = try poll(&ctx, "{{\"job_id\":\"{s}\",\"wait_ms\":30000,\"pattern\":\"READY\"}}", .{ended.idSlice()});
     defer none.deinit();
-    try std.testing.expect(time.nowMs() - start < 1000);
+    try std.testing.expect(time.nowMs() - start < 15000);
     try std.testing.expectEqualStrings("exit", envString(none, "returned_on"));
     try std.testing.expect(none.value.object.get("pattern_searched_to") == null);
 

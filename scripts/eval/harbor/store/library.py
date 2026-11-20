@@ -1,7 +1,7 @@
 """The viewer's read path: job views, trial details and run records from the
 store, kept current with the jobs directories the service watches.
 
-Views are assembled by scripts/eval/harbor/viewer/data.py from stored trial
+Views are assembled by scripts/eval/harbor/bench/data.py from stored trial
 rows; only elapsed times of still-running trials and jobs are refreshed at
 read time, exactly as a file read at that moment would compute them.
 """
@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.store.backend import Store
-from scripts.eval.harbor.viewer import data
+from scripts.eval.harbor.bench import data
 
 
 def _refresh(row: Dict[str, Any], moment: dt.datetime) -> Dict[str, Any]:

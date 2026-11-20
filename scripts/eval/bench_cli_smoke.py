@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json  # noqa: E402
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json  # noqa: E402
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run, wait_status  # noqa: E402
 
 # A service from before the login was dropped, in a separate process: the

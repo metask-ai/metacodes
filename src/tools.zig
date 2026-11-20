@@ -124,9 +124,16 @@ pub const ToolEntry = struct {
     swarm_gated: bool = false,
     /// Only advertised when the active long-horizon treatment includes TinyKG.
     tinykg_gated: bool = false,
+    /// Preview tools require explicit Host opt-in for advertisement and dispatch.
+    preview_gated: bool = false,
     /// 执行期必需的进程外可执行依赖。非 null 时 catalog 准入先探测可用性,
     /// 缺失则拒绝创建而不是广告后首调失败。
     runtime_dependency: ?RuntimeDependency = null,
+
+    pub fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+        if (self.preview_gated and !ctx.preview) return error.PreviewFeatureDisabled;
+        return self.execute.run(ctx, args);
+    }
 };
 
 const SESSION_TASK_STATUS_VALUES: []const []const u8 = &.{ "pending", "in_progress", "completed", "deleted" };
@@ -691,6 +698,16 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .legacy_inline = swarm_tools.executeSpawnTeammate },
         .swarm_gated = true,
     },
+    .{
+        .name = "ExecuteCode",
+        .preview_gated = true,
+        .description = "Execute JavaScript in a persistent per-session context. Use top-level await tools.ToolName(args) to call tools from the current tools list, e.g. var data = await tools.Read({file_path:'/absolute/path'}); data. Tools retain all permission, hook, sandbox and budget checks. Calls return Promises; await every call. JSON tool results become JS values; text stays a string; tool errors reject with Error.result. Global var/let/const declarations persist across successful calls. The last expression and console.log output are returned; intermediate values stay in the VM. No filesystem, process, network, imports, timers or TypeScript runtime. Up to 128 calls, 64 MiB heap and 64 KiB output. Calls are dispatched sequentially, including Promise.all. Use AskUserQuestion outside scripts. Failed evaluations reset the VM before its next use; tool side effects are retained. timeout_ms bounds JS and time between tools; running tools retain their own timeout/cancellation.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "code", .type = "string", .description = "JavaScript source; top-level await and the last expression are supported. Maximum 256 KiB." },
+            .{ .name = "timeout_ms", .type = "integer", .description = "JavaScript deadline in milliseconds, 1-120000; default 30000. Checked between host calls as well." },
+        }, .required = &.{"code"}, .additional_properties = false },
+        .execute = .{ .legacy_inline = @import("tools/execute_code.zig").execute },
+    },
 };
 
 comptime {
@@ -778,6 +795,7 @@ pub fn toToolDefinitionsFull(
 
     // Swarm 工具门控(F5):未开 --agent-teams 时不广告 TeamCreate/TeamDelete/SendMessage。
     const teams_on = if (prompt_ctx) |pc| pc.agent_teams else false;
+    const preview_on = if (prompt_ctx) |pc| pc.preview else false;
     const tinykg_on = if (prompt_ctx) |pc| pc.tinykg_enabled else true;
     // ToolSearch 是 deferred 工具的发现/激活入口。没有任何 deferred 工具时仍广告它，
     // 会诱导模型对已经带完整 schema 的常驻工具做 select:Write/KgRecall，徒增一轮。
@@ -787,6 +805,7 @@ pub fn toToolDefinitionsFull(
     for (registry) |tool| {
         if (tool.swarm_gated and !teams_on) continue;
         if (tool.tinykg_gated and !tinykg_on) continue;
+        if (tool.preview_gated and !preview_on) continue;
         if (tool.deferred) {
             has_deferred = true;
             break;
@@ -806,6 +825,7 @@ pub fn toToolDefinitionsFull(
     for (registry) |*tool| {
         if (tool.swarm_gated and !teams_on) continue;
         if (tool.tinykg_gated and !tinykg_on) continue;
+        if (tool.preview_gated and !preview_on) continue;
         if (std.mem.eql(u8, tool.name, "ToolSearch") and !has_deferred) continue;
         const desc: []const u8 = blk: {
             // env override(slot "TOOL_DESC_<UPPER_NAME>")优先于 describe_fn / 静态描述。
@@ -883,7 +903,7 @@ pub fn redescribeForContext(
 }
 
 pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
-    var body = try tool.execute.run(ctx, args);
+    var body = try tool.run(ctx, args);
     errdefer body.deinit(ctx.allocator);
     return (try body.takeModelBytes(ctx.allocator)).bytes;
 }
@@ -1022,7 +1042,7 @@ fn dispatchInto(out: *ToolDispatchOutcome, ctx: *const ToolContext, name: []cons
     if (getTool(name)) |t| {
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
-        out.* = .{ .ok = try t.execute.run(ctx, args) };
+        out.* = .{ .ok = try t.run(ctx, args) };
         return;
     }
     if (ctx.dyn_registry) |dr| {
@@ -1041,7 +1061,7 @@ fn dispatchInto(out: *ToolDispatchOutcome, ctx: *const ToolContext, name: []cons
             if (getTool(repaired)) |t| {
                 try validateRequired(repaired, args);
                 try validateTypes(repaired, args);
-                out.* = .{ .ok = try t.execute.run(ctx, args) };
+                out.* = .{ .ok = try t.run(ctx, args) };
                 return;
             }
             if (ctx.dyn_registry) |dr| {
@@ -1201,6 +1221,10 @@ const ToolNameIter = struct {
             return null;
         }
         while (self.static_idx < registry.len) {
+            if (registry[self.static_idx].preview_gated and !self.ctx.preview) {
+                self.static_idx += 1;
+                continue;
+            }
             const nm = registry[self.static_idx].name;
             self.static_idx += 1;
             if (self.ctx.execution_policy) |policy| {
@@ -1365,7 +1389,7 @@ test "toToolDefinitions includes ToolSearch when native formal audit is deferred
     // 是 deferred 静态工具，因此 ToolSearch 必须出现；只排除 swarm-gated 工具。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated) non_gated += 1;
+        if (!t.swarm_gated and !t.preview_gated) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated);
     // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
@@ -1405,7 +1429,7 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
     // prompt_ctx=null 门控 swarm。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated) non_gated += 1;
+        if (!t.swarm_gated and !t.preview_gated) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated + 1);
     // 动态工具在末尾。

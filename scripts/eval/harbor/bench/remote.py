@@ -1,8 +1,8 @@
 """Remote side of an SSH Bench executor. Runs on the Linux execution host.
 
-    python3 -m scripts.eval.harbor.viewer.remote run <spec.json>
-    python3 -m scripts.eval.harbor.viewer.remote manifest <job-dir>
-    python3 -m scripts.eval.harbor.viewer.remote pack <job-dir>   # JSON items on stdin
+    python3 -m scripts.eval.harbor.bench.remote run <spec.json>
+    python3 -m scripts.eval.harbor.bench.remote manifest <job-dir>
+    python3 -m scripts.eval.harbor.bench.remote pack <job-dir>   # JSON items on stdin
 
 `run` reads one JSON line from stdin first,
 `{"env": {NAME: value}, "credential": "<real token>"}`, carried by the SSH
@@ -112,7 +112,7 @@ def run(spec_path):
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
             if options.get("refuse_local_upstream"):
-                from scripts.eval.harbor.viewer.egress import names_this_machine
+                from scripts.eval.harbor.bench.egress import names_this_machine
                 if names_this_machine(urlsplit(options["upstream"]).hostname or ""):
                     # This machine resolves the imported address to itself:
                     # never send the key to whatever listens here.
@@ -141,7 +141,7 @@ def run(spec_path):
         if spec.get("egress") or spec.get("ghcr_mirror"):
             if runtime not in sys.path:
                 sys.path.insert(0, runtime)
-            from scripts.eval.harbor.viewer import egress
+            from scripts.eval.harbor.bench import egress
         if spec.get("egress"):
             # For this run only: the forwarder on the Docker bridge and a
             # DOCKER_CONFIG that tells the docker CLI to give every container
@@ -333,7 +333,7 @@ def egress_probe(options):
     user-defined network (as Harbor's compose projects use) fetches the
     workbench proxy's probe page through the forwarder (workbench mode) or
     reaches the site proxy (proxy mode). Prints one JSON line."""
-    from scripts.eval.harbor.viewer import egress
+    from scripts.eval.harbor.bench import egress
     import uuid
     network = "metacodes-bench-egress-" + uuid.uuid4().hex[:8]
     result = {"ok": False}

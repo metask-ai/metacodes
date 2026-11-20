@@ -18,7 +18,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import READY, WAIT_S, case_tmpdir, run, submit, wait_for  # noqa: E402
+from tty_driver import READY, case_tmpdir, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 NOT_SET = "not set — /login, or configure .env"

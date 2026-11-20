@@ -795,7 +795,9 @@ pub const LoginDialog = struct {
                 }
                 self.clearKey();
                 self.failure_len = 0;
-                self.stage = .key_page;
+                // A provider the user configured has no page to choose or
+                // open: its key comes from whoever runs it.
+                self.stage = if (self.pageless()) .key_entry else .key_page;
             },
         }
     }
@@ -803,6 +805,13 @@ pub const LoginDialog = struct {
     fn keyPages(self: *const LoginDialog) []const provider_profile.KeyPage {
         const setup = self.current().profile.api_key_setup orelse return &.{};
         return setup.pages;
+    }
+
+    /// The key is only pasted: one page, and nowhere to create the key on
+    /// (`KeyPage.url`, a configured provider's).
+    fn pageless(self: *const LoginDialog) bool {
+        const pages = self.keyPages();
+        return pages.len == 1 and pages[0].url == null;
     }
 
     fn clearKey(self: *LoginDialog) void {
@@ -1048,9 +1057,14 @@ pub const LoginDialog = struct {
             },
             .key_entry => {
                 const page = self.keyPages()[self.key_page];
-                try p.text("Create a key on this page, then paste it here:");
-                try p.blank();
-                try p.raw(page.url);
+                if (page.url) |url| {
+                    try p.text("Create a key on this page, then paste it here:");
+                    try p.blank();
+                    try p.raw(url);
+                } else {
+                    var head_buf: [160]u8 = undefined;
+                    try p.text(std.fmt.bufPrint(&head_buf, "Paste the API key for {s}:", .{self.current().profile.display_name}) catch "Paste the API key:");
+                }
                 try p.blank();
                 var mask_buf: [64]u8 = undefined;
                 const shown = @min(self.key_len, 24);
@@ -1260,10 +1274,10 @@ pub const LoginDialog = struct {
                 },
                 .enter => {
                     if (self.keyPages().len == 0) return .none;
-                    if (self.key_options.open_browser) {
+                    if (self.key_options.open_browser) if (self.keyPages()[self.key_page].url) |url| {
                         // Best effort: the page is also printed whole to copy.
-                        @import("../core/auth.zig").openBrowser(self.allocator, self.keyPages()[self.key_page].url) catch {};
-                    }
+                        @import("../core/auth.zig").openBrowser(self.allocator, url) catch {};
+                    };
                     self.stage = .key_entry;
                     return .redraw;
                 },
@@ -1279,9 +1293,14 @@ pub const LoginDialog = struct {
             .key_entry => switch (k) {
                 .esc => {
                     self.clearKey();
+                    // Back the way it came: a key grant's ways for a key
+                    // pasted from there with no plan to pick, the provider
+                    // list for a pasted key with no page, else the page list.
                     if (self.pasting and self.keyPages().len <= 1) {
                         self.pasting = false;
                         self.stage = .how;
+                    } else if (self.pageless()) {
+                        self.backToList();
                     } else {
                         self.stage = .key_page;
                     }
@@ -2127,6 +2146,41 @@ test "login: a key provider goes plan page → paste, and the key is never drawn
     try testing.expectEqual(Step.redraw, dialog.key(.enter));
     try testing.expectEqual(Step.done, dialog.key(.ctrl_c));
     try testing.expect(dialog.outcome == .interrupted);
+}
+
+test "login: a provider the user configured goes straight to the paste, with no page to open" {
+    const kinds = [_]provider_profile.CredentialKind{.api_key};
+    const pages = [_]provider_profile.KeyPage{.{
+        .id = @import("../provider/ids.zig").Slug.lit("key"),
+        .label = "House relay",
+        .url = null,
+        .check_url = "https://relay.example.com/v1/models",
+        .check_wire = .openai_chat,
+    }};
+    const profile = provider_profile.ProviderProfile{
+        .id = @import("../provider/ids.zig").Slug.lit("house-relay"),
+        .implementation_id = @import("../provider/ids.zig").Slug.lit("house-relay"),
+        .display_name = "House relay",
+        .channels = &.{},
+        .accepted_credential_kinds = &kinds,
+        .api_key_setup = .{ .kind = .api_key, .pages = &pages },
+    };
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    dialog.add(.{ .profile = &profile, .method = .api_key });
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.key_entry, dialog.stage);
+    for ("sk-relay-1") |c| _ = dialog.key(.{ .char = c });
+    const entry = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(entry);
+    try testing.expect(std.mem.indexOf(u8, entry, "Paste the API key for House relay:") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "Create a key on this page") == null);
+    try testing.expect(std.mem.indexOf(u8, entry, "(10 characters)") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "sk-relay") == null);
+    // Esc goes back to the providers, there being no page list to go back to.
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.choose, dialog.stage);
+    try testing.expectEqual(@as(usize, 0), dialog.key_len);
 }
 
 /// OpenRouter's sign-in, prepared the way `/login` prepares it.

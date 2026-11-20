@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "feature_schema": "metacodes-skill-text-v1",
+  "model": "claude-sonnet-4-20250514",
+  "seed": {
+    "instruction": "Count carefully and verify the final number.",
+    "sha256": "f9a30ad1f6cb80d91b5714d655b92d0502840df79e68a735a1d43fa423748fd9",
+    "router": {
+      "instruction_sha256": "f9a30ad1f6cb80d91b5714d655b92d0502840df79e68a735a1d43fa423748fd9",
+      "intercept": 0,
+      "weights": [0, 0, 0, 0, 1],
+      "threshold": 0.5,
+      "minimum": [0, 0, 0, 0, 0],
+      "maximum": [10, 10, 1, 1, 1]
+    }
+  },
+  "evolved": {
+    "instruction": "Inspect only the necessary files before editing.",
+    "sha256": "783e8941b10e5c8e3664980220735e458ca90fa62042dd002036a510d494a663",
+    "router": {
+      "instruction_sha256": "783e8941b10e5c8e3664980220735e458ca90fa62042dd002036a510d494a663",
+      "intercept": 0,
+      "weights": [0, 0, 0, 1, 0],
+      "threshold": 0.5,
+      "minimum": [0, 0, 0, 0, 0],
+      "maximum": [10, 10, 1, 1, 1]
+    }
+  }
+}

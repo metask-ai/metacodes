@@ -8,7 +8,7 @@
 # 用法: ./scripts/test_prompt_tool.sh
 
 set -u
-cd "$(dirname "$0")/.."   # cc-zig 根
+cd "$(dirname "$0")/.." || exit 1   # cc-zig 根
 
 BIN=./zig-out/bin/metacodes
 [[ -x "$BIN" ]] || { echo "找不到 $BIN,先 zig build" >&2; exit 2; }

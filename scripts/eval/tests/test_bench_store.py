@@ -35,8 +35,10 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest, library as library_module, migrate, schema
 from scripts.eval.harbor.store.backend import Store, StoreError
 from scripts.eval.harbor.store.library import StoreLibrary
-from scripts.eval.harbor.viewer import data, server
-from scripts.eval.harbor.viewer.runner import atomic_json
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.viewer import server
+from scripts.eval.harbor.bench.runner import atomic_json
+from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.test_harbor_viewer import _job, _trial, _write
 
 FIXED = dt.datetime(2026, 11, 16, 8, 40, tzinfo=dt.timezone.utc)
@@ -196,7 +198,7 @@ class EquivalenceTest(StoreCase):
         build_fixture(self.root)
         expected = normal(file_outputs(self.root))
         store = self.sqlite()
-        http = server.make_server(StoreLibrary(store, [self.root]), "127.0.0.1", 0)
+        http = server.make_server(Workbench(StoreLibrary(store, [self.root])), "127.0.0.1", 0)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
@@ -697,7 +699,7 @@ class TextSafetyTest(StoreCase):
             self.assertEqual(tx.one("SELECT message FROM verifier_tests"), ("bad�byte �",))
             self.assertEqual(tx.one("SELECT stop_reason FROM trials WHERE name = 'emoji__a'"), ("end�turn",))
         # The page serves it as valid UTF-8 JSON.
-        http = server.make_server(library, "127.0.0.1", 0)
+        http = server.make_server(Workbench(library), "127.0.0.1", 0)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
@@ -934,7 +936,7 @@ class MigrationDuringRunTest(StoreCase):
 @unittest.skipUnless(os.name != "nt", "the fake Harbor executable is a POSIX script")
 class WorkerEndToEndTest(StoreCase):
     def test_launched_worker_fills_the_configured_store_before_reporting_done(self):
-        from scripts.eval.harbor.viewer.runner import RunManager
+        from scripts.eval.harbor.bench.runner import RunManager
         from scripts.eval.tests.test_bench_workbench import fixture, wait_run
 
         config, binary_dir = fixture(self.temp)

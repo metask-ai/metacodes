@@ -7,7 +7,7 @@
 # 用法:scripts/perf_baseline.sh [--build]   (--build 先 zig build -Doptimize=ReleaseSmall)
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 BIN=zig-out/bin/metacodes
 

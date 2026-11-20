@@ -2,6 +2,7 @@ const std = @import("std");
 const model_name = @import("api/model_name.zig");
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
+const terminal_prompt = @import("app/terminal_prompt.zig");
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_net = @import("platform").net;
@@ -162,6 +163,8 @@ pub const conversation = @import("core/conversation.zig");
 pub const message = @import("core/message.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
+pub const harnessmm = @import("core/harnessmm.zig");
+pub const skill_rsi = @import("skills/rsi.zig");
 pub const agent_session = @import("core/agent_session.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
 pub const response_candidate = @import("core/response_candidate.zig");
@@ -2630,7 +2633,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "bench", "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "sealed", "terminal-setup", "update" };
+    const subcommands = [_][]const u8{ "bench", "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "mcp", "providers", "sealed", "terminal-setup", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -2648,6 +2651,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "providers")) return @import("app/providers_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
@@ -3324,7 +3328,7 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
             std.debug.print("error: no terminal to paste the key into; use --api-key-stdin\n", .{});
             return 2;
         };
-        std.debug.print("Create an API key for {s}.\n", .{profile.display_name});
+        if (page.url != null) std.debug.print("Create an API key for {s}.\n", .{profile.display_name});
         if (setup.note) |note| std.debug.print("{s}\n", .{note});
         if (request.page == null and setup.pages.len > 1) {
             std.debug.print("\nWhich plan is the key for?\n", .{});
@@ -3346,9 +3350,16 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
                 page = setup.pages[choice - 1];
             }
         }
-        std.debug.print("\nOpen this page and create a key:\n{s}\n\n", .{page.url});
-        if (request.open_browser) auth.openBrowser(allocator, page.url) catch {};
-        key_len = readSecretLine("Paste the key (it is not shown) and press Enter: ", &key_buffer) catch |err| {
+        var prompt_buf: [256]u8 = undefined;
+        const prompt = if (page.url) |url| prompt: {
+            std.debug.print("\nOpen this page and create a key:\n{s}\n\n", .{url});
+            if (request.open_browser) auth.openBrowser(allocator, url) catch {};
+            break :prompt "Paste the key (it is not shown) and press Enter: ";
+        } else
+            // A provider the user configured: the key comes from whoever
+            // runs it, and there is no page to open.
+            std.fmt.bufPrint(&prompt_buf, "Paste the API key for {s} (it is not shown) and press Enter: ", .{profile.display_name}) catch "Paste the key (it is not shown) and press Enter: ";
+        key_len = readSecretLine(prompt, &key_buffer) catch |err| {
             std.debug.print("\n", .{});
             if (err == error.Interrupted) {
                 std.debug.print("Login interrupted; nothing was stored.\n", .{});
@@ -3434,51 +3445,9 @@ fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []co
     return 0;
 }
 
-/// Read a line from the terminal without echo (raw mode, so Ctrl+C arrives as
-/// a byte and is honoured). Bracketed-paste markers and other escape sequences
-/// are skipped; a non-terminal stdin is read as a plain line.
-/// Echo is off before the prompt is written: a paste that arrived between the
-/// prompt and the mode switch would be echoed by the terminal itself.
-fn readSecretLine(prompt: []const u8, buf: []u8) !usize {
-    const saved = platform_term.enterRaw(0) orelse {
-        std.debug.print("{s}", .{prompt});
-        return readLine(buf);
-    };
-    defer platform_term.restoreMode(0, saved);
-    std.debug.print("{s}", .{prompt});
-    var len: usize = 0;
-    var in_escape = false;
-    while (true) {
-        var ch: [1]u8 = undefined;
-        const n = pfs.read(0, ch[0..1]);
-        if (n < 0) return error.InputFailed;
-        if (n == 0) break;
-        const c = ch[0];
-        if (in_escape) {
-            // CSI ends on a byte in 0x40..0x7e ('~' for the paste markers).
-            if (c >= 0x40 and c <= 0x7e and c != '[') in_escape = false;
-            continue;
-        }
-        switch (c) {
-            '\r', '\n' => break,
-            0x03 => return error.Interrupted,
-            0x1b => in_escape = true,
-            0x7f, 0x08 => {
-                if (len > 0) {
-                    len -= 1;
-                    buf[len] = 0;
-                }
-            },
-            else => {
-                if (c < 0x20) continue;
-                if (len == buf.len) return error.KeyTooLong;
-                buf[len] = c;
-                len += 1;
-            },
-        }
-    }
-    return len;
-}
+/// Shared with `metacodes providers add` (`app/terminal_prompt.zig`).
+const readSecretLine = terminal_prompt.readSecretLine;
+const readLine = terminal_prompt.readLine;
 
 /// `metacodes logout` (#499 part 2): remove both Metask sign-ins — the
 /// browser one in auth.json and the device-code one in oauth/metask.json,
@@ -3634,20 +3603,6 @@ fn promptChoice(allocator: std.mem.Allocator, count: usize) !usize {
         if (v >= 1 and v <= count) return v - 1;
         std.debug.print("Choice out of range.\n", .{});
     }
-}
-
-fn readLine(buf: []u8) !usize {
-    var len: usize = 0;
-    while (len < buf.len) {
-        var ch: [1]u8 = undefined;
-        const n = pfs.read(0, ch[0..1]);
-        if (n < 0) return error.InputFailed;
-        if (n == 0) break;
-        if (ch[0] == '\n' or ch[0] == '\r') break;
-        buf[len] = ch[0];
-        len += 1;
-    }
-    return len;
 }
 
 /// `metacodes login status`: which credential a plain start here uses and
@@ -4658,7 +4613,16 @@ fn printProviderCredentialHelp(
                 .{profile.id.slice()},
             );
             if (profile.api_key_setup) |setup| {
-                std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
+                // A provider the user defined has no page: its key comes from
+                // whoever runs it (`KeyPage.url`).
+                const opens_page = for (setup.pages) |page| {
+                    if (page.url != null) break true;
+                } else false;
+                if (opens_page) {
+                    std.debug.print("  {s} login --provider {s}   (opens the page the key is created on, then stores it)\n", .{ command, profile.id.slice() });
+                } else {
+                    std.debug.print("  {s} login --provider {s}   (stores a key you paste; for a server that needs none, paste `{s}`)\n", .{ command, profile.id.slice(), @import("app/providers_cli.zig").no_key_placeholder });
+                }
                 if (setup.note) |note| std.debug.print("  {s}\n", .{note});
             } else if (profile.declaresInteractiveOAuth() and profile.oauth_client_id != null) {
                 std.debug.print("  {s} login --provider {s}   (signs in in the browser, then stores the sign-in)\n", .{ command, profile.id.slice() });
@@ -4788,6 +4752,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.allowed_tools = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--disallowedTools") or std.mem.eql(u8, arg, "--disallowed-tools")) {
             if (args.next()) |s| config.disallowed_tools = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--preview")) {
+            config.preview = .enabled;
+        } else if (std.mem.eql(u8, arg, "--no-preview")) {
+            config.preview = .disabled;
         } else if (std.mem.eql(u8, arg, "--verification-checkpoint")) {
             config.verification_checkpoint = true;
         } else if (std.mem.eql(u8, arg, "--verification-final-gate")) {
@@ -4822,6 +4790,24 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.check_gate_observe = true;
         } else if (std.mem.eql(u8, arg, "--learning-turn")) {
             config.learning_turn = true;
+        } else if (std.mem.eql(u8, arg, "--harnessmm")) {
+            config.harnessmm = true;
+        } else if (std.mem.eql(u8, arg, "--no-harnessmm")) {
+            config.harnessmm = false;
+        } else if (std.mem.eql(u8, arg, "--rsi")) {
+            config.rsi = true;
+        } else if (std.mem.eql(u8, arg, "--no-rsi")) {
+            config.rsi = false;
+        } else if (std.mem.eql(u8, arg, "--rsi-policy")) {
+            const path = args.next() orelse {
+                setParseError(config, allocator, "missing value for --rsi-policy", .{});
+                return;
+            };
+            if (path.len == 0 or std.mem.startsWith(u8, path, "--")) {
+                setParseError(config, allocator, "invalid value for --rsi-policy", .{});
+                return;
+            }
+            config.rsi_policy_path = allocator.dupe(u8, path) catch path;
         } else if (std.mem.eql(u8, arg, "--learning-turn-observe")) {
             config.learning_turn_observe = true;
         } else if (std.mem.eql(u8, arg, "--verifier")) {
@@ -5416,6 +5402,10 @@ fn printHelp() void {
         \\                        after a backup; --restore undoes it (terminal-setup --help for more)
         \\  mcp login <server> [--no-browser] | mcp logout <server> | mcp list
         \\                        OAuth login for an HTTP or SSE MCP server (stored, refreshed per session)
+        \\  providers add <id> --base-url <url> --protocol <wire> [--model <id>]... [--probe] | providers probe <id>
+        \\  | providers list | providers remove <id>
+        \\                        A model API of your own (a relay, a gateway, a local server), in config.json;
+        \\                        providers --help for more
         \\  update [--check] [--version X.Y.Z] [--release-base <url>] [--pull] [--allow-downgrade]
         \\         [--no-sdk] [--ignore-running] [--json]
         \\                        Bring this install up to date: the latest release (from its recorded
@@ -5448,6 +5438,8 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
+        \\  --preview             Enable preview features, including ExecuteCode
+        \\  --no-preview          Disable preview features, overriding config.json
         \\  --verification-checkpoint  Enable the experimental post-test checkpoint
         \\  --verification-final-gate  Enforce the session-end verification obligation
         \\  --verification-final-observe  Record (not enforce) the session-end verification obligation
@@ -5460,6 +5452,9 @@ fn printHelp() void {
         \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
         \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
         \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
+        \\  --harnessmm / --no-harnessmm  Preview: guarded decision reuse and callback certificates (requires --preview, default off)
+        \\  --rsi / --no-rsi     Preview: evolved skills and learned routers (requires --preview, default off)
+        \\  --rsi-policy <file>  Frozen RSI policy (doc/SKILL_RSI_PROTOCOL.md)
         \\  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
         \\                        for the next attempt (needs --check-gate[-observe], or in print mode
         \\                        METACODES_HOST_CHECK under METACODES_SELF_EVOLUTION with METACODES_TASK_HINT)
@@ -5790,6 +5785,7 @@ test {
     _ = &@import("provider/api_key_store.zig");
     _ = &@import("provider/alias.zig");
     _ = &@import("provider/custom_provider.zig");
+    _ = &@import("provider/model_listing.zig");
     _ = &@import("provider/oauth.zig");
     _ = &@import("kg/provider_audit.zig");
     _ = &@import("api/oauth_exchange.zig");
@@ -5800,6 +5796,7 @@ test {
     _ = &@import("api/oauth_revoke.zig");
     _ = &@import("api/codex_usage.zig");
     _ = &@import("api/catalog_fetch.zig");
+    _ = &@import("api/model_probe.zig");
     _ = &@import("api/models_pages.zig");
     _ = &@import("api/gemini_signatures.zig");
     _ = &@import("api/models_cache.zig");
@@ -5877,6 +5874,8 @@ test {
     _ = &@import("mcp/conformance.zig");
     _ = &@import("mcp/result_commit_test.zig");
     _ = &@import("app/mcp_cli.zig");
+    _ = &@import("app/terminal_prompt.zig");
+    _ = &@import("app/providers_cli.zig");
     _ = &@import("util/toml.zig");
     _ = &@import("skills/runtime/frontmatter.zig");
     _ = &@import("tools/dynamic.zig");

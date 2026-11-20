@@ -33,8 +33,10 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
-from scripts.eval.harbor.viewer import data, executors, server, setup
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench import data, executors, setup
+from scripts.eval.harbor.viewer import server
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, RotatingGateway, gaia2_dataset, session_fixture,
                                                      wait_run)
@@ -606,7 +608,7 @@ class SshExecutorTest(SetupFixture):
         runtime = list((self.remote_home / ".metacodes-bench/runtime").iterdir())
         bundles = list((self.remote_home / ".metacodes-bench/bundles").iterdir())
         self.assertEqual(len(runtime), 1)
-        self.assertTrue((runtime[0] / "scripts/eval/harbor/viewer/remote.py").is_file())
+        self.assertTrue((runtime[0] / "scripts/eval/harbor/bench/remote.py").is_file())
         self.assertTrue(os.access(bundles[0] / "bin/metacodes", os.X_OK))
         catalog = RunManager(self.state / "bench/jobs", self.config).catalog()
         relay_state = next(e for e in catalog["executors"] if e["name"] == "relay-4090")
@@ -643,7 +645,7 @@ class SshRunTest(SetupFixture):
                    harbor=str(self.templates / "harbor"))
         atomic_json(self.config, cfg)
         manager = RunManager(self.state / "bench/jobs", self.config)
-        http = server.make_server(data.Library([manager.jobs_dir]), "127.0.0.1", 0, manager)
+        http = server.make_server(Workbench(data.Library([manager.jobs_dir]), manager), "127.0.0.1", 0)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
@@ -838,7 +840,7 @@ class SshRunTest(SetupFixture):
                 "runtime": runtime}
         (self.remote_home / "spec.json").write_text(json.dumps(spec))
         argv = executors.ssh_argv(relay, ["env", "PYTHONPATH=" + runtime, "python3", "-m",
-                                          "scripts.eval.harbor.viewer.remote", "run", "spec.json"])
+                                          "scripts.eval.harbor.bench.remote", "run", "spec.json"])
         env = {**os.environ, "FAKE_BENCH_DELAY": "30"}
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         process.stdin.write(b'{"env": {"METASK_API_KEY": "k"}}\n')
@@ -1054,7 +1056,7 @@ class SuiteOnExecutorTest(SetupFixture):
             self.assertNotIn(b"real-openai-key", content, path)
 
     def test_real_adapter_suites_ship_their_tasks_but_not_the_download_cache(self):
-        from scripts.eval.harbor.viewer.runner import settings
+        from scripts.eval.harbor.bench.runner import settings
         from scripts.eval.tests.test_bench_suites import ADAPTER_IDS, offline_adapter_sources
 
         manager, client, _ = self.prepare_remote()
@@ -1112,7 +1114,7 @@ class SetupHttpTest(SetupFixture):
     def setUp(self):
         super().setUp()
         self.manager = RunManager(self.state / "bench/jobs", self.config)
-        http = server.make_server(data.Library([self.manager.jobs_dir]), "127.0.0.1", 0, self.manager)
+        http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager), "127.0.0.1", 0)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
@@ -1235,7 +1237,7 @@ def proxy_request(port, head, payload=b""):
 class EgressUnitTest(unittest.TestCase):
     def test_forwarder_relays_bytes_end_to_end(self):
         import socket
-        from scripts.eval.harbor.viewer import egress
+        from scripts.eval.harbor.bench import egress
         port, close = echo_server()
         self.addCleanup(close)
         with egress.Forwarder("127.0.0.1", ("127.0.0.1", port)) as forwarder:
@@ -1250,7 +1252,7 @@ class EgressUnitTest(unittest.TestCase):
         self.assertEqual(received, payload)
 
     def test_proxy_tunnels_allowed_ports_and_refuses_the_rest(self):
-        from scripts.eval.harbor.viewer import egress
+        from scripts.eval.harbor.bench import egress
         port, close = echo_server()
         self.addCleanup(close)
         # A permissive address check, so the loopback echo server can stand
@@ -1314,7 +1316,7 @@ class EgressUnitTest(unittest.TestCase):
 
     def test_plain_http_is_forwarded_in_origin_form_without_proxy_credentials(self):
         from http.server import BaseHTTPRequestHandler
-        from scripts.eval.harbor.viewer import egress
+        from scripts.eval.harbor.bench import egress
         seen = []
 
         class Origin(BaseHTTPRequestHandler):
@@ -1350,7 +1352,7 @@ class EgressUnitTest(unittest.TestCase):
         self.assertEqual(headers.get("Connection"), "close")
 
     def test_docker_config_holds_only_proxies_and_noproxy_names_relay_and_services(self):
-        from scripts.eval.harbor.viewer import egress
+        from scripts.eval.harbor.bench import egress
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
         home = root / "home"
@@ -1429,7 +1431,7 @@ class EgressRunTest(SetupFixture):
         self.assertNotIn("auths", written)
         default = written["proxies"]["default"]
         # The forwarder binds the host's docker0 gateway, else metrics_bind.
-        from scripts.eval.harbor.viewer import egress as egress_module
+        from scripts.eval.harbor.bench import egress as egress_module
         gateway = egress_module.docker_gateway() or "127.0.0.1"
         self.assertRegex(default["httpProxy"], r"^http://" + re.escape(gateway) + r":\d+$")
         no_proxy = default["noProxy"].split(",")

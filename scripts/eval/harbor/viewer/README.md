@@ -39,14 +39,19 @@ coverage. See [metric definitions and storage](../../../../doc/BENCH_WORKBENCH.m
 Historical timings remain unknown; new workbench runs capture numeric
 request metrics through the host streaming relay.
 
-`data.py` is the projection (applied to the stored bytes by `../store/ingest.py`),
-`runner.py` validates selections, `batches.py` freezes a bundle and runs a batch's datasets in order, and `worker.py` owns one durable execution
-and ingests its job. The workbench has no login (internal network); POSTs
-with a foreign browser `Origin` are refused, and a service without
-`--config` is read-only. The benchmark catalog (suites, categories, adapters, WorkBuddy
-runner) is `scripts/eval/harbor/suites/`. `executors.py` (this machine or
-SSH hosts), `remote.py` (the driver on an SSH host) and `setup.py`
-(`bench setup`, page sign-in) let a launch run on any configured executor
-through the same worker. Contract tests are
+This directory is only the web presentation: `server.py` maps routes onto the
+runtime's `Workbench` and `static/` is the page. The runtime lives in
+[`../bench/`](../bench/): `data.py` is the projection (applied to the stored
+bytes by `../store/ingest.py`), `runner.py` validates selections, `batches.py`
+freezes a bundle and runs a batch's datasets in order, `worker.py` owns one
+durable execution and ingests its job, and `workbench.py` is the facade the
+page and the CLI both read. `executors.py` (this machine or SSH hosts),
+`remote.py` (the driver on an SSH host), `setup.py` (`bench setup`) and
+`providers.py` (imported model providers) let a launch run on any configured
+executor through the same worker. The benchmark catalog (suites, categories,
+adapters, WorkBuddy runner) is `scripts/eval/harbor/suites/`. The workbench
+has no login (internal network); POSTs with a foreign browser `Origin` are
+refused, and a service without `--config` is read-only. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
-`test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py` and `test_bench_batches.py`.
+`test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py`,
+`test_bench_batches.py` and `test_bench_providers.py`.
