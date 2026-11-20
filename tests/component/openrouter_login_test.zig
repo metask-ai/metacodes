@@ -807,3 +807,198 @@ test "L2 OpenRouter: /model lists the account's models; switching to and from th
         try testing.expect(std.mem.indexOf(u8, seen.raw, "metask-key") == null);
     }
 }
+
+fn appWithOpenRouterKey(case: *Case, io: std.Io) !*App {
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+    const argv = [_][*:0]const u8{"metacodes"};
+    const app = try App.init(testing.allocator, io, try case.config(&argv), "metask-key");
+    app.openrouter_retry_pause_ms = 20;
+    return app;
+}
+
+fn waitForFetch(app: *App) !App.OpenRouterChange {
+    const deadline = cc.util_time.nowMs() + 10_000;
+    while (cc.util_time.nowMs() < deadline) {
+        const change = app.takeOpenRouterRefresh(cc.util_time.nowMs());
+        if (app.openrouter_refresh == null) return change;
+        cc.util_time.sleepMs(10);
+    }
+    return error.FetchNeverFinished;
+}
+
+test "L2 OpenRouter: a sign-in's list downloads in the background; /model says so, and fills in with the filter kept (#572)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.start(LISTING, 0);
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    server.gateNextResponse();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const app = try appWithOpenRouterKey(&case, io_runtime.io());
+    defer app.deinit();
+
+    try app.startOpenRouterRefresh(true);
+    try server.waitUntilResponseGated();
+    const picker_host = cc.repl_picker_host;
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    const waiting = app.model_picker.shownListNote() orelse return error.NoLineAboutTheList;
+    try testing.expect(waiting.state == .downloading);
+    try testing.expectEqualStrings("OpenRouter", waiting.name());
+    for ("kimi-k3") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    try testing.expect(app.model_picker.focusedOffer() == null);
+    try testing.expect(!app.takeOpenRouterRefresh(cc.util_time.nowMs()).listed);
+    try testing.expect(!picker_host.renote(app, .unguarded));
+
+    server.releaseGatedResponse();
+    try testing.expect((try waitForFetch(app)).listed);
+    picker_host.relist(app, .unguarded);
+    try testing.expectEqualStrings("kimi-k3", app.model_picker.filter());
+    try testing.expectEqualStrings("moonshotai/kimi-k3", app.model_picker.focusedOffer().?.request_model_id);
+    try testing.expect(app.model_picker.shownListNote() == null);
+    try testing.expectEqual(@as(usize, 1), server.requestCount());
+    try testing.expectEqualStrings("GET /api/v1/models/user HTTP/1.1", requestLine(server.lastRequest().?));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(server.lastRequest().?, "authorization").?);
+    const later = try cc.provider_host.Host.create(testing.allocator);
+    defer later.destroy();
+    openrouter_login.applyOriginOverride(later);
+    try testing.expectEqual(cc.api_openrouter_catalog.Kept.fresh, cc.api_openrouter_catalog.adoptKept(later, testing.allocator, case.root));
+}
+
+test "L2 OpenRouter: a dropped connection is tried once more; failing again, /model says why and Ctrl+R fetches again (#572)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startFlaky(LISTING, 3);
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const app = try appWithOpenRouterKey(&case, io_runtime.io());
+    defer app.deinit();
+
+    try app.startOpenRouterRefresh(true);
+    try testing.expect(!(try waitForFetch(app)).listed);
+    try testing.expectEqual(@as(usize, 2), server.requestCount());
+    const picker_host = cc.repl_picker_host;
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    const failed = app.model_picker.shownListNote() orelse return error.NoLineAboutTheList;
+    try testing.expect(failed.state == .failed and failed.state.failed == .connection);
+    try testing.expect(failed.retryable());
+
+    try testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .retry, .unguarded));
+    try testing.expect(app.model_picker.shownListNote().?.state == .downloading);
+    try testing.expect((try waitForFetch(app)).listed);
+    picker_host.relist(app, .unguarded);
+    try testing.expect(app.model_picker.shownListNote() == null);
+    try testing.expectEqual(@as(usize, 4), server.requestCount());
+    try testing.expectEqual(@as(usize, 2), openRouterOffers(try app.providerHost()));
+}
+
+test "L2 OpenRouter: a refused key is not tried again, and /model says to sign in again, not Ctrl+R (#572)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startWithStatus(
+        \\{"error":{"code":401,"message":"User not found."}}
+    , 0, "HTTP/1.1 401 Unauthorized");
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const app = try appWithOpenRouterKey(&case, io_runtime.io());
+    defer app.deinit();
+
+    try app.startOpenRouterRefresh(true);
+    try testing.expect(!(try waitForFetch(app)).listed);
+    try testing.expectEqual(@as(usize, 1), server.requestCount());
+    const picker_host = cc.repl_picker_host;
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    const refused = app.model_picker.shownListNote() orelse return error.NoLineAboutTheList;
+    try testing.expect(refused.state == .failed and refused.state.failed == .refused);
+    try testing.expectEqual(picker_host.Result.ignored, picker_host.onKey(app, &ui, .retry, .unguarded));
+    try testing.expectEqual(@as(usize, 1), server.requestCount());
+}
+
+test "L2 OpenRouter: a fetch that only updates a kept list says nothing in /model, and a newer fetch supersedes it (#572)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startCassette(&.{ LISTING, LISTING }, 0);
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    server.gateResponseAt(0);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const app = try appWithOpenRouterKey(&case, io_runtime.io());
+    defer app.deinit();
+
+    try app.startOpenRouterRefresh(false);
+    try server.waitUntilResponseGated();
+    try testing.expect(app.openRouterListNote(cc.util_time.nowMs()) == null);
+    try app.startOpenRouterRefresh(true);
+    try testing.expect(app.openRouterListNote(cc.util_time.nowMs()).?.state == .downloading);
+    server.releaseGatedResponse();
+    try testing.expect((try waitForFetch(app)).listed);
+    try testing.expect(app.openRouterListNote(cc.util_time.nowMs()) == null);
+}
+
+test "L2 OpenRouter: a fetch with no new byte for a minute is said to have stalled, and still taken when it comes (#572)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.start(LISTING, 0);
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    server.gateNextResponse();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const app = try appWithOpenRouterKey(&case, io_runtime.io());
+    defer app.deinit();
+
+    try app.startOpenRouterRefresh(true);
+    try server.waitUntilResponseGated();
+    const started = cc.util_time.nowMs();
+    try testing.expect(app.openRouterListNote(started).?.state == .downloading);
+    const later = started + App.OPENROUTER_STALL_MS + 1;
+    _ = app.takeOpenRouterRefresh(later);
+    const stalled = app.openRouterListNote(later).?;
+    try testing.expect(stalled.state == .failed and stalled.state.failed == .stalled);
+    try testing.expect(stalled.retryable());
+    server.releaseGatedResponse();
+    try testing.expect((try waitForFetch(app)).listed);
+    try testing.expect(app.openRouterListNote(cc.util_time.nowMs()) == null);
+}
+
+test "L2 catalog fetch: an answer cut off partway is Interrupted, not a parse error, and the bytes that came are counted (#572)" {
+    const a = testing.allocator;
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    for ([_]harness.LossyProxy.Framing{ .content_length, .chunked }) |framing| {
+        var proxy = try harness.LossyProxy.start(LISTING, .{ .content_type = "application/json", .framing = framing, .cut_at = 100, .cut_always = true });
+        defer proxy.stop();
+        const url = try proxy.urlOwned(a);
+        defer a.free(url);
+        var received: std.atomic.Value(u64) = .init(0);
+        try testing.expectError(error.Interrupted, cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{ .url = url, .progress = &received }));
+        try testing.expectEqual(@as(u64, 100), received.load(.monotonic));
+    }
+    var whole = try harness.LossyProxy.start(LISTING, .{ .content_type = "application/json", .framing = .content_length });
+    defer whole.stop();
+    const url = try whole.urlOwned(a);
+    defer a.free(url);
+    var received: std.atomic.Value(u64) = .init(0);
+    const answer = try cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{ .url = url, .progress = &received });
+    defer a.free(answer.body);
+    try testing.expectEqualStrings(LISTING, answer.body);
+    try testing.expectEqual(@as(u64, LISTING.len), received.load(.monotonic));
+}

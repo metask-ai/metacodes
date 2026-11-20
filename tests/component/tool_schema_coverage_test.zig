@@ -59,8 +59,9 @@ test "L2 守卫: 有 prop_specs 的工具,每个 spec 的 type 非空(模型需�
 
 test "L2 端到端: 序列化请求体里每个有 required 的工具 properties 含其字段+type(非空 {})" {
     const a = std.testing.allocator;
-    const defs = try tools.toToolDefinitions(a);
-    defer a.free(defs);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const defs = try tools.toToolDefinitionsFull(scratch.allocator(), null, &.{ .preview = true });
 
     const types = cc.json_mod;
     const msg = cc.types_mod.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };

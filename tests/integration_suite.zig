@@ -6,6 +6,8 @@
 //! changing any test body or assertion.
 
 test {
+    _ = @import("component/teamwork_command_test.zig");
+    _ = @import("component/execute_code_test.zig");
     _ = @import("integration/http_stream_e2e_test.zig");
     _ = @import("integration/tool_abort_test.zig");
     _ = @import("integration/mcp_e2e_test.zig");
@@ -127,6 +129,7 @@ test {
     _ = @import("component/formal_kernel_test.zig");
     _ = @import("component/memory_migration_adapter_test.zig");
     _ = @import("component/goal_state_test.zig");
+    _ = @import("component/usage_report_test.zig");
     _ = @import("component/auth_test.zig");
     _ = @import("component/schema_validation_test.zig");
     _ = @import("component/tool_schema_coverage_test.zig");
@@ -156,6 +159,7 @@ test {
     _ = @import("component/openai_responses_test.zig");
     _ = @import("component/gemini_provider_test.zig");
     _ = @import("component/background_main_test.zig");
+    _ = @import("component/harnessmm_test.zig");
     _ = @import("component/suspend_resume_test.zig");
     _ = @import("component/permission_unanswered_test.zig");
     _ = @import("component/diff_highlight_test.zig");

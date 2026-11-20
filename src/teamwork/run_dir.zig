@@ -5,11 +5,16 @@
 //!   ORIGINAL_REQUEST.md   write-once; the completion audit's baseline
 //!   budget.jsonl          append-only run ledger (ledger.zig)
 //!   open_issues.json      reviewer findings (#517)
+//!   run.json              the runtime's own state (runtime.zig)
+//!   worktree/             the implementer's git worktree (merge_back.zig)
+//!   audits/audit-<n>.md   completion audit reports (runtime.zig)
+//!   merge.patch           the change merge-back applied or could not apply
+//!   merge-conflicts.txt   paths both the user and the implementer changed
+//!   seat-status/<seat>.json   written by the runtime, outside seat write roots
 //!   seats/<seat_id>/
 //!     packet.md           written by the runtime
 //!     handoff.md          written by the seat
 //!     progress.md         written by the seat
-//!     status.json         written by the runtime
 //!     review.json         written by a reviewer seat (reviewer.zig)
 //!     open_issues.json    the runtime's read-only copy of the ledger
 //!                         for this seat (issues.zig)
@@ -24,6 +29,8 @@
 //! it owns; it is not thread-safe and the runtime serializes calls.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const rng = @import("platform").rng;
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 const util_fs = @import("../util/fs.zig");
@@ -38,6 +45,12 @@ pub const original_request_file = "ORIGINAL_REQUEST.md";
 pub const budget_file = "budget.jsonl";
 pub const open_issues_file = "open_issues.json";
 pub const seats_dir = "seats";
+pub const seat_status_dir = "seat-status";
+pub const state_file = "run.json";
+pub const worktree_dir = "worktree";
+pub const audits_dir = "audits";
+pub const merge_patch_file = "merge.patch";
+pub const merge_conflicts_file = "merge-conflicts.txt";
 
 /// `ORIGINAL_REQUEST.md` as a packet names it, relative to the seat directory.
 pub const seat_relative_original_request = "../../" ++ original_request_file;
@@ -46,12 +59,20 @@ pub const seat_relative_open_issues = "../../" ++ open_issues_file;
 /// The seat's read-only copy of the ledger, relative to the seat directory.
 /// Packets name this one: only the runtime writes the run-level ledger.
 pub const seat_relative_open_issues_copy = open_issues_file;
+/// The first completion audit's report, relative to the seat directory: the
+/// one a repair round's packets name (a second failed audit ends the run).
+pub const seat_relative_first_audit_report = "../../" ++ audits_dir ++ "/audit-1.md";
 
 pub const RunFile = enum {
     original_request,
     budget,
     open_issues,
     seats,
+    state,
+    worktree,
+    audits,
+    merge_patch,
+    merge_conflicts,
 
     pub fn name(self: RunFile) []const u8 {
         return switch (self) {
@@ -59,6 +80,11 @@ pub const RunFile = enum {
             .budget => budget_file,
             .open_issues => open_issues_file,
             .seats => seats_dir,
+            .state => state_file,
+            .worktree => worktree_dir,
+            .audits => audits_dir,
+            .merge_patch => merge_patch_file,
+            .merge_conflicts => merge_conflicts_file,
         };
     }
 };
@@ -91,6 +117,8 @@ pub const SeatRecord = struct {
     role: types.Role,
     harness: types.Harness,
     status: types.SeatStatus,
+    /// The exact immutable role charter used for this dispatch.
+    charter_sha256: ?[64]u8 = null,
 };
 
 pub const Error = error{
@@ -117,7 +145,7 @@ pub const PathBuf = [std.fs.max_path_bytes]u8;
 
 pub const RecoveredSeat = union(enum) {
     recorded: Recorded,
-    /// A seat directory without a readable `status.json`: the runtime crashed
+    /// A seat directory without a readable status record: the runtime crashed
     /// between creating the directory and recording the seat, or mid-write
     /// outside the atomic path. The runtime decides whether to re-record it.
     damaged: SeatId,
@@ -156,6 +184,15 @@ pub const RunDir = struct {
     /// and an empty `open_issues.json`. Fails with `RunExists` rather than
     /// adopting a directory some earlier run left behind.
     pub fn create(gpa: std.mem.Allocator, state_root: []const u8, run_id: RunId) Error!RunDir {
+        var self = try reserveRoot(gpa, state_root, run_id, false);
+        errdefer self.deinit(gpa);
+        try self.initialize();
+        return self;
+    }
+
+    /// Run.start acquires the lease before initializing a possibly interrupted
+    /// reservation. The caller must check that initial state has not published.
+    pub fn reserveRoot(gpa: std.mem.Allocator, state_root: []const u8, run_id: RunId, retry: bool) Error!RunDir {
         var self = try init(gpa, state_root, run_id);
         errdefer self.deinit(gpa);
 
@@ -167,12 +204,20 @@ pub const RunDir = struct {
         };
         const root_z = try joinZ(&buf, &.{self.root});
         if (pfs.mkdir(root_z.ptr, 0o700) != 0) {
-            return if (pfs.lastErrnoIs(.EXIST)) error.RunExists else error.MkdirFailed;
+            if (!pfs.lastErrnoIs(.EXIST)) return error.MkdirFailed;
+            if (!retry or pfs.isSymlink(root_z.ptr) or pfs.isExistingNonDir(root_z.ptr)) return error.RunExists;
         }
-        if (pfs.mkdir((try self.path(&buf, .seats)).ptr, 0o700) != 0) return error.MkdirFailed;
+        return self;
+    }
+
+    pub fn initialize(self: *const RunDir) Error!void {
+        var buf: PathBuf = undefined;
+        const seats = try self.path(&buf, .seats);
+        if (pfs.mkdir(seats.ptr, 0o700) != 0 and
+            (!pfs.lastErrnoIs(.EXIST) or pfs.isSymlink(seats.ptr) or pfs.isExistingNonDir(seats.ptr))) return error.MkdirFailed;
+        try self.ensureStatusDir();
         try createEmpty(try self.path(&buf, .budget));
         try writeAtomic(try self.path(&buf, .open_issues), "[]\n");
-        return self;
     }
 
     /// Open an existing run directory (after a restart, say).
@@ -210,7 +255,15 @@ pub const RunDir = struct {
 
     /// Absolute path of one of a seat's files.
     pub fn seatPath(self: *const RunDir, buf: *PathBuf, seat: SeatId, file: SeatFile) error{PathTooLong}![:0]const u8 {
+        if (file == .status) return std.fmt.bufPrintZ(buf, "{s}/{s}/{s}.json", .{ self.root, seat_status_dir, seat.slice() }) catch error.PathTooLong;
         return joinZ(buf, &.{ self.root, seats_dir, seat.slice(), file.name() });
+    }
+
+    fn ensureStatusDir(self: *const RunDir) Error!void {
+        var buf: PathBuf = undefined;
+        const dir = try joinZ(&buf, &.{ self.root, seat_status_dir });
+        if (pfs.mkdir(dir.ptr, 0o700) != 0 and
+            (!pfs.lastErrnoIs(.EXIST) or pfs.isSymlink(dir.ptr) or pfs.isExistingNonDir(dir.ptr))) return error.MkdirFailed;
     }
 
     /// Record the user's original request. Write-once and atomic: the bytes
@@ -220,21 +273,14 @@ pub const RunDir = struct {
     pub fn writeOriginalRequest(self: *const RunDir, bytes: []const u8) Error!void {
         var final_buf: PathBuf = undefined;
         const final = try self.path(&final_buf, .original_request);
-        var tmp_buf: PathBuf = undefined;
-        const tmp = try joinZ(&tmp_buf, &.{ self.root, original_request_file ++ ".tmp" });
         if (pfs.exists(final.ptr)) return error.OriginalRequestExists;
-        try writeFresh(tmp, bytes);
-        const result = pfs.installNoReplace(tmp.ptr, final.ptr) catch {
-            pfs.unlinkPath(tmp.ptr) catch {};
-            return error.WriteFailed;
-        };
+        var tmp_buf: PathBuf = undefined;
+        const tmp = try writeTemporary(&tmp_buf, final, bytes);
+        defer pfs.unlinkPath(tmp.ptr) catch {};
+        const result = pfs.installNoReplace(tmp.ptr, final.ptr) catch return error.WriteFailed;
         switch (result) {
-            .moved => {},
-            .linked => pfs.unlinkPath(tmp.ptr) catch {},
-            .already_exists => {
-                pfs.unlinkPath(tmp.ptr) catch {};
-                return error.OriginalRequestExists;
-            },
+            .moved, .linked => {},
+            .already_exists => return error.OriginalRequestExists,
         }
     }
 
@@ -266,34 +312,39 @@ pub const RunDir = struct {
     /// by `gpa`.
     pub fn readHandoff(self: *const RunDir, gpa: std.mem.Allocator, seat: SeatId) ReadHandoffError!types.Handoff {
         var buf: PathBuf = undefined;
-        const text = swarm_team.readFileAlloc(gpa, try self.seatPath(&buf, seat, .handoff)) orelse
+        const text = (try readSeatOutput(gpa, try self.seatPath(&buf, seat, .handoff), max_handoff_bytes)) orelse
             return error.HandoffMissing;
         defer gpa.free(text);
         return types.Handoff.parse(gpa, text);
     }
 
-    /// Atomically replace the seat's `status.json`.
+    /// Atomically replace the controller-owned record outside seat output.
     pub fn writeSeatRecord(self: *const RunDir, record: SeatRecord) Error!void {
         var buf: PathBuf = undefined;
-        try self.requireSeat(record.id);
+        try self.ensureStatusDir();
         var text_buf: [512]u8 = undefined;
         const text = std.fmt.bufPrint(
             &text_buf,
-            "{{\"seat_id\":\"{s}\",\"role\":\"{s}\",\"harness\":\"{s}\",\"status\":\"{s}\"}}\n",
-            .{ record.id.slice(), record.role.name(), record.harness.name(), record.status.name() },
+            "{{\"seat_id\":\"{s}\",\"role\":\"{s}\",\"harness\":\"{s}\",\"status\":\"{s}\",\"charter_sha256\":{s}{s}{s}}}\n",
+            .{ record.id.slice(), record.role.name(), record.harness.name(), record.status.name(), if (record.charter_sha256 != null) "\"" else "", if (record.charter_sha256) |digest| &digest else "null", if (record.charter_sha256 != null) "\"" else "" },
         ) catch unreachable; // ids are <= 64 path-safe bytes; enum names are short
         try writeAtomic(try self.seatPath(&buf, record.id, .status), text);
     }
 
     pub fn readSeatRecord(self: *const RunDir, seat: SeatId) Error!SeatRecord {
         var buf: PathBuf = undefined;
-        try self.requireSeat(seat);
         // status.json is a few hundred bytes; a fixed scratch keeps this
         // allocation-free for callers.
         var scratch_bytes: [16 * 1024]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&scratch_bytes);
         const scratch = fba.allocator();
-        const text = swarm_team.readFileAlloc(scratch, try self.seatPath(&buf, seat, .status)) orelse
+        const status_dir = try joinZ(&buf, &.{ self.root, seat_status_dir });
+        const record_path = if (pfs.exists(status_dir.ptr)) try self.seatPath(&buf, seat, .status) else blk: {
+            // Legacy records can still be displayed by read-only status.
+            try self.requireSeat(seat);
+            break :blk try joinZ(&buf, &.{ self.root, seats_dir, seat.slice(), "status.json" });
+        };
+        const text = (readSeatOutput(scratch, record_path, 512) catch return error.StatusCorrupt) orelse
             return error.StatusCorrupt;
         return parseRecord(scratch, seat, text) catch error.StatusCorrupt;
     }
@@ -334,15 +385,19 @@ pub const RunDir = struct {
     fn requireSeat(self: *const RunDir, seat: SeatId) Error!void {
         var buf: PathBuf = undefined;
         const dir = try self.seatDir(&buf, seat);
-        if (!pfs.exists(dir.ptr) or pfs.isExistingNonDir(dir.ptr)) return error.SeatNotFound;
+        if (!pfs.exists(dir.ptr) or pfs.isSymlink(dir.ptr) or pfs.isExistingNonDir(dir.ptr)) return error.SeatNotFound;
     }
 };
+
+const max_handoff_bytes = 1024 * 1024;
 
 /// The outcome of a seat whose harness exited cleanly: the handoff at
 /// `handoff_path`, parsed, or the contract failure. Every driver ends with
 /// this, so all harnesses report a clean exit the same way.
 pub fn collectHandoff(gpa: std.mem.Allocator, handoff_path: []const u8) error{OutOfMemory}!types.SeatOutcome {
-    const text = swarm_team.readFileAlloc(gpa, handoff_path) orelse
+    var buf: PathBuf = undefined;
+    const path = std.fmt.bufPrintZ(&buf, "{s}", .{handoff_path}) catch return .{ .failed = .handoff_missing };
+    const text = (try readSeatOutput(gpa, path, max_handoff_bytes)) orelse
         return .{ .failed = .handoff_missing };
     defer gpa.free(text);
     const handoff = types.Handoff.parse(gpa, text) catch |err| return switch (err) {
@@ -350,6 +405,35 @@ pub fn collectHandoff(gpa: std.mem.Allocator, handoff_path: []const u8) error{Ou
         else => |contract| .{ .failed = .{ .handoff_invalid = contract } },
     };
     return .{ .finished = handoff };
+}
+
+/// Only consume a bounded, standalone regular file from a seat. A FIFO
+/// cannot block the controller while it checks the descriptor's type.
+pub fn readSeatOutput(gpa: std.mem.Allocator, path: [:0]const u8, limit: usize) error{OutOfMemory}!?[]u8 {
+    const parent = std.fs.path.dirname(path) orelse return null;
+    var buf: PathBuf = undefined;
+    const parent_z = std.fmt.bufPrintZ(&buf, "{s}", .{parent}) catch return null;
+    if (pfs.isSymlink(parent_z.ptr)) return null;
+    var flags: pfs.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true };
+    if (builtin.os.tag != .windows) flags.NONBLOCK = true;
+    const fd = pfs.open(path.ptr, flags, 0);
+    if (fd < 0) return null;
+    defer pfs.close(fd);
+    const info = pfs.fileInfo(fd) catch return null;
+    if (!info.is_regular or info.link_count != 1 or info.size > limit) return null;
+    const bytes = try gpa.alloc(u8, @intCast(info.size));
+    var keep = false;
+    defer if (!keep) gpa.free(bytes);
+    var used: usize = 0;
+    while (used < bytes.len) {
+        const n = pfs.readZ(fd, bytes[used..]) catch return null;
+        if (n == 0) return null;
+        used += n;
+    }
+    var extra: [1]u8 = undefined;
+    if ((pfs.readZ(fd, &extra) catch return null) != 0) return null;
+    keep = true;
+    return bytes;
 }
 
 fn parseRecord(scratch: std.mem.Allocator, seat: SeatId, text: []const u8) !SeatRecord {
@@ -363,6 +447,13 @@ fn parseRecord(scratch: std.mem.Allocator, seat: SeatId, text: []const u8) !Seat
         .role = types.Role.parse(stringField(obj, "role") orelse return error.StatusCorrupt) orelse return error.StatusCorrupt,
         .harness = types.Harness.parse(stringField(obj, "harness") orelse return error.StatusCorrupt) orelse return error.StatusCorrupt,
         .status = types.SeatStatus.parse(stringField(obj, "status") orelse return error.StatusCorrupt) orelse return error.StatusCorrupt,
+        .charter_sha256 = blk: {
+            const value = obj.get("charter_sha256") orelse break :blk null;
+            if (value == .null) break :blk null;
+            if (value != .string or value.string.len != 64) return error.StatusCorrupt;
+            for (value.string) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return error.StatusCorrupt;
+            break :blk value.string[0..64].*;
+        },
     };
 }
 
@@ -393,26 +484,33 @@ fn joinZ(buf: *PathBuf, parts: []const []const u8) error{PathTooLong}![:0]const 
 
 /// Replace `path_z` atomically (temporary file + rename).
 pub fn writeAtomic(path_z: [:0]const u8, bytes: []const u8) Error!void {
-    swarm_team.atomicWrite(path_z, bytes) catch |err| return switch (err) {
-        error.PathTooLong => error.PathTooLong,
-        else => error.WriteFailed,
-    };
+    var tmp_buf: PathBuf = undefined;
+    const tmp = try writeTemporary(&tmp_buf, path_z, bytes);
+    defer pfs.unlinkPath(tmp.ptr) catch {};
+    if (pfs.renameReplace(tmp.ptr, path_z.ptr) != 0) return error.WriteFailed;
 }
 
 /// Create `path_z` empty; an existing file is left alone.
 fn createEmpty(path_z: [:0]const u8) Error!void {
-    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
     if (fd < 0) return error.WriteFailed;
     pfs.close(fd);
 }
 
-/// Write `bytes` to `path_z` (truncating) and flush them to disk.
-fn writeFresh(path_z: [:0]const u8, bytes: []const u8) Error!void {
-    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+/// Create a fresh file beside the destination. Never open a seat-owned entry
+/// for writing, even if it happens to be a link or an existing regular file.
+fn writeTemporary(buf: *PathBuf, path_z: [:0]const u8, bytes: []const u8) Error![:0]const u8 {
+    var nonce: [16]u8 = undefined;
+    if (!rng.randomBytes(&nonce)) return error.WriteFailed;
+    const suffix = std.fmt.bytesToHex(nonce, .lower);
+    const tmp = std.fmt.bufPrintZ(buf, "{s}.{s}.tmp", .{ path_z, &suffix }) catch return error.PathTooLong;
+    const fd = pfs.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
     if (fd < 0) return error.WriteFailed;
+    errdefer pfs.unlinkPath(tmp.ptr) catch {};
     defer pfs.close(fd);
     if (!pfs.writeAll(fd, bytes)) return error.WriteFailed;
     pfs.fsyncChecked(fd) catch return error.WriteFailed;
+    return tmp;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -503,9 +601,9 @@ test "run dir: seats record status, packets and handoffs" {
 
     try testing.expectError(error.HandoffMissing, run.readHandoff(testing.allocator, seat.id));
     var buf: PathBuf = undefined;
-    try writeFresh(try run.seatPath(&buf, seat.id, .handoff), "## Observation\no\n## Reasoning\nr\n## Caveats\nc\n## Conclusion\nk\n");
+    try writeAtomic(try run.seatPath(&buf, seat.id, .handoff), "## Observation\no\n## Reasoning\nr\n## Caveats\nc\n## Conclusion\nk\n");
     try testing.expectError(error.MissingVerification, run.readHandoff(testing.allocator, seat.id));
-    try writeFresh(try run.seatPath(&buf, seat.id, .handoff), "## Observation\no\n## Reasoning\nr\n## Caveats\nc\n## Conclusion\nk\n## Verification\nv\n");
+    try writeAtomic(try run.seatPath(&buf, seat.id, .handoff), "## Observation\no\n## Reasoning\nr\n## Caveats\nc\n## Conclusion\nk\n## Verification\nv\n");
     var handoff = try run.readHandoff(testing.allocator, seat.id);
     defer handoff.deinit(testing.allocator);
     try testing.expectEqualStrings("k", handoff.conclusion);
@@ -522,18 +620,18 @@ test "run dir: recover rebuilds the seat table after a simulated crash" {
         try run.createSeat(testRecord("reviewer-1", .reviewer, .metacodes, .queued));
         try run.createSeat(testRecord("implementer-1", .implementer, .claude_code, .working));
         var buf: PathBuf = undefined;
-        try writeFresh(try run.seatPath(&buf, try SeatId.parse("implementer-1"), .handoff), "partial");
+        try writeAtomic(try run.seatPath(&buf, try SeatId.parse("implementer-1"), .handoff), "partial");
         // Crash between mkdir and the first status write.
         _ = pfs.mkdir((try run.seatDir(&buf, try SeatId.parse("verifier-1"))).ptr, 0o700);
         // A status file torn by something that bypassed the atomic write.
         _ = pfs.mkdir((try run.seatDir(&buf, try SeatId.parse("interviewer-1"))).ptr, 0o700);
-        try writeFresh(try run.seatPath(&buf, try SeatId.parse("interviewer-1"), .status), "{\"seat_id\":\"interv");
+        try writeAtomic(try run.seatPath(&buf, try SeatId.parse("interviewer-1"), .status), "{\"seat_id\":\"interv");
         // A status naming another seat is not trusted either.
         _ = pfs.mkdir((try run.seatDir(&buf, try SeatId.parse("manager-1"))).ptr, 0o700);
-        try writeFresh(try run.seatPath(&buf, try SeatId.parse("manager-1"), .status), "{\"seat_id\":\"reviewer-1\",\"role\":\"manager\",\"harness\":\"metacodes\",\"status\":\"done\"}");
+        try writeAtomic(try run.seatPath(&buf, try SeatId.parse("manager-1"), .status), "{\"seat_id\":\"reviewer-1\",\"role\":\"manager\",\"harness\":\"metacodes\",\"status\":\"done\"}");
         // Debris that is not a seat.
         _ = pfs.mkdir((try joinZ(&buf, &.{ run.root, seats_dir, "Not.A.Seat" })).ptr, 0o700);
-        try writeFresh(try joinZ(&buf, &.{ run.root, seats_dir, "status.json.tmp" }), "x");
+        try writeAtomic(try joinZ(&buf, &.{ run.root, seats_dir, "status.json.tmp" }), "x");
         // The process dies here: nothing is closed or flushed beyond this point.
     }
 

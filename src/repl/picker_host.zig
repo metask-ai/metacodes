@@ -27,6 +27,7 @@ const picker_mod = @import("model_picker.zig");
 const view_mod = @import("model_picker_view.zig");
 const provider_host_mod = @import("../provider/host.zig");
 const state_env = @import("../app/state_env.zig");
+const util_time = @import("../util/time.zig");
 const RenderRegion = @import("tui/render_region.zig").RenderRegion;
 
 pub const Key = picker_mod.Key;
@@ -83,6 +84,7 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
         app.model_picker.presetScope(preset.scope);
         if (preset.filter_len > 0) app.model_picker.presetFilter(preset.filter());
     }
+    _ = app.model_picker.setListNote(app.openRouterListNote(util_time.nowMs()));
     setOpen(ui, true);
 }
 
@@ -94,7 +96,34 @@ pub fn keep(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
     guard.lock();
     defer guard.unlock();
     app.model_picker.page_rows = pageRowsFor(ui.rows);
+    _ = app.model_picker.setListNote(app.openRouterListNote(util_time.nowMs()));
     setOpen(ui, true);
+}
+
+pub fn relist(app: *app_mod.App, guard: Guard) void {
+    refresh(app, guard);
+    _ = renote(app, guard);
+}
+
+pub fn renote(app: *app_mod.App, guard: Guard) bool {
+    const now = util_time.nowMs();
+    app.sampleOpenRouterProgress(now);
+    const note = app.openRouterListNote(now);
+    guard.lock();
+    defer guard.unlock();
+    return app.model_picker.setListNote(note);
+}
+
+fn retryList(app: *app_mod.App, provider: picker_mod.Slug, guard: Guard) Result {
+    if (!provider.eqlText("openrouter")) return .ignored;
+    app.startOpenRouterRefresh(true) catch |err| {
+        guard.lock();
+        defer guard.unlock();
+        app.model_picker.setNotice("the download did not start ({s})", .{@errorName(err)});
+        return .redraw;
+    };
+    _ = renote(app, guard);
+    return .redraw;
 }
 
 pub fn close(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
@@ -182,6 +211,7 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key, guard: Guard) R
             return .cancelled;
         },
         .commit => |commit| return apply(app, ui, commit, guard),
+        .retry_list => |provider| return retryList(app, provider, guard),
     }
 }
 

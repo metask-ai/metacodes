@@ -38,7 +38,8 @@ def test_T05c_bare_newline_does_not_exit(bin_path):
     raw = run(bin_path, ["sleep:0.8", "type:line1", "raw:\\x0a", "sleep:0.3", "type:line2", "sleep:0.3"])
     assert b"Goodbye" not in raw, "裸 \\n 不应触发 Goodbye!/退出"
     from screen import Screen
-    sc = Screen(24, 80); sc.feed(raw)
+    sc = Screen(24, 80)
+    sc.feed(raw)
     # 提交 line1 后 REPL 仍活,line2 进了输入框(或 scrollback)。
     # Windows/ConPTY:提交触发的请求失败重渲染与 line2 键入在 conhost 输入翻译层下时序
     # 不稳定(line2 可能尚在 pending 未回显)。核心回归护栏是"不退出"(上面 Goodbye 断言,
@@ -55,7 +56,8 @@ def test_T05d_empty_submit_does_not_exit(bin_path):
     raw = run(bin_path, ["sleep:0.8", "raw:\\x0a", "sleep:0.3", "type:after", "sleep:0.3"])
     assert b"Goodbye" not in raw, "空提交不应触发 Goodbye!/退出"
     from screen import Screen
-    sc = Screen(24, 80); sc.feed(raw)
+    sc = Screen(24, 80)
+    sc.feed(raw)
     assert any("after" in sc.line_text(r) for r in range(sc.rows)), "空提交后 REPL 应仍接收 after"
 
 
@@ -73,7 +75,8 @@ def test_T09b_ctrl_u_paste_hint(bin_path):
     # 之后打字提示消失;Ctrl+Y 把删除内容粘回。
     from screen import Screen
     raw = run(bin_path, ["sleep:0.8", "type:hello world", "key:ctrl_u", "sleep:0.3"])
-    sc = Screen(24, 80); sc.feed(raw)
+    sc = Screen(24, 80)
+    sc.feed(raw)
     hint_rows = [r for r in range(sc.rows) if "Ctrl+Y to paste deleted text" in sc.line_text(r)]
     assert hint_rows, "Ctrl+U 后未显示 'Ctrl+Y to paste deleted text' 提示"
     # 提示在输入框(❯)上方
@@ -82,12 +85,14 @@ def test_T09b_ctrl_u_paste_hint(bin_path):
 
     # 打字后提示消失
     raw2 = run(bin_path, ["sleep:0.8", "type:hello", "key:ctrl_u", "sleep:0.1", "type:Z", "sleep:0.3"])
-    sc2 = Screen(24, 80); sc2.feed(raw2)
+    sc2 = Screen(24, 80)
+    sc2.feed(raw2)
     assert not any("Ctrl+Y to paste" in sc2.line_text(r) for r in range(sc2.rows)), "打字后提示应消失"
 
     # Ctrl+Y 粘回删除内容
     raw3 = run(bin_path, ["sleep:0.8", "type:hello", "key:ctrl_u", "sleep:0.15", "key:ctrl_y", "sleep:0.3"])
-    sc3 = Screen(24, 80); sc3.feed(raw3)
+    sc3 = Screen(24, 80)
+    sc3.feed(raw3)
     assert any("hello" in sc3.line_text(r) for r in range(sc3.rows)), "Ctrl+Y 应把删除的 hello 粘回"
 
 
@@ -117,7 +122,8 @@ def test_vmove_up_softwrap_is_visual_line(bin_path):
         "key:up", "type:@", "sleep:0.2",
     ], term_size=(24, 40))
     from screen import Screen
-    sc = Screen(24, 40); sc.feed(raw)
+    sc = Screen(24, 40)
+    sc.feed(raw)
     # @ 必须落在某条全 'a' 的软折续行里(行内含 a 且含 @),而不是 short 行、不是逻辑行首。
     rows_with_at = [r for r in range(sc.rows) if "@" in sc.line_text(r)]
     assert rows_with_at, "未找到插入的 @ 标记"
@@ -156,7 +162,8 @@ def test_paste_placeholder_footer(bin_path):
     home = case_tmpdir("cc-tty-paste-")
     paste = "\\x1b[200~L0\\x0aL1\\x0aL2\\x0aL3\\x1b[201~"
     raw = run(bin_path, ["sleep:0.8", f"raw:{paste}", "sleep:0.4"], env={"HOME": home})
-    sc = Screen(24, 80); sc.feed(raw)
+    sc = Screen(24, 80)
+    sc.feed(raw)
     # 占位符出现在输入框
     assert any("[Pasted text #" in sc.line_text(r) for r in range(sc.rows)), \
         "≥4 行粘贴应转占位符 [Pasted text #N ...]"
@@ -167,7 +174,8 @@ def test_paste_placeholder_footer(bin_path):
         "占位符态 footer 应显 'paste again to expand'"
     # 占位符删除后(ctrl_u 清行)footer 复原(不再显 paste again to expand)。
     raw2 = run(bin_path, ["sleep:0.8", f"raw:{paste}", "sleep:0.2", "key:ctrl_u", "sleep:0.3"], env={"HOME": home})
-    sc2 = Screen(24, 80); sc2.feed(raw2)
+    sc2 = Screen(24, 80)
+    sc2.feed(raw2)
     assert not any("paste again to expand" in sc2.line_text(r) for r in range(sc2.rows)), \
         "占位符删除后 footer 应复原(不再显 paste again to expand)"
 

@@ -159,6 +159,7 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
             // Tab cycles scope. It cannot be a filter character, so it is the
             // one key that can carry an explicit choice without stealing input.
             .tab => .cycle_scope,
+            .ctrl_r => .retry,
             .char => |byte| .{ .char = byte },
             else => null,
         };
@@ -673,6 +674,19 @@ test "issue #16: an open picker owns the keyboard without touching the draft" {
     // Tab cannot be a filter character, which is what makes it usable for the
     // one explicit choice the picker needs.
     try testing.expect(press(&state, .tab).picker_key == .cycle_scope);
+}
+
+test "Ctrl+R in an open picker is the picker's: it fetches again a list that did not come (#572)" {
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    ix.editor = .{ .view = "explain this function", .cursor = 4 };
+    try testing.expect(press(&state, .ctrl_r).action != .picker_key);
+    ix.picker_open = true;
+    const retried = press(&state, .ctrl_r);
+    try testing.expectEqual(event.LoopAction.picker_key, retried.action);
+    try testing.expect(retried.picker_key == .retry);
+    try testing.expectEqualStrings("explain this function", ix.editor.view);
+    try testing.expectEqual(@as(usize, 4), ix.editor.cursor);
 }
 
 test "issue #16: an open picker never traps the session" {

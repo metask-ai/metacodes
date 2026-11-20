@@ -463,11 +463,12 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "content_sha256": digest("preflight-content"),
                 "target_platform": "linux/amd64",
             }
-            file_identity = lambda path: {
-                "path": str(Path(path).resolve()),
-                "bytes": Path(path).stat().st_size,
-                "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
-            }
+            def file_identity(path):
+                return {
+                    "path": str(Path(path).resolve()),
+                    "bytes": Path(path).stat().st_size,
+                    "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                }
             runner_tools = {
                 "bash": {"path": f"{FIXTURE}/bash", "bytes": 1, "sha256": digest("bash"), "version_first_line": "bash", "version_sha256": digest("bash-version")},
                 "uv": {"path": f"{FIXTURE}/uv", "bytes": 1, "sha256": digest("uv"), "version_first_line": "uv", "version_sha256": digest("uv-version")},
@@ -3046,27 +3047,34 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
             "selected_tasks": names,
             "selected_tasks_sha256": digest("selected"),
         }
-        file_identity = lambda path, **_: {
-            "path": str(Path(path).resolve()),
-            "bytes": Path(path).stat().st_size,
-            "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
-        }
-        tool = lambda path, _args, bash=False: {
-            "path": str(path),
-            "bytes": 1,
-            "sha256": digest(str(path)),
-            "version_first_line": "bash" if bash else "uv",
-            "version_sha256": digest(f"{path}-version"),
-        }
+        def file_identity(path, **_):
+            return {
+                "path": str(Path(path).resolve()),
+                "bytes": Path(path).stat().st_size,
+                "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            }
+
+        def tool(path, _args, bash=False):
+            return {
+                "path": str(path),
+                "bytes": 1,
+                "sha256": digest(str(path)),
+                "version_first_line": "bash" if bash else "uv",
+                "version_sha256": digest(f"{path}-version"),
+            }
+
         host = {
             name: {"path": f"{FIXTURE}/{name}.py", "bytes": 1, "sha256": digest(name)}
             for name in HOST_CONTROL_PLANE_MODULES
         }
-        git = lambda _repo, *args: (
-            WORKBUDDY_PINNED_COMMIT
-            if args[0] == "rev-parse"
-            else "https://github.com/Tencent/workbuddy-bench"
-        )
+
+        def git(_repo, *args):
+            return (
+                WORKBUDDY_PINNED_COMMIT
+                if args[0] == "rev-parse"
+                else "https://github.com/Tencent/workbuddy-bench"
+            )
+
         with mock.patch.dict(
             os.environ,
             {
@@ -4530,7 +4538,6 @@ result = {
 
     def _resume(self, root, manifest_path, journal_path, failure_receipt,
                 started_ns, runner_argv):
-        repo = Path(__file__).resolve().parents[3]
         with mock.patch.object(launch_gate, "_reobserve_launch_inputs"):
             return launch_gate.resume_trials(
                 manifest_path=manifest_path,

@@ -1048,11 +1048,21 @@ completions, with the fields a route reads, and `Host.ingestOpenRouterBuiltin`
 makes them one `auto` offer each, priced at the model's listed price (the
 upstream OpenRouter picks may charge otherwise). The listing is fetched after
 a sign-in or a pasted key, on `/providers refresh`, and in the REPL's
-background when none is kept or it is a day old and a key is set; it is kept
-in `<state root>/cache/models/`, and every start reads the kept copy whatever
-its age, so a stored pin resolves without a request. Compiled in is only
-OpenRouter's router model, `openrouter/auto`, so the provider is listed before
-a sign-in and keeps a route if the listing cannot be fetched.
+background when none is kept or it is a day old and a key is set, whatever
+route the session runs on; it is kept in `<state root>/cache/models/`, and
+every start reads the kept copy whatever its age, so a stored pin resolves
+without a request. Compiled in is only OpenRouter's router model,
+`openrouter/auto`, so the provider is listed before a sign-in and keeps a
+route if the listing cannot be fetched.
+
+In the TUI a sign-in's fetch runs in the background too (`Refresh`): `/model`
+opens at once, says on a line under its title how much of the listing has
+come, and fills in when it comes, filter and cursor kept; the REPL takes the
+listing on its input loop's tick, where nothing reads the catalog. A fetch
+that fails to connect, or whose answer stops partway, is tried once more; one
+that still fails, or brings no byte for 60 seconds, is said with its reason
+on that line, and Ctrl+R in `/model` fetches again (#572). A start that only
+updates a kept listing says nothing.
 
 Pinning one upstream — an offer per endpoint, its request naming the
 endpoint's tag in `provider.order` with `allow_fallbacks: false` — is the
@@ -1171,8 +1181,9 @@ The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
 streaming; a commit during a reply changes the next turn, not the one in flight.
 `Ctrl+C`/`Ctrl+D` deliberately pass through, so there is always an exit that does
-not depend on the picker's own state machine. `q` closes only on an empty
-filter, which keeps it typeable inside a model name.
+not depend on the picker's own state machine. Every printable key is the
+filter, `q` included, so a search can start with any letter (#599); Esc
+clears the filter, then closes.
 
 Enter commits at the scope the header brackets. Session is the default, and
 `Tab` cycles session → global → once, so any durable write is an explicit act

@@ -157,13 +157,9 @@ pub fn refresh(
 ) !usize {
     const url = try listingUrl(allocator);
     defer allocator.free(url);
-    const answer = try catalog_fetch.fetch(allocator, io, .{ .url = url, .bearer = key });
-    defer allocator.free(answer.body);
-    const trimmed = try trim(allocator, answer.body);
+    const trimmed = try fetchTrimmed(allocator, io, url, key, null);
     defer allocator.free(trimmed);
-    models_cache.store(allocator, state_root, cacheKey(url), url, trimmed, time.nowUnix()) catch |err| {
-        log.debug("catalog", "the OpenRouter listing was not kept: {s}", .{@errorName(err)});
-    };
+    keep(allocator, state_root, url, trimmed);
     if (host) |live| return live.ingestOpenRouterBuiltin(trimmed);
     var count_arena = std.heap.ArenaAllocator.init(allocator);
     defer count_arena.deinit();
@@ -171,25 +167,80 @@ pub fn refresh(
     return parsed.object.get("data").?.array.items.len;
 }
 
+fn fetchTrimmed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    key: []const u8,
+    progress: ?*std.atomic.Value(u64),
+) ![]u8 {
+    const answer = try catalog_fetch.fetch(allocator, io, .{ .url = url, .bearer = key, .progress = progress });
+    defer allocator.free(answer.body);
+    return trim(allocator, answer.body);
+}
+
+fn keep(allocator: std.mem.Allocator, state_root: []const u8, url: []const u8, trimmed: []const u8) void {
+    models_cache.store(allocator, state_root, cacheKey(url), url, trimmed, time.nowUnix()) catch |err| {
+        log.debug("catalog", "the OpenRouter listing was not kept: {s}", .{@errorName(err)});
+    };
+}
+
+pub const Failure = enum(u8) {
+    connection,
+    interrupted,
+    refused,
+    busy,
+    server_error,
+    not_a_list,
+    too_large,
+    other,
+
+    pub fn of(err: anyerror) Failure {
+        return switch (err) {
+            error.RequestFailed => .connection,
+            error.Interrupted => .interrupted,
+            error.Unauthorized => .refused,
+            error.RateLimited => .busy,
+            error.HttpError => .server_error,
+            error.InvalidListing, error.NoUsableModels => .not_a_list,
+            error.TooLarge => .too_large,
+            else => .other,
+        };
+    }
+
+    pub fn transient(self: Failure) bool {
+        return self == .connection or self == .interrupted;
+    }
+};
+
 /// One background fetch of the listing, for a start that found none kept or
-/// a day-old one. Detached, on copies it owns, `std.heap.c_allocator` and an
-/// I/O runtime of its own; it only writes the kept copy, which the REPL takes
-/// at an idle point (`App.adoptOpenRouterRefresh`). The session and the
+/// a day-old one, a sign-in in the TUI, or a retry from `/model`. Detached,
+/// on copies it owns, `std.heap.c_allocator` and an I/O runtime of its own;
+/// it only writes the kept copy, which the REPL takes at an idle point or on
+/// its input loop's tick (`App.takeOpenRouterRefresh`). The session and the
 /// thread each hold a reference; the last to let go frees it.
 pub const Refresh = struct {
     refs: std.atomic.Value(u8) = .init(2),
     state: std.atomic.Value(State) = .init(.running),
+    failure: std.atomic.Value(Failure) = .init(.other),
+    received: std.atomic.Value(u64) = .init(0),
+    superseded: std.atomic.Value(bool) = .init(false),
     key: []u8,
     state_root: []u8,
+    retry_pause_ms: u32,
 
     pub const State = enum(u8) { running, kept, failed };
 
+    pub const Options = struct {
+        retry_pause_ms: u32 = 2000,
+    };
+
     const gpa = std.heap.c_allocator;
 
-    pub fn start(key: []const u8, state_root: []const u8) !*Refresh {
+    pub fn start(key: []const u8, state_root: []const u8, options: Options) !*Refresh {
         const self = try gpa.create(Refresh);
         errdefer gpa.destroy(self);
-        self.* = .{ .key = try gpa.dupe(u8, key), .state_root = undefined };
+        self.* = .{ .key = try gpa.dupe(u8, key), .state_root = undefined, .retry_pause_ms = options.retry_pause_ms };
         errdefer secureFree(self.key);
         self.state_root = try gpa.dupe(u8, state_root);
         errdefer gpa.free(self.state_root);
@@ -207,6 +258,18 @@ pub const Refresh = struct {
         return self.state.load(.acquire) == .kept;
     }
 
+    pub fn failureReason(self: *const Refresh) Failure {
+        return if (self.state.load(.acquire) == .failed) self.failure.load(.monotonic) else .other;
+    }
+
+    pub fn bytesReceived(self: *const Refresh) u64 {
+        return self.received.load(.monotonic);
+    }
+
+    pub fn supersede(self: *Refresh) void {
+        self.superseded.store(true, .release);
+    }
+
     pub fn release(self: *Refresh) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         secureFree(self.key);
@@ -218,12 +281,36 @@ pub const Refresh = struct {
         defer self.release();
         var threaded = platform.signal.threadedIo(gpa, .{});
         defer threaded.deinit();
-        _ = refresh(gpa, threaded.io(), self.state_root, self.key, null) catch |err| {
-            log.debug("catalog", "background OpenRouter listing refresh failed: {s}", .{@errorName(err)});
+        if (self.fetchAndKeep(threaded.io())) |failure| {
+            self.failure.store(failure, .monotonic);
             self.state.store(.failed, .release);
-            return;
+        } else {
+            self.state.store(.kept, .release);
+        }
+    }
+
+    fn fetchAndKeep(self: *Refresh, io: std.Io) ?Failure {
+        const url = listingUrl(gpa) catch |err| return Failure.of(err);
+        defer gpa.free(url);
+        var tries: u8 = 0;
+        const trimmed = while (true) {
+            tries += 1;
+            self.received.store(0, .monotonic);
+            if (fetchTrimmed(gpa, io, url, self.key, &self.received)) |body| break body else |err| {
+                const failure = Failure.of(err);
+                if (tries == 1 and failure.transient() and !self.superseded.load(.acquire)) {
+                    log.debug("catalog", "OpenRouter listing fetch failed ({s}); trying once more", .{@errorName(err)});
+                    time.sleepMs(self.retry_pause_ms);
+                    continue;
+                }
+                log.debug("catalog", "background OpenRouter listing refresh failed: {s}", .{@errorName(err)});
+                return failure;
+            }
         };
-        self.state.store(.kept, .release);
+        defer gpa.free(trimmed);
+        if (self.superseded.load(.acquire)) return .other;
+        keep(gpa, self.state_root, url, trimmed);
+        return null;
     }
 
     fn secureFree(bytes: []u8) void {
@@ -263,4 +350,21 @@ test "the kept listing holds the models a session can use, with the fields a rou
     );
     try testing.expectError(error.NoUsableModels, trim(a, "{\"data\": [{\"id\": \"x\", \"supported_parameters\": []}]}"));
     try testing.expectError(error.InvalidListing, trim(a, "<html></html>"));
+}
+
+test "a failed fetch is told by what mends it: a retry for the way there, another key for a refused one (#572)" {
+    try testing.expectEqual(Failure.connection, Failure.of(error.RequestFailed));
+    try testing.expectEqual(Failure.interrupted, Failure.of(error.Interrupted));
+    try testing.expectEqual(Failure.refused, Failure.of(error.Unauthorized));
+    try testing.expectEqual(Failure.busy, Failure.of(error.RateLimited));
+    try testing.expectEqual(Failure.server_error, Failure.of(error.HttpError));
+    try testing.expectEqual(Failure.not_a_list, Failure.of(error.InvalidListing));
+    try testing.expectEqual(Failure.not_a_list, Failure.of(error.NoUsableModels));
+    try testing.expectEqual(Failure.too_large, Failure.of(error.TooLarge));
+    try testing.expectEqual(Failure.other, Failure.of(error.OutOfMemory));
+    try testing.expect(Failure.connection.transient());
+    try testing.expect(Failure.interrupted.transient());
+    for ([_]Failure{ .refused, .busy, .server_error, .not_a_list, .too_large, .other }) |failure| {
+        try testing.expect(!failure.transient());
+    }
 }

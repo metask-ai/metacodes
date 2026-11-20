@@ -25,6 +25,8 @@ pub const plugin = @import("plugin/root.zig");
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
+pub const skill_rsi = @import("skills/rsi.zig"); // frozen procedural instructions and local ridge routing
+pub const harnessmm = @import("core/harnessmm.zig"); // EDG / GDR / native callback certificates
 pub const agent_session = @import("core/agent_session.zig");
 pub const tool_catalog = @import("core/tool_catalog.zig");
 pub const workspace_policy = @import("core/workspace_policy.zig");
@@ -101,6 +103,12 @@ pub const teamwork_issues = @import("teamwork/issues.zig"); // open_issues.json 
 pub const teamwork_reviewer = @import("teamwork/reviewer.zig"); // built-in reviewer: charter, review.json, verification (#517)
 pub const teamwork_charters = @import("teamwork/charters.zig"); // role charters (#515)
 pub const teamwork_drivers = @import("teamwork/drivers/factory.zig"); // seat drivers by harness (#515, #521)
+pub const teamwork_audit = @import("teamwork/audit.zig"); // completion audit seam (#516)
+pub const teamwork_merge_back = @import("teamwork/merge_back.zig"); // implementer worktree and merge-back (#523)
+pub const teamwork_runtime = @import("teamwork/runtime.zig"); // run state machine and operations API (#514, #520, #523)
+pub const teamwork_swe_loop = @import("teamwork/swe_loop.zig"); // built-in deterministic manager (#514)
+pub const teamwork_verifier_auditor = @import("teamwork/verifier_auditor.zig"); // completion audit by the isolated verifier (#516)
+pub const teamwork_mcp_server = @import("teamwork/mcp_server.zig"); // approved runtime operations over MCP (#522)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
@@ -273,6 +281,7 @@ test {
     _ = &@import("teamwork/drivers/metacodes.zig");
     _ = &@import("teamwork/drivers/claude_code.zig");
     _ = &@import("teamwork/drivers/drivers_test.zig");
+    _ = &@import("teamwork/runtime_test.zig");
     // Reached through the Bash tool, not re-exported: name it so its own tests run.
     _ = &@import("core/command_file_changes.zig");
 }

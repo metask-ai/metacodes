@@ -171,8 +171,8 @@ def main():
         print(f"ledger: {len(local_ok)} completed, {len(local_failed)} failed (not billable)")
         print(f"server: {len(remote)} billed requests, cost {total_cost} mU = {total_cost / 1000:.3f} U")
         for rid, s_ in sorted(remote.items(), key=lambda kv: kv[1].get("ts", "")):
-            l = local_ok.get(rid)
-            flag = "OK " if l and not [p for p in problems if p.get("request_id") == rid] else "!! "
+            local = local_ok.get(rid)
+            flag = "OK " if local and not [p for p in problems if p.get("request_id") == rid] else "!! "
             print(f"  {flag}{rid}  {s_.get('model')}  in={s_.get('input_tokens')} out={s_.get('output_tokens')} cache={s_.get('cache_read_tokens')}  cost={s_.get('cost_mu')} mU  (quota/A/U {s_.get('from_quota_mu')}/{s_.get('from_a_mu')}/{s_.get('from_u_mu')})")
         for p in problems:
             print(f"  MISMATCH {p}")

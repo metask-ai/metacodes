@@ -6,8 +6,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const ABI_REVISION = 28;
+const ABI_REVISION = 29;
 const BUILTIN_TOOLS = [
+  'ExecuteCode',
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',
 ];
@@ -222,9 +223,11 @@ class AgentCoreError extends Error {
 
 class Runtime {
   /**
-   * @param {{tools?: string[], hostTools?: object[], library?: string}} [options]
+   * @param {{tools?: string[], hostTools?: object[], library?: string, preview?: boolean}} [options]
    */
-  constructor({ tools = DEFAULT_TOOLS, hostTools = [], library } = {}) {
+  constructor({ tools = DEFAULT_TOOLS, hostTools = [], library, preview = false } = {}) {
+    if (typeof preview !== 'boolean') throw new TypeError('preview must be a boolean');
+    if (preview) tools = [...new Set([...tools, 'ExecuteCode'])];
     const unknown = tools.filter((name) => !BUILTIN_TOOLS.includes(name));
     if (unknown.length) throw new Error(`unknown built-in tools: ${unknown.join(', ')}`);
     this._native = loadNative(library);
@@ -242,7 +245,7 @@ class Runtime {
     }));
     this._handle = this._native.runtimeCreate(this.tools, specs, (kind, handle, index, args) => {
       this._dispatchTool(handle, index, args);
-    });
+    }, preview);
   }
 
   _dispatchTool(handle, index, args) {

@@ -571,6 +571,7 @@ pub fn buildOptions(
         // transcript 用真 id 而 agent_loop 内 KG 任务 claim/lease 归属却是 single,
         // 并发 headless 进程共享 KG store 时租约互相碰撞)。
         .session = app.session_id,
+        .preview = app.config.preview.isEnabled(),
         // Span recording, as session_service.buildRunOptions does for the other frontends.
         .telemetry = @import("../telemetry/telemetry.zig").forSession(app.sessionDir()),
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
@@ -638,6 +639,9 @@ pub fn buildOptions(
         .api_client = app.anthropicClientOrNull(),
         .tool_defs = app.tool_defs,
         .system_prompt = app.system_prompt,
+        .harnessmm = app.config.harnessmm,
+        .rsi = app.config.rsi,
+        .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
         .inject_user_context = app.user_context,
         .time_announcer = if (app.time_announcer) |*announcer| announcer else null,
         .goal_meter = if (app.goal_meter) |*meter| meter else null,

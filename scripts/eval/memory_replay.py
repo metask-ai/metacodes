@@ -32,7 +32,6 @@ from .memory_budget_journal import (
     validate_checkpoint_payload,
 )
 from .memory_consolidation import (
-    SCHEMA_VERSION as CONSOLIDATION_SCHEMA_VERSION,
     validate_artifacts as _validate_consolidation_artifacts,
     validate_receipt as _validate_consolidation_receipt,
 )

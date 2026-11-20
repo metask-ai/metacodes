@@ -104,7 +104,8 @@ def test_T17_help_then_question_no_corruption(bin_path):
 def _menu_rows_classes(raw):
     """返回菜单各行 (text, 命令名首字符的 border_class)。用于验证高亮选中项。"""
     from screen import Screen
-    sc = Screen(24, 80); sc.feed(raw)
+    sc = Screen(24, 80)
+    sc.feed(raw)
     # 找下边框(全 ─ 行)与 footer(含 shift+tab)之间的菜单行
     rows = []
     for r in range(sc.rows):

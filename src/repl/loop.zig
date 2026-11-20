@@ -1390,6 +1390,10 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
 
     // ② spawnBackground(prebuilt=copy)。consume 语义:成功转移给 job,失败它自己释放 copy。
     _ = try reg.spawnBackground(.{
+        .preview = app.config.preview.isEnabled(),
+        .harnessmm = app.config.harnessmm,
+        .rsi = app.config.rsi,
+        .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
         .prompt = "", // 忽略(prebuilt 非 null)
         .system_prompt = app.system_prompt orelse "",
         .session = app.session_id,
@@ -1583,6 +1587,16 @@ fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text:
 
 /// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
 var g_paste_id: usize = 0;
+
+fn openRouterTick(app: *app_mod.App, region: *render_region_mod.RenderRegion) bool {
+    const change = app.takeOpenRouterRefresh(util_time.nowMs());
+    if (!region.pickerOpen()) return false;
+    if (change.listed) {
+        picker_host.relist(app, .of(region));
+        return true;
+    }
+    return picker_host.renote(app, .of(region));
+}
 
 /// What the footer's MCP notice depends on, packed: a change means redraw.
 fn mcpFooterKey(app: *const app_mod.App) u64 {
@@ -1937,6 +1951,7 @@ fn readLineRaw(
                     mcp_footer_seen = key;
                     redraw(region, &editor, app);
                 }
+                if (openRouterTick(app, region)) redraw(region, &editor, app);
             }
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
@@ -3262,7 +3277,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             if (dialog.outcome == .key_stored and dialog.chosenProfile().key_grant != null) {
                 // A key pasted for a provider whose site describes keys
                 // (OpenRouter): what it said, and what a sign-in's key says.
-                printKeyGrantSignedIn(app, dialog.chosenProfile(), previous_keys.forProvider(dialog.chosenProfile().id));
+                printKeyGrantSignedIn(app, dialog.chosenProfile(), previous_keys.forProvider(dialog.chosenProfile().id), .background);
             } else if (dialog.outcome == .key_stored) {
                 cmd_output.print("Stored the key for {s} · /model to choose a model\n", .{label});
                 // A key variable in the shell or `.env` is read before the
@@ -3272,7 +3287,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
                     cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
                 }
             } else if (dialog.chosenProfile().key_grant != null) {
-                printKeyGrantSignedIn(app, dialog.chosenProfile(), previous_keys.forProvider(dialog.chosenProfile().id));
+                printKeyGrantSignedIn(app, dialog.chosenProfile(), previous_keys.forProvider(dialog.chosenProfile().id), .background);
             } else {
                 cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
             }
@@ -3314,10 +3329,12 @@ const PreviousKeys = struct {
     }
 };
 
+const ListingFetch = enum { background, now };
+
 /// After a key grant (OpenRouter) stored a key: what the provider said about
 /// it, an account without credits, the key a previous sign-in left behind,
 /// and a variable that is read before the stored key.
-fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile, previous: ?[]const u8) void {
+fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile, previous: ?[]const u8, fetch: ListingFetch) void {
     const th = app.theme;
     const grant = profile.key_grant orelse return;
     const grant_origin = openrouter_login.origin(grant);
@@ -3340,16 +3357,28 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     if (app.storedKeyShadowNotice(profile, &notice_buf)) |notice| {
         cmd_output.print("{s}{s}{s}\n", .{ th.warn, notice, th.reset });
     }
-    // The account's own models, so /model lists them now.
-    _ = app.refreshOpenRouterListing() catch |err| {
-        cmd_output.print("{s}{s}'s model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, profile.display_name, @errorName(err), th.reset });
-    };
+    // The account's own models, so /model lists them.
+    switch (fetch) {
+        .background => app.startOpenRouterRefresh(true) catch |err| {
+            @import("../util/log.zig").debug("catalog", "OpenRouter listing not fetched in the background ({s}); fetching now", .{@errorName(err)});
+            fetchListingNow(app, profile);
+        },
+        .now => fetchListingNow(app, profile),
+    }
     // Signed in: on to choosing the model, as `/login` goes on for Metask.
     // The picker opens applying it from now on, so the next start uses it
     // too; on the free models when the account has no credits, the only ones
     // that answer then.
     app.pending_overlay = .model_picker;
     app.pending_picker_preset = app_mod.PickerPreset.withFilter(.global, if (meta.free_tier orelse false) ":free" else "");
+}
+
+fn fetchListingNow(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile) void {
+    const th = app.theme;
+    cmd_output.print("{s}Downloading the models your {s} account can use…{s}\n", .{ th.dim, profile.display_name, th.reset });
+    _ = app.refreshOpenRouterListing() catch |err| {
+        cmd_output.print("{s}{s}'s model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, profile.display_name, @errorName(err), th.reset });
+    };
 }
 
 /// Offer one provider in `/login`'s list. The one `/login <id>` named is
@@ -3608,7 +3637,7 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         return;
     };
     if (flow == .key_grant) {
-        printKeyGrantSignedIn(app, built, previous_keys.forProvider(built.id));
+        printKeyGrantSignedIn(app, built, previous_keys.forProvider(built.id), .now);
     } else {
         cmd_output.print("Signed in to {s} · /model to choose a model\n", .{outcome.provider_id.slice()});
     }
@@ -3623,6 +3652,7 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     if (std.mem.eql(u8, rest, "refresh")) {
+        if (app.hasOpenRouterKey()) cmd_output.print("{s}Downloading OpenRouter's model list…{s}\n", .{ app.theme.dim, app.theme.reset });
         const refreshed = app.refreshProviderCatalogs() catch |err| {
             cmd_output.print("\x1b[31mcatalog refresh failed: {s}\x1b[0m\n", .{@errorName(err)});
             return;
@@ -4688,7 +4718,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
         &app.permission_ctx,
         &app.abort,
         prompt,
-        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id }, // 单轮,无工具(纯回答)
+        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.isEnabled() }, // 单轮,无工具(纯回答)
     );
     defer result.deinit();
     return try allocator.dupe(u8, result.final_text);

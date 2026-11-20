@@ -7,7 +7,9 @@
 - shutdown → 回 null;exit → 退出。
 诊断内容可被 MOCK_LSP_MESSAGE env 覆盖(默认含独特标记 MOCK_LSP_DIAG)。
 """
-import sys, json, os
+import sys
+import json
+import os
 
 def read_message():
     # 读 header 到 \r\n\r\n

@@ -10,7 +10,6 @@ import unittest
 from unittest import mock
 
 from scripts.eval.memory_agent_runtime import PRODUCTION_MODEL_FINGERPRINT
-from scripts.eval.memory_replay import PRODUCTION_PROVIDER_ID
 from scripts.eval.model import stable_json
 from scripts.eval.project_harness_e3_experiment import E3_ROLLOUT_TIMEOUT_SECONDS
 from scripts.eval.project_harness_rule_impact_cases import (

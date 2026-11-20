@@ -100,6 +100,7 @@ const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const models_cache_mod = @import("api/models_cache.zig");
+const openrouter_catalog_mod = @import("api/openrouter_catalog.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
 const bedrock_mod = @import("api/bedrock_client.zig");
@@ -439,9 +440,15 @@ pub const App = struct {
     /// REPL takes its answer (`adoptModelCatalogRefresh`) or the App ends.
     models_refresh: ?*models_cache_mod.Refresh = null,
     /// A background fetch of OpenRouter's listing, for a start that found
-    /// none kept or a day-old one (`api/openrouter_catalog.zig`); the REPL
-    /// takes it at the idle points it takes `models_refresh` at.
-    openrouter_refresh: ?*@import("api/openrouter_catalog.zig").Refresh = null,
+    /// none kept or a day-old one, a sign-in in the TUI, or a retry from
+    /// `/model` (`api/openrouter_catalog.zig`); the REPL takes it at the idle
+    /// points it takes `models_refresh` at, and on its input loop's tick.
+    openrouter_refresh: ?*openrouter_catalog_mod.Refresh = null,
+    openrouter_refresh_shown: bool = false,
+    openrouter_progress: struct { bytes: u64 = 0, at_ms: i64 = 0 } = .{},
+    openrouter_failure: ?openrouter_catalog_mod.Failure = null,
+    openrouter_background: bool = false,
+    openrouter_retry_pause_ms: u32 = 2000,
     /// The REPL hosts this App: catalogs may refresh in the background
     /// (`InitOptions.models_cache`).
     background_catalogs: bool = false,
@@ -716,6 +723,7 @@ pub const App = struct {
     loop_remaining: u32 = 0,
     /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
     system_prompt: ?[]u8 = null,
+    rsi_policy: ?@import("skills/rsi.zig").Loaded = null,
     /// 首条 user-context message(CLAUDE.md 链 + AutoMem + currentDate,`<system-reminder>` 包裹)。
     /// init 时构建一次(memoize),agent_loop 每轮 prepend。owned;deinit free。
     /// null = 无记忆内容 / CLAUDE_CODE_DISABLE_CLAUDE_MDS。
@@ -806,13 +814,15 @@ pub const App = struct {
     ) !*App {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
+        var active_config = config;
+        active_config.preview = try @import("app/config.zig").resolvePreview(allocator, config.state_root, config.preview);
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,
         // 最后 toToolDefinitionsWithDyn 一次性构造给 API 的 tool 清单。
         app.* = .{
             .allocator = allocator,
-            .config = config,
+            .config = active_config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
@@ -821,6 +831,7 @@ pub const App = struct {
             .unchosen_local_providers = options.unchosen_local_providers,
             .local_provider = options.local_provider,
             .startup_notice = options.startup_notice,
+            .openrouter_background = options.models_cache and std.c.getenv("METACODES_NO_PROBE") == null,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
@@ -860,6 +871,12 @@ pub const App = struct {
         };
         errdefer if (app.state_root_default) |owned| allocator.free(owned);
         errdefer app.tool_defs_arena.deinit();
+
+        if (app.config.preview.isEnabled() and app.config.rsi) {
+            const path = config.rsi_policy_path orelse return error.SkillPolicyRequired;
+            app.rsi_policy = try @import("skills/rsi.zig").Loaded.load(allocator, path);
+        }
+        errdefer if (app.rsi_policy) |*policy| policy.deinit();
 
         // OpenAI 后端:仅当 provider_kind==.openai 才建(chat/completions 或 Responses,
         // 按 config.openai_protocol 显式选择)。base_url 复用 config.base_url(record/replay
@@ -1208,6 +1225,7 @@ pub const App = struct {
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
         app.swarm = .{
             .allocator = allocator,
+            .preview = app.config.preview.isEnabled(),
             .session = app.session_id,
             .state_root = app.stateRoot(),
             .api_key = app.api_key,
@@ -2399,6 +2417,7 @@ pub const App = struct {
         app.retired_workspace_strings.deinit(app.allocator);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
+        if (app.rsi_policy) |*policy| policy.deinit();
         if (app.user_context) |u| app.allocator.free(u);
         app.allocator.destroy(app);
         // Every Run of this App has ended: send what is queued (last App only).
@@ -2676,32 +2695,110 @@ pub const App = struct {
     /// in the REPL, with none kept or a day-old one and a key set, a fetch in
     /// the background, taken at an idle point (`adoptOpenRouterRefresh`).
     fn adoptOpenRouterListing(app: *App, host: *provider_host_mod.Host) void {
-        const openrouter_catalog = @import("api/openrouter_catalog.zig");
-        const kept = openrouter_catalog.adoptKept(host, app.allocator, app.stateRoot());
-        if (kept == .fresh or !app.background_catalogs or app.openrouter_refresh != null) return;
-        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return;
-        defer {
-            std.crypto.secureZero(u8, key);
-            app.allocator.free(key);
-        }
-        app.openrouter_refresh = openrouter_catalog.Refresh.start(key, app.stateRoot()) catch |err| blk: {
+        const kept = openrouter_catalog_mod.adoptKept(host, app.allocator, app.stateRoot());
+        if (kept == .fresh or !app.openrouter_background or app.openrouter_refresh != null) return;
+        app.startOpenRouterRefreshIn(host, kept == .none) catch |err| {
             @import("util/log.zig").debug("catalog", "OpenRouter listing refresh not started: {s}", .{@errorName(err)});
-            break :blk null;
         };
     }
 
     /// Take a finished background fetch of OpenRouter's listing into the
     /// live catalog. Called where the REPL takes `models_refresh`.
     pub fn adoptOpenRouterRefresh(app: *App) void {
+        if (app.takeOpenRouterRefresh(@import("util/time.zig").nowMs()).listed) {
+            app.refreshModelPicker() catch app.model_picker.markFailed();
+        }
+    }
+
+    pub const OPENROUTER_STALL_MS: i64 = 60 * std.time.ms_per_s;
+
+    pub fn startOpenRouterRefresh(app: *App, shown: bool) !void {
+        return app.startOpenRouterRefreshIn(try app.providerHost(), shown);
+    }
+
+    fn startOpenRouterRefreshIn(app: *App, host: *provider_host_mod.Host, shown: bool) !void {
+        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return error.MissingCredentials;
+        defer {
+            std.crypto.secureZero(u8, key);
+            app.allocator.free(key);
+        }
+        const refresh = try openrouter_catalog_mod.Refresh.start(key, app.stateRoot(), .{ .retry_pause_ms = app.openrouter_retry_pause_ms });
+        app.dropOpenRouterRefresh();
+        app.openrouter_refresh = refresh;
+        app.openrouter_refresh_shown = shown;
+        app.openrouter_failure = null;
+        app.openrouter_progress = .{ .at_ms = @import("util/time.zig").nowMs() };
+    }
+
+    fn dropOpenRouterRefresh(app: *App) void {
         const refresh = app.openrouter_refresh orelse return;
-        if (!refresh.finished()) return;
+        app.openrouter_refresh = null;
+        refresh.supersede();
+        refresh.release();
+    }
+
+    pub const OpenRouterChange = struct {
+        listed: bool = false,
+    };
+
+    pub fn takeOpenRouterRefresh(app: *App, now_ms: i64) OpenRouterChange {
+        const refresh = app.openrouter_refresh orelse return .{};
+        if (!refresh.finished()) {
+            app.sampleOpenRouterProgress(now_ms);
+            return .{};
+        }
         app.openrouter_refresh = null;
         const kept = refresh.kept();
+        const failure = refresh.failureReason();
         refresh.release();
-        if (!kept) return;
-        const host = app.provider_host orelse return;
-        if (@import("api/openrouter_catalog.zig").adoptKept(host, app.allocator, app.stateRoot()) == .none) return;
-        app.refreshModelPicker() catch app.model_picker.markFailed();
+        if (!kept) {
+            if (app.openrouter_refresh_shown) app.openrouter_failure = failure;
+            return .{};
+        }
+        app.openrouter_failure = null;
+        const host = app.provider_host orelse return .{};
+        if (openrouter_catalog_mod.adoptKept(host, app.allocator, app.stateRoot()) == .none) return .{};
+        return .{ .listed = true };
+    }
+
+    pub fn sampleOpenRouterProgress(app: *App, now_ms: i64) void {
+        const refresh = app.openrouter_refresh orelse return;
+        const bytes = refresh.bytesReceived();
+        if (bytes != app.openrouter_progress.bytes) app.openrouter_progress = .{ .bytes = bytes, .at_ms = now_ms };
+    }
+
+    pub fn openRouterListNote(app: *const App, now_ms: i64) ?model_picker_mod.ListNote {
+        const ListNote = model_picker_mod.ListNote;
+        const name = if (app.provider_host) |host|
+            (if (host.registry.findById(openrouter_profile_id)) |profile| profile.display_name else "OpenRouter")
+        else
+            "OpenRouter";
+        if (app.openrouter_refresh) |refresh| {
+            if (!app.openrouter_refresh_shown) return null;
+            if (now_ms - app.openrouter_progress.at_ms >= OPENROUTER_STALL_MS) {
+                return ListNote.init(openrouter_profile_id, name, .{ .failed = .stalled });
+            }
+            return ListNote.init(openrouter_profile_id, name, .{ .downloading = refresh.bytesReceived() });
+        }
+        const failure = app.openrouter_failure orelse return null;
+        return ListNote.init(openrouter_profile_id, name, .{ .failed = switch (failure) {
+            .connection => .connection,
+            .interrupted => .interrupted,
+            .refused => .refused,
+            .busy => .busy,
+            .server_error => .server_error,
+            .not_a_list => .not_a_list,
+            .too_large => .too_large,
+            .other => .other,
+        } });
+    }
+
+    pub fn hasOpenRouterKey(app: *App) bool {
+        const host = app.providerHost() catch return false;
+        const key = app.providerSecretIn(host, openrouter_profile_id) orelse return false;
+        std.crypto.secureZero(u8, key);
+        app.allocator.free(key);
+        return true;
     }
 
     /// Fetch OpenRouter's listing now with the key OpenRouter's requests
@@ -2714,7 +2811,12 @@ pub const App = struct {
             std.crypto.secureZero(u8, key);
             app.allocator.free(key);
         }
-        const count = try @import("api/openrouter_catalog.zig").refresh(app.allocator, app.io, app.stateRoot(), key, host);
+        app.dropOpenRouterRefresh();
+        const count = openrouter_catalog_mod.refresh(app.allocator, app.io, app.stateRoot(), key, host) catch |err| {
+            app.openrouter_failure = openrouter_catalog_mod.Failure.of(err);
+            return err;
+        };
+        app.openrouter_failure = null;
         app.refreshModelPicker() catch app.model_picker.markFailed();
         return count;
     }
@@ -5444,6 +5546,7 @@ pub const App = struct {
     /// this thread once every server has reported. Failures are recorded per
     /// server (`mcp_report`, `/mcp`) and never stop the App.
     fn beginMcpStartup(app: *App) void {
+        if (app.config.mcp_connect == .disabled) return;
         const log = @import("util/log.zig");
         const arena_state = app.allocator.create(std.heap.ArenaAllocator) catch |err| {
             log.warn("mcp", "no servers connected: {s}", .{@errorName(err)});
@@ -5614,6 +5717,7 @@ pub const App = struct {
         // `--agent-teams` would leave them out of "Using your tools").
         const defs_allocator = app.tool_defs_arena.allocator();
         const probe_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .agent_teams = app.config.agent_teams,
             .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
         };
@@ -5622,6 +5726,7 @@ pub const App = struct {
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
 
         const prompt_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .permission_mode = app.config.permission_mode,
             .enabled_tool_names = enabled_names,
             .agent_type = "", // 主对话

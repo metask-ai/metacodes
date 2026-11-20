@@ -21,7 +21,7 @@ helper contract and the current network-policy limits.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 28 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 29 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
 | Node package | `require('metacodes')` ([sdk/node](../sdk/node/README.md)) | experimental, unpublished; macOS and Linux | same exact-revision rule; the addon is rebuilt per platform |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -33,6 +33,35 @@ Beyond the endpoints and access rules of
 [Web and daemon HTTP surface](#web-and-daemon-http-surface), there is no
 general HTTP service API promise yet. The Web and daemon hosts are product
 surfaces built over the same core protocols.
+
+## Preview features
+
+Preview features default to disabled. Start with `metacodes --preview` to
+enable them, or save `"preview": true` at the root of the installation's
+`config.json` (`<state root>/config.json`). `--no-preview` disables them for
+one start, including when the saved setting is true. Command-line flags
+override the saved value; the last preview flag wins. Only a root JSON boolean
+is accepted. Child agents inherit the resolved setting. A feature's own
+selection and permission rules still apply after preview is enabled.
+
+Source embedders set `AgentRuntime.RuntimeConfig.preview = true`. AgentCore
+ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default 0);
+Python uses `Runtime(preview=True)` and Node.js uses
+`new Runtime({ preview: true })`. The SDKs include `ExecuteCode` when enabled.
+Selecting a preview built-in by name while preview is disabled is rejected.
+
+## JavaScript tool orchestration
+
+`ExecuteCode({code, timeout_ms?})` runs JavaScript in a per-session QuickJS
+context. `await tools.Read(args)` and the equivalent interfaces for selected
+built-in, Host and process tools enter the kernel's ordinary tool admission
+and execution pipeline. Meta Code and its tools remain implemented in Zig.
+The result contains the last expression, explicit logs and the inner call count;
+intermediate tool results stay outside provider messages. This is a preview
+feature: it is absent from the tool menu by default, and a guessed invocation
+is rejected before creating a VM. Enabling preview admits it to the catalog;
+Session tool selection and ordinary admission still apply. The normative behavior, limits and reset
+rules are in [PROGRAMMATIC_TOOL_CALLING.md](PROGRAMMATIC_TOOL_CALLING.md).
 
 ## Provider selection surface
 
@@ -126,7 +155,10 @@ of models under a heading per provider (where its key comes from, who bills
 it), the cursor on the model in use; a model served on several routes lists
 them under it while the cursor is on it, the reasoning level is a line under
 the list changed with ←/→, the three scopes are named in the header (`Tab`
-cycles them), typing filters across every provider, and closing without a
+cycles them), typing filters across every provider, a line under the header
+says that OpenRouter's model list is still downloading (how much has come)
+or why it did not come (`Ctrl+R` downloads it again) and the list fills in
+when it comes, and closing without a
 choice prints `kept <model>` (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
@@ -271,6 +303,97 @@ promise: the HTTP endpoint shapes remain pre-1.0.
 
 ## CLI surface
 
+`metacodes [--state-dir <dir>] --preview teamwork run --request-file <file> --approve
+--budget-usd <cap>` runs the approved SWE loop synchronously: implementer,
+reviewer, isolated completion verifier, then merge-back into the user's
+workspace without committing. `--approve` authorizes the request bytes,
+configured harnesses and pinned check, spend up to the positive dollar cap,
+and merge-back. No App/provider, seat or worktree starts before approval.
+The state root must be outside the repository. All workers, pinned checks
+and verifier tools require Sandbox Foundations; an unavailable backend fails
+closed. Native and Claude Code implementer/reviewer seats are supported.
+
+Teamwork is a **preview feature**, disabled by default. It uses the same root
+`"preview": true` in `<state root>/config.json` and the same `--preview` /
+`--no-preview` flags as ExecuteCode. Flags may precede `teamwork` or follow
+the action; the last flag wins and overrides the saved value. CLI dispatch
+before App initialization and App initialization share `app/config.zig`'s
+`resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
+selects the feature; it does not approve a task or authorize spend.
+
+With preview disabled, start/resume and Manager execution fail with
+`PreviewDisabled` before App/provider startup, run creation or recovery,
+worker probes, budget admission, auditing or merge-back. A saved approval,
+checkpoint or MCP field cannot grant current preview authorization. Read-only
+CLI status remains available without loading global configuration. Existing
+runtime/MCP handles retain status, cancellation and destruction/cleanup after
+host opt-out; only the host's abort signal is safe to change concurrently.
+
+Zig hosts explicitly supply `teamwork_runtime.Deps.preview` (default false),
+independently of the approved task configuration. `Run.start`, `reopen`,
+`dispatch` and `requestCompletion` enforce it. Production hosts project the
+resolved `app.config.preview.isEnabled()` and propagate that bool into native
+seat and verifier subagents and worker launch admission. Third-party Claude
+Code is gated before probing/launch; it is not passed metacodes-only flags.
+This increment adds no AgentCore ABI field: the shared revision-29 preview
+setting and SDK bindings come from the preview framework dependency.
+
+Configuration precedence is `<state root>/config.json`'s `teamwork` object,
+repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
+`--config-json <object>` / `--budget-usd` / `--max-rounds` /
+`--check-command`. CLI overrides are applied left to right. `--id <id>`
+selects a path-safe run id; otherwise one is generated and printed to stderr.
+Provider options are `--provider`, `--model`, `--base-url`, `--api-key`, and
+`--verbose`. This CLI uses the deterministic manager and an already-written
+request; configured model/effort or external harnesses for manager/interviewer
+are rejected. The verifier must be native; explicit verifier effort and tier
+aliases are rejected until wired. No REPL interviewer is implied.
+
+`metacodes [--state-dir <dir>] teamwork status <id> [--json]` prints JSON
+containing saved state/detail, repository, dispatch counts, audit results,
+merge-conflict count, seats and budget totals. It reads only run files: no
+global provider configuration, credentials, startup, state rewrite or ledger
+repair. A missing budget ledger means no charges yet. A torn budget tail is
+reported and excluded from totals; `budget.pending` shows an outstanding
+pre-call reservation without consuming, settling or deleting it. Reads during
+execution are observations of individually atomic files, not one transaction.
+`teamwork resume <id> --preview --approve` resumes from the approval stored with `run.json`.
+The approved budget, check, seat models, effective permissions and sandbox
+restrictions must match the run's saved fingerprints. Older CLI runs without
+a host-policy fingerprint still support status, and need a new approval to run.
+Inherited native seat models are pinned before the first dispatch. Provider
+credentials/endpoint can be supplied again. Resume also accepts the originally
+saved repository when invoked elsewhere. An OS lifetime lock permits one
+driver per run. Ctrl-C forwards cancellation to the run. Exit codes are 0 for
+done/status/help, 1 for runtime failure and 2 for invalid input/refusal.
+
+`teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
+the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)
+on stdin/stdout. The built CLI binds `Server.init(gpa, run).serve()`. The CLI host exposes
+`teamwork_command.Host.create(arena, app, cfg)` / `Host.deps()` and
+`executeWithMcp(arena, app, prepared, ?McpHost)`. The `McpHost.serveFn(gpa,
+run)` callback owns stdin/stdout until return; it receives a live approved
+`runtime.Run` instead of running the deterministic loop. Without a bound
+callback the command refuses before App startup. See
+[TEAMWORK_DESIGN.md](TEAMWORK_DESIGN.md) for the runtime contracts.
+
+Budget admission writes `budget.jsonl.pending` before a paid worker/audit
+call. A durable charge settles it; restart consumes an unresolved allowance
+as `reserved` instead of treating unknown spend as zero. `reserved` is cap
+consumption, not a measured bill. The workers/audit cap does not include the
+MCP client's own Manager model calls.
+
+The completion auditor's PASS includes the reviewed tree ID. Pinned checks
+and verifier probes run in a disposable checkout of that tree. Merge-back
+checks full file preimages against a private Git index. Changes to submodule
+commit pointers are refused and the candidate and patch are retained.
+
+Teamwork CLI hosts set `Config.mcp_connect = .disabled`: configured outbound
+MCP servers (including imported Claude Code config) are not launched. The
+built-in tool surface is still published before seat dependencies are built.
+This prevents recursive launches of the teamwork endpoint and empty native
+seat tool lists. Ordinary CLI/REPL MCP connection modes retain their behavior.
+
 `metacodes --help` enumerates the current flag set and is the authoritative
 pre-1.0 surface; `metacodes --version` prints `metacodes <semver>` as its first
 line, then the build identity (commit and dirty state, Zig, target and
@@ -326,6 +449,26 @@ The flag surface is fail-closed: an unknown flag or positional argument exits wi
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
+Two independent preview features default to off and require the shared
+`--preview` opt-in (or saved `"preview": true`). `--harnessmm` / `--no-harnessmm`
+enables bounded runtime EDGs, guarded reuse of decisions through the native
+tool dispatcher, and durable callback-substitution certificates; the
+[HarnessMM protocol](HARNESSMM_PROTOCOL.md) defines supported guards and
+conservative fallback. `--rsi` / `--no-rsi`, with `--rsi-policy <file>`,
+enables the evolved procedural instruction and its own local ridge router
+together. With preview or RSI off, its policy is not opened or required; with
+preview or HarnessMM off, plans are not admitted and certificates are not read
+or written. Preview alone selects neither optimization. Neither runtime switch
+starts optimization. The [RSI protocol](SKILL_RSI_PROTOCOL.md) defines offline
+training, budgets, exact features, hash binding and host-origin injection.
+Zig consumers use `harnessmm`, `skill_rsi`, and `agent_loop.Options.harnessmm`,
+`rsi` / `rsi_policy` together with `agent_loop.Options.preview`. Explicit child
+selections use the matching `subagent.SpawnOptions` fields; fresh children
+default to no selection, while background root continuation retains it.
+The policy is borrowed for the run or job lifetime. Restoring a conversation
+does not restore feature permission or execute historical graphs; inactive
+host guidance is omitted only from provider projection. C ABI layouts are
+unchanged by these selections and AgentCore Sessions do not implicitly inherit CLI features.
 `metacodes update [--check] [--version X.Y.Z] [--release-base <url>] [--pull]
 [--allow-downgrade] [--no-sdk] [--ignore-running] [--json]` brings the install
 the executable belongs to up to date from the source its install record names
@@ -918,7 +1061,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 28 does not carry them.
+AgentCore revision 29 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -1032,6 +1175,19 @@ position without an epoch, or lies past the journal's end, the server sends
 and replays from the oldest event it kept; when old events were evicted under
 the cursor, the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
 
+The UDS transport of `serve` takes the frontend's two lines, the answer and
+the capability frame, as NDJSON ops, so a UDS-only frontend needs no HTTP side
+channel for either. `{"op":"respond","session":"<id>","id":N,...}` answers the
+pending `ui_request` N with the same answer fields `POST /respond` takes
+beside the routing fields (`{"ok":true}`; a stale or unknown id replies
+`{"ok":false,"error":"no pending request with this id"}`, the 409 of the HTTP
+surface, and a line without `id` replies `{"ok":false,"error":"missing id"}`).
+`{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` is
+the capability frame itself
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#23-transports)) beside the routing
+fields, answered with the `capabilities_accepted` acknowledgement line (also
+journaled, like the HTTP route) or `capabilities_refused`.
+
 ### Web and daemon messages: `POST /message` and `GET /state`
 
 `--web` and `serve` take a message at `POST /message`, `serve --sessions N`
@@ -1043,18 +1199,7 @@ at `POST /s/<id>/message`:
 
 The UDS transport's `{"op":"message","session":"<id>",...}` reads the same
 three fields with the same checks (replies `{"ok":true}` or
-`{"ok":false,"error":"..."}`). The other interactive routes have UDS ops too,
-so a UDS-only frontend needs no HTTP side channel:
-`{"op":"respond","session":"<id>","id":N,...}` answers the pending
-`ui_request` N with the same answer fields `POST /respond` takes beside the
-routing fields (`{"ok":true}`; a stale or unknown id replies
-`{"ok":false,"error":"no pending request with this id"}`, the 409 of the HTTP
-surface, and a line without `id` replies `{"ok":false,"error":"missing id"}`),
-and `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}`
-is the capability frame itself
-([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#23-transports)) beside the routing
-fields, answered with the `capabilities_accepted` acknowledgement line (also
-journaled, like the HTTP route) or `capabilities_refused`.
+`{"ok":false,"error":"..."}`).
 
 - `text` is required and must not be empty after trimming. A body that is not
   a JSON object is the text itself.
@@ -1530,7 +1675,7 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 28,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 29,
 the exact 80-byte root, all seven mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.
@@ -1654,3 +1799,24 @@ documented paired release API: AgentCore-owned byte buffers are released with
 registered release function. Hosts must not retain sink pointers, call mutating
 session APIs reentrantly, or destroy a runtime with active sessions. The normative
 ownership rules live beside each public header/type and its consumer fixture.
+
+## Teamwork Manager MCP (#522)
+
+The normative Manager protocol is [TEAMWORK_MCP.md](TEAMWORK_MCP.md).
+`teamwork/mcp_server.zig` exposes `Server.init(gpa, run: *runtime.Run) Server`,
+`handle(self, gpa, line) error{OutOfMemory}!?[]u8`, `serve(self) !void` on
+stdin/stdout, and `serveFds(self, input: platform.fs.Fd, output: platform.fs.Fd)
+!void`. The host starts an already-user-approved run and retains ownership.
+`handle` responses are owned by its allocator; the caller frees them. Serving
+uses bounded NDJSON with protocol-only stdout and cancels live runs on EOF.
+
+The tools are `teamwork_status`, synchronous `teamwork_dispatch` (only
+implementer/reviewer and optional instructions), `teamwork_request_completion`
+and `teamwork_cancel`. No tool starts or approves a run, replaces the approved
+request, changes configuration/budget/check command, or chooses a workspace.
+The runtime alone verifies review approval, independently audits and merges;
+an unavailable audit cannot complete. Results contain real runtime snapshots
+in text and structured content. See the normative document for lifecycle,
+error codes, ownership, limits and cancellation semantics, and the
+[Claude Code consumer fixture](../examples/teamwork/claude-code-mcp.json) for
+host CLI integration.

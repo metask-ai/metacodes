@@ -10,7 +10,9 @@
     python3 compare_tool_cards.py zig  <task>   # cc-zig
 tasks: read | bash | write | grep | edit | ls
 """
-import os, sys, tempfile
+import os
+import sys
+import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 ROOT = os.path.dirname(os.path.dirname(HERE))

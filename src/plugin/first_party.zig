@@ -71,6 +71,8 @@ pub const OFFLINE_CODING_TOOLS = [_][]const u8{
     "KillShell",
 };
 
+pub const PREVIEW_TOOLS = [_][]const u8{"ExecuteCode"};
+
 pub const INTERACTION_TOOLS = [_][]const u8{"AskUserQuestion"};
 /// Mandatory recovery plane. Unlike profile tools, this capability is part of
 /// the Tool Result kernel and remains available in text-only/Host-only/
