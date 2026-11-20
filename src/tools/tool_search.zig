@@ -127,7 +127,7 @@ fn visibleToModel(ctx: *const ToolContext, name: []const u8, deferred: bool) boo
 /// need their host contexts, standing in for the `tools.toToolDefinitionsFull`
 /// gates.
 fn staticVisible(ctx: *const ToolContext, t: *const tools.ToolEntry) bool {
-    if (t.preview_gated and !ctx.preview) return false;
+    if (!t.previewAllowed(ctx.preview)) return false;
     if (t.tinykg_gated and t.deferred and !kgReady(ctx)) return false;
     if (ctx.request_tools == null) {
         if (t.tinykg_gated and ctx.kg == null) return false;

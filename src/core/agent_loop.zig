@@ -376,7 +376,7 @@ pub const JobWaitOptions = struct {
 };
 
 pub const Options = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// Where to leave the structured detail of this Run's model failure (issue
     /// #408), owned by the caller. Set to a value exactly when the Run stops
     /// with `api_error` or `max_tokens_exhausted`, and to null otherwise, so a
@@ -1753,7 +1753,7 @@ pub fn run(
 }
 
 fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
-    if (!opts.preview or !opts.rsi) return;
+    if (!opts.rsi) return;
     const policy = opts.rsi_policy orelse return error.SkillPolicyRequired;
     const rsi = @import("../skills/rsi.zig");
     // One persisted host note per participant task. Retrying/resuming does not
@@ -2252,10 +2252,10 @@ fn runCounted(
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
-    const harnessmm_enabled = opts.preview and opts.harnessmm;
+    const harnessmm_enabled = opts.harnessmm;
     const comment_guidance = @import("system_prompt.zig").COMMENT_GUIDANCE;
     const base_prompt = opts.system_prompt orelse "";
-    const preview_prompt = if (opts.preview and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
+    const preview_prompt = if (opts.preview.comment_guard and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
         try std.mem.concat(allocator, u8, &.{ base_prompt, if (base_prompt.len > 0) "\n\n" else "", comment_guidance })
     else
         null;
@@ -3100,7 +3100,7 @@ fn runCounted(
             }
             var api_messages = try buildApiMessagesWithFeatures(conversation, allocator, opts.inject_user_context, synthetic_user_input, .{
                 .harnessmm = harnessmm_enabled,
-                .rsi = opts.preview and opts.rsi,
+                .rsi = opts.rsi,
             });
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
@@ -4673,7 +4673,7 @@ fn runCounted(
         base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
         base_ctx.kg_agent_ident = opts.kg_agent_ident;
         base_ctx.preview = opts.preview;
-        if (opts.preview) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
+        if (opts.preview.execute_code) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop

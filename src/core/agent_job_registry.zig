@@ -325,7 +325,7 @@ fn dupeUtf8Preview(a: std.mem.Allocator, bytes: []const u8, max: usize) ![]u8 {
 /// 启动后台 job 所需的全部参数。调用方(agent.zig)填好后交给 spawnBackground,
 /// 由 registry 内部 dupe 进堆分配的 JobInput。
 pub const SpawnParams = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     harnessmm: bool = false,
     rsi: bool = false,
     /// Borrowed from the App, which joins background jobs before freeing it.
@@ -402,7 +402,7 @@ const JobInput = struct {
     permission_ctx: permission_mod.PermissionContext,
     perm_override: ?@import("../types.zig").PermissionMode,
     agent_depth: u8,
-    preview: bool,
+    preview: @import("../preview.zig").Features,
     harnessmm: bool,
     rsi: bool,
     rsi_policy: ?*const @import("../skills/rsi.zig").Policy,

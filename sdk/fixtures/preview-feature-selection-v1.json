@@ -2,9 +2,9 @@
   "schema": "metacodes-preview-feature-selection-v1",
   "cases": [
     {"preview": false, "harnessmm": false, "rsi": false, "reuse": false, "instruction": false},
-    {"preview": false, "harnessmm": true, "rsi": false, "reuse": false, "instruction": false},
-    {"preview": false, "harnessmm": false, "rsi": true, "reuse": false, "instruction": false},
-    {"preview": false, "harnessmm": true, "rsi": true, "reuse": false, "instruction": false},
+    {"preview": false, "harnessmm": true, "rsi": false, "reuse": true, "instruction": false},
+    {"preview": false, "harnessmm": false, "rsi": true, "reuse": false, "instruction": true},
+    {"preview": false, "harnessmm": true, "rsi": true, "reuse": true, "instruction": true},
     {"preview": true, "harnessmm": false, "rsi": false, "reuse": false, "instruction": false},
     {"preview": true, "harnessmm": true, "rsi": false, "reuse": true, "instruction": false},
     {"preview": true, "harnessmm": false, "rsi": true, "reuse": false, "instruction": true},

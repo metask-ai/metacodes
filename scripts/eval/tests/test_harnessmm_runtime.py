@@ -127,7 +127,7 @@ class HarnessMMRuntimeTest(unittest.TestCase):
         scenarios = [(["--" + name for name in ("preview", "harnessmm", "rsi") if row[name]],
                       row["preview"], row["reuse"], row["instruction"]) for row in fixture["cases"]]
         scenarios += [
-                (["--preview", "--harnessmm", "--rsi", "--no-preview"], False, False, False),
+                (["--preview", "--harnessmm", "--rsi", "--no-preview"], False, True, True),
                 (["--no-preview", "--preview", "--harnessmm", "--rsi"], True, True, True)]
         for flags, preview, reuse, rsi in scenarios:
             with self.subTest(flags=flags):
@@ -190,11 +190,12 @@ class HarnessMMRuntimeTest(unittest.TestCase):
         self.assertTrue(certificates[0]["native_receipt_is_error"])
         self.assertTrue(tool_results(requests[-1])[-1]["is_error"])
 
-    def test_saved_preview_and_cli_override_gate_real_reuse_and_rsi(self):
+    def test_own_selections_gate_real_reuse_and_rsi_regardless_of_saved_preview(self):
         for saved, flags, enabled in (
                 (True, ["--harnessmm", "--rsi"], True),
-                (True, ["--harnessmm", "--rsi", "--no-preview"], False),
-                (False, ["--preview", "--harnessmm", "--rsi"], True)):
+                (True, ["--harnessmm", "--rsi", "--no-preview"], True),
+                (False, ["--harnessmm", "--rsi"], True),
+                (True, ["--harnessmm", "--rsi", "--no-harnessmm", "--no-rsi"], False)):
             with self.subTest(saved=saved, flags=flags):
                 result, requests, certificates = self.run_actor(flags, saved_preview=saved)
                 self.assertEqual(result.returncode, 0, result.stderr)

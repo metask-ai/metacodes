@@ -5,13 +5,13 @@ const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn checkFile(ctx: *const ToolContext, path: []const u8, before: []const u8, after: []const u8) !void {
-    if (!ctx.preview or after.len == 0) return;
+    if (!ctx.preview.comment_guard or after.len == 0) return;
     const rule = language_rules.ruleForPath(path) orelse return;
     try check(ctx, path, rule, before, after);
 }
 
 pub fn checkCell(ctx: *const ToolContext, path: []const u8, language: []const u8, before: []const u8, after: []const u8) !void {
-    if (!ctx.preview or language.len == 0 or after.len == 0) return;
+    if (!ctx.preview.comment_guard or language.len == 0 or after.len == 0) return;
     const rule = language_rules.ruleForName(language) orelse return;
     try check(ctx, path, rule, before, after);
 }
@@ -71,7 +71,7 @@ fn check(ctx: *const ToolContext, path: []const u8, rule: *const hl.LangRule, be
 }
 
 test "comment preview compares comment tokens and their multiplicity" {
-    const ctx: ToolContext = .{ .allocator = std.testing.allocator, .preview = true };
+    const ctx: ToolContext = .{ .allocator = std.testing.allocator, .preview = .all };
     try checkFile(&ctx, "tool.py", "", "#!/usr/bin/env python3\nprint('#tag')  # noqa\n");
     try checkFile(&ctx, "main.c", "/* existing */\n", "int x; /* existing */\n");
     try checkFile(&ctx, "main.c", "/* removed */\n", "int x;\n");

@@ -296,7 +296,7 @@ const parent_env = [_][:0]const u8{
 };
 
 fn claudeOptions() claude_code.Options {
-    return .{ .preview = true, .parent_env = &parent_env, .home_dir = "/nonexistent-home" };
+    return .{ .preview = .all, .parent_env = &parent_env, .home_dir = "/nonexistent-home" };
 }
 
 fn claudeSpec(command: []const u8, budget: types.BudgetEnforcement) !types.SeatSpec {
@@ -543,7 +543,7 @@ const MetacodesHost = struct {
 
     fn deps(self: *const MetacodesHost, prov: provider_mod.Provider, fx: *const Fixture) metacodes.Deps {
         return .{
-            .preview = true,
+            .preview = .all,
             .provider = prov,
             .tool_defs = self.tool_defs,
             .permission_ctx = &self.perm,
@@ -604,8 +604,8 @@ test "teamwork drivers L2: switching a seat's harness in config switches the spa
 
     var abort = types.AbortSignal.init();
     var disabled = deps;
-    disabled.metacodes.preview = false;
-    disabled.claude_code.preview = false;
+    disabled.metacodes.preview = .none;
+    disabled.claude_code.preview = .none;
     for ([_]struct { spec: *const types.SeatSpec, seat: usize }{
         .{ .spec = local_spec, .seat = local_seat },
         .{ .spec = external_spec, .seat = external_seat },

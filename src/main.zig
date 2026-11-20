@@ -2729,8 +2729,7 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
     for (0..leading) |_| _ = args.next();
     var name = args.next() orelse return null;
     var leading_preview: types.PreviewSetting = .inherit;
-    while (std.mem.eql(u8, name, "--preview") or std.mem.eql(u8, name, "--no-preview")) {
-        leading_preview = if (std.mem.eql(u8, name, "--preview")) .enabled else .disabled;
+    while (leading_preview.applyArg(name) catch return null) {
         name = args.next() orelse return null;
     }
     if (!std.mem.eql(u8, name, "teamwork")) return null;
@@ -2751,7 +2750,7 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
         std.process.exit(0);
     }
     const cwd = try @import("util/fs.zig").getCwd(arena);
-    if (options.host_config.preview == .inherit) options.host_config.preview = leading_preview;
+    options.host_config.preview = leading_preview.overlay(options.host_config.preview);
     if (options.approve) options.host_config.preview = try @import("app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
     const prepared = teamwork_command.prepare(arena, options, state_root, cwd) catch |err| {
         std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
@@ -4892,11 +4891,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.allowed_tools = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--disallowedTools") or std.mem.eql(u8, arg, "--disallowed-tools")) {
             if (args.next()) |s| config.disallowed_tools = allocator.dupe(u8, s) catch s;
-        } else if (std.mem.eql(u8, arg, "--preview")) {
-            config.preview = .enabled;
-        } else if (std.mem.eql(u8, arg, "--no-preview")) {
-            config.preview = .disabled;
-        } else if (std.mem.eql(u8, arg, "--verification-checkpoint")) {
+        } else if (config.preview.applyArg(arg) catch {
+            setParseError(config, allocator, "unknown preview feature in '{s}'", .{arg});
+            return;
+        }) {} else if (std.mem.eql(u8, arg, "--verification-checkpoint")) {
             config.verification_checkpoint = true;
         } else if (std.mem.eql(u8, arg, "--verification-final-gate")) {
             config.verification_final_gate = true;
@@ -5581,8 +5579,10 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
-        \\  --preview             Enable preview features, including ExecuteCode and Teamwork
-        \\  --no-preview          Disable preview features, overriding config.json
+        \\  --preview             Enable every preview feature: execute_code, teamwork, comment_guard
+        \\  --no-preview          Disable every preview feature, overriding config.json
+        \\  --preview=<list>      Enable the listed preview features, e.g. --preview=execute_code,teamwork
+        \\  --no-preview=<list>   Disable the listed preview features
         \\  --verification-checkpoint  Enable the experimental post-test checkpoint
         \\  --verification-final-gate  Enforce the session-end verification obligation
         \\  --verification-final-observe  Record (not enforce) the session-end verification obligation
@@ -5595,8 +5595,8 @@ fn printHelp() void {
         \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
         \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
         \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
-        \\  --harnessmm / --no-harnessmm  Preview: guarded decision reuse and callback certificates (requires --preview, default off)
-        \\  --rsi / --no-rsi     Preview: evolved skills and learned routers (requires --preview, default off)
+        \\  --harnessmm / --no-harnessmm  Preview: guarded decision reuse and callback certificates (default off)
+        \\  --rsi / --no-rsi     Preview: evolved skills and learned routers (default off)
         \\  --rsi-policy <file>  Frozen RSI policy (doc/SKILL_RSI_PROTOCOL.md)
         \\  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
         \\                        for the next attempt (needs --check-gate[-observe], or in print mode

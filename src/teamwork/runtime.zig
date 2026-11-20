@@ -92,7 +92,7 @@ pub const SeatSource = union(enum) {
 pub const Deps = struct {
     /// Current host authorization, never restored from run state or model input.
     /// Status, cancellation and destruction remain available when disabled.
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     seats: SeatSource,
     /// The completion audit: in production
     /// `verifier_auditor.VerifierAuditor`; a host without a verifier passes
@@ -379,7 +379,7 @@ pub const Run = struct {
     /// issue ledger, and the implementer's worktree of a snapshot of the
     /// workspace. `cfg`'s strings must outlive the run.
     pub fn start(gpa: std.mem.Allocator, deps: Deps, request: ApprovedRequest, cfg: config.Config.Enabled, options: StartOptions) StartError!*Run {
-        if (!deps.preview) return error.PreviewDisabled;
+        if (!deps.preview.teamwork) return error.PreviewDisabled;
         if (std.mem.trim(u8, request.text, " \t\r\n").len == 0) return error.EmptyRequest;
         const self = blk: {
             // Resolve the repository before anything is written.
@@ -426,7 +426,7 @@ pub const Run = struct {
     /// counted; an interrupted merge-back fails the run for the user to
     /// inspect. A terminal run reopens as it ended.
     pub fn reopen(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId) ReopenError!*Run {
-        if (!deps.preview) return error.PreviewDisabled;
+        if (!deps.preview.teamwork) return error.PreviewDisabled;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         var buf: run_dir.PathBuf = undefined;
@@ -589,7 +589,7 @@ pub const Run = struct {
     /// (`reviewer.judgeSeat`: a metacodes reviewer's Bash calls through
     /// `BashCallLog`, the pinned check re-run, zero edits, ledger updates).
     pub fn dispatch(self: *Run, role: Role, instructions: []const u8) Error!SeatId {
-        if (!self.deps.preview) return error.PreviewDisabled;
+        if (!self.deps.preview.teamwork) return error.PreviewDisabled;
         try self.checkLive();
         switch (role) {
             .implementer => switch (self.state) {
@@ -663,7 +663,7 @@ pub const Run = struct {
     /// completion audit (at most `max_audits`), and on a pass merges the
     /// approved tree into the user's workspace. Nothing else reaches `done`.
     pub fn requestCompletion(self: *Run) Error!CompletionResult {
-        if (!self.deps.preview) return error.PreviewDisabled;
+        if (!self.deps.preview.teamwork) return error.PreviewDisabled;
         try self.checkLive();
         const approved = switch (self.state) {
             .review_approved => |tree| tree,
@@ -961,7 +961,7 @@ pub const Run = struct {
     }
 
     fn mergeBack(self: *Run, approved: TreeId) Error!CompletionResult {
-        if (!self.deps.preview) return error.PreviewDisabled;
+        if (!self.deps.preview.teamwork) return error.PreviewDisabled;
         var patch_buf: run_dir.PathBuf = undefined;
         var conflicts_buf: run_dir.PathBuf = undefined;
         const merged = merge_back.mergeBack(self.gpa, .{

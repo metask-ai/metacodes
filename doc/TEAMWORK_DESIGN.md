@@ -156,7 +156,7 @@ manager 的外部 harness 或 model/effort 配置明确拒绝。
 `[skip-interview]` 与 `[seats=<role>:<harness>[:<model>],...]`。`parseSegments` 去掉参数段,
 其余文本即待批准文本;没有前导 `[` 时原样使用。`seats` 是只对本次运行生效的配置层,位于
 项目配置之上、CLI 覆盖之下。未知、重复、未闭合或格式错误的参数段直接报错,不当作请求文本。
-REPL `/teamwork <请求>` 先检查 preview(关闭时明确报错,不退化成普通对话),再按同样的分层
+REPL `/teamwork <请求>` 先检查 `teamwork` preview 特性(关闭时明确报错,不退化成普通对话),再按同样的分层
 加载配置;未带 `[skip-interview]` 时由 `interview.draft` 在运行目录里以 `interviewer-1` 运行
 interviewer seat(任意 harness):工作目录是工作区快照的临时 worktree(`interview/`,结束即删),
 花费记入同一运行的预算账本,packet 只含固定文本与用户请求。草稿是 handoff 的 Conclusion 加

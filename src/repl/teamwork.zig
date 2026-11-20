@@ -37,8 +37,8 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
         showStatus(app, allocator, session, std.mem.trim(u8, args["status".len..], " \t"));
         return;
     }
-    if (!app.config.preview.isEnabled()) {
-        cmd_output.print("{s}/teamwork is a preview feature and preview is off. Start metacodes with --preview or set \"preview\": true in config.json.{s}\n", .{ theme.danger, theme.reset });
+    if (!app.config.preview.features().teamwork) {
+        cmd_output.print("{s}/teamwork is a preview feature and it is off. Start metacodes with --preview=teamwork (or --preview), or set \"preview\": {{\"teamwork\": true}} in config.json.{s}\n", .{ theme.danger, theme.reset });
         return;
     }
     if (std.mem.trim(u8, args, " \t\r\n").len == 0) {

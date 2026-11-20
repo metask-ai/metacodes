@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Each preview feature has its own switch.** `execute_code`, `teamwork` and
+  `comment_guard` can be enabled one by one with `--preview=<list>` /
+  `--no-preview=<list>` or a root `"preview"` object in `config.json`, such as
+  `{"execute_code": true}`. `--preview`, `--no-preview` and `"preview": true`
+  still switch them all. HarnessMM and RSI no longer need `--preview`:
+  `--harnessmm` and `--rsi` alone select them. Zig embedders now set
+  `RuntimeConfig.preview` to a `preview.Features` value (`.all`, `.none` or
+  individual fields); the AgentCore ABI keeps `RuntimeConfigV1.preview` as
+  all-or-nothing.
+
 - **A Bench SSH executor is a `metacodes` node.** The workbench no longer
   copies a Python runtime to an SSH executor: `metacodes bench setup
   --executor NAME` installs the bundle's `metacodes` there

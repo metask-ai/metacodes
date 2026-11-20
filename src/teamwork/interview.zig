@@ -91,7 +91,7 @@ pub const interviewer_seat = "interviewer-1";
 pub const interview_worktree_dir = "interview";
 
 pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8, abort: *const types.AbortSignal) !Draft {
-    if (!deps.preview) return error.PreviewDisabled;
+    if (!deps.preview.teamwork) return error.PreviewDisabled;
     if (std.mem.trim(u8, request, " \t\r\n").len == 0) return error.EmptyRequest;
     const repo = try merge_back.toplevel(gpa, options.workspace, null);
     defer gpa.free(repo);

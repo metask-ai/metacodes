@@ -4,35 +4,32 @@ HarnessMM is the runtime EDG, Guarded Decision Reuse (GDR) and Certified
 Callback Substitution (CCS) feature. RSI combines offline instruction evolution
 and per-instruction ridge routing; its contract is in
 [SKILL_RSI_PROTOCOL.md](SKILL_RSI_PROTOCOL.md). The two features have independent
-CLI switches, default off, and both require the shared preview opt-in. The last
-positive or negative occurrence of each switch wins.
+CLI switches and both default off. Each switch alone decides its feature; the
+shared preview setting (`--preview`, `--no-preview`, saved `"preview"`) neither
+selects nor blocks them. The last positive or negative occurrence of each
+switch wins.
 
-| Preview | HarnessMM | RSI | Runtime behavior |
-|---|---|---|---|
-| off | either | either | Ordinary native loop; no RSI policy or certificate journal opened. |
-| on | off | off | Neither optimization is selected. |
-| on | on | off | Allow guarded EDG reuse and certificate recording. |
-| on | off | on | Route the frozen evolved instruction; use the ordinary callback loop. |
-| on | on | on | Apply both mechanisms. |
+| HarnessMM | RSI | Runtime behavior |
+|---|---|---|
+| off | off | Ordinary native loop; no RSI policy or certificate journal opened. |
+| on | off | Allow guarded EDG reuse and certificate recording. |
+| off | on | Route the frozen evolved instruction; use the ordinary callback loop. |
+| on | on | Apply both mechanisms. |
 
-Use `--harnessmm` / `--no-harnessmm` and `--rsi` / `--no-rsi`.
-Opt into preview with `--preview` or the root boolean `"preview": true` in
-`<state root>/config.json`. `--no-preview` overrides the saved value; the last
-preview flag wins. `--preview` alone selects neither optimization. For example:
+Use `--harnessmm` / `--no-harnessmm` and `--rsi` / `--no-rsi`. For example:
 
 ```sh
-metacodes --preview --harnessmm -p "your task"
-metacodes --preview --rsi --rsi-policy policy.json -p "your task"
-metacodes --preview --harnessmm --rsi --rsi-policy policy.json -p "your task"
+metacodes --harnessmm -p "your task"
+metacodes --rsi --rsi-policy policy.json -p "your task"
+metacodes --harnessmm --rsi --rsi-policy policy.json -p "your task"
 ```
 
 RSI additionally requires `--rsi-policy <file>` when effective. These switches are wired in
 headless, REPL, web and daemon CLI hosts. Zig consumers use
-`agent_loop.Options.preview`, `harnessmm`, `rsi` and `rsi_policy` (retaining the
+`agent_loop.Options.harnessmm`, `rsi` and `rsi_policy` (retaining the
 immutable policy for the Run). This integration adds no C ABI field or revision.
-Fresh child agents inherit the shared preview permission, but do not implicitly
-select HarnessMM or RSI. Hosts can explicitly select them through the same
-fields in `subagent.SpawnOptions`; the child still requires preview. A root
+Fresh child agents do not implicitly select HarnessMM or RSI. Hosts can
+explicitly select them through the same fields in `subagent.SpawnOptions`. A root
 conversation handed to a background job preserves its explicit selections;
 its borrowed policy must outlive the job. The CLI App joins jobs before freeing it.
 
@@ -63,7 +60,7 @@ semantic inference or extra selector-model request.
 
 Malformed, cyclic, oversized, unsupported or root-mismatched plans retain the
 ordinary callback loop. Graphs live only within the current Run; a resumed or
-new Run needs a fresh slow-actor plan. When preview or an individual feature is
+new Run needs a fresh slow-actor plan. When an individual feature is
 disabled, that feature's historical standalone host guidance is excluded from
 new provider requests. The transcript, message positions and actual native
 calls and receipts remain intact; configuration changes do not re-author old graphs.
@@ -125,7 +122,8 @@ and are never appended to provider prompts.
 The native consumer test runs all four switch combinations against a local
 mock provider. A root plus three successors yields the same four Bash receipts.
 The shared [selection fixture](../sdk/fixtures/preview-feature-selection-v1.json)
-covers preview crossed with both independent selections. Saved preview values,
+covers preview crossed with both independent selections: only each feature's own
+selection decides it. Saved preview values,
 CLI overrides, explicit child selections, background root continuation and
 resume are checked against actual requests or certificate artifacts.
 HarnessMM reduces physical model calls from five to two and writes three
