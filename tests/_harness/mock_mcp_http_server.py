@@ -26,8 +26,9 @@ Paths select the server:
             those ids (a result for the ping, method-not-found for the roots).
   /expire   a Classic server with numbered sessions. GET /forget drops every
             live session (the next request on one is a 404); GET /failinit
-            makes the next initialize a 503; GET /refusecalls makes every
-            later tools/call a 404.
+            makes the next initialize a 503; GET /downgrade makes later
+            initializes select 2025-06-18; GET /refusecalls makes every later
+            tools/call a 404.
   /elicit   a Classic server whose tools/call asks for input over
             elicitation/create only when the session declared elicitation.
   /poll     /keepalive whose tools/call answers over SSE polling: each stream
@@ -48,7 +49,7 @@ LOG = []
 LOCK = threading.Lock()
 PENDING = {}
 REPLIES = {}
-SESSIONS = {"next": 0, "live": set(), "refuse_calls": False, "declared": {}, "failed_inits": 0}
+SESSIONS = {"next": 0, "live": set(), "refuse_calls": False, "declared": {}, "failed_inits": 0, "version": "2025-11-25"}
 POLLS = {"count": 0}
 POLL_ROUNDS = 5
 # Client port -> socket of every /idleclose connection still open.
@@ -106,6 +107,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/failinit":
             with LOCK:
                 SESSIONS["failed_inits"] = 1
+            return self.reply(200, {})
+        if self.path == "/downgrade":
+            with LOCK:
+                SESSIONS["version"] = "2025-06-18"
             return self.reply(200, {})
         if self.path == "/refusecalls":
             with LOCK:
@@ -304,8 +309,9 @@ class Handler(BaseHTTPRequestHandler):
                 assigned = "s%d" % SESSIONS["next"]
                 SESSIONS["live"].add(assigned)
                 SESSIONS["declared"][assigned] = "elicitation" in (params.get("capabilities") or {})
+                version = SESSIONS["version"]
             record(path=self.path, declared=params.get("capabilities"))
-            result = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": mode, "version": "1"}}
+            result = {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": mode, "version": "1"}}
             return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": result}, {"Mcp-Session-Id": assigned})
         with LOCK:
             live = session in SESSIONS["live"]

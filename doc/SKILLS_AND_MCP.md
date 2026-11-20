@@ -345,7 +345,8 @@ the handshake revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   is answered on its own POST), keeps the handshake's `MCP-Session-Id` and
   `MCP-Protocol-Version` (DELETE on close; a 404 to a request carrying the
   session id means the server ended the session, so the client sends a new
-  `initialize` without it and repeats the request once in the new session), and sends `Mcp-Method`, `Mcp-Name`
+  `initialize` without it, adopts the revision the server selects, and repeats
+  the request once in the new session), and sends `Mcp-Method`, `Mcp-Name`
   and `Mcp-Param-*` (from `x-mcp-header`; a tool with an invalid annotation is
   dropped) on 2026-07-28. An SSE response that ends before its answer is
   resumed when the server numbered its events: after the stream's `retry`

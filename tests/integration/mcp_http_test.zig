@@ -701,3 +701,42 @@ test "MCP HTTP: a session that could not be renewed is renewed before the next r
         } else try std.testing.expect(got.session == null);
     }
 }
+
+test "MCP HTTP: a renewed session that selects another revision is adopted, not refused" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "expire"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000, .request_timeout_ms = 10_000 });
+        defer client.close();
+        try std.testing.expectEqualStrings("2025-11-25", client.protocol_version);
+        a.free(try mock.get(a, "downgrade"));
+        a.free(try mock.get(a, "forget"));
+        const called = try client.callTool("ask", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "expire:s2") != null);
+        try std.testing.expectEqualStrings("2025-06-18", client.protocol_version);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var versions: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{});
+        const method = value.object.get("method") orelse continue;
+        if (method != .string or !std.mem.eql(u8, method.string, "tools/call")) continue;
+        const headers = value.object.get("headers") orelse continue;
+        const version = headers.object.get("mcp-protocol-version") orelse continue;
+        try versions.append(arena.allocator(), version.string);
+    }
+    try std.testing.expectEqual(@as(usize, 2), versions.items.len);
+    try std.testing.expectEqualStrings("2025-11-25", versions.items[0]);
+    try std.testing.expectEqualStrings("2025-06-18", versions.items[1]);
+}

@@ -1227,7 +1227,7 @@ pub const McpClient = struct {
             .diagnostic => return error.McpSessionExpired,
         };
         defer handshake.deinit();
-        if (handshake.era != self.era) return error.McpSessionExpired;
+        self.adoptEra(handshake.era, handshake.capabilities);
         self.transport.setProtocolVersion(self.era.version());
         const notification = try classic.encodeInitializedNotification(arena.allocator());
         try self.transport.send(notification, .{ .method = "notifications/initialized", .kind = .notification });

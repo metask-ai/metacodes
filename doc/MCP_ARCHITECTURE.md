@@ -52,7 +52,7 @@ distinction to the caller.
 
 | Case | Examples | Behaviour |
 |---|---|---|
-| Valid protocol continuation | MRTR retry with `inputResponses` and `requestState`; SSE resumption with `Last-Event-ID` (counted as stalled only while no new event id arrives, so a polling server can keep a long call open); a POST a 401 refused, repeated after refreshing the token; a Streamable HTTP request a 404 refused for an expired Classic session, repeated once after a new `initialize` | Completes the one logical request. Never reaches a caller as a failure |
+| Valid protocol continuation | MRTR retry with `inputResponses` and `requestState`; SSE resumption with `Last-Event-ID` (counted as stalled only while no new event id arrives, so a polling server can keep a long call open); a POST a 401 refused, repeated after refreshing the token; a Streamable HTTP request a 404 refused for an expired Classic session, repeated once after a new `initialize` (whose selected revision is adopted, even if it differs from the old one) | Completes the one logical request. Never reaches a caller as a failure |
 | Known not delivered (`not_delivered`) | Interrupted before the send; a POST whose body was never fully written; a pooled connection that failed on write; a 401/403 refusal | May be sent again. The client does so only for a pooled-connection write failure |
 | Indeterminate (`indeterminate`) | No answer after the request left: timeout, dropped connection, server exit, HTTP 5xx, a connector's `indeterminate` | **Never replayed.** Reported with its cause; the product tells the model the call may have executed |
 
