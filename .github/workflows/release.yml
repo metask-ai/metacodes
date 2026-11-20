@@ -173,6 +173,16 @@ jobs:
       # near a minute on that box).
       - name: Full suite in release configuration
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
+      - name: The working tree is still clean before staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          dirty=$(git status --porcelain=v1 --untracked-files=normal -- .)
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty"
+            echo "::error::the steps before staging changed the working tree; a stable release manifest refuses a dirty tree"
+            exit 1
+          fi
       - name: Stage, manifest and verify the release unit
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} $RELEASE_SYMBOLS
       # The executable needs no CPU feature, glibc or macOS newer than its
@@ -301,6 +311,16 @@ jobs:
       - name: Full suite in release configuration
         shell: cmd
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
+      - name: The working tree is still clean before staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          dirty=$(git status --porcelain=v1 --untracked-files=normal -- .)
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty"
+            echo "::error::the steps before staging changed the working tree; a stable release manifest refuses a dirty tree"
+            exit 1
+          fi
       - name: Stage, manifest and verify the release unit
         shell: cmd
         run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Dtarget=x86_64-windows-gnu
