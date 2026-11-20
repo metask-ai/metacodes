@@ -880,10 +880,7 @@ test "L2 chatgpt-codex: a /model pick binds the sign-in with the Codex request p
     try testing.expectEqual(cc.provider_profile.RequestProfile.chatgpt_codex, app.openai_client.?.declared_dialect.request_profile.?);
 
     // The next plain start: the default stored in this state root resolves
-    // to it, and its credential is the sign-in. Read through the store of
-    // `case.state` itself: `applyPersistedGlobalSelection` reads the
-    // process-wide state root, which another test in the same process may
-    // have fixed first (doc: gate-pr local gotchas, unbound_session_test).
+    // to it, and its credential is the sign-in.
     var store = try cc.provider_config_store.Store.initHome(a, case.state);
     defer store.deinit();
     var document = try store.load();
