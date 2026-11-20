@@ -69,7 +69,7 @@ pub const RequestSource = enum {
     request_file,
     skip_interview,
     interview,
-    interview_edited,
+    user_edited,
 };
 
 /// Where seat drivers come from.

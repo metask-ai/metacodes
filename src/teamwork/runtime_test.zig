@@ -1356,7 +1356,7 @@ const ScriptedVerdicts = struct {
         return .{ .ctx = self, .decideFn = decide };
     }
 
-    fn decide(ctx: *anyopaque, _: []const u8) anyerror!interview.Decision {
+    fn decide(ctx: *anyopaque, _: []const u8, _: []const u8) anyerror!interview.Decision {
         const self: *ScriptedVerdicts = @ptrCast(@alignCast(ctx));
         defer self.calls += 1;
         return self.decisions[self.calls];
@@ -1406,20 +1406,20 @@ test "teamwork interview L2: no worker before approval, and the edited approval 
     try testing.expect(!exists(fx.state(), "teamwork/" ++ run_id_text ++ "/run.json"));
 
     var rejecting: ScriptedVerdicts = .{ .decisions = &.{ .{ .edit = "something else" }, .reject } };
-    try testing.expect(try interview.approve(drafted.text, rejecting.prompter()) == null);
+    try testing.expect(try interview.approve(drafted.text, .interview, "terms", rejecting.prompter()) == null);
     try testing.expectEqual(@as(usize, 1), seats.ran.items.len);
 
     const edited = "Add feature.txt containing \"feature\".\r\nKeep README.md as it is.  \n";
     var editing: ScriptedVerdicts = .{ .decisions = &.{ .{ .edit = edited }, .approve } };
-    const approved = (try interview.approve(drafted.text, editing.prompter())).?;
-    try testing.expectEqual(runtime.RequestSource.interview_edited, approved.source);
+    const approved = (try interview.approve(drafted.text, .interview, "terms", editing.prompter())).?;
+    try testing.expectEqual(runtime.RequestSource.user_edited, approved.source);
     const run = try runtime.Run.start(testing.allocator, deps, .{ .text = approved.text, .source = approved.source }, cfg, fx.options());
     defer run.destroy();
     try expectFile(fx.state(), "teamwork/" ++ run_id_text ++ "/ORIGINAL_REQUEST.md", edited);
     try testing.expectEqual(@as(f64, 0.25), run.ledger.spent_usd);
     const saved = readFile(fx.state(), "teamwork/" ++ run_id_text ++ "/run.json") orelse return error.FileMissing;
     defer testing.allocator.free(saved);
-    try testing.expect(std.mem.indexOf(u8, saved, "\"request_source\":\"interview_edited\"") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "\"request_source\":\"user_edited\"") != null);
 
     const final = try swe_loop.drive(run);
     try testing.expectEqual(runtime.Phase.done, final.phase());

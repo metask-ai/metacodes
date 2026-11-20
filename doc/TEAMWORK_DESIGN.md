@@ -160,9 +160,11 @@ REPL `/teamwork <请求>` 先检查 preview(关闭时明确报错,不退化成�
 加载配置;未带 `[skip-interview]` 时由 `interview.draft` 在运行目录里以 `interviewer-1` 运行
 interviewer seat(任意 harness):工作目录是工作区快照的临时 worktree(`interview/`,结束即删),
 花费记入同一运行的预算账本,packet 只含固定文本与用户请求。草稿是 handoff 的 Conclusion 加
-Verification。`interview.approve` 让用户批准、修改(替换全文后再次确认)或拒绝;批准的字节
+Verification。REPL 把 `app.abort` 转发给面试(Ctrl+C 取消 interviewer,结束后复位,不影响下一条消息)。
+`interview.approve` 连同批准所授权的预算、seats、固定检查与合回目标一起展示,让用户批准、修改(替换全文后再次确认)
+或拒绝;`[skip-interview]` 同样经过这一步,只是展示的是原始请求;批准的字节
 原样交给 `Run.start` 写入 `ORIGINAL_REQUEST.md`,之后才派任何 implementer/reviewer。
-`ApprovedRequest.source`(`request_file` / `skip_interview` / `interview` / `interview_edited`)
+`ApprovedRequest.source`(`request_file` / `skip_interview` / `interview` / `user_edited`)
 写入 `run.json` 的 `request_source`,恢复时保留,`teamwork status` 一并输出。REPL 用
 `AgentJobRegistry.makeProvider` 给运行单独的 provider client,在后台线程驱动 SWE loop,
 提示用户“已开始,可随时用 `/teamwork status` 询问进度”;退出 REPL 会取消未结束的运行,

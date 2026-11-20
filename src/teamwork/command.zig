@@ -502,25 +502,52 @@ pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prom
     deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
     const options: runtime.StartOptions = .{ .state_root = app.stateRoot(), .run_id = job.id, .workspace = repo };
 
-    const approved: interview.Approved = if (segments.skip_interview)
-        .{ .text = segments.request, .source = .skip_interview }
+    const terms = try approvalTerms(arena, cfg, repo);
+    const verdict: ?interview.Approved = if (segments.skip_interview)
+        try interview.approve(segments.request, .skip_interview, terms, prompter)
     else blk: {
-        var drafted = try interview.draft(gpa, deps, cfg, options, segments.request, &job.interview_abort);
+        var drafted = try draftInterruptibly(app, job, deps, cfg, options, segments.request);
         defer drafted.deinit(gpa);
         switch (drafted) {
             .text => |proposal| {
-                const verdict = try interview.approve(proposal, prompter) orelse return .{ .rejected = job.id };
-                break :blk .{ .text = try arena.dupe(u8, verdict.text), .source = verdict.source };
+                const decided = try interview.approve(proposal, .interview, terms, prompter) orelse break :blk null;
+                break :blk interview.Approved{ .text = try arena.dupe(u8, decided.text), .source = decided.source };
             },
             .failed => return .{ .interview_failed = job.id },
             .budget_exhausted => return .{ .budget_exhausted = job.id },
             .aborted => return .{ .aborted = job.id },
         }
     };
+    const approved = verdict orelse return .{ .rejected = job.id };
     job.run = try runtime.Run.start(gpa, deps, .{ .text = approved.text, .source = approved.source }, cfg, options);
     job.thread = try platform.thread.spawn(.full, Background.drive, .{job});
     started = true;
     return .{ .started = job };
+}
+
+fn draftInterruptibly(app: *App, job: *Background, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8) !interview.Draft {
+    var stopped = std.atomic.Value(bool).init(false);
+    const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &job.interview_abort, &stopped });
+    defer {
+        stopped.store(true, .release);
+        watcher.join();
+        app.abort.reset();
+    }
+    return interview.draft(std.heap.c_allocator, deps, cfg, options, request, &job.interview_abort);
+}
+
+fn approvalTerms(arena: std.mem.Allocator, cfg: config.Config.Enabled, repo: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.print("Approving also authorizes spend up to ${d} (at most {d} seats per role), these seats:", .{ cfg.budget_usd, cfg.max_rounds });
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .verifier }) |role| {
+        const seat = cfg.seats.get(role);
+        try w.print(" {s}={s}", .{ role.name(), seat.harnessKind().name() });
+        if (seat.model) |model| try w.print("/{s}", .{model});
+    }
+    if (cfg.check_command) |check| try w.print(", the check `{s}`", .{check.text}) else try w.writeAll(", no pinned check");
+    try w.print(", and merging the result into {s} as uncommitted changes.", .{repo});
+    return out.toOwnedSlice();
 }
 
 fn forwardAbort(source: *const types.AbortSignal, dest: *types.AbortSignal, stopped: *std.atomic.Value(bool)) void {

@@ -140,7 +140,7 @@ pub fn draft(gpa: std.mem.Allocator, deps: runtime.Deps, cfg: config.Config.Enab
     defer outcome.deinit(gpa);
     record.status = if (outcome == .finished) .done else .failed;
     try dir.writeSeatRecord(record);
-    if (ledger.isExhausted()) return .budget_exhausted;
+    if (outcome != .aborted and ledger.isExhausted()) return .budget_exhausted;
     return switch (outcome) {
         .finished => |handoff| .{ .text = try std.fmt.allocPrint(gpa, "{s}\n\n## Acceptance checks\n\n{s}\n", .{
             std.mem.trim(u8, handoff.conclusion, " \t\r\n"),
@@ -181,15 +181,15 @@ pub const Approved = struct {
 
 pub const Prompter = struct {
     ctx: *anyopaque,
-    decideFn: *const fn (ctx: *anyopaque, draft: []const u8) anyerror!Decision,
+    decideFn: *const fn (ctx: *anyopaque, terms: []const u8, draft: []const u8) anyerror!Decision,
 };
 
-pub fn approve(proposal: []const u8, prompter: Prompter) !?Approved {
+pub fn approve(proposal: []const u8, unchanged: RequestSource, terms: []const u8, prompter: Prompter) !?Approved {
     var current = proposal;
     var edited = false;
     while (true) {
-        switch (try prompter.decideFn(prompter.ctx, current)) {
-            .approve => return .{ .text = current, .source = if (edited) .interview_edited else .interview },
+        switch (try prompter.decideFn(prompter.ctx, terms, current)) {
+            .approve => return .{ .text = current, .source = if (edited) .user_edited else unchanged },
             .edit => |text| {
                 if (std.mem.trim(u8, text, " \t\r\n").len == 0) continue;
                 current = text;
@@ -256,7 +256,7 @@ const ScriptedPrompter = struct {
         return .{ .ctx = self, .decideFn = decide };
     }
 
-    fn decide(ctx: *anyopaque, proposal: []const u8) anyerror!Decision {
+    fn decide(ctx: *anyopaque, _: []const u8, proposal: []const u8) anyerror!Decision {
         const self: *ScriptedPrompter = @ptrCast(@alignCast(ctx));
         self.shown[self.calls] = proposal;
         defer self.calls += 1;
@@ -266,16 +266,16 @@ const ScriptedPrompter = struct {
 
 test "approve: the approved bytes are the last text the user saw" {
     var plain: ScriptedPrompter = .{ .decisions = &.{.approve} };
-    const as_drafted = (try approve("draft\n", plain.prompter())).?;
+    const as_drafted = (try approve("draft\n", .interview, "terms", plain.prompter())).?;
     try std.testing.expectEqualStrings("draft\n", as_drafted.text);
     try std.testing.expectEqual(RequestSource.interview, as_drafted.source);
 
     var editing: ScriptedPrompter = .{ .decisions = &.{ .{ .edit = "  \n" }, .{ .edit = "edited\r\ntext \n" }, .approve } };
-    const edited = (try approve("draft\n", editing.prompter())).?;
+    const edited = (try approve("draft\n", .interview, "terms", editing.prompter())).?;
     try std.testing.expectEqualStrings("edited\r\ntext \n", edited.text);
-    try std.testing.expectEqual(RequestSource.interview_edited, edited.source);
+    try std.testing.expectEqual(RequestSource.user_edited, edited.source);
     try std.testing.expectEqualStrings("edited\r\ntext \n", editing.shown[2]);
 
     var rejecting: ScriptedPrompter = .{ .decisions = &.{ .{ .edit = "other" }, .reject } };
-    try std.testing.expect(try approve("draft\n", rejecting.prompter()) == null);
+    try std.testing.expect(try approve("draft\n", .interview, "terms", rejecting.prompter()) == null);
 }

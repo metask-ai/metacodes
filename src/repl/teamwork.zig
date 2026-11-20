@@ -20,7 +20,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         const job = self.job orelse return;
         self.job = null;
-        if (!job.finished()) cmd_output.print("Teamwork run {s} was cancelled with this session. Continue it with: metacodes --preview teamwork resume {s} --approve\n", .{ job.id.slice(), job.id.slice() });
+        if (!job.finished()) cmd_output.print("Teamwork run {s} was cancelled with this session. Continue it with: metacodes --preview teamwork resume {s} --approve (under the same permission mode and sandbox settings)\n", .{ job.id.slice(), job.id.slice() });
         job.stop();
     }
 };
@@ -56,7 +56,9 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
     var prompter_state: Prompter = .{ .app = app, .allocator = allocator, .reader = reader };
     defer prompter_state.deinit();
     cmd_output.print("Preparing the teamwork run; unless the request says [skip-interview], the interviewer drafts the task first…\n", .{});
-    const outcome = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter()) catch |err| {
+    const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter());
+    app.abort.reset();
+    const outcome = result catch |err| {
         cmd_output.print("{s}/teamwork failed: {s}{s}\n", .{ theme.danger, @errorName(err), theme.reset });
         return;
     };
@@ -65,11 +67,15 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
             session.job = job;
             cmd_output.print("Teamwork run {s} has started in the background. Ask about its progress at any time: /teamwork status\n", .{job.id.slice()});
         },
-        .rejected => |id| cmd_output.print("Rejected. Nothing was started (interview record: teamwork run {s}).\n", .{id.slice()}),
-        .interview_failed => |id| cmd_output.print("{s}The interviewer did not produce a draft (run {s}). Nothing was started.{s}\n", .{ theme.danger, id.slice(), theme.reset }),
-        .budget_exhausted => |id| cmd_output.print("{s}The budget ran out during the interview (run {s}). Nothing was started.{s}\n", .{ theme.danger, id.slice(), theme.reset }),
-        .aborted => |id| cmd_output.print("The interview was cancelled (run {s}). Nothing was started.\n", .{id.slice()}),
+        .rejected => |id| ended(app, "Rejected.", id),
+        .interview_failed => |id| ended(app, "The interviewer did not produce a draft.", id),
+        .budget_exhausted => |id| ended(app, "The budget ran out during the interview.", id),
+        .aborted => |id| ended(app, "The interview was cancelled.", id),
     }
+}
+
+fn ended(app: *app_mod.App, what: []const u8, id: types.RunId) void {
+    cmd_output.print("{s} Nothing was started. Any interview spend is recorded in {s}/teamwork/{s}/budget.jsonl.\n", .{ what, app.stateRoot(), id.slice() });
 }
 
 fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *const Session, explicit: []const u8) void {
@@ -105,10 +111,10 @@ const Prompter = struct {
         self.edits.deinit(self.allocator);
     }
 
-    fn decide(ctx: *anyopaque, proposal: []const u8) anyerror!interview.Decision {
+    fn decide(ctx: *anyopaque, terms: []const u8, proposal: []const u8) anyerror!interview.Decision {
         const self: *Prompter = @ptrCast(@alignCast(ctx));
         const theme = self.app.theme;
-        cmd_output.print("\n{s}Proposed task{s}\n\n{s}\n", .{ theme.dim, theme.reset, proposal });
+        cmd_output.print("\n{s}Proposed task{s}\n\n{s}\n\n{s}\n", .{ theme.dim, theme.reset, proposal, terms });
         while (true) {
             cmd_output.print("Approve and start? [y]es / [e]dit / [n]o: ", .{});
             cmd_output.end();

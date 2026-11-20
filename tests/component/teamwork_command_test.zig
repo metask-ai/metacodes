@@ -542,6 +542,11 @@ const fake_claude =
     \\case "$seat" in
     \\*interviewer-*)
     \\  printf 'interview workspace\n' > interview-scratch.txt
+    \\  if [ -f slow-interview ]; then
+    \\    : > "$seat/started"
+    \\    sleep 30
+    \\    : > "$seat/finished"
+    \\  fi
     \\  cat > "$seat/handoff.md" <<'HANDOFF'
     \\## Observation
     \\o
@@ -620,11 +625,12 @@ test "teamwork REPL L2: a rejected interview starts nothing; an edited approval 
     const started = try onlyRun(&c);
     try testing.expectEqualStrings(edited, try c.read(try std.fmt.allocPrint(a, "{s}/ORIGINAL_REQUEST.md", .{started})));
     const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read(try std.fmt.allocPrint(a, "{s}/run.json", .{started})), .{});
-    try testing.expectEqualStrings("interview_edited", saved.object.get("request_source").?.string);
+    try testing.expectEqualStrings("user_edited", saved.object.get("request_source").?.string);
     try testing.expect(!try c.exists("repo/interview-scratch.txt"));
     try c.tmp.dir.deleteTree(testing.io, "state/teamwork");
 
-    const skipped = try replSession(&c, url, "/teamwork [skip-interview] Add feature.txt\n");
+    const skipped = try replSession(&c, url, "/teamwork [skip-interview] Add feature.txt\ny\n");
+    try testing.expect(std.mem.indexOf(u8, skipped.stderr, "Approving also authorizes spend up to $2") != null);
     try testing.expect(std.mem.indexOf(u8, skipped.stderr, "has started in the background") != null);
     const direct = try onlyRun(&c);
     try testing.expectEqualStrings("Add feature.txt", try c.read(try std.fmt.allocPrint(a, "{s}/ORIGINAL_REQUEST.md", .{direct})));
@@ -645,4 +651,61 @@ test "teamwork REPL L2: with preview off /teamwork is refused and never becomes 
     try testing.expect(std.mem.indexOf(u8, out.stderr, "/teamwork is a preview feature and preview is off") != null);
     try testing.expectEqual(@as(usize, 0), server.requestCount());
     try testing.expect(!try c.exists("state/teamwork"));
+}
+
+test "teamwork REPL L2: Ctrl+C cancels a running interview and the next message still runs" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    const raw = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+    const reply = start ++ "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello back\"}}\n\n" ++ stop;
+    var server = try harness.MockServer.startCassette(&.{reply}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    _ = try replCase(&c);
+    try c.write("repo/slow-interview", "");
+    const err_file = try c.tmp.dir.createFile(testing.io, "repl.err", .{});
+    const home = try std.fmt.allocPrint(a, "HOME={s}", .{c.root});
+    const tmp = try std.fmt.allocPrint(a, "TMPDIR={s}", .{c.root});
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ "/usr/bin/env", "-u", "METACODES_PROVIDER", "-u", "METACODES_MODEL", "-u", "METACODES_CONFIG_FILE", "-u", "METASK_API_KEY", "-u", "METASK_GATEWAY_URL", home, tmp, "METACODES_NO_PROBE=1", "METACODES_KG_AUTOSTART=0", "METACODES_JEV_URL=off", std.mem.span(raw), "--state-dir", c.state, "--api-key", "fixture-key", "--model", "fixture", "--base-url", url },
+        .cwd = .{ .path = c.repo },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .{ .file = err_file },
+    });
+    defer child.kill(testing.io);
+    err_file.close(testing.io);
+    try child.stdin.?.writeStreamingAll(testing.io, "/teamwork Add feature.txt\n");
+    const run = waitForRun: {
+        var waited: usize = 0;
+        while (waited < 600) : (waited += 1) {
+            if (c.exists("state/teamwork") catch false) {
+                const found = onlyRun(&c) catch null;
+                if (found) |dir| if (try c.exists(try std.fmt.allocPrint(a, "{s}/seats/interviewer-1/started", .{dir}))) break :waitForRun dir;
+            }
+            if (try outputHas(&c, "SandboxUnavailable")) return;
+            try std.Io.sleep(testing.io, .fromMilliseconds(50), .awake);
+        }
+        return error.InterviewNeverStarted;
+    };
+    try std.posix.kill(child.id.?, std.posix.SIG.INT);
+    var waited: usize = 0;
+    while (!try outputHas(&c, "The interview was cancelled.")) : (waited += 1) {
+        if (waited > 600) return error.InterviewNotCancelled;
+        try std.Io.sleep(testing.io, .fromMilliseconds(50), .awake);
+    }
+    try child.stdin.?.writeStreamingAll(testing.io, "hello\n");
+    child.stdin.?.close(testing.io);
+    child.stdin = null;
+    _ = try child.wait(testing.io);
+    try testing.expectEqual(@as(usize, 1), server.requestCount());
+    for ([_][]const u8{ "ORIGINAL_REQUEST.md", "run.json", "interview", "seats/implementer-1", "seats/interviewer-1/finished" }) |rel|
+        try testing.expect(!try c.exists(try std.fmt.allocPrint(a, "{s}/{s}", .{ run, rel })));
+}
+
+fn outputHas(c: *Case, needle: []const u8) !bool {
+    const text = c.read("repl.err") catch return false;
+    return std.mem.indexOf(u8, text, needle) != null;
 }

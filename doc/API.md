@@ -374,10 +374,12 @@ below the CLI options; a `claude_code` seat still takes its `command` from a
 lower layer. An unknown, duplicated, unterminated or malformed segment fails
 with `UnknownTeamworkSegment`, `DuplicateTeamworkSegment`,
 `UnterminatedTeamworkSegment` or `InvalidTeamworkSeats` before any state is
-created; a request without leading `[` is used byte for byte. `run.json` and
+created; a request without leading `[` is used byte for byte. A request file
+whose own text starts with `[` (such as `[WIP] ...`), which earlier versions
+accepted as is, is now refused; start it with any other character. `run.json` and
 `teamwork status` record `request_source`: `request_file` (a CLI request
 file), `skip_interview`, `interview` (the interviewer's draft approved
-unchanged) or `interview_edited` (text the user edited, then approved). Runs
+unchanged) or `user_edited` (text the user edited, then approved). Runs
 saved before this field report `request_file`.
 
 In the REPL, `/teamwork <request>` accepts the same segments and the same
@@ -385,14 +387,23 @@ configuration layers. With preview off it prints an error and sends nothing
 to the model. Otherwise the interviewer seat (either harness) reads a
 disposable snapshot of the workspace and drafts a task statement, charged to
 the run's budget ledger. The user answers `y` (approve), `e` (type a
-replacement statement, shown again for approval) or `n` (reject). No
+replacement statement, shown again for approval) or `n` (reject). Each prompt
+also states what approval authorizes: the dollar cap and seats per role,
+every seat's harness and model, the pinned check, and merge-back into the
+repository as uncommitted changes. Ctrl+C while the interviewer drafts
+cancels that seat (as `aborted`, even when the unreported spend of a killed
+seat fills the cap) and leaves the next message unaffected. No
 implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
 approval; the approved bytes are written to `ORIGINAL_REQUEST.md` unchanged,
 then the run continues on a background thread with its own provider client,
 and the REPL stays available. `/teamwork status [<id>]` prints the same JSON
 as `teamwork status`. One run per REPL session at a time; leaving the REPL
-cancels an unfinished run, which `teamwork resume <id> --approve` continues.
-`[skip-interview]` approves the request text itself, without an interview.
+cancels an unfinished run, which `teamwork resume <id> --approve` continues
+under the same permission mode and sandbox settings. `[skip-interview]` skips
+the interviewer: the same prompt shows the request text itself for approval.
+After a rejected, failed or cancelled interview nothing has started; the run
+directory then holds only the interviewer seat and its `budget.jsonl`, which
+`teamwork status` does not read (it has no `run.json`).
 
 `metacodes [--state-dir <dir>] teamwork status <id> [--json]` prints JSON
 containing saved state/detail, repository, dispatch counts, audit results,
