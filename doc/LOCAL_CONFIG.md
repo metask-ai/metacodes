@@ -59,6 +59,10 @@ The unified preview setting is the root boolean `preview` in the state root's
 `--preview` or `--no-preview` to override the saved value for an invocation;
 the last flag wins. For example, `{"preview": true}` opts into preview.
 
+This switch also enables the system instruction to avoid adding code comments
+and the corresponding check in the built-in file editors. Use
+`metacodes --no-preview` to turn both off for one invocation.
+
 HarnessMM and RSI additionally require their independent selections:
 `--harnessmm` and `--rsi --rsi-policy policy.json`. Preview alone selects
 neither. Without preview, those selections leave the ordinary model/tool

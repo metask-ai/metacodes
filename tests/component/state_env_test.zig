@@ -254,6 +254,9 @@ test "preview: CLI flags and persisted config change the actual provider tool me
             if (std.mem.eql(u8, tool.object.get("name").?.string, "ExecuteCode")) found = true;
         }
         try testing.expectEqual(scenario.enabled, found);
+        const request = server.lastRequest().?.body();
+        try testing.expectEqual(scenario.enabled, std.mem.indexOf(u8, request, "Do not add explanatory code comments.") != null);
+        try testing.expectEqual(!scenario.enabled, std.mem.indexOf(u8, request, "Only add comments where the logic isn't self-evident.") != null);
     }
 }
 

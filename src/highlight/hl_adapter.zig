@@ -10,6 +10,7 @@
 const std = @import("std");
 const hl = @import("hl");
 const highlight = @import("highlight.zig");
+var rule_mutex: @import("platform").sync.Mutex = .{};
 
 /// TokenType(hl-zig 4 类 + none)→ highlight.Group(tree-sitter 子集)。
 fn groupFromToken(t: hl.TokenType) highlight.Group {
@@ -31,7 +32,7 @@ pub fn highlightFileByPath(gpa: std.mem.Allocator, source: []const u8, path: []c
 /// 按语言名(如 "zig"/"python"/"typescript")高亮。NotebookEdit 等无法从扩展名推断的工具用它。
 /// 名不识别 → error。
 pub fn highlightFileByName(gpa: std.mem.Allocator, source: []const u8, name: []const u8) !highlight.Highlights {
-    const rule = hl.lookupByName(name) orelse return error.UnsupportedLanguage;
+    const rule = ruleForName(name) orelse return error.UnsupportedLanguage;
     return highlightFileWithRule(gpa, source, rule);
 }
 
@@ -41,7 +42,15 @@ pub fn ruleForPath(path: []const u8) ?*const hl.LangRule {
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
     if (dot + 1 >= base.len) return null;
     const ext = base[dot..]; // 含点,如 ".zig"
+    rule_mutex.lock();
+    defer rule_mutex.unlock();
     return hl.lookupByExtension(ext);
+}
+
+pub fn ruleForName(name: []const u8) ?*const hl.LangRule {
+    rule_mutex.lock();
+    defer rule_mutex.unlock();
+    return hl.lookupByName(name);
 }
 
 pub fn highlightFileWithRule(gpa: std.mem.Allocator, source: []const u8, rule: *const hl.LangRule) !highlight.Highlights {

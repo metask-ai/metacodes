@@ -2251,6 +2251,14 @@ fn runCounted(
     counters: *RunCounters,
 ) !RunResult {
     const harnessmm_enabled = opts.preview and opts.harnessmm;
+    const comment_guidance = @import("system_prompt.zig").COMMENT_GUIDANCE;
+    const base_prompt = opts.system_prompt orelse "";
+    const preview_prompt = if (opts.preview and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
+        try std.mem.concat(allocator, u8, &.{ base_prompt, if (base_prompt.len > 0) "\n\n" else "", comment_guidance })
+    else
+        null;
+    defer if (preview_prompt) |owned| allocator.free(owned);
+    const run_prompt = preview_prompt orelse opts.system_prompt;
     var harnessmm = harnessmm_mod.State.init(allocator);
     defer harnessmm.deinit();
     var harnessmm_journal: ?harnessmm_mod.Journal = if (harnessmm_enabled)
@@ -2688,11 +2696,11 @@ fn runCounted(
         defer freeOwnedSlice(u8, allocator, sys_prompt_owned);
         const augmented_system_prompt: ?[]const u8 = blk: {
             const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
-            if (!in_swarm) break :blk opts.system_prompt;
-            const base = opts.system_prompt orelse "";
+            if (!in_swarm) break :blk run_prompt;
+            const base = run_prompt orelse "";
             const swarm_seg = "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM;
             sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, swarm_seg }) catch null;
-            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
+            break :blk if (sys_prompt_owned) |p| p else run_prompt;
         };
         var projected_guidance_owned: ?[]u8 = null;
         defer freeOwnedSlice(u8, allocator, projected_guidance_owned);

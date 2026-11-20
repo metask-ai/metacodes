@@ -211,6 +211,23 @@ class PythonSdkTest(unittest.TestCase):
         with self.assertRaisesRegex(metacodes.AgentCoreError, "PreviewFeatureDisabled"):
             metacodes.Runtime(tools=["ExecuteCode"])
 
+    def test_preview_comment_check_matches_the_provider_prompt_and_disk(self) -> None:
+        for preview in (True, False):
+            with self.subTest(preview=preview):
+                target = self.root / "example.py"
+                source = "answer = 42  # explain\n"
+                script = [("tool", "Write", {"file_path": str(target), "content": source}), ("echo",)]
+                with MockProvider(script) as provider:
+                    with metacodes.Runtime(tools=["Write"], preview=preview) as runtime:
+                        session = self.session(runtime, provider, permission_mode="full_access")
+                        result = session.run("write the example")
+                self.assertEqual(preview, "Do not add explanatory code comments." in str(provider.requests[0]["system"]))
+                if preview:
+                    self.assertIn("adds a code comment", result.text)
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertEqual(source, target.read_text(encoding="utf-8"))
+
     def test_execute_code_calls_python_tools_and_keeps_intermediates_local(self) -> None:
         calls = []
 
