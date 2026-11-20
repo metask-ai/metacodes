@@ -441,7 +441,7 @@ already announced stays pending and is answered or cancelled as before.
 | `--web`, `serve` | `POST /capabilities` | `200` `capabilities_accepted`, `400` `capabilities_refused` |
 | `serve --sessions N` | `POST /s/<id>/capabilities` | the same, per Session |
 | `SessionHost` | `HostedSession.declareCapabilities(allocator, frame)` | the acknowledgement line, or a `DeclareError` |
-| UDS (`serve --uds`) | the frame itself as one NDJSON line, with the routing fields beside it: `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` | the acknowledgement line |
+| UDS (`serve --uds`) | the frame itself as one NDJSON line, with the routing fields beside it: `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` | the acknowledgement line, or the `capabilities_refused` line |
 
 UDS is a full UI frontend: it carries answers too. `{"op":"respond","session":
 "<id>","id":N,...}` answers UI request `N` with the same answer fields
