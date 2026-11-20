@@ -412,6 +412,8 @@ def main(argv=None):
             value = getattr(args, name)
             if value is not None:
                 cfg[name] = str(value.expanduser().resolve())
+        if args.bundle is not None:
+            cfg.pop("bundle_source", None)
         for name in ("model", "key_env", "harbor"):
             value = getattr(args, name)
             if value is not None:

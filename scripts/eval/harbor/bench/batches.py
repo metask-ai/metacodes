@@ -85,6 +85,8 @@ def bundle_choices(cfg: Dict[str, Any], config_path: Path) -> List[Dict[str, Any
             return
         if not builds.selectable(resolved, cfg.get("source_repo")):
             return
+        if builds.is_git_unit(resolved):
+            source = None
         seen.add(resolved)
         choices.append({"id": resolved.name, "path": str(resolved), "current": current,
                         "label": bundle_label(resolved, manifest, source),
@@ -114,7 +116,7 @@ def current_metacodes(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         manifest = check_bundle(Path(path))
     except ValueError:
         return None
-    source = cfg.get("bundle_source")
+    source = None if builds.is_git_unit(Path(path).expanduser().resolve()) else cfg.get("bundle_source")
     return {"label": bundle_label(Path(path), manifest, source), "commit": bundle_commit(Path(path), manifest, source),
             "bundle": str(path), "frozen": False}
 

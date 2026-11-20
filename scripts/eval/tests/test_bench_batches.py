@@ -6,6 +6,7 @@ store and the page API are read back over HTTP. No provider or Docker calls.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -328,6 +329,34 @@ class BatchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'source_repo 没有验证'):
             self.client.request('api/runs', run)
         self.assertEqual(self.manager.runs(), [])
+
+    def test_default_git_bundle_is_named_by_its_own_manifest(self):
+        new = '1' * 40
+        unit = self.git_unit(new, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'bundle': str(self.root / 'bundles' / unit),
+                                  'source_repo': 'https://example.com/fork.git',
+                                  'bundle_source': {'kind': 'checkout-overlay', 'commit': '0' * 12,
+                                                    'base_release': '0.12.0'}})
+        listed = self.client.request('api/workbench')['bundles']
+        self.assertEqual([(b['id'], b['commit'], b['current']) for b in listed], [(unit, new, True)])
+        run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1',
+                                               'tasks': ['fix-git']})
+        self.assertEqual(run['metacodes']['commit'], new)
+        wait_run(self.manager, run['name'])
+        created = self.client.request('api/batches', self.request())
+        self.assertEqual((created['metacodes']['commit'], created['metacodes']['git']['commit']), (new, new))
+
+    def test_bundle_flag_drops_the_previous_bundle_source(self):
+        state = self.root / 'cli-state'
+        (state / 'bench').mkdir(parents=True)
+        atomic_json(state / 'bench' / 'workbench.json',
+                    {'bundle_source': {'kind': 'checkout-overlay', 'commit': '0' * 12}})
+        with patch('sys.stdout', io.StringIO()):
+            cli.main(['info', '--state-root', str(state), '--bundle', str(self.root / 'bundle'), '--json'])
+        saved = json.loads((state / 'bench' / 'workbench.json').read_text())
+        self.assertEqual(saved['bundle'], str((self.root / 'bundle').resolve()))
+        self.assertNotIn('bundle_source', saved)
 
     def test_invalid_batches_are_refused_before_anything_is_written(self):
         for override in ({'items': []}, {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}] * 2},
