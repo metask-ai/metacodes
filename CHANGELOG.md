@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.13.0 — 2026-11-20
+
 ### Changed
 
 - **Each preview feature has its own switch.** `execute_code`, `teamwork` and
