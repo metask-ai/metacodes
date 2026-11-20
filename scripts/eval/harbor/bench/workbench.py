@@ -118,10 +118,10 @@ class Workbench:
             return dict(READ_ONLY_CATALOG)
         return {**self.manager.catalog(), "config_path": str(self.manager.config_path)}
 
-    def suite_tasks(self, suite_id) -> Dict[str, Any]:
+    def suite_tasks(self, suite_id, executor=None) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
-        return self.manager.suite_tasks(suite_id)
+        return self.manager.suite_tasks(suite_id, executor)
 
     def job_view(self, name, with_rows=True, runs=None) -> Optional[Dict[str, Any]]:
         """A stored job, labelled by its launch and corrected by its durable worker outcome."""

@@ -253,8 +253,10 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(suites.label("aime-2025")["category_name"], "竞赛数学")
 
     def test_workbuddy_platform_matches_the_stager(self):
+        from scripts.eval.workbuddy.environment_preflight import DEFAULT_HARNESS_IMAGE
         from scripts.eval.workbuddy.stage_artifacts import TARGET_PLATFORM
         self.assertEqual(wb.TARGET_PLATFORM, TARGET_PLATFORM)
+        self.assertEqual(wb.HARNESS_IMAGE, DEFAULT_HARNESS_IMAGE)
 
     def test_binary_carries_every_module_the_workbench_imports(self):
         assets = set(re.findall(r'\.path = "([^"]+)"', (REPO / "scripts/bench_assets.zig").read_text()))
@@ -723,6 +725,19 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(trial["row"]["status"], "pass")
         public = json.dumps(catalog) + "".join(p.read_text() for p in self.manager.records.iterdir())
         self.assertNotIn("session-access", public)
+
+    def test_the_mount_image_build_checks_the_manifest_it_builds_from(self):
+        """Staged artifacts swapped after the node's check: the build reads the
+        manifest once and refuses before Docker runs."""
+        import threading
+        repo = workbuddy_checkout(self.root)
+        staged = {"metacodes": "b" * 64, "tinykg": "b" * 64, "metacodes-formal-kernel": "b" * 64, "ripgrep": "b" * 64}
+        manifest = json.loads((repo / wb.ARTIFACT_MANIFEST).read_text())
+        manifest["executables"] = {label: {"sha256": digest} for label, digest in staged.items()}
+        atomic_json(repo / wb.ARTIFACT_MANIFEST, manifest)
+        expected = {**staged, "metacodes": "a" * 64}
+        with self.assertRaisesRegex(ValueError, "metacodes"):
+            wb.build_harness_image(repo, "t:x", threading.Event(), expected=expected, docker=str(self.root / "no-docker"))
 
     def test_workbuddy_readiness_reports_an_unpinned_checkout(self):
         repo = workbuddy_checkout(self.root, head="0" * 40)

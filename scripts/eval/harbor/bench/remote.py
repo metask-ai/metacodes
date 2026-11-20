@@ -1,8 +1,9 @@
-"""Remote side of an SSH Bench executor. Runs on the Linux execution host.
+"""Remote side of an SSH Bench executor. Runs on the Linux execution host,
+inside that host's own `metacodes` (node.py):
 
-    python3 -m scripts.eval.harbor.bench.remote run <spec.json>
-    python3 -m scripts.eval.harbor.bench.remote manifest <job-dir>
-    python3 -m scripts.eval.harbor.bench.remote pack <job-dir>   # JSON items on stdin
+    metacodes bench node run <spec.json>
+    metacodes bench node manifest <job-dir>
+    metacodes bench node pack <job-dir>   # JSON items on stdin
 
 `run` reads one JSON line from stdin first,
 `{"env": {NAME: value}, "credential": "<real token>"}`, carried by the SSH
@@ -98,8 +99,8 @@ def run(spec_path):
             argv[index] = absolute(value)
     env = dict(os.environ)
     env.update(secret_env)
-    runtime = absolute(spec.get("runtime") or ".")
-    env["PYTHONPATH"] = runtime
+    # Harbor imports the agent from this node's own runtime.
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
     env["PYTHONUNBUFFERED"] = "1"
     relay = None
     credential = None
@@ -108,7 +109,6 @@ def run(spec_path):
     hung_up = threading.Event()
     try:
         if spec.get("relay"):
-            sys.path.insert(0, runtime)
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
             connect = None
@@ -141,8 +141,6 @@ def run(spec_path):
                 for role in ("api_key", "base_url", "model"):
                     env.pop(judge["env"][role], None)  # the executor's own judge settings
         if spec.get("egress") or spec.get("ghcr_mirror"):
-            if runtime not in sys.path:
-                sys.path.insert(0, runtime)
             from scripts.eval.harbor.bench import egress
         if spec.get("egress"):
             # For this run only: the forwarder on the Docker bridge and a
@@ -171,8 +169,41 @@ def dataset_selection(argv):
     return dataset, [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-i"]
 
 
-def supervise(spec, argv, env, credential, stop, hung_up, egress=None):
-    """Run Harbor: control channel, heartbeats, cancel; the exit code."""
+def beating(phase, stop, work):
+    """work() with a heartbeat every 2 s: preparation can outlast the
+    worker's 90 s heartbeat window. A closed channel sets `stop`."""
+    done = threading.Event()
+
+    def beat():
+        while not done.wait(2):
+            try:
+                emit("heartbeat", phase=phase)
+            except (BrokenPipeError, OSError):
+                stop.set()
+                return
+    threading.Thread(target=beat, daemon=True).start()
+    try:
+        return work()
+    finally:
+        done.set()
+
+
+def cancelled_exit():
+    try:
+        emit("exit", code=130, cancelled=True)
+    except (BrokenPipeError, OSError):
+        pass
+    return 130
+
+
+def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None, finish=None):
+    """Run Harbor: control channel, heartbeats, cancel; the exit code.
+
+    `prepare(stop)`, when given, runs first under heartbeats and with cancel
+    already handled; it returns (argv, env, cwd), or None once `stop` is set,
+    and raises ValueError with a user-facing reason. `finish()`, when given,
+    runs under heartbeats before the run's one terminal event, however the
+    run ends."""
 
     def control():
         for line in sys.stdin.buffer:
@@ -194,39 +225,42 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None):
         stop.set()
 
     threading.Thread(target=control, daemon=True).start()
+
+    def finishing():
+        if finish is not None:
+            try:
+                beating("finish", stop, finish)
+            except Exception as exc:  # the run's outcome is reported regardless
+                print(f"清理失败：{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+    if prepare is not None:
+        try:
+            prepared = beating("prepare", stop, lambda: prepare(stop))
+        except ValueError as exc:
+            finishing()
+            emit("error", message=str(exc))
+            return 2
+        if prepared is None or stop.is_set():
+            finishing()
+            return cancelled_exit()
+        argv, env, cwd = prepared
     dataset, patterns = dataset_selection(argv)
     if egress is not None and dataset:
         images = egress.ghcr_images(Path(dataset), patterns)
         if images:
-            # Pulls can outlast the worker's 90 s heartbeat window.
-            pulling = threading.Event()
-
-            def beat():
-                while not pulling.wait(2):
-                    try:
-                        emit("heartbeat", phase="ghcr")
-                    except (BrokenPipeError, OSError):
-                        stop.set()
-                        return
-            threading.Thread(target=beat, daemon=True).start()
-            try:
-                tagged = egress.ensure_ghcr(images, spec["ghcr_mirror"], env=env, stop=stop,
-                                            log=lambda text: print(text, file=sys.stderr, flush=True))
-            finally:
-                pulling.set()
+            tagged = beating("ghcr", stop, lambda: egress.ensure_ghcr(
+                images, spec["ghcr_mirror"], env=env, stop=stop,
+                log=lambda text: print(text, file=sys.stderr, flush=True)))
             try:
                 emit("ghcr", images=len(images), tagged=len(tagged))
             except (BrokenPipeError, OSError):
                 stop.set()
             if stop.is_set():  # cancelled (or the channel closed) while pulling
-                try:
-                    emit("exit", code=130, cancelled=True)
-                except (BrokenPipeError, OSError):
-                    pass
-                return 130
+                finishing()
+                return cancelled_exit()
     # Harbor's own output goes to stderr, which SSH carries to the local
     # worker's log; stdout carries only events.
-    process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
+    process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
                                start_new_session=True)
     emit("started", pid=process.pid)
     interrupted_at = None
@@ -245,6 +279,7 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None):
                 stop.set()
             last = time.monotonic()
         time.sleep(0.25)
+    finishing()
     try:
         emit("exit", code=process.returncode, cancelled=interrupted_at is not None)
     except (BrokenPipeError, OSError):

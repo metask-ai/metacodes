@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **A Bench SSH executor is a `metacodes` node.** The workbench no longer
+  copies a Python runtime to an SSH executor: `metacodes bench setup
+  --executor NAME` installs the bundle's `metacodes` there
+  (`<state_dir>/bin/metacodes`, and `~/.local/bin/metacodes` when free), and
+  every run, copy-back and readiness probe goes through
+  `metacodes bench node …` on that machine. The node reports its own version
+  and the WorkBuddy suites prepared on it, so WorkBuddy Code and Security now
+  run on an SSH executor with that executor's own checkout. `node peers`
+  lists the nodes a machine drives and the workbenches that drove it.
+  Re-run setup for each SSH executor once after upgrading; until then its
+  readiness says the node is missing.
+
 - **Preview features require opt-in.** `--preview` enables them; `--no-preview`
   overrides a saved root `"preview": true` in the installation's `config.json`.
   ExecuteCode JavaScript orchestration is a preview feature and is hidden and

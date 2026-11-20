@@ -68,8 +68,15 @@ def prepare(spec, env):
     placeholder and forwards upstream with the real, current credential."""
     if spec.get("runner") == "workbuddy":
         if (spec.get("executor") or {}).get("kind") == "ssh":
-            # RunManager refuses this combination; never run it half-remote.
-            raise ValueError("WorkBuddy 评测只能在本机执行器运行")
+            # The node runs its own checkout behind a relay that holds the
+            # access token; a session login is refreshed here and pushed.
+            try:
+                source, gateway = credentials.for_run(spec, env)
+            except ValueError as exc:  # account messages are user-facing, secret-free
+                raise LaunchRefused(str(exc)) from None
+            spec = {**spec, "account_gateway": gateway}
+            remote = RemoteRun(spec)
+            return {**spec, "remote_spec_path": remote.upload_run(remote.remote_spec())}, remote, source
         # WorkBuddy's own host proxy holds the key; its task containers get
         # only that proxy's route token.
         if spec.get("auth_mode") == "metask":
@@ -149,12 +156,15 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     doing (RunManager shows a receipt older than 30 seconds as interrupted),
     and the run is `finished` only when the final copy was verified
     complete; otherwise the receipt says where the results still are."""
-    # The run's key plus the suite's execution-host variables (a judge key),
-    # all over the SSH channel's stdin.
-    secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
-    secret_env[spec["key_env"]] = env[spec["key_env"]]  # the placeholder
-    if spec.get("judge"):
-        secret_env[JUDGE_TOKEN_ENV] = env[JUDGE_TOKEN_ENV]  # the judge's placeholder
+    secret_env = {}
+    if spec.get("runner") != "workbuddy":
+        # The run's key plus the suite's execution-host variables (a judge
+        # key), all over the SSH channel's stdin. A WorkBuddy node needs only
+        # the credential for its relay.
+        secret_env = {name: env[name] for name in spec.get("forward_env") or () if env.get(name)}
+        secret_env[spec["key_env"]] = env[spec["key_env"]]  # the placeholder
+        if spec.get("judge"):
+            secret_env[JUDGE_TOKEN_ENV] = env[JUDGE_TOKEN_ENV]  # the judge's placeholder
     # The real access token goes beside it for the remote relay only; a
     # refreshed one follows on the same channel. The refresh token stays here.
     if getattr(source, "refreshing", False):
