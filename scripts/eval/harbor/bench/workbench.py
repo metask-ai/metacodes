@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.bench import data
-from scripts.eval.harbor.bench.batches import BatchManager, public as public_batch
+from scripts.eval.harbor.bench.batches import BATCH_ACTIVE, BatchManager, public as public_batch
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
 from scripts.eval.harbor.store import config as store_config
@@ -271,6 +272,30 @@ class Workbench:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.batches.cancel(batch_id)
+
+    def delete_batch(self, batch_id) -> Dict[str, Any]:
+        manager = self.manager
+        if not manager:
+            raise ValueError(READ_ONLY)
+        with self.batches.lock, manager.lock:
+            record = next((r for r in self.batch_records() if r["id"] == batch_id), None)
+            if record is None:
+                raise ValueError("批次不存在")
+            runs = [item["run"] for item in record["items"] if data.NAME.fullmatch(item.get("run") or "")]
+            running = {r["name"] for r in manager.runs() if r.get("status") in ACTIVE}
+            if record["status"] in BATCH_ACTIVE or running.intersection(runs):
+                raise ValueError("批次还在运行，请先取消，结束后再删除")
+
+            def remove_files():
+                self.batches.path(batch_id).unlink(missing_ok=True)
+                for run in runs:
+                    for path in manager.records.glob(run + ".*"):
+                        if path.stem == run:
+                            path.unlink()
+                    shutil.rmtree(manager.jobs_dir / run, ignore_errors=True)
+
+            self.library.delete_batch(batch_id, runs, remove_files)
+        return {"id": batch_id, "deleted": True, "runs": runs}
 
     def start_setup(self, request) -> Dict[str, Any]:
         if not self.manager:

@@ -162,6 +162,15 @@ class StoreLibrary:
             rows = tx.query("SELECT record_json FROM runs")
         return [json.loads(row[0]) for row in rows]
 
+    def delete_batch(self, batch_id: str, jobs: List[str], remove_files: Callable[[], None]) -> None:
+        with self._sync_lock:
+            remove_files()
+            with self.store.transaction() as tx:
+                for job in jobs:
+                    tx.execute("DELETE FROM runs WHERE name = ?", (job,))
+                    tx.execute("DELETE FROM jobs WHERE name = ?", (job,))
+                tx.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+
     def replace_store(self, store: Store) -> Store:
         """Serve from `store` from now on; returns the previous store, which
         the caller closes. A sync in flight finishes on the old one first."""

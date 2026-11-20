@@ -223,11 +223,38 @@ class BatchTest(unittest.TestCase):
                 time.sleep(.05)
             with self.assertRaisesRegex(ValueError, '批次|已有评测'):
                 self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 1, 'concurrency': 1})
+            with self.assertRaisesRegex(ValueError, '先取消'):
+                self.client.request('api/batch/delete', {'id': created['id']})
             self.client.request('api/batch/cancel', {'id': created['id']})
             record = self.wait_batch(created['id'])
         self.assertEqual(record['status'], 'cancelled')
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
+
+    def test_deleting_a_batch_removes_its_runs_results_and_rows(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        doomed = self.wait_batch(self.client.request('api/batches', one)['id'])
+        kept = self.wait_batch(self.client.request('api/batches', one)['id'])
+        self.client.request('api/batch?id=' + doomed['id'])
+        run = doomed['items'][0]['run']
+        before = self.client.request('api/store')['counts']
+        self.assertEqual((before['batches'], before['jobs'], before['runs']), (2, 2, 2))
+
+        deleted = self.client.request('api/batch/delete', {'id': doomed['id']})
+
+        self.assertEqual(deleted['runs'], [run])
+        self.assertFalse(self.manager.batches.path(doomed['id']).exists())
+        self.assertEqual(list(self.manager.records.glob(run + '.*')), [])
+        self.assertFalse((self.manager.jobs_dir / run).exists())
+        with self.assertRaises(ValueError):
+            self.client.request('api/batch?id=' + doomed['id'])
+        counts = self.client.request('api/store')['counts']
+        self.assertEqual((counts['batches'], counts['jobs'], counts['runs']), (1, 1, 1))
+        listing = self.client.request('api/jobs?batch=all')
+        self.assertEqual([b['id'] for b in listing['batches']], [kept['id']])
+        self.assertEqual([j['name'] for j in listing['jobs']], [kept['items'][0]['run']])
+        with self.assertRaisesRegex(ValueError, '不存在'):
+            self.client.request('api/batch/delete', {'id': doomed['id']})
 
     def test_a_modified_frozen_bundle_is_refused(self):
         # The server's scheduler would race the tampering below (create()
