@@ -1,5 +1,4 @@
 import copy
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -8,7 +7,7 @@ import tempfile
 import unittest
 
 from scripts.eval.skill_rsi import (
-    CommandAdapter, RSIError, Settings, candidate, digest, features, fit_router,
+    CommandAdapter, RSIError, Settings, digest, features, fit_router,
     main, route, run_rsi, stable, strict_json,
 )
 from scripts.eval.memory_budget_journal import BudgetAuthority, BudgetJournal
