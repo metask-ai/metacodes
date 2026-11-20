@@ -25,6 +25,7 @@ const permission_mod = @import("../../permission.zig");
 const tools_mod = @import("../../tools.zig");
 const usage_mod = @import("../../core/usage.zig");
 const reviewer = @import("../reviewer.zig");
+const system_prompt = @import("../../core/system_prompt.zig");
 const observation = @import("../../tools/observation.zig");
 const swarm_team = @import("../../swarm/team.zig");
 const util_fs = @import("../../util/fs.zig");
@@ -737,9 +738,12 @@ test "teamwork drivers L2: metacodes seat cannot write outside its workspace and
     var inside_buf: PathBuf = undefined;
     try testing.expect(pfs.exists(try std.fmt.bufPrintZ(&inside_buf, "{s}/notes/plan.md", .{fx.workspace()})));
 
-    // Provider-visible bytes: the charter alone as system prompt, the fixed
-    // bootstrap first; run id and state paths only in the environment block.
-    try testing.expectEqualStrings(charters.forRole(.implementer), scripted.first_system.?);
+    // Provider-visible bytes: the charter and the preview comment guidance as
+    // system prompt, the fixed bootstrap first; run id and state paths only in
+    // the environment block.
+    const implementer_system = try std.mem.concat(testing.allocator, u8, &.{ charters.forRole(.implementer), "\n\n", system_prompt.COMMENT_GUIDANCE });
+    defer testing.allocator.free(implementer_system);
+    try testing.expectEqualStrings(implementer_system, scripted.first_system.?);
     const first = scripted.first_user.?;
     try testing.expect(std.mem.startsWith(u8, first, common.bootstrap));
     const env_at = std.mem.indexOf(u8, first, metacodes.environment_open).?;
@@ -1049,7 +1053,9 @@ test "teamwork drivers L2: a metacodes reviewer seat taps the plugged-in tool ob
     defer outcome.deinit(testing.allocator);
 
     try testing.expect(outcome == .finished);
-    try testing.expectEqualStrings(reviewer.charter, scripted.first_system.?);
+    const reviewer_system = try std.mem.concat(testing.allocator, u8, &.{ reviewer.charter, "\n\n", system_prompt.COMMENT_GUIDANCE });
+    defer testing.allocator.free(reviewer_system);
+    try testing.expectEqualStrings(reviewer_system, scripted.first_system.?);
     try testing.expectEqual(@as(usize, 1), recorder.bash_inputs.items.len);
     try testing.expect(std.mem.indexOf(u8, recorder.bash_inputs.items[0], "\"ls\"") != null);
     // A reviewer's Write/Edit cannot reach the workspace.
