@@ -144,11 +144,11 @@ class BatchTest(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.manager = RunManager(self.root / 'jobs', self.config)
         self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager),
-                                       '127.0.0.1', 0, 'test-capability')
+                                       '127.0.0.1', 0)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/', 'test-capability')
+        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self, **override):
         return {'model': 'tokenjoy/test-model', 'attempts': 1, 'concurrency': 4, 'name': '回归',
@@ -251,9 +251,6 @@ class BatchTest(unittest.TestCase):
                 self.client.request('api/batches', self.request(**override))
         self.assertEqual(self.manager.batches.records(), [])
         self.assertFalse((self.root / 'bundles' / 'frozen').exists())
-        anonymous = cli.Client(self.client.url)
-        with self.assertRaisesRegex(ValueError, '授权'):
-            anonymous.request('api/batches', self.request())
 
     def test_database_page_tests_switches_and_migrates(self):
         run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 1, 'concurrency': 1})
@@ -285,10 +282,6 @@ class BatchTest(unittest.TestCase):
             store.close()
         same = self.client.request('api/store', {'action': 'apply', 'store': {'backend': 'sqlite', 'path': str(target)}})
         self.assertTrue(same['unchanged'])
-        anonymous = cli.Client(self.client.url)
-        with self.assertRaisesRegex(ValueError, '授权'):
-            anonymous.request('api/store', {'action': 'test', 'store': {'backend': 'sqlite', 'path': str(target)}})
-        self.assertFalse(anonymous.request('api/store')['can_edit'])
 
 
 if __name__ == '__main__':

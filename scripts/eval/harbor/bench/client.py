@@ -12,18 +12,20 @@ import urllib.request
 
 
 class Client:
-    def __init__(self, url, token="", api_url=None):
+    def __init__(self, url, api_url=None, legacy_token=""):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
             raise ValueError("工作台地址必须是 http(s) URL")
         self.url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
-        self.token = token or urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
         self.api_url = api_url or self.url
+        # Only for a service started before the login was dropped, read from
+        # this machine's private receipt: it is needed to stop that service.
+        self.legacy_token = legacy_token
 
     def request(self, path, payload=None):
         headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = "Bearer " + self.token
+        if self.legacy_token:
+            headers["Authorization"] = "Bearer " + self.legacy_token
         body = None
         if payload is not None:
             body = json.dumps(payload).encode()
@@ -42,4 +44,4 @@ class Client:
             raise ValueError(message) from None
 
     def open_url(self):
-        return self.url + ("?token=" + self.token if self.token else "")
+        return self.url

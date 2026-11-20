@@ -13,17 +13,46 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json  # noqa: E402
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run, wait_status  # noqa: E402
 
-# Run the server with the base revision's headers in a separate process.
+# A service from before the login was dropped, in a separate process: the
+# base revision's headers, a capability every POST must carry, and a
+# receipt holding that capability (what such a service wrote).
+LEGACY_TOKEN = 'legacy-capability'
 LEGACY_SERVER = """
 import sys
 from scripts.eval.harbor.viewer import server
+TOKEN = 'legacy-capability'
+base_handler, base_json = server.make_handler, server.atomic_json
+
+
+def legacy_handler(*args, **kwargs):
+    base = base_handler(*args, **kwargs)
+
+    class Legacy(base):
+        def authorized(self):
+            return self.headers.get('Authorization', '') == 'Bearer ' + TOKEN
+
+        def do_POST(self):
+            if not self.authorized():
+                self.send_json({'error': 'login link required'}, 403)
+                return
+            super().do_POST()
+    return Legacy
+
+
+def receipt(path, value):
+    if 'pid' in value:
+        value = {**{k: v for k, v in value.items() if k != 'bind'}, 'token': TOKEN}
+    base_json(path, value)
+
+
+server.make_handler, server.atomic_json = legacy_handler, receipt
 server.SECURITY_HEADERS = (
     ("Cache-Control", "no-store"),
     ("X-Content-Type-Options", "nosniff"),
@@ -54,7 +83,7 @@ def main():
         state = root / 'state'
         env = {**os.environ, 'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                'TOKENJOY_API_KEY': 'private-cli-fixture', 'HOME': str(root),
-               'METACODES_BENCH_URL': '', 'METACODES_BENCH_TOKEN': ''}
+               'METACODES_BENCH_URL': ''}
         command = [str(native), '--state-dir', str(state), 'bench']
         def invoke(extra, expected=0):
             p = subprocess.run(command + extra, env=env, cwd=root, capture_output=True, text=True, timeout=40)
@@ -72,33 +101,50 @@ def main():
             config_path = ready.with_name('workbench.json')
             atomic_json(config_path, {**config, 'jobs_dir': str(jobs_dir)})
             manager = RunManager(jobs_dir, config_path)
-            legacy = subprocess.Popen(
-                [sys.executable, '-c', LEGACY_SERVER, '--config', str(config_path),
-                 '--jobs-dir', str(jobs_dir), '--port', '0', '--ready-file', str(ready)],
-                env={**env, 'FAKE_BENCH_RELEASE_FILE': str(release)}, cwd=REPO,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            )
-            deadline = time.monotonic() + 10
-            while not ready.exists():
-                assert legacy.poll() is None, 'legacy workbench exited before ready'
-                assert time.monotonic() < deadline, 'legacy workbench did not become ready'
-                time.sleep(.05)
+            def start_legacy(port='0'):
+                ready.unlink(missing_ok=True)
+                process = subprocess.Popen(
+                    [sys.executable, '-c', LEGACY_SERVER, '--config', str(config_path),
+                     '--jobs-dir', str(jobs_dir), '--port', port, '--ready-file', str(ready)],
+                    env={**env, 'FAKE_BENCH_RELEASE_FILE': str(release)}, cwd=REPO,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 10
+                while not ready.exists():
+                    assert process.poll() is None, 'legacy workbench exited before ready'
+                    assert time.monotonic() < deadline, 'legacy workbench did not become ready'
+                    time.sleep(.05)
+                return process
+
+            legacy = start_legacy()
             old_url = json.loads(ready.read_text())['url']
             port = str(urlsplit(old_url).port)
-            reused = json.loads(invoke(['--no-open', '--json']))
-            assert reused['url'].startswith(old_url + '?token='), reused
             with urlopen(old_url, timeout=5) as response:
                 assert 'Content-Security-Policy' in response.headers
-            active = json.loads(invoke(['run', '--task', 'fix-git', '--json']))
+            # The old service really requires its capability: a run is
+            # started on it with the capability, as its page did.
+            launch = Request(old_url + 'api/runs', data=json.dumps(
+                {'model': config['model'], 'tasks': ['fix-git'], 'attempts': 1, 'concurrency': 1}).encode(),
+                headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + LEGACY_TOKEN})
+            with urlopen(launch, timeout=10) as response:
+                active = json.load(response)
             assert wait_status(manager, active['name'], 'running') == 'running', active
+            # `bench stop` stops it with the capability from the local receipt.
             assert json.loads(invoke(['stop', '--json']))['stopped']
             assert legacy.wait(timeout=10) == 0
-
-            started = json.loads(invoke(['--no-open', '--json', '--port', port,
+            # Opening the workbench while an old service runs replaces it on
+            # the same entry. Its receipt cannot tell 127.0.0.1 from 0.0.0.0,
+            # so it is kept until the bind is given.
+            legacy = start_legacy(port)
+            assert json.loads(ready.read_text())['token'] == LEGACY_TOKEN
+            invoke(['--no-open', '--json'], expected=1)
+            assert legacy.poll() is None, 'an old service whose entry is unknown must keep running'
+            started = json.loads(invoke(['--no-open', '--json', '--bind', '127.0.0.1',
                                         '--bundle', config['bundle'], '--provider-config', config['provider_config'],
                                         '--model', config['model'], '--harbor', config['harbor']]))
-            assert started['url'].startswith(old_url + '?token='), started
-            assert started['url'] != reused['url'], 'reopening must issue a new capability'
+            assert started['url'] == old_url, started
+            assert legacy.wait(timeout=10) == 0, 'the old service must be replaced'
+            assert 'token' not in json.loads(ready.read_text()), 'the new receipt carries no capability'
             for path in ('', 'index.html'):
                 with urlopen(old_url + path, timeout=5) as response:
                     assert 'Content-Security-Policy' not in response.headers, path
