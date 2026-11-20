@@ -146,6 +146,18 @@ pub fn adoptKept(host: *provider_host.Host, allocator: std.mem.Allocator, state_
     return if (fresh != null) .fresh else .stale;
 }
 
+pub fn keptAge(allocator: std.mem.Allocator, state_root: []const u8) Kept {
+    const url = listingUrl(allocator) catch return .none;
+    defer allocator.free(url);
+    const key = cacheKey(url);
+    const now = time.nowUnix();
+    const kept = models_cache.load(allocator, state_root, key, url, now, ANY_AGE) orelse return .none;
+    allocator.free(kept);
+    const fresh = models_cache.load(allocator, state_root, key, url, now, STALE_SECONDS) orelse return .stale;
+    allocator.free(fresh);
+    return .fresh;
+}
+
 /// Fetch the account's listing with `key`, keep it trimmed, and, given a
 /// host, ingest it there. Returns how many models it lists.
 pub fn refresh(

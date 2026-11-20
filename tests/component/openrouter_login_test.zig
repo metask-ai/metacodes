@@ -700,6 +700,115 @@ test "L2 OpenRouter: the account's listing is fetched with the key, kept, and a 
     try testing.expect(later.kernel.catalogSnapshot().find(pinned.?) != null);
 }
 
+const PinnedDefault = struct {
+    offer_id: cc.provider_ids.OfferId,
+    revision: cc.provider_ids.OfferRevision,
+};
+
+fn pinOpenRouterDefault(case: *Case, io: std.Io, model: []const u8) !PinnedDefault {
+    const a = case.arena.allocator();
+    const host = try cc.provider_host.Host.create(testing.allocator);
+    defer host.destroy();
+    openrouter_login.applyOriginOverride(host);
+    _ = try cc.api_openrouter_catalog.refresh(testing.allocator, io, case.root, KEY, host);
+    var found: ?PinnedDefault = null;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openrouter") and std.mem.eql(u8, item.request_model_id, model))
+            found = .{ .offer_id = item.offer_id, .revision = item.offer_revision };
+    }
+    const pinned = found orelse return error.ModelNotListed;
+    const config_path = try std.fs.path.join(a, &.{ case.root, "config.json" });
+    try case.setEnv(cc.provider_config_store.CONFIG_PATH_ENV, (try a.dupeZ(u8, config_path)).ptr);
+    var store = try cc.provider_config_store.Store.initPath(testing.allocator, config_path);
+    defer store.deinit();
+    _ = try cc.provider_config_store.setGlobalSelection(
+        &store,
+        cc.provider_selection.RuntimeSelection.pinned(pinned.offer_id, pinned.revision, .global),
+        null,
+        "openrouter-default",
+    );
+    return pinned;
+}
+
+fn dropKeptListing(case: *Case) !void {
+    const models = try std.fs.path.join(case.arena.allocator(), &.{ case.root, "cache", "models" });
+    try std.Io.Dir.cwd().deleteTree(testing.io, models);
+    try testing.expectEqual(cc.api_openrouter_catalog.Kept.none, cc.api_openrouter_catalog.keptAge(testing.allocator, case.root));
+}
+
+test "L2 OpenRouter: a stored default on an OpenRouter model starts with no listing kept: the start downloads the listing first" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", null);
+    var server = try harness.MockServer.startCassette(&.{ LISTING, LISTING }, 0);
+    defer server.stop();
+    _ = try case.openRouterAt(server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+    const pinned = try pinOpenRouterDefault(&case, io_runtime.io(), "deepseek/deepseek-v4.1-flash");
+    try dropKeptListing(&case);
+
+    const argv = [_][*:0]const u8{"metacodes"};
+    var config = try case.config(&argv);
+    try testing.expect(cc.applyPersistedGlobalSelection(&config, a));
+
+    try testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", config.model);
+    try testing.expectEqualStrings("openrouter", config.resolved_provider_id.?);
+    try testing.expectEqualStrings(&pinned.offer_id.render(), config.selected_offer_id.?);
+    try testing.expectEqual(@as(usize, 2), server.requestCount());
+    const fetched = server.lastRequest().?;
+    try testing.expectEqualStrings("GET /api/v1/models/user HTTP/1.1", requestLine(fetched));
+    try testing.expectEqualStrings("Bearer " ++ KEY, headerValue(fetched, "authorization").?);
+    try testing.expect(cc.api_openrouter_catalog.keptAge(testing.allocator, case.root) == .fresh);
+}
+
+test "L2 OpenRouter: a start downloads a missing listing only with no probe barred, a key set and nothing kept, and says why it failed" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", null);
+    var listing_server = try harness.MockServer.start(LISTING, 0);
+    defer listing_server.stop();
+    _ = try case.openRouterAt(listing_server);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    _ = try pinOpenRouterDefault(&case, io_runtime.io(), "deepseek/deepseek-v4.1-flash");
+    const argv = [_][*:0]const u8{"metacodes"};
+    const config = try case.config(&argv);
+
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+    try testing.expect(cc.fetchMissingOpenRouterListing(a, config) == .skipped);
+    try testing.expectEqual(@as(usize, 1), listing_server.requestCount());
+
+    try dropKeptListing(&case);
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    try testing.expect(cc.fetchMissingOpenRouterListing(a, config) == .skipped);
+    try case.setEnv("METACODES_NO_PROBE", null);
+
+    _ = try key_store.remove(testing.allocator, case.root, OPENROUTER);
+    try testing.expect(cc.fetchMissingOpenRouterListing(a, config) == .skipped);
+    try key_store.saveWithMeta(testing.allocator, case.root, OPENROUTER, .api_key, KEY, null, .{ .obtained = .browser_sign_in }, 1);
+    try testing.expectEqual(@as(usize, 1), listing_server.requestCount());
+
+    const answers = [_]struct { status: []const u8, failure: cc.api_openrouter_catalog.Failure }{
+        .{ .status = "HTTP/1.1 500 Internal Server Error", .failure = .server_error },
+        .{ .status = "HTTP/1.1 401 Unauthorized", .failure = .refused },
+    };
+    for (answers) |answer| {
+        var refusing = try harness.MockServer.startRepeatingStatus("{\"error\":{\"message\":\"no\"}}", answer.status, "");
+        defer refusing.stop();
+        _ = try case.openRouterAt(refusing);
+        const outcome = cc.fetchMissingOpenRouterListing(a, config);
+        try testing.expect(outcome == .failed);
+        try testing.expectEqual(answer.failure, outcome.failed);
+        try testing.expect(cc.api_openrouter_catalog.keptAge(testing.allocator, case.root) == .none);
+    }
+}
+
 /// A provider of the user's own on the OpenAI wire, at `origin`.
 fn relayConfig(a: std.mem.Allocator, origin: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a,
