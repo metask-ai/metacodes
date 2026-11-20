@@ -47,12 +47,19 @@ class SessionLogin:
         return doc
 
     def bearer(self, request, stale=None):
+        return self.access(request, stale)["access_token"]
+
+    def access(self, request, stale=None, margin=300):
+        """The current access token and its expiry, refreshed when it expires
+        within `margin` seconds (or, with `stale`, when it is still the one
+        the gateway rejected). Re-read under the lock: another process may
+        have rotated the refresh token, which must not be reused."""
         with refresh_lock(self.path.parent):
             current = self.read()
             if stale is not None and current["access_token"] != stale:
-                return current["access_token"]
-            if stale is None and current["expires_at"] > time.time() + 300:
-                return current["access_token"]
+                return current
+            if stale is None and current["expires_at"] > time.time() + margin:
+                return current
             token = request("/api/oauth/token", origin=self.site, json_body={
                 "grant_type": "refresh_token", "client_id": "metacodes",
                 "refresh_token": current["refresh_token"]})
@@ -61,13 +68,13 @@ class SessionLogin:
                 raise ValueError("Metask 登录刷新失败，请重新运行 metacodes login")
             latest = self.read()
             if latest["refresh_token"] != current["refresh_token"]:
-                return latest["access_token"]
+                return latest
             updated = {**latest, **{k: token[k] for k in (
                 "access_token", "refresh_token", "token_type", "scope", "gateway_url", "models_url", "client_name") if k in token},
                 "expires_at": int(time.time()) + token["expires_in"]}
             origin_url(updated["gateway_url"])
             private_json(self.path, updated)
-            return updated["access_token"]
+            return updated
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -231,6 +238,13 @@ class Account:
             private_json(self.auth_path, current)
             return updated["access_token"]
 
+    def session_access(self, stale=None, margin=300):
+        """(access token, expires_at) of the current CLI session login."""
+        if not self.session:
+            raise ValueError("当前登录没有可刷新的 Metask 会话")
+        doc = self.session.access(self.request, stale, margin)
+        return doc["access_token"], doc["expires_at"]
+
     def keys(self):
         login = self.login()
         if self.session:
@@ -274,7 +288,9 @@ class Account:
         result.sort(key=lambda key: key["secret"] != login.get("api_key"))
         return result
 
-    def model_directory(self, key):
+    def model_directory(self, key, any_endpoint=False):
+        """The models a key serves; Anthropic Messages capable ones unless
+        `any_endpoint` (an LLM judge calls Chat Completions)."""
         try:
             document = self.request("/v1/models", key["secret"])
         except AccountHTTPError as exc:
@@ -289,14 +305,15 @@ class Account:
             for name in ("capabilities", "endpoints", "messages"):
                 value = value.get(name) if isinstance(value, dict) else None
             return not isinstance(value, dict) or value.get("supported") is not False
-        return [m for m in rows if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"] and messages_supported(m)]
+        return [m for m in rows if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]
+                and (any_endpoint or messages_supported(m))]
 
-    def credential(self, model=None, key_id=None):
+    def credential(self, model=None, key_id=None, any_endpoint=False):
         for key in self.keys():
             if key_id is not None and key["id"] != key_id:
                 continue
             name = model.removeprefix("metask/") if model else None
-            if name is None or any(m["id"] == name for m in self.model_directory(key)):
+            if name is None or any(m["id"] == name for m in self.model_directory(key, any_endpoint)):
                 return self.oauth_bearer() if self.session else key["secret"]
         raise ValueError("所选模型的账号 Key 已不可用，请刷新模型目录后重试")
 

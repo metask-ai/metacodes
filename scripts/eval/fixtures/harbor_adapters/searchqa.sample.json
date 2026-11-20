@@ -1,0 +1,9 @@
+{
+ "_comment": "Synthetic members in the SearchQA test.zip layout (one JSON per clue); not dataset content.",
+ "members": [
+  {"name": "000101-1000_jeopardy_banking_200.json", "record": {"category": "BANKING", "air_date": "2000-01-01", "question": "It's the central bank of the United States", "value": "$200", "id": 101, "answer": "the Federal Reserve", "round": "Jeopardy!", "show_number": "1000", "search_results": [{"url": "/url?q=https://example.org/fed", "snippet": "The Federal Reserve is the central bank of the United States.", "related_links": null, "title": "Federal Reserve"}, {"url": "/url?q=https://example.org/b", "snippet": "", "related_links": null, "title": "Empty"}]}},
+  {"name": "000102-1000_jeopardy_exports_400.json", "record": {"category": "EXPORTS", "air_date": "2000-01-01", "question": "Brazil was once the top producer of this sweet stuff", "value": "$400", "id": 102, "answer": "cocoa (or chocolate)", "round": "Jeopardy!", "show_number": "1000", "search_results": [{"url": "/url?q=https://example.org/c", "snippet": "Brazil went from being the world's third-leading cocoa producer...", "related_links": null, "title": "Cocoa"}]}},
+  {"name": "000103-1000_jeopardy_unanswered_600.json", "record": {"category": "BROKEN", "air_date": "2000-01-01", "question": "A clue without an answer", "value": "$600", "id": 103, "answer": "", "round": "Jeopardy!", "show_number": "1000", "search_results": [{"url": "/url?q=https://example.org/d", "snippet": "text", "related_links": null, "title": "T"}]}},
+  {"name": "000104-1000_jeopardy_poets_800.json", "record": {"category": "POETS", "air_date": "2000-01-01", "question": "He wrote 'The Raven'", "value": "$800", "id": 104, "answer": "(Edgar Allan) Poe", "round": "Jeopardy!", "show_number": "1000", "search_results": [{"url": "/url?q=https://example.org/e", "snippet": "The Raven is a narrative poem by Edgar Allan Poe.", "related_links": null, "title": "The Raven"}]}}
+ ]
+}

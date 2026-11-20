@@ -95,6 +95,25 @@ def ca_bundle_check() -> str:
     return " || ".join(f"test -s {shlex.quote(path)}" for path in CA_BUNDLE_PATHS)
 
 
+def trust_relay_ca(ca_path: str, trust_bundle: str, bundles=CA_BUNDLE_PATHS) -> str:
+    """Shell that trusts the run's relay CA in a disposable task image.
+
+    The CA is appended to every system bundle present (metacodes reads those
+    paths), and the first non-empty result is copied to `trust_bundle`, one
+    fixed, world-readable path for clients that read no system bundle, such
+    as an LLM judge's httpx (SSL_CERT_FILE). Exits non-zero when no bundle
+    exists or a write fails."""
+    paths = " ".join(shlex.quote(p) for p in bundles)
+    trust = shlex.quote(trust_bundle)
+    parent = shlex.quote(trust_bundle.rsplit("/", 1)[0] or "/")
+    return (f"for bundle in {paths}; do "
+            f'if [ -f "$bundle" ]; then printf "\\n" >> "$bundle"; '
+            f'cat {shlex.quote(ca_path)} >> "$bundle" || exit 1; fi; done; '
+            f"mkdir -p {parent} || exit 1; "
+            f'for bundle in {paths}; do if [ -s "$bundle" ]; then '
+            f'cat "$bundle" > {trust} && chmod 0644 {trust} && exit 0; exit 1; fi; done; exit 1')
+
+
 class BundleError(ValueError):
     """The path given as the metacodes bundle is not a Linux release prefix."""
 
@@ -182,6 +201,37 @@ def metacodes_flags(
             raise ValueError("max_tokens must be a positive integer")
         flags += ["--max-tokens", str(max_tokens)]
     return flags
+
+
+def mcp_servers_config(servers: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+    """metacodes `mcpServers` entries for the MCP servers a Harbor task declares.
+
+    Harbor passes a task's `[[environment.mcp_servers]]` (MCPServerConfig:
+    name, transport sse/streamable-http/stdio, url, command, args, headers)
+    to the agent; GAIA2's CLI mode serves its environment that way. Without
+    them the agent would see none of the task's tools.
+    """
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for server in servers:
+        get = server.get if isinstance(server, Mapping) else (lambda key, s=server: getattr(s, key, None))
+        name, transport = get("name"), get("transport") or "sse"
+        if not isinstance(name, str) or not name:
+            raise ValueError("MCP server without a name")
+        if transport in ("streamable-http", "sse"):
+            if not get("url"):
+                raise ValueError(f"MCP server {name} has no url")
+            entry: Dict[str, Any] = {"type": "http" if transport == "streamable-http" else "sse", "url": get("url")}
+            if get("headers"):
+                entry["headers"] = dict(get("headers"))
+        elif transport == "stdio":
+            if not get("command"):
+                raise ValueError(f"MCP server {name} has no command")
+            entry = {"type": "stdio", "command": get("command"), "args": list(get("args") or [])}
+        else:
+            raise ValueError(f"MCP server {name}: unsupported transport {transport}")
+        result[name] = entry
+    return result
 
 
 def run_command(

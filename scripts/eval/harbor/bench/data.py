@@ -29,7 +29,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from scripts.eval.harbor.profiling import usage_values
+from scripts.eval.harbor.profiling import CONTEXT_PARTS, usage_values
 
 VALID = ("pass", "partial", "fail", "timeout")
 STATUSES = VALID + ("invalid", "running")
@@ -142,6 +142,33 @@ def json_lines(path):
         return
 
 
+def composition_tokens(composition, input_tokens):
+    """A request's input tokens apportioned over its context parts by their
+    byte shares (the relay records sizes only), or None without both."""
+    if not isinstance(composition, dict) or input_tokens is None:
+        return None
+    sizes = {part: number(composition.get(part)) or 0 for part in CONTEXT_PARTS}
+    total = sum(sizes.values())
+    if total <= 0:
+        return None
+    return {part: input_tokens * size / total for part, size in sizes.items()}
+
+
+def tool_events(trial_dir):
+    """Per tool call id: name, error flag and execution time, from the
+    metacodes event stream (tool_start / tool_result)."""
+    calls = {}
+    for event in json_lines(trial_dir / "agent" / "metacodes-output.jsonl"):
+        kind = event.get("type")
+        if kind not in ("tool_start", "tool_result") or not isinstance(event.get("id"), str):
+            continue
+        call = calls.setdefault(event["id"], {"name": str(event.get("name") or "?"), "elapsed_ms": None, "is_error": False})
+        if kind == "tool_result":
+            call["elapsed_ms"] = number(event.get("elapsed_ms"))
+            call["is_error"] = bool(event.get("is_error"))
+    return calls
+
+
 def execution_metrics(trial_dir):
     events = json_lines(trial_dir / "agent" / "metacodes-output.jsonl")
     first, totals, result, first_seen = None, {}, {}, False
@@ -155,10 +182,11 @@ def execution_metrics(trial_dir):
                 totals[key] = totals.get(key, 0) + value
         elif event.get("type") == "result":
             result = event
-    requests = list(json_lines(trial_dir.parent / ".bench-metrics" / (trial_dir.name + ".jsonl")))
-    requests.sort(key=lambda r: (r.get("request", 0), r.get("started_at", "")))
+    requests = request_rows(trial_dir)
+    composition = None
     if requests:
         first = number(requests[0].get("input_tokens"))
+        composition = composition_tokens(requests[0].get("composition"), first)
         if not totals:
             for request in requests:
                 for key in ("input_tokens", "output_tokens", "cache_tokens", "cache_creation_tokens"):
@@ -169,11 +197,17 @@ def execution_metrics(trial_dir):
     ttfts = [t for t in ttfts if t is not None and t >= 0]
     speed = [r for r in requests if r.get("complete") is True and number(r.get("generation_ms"))
              and number(r.get("generation_ms")) > 0 and number(r.get("output_tokens")) is not None]
-    return {"result": result, "usage": totals, "initial_input_tokens": first,
+    return {"result": result, "usage": totals, "initial_input_tokens": first, "initial_composition": composition,
             "requests": len(requests), "ttft_samples_ms": ttfts,
             "tps_output_tokens": sum(r["output_tokens"] for r in speed),
             "tps_generation_ms": sum(r["generation_ms"] for r in speed),
             "profiled_requests": len(speed)}
+
+
+def request_rows(trial_dir):
+    rows = list(json_lines(trial_dir.parent / ".bench-metrics" / (trial_dir.name + ".jsonl")))
+    rows.sort(key=lambda r: (number(r.get("request")) or 0, str(r.get("started_at", ""))))
+    return rows
 
 
 def percentile(values, quantile):
@@ -336,6 +370,7 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
         "tool_calls": agent.get("tool_calls"),
         "input_tokens": input_tokens,
         "initial_input_tokens": measured["initial_input_tokens"],
+        "initial_composition": measured["initial_composition"],
         "total_tokens": total_tokens,
         "tokens_partial": partial,
         "cache_tokens": cache_tokens,
@@ -367,6 +402,7 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
     result = read_json(trial_dir / "result.json") or {}
     exception = result.get("exception_info") or {}
     trajectory = read_json(trial_dir / "agent" / "trajectory.json") or {}
+    calls_by_id = tool_events(trial_dir)
     steps = []
     tools: Dict[str, int] = {}
     for step in trajectory.get("steps") or []:
@@ -383,6 +419,7 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
                     "id": call.get("tool_call_id"),
                     "name": name,
                     "arguments": clip(call.get("arguments") or {}, 3000),
+                    "elapsed_ms": (calls_by_id.get(call.get("tool_call_id")) or {}).get("elapsed_ms"),
                 }
             )
         observation = step.get("observation")
@@ -421,18 +458,94 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
         "verifier_output": tail(trial_dir / "verifier" / "test-stdout.txt"),
         "stderr": tail(trial_dir / "agent" / "metacodes-stderr.log"),
         "final_metrics": trajectory.get("final_metrics"),
+        "requests": request_timeline(trial_dir),
+        "tool_timing": tool_timing(calls_by_id),
+        "time_split": time_split(row, trial_dir, calls_by_id),
     }
+
+
+def request_timeline(trial_dir: Path) -> List[Dict[str, Any]]:
+    """Each model request in order: when it started (seconds after the
+    first), its timing and token usage, and its context split by part."""
+    rows = request_rows(trial_dir)
+    origin = parse_time(rows[0].get("started_at")) if rows else None
+    timeline = []
+    for index, request in enumerate(rows, 1):
+        started = parse_time(request.get("started_at"))
+        input_tokens = number(request.get("input_tokens"))
+        composition = request.get("composition")
+        timeline.append({
+            "seq": index,
+            "offset_s": (started - origin).total_seconds() if started and origin else None,
+            "http_status": number(request.get("http_status")),
+            "complete": request.get("complete") is True,
+            **{key: number(request.get(key)) for key in ("duration_ms", "ttft_ms", "generation_ms", "output_tokens",
+                                                          "cache_tokens", "cache_creation_tokens")},
+            "input_tokens": input_tokens,
+            "composition": composition_tokens(composition, input_tokens),
+            "tool_count": number(composition.get("tool_count")) if isinstance(composition, dict) else None,
+            "messages": number(composition.get("messages")) if isinstance(composition, dict) else None,
+        })
+    return timeline
+
+
+def tool_timing(calls: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per tool: calls, errors, and total / mean / max execution time."""
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for call in calls.values():
+        entry = by_name.setdefault(call["name"], {"name": call["name"], "calls": 0, "errors": 0, "timed": 0,
+                                                  "total_ms": 0.0, "max_ms": None})
+        entry["calls"] += 1
+        entry["errors"] += int(call["is_error"])
+        if call["elapsed_ms"] is not None:
+            entry["timed"] += 1
+            entry["total_ms"] += call["elapsed_ms"]
+            entry["max_ms"] = max(entry["max_ms"] or 0.0, call["elapsed_ms"])
+    for entry in by_name.values():
+        entry["mean_ms"] = entry["total_ms"] / entry["timed"] if entry["timed"] else None
+        if not entry["timed"]:
+            entry["total_ms"] = None
+    return sorted(by_name.values(), key=lambda e: (-(e["total_ms"] or 0), -e["calls"], e["name"]))
+
+
+def time_split(row: Dict[str, Any], trial_dir: Path, calls: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Where the agent phase went: waiting on the model (request durations),
+    running tools (their measured execution), and the rest (harness, I/O)."""
+    durations = [number(r.get("duration_ms")) for r in request_rows(trial_dir)]
+    durations = [d for d in durations if d is not None]
+    model_s = sum(durations) / 1000 if durations else None
+    timed = [c["elapsed_ms"] for c in calls.values() if c["elapsed_ms"] is not None]
+    tool_s = sum(timed) / 1000 if timed else None
+    agent_s = row["phases"].get("agent")
+    other_s = None
+    if agent_s is not None and (model_s is not None or tool_s is not None):
+        other_s = max(0.0, agent_s - (model_s or 0) - (tool_s or 0))
+    return {"agent_s": agent_s, "model_s": model_s, "tool_s": tool_s, "other_s": other_s,
+            "requests": len(durations), "tool_calls": len(calls)}
 
 
 # -------------------------------------------------------------------- jobs
 
 
+# A runner that drives Harbor itself (WorkBuddy) leaves Harbor's own run
+# directories under <job>/<NESTED_RUNS>/<run>/<trial>; their trials belong to
+# the workbench job.
+NESTED_RUNS = "workbuddy"
+
+
 def trial_dirs(job_dir: Path) -> List[Path]:
-    return sorted(
-        child
-        for child in job_dir.iterdir()
-        if child.is_dir() and "__" in child.name and (child / "config.json").is_file()
-    )
+    def trials(parent: Path) -> List[Path]:
+        return [child for child in parent.iterdir()
+                if child.is_dir() and not child.is_symlink() and "__" in child.name
+                and (child / "config.json").is_file()]
+
+    found = trials(job_dir)
+    nested = job_dir / NESTED_RUNS
+    if nested.is_dir() and not nested.is_symlink():
+        for run in sorted(nested.iterdir()):
+            if run.is_dir() and not run.is_symlink():
+                found += trials(run)
+    return sorted(found, key=lambda path: (path.name, str(path)))
 
 
 def job_identity(job_dir: Path) -> Dict[str, Any]:
@@ -480,6 +593,7 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     tps_output = total("tps_output_tokens") or 0
     tps_generation = total("tps_generation_ms") or 0
     initials = [r["initial_input_tokens"] for r in rows if r.get("initial_input_tokens") is not None]
+    compositions = [r["initial_composition"] for r in rows if r.get("initial_composition")]
 
     return {
         "trials": len(rows),
@@ -500,6 +614,8 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "initial_input_tokens": sum(initials) if initials else None,
         "initial_token_trials": len(initials),
         "initial_input_tokens_mean": sum(initials) / len(initials) if initials else None,
+        **composition_fields({part: sum(c.get(part) or 0 for c in compositions) for part in CONTEXT_PARTS}
+                             if compositions else None, len(compositions)),
         "input_tokens": total("input_tokens"),
         "cache_tokens": total("cache_tokens"),
         "output_tokens": total("output_tokens"),
@@ -514,6 +630,13 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             row["phases"]["agent"] for row in rows if row["phases"].get("agent") is not None
         ),
     }
+
+
+def composition_fields(total: Optional[Dict[str, float]], trials: int) -> Dict[str, Any]:
+    """Initial-context composition of a set of trials: the per-part sum, the
+    number of trials that recorded one, and the per-part mean."""
+    return {"initial_composition_sum": total, "initial_composition_trials": trials,
+            "initial_composition_mean": {k: v / trials for k, v in total.items()} if total and trials else None}
 
 
 def merge_summaries(summaries):
@@ -532,29 +655,45 @@ def merge_summaries(summaries):
     result["one_shot_pass_rate"] = result["pass_rate"]
     result["first_pass_rate"] = result["first_passed"] / result["first_valid"] if result["first_valid"] else None
     result["initial_input_tokens_mean"] = result["initial_input_tokens"] / result["initial_token_trials"] if result["initial_token_trials"] else None
+    compositions = [s for s in summaries if s.get("initial_composition_sum")]
+    result.update(composition_fields(
+        {part: sum(s["initial_composition_sum"].get(part) or 0 for s in compositions) for part in CONTEXT_PARTS}
+        if compositions else None, sum(s.get("initial_composition_trials") or 0 for s in compositions)))
     ttfts = [t for s in summaries for t in s.get("ttft_samples_ms", [])]
     result["ttft_samples_ms"] = ttfts
     result.update(performance_fields(ttfts, result["tps_output_tokens"] or 0, result["tps_generation_ms"] or 0))
     return result
 
 
-def job_view(job_dir: Path, with_rows: bool = True) -> Dict[str, Any]:
+def job_header(job_dir: Path) -> Dict[str, Any]:
+    """The job-level fields of a view, from the job's own config and result."""
+
     result = read_json(job_dir / "result.json") or {}
-    rows = [trial_row(path) for path in trial_dirs(job_dir)]
+    started = parse_time(result.get("started_at"))
+    finished = parse_time(result.get("finished_at"))
+    return {
+        "name": job_dir.name,
+        **job_identity(job_dir),
+        "planned": result.get("n_total_trials"),
+        "started_at": started.isoformat() if started else None,
+        "finished_at": finished.isoformat() if finished else None,
+    }
+
+
+def assemble_view(header: Dict[str, Any], rows: List[Dict[str, Any]], with_rows: bool = True) -> Dict[str, Any]:
+    """A job view from its header and trial rows (from files or the store)."""
+
     attempts = {}
     for row in sorted(rows, key=trial_order):
         attempts[row["task"]] = attempts.get(row["task"], 0) + 1
         row["attempt_number"] = attempts[row["task"]]
         row["first_attempt"] = row["attempt_number"] == 1
-    planned = result.get("n_total_trials")
-    started = parse_time(result.get("started_at"))
-    finished = parse_time(result.get("finished_at"))
+    planned = header.get("planned")
+    started = parse_time(header.get("started_at"))
+    finished = parse_time(header.get("finished_at"))
     view = {
-        "name": job_dir.name,
-        **job_identity(job_dir),
+        **header,
         "planned": planned if isinstance(planned, int) else len(rows),
-        "started_at": started.isoformat() if started else None,
-        "finished_at": finished.isoformat() if finished else None,
         "running": finished is None,
         "wall_s": ((finished or dt.datetime.now(dt.timezone.utc)) - started).total_seconds() if started else None,
         "summary": summarize(rows),
@@ -562,6 +701,10 @@ def job_view(job_dir: Path, with_rows: bool = True) -> Dict[str, Any]:
     if with_rows:
         view["rows"] = rows
     return view
+
+
+def job_view(job_dir: Path, with_rows: bool = True) -> Dict[str, Any]:
+    return assemble_view(job_header(job_dir), [trial_row(path) for path in trial_dirs(job_dir)], with_rows)
 
 
 class Library:
@@ -597,10 +740,8 @@ class Library:
         job_dir = self.job_dir(job)
         if job_dir is None or not isinstance(trial, str) or not NAME.match(trial):
             return None
-        candidate = job_dir / trial
-        if candidate.is_symlink() or candidate.parent != job_dir or not (candidate / "config.json").is_file():
-            return None
-        return candidate
+        # Only a trial this job actually lists, never a constructed path.
+        return next((path for path in trial_dirs(job_dir) if path.name == trial), None)
 
     def overview(self) -> List[Dict[str, Any]]:
         views = [job_view(path, with_rows=False) for path in self.jobs().values()]

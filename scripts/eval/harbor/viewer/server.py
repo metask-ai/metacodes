@@ -3,8 +3,9 @@
     python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 18766
 
 This module is presentation only: HTTP routes, authorization and the static
-page. What a route answers comes from `Workbench`; without `--config` it is
-read-only. Python 3.9, stdlib only.
+page. What a route answers comes from `Workbench`, which serves the jobs under
+each `--jobs-dir` from the evaluation store; without `--config` it is
+read-only. Python 3.9; SQLite needs only the standard library.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from http.cookies import SimpleCookie
 from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.store.backend import json_text
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC = {
@@ -42,6 +44,11 @@ SECURITY_HEADERS = (
     # CSP blocks the browser annotation overlays (e.g. Codex desktop's selection).
     ("Referrer-Policy", "no-referrer"),
 )
+
+
+# A batch request lists task names for every dataset; other bodies are small.
+POST_LIMITS = {"/api/batches": 512 * 1024}
+POST_LIMIT = 16384
 
 
 def make_handler(workbench: Workbench, token=""):
@@ -72,13 +79,30 @@ def make_handler(workbench: Workbench, token=""):
                 self.send_json({"error": "请使用 metacodes bench 输出的工作台授权链接"}, 403)
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 16384 or self.headers.get_content_type() != "application/json":
-                    raise ValueError("需要 application/json（不超过 16KB）")
-                payload = json.loads(self.rfile.read(length))
                 path = urlsplit(self.path).path
+                limit = POST_LIMITS.get(path, POST_LIMIT)
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= limit or self.headers.get_content_type() != "application/json":
+                    raise ValueError(f"需要 application/json（不超过 {limit // 1024}KB）")
+                payload = json.loads(self.rfile.read(length))
                 if path == "/api/runs":
                     self.send_json(workbench.launch(payload), 202)
+                elif path == "/api/batches":
+                    self.send_json(workbench.create_batch(payload), 202)
+                elif path == "/api/batch/cancel" and isinstance(payload, dict):
+                    self.send_json(workbench.cancel_batch(payload.get("id")))
+                elif path == "/api/store":
+                    self.send_json(workbench.store_action(payload))
+                elif path == "/api/setup":
+                    self.send_json(workbench.start_setup(payload), 202)
+                elif path == "/api/login" and payload == {}:
+                    self.send_json(workbench.start_login(), 202)
+                elif path == "/api/providers":
+                    self.send_json(workbench.add_provider(payload), 201)
+                elif path == "/api/providers/remove" and isinstance(payload, dict):
+                    self.send_json(workbench.remove_provider(payload.get("id")))
+                elif path == "/api/providers/probe" and isinstance(payload, dict):
+                    self.send_json(workbench.probe_provider(payload.get("id"), payload.get("model")))
                 elif path == "/api/cancel" and isinstance(payload, dict):
                     self.send_json(workbench.cancel(payload.get("name")))
                 elif path == "/api/stop" and payload == {}:
@@ -114,10 +138,34 @@ def make_handler(workbench: Workbench, token=""):
                 self.send_bytes((STATIC_DIR / name).read_bytes(), mime)
             elif path == "/api/workbench":
                 self.send_json({**workbench.catalog(), "can_run": self.authorized()})
+            elif path == "/api/suite":
+                try:
+                    self.send_json(workbench.suite_tasks(query.get("id")))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, 404)
+            elif path in ("/api/setup", "/api/login", "/api/providers"):
+                # Setup logs, the device code and provider endpoints are for
+                # the capability holder.
+                if not self.authorized():
+                    self.send_json({"error": "请使用 metacodes bench 输出的工作台授权链接"}, 403)
+                elif path == "/api/providers":
+                    self.send_json(workbench.providers())
+                elif path == "/api/setup":
+                    self.send_json(workbench.setup_status())
+                else:
+                    self.send_json(workbench.login_status())
+            elif path == "/api/batch":
+                value = workbench.batch(query.get("id"))
+                if value is None:
+                    self.send_json({"error": "no such batch"}, 404)
+                    return
+                self.send_json({**value, "can_run": self.authorized()})
+            elif path == "/api/store":
+                self.send_json(workbench.store_status(self.authorized()))
             elif path == "/api/run":
                 self.send_found(workbench.run(query.get("name")), "no such run")
             elif path == "/api/jobs":
-                self.send_json(workbench.jobs())
+                self.send_json(workbench.jobs(query.get("batch") or "all"))
             elif path == "/api/job":
                 self.send_found(workbench.job(query.get("name", "")), "no such job")
             elif path == "/api/trial":
@@ -127,7 +175,7 @@ def make_handler(workbench: Workbench, token=""):
                 if view is None:
                     self.send_json({"error": "no such job"}, 404)
                     return
-                self.send_bytes(data.job_csv(view).encode("utf-8"), "text/csv; charset=utf-8",
+                self.send_bytes(data.job_csv(view).encode("utf-8", "replace"), "text/csv; charset=utf-8",
                                 attachment=f"{view['name']}.csv")
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -139,7 +187,9 @@ def make_handler(workbench: Workbench, token=""):
                 self.send_json(value)
 
         def send_json(self, value, status: int = 200) -> None:
-            body = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            # A lone surrogate (a broken emoji in a trajectory) is sent as
+            # its JSON escape instead of failing the response.
+            body = json_text(value).encode("utf-8")
             self.send_bytes(body, "application/json; charset=utf-8", status=status)
 
         def send_bytes(self, body: bytes, mime: str, status: int = 200, attachment: Optional[str] = None) -> None:
@@ -160,6 +210,13 @@ def make_handler(workbench: Workbench, token=""):
 
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
+    workbench: Optional[Workbench] = None
+
+    def server_close(self):
+        super().server_close()
+        if self.workbench is not None:
+            self.workbench.close()
+
     def server_bind(self):
         # HTTPServer otherwise reverse-resolves the bind address. A public
         # bind can stall on DNS before the CLI's readiness deadline, even
@@ -170,6 +227,8 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
 
 def make_server(workbench: Workbench, bind: str, port: int, token="") -> ThreadingHTTPServer:
     server = WorkbenchHTTPServer((bind, port), make_handler(workbench, token))
+    server.workbench = workbench
+    workbench.start_batches()
     server.daemon_threads = True
     return server
 
@@ -187,14 +246,17 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     manager = RunManager(args.jobs_dir[0], args.config) if args.config else None
     token = secrets.token_urlsafe(32) if manager else ""
-    server = make_server(Workbench(data.Library(args.jobs_dir), manager), args.bind, args.port, token)
+    workbench = Workbench(data.Library(args.jobs_dir), manager)
+    server = make_server(workbench, args.bind, args.port, token)
+    workbench.sync_in_background()
     host = "127.0.0.1" if args.bind == "0.0.0.0" else args.bind
     url = args.public_url or f"http://{host}:{server.server_address[1]}/"
     url = url.rstrip("/") + "/"
     if args.ready_file:
         atomic_json(args.ready_file, {"url": url, "token": token, "pid": os.getpid(),
                                     "listen_url": f"http://{host}:{server.server_address[1]}/",
-                                    "jobs_dir": str(args.jobs_dir[0].resolve())})
+                                    "jobs_dir": str(args.jobs_dir[0].resolve()),
+                                    "store": workbench.library.store.config.describe()})
         args.ready_file.chmod(0o600)
     print("Bench 工作台：" + url, flush=True)
     try:

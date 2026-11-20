@@ -18,7 +18,9 @@ One trial:
 
 Credentials are not handled here: pass the provider key with Harbor's
 ``--ae NAME=value`` (e.g. ``--ae DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY``), which
-Harbor forwards to the agent's commands and redacts from its logs.
+Harbor forwards to the agent's commands and redacts from its logs. The Bench
+workbench passes only a run-scoped placeholder this way and routes the agent
+through its credential relay (``metrics_proxy``), which holds the real key.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ from harbor.models.trajectories import (
 )
 
 from scripts.eval.harbor import command as cmd
-from scripts.eval.harbor.profiling import routed_config
+from scripts.eval.harbor.profiling import TRUST_BUNDLE, routed_config
 
 # Set instead of `--ak bundle=...` when every trial of a job uses one bundle.
 BUNDLE_ENV = "METACODES_HARBOR_BUNDLE"
@@ -64,7 +66,10 @@ def _sha256(path: Path) -> str:
 class MetacodesAgent(BaseInstalledAgent):
     """Run a metacodes Linux release bundle as a Harbor installed agent."""
 
-    capabilities = AgentCapabilities(atif=True, native_config=True)
+    # mcp_servers: tasks such as GAIA2 (CLI mode) expose their tools through MCP
+    # servers, which the run config below forwards; Harbor refuses such tasks
+    # unless the agent declares it.
+    capabilities = AgentCapabilities(atif=True, native_config=True, mcp_servers=True)
 
     def __init__(
         self,
@@ -154,12 +159,7 @@ class MetacodesAgent(BaseInstalledAgent):
             # endpoint-policy checks remain enabled.
             destination = "/tmp/metacodes-bench-relay-ca.pem"
             await environment.upload_file(self._metrics_ca, destination)
-            bundles = " ".join(shlex.quote(p) for p in cmd.CA_BUNDLE_PATHS)
-            await self.exec_as_root(environment, command=(
-                f"for bundle in {bundles}; do "
-                f'if [ -f "$bundle" ]; then printf "\\n" >> "$bundle"; '
-                f'cat {shlex.quote(destination)} >> "$bundle" || exit 1; fi; done'
-            ))
+            await self.exec_as_root(environment, command=cmd.trust_relay_ca(destination, TRUST_BUNDLE))
 
     async def _ensure_ca_bundle(self, environment: BaseEnvironment) -> None:
         """Install the system CA bundle when the image has none.
@@ -205,11 +205,16 @@ class MetacodesAgent(BaseInstalledAgent):
             local_instruction.write_text(instruction, encoding="utf-8")
             await environment.upload_file(local_instruction, remote_instruction)
             config = self.config_source
-            if config is not None:
+            servers = cmd.mcp_servers_config(self.mcp_servers)
+            if config is not None or servers:
                 local_config = Path(scratch) / "config.json"
-                document = config if isinstance(config, dict) else json.loads(Path(config).read_text(encoding="utf-8"))
-                if self._metrics_proxy:
+                document = {} if config is None else (
+                    config if isinstance(config, dict) else json.loads(Path(config).read_text(encoding="utf-8")))
+                if self._metrics_proxy and config is not None:
                     document = routed_config(document, self._provider, self._metrics_proxy, trial_name)
+                if servers:
+                    # The task's own MCP servers (GAIA2 CLI's ARE sidecar).
+                    document = {**document, "mcpServers": {**(document.get("mcpServers") or {}), **servers}}
                 local_config.write_text(json.dumps(document), encoding="utf-8")
                 remote_config = f"/tmp/metacodes-config-{trial}.json"
                 await environment.upload_file(local_config, remote_config)
