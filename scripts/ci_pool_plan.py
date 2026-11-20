@@ -368,7 +368,9 @@ def cmd_watch(args: argparse.Namespace, env: Dict[str, str], now: Callable[[], f
             print(f"watch: {state}: {detail}")
         if state == "done":
             write_lines(args.github_output, {"fallback": "false", "vm_result": detail})
-            return 0
+            # Fail with the pool job so `gh run rerun --failed` reruns this
+            # watch too; a passing watch would keep the old vm_result.
+            return 0 if detail == "success" else 1
         if state == "fallback":
             write_lines(args.github_output, {"fallback": "true", "vm_result": ""})
             return 0
