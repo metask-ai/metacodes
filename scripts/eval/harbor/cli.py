@@ -44,18 +44,15 @@ def read_env(path):
 
 
 class Client:
-    def __init__(self, url, token="", api_url=None):
+    def __init__(self, url, api_url=None):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
             raise ValueError("工作台地址必须是 http(s) URL")
         self.url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", ""))
-        self.token = token or urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
         self.api_url = api_url or self.url
 
     def request(self, path, payload=None):
         headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = "Bearer " + self.token
         body = None
         if payload is not None:
             body = json.dumps(payload).encode()
@@ -74,7 +71,7 @@ class Client:
             raise ValueError(message) from None
 
     def open_url(self):
-        return self.url + ("?token=" + self.token if self.token else "")
+        return self.url
 
 
 def same_service(saved, jobs_dir, store):
@@ -85,7 +82,7 @@ def ensure_service(args, root, config, jobs_dir, store):
     ready = root / "service.json"
     saved = settings(ready)
     if saved.get("url") and saved.get("jobs_dir") == str(jobs_dir):
-        client = Client(saved["url"], saved.get("token", ""), saved.get("listen_url"))
+        client = Client(saved["url"], saved.get("listen_url"))
         try:
             if client.request("api/workbench").get("service") == "metacodes-bench":
                 if same_service(saved, jobs_dir, store):
@@ -116,7 +113,7 @@ def ensure_service(args, root, config, jobs_dir, store):
         value = settings(handshake)
         if value.get("url"):
             # Do not return a URL until its HTTP service answers.
-            client = Client(value["url"], value.get("token", ""), value.get("listen_url"))
+            client = Client(value["url"], value.get("listen_url"))
             try:
                 client.request("api/workbench")
                 atomic_json(ready, value)
@@ -393,11 +390,11 @@ def main(argv=None):
         jobs_dir = Path(cfg.get("jobs_dir") or root / "jobs").resolve()
         cfg["jobs_dir"] = str(jobs_dir)
         atomic_json(config, cfg)
-        client = Client(args.url, os.environ.get("METACODES_BENCH_TOKEN", "")) if args.url else None
+        client = Client(args.url) if args.url else None
         if client is None and args.action in ("info", "list"):
             saved = settings(root / "service.json")
             if same_service(saved, jobs_dir, store):
-                existing = Client(saved["url"], saved.get("token", ""), saved.get("listen_url"))
+                existing = Client(saved["url"], saved.get("listen_url"))
                 try:
                     if existing.request("api/workbench").get("service") == "metacodes-bench":
                         client = existing
@@ -421,7 +418,7 @@ def main(argv=None):
         if args.action == "stop":
             saved = settings(root / "service.json")
             if client is None and saved.get("url"):
-                client = Client(saved["url"], saved.get("token", ""), saved.get("listen_url"))
+                client = Client(saved["url"], saved.get("listen_url"))
             if client is None:
                 value = {"stopped": True, "message": "工作台未启动"}
             else:

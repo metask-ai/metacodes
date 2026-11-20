@@ -41,8 +41,9 @@ request metrics through the host streaming relay.
 
 `data.py` is the projection (applied to the stored bytes by `../store/ingest.py`),
 `runner.py` validates selections, `batches.py` freezes a bundle and runs a batch's datasets in order, and `worker.py` owns one durable execution
-and ingests its job. HTTP launch/cancel routes require the workbench
-capability. The benchmark catalog (suites, categories, adapters, WorkBuddy
+and ingests its job. The workbench has no login (internal network); POSTs
+with a foreign browser `Origin` are refused, and a service without
+`--config` is read-only. The benchmark catalog (suites, categories, adapters, WorkBuddy
 runner) is `scripts/eval/harbor/suites/`. `executors.py` (this machine or
 SSH hosts), `remote.py` (the driver on an SSH host) and `setup.py`
 (`bench setup`, page sign-in) let a launch run on any configured executor

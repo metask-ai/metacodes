@@ -13,10 +13,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hmac
 import json
 import os
-import secrets
 import socketserver
 import sys
 import threading
@@ -24,7 +22,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
-from http.cookies import SimpleCookie
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.store import config as store_config
@@ -86,7 +83,7 @@ def task_groups(view, item):
     return sorted(groups.values(), key=lambda g: g["task"])
 
 
-def make_handler(library: StoreLibrary, manager=None, token=""):
+def make_handler(library: StoreLibrary, manager=None):
     setups = SetupManager(manager.config_path) if manager else None
     logins = LoginManager(manager.config_path) if manager else None
     if manager is not None:
@@ -216,27 +213,21 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
         server_version = "metacodes-bench-viewer/1"
 
         def authorized(self):
-            if manager is None:
-                return False
-            bearer = self.headers.get("Authorization", "").removeprefix("Bearer ")
-            cookie = SimpleCookie()
-            try:
-                cookie.load(self.headers.get("Cookie", ""))
-            except Exception:
-                return False
-            value = cookie["bench_session"].value if "bench_session" in cookie else ""
-            return bool(token) and (hmac.compare_digest(bearer, token) or hmac.compare_digest(value, token))
+            # The workbench runs on a trusted internal network: whoever can
+            # open the page may configure and launch. Only a service started
+            # without --config (a plain viewer) is read-only.
+            return manager is not None
 
         def do_POST(self):
-            # A browser must prove same-origin intent as well as carry the
-            # workbench capability. Native clients use a bearer capability.
+            # No login, but a page from another site must not drive the
+            # workbench through a visitor's browser.
             origin = self.headers.get("Origin")
             host = self.headers.get("Host", "")
             if origin and urlsplit(origin).netloc != host:
                 self.send_json({"error": "origin refused"}, 403)
                 return
             if not self.authorized():
-                self.send_json({"error": "请使用 metacodes bench 输出的工作台授权链接"}, 403)
+                self.send_json({"error": "当前服务为只读模式"}, 403)
                 return
             try:
                 path = urlsplit(self.path).path
@@ -287,13 +278,6 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
             url = urlsplit(self.path)
             query = {key: values[0] for key, values in parse_qs(url.query).items()}
-            if url.path == "/" and token and hmac.compare_digest(query.get("token", ""), token):
-                self.send_response(303)
-                self.send_header("Set-Cookie", "bench_session=" + token + "; Path=/; HttpOnly; SameSite=Strict")
-                self.send_header("Location", "/")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                return
             try:
                 self.route(url.path, query)
             except BrokenPipeError:
@@ -317,10 +301,9 @@ def make_handler(library: StoreLibrary, manager=None, token=""):
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, 404)
             elif path in ("/api/setup", "/api/login", "/api/providers"):
-                # Setup logs, the device code and provider endpoints are for
-                # the capability holder.
+                # A plain viewer (no --config) has none of these.
                 if not self.authorized():
-                    self.send_json({"error": "请使用 metacodes bench 输出的工作台授权链接"}, 403)
+                    self.send_json({"error": "当前服务为只读模式"}, 403)
                 elif path == "/api/providers":
                     self.send_json(manager.providers.listing())
                 elif path == "/api/setup":
@@ -466,12 +449,12 @@ def library_for(roots, manager=None) -> StoreLibrary:
     return StoreLibrary(store, roots, owns_store=True)
 
 
-def make_server(library, bind: str, port: int, manager=None, token="") -> ThreadingHTTPServer:
+def make_server(library, bind: str, port: int, manager=None) -> ThreadingHTTPServer:
     """`library` is a StoreLibrary, or a data.Library whose roots are then
     served through the workbench's store."""
     if isinstance(library, data.Library):
         library = library_for(library.roots, manager)
-    server = WorkbenchHTTPServer((bind, port), make_handler(library, manager, token))
+    server = WorkbenchHTTPServer((bind, port), make_handler(library, manager))
     server.library = library
     if manager is not None:
         # Batches advance on their own: a dataset ends, the next one starts.
@@ -493,16 +476,15 @@ def main(argv=None) -> int:
     parser.add_argument("--public-url")
     args = parser.parse_args(argv)
     manager = RunManager(args.jobs_dir[0], args.config) if args.config else None
-    token = secrets.token_urlsafe(32) if manager else ""
     library = library_for(args.jobs_dir, manager)
-    server = make_server(library, args.bind, args.port, manager, token)
+    server = make_server(library, args.bind, args.port, manager)
     # Historical imports can take a while; serve meanwhile.
     library.start_background()
     host = "127.0.0.1" if args.bind == "0.0.0.0" else args.bind
     url = args.public_url or f"http://{host}:{server.server_address[1]}/"
     url = url.rstrip("/") + "/"
     if args.ready_file:
-        atomic_json(args.ready_file, {"url": url, "token": token, "pid": os.getpid(),
+        atomic_json(args.ready_file, {"url": url, "pid": os.getpid(),
                                     "listen_url": f"http://{host}:{server.server_address[1]}/",
                                     "jobs_dir": str(args.jobs_dir[0].resolve()),
                                     "store": library.store.config.describe()})

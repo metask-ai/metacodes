@@ -492,12 +492,12 @@ class WorkbenchTest(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.manager = RunManager(self.root / 'jobs', config)
         self.http = server.make_server(data.Library([self.manager.jobs_dir]), '127.0.0.1', 0,
-                                       self.manager, 'test-capability')
+                                       self.manager)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/', 'test-capability')
+        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self):
         return {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 2, 'concurrency': 1}
@@ -527,13 +527,13 @@ class WorkbenchTest(unittest.TestCase):
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
 
-    def test_missing_authorization_and_cross_origin_are_refused(self):
+    def test_no_credential_is_needed_but_cross_origin_is_refused(self):
         import urllib.request
-        anonymous = cli.Client(self.client.url)
-        with self.assertRaisesRegex(ValueError, '授权'):
-            anonymous.request('api/runs', self.request())
-        request = urllib.request.Request(self.client.url + 'api/runs', data=b'{}', headers={
-            'Content-Type': 'application/json', 'Authorization': 'Bearer test-capability', 'Origin': 'https://other.example'})
+        # An internal-network workbench: the page needs no link capability.
+        catalog = self.client.request('api/workbench')
+        self.assertTrue(catalog['can_run'])
+        request = urllib.request.Request(self.client.url + 'api/runs', data=json.dumps(self.request()).encode(), headers={
+            'Content-Type': 'application/json', 'Origin': 'https://other.example'})
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request)
         self.assertEqual(caught.exception.code, 403)

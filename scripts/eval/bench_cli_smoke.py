@@ -54,7 +54,7 @@ def main():
         state = root / 'state'
         env = {**os.environ, 'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                'TOKENJOY_API_KEY': 'private-cli-fixture', 'HOME': str(root),
-               'METACODES_BENCH_URL': '', 'METACODES_BENCH_TOKEN': ''}
+               'METACODES_BENCH_URL': ''}
         command = [str(native), '--state-dir', str(state), 'bench']
         def invoke(extra, expected=0):
             p = subprocess.run(command + extra, env=env, cwd=root, capture_output=True, text=True, timeout=40)
@@ -86,7 +86,7 @@ def main():
             old_url = json.loads(ready.read_text())['url']
             port = str(urlsplit(old_url).port)
             reused = json.loads(invoke(['--no-open', '--json']))
-            assert reused['url'].startswith(old_url + '?token='), reused
+            assert reused['url'] == old_url, reused  # no capability in the link
             with urlopen(old_url, timeout=5) as response:
                 assert 'Content-Security-Policy' in response.headers
             active = json.loads(invoke(['run', '--task', 'fix-git', '--json']))
@@ -97,8 +97,7 @@ def main():
             started = json.loads(invoke(['--no-open', '--json', '--port', port,
                                         '--bundle', config['bundle'], '--provider-config', config['provider_config'],
                                         '--model', config['model'], '--harbor', config['harbor']]))
-            assert started['url'].startswith(old_url + '?token='), started
-            assert started['url'] != reused['url'], 'reopening must issue a new capability'
+            assert started['url'] == old_url, started
             for path in ('', 'index.html'):
                 with urlopen(old_url + path, timeout=5) as response:
                     assert 'Content-Security-Policy' not in response.headers, path

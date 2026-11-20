@@ -198,9 +198,8 @@ result. Every command is logged (in the terminal, or in the page's step list),
 `--dry-run` executes only read-only checks, and no secret is stored or
 printed. Steps that need root run only when `sudo -n` works; otherwise the
 step reports the exact command to run. The page's `POST /api/setup`
-(`{"executor": NAME, "dry_run": bool}`) has the same capability and
-same-origin rules as `/api/runs`, and its progress (`GET /api/setup`) is only
-shown to the capability holder. Setup refuses to run while a benchmark is
+(`{"executor": NAME, "dry_run": bool}`) has the same same-origin rule as
+`/api/runs`. Setup refuses to run while a benchmark is
 active, because it may restart Docker, and a launch is refused while a setup
 that is not a dry run is in progress; the service checks both under one lock.
 
@@ -454,7 +453,7 @@ metacodes bench provider remove --id gw
   through the run's relay to the imported upstream; under `--auth provider`
   its judge reads the execution host's variables as for `--provider-config`
   and the run is allowed.
-- HTTP (workbench capability required): `GET /api/providers`,
+- HTTP: `GET /api/providers`,
   `POST /api/providers` (`id`, `base_url`, `api_key`, optional `name`,
   `protocol`, `auth`, `models`, `replace`, `probe`),
   `POST /api/providers/probe` (`id`, `model`), `POST /api/providers/remove`
@@ -707,24 +706,23 @@ metacodes bench --jobs-dir /path/to/harbor-runs --bind 0.0.0.0 \
   --port 18766 --public-url http://devbox:18766/ --no-open
 
 # On Mac, connect to that existing service:
-metacodes bench --url 'http://devbox:18766/?token=<workbench capability>'
+metacodes bench --url http://devbox:18766/
 metacodes bench info --url http://devbox:18766/
 ```
 
-The link printed when a service starts contains a workbench capability.
-Opening it creates an HttpOnly SameSite cookie and redirects to a clean URL.
-Reads remain available without the capability. Run/cancel requests require
-the cookie or a bearer capability and reject foreign browser origins. A CLI
-client can also supply `METACODES_BENCH_TOKEN`. The workbench keeps its service
-receipt (including capability) at `<state root>/bench/service.json` with mode
-0600 on POSIX.
+The workbench is meant for a trusted internal network and has no login:
+anyone who can open the address can configure it (providers and their API
+keys, database, setup) and launch or cancel runs. Bind it only to an
+internal address. Requests that another site's page sends from a browser
+(a foreign `Origin`) are still refused. A service started without
+`--config` (a plain results viewer) is read-only. The service receipt is
+`<state root>/bench/service.json` (mode 0600 on POSIX).
 
 After upgrading the binary, a running workbench keeps serving the previous
 version. On the service host, use the existing state directory for both
 commands. Run `metacodes bench stop` and wait for the old listener to stop
 responding, then rerun `metacodes bench` with the same jobs directory and any
-bind, port, and public URL options. Open the new link to use selection and
-annotation in Codex desktop. Active benchmark workers continue through the
+bind, port, and public URL options. Active benchmark workers continue through the
 restart.
 
 ## Using the page
@@ -774,8 +772,7 @@ page shows its attempts side by side, then the selected attempt's detail:
   from the metacodes event stream) and the rest; a per-tool timing table.
 - **Trajectory**: every step, with each tool call's execution time.
 
-The 数据库 page shows the active store and its contents. With the workbench
-capability it tests a SQLite path or a PostgreSQL DSN (no password in the
+The 数据库 page shows the active store and its contents. It tests a SQLite path or a PostgreSQL DSN (no password in the
 DSN; `password_env` names the variable), and switches the service to it,
 optionally migrating and verifying the current data first (the same copy as
 `metacodes bench db migrate`). The new `store` is written to `workbench.json`

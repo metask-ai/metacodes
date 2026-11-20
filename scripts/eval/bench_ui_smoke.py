@@ -34,7 +34,7 @@ def main():
         manager = RunManager(root / 'jobs', config)
         with patch.dict(os.environ, {'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                                      'TOKENJOY_API_KEY': 'private-ui-fixture'}):
-            http = server.make_server(data.Library([manager.jobs_dir]), '127.0.0.1', 0, manager, 'ui-fixture')
+            http = server.make_server(data.Library([manager.jobs_dir]), '127.0.0.1', 0, manager)
             threading.Thread(target=http.serve_forever, daemon=True).start()
             try:
                 with sync_playwright() as playwright:
@@ -42,7 +42,7 @@ def main():
                     page = browser.new_page(viewport={'width': 1440, 'height': 1100})
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
-                    page.goto(f'http://127.0.0.1:{http.server_address[1]}/?token=ui-fixture#/new')
+                    page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
                     page.get_by_role('checkbox', name='fix-git', exact=True).check()
                     page.get_by_role('button', name='开始评测', exact=True).click()
                     page.wait_for_url('**/#/run/*')

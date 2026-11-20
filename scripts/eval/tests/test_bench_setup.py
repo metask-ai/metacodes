@@ -643,11 +643,11 @@ class SshRunTest(SetupFixture):
                    harbor=str(self.templates / "harbor"))
         atomic_json(self.config, cfg)
         manager = RunManager(self.state / "bench/jobs", self.config)
-        http = server.make_server(data.Library([manager.jobs_dir]), "127.0.0.1", 0, manager, "cap")
+        http = server.make_server(data.Library([manager.jobs_dir]), "127.0.0.1", 0, manager)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
-        return manager, cli.Client(f"http://127.0.0.1:{http.server_address[1]}/", "cap"), calls
+        return manager, cli.Client(f"http://127.0.0.1:{http.server_address[1]}/"), calls
 
     def request(self):
         return {"model": "metask/session-model", "tasks": ["fix-git"], "attempts": 1, "concurrency": 1,
@@ -1112,20 +1112,16 @@ class SetupHttpTest(SetupFixture):
     def setUp(self):
         super().setUp()
         self.manager = RunManager(self.state / "bench/jobs", self.config)
-        http = server.make_server(data.Library([self.manager.jobs_dir]), "127.0.0.1", 0, self.manager, "cap")
+        http = server.make_server(data.Library([self.manager.jobs_dir]), "127.0.0.1", 0, self.manager)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
         self.url = f"http://127.0.0.1:{http.server_address[1]}/"
-        self.client = cli.Client(self.url, "cap")
+        self.client = cli.Client(self.url)
 
-    def test_setup_endpoint_requires_capability_and_same_origin(self):
-        with self.assertRaisesRegex(ValueError, "授权"):
-            cli.Client(self.url).request("api/setup", {"dry_run": True})
-        with self.assertRaisesRegex(ValueError, "授权"):
-            cli.Client(self.url).request("api/setup")
+    def test_setup_endpoint_requires_same_origin(self):
         request = urllib.request.Request(self.url + "api/setup", data=b'{"dry_run": true}', headers={
-            "Content-Type": "application/json", "Authorization": "Bearer cap", "Origin": "https://evil.example"})
+            "Content-Type": "application/json", "Origin": "https://evil.example"})
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request)
         self.assertEqual(caught.exception.code, 403)
@@ -1187,8 +1183,6 @@ class SetupHttpTest(SetupFixture):
         self.assertEqual((status["verification_uri"], status["user_code"]), ("https://example.invalid/device", "ABCD-1234"))
         self.assertEqual(self.calls("metacodes")[0][1],
                          ["--state-dir", str(self.root / "account"), "login", "--provider", "metask", "--no-browser"])
-        with self.assertRaisesRegex(ValueError, "授权"):
-            cli.Client(self.url).request("api/login")
         # A restarted service has no sign-in of its own: the earlier log's
         # expired device code is not shown as an unfinished sign-in.
         fresh = setup.LoginManager(self.config)
