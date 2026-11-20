@@ -149,7 +149,26 @@ metacodes seat 根本没有放 `command` 的位置;`BudgetEnforcement.wallclock_
 `--config-json` 可覆盖 seat 的 harness/model/effort;`--max-rounds` 与
 `--check-command` 接入 runtime 的真实 dispatch cap / pinned check。
 
-CLI 使用确定性 SWE manager 和请求文件,不执行 interviewer;未接线的角色配置明确拒绝。
+CLI 使用确定性 SWE manager 和请求文件,`--approve` 直接批准请求文件,不执行 interviewer;
+manager 的外部 harness 或 model/effort 配置明确拒绝。
+
+**请求参数段与面试(#518)**:`src/teamwork/interview.zig`。请求开头可以有若干方括号参数段:
+`[skip-interview]` 与 `[seats=<role>:<harness>[:<model>],...]`。`parseSegments` 去掉参数段,
+其余文本即待批准文本;没有前导 `[` 时原样使用。`seats` 是只对本次运行生效的配置层,位于
+项目配置之上、CLI 覆盖之下。未知、重复、未闭合或格式错误的参数段直接报错,不当作请求文本。
+REPL `/teamwork <请求>` 先检查 preview(关闭时明确报错,不退化成普通对话),再按同样的分层
+加载配置;未带 `[skip-interview]` 时由 `interview.draft` 在运行目录里以 `interviewer-1` 运行
+interviewer seat(任意 harness):工作目录是工作区快照的临时 worktree(`interview/`,结束即删),
+花费记入同一运行的预算账本,packet 只含固定文本与用户请求。草稿是 handoff 的 Conclusion 加
+Verification。REPL 把 `app.abort` 转发给面试(Ctrl+C 取消 interviewer,结束后复位,不影响下一条消息)。
+`interview.approve` 连同批准所授权的预算、seats、固定检查与合回目标一起展示,让用户批准、修改(替换全文后再次确认)
+或拒绝;`[skip-interview]` 同样经过这一步,只是展示的是原始请求;批准的字节
+原样交给 `Run.start` 写入 `ORIGINAL_REQUEST.md`,之后才派任何 implementer/reviewer。
+`ApprovedRequest.source`(`request_file` / `skip_interview` / `interview` / `user_edited`)
+写入 `run.json` 的 `request_source`,恢复时保留,`teamwork status` 一并输出。REPL 用
+`AgentJobRegistry.makeProvider` 给运行单独的 provider client,在后台线程驱动 SWE loop,
+提示用户“已开始,可随时用 `/teamwork status` 询问进度”;退出 REPL 会取消未结束的运行,
+可用 `teamwork resume` 继续。
 `command.Host` 向 worker、pinned check 和 verifier 提供强制沙箱,state root 必须在仓库外。
 `run.json` 在创建候选 worktree 前原子保存批准配置、继承模型和宿主权限指纹。`teamwork resume <id>
 --approve` 使用这份配置,拒绝权限和沙箱策略发生变化的恢复请求。`teamwork status <id> [--json]` 只读运行文件,缺失账本为空,
@@ -163,7 +182,8 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 
 ```
 <state_root>/teamwork/<run_id>/
-  ORIGINAL_REQUEST.md     只写一次;审计的基准
+  ORIGINAL_REQUEST.md     只写一次;审计的基准(用户批准后才写)
+  interview/              面试期间的临时快照 worktree,面试结束即删(#518)
   budget.jsonl            预算账本(§5)
   open_issues.json        评审发现台账(#517),初始为 []
   seats/<seat_id>/
@@ -460,7 +480,7 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 `src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
 `teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)、
 `teamwork_runtime`、`teamwork_swe_loop`、`teamwork_audit`、`teamwork_merge_back`、
-`teamwork_verifier_auditor` 与 `teamwork_mcp_server`
+`teamwork_verifier_auditor`、`teamwork_mcp_server` 与 `teamwork_interview`
 (与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 
@@ -515,7 +535,7 @@ L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成�
 | #515 | runtime / seat 分层、角色配置、worker 契约 | 类型、配置、驱动、runtime、确定性 SWE Manager 已接通(§7、§10)。 |
 | #516 | 独立 verifier / 完成审计 | `VerifierAuditor` 已接隔离 verifier,最多两次审计,失败反馈修复轮;只有 PASS 交付。UNVERIFIED 后的 leads 轮仍待做。 |
 | #517 | reviewer 角色与 open-issues 台账 | runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows `workspaceTree` 尚不支持。 |
-| #518 | `/teamwork` 命令、面试与批准 | CLI 显式批准入口、配置加载、状态和恢复。交互式面试与 REPL `/teamwork` 尚待做。 |
+| #518 | `/teamwork` 命令、面试与批准 | 已完成:CLI 显式批准入口、配置加载、状态和恢复;请求参数段 `[skip-interview]` / `[seats=...]`(CLI 与 REPL);REPL `/teamwork` 的 interviewer 面试、批准/修改/拒绝与后台运行;`request_source` 记录批准来源(§3)。 |
 | #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名已由 #544 完成。 |
 | #544 | seat 稳定路径别名 | 已做(§7.1):`$WORKSPACE` / `$SEAT` 在工具准入层解析,隔离 verifier 的快照同样用 `$WORKSPACE`;metacodes seat 的首个 provider 请求跨运行逐字节相同;Claude Code seat 只有 `--add-dir` 取值随运行变化。 |
 | #520 | 运行级预算 | 付费调用前预留、退出记账、丢失报告/崩溃时消耗预留、恢复固定原策略、预算触顶停止且不合回。 |

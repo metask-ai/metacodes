@@ -496,3 +496,217 @@ test "teamwork command: resume refuses a weaker host sandbox policy" {
     try testing.expectEqual(@as(usize, 0), provider.requestCount());
     try testing.expectEqualStrings(live, try c.read("state/teamwork/policy1/run.json"));
 }
+
+test "teamwork command: request segments skip the interview and override seats for one headless run" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    const text = start ++ "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"No handoff in this fixture\"}}\n\n" ++ stop;
+    var server = try harness.MockServer.startCassette(&.{text}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    try c.write("request.md", "[skip-interviews] Add feature.txt.\n");
+    const unknown = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--approve", "--budget-usd", "2", "--api-key", "fixture-key", "--base-url", url });
+    try testing.expectEqual(@as(i32, 2), unknown.exit_code);
+    try testing.expect(std.mem.indexOf(u8, unknown.stderr, "UnknownTeamworkSegment") != null);
+    try testing.expect(!try c.exists("state/teamwork"));
+    try c.write("request.md", "[skip-interview] [seats=reviewer:metacodes:segment-review]\nAdd feature.txt containing feature.\n");
+    const out = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--id", "seg1", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--model", "fixture-original", "--api-key", "fixture-key", "--base-url", url });
+    if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) return;
+    try testing.expectEqual(@as(i32, 1), out.exit_code);
+    try testing.expectEqualStrings("Add feature.txt containing feature.\n", try c.read("state/teamwork/seg1/ORIGINAL_REQUEST.md"));
+    const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read("state/teamwork/seg1/run.json"), .{});
+    try testing.expectEqualStrings("skip_interview", saved.object.get("request_source").?.string);
+    const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, saved.object.get("approved_config_json").?.string, .{});
+    const seats = policy.object.get("seats").?.object;
+    try testing.expectEqualStrings("segment-review", seats.get("reviewer").?.object.get("model").?.string);
+    try testing.expectEqualStrings("fixture-original", seats.get("implementer").?.object.get("model").?.string);
+    const status = try c.cli(&.{ "status", "seg1" });
+    try testing.expectEqual(@as(i32, 0), status.exit_code);
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, status.stdout, .{});
+    try testing.expectEqualStrings("skip_interview", value.object.get("request_source").?.string);
+}
+
+const fake_claude =
+    \\#!/bin/sh
+    \\case "$1" in
+    \\--version) echo '2.1.323 (Claude Code)'; exit 0 ;;
+    \\--help) echo '--print --output-format stream-json --verbose --add-dir --permission-mode acceptEdits dontAsk --permission-prompts host none --no-session-persistence --model --effort --max-budget-usd --append-system-prompt --strict-mcp-config --mcp-config'; exit 0 ;;
+    \\esac
+    \\seat=''; prev=''
+    \\for arg in "$@"; do
+    \\  if [ "$prev" = '--add-dir' ]; then seat="$arg"; fi
+    \\  prev="$arg"
+    \\done
+    \\case "$seat" in
+    \\*interviewer-*)
+    \\  printf 'interview workspace\n' > interview-scratch.txt
+    \\  if [ -f slow-interview ]; then
+    \\    : > "$seat/started"
+    \\    sleep 30
+    \\    : > "$seat/finished"
+    \\  fi
+    \\  cat > "$seat/handoff.md" <<'HANDOFF'
+    \\## Observation
+    \\o
+    \\## Reasoning
+    \\r
+    \\## Caveats
+    \\c
+    \\## Conclusion
+    \\Create feature.txt.
+    \\## Verification
+    \\test -f feature.txt
+    \\HANDOFF
+    \\  ;;
+    \\esac
+    \\echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1}'
+    \\
+;
+
+fn replSession(c: *Case, url: []const u8, input: []const u8) !cc.tools_common.SpawnOut {
+    const raw = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+    const a = c.arena.allocator();
+    const home = try std.fmt.allocPrint(a, "HOME={s}", .{c.root});
+    const tmp = try std.fmt.allocPrint(a, "TMPDIR={s}", .{c.root});
+    return c.spawnInput(&.{ "/usr/bin/env", "-u", "METACODES_PROVIDER", "-u", "METACODES_MODEL", "-u", "METACODES_CONFIG_FILE", "-u", "METASK_API_KEY", "-u", "METASK_GATEWAY_URL", home, tmp, "METACODES_NO_PROBE=1", "METACODES_KG_AUTOSTART=0", "METACODES_JEV_URL=off", std.mem.span(raw), "--state-dir", c.state, "--api-key", "fixture-key", "--model", "fixture", "--base-url", url }, input);
+}
+
+fn onlyRun(c: *Case) ![]const u8 {
+    var dir = try c.tmp.dir.openDir(testing.io, "state/teamwork", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    const entry = (try it.next(testing.io)) orelse return error.NoRun;
+    const name = try c.arena.allocator().dupe(u8, entry.name);
+    try testing.expect((try it.next(testing.io)) == null);
+    return std.fmt.allocPrint(c.arena.allocator(), "state/teamwork/{s}", .{name});
+}
+
+fn replCase(c: *Case) ![]const u8 {
+    const a = c.arena.allocator();
+    try c.write("claude-fixture", fake_claude);
+    const binary = try std.fmt.allocPrintSentinel(a, "{s}/claude-fixture", .{c.root}, 0);
+    try testing.expectEqual(@as(c_int, 0), pfs.chmod(binary, 0o755));
+    const global = try std.fmt.allocPrint(a,
+        \\{{"preview":true,"teamwork":{{"budget_usd":2,"max_rounds":1,"seats":{{"interviewer":{{"harness":"claude_code","command":"{s}"}},"implementer":{{"harness":"claude_code","command":"{s}"}}}}}}}}
+    , .{ binary, binary });
+    try c.write("state/config.json", global);
+    return binary;
+}
+
+test "teamwork REPL L2: a rejected interview starts nothing; an edited approval is ORIGINAL_REQUEST byte for byte" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    var server = try harness.MockServer.startCassette(&.{}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    _ = try replCase(&c);
+
+    const rejected = try replSession(&c, url, "/teamwork Add feature.txt\nn\n");
+    if (std.mem.indexOf(u8, rejected.stderr, "SandboxUnavailable") != null) return;
+    try testing.expect(std.mem.indexOf(u8, rejected.stderr, "Create feature.txt.\n\n## Acceptance checks\n\ntest -f feature.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, rejected.stderr, "Rejected. Nothing was started") != null);
+    const run = try onlyRun(&c);
+    const packet = try c.read(try std.fmt.allocPrint(a, "{s}/seats/interviewer-1/packet.md", .{run}));
+    try testing.expect(std.mem.endsWith(u8, packet, "## Request\n\nAdd feature.txt"));
+    try testing.expect(std.mem.indexOf(u8, packet, c.root) == null);
+    for ([_][]const u8{ "ORIGINAL_REQUEST.md", "run.json", "worktree", "interview", "seats/implementer-1", "seats/reviewer-1" }) |rel|
+        try testing.expect(!try c.exists(try std.fmt.allocPrint(a, "{s}/{s}", .{ run, rel })));
+    try testing.expect(!try c.exists("repo/interview-scratch.txt"));
+    try testing.expectEqual(@as(usize, 0), server.requestCount());
+    try c.tmp.dir.deleteTree(testing.io, "state/teamwork");
+
+    const edited = "Ship feature.txt holding the word \"feature\".  ";
+    const approved = try replSession(&c, url, "/teamwork Add feature.txt\nmaybe\ne\n" ++ edited ++ "\ny\n");
+    try testing.expect(std.mem.indexOf(u8, approved.stderr, "has started in the background") != null);
+    const started = try onlyRun(&c);
+    try testing.expectEqualStrings(edited, try c.read(try std.fmt.allocPrint(a, "{s}/ORIGINAL_REQUEST.md", .{started})));
+    const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read(try std.fmt.allocPrint(a, "{s}/run.json", .{started})), .{});
+    try testing.expectEqualStrings("user_edited", saved.object.get("request_source").?.string);
+    try testing.expect(!try c.exists("repo/interview-scratch.txt"));
+    try c.tmp.dir.deleteTree(testing.io, "state/teamwork");
+
+    const skipped = try replSession(&c, url, "/teamwork [skip-interview] Add feature.txt\ny\n");
+    try testing.expect(std.mem.indexOf(u8, skipped.stderr, "Approving also authorizes spend up to $2") != null);
+    try testing.expect(std.mem.indexOf(u8, skipped.stderr, "has started in the background") != null);
+    const direct = try onlyRun(&c);
+    try testing.expectEqualStrings("Add feature.txt", try c.read(try std.fmt.allocPrint(a, "{s}/ORIGINAL_REQUEST.md", .{direct})));
+    try testing.expect(!try c.exists(try std.fmt.allocPrint(a, "{s}/seats/interviewer-1", .{direct})));
+    const direct_state = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read(try std.fmt.allocPrint(a, "{s}/run.json", .{direct})), .{});
+    try testing.expectEqualStrings("skip_interview", direct_state.object.get("request_source").?.string);
+}
+
+test "teamwork REPL L2: with preview off /teamwork is refused and never becomes a model turn" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    var server = try harness.MockServer.startCassette(&.{}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(c.arena.allocator());
+    try c.write("state/config.json", "{\"teamwork\":{\"budget_usd\":2}}");
+    const out = try replSession(&c, url, "/teamwork Add feature.txt\n");
+    try testing.expect(std.mem.indexOf(u8, out.stderr, "/teamwork is a preview feature and preview is off") != null);
+    try testing.expectEqual(@as(usize, 0), server.requestCount());
+    try testing.expect(!try c.exists("state/teamwork"));
+}
+
+test "teamwork REPL L2: Ctrl+C cancels a running interview and the next message still runs" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    const raw = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+    const reply = start ++ "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello back\"}}\n\n" ++ stop;
+    var server = try harness.MockServer.startCassette(&.{reply}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    _ = try replCase(&c);
+    try c.write("repo/slow-interview", "");
+    const err_file = try c.tmp.dir.createFile(testing.io, "repl.err", .{});
+    const home = try std.fmt.allocPrint(a, "HOME={s}", .{c.root});
+    const tmp = try std.fmt.allocPrint(a, "TMPDIR={s}", .{c.root});
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ "/usr/bin/env", "-u", "METACODES_PROVIDER", "-u", "METACODES_MODEL", "-u", "METACODES_CONFIG_FILE", "-u", "METASK_API_KEY", "-u", "METASK_GATEWAY_URL", home, tmp, "METACODES_NO_PROBE=1", "METACODES_KG_AUTOSTART=0", "METACODES_JEV_URL=off", std.mem.span(raw), "--state-dir", c.state, "--api-key", "fixture-key", "--model", "fixture", "--base-url", url },
+        .cwd = .{ .path = c.repo },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .{ .file = err_file },
+    });
+    defer child.kill(testing.io);
+    err_file.close(testing.io);
+    try child.stdin.?.writeStreamingAll(testing.io, "/teamwork Add feature.txt\n");
+    const run = waitForRun: {
+        var waited: usize = 0;
+        while (waited < 600) : (waited += 1) {
+            if (c.exists("state/teamwork") catch false) {
+                const found = onlyRun(&c) catch null;
+                if (found) |dir| if (try c.exists(try std.fmt.allocPrint(a, "{s}/seats/interviewer-1/started", .{dir}))) break :waitForRun dir;
+            }
+            if (try outputHas(&c, "SandboxUnavailable")) return;
+            try std.Io.sleep(testing.io, .fromMilliseconds(50), .awake);
+        }
+        return error.InterviewNeverStarted;
+    };
+    try std.posix.kill(child.id.?, std.posix.SIG.INT);
+    var waited: usize = 0;
+    while (!try outputHas(&c, "The interview was cancelled.")) : (waited += 1) {
+        if (waited > 600) return error.InterviewNotCancelled;
+        try std.Io.sleep(testing.io, .fromMilliseconds(50), .awake);
+    }
+    try child.stdin.?.writeStreamingAll(testing.io, "hello\n");
+    child.stdin.?.close(testing.io);
+    child.stdin = null;
+    _ = try child.wait(testing.io);
+    try testing.expectEqual(@as(usize, 1), server.requestCount());
+    for ([_][]const u8{ "ORIGINAL_REQUEST.md", "run.json", "interview", "seats/implementer-1", "seats/interviewer-1/finished" }) |rel|
+        try testing.expect(!try c.exists(try std.fmt.allocPrint(a, "{s}/{s}", .{ run, rel })));
+}
+
+fn outputHas(c: *Case, needle: []const u8) !bool {
+    const text = c.read("repl.err") catch return false;
+    return std.mem.indexOf(u8, text, needle) != null;
+}

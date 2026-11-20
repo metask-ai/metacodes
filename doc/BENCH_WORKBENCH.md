@@ -56,6 +56,7 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 竞赛数学 | `aime-2025` | harbor-registry | `-d aime@1.0`, 2025 I/II only | 30 (30) |
 | 终端工程 | `terminal-bench-2.1` | harbor-registry | `-d terminal-bench/terminal-bench-2-1` | 89 (89) |
 | 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
+| 终端工程 | `frontier-harness-eval-1.1` | harbor-registry | `-d frontier-harness-eval/frontier-harness-eval@v1.1.0` | 62 (62) |
 | 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
@@ -76,6 +77,14 @@ is in neither registry, so `gaia2-cli` runs a locally generated dataset with
 `-p`. Its tasks reach the agent's tools through an MCP sidecar
 (`[[environment.mcp_servers]]`), which the metacodes Harbor agent writes into
 the trial's `mcpServers`.
+
+`frontier-harness-eval-1.1` is the pinned task set of the
+[FrontierHarness Eval](https://frontierharness.org/) leaderboard (a Hub
+dataset whose 62 tasks are named `terminal-bench/<name>`). The workbench runs
+it on its own Docker executors with the chosen model, so scores are for
+internal comparison: leaderboard results use Runta runtimes, the five Baseten
+models at effort `max` and 4 attempts per task
+([frontier-harness-eval/eval](https://github.com/frontier-harness-eval/eval/tree/release/v1.1)).
 
 `bench prepare --suite gaia2-cli` needs no manual steps on the workbench
 machine: it fetches Harbor v0.26.0 at its pinned commit
