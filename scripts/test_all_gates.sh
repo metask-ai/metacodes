@@ -5,7 +5,7 @@
 # all the tests — dev-only suites passed while deployment reality went
 # unasserted. Set the env vars below to real fixtures where available.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 : "${METACODES_WB_CORPUS:=/private/tmp/workbuddy-full-20260816/results}"
 : "${METACODES_WORKBUDDY_CHECKOUT:=/private/tmp/workbuddy-full-20260816}"

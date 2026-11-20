@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Grade report.md for the taint_trace case: exactly one FINDING line naming
 the unguarded chain (handlers.export -> exec_backend.run_command)."""
-import re
 import sys
 from pathlib import Path
 

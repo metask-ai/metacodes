@@ -5,9 +5,7 @@
 """
 from __future__ import annotations
 import re
-import sys
 from pathlib import Path
-from collections import OrderedDict
 
 PRISM_SRC = Path("/tmp/prism-src/src/languages")
 
@@ -917,12 +915,12 @@ def main():
         entries.append(entry)
 
     # ── 序列化为二进制 blob ──────────────────────────────────
-    import struct, zlib
+    import struct
+    import zlib
 
     # escape 类型映射: 0=无转义, 1=\, 2=''
     ESCAPE_BACKSLASH = 1
     ESCAPE_DOUBLE = 2
-    ESCAPE_NONE = 0
 
     # 某些语言用 '' 转义而非 \
     DOUBLE_ESCAPE_LANGS = {"sql", "pascal", "vbnet", "visual-basic", "delphi", "ada", "eiffel", "fortran"}

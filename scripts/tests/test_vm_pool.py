@@ -394,7 +394,9 @@ class GitHubTest(PoolTestCase):
     def test_the_app_jwt_is_signed_by_the_private_key(self) -> None:
         github, _ = self.github({})
         header, payload, signature = github.app_jwt().split(".")
-        decode = lambda part: base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+        def decode(part):
+            return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
         self.assertEqual(json.loads(decode(header)), {"alg": "RS256", "typ": "JWT"})
         self.assertEqual(json.loads(decode(payload)), {"iat": NOW - 60, "exp": NOW + 540, "iss": 7})
         public = self.tmp / "app.pub"
@@ -485,7 +487,9 @@ class CheckTest(PoolTestCase):
         for name in ("app.pem", "vm_key"):
             (self.tmp / name).write_text("k", encoding="utf-8")
             os.chmod(self.tmp / name, 0o600)
-        which = lambda tool: f"/usr/bin/{tool}"
+        def which(tool):
+            return f"/usr/bin/{tool}"
+
         out = io.StringIO()
         with redirect_stdout(out):
             self.assertEqual(pool.check(self.config, self.host(), which), 0, out.getvalue())

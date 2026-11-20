@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate report.md from data/ (shard summaries + meta). Do not hand-edit report."""
-import json, glob, statistics
+import json
+import glob
+import statistics
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 meta = json.loads((HERE/"data/meta.json").read_text())
@@ -8,19 +10,22 @@ rows = []
 for f in sorted(glob.glob(str(HERE/"data/run-metacodes-oj/*.json"))):
     rows += json.load(open(f))["rows"]
 seen = {}
-for r in rows: seen[r["task_id"]] = r
+for r in rows:
+    seen[r["task_id"]] = r
 rows = list(seen.values())
 graded = [r for r in rows if r.get("task_score") is not None and r.get("evaluation_complete") == 1]
 passed = sum(1 for r in graded if r.get("passed") == 1)
 tot = sum(r["task_score"] for r in graded)
 sc = sorted(r["task_score"] for r in graded)
 dist = [0]*5
-for x in sc: dist[min(4, int(x*5))] += 1
+for x in sc:
+    dist[min(4, int(x*5))] += 1
 res = [(r["task_id"], str(r.get("error") or "")) for r in rows if r.get("evaluation_complete") == 0 or r.get("error")]
 L = []
 L.append(f"# 评测报告:{meta['round']}\n")
 L.append("> 本文件由 generate_report.py 从 data/ 生成,请勿手改。\n")
-s = meta["system_under_test"]; j = meta["judge"]
+s = meta["system_under_test"]
+j = meta["judge"]
 L.append(f"- 被测系统:**{s['scaffold']}** @ `{s['commit'][:12]}` × {s['model']}")
 L.append(f"- Judge:**{j['model']}** ×{j['repeats']}(定义内配置,可对标官方)")
 L.append(f"- 拓扑:patron {meta['topology']['patron']};kunshan {meta['topology']['kunshan']}\n")

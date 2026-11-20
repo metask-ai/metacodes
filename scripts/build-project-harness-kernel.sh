@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 # A step that fails inside `$(...)` would otherwise end the script with its
 # output still captured: name the line and the command on the way out.
-trap 'status=$?; echo "build-project-harness-kernel: failed (exit $status) at line $LINENO: $BASH_COMMAND" >&2' ERR
+trap 'echo "build-project-harness-kernel: failed (exit $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 lean_dir="$repo_dir/control-plane/lean"

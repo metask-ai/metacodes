@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-from .model import Binding, Busy, LoopError, REPORT_SCHEMA, REQUIRED_CHECKS, SHA, Snapshot, validate_report
+from .model import Busy, LoopError, REQUIRED_CHECKS, SHA, Snapshot
 from .policy import require_direct_merge
 
 
