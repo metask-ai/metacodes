@@ -174,6 +174,30 @@ def selectable(path, repo=None):
     return _verified_by(info, info["commit"], repo or DEFAULT_REPO)
 
 
+def provenance(path):
+    if not is_git_unit(path):
+        return None
+    info = build_info(Path(path))
+    return {key: info[key] for key in ("commit", "source_id", "trust_policy")} if info else None
+
+
+def frozen_problem(frozen, repo=None):
+    git = frozen.get("git")
+    if not git and not is_git_unit(frozen.get("source_bundle") or ""):
+        return None
+    refusal = "批次冻结的 metacodes 包由 Git 构建，当前 source_repo 没有验证它，本项不再运行"
+    if not isinstance(git, dict) or git.get("trust_policy") != TRUST_POLICY \
+            or git.get("source_id") != source_id(repo or DEFAULT_REPO):
+        return refusal
+    try:
+        source = check_bundle(Path(frozen["bundle"])).get("source")
+    except ValueError:
+        return refusal
+    if not isinstance(source, dict) or source.get("commit") != git.get("commit"):
+        return refusal
+    return None
+
+
 def _redact(text, repo):
     return re.sub(r"(://)[^/@\s]+@", r"\1***@", text.replace(repo, "<source_repo>"))
 

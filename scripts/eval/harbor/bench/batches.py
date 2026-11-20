@@ -259,6 +259,9 @@ class BatchManager:
                             "concurrency": run_request["concurrency"], "request": run_request, "route": checked["route"],
                             "status": "pending", "run": None, "error": None, "started_at": None, "finished_at": None})
         metacodes = freeze(choice, self.runs.config_path)
+        git = builds.provenance(choice["path"])
+        if git:
+            metacodes["git"] = git
         batch_id = _new_id()
         record = {"id": batch_id, "name": name.strip() or None, "status": "queued", "created_at": now(),
                   "started_at": None, "finished_at": None, "model": request.get("model"),

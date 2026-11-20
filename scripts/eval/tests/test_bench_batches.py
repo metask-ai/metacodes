@@ -295,6 +295,40 @@ class BatchTest(unittest.TestCase):
             spec = json.loads((self.manager.jobs_dir / '.bench-runs' / (item['run'] + '.spec')).read_text())
             self.assertEqual(spec['bundle'], frozen)
 
+    def test_frozen_git_bundle_runs_after_the_original_is_archived(self):
+        unit = self.git_unit('d' * 40, 'https://example.com/fork.git')
+        cfg = {k: v for k, v in json.loads(self.config.read_text()).items() if k != 'bundle'}
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        archive = self.root / 'archive'
+        archive.mkdir()
+        for path in (self.root / 'bundles').glob(unit + '*'):
+            path.rename(archive / path.name)
+        final = self.wait_batch(created['id'])
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual([i['status'] for i in final['items']], ['finished', 'finished'])
+
+    def test_frozen_git_bundle_is_refused_after_a_repository_switch(self):
+        unit = self.git_unit('e' * 40, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/official.git'})
+        final = self.wait_batch(created['id'], statuses=('finished', 'failed', 'cancelled'))
+        self.assertTrue(all('source_repo 没有验证' in (i['error'] or '') for i in final['items']), final)
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_default_bundle_is_judged_by_its_resolved_path(self):
+        unit = self.git_unit('f' * 40, 'https://example.com/fork.git')
+        link = self.root / 'current-bundle'
+        link.symlink_to(self.root / 'bundles' / unit)
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'bundle': str(link), 'source_repo': 'https://example.com/official.git'})
+        run = {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}
+        with self.assertRaisesRegex(ValueError, 'source_repo 没有验证'):
+            self.client.request('api/runs', run)
+        self.assertEqual(self.manager.runs(), [])
+
     def test_invalid_batches_are_refused_before_anything_is_written(self):
         for override in ({'items': []}, {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}] * 2},
                          {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git;rm -rf /']}]},
