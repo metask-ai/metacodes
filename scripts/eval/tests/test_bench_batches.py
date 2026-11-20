@@ -21,7 +21,7 @@ from scripts.eval.harbor import cli, profiling
 from scripts.eval.harbor.store.backend import Store
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest
-from scripts.eval.harbor.bench import batches, data
+from scripts.eval.harbor.bench import batches, data, executors
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
@@ -336,33 +336,58 @@ class BatchTest(unittest.TestCase):
                 bench.delete_batch(batch['id'])
         self.assertTrue((other.jobs_dir / run).is_dir())
 
-    def test_an_import_waits_for_a_deletion_and_does_not_restore_the_batch(self):
+    def test_imports_syncs_and_deletions_of_a_jobs_directory_exclude_each_other(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         batch = self.wait_batch(self.client.request('api/batches', one)['id'])
-        self.client.request('api/batch?id=' + batch['id'])
-        imported = threading.Event()
-        removing = threading.Event()
         library = self.workbench.library
-        remove = self.workbench._remove_run_files
+        lock = self.manager.jobs_dir / ingest.ROOT_LOCK
+        with ingest.root_lock(self.manager.jobs_dir):
+            lock.chmod(0o400)
+            importer = threading.Thread(target=ingest.ingest_root, args=(library.store, self.manager.jobs_dir))
+            outcome = {}
 
-        def slow_remove(runs):
-            removing.set()
-            imported.wait(1)
-            remove(runs)
+            def sync_back():
+                try:
+                    executors.sync_run(self.manager.jobs_dir, 'missing-run', log=lambda text: None)
+                except ValueError as exc:
+                    outcome['error'] = str(exc)
 
-        def import_now():
-            removing.wait(5)
-            ingest.ingest_root(library.store, self.manager.jobs_dir)
-            imported.set()
-
-        importer = threading.Thread(target=import_now)
-        importer.start()
-        with patch.object(self.workbench, '_remove_run_files', side_effect=slow_remove):
-            self.workbench.delete_batch(batch['id'])
+            syncer = threading.Thread(target=sync_back)
+            importer.start()
+            syncer.start()
+            with self.assertRaisesRegex(ValueError, '稍后重试'):
+                self.workbench.delete_batch(batch['id'])
+            time.sleep(.3)
+            self.assertTrue(importer.is_alive())
+            self.assertTrue(syncer.is_alive())
         importer.join(10)
-        self.assertTrue(imported.is_set())
-        with library.store.read() as tx:
-            self.assertIsNone(tx.one("SELECT id FROM batches WHERE id = ?", (batch['id'],)))
+        syncer.join(10)
+        self.assertIn('运行不存在', outcome['error'])
+        self.assertTrue(self.manager.batches.path(batch['id']).exists())
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertEqual(self.client.request('api/store')['counts']['batches'], 0)
+
+    def test_a_partly_removed_launch_failure_keeps_its_receipt_for_a_retry(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        atomic_json(self.manager.records / 'launch-failed.json', {'name': 'launch-failed', 'status': 'failed',
+                                                                  'batch': batch['id'], 'error': 'OSError'})
+        for suffix in ('.log', '.spec'):
+            (self.manager.records / ('launch-failed' + suffix)).write_text('x')
+        unlink = Path.unlink
+
+        def failing_unlink(path, missing_ok=False):
+            if path.name == 'launch-failed.log':
+                raise PermissionError('denied')
+            unlink(path, missing_ok=missing_ok)
+
+        with patch.object(Path, 'unlink', failing_unlink):
+            with self.assertRaisesRegex(ValueError, '可以重试'):
+                self.workbench.delete_batch(batch['id'])
+        self.assertTrue((self.manager.records / 'launch-failed.json').exists())
+        deleted = self.workbench.delete_batch(batch['id'])
+        self.assertIn('launch-failed', deleted['runs'])
+        self.assertEqual(list(self.manager.records.glob('launch-failed.*')), [])
 
     def test_a_batch_from_another_jobs_directory_is_refused(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])

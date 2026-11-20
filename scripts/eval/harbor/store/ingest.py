@@ -756,25 +756,39 @@ ROOT_LOCK = ".bench-store.lock"
 
 
 @contextlib.contextmanager
-def root_lock(root: Path) -> Iterator[None]:
-    """Serializes imports and batch deletions of one jobs directory across
-    processes. A directory this process cannot write is imported unlocked:
-    nothing here can delete from it either."""
+def root_lock(root: Path, wait: bool = True) -> Iterator[None]:
+    """Serializes imports, manual result syncs and batch deletions of one
+    jobs directory across processes. A missing directory, or one this
+    process cannot write that has no lock yet, is read unlocked: nothing
+    here can delete from it."""
+    path = Path(root) / ROOT_LOCK
     try:
-        fd = os.open(Path(root) / ROOT_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
+        fd = os.open(path, (os.O_RDWR if os.name == "nt" else os.O_RDONLY) | os.O_CREAT, 0o600)
+    except FileNotFoundError:
         yield
         return
+    except OSError as exc:
+        if not path.exists() and not os.access(root, os.W_OK):
+            yield
+            return
+        raise ValueError(f"无法打开 jobs 目录的锁 {path}（{exc.strerror}），处理后可以重试") from None
     try:
         if os.name == "nt":
             import msvcrt
             if not os.fstat(fd).st_size:
                 os.write(fd, b"\0")
             os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            mode = msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK
         else:
             import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            mode = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            if os.name == "nt":
+                msvcrt.locking(fd, mode, 1)
+            else:
+                fcntl.flock(fd, mode)
+        except OSError:
+            raise ValueError("这个 jobs 目录正在导入或同步结果，请稍后重试") from None
         try:
             yield
         finally:
@@ -787,11 +801,11 @@ def root_lock(root: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def ingest_root(store: Store, root: Path, *, verify: bool = False,
+def ingest_root(store: Store, root: Path, *, verify: bool = False, wait: bool = True,
                 log: Callable[[str], None] = lambda message: None) -> RootResult:
     """Every job directory and launch record under one Harbor jobs directory."""
     root = Path(root).expanduser().resolve()
-    with root_lock(root):
+    with root_lock(root, wait):
         return _ingest_root(store, root, verify, log)
 
 

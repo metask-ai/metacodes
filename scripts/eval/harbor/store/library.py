@@ -52,7 +52,7 @@ class StoreLibrary:
         results = []
         for root in self.roots:
             try:
-                results.append(ingest.ingest_root(self.store, root, verify=verify, log=self.log))
+                results.append(ingest.ingest_root(self.store, root, verify=verify, wait=False, log=self.log))
             except ValueError as exc:
                 self.log("bench store: " + str(exc))
         ingest.refresh_projections(self.store, self.log)
@@ -176,7 +176,7 @@ class StoreLibrary:
         owners = [("batches", "id", batch_id, jobs_dir / ingest.BATCHES_DIR)]
         for job in jobs:
             owners += [("runs", "name", job, jobs_dir / ".bench-runs"), ("jobs", "name", job, jobs_dir / job)]
-        with self._sync_lock, ingest.root_lock(jobs_dir):
+        with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
             with self.store.read() as tx:
                 sources = {(table, value): tx.one(f"SELECT source_dir FROM {table} WHERE {key} = ?", (value,))
                            for table, key, value, _ in owners}

@@ -307,7 +307,7 @@ class Workbench:
                     shutil.rmtree(manager.jobs_dir / run)
                 except FileNotFoundError:
                     pass
-            for path in receipts:
+            for path in sorted(receipts, key=lambda path: path.suffix == ".json"):
                 path.unlink(missing_ok=True)
         except OSError as exc:
             raise ValueError(f"删除文件失败（{exc}），批次已保留，处理后可以重试") from None

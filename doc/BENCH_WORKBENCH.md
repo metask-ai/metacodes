@@ -840,9 +840,11 @@ Only a batch recorded in this service's jobs directory is deleted; one ingested
 from another jobs directory sharing the database is refused. When a file
 cannot be removed or the database delete fails, the request fails and the
 batch stays for a retry: the manifest goes last, after the rows are gone.
-Imports of a jobs directory (the service's sync, `bench db import`) and
-deletions from it take the same lock, `<jobs-dir>/.bench-store.lock`, so an
-import cannot write a deleted batch back.
+Imports of a jobs directory (the service's sync, `bench db import`),
+`bench sync --run` and deletions from it take the same lock,
+`<jobs-dir>/.bench-store.lock`, so none of them can write a deleted batch
+back. A deletion that finds the lock held fails and can be retried; the
+service's sync skips the directory until its next round.
 Batch records are ingested into the `batches` table of the evaluation
 database (schema v3).
 
@@ -915,7 +917,7 @@ there into the evaluation database):
 <jobs-dir>/
   .bench-runs/                     # launch receipts, specs, worker logs
   .bench-batches/<id>.json         # batches: frozen version, datasets, state
-  .bench-store.lock                # serializes imports and batch deletions
+  .bench-store.lock                # serializes imports, result syncs and batch deletions
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage
