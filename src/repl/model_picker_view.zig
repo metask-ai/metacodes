@@ -95,11 +95,14 @@ fn emptyText(picker: *const Picker, buf: []u8) []const u8 {
 /// The list is empty because no provider has a credential, not because of a
 /// filter or the catalog's state (#488).
 fn noneConfigured(picker: *const Picker) bool {
-    if (picker.filter_len > 0) return false;
-    return switch (picker.status) {
-        .ready, .stale => true,
-        .loading, .empty, .failed => false,
-    };
+    switch (picker.status) {
+        .ready, .stale => {},
+        .loading, .empty, .failed => return false,
+    }
+    for (0..picker.offers.items.len) |index| {
+        if (picker.isReady(index)) return false;
+    }
+    return true;
 }
 
 fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
@@ -375,7 +378,7 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme, applies: bool) u1
     line(w);
     const esc: []const u8 = if (picker.filter_len > 0) "esc clear filter" else "esc cancel";
     if (!applies) {
-        w.print("  {s}{s} · q close{s}", .{ th.dim, esc, th.reset }) catch {};
+        w.print("  {s}{s}{s}", .{ th.dim, esc, th.reset }) catch {};
     } else {
         const reasoning = if (picker.focusedOffer()) |offer| picker_mod.firstEnumeration(offer.controls) != null else false;
         w.print("  {s}enter apply{s} · tab scope{s} · {s}{s}", .{
@@ -937,8 +940,8 @@ test "with no provider configured, the list says /login and this install's .env,
     const text = try screen(arena, &picker, 120);
     const hint = "no providers configured — /login, or configure /home/u/.metacodes/.env";
     try testing.expect(std.mem.indexOf(u8, text, hint) != null);
-    try testing.expect(std.mem.indexOf(u8, text, "esc cancel · q close") != null);
-    for ([_][]const u8{ "enter apply", "m1", "k1", "Not configured" }) |gone| {
+    try testing.expect(std.mem.indexOf(u8, text, "esc cancel") != null);
+    for ([_][]const u8{ "enter apply", "m1", "k1", "Not configured", "q close" }) |gone| {
         try testing.expect(std.mem.indexOf(u8, text, gone) == null);
     }
     // A long path wraps inside the width, and the rows drawn are the rows
@@ -955,6 +958,27 @@ test "with no provider configured, the list says /login and this install's .env,
                 return error.RowTooWide;
             }
         }
+    }
+}
+
+test "with no provider configured, a filter typed, q first, still names only the ways out (#599)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{
+        offerOf("metask", "default", "m1", "anthropic_messages"),
+        offerOf("qwen", "default", "qwen3", "openai_chat"),
+    };
+    try seed(&picker, &offers, null);
+    try picker.setReadiness(&.{ false, false }, &.{});
+    try testing.expect(picker.onKey(.{ .char = 'q' }) == .redraw);
+    const text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing matches this filter — Esc clears it") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "esc clear filter") != null);
+    for ([_][]const u8{ "enter apply", "tab scope", "q close", "qwen3" }) |gone| {
+        try testing.expect(std.mem.indexOf(u8, text, gone) == null);
     }
 }
 

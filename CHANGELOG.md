@@ -744,6 +744,16 @@ status, compatibility boundaries, and entry points are defined by
   ended the line typed so far was sent as the next message. It now inserts
   a newline in the draft, as it does at the prompt; Enter still queues the
   whole draft, newline included, as one message.
+- **A `/model` search can start with `q`** (#599). On an empty filter `q`
+  closed the picker, so typing `qwen` closed the list on its first letter
+  and left `wen` in the input box: no model whose name starts with `q`
+  could be searched for. `q` is now a filter letter like any other, as the
+  list's `type to filter` says, and Esc is the way out (it clears the filter
+  first). The list no longer shows `q close`, and when no provider is
+  configured it names only the ways out with a filter typed too (it said
+  `enter apply · tab scope`, though there was nothing to apply). The screen
+  that says where a provider's key goes has nothing to type into and still
+  closes on `q`.
 - **`/model` names the variable and the file for a provider without a key**
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these

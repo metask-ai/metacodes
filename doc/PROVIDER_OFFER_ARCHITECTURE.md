@@ -1171,8 +1171,9 @@ The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
 streaming; a commit during a reply changes the next turn, not the one in flight.
 `Ctrl+C`/`Ctrl+D` deliberately pass through, so there is always an exit that does
-not depend on the picker's own state machine. `q` closes only on an empty
-filter, which keeps it typeable inside a model name.
+not depend on the picker's own state machine. Every printable key is the
+filter, `q` included, so a search can start with any letter (#599); Esc
+clears the filter, then closes.
 
 Enter commits at the scope the header brackets. Session is the default, and
 `Tab` cycles session → global → once, so any durable write is an explicit act
