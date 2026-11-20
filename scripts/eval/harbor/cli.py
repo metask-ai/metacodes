@@ -14,6 +14,7 @@ import ipaddress
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -368,10 +369,25 @@ def show(value, as_json, render, *extra):
         render(value, *extra)
 
 
+def build_command(args, root, cfg):
+    from scripts.eval.harbor.bench import builds
+    stop = threading.Event()
+    previous = signal.signal(signal.SIGINT, lambda *_: stop.set())
+    try:
+        unit, info = builds.bundle(args.ref, root, cfg.get("source_repo"), cancelled=stop.is_set)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    value = {"bundle": unit.name, "path": str(unit), "ref": info["ref"], "commit": info["commit"],
+             "version": info["version"]}
+    print(json.dumps(value, ensure_ascii=False) if args.json else
+          f"{value['bundle']}：{args.ref} @ {value['commit'][:12]}（{value['version']}），已可在批次中选择")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
-                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync", "provider"])
+                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync", "provider", "build"])
     parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"] + PROVIDER_COMMANDS,
                         help="bench db 的子命令（status、import、migrate）或 bench provider 的子命令（add、list、remove、probe）")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
@@ -408,6 +424,7 @@ def main(argv=None):
     parser.add_argument("--run", metavar="NAME", help="sync：把这次 SSH 执行机器运行的结果同步回本机")
     parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
     parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
+    parser.add_argument("--ref", help="build：在 Docker 中编译这个 git 版本（提交、分支或 tag）的 Linux 包，供批次选择")
     parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
     parser.add_argument("--id", help="provider：Provider 标识（小写字母、数字、-、_），模型以 <标识>/<模型> 出现")
     parser.add_argument("--name", help="provider add：显示名称")
@@ -461,10 +478,13 @@ def main(argv=None):
             # Local to this machine's workbench state, like setup; a running
             # service sees the change on its next catalog read.
             return provider_command(args, root)
+        previous_bundle = Path(cfg["bundle"]).expanduser().resolve() if cfg.get("bundle") else None
         for name in ("bundle", "provider_config", "jobs_dir", "account_state_dir", "workbuddy_checkout"):
             value = getattr(args, name)
             if value is not None:
                 cfg[name] = str(value.expanduser().resolve())
+        if args.bundle is not None and Path(cfg["bundle"]) != previous_bundle:
+            cfg.pop("bundle_source", None)
         for name in ("model", "key_env", "harbor"):
             value = getattr(args, name)
             if value is not None:
@@ -487,6 +507,10 @@ def main(argv=None):
         cfg["jobs_dir"] = str(jobs_dir)
         atomic_json(config, cfg)
         client = Client(args.url) if args.url else None
+        if args.action == "build":
+            if args.url or args.ref is None:
+                parser.error("bench build 需要 --ref，并在保存这个包的工作台机器上运行")
+            return build_command(args, root, cfg)
         if args.action == "prepare":
             if args.url or not args.suite:
                 parser.error("bench prepare 需要 --suite，并在执行机器本地运行")

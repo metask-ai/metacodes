@@ -21,7 +21,7 @@ from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
-from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.bench.providers import KEY_ENV as PROVIDER_KEY_ENV, Providers, loopback, write_config
 
@@ -200,7 +200,7 @@ class RunManager:
                      reasons=default["reasons"], ready=not default["reasons"])
         return entry
 
-    def catalog(self):
+    def catalog(self, bundle_supplied=False):
         from scripts.eval.harbor.bench.batches import bundle_choices
         cfg = settings(self.config_path)
         mode = cfg.get("auth_mode") or ("provider" if cfg.get("provider_config") else "metask")
@@ -262,11 +262,9 @@ class RunManager:
         global_reasons = list(reasons)
         # Harbor suites need the Linux bundle; WorkBuddy brings its own
         # Harbor and staged artifacts and checks its own prerequisites.
-        harbor_reasons = []
-        try:
-            check_bundle(Path(cfg.get("bundle") or "/nonexistent-metacodes-bundle"))
-        except ValueError:
-            harbor_reasons.append("请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本")
+        choices = bundle_choices(cfg, self.config_path)
+        default_problem = None if choices or bundle_supplied else self.run_bundle(cfg, None, None)[1]
+        harbor_reasons = [default_problem] if default_problem else []
         ctx = self.suite_context(cfg)
         # Registry suites on SSH executors are downloaded on this machine.
         local_harbor = executors.workbench_harbor(cfg) if any(s["kind"] == "ssh" for s in states) else None
@@ -294,7 +292,7 @@ class RunManager:
                 "account_groups": account_groups,
                 "providers": {"count": len({m["provider"] for m in imported}), "models": len(imported)},
                 "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
-                "bundles": [{k: v for k, v in b.items() if k != "source"} for b in bundle_choices(cfg, self.config_path)]}
+                "bundles": [{k: v for k, v in b.items() if k != "source"} for b in choices]}
 
     def add_provider(self, request):
         return self.providers.add(request, reserved=configured_provider_ids(settings(self.config_path)))
@@ -318,7 +316,24 @@ class RunManager:
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
-    def launch(self, request, *, dry_run=False, frozen=None, batch=None, pinned=None):
+    def bundle_problem(self, path, cfg):
+        try:
+            check_bundle(Path(path or "/nonexistent-metacodes-bundle"))
+        except ValueError:
+            return "请用 metacodes bench --bundle <Linux发行包目录> 配置评测版本"
+        if not builds.selectable(path, cfg.get("source_repo")):
+            return (f"metacodes 包 {Path(path).name} 由 Git 构建，当前 source_repo 没有验证它；"
+                    "请用 metacodes bench build --ref 重新验证，或换一个版本")
+        return None
+
+    def run_bundle(self, cfg, frozen, bundle):
+        if frozen:
+            return frozen["bundle"], builds.frozen_problem(frozen, cfg.get("source_repo"))
+        path = bundle or cfg.get("bundle")
+        resolved = str(Path(path).expanduser().resolve()) if path else None
+        return resolved, self.bundle_problem(resolved, cfg)
+
+    def launch(self, request, *, dry_run=False, frozen=None, batch=None, pinned=None, bundle=None):
         """Start one run. `dry_run` only validates (a batch checks every
         dataset before it is created); `frozen` is a batch's frozen bundle,
         which replaces the configured one, and `batch` names that batch.
@@ -338,7 +353,7 @@ class RunManager:
         suite = suites.resolved(suites.get(suite_id))
         if self.setup_running():  # checked again under the lock below
             raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
-        catalog = self.catalog()
+        catalog = self.catalog(bundle_supplied=frozen is not None or bundle is not None)
         wanted = request.get("executor", catalog["default_executor"])
         state = next((e for e in catalog["executors"] if e["name"] == wanted), None)
         if state is None:
@@ -386,6 +401,10 @@ class RunManager:
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
         if dry_run:
+            if suite.runner != suites.WORKBUDDY:
+                problem = self.run_bundle(settings(self.config_path), frozen, bundle)[1]
+                if problem:
+                    raise ValueError(problem)
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
                     "executor": state["name"]}
         with self.lock:
@@ -397,6 +416,11 @@ class RunManager:
             if self.setup_running():
                 raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
             cfg = settings(self.config_path)
+            used_bundle = frozen["bundle"] if frozen else cfg.get("bundle")
+            if suite.runner != suites.WORKBUDDY:
+                used_bundle, problem = self.run_bundle(cfg, frozen, None)
+                if problem:
+                    raise ValueError(problem)
             executor = executors.find(cfg, state["name"])
             facts = self.executor_facts(executor)
             mode = "provider" if imported else catalog["authentication"]["kind"]
@@ -416,7 +440,7 @@ class RunManager:
                 record["judge"] = shown_judge  # model id and route only
             from scripts.eval.harbor.bench.batches import current_metacodes
             metacodes = ({k: frozen.get(k) for k in ("label", "commit", "digest", "release", "frozen")}
-                         if frozen else current_metacodes(cfg))
+                         if frozen else current_metacodes(cfg, used_bundle))
             if metacodes:
                 record["metacodes"] = metacodes
             if batch:
@@ -438,7 +462,7 @@ class RunManager:
                     raise ValueError(problem)
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
-            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": frozen["bundle"] if frozen else cfg.get("bundle"),
+            spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": used_bundle,
                     "auth_mode": mode, "account_state_dir": cfg.get("account_state_dir") if mode == "metask" else None,
                     "account_gateway": cfg.get("account_gateway") if mode == "metask" else None,
                     "account_key_id": account_key_id,

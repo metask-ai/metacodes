@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.store.ingest import BATCHES_DIR
-from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, now, settings
 
 MAX_ITEMS = 16
@@ -83,6 +83,10 @@ def bundle_choices(cfg: Dict[str, Any], config_path: Path) -> List[Dict[str, Any
             manifest = check_bundle(resolved)
         except ValueError:
             return
+        if not builds.selectable(resolved, cfg.get("source_repo")):
+            return
+        if builds.is_git_unit(resolved):
+            source = None
         seen.add(resolved)
         choices.append({"id": resolved.name, "path": str(resolved), "current": current,
                         "label": bundle_label(resolved, manifest, source),
@@ -103,18 +107,19 @@ def bundle_choices(cfg: Dict[str, Any], config_path: Path) -> List[Dict[str, Any
     return choices
 
 
-def current_metacodes(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The configured bundle, unfrozen, as a run record names it."""
-    path = cfg.get("bundle")
+def current_metacodes(cfg: Dict[str, Any], used: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The bundle a run uses, unfrozen, as its record names it."""
+    path = used or cfg.get("bundle")
     if not path:
         return None
+    resolved = Path(path).expanduser().resolve()
     try:
-        manifest = check_bundle(Path(path))
+        manifest = check_bundle(resolved)
     except ValueError:
         return None
-    source = cfg.get("bundle_source")
-    return {"label": bundle_label(Path(path), manifest, source), "commit": bundle_commit(Path(path), manifest, source),
-            "bundle": str(path), "frozen": False}
+    source = None if builds.is_git_unit(resolved) else cfg.get("bundle_source")
+    return {"label": bundle_label(resolved, manifest, source), "commit": bundle_commit(resolved, manifest, source),
+            "bundle": str(resolved), "frozen": False}
 
 
 def bundle_files(root: Path) -> List[str]:
@@ -227,6 +232,13 @@ class BatchManager:
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)
         if type(concurrency) is not int or not 1 <= concurrency <= 16:
             raise ValueError("concurrency 必须是 1–16 的整数")
+        cfg = settings(self.runs.config_path)
+        choices = bundle_choices(cfg, self.runs.config_path)
+        wanted = request.get("bundle")
+        choice = next((c for c in choices if c["id"] == wanted), None) if wanted else \
+            next((c for c in choices if c["current"]), None)
+        if choice is None:
+            raise ValueError("请选择工作台列出的 metacodes 版本" if wanted else "请先配置 metacodes 发行包（bench setup）")
         seen, planned = set(), []
         for item in items:
             if not isinstance(item, dict) or set(item) - {"suite", "tasks"}:
@@ -240,7 +252,7 @@ class BatchManager:
             if "executor" in request:
                 run_request["executor"] = request["executor"]
             try:
-                checked = self.runs.launch(run_request, dry_run=True)
+                checked = self.runs.launch(run_request, dry_run=True, bundle=choice["path"])
             except ValueError as exc:
                 raise ValueError(f"{suite.name}：{exc}") from None
             run_request.update(tasks=checked["tasks"], executor=checked["executor"])
@@ -249,14 +261,10 @@ class BatchManager:
             planned.append({"suite": suite.id, **suites.label(suite.id), "tasks": checked["tasks"],
                             "concurrency": run_request["concurrency"], "request": run_request, "route": checked["route"],
                             "status": "pending", "run": None, "error": None, "started_at": None, "finished_at": None})
-        cfg = settings(self.runs.config_path)
-        choices = bundle_choices(cfg, self.runs.config_path)
-        wanted = request.get("bundle")
-        choice = next((c for c in choices if c["id"] == wanted), None) if wanted else \
-            next((c for c in choices if c["current"]), None)
-        if choice is None:
-            raise ValueError("请选择工作台列出的 metacodes 版本" if wanted else "请先配置 metacodes 发行包（bench setup）")
         metacodes = freeze(choice, self.runs.config_path)
+        git = builds.provenance(choice["path"])
+        if git:
+            metacodes["git"] = git
         batch_id = _new_id()
         record = {"id": batch_id, "name": name.strip() or None, "status": "queued", "created_at": now(),
                   "started_at": None, "finished_at": None, "model": request.get("model"),

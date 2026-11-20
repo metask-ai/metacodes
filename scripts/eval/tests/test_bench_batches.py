@@ -6,8 +6,10 @@ store and the page API are read back over HTTP. No provider or Docker calls.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -240,6 +242,145 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(record['items'][0]['status'], 'failed')
         self.assertIn('已被修改', record['items'][0]['error'])
         self.assertEqual(self.manager.runs(), [])
+
+    def git_unit(self, commit, repo):
+        from scripts.eval.harbor.bench import builds
+        unit = builds.unit_path(self.root, commit)
+        shutil.copytree(self.root / 'bundle', unit)
+        atomic_json(unit / 'manifest.json', {'target': {'os': 'linux'}, 'source': {'commit': commit, 'dirty': False}})
+        atomic_json(unit.parent / (unit.name + '.json'),
+                    {'ref': 'main', 'commit': commit, 'version': '0.0.0-dev', 'built_at': 'now',
+                     'source_id': builds.source_id(repo), 'trust_policy': builds.TRUST_POLICY})
+        return unit.name
+
+    def test_git_bundle_is_offered_only_while_its_repository_is_configured(self):
+        unit = self.git_unit('a' * 40, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+
+        def listed():
+            return [b['id'] for b in self.client.request('api/workbench')['bundles']]
+
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        self.assertIn(unit, listed())
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/official.git'})
+        self.assertNotIn(unit, listed())
+        with self.assertRaisesRegex(ValueError, '版本'):
+            self.client.request('api/batches', self.request(bundle=unit))
+        self.assertFalse((self.root / 'bundles' / 'frozen').exists())
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        self.assertEqual(Path(created['metacodes']['bundle']).parent, self.root / 'bundles' / 'frozen')
+
+    def test_default_git_bundle_is_checked_before_a_single_run_is_recorded(self):
+        unit = self.git_unit('b' * 40, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'bundle': str(self.root / 'bundles' / unit),
+                                  'source_repo': 'https://example.com/official.git'})
+        run = {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}
+        with self.assertRaisesRegex(ValueError, 'source_repo 没有验证'):
+            self.client.request('api/runs', run)
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_a_verified_git_bundle_alone_runs_a_batch(self):
+        unit = self.git_unit('c' * 40, 'https://example.com/fork.git')
+        cfg = {k: v for k, v in json.loads(self.config.read_text()).items() if k != 'bundle'}
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        catalog = self.client.request('api/workbench')
+        self.assertEqual(catalog['harbor_reasons'], [])
+        self.assertEqual([b['id'] for b in catalog['bundles']], [unit])
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        final = self.wait_batch(created['id'])
+        self.assertEqual(final['status'], 'finished', final)
+        frozen = created['metacodes']['bundle']
+        for item in final['items']:
+            spec = json.loads((self.manager.jobs_dir / '.bench-runs' / (item['run'] + '.spec')).read_text())
+            self.assertEqual(spec['bundle'], frozen)
+
+    def test_frozen_git_bundle_runs_after_the_original_is_archived(self):
+        unit = self.git_unit('d' * 40, 'https://example.com/fork.git')
+        cfg = {k: v for k, v in json.loads(self.config.read_text()).items() if k != 'bundle'}
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        archive = self.root / 'archive'
+        archive.mkdir()
+        for path in (self.root / 'bundles').glob(unit + '*'):
+            path.rename(archive / path.name)
+        final = self.wait_batch(created['id'])
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual([i['status'] for i in final['items']], ['finished', 'finished'])
+
+    def test_frozen_git_bundle_is_refused_after_a_repository_switch(self):
+        self.manager.batches.stop()
+        self.manager.batches._thread.join(5)
+        unit = self.git_unit('e' * 40, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
+        created = self.client.request('api/batches', self.request(bundle=unit))
+        atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/official.git'})
+        final = self.wait_batch(created['id'], statuses=('finished', 'failed', 'cancelled'))
+        self.assertTrue(all('source_repo 没有验证' in (i['error'] or '') for i in final['items']), final)
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_default_bundle_is_judged_by_its_resolved_path(self):
+        unit = self.git_unit('f' * 40, 'https://example.com/fork.git')
+        link = self.root / 'current-bundle'
+        link.symlink_to(self.root / 'bundles' / unit)
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'bundle': str(link), 'source_repo': 'https://example.com/official.git'})
+        run = {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}
+        with self.assertRaisesRegex(ValueError, 'source_repo 没有验证'):
+            self.client.request('api/runs', run)
+        self.assertEqual(self.manager.runs(), [])
+
+    def test_default_git_bundle_is_named_by_its_own_manifest(self):
+        new = '1' * 40
+        unit = self.git_unit(new, 'https://example.com/fork.git')
+        cfg = json.loads(self.config.read_text())
+        atomic_json(self.config, {**cfg, 'bundle': str(self.root / 'bundles' / unit),
+                                  'source_repo': 'https://example.com/fork.git',
+                                  'bundle_source': {'kind': 'checkout-overlay', 'commit': '0' * 12,
+                                                    'base_release': '0.12.0'}})
+        listed = self.client.request('api/workbench')['bundles']
+        self.assertEqual([(b['id'], b['commit'], b['current']) for b in listed], [(unit, new, True)])
+        run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1',
+                                               'tasks': ['fix-git']})
+        self.assertEqual(run['metacodes']['commit'], new)
+        wait_run(self.manager, run['name'])
+        created = self.client.request('api/batches', self.request())
+        self.assertEqual((created['metacodes']['commit'], created['metacodes']['git']['commit']), (new, new))
+
+    def test_run_record_names_the_bundle_the_worker_uses(self):
+        new = '2' * 40
+        unit = self.root / 'bundles' / self.git_unit(new, 'https://example.com/fork.git')
+        link = self.root / ('metacodes-dev-' + '0' * 12 + '-overlay')
+        link.symlink_to(unit)
+        cfg = json.loads(self.config.read_text())
+        run = {'model': 'tokenjoy/test-model', 'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}
+        with patch.dict(os.environ, {'HOME': str(self.root)}):
+            for default in (str(link), '~/bundles/' + unit.name):
+                with self.subTest(default=default):
+                    atomic_json(self.config, {**cfg, 'bundle': default, 'source_repo': 'https://example.com/fork.git'})
+                    record = self.client.request('api/runs', run)
+                    self.assertEqual((record['metacodes']['commit'], record['metacodes']['bundle']), (new, str(unit)))
+                    spec = json.loads((self.manager.jobs_dir / '.bench-runs' / (record['name'] + '.spec')).read_text())
+                    self.assertEqual(spec['bundle'], str(unit))
+                    wait_run(self.manager, record['name'])
+
+    def test_bundle_flag_drops_the_previous_bundle_source(self):
+        state = self.root / 'cli-state'
+        (state / 'bench').mkdir(parents=True)
+        atomic_json(state / 'bench' / 'workbench.json',
+                    {'bundle_source': {'kind': 'checkout-overlay', 'commit': '0' * 12}})
+        with patch('sys.stdout', io.StringIO()):
+            cli.main(['info', '--state-root', str(state), '--bundle', str(self.root / 'bundle'), '--json'])
+        saved = json.loads((state / 'bench' / 'workbench.json').read_text())
+        self.assertEqual(saved['bundle'], str((self.root / 'bundle').resolve()))
+        self.assertNotIn('bundle_source', saved)
+        source = {'kind': 'checkout-overlay', 'commit': 'worktree', 'base_release': '0.12.0'}
+        atomic_json(state / 'bench' / 'workbench.json', {**saved, 'bundle_source': source})
+        with patch('sys.stdout', io.StringIO()):
+            cli.main(['info', '--state-root', str(state), '--bundle', str(self.root / 'bundle'), '--json'])
+        self.assertEqual(json.loads((state / 'bench' / 'workbench.json').read_text())['bundle_source'], source)
 
     def test_invalid_batches_are_refused_before_anything_is_written(self):
         for override in ({'items': []}, {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}] * 2},
