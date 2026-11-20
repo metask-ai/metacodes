@@ -42,8 +42,11 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     const window = @max(picker.page_rows, 1);
     const top = @min(picker.window_top, visible.len -| 1);
     const end = @min(top + window, visible.len);
-    const layout = Layout.of(picker, visible[top..end], cols);
-    for (visible[top..end], top..) |row, index| {
+    const sticky = if (picker.cursor == top) null else stickyHeading(visible, top);
+    const first = if (sticky != null) top + 1 else top;
+    const layout = Layout.of(picker, visible[first..end], cols);
+    if (sticky) |heading| rows += drawRow(picker, w, th, layout, heading, false);
+    for (visible[first..end], first..) |row, index| {
         rows += drawRow(picker, w, th, layout, row, index == picker.cursor);
     }
     if (end < visible.len or top > 0) {
@@ -71,6 +74,16 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     }
     if (picker.stage == .list) rows += controls(picker, w, th, cols);
     return rows + footer(picker, w, th, true);
+}
+
+fn stickyHeading(visible: []const Row, top: usize) ?Row {
+    if (top >= visible.len or visible[top] == .heading) return null;
+    var index = top;
+    while (index > 0) {
+        index -= 1;
+        if (visible[index] == .heading) return visible[index];
+    }
+    return null;
 }
 
 /// What an empty list says instead of rows, written into `buf` when it
@@ -186,8 +199,6 @@ fn scopeLabel(scope: selection_mod.Scope) []const u8 {
 const Layout = struct {
     cols: usize,
     name_width: usize,
-    /// A filter is on: the list is flat, and each model names its provider.
-    flat: bool,
     /// Some model in view has a price and the row has room for it.
     priced: bool,
     /// The channel column of the route rows: the longest channel in view and
@@ -207,16 +218,32 @@ const Layout = struct {
             .route => |route| channel = @max(channel, textWidth(picker.offers.items[route.offer_index].channel_id.slice())),
             else => {},
         };
-        const cap = @max(cols / 3, 16);
+        const shows_price = priced and cols >= 100;
+        var after: usize = 0;
+        for (rows) |row| if (row == .model) {
+            after = @max(after, afterName(picker, row.model, shows_price));
+        };
+        const room = (cols -| 1) -| (5 + after);
         return .{
             .cols = cols,
-            .name_width = @min(longest + 2, cap),
-            .flat = picker.filter_len > 0,
-            .priced = priced and cols >= 100,
+            .name_width = @min(longest + 2, @max(room, 16)),
+            .priced = shows_price,
             .channel_width = @min(channel, 24) + 2,
         };
     }
 };
+
+fn afterName(picker: *const Picker, group: picker_mod.Group, priced: bool) usize {
+    var width: usize = 6;
+    if (priced) {
+        var price_buf: [96]u8 = undefined;
+        var price: std.Io.Writer = .fixed(&price_buf);
+        writePrice(&price, picker.offers.items[group.offer_index].quote);
+        width += textWidth(price.buffered());
+    }
+    if (group.offer_count > 1) width += std.fmt.count("   {d} routes", .{group.offer_count});
+    return width;
+}
 
 fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, row: Row, selected: bool) u16 {
     line(w);
@@ -244,12 +271,6 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
             writeWindow(w, offer.limits);
             if (layout.priced) writePrice(w, offer.quote);
             if (group.offer_count > 1) w.print("   {d} routes", .{group.offer_count}) catch {};
-            if (layout.flat) {
-                var used: usize = 5 + layout.name_width + 6 + (if (group.offer_count > 1) @as(usize, 11) else 0);
-                if (layout.priced) used += 22;
-                const provider = providerName(picker, offer.provider_id);
-                w.print("   {s}", .{clip(provider, layout.cols -| (used + 4))}) catch {};
-            }
             w.print("{s}", .{th.reset}) catch {};
         },
         .route => |route| {
@@ -597,14 +618,6 @@ fn protocolName(protocol: []const u8) []const u8 {
     if (std.mem.eql(u8, protocol, "openai_responses")) return "OpenAI Responses API";
     if (std.mem.eql(u8, protocol, "gemini_generate")) return "Gemini API";
     return protocol;
-}
-
-fn providerName(picker: *const Picker, provider: picker_mod.Slug) []const u8 {
-    if (picker.noteFor(provider)) |note| return note.name();
-    for (picker.offers.items) |*offer| {
-        if (offer.provider_id.eql(provider)) return offer.provider_id.slice();
-    }
-    return "";
 }
 
 fn line(w: *std.Io.Writer) void {
@@ -993,23 +1006,116 @@ test "the setup stage of a provider that signs in on its own site names /login <
     try testing.expect(std.mem.indexOf(u8, text, "Or set OPENROUTER_API_KEY in /home/u/.local/opt/metacodes/state/.env, then restart") != null);
 }
 
-test "a filter lists the matches flat, each naming its provider" {
+test "a filter keeps the headings, so a match says which route it goes through and who bills it (#600)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const priced: offer_mod.Quote = .{ .known = .{
+        .currency = offer_mod.Currency.lit("USD"),
+        .billing_unit = .per_million_tokens,
+        .input_price_micros = 35_000,
+        .output_price_micros = 150_000,
+    } };
+    var direct = offerOf("deepseek", "default", "DeepSeek V4.1 Flash", "openai_chat");
+    direct.limits = .{ .context_window = 1_048_576 };
+    var dated = offerOf("openrouter", "auto", "DeepSeek: DeepSeek V4.1 Flash 1017", "openai_chat");
+    dated.quote = priced;
+    var plain = offerOf("openrouter", "auto", "DeepSeek: DeepSeek V4.1 Flash", "openai_chat");
+    plain.quote = priced;
+    const offers = [_]control_plane.OfferSummary{ direct, offerOf("openrouter", "auto", "Qwen: Qwen4 Max", "openai_chat"), dated, plain };
+    try seed(&picker, &offers, offers[0].offer_id);
+    const notes = [_]picker_mod.ProviderNote{
+        picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .environment),
+        picker_mod.ProviderNote.init(ids.Slug.lit("openrouter"), "OpenRouter", .signed_in),
+    };
+    try picker.setReadiness(&.{ true, true, true, true }, &notes);
+    for ("deepseek") |byte| _ = picker.onKey(.{ .char = byte });
+    for ([_]usize{ 80, 120 }) |cols| {
+        const buffer = try arena.alloc(u8, 32 * 1024);
+        const rows = try visibleRows(arena, drawAt(&picker, buffer, cols));
+        try testing.expect(std.mem.startsWith(u8, rows[0], "  Model  /deepseek"));
+        try testing.expectEqualStrings("  DeepSeek · key from shell · billed to your DeepSeek account", rows[1]);
+        try testing.expect(std.mem.startsWith(u8, rows[2], "  >* DeepSeek V4.1 Flash "));
+        try testing.expectEqualStrings("  OpenRouter · signed in · billed to your OpenRouter account", rows[3]);
+        try testing.expect(std.mem.startsWith(u8, rows[4], "     DeepSeek: DeepSeek V4.1 Flash 1017 "));
+        try testing.expect(std.mem.startsWith(u8, rows[5], "     DeepSeek: DeepSeek V4.1 Flash "));
+        try testing.expect(std.mem.endsWith(u8, rows[2], "1M"));
+        for (rows[4..6]) |row| {
+            try testing.expect(std.mem.endsWith(u8, row, if (cols >= 100) "200K   USD 0.03/0.15 per 1M" else "200K"));
+        }
+        for (rows) |row| try testing.expect(textWidth(row) < cols);
+    }
+}
+
+test "a window scrolled into a group opens with that group's heading, never over the cursor (#600)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [20][24]u8 = undefined;
+    var offers: [21]control_plane.OfferSummary = undefined;
+    offers[0] = offerOf("deepseek", "default", "DeepSeek V4 Pro", "openai_chat");
+    for (offers[1..], 0..) |*slot, index| {
+        const name = std.fmt.bufPrint(&names[index], "Vendor: Model {d:0>2}", .{index}) catch unreachable;
+        slot.* = offerOf("openrouter", "auto", name, "openai_chat");
+    }
+    try seed(&picker, &offers, offers[0].offer_id);
+    const notes = [_]picker_mod.ProviderNote{
+        picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .environment),
+        picker_mod.ProviderNote.init(ids.Slug.lit("openrouter"), "OpenRouter", .environment),
+    };
+    var ready: [21]bool = undefined;
+    @memset(&ready, true);
+    try picker.setReadiness(&ready, &notes);
+    picker.page_rows = 6;
+    for (0..20) |step| {
+        _ = picker.onKey(if (step < 10) .down else .up);
+        const buffer = try arena.alloc(u8, 32 * 1024);
+        const rows = try visibleRows(arena, drawAt(&picker, buffer, 80));
+        try testing.expect(std.mem.startsWith(u8, rows[1], "  DeepSeek · ") or std.mem.startsWith(u8, rows[1], "  OpenRouter · "));
+        var listed: usize = 0;
+        var cursors: usize = 0;
+        for (rows[1..]) |row| {
+            if (std.mem.startsWith(u8, row, "  [")) break;
+            listed += 1;
+            if (std.mem.startsWith(u8, row, "  >")) cursors += 1;
+        }
+        try testing.expectEqual(@as(usize, 6), listed);
+        try testing.expectEqual(@as(usize, 1), cursors);
+        if (step == 9) {
+            try testing.expectEqualStrings("  OpenRouter · key from shell · billed to your OpenRouter account", rows[1]);
+            try testing.expect(std.mem.startsWith(u8, rows[6], "  >  Vendor: Model 09"));
+        }
+    }
+    try testing.expectEqualStrings("DeepSeek V4 Pro", picker.focusedOffer().?.display_name);
+}
+
+test "a name is cut where its row ends, not at a third of the width (#600)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]control_plane.OfferSummary{
-        offerOf("metask", "default", "glm-5.3", "anthropic_messages"),
-        offerOf("zai-coding-plan", "default", "glm-4.6", "anthropic_messages"),
+        offerOf("openrouter", "auto", "NVIDIA: Nemotron 3.5 Super VL", "openai_chat"),
+        offerOf("openrouter", "auto", "NVIDIA: Nemotron 3.5 Super VL (free)", "openai_chat"),
+        offerOf("openrouter", "auto", "Google: Nano Banana Pro (Gemini 3 Pro Image)", "openai_chat"),
     };
     try seed(&picker, &offers, null);
-    for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
-    const text = try screen(arena, &picker, 120);
-    try testing.expect(std.mem.indexOf(u8, text, "Model  /glm") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "metask") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "zai-coding-plan") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "billed to") == null);
+    const text = try screen(arena, &picker, 80);
+    for (offers) |offer| try testing.expect(std.mem.indexOf(u8, text, offer.display_name) != null);
+    const buffer = try arena.alloc(u8, 32 * 1024);
+    var models: usize = 0;
+    for (try visibleRows(arena, drawAt(&picker, buffer, 50))) |row| {
+        if (!std.mem.startsWith(u8, row, "  > ") and !std.mem.startsWith(u8, row, "     ")) continue;
+        models += 1;
+        try testing.expect(textWidth(row) < 50);
+        try testing.expect(std.mem.endsWith(u8, row, "200K"));
+    }
+    try testing.expectEqual(@as(usize, 3), models);
 }
 
 test "a long list scrolls with a position indicator that counts models, not headings" {

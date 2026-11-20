@@ -1152,11 +1152,17 @@ A row per model, grouped by *canonical id*, never by visible name: two
 channels serving "GLM-4.6" over different protocols, regions, or prices are
 different routes, and collapsing them by display name would hide the choice the
 offer model exists to give. The providers are headings, the one in use first,
-each saying where its credential comes from and who bills it; a typed filter
-drops the headings and lists the matches flat, naming each one's provider. A
-model served on several routes lists them under it, in words ("OpenAI Chat
-API"), while the cursor is on it: Enter on the model takes its preferred route
-(the one in use, else the first), Enter on a route takes that one. The
+each saying where its credential comes from and who bills it. A typed filter
+keeps them over the matches (#600), the providers with a model that holds the
+typed text whole first: a reseller lists other providers' models under their
+names (OpenRouter's "DeepSeek: DeepSeek V4 Pro"), and only the heading says
+which route a match goes through and whose account it bills. A window scrolled
+into a group opens with that group's heading in place of its first row, the
+cursor kept below it, and a model's name takes the room the rest of its row
+leaves rather than a fixed share of the width. A model served on several
+routes lists them under it, in words ("OpenAI Chat API"), while the cursor is
+on it: Enter on the model takes its preferred route (the one in use, else the
+first), Enter on a route takes that one. The
 reasoning effort the focused route declares is a line under the list, changed
 with ←/→ from any row; the level wanted is remembered, and each model shows and
 commits the nearest one its vocabulary has. The level the session runs with,
