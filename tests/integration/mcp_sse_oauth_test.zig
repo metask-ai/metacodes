@@ -325,6 +325,130 @@ test "MCP OAuth: login discovers, registers, authorizes with PKCE; sessions send
     try std.testing.expectEqualStrings("at-2", record.access_token);
 }
 
+const Transcript = struct {
+    text: std.ArrayList(u8) = .empty,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *Transcript = @ptrCast(@alignCast(ctx));
+        self.text.appendSlice(std.testing.allocator, bytes) catch {};
+    }
+
+    fn notify(self: *Transcript) cc.mcp_oauth.Notify {
+        return .{ .ctx = self, .write = write };
+    }
+
+    fn deinit(self: *Transcript) void {
+        self.text.deinit(std.testing.allocator);
+    }
+};
+
+fn scopedLogin(state_root: []const u8, url: []const u8, settings: cc.mcp_config.OAuthSettings, transcript: *Transcript) !cc.mcp_oauth.LoginResult {
+    var browser: Browser = .{};
+    defer browser.finish();
+    return cc.mcp_oauth.login(std.testing.allocator, std.testing.io, state_root, .{
+        .name = "scoped",
+        .target = .{ .url = url, .wire = .streamable },
+        .settings = settings,
+    }, .{ .open_browser = false, .open_url = browser.opener(), .notify = transcript.notify() });
+}
+
+fn storedLoginExists(state_root: []const u8, url: []const u8) !bool {
+    const a = std.testing.allocator;
+    const path = try cc.mcp_oauth.storePath(a, state_root, "scoped", url);
+    defer a.free(path);
+    var record = (try cc.mcp_oauth.loadRecord(a, path, url)) orelse return false;
+    record.deinit(a);
+    return true;
+}
+
+test "MCP OAuth: a challenge without a scope asks for every scope the resource lists, and the server's acceptance is checked" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "scoped-mcp");
+
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    var result = try scopedLogin(state_root, url, .{}, &transcript);
+    defer result.deinit(a);
+    try std.testing.expectEqual(cc.mcp_oauth.Verification.accepted, result.verification);
+    try std.testing.expectEqualStrings("mcp:tools mcp:extra", result.scope.?);
+    try std.testing.expect(try storedLoginExists(state_root, url));
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const authorize = (try mock.seen(aa, "/as/authorize"))[0];
+    try std.testing.expectEqualStrings("mcp:tools mcp:extra", field(authorize, &.{ "query", "scope" }).?);
+    try std.testing.expectEqualStrings(url, field(authorize, &.{ "query", "resource" }).?);
+    const register = (try mock.seen(aa, "/as/register"))[0];
+    try std.testing.expectEqualStrings("mcp:tools mcp:extra", register.get("body").?.object.get("scope").?.string);
+    try std.testing.expectEqualStrings("metacodes", register.get("body").?.object.get("client_name").?.string);
+
+    var initialized_with_token: usize = 0;
+    var ended: usize = 0;
+    for (try mock.seen(aa, "/scoped-mcp")) |entry| {
+        const method = field(entry, &.{"method"}) orelse "";
+        if (std.mem.eql(u8, method, "initialize") and field(entry, &.{ "headers", "authorization" }) != null) initialized_with_token += 1;
+        if (std.mem.eql(u8, method, "DELETE")) {
+            ended += 1;
+            try std.testing.expectEqualStrings("scoped-1", field(entry, &.{"session"}).?);
+            try std.testing.expect(std.mem.startsWith(u8, field(entry, &.{"authorization"}).?, "Bearer at-"));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), initialized_with_token);
+    try std.testing.expectEqual(@as(usize, 1), ended);
+}
+
+test "MCP OAuth: a token the server refuses is reported with the server's answer and not stored" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "scoped-mcp");
+
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    try std.testing.expectError(
+        error.McpOAuthTokenNotAccepted,
+        scopedLogin(state_root, url, .{ .scopes = "mcp:extra" }, &transcript),
+    );
+    const text = transcript.text.items;
+    try std.testing.expect(std.mem.indexOf(u8, text, "did not accept the token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "HTTP 401 invalid_token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sign in to use this server") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Scope requested: mcp:extra; granted: mcp:extra.") != null);
+    try std.testing.expect(!try storedLoginExists(state_root, url));
+}
+
+test "MCP OAuth: a token the server cannot check right now is stored, and the login says it is unverified" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "scoped-mcp");
+
+    try mock.post("control/unavailable");
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    var result = try scopedLogin(state_root, url, .{}, &transcript);
+    defer result.deinit(a);
+    try std.testing.expectEqual(cc.mcp_oauth.Verification{ .unexpected_status = 503 }, result.verification);
+    try std.testing.expect(try storedLoginExists(state_root, url));
+}
+
 test "MCP OAuth: configuration reaches the wire — startup connects an sse server and a logged-in http server" {
     var mock = (try Mock.start()) orelse return error.SkipZigTest;
     defer mock.stop();
