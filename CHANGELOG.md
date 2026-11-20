@@ -83,8 +83,8 @@ status, compatibility boundaries, and entry points are defined by
 - **`/model` is one screen, models first** (follow-up to #527). The models of
   every configured provider are listed under a heading per provider that says
   where its key comes from and who bills it, the provider in use first and the
-  cursor on the model in use; typing filters across them all and lists the
-  matches flat. A model served on several routes lists them under it, in
+  cursor on the model in use; typing filters across them all, under the same
+  headings. A model served on several routes lists them under it, in
   words, while the cursor is on it; Enter on the model takes its preferred
   route, Enter on a route takes that one. The reasoning level is a line under
   the list, changed with ←/→ from any row, and kept as the level wanted: each
@@ -110,6 +110,23 @@ status, compatibility boundaries, and entry points are defined by
   level. When `/model` opens, the level the session runs with starts
   selected even when it is `none` or `minimal` (before, only a level that
   thinks did), so DeepSeek's default does not replace thinking turned off.
+- **`/model` keeps the provider headings while you filter, so a match says
+  which route it goes through and who bills it** (#600). Typing used to list
+  the matches flat with the provider's name trailing each row, and OpenRouter
+  lists about 300 models under their makers' names (`DeepSeek: DeepSeek V4
+  Pro 0423`), so its rows and DeepSeek's own read alike. The matches now sit
+  under the same headings as the unfiltered list (`OpenRouter · key from
+  shell · billed to your OpenRouter account`), the providers with a model
+  that holds the typed text whole first; the first row is the one it was.
+  A list scrolled into a group opens with that group's heading in place of
+  its first row, filtered or not, the cursor kept below it; when that row
+  is the model whose routes are listed, the line names the model too.
+  PgDn and PgUp move a row less than the window, so no model is left
+  between two pages. A model's name takes the room the rest of its row
+  leaves instead of a third of the width, measured in terminal columns
+  (a full-width character takes two): at 80 columns the third cut 116 of
+  OpenRouter's 324 names, 46 of them to the same text as another, a free
+  model and its paid one among them.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
@@ -637,6 +654,36 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/login openrouter` no longer stops the TUI while the account's model
+  list downloads, and `/model` says how the download goes** (#572). The list
+  (`GET /api/v1/models/user`, about 0.8 MB) was fetched on the REPL's thread
+  inside `/login`, with no word before it and no time limit: the screen sat
+  unchanged until it came. A download that failed still opened `/model`, and
+  on an account without credits, preset to `:free`, the picker was empty.
+  Now the list downloads in the background and `/model` opens at once; a line
+  under its title says `Downloading the models your OpenRouter account can
+  use…` with how much has come, a filter that finds nothing yet says the
+  models are still downloading, and the list fills in when it comes, the
+  filter, the scope and the row under the cursor kept. A download whose
+  connection fails, or whose answer stops partway, is tried once more by
+  itself; one that still fails, or brings no new byte for 60 seconds, says
+  why on that line (`no connection`, `answer cut off`, …) and that Ctrl+R in
+  `/model` downloads it again. A refused key says `/login openrouter`
+  instead. `/providers refresh` says it is downloading before it waits, and
+  `/login` without the TUI downloads before it returns, as before, saying so
+  first.
+
+- **A start downloads OpenRouter's model list whatever route the session
+  runs on** (#572). With a key set and no list kept, or a day-old one, only a
+  session on an Anthropic Messages route with the `/v1/models` probe on
+  fetched it; a start with OpenRouter alone, on OpenRouter itself, on an
+  OpenAI-wire provider or on a Metask sign-in never did, so `/model` offered
+  only `Auto Router`, and a kept list never updated. Every interactive start
+  without `METACODES_NO_PROBE` now fetches it in the background; a first
+  download is said in `/model` as above, an update of a kept list is quiet.
+  A catalog answer cut off partway is now reported as `Interrupted` rather
+  than as `TooLarge` or a parse error.
+
 - **Token and cost totals no longer count part of a streamed response
   twice.** A provider reports a response's usage as a running total:
   Anthropic's `message_delta.usage` is cumulative and follows a
@@ -744,6 +791,16 @@ status, compatibility boundaries, and entry points are defined by
   ended the line typed so far was sent as the next message. It now inserts
   a newline in the draft, as it does at the prompt; Enter still queues the
   whole draft, newline included, as one message.
+- **A `/model` search can start with `q`** (#599). On an empty filter `q`
+  closed the picker, so typing `qwen` closed the list on its first letter
+  and left `wen` in the input box: no model whose name starts with `q`
+  could be searched for. `q` is now a filter letter like any other, as the
+  list's `type to filter` says, and Esc is the way out (it clears the filter
+  first). The list no longer shows `q close`, and when no provider is
+  configured it names only the ways out with a filter typed too (it said
+  `enter apply · tab scope`, though there was nothing to apply). The screen
+  that says where a provider's key goes has nothing to type into and still
+  closes on `q`.
 - **`/model` names the variable and the file for a provider without a key**
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these

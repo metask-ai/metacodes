@@ -1048,11 +1048,21 @@ completions, with the fields a route reads, and `Host.ingestOpenRouterBuiltin`
 makes them one `auto` offer each, priced at the model's listed price (the
 upstream OpenRouter picks may charge otherwise). The listing is fetched after
 a sign-in or a pasted key, on `/providers refresh`, and in the REPL's
-background when none is kept or it is a day old and a key is set; it is kept
-in `<state root>/cache/models/`, and every start reads the kept copy whatever
-its age, so a stored pin resolves without a request. Compiled in is only
-OpenRouter's router model, `openrouter/auto`, so the provider is listed before
-a sign-in and keeps a route if the listing cannot be fetched.
+background when none is kept or it is a day old and a key is set, whatever
+route the session runs on; it is kept in `<state root>/cache/models/`, and
+every start reads the kept copy whatever its age, so a stored pin resolves
+without a request. Compiled in is only OpenRouter's router model,
+`openrouter/auto`, so the provider is listed before a sign-in and keeps a
+route if the listing cannot be fetched.
+
+In the TUI a sign-in's fetch runs in the background too (`Refresh`): `/model`
+opens at once, says on a line under its title how much of the listing has
+come, and fills in when it comes, filter and cursor kept; the REPL takes the
+listing on its input loop's tick, where nothing reads the catalog. A fetch
+that fails to connect, or whose answer stops partway, is tried once more; one
+that still fails, or brings no byte for 60 seconds, is said with its reason
+on that line, and Ctrl+R in `/model` fetches again (#572). A start that only
+updates a kept listing says nothing.
 
 Pinning one upstream — an offer per endpoint, its request naming the
 endpoint's tag in `provider.order` with `allow_fallbacks: false` — is the
@@ -1152,11 +1162,19 @@ A row per model, grouped by *canonical id*, never by visible name: two
 channels serving "GLM-4.6" over different protocols, regions, or prices are
 different routes, and collapsing them by display name would hide the choice the
 offer model exists to give. The providers are headings, the one in use first,
-each saying where its credential comes from and who bills it; a typed filter
-drops the headings and lists the matches flat, naming each one's provider. A
-model served on several routes lists them under it, in words ("OpenAI Chat
-API"), while the cursor is on it: Enter on the model takes its preferred route
-(the one in use, else the first), Enter on a route takes that one. The
+each saying where its credential comes from and who bills it. A typed filter
+keeps them over the matches (#600), the providers with a model that holds the
+typed text whole first: a reseller lists other providers' models under their
+names (OpenRouter's "DeepSeek: DeepSeek V4 Pro"), and only the heading says
+which route a match goes through and whose account it bills. A window scrolled
+into a group opens with that group's heading in place of its first row, the
+cursor kept below it (the line names the model too when that row is the model
+whose routes are listed), so PgDn and PgUp move a row less than the window. A
+model's name takes the room the rest of its row leaves, in terminal columns,
+rather than a fixed share of the width. A model served on several
+routes lists them under it, in words ("OpenAI Chat API"), while the cursor is
+on it: Enter on the model takes its preferred route (the one in use, else the
+first), Enter on a route takes that one. The
 reasoning effort the focused route declares is a line under the list, changed
 with ←/→ from any row; the level wanted is remembered, and each model shows and
 commits the nearest one its vocabulary has. The level the session runs with,
@@ -1171,8 +1189,9 @@ The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
 streaming; a commit during a reply changes the next turn, not the one in flight.
 `Ctrl+C`/`Ctrl+D` deliberately pass through, so there is always an exit that does
-not depend on the picker's own state machine. `q` closes only on an empty
-filter, which keeps it typeable inside a model name.
+not depend on the picker's own state machine. Every printable key is the
+filter, `q` included, so a search can start with any letter (#599); Esc
+clears the filter, then closes.
 
 Enter commits at the scope the header brackets. Session is the default, and
 `Tab` cycles session → global → once, so any durable write is an explicit act

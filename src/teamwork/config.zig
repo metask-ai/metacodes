@@ -49,6 +49,9 @@ pub const Layer = struct {
     /// The host-pinned check the runtime re-runs to verify an approval
     /// (#517); borrowed from the parse arena.
     check_command: ?[]const u8 = null,
+    /// The cap on dispatches per role in one run (#514): the built-in loop
+    /// and any manager stop there, so a run always terminates.
+    max_rounds: ?u32 = null,
     seats: std.EnumArray(Role, SeatLayer) = .initFill(.{}),
 };
 
@@ -106,7 +109,15 @@ pub const ValidateError = error{
     /// cannot be observed, so without a pinned check the runtime could never
     /// verify one of its approvals.
     ExternalReviewerWithoutCheck,
+    /// `max_rounds` is 0 or above `max_rounds_limit`.
+    InvalidMaxRounds,
 };
+
+/// The dispatch cap per role when `max_rounds` is not configured.
+pub const default_max_rounds: u32 = 3;
+/// The largest accepted `max_rounds`: a bound on what one run may spend in
+/// rounds, independent of the dollar cap.
+pub const max_rounds_limit: u32 = 20;
 
 /// The host-pinned check command (#517). The runtime runs exactly this
 /// string, in the workspace, through the sandboxed shell path; it never runs
@@ -135,6 +146,10 @@ pub const Config = union(enum) {
         /// Re-run by the runtime before an approval counts; required when
         /// the reviewer seat is external.
         check_command: ?CheckCommand = null,
+        /// The most seats of one role a run dispatches (1 ..
+        /// `max_rounds_limit`); the runtime fails the run with
+        /// `rounds_exhausted` rather than go past it.
+        max_rounds: u32 = default_max_rounds,
         /// One spec per role; strings borrowed from the parse arenas.
         seats: std.EnumArray(Role, types.SeatSpec),
     };
@@ -169,6 +184,9 @@ pub fn parseValue(arena: std.mem.Allocator, value: std.json.Value, diag: ?*Diagn
             layer.budget_usd = numberOf(item) orelse return error.WrongType;
         } else if (std.mem.eql(u8, key, "check_command")) {
             layer.check_command = try arena.dupe(u8, try stringOf(item));
+        } else if (std.mem.eql(u8, key, "max_rounds")) {
+            if (item != .integer or item.integer < 0 or item.integer > std.math.maxInt(u32)) return error.WrongType;
+            layer.max_rounds = @intCast(item.integer);
         } else if (std.mem.eql(u8, key, "seats")) {
             if (item != .object) return error.NotAnObject;
             var seats = item.object.iterator();
@@ -244,6 +262,7 @@ pub fn merge(lower: Layer, upper: Layer) Layer {
     if (upper.enabled) |v| out.enabled = v;
     if (upper.budget_usd) |v| out.budget_usd = v;
     if (upper.check_command) |v| out.check_command = v;
+    if (upper.max_rounds) |v| out.max_rounds = v;
     for (std.enums.values(Role)) |role| {
         out.seats.set(role, mergeSeat(lower.seats.get(role), upper.seats.get(role)));
     }
@@ -285,6 +304,9 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
         null;
     if (check_command == null and seats.get(.reviewer).harnessKind() != .metacodes)
         return fail(diag, .reviewer, "check_command", error.ExternalReviewerWithoutCheck);
+    setDiag(diag, null, "max_rounds");
+    const max_rounds = layer.max_rounds orelse default_max_rounds;
+    if (max_rounds == 0 or max_rounds > max_rounds_limit) return error.InvalidMaxRounds;
     setDiag(diag, null, "budget_usd");
     if (layer.budget_usd) |usd| {
         if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidBudget;
@@ -295,7 +317,7 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
     }
     const budget_usd = layer.budget_usd orelse return error.BudgetMissing;
     setDiag(diag, null, null);
-    return .{ .enabled = .{ .budget_usd = budget_usd, .check_command = check_command, .seats = seats } };
+    return .{ .enabled = .{ .budget_usd = budget_usd, .check_command = check_command, .max_rounds = max_rounds, .seats = seats } };
 }
 
 fn validateSeat(role: Role, seat: SeatLayer, diag: ?*Diagnostic) ValidateError!types.SeatSpec {
@@ -506,6 +528,23 @@ test "config: an enabled run without a positive dollar cap is rejected" {
     // A disabled run needs no cap, but a nonsensical one is still an error.
     try testing.expect(try load(a, "{\"enabled\":false}") == .disabled);
     try testing.expectError(error.InvalidBudget, load(a, "{\"budget_usd\":-1}"));
+}
+
+test "config: max_rounds defaults, merges and is bounded" {
+    var arena = arenaFixture();
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(default_max_rounds, (try load(a, "{\"enabled\":true,\"budget_usd\":1}")).enabled.max_rounds);
+    const project = try parse(a, "{\"enabled\":true,\"budget_usd\":1,\"max_rounds\":5}", null);
+    try testing.expectEqual(@as(u32, 5), (try validate(project, null)).enabled.max_rounds);
+    const cli = try parse(a, "{\"max_rounds\":2}", null);
+    try testing.expectEqual(@as(u32, 2), (try validate(merge(project, cli), null)).enabled.max_rounds);
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidMaxRounds, validate(try parse(a, "{\"max_rounds\":0}", null), &diag));
+    try testing.expectEqualStrings("max_rounds", diag.field.?);
+    try testing.expectError(error.InvalidMaxRounds, load(a, "{\"max_rounds\":21}"));
+    try testing.expectError(error.WrongType, load(a, "{\"max_rounds\":-1}"));
+    try testing.expectError(error.WrongType, load(a, "{\"max_rounds\":\"3\"}"));
 }
 
 test "config: merge layers global < project < cli" {

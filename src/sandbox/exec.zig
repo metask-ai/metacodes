@@ -182,6 +182,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
             .additional_dirs = opts.additional_dirs,
             .network = bwrapNetwork(sb),
             .tmpdir = ppaths.tempDir(),
+            .temp_writes = sb.temp_writes,
         }, cmd);
         return .{ .wrapped = .{ .argv = argv, .profile_path = null, .backend = .bwrap, .allocator = alloc } };
     }
@@ -196,6 +197,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
         .deny_read = sb.deny_read,
         .main_git_dir = opts.main_git_dir,
         .additional_dirs = opts.additional_dirs,
+        .temp_writes = sb.temp_writes,
     });
     defer alloc.free(prof);
 
@@ -220,6 +222,16 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
     try argv.append(alloc, try alloc.dupe(u8, "/usr/bin/sandbox-exec"));
     try argv.append(alloc, try alloc.dupe(u8, "-f"));
     try argv.append(alloc, try alloc.dupe(u8, prof_path));
+    if (sb.temp_writes == .isolated) if (sb.temp_writes.isolated) |path| {
+        try argv.append(alloc, try alloc.dupe(u8, "/usr/bin/env"));
+        for ([_][]const u8{ "TMPDIR", "TMP", "TEMP" }) |key| {
+            const assignment = try std.fmt.allocPrint(alloc, "{s}={s}", .{ key, path });
+            argv.append(alloc, assignment) catch |err| {
+                alloc.free(assignment);
+                return err;
+            };
+        }
+    };
     try argv.append(alloc, try alloc.dupe(u8, "/bin/bash"));
     try argv.append(alloc, try alloc.dupe(u8, "-c"));
     try argv.append(alloc, try alloc.dupe(u8, cmd));
@@ -326,7 +338,7 @@ var profile_counter: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
     const pid: i64 = pprocess.currentPid();
     const n = profile_counter.fetchAdd(1, .monotonic);
-    const tmpdir_raw = if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp";
+    const tmpdir_raw = ppaths.tempDir();
     // 去掉末尾 / ,统一用 fmt 的显式 / 拼
     const tmpdir = if (tmpdir_raw.len > 1 and tmpdir_raw[tmpdir_raw.len - 1] == '/')
         tmpdir_raw[0 .. tmpdir_raw.len - 1]
@@ -336,8 +348,9 @@ fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
     const path_z = try std.fmt.bufPrint(&path_buf, "{s}/cczig_sb_{d}_{d}.sb\x00", .{ tmpdir, pid, n });
     const path = path_z[0 .. path_z.len - 1];
 
-    const fd = pfs.open(@ptrCast(path_z.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(@ptrCast(path_z.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.WriteProfileFailed;
+    errdefer pfs.unlinkPath(@ptrCast(path_z.ptr)) catch {};
     defer _ = pfs.close(fd);
 
     var written: usize = 0;

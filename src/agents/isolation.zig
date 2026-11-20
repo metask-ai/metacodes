@@ -2,6 +2,7 @@
 //! 工作树或提交变化则自动移除，有变化则保留路径交给父 agent/用户验收。
 
 const std = @import("std");
+const controller_git = @import("../util/controller_git.zig");
 const common = @import("../tools/common.zig");
 const teammate_process = @import("../swarm/teammate_process.zig");
 const pfs = @import("platform").fs;
@@ -347,18 +348,20 @@ fn gitEnvOutput(
     args: []const []const u8,
     abort: anytype,
 ) ![]u8 {
+    const prefix = try controller_git.prefix(allocator, cwd, abort);
+    defer prefix.deinit(allocator);
     var argv = std.ArrayList(?[*:0]const u8).empty;
     defer freeArgv(allocator, &argv);
     try appendZ(allocator, &argv, "/usr/bin/env");
     for (env) |assignment| try appendZ(allocator, &argv, assignment);
-    try appendZ(allocator, &argv, "git");
+    for (prefix.items) |arg| try appendZ(allocator, &argv, arg);
     try appendZ(allocator, &argv, "-C");
     try appendZ(allocator, &argv, cwd);
     for (args) |arg| try appendZ(allocator, &argv, arg);
     try argv.append(allocator, null);
     const out = try common.spawnCaptureWithStderrTimed(argv.items, allocator, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer allocator.free(out.stderr);
-    if (out.exit_code != 0) {
+    if (out.exit_code != 0 or !out.capture_complete) {
         allocator.free(out.stdout);
         return error.GitCommandFailed;
     }
@@ -374,7 +377,9 @@ fn deleteBranch(allocator: std.mem.Allocator, repo: []const u8, branch: []const 
 }
 
 fn appendZ(allocator: std.mem.Allocator, argv: *std.ArrayList(?[*:0]const u8), value: []const u8) !void {
-    try argv.append(allocator, (try allocator.dupeZ(u8, value)).ptr);
+    const z = try allocator.dupeZ(u8, value);
+    errdefer allocator.free(z);
+    try argv.append(allocator, z.ptr);
 }
 
 fn freeArgv(allocator: std.mem.Allocator, argv: *std.ArrayList(?[*:0]const u8)) void {
@@ -416,6 +421,38 @@ fn testRepo(tmp: *std.testing.TmpDir, buf: *[std.fs.max_path_bytes]u8) ![]const 
     try testWrite(root, "new.txt", "untracked\n");
     try testWrite(root, "debug.log", "ignored\n");
     return root;
+}
+
+test "Snapshot: candidate content filters never execute on the controller" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = try testRepo(&tmp, &buf);
+    var state_tmp = testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = state_buf[0..try state_tmp.dir.realPath(testing.io, &state_buf)];
+    try testWrite(repo, ".gitattributes", "*.dat filter=candidate\n");
+    try testWrite(repo, "filter.sh", "printf called > filter-ran\ncat\n");
+    try testWrite(repo, "data.dat", "candidate bytes\n");
+    for ([_][]const []const u8{
+        &.{ "config", "filter.candidate.clean", "/bin/sh ./filter.sh" },
+        &.{ "config", "filter.candidate.smudge", "/bin/sh ./filter.sh" },
+        &.{ "config", "filter.candidate.required", "true" },
+    }) |args| gpa.free(try testGit(repo, args));
+    var snap = try Snapshot.create(gpa, state_root, repo, null, null);
+    defer snap.deinit();
+    try testing.expect(!try testExists(repo, "filter-ran"));
+    try testing.expect(!try testExists(snap.path, "filter-ran"));
+    const data = try testGit(snap.path, &.{ "show", "candidate:data.dat" });
+    defer gpa.free(data);
+    try testing.expectEqualStrings("candidate bytes", data);
+    try testing.expect(snap.workspaceUnchanged(null));
+    try testWrite(repo, "data.dat", "changed bytes\n");
+    try testing.expect(!snap.workspaceUnchanged(null));
+    try testing.expect(!try testExists(repo, "filter-ran"));
 }
 
 test "Snapshot: working tree in, ignored out, actor index/HEAD/refs/stash untouched, always deleted" {

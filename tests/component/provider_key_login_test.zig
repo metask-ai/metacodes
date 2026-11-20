@@ -342,9 +342,10 @@ test "L2 key login (#488): /model takes no key and does not list a provider with
     picker_host.open(app, &ui, .unguarded);
     for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
     const configured = try picker.rows(&rows);
-    try std.testing.expect(configured.len > 0);
-    try std.testing.expect(configured[0] == .model);
-    try std.testing.expect(picker.offers.items[configured[0].model.offer_index].provider_id.eqlText("zai-coding-plan"));
+    try std.testing.expect(configured.len > 1);
+    try std.testing.expect(picker.offers.items[configured[0].heading.offer_index].provider_id.eqlText("zai-coding-plan"));
+    try std.testing.expect(configured[1] == .model);
+    try std.testing.expect(picker.offers.items[configured[1].model.offer_index].provider_id.eqlText("zai-coding-plan"));
     // The cursor is on GLM-5.3, listed first; Enter applies its preferred
     // route, the first (cn-anthropic).
     const focused = picker.focusedOffer() orelse return error.NoFocusedOffer;

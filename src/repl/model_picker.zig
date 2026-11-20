@@ -23,7 +23,7 @@
 //!   are different routes, and collapsing them by display name would hide the
 //!   choice this whole model exists to give. The providers are headings (the
 //!   one in use first), each saying where its credential comes from and who
-//!   bills it; a typed filter drops the headings and lists the matches flat.
+//!   bills it, filtered or not.
 //! - A model served on several routes shows them under it while the cursor is
 //!   on it. Enter on the model takes its preferred route (the one in use, else
 //!   the first in catalog order); Enter on a route takes that route.
@@ -134,6 +134,58 @@ pub const ProviderNote = struct {
     }
 };
 
+pub const ListNote = struct {
+    provider: Slug,
+    name_buffer: [MAX_PROVIDER_NAME]u8 = undefined,
+    name_len: usize = 0,
+    state: State,
+
+    pub const State = union(enum) {
+        downloading: u64,
+        failed: Failure,
+    };
+
+    pub const Failure = enum {
+        connection,
+        interrupted,
+        refused,
+        busy,
+        server_error,
+        not_a_list,
+        too_large,
+        stalled,
+        other,
+    };
+
+    pub fn init(provider: Slug, display_name: []const u8, state: State) ListNote {
+        var note = ListNote{ .provider = provider, .state = state };
+        const len = @min(display_name.len, MAX_PROVIDER_NAME);
+        @memcpy(note.name_buffer[0..len], display_name[0..len]);
+        note.name_len = len;
+        return note;
+    }
+
+    pub fn name(self: *const ListNote) []const u8 {
+        return self.name_buffer[0..self.name_len];
+    }
+
+    pub fn retryable(self: ListNote) bool {
+        return switch (self.state) {
+            .downloading => false,
+            .failed => |failure| failure != .refused,
+        };
+    }
+
+    pub fn eql(self: *const ListNote, other: *const ListNote) bool {
+        if (!self.provider.eql(other.provider)) return false;
+        if (!std.mem.eql(u8, self.name(), other.name())) return false;
+        return switch (self.state) {
+            .downloading => |bytes| other.state == .downloading and other.state.downloading == bytes,
+            .failed => |failure| other.state == .failed and other.state.failed == failure,
+        };
+    }
+};
+
 /// What the list is showing right now. `stale` and `failed` are states a client
 /// must be able to render: a picker that silently shows an out-of-date catalog
 /// invites committing to a route that no longer exists.
@@ -178,6 +230,7 @@ pub const Outcome = union(enum) {
     ignored,
     closed,
     commit: Commit,
+    retry_list: Slug,
 };
 
 pub const Key = union(enum) {
@@ -199,6 +252,7 @@ pub const Key = union(enum) {
     /// Cycles session → global → once. Session is the default, so any other
     /// scope is always an explicit act.
     cycle_scope,
+    retry,
     char: u8,
 };
 
@@ -292,8 +346,24 @@ pub const Picker = struct {
     intents: controls_mod.ControlValues = .{},
     scope: Scope = .session,
 
+    list_note: ?ListNote = null,
+
     pub fn init(allocator: std.mem.Allocator) Picker {
         return .{ .allocator = allocator };
+    }
+
+    pub fn setListNote(self: *Picker, note: ?ListNote) bool {
+        if (self.list_note) |*shown| {
+            if (note) |*wanted| if (shown.eql(wanted)) return false;
+        } else if (note == null) return false;
+        self.list_note = note;
+        return true;
+    }
+
+    pub fn shownListNote(self: *const Picker) ?*const ListNote {
+        const note = if (self.list_note) |*value| value else return null;
+        if (self.noteFor(note.provider) == null) return null;
+        return note;
     }
 
     pub fn deinit(self: *Picker) void {
@@ -506,14 +576,25 @@ pub const Picker = struct {
                         if (buffer.list.items.len == start + 1) buffer.list.shrinkRetainingCapacity(start);
                     }
                 } else {
-                    // Flat, across the configured providers: someone looking
-                    // for GLM should not have to know it lives behind
-                    // `zai-coding-plan`. The models that hold the typed text
-                    // whole come first, the ones that only hold its letters
-                    // in order after them: `glm` lists GLM-5.3 before
-                    // `google/gemini-…`. Within each, in the list's order.
-                    for ([_]Match{ .whole, .scattered }) |tier| {
-                        for (providers.items) |first| try self.modelRows(buffer, self.offers.items[first].provider_id, tier);
+                    // Across the configured providers, each under its
+                    // heading: someone looking for GLM should not have to
+                    // know it lives behind `zai-coding-plan`. The providers
+                    // with a model that holds the typed text whole come
+                    // first, the ones whose models only hold its letters in
+                    // order after them, and so do the models within each:
+                    // `glm` lists GLM-5.3 before `google/gemini-…`.
+                    // Otherwise in the list's order.
+                    for ([_]Match{ .whole, .scattered }) |best| {
+                        for (providers.items) |first| {
+                            const provider = self.offers.items[first].provider_id;
+                            const match = self.providerMatch(provider) orelse continue;
+                            if (match != best) continue;
+                            const start = buffer.list.items.len;
+                            try buffer.list.append(buffer.gpa, .{ .heading = .{ .offer_index = first } });
+                            try self.modelRows(buffer, provider, .whole);
+                            try self.modelRows(buffer, provider, .scattered);
+                            if (buffer.list.items.len == start + 1) buffer.list.shrinkRetainingCapacity(start);
+                        }
                     }
                 }
             },
@@ -612,6 +693,17 @@ pub const Picker = struct {
                 holds(offer.request_model_id, needle) or holds(offer.provider_id.slice(), needle)) return .whole;
         }
         return .scattered;
+    }
+
+    fn providerMatch(self: *const Picker, provider: Slug) ?Match {
+        var best: ?Match = null;
+        for (self.offers.items, 0..) |*offer, index| {
+            if (!offer.provider_id.eql(provider) or !self.isReady(index)) continue;
+            if (!self.matchesOffer(offer)) continue;
+            if (self.modelMatch(provider, canonicalKey(offer.*)) == .whole) return .whole;
+            best = .scattered;
+        }
+        return best;
     }
 
     fn matchesOffer(self: *const Picker, offer: *const OfferSummary) bool {
@@ -826,6 +918,11 @@ pub const Picker = struct {
                 };
                 return .redraw;
             },
+            .retry => {
+                const note = self.shownListNote() orelse return .ignored;
+                if (!note.retryable()) return .ignored;
+                return .{ .retry_list = note.provider };
+            },
             .backspace => {
                 if (self.filter_len == 0) return .ignored;
                 self.filter_len -= 1;
@@ -834,9 +931,6 @@ pub const Picker = struct {
             },
             .escape => return self.back(),
             .char => |byte| {
-                // `q` closes only on an empty filter, so it stays typeable in a
-                // model name. Same rule the `?` help key already uses.
-                if (byte == 'q' and self.filter_len == 0) return .closed;
                 if (byte < 0x20 or byte == 0x7f) return .ignored;
                 if (self.filter_len == MAX_FILTER) return .ignored;
                 self.filter_buffer[self.filter_len] = byte;
@@ -879,7 +973,7 @@ pub const Picker = struct {
     fn pageMove(self: *Picker, visible: []const Row, down: bool) Outcome {
         const count = visible.len;
         if (count == 0) return .ignored;
-        const step = @max(self.page_rows, 1);
+        const step = if (self.page_rows > 1) self.page_rows - 1 else 1;
         const target = if (down) @min(self.cursor + step, count - 1) else self.cursor -| step;
         const index = focusableNear(visible, target, !down) orelse focusableNear(visible, target, down) orelse return .ignored;
         self.cursor = index;
@@ -909,8 +1003,8 @@ pub const Picker = struct {
     }
 
     /// Keep the cursor inside the visible window, scrolling by the minimum
-    /// needed so a long list does not jump under the user, and showing the
-    /// heading of the first model in it.
+    /// needed so a long list does not jump under the user, with a row above
+    /// it once scrolled.
     fn scrollTo(self: *Picker, list: []const Row) void {
         const count = list.len;
         const rows_visible = @max(self.page_rows, 1);
@@ -923,7 +1017,7 @@ pub const Picker = struct {
         } else if (self.cursor >= self.window_top + rows_visible) {
             self.window_top = self.cursor - rows_visible + 1;
         }
-        if (self.window_top > 0 and self.window_top == self.cursor and list[self.window_top - 1] == .heading) {
+        if (self.window_top > 0 and self.window_top == self.cursor and rows_visible > 1) {
             self.window_top -= 1;
         }
         const max_top = count - rows_visible;
@@ -1393,8 +1487,8 @@ test "a sign-in's preset opens on its filter and scope, as if typed and cycled, 
     picker.presetFilter(":free");
     try testing.expectEqualStrings(":free", picker.filter());
     var letters: [16]u8 = undefined;
-    // The two free models, flat; not the paid one.
-    try testing.expectEqualStrings("MM", try shape(&picker, &letters));
+    // The two free models under OpenRouter's heading; not the paid one.
+    try testing.expectEqualStrings("HMM", try shape(&picker, &letters));
     try testing.expectEqual(Scope.global, picker.scope);
     // Enter applies the one under the cursor from now on.
     const committed = picker.onKey(.enter).commit;
@@ -1409,7 +1503,7 @@ test "a sign-in's preset opens on its filter and scope, as if typed and cycled, 
     try testing.expectEqual(Scope.session, picker.scope);
 }
 
-test "a typed filter lists the matches flat, and Esc clears it, then closes" {
+test "a typed filter keeps the matches under their providers' headings, and Esc clears it, then closes" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
     const offers = [_]OfferSummary{
@@ -1421,11 +1515,11 @@ test "a typed filter lists the matches flat, and Esc clears it, then closes" {
     picker.restart();
     for ("g46") |byte| _ = picker.onKey(.{ .char = byte });
     var letters: [16]u8 = undefined;
-    try testing.expectEqualStrings("M", try shape(&picker, &letters));
+    try testing.expectEqualStrings("HM", try shape(&picker, &letters));
     _ = picker.onKey(.backspace);
     _ = picker.onKey(.backspace);
-    // "g" matches across providers, without headings.
-    try testing.expectEqualStrings("MM", try shape(&picker, &letters));
+    // "g" matches across providers, each under its heading.
+    try testing.expectEqualStrings("HMHM", try shape(&picker, &letters));
     try testing.expect(picker.onKey(.escape) == .redraw);
     try testing.expectEqual(@as(usize, 0), picker.filter_len);
     try testing.expectEqualStrings("HMMHM", try shape(&picker, &letters));
@@ -1457,21 +1551,111 @@ test "a typed filter lists the models that hold it whole before the ones that on
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqualStrings("zai/glm-5.3", labels[0]);
     try testing.expectEqualStrings("google/gemini-4-argon", labels[1]);
+    var letters: [16]u8 = undefined;
+    try testing.expectEqualStrings("HMRRHM", try shape(&picker, &letters));
+    try testing.expectEqualStrings("zai", picker.offers.items[listed[0].heading.offer_index].provider_id.slice());
     // The cursor starts on the whole match, and the model is listed once
     // though it has two routes.
     try testing.expectEqualStrings("glm-5.3", picker.focusedOffer().?.request_model_id);
 }
 
-test "q types into a non-empty filter and closes only when the filter is empty" {
+test "a filter lists a model OpenRouter resells under OpenRouter's heading, apart from the provider's own (#600)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{fixtureOffer("qwen", "default", "Qwen3", null, "qwen3", "openai_chat")};
+    const offers = [_]OfferSummary{
+        fixtureOffer("openrouter", "auto", "Google: Vision 4o", null, "google/vision-4o", "openai_chat"),
+        fixtureOffer("openrouter", "auto", "DeepSeek: DeepSeek V4 Pro", null, "deepseek/deepseek-v4-pro", "openai_chat"),
+        fixtureOffer("openrouter", "auto", "Qwen: Qwen4 Max", null, "qwen/qwen4-max", "openai_chat"),
+        fixtureOffer("kimi", "default", "Kimi Vision 4", null, "kimi-vision-4", "openai_chat"),
+        fixtureOffer("deepseek", "default", "DeepSeek V4 Pro", "deepseek/deepseek-v4-pro", "deepseek-v4-pro", "openai_chat"),
+    };
     try loadFixture(&picker, &offers, null);
     picker.restart();
-    _ = picker.onKey(.{ .char = 'w' });
+    for ("v4") |byte| _ = picker.onKey(.{ .char = byte });
+    var buffer = Picker.RowBuffer.init(testing.allocator);
+    defer buffer.deinit();
+    var letters: [16]u8 = undefined;
+    try testing.expectEqualStrings("HMMHMHM", try shape(&picker, &letters));
+    var list = try picker.rows(&buffer);
+    const wanted = [_][]const u8{ "openrouter", "DeepSeek: DeepSeek V4 Pro", "Google: Vision 4o", "deepseek", "DeepSeek V4 Pro", "kimi", "Kimi Vision 4" };
+    for (list, wanted) |row, want| {
+        const offer = switch (row) {
+            .heading => |heading| picker.offers.items[heading.offer_index],
+            .model => |group| picker.offers.items[group.offer_index],
+            .route => unreachable,
+        };
+        const seen = if (row == .heading) offer.provider_id.slice() else offer.display_name;
+        try testing.expectEqualStrings(want, seen);
+    }
+    try testing.expectEqualStrings("deepseek/deepseek-v4-pro", picker.focusedOffer().?.request_model_id);
+
+    try loadFixture(&picker, &offers, offers[4].offer_id);
+    picker.restart();
+    for ("v4") |byte| _ = picker.onKey(.{ .char = byte });
+    list = try picker.rows(&buffer);
+    try testing.expectEqualStrings("HMHMMHM", try shape(&picker, &letters));
+    try testing.expectEqualStrings("deepseek", picker.offers.items[list[0].heading.offer_index].provider_id.slice());
+}
+
+test "a scrolled window keeps a row above the cursor, for the heading the view draws there (#600)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [20][4]u8 = undefined;
+    var offers: [20]OfferSummary = undefined;
+    for (&offers, 0..) |*slot, index| {
+        const id = std.fmt.bufPrint(&names[index], "m{d:0>2}", .{index}) catch unreachable;
+        slot.* = fixtureOffer("openrouter", "auto", id, null, id, "openai_chat");
+    }
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    picker.page_rows = 5;
+    _ = picker.onKey(.end);
+    try testing.expectEqual(@as(usize, 20), picker.cursor);
+    try testing.expectEqual(@as(usize, 16), picker.window_top);
+    for (0..14) |_| {
+        _ = picker.onKey(.up);
+        try testing.expect(picker.cursor < picker.window_top + picker.page_rows);
+        try testing.expect(picker.window_top < picker.cursor);
+    }
+    try testing.expectEqual(@as(usize, 6), picker.cursor);
+    try testing.expectEqual(@as(usize, 5), picker.window_top);
+    for (0..3) |_| _ = picker.onKey(.down);
+    try testing.expectEqual(@as(usize, 5), picker.window_top);
+    _ = picker.onKey(.home);
+    try testing.expectEqual(@as(usize, 1), picker.cursor);
+    try testing.expectEqual(@as(usize, 0), picker.window_top);
+}
+
+test "q is a filter letter like any other, the first one too (#599)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("deepseek", "default", "DeepSeek V4 Pro", null, "deepseek-v4-pro", "openai_chat"),
+        fixtureOffer("qwen", "default", "Qwen3", null, "qwen3", "openai_chat"),
+        fixtureOffer("qwen", "default", "QwQ 32B", null, "qwq-32b", "openai_chat"),
+    };
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .redraw);
-    try testing.expectEqualStrings("wq", picker.filter());
-    _ = picker.onKey(.escape);
+    try testing.expectEqualStrings("q", picker.filter());
+    try testing.expectEqual(Stage.list, picker.stage);
+    for ("wq") |byte| try testing.expect(picker.onKey(.{ .char = byte }) == .redraw);
+    try testing.expectEqualStrings("qwq", picker.filter());
+    try testing.expectEqualStrings("qwq-32b", picker.focusedOffer().?.request_model_id);
+    try testing.expect(picker.onKey(.escape) == .redraw);
+    try testing.expectEqualStrings("", picker.filter());
+    try testing.expect(picker.onKey(.escape) == .closed);
+}
+
+test "the setup stage, which takes no typing, still closes on q (#599)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{fixtureOffer("kimi", "default", "K3", null, "k3", "openai_chat")};
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    picker.enterSetup(.{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" });
+    try testing.expect(picker.onKey(.{ .char = 'a' }) == .ignored);
+    try testing.expectEqual(Stage.setup, picker.stage);
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .closed);
 }
 
@@ -1493,6 +1677,8 @@ test "navigation wraps, skips headings, pages, and keeps the cursor inside the w
     // Past bravo's heading.
     try testing.expectEqual(@as(usize, 8), picker.cursor);
     try testing.expect(picker.cursor < picker.window_top + picker.page_rows);
+    _ = picker.onKey(.page_down);
+    try testing.expectEqual(@as(usize, 12), picker.cursor);
     _ = picker.onKey(.page_down);
     try testing.expectEqual(@as(usize, 13), picker.cursor);
     _ = picker.onKey(.down);
@@ -1735,7 +1921,7 @@ test "a filter does not find the models of a provider with no ready offer (#488)
     // `glm` matches both models; only the configured one is listed.
     for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
     var letters: [16]u8 = undefined;
-    try testing.expectEqualStrings("M", try shape(&picker, &letters));
+    try testing.expectEqualStrings("HM", try shape(&picker, &letters));
     try testing.expectEqualStrings("glm-5.3", picker.focusedOffer().?.request_model_id);
     // What only the other provider matches lists nothing, and Enter there
     // neither commits nor shows a setup.
@@ -1801,4 +1987,56 @@ test "a provider note keeps its name when what it was read from is freed" {
     @memset(&name, 'x');
     try testing.expectEqualStrings("DeepSeek", note.name());
     try testing.expectEqualStrings("key from .env", note.originText().?);
+}
+
+fn openRouterNote(state: ListNote.State) ListNote {
+    return ListNote.init(Slug.lit("openrouter"), "OpenRouter", state);
+}
+
+test "Ctrl+R asks for a list again only when it did not come, and not for a refused key (#572)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{fixtureOffer("openrouter", "auto", "Auto Router", "openrouter/auto", "openrouter/auto", "openai_chat")};
+    try loadFixture(&picker, &offers, null);
+    try picker.setReadiness(&.{true}, &.{ProviderNote.init(Slug.lit("openrouter"), "OpenRouter", .saved_key)});
+    picker.restart();
+    try testing.expect(picker.onKey(.retry) == .ignored);
+    try testing.expect(picker.setListNote(openRouterNote(.{ .downloading = 1024 })));
+    try testing.expect(picker.onKey(.retry) == .ignored);
+    try testing.expect(picker.setListNote(openRouterNote(.{ .failed = .refused })));
+    try testing.expect(picker.onKey(.retry) == .ignored);
+    for (":free") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expect(picker.setListNote(openRouterNote(.{ .failed = .connection })));
+    const outcome = picker.onKey(.retry);
+    try testing.expect(outcome == .retry_list);
+    try testing.expect(outcome.retry_list.eqlText("openrouter"));
+    try testing.expectEqualStrings(":free", picker.filter());
+    picker.enterSetup(.{ .provider = Slug.lit("openrouter"), .sign_in = true });
+    try testing.expect(picker.onKey(.retry) == .ignored);
+}
+
+test "a line about a list is said once, kept across snapshots, and only for a provider the picker lists (#572)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const auto = fixtureOffer("openrouter", "auto", "Auto Router", "openrouter/auto", "openrouter/auto", "openai_chat");
+    const flash = fixtureOffer("openrouter", "auto", "DeepSeek V4.1 Flash", "deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash", "openai_chat");
+    try loadFixture(&picker, &.{auto}, null);
+    const notes = [_]ProviderNote{ProviderNote.init(Slug.lit("openrouter"), "OpenRouter", .saved_key)};
+    try picker.setReadiness(&.{true}, &notes);
+    picker.restart();
+    for ("deep") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expect(picker.setListNote(openRouterNote(.{ .downloading = 0 })));
+    try testing.expect(!picker.setListNote(openRouterNote(.{ .downloading = 0 })));
+    try testing.expect(picker.setListNote(openRouterNote(.{ .downloading = 4096 })));
+    try testing.expect(picker.shownListNote() != null);
+    try loadFixture(&picker, &.{ auto, flash }, null);
+    try picker.setReadiness(&.{ true, true }, &notes);
+    try testing.expectEqualStrings("deep", picker.filter());
+    try testing.expectEqualStrings("DeepSeek V4.1 Flash", picker.focusedOffer().?.display_name);
+    try testing.expect(picker.shownListNote() != null);
+    try testing.expect(picker.setListNote(null));
+    try testing.expect(!picker.setListNote(null));
+    try testing.expect(picker.setListNote(openRouterNote(.{ .failed = .connection })));
+    try picker.setReadiness(&.{ false, false }, &.{});
+    try testing.expect(picker.shownListNote() == null);
 }

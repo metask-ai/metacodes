@@ -23,6 +23,8 @@ pub const SandboxSettings = struct {
     fail_if_unavailable: bool = false,
     allow_unsandboxed_commands: bool = true,
     auto_allow_bash_if_sandboxed: bool = true,
+    // Host-only policy. Teamwork does not grant writes to shared temp roots.
+    temp_writes: TempWrites = .system,
 
     allow_write: []const []const u8 = &.{},
     deny_write: []const []const u8 = &.{},
@@ -35,6 +37,8 @@ pub const SandboxSettings = struct {
     excluded_commands: []const []const u8 = &.{},
 
     allocator: ?std.mem.Allocator = null,
+
+    pub const TempWrites = union(enum) { system, isolated: ?[]const u8 };
 
     pub fn deinit(self: *SandboxSettings) void {
         const a = self.allocator orelse return;
