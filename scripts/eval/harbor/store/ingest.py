@@ -15,6 +15,7 @@ recomputes its projections from its own blobs when the code changes.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import sys
@@ -23,7 +24,7 @@ import threading
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from scripts.eval.harbor import profiling
 from scripts.eval.harbor.store import schema
@@ -751,10 +752,64 @@ def ingest_batches(store: Store, batches_dir: Path) -> int:
     return written
 
 
-def ingest_root(store: Store, root: Path, *, verify: bool = False,
+ROOT_LOCK = ".bench-store.lock"
+
+
+@contextlib.contextmanager
+def root_lock(root: Path, wait: bool = True) -> Iterator[None]:
+    """Serializes imports, manual result syncs and batch deletions of one
+    jobs directory across processes. A missing directory, or one this
+    process cannot write that has no lock yet, is read unlocked: nothing
+    here can delete from it."""
+    path = Path(root) / ROOT_LOCK
+    try:
+        fd = os.open(path, (os.O_RDWR if os.name == "nt" else os.O_RDONLY) | os.O_CREAT, 0o600)
+    except FileNotFoundError:
+        yield
+        return
+    except OSError as exc:
+        if not path.exists() and not os.access(root, os.W_OK):
+            yield
+            return
+        raise ValueError(f"无法打开 jobs 目录的锁 {path}（{exc.strerror}），处理后可以重试") from None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if not os.fstat(fd).st_size:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            mode = msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK
+        else:
+            import fcntl
+            mode = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            if os.name == "nt":
+                msvcrt.locking(fd, mode, 1)
+            else:
+                fcntl.flock(fd, mode)
+        except OSError:
+            raise ValueError("这个 jobs 目录正在导入或同步结果，请稍后重试") from None
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def ingest_root(store: Store, root: Path, *, verify: bool = False, wait: bool = True,
                 log: Callable[[str], None] = lambda message: None) -> RootResult:
     """Every job directory and launch record under one Harbor jobs directory."""
     root = Path(root).expanduser().resolve()
+    with root_lock(root, wait):
+        return _ingest_root(store, root, verify, log)
+
+
+def _ingest_root(store: Store, root: Path, verify: bool, log: Callable[[str], None]) -> RootResult:
     result = RootResult(str(root))
     try:
         children = sorted(root.iterdir())
@@ -830,12 +885,14 @@ class WorkerSync:
         self.thread = threading.Thread(target=loop, name="bench-store-sync", daemon=True)
         self.thread.start()
 
-    def finish(self, heartbeat: Callable[[], None]) -> None:
-        """Final verified ingestion; `heartbeat` keeps the run visibly alive."""
+    def finish(self, heartbeat: Callable[[], None], record: Dict[str, Any]) -> None:
+        """Final verified ingestion of the job, then the run's final record;
+        `heartbeat` keeps the run visibly alive."""
         if self.config is None:
             return
         self.stop.set()
-        final = threading.Thread(target=lambda: (self.thread.join() if self.thread else None, self.once(verify=True)),
+        final = threading.Thread(target=lambda: (self.thread.join() if self.thread else None, self.once(verify=True),
+                                                 self.record(record)),
                                  name="bench-store-final", daemon=True)
         final.start()
         while final.is_alive():
@@ -843,14 +900,11 @@ class WorkerSync:
             if final.is_alive():
                 heartbeat()
 
-    def record(self, name: str) -> None:
-        """Store the run's final receipt, spec and worker log."""
+    def record(self, record: Dict[str, Any]) -> None:
+        """Store the run's final record, spec and worker log."""
         try:
             store = self._open()
-            if store is None:
-                return
-            record = data.read_json(self.records_dir / (name + ".json"))
-            if isinstance(record, dict) and record.get("status") in schema.RUN_STATUSES and record.get("name") == name:
+            if store is not None:
                 ingest_run(store, self.records_dir, record)
         except Exception as exc:
             stderr_log(f"bench store: recording run failed: {type(exc).__name__}: {exc}")

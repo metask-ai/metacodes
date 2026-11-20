@@ -20,7 +20,8 @@ from unittest.mock import patch
 from scripts.eval.harbor import cli, profiling
 from scripts.eval.harbor.store.backend import Store
 from scripts.eval.harbor.store import config as store_config
-from scripts.eval.harbor.bench import batches, data
+from scripts.eval.harbor.store import ingest
+from scripts.eval.harbor.bench import batches, data, executors
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
@@ -145,8 +146,8 @@ class BatchTest(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.manager = RunManager(self.root / 'jobs', self.config)
-        self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager),
-                                       '127.0.0.1', 0)
+        self.workbench = Workbench(data.Library([self.manager.jobs_dir]), self.manager)
+        self.http = server.make_server(self.workbench, '127.0.0.1', 0)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
@@ -223,11 +224,186 @@ class BatchTest(unittest.TestCase):
                 time.sleep(.05)
             with self.assertRaisesRegex(ValueError, '批次|已有评测'):
                 self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 1, 'concurrency': 1})
+            with self.assertRaisesRegex(ValueError, '先取消'):
+                self.client.request('api/batch/delete', {'id': created['id']})
             self.client.request('api/batch/cancel', {'id': created['id']})
             record = self.wait_batch(created['id'])
         self.assertEqual(record['status'], 'cancelled')
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
+
+    def test_deleting_a_batch_removes_its_runs_results_and_rows(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        doomed = self.wait_batch(self.client.request('api/batches', one)['id'])
+        kept = self.wait_batch(self.client.request('api/batches', one)['id'])
+        run = doomed['items'][0]['run']
+        atomic_json(self.manager.records / 'launch-failed.json', {'name': 'launch-failed', 'status': 'failed',
+                                                                  'batch': doomed['id'], 'error': 'OSError'})
+        self.client.request('api/batch?id=' + doomed['id'])
+        before = self.client.request('api/store')['counts']
+        self.assertEqual((before['batches'], before['jobs'], before['runs']), (2, 2, 3))
+
+        deleted = self.client.request('api/batch/delete', {'id': doomed['id']})
+
+        self.assertEqual(deleted['runs'], sorted([run, 'launch-failed']))
+        self.assertFalse(self.manager.batches.path(doomed['id']).exists())
+        self.assertEqual(list(self.manager.records.glob(run + '.*')), [])
+        self.assertFalse((self.manager.records / 'launch-failed.json').exists())
+        self.assertFalse((self.manager.jobs_dir / run).exists())
+        with self.assertRaises(ValueError):
+            self.client.request('api/batch?id=' + doomed['id'])
+        counts = self.client.request('api/store')['counts']
+        self.assertEqual((counts['batches'], counts['jobs'], counts['runs']), (1, 1, 1))
+        listing = self.client.request('api/jobs?batch=all')
+        self.assertEqual([b['id'] for b in listing['batches']], [kept['id']])
+        self.assertEqual([j['name'] for j in listing['jobs']], [kept['items'][0]['run']])
+        with self.assertRaisesRegex(ValueError, '不存在'):
+            self.client.request('api/batch/delete', {'id': doomed['id']})
+        with self.workbench.library.store.read() as tx:
+            orphans = tx.query("SELECT sha256 FROM blobs WHERE sha256 NOT IN (SELECT sha256 FROM files WHERE sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT tail_sha256 FROM files WHERE tail_sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT spec_sha256 FROM runs WHERE spec_sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT log_sha256 FROM runs WHERE log_sha256 IS NOT NULL)")
+            spec = tx.one("SELECT b.encoding, b.content FROM runs r JOIN blobs b ON b.sha256 = r.spec_sha256 WHERE r.name = ?",
+                         (kept['items'][0]['run'],))
+        self.assertEqual(orphans, [])
+        self.assertEqual(json.loads(ingest.decode(*spec))['name'], kept['items'][0]['run'])
+
+    def test_a_batch_whose_files_cannot_be_removed_stays_for_a_retry(self):
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions')
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        job = self.manager.jobs_dir / batch['items'][0]['run']
+        job.chmod(0o500)
+        try:
+            with self.assertRaisesRegex(ValueError, '可以重试'):
+                self.client.request('api/batch/delete', {'id': batch['id']})
+            self.assertTrue(self.manager.batches.path(batch['id']).exists())
+            self.assertEqual(self.client.request('api/batch?id=' + batch['id'])['id'], batch['id'])
+        finally:
+            job.chmod(0o700)
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertFalse(job.exists())
+        self.assertEqual(self.client.request('api/store')['counts']['batches'], 0)
+
+    def test_a_batch_whose_receipts_cannot_be_listed_stays_for_a_retry(self):
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions')
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        run = batch['items'][0]['run']
+        self.manager.records.chmod(0o300)
+        try:
+            with self.assertRaisesRegex(ValueError, '可以重试'):
+                self.client.request('api/batch/delete', {'id': batch['id']})
+        finally:
+            self.manager.records.chmod(0o700)
+        self.assertTrue((self.manager.jobs_dir / run).is_dir())
+        self.assertTrue((self.manager.records / (run + '.json')).exists())
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertEqual(list(self.manager.records.glob(run + '.*')), [])
+        self.assertEqual(self.client.request('api/store')['counts']['runs'], 0)
+
+    def test_a_failed_database_delete_keeps_the_ended_manifest_for_a_retry(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        self.client.request('api/batch?id=' + batch['id'])
+        stale = json.dumps({**batch, 'status': 'queued'})
+        with self.workbench.library.store.transaction() as tx:
+            tx.execute("UPDATE batches SET status = 'queued', record_json = ? WHERE id = ?", (stale, batch['id']))
+        with patch.object(ingest, 'collect_garbage', side_effect=RuntimeError('database is locked')):
+            with self.assertRaisesRegex(RuntimeError, 'locked'):
+                self.workbench.delete_batch(batch['id'])
+        self.assertTrue(self.manager.batches.path(batch['id']).exists())
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertFalse(self.manager.batches.path(batch['id']).exists())
+        self.assertEqual(self.client.request('api/store')['counts']['batches'], 0)
+
+    def test_a_batch_deleted_by_its_owner_meanwhile_is_not_deleted_again(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        run = batch['items'][0]['run']
+        self.client.request('api/batch?id=' + batch['id'])
+        other = RunManager(self.root / 'jobs-b', self.config)
+        shutil.copytree(self.manager.jobs_dir / run, other.jobs_dir / run)
+        bench = Workbench(data.Library([other.jobs_dir]), other)
+        self.addCleanup(bench.close)
+        seen = bench.batch_records()
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        with patch.object(bench, 'batch_records', return_value=seen):
+            with self.assertRaisesRegex(ValueError, '不存在'):
+                bench.delete_batch(batch['id'])
+        self.assertTrue((other.jobs_dir / run).is_dir())
+
+    def test_imports_syncs_and_deletions_of_a_jobs_directory_exclude_each_other(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        library = self.workbench.library
+        lock = self.manager.jobs_dir / ingest.ROOT_LOCK
+        with ingest.root_lock(self.manager.jobs_dir):
+            lock.chmod(0o400)
+            importer = threading.Thread(target=ingest.ingest_root, args=(library.store, self.manager.jobs_dir))
+            outcome = {}
+
+            def sync_back():
+                try:
+                    executors.sync_run(self.manager.jobs_dir, 'missing-run', log=lambda text: None)
+                except ValueError as exc:
+                    outcome['error'] = str(exc)
+
+            syncer = threading.Thread(target=sync_back)
+            importer.start()
+            syncer.start()
+            with self.assertRaisesRegex(ValueError, '稍后重试'):
+                self.workbench.delete_batch(batch['id'])
+            time.sleep(.3)
+            self.assertTrue(importer.is_alive())
+            self.assertTrue(syncer.is_alive())
+        importer.join(10)
+        syncer.join(10)
+        self.assertIn('运行不存在', outcome['error'])
+        self.assertTrue(self.manager.batches.path(batch['id']).exists())
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertEqual(self.client.request('api/store')['counts']['batches'], 0)
+
+    def test_a_partly_removed_launch_failure_keeps_its_receipt_for_a_retry(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        atomic_json(self.manager.records / 'launch-failed.json', {'name': 'launch-failed', 'status': 'failed',
+                                                                  'batch': batch['id'], 'error': 'OSError'})
+        for suffix in ('.log', '.spec'):
+            (self.manager.records / ('launch-failed' + suffix)).write_text('x')
+        unlink = Path.unlink
+
+        def failing_unlink(path, missing_ok=False):
+            if path.name == 'launch-failed.log':
+                raise PermissionError('denied')
+            unlink(path, missing_ok=missing_ok)
+
+        with patch.object(Path, 'unlink', failing_unlink):
+            with self.assertRaisesRegex(ValueError, '可以重试'):
+                self.workbench.delete_batch(batch['id'])
+        self.assertTrue((self.manager.records / 'launch-failed.json').exists())
+        deleted = self.workbench.delete_batch(batch['id'])
+        self.assertIn('launch-failed', deleted['runs'])
+        self.assertEqual(list(self.manager.records.glob('launch-failed.*')), [])
+
+    def test_a_batch_from_another_jobs_directory_is_refused(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        run = batch['items'][0]['run']
+        self.client.request('api/batch?id=' + batch['id'])
+        other = RunManager(self.root / 'jobs-b', self.config)
+        shutil.copytree(self.manager.jobs_dir / run, other.jobs_dir / run)
+        bench = Workbench(data.Library([other.jobs_dir]), other)
+        self.addCleanup(bench.close)
+        with self.assertRaisesRegex(ValueError, '请在那个 jobs 目录'):
+            bench.delete_batch(batch['id'])
+        self.assertTrue((other.jobs_dir / run).is_dir())
+        self.assertTrue((self.manager.jobs_dir / run).is_dir())
+        self.assertTrue(self.manager.batches.path(batch['id']).exists())
+        self.assertEqual(self.client.request('api/store')['counts']['batches'], 1)
 
     def test_a_modified_frozen_bundle_is_refused(self):
         # The server's scheduler would race the tampering below (create()

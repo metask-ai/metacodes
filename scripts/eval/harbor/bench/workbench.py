@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.bench import data
-from scripts.eval.harbor.bench.batches import BatchManager, public as public_batch
+from scripts.eval.harbor.bench.batches import BATCH_ACTIVE, BatchManager, public as public_batch
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
 from scripts.eval.harbor.store import config as store_config
@@ -271,6 +272,45 @@ class Workbench:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.batches.cancel(batch_id)
+
+    def delete_batch(self, batch_id) -> Dict[str, Any]:
+        manager = self.manager
+        if not manager:
+            raise ValueError(READ_ONLY)
+        if not isinstance(batch_id, str) or not data.NAME.fullmatch(batch_id):
+            raise ValueError("批次不存在")
+        with self.batches.lock, manager.lock:
+            record = next((r for r in self.batch_records() if r["id"] == batch_id), None)
+            if record is None:
+                raise ValueError("批次不存在")
+            receipts = manager.runs()
+            names = {item.get("run") for item in record["items"]} | set(self.library.batch_runs(batch_id))
+            names |= {r["name"] for r in receipts if r.get("batch") == batch_id}
+            runs = sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
+            running = {r["name"] for r in receipts if r.get("status") in ACTIVE}
+            if record["status"] in BATCH_ACTIVE or running.intersection(runs):
+                raise ValueError("批次还在运行，请先取消，结束后再删除")
+            self.library.delete_batch(batch_id, runs, manager.jobs_dir, self.batches.path(batch_id),
+                                      lambda: self._remove_run_files(runs))
+        return {"id": batch_id, "deleted": True, "runs": runs}
+
+    def _remove_run_files(self, runs) -> None:
+        manager = self.manager
+        try:
+            try:
+                receipts = [manager.records / name for name in os.listdir(manager.records)
+                            if name.rpartition(".")[0] in runs]
+            except FileNotFoundError:
+                receipts = []
+            for run in runs:
+                try:
+                    shutil.rmtree(manager.jobs_dir / run)
+                except FileNotFoundError:
+                    pass
+            for path in sorted(receipts, key=lambda path: path.suffix == ".json"):
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ValueError(f"删除文件失败（{exc}），批次已保留，处理后可以重试") from None
 
     def start_setup(self, request) -> Dict[str, Any]:
         if not self.manager:
