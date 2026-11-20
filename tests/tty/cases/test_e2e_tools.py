@@ -9,10 +9,9 @@
 """
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import assert_tool_e2e, read_tool_uses, tool_called, run_live, keep_home as _keep_home, require_model  # noqa: E402
+from e2e_helpers import assert_tool_e2e, read_tool_uses, run_live, keep_home as _keep_home, require_model  # noqa: E402
 
 
 def test_e2e_write(bin_path):
@@ -140,9 +139,7 @@ def test_e2e_task_update_numeric_id(bin_path):
     require_model()
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from e2e_helpers import RETRIES, fresh_home, read_tool_uses, read_tool_results_with_error  # noqa: E402
-    from tty_driver import run as _run  # noqa: E402
-    import json as _json
+    from e2e_helpers import RETRIES, fresh_home, read_tool_results_with_error  # noqa: E402
     import shutil as _shutil
 
     last_diag = None
@@ -208,7 +205,6 @@ def test_e2e_task_subagent(bin_path):
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from e2e_helpers import RETRIES, fresh_home, find_subagent_done  # noqa: E402
-    from tty_driver import run as _run  # noqa: E402
     import shutil as _shutil
 
     prompt = ("Launch a background subagent with the Task tool (run_in_background true, "
@@ -268,7 +264,6 @@ def test_e2e_agent_tree_onscreen(bin_path):
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from e2e_helpers import RETRIES, fresh_home  # noqa: E402
-    from tty_driver import run as _run  # noqa: E402
     from asserts import TTYAssert  # noqa: E402
     import shutil as _shutil
 

@@ -16,7 +16,7 @@ import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Dict, Mapping, Sequence
 
 from . import WORKBUDDY_PINNED_COMMIT
 from ..model import O_BINARY, fsync_directory, open_nofollow

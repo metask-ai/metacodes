@@ -61,15 +61,15 @@ for slug in slugs:
         d = read(path)
         if d.get("run_id") not in selected_ids:
             continue
-        l = pick(d, ["run_id", "content_sha256", "harness_fingerprint", "quality_evidence", "evaluation_treatment"])
-        l["file"] = str(path.relative_to(base))
-        l["sha256"] = digest(path)
-        l["artifacts"] = {k: pick(v, ["bytes", "sha256"]) for k, v in d["artifacts"]["executables"].items()}
-        l["artifact_manifest_sha256"] = d["artifacts"]["manifest"]["sha256"]
-        l["workbuddy"] = pick(d["workbuddy"], ["commit", "overlay_content_sha256"])
-        l["model"] = pick(d["model"], ["backend_model_name", "fingerprint", "slug"])
-        l["execution"] = pick(d["execution"], ["n_attempts", "n_concurrent_trials", "local_tinykg", "remote_tinykg_env_cleared"])
-        launches.append(l)
+        launch = pick(d, ["run_id", "content_sha256", "harness_fingerprint", "quality_evidence", "evaluation_treatment"])
+        launch["file"] = str(path.relative_to(base))
+        launch["sha256"] = digest(path)
+        launch["artifacts"] = {k: pick(v, ["bytes", "sha256"]) for k, v in d["artifacts"]["executables"].items()}
+        launch["artifact_manifest_sha256"] = d["artifacts"]["manifest"]["sha256"]
+        launch["workbuddy"] = pick(d["workbuddy"], ["commit", "overlay_content_sha256"])
+        launch["model"] = pick(d["model"], ["backend_model_name", "fingerprint", "slug"])
+        launch["execution"] = pick(d["execution"], ["n_attempts", "n_concurrent_trials", "local_tinykg", "remote_tinykg_env_cleared"])
+        launches.append(launch)
     for path in sorted(private.glob("receipt-*.json")):
         d = read(path)
         if d.get("run_id") not in selected_ids:

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import copy
 import hashlib
-import json
 from pathlib import Path
 import tempfile
 import unittest

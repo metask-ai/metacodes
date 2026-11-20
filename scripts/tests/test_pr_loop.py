@@ -10,12 +10,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / ".github"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github"))
 
-from pr_loop.adapters import Codex, Git, GitHub, run
+from pr_loop.adapters import Codex, GitHub, run
 from pr_loop.controller import Controller, Store
 from pr_loop.model import Binding, Busy, DEFAULT_REPO, LoopError, REQUIRED_CHECKS, State, validate_report
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 PASS = {"verdict": "pass", "summary": "No blocking findings", "findings": [], "question": ""}

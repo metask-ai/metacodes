@@ -1754,7 +1754,6 @@ class LongHorizonExperimentTest(unittest.TestCase):
     def test_multi_arm_checkpoints_infrastructure_failure_before_abort(self):
         experiment = copy.deepcopy(self.experiment)
         experiment["budget"]["paid_rollouts_enabled"] = True
-        task = sorted(self.suite["tasks"], key=lambda item: item["id"])[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binary = root / "metacodes"

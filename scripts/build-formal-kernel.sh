@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 # A step that fails inside `$(...)` would otherwise end the script with its
 # output still captured: name the line and the command on the way out.
-trap 'status=$?; echo "build-formal-kernel: failed (exit $status) at line $LINENO: $BASH_COMMAND" >&2' ERR
+trap 'echo "build-formal-kernel: failed (exit $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # Build the independently shipped Lean governance kernel and prove that the
 # artifact actually starts on the host.  A successful `lake build` is not a

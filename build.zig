@@ -2821,8 +2821,15 @@ pub fn build(b: *std.Build) void {
     gate_static_step.dependOn(&scrollback_test_cmd.step);
     gate_static_step.dependOn(&builtin_egress_test_cmd.step);
     gate_static_step.dependOn(&gate_diff_check.step);
+    const gate_lint = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/lint.py",
+    });
+    const lint_step = b.step("lint", "Lint Python, shell scripts and GitHub Actions workflows");
+    lint_step.dependOn(&gate_lint.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
     gate_pr_step.dependOn(gate_static_step);
+    gate_pr_step.dependOn(&gate_lint.step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);

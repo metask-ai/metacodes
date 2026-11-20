@@ -41,7 +41,6 @@ def pe32plus(imports: list[str]) -> bytes:
     """A PE32+ image whose one section holds the import descriptors and names."""
     e_lfanew = 0x40
     optional_size = 240
-    section_table = e_lfanew + 24 + optional_size
     raw = 0x200
     rva = 0x1000
     descriptors_size = (len(imports) + 1) * 20

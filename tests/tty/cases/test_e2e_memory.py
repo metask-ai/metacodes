@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
 from e2e_helpers import (  # noqa: E402
     SkipTest, RETRIES, fresh_home, run_live,
-    read_tool_uses, tool_called, require_model,
+    read_tool_uses, require_model,
 )
 
 

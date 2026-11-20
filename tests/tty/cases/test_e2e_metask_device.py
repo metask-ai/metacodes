@@ -151,7 +151,7 @@ def _ledger(home):
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as f:
-        return [json.loads(l) for l in f if l.strip()]
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def test_e2e_metask_device_flow_and_reconcile(bin_path):

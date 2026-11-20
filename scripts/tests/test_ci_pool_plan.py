@@ -183,7 +183,9 @@ def needs(platform, mode="", plan_result="success", hosted="", watch="", fallbac
 class VerdictTest(unittest.TestCase):
     def test_the_gates_pass_where_they_ran(self) -> None:
         for platform in plan.PLATFORMS.values():
-            n = lambda *args, **kwargs: needs(platform, *args, **kwargs)
+            def n(*args, **kwargs):
+                return needs(platform, *args, **kwargs)
+
             cases = [
                 (n("hosted", hosted="success", watch="skipped"), True),
                 (n("hosted", hosted="failure", watch="skipped"), False),
