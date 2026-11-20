@@ -380,7 +380,7 @@ static inline uint16_t tofp16(double d)
     uint64_t a, addend;
     uint32_t v, sgn;
     int shift;
-
+    
     a = float64_as_uint64(d);
     sgn = a >> 63;
     a = a & 0x7fffffffffffffff;

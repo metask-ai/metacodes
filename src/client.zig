@@ -9,6 +9,7 @@ const api_stream = @import("api/stream.zig");
 const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
 const no_redirects = @import("api/http_status.zig").no_redirects;
 const copyRedirectLocation = @import("api/http_status.zig").copyRedirectLocation;
+const answerHasBody = @import("api/http_status.zig").answerHasBody;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
 const model_error = @import("api/model_error.zig");
@@ -556,6 +557,90 @@ pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_ob
     model_error.noteStreamError(err_obj);
 }
 
+/// What lies beneath a stream read that failed (#573). std folds every
+/// transport failure into `ReadFailed`, and the stream's log line named only
+/// that, so a drop the proxy caused looked like any other. This collects the
+/// layers it came from:
+/// - `body`: the HTTP body's own error, such as `HttpChunkTruncated` (a
+///   chunked body that ended before its terminating chunk);
+/// - `tls`: the TLS layer's, such as `TlsConnectionTruncated` (a record cut
+///   short), and `tls_ended`: whether TLS took the stream as ended. std.http
+///   lets an end of the TCP stream at a record boundary stand in for a
+///   close_notify, so `yes` is either, not proof that a close_notify came;
+///   null on a plain connection;
+/// - `socket`: the socket's, such as `ConnectionResetByPeer` for a reset;
+/// - how the answer was framed, and whether its head kept the connection
+///   alive (`no` when the server said it would close after the answer).
+pub const ReadFailure = struct {
+    body: ?anyerror = null,
+    tls: ?anyerror = null,
+    tls_ended: ?bool = null,
+    socket: ?anyerror = null,
+    framing: []const u8,
+    /// The response head's: false when the server said it would close.
+    head_keep_alive: bool,
+
+    /// Read from `request` after a body read failed. `head` is the response's:
+    /// only its framing and keep-alive are read, which the body reader leaves
+    /// valid.
+    pub fn of(request: *http.Client.Request, head: *const http.Client.Response.Head) ReadFailure {
+        var failure: ReadFailure = .{
+            .body = if (request.reader.body_err) |err| err else null,
+            .framing = if (head.transfer_encoding == .chunked)
+                "chunked"
+            else if (head.content_length != null)
+                "content-length"
+            else
+                "close-delimited",
+            .head_keep_alive = head.keep_alive,
+        };
+        const connection = request.connection orelse return failure;
+        failure.socket = if (connection.stream_reader.err) |err| err else null;
+        if (connection.protocol == .tls) {
+            // `Connection.getReadError` asserts that one of the two errors is
+            // set; a stream can fail with neither (a cut chunked body), so the
+            // TLS client is read directly.
+            const tls_client: *std.crypto.tls.Client = @alignCast(@fieldParentPtr("reader", connection.reader()));
+            failure.tls = if (tls_client.read_err) |err| err else null;
+            failure.tls_ended = tls_client.received_close_notify;
+        }
+        return failure;
+    }
+
+    pub fn format(self: ReadFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("body {s}, ", .{errorText(self.body)});
+        if (self.tls_ended) |ended| {
+            try writer.print("tls {s}, tls ended {s}, ", .{ errorText(self.tls), if (ended) "yes" else "no" });
+        } else {
+            try writer.writeAll("plain, ");
+        }
+        try writer.print("socket {s}; {s}, keep-alive {s}", .{ errorText(self.socket), self.framing, if (self.head_keep_alive) "yes" else "no" });
+    }
+
+    fn errorText(err: ?anyerror) []const u8 {
+        return if (err) |e| @errorName(e) else "none";
+    }
+};
+
+test "ReadFailure names each layer, and an unknown TLS end as an end" {
+    var buf: [256]u8 = undefined;
+    const cut_chunk: ReadFailure = .{ .body = error.HttpChunkTruncated, .framing = "chunked", .head_keep_alive = false };
+    try std.testing.expectEqualStrings(
+        "body HttpChunkTruncated, plain, socket none; chunked, keep-alive no",
+        try std.fmt.bufPrint(&buf, "{f}", .{cut_chunk}),
+    );
+    const cut_record: ReadFailure = .{ .tls = error.TlsConnectionTruncated, .tls_ended = false, .framing = "chunked", .head_keep_alive = true };
+    try std.testing.expectEqualStrings(
+        "body none, tls TlsConnectionTruncated, tls ended no, socket none; chunked, keep-alive yes",
+        try std.fmt.bufPrint(&buf, "{f}", .{cut_record}),
+    );
+    const reset: ReadFailure = .{ .tls_ended = false, .socket = error.ConnectionResetByPeer, .framing = "content-length", .head_keep_alive = true };
+    try std.testing.expectEqualStrings(
+        "body none, tls none, tls ended no, socket ConnectionResetByPeer; content-length, keep-alive yes",
+        try std.fmt.bufPrint(&buf, "{f}", .{reset}),
+    );
+}
+
 /// The start of a non-2xx response body, read into `dest`: the whole body when
 /// it fits, else its first `dest.len` bytes. `dest.len` is the `read_bound` to
 /// pass to `reportHttpFailure`. Call it before the request is deinitialized,
@@ -569,6 +654,10 @@ pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_ob
 /// apart) had each later piece decoded onto the front of `dest`, over what had
 /// already been read, and came out scrambled (#565).
 pub fn readErrorBody(request: *http.Client.Request, head: http.Client.Response.Head, dest: []u8) []const u8 {
+    // A 1xx, 204 or 304 answer has no body, but std 0.16 reads one to the end
+    // of the connection, and a server asked to keep it open (#573) leaves it
+    // open: the read would last until the idle monitor fires.
+    if (!answerHasBody(&head)) return dest[0..0];
     var transfer_buf: [8192]u8 = undefined;
     const body_reader = request.reader.bodyReader(&transfer_buf, head.transfer_encoding, head.content_length);
     const n = body_reader.readSliceShort(dest) catch 0;
@@ -1154,7 +1243,16 @@ pub const Client = struct {
         // Refresh replaces fixed bytes the client owns; a Session's
         // replaceable credential is rotated by its Host instead.
         const stale = client.credential.lendable() orelse return error.Unauthorized;
+        // The route can move while the refresh runs: a `/model` commit from
+        // the reply's key thread rebinds the client and takes the callback
+        // off. The token is for the route the request was sent on; on any
+        // other it is neither installed nor sent.
+        const sent_to = client.base_url;
         const token = callback(ctx, stale) catch return error.Unauthorized;
+        if (client.refresh_fn == null or !std.mem.eql(u8, sent_to, client.base_url)) {
+            secureFree(client.allocator, token);
+            return error.Unauthorized;
+        }
         client.replaceRefreshToken(token) catch {
             secureFree(client.allocator, token);
             return error.Unauthorized;
@@ -1301,6 +1399,9 @@ pub const Client = struct {
         };
         // errdefer 销毁顺序：先 req.deinit()（释放连接/缓冲），再 destroy 槽位。
         errdefer req_ptr.deinit();
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         // 总是登记:abort 路由(有 signal 时)+ 空闲监视(idle limit > 0 时)。收头阶段的等待也
         // 由同一只表计时——请求发出后对端一个字节都不回同样是 stall。
         try client.abort_registry.registerMonitored(
@@ -1535,6 +1636,9 @@ fn getModelsPage(
         },
     }) catch return error.RequestFailed;
     defer req.deinit();
+    // As the stream request (#573): std does not check a `content-length`
+    // body for a cut, so a list the proxy cut short read as a complete one.
+    http_connection.keepServerOpen(&req);
 
     http_connection.sendBodiless(&req) catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
@@ -1918,7 +2022,7 @@ pub const StreamResponse = struct {
                     reportBodyStall("stream", self.id, stall);
                     return error.StreamStalled;
                 }
-                log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
+                log.warnId("stream", self.id, "event_iter.next failed: {s} ({f})", .{ @errorName(err), ReadFailure.of(self.stream_result.request, &self.stream_result.response.head) });
                 return error.RequestFailed;
             },
             error.ApiErrorEvent => {

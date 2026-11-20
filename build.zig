@@ -2551,6 +2551,22 @@ pub fn build(b: *std.Build) void {
     tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
     units_test_step.dependOn(&tinykg_contract_test_cmd.step);
 
+    // QuickJS is upstream bytes plus patches/*.patch: the verifier fails on a
+    // drifted, undeclared or edited file and on a patch that no longer applies.
+    const quickjs_sources_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_stage_quickjs_sources",
+        "-v",
+    });
+    const quickjs_sources_test_step = b.step(
+        "test:quickjs-sources",
+        "Verify the vendored QuickJS sources, patches and manifest",
+    );
+    quickjs_sources_test_step.dependOn(&quickjs_sources_test_cmd.step);
+    units_test_step.dependOn(&quickjs_sources_test_cmd.step);
+
     // The trajectory audit itself only runs against a real ~/.metacodes, which
     // CI does not have - but its parsing does not need one, and two defects in
     // it were caught by these tests rather than by the real data (which
@@ -2763,13 +2779,30 @@ pub fn build(b: *std.Build) void {
         core_shard_reporter,
         staged_lean_kernels,
     );
+    // gate:static —— the guards that only read the source (#587). Inside
+    // gate:pr they ran beside every compile and test step, and the build
+    // runner has no fail-fast, so a guard that fails in seconds on its own was
+    // reported only at the end of the whole gate. The checklist and every CI
+    // gate leg run this first; gate:pr still includes it.
+    const gate_static_step = b.step("gate:static", "Run the source-level guards alone: fmt, the boundary gates, the discipline scans, git diff --check");
+    gate_static_step.dependOn(&gate_fmt.step);
+    // The boundary gates' scans only: their self-tests are test binaries,
+    // which bring in the fs-helper install (`addTestRunArtifact`), and run
+    // in `test:units` with the rest of the suite.
+    gate_static_step.dependOn(&http_status_gate_run.step);
+    gate_static_step.dependOn(&subsystem_boundary_run.step);
+    gate_static_step.dependOn(&io_threaded_test_cmd.step);
+    gate_static_step.dependOn(&thread_stack_test_cmd.step);
+    gate_static_step.dependOn(&terminal_io_test_cmd.step);
+    gate_static_step.dependOn(&scrollback_test_cmd.step);
+    gate_static_step.dependOn(&builtin_egress_test_cmd.step);
+    gate_static_step.dependOn(&gate_diff_check.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
-    gate_pr_step.dependOn(&gate_fmt.step);
+    gate_pr_step.dependOn(gate_static_step);
     gate_pr_step.dependOn(test_step);
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
-    gate_pr_step.dependOn(&gate_diff_check.step);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
@@ -3263,6 +3296,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/microcompact_test.zig",
         "tests/component/kg_task_projection_test.zig",
         "tests/component/goal_state_test.zig",
+        "tests/component/usage_report_test.zig",
         "tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",

@@ -71,7 +71,7 @@ typedef uint32_t JSAtom;
 #endif
 
 #define JS_SHORT_BIG_INT_BITS JS_LIMB_BITS
-
+    
 enum {
     /* all tags with a reference count are negative */
     JS_TAG_FIRST       = -9, /* first negative tag */
@@ -942,7 +942,7 @@ typedef JSModuleDef *JSModuleLoaderFunc2(JSContext *ctx,
 /* return -1 if exception, 0 if OK */
 typedef int JSModuleCheckSupportedImportAttributes(JSContext *ctx, void *opaque,
                                                    JSValueConst attributes);
-
+                                                   
 /* module_normalize = NULL is allowed and invokes the default module
    filename normalizer */
 void JS_SetModuleLoaderFunc(JSRuntime *rt,
@@ -1137,7 +1137,7 @@ int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 /* associate a JSValue to a C module */
 int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);
 JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
-
+                        
 /* debug value output */
 
 typedef struct {

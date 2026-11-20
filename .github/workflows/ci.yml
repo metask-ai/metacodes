@@ -7,24 +7,44 @@ on:
   # under the old rules (doc/CI_DESIGN.md §3).
   merge_group:
   workflow_dispatch:
+  # main's nightly run: the one run that saves the caches every pull request
+  # restores (doc/CI_DESIGN.md §5). 19:00 UTC is 03:00 in Beijing.
+  schedule:
+    - cron: "0 19 * * *"
 
 permissions:
   contents: read
   pull-requests: read # the version state gate reads the PR's current labels
+  # The runner pools' plan, watches and stand-downs read this repository's
+  # own runs and jobs (scripts/ci_pool_plan.py); read-only, which a fork's
+  # pull request gets too.
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Topology: GitHub-hosted runners only (the repository is public;
-# organization policy keeps public repositories off the self-hosted fleet, and
-# hosted standard runners are free for public repositories). Each platform's
-# gates are split into legs that run in parallel on separate runners, and the
-# TTY suites into shards; a small result job per platform reports the leg or
-# shard results under the name the ruleset requires (doc/CI_DESIGN.md §4).
+env:
+  # 'true' only on main's scheduled or dispatched run, which builds from empty
+  # Zig caches and saves them. Every other run, pull requests included,
+  # restores what main saved and saves nothing (doc/CI_DESIGN.md §5).
+  WARM_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+
+# Topology: GitHub-hosted runners (the repository is public, hosted standard
+# runners are free for public repositories, and organization policy keeps
+# public repositories off the self-hosted fleet). The exceptions are the
+# macOS and Windows gates of organization members' pull requests (and main's
+# warm run): they try a self-hosted runner first whenever
+# .github/runner-pools.json switches it on (macOS: a runner on the Mac
+# Studio's `ci-host` account; Windows: off); the hosted legs take over when a
+# runner is off, busy or not taking jobs (doc/CI_DESIGN.md §6).
+# Each platform's hosted gates are split into legs that run in parallel on
+# separate runners, and the TTY suites into shards; a small result job per
+# platform reports the leg or shard results under the name the ruleset
+# requires (doc/CI_DESIGN.md §4).
 # Within a leg, steps run cheapest-first for fail-fast. Every runner is
-# ephemeral: nothing persists between runs except what actions/cache and
-# setup-zig restore explicitly.
+# ephemeral: nothing persists between runs except the caches main's nightly
+# run saves and the other runs restore (doc/CI_DESIGN.md §5).
 jobs:
   # A release or reopen PR adds only what scripts/release_cut.py generates.
   # When that is proven against the merge commit, and the base commit already
@@ -114,6 +134,45 @@ jobs:
           esac
           python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT"
 
+  # Where the macOS and Windows gates run (scripts/ci_pool_plan.py plan,
+  # doc/CI_DESIGN.md §6): a platform's pool when .github/runner-pools.json
+  # switches it on, the pull request's author is an organization member and a
+  # slot is free, the hosted legs otherwise, both on main's warm run. It reads the pools' occupancy from this repository's own
+  # runs with the run's read-only token, which a fork's pull request gets too
+  # (vars and secrets it does not). It never fails: every doubt is `hosted`,
+  # and an empty plan runs the hosted legs.
+  runner-plan:
+    name: Runner plan
+    needs: [release-fast-path, scope]
+    if: ${{ !cancelled() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    outputs:
+      macos_mode: ${{ steps.plan.outputs.macos_mode }}
+      macos_label: ${{ steps.plan.outputs.macos_label }}
+      macos_zig_build_jobs: ${{ steps.plan.outputs.macos_zig_build_jobs }}
+      macos_timeout_minutes: ${{ steps.plan.outputs.macos_timeout_minutes }}
+      macos_pickup_timeout_minutes: ${{ steps.plan.outputs.macos_pickup_timeout_minutes }}
+      macos_reason: ${{ steps.plan.outputs.macos_reason }}
+      windows_mode: ${{ steps.plan.outputs.windows_mode }}
+      windows_label: ${{ steps.plan.outputs.windows_label }}
+      windows_zig_build_jobs: ${{ steps.plan.outputs.windows_zig_build_jobs }}
+      windows_timeout_minutes: ${{ steps.plan.outputs.windows_timeout_minutes }}
+      windows_pickup_timeout_minutes: ${{ steps.plan.outputs.windows_pickup_timeout_minutes }}
+      windows_reason: ${{ steps.plan.outputs.windows_reason }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Decide
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+          SUITES: ${{ needs.scope.outputs.suites }}
+          # Only organization members' pull requests use a self-hosted runner.
+          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: python3 scripts/ci_pool_plan.py plan --github-output "$GITHUB_OUTPUT"
+
   # The POSIX gates, one leg per runner (doc/CI_DESIGN.md §4). The legs'
   # steps together are a superset of the AGENTS.md "Before submitting"
   # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
@@ -122,8 +181,8 @@ jobs:
   # drift apart silently. Each step names the legs it belongs to through the
   # matrix flags `units`, `product`, `release` and `checks`; a step
   # without one is environment setup and runs on every leg. Linux has a runner
-  # per flag. macOS has three, since an
-  # organization runs at most five macOS jobs at once.
+  # per flag. Hosted macOS has three, since an organization runs at most
+  # five macOS jobs at once; the pool runs them as one (`gates-macos-vm`).
   # 45 minutes: a cold hosted runner compiles a leg's share of the tree and
   # the Lean kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
   gates-linux:
@@ -171,32 +230,55 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      # use-cache: setup-zig points both Zig cache env vars at one directory
-      # and restores/saves it through actions/cache keyed by OS and Zig
-      # version. Zig's cache is content-addressed and folds the compiler
-      # version into every hash, so a restored directory is always safe; test
-      # execution is not affected because test Run steps are has_side_effects
-      # in build.zig. cache-size-limit: the directory is dropped instead of
-      # saved once it exceeds this many MiB (the default 2 GiB is below what
-      # one full run of these gates produces). cache-key: each leg builds a
-      # different share of the graph, so each keeps its own cache line.
+      # The pool job only (POOL_JOB): its env leaves FAST_PATH unset and this
+      # step sets it. If the watch already finished, the hosted legs took over
+      # before a VM took this job, so FAST_PATH=true and every later step
+      # skips; otherwise it carries the release fast path decision
+      # (scripts/ci_pool_plan.py stand-down, doc/CI_DESIGN.md §6).
+      - name: Stand down if the hosted legs took over
+        if: env.POOL_JOB == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_pool_plan.py stand-down --platform macos --github-env "$GITHUB_ENV"
+      # setup-zig points ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR at
+      # .zig-cache. Its own cache stays off, since it saves on every run; the
+      # steps below restore and save explicitly (doc/CI_DESIGN.md §5). Zig's
+      # cache is content-addressed and folds the compiler version into every
+      # hash, so a restored directory is always safe; test execution is not
+      # affected because test Run steps are has_side_effects in build.zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
-          cache-key: ${{ matrix.leg }}
-      - name: Zig format check
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
-        run: zig fmt --check build.zig src tests
+          use-cache: false
+      # Every run but main's warm one restores the newest Zig cache main saved
+      # for this leg. A pull request can read its base branch's caches, never
+      # another pull request's, and saves none of its own. The key is the
+      # prefix of what main saves (its run ID follows), so the newest wins.
+      # Each leg builds a different share of the graph and keeps its own line.
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
+      # The source-level guards (fmt, the boundary gates, the discipline
+      # scans, git diff --check) take seconds, and the build runner has no
+      # fail-fast: inside a suite step a failed guard is reported only when
+      # the whole leg has finished. So every leg runs them first (#587).
+      - name: Source-level guards
+        if: (matrix.units || matrix.product || matrix.release || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: zig build gate:static
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
       # (restore-keys) and Lake hash-verifies what it restores; a stale or
-      # torn copy self-heals into a rebuild rather than wrong results.
+      # torn copy self-heals into a rebuild rather than wrong results. Every
+      # run restores; only main's warm run saves (after the kernel build).
       - name: Restore Lean toolchain and build products
+        id: lean
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.elan
@@ -229,6 +311,16 @@ jobs:
           # stage itself. One line: test_gate_manifest.py shlex-splits every
           # line of this block on its own.
           LAKE="$(command -v lake)" bash scripts/build-project-harness-kernel.sh "$RUNNER_TEMP/metacodes-project-kernel"
+      # One leg saves, once per state of the Lean sources (the key is their
+      # hash): an exact hit means main already holds this state.
+      - name: Save Lean toolchain and build products
+        if: env.WARM_CACHE == 'true' && matrix.units && steps.lean.outputs.cache-hit != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: ${{ steps.lean.outputs.cache-primary-key }}
       - name: Install ripgrep
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
@@ -554,16 +646,33 @@ jobs:
       - name: AgentCore release unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_agentcore_release -v
+      - name: Runner plan and VM pool unit tests
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_ci_pool_plan scripts.tests.test_vm_pool -v
       - name: Diff whitespace check
         if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
+      # main's warm run saves what this leg built from an empty cache, so the
+      # entry holds only what the current tree needs and does not grow night
+      # after night. A failed leg saves nothing and the previous night's entry
+      # stays. Cache keys are immutable, hence the run ID in each.
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # The same steps (the YAML alias of `gates-linux`'s list) on two macOS
-  # runners: units and integration with the checks, product, and release. Each
-  # waits on its own LLVM builds (the integration suite on the ReleaseSmall
-  # app, the evaluation suite on two ReleaseSafe drivers, the release layout
-  # on two more ReleaseSmall builds), which a three-core runner cannot overlap
-  # with the rest. A leg's flags are what its steps read, not its name.
+  # The same steps (the YAML alias of `gates-linux`'s list) on three hosted
+  # macOS runners: units and integration with the checks, product, and
+  # release. Each waits on its own LLVM builds (the integration suite on the
+  # ReleaseSmall app, the evaluation suite on two ReleaseSafe drivers, the
+  # release layout on two more ReleaseSmall builds), which a three-core runner
+  # cannot overlap with the rest. A leg's flags are what its steps read, not
+  # its name. They run unless the plan sent the gates to the pool and a VM
+  # took them: at once on `hosted` or an empty plan, beside the pool job on
+  # `both`, and on `self-hosted` only when the watch fell back (§6). The
+  # Windows legs (`windows-gates`) do the same.
   gates-macos:
     name: Gates (macOS) / ${{ matrix.leg }}
     timeout-minutes: 45
@@ -579,8 +688,8 @@ jobs:
           - leg: release
             release: true
     runs-on: macos-latest
-    needs: [release-fast-path, scope]
-    if: ${{ !cancelled() }}
+    needs: [release-fast-path, scope, runner-plan, gates-macos-watch]
+    if: ${{ !cancelled() && (needs.runner-plan.outputs.macos_mode != 'self-hosted' || needs.gates-macos-watch.outputs.fallback == 'true') }}
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       SUITES: ${{ needs.scope.outputs.suites }}
@@ -590,6 +699,62 @@ jobs:
       # runner's 7 GB hold (the app and the drivers peak at 1 to 2 GB each).
       ZIG_BUILD_JOBS: "6"
     steps: *gates-steps
+
+  # The macOS gates as one job on the self-hosted runner (doc/CI_DESIGN.md
+  # §6): it has the cores and memory a hosted runner lacks, so one job runs
+  # what the hosted legs split, without their repeated checkout, setup and
+  # compilation. It is the runner on the Mac Studio's `ci-host` account: jobs
+  # share the host and nothing isolates one from the next, so only
+  # organization members' pull requests are sent to it, and the runner's own
+  # pre-job hook fails any other author's job.
+  # FAST_PATH is left to the stand-down step.
+  gates-macos-vm:
+    name: Gates (macOS) / ${{ matrix.leg }}
+    needs: [release-fast-path, scope, runner-plan]
+    if: ${{ !cancelled() && (needs.runner-plan.outputs.macos_mode == 'self-hosted' || needs.runner-plan.outputs.macos_mode == 'both') }}
+    timeout-minutes: ${{ fromJSON(needs.runner-plan.outputs.macos_timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: all
+            units: true
+            checks: true
+            product: true
+            release: true
+    runs-on: ${{ needs.runner-plan.outputs.macos_label }}
+    env:
+      POOL_JOB: "true"
+      RELEASE_FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+      SUITES: ${{ needs.scope.outputs.suites }}
+      DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
+      RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
+      # .github/runner-pools.json, sized to the runner.
+      ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.macos_zig_build_jobs }}
+    steps: *gates-steps
+
+  # Follows the pool job of this run (scripts/ci_pool_plan.py watch): a VM
+  # that takes it within the pickup timeout is followed to the end; otherwise
+  # `fallback=true` hands the gates to the hosted legs. The required check
+  # reads this job's outputs instead of waiting for the pool job, which a pool
+  # that is down would keep queued for GitHub's 24 hours.
+  gates-macos-watch:
+    name: macOS pool watch
+    needs: [runner-plan]
+    if: ${{ !cancelled() && (needs.runner-plan.outputs.macos_mode == 'self-hosted' || needs.runner-plan.outputs.macos_mode == 'both') }}
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    outputs:
+      fallback: ${{ steps.watch.outputs.fallback }}
+      vm_result: ${{ steps.watch.outputs.vm_result }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Wait for a VM to take the pool job
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PICKUP_TIMEOUT_MINUTES: ${{ needs.runner-plan.outputs.macos_pickup_timeout_minutes }}
+        run: python3 scripts/ci_pool_plan.py watch --platform macos --pickup-timeout-minutes "$PICKUP_TIMEOUT_MINUTES" --github-output "$GITHUB_OUTPUT"
 
   # The Python and Node packages over the AgentCore shared library (sdk/python,
   # sdk/node). Not a required check yet: it builds a ReleaseSafe bundle, which
@@ -628,12 +793,19 @@ jobs:
         run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: env.SDK != 'false'
+      # Caches as in `gates-linux` (doc/CI_DESIGN.md §5).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.SDK != 'false'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.SDK != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-sdk-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-sdk-run-
       - name: Build the AgentCore bundle
         if: env.SDK != 'false'
         run: |
@@ -674,6 +846,12 @@ jobs:
       - name: Rehearse a formal AgentCore release
         if: env.SDK != 'false'
         run: python3 scripts/agentcore_release.py rehearse --target ${{ matrix.target }} --work "$RUNNER_TEMP/rehearsal"
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && env.SDK != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-sdk-run-${{ github.run_id }}-${{ github.run_attempt }}
 
   # The offline TTY suite (tests/tty) drives the debug binary in a pseudo
   # terminal and asserts the screen a person would see. No workflow ran it
@@ -728,14 +906,20 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
-      # See `gates-linux` for the cache semantics. Every shard builds the same
-      # binaries, so they share one cache line.
+      # See `gates-linux` for the caches. Every shard builds the same
+      # binaries, so they share one cache line, which shard 1 saves.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.TTY != 'false'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && env.TTY != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-tty-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-tty-run-
       - name: Offline TTY suite (POSIX pty)
         if: runner.os != 'Windows' && env.FAST_PATH != 'true' && env.TTY != 'false'
         env:
@@ -751,6 +935,12 @@ jobs:
         run: |
           python -m pip install pywinpty==3.0.5 || exit /b 1
           zig build windows:tty -Dtarget=x86_64-windows-gnu
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && matrix.shard == 1 && env.FAST_PATH != 'true' && env.TTY != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-tty-run-${{ github.run_id }}-${{ github.run_attempt }}
 
   tty-windows:
     name: TTY (Windows) / ${{ matrix.shard }} of ${{ strategy.job-total }}
@@ -768,9 +958,10 @@ jobs:
       TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     steps: *tty-steps
 
-  # Four legs: the three parts of the repository-wide suite, and the release
-  # unit with the Windows script suites. Each step reads its leg's flag, as in
-  # `gates-linux`.
+  # Four hosted legs: the three parts of the repository-wide suite, and the
+  # release unit with the Windows script suites. Each step reads its leg's
+  # flag, as in `gates-linux`. Like the hosted macOS legs they run unless the
+  # plan sent the gates to the Windows pool and a VM took them (§6).
   windows-gates:
     name: Gates (Windows) / ${{ matrix.leg }}
     # 45 minutes: same reasoning as `gates-linux`; the hosted Windows runner
@@ -789,10 +980,10 @@ jobs:
           - leg: release
             release: true
     runs-on: windows-latest
-    needs: [release-fast-path, scope]
+    needs: [release-fast-path, scope, runner-plan, windows-gates-watch]
     # A failed decision leaves FAST_PATH and SUITES empty: run in full rather
     # than skip.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (needs.runner-plan.outputs.windows_mode != 'self-hosted' || needs.windows-gates-watch.outputs.fallback == 'true') }}
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       # 'false' only for a documentation-only change; the version state gate
@@ -801,7 +992,7 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       # As in `gates-linux`.
       ZIG_BUILD_JOBS: "8"
-    steps:
+    steps: &windows-gates-steps
       - name: Release fast path
         env:
           REASON: ${{ needs.release-fast-path.outputs.reason }}
@@ -817,14 +1008,26 @@ jobs:
           # fingerprint tests resolve historical commits with `git rev-parse`,
           # which a depth-1 checkout cannot (5 errors on the first full run).
           fetch-depth: 0
-      # See `gates-linux` for the cache semantics.
+      # The Windows pool job only, as in `gates-linux`: it sets FAST_PATH.
+      - name: Stand down if the hosted legs took over
+        if: env.POOL_JOB == 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: cmd
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts\ci_pool_plan.py stand-down --platform windows --github-env "%GITHUB_ENV%"
+      # See `gates-linux` for the caches.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
-          cache-key: ${{ matrix.leg }}
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-
       # The hosted Windows image checks out with core.autocrlf=true, and
       # .gitattributes (`* text=auto eol=lf`) is the contract: @embedFile'd
       # templates and pinned fixtures hash by the byte. List what is wrong for
@@ -841,6 +1044,11 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
+      # As in `gates-linux`: the source-level guards first, on every leg.
+      - name: Source-level guards
+        if: (matrix.units || matrix.integration || matrix.product || matrix.release) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: cmd
+        run: zig build gate:static
       # PyYAML for the Python suites that `zig build test` runs; see
       # `gates-linux`.
       - name: Install Python development dependencies
@@ -891,8 +1099,9 @@ jobs:
       # Lean cache as `gates-linux`; the kernel scripts run under Git Bash
       # (kernels:stage invokes bash).
       - name: Restore Lean toolchain and build products
+        id: lean
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.elan
@@ -972,6 +1181,68 @@ jobs:
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)
           exit /b 0
+      # As in `gates-linux`: main's warm run saves, pull requests never do. The
+      # suite builds the Lean kernels here, so the Lean products are saved
+      # after it.
+      - name: Save Lean toolchain and build products
+        if: env.WARM_CACHE == 'true' && matrix.units && steps.lean.outputs.cache-hit != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            control-plane/lean/.lake
+          key: ${{ steps.lean.outputs.cache-primary-key }}
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-gates-${{ matrix.leg }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # The Windows gates as one job on a self-hosted runner, switched off until
+  # AIPC has one (doc/CI_DESIGN.md §6), as `gates-macos-vm` is for macOS: the hosted legs'
+  # steps with every flag set. FAST_PATH is left to the stand-down step.
+  windows-gates-vm:
+    name: Gates (Windows) / ${{ matrix.leg }}
+    needs: [release-fast-path, scope, runner-plan]
+    if: ${{ !cancelled() && (needs.runner-plan.outputs.windows_mode == 'self-hosted' || needs.runner-plan.outputs.windows_mode == 'both') }}
+    timeout-minutes: ${{ fromJSON(needs.runner-plan.outputs.windows_timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: all
+            units: true
+            integration: true
+            product: true
+            release: true
+    runs-on: ${{ needs.runner-plan.outputs.windows_label }}
+    env:
+      POOL_JOB: "true"
+      RELEASE_FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+      SUITES: ${{ needs.scope.outputs.suites }}
+      # .github/runner-pools.json, sized to the runner.
+      ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.windows_zig_build_jobs }}
+    steps: *windows-gates-steps
+
+  # As `gates-macos-watch`, for the Windows pool job.
+  windows-gates-watch:
+    name: Windows pool watch
+    needs: [runner-plan]
+    if: ${{ !cancelled() && (needs.runner-plan.outputs.windows_mode == 'self-hosted' || needs.runner-plan.outputs.windows_mode == 'both') }}
+    timeout-minutes: 135
+    runs-on: ubuntu-latest
+    outputs:
+      fallback: ${{ steps.watch.outputs.fallback }}
+      vm_result: ${{ steps.watch.outputs.vm_result }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Wait for a VM to take the pool job
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PICKUP_TIMEOUT_MINUTES: ${{ needs.runner-plan.outputs.windows_pickup_timeout_minutes }}
+        run: python3 scripts/ci_pool_plan.py watch --platform windows --pickup-timeout-minutes "$PICKUP_TIMEOUT_MINUTES" --github-output "$GITHUB_OUTPUT"
 
   # The checks the `Protect main` ruleset requires: Gates (Linux), Gates
   # (macOS), Gates (Windows) and TTY (Linux) (doc/CI_DESIGN.md §1, §4). Each
@@ -994,21 +1265,34 @@ jobs:
           echo "$NEEDS" | jq -c 'map_values(.result)'
           echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
 
+  # Gates (macOS) and Gates (Windows) pass when the gates passed where they
+  # ran: the pool job (through the watch), or the hosted legs
+  # (scripts/ci_pool_plan.py verdict). Neither needs its pool job.
   gates-macos-result:
     name: Gates (macOS)
-    needs: gates-macos
+    needs: [runner-plan, gates-macos-watch, gates-macos]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: *result-steps
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The gates passed where they ran
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_pool_plan.py verdict --platform macos
 
   gates-windows-result:
     name: Gates (Windows)
-    needs: windows-gates
+    needs: [runner-plan, windows-gates-watch, windows-gates]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: *result-steps
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The gates passed where they ran
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_pool_plan.py verdict --platform windows
 
   tty-linux-result:
     name: TTY (Linux)
@@ -1028,7 +1312,9 @@ jobs:
 
   full-pr-evidence:
     name: Full PR evidence
-    needs: [release-fast-path, scope, gates-linux, gates-macos, windows-gates, tty-linux, tty-windows, sdk-bindings]
+    # macOS and Windows through their result jobs: the pool job or the hosted
+    # legs, wherever the gates ran (§6).
+    needs: [release-fast-path, scope, gates-linux, gates-macos-result, gates-windows-result, tty-linux, tty-windows, sdk-bindings]
     if: ${{ always() && github.event_name == 'pull_request' && needs.scope.outputs.scope == 'full' && needs.release-fast-path.outputs.fast == 'false' }}
     timeout-minutes: 5
     runs-on: ubuntu-latest

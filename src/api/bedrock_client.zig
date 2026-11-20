@@ -326,6 +326,9 @@ pub const BedrockClient = struct {
             // errdefer destroys req_ptr; req_ptr.* was never initialized.
             return client_mod.requestSetupFailure("bedrock", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);
@@ -687,6 +690,10 @@ const BedrockStream = struct {
     /// what is replayed is always a prefix of what the model produced.
     reasoning_cut: bool = false,
     context_window_numbers: error_class.ContextWindowNumbers = .{},
+    /// What this response's `metadata` events have reported so far. Converse
+    /// sends its usage as the response's total; the cursor hands on only what
+    /// a report adds, so a repeated `metadata` event counts nothing twice.
+    usage_reports: api_stream.UsageReportCursor = .{},
     queue: std.ArrayList(StreamEvent) = .empty,
     queue_pos: usize = 0,
 
@@ -793,7 +800,7 @@ const BedrockStream = struct {
                     client_mod.reportStreamIncomplete("bedrock", self.id);
                     return error.StreamIncomplete;
                 }
-                log.warnId("bedrock", self.id, "event stream read failed: {s}", .{@errorName(err)});
+                log.warnId("bedrock", self.id, "event stream read failed: {s} ({f})", .{ @errorName(err), client_mod.ReadFailure.of(self.request, &self.response.head) });
                 return api_stream.midStreamReadError(err);
             } orelse {
                 self.done = true;
@@ -889,12 +896,12 @@ const BedrockStream = struct {
             self.last_stop = mapStopReason(stringField(payload, "stopReason") orelse "");
         } else if (std.mem.eql(u8, event_type, "metadata")) {
             const usage = objectField(payload, "usage") orelse return;
-            try self.queue.append(self.allocator, .{ .usage = .{
+            try self.queue.append(self.allocator, .{ .usage = self.usage_reports.increment(.{
                 .input_tokens = intField(usage, "inputTokens"),
                 .output_tokens = intField(usage, "outputTokens"),
                 .cache_read_input_tokens = intField(usage, "cacheReadInputTokens"),
                 .cache_creation_input_tokens = intField(usage, "cacheWriteInputTokens"),
-            } });
+            }) });
         }
     }
 

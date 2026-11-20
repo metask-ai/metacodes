@@ -5,7 +5,9 @@ Start here rather than reading design ledgers chronologically.
 ## Start here
 
 - **Using metacodes:** [Getting started](GETTING_STARTED.md) — install,
-  providers, Metask OAuth, build from source; [Local configuration](LOCAL_CONFIG.md)
+  providers, Metask OAuth, build from source; [Providers](PROVIDERS.md) — where
+  models come from: a Metask account, a vendor's key, a model API of your own
+  (`metacodes providers`); [Local configuration](LOCAL_CONFIG.md)
   — your own provider key in the install's `.env`; [Terminal setup](TERMINAL_SETUP.md)
   — Shift+Enter for a newline in Apple Terminal and VS Code.
 - **Embedding it in your program:** [API overview](API.md), then
@@ -104,6 +106,10 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [CI design](CI_DESIGN.md) — required checks, the change scope that skips
   suites a change cannot affect, and the merge queue that tests a batch of
   PRs once.
+- [The VM pools](VM_POOLS.md) — the single-use VMs on the Mac Studio and
+  on AIPC designed for CI's macOS and Windows gates, not in use (the macOS
+  gates run on a host runner): security model, host controller, setup and
+  operation.
 - [Release automation](RELEASE_AUTOMATION_DESIGN.md) — version bumping,
   cutting, tagging, publishing, and the CI fast path for release PRs.
 - [`metacodes update`](UPDATE_DESIGN.md) — bring an install up to date from

@@ -202,7 +202,7 @@ pub const PROFILE = profile.ProviderProfile{
 test "kimi profile: each platform's key page checks against that platform's model listing" {
     try profile.validateProfile(PROFILE);
     const default = PROFILE.defaultKeyPage(PROFILE.default_channel).?;
-    try std.testing.expectEqualStrings("https://platform.kimi.com/console/api-keys", default.url);
+    try std.testing.expectEqualStrings("https://platform.kimi.com/console/api-keys", default.url.?);
     try std.testing.expectEqualStrings("https://api.moonshot.cn/v1/models", default.check_url.?);
     const global = PROFILE.defaultKeyPage(Slug.lit("global-openai")).?;
     try std.testing.expectEqualStrings("https://api.moonshot.ai/v1/models", global.check_url.?);
