@@ -1154,6 +1154,12 @@ class RemoteRun:
                 return event.get("code")
         return None
 
+    def error_message(self) -> Optional[str]:
+        for event in reversed(self.events):
+            if event.get("event") == "error" and isinstance(event.get("message"), str):
+                return event["message"]
+        return None
+
     @property
     def local_job_dir(self) -> Path:
         return Path(self.spec["jobs_dir"]) / self.spec["name"]
