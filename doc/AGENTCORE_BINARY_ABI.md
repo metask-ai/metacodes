@@ -560,9 +560,13 @@ other VCS metadata excluded. They describe what changed in the workspace while
 the command ran, so another writer active in the same window can appear in
 them. A modification is reported without a diff (`diff_complete` false) when
 its previous content is unknown — always the case in a Session whose shell is
-sandboxed, where the observation does not run git. A call the observation could
-not cover — a workspace too large to list, a command that moved to the
-background or was started with `run_in_background` — carries `lost`.
+sandboxed, where the observation does not run git. In such a Session the
+observation also lists and opens files through the sandbox, so a path the
+sandbox hides from the command (`denyRead`) is never reported, with or without
+its contents. A call the observation could not cover — a workspace too large to
+list, a listing that could not read every directory, a changed file the sandbox
+would not open, a command that moved to the background or was started with
+`run_in_background` — carries `lost`.
 
 Core file-change evidence may retain arbitrary file bytes, but AgentCore's JSON
 boundary publishes `unified_diff` only as valid UTF-8. A diff whose only

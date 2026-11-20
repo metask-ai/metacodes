@@ -348,16 +348,29 @@ Bash 观测没能覆盖)也照发一条空 `changes` 的事件,Run 账本同时�
   `.jj` 排除),逐个 lstat。路径的身份(dev/inode)、大小、mtime、ctime 任一变化即为修改;消失的
   路径与新出现的、inode/大小/mtime 相同的路径配对成 `moved`。Windows 上的 stat 不带文件身份
   (没有 inode,也没有 ctime),只看大小与 mtime,改名报成一条 `deleted` 加一条 `created`。
+- **列表的出入不等于文件的出入**:两次列举之间忽略规则可能变了。从列表里消失的路径先 lstat
+  确认:文件还在就不是删除(内容变了报修改);新出现的路径若早在观测开始前(留 2 秒时钟余量)
+  就没动过——POSIX 看 ctime,Windows 看创建与修改时间——就只是重新可见,不算新建。ripgrep
+  遍历出错(退出码 2,例如读不了的子目录)时,列到的照用,并置 `lost`。
 - **diff 从哪来**:新建文件读执行后的内容;修改/删除需要"执行前",git 工作区里执行前已与 index
   不同(或未跟踪)的文件预先复制(有上限),与 index 一致的文件事后从 index 取——**仅当命令没动过
-  index**(`git add`/`stash`/`checkout` 会把执行后的内容放进 index),且 blob 大小与执行前一致
-  (CRLF/LFS 过滤会让二者不同)。取不到"执行前"、二进制、超大文件:照报这次修改,不带 diff,
+  index**(`git add`/`stash`/`checkout` 会把执行后的内容放进 index),且 blob 大小与执行前一致,
+  且该路径没有 `filter`、`working-tree-encoding`、`ident` 属性(`git check-attr`;行尾转换与
+  `ident` 只要改了字节就改了大小,另外两种可以等长换掉每个字节——UTF-16LE 的 `中\n` 和它的
+  UTF-8 blob 都是 4 字节),且命令期间属性与配置的来源都没变(工作区里的 `.gitattributes`、
+  根到仓库顶之间各级的 `.gitattributes`、`info/attributes`、`.git/config`)。取不到"执行前"、
+  二进制、超大文件:照报这次修改,不带 diff,
   `diff_complete = false`;行 diff 表达不了的末尾换行变化同样如此(只改末尾换行 → 不带 diff;
   任一侧缺末尾换行 → 带 diff 但 `diff_complete = false`)。能证明内容没变的(`touch`、写回
   相同字节)不算修改,也不占单次 64 条的记录上限。
-- **沙箱会话不跑 git**:会话启用沙箱时观测完全不调用 git——沙箱内的命令可以写工作区里的
+- **沙箱会话走沙箱**:会话启用沙箱时观测完全不调用 git——沙箱内的命令可以写工作区里的
   `.git/config`,而观测在沙箱外运行 git,被植入的 fsmonitor/clean filter 会越过沙箱执行。此时
-  修改照报,只是不带 diff。非沙箱会话里也总带 `-c core.fsmonitor=false`。
+  修改照报,只是不带 diff。非沙箱会话里也总带 `-c core.fsmonitor=false`。列举也在沙箱里跑
+  (与 Glob/Grep 同一个包装),每条变更发布前先经沙箱文件执行器打开、并核对打开的正是 lstat
+  看到的那个文件(bubblewrap 把禁读文件绑成 `/dev/null`),内容也从那个句柄读:沙箱对命令藏起
+  来的(`denyRead`),路径、大小、内容都不进事件和账本,打不开的变更不发布并置 `lost`。
+  Seatbelt 拒读的目录让列举出错,同样置 `lost`;bubblewrap 把它显示为空的只读目录,命令也写
+  不进去。沙箱不可用时整次调用 `lost`。每条变更多一次沙箱进程,开销随变更数增长。
 - **范围(明说)**:只覆盖工作区根之下 ripgrep 能列出的普通文件;被忽略的文件、symlink、根之外的
   路径不在内。记录说的是**命令执行窗口内**工作区的变化,同窗口里的其他写者(后台 subagent、
   用户的编辑器)也会出现在里面。只读命令(与权限自动放行、并行调度共用同一分类器)不观测。

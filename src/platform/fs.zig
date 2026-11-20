@@ -1247,10 +1247,14 @@ pub const PathStat = struct {
     changed_ns: i128,
     device: u64,
     inode: u64,
+    /// Creation time, nanoseconds since the Unix epoch. Windows only, where it
+    /// stands in for the missing ctime; zero elsewhere.
+    created_ns: i128 = 0,
 
     pub fn eql(a: PathStat, b: PathStat) bool {
         return a.kind == b.kind and a.size == b.size and a.modified_ns == b.modified_ns and
-            a.changed_ns == b.changed_ns and a.device == b.device and a.inode == b.inode;
+            a.changed_ns == b.changed_ns and a.device == b.device and a.inode == b.inode and
+            a.created_ns == b.created_ns;
     }
 };
 
@@ -1279,6 +1283,7 @@ pub fn statNoFollow(path_z: [*:0]const u8) StatError!PathStat {
         const is_link = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 and
             (data.dwReserved0 == IO_REPARSE_TAG_SYMLINK or data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT);
         const ticks = (@as(i128, data.ftLastWriteTime[1]) << 32) | data.ftLastWriteTime[0];
+        const born = (@as(i128, data.ftCreationTime[1]) << 32) | data.ftCreationTime[0];
         return .{
             .kind = if (is_link)
                 .symlink
@@ -1292,6 +1297,7 @@ pub fn statNoFollow(path_z: [*:0]const u8) StatError!PathStat {
             .changed_ns = 0,
             .device = 0,
             .inode = 0,
+            .created_ns = (born - 116_444_736_000_000_000) * 100,
         };
     }
     if (builtin.os.tag == .linux) {

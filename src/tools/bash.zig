@@ -14,6 +14,7 @@ const tool_result = @import("../core/tool_result.zig");
 const ResultMetrics = @import("../core/tool_result_metrics.zig").Metrics;
 const result_budget = @import("../core/result_budget.zig");
 const command_file_changes = @import("../core/command_file_changes.zig");
+const sandbox_fs = @import("../sandbox/filesystem.zig");
 const bash_readonly = @import("../permission/bash_readonly.zig");
 
 /// nowMs：毫秒时间戳，复用 util/time.zig
@@ -747,10 +748,13 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
     //
     // In a sandboxed session the observation never runs git: any earlier
     // sandboxed command could have written `.git/config` (the root is
-    // writable), and git here runs outside the sandbox.
+    // writable), and git here runs outside the sandbox. It lists and opens
+    // files through the sandbox instead, so what `denyRead` hides from the
+    // command is not reported either.
     var observation: ?command_file_changes.Observation = if (observesFileChanges(ctx, args)) blk: {
         const options: command_file_changes.Options = .{
-            .git_baselines = if (ctx.sandbox) |sb| !sb.enabled else true,
+            .git_baselines = !sandbox_fs.enabled(ctx),
+            .confined = if (sandbox_fs.enabled(ctx)) ctx else null,
         };
         if (ctx.cwd_abs.len > 0) break :blk command_file_changes.Observation.begin(allocator, ctx.cwd_abs, ctx.abort, options);
         const here = util_fs.getCwd(allocator) catch break :blk command_file_changes.Observation.begin(allocator, "", ctx.abort, options);

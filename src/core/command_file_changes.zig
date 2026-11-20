@@ -46,6 +46,8 @@ const common = @import("../tools/common.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const ToolContext = @import("../tools/context.zig").ToolContext;
+const sandbox_fs = @import("../sandbox/filesystem.zig");
 
 pub const Limits = struct {
     /// Files one listing may hold. Beyond this the workspace is "too large"
@@ -68,6 +70,10 @@ pub const Limits = struct {
     /// changes may still be touch-only (skipped), so a few more are examined;
     /// anything left after this is reported as overflow, never dropped.
     max_examined: usize = 4 * file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1,
+    /// A path the listing shows only afterwards (an ignore rule was removed)
+    /// was already there when its status-change time is this much older than
+    /// the observation: filesystem clocks are coarse (FAT: 2 s).
+    clock_slack_ms: u64 = 2_000,
 };
 
 pub const Options = struct {
@@ -79,6 +85,13 @@ pub const Options = struct {
     /// or clean filter would execute unconfined. Without git, modifications
     /// are still reported, only without a diff.
     git_baselines: bool = true,
+    /// The session's sandbox, when the command runs in one. The listing then
+    /// runs inside it and a change is published only if the sandbox lets the
+    /// command open the file, whose contents are read through it too: what
+    /// the sandbox hides from the command (`denyRead`) stays out of the
+    /// event and the journal. A sandbox that cannot be reached makes the call
+    /// `lost`.
+    confined: ?*const ToolContext = null,
 };
 
 /// Why a call went unobserved. Every gap reaches the consumer as `lost`.
@@ -211,9 +224,16 @@ const AbortBridge = struct {
     }
 };
 
-fn takeSnapshot(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSignal, limits: Limits) SnapshotResult {
+fn takeSnapshot(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSignal, limits: Limits, confined: ?*const ToolContext) SnapshotResult {
     const rg = toolchain.ripgrepPath() catch return .{ .gap = .listing_failed };
-    const argv = [_]?[*:0]const u8{
+    var root_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    // A confined listing names the root explicitly: the sandbox wrapper may
+    // run it from the session's directory, not from `root`.
+    const root_z: ?[*:0]const u8 = if (confined != null)
+        (std.fmt.bufPrintZ(&root_buf, "{s}", .{root}) catch return .{ .gap = .listing_failed }).ptr
+    else
+        null;
+    var argv = [_]?[*:0]const u8{
         rg.ptr,
         "--files",
         "--hidden",
@@ -226,9 +246,17 @@ fn takeSnapshot(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSi
         "--glob=!.hg",
         "--glob=!.svn",
         "--glob=!.jj",
+        "--",
+        root_z,
         null,
     };
-    const captured = common.captureWithSpawnRetry(&argv, gpa, .{
+    var wrapped: ?sandbox_fs.SearchCommand = if (confined) |ctx|
+        (sandbox_fs.wrapArgv(ctx, &argv) catch return .{ .gap = .listing_failed }) orelse
+            return .{ .gap = .listing_failed }
+    else
+        null;
+    defer if (wrapped) |*w| w.deinit();
+    const captured = common.captureWithSpawnRetry(if (wrapped) |w| w.argv else &argv, gpa, .{
         .timeout_ms = limits.listing_timeout_ms,
         .max_bytes = limits.max_listing_bytes,
         .want_stderr = false,
@@ -249,10 +277,15 @@ fn takeSnapshot(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSi
     if (!captured.capture_complete) return .{ .gap = .workspace_too_large };
     // 0 = files listed, 1 = none. 2 is an error that may still have listed
     // (an unreadable subdirectory): accept it only with output, so a rejected
-    // flag can never pass for an empty workspace.
+    // flag can never pass for an empty workspace, and count it as unobserved:
+    // what that directory holds, and what happens in it, is not seen.
+    var unobserved: usize = 0;
     switch (captured.exit_code) {
         0, 1 => {},
-        2 => if (listing.len == 0) return .{ .gap = .listing_failed },
+        2 => {
+            if (listing.len == 0) return .{ .gap = .listing_failed };
+            unobserved += 1;
+        },
         else => return .{ .gap = .listing_failed },
     }
 
@@ -262,11 +295,14 @@ fn takeSnapshot(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSi
     if (count > limits.max_files) return .{ .gap = .workspace_too_large };
     files.ensureTotalCapacity(gpa, @intCast(count)) catch return .{ .gap = .out_of_memory };
 
-    var unobserved: usize = 0;
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     var it = std.mem.splitScalar(u8, listing, 0);
-    while (it.next()) |rel| {
-        if (rel.len == 0) continue;
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const rel = if (confined != null) underRoot(root, entry) orelse {
+            unobserved += 1;
+            continue;
+        } else entry;
         const z = joinZ(&path_buf, root, rel) orelse {
             unobserved += 1;
             continue;
@@ -283,6 +319,13 @@ fn takeSnapshot(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSi
     }
     keep = true;
     return .{ .ok = .{ .listing = listing, .files = files, .unobserved = unobserved } };
+}
+
+/// `entry` without the `root/` a listing of `root` by name prefixes it with.
+fn underRoot(root: []const u8, entry: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, root, "/");
+    if (entry.len <= trimmed.len + 1 or !std.mem.startsWith(u8, entry, trimmed) or entry[trimmed.len] != '/') return null;
+    return entry[trimmed.len + 1 ..];
 }
 
 fn joinZ(buf: *[std.fs.max_path_bytes + 1]u8, root: []const u8, rel: []const u8) ?[*:0]const u8 {
@@ -370,11 +413,48 @@ const GitBefore = struct {
     dirty: std.StringHashMapUnmanaged(void) = .empty,
     /// Copies of dirty files, root-relative path → bytes.
     copies: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Where attributes and config come from, outside the listing: the
+    /// repository's `info/attributes` and `config`, and the `.gitattributes`
+    /// of the directories between the repository top and the root. Paired
+    /// with their state before the command (null: absent).
+    attribute_sources: std.ArrayListUnmanaged(Source) = .empty,
+
+    const Source = struct { path: [:0]const u8, then: ?pfs.PathStat };
 
     fn deinit(self: *GitBefore) void {
         self.arena.deinit();
     }
+
+    /// The attributes that decide how a file's index blob relates to its
+    /// bytes on disk are the ones the command started with.
+    fn attributesUnchanged(self: *const GitBefore, changes: []const Change) bool {
+        for (changes) |c| {
+            if (std.mem.eql(u8, std.fs.path.basenamePosix(c.rel), ".gitattributes")) return false;
+            if (c.from_rel) |f| if (std.mem.eql(u8, std.fs.path.basenamePosix(f), ".gitattributes")) return false;
+        }
+        for (self.attribute_sources.items) |src| {
+            const now: ?pfs.PathStat = pfs.statNoFollow(src.path.ptr) catch |err| switch (err) {
+                error.NotFound => null,
+                error.Unavailable => return false,
+            };
+            if ((src.then == null) != (now == null)) return false;
+            if (src.then) |t| if (!t.eql(now.?)) return false;
+        }
+        return true;
+    }
 };
+
+fn resolveGitPath(a: std.mem.Allocator, root: []const u8, path: []const u8) error{OutOfMemory}![:0]const u8 {
+    return if (std.fs.path.isAbsolute(path))
+        try a.dupeZ(u8, path)
+    else
+        try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ root, path }, 0);
+}
+
+fn addSource(before: *GitBefore, path: [:0]const u8) error{OutOfMemory}!void {
+    const then: ?pfs.PathStat = pfs.statNoFollow(path.ptr) catch null;
+    try before.attribute_sources.append(before.arena.allocator(), .{ .path = path, .then = then });
+}
 
 const Read = union(enum) { bytes: []u8, unavailable };
 
@@ -384,6 +464,11 @@ fn readRegular(allocator: std.mem.Allocator, path_z: [*:0]const u8, max_bytes: u
     const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return .unavailable;
     defer pfs.close(fd);
+    return readOpen(allocator, fd, max_bytes);
+}
+
+/// Read an open regular file, refusing anything over `max_bytes`.
+fn readOpen(allocator: std.mem.Allocator, fd: pfs.Fd, max_bytes: usize) error{OutOfMemory}!Read {
     const info = pfs.fileInfo(fd) catch return .unavailable;
     if (!info.is_regular or info.size > max_bytes) return .unavailable;
     var out: std.ArrayList(u8) = .empty;
@@ -428,16 +513,28 @@ fn takeGitBefore(
     defer if (!keep) before.deinit();
     const a = before.arena.allocator();
 
-    switch (try runGit(a, root, &.{ "rev-parse", "--show-prefix", "--git-path", "index" }, abort, limits.git_timeout_ms, 64 * 1024, null)) {
+    switch (try runGit(a, root, &.{
+        "rev-parse",  "--show-prefix",   "--git-path", "index",
+        "--git-path", "info/attributes", "--git-path", "config",
+    }, abort, limits.git_timeout_ms, 64 * 1024, null)) {
         .ok => |r| {
             var lines = std.mem.splitScalar(u8, r.out, '\n');
             before.prefix = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
             const index_rel = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
-            if (index_rel.len == 0) return .none;
-            before.index_path = if (std.fs.path.isAbsolute(index_rel))
-                try a.dupeZ(u8, index_rel)
-            else
-                try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ root, index_rel }, 0);
+            const info_attributes = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
+            const config = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
+            if (index_rel.len == 0 or info_attributes.len == 0 or config.len == 0) return .none;
+            before.index_path = try resolveGitPath(a, root, index_rel);
+            try addSource(&before, try resolveGitPath(a, root, info_attributes));
+            try addSource(&before, try resolveGitPath(a, root, config));
+            // One `.gitattributes` per directory between the top and the root;
+            // the root's own and those below it are in the listing.
+            var up: std.ArrayList(u8) = .empty;
+            var depth = std.mem.count(u8, before.prefix, "/");
+            while (depth > 0) : (depth -= 1) {
+                try up.appendSlice(a, "../");
+                try addSource(&before, try std.fmt.allocPrintSentinel(a, "{s}/{s}.gitattributes", .{ root, up.items }, 0));
+            }
         },
         .refused, .unavailable => return .none,
         .timed_out => return .timed_out,
@@ -524,41 +621,91 @@ const Change = struct {
     }
 };
 
-/// Pure comparison of two snapshots. Slices borrow the snapshots.
-fn compare(gpa: std.mem.Allocator, before: *const Snapshot, after: *const Snapshot) error{OutOfMemory}![]Change {
+/// The file was there, untouched, before `since_ns`. POSIX ctime moves on
+/// every write, rename and metadata change and no tool can set it back;
+/// Windows reports no ctime here, so its creation and last write must both
+/// predate it.
+fn untouchedSince(stat: pfs.PathStat, since_ns: i128) bool {
+    if (builtin.os.tag == .windows)
+        return stat.created_ns != 0 and stat.created_ns < since_ns and stat.modified_ns < since_ns;
+    return stat.changed_ns != 0 and stat.changed_ns < since_ns;
+}
+
+/// Compare two snapshots of `root`. A listing only shows what its ignore
+/// rules let through, so a path's presence in one listing and absence from
+/// the other is a fact about the listing until the file itself is asked:
+/// a vanished path still on disk is not a deletion (an ignore rule now covers
+/// it) and a new path untouched since before `since_ns` is not a creation
+/// (one stopped covering it). Paths that cannot be asked add to
+/// `unobserved`. Slices borrow the snapshots.
+fn compare(
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    before: *const Snapshot,
+    after: *const Snapshot,
+    since_ns: i128,
+    unobserved: *usize,
+) error{OutOfMemory}![]Change {
     var changes: std.ArrayList(Change) = .empty;
     errdefer changes.deinit(gpa);
     var gone: std.ArrayList(Change) = .empty;
     defer gone.deinit(gpa);
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
 
     var bit = before.files.iterator();
     while (bit.next()) |e| {
+        const was = e.value_ptr.*;
         if (after.files.get(e.key_ptr.*)) |now| {
-            if (!now.eql(e.value_ptr.*))
-                try changes.append(gpa, .{ .rel = e.key_ptr.*, .kind = .modified, .before = e.value_ptr.*, .after = now });
-        } else {
-            try gone.append(gpa, .{ .rel = e.key_ptr.*, .kind = .deleted, .before = e.value_ptr.*, .after = null });
+            if (!now.eql(was))
+                try changes.append(gpa, .{ .rel = e.key_ptr.*, .kind = .modified, .before = was, .after = now });
+            continue;
         }
+        const z = joinZ(&path_buf, root, e.key_ptr.*) orelse {
+            unobserved.* += 1;
+            continue;
+        };
+        if (pfs.statNoFollow(z)) |now| {
+            if (now.kind == .regular) {
+                if (!now.eql(was))
+                    try changes.append(gpa, .{ .rel = e.key_ptr.*, .kind = .modified, .before = was, .after = now });
+                continue;
+            }
+            // Replaced by a directory, a link or a device: the file is gone.
+        } else |err| switch (err) {
+            error.NotFound => {},
+            error.Unavailable => {
+                unobserved.* += 1;
+                continue;
+            },
+        }
+        try gone.append(gpa, .{ .rel = e.key_ptr.*, .kind = .deleted, .before = was, .after = null });
     }
 
     // New paths, indexed by file identity so a vanished path can claim the
     // file it was renamed to. Identity alone is not enough — a freed inode is
     // reused — so a move also needs the same size and modification time,
     // which `rename` preserves and a fresh file does not.
-    const Identity = struct { device: u64, inode: u64 };
-    var arrived: std.AutoHashMapUnmanaged(Identity, usize) = .empty;
+    var arrived: std.ArrayList(Change) = .empty;
     defer arrived.deinit(gpa);
+    const Identity = struct { device: u64, inode: u64 };
+    var by_identity: std.AutoHashMapUnmanaged(Identity, usize) = .empty;
+    defer by_identity.deinit(gpa);
     var ait = after.files.iterator();
     while (ait.next()) |e| {
         if (before.files.contains(e.key_ptr.*)) continue;
-        try changes.append(gpa, .{ .rel = e.key_ptr.*, .kind = .created, .before = null, .after = e.value_ptr.* });
+        try arrived.append(gpa, .{ .rel = e.key_ptr.*, .kind = .created, .before = null, .after = e.value_ptr.* });
         if (e.value_ptr.inode != 0)
-            try arrived.put(gpa, .{ .device = e.value_ptr.device, .inode = e.value_ptr.inode }, changes.items.len - 1);
+            try by_identity.put(gpa, .{ .device = e.value_ptr.device, .inode = e.value_ptr.inode }, arrived.items.len - 1);
     }
+    // What a vanished file looked like, for the unpaired: a new path that
+    // could be one of them is reported, never explained away as old.
+    const Shape = struct { size: u64, modified_ns: i128 };
+    var unpaired_gone: std.AutoHashMapUnmanaged(Shape, void) = .empty;
+    defer unpaired_gone.deinit(gpa);
     for (gone.items) |g| {
         const b = g.before.?;
-        if (b.inode != 0) if (arrived.get(.{ .device = b.device, .inode = b.inode })) |idx| {
-            const c = &changes.items[idx];
+        if (b.inode != 0) if (by_identity.get(.{ .device = b.device, .inode = b.inode })) |idx| {
+            const c = &arrived.items[idx];
             if (c.kind == .created and c.after.?.size == b.size and c.after.?.modified_ns == b.modified_ns) {
                 c.kind = .moved;
                 c.from_rel = g.rel;
@@ -566,7 +713,14 @@ fn compare(gpa: std.mem.Allocator, before: *const Snapshot, after: *const Snapsh
                 continue;
             }
         };
+        try unpaired_gone.put(gpa, .{ .size = b.size, .modified_ns = b.modified_ns }, {});
         try changes.append(gpa, g);
+    }
+    for (arrived.items) |c| {
+        if (c.kind == .created and untouchedSince(c.after.?, since_ns) and
+            !unpaired_gone.contains(.{ .size = c.after.?.size, .modified_ns = c.after.?.modified_ns }))
+            continue;
+        try changes.append(gpa, c);
     }
     const out = try changes.toOwnedSlice(gpa);
     std.mem.sort(Change, out, {}, Change.lessThan);
@@ -594,6 +748,11 @@ pub const Observation = struct {
     /// Owned; empty when `begin` could not copy it.
     root: []u8,
     limits: Limits,
+    /// See `Options.confined`; borrowed for the observation's lifetime.
+    confined: ?*const ToolContext = null,
+    /// Wall clock when the observation began, less `Limits.clock_slack_ms`:
+    /// a file untouched since then was not the command's doing.
+    since_ns: i128 = 0,
     state: union(enum) {
         watching: struct { snapshot: Snapshot, git: ?GitBefore },
         gap: Gap,
@@ -604,14 +763,22 @@ pub const Observation = struct {
     pub fn begin(gpa: std.mem.Allocator, root: []const u8, abort: ?*const AbortSignal, options: Options) Observation {
         const limits = options.limits;
         const owned = gpa.dupe(u8, root) catch return .{ .gpa = gpa, .root = &.{}, .limits = limits, .state = .{ .gap = .out_of_memory } };
-        var self = Observation{ .gpa = gpa, .root = owned, .limits = limits, .state = .{ .gap = .listing_failed } };
+        const slack: i128 = @as(i128, limits.clock_slack_ms) * std.time.ns_per_ms;
+        var self = Observation{
+            .gpa = gpa,
+            .root = owned,
+            .limits = limits,
+            .confined = options.confined,
+            .since_ns = @as(i128, util_time.nowWallNs()) - slack,
+            .state = .{ .gap = .listing_failed },
+        };
         const remembered = breaker.get(root);
         if (remembered.too_large) {
             self.state = .{ .gap = .workspace_too_large_before };
             return self;
         }
         const started = util_time.nowMs();
-        var snapshot = switch (takeSnapshot(gpa, root, abort, limits)) {
+        var snapshot = switch (takeSnapshot(gpa, root, abort, limits, options.confined)) {
             .ok => |s| s,
             .gap => |gap| {
                 noteGap(root, gap);
@@ -673,7 +840,7 @@ pub const Observation = struct {
                 return;
             },
         };
-        var after = switch (takeSnapshot(self.gpa, self.root, abort, self.limits)) {
+        var after = switch (takeSnapshot(self.gpa, self.root, abort, self.limits, self.confined)) {
             .ok => |s| s,
             .gap => |gap| {
                 noteGap(self.root, gap);
@@ -698,15 +865,20 @@ pub const Observation = struct {
         abort: ?*const AbortSignal,
         sink: file_change.Sink,
     ) error{OutOfMemory}!void {
-        const changes = try compare(self.gpa, before, after);
+        var unasked: usize = 0;
+        const changes = try compare(self.gpa, self.root, before, after, self.since_ns, &unasked);
         defer self.gpa.free(changes);
+        if (unasked > 0) sink.noteIncomplete();
         if (changes.len == 0) return;
 
         // Index "befores" are bounded by `max_baseline_bytes` in total.
         var baselines_state = std.heap.ArenaAllocator.init(self.gpa);
         defer baselines_state.deinit();
         const examined = @min(changes.len, self.limits.max_examined);
-        const from_index = try self.indexBaselines(baselines_state.allocator(), changes[0..examined], git, abort);
+        // An attribute or config the command changed may have changed how a
+        // blob maps to the bytes on disk: then no index blob is a known before.
+        const trusted_git: ?*const GitBefore = if (git) |g| (if (g.attributesUnchanged(changes)) g else null) else null;
+        const from_index = try self.indexBaselines(baselines_state.allocator(), changes[0..examined], trusted_git, abort);
 
         // One file's contents, LCS table and diff at a time: the arena is reset
         // between files and reuses its largest buffer, so peak memory is the
@@ -723,6 +895,16 @@ pub const Observation = struct {
         while (next < examined and published < cap) : (next += 1) {
             defer _ = per_file_state.reset(.retain_capacity);
             const change = changes[next];
+            // Under a sandbox, a file the command could not open is not
+            // reported at all: its path, size and contents stay inside.
+            var confined_fd: ?pfs.Fd = null;
+            defer if (confined_fd) |fd| pfs.close(fd);
+            if (change.kind != .deleted) if (self.confined) |ctx| {
+                confined_fd = self.openConfined(ctx, per_file, change.rel, change.after.?) orelse {
+                    sink.noteIncomplete();
+                    continue;
+                };
+            };
             const old: ?[]const u8 = switch (change.kind) {
                 .created => "",
                 .moved => null, // same size and mtime: the move carried the content
@@ -733,8 +915,11 @@ pub const Observation = struct {
                 .moved => null,
                 .created, .modified => blk: {
                     if (change.after.?.size > self.limits.max_file_bytes) break :blk null;
-                    const z = joinZ(&path_buf, self.root, change.rel) orelse break :blk null;
-                    break :blk switch (try readRegular(per_file, z, self.limits.max_file_bytes)) {
+                    const read = if (confined_fd) |fd|
+                        try readOpen(per_file, fd, self.limits.max_file_bytes)
+                    else
+                        try readRegular(per_file, joinZ(&path_buf, self.root, change.rel) orelse break :blk null, self.limits.max_file_bytes);
+                    break :blk switch (read) {
                         .bytes => |b| b,
                         .unavailable => null,
                     };
@@ -787,6 +972,13 @@ pub const Observation = struct {
                 // The record cap is full and more changed paths remain: one
                 // more publication makes the collector record the overflow.
                 const extra = changes[next];
+                if (extra.kind != .deleted) if (self.confined) |ctx| {
+                    const fd = self.openConfined(ctx, per_file, extra.rel, extra.after.?) orelse {
+                        sink.noteIncomplete();
+                        return;
+                    };
+                    pfs.close(fd);
+                };
                 sink.publish(.{
                     .path = try std.fs.path.join(per_file, &.{ self.root, extra.rel }),
                     .kind = extra.kind,
@@ -799,6 +991,23 @@ pub const Observation = struct {
             }
         }
         log.debug("bash_fc", "after: changes={d} examined={d} published={d}", .{ changes.len, next, published });
+    }
+
+    /// Open `rel` read-only the way the sandboxed command would, and only if
+    /// that opens the very file `seen` describes: bubblewrap hides a file by
+    /// binding `/dev/null` over it, which opens fine and is something else.
+    fn openConfined(self: *const Observation, ctx: *const ToolContext, scratch: std.mem.Allocator, rel: []const u8, seen: pfs.PathStat) ?pfs.Fd {
+        const path = std.fs.path.join(scratch, &.{ self.root, rel }) catch return null;
+        const fd = sandbox_fs.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch return null;
+        const info = pfs.fileInfo(fd) catch {
+            pfs.close(fd);
+            return null;
+        };
+        if (!info.is_regular or info.device != seen.device or info.inode != seen.inode) {
+            pfs.close(fd);
+            return null;
+        }
+        return fd;
     }
 
     /// "Before" bytes from the index for changed files that matched it before
@@ -819,8 +1028,9 @@ pub const Observation = struct {
         const index_now = pfs.statNoFollow(g.index_path.ptr) catch return out;
         if (!index_then.eql(index_now)) return out;
 
-        var request: std.ArrayList(u8) = .empty;
-        var wanted: std.ArrayList(usize) = .empty;
+        var candidates: std.ArrayList(usize) = .empty;
+        var attr_request: std.ArrayList(u8) = .empty;
+        var request_bytes: usize = 0;
         var expected_bytes: usize = 0;
         for (changes, 0..) |c, i| {
             if (c.kind != .modified and c.kind != .deleted) continue;
@@ -829,10 +1039,45 @@ pub const Observation = struct {
             if (size > self.limits.max_file_bytes) continue;
             if (expected_bytes + size > self.limits.max_baseline_bytes) continue;
             if (std.mem.indexOfAny(u8, c.rel, "\n\r") != null) continue; // breaks the batch protocol
-            if (request.items.len + g.prefix.len + c.rel.len + 2 > MAX_CAT_FILE_REQUEST_BYTES) continue;
-            try request.print(allocator, ":{s}{s}\n", .{ g.prefix, c.rel });
-            try wanted.append(allocator, i);
+            const line = 1 + g.prefix.len + c.rel.len + 1; // `:<prefix><rel>\n`
+            if (request_bytes + line > MAX_CAT_FILE_REQUEST_BYTES) continue;
+            request_bytes += line;
+            try attr_request.appendSlice(allocator, c.rel);
+            try attr_request.append(allocator, 0);
+            try candidates.append(allocator, i);
             expected_bytes += size;
+        }
+        if (candidates.items.len == 0) return out;
+
+        // The index holds the cleaned form. End-of-line and `ident`
+        // conversions change a file's size whenever they change its bytes, so
+        // an equal-size blob is the file; a `filter` or a working-tree
+        // encoding can keep the size and change every byte (UTF-16LE `中\n`
+        // and its UTF-8 blob are both 4 bytes). Those files have no index
+        // before.
+        const attr_bytes = switch (try runGit(allocator, self.root, &.{
+            "check-attr", "-z", "--stdin", "filter", "working-tree-encoding", "ident",
+        }, abort, self.limits.git_timeout_ms, attr_request.items.len * 3 + candidates.items.len * 96 + 4096, attr_request.items)) {
+            .ok => |r| if (r.complete) r.out else return out,
+            else => return out,
+        };
+        var request: std.ArrayList(u8) = .empty;
+        var wanted: std.ArrayList(usize) = .empty;
+        var answers = std.mem.splitScalar(u8, attr_bytes, 0);
+        for (candidates.items) |i| {
+            var plain = true;
+            for (0..3) |_| {
+                const path = answers.next() orelse return out;
+                _ = answers.next() orelse return out; // attribute name
+                const info = answers.next() orelse return out;
+                // Answers come back in request order; anything else means
+                // the stream is not what was asked for.
+                if (!std.mem.eql(u8, path, changes[i].rel)) return out;
+                if (!std.mem.eql(u8, info, "unspecified") and !std.mem.eql(u8, info, "unset")) plain = false;
+            }
+            if (!plain) continue;
+            try request.print(allocator, ":{s}{s}\n", .{ g.prefix, changes[i].rel });
+            try wanted.append(allocator, i);
         }
         if (wanted.items.len == 0) return out;
         // Each answer is a header line plus the blob and a newline.
@@ -857,9 +1102,9 @@ pub const Observation = struct {
             if (pos + size + 1 > bytes.len) break;
             const blob = bytes[pos..][0..size];
             pos += size + 1;
-            // A clean/smudge filter (CRLF, LFS) makes the index blob differ
-            // from the bytes that were on disk; only an exact-size blob can be
-            // the before.
+            // An end-of-line or `ident` conversion makes the blob differ in
+            // size from the bytes that were on disk; only an exact-size blob
+            // can be the before.
             if (std.mem.eql(u8, kind, "blob") and size == changes[i].before.?.size) out[i] = blob;
         }
         return out;
@@ -1327,4 +1572,273 @@ test "the breaker trips at once on size and only on a repeated timeout" {
     try testing.expect(b.get("/v").git_slow);
     b.note("/u", .too_large);
     try testing.expect(b.get("/u").too_large);
+}
+
+test "a path an ignore rule hides during the command is not reported deleted" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("build/report.txt", "report\n");
+    try fx.write("keep.txt", "keep\n");
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried });
+    defer obs.deinit();
+    try fx.write(".gitignore", "build/\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expect(!got.incomplete);
+    try testing.expect(got.find("report.txt") == null);
+    try testing.expectEqual(file_change.Kind.created, (try got.get(".gitignore")).kind);
+    try testing.expectEqual(@as(usize, 1), got.records.items.len);
+}
+
+test "a file the command changes and hides is a modification, not a deletion" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("build/report.txt", "v1\n");
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried });
+    defer obs.deinit();
+    try fx.write("build/report.txt", "version two\n");
+    try fx.write(".gitignore", "build/\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    const rec = try got.get("report.txt");
+    try testing.expectEqual(file_change.Kind.modified, rec.kind);
+    try testing.expectEqual(@as(u64, 12), rec.after_bytes);
+}
+
+test "a path an ignore rule reveals during the command is not reported created" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write(".gitignore", "build/\n");
+    try fx.write("build/old.txt", "old\n");
+    tick();
+    var limits = unhurried;
+    limits.clock_slack_ms = 0; // the tick above is the gap
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+    defer obs.deinit();
+    try fx.write(".gitignore", "# nothing ignored\n");
+    try fx.write("build/new.txt", "new\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expect(!got.incomplete);
+    try testing.expect(got.find("old.txt") == null);
+    try testing.expectEqual(file_change.Kind.created, (try got.get("new.txt")).kind);
+    try testing.expectEqual(file_change.Kind.modified, (try got.get(".gitignore")).kind);
+    try testing.expectEqual(@as(usize, 2), got.records.items.len);
+}
+
+test "a listing that could not read every directory makes the report incomplete" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // POSIX permissions
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("open.txt", "o\n");
+    try fx.write("locked/inner.txt", "i\n");
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const locked = joinZ(&path_buf, fx.root, "locked").?;
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(locked, 0));
+    defer _ = std.c.chmod(locked, 0o755);
+    // A superuser reads it anyway, and there is nothing to test.
+    const probe = std.c.open(locked, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
+    if (probe >= 0) {
+        _ = std.c.close(probe);
+        return error.SkipZigTest;
+    }
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried });
+    defer obs.deinit();
+    try fx.write("open.txt", "o, changed\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expect(got.incomplete);
+    try testing.expectEqual(file_change.Kind.modified, (try got.get("open.txt")).kind);
+}
+
+/// `中\n` in UTF-16LE: four bytes, like its UTF-8 form in the index.
+const UTF16LE_ZHONG = "\x2d\x4e\x0a\x00";
+const UTF8_ZHONG = "\xe4\xb8\xad\n";
+
+test "a clean file under a working-tree encoding does not take its index blob as the before" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write(".gitattributes", "u16.txt working-tree-encoding=UTF-16LE\n");
+    try fx.write("u16.txt", UTF16LE_ZHONG);
+    try fx.write("plain.txt", "a\nb\n");
+    try commitAll(&fx);
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried });
+    defer obs.deinit();
+    try testing.expect(obs.state.watching.git != null);
+    // The index blob's exact bytes: equal to it, yet a real change.
+    try fx.write("u16.txt", UTF8_ZHONG);
+    try fx.write("plain.txt", "a\nc\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    const enc = try got.get("u16.txt");
+    try testing.expectEqual(file_change.Kind.modified, enc.kind);
+    try testing.expect(enc.diff == null and !enc.diff_complete);
+    // A file without a converting attribute still gets its diff from the index.
+    try testing.expectEqualStrings(
+        "--- a/plain.txt\n+++ b/plain.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n",
+        (try got.get("plain.txt")).diff orelse return error.TestExpectedDiff,
+    );
+}
+
+test "attributes the command changes stop the index from standing in for the before" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write(".gitattributes", "u16.txt working-tree-encoding=UTF-16LE\n");
+    try fx.write("u16.txt", UTF16LE_ZHONG);
+    try commitAll(&fx);
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried });
+    defer obs.deinit();
+    // Migrate the file to UTF-8 and drop the attribute in one command.
+    try fx.write(".gitattributes", "# utf-8 now\n");
+    try fx.write("u16.txt", UTF8_ZHONG);
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    const enc = try got.get("u16.txt");
+    try testing.expectEqual(file_change.Kind.modified, enc.kind);
+    try testing.expect(enc.diff == null and !enc.diff_complete);
+}
+
+fn sandboxed(fx: *const Fixture, ctx: *ToolContext, sb: *@import("../sandbox/config.zig").SandboxSettings, hidden: []const []const u8) !void {
+    if (comptime !@import("../sandbox/filesystem_helper.zig").supported) return error.SkipZigTest;
+    if (!@import("../sandbox/exec.zig").hostSupported()) return error.SkipZigTest;
+    sb.* = .{ .enabled = true, .deny_read = hidden };
+    ctx.* = ToolContext.simple(testing.allocator);
+    ctx.cwd_abs = fx.root;
+    ctx.sandbox = sb;
+}
+
+test "under a sandbox the observation reports only what the sandbox lets the command open" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("secret/old.txt", "kept out\n");
+    try fx.write("token.env", "TOKEN=1\n");
+    try fx.write("visible.txt", "v1\n");
+    var secret_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var token_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const hidden = [_][]const u8{
+        try std.fmt.bufPrint(&secret_buf, "{s}/secret", .{fx.root}),
+        try std.fmt.bufPrint(&token_buf, "{s}/token.env", .{fx.root}),
+    };
+    var sb: @import("../sandbox/config.zig").SandboxSettings = undefined;
+    var ctx: ToolContext = undefined;
+    try sandboxed(&fx, &ctx, &sb, &hidden);
+    tick();
+
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried, .git_baselines = false, .confined = &ctx });
+    defer obs.deinit();
+    try testing.expect(obs.state == .watching);
+    // A hidden directory's files are not even listed: their deletion would
+    // need no opening to be reported.
+    try fx.write("secret/new.txt", "SANDBOX-HIDDEN-MARKER\n");
+    try fx.remove("secret/old.txt");
+    // A hidden file can be listed (Seatbelt shows its name in a readable
+    // directory) but the command cannot open it.
+    try fx.write("token.env", "TOKEN=SANDBOX-HIDDEN-MARKER\n");
+    try fx.write("visible.txt", "v2\n");
+
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expectEqual(@as(usize, 1), got.records.items.len);
+    const rec = try got.get("visible.txt");
+    try testing.expectEqual(file_change.Kind.modified, rec.kind);
+    for (got.records.items) |r| if (r.diff) |d| try testing.expect(std.mem.indexOf(u8, d, "SANDBOX-HIDDEN-MARKER") == null);
+    // Seatbelt refuses the directory and the file, so the listing knows it
+    // missed something; bubblewrap shows them empty and read-only.
+    if (builtin.os.tag == .macos) try testing.expect(got.incomplete);
+}
+
+test "under a sandbox the overflow signal never names a file the command cannot open" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("zz.env", "a\n");
+    var token_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const hidden = [_][]const u8{try std.fmt.bufPrint(&token_buf, "{s}/zz.env", .{fx.root})};
+    var sb: @import("../sandbox/config.zig").SandboxSettings = undefined;
+    var ctx: ToolContext = undefined;
+    try sandboxed(&fx, &ctx, &sb, &hidden);
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried, .git_baselines = false, .confined = &ctx });
+    defer obs.deinit();
+    const cap = file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1;
+    var name_buf: [32]u8 = undefined;
+    for (0..cap) |i| try fx.write(try std.fmt.bufPrint(&name_buf, "n{d:0>3}.txt", .{i}), "x\n");
+    try fx.write("zz.env", "changed\n"); // sorts after every n*.txt: the one past the cap
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expectEqual(cap, got.records.items.len);
+    try testing.expect(got.find("zz.env") == null);
+}
+
+test "a sandbox that cannot be reached makes the call lost" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("a.txt", "a\n");
+    // `confined` with no sandbox to run in: the listing cannot be confined.
+    var ctx = ToolContext.simple(testing.allocator);
+    ctx.cwd_abs = fx.root;
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried, .git_baselines = false, .confined = &ctx });
+    defer obs.deinit();
+    try testing.expectEqual(Gap.listing_failed, switch (obs.state) {
+        .gap => |gap| gap,
+        .watching => return error.TestExpectedGap,
+    });
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expect(got.incomplete);
+    try testing.expectEqual(@as(usize, 0), got.records.items.len);
+}
+
+test "files of a renamed directory are moves, not files that were already there" {
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("olddir/a.txt", "a\n");
+    try fx.write("olddir/b.txt", "bb\n");
+    tick();
+    // Renaming a directory leaves its files' ctime alone: only pairing them
+    // with the paths they left keeps them from passing for untouched.
+    var limits = unhurried;
+    limits.clock_slack_ms = 0;
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+    defer obs.deinit();
+    try fx.rename("olddir", "newdir");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expect(!got.incomplete);
+    var kinds = std.EnumArray(file_change.Kind, usize).initFill(0);
+    for (got.records.items) |r| kinds.getPtr(r.kind).* += 1;
+    if (builtin.os.tag == .windows) {
+        // No file identity: each file is a deletion and a creation.
+        try testing.expectEqual(@as(usize, 2), kinds.get(.deleted));
+        try testing.expectEqual(@as(usize, 2), kinds.get(.created));
+    } else {
+        try testing.expectEqual(@as(usize, 2), kinds.get(.moved));
+        try testing.expectEqual(@as(usize, 2), got.records.items.len);
+    }
 }
