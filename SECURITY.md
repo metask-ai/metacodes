@@ -59,6 +59,9 @@ the session's directories, and answer its permission questions. The rules
   daemon hold. A fresh create never overwrites a persisted conversation, and
   a refused create builds and writes nothing.
 - **UDS.** The `serve --uds <path>` transport takes no token; its only access
-  control is the socket file's mode 0600. Put the socket in a private (0700)
+  control is the socket file's mode 0600. Whoever can connect can list the
+  sessions, send them messages, interrupt a run, read a session's event
+  stream, answer its UI requests (permission questions included) and replace
+  its capability declaration. Put the socket in a private (0700)
   directory: the mode is tightened right after `bind`, and some BSD-derived
   systems ignore socket file modes.
