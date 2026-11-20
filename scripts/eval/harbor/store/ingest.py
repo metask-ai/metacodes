@@ -15,6 +15,7 @@ recomputes its projections from its own blobs when the code changes.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import sys
@@ -23,7 +24,7 @@ import threading
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from scripts.eval.harbor import profiling
 from scripts.eval.harbor.store import schema
@@ -751,10 +752,50 @@ def ingest_batches(store: Store, batches_dir: Path) -> int:
     return written
 
 
+ROOT_LOCK = ".bench-store.lock"
+
+
+@contextlib.contextmanager
+def root_lock(root: Path) -> Iterator[None]:
+    """Serializes imports and batch deletions of one jobs directory across
+    processes. A directory this process cannot write is imported unlocked:
+    nothing here can delete from it either."""
+    try:
+        fd = os.open(Path(root) / ROOT_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if not os.fstat(fd).st_size:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def ingest_root(store: Store, root: Path, *, verify: bool = False,
                 log: Callable[[str], None] = lambda message: None) -> RootResult:
     """Every job directory and launch record under one Harbor jobs directory."""
     root = Path(root).expanduser().resolve()
+    with root_lock(root):
+        return _ingest_root(store, root, verify, log)
+
+
+def _ingest_root(store: Store, root: Path, verify: bool, log: Callable[[str], None]) -> RootResult:
     result = RootResult(str(root))
     try:
         children = sorted(root.iterdir())

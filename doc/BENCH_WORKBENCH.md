@@ -838,7 +838,11 @@ and their rows in the evaluation database; the frozen bundle copy stays, since
 other batches may share it. A batch still running must be stopped first.
 Only a batch recorded in this service's jobs directory is deleted; one ingested
 from another jobs directory sharing the database is refused. When a file
-cannot be removed, the request fails and the batch stays for a retry.
+cannot be removed or the database delete fails, the request fails and the
+batch stays for a retry: the manifest goes last, after the rows are gone.
+Imports of a jobs directory (the service's sync, `bench db import`) and
+deletions from it take the same lock, `<jobs-dir>/.bench-store.lock`, so an
+import cannot write a deleted batch back.
 Batch records are ingested into the `batches` table of the evaluation
 database (schema v3).
 
@@ -911,6 +915,7 @@ there into the evaluation database):
 <jobs-dir>/
   .bench-runs/                     # launch receipts, specs, worker logs
   .bench-batches/<id>.json         # batches: frozen version, datasets, state
+  .bench-store.lock                # serializes imports and batch deletions
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage

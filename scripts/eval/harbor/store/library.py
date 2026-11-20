@@ -167,18 +167,25 @@ class StoreLibrary:
             rows = tx.query("SELECT name, record_json FROM runs")
         return [name for name, record_json in rows if json.loads(record_json).get("batch") == batch_id]
 
-    def delete_batch(self, batch_id: str, jobs: List[str], jobs_dir: Path,
+    def delete_batch(self, batch_id: str, jobs: List[str], jobs_dir: Path, manifest: Path,
                      remove_files: Callable[[], None]) -> None:
+        """Delete a batch this jobs directory owns: its job files, then its
+        rows, then its manifest, so a failure at any step leaves a batch that
+        a retry finds and finishes."""
         jobs_dir = Path(jobs_dir).resolve()
         owners = [("batches", "id", batch_id, jobs_dir / ingest.BATCHES_DIR)]
         for job in jobs:
             owners += [("runs", "name", job, jobs_dir / ".bench-runs"), ("jobs", "name", job, jobs_dir / job)]
-        with self._sync_lock:
+        with self._sync_lock, ingest.root_lock(jobs_dir):
             with self.store.read() as tx:
-                for table, key, value, source in owners:
-                    row = tx.one(f"SELECT source_dir FROM {table} WHERE {key} = ?", (value,))
-                    if row and row[0] != str(source):
-                        raise ValueError(f"批次 {batch_id} 的数据来自 {Path(row[0]).parent}，请在那个 jobs 目录的工作台删除")
+                sources = {(table, value): tx.one(f"SELECT source_dir FROM {table} WHERE {key} = ?", (value,))
+                           for table, key, value, _ in owners}
+            for table, _, value, source in owners:
+                row = sources[(table, value)]
+                if row and row[0] != str(source):
+                    raise ValueError(f"批次 {batch_id} 的数据来自 {Path(row[0]).parent}，请在那个 jobs 目录的工作台删除")
+            if sources[("batches", batch_id)] is None and not manifest.exists():
+                raise ValueError("批次不存在")
             remove_files()
             with self.store.transaction() as tx:
                 digests: List[str] = []
@@ -191,6 +198,10 @@ class StoreLibrary:
                     tx.execute("DELETE FROM jobs WHERE name = ?", (job,))
                 tx.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
                 ingest.collect_garbage(tx, digests)
+            try:
+                manifest.unlink(missing_ok=True)
+            except OSError as exc:
+                raise ValueError(f"删除批次清单失败（{exc}），可以重试") from None
 
     def replace_store(self, store: Store) -> Store:
         """Serve from `store` from now on; returns the previous store, which

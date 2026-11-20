@@ -287,6 +287,83 @@ class BatchTest(unittest.TestCase):
         self.assertFalse(job.exists())
         self.assertEqual(self.client.request('api/store')['counts']['batches'], 0)
 
+    def test_a_batch_whose_receipts_cannot_be_listed_stays_for_a_retry(self):
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions')
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        run = batch['items'][0]['run']
+        self.manager.records.chmod(0o300)
+        try:
+            with self.assertRaisesRegex(ValueError, '可以重试'):
+                self.client.request('api/batch/delete', {'id': batch['id']})
+        finally:
+            self.manager.records.chmod(0o700)
+        self.assertTrue((self.manager.jobs_dir / run).is_dir())
+        self.assertTrue((self.manager.records / (run + '.json')).exists())
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertEqual(list(self.manager.records.glob(run + '.*')), [])
+        self.assertEqual(self.client.request('api/store')['counts']['runs'], 0)
+
+    def test_a_failed_database_delete_keeps_the_ended_manifest_for_a_retry(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        self.client.request('api/batch?id=' + batch['id'])
+        stale = json.dumps({**batch, 'status': 'queued'})
+        with self.workbench.library.store.transaction() as tx:
+            tx.execute("UPDATE batches SET status = 'queued', record_json = ? WHERE id = ?", (stale, batch['id']))
+        with patch.object(ingest, 'collect_garbage', side_effect=RuntimeError('database is locked')):
+            with self.assertRaisesRegex(RuntimeError, 'locked'):
+                self.workbench.delete_batch(batch['id'])
+        self.assertTrue(self.manager.batches.path(batch['id']).exists())
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        self.assertFalse(self.manager.batches.path(batch['id']).exists())
+        self.assertEqual(self.client.request('api/store')['counts']['batches'], 0)
+
+    def test_a_batch_deleted_by_its_owner_meanwhile_is_not_deleted_again(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        run = batch['items'][0]['run']
+        self.client.request('api/batch?id=' + batch['id'])
+        other = RunManager(self.root / 'jobs-b', self.config)
+        shutil.copytree(self.manager.jobs_dir / run, other.jobs_dir / run)
+        bench = Workbench(data.Library([other.jobs_dir]), other)
+        self.addCleanup(bench.close)
+        seen = bench.batch_records()
+        self.client.request('api/batch/delete', {'id': batch['id']})
+        with patch.object(bench, 'batch_records', return_value=seen):
+            with self.assertRaisesRegex(ValueError, '不存在'):
+                bench.delete_batch(batch['id'])
+        self.assertTrue((other.jobs_dir / run).is_dir())
+
+    def test_an_import_waits_for_a_deletion_and_does_not_restore_the_batch(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        batch = self.wait_batch(self.client.request('api/batches', one)['id'])
+        self.client.request('api/batch?id=' + batch['id'])
+        imported = threading.Event()
+        removing = threading.Event()
+        library = self.workbench.library
+        remove = self.workbench._remove_run_files
+
+        def slow_remove(runs):
+            removing.set()
+            imported.wait(1)
+            remove(runs)
+
+        def import_now():
+            removing.wait(5)
+            ingest.ingest_root(library.store, self.manager.jobs_dir)
+            imported.set()
+
+        importer = threading.Thread(target=import_now)
+        importer.start()
+        with patch.object(self.workbench, '_remove_run_files', side_effect=slow_remove):
+            self.workbench.delete_batch(batch['id'])
+        importer.join(10)
+        self.assertTrue(imported.is_set())
+        with library.store.read() as tx:
+            self.assertIsNone(tx.one("SELECT id FROM batches WHERE id = ?", (batch['id'],)))
+
     def test_a_batch_from_another_jobs_directory_is_refused(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         batch = self.wait_batch(self.client.request('api/batches', one)['id'])

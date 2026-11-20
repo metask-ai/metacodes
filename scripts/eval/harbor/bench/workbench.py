@@ -290,21 +290,25 @@ class Workbench:
             running = {r["name"] for r in receipts if r.get("status") in ACTIVE}
             if record["status"] in BATCH_ACTIVE or running.intersection(runs):
                 raise ValueError("批次还在运行，请先取消，结束后再删除")
-            self.library.delete_batch(batch_id, runs, manager.jobs_dir, lambda: self._remove_batch_files(batch_id, runs))
+            self.library.delete_batch(batch_id, runs, manager.jobs_dir, self.batches.path(batch_id),
+                                      lambda: self._remove_run_files(runs))
         return {"id": batch_id, "deleted": True, "runs": runs}
 
-    def _remove_batch_files(self, batch_id, runs) -> None:
+    def _remove_run_files(self, runs) -> None:
         manager = self.manager
         try:
+            try:
+                receipts = [manager.records / name for name in os.listdir(manager.records)
+                            if name.rpartition(".")[0] in runs]
+            except FileNotFoundError:
+                receipts = []
             for run in runs:
                 try:
                     shutil.rmtree(manager.jobs_dir / run)
                 except FileNotFoundError:
                     pass
-                for path in manager.records.glob(run + ".*"):
-                    if path.stem == run:
-                        path.unlink(missing_ok=True)
-            self.batches.path(batch_id).unlink(missing_ok=True)
+            for path in receipts:
+                path.unlink(missing_ok=True)
         except OSError as exc:
             raise ValueError(f"删除文件失败（{exc}），批次已保留，处理后可以重试") from None
 
