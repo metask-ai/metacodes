@@ -587,7 +587,7 @@ async function renderNewBatch() {
       if (s && s.judge) notes.push(s.name + '：' + judgeText(s.judge) + '；分数与使用其他评委（如官方 openai/gpt-4o-mini）的结果不可直接比较');
     }
     if (!suites.length) notes.push(...(c.reasons || []));
-    if (!c.can_run) notes.push('请使用 metacodes bench 输出的授权链接打开工作台，启用运行操作。');
+    if (!c.can_run) notes.push('当前服务为只读模式（未用 metacodes bench 启动），不能发起评测。');
     const actions = [];
     if (c.can_run && reasons.length) {
       actions.push(h('button', { type: 'button', class: 'button primary', onclick: () => startSetup(false) }, '一键配置'),
@@ -1050,7 +1050,7 @@ async function renderSettings() {
     h('label', { class: 'check' }, migrate, '把当前数据库的数据迁移到新数据库（逐表复制并校验，可重复执行）'),
     h('div', { class: 'header-actions' }, testBtn, applyBtn), result,
     h('p', { class: 'muted', text: '有评测或批次运行时不能切换。切换后新数据写入新数据库；不勾选迁移时，作业目录仍会同步进新库，但只存在于旧库的数据不会出现。命令行等价操作：metacodes bench db migrate --to <目标> --switch' }))
-    : h('div', { class: 'empty', text: '修改数据库需要用 metacodes bench 输出的授权链接打开工作台。' });
+    : h('div', { class: 'empty', text: '当前服务为只读模式（未用 metacodes bench 启动），不能修改数据库。' });
   return h('div', {}, current, panel('配置数据库', '工作台配置中的 store', form));
 }
 
@@ -1069,7 +1069,7 @@ async function renderProviders() {
   crumbs([{ text: '看板', href: '#/' }, { text: '用 URL + API Key 导入评测用的模型' }]);
   let list;
   try { list = await api('/api/providers'); } catch (e) {
-    return h('div', { class: 'empty', text: e.message || '管理 Provider 需要用 metacodes bench 输出的授权链接打开工作台。' });
+    return h('div', { class: 'empty', text: e.message || '当前服务为只读模式（未用 metacodes bench 启动），不能管理 Provider。' });
   }
   const protocols = list.protocols || {};
   const result = h('div', { class: 'result', role: 'status' });

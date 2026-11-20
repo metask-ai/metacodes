@@ -255,7 +255,7 @@ class Providers:
                 probe = (entry.get("probes") or {}).get(model) or {}
                 status = "" if not probe else " · 探测通过" if probe.get("ok") else " · 探测失败"
                 # Pass/fail only: replies and error bodies stay on the
-                # authorized provider page.
+                # Provider page.
                 result.append({"id": entry["id"] + "/" + model, "label": (entry.get("name") or entry["id"]) + " / " + model + status,
                                "source": "provider", "provider": entry["id"],
                                "probe": {"ok": bool(probe.get("ok")), "at": probe.get("at")} if probe else None})

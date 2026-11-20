@@ -49,8 +49,9 @@ page and the CLI both read. `executors.py` (this machine or SSH hosts),
 `remote.py` (the driver on an SSH host), `setup.py` (`bench setup`) and
 `providers.py` (imported model providers) let a launch run on any configured
 executor through the same worker. The benchmark catalog (suites, categories,
-adapters, WorkBuddy runner) is `scripts/eval/harbor/suites/`. HTTP
-launch/cancel routes require the workbench capability. Contract tests are
+adapters, WorkBuddy runner) is `scripts/eval/harbor/suites/`. The workbench
+has no login (internal network); POSTs with a foreign browser `Origin` are
+refused, and a service without `--config` is read-only. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
 `test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py`,
 `test_bench_batches.py` and `test_bench_providers.py`.

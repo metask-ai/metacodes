@@ -5,14 +5,17 @@ separately. No provider or Docker calls are made by these tests.
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import concurrent.futures
 import os
+import socket
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -495,12 +498,12 @@ class WorkbenchTest(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.manager = RunManager(self.root / 'jobs', config)
         self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager),
-                                       '127.0.0.1', 0, 'test-capability')
+                                       '127.0.0.1', 0)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/', 'test-capability')
+        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self):
         return {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 2, 'concurrency': 1}
@@ -530,18 +533,126 @@ class WorkbenchTest(unittest.TestCase):
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
 
-    def test_missing_authorization_and_cross_origin_are_refused(self):
+    def test_no_credential_is_needed_but_cross_origin_is_refused(self):
         import urllib.request
-        anonymous = cli.Client(self.client.url)
-        with self.assertRaisesRegex(ValueError, '授权'):
-            anonymous.request('api/runs', self.request())
-        request = urllib.request.Request(self.client.url + 'api/runs', data=b'{}', headers={
-            'Content-Type': 'application/json', 'Authorization': 'Bearer test-capability', 'Origin': 'https://other.example'})
+        # An internal-network workbench: the page needs no link capability.
+        catalog = self.client.request('api/workbench')
+        self.assertTrue(catalog['can_run'])
+        request = urllib.request.Request(self.client.url + 'api/runs', data=json.dumps(self.request()).encode(), headers={
+            'Content-Type': 'application/json', 'Origin': 'https://other.example'})
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request)
         self.assertEqual(caught.exception.code, 403)
         caught.exception.close()
         self.assertEqual(self.manager.runs(), [])
+
+    def raw(self, method, path, host=None, origin=None, body=None):
+        """(status, error) of one request with chosen Host and Origin headers."""
+        import http.client
+        port = self.http.server_address[1]
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        headers = {'Host': host or f'127.0.0.1:{port}'}
+        if origin is not None:
+            headers['Origin'] = origin
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
+        try:
+            connection.request(method, path, body=json.dumps(body).encode() if body is not None else None,
+                               headers=headers)
+            response = connection.getresponse()
+            return response.status, (json.loads(response.read() or b'{}') or {}).get('error')
+        finally:
+            connection.close()
+
+    def test_only_the_workbench_entries_are_served_and_origins_must_match_exactly(self):
+        port = self.http.server_address[1]
+        cancel = {'name': 'bench-20260101-000000-abcdef'}  # passes the checks, then "运行不存在"
+        # A DNS-rebound foreign name reaches the service with that name in Host.
+        for method, body in (('GET', None), ('POST', cancel)):
+            path = '/api/workbench' if method == 'GET' else '/api/cancel'
+            with self.subTest(method=method):
+                self.assertEqual(self.raw(method, path, host=f'evil.example:{port}',
+                                          origin=f'http://evil.example:{port}' if body else None, body=body)[0], 403)
+        # Trusted entries: IP literals and localhost on the listening port.
+        for host in (f'127.0.0.1:{port}', f'localhost:{port}'):
+            with self.subTest(host=host):
+                self.assertEqual(self.raw('GET', '/api/workbench', host=host)[0], 200)
+                self.assertEqual(self.raw('POST', '/api/cancel', host=host, origin='http://' + host, body=cancel)[0], 400)
+        # The CLI sends no Origin.
+        self.assertEqual(self.raw('POST', '/api/cancel', body=cancel)[0], 400)
+        # The browser Origin must be that entry exactly: scheme, host, port.
+        for origin in (f'https://127.0.0.1:{port}', f'http://127.0.0.1:{port + 1}', 'http://127.0.0.1',
+                       f'http://localhost:{port}', 'null', f'http://evil.example:{port}'):
+            with self.subTest(origin=origin):
+                self.assertEqual(self.raw('POST', '/api/cancel', origin=origin, body=cancel)[0], 403)
+        self.assertEqual(self.raw('GET', '/api/workbench', host=f'127.0.0.1:{port + 1}')[0], 403)
+
+    def test_a_configured_public_url_is_a_trusted_entry(self):
+        self.assertEqual(server.trusted_origin('devbox:18766', 18766, 'http://devbox:18766/'), ('http', 'devbox', 18766))
+        self.assertEqual(server.trusted_origin('bench.example', 18766, 'https://bench.example/'),
+                         ('https', 'bench.example', 443))
+        self.assertIsNone(server.trusted_origin('other:18766', 18766, 'http://devbox:18766/'))
+        self.assertIsNone(server.trusted_origin('evil.example:18766', 18766, None))
+        self.assertEqual(server.trusted_origin('[::1]:18766', 18766), ('http', '::1', 18766))
+        trusted = server.trusted_origin('bench.example', 18766, 'https://bench.example/')
+        self.assertTrue(server.same_origin('https://bench.example', trusted))
+        self.assertTrue(server.same_origin('https://bench.example:443', trusted))
+        self.assertFalse(server.same_origin('http://bench.example', trusted))
+
+    def test_a_receipt_names_its_service_only_while_it_serves_this_workbench(self):
+        url = f'http://127.0.0.1:{self.http.server_address[1]}/'
+        saved = {'url': url, 'listen_url': url}
+        self.assertIsNotNone(cli.receipt_client(saved, self.manager.config_path))
+        # The port now belongs to a workbench of another state directory.
+        self.assertIsNone(cli.receipt_client(saved, self.root / 'other' / 'workbench.json'))
+        self.assertIsNone(cli.receipt_client({}, self.manager.config_path))
+        # Ownership does not depend on the database statistics.
+        with patch.object(Workbench, 'store_status', side_effect=RuntimeError('database busy')):
+            self.assertIsNotNone(cli.receipt_client(saved, self.manager.config_path))
+
+    def test_a_service_that_cannot_tell_whose_it_is_keeps_its_receipt(self):
+        root = self.root / 'state' / 'bench'
+        root.mkdir(parents=True)
+        url = f'http://127.0.0.1:{self.http.server_address[1]}/'
+        receipt = {'url': url, 'listen_url': url, 'jobs_dir': str(self.manager.jobs_dir)}
+        atomic_json(root / 'service.json', receipt)
+        with patch.object(cli.Client, 'request', side_effect=ValueError('internal error')):
+            with self.assertRaisesRegex(ValueError, '无法确认'):
+                cli.receipt_client(receipt, self.manager.config_path)
+            self.assertEqual(cli.main(['stop', '--state-root', str(root.parent)]), 1)
+        self.assertEqual(json.loads((root / 'service.json').read_text()), receipt)
+        closed = socket.socket()
+        closed.bind(('127.0.0.1', 0))
+        gone = f'http://127.0.0.1:{closed.getsockname()[1]}/'
+        closed.close()
+        self.assertIsNone(cli.receipt_client({'url': gone}, self.manager.config_path))
+
+    def test_a_login_era_service_is_known_by_its_receipt_capability(self):
+        legacy = {'url': 'http://127.0.0.1:1/', 'token': 'capability'}
+        for can_run, mine in ((True, True), (False, False)):
+            catalog = {'service': 'metacodes-bench', 'can_run': can_run}
+            with self.subTest(can_run=can_run), patch.object(cli.Client, 'request', return_value=catalog) as request:
+                client = cli.receipt_client(legacy, self.manager.config_path)
+                self.assertEqual(client is not None, mine)
+                request.assert_called_once_with('api/workbench')
+
+    def test_replacing_a_running_service_keeps_its_entry(self):
+        def args(**given):
+            return argparse.Namespace(**{'bind': None, 'port': None, 'public_url': None, **given})
+        self.assertEqual(cli.service_entry(args(), {}), ('127.0.0.1', 0, None))
+        shared = {'url': 'http://10.0.0.2:18766/', 'listen_url': 'http://127.0.0.1:18766/'}
+        self.assertEqual(cli.service_entry(args(), {**shared, 'bind': '0.0.0.0'}),
+                         ('0.0.0.0', 18766, 'http://10.0.0.2:18766/'))
+        # An older receipt has no bind, and 127.0.0.1 may have been 0.0.0.0.
+        with self.assertRaisesRegex(ValueError, '--bind'):
+            cli.service_entry(args(), shared)
+        self.assertEqual(cli.service_entry(args(bind='0.0.0.0'), shared), ('0.0.0.0', 18766, 'http://10.0.0.2:18766/'))
+        direct = {'url': 'http://10.0.0.2:18766/', 'listen_url': 'http://10.0.0.2:18766/'}
+        self.assertEqual(cli.service_entry(args(), direct), ('10.0.0.2', 18766, None))
+        self.assertEqual(cli.service_entry(args(port=9000), direct), ('10.0.0.2', 9000, None))
+        # An older service bound to a host name gave that name as its page.
+        named = {'url': 'http://devbox:18766/', 'listen_url': 'http://devbox:18766/'}
+        self.assertEqual(cli.service_entry(args(), named), ('devbox', 18766, 'http://devbox:18766/'))
 
     def test_unknown_models_shell_fragments_and_bad_ranges_are_refused_before_spawn(self):
         for override in ({'tasks': ['--path /etc']}, {'tasks': ['fix-git;touch /tmp/x']},
@@ -1128,20 +1239,26 @@ class AccountInventoryTest(unittest.TestCase):
 
 
 class ServiceReuseTest(unittest.TestCase):
+    STORE = {'backend': 'sqlite', 'path': '/state/bench/bench.sqlite'}
+    CONFIG = Path('/state/bench/workbench.json')
+
+    def store(self):
+        return types.SimpleNamespace(describe=lambda: self.STORE)
+
     def test_directory_check_and_client_come_from_one_service_record(self):
         # A second read would see another startup's service for directory B.
-        records = iter([{'url': 'http://127.0.0.1:1/', 'token': 'a', 'jobs_dir': '/jobs/a'},
-                        {'url': 'http://127.0.0.1:2/', 'token': 'b', 'jobs_dir': '/jobs/b'}])
+        records = iter([{'url': 'http://127.0.0.1:1/', 'jobs_dir': '/jobs/a', 'store': self.STORE},
+                        {'url': 'http://127.0.0.1:2/', 'jobs_dir': '/jobs/b', 'store': self.STORE}])
         with patch.object(cli, 'settings', side_effect=lambda _path: next(records)), \
-                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench'}):
-            client = cli.running_service(Path('/state/bench'), '/jobs/a')
-        self.assertEqual((client.url, client.token), ('http://127.0.0.1:1/', 'a'))
+                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}):
+            client = cli.running_service(Path('/state/bench'), self.CONFIG, '/jobs/a', self.store())
+        self.assertEqual(client.url, 'http://127.0.0.1:1/')
 
     def test_service_for_another_directory_is_not_reused(self):
-        record = {'url': 'http://127.0.0.1:2/', 'token': 'b', 'jobs_dir': '/jobs/b'}
+        record = {'url': 'http://127.0.0.1:2/', 'jobs_dir': '/jobs/b', 'store': self.STORE}
         with patch.object(cli, 'settings', return_value=record), \
-                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench'}):
-            self.assertIsNone(cli.running_service(Path('/state/bench'), '/jobs/a'))
+                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}):
+            self.assertIsNone(cli.running_service(Path('/state/bench'), self.CONFIG, '/jobs/a', self.store()))
 
 
 class LayeringTest(unittest.TestCase):

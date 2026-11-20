@@ -546,11 +546,11 @@ class SuiteLaunchTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.manager = RunManager(self.root / "jobs", config)
-        self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager), "127.0.0.1", 0, "cap")
+        self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager), "127.0.0.1", 0)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.client = cli.Client(f"http://127.0.0.1:{self.http.server_address[1]}/", "cap")
+        self.client = cli.Client(f"http://127.0.0.1:{self.http.server_address[1]}/")
 
     def launch(self, **request):
         run = self.client.request("api/runs", {"model": "tokenjoy/test-model", "attempts": 1, "concurrency": 1, **request})
@@ -658,10 +658,9 @@ class SuiteLaunchTest(unittest.TestCase):
                 self.assertEqual(run["suite"], suite_id)
 
     def test_cli_runs_a_suite_with_its_default_sample(self):
-        with patch.dict(os.environ, {"METACODES_BENCH_TOKEN": "cap"}):
-            with contextlib.redirect_stdout(io.StringIO()) as out:
-                code = cli.main(["run", "--state-root", str(self.root / "state"), "--url", self.client.url,
-                                 "--suite", "aime-2025", "--model", "tokenjoy/test-model", "--wait", "--json"])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = cli.main(["run", "--state-root", str(self.root / "state"), "--url", self.client.url,
+                             "--suite", "aime-2025", "--model", "tokenjoy/test-model", "--wait", "--json"])
         self.assertEqual(code, 0, out.getvalue())
         record = json.loads(out.getvalue())
         argv = json.loads((self.manager.jobs_dir / record["name"] / "argv.json").read_text())

@@ -424,11 +424,11 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.addCleanup(self.upstream.shutdown)
         self.manager = RunManager(self.root / 'jobs', config)
         self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager),
-                                       '127.0.0.1', 0, 'test-capability')
+                                       '127.0.0.1', 0)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/', 'test-capability')
+        self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def test_imported_model_runs_with_only_a_placeholder_and_the_relay_sends_the_key(self):
         added = self.client.request('api/providers', {
@@ -439,8 +439,6 @@ class ImportedProviderRunTest(unittest.TestCase):
         listing = self.client.request('api/providers')
         self.assertEqual(listing['providers'][0]['id'], 'local')
         self.assertNotIn(KEY, json.dumps(listing))
-        with self.assertRaisesRegex(ValueError, '授权'):
-            cli.Client(self.client.url).request('api/providers')
         catalog = self.client.request('api/workbench')
         self.assertIn('local/echo', [m['id'] for m in catalog['models']])
         self.assertIn('tokenjoy/test-model', [m['id'] for m in catalog['models']])
