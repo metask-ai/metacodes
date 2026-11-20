@@ -416,7 +416,16 @@ fallback), in `src/mcp/oauth.zig`:
    kernel-chosen port, or `oauth.callbackPort` for a client whose redirect is
    registered in advance.
 4. **Token.** The code is exchanged with its verifier and the same
-   `resource`; the answer is stored in
+   `resource`. Before it is stored, the new token is tried with one
+   authenticated request in the server's own transport (an `initialize`, or
+   the SSE stream's GET; a session it opens is ended with `DELETE`). A 401
+   or 403 fails the login and stores nothing: the CLI prints the server's
+   answer (`error`, `error_description`, the scope it asks for, a body
+   excerpt) and the scope requested and granted. Any other status, or no
+   answer, stores the token and says it is unverified. A token response
+   whose `scope` is `""` is recorded as no scope granted. A refused
+   registration or token request prints the authorization server's `error`
+   and `error_description`. The answer is stored in
    `<state root>/mcp-oauth/<server>-<hash>.json` (mode 0600, written
    atomically), keyed to the server name and URL so a token never reaches
    another URL.
@@ -445,6 +454,12 @@ the negotiated revision, needs authentication — with the `metacodes mcp login`
 command that fixes it — or why it failed), tool count and log, followed by project servers awaiting approval, disabled names and
 configuration problems. While servers are still connecting it shows each one's
 state so far (`connecting… 3s`), without waiting for them.
+The model is told as well: when ToolSearch finds nothing, or the model calls
+an `mcp__…` tool that does not exist, the result names the configured servers
+that did not connect with the reason `/mcp` shows (for a 401, the
+`metacodes mcp login` command), says that a new session picks them up, and
+asks the model to tell the user instead of reaching the server another way.
+Nothing about them enters the system prompt.
 The tool list is fixed for a session (it is part of the cached prompt); when a
 server announces `notifications/tools/list_changed`, `/mcp` says so and the new
 list applies after a restart.

@@ -457,7 +457,9 @@ configured HTTP or SSE server and stores the token that later sessions send and
 refresh; `metacodes mcp logout <server>` forgets it and `metacodes mcp list`
 prints each configured server's transport and how it authenticates; they exit
 0 on success, 1 when the server is unknown, is not a URL server, already sends
-a configured `Authorization`, or the login fails, and 2 for a usage error
+a configured `Authorization`, or the login fails (including a server that
+answers the new token with 401 or 403; nothing is stored then), and 2 for a
+usage error
 ([SKILLS_AND_MCP.md](SKILLS_AND_MCP.md#authorization-oauth)).
 The flag surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
