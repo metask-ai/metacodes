@@ -55,6 +55,7 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const openrouter_dialect = @import("dialects/openrouter.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
@@ -62,6 +63,10 @@ const credential_mod = @import("credential_cell.zig");
 const error_class = @import("error_class.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("model_context.zig");
+const RequestProfile = @import("../provider/request_profile.zig").RequestProfile;
+const chatgpt_claims = @import("../provider/chatgpt_claims.zig");
+const codex_usage = @import("codex_usage.zig");
+const last_error = @import("last_error.zig");
 
 const StreamEvent = api_stream.StreamEvent;
 const StreamHandle = api_stream.StreamHandle;
@@ -346,7 +351,7 @@ pub const OpenAIClient = struct {
         // wire 协议分派:chat/completions(默认)或 Responses API(typed SSE)。
         const body = switch (self.protocol) {
             .chat_completions => try serializeOpenAIRequestWithOverridesAndDialectReport(self.allocator, model, messages, system, tools, o, dialect, &report),
-            .responses => try serializeOpenAIResponsesRequestReport(self.allocator, model, messages, system, tools, o, dialect, &report),
+            .responses => try serializeOpenAIResponsesRequestProfiled(self.allocator, model, messages, system, tools, o, dialect, self.declared_dialect.request_profile, &report),
         };
         defer self.allocator.free(body);
         // Owned here until a stream takes it: every failed attempt leaves it
@@ -383,7 +388,14 @@ pub const OpenAIClient = struct {
             const callback = self.refresh_fn orelse return error.Unauthorized;
             const ctx = self.refresh_ctx orelse return error.Unauthorized;
             const stale = self.credential.lendable() orelse return error.Unauthorized;
+            // As in `Client.refreshExpiredToken`: a token refreshed while the
+            // route moved is for the route the request was sent on, not this one.
+            const sent_to = self.base_url orelse "";
             const token = callback(ctx, stale) catch return error.Unauthorized;
+            if (self.refresh_fn == null or !std.mem.eql(u8, sent_to, self.base_url orelse "")) {
+                secureFree(self.allocator, token);
+                return error.Unauthorized;
+            }
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
                 return error.Unauthorized;
@@ -395,6 +407,48 @@ pub const OpenAIClient = struct {
             return self.doStream(body, abort, dialect, content_chunks, image_placeholder_ids, 1, retry_hint) catch |replay_err|
                 return if (replay_err == error.TokenExpired) error.Unauthorized else replay_err;
         };
+    }
+
+    /// The most headers a request profile adds: its fixed ones and the
+    /// ChatGPT workspace.
+    const MAX_PROFILE_HEADERS = 4;
+
+    /// Content type, credential, OpenRouter's app attribution and what a
+    /// request profile adds.
+    const REQUEST_HEADERS_CAPACITY = 2 + openrouter_dialect.ATTRIBUTION_HEADERS.len + MAX_PROFILE_HEADERS;
+
+    /// The request's extra headers: content type and credential; on a route
+    /// in OpenRouter's dialect, who is calling (its app attribution, which no
+    /// other route carries); then what the route's request profile adds.
+    /// Slices borrow `auth`, the profile's static data and `scratch`.
+    fn requestHeaders(
+        self: *const OpenAIClient,
+        buffer: *[REQUEST_HEADERS_CAPACITY]http.Header,
+        auth: auth_header_mod.Header,
+        scratch: std.mem.Allocator,
+        rid: log.RequestId,
+    ) []const http.Header {
+        buffer[0] = .{ .name = "content-type", .value = "application/json" };
+        buffer[1] = .{ .name = auth.name, .value = auth.value };
+        var len: usize = 2;
+        if (self.declared_dialect.vendorFor(self.model, self.model) == .openrouter) {
+            const attribution = openrouter_dialect.ATTRIBUTION_HEADERS;
+            @memcpy(buffer[len..][0..attribution.len], &attribution);
+            len += attribution.len;
+        }
+        const profile = self.declared_dialect.request_profile orelse return buffer[0..len];
+        for (profile.headers()) |header| {
+            if (len == buffer.len) break;
+            buffer[len] = .{ .name = header.name, .value = header.value };
+            len += 1;
+        }
+        if (profile.sendsChatgptAccount() and len < buffer.len) {
+            if (chatgpt_claims.accountId(scratch, bearerToken(auth.value))) |account| {
+                buffer[len] = .{ .name = "chatgpt-account-id", .value = account };
+                len += 1;
+            } else log.warnId("openai", rid, "the access token names no ChatGPT workspace; sending without chatgpt-account-id", .{});
+        }
+        return buffer[0..len];
     }
 
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
@@ -421,6 +475,15 @@ pub const OpenAIClient = struct {
             return credential_mod.requestError(err);
         };
         defer secureFree(self.allocator, auth.value);
+        // What the route's endpoint requires besides (`request_profile.zig`):
+        // fixed headers, and the ChatGPT workspace the token is for, read
+        // from the very token this request carries so a refresh can never
+        // pair one account's token with another's id; on a route in
+        // OpenRouter's dialect, its app attribution.
+        var headers_buffer: [REQUEST_HEADERS_CAPACITY]http.Header = undefined;
+        var account_scratch: [8 * 1024]u8 = undefined;
+        var account_fba = std.heap.FixedBufferAllocator.init(&account_scratch);
+        const extra_headers = self.requestHeaders(&headers_buffer, auth, account_fba.allocator(), rid);
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,
@@ -431,14 +494,14 @@ pub const OpenAIClient = struct {
             // takes the offer (DeepSeek, #467) sends bytes the SSE parser
             // cannot read.
             .headers = .{ .accept_encoding = .omit },
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json" },
-                .{ .name = auth.name, .value = auth.value },
-            },
+            .extra_headers = extra_headers,
         }) catch |err| {
             // req_ptr.* 未初始化, errdefer destroy 即可
             return client_mod.requestSetupFailure("openai", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);
@@ -492,6 +555,11 @@ pub const OpenAIClient = struct {
             // retried, an overflow is ContextWindowExceeded with its numbers kept.
             const info = client_mod.errorBodyInfo(status.code, preview);
             self.last_context_window_numbers = info.context_window_numbers;
+            if (self.declared_dialect.request_profile == .chatgpt_codex) if (noteCodexUsageRefusal(status.code, preview)) {
+                // A used-up plan or a plan without Codex: a retry seconds
+                // later only spends attempts, so it ends the request here.
+                return error.HttpError;
+            };
             return client_mod.httpFailureError(status.code, info);
         }
         client_mod.noteRequestAccepted();
@@ -595,6 +663,9 @@ const OpenAIStream = struct {
     /// 下一次 next() 经 takeQueued 紧接着吐出。单槽即可:每个 chunk 至多一个 usage
     /// 对象,且槽在读下一行之前必被 takeQueued 清空。
     pending_usage: ?UsageDelta = null,
+    /// 本响应已报告的 usage。chat 的 usage 对象是整条响应的累计值,部分兼容端在多个
+    /// chunk 上重复它;Responses 的终止事件也是累计值。经 cursor 只发新增部分。
+    usage_reports: api_stream.UsageReportCursor = .{},
     /// chat 协议:这条路由的方言怎么读 list 型 `delta.content`(`ModelProfile.content_chunks`,
     /// 建流时从方言 profile 取,没有默认值)。`.none` 时 list 整个忽略,与引入前相同。
     content_chunks: dialect_mod.ContentChunks,
@@ -815,7 +886,7 @@ const OpenAIStream = struct {
                     client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
                 }
-                log.warnId("openai", self.id, "stream read failed: {s}", .{@errorName(err)});
+                log.warnId("openai", self.id, "stream read failed: {s} ({f})", .{ @errorName(err), client_mod.ReadFailure.of(self.request, &self.response.head) });
                 return api_stream.midStreamReadError(err);
             };
             const line = line_opt orelse {
@@ -874,7 +945,8 @@ const OpenAIStream = struct {
         // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
         // chunk 都带 `"usage":null`——旧实现按 substring `"usage"` 判存在并立即 return,
         // 把这些 chunk 的文本/推理/tool_call 增量/finish_reason 全部吞掉(issue #258)。
-        const usage: ?UsageDelta = if (chatUsageObject(data)) |obj| chatUsageDelta(obj) else null;
+        const report: ?api_stream.UsageReport = if (chatUsageObject(data)) |obj| chatUsageReport(obj) else null;
+        const usage: ?UsageDelta = if (report) |r| self.usage_reports.increment(r) else null;
         // 内容侧照常处理。同 chunk 既有内容事件又有 usage 对象时,两个都发且顺序固定:
         // 先内容、后 usage(存 pending_usage,下一次 next() 经 takeQueued 吐出)。
         // tool_call 增量本身不产事件(终止时才 flush),故"tool_calls + usage 同 chunk"时
@@ -1098,7 +1170,7 @@ const OpenAIStream = struct {
         self.buildFlush();
         self.flushed = true;
         self.pending_done = true;
-        if (responsesUsageObject(data)) |usage_obj| return StreamEvent{ .usage = responsesUsageDelta(usage_obj) };
+        if (responsesUsageObject(data)) |usage_obj| return StreamEvent{ .usage = self.usage_reports.increment(responsesUsageReport(usage_obj)) };
         // 无 usage 对象(缺失或 `"usage":null`):不伪造全零 usage——那会把"未计量"
         // 报成"已计量为 0"(cache_break.ResponseUsage.reported)。直接吐队首事件。
         return self.takeQueued();
@@ -1453,9 +1525,9 @@ fn chatUsageObject(data: []const u8) ?[]const u8 {
     return null;
 }
 
-/// OpenAI chat usage 对象 → 中立 UsageDelta。数值只从 usage 对象本身读,不扫整个 chunk。
-/// 语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens
-/// (prompt_tokens_details 下,经 cache.parseOpenAICacheUsage),中立 UsageDelta 约定
+/// OpenAI chat usage 对象 → 中立 UsageReport(整条响应的累计值)。数值只从 usage 对象本身读,
+/// 不扫整个 chunk。语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens
+/// (prompt_tokens_details 下,经 cache.parseOpenAICacheUsage),中立 usage 约定
 /// input_tokens 不含 cache。消费方(usage 锚点/成本累计)按 in+cache_r+cache_w 求和——
 /// 不减会把缓存双计。`"prompt_tokens":` 含闭引号+冒号,不会命中 `prompt_tokens_details`。
 /// Read a required non-negative integer from a usage object without collapsing
@@ -1463,7 +1535,7 @@ fn chatUsageObject(data: []const u8) ?[]const u8 {
 /// historical absent-is-zero behavior; prompt/completion counters are the
 /// contract's required pair, so an unreadable one makes the whole sample
 /// unavailable and lets the caller preserve `metering:unknown`.
-fn chatUsageDelta(usage_obj: []const u8) ?UsageDelta {
+fn chatUsageReport(usage_obj: []const u8) ?api_stream.UsageReport {
     const prompt_tokens = usageIntField(usage_obj, "prompt_tokens") orelse return null;
     const completion_tokens = usageIntField(usage_obj, "completion_tokens") orelse return null;
     const cu = cache.parseOpenAICacheUsage(usage_obj);
@@ -1492,10 +1564,10 @@ fn responsesUsageObject(data: []const u8) ?[]const u8 {
     return util_json.topLevelObjectField(response, "usage");
 }
 
-/// Responses usage 对象 → 中立 UsageDelta(归一同 chatUsageDelta:input_tokens **包含**
+/// Responses usage 对象 → 中立 UsageReport(归一同 chatUsageReport:input_tokens **包含**
 /// input_tokens_details.cached_tokens,减掉防双计)。`"input_tokens":` 含闭引号+冒号,
 /// 不会命中 `"input_tokens_details"`。
-fn responsesUsageDelta(usage_obj: []const u8) UsageDelta {
+fn responsesUsageReport(usage_obj: []const u8) api_stream.UsageReport {
     const cached = util_json.extractIntField(usage_obj, "cached_tokens");
     return .{
         .input_tokens = util_json.extractIntField(usage_obj, "input_tokens") -| cached,
@@ -1866,6 +1938,30 @@ fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t:
     try out.appendSlice(allocator, "}}");
 }
 
+/// The token of an `authorization: Bearer <token>` value; the value itself
+/// for any other scheme.
+fn bearerToken(header_value: []const u8) []const u8 {
+    const prefix = "Bearer ";
+    return if (std.mem.startsWith(u8, header_value, prefix)) header_value[prefix.len..] else header_value;
+}
+
+/// A Codex backend usage refusal (`codex_usage.zig`) in the words the failure
+/// line shows, with the wait in the Run's failure detail. False for any other
+/// failure, which keeps the generic classification.
+fn noteCodexUsageRefusal(status: u16, body: []const u8) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const refusal = codex_usage.parse(fba.allocator(), status, body) orelse return false;
+    const now = @import("../util/time.zig").nowUnix();
+    const zone = @import("../core/time_context.zig").systemZone(now);
+    var detail_buffer: [256]u8 = undefined;
+    const summary = codex_usage.summarize(refusal, now, zone.offset_minutes, &detail_buffer);
+    log.err("openai", "{s}: {s}", .{ summary.kind, summary.detail });
+    last_error.recordNamed(summary.kind, summary.detail);
+    if (codex_usage.waitMs(refusal, now)) |wait| model_error.noteRetryAfterInBody(wait);
+    return true;
+}
+
 /// 中立 Conversation/tools → OpenAI **Responses API** 请求 body(/v1/responses)。caller free。
 /// 与 chat/completions 的 wire 差异(本函数锁住的全部脏活):
 ///   - messages → `input` items:text-bearing user/assistant 是 {role,content};tool_use 是
@@ -1905,6 +2001,23 @@ pub fn serializeOpenAIResponsesRequestReport(
     dialect: dialect_mod.Dialect,
     report: *json_mod.SerializationReport,
 ) ![]u8 {
+    return serializeOpenAIResponsesRequestProfiled(allocator, model, messages, system, tools, overrides, dialect, null, report);
+}
+
+/// 同上,再按路由的请求档案(`request_profile.zig`)补上该端点要求的字段:
+/// Codex 后端要 `include:["reasoning.encrypted_content"]`(`store:false` 下推理只能
+/// 加密回传),且 `instructions` 必须出现(无 system 时发空串)。null = 不加任何东西。
+pub fn serializeOpenAIResponsesRequestProfiled(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    request_profile: ?RequestProfile,
+    report: *json_mod.SerializationReport,
+) ![]u8 {
     const profile = dialect.profileFor(.openai, model);
     const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
@@ -1935,7 +2048,19 @@ pub fn serializeOpenAIResponsesRequestReport(
         try util_json.serializeNumber(p, &out, allocator);
     }
     try out.appendSlice(allocator, ",\"stream\":true,\"store\":false");
-    // system → instructions。组装链与 chat 一致(dialect 注入 + 能力激活),非空才发。
+    if (request_profile) |route_profile| {
+        const include = route_profile.responsesInclude();
+        if (include.len > 0) {
+            try out.appendSlice(allocator, ",\"include\":[");
+            for (include, 0..) |entry, index| {
+                if (index > 0) try out.append(allocator, ',');
+                try util_json.serializeString(entry, &out, allocator);
+            }
+            try out.append(allocator, ']');
+        }
+    }
+    // system → instructions。组装链与 chat 一致(dialect 注入 + 能力激活),非空才发
+    // (请求档案要求时空串也发)。
     var sys_buf: std.ArrayList(u8) = .empty;
     defer sys_buf.deinit(allocator);
     if (system) |sys| try sys_buf.appendSlice(allocator, sys);
@@ -1946,7 +2071,8 @@ pub fn serializeOpenAIResponsesRequestReport(
         &sys_buf,
         allocator,
     );
-    if (sys_buf.items.len != 0) {
+    const instructions_required = if (request_profile) |route_profile| route_profile.requiresInstructions() else false;
+    if (sys_buf.items.len != 0 or instructions_required) {
         try out.appendSlice(allocator, ",\"instructions\":");
         try util_json.serializeString(sys_buf.items, &out, allocator);
     }
@@ -3023,6 +3149,28 @@ test "issue #258: choices[i].usage(兼容端位置)按 object 才计,null 不计
 }
 
 // Responses:usage 只在 `response.usage` 是 object 时发,数值只从该对象读。
+test "chat usage repeated on every chunk is a running total: usage events carry increments" {
+    // Some OpenAI-compatible servers attach the response's usage-so-far to every
+    // chunk. Each is a total, so adding them would count the prompt three times.
+    const a = std.testing.allocator;
+    var got = try replaySse(
+        a,
+        "gpt-4o",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualStrings("Hello", got.text.items);
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{ .input_tokens = 20, .output_tokens = 1, .cache_read_input_tokens = 80 },
+        .{ .output_tokens = 1 },
+        .{ .output_tokens = 1 },
+    }, got.usages.items);
+}
+
 test "issue #258 Responses: usage 从 response.usage 读——回显的 tools schema 里同名属性不干扰" {
     const a = std.testing.allocator;
     var got = try replaySse(

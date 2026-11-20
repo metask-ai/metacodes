@@ -24,8 +24,9 @@ source link, and retained Apache-2.0 text satisfy the intended distribution.
 ## QuickJS 2025-09-13
 
 QuickJS is checked-in MIT-licensed C source, statically linked into metacodes and
-AgentCore. Source, archive digest and the local patch are recorded in
-`vendor/quickjs/README.md`. Its notice is reproduced here and retained in
+AgentCore. The official archive, its digest and every file are pinned in
+`vendor/quickjs/manifest.json`; the local changes are `vendor/quickjs/patches/`
+(see `vendor/quickjs/README.md`). Its notice is reproduced here and retained in
 `vendor/quickjs/LICENSE`. CLI distributions include this full notice; AgentCore
 bundles also ship `licenses/quickjs-LICENSE`.
 

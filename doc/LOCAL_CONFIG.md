@@ -4,7 +4,10 @@ You can use metacodes with your own provider key instead of a Metask sign-in.
 Put the key in one file of your install, `.env` in its state root, and start
 metacodes again. Nothing goes into your shell profile and nothing into a
 project directory. This page covers where the file is, what it may contain,
-and how metacodes decides which provider to use.
+and how metacodes decides which provider to use. [PROVIDERS.md](PROVIDERS.md)
+covers every way to give metacodes a model: a Metask account, a vendor's key
+pasted with `metacodes login --provider <id>`, and a model API of your own
+(`metacodes providers add`).
 
 - [Where the file is](#where-the-file-is)
 - [Writing the file](#writing-the-file)
@@ -90,11 +93,14 @@ first one is the one to use; the others are accepted too):
 | Alibaba Qwen (`qwen`) | `DASHSCOPE_API_KEY` |
 | MiniMax (`minimax`) | `MINIMAX_API_KEY` |
 | Amazon Bedrock (`bedrock`) | `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) |
+| OpenRouter (`openrouter`) | `OPENROUTER_API_KEY` (`/login openrouter` signs in on OpenRouter instead and stores the key it creates) |
 | Metask (`metask`) | `METASK_API_KEY` (see [the order below](#which-provider-and-model-are-used): it counts as a Metask sign-in unless the file names another provider) |
 
-A provider you define in `config.json` (`custom_providers`, see
-[User-defined providers](PROVIDER_OFFER_ARCHITECTURE.md#user-defined-providers))
-adds the names in its `env_aliases`, and the variables `config.json` names
+A provider you define in `config.json` (`custom_providers`: written by
+`metacodes providers add`, see [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own),
+or by hand, see [User-defined providers](PROVIDER_OFFER_ARCHITECTURE.md#user-defined-providers))
+adds the names in its `env_aliases` — `providers add --key-env <NAME>` writes
+one — and the variables `config.json` names
 elsewhere are accepted too: `providers.<id>.credentials[].env` (a
 [credential pool](PROVIDER_OFFER_ARCHITECTURE.md#credential-pools)) and
 `provider_catalogs.<id>.credential_env`. These two are read where that pool or
@@ -319,9 +325,12 @@ Request addresses are never read from it: `METACODES_BASE_URL`,
 `METACODES_KG_URL`, and any other name ending in `_URL`, even one that a
 provider definition names. A file that could redirect requests could send
 your key somewhere else. To use your own relay or endpoint, define it in
-`config.json` as a [user-defined provider](PROVIDER_OFFER_ARCHITECTURE.md#user-defined-providers),
-where the endpoint rules and `metacodes --check-providers` apply; its key can
-then live in this file.
+`config.json` as a [user-defined provider](PROVIDER_OFFER_ARCHITECTURE.md#user-defined-providers)
+— `metacodes providers add <id> --base-url <url> --protocol <wire> --model <id>`
+writes one ([PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own)) — where the
+endpoint rules and `metacodes --check-providers` apply; its key can then live
+in this file (`--key-env <NAME>`), or in its own key file
+(`metacodes login --provider <id>`).
 
 The file sets nothing else either: it is not loaded into the environment, so
 tools and commands that metacodes runs do not see its values.

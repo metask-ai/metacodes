@@ -40,7 +40,10 @@ primary branch.
 CI runs on GitHub-hosted runners (`ubuntu-latest`, `macos-latest`,
 `windows-latest`). The repository is public, hosted standard runners are free
 for public repositories, and organization policy keeps public repositories off
-the organization's self-hosted fleet (2026-09-21). The self-hosted era below is
+the organization's self-hosted fleet (2026-09-21). The exceptions, decided
+2026-11-18, are the macOS and Windows gates' pools of single-use VMs on the
+Mac Studio and on AIPC, tried first with the hosted legs as the fallback
+([doc/VM_POOLS.md](doc/VM_POOLS.md)); no PR code reaches a persistent machine. The self-hosted era below is
 kept as the evidence trail for the gate design; its runner-specific machinery
 (persistent caches, fork-isolation guards, per-machine concurrency lanes) is
 gone.

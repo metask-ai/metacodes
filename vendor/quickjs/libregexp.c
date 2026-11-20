@@ -205,7 +205,7 @@ static __maybe_unused void re_string_list_dump(const char *str, const REStringLi
         }
     }
     printf("]\n");
-
+    
     j = 0;
     for(i = 0; i < s->hash_size; i++) {
         for(p = s->hash_table[i]; p != NULL; p = p->next) {
@@ -352,7 +352,7 @@ static int re_string_list_canonicalize(REParseState *s1,
         REStringList a_s, *a = &a_s;
         int i, j;
         REString *p;
-
+        
         /* XXX: simplify */
         re_string_list_init(s1, a);
 
@@ -360,7 +360,7 @@ static int re_string_list_canonicalize(REParseState *s1,
         a->hash_size = s->hash_size;
         a->hash_bits = s->hash_bits;
         a->hash_table = s->hash_table;
-
+        
         s->n_strings = 0;
         s->hash_size = 0;
         s->hash_bits = 0;
@@ -936,14 +936,14 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     const uint8_t *p;
     DynBuf str;
     int c;
-
+    
     p = *pp;
     if (*p != '{')
         return re_parse_error(s, "expecting '{' after \\q");
 
     dbuf_init2(&str, s->opaque, lre_realloc);
     re_string_list_init(s, cr);
-
+    
     p++;
     for(;;) {
         str.size = 0;
@@ -1218,7 +1218,7 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
     REString **tab, *p;
     int i, j, split_pos, last_match_pos, n;
     BOOL has_empty_string, is_last;
-
+    
     //    re_string_list_dump("sl", sl);
     if (sl->n_strings == 0) {
         /* simple case: only characters */
@@ -1244,7 +1244,7 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
             }
         }
         assert(n <= sl->n_strings);
-
+        
         rqsort(tab, n, sizeof(tab[0]), re_string_cmp_len, NULL);
 
         last_match_pos = -1;
@@ -1285,7 +1285,7 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
             put_u32(s->byte_code.buf + last_match_pos, s->byte_code.size - (last_match_pos + 4));
             last_match_pos = next_pos;
         }
-
+        
         lre_realloc(s->opaque, tab, 0);
     }
     return 0;
@@ -1297,7 +1297,7 @@ static int re_parse_class_set_operand(REParseState *s, REStringList *cr, const u
 {
     int c1;
     const uint8_t *p = *pp;
-
+    
     if (*p == '[') {
         if (re_parse_nested_class(s, cr, pp))
             return -1;
@@ -1339,7 +1339,7 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
         p++;
         invert = TRUE;
     }
-
+    
     /* handle unions */
     is_first = TRUE;
     for(;;) {
@@ -2066,7 +2066,7 @@ static int re_parse_term(REParseState *s, BOOL is_backward_dir)
             emit_back_reference:
                 last_atom_start = s->byte_code.size;
                 last_capture_count = s->capture_count;
-
+                
                 re_emit_op_u8(s, REOP_back_reference + 2 * is_backward_dir + s->ignore_case, c);
             }
             break;
@@ -2436,7 +2436,7 @@ static int compute_stack_size(const uint8_t *bc_buf, int bc_buf_len)
 static void *lre_bytecode_realloc(void *opaque, void *ptr, size_t size)
 {
     if (size > (INT32_MAX / 2)) {
-        /* the bytecode cannot be larger than 2G. Leave some slack to
+        /* the bytecode cannot be larger than 2G. Leave some slack to 
            avoid some overflows. */
         return NULL;
     } else {

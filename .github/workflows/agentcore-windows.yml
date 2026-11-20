@@ -6,9 +6,17 @@ on:
   # itself while main still requires a merge queue (doc/CI_DESIGN.md §3).
   merge_group:
   workflow_dispatch:
+  # main's nightly run saves the Zig cache pull requests restore, as in
+  # ci.yml (doc/CI_DESIGN.md §5).
+  schedule:
+    - cron: "0 19 * * *"
 
 permissions:
   contents: read
+
+env:
+  # As in ci.yml: 'true' only on main's scheduled or dispatched run.
+  WARM_CACHE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
   native-windows-gate:
@@ -47,13 +55,20 @@ jobs:
             echo "no native-gate path changed; reporting success without building"
           fi
           printf 'changed files:\n%s\n' "$changed"
-      # See ci.yml `gates` for the cache semantics.
+      # See ci.yml `gates` for the caches: restored from what main's warm run
+      # saved, saved only by that run.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: steps.scope.outputs.relevant == 'true'
         with:
           version: 0.16.0
-          use-cache: true
-          cache-size-limit: 4096
+          use-cache: false
+      - name: Restore the Zig cache main saved
+        if: env.WARM_CACHE != 'true' && steps.scope.outputs.relevant == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
+          restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
       - name: Rust toolchain (Windows)
         if: steps.scope.outputs.relevant == 'true'
         shell: cmd
@@ -89,3 +104,9 @@ jobs:
         if: steps.scope.outputs.relevant == 'true'
         shell: cmd
         run: zig build windows:gate -Dtarget=x86_64-windows-gnu --test-timeout 5m
+      - name: Save the Zig cache for pull requests
+        if: env.WARM_CACHE == 'true' && steps.scope.outputs.relevant == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-${{ github.run_id }}-${{ github.run_attempt }}

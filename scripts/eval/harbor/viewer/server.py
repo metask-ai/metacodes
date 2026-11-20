@@ -1,11 +1,10 @@
-"""Serve the Harbor bench viewer.
+"""Serve the Bench workbench page over the runtime in `scripts.eval.harbor.bench`.
 
     python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 18766
 
-Read-only: it lists the jobs under each `--jobs-dir`, and serves their
-summaries, per-trial rows, trajectories and verifier output as JSON to a
-static page.  Names in requests are validated against the jobs actually on
-disk, so no request can read outside them.  Python 3.9, stdlib only.
+This module is presentation only: HTTP routes, authorization and the static
+page. What a route answers comes from `Workbench`; without `--config` it is
+read-only. Python 3.9, stdlib only.
 """
 
 from __future__ import annotations
@@ -24,8 +23,9 @@ from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 from http.cookies import SimpleCookie
 
-from scripts.eval.harbor.viewer import data
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.workbench import Workbench
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC = {
@@ -37,41 +37,19 @@ STATIC = {
 SECURITY_HEADERS = (
     ("Cache-Control", "no-store"),
     ("X-Content-Type-Options", "nosniff"),
-    (
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-    ),
+    ("X-Frame-Options", "DENY"),
+    # No Content-Security-Policy: the workbench runs on a private network, and a
+    # CSP blocks the browser annotation overlays (e.g. Codex desktop's selection).
     ("Referrer-Policy", "no-referrer"),
 )
 
 
-def make_handler(library: data.Library, manager=None, token=""):
-    def managed_view(path, with_rows=True):
-        view = data.job_view(path)
-        run = next((r for r in manager.runs() if r["name"] == path.name), None) if manager else None
-        if run and run["status"] in {"failed", "cancelled", "interrupted"} and view["running"]:
-            # Harbor may be interrupted before it writes a final result.
-            # Preserve those files, and display the durable worker outcome.
-            view["running"] = False
-            view["execution_status"] = run["status"]
-            for row in view["rows"]:
-                if row["status"] == "running":
-                    row.update(status="invalid", cause="execution: " + run["status"])
-            view["summary"] = data.summarize(view["rows"])
-            started, finished = data.parse_time(view.get("started_at")), data.parse_time(run.get("finished_at"))
-            if finished:
-                view["finished_at"] = finished.isoformat()
-                view["wall_s"] = (finished - started).total_seconds() if started else None
-        if not with_rows:
-            view.pop("rows", None)
-        return view
-
+def make_handler(workbench: Workbench, token=""):
     class Handler(BaseHTTPRequestHandler):
         server_version = "metacodes-bench-viewer/1"
 
         def authorized(self):
-            if manager is None:
+            if not workbench.can_launch:
                 return False
             bearer = self.headers.get("Authorization", "").removeprefix("Bearer ")
             cookie = SimpleCookie()
@@ -100,9 +78,9 @@ def make_handler(library: data.Library, manager=None, token=""):
                 payload = json.loads(self.rfile.read(length))
                 path = urlsplit(self.path).path
                 if path == "/api/runs":
-                    self.send_json(manager.launch(payload), 202)
+                    self.send_json(workbench.launch(payload), 202)
                 elif path == "/api/cancel" and isinstance(payload, dict):
-                    self.send_json(manager.cancel(payload.get("name")))
+                    self.send_json(workbench.cancel(payload.get("name")))
                 elif path == "/api/stop" and payload == {}:
                     self.send_json({"stopped": True})
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -135,53 +113,30 @@ def make_handler(library: data.Library, manager=None, token=""):
                 name, mime = STATIC[path]
                 self.send_bytes((STATIC_DIR / name).read_bytes(), mime)
             elif path == "/api/workbench":
-                catalog = manager.catalog() if manager else {"service": "metacodes-bench", "schema_version": 1, "ready": False, "reasons": ["当前服务为只读模式"], "runs": []}
-                self.send_json({**catalog, "can_run": self.authorized()})
+                self.send_json({**workbench.catalog(), "can_run": self.authorized()})
             elif path == "/api/run":
-                record = next((r for r in manager.runs() if r["name"] == query.get("name")), None) if manager else None
-                if not record:
-                    self.send_json({"error": "no such run"}, 404)
-                    return
-                self.send_json({**record, "log": data.tail(manager.records / (record["name"] + ".log"))})
+                self.send_found(workbench.run(query.get("name")), "no such run")
             elif path == "/api/jobs":
-                jobs = [managed_view(p, False) for p in library.jobs().values()]
-                jobs.sort(key=lambda view: view["started_at"] or "", reverse=True)
-                self.send_json({"jobs": jobs, "runs": manager.runs() if manager else [],
-                                "summary": data.merge_summaries(j["summary"] for j in jobs),
-                                "storage": {"jobs_dirs": [str(root) for root in library.roots],
-                                            "records_dir": str(manager.records) if manager else None,
-                                            "format": "Harbor JSON / JSONL"}})
+                self.send_json(workbench.jobs())
             elif path == "/api/job":
-                job_dir = library.job_dir(query.get("name", ""))
-                if job_dir is None:
-                    self.send_json({"error": "no such job"}, 404)
-                    return
-                self.send_json(managed_view(job_dir))
+                self.send_found(workbench.job(query.get("name", "")), "no such job")
             elif path == "/api/trial":
-                trial_dir = library.trial_dir(query.get("job", ""), query.get("trial", ""))
-                if trial_dir is None:
-                    self.send_json({"error": "no such trial"}, 404)
-                    return
-                detail = data.trial_detail(trial_dir)
-                view = managed_view(trial_dir.parent)
-                for row in view["rows"]:
-                    if row["trial"] == trial_dir.name:
-                        detail["row"] = row
-                        break
-                self.send_json(detail)
+                self.send_found(workbench.trial(query.get("job", ""), query.get("trial", "")), "no such trial")
             elif path == "/api/job.csv":
-                job_dir = library.job_dir(query.get("name", ""))
-                if job_dir is None:
+                view = workbench.job(query.get("name", ""))
+                if view is None:
                     self.send_json({"error": "no such job"}, 404)
                     return
-                body = data.job_csv(managed_view(job_dir)).encode("utf-8")
-                self.send_bytes(
-                    body,
-                    "text/csv; charset=utf-8",
-                    attachment=f"{job_dir.name}.csv",
-                )
+                self.send_bytes(data.job_csv(view).encode("utf-8"), "text/csv; charset=utf-8",
+                                attachment=f"{view['name']}.csv")
             else:
                 self.send_json({"error": "not found"}, 404)
+
+        def send_found(self, value, missing: str) -> None:
+            if value is None:
+                self.send_json({"error": missing}, 404)
+            else:
+                self.send_json(value)
 
         def send_json(self, value, status: int = 200) -> None:
             body = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -213,8 +168,8 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-def make_server(library: data.Library, bind: str, port: int, manager=None, token="") -> ThreadingHTTPServer:
-    server = WorkbenchHTTPServer((bind, port), make_handler(library, manager, token))
+def make_server(workbench: Workbench, bind: str, port: int, token="") -> ThreadingHTTPServer:
+    server = WorkbenchHTTPServer((bind, port), make_handler(workbench, token))
     server.daemon_threads = True
     return server
 
@@ -232,7 +187,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     manager = RunManager(args.jobs_dir[0], args.config) if args.config else None
     token = secrets.token_urlsafe(32) if manager else ""
-    server = make_server(data.Library(args.jobs_dir), args.bind, args.port, manager, token)
+    server = make_server(Workbench(data.Library(args.jobs_dir), manager), args.bind, args.port, token)
     host = "127.0.0.1" if args.bind == "0.0.0.0" else args.bind
     url = args.public_url or f"http://{host}:{server.server_address[1]}/"
     url = url.rstrip("/") + "/"

@@ -206,6 +206,9 @@ pub const CommitOutcome = union(enum) {
         /// `adoptConfigRevision`. Two counters both called `config_revision`
         /// would make `expected_config_revision` meaningless.
         requires_persist: bool = false,
+        /// What `scope` held before this commit, for a host that cannot move
+        /// the session onto the route and puts it back (`revertCommit`).
+        previous: ?RuntimeSelection = null,
     };
 
     pub const Conflict = struct {
@@ -250,6 +253,9 @@ pub const SwitchFailure = enum {
     all_candidates_rejected,
     control_rejected,
     revision_conflict,
+    /// The kernel accepted the route, and the host could not move the session
+    /// onto it (no credential for it, say): the commit was reverted.
+    binding_failed,
 };
 
 pub const ControlPlaneEvent = struct {
@@ -780,14 +786,10 @@ pub const Kernel = struct {
         committed.resolved_offer_revision = validation.ok.offer_revision;
         committed.catalog_revision = self.catalogRevisionLocked();
 
-        switch (scope) {
-            .once => self.once_selection = committed,
-            .session => self.session_selection = committed,
-            .global => {
-                committed.config_revision = self.config_revision;
-                self.global_selection = committed;
-            },
-        }
+        const slot = self.scopeSlot(scope);
+        const previous = slot.*;
+        if (scope == .global) committed.config_revision = self.config_revision;
+        slot.* = committed;
 
         _ = self.journal.append(.runtime_selection_changed, .{ .runtime_selection_changed = .{
             .scope = scope,
@@ -800,7 +802,47 @@ pub const Kernel = struct {
             .config_revision = self.config_revision,
             .catalog_revision = self.catalogRevisionLocked(),
             .requires_persist = scope == .global,
+            .previous = previous,
         } };
+    }
+
+    /// Undo `committed`, a commit the host could not apply: the binding found
+    /// no credential for the route, say, so the session is still on the route
+    /// it had. Its scope holds again what it held before, or the kernel would
+    /// name — and a turn-boundary token refresh would serve — a route nothing
+    /// is sent on. A later commit to that scope stands. Not silent: the
+    /// journal records the switch as failed.
+    pub fn revertCommit(self: *Kernel, committed: CommitOutcome.Committed) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const slot = self.scopeSlot(committed.scope);
+        const held = slot.* orelse return;
+        if (!sameCommit(held, committed.selection)) return;
+        slot.* = committed.previous;
+        _ = self.journal.append(.runtime_switch_failed, .{ .runtime_switch_failed = .{
+            .scope = committed.scope,
+            .reason = .binding_failed,
+        } }, self.eventContext(.{}));
+    }
+
+    fn scopeSlot(self: *Kernel, scope: Scope) *?RuntimeSelection {
+        return switch (scope) {
+            .once => &self.once_selection,
+            .session => &self.session_selection,
+            .global => &self.global_selection,
+        };
+    }
+
+    /// Whether `held` is still the selection a commit wrote: the offer it
+    /// resolved and the revisions it resolved against. Only a commit of the
+    /// same route against the same revisions matches as well.
+    fn sameCommit(held: RuntimeSelection, written: RuntimeSelection) bool {
+        const held_offer = held.resolved_offer_id orelse return false;
+        const written_offer = written.resolved_offer_id orelse return false;
+        return held_offer.eql(written_offer) and
+            std.meta.eql(held.resolved_offer_revision, written.resolved_offer_revision) and
+            held.catalog_revision == written.catalog_revision and
+            held.config_revision == written.config_revision;
     }
 
     /// Install a selection that a *previous* process committed, read back from
@@ -1269,6 +1311,46 @@ test "a failed switch leaves the old runtime active and writes no partial state"
     const last = kernel.journal.items()[kernel.journal.len - 1];
     try std.testing.expectEqual(EventType.runtime_switch_failed, last.event_type);
     try std.testing.expectEqual(SwitchFailure.pinned_offer_unavailable, last.payload.runtime_switch_failed.reason);
+}
+
+test "a commit the host could not apply is reverted to what its scope held" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try buildCatalog(a, &registry);
+    defer catalog.deinit();
+    var kernel = Kernel.init(a, &catalog);
+    defer kernel.deinit();
+
+    const running = catalog.items()[0];
+    const unbindable = catalog.items()[1];
+    const later = catalog.items()[2];
+    _ = kernel.selectionCommit(.{}, RuntimeSelection.pinned(running.offer_id, running.offer_revision, .session), .session);
+
+    // The kernel accepts the route; the host then finds no credential for it.
+    const failed = kernel.selectionCommit(.{}, RuntimeSelection.pinned(unbindable.offer_id, unbindable.offer_revision, .session), .session);
+    try std.testing.expect(kernel.currentOfferId().?.eql(unbindable.offer_id));
+    kernel.revertCommit(failed.committed);
+    // The session is still on the route it had, and the kernel says so.
+    try std.testing.expect(kernel.currentOfferId().?.eql(running.offer_id));
+    const last = kernel.journal.items()[kernel.journal.len - 1];
+    try std.testing.expectEqual(EventType.runtime_switch_failed, last.event_type);
+    try std.testing.expectEqual(SwitchFailure.binding_failed, last.payload.runtime_switch_failed.reason);
+
+    // A scope that held nothing holds nothing again: a global commit that
+    // could not be applied leaves no global selection behind.
+    const global = kernel.selectionCommit(.{}, RuntimeSelection.pinned(unbindable.offer_id, unbindable.offer_revision, .global), .global);
+    kernel.revertCommit(global.committed);
+    try std.testing.expect(kernel.global_selection == null);
+
+    // A later commit to the scope stands: reverting the earlier one does not
+    // undo it.
+    const stale = kernel.selectionCommit(.{}, RuntimeSelection.pinned(unbindable.offer_id, unbindable.offer_revision, .session), .session);
+    _ = kernel.selectionCommit(.{}, RuntimeSelection.pinned(later.offer_id, later.offer_revision, .session), .session);
+    const events_before = kernel.journal.len;
+    kernel.revertCommit(stale.committed);
+    try std.testing.expect(kernel.currentOfferId().?.eql(later.offer_id));
+    try std.testing.expectEqual(events_before, kernel.journal.len);
 }
 
 test "committing revalidates controls against the resolved offer" {
