@@ -8,7 +8,7 @@ followed, so a job directory cannot pull outside files into the store.
 
 Derived values come from the stored bytes only: the trial's files are
 written to a private temporary directory, with their recorded mtimes, and
-scripts/eval/harbor/viewer/data.py computes the row and detail exactly as it
+scripts/eval/harbor/bench/data.py computes the row and detail exactly as it
 does for a live job directory. The numbers the page shows therefore cannot
 diverge between files and database, and a store copied to another machine
 recomputes its projections from its own blobs when the code changes.
@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from scripts.eval.harbor import profiling
 from scripts.eval.harbor.store import schema
 from scripts.eval.harbor.store.backend import Store, StoreError, Tx, blob_bytes, clean_text, json_text, now
-from scripts.eval.harbor.viewer import data
+from scripts.eval.harbor.bench import data
 
 MAX_FILE_BYTES = 256 * 1024 * 1024
 # What an oversize file keeps: its last bytes. data.py reads a file over

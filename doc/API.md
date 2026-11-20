@@ -21,7 +21,7 @@ helper contract and the current network-policy limits.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 28 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 29 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
 | Node package | `require('metacodes')` ([sdk/node](../sdk/node/README.md)) | experimental, unpublished; macOS and Linux | same exact-revision rule; the addon is rebuilt per platform |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -33,6 +33,35 @@ Beyond the endpoints and access rules of
 [Web and daemon HTTP surface](#web-and-daemon-http-surface), there is no
 general HTTP service API promise yet. The Web and daemon hosts are product
 surfaces built over the same core protocols.
+
+## Preview features
+
+Preview features default to disabled. Start with `metacodes --preview` to
+enable them, or save `"preview": true` at the root of the installation's
+`config.json` (`<state root>/config.json`). `--no-preview` disables them for
+one start, including when the saved setting is true. Command-line flags
+override the saved value; the last preview flag wins. Only a root JSON boolean
+is accepted. Child agents inherit the resolved setting. A feature's own
+selection and permission rules still apply after preview is enabled.
+
+Source embedders set `AgentRuntime.RuntimeConfig.preview = true`. AgentCore
+ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default 0);
+Python uses `Runtime(preview=True)` and Node.js uses
+`new Runtime({ preview: true })`. The SDKs include `ExecuteCode` when enabled.
+Selecting a preview built-in by name while preview is disabled is rejected.
+
+## JavaScript tool orchestration
+
+`ExecuteCode({code, timeout_ms?})` runs JavaScript in a per-session QuickJS
+context. `await tools.Read(args)` and the equivalent interfaces for selected
+built-in, Host and process tools enter the kernel's ordinary tool admission
+and execution pipeline. Meta Code and its tools remain implemented in Zig.
+The result contains the last expression, explicit logs and the inner call count;
+intermediate tool results stay outside provider messages. This is a preview
+feature: it is absent from the tool menu by default, and a guessed invocation
+is rejected before creating a VM. Enabling preview admits it to the catalog;
+Session tool selection and ordinary admission still apply. The normative behavior, limits and reset
+rules are in [PROGRAMMATIC_TOOL_CALLING.md](PROGRAMMATIC_TOOL_CALLING.md).
 
 ## Provider selection surface
 
@@ -115,8 +144,12 @@ normative model; the entry points are:
 | `METACODES_STREAM_IDLE_TIMEOUT_MS` | stream liveness, **head phase**: a request whose connection stays open but delivers no byte before the response head for this long (default 120000; 0 disables liveness monitoring entirely) is shut down by the client's monitor and retried as a transient network error. Nothing in a blocked socket read notices an abort flag; this is what turns a silent gateway or proxy into a bounded failure instead of a frozen session. Progress is measured per SSE line, not per parsed event: a tool call's `input_json_delta` frames and unknown events keep the request alive, but keepalive lines (`event: ping`, `data: {"type":"ping"}`, `:` comments) do not — they prove the gateway connection is up, not that the model is producing (2026-09-23: a gateway pinged every 15 s for 55 minutes over an upstream that produced nothing) |
 | `METACODES_STREAM_BODY_IDLE_TIMEOUT_MS` | stream liveness, **body phase** (response head accepted): unset = automatic, `clamp(max_tokens × 100 ms, 600000, 1800000)` — a gateway may generate an entire tool call before writing a byte of it, so the tolerated silence scales with the response the request allows; an explicit value is a flat limit in ms; 0 disables body-phase monitoring. Past the limit the client shuts the connection down, the turn ends with `StreamStalled` and the TUI reports `正文空闲超时: <idle> ms 内无任何字节(上限 <limit> ms)` when the connection itself went silent, or `<idle> ms 内无模型输出,但网关 keepalive 仍在到达(最近字节 <n> ms 前)…` when a gateway kept the connection alive over a dead upstream — instead of the generic failure text. A user cancel (Ctrl+C/Esc) that wakes the blocked read is reported as an abort, never as an API error, and the streamed prefix is kept as partial text. A body-phase stall after visible output (text, thinking or a tool call) is not retried automatically in the TUI (the streamed prefix cannot be pretended away); a stall, a stream that ended without a stop report, or a dropped connection before any visible output is re-sent once (an in-stream server error, reported as `API 错误帧: …` on every wire, is not). Independently of this limit, once an endpoint has been seen to send keepalives mid-stream (three pings or SSE comments, each ending a silence of at least 2 s), a streamed body with no byte at all, keepalives included, for max(4 × the longest such interval, 2 minutes) is judged a dead connection and reported as `连接已断: <n> ms 内无任何字节,连 keepalive 也没有…`; 0 here disables that rule as well |
 | `metacodes login --provider <id> --oauth-token-json <file>` | import an OAuth token into that provider's own store; refresh, single flight, and rotated-refresh persistence then run themselves |
-| `metacodes login --provider <id> [--key-page <page>] [--api-key-stdin] [--no-check]` | for a provider that declares key pages and no sign-in it can run — every built-in vendor but Metask: `openai`, `gemini`, `qwen`, `minimax`, `kimi`, `deepseek`, `zai-coding-plan`, `kimi-code`, `bedrock` (OpenAI's OAuth sign-in runs instead once an OAuth client is configured for it, or with `--client-id`): open the key page (the one for the default channel's region; `--key-page` picks another), read the pasted key with echo off (or from stdin, or `--api-key <key>`), check it with a GET the provider does not bill, the key placed where the provider's requests carry it (Gemini's `x-goog-api-key`), and store it in `<state root>/keys/<id>.json` (0600). A 401/403, or what the provider words as a wrong key (Gemini's 400 `API_KEY_INVALID`), refuses it; nothing is stored then. Only that provider's resolution reads the file, after its environment aliases: when one of them is set in the shell or in `.env`, the login says so by the variable's name (`warning: DASHSCOPE_API_KEY is set in your shell and is used before the stored key: …`; `/login` prints the same line); `metacodes logout --provider <id>` removes it. `METACODES_KEY_CHECK_URL` (https, or http to a loopback host) replaces the check URL for a local mock |
+| `metacodes login --provider <id> [--key-page <page>] [--api-key-stdin] [--no-check]` | for a provider that declares key pages and no sign-in it can run — every built-in vendor but Metask: `openai`, `gemini`, `qwen`, `minimax`, `kimi`, `deepseek`, `zai-coding-plan`, `kimi-code`, `bedrock` (OpenAI's OAuth sign-in runs instead once an OAuth client is configured for it, or with `--client-id`), and every provider defined in `custom_providers` that accepts an API key (no page is opened for one: the key is pasted, checked at its default channel's model listing, and stored with no page recorded): open the key page (the one for the default channel's region; `--key-page` picks another), read the pasted key with echo off (or from stdin, or `--api-key <key>`), check it with a GET the provider does not bill, the key placed where the provider's requests carry it (Gemini's `x-goog-api-key`), and store it in `<state root>/keys/<id>.json` (0600). A 401/403, or what the provider words as a wrong key (Gemini's 400 `API_KEY_INVALID`), refuses it; nothing is stored then. Only that provider's resolution reads the file, after its environment aliases: when one of them is set in the shell or in `.env`, the login says so by the variable's name (`warning: DASHSCOPE_API_KEY is set in your shell and is used before the stored key: …`; `/login` prints the same line); `metacodes logout --provider <id>` removes it. `METACODES_KEY_CHECK_URL` (https, or http to a loopback host) replaces the check URL for a local mock |
 | `metacodes login --provider openrouter [--device-code] [--no-browser]` | OpenRouter's own sign-in (`ProviderProfile.key_grant`, its PKCE flow): the browser goes to `https://openrouter.ai/auth` with an S256 challenge and a loopback callback on any free port (1456, else 1457, else one the system picks), taken only with its own `state`; a refusal ends it at once. `--device-code` (taken unasked in an SSH session unless `--no-browser`) prints a page without a callback, whose code is pasted back at a hidden prompt. `POST /api/v1/auth/keys` trades the code and the verifier for an API key of the user's own account, which is stored in `<state root>/keys/openrouter.json` like a pasted one, with what `GET /api/v1/key` said about it (label, spending limit, expiry, free tier); then the account's listing (`GET /api/v1/models/user`) is fetched and kept for `/model`. `--api-key-stdin` stores a key created on OpenRouter instead, checked and described by `GET /api/v1/key`. `logout --provider openrouter` removes the key from this machine and names `https://openrouter.ai/keys/<sha256 hex of the key>`, where its owner deletes it (only a management key could delete it from here). `METACODES_OPENROUTER_URL` (https, or http to a loopback host; process environment only) moves every OpenRouter address, requests included, for a local mock |
+| `metacodes providers add <id> --base-url <url> --protocol <wire> [--protocol <wire>[=<url>]]… [--model <id>]… [--probe] [--display-name <name>] [--dialect <vendor>] [--key-env <VAR>] [--auth bearer\|header:<name>[:<prefix>]] [--subscription-plan] [--replace]` | write `custom_providers.<id>` ([PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own)): one channel per wire; the document is checked as `--check-providers` checks it, in the lock that writes it, and a definition that would not load is not written; an endpoint the policy refuses, a built-in id, a taken id (without `--replace`) and a `--key-env` another provider reads are refused first. With no arguments at a terminal it asks for each part; without one a missing part exits 2. `--probe` asks the endpoint's model listing (at a terminal: the key, then a pick); `--subscription-plan` writes `"subscription_plan": true`, so a `-p`, `serve` or CI start on it warns as on `kimi-code`. Applies from the next start |
+| `metacodes providers probe <id>` / `probe --base-url <url> --protocol <wire> [--auth …] [--key-env <VAR> \| --api-key-stdin]` | list the models the endpoint serves (the `data` array, an enriched `models` map, or Gemini's `models` array); a key, when there is one, is sent as the provider's requests send it, and no redirect is followed; nothing is stored; exit 1 when no listing answered |
+| `metacodes providers list` | the defined providers: channels, models, where each one's key comes from (names and paths, never a value), disabled ones marked |
+| `metacodes providers remove <id>` | remove a defined provider whole: `custom_providers.<id>`, `providers.<id>` and a `global_selection` that resolved to it in one write, then `keys/<id>.json` and `oauth/<id>.json` (not revoked); a built-in id exits 2. `/providers remove <id>` does the same for a defined provider |
 | `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `presets` and `directory_presets` (#489), `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
 | `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
@@ -326,6 +359,26 @@ The flag surface is fail-closed: an unknown flag or positional argument exits wi
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
+Two independent preview features default to off and require the shared
+`--preview` opt-in (or saved `"preview": true`). `--harnessmm` / `--no-harnessmm`
+enables bounded runtime EDGs, guarded reuse of decisions through the native
+tool dispatcher, and durable callback-substitution certificates; the
+[HarnessMM protocol](HARNESSMM_PROTOCOL.md) defines supported guards and
+conservative fallback. `--rsi` / `--no-rsi`, with `--rsi-policy <file>`,
+enables the evolved procedural instruction and its own local ridge router
+together. With preview or RSI off, its policy is not opened or required; with
+preview or HarnessMM off, plans are not admitted and certificates are not read
+or written. Preview alone selects neither optimization. Neither runtime switch
+starts optimization. The [RSI protocol](SKILL_RSI_PROTOCOL.md) defines offline
+training, budgets, exact features, hash binding and host-origin injection.
+Zig consumers use `harnessmm`, `skill_rsi`, and `agent_loop.Options.harnessmm`,
+`rsi` / `rsi_policy` together with `agent_loop.Options.preview`. Explicit child
+selections use the matching `subagent.SpawnOptions` fields; fresh children
+default to no selection, while background root continuation retains it.
+The policy is borrowed for the run or job lifetime. Restoring a conversation
+does not restore feature permission or execute historical graphs; inactive
+host guidance is omitted only from provider projection. C ABI layouts are
+unchanged by these selections and AgentCore Sessions do not implicitly inherit CLI features.
 `metacodes update [--check] [--version X.Y.Z] [--release-base <url>] [--pull]
 [--allow-downgrade] [--no-sdk] [--ignore-running] [--json]` brings the install
 the executable belongs to up to date from the source its install record names
@@ -918,7 +971,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 28 does not carry them.
+AgentCore revision 29 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -1530,7 +1583,7 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 28,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 29,
 the exact 80-byte root, all seven mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.

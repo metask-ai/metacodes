@@ -17,7 +17,7 @@ from urllib.request import urlopen
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json  # noqa: E402
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json  # noqa: E402
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run, wait_status  # noqa: E402
 
 # Run the server with the base revision's headers in a separate process.

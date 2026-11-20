@@ -331,7 +331,7 @@ def test_gen_region_agent_churn_no_spinner_residue(bin_path):
               term_size=(30, 100), per_key_drain=0.05, startup_drain=0.8)
     a = TTYAssert(raw, rows=30, cols=100)
     lines = [a.final.line_text(r) for r in range(30)]
-    spin = [l for l in lines if re.search(r"[✸✻✦✶✺✷✽·] \w+…", l)]
+    spin = [line for line in lines if re.search(r"[✸✻✦✶✺✷✽·] \w+…", line)]
     # 最终屏最多 1 个 spinner(完成态/收尾),不得有多行遗留快照。
     assert len(spin) <= 1, f"生成期 agent 树变化致 spinner 遗留 scrollback({len(spin)} 行):\n" + "\n".join(lines)
 
@@ -390,7 +390,6 @@ def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):
     # (根因:viewer 从很低的区顶相对下移画 view_rows=rows-3 行,撑出屏底滚屏)。修:view_rows 夹到
     # anchor 下方可用行数,不滚屏。本测试:/agent-test-multi 造 3 agent(高区)→ 慢 mock 进生成期 →
     # Ctrl+O。断言:footer 恰好 1 次(无重复)、transcript 正常打开。
-    import re
     from slow_mock_server import SlowMockServer, slow_text_then_tooluse
     # 慢 text turn(宽窗口)以 tool_use 收尾;agent tree 由 /agent-test-multi 预置。
     turns = [slow_text_then_tooluse(n_chunks=14, delay=0.5)]
@@ -433,16 +432,16 @@ def test_ctrl_o_hold_with_repeat_delay_is_one_pair_during_generation(bin_path):
         raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt")]
                   + _hold_events("esc to interrupt"),
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.05, term_size=(24, 80))
-    h, l = raw.count(_HOLD_H), raw.count(_HOLD_L)
-    assert (h, l) == (1, 1), f"按住一次应恰好一对 alt-screen 开/关,实得 h/l={h}/{l}"
+    opened, closed = raw.count(_HOLD_H), raw.count(_HOLD_L)
+    assert (opened, closed) == (1, 1), f"按住一次应恰好一对 alt-screen 开/关,实得 h/l={opened}/{closed}"
 
 
 def test_ctrl_o_hold_with_repeat_delay_is_one_pair_at_the_prompt(bin_path):
     # 输入期同一套去抖(loop.zig)。viewer 开着时主屏 footer 不在,关掉后回来。
     raw = run(bin_path, [READY] + _hold_events("bypass permissions on"),
               per_key_drain=0.05, term_size=(24, 80))
-    h, l = raw.count(_HOLD_H), raw.count(_HOLD_L)
-    assert (h, l) == (1, 1), f"按住一次应恰好一对 alt-screen 开/关,实得 h/l={h}/{l}"
+    opened, closed = raw.count(_HOLD_H), raw.count(_HOLD_L)
+    assert (opened, closed) == (1, 1), f"按住一次应恰好一对 alt-screen 开/关,实得 h/l={opened}/{closed}"
 
 
 def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
@@ -484,15 +483,15 @@ def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
     full = "\n".join(a.final.line_text(r) for r in range(a.rows))
 
     # sanity:Ctrl+O 确实开过 alt-screen viewer(否则没走到目标路径)。
-    h, l = raw.count(H), raw.count(L)
-    assert h >= 1, "Ctrl+O 未进 alt-screen(没复现到目标路径):\n" + full
+    opened, closed = raw.count(H), raw.count(L)
+    assert opened >= 1, "Ctrl+O 未进 alt-screen(没复现到目标路径):\n" + full
 
     # 机制核心:每个 burst(两个,生成期 + 停止后)经去抖只产生 1 对 open/close → 总 alt-screen 开关有界。
     # 去抖前同输入是每 burst ≈10 对(h/l≈20/20)→ 此 bound 清晰区分修前/修后,且 close 由 viewer
     # 内部消费故 h==l(末态 viewer 关闭,无悬挂)。
-    assert h <= 4 and l <= 4, \
-        f"按住 Ctrl+O 产生过多 alt-screen 开关(h/l={h}/{l},去抖失效 → 真终端 footer 堆叠/不幂等)"
-    assert h == l, f"alt-screen 开/关不配对(h/l={h}/{l}),末态有悬挂 viewer"
+    assert opened <= 4 and closed <= 4, \
+        f"按住 Ctrl+O 产生过多 alt-screen 开关(h/l={opened}/{closed},去抖失效 → 真终端 footer 堆叠/不幂等)"
+    assert opened == closed, f"alt-screen 开/关不配对(h/l={opened}/{closed}),末态有悬挂 viewer"
 
     # 末态干净:无生成期 footer / transcript footer 残留(多行堆叠 bug)。
     assert "Showing detailed transcript" not in full, "停止后残留 transcript footer:\n" + full
@@ -591,13 +590,13 @@ def test_ctrl_o_during_websearch_card_no_card_pileup(bin_path):
     prose_txt = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", prose).decode("utf-8", "replace")
 
     # sanity:确实走到了"有 WebSearch 卡 + Ctrl+O 进 alt-screen"的目标路径。
-    h, l = raw.count(H), raw.count(L)
-    assert h >= 1, "Ctrl+O 未进 alt-screen(没复现到目标路径):\n" + full
+    opened, closed = raw.count(H), raw.count(L)
+    assert opened >= 1, "Ctrl+O 未进 alt-screen(没复现到目标路径):\n" + full
 
     # ① alt-screen 开关有界(去抖):每个 burst 折叠成一对 → 总数小;修前同输入 ≈20+ 对。
-    assert h <= 4 and l <= 4, \
-        f"按住 Ctrl+O 产生过多 alt-screen 开关(h/l={h}/{l},去抖失效 → 真终端卡/spinner 堆叠)"
-    assert h == l, f"alt-screen 开/关不配对(h/l={h}/{l}),末态有悬挂 viewer"
+    assert opened <= 4 and closed <= 4, \
+        f"按住 Ctrl+O 产生过多 alt-screen 开关(h/l={opened}/{closed},去抖失效 → 真终端卡/spinner 堆叠)"
+    assert opened == closed, f"alt-screen 开/关不配对(h/l={opened}/{closed}),末态有悬挂 viewer"
 
     # ② 进度卡不堆叠:`⏺ Web Search` 卡是瞬态固定区元素,完成走 clearToolCard,正常永不进 scrollback。
     #    用户症状是它一行接一行 commit → 此处钉死 committed 里至多 1 次(留 1 容差给边界提交)。

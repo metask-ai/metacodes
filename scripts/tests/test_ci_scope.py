@@ -547,6 +547,22 @@ class WorkflowTest(unittest.TestCase):
                 unflagged = {step_label(step) for step in self.jobs[job]["steps"] if not leg_flags(step)}
                 self.assertEqual(unflagged, setup)
 
+    def test_every_gate_leg_runs_the_source_level_guards_first(self) -> None:
+        # `zig build gate:static` takes seconds, and a failed guard inside a
+        # suite step is reported only when the step ends (#587): every leg
+        # runs it before anything else that builds.
+        for job, os_name, flags in GATE_JOBS:
+            with self.subTest(job=job):
+                steps = [step for step in self.jobs[job]["steps"] if runs_on(step, os_name)]
+                guards = [i for i, step in enumerate(steps) if step.get("run", "").strip() == "zig build gate:static"]
+                self.assertEqual(len(guards), 1)
+                guard = steps[guards[0]]
+                self.assertEqual(leg_flags(guard), flags)
+                self.assertNotIn("runner.os", guard["if"])
+                for step in steps[:guards[0]]:
+                    run = step.get("run", "")
+                    self.assertNotRegex(run, r"\b(zig|lake) ", step_label(step))
+
     def test_every_platform_runs_every_part_of_the_suite(self) -> None:
         # `zig build test` is exactly its three parts (build.zig); each
         # platform must run all three on legs it has.

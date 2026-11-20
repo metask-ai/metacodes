@@ -30,8 +30,10 @@ from scripts.eval.harbor import cli, suites
 from scripts.eval.harbor import command as cmd
 from scripts.eval.harbor.adapters import gaia2_cli
 from scripts.eval.harbor.suites import workbuddy as wb
-from scripts.eval.harbor.viewer import data, server
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.viewer import server
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import fixture, session_fixture, wait_run
 from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV, WORKBUDDY_PINNED_COMMIT
@@ -257,7 +259,7 @@ class CatalogTest(unittest.TestCase):
     def test_binary_carries_every_module_the_workbench_imports(self):
         assets = set(re.findall(r'\.path = "([^"]+)"', (REPO / "scripts/bench_assets.zig").read_text()))
         probe = ("import sys, json\n"
-                 "import scripts.eval.harbor.cli, scripts.eval.harbor.viewer.server, scripts.eval.harbor.viewer.worker\n"
+                 "import scripts.eval.harbor.cli, scripts.eval.harbor.viewer.server, scripts.eval.harbor.bench.worker\n"
                  "import scripts.eval.harbor.suites.workbuddy, scripts.eval.harbor.adapters.gaia2_cli\n"
                  "print(json.dumps(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('scripts') and getattr(m, '__file__', None))))")
         loaded = json.loads(subprocess.run([sys.executable, "-c", probe], cwd=REPO, check=True,
@@ -544,7 +546,7 @@ class SuiteLaunchTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.manager = RunManager(self.root / "jobs", config)
-        self.http = server.make_server(data.Library([self.manager.jobs_dir]), "127.0.0.1", 0, self.manager, "cap")
+        self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager), "127.0.0.1", 0, "cap")
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)

@@ -12,14 +12,15 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.stage_ripgrep_binary import (
     StageError,
     RipgrepBundle,
     TARGET_CONTRACTS,
     validate_artifact_bytes,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def validate_bundle_inventory(bundle_dir: Path, bundle: RipgrepBundle) -> None:

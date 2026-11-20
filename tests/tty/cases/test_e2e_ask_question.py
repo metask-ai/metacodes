@@ -13,13 +13,11 @@ wait_s 给足(模型要时间调工具):~42s。SKIP=TTY_SKIP_MODEL=1。
 import os
 import sys
 import re
-import time
 import json
 import glob
 import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run  # noqa: E402
 from e2e_helpers import SkipTest, fresh_home, run_live, require_model  # noqa: E402
 
 WAIT = 42

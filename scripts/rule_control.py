@@ -2173,7 +2173,6 @@ def observe_treatment_activation(repo: Path) -> Observation:
     promotion_source = function_source("promotion", "validate_multi_arm_evidence")
     cli_source = sources["cli"]
     attester_tests = sources["attester_tests"]
-    experiment_tests = sources["experiment_tests"]
     checkpoint_test = function_source(
         "experiment_tests", "test_multi_arm_checkpoints_treatment_failure_before_abort"
     )

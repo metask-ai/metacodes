@@ -14,7 +14,7 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import READY, WAIT_S, run, wait_for  # noqa: E402
+from tty_driver import READY, run, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 COUNT = 300
@@ -85,7 +85,7 @@ def test_picker_up_from_the_first_row_commits_the_last_model(bin_path):
 
 def test_picker_page_down_moves_a_page(bin_path):
     text = _run(bin_path, OPEN_MODEL_STAGE + ["raw:\\x1b[6~", "raw:\\x1b[6~", "sleep:0.5"])
-    assert f"/{COUNT}]" in text and f"/256]" not in text, "计数被截断:\n" + text
+    assert f"/{COUNT}]" in text and "/256]" not in text, "计数被截断:\n" + text
     assert "[1/" not in text, "PgDn 没有移动:\n" + text
 
 

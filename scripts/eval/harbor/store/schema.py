@@ -22,7 +22,7 @@ Layers:
   WorkBuddy launch), so one name in two nested runs is two trials, as on
   disk; `row_json.trial` is the directory name the page shows.
 - projection: `jobs.header_json`, `trials.row_json` and `trials.detail_json`
-  are exactly what scripts/eval/harbor/viewer/data.py computes from the stored
+  are exactly what scripts/eval/harbor/bench/data.py computes from the stored
   bytes; `projection` names the code that computed them and
   `inputs_digest` the bytes, so either change recomputes them.
 """

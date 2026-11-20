@@ -61,7 +61,7 @@ INPUT_FILES = {
     "scripts/repack_agentcore_macos_archive.sh",
     "scripts/stage_ripgrep_binary.py",
 }
-INPUT_PREFIXES = ("src/", "lib/", "sdk/", "vendor/ripgrep/", "deps/")
+INPUT_PREFIXES = ("src/", "lib/", "sdk/", "vendor/ripgrep/", "vendor/quickjs/", "deps/")
 # What moves on every release without changing what AgentCore is: its own version
 # records, documents that ship nowhere, the package tests, and the main project's
 # version mirror, which the library compiles but no ABI call reports.

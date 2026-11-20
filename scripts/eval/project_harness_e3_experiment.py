@@ -43,7 +43,6 @@ from .project_harness_evolution import (
     _identity,
     _read_json,
     _read_regular,
-    _sha256_bytes,
     _sha256_file,
     _wire_json,
 )

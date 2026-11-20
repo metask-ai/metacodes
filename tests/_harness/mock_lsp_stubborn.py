@@ -3,7 +3,9 @@
 用于测 client.shutdown 的 SIGKILL 升级——SIGTERM 被吞,必须靠 SIGKILL 才能杀掉,
 否则 reader 线程永挂、join 死锁。SIGKILL 不可 trap,transport.terminate 升级后一定杀死。
 """
-import sys, json, signal
+import sys
+import json
+import signal
 
 signal.signal(signal.SIGTERM, signal.SIG_IGN)  # 吞掉 SIGTERM
 

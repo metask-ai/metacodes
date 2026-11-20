@@ -12,7 +12,9 @@ benchmark's pinned Harbor fork and its local proxy.
 | `metacodes_agent.py` | `MetacodesAgent`, the Harbor `BaseInstalledAgent` |
 | `command.py` | Harbor-free core: bundle check, model split, the trial script, trace → ATIF |
 | `smoke.py`, `smoke_provider.py`, `fixtures/smoke-task/` | zero-cost end-to-end smoke through the real `harbor run` |
-| `viewer/` | web workbench over Harbor job directories ([viewer/README.md](viewer/README.md)) |
+| `bench/` | Bench runtime: job projection, launches, durable workers, executors, providers, the `Workbench` facade |
+| `viewer/` | web page over the runtime ([viewer/README.md](viewer/README.md)) |
+| `cli.py` | `metacodes bench`: terminal presentation of the runtime |
 | `store/` | evaluation database (SQLite or PostgreSQL) the workbench syncs jobs into and reads from |
 | `suites/` | benchmark catalog (categories, harbor-registry / harbor-local / WorkBuddy suites) and the WorkBuddy runner |
 | `adapters/` | dataset adapters for harbor-local suites ([adapters/README.md](adapters/README.md)) |

@@ -31,8 +31,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from scripts.eval.harbor.viewer import data
-from scripts.eval.harbor.viewer.account import NoRedirect, private_json, refresh_lock
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.account import NoRedirect, private_json, refresh_lock
 
 PROTOCOLS = {"openai_chat": "OpenAI Chat Completions", "openai_responses": "OpenAI Responses",
              "anthropic_messages": "Anthropic Messages"}
@@ -178,7 +178,7 @@ def loopback(url):
     """Whether `url` reaches the workbench machine itself, which another
     machine would read as itself: localhost names, loopback or unspecified
     addresses (IPv4-mapped too) and names that resolve to them here."""
-    from scripts.eval.harbor.viewer.egress import names_this_machine
+    from scripts.eval.harbor.bench.egress import names_this_machine
     return names_this_machine(urllib.parse.urlsplit(url).hostname or "")
 
 

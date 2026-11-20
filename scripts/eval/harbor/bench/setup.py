@@ -9,15 +9,15 @@ sudo; otherwise the step reports the exact command for the user. Signing in to
 Metask always stays with the user (`metacodes login`, or the page's 登录
 button, which shows the device code).
 
-    python3 -m scripts.eval.harbor.viewer.setup --config <workbench.json> \
+    python3 -m scripts.eval.harbor.bench.setup --config <workbench.json> \
         [--executor NAME] [--dry-run] [--progress FILE]
 
 Python 3.9, stdlib only.
 """
 from __future__ import annotations
 
-import argparse
 import datetime as dt
+import getopt
 import hashlib
 import json
 import os
@@ -34,11 +34,11 @@ import threading
 import urllib.request
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
 from scripts.eval.harbor.command import check_bundle
-from scripts.eval.harbor.viewer import data, executors
-from scripts.eval.harbor.viewer.executors import LocalExecutor, SshExecutor, display, shell_argv
+from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench.executors import LocalExecutor, SshExecutor, display, shell_argv
 
 UV_VERSION = "0.13.9"
 HARBOR_VERSION = "0.26.0"
@@ -160,7 +160,7 @@ class Setup:
         cfg = self.settings()
         change(cfg)
         data_path = self.config_path
-        from scripts.eval.harbor.viewer.runner import atomic_json
+        from scripts.eval.harbor.bench.runner import atomic_json
         atomic_json(data_path, cfg)
         self.cfg = cfg
         # Later steps see what earlier ones wrote (egress, mirrors).
@@ -945,12 +945,12 @@ def step_egress(s: Setup):
         reverse = None
         if mode == "workbench":
             if not s.dry_run:
-                from scripts.eval.harbor.viewer.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
+                from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
                 allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
                 proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
             reverse = (options["tunnel_port"], proxy.port if proxy else 0)
         argv = executors.ssh_argv(s.executor, ["env", "PYTHONPATH=" + runtime, s.executor.python, "-m",
-                                               "scripts.eval.harbor.viewer.remote", "egress-probe",
+                                               "scripts.eval.harbor.bench.remote", "egress-probe",
                                                json.dumps(options)], reverse=reverse)
         done = s.run(argv, mutate=True, timeout=600)
     finally:
@@ -1020,7 +1020,7 @@ def step_login(s: Setup):
     mode = s.cfg.get("auth_mode") or ("provider" if s.cfg.get("provider_config") else "metask")
     if mode != "metask":
         raise Skip("使用第三方 Provider，不需要 Metask 登录")
-    from scripts.eval.harbor.viewer.account import Account
+    from scripts.eval.harbor.bench.account import Account
     state = s.cfg.get("account_state_dir")
     try:
         Account(state).login()
@@ -1118,10 +1118,10 @@ class SetupManager:
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             ident = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
             progress = self.directory / (ident + ".json")
-            from scripts.eval.harbor.viewer.runner import atomic_json
+            from scripts.eval.harbor.bench.runner import atomic_json
             atomic_json(progress, {"schema_version": 1, "id": ident, "executor": executor.name, "kind": executor.kind,
                                    "dry_run": dry_run, "status": "running", "started_at": now(), "steps": []})
-            argv = [sys.executable, "-m", "scripts.eval.harbor.viewer.setup", "--config", str(self.config_path),
+            argv = [sys.executable, "-m", "scripts.eval.harbor.bench.setup", "--config", str(self.config_path),
                     "--executor", executor.name, "--progress", str(progress)] + (["--dry-run"] if dry_run else [])
             with (self.directory / (ident + ".log")).open("wb") as log:
                 self.process = subprocess.Popen(argv, cwd=cwd, env=runtime_env, stdin=subprocess.DEVNULL,
@@ -1175,27 +1175,34 @@ class LoginManager:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="One-click setup of a Bench execution machine")
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--executor")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--progress", type=Path)
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    from scripts.eval.harbor.viewer.runner import atomic_json
+    try:
+        options, rest = getopt.getopt(sys.argv[1:] if argv is None else argv, "",
+                                      ["config=", "executor=", "dry-run", "progress=", "json"])
+    except getopt.GetoptError as exc:
+        print("bench setup: " + str(exc), file=sys.stderr)
+        return 2
+    options = dict(options)
+    if rest or "--config" not in options:
+        print("usage: setup.py --config <workbench.json> [--executor NAME] [--dry-run] [--progress FILE] [--json]",
+              file=sys.stderr)
+        return 2
+    config, executor = Path(options["--config"]), options.get("--executor")
+    progress_path = Path(options["--progress"]) if "--progress" in options else None
+    dry_run, as_json = "--dry-run" in options, "--json" in options
+    from scripts.eval.harbor.bench.runner import atomic_json
 
     def save(progress):
-        if args.progress:
-            atomic_json(args.progress, progress)
+        if progress_path:
+            atomic_json(progress_path, progress)
     try:
-        progress = run_setup(args.config, args.executor, dry_run=args.dry_run, on_change=save)
+        progress = run_setup(config, executor, dry_run=dry_run, on_change=save)
     except ValueError as exc:
         print("bench setup: " + str(exc), file=sys.stderr)
-        if args.progress:
-            value = data.read_json(args.progress) or {}
-            atomic_json(args.progress, {**value, "status": "failed", "error": str(exc), "finished_at": now()})
+        if progress_path:
+            value = data.read_json(progress_path) or {}
+            atomic_json(progress_path, {**value, "status": "failed", "error": str(exc), "finished_at": now()})
         return 1
-    print(json.dumps(progress, ensure_ascii=False) if args.json else format_progress(progress))
+    print(json.dumps(progress, ensure_ascii=False) if as_json else format_progress(progress))
     return 0 if progress["status"] in ("ready", "planned") else 1
 
 

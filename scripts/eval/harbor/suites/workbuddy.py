@@ -153,7 +153,7 @@ def config_paths(spec) -> List[Path]:
 
 def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     """Write the transient configs and the workbench job; return argv, cwd, env."""
-    from scripts.eval.harbor.viewer.runner import atomic_json, now
+    from scripts.eval.harbor.bench.runner import atomic_json, now
     wb = spec["workbuddy"]
     model, job = job_documents(spec)
     for path, document in zip(config_paths(spec), (model, job)):
@@ -184,8 +184,8 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
 
 def finish(spec):
     """Mark the workbench job finished and remove the transient configs."""
-    from scripts.eval.harbor.viewer import data
-    from scripts.eval.harbor.viewer.runner import atomic_json, now
+    from scripts.eval.harbor.bench import data
+    from scripts.eval.harbor.bench.runner import atomic_json, now
     for path in config_paths(spec):
         try:
             path.unlink()

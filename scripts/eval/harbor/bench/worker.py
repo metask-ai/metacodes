@@ -11,13 +11,13 @@ import threading
 import time
 from pathlib import Path
 
-from scripts.eval.harbor.viewer.runner import atomic_json, now, runtime_env
-from scripts.eval.harbor.viewer.account import Account
+from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env
+from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_for, judge_argv, placeholder,
                                            route_problem, upstream_for)
-from scripts.eval.harbor.viewer import credentials
+from scripts.eval.harbor.bench import credentials
 from scripts.eval.harbor.store.ingest import WorkerSync
-from scripts.eval.harbor.viewer.executors import RemoteRun
+from scripts.eval.harbor.bench.executors import RemoteRun
 
 
 def command(spec):

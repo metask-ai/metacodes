@@ -18,6 +18,15 @@ In-process frontends (the TUI, headless runs, the AgentCore C ABI's
 directly. They never serialize, never declare capabilities, and behave as
 before this exchange existed.
 
+`ExecuteCode` is a preview feature, disabled by default. The Host's preview
+configuration controls its availability: without opt-in it is absent from the
+tool menu and direct invocation is rejected before VM creation. Model input
+cannot enable preview. When enabled it is an ordinary model tool on this wire. Its inner tool invocations
+emit ordinary tool lifecycle, policy and file-change evidence, but do not create
+additional provider tool-use/result messages. Runtime state is ephemeral and
+never part of a transcript or wire checkpoint. See the normative
+[JavaScript execution contract](PROGRAMMATIC_TOOL_CALLING.md).
+
 ## 1. Lines
 
 Every line is one JSON object with the schema version `v` (currently `1`) and

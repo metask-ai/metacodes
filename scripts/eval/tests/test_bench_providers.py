@@ -21,9 +21,11 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.profiling import auth_for, route_problem, upstream_for
-from scripts.eval.harbor.viewer import data, providers, server
-from scripts.eval.harbor.viewer.providers import Providers, echoed, normalize_base_url, reply_text
-from scripts.eval.harbor.viewer.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench import data, providers
+from scripts.eval.harbor.viewer import server
+from scripts.eval.harbor.bench.providers import Providers, echoed, normalize_base_url, reply_text
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run
 
@@ -265,7 +267,7 @@ class ProviderStoreTest(unittest.TestCase):
         self.assertTrue(self.store.find('gw')['probes']['echo']['ok'])
 
     def test_names_resolving_here_and_mapped_addresses_count_as_this_machine(self):
-        from scripts.eval.harbor.viewer import egress
+        from scripts.eval.harbor.bench import egress
 
         def resolve(host, _port):
             table = {'devbox-alias': '127.0.1.1', 'v6-alias': '::ffff:127.0.0.1', 'gw.example': '203.0.113.7'}
@@ -284,7 +286,7 @@ class ProviderStoreTest(unittest.TestCase):
             self.assertFalse(providers.loopback('https://gw.example/v1'))
 
     def test_the_executor_refuses_an_imported_upstream_that_resolves_to_itself(self):
-        from scripts.eval.harbor.viewer import remote
+        from scripts.eval.harbor.bench import remote
         runtime = str(Path(__file__).resolve().parents[3])
         spec = {'argv': ['harbor', 'run'], 'key_env': providers.KEY_ENV, 'runtime': runtime,
                 'relay': {'upstream': 'http://127.0.0.1:9', 'bind': '127.0.0.1', 'auth_header': 'Authorization',
@@ -421,8 +423,8 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.addCleanup(self.upstream.server_close)
         self.addCleanup(self.upstream.shutdown)
         self.manager = RunManager(self.root / 'jobs', config)
-        self.http = server.make_server(data.Library([self.manager.jobs_dir]), '127.0.0.1', 0,
-                                       self.manager, 'test-capability')
+        self.http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager),
+                                       '127.0.0.1', 0, 'test-capability')
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
@@ -484,7 +486,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertTrue(any('TOKENJOY_API_KEY' in w for w in catalog['warnings']), catalog['warnings'])
 
     def test_an_edit_after_launch_is_never_paired_with_the_old_route(self):
-        from scripts.eval.harbor.viewer import credentials
+        from scripts.eval.harbor.bench import credentials
         base = f'http://127.0.0.1:{self.upstream.server_port}'
         self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
         route = self.manager.providers.run_route('local/echo')
@@ -548,7 +550,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertEqual(len(self.manager.runs()), 1)
 
     def test_a_loopback_import_is_refused_on_an_ssh_executor(self):
-        from scripts.eval.harbor.viewer import executors
+        from scripts.eval.harbor.bench import executors
         base = f'http://127.0.0.1:{self.upstream.server_port}'
         self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
         cfg = json.loads(self.manager.config_path.read_text())
@@ -567,7 +569,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertEqual(self.manager.runs(), [])
 
     def test_the_final_route_snapshot_is_checked_against_the_ssh_executor(self):
-        from scripts.eval.harbor.viewer import egress, executors
+        from scripts.eval.harbor.bench import egress, executors
         self.client.request('api/providers', {'id': 'gw', 'base_url': 'http://gw.example:9', 'api_key': KEY,
                                               'models': ['echo']})
         cfg = json.loads(self.manager.config_path.read_text())

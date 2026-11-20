@@ -1,5 +1,4 @@
 import contextlib
-import copy
 import io
 import json
 import tempfile

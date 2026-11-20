@@ -21,7 +21,7 @@ fn readGoal(
 }
 
 comptime {
-    if (wire.ABI_REVISION != 28 or
+    if (wire.ABI_REVISION != 29 or
         wire.MAX_STREAM_RETRY_BUDGET_V1 != 8 or
         wire.MAX_CREDENTIAL_BYTES_V1 != 16 * 1024 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or

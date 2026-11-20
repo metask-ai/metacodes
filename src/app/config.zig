@@ -24,6 +24,7 @@ pub const FileConfig = struct {
     max_turns: ?u32 = null,
     verbose: ?bool = null,
     no_theme: ?bool = null,
+    preview: ?bool = null,
 
     pub fn deinit(self: FileConfig, allocator: std.mem.Allocator) void {
         if (self.model) |m| allocator.free(m);
@@ -121,6 +122,9 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
     if (config.no_theme) |v| {
         try fields.append(arena, .{ .key = "no_theme", .json = if (v) "true" else "false" });
     }
+    if (config.preview) |v| {
+        try fields.append(arena, .{ .key = "preview", .json = if (v) "true" else "false" });
+    }
 
     const merged = json_merge.mergeObjectFields(allocator, existing, fields.items) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -163,6 +167,7 @@ fn readWhole(allocator: std.mem.Allocator, path_z: [:0]const u8) ![]u8 {
 
 fn parseJson(allocator: std.mem.Allocator, data: []const u8) !FileConfig {
     var cfg = FileConfig{};
+    errdefer cfg.deinit(allocator);
     if (util_json.extractStringField(data, "model")) |v| {
         cfg.model = try allocator.dupe(u8, v);
     }
@@ -172,6 +177,17 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8) !FileConfig {
     cfg.max_turns = parseUintField(data, "max_turns");
     cfg.verbose = parseBoolField(data, "verbose");
     cfg.no_theme = parseBoolField(data, "no_theme");
+    // Preview opt-in is a root boolean, never a similarly named nested field.
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return cfg,
+    };
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("preview")) |value| {
+            if (value == .bool) cfg.preview = value.bool;
+        }
+    }
     return cfg;
 }
 

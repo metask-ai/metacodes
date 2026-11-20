@@ -19,7 +19,6 @@ claim 证据(软):subagent 被要求把认领返回的 JSON 转述进 final_text
 无 auth.json → SkipTest(环境无真模型凭证)。
 """
 import glob
-import json
 import os
 import shutil
 import subprocess

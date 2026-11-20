@@ -630,6 +630,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
     _ = app.refreshWorkspaceRoot();
     return .{
         .session = app.session_id,
+        .preview = app.config.preview.isEnabled(),
         // Span recording into the session store and the OTLP exporter (observer only).
         .telemetry = @import("telemetry/telemetry.zig").forSession(app.sessionDir()),
         .verbose = app.config.verbose,
@@ -660,6 +661,9 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .api_client = app.anthropicClientOrNull(),
         .tool_defs = app.tool_defs,
         .system_prompt = app.system_prompt,
+        .harnessmm = app.config.harnessmm,
+        .rsi = app.config.rsi,
+        .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
         .inject_user_context = app.user_context,
         .time_announcer = if (app.time_announcer) |*announcer| announcer else null,
         .goal_meter = if (app.goal_meter) |*meter| meter else null,

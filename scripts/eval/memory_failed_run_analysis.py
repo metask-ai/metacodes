@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 from .memory_benchmark import render_memory_markdown, summarize_memory
 from .memory_budget_journal import validate_checkpoint_payload
 from .memory_query_plan import (
-    MULTIPLE_DISTINCT_SEED_PLANS_REASON,
     QUERY_PLAN_INVALID_PREFIX,
     SIDECAR_NAME,
     build_query_plan_trace,

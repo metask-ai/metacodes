@@ -1,0 +1,96 @@
+{
+  "bundle_schema": "metacodes.quickjs-source/v1",
+  "license": "MIT",
+  "upstream_release": "2025-09-13",
+  "upstream_archive": {
+    "url": "https://bellard.org/quickjs/quickjs-2025-09-13-2.tar.xz",
+    "sha256": "996c6b5018fc955ad4d06426d0e9cb713685a00c825aa5c0418bd53f7df8b0b4",
+    "root": "quickjs-2025-09-13"
+  },
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "598fd7fc928e4350abce36e337ba5a1346923c5c692f5be92c3d8e29ddd7c18d"
+    },
+    {
+      "path": "VERSION",
+      "sha256": "164beb8843157a89dd74f069984229709b71fcfb2d61774c0695d30432a50143"
+    },
+    {
+      "path": "cutils.c",
+      "sha256": "203cc40bb8c8f4e3c6ce81f50526c0605ec0c21428c3317422646b445bc2e8fb"
+    },
+    {
+      "path": "cutils.h",
+      "sha256": "660cde528f35a955e9869b83a94ab95cced175704960f9f22974a7685daf7f4b"
+    },
+    {
+      "path": "dtoa.c",
+      "sha256": "af5abd68fa9806d1a19bdd5f2daef00d5fd0990ae56311382dfed4700343f074"
+    },
+    {
+      "path": "dtoa.h",
+      "sha256": "462070f7678a894b9f3612422f280f4dce412eb360a5cc585a513f407fc23114"
+    },
+    {
+      "path": "libregexp-opcode.h",
+      "sha256": "b7f19ead29be0c4c4983ac0764642449bf86616482d143415495ec6ba0645e9a"
+    },
+    {
+      "path": "libregexp.c",
+      "sha256": "bcdbb93fb104bc0ddb9addd1a1a7dedf4893371a69b84d395c79abfe6539be80"
+    },
+    {
+      "path": "libregexp.h",
+      "sha256": "ff67a7d8ed066517a5971a30dd3cc353257d6d9d7b6acda1d5cc655c98704b4f"
+    },
+    {
+      "path": "libunicode-table.h",
+      "sha256": "48d21f5586cc9fa9ca82bded980d62aa0edae9c6be599cca16e937b4b807e5b5"
+    },
+    {
+      "path": "libunicode.c",
+      "sha256": "e7bdc6052825b8fab8d6717106a2fbf72e801f9b5bc1c24506baaa4fb63618c5"
+    },
+    {
+      "path": "libunicode.h",
+      "sha256": "6ccc9a01f442490316f56c144f3c62089ff9139a8765e7292ecdd426cbbd3e00"
+    },
+    {
+      "path": "list.h",
+      "sha256": "181c6b25d9d0e4853315d36a6e6fab3b2c3554271693d898a439384ba0f67c2b"
+    },
+    {
+      "path": "quickjs-atom.h",
+      "sha256": "ae2f345fa9061c99606ce5d44124ecad4ca6926f8ad3719b0494877459ffa226"
+    },
+    {
+      "path": "quickjs-opcode.h",
+      "sha256": "a45216ee91c6e9b2c01626b3d6c5acf57717a1d6b3bfedd148ea85c444d98382"
+    },
+    {
+      "path": "quickjs.c",
+      "sha256": "f1c17b0c9bda1e7e7a3436f3b426085962d361294c5ada2a21b719ac39287170"
+    },
+    {
+      "path": "quickjs.h",
+      "sha256": "ad3455cafab56a036e5b94c8e6915e653a09f48e32e72cb66f0d0775047a7bb5"
+    }
+  ],
+  "patches": [
+    {
+      "path": "patches/0001-optional-atomics.patch",
+      "sha256": "7f3d85c184c4b63fcd16f790f3e36b9b904d6592301334008ba7a15512a2763f"
+    },
+    {
+      "path": "patches/0002-typed-dbuf-realloc.patch",
+      "sha256": "a97d119c3b1e6c91e6c96c7e4d37f3eb08f1a07ab6429b56d64fcf86c19a0fc6"
+    }
+  ],
+  "patched": [
+    {
+      "path": "quickjs.c",
+      "sha256": "5020dc487cd8dfe19740c8adae6b125f361a72853cb49bd4dfca2ca8f33ea97f"
+    }
+  ]
+}

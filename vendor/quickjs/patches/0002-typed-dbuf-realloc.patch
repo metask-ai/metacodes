@@ -1,0 +1,36 @@
+Give DynBuf an exactly typed realloc callback.
+
+Upstream casts js_realloc_rt (JSRuntime *) to DynBufReallocFunc (void *).
+Calling through the cast is undefined behaviour that clang's function
+sanitizer traps in Debug and ReleaseSafe builds. A void * adapter keeps the
+sanitizer on instead of disabling it for the whole engine.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1465,9 +1465,16 @@
+         return 0;
+ }
+ 
++/* DynBuf callbacks take void *, not JSRuntime *. Keep the C function type
++   exact so indirect calls also pass the host's function sanitizer. */
++static void *js_dbuf_realloc(void *opaque, void *ptr, size_t size)
++{
++    return js_realloc_rt(opaque, ptr, size);
++}
++
+ static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
+ {
+-    dbuf_init2(s, ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
++    dbuf_init2(s, ctx->rt, js_dbuf_realloc);
+ }
+ 
+ static void *js_realloc_bytecode_rt(void *opaque, void *ptr, size_t size)
+@@ -43981,7 +43988,7 @@
+     if (buf_len < 0)
+         return -1;
+     out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
+-                                ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
++                                ctx->rt, js_dbuf_realloc);
+     js_free(ctx, buf);
+     if (out_len < 0)
+         return -1;

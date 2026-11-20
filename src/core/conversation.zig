@@ -111,6 +111,8 @@ pub fn isUserPrompt(m: msg.Message) bool {
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
+    /// Ephemeral per-agent JS heap; never serialized, cloned or provider-visible.
+    code_runtime: ?@import("code_runtime").Runtime = null,
     /// P1.5 纯投影压缩:boundary 型压缩**不删除原始消息**。压缩=推进
     /// 这个 boundary 游标 + 存一条 compact_summary。发给模型 / token 估算都只看 [boundary..] + summary
     /// (见 activeStart/totalTokens/buildApiMessages)。对齐 cc 的 getMessagesAfterCompactBoundary。
@@ -144,9 +146,19 @@ pub const Conversation = struct {
     }
 
     pub fn deinit(self: *Conversation) void {
+        if (self.code_runtime) |*runtime| runtime.deinit();
         for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
         if (self.compact_summary) |s| self.allocator.free(s);
+    }
+
+    pub fn codeRuntime(self: *Conversation) !*@import("code_runtime").Runtime {
+        if (self.code_runtime) |*runtime| if (!runtime.healthy) {
+            runtime.deinit();
+            self.code_runtime = null;
+        };
+        if (self.code_runtime == null) self.code_runtime = try @import("code_runtime").Runtime.init();
+        return &self.code_runtime.?;
     }
 
     /// 投影起点:活跃窗口 = messages[activeStart()..]。boundary 若越界(消息被 reset)则回 0。

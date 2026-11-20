@@ -28,8 +28,8 @@ from typing import Any, Dict, List, Optional
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.store.ingest import BATCHES_DIR
-from scripts.eval.harbor.viewer import data, executors
-from scripts.eval.harbor.viewer.runner import ACTIVE, atomic_json, now, settings
+from scripts.eval.harbor.bench import data, executors
+from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, now, settings
 
 MAX_ITEMS = 16
 NAME_LIMIT = 80

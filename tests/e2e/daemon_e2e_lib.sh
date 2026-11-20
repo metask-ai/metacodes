@@ -88,6 +88,7 @@ start_collector() {
   python3 "$E2E_DIR/otlp_mock_collector.py" "$TMP/collector.url" "$TMP/otlp.jsonl" >"$TMP/collector.out" 2>&1 &
   COLLECTOR_PID=$!
   wait_for_line "$TMP/collector.url" "$COLLECTOR_PID" '^http://' || fail "OTLP collector did not start"
+  # shellcheck disable=SC2034
   COLLECTOR_URL="$(tr -d '[:space:]' <"$TMP/collector.url")"
 }
 
@@ -95,6 +96,7 @@ start_mock() {
   python3 "$E2E_DIR/daemon_mock_provider.py" "$TMP/mock.url" >"$TMP/mock.out" 2>&1 &
   MOCK_PID=$!
   wait_for_line "$TMP/mock.url" "$MOCK_PID" '/v1/messages$' || fail "mock provider did not start"
+  # shellcheck disable=SC2034
   BASE_URL="$(tr -d '[:space:]' <"$TMP/mock.url")"
 }
 

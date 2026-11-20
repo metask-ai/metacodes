@@ -12,7 +12,6 @@
 任一次工具被正确调用即 pass;全失败才判负。强提示词("Use the X tool to …")提高命中。
 """
 import os
-import re
 import sys
 import json
 import glob

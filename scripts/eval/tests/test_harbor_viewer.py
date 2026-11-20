@@ -17,7 +17,9 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.eval.harbor.viewer import data, server
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.viewer import server
 
 
 def _write(path: Path, value) -> None:
@@ -186,7 +188,7 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         job = _job(self.root, "pilot", "m", planned=1)
         _trial(job, "task__aaa", reward=1.0, steps=[{"step_id": 1, "source": "agent", "message": "hi"}])
-        self.server = server.make_server(data.Library([self.root]), "127.0.0.1", 0)
+        self.server = server.make_server(Workbench(data.Library([self.root])), "127.0.0.1", 0)
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(self.server.server_close)
@@ -203,7 +205,7 @@ class ServerTest(unittest.TestCase):
 
     def test_public_bind_serves_http_without_reverse_dns(self):
         with patch('socket.getfqdn', side_effect=AssertionError('startup must not depend on reverse DNS')):
-            http = server.make_server(data.Library([self.root]), '0.0.0.0', 0)
+            http = server.make_server(Workbench(data.Library([self.root])), '0.0.0.0', 0)
             self.addCleanup(http.server_close)
             self.assertEqual(http.server_name, '0.0.0.0')
             threading.Thread(target=http.serve_forever, daemon=True).start()
