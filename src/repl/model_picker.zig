@@ -834,9 +834,10 @@ pub const Picker = struct {
             },
             .escape => return self.back(),
             .char => |byte| {
-                // `q` closes only on an empty filter, so it stays typeable in a
-                // model name. Same rule the `?` help key already uses.
-                if (byte == 'q' and self.filter_len == 0) return .closed;
+                // Every printable key is the filter, `q` included, even as
+                // the first letter: a search can start with any letter
+                // (qwen, qwq; #599), and Esc is the way out. Only the setup
+                // stage, which takes no typing, closes on `q`.
                 if (byte < 0x20 or byte == 0x7f) return .ignored;
                 if (self.filter_len == MAX_FILTER) return .ignored;
                 self.filter_buffer[self.filter_len] = byte;
@@ -1462,16 +1463,38 @@ test "a typed filter lists the models that hold it whole before the ones that on
     try testing.expectEqualStrings("glm-5.3", picker.focusedOffer().?.request_model_id);
 }
 
-test "q types into a non-empty filter and closes only when the filter is empty" {
+test "q is a filter letter like any other, the first one too (#599)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{fixtureOffer("qwen", "default", "Qwen3", null, "qwen3", "openai_chat")};
+    const offers = [_]OfferSummary{
+        fixtureOffer("deepseek", "default", "DeepSeek V4 Pro", null, "deepseek-v4-pro", "openai_chat"),
+        fixtureOffer("qwen", "default", "Qwen3", null, "qwen3", "openai_chat"),
+        fixtureOffer("qwen", "default", "QwQ 32B", null, "qwq-32b", "openai_chat"),
+    };
     try loadFixture(&picker, &offers, null);
     picker.restart();
-    _ = picker.onKey(.{ .char = 'w' });
+    // The first key of a search filters; it used to close the picker.
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .redraw);
-    try testing.expectEqualStrings("wq", picker.filter());
-    _ = picker.onKey(.escape);
+    try testing.expectEqualStrings("q", picker.filter());
+    try testing.expectEqual(Stage.list, picker.stage);
+    for ("wq") |byte| try testing.expect(picker.onKey(.{ .char = byte }) == .redraw);
+    try testing.expectEqualStrings("qwq", picker.filter());
+    try testing.expectEqualStrings("qwq-32b", picker.focusedOffer().?.request_model_id);
+    // Esc is the way out: it clears the filter, then closes.
+    try testing.expect(picker.onKey(.escape) == .redraw);
+    try testing.expectEqualStrings("", picker.filter());
+    try testing.expect(picker.onKey(.escape) == .closed);
+}
+
+test "the setup stage, which takes no typing, still closes on q (#599)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{fixtureOffer("kimi", "default", "K3", null, "k3", "openai_chat")};
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    picker.enterSetup(.{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" });
+    try testing.expect(picker.onKey(.{ .char = 'a' }) == .ignored);
+    try testing.expectEqual(Stage.setup, picker.stage);
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .closed);
 }
 
