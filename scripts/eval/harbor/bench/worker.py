@@ -216,7 +216,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         complete = False
     code = remote.exit_code()
     if code is None:
-        lost = "SSH 连接中断"
+        lost = remote.error_message() or "SSH 连接中断"
         if remote.tunnel_port is not None and not remote.events and remote.process.returncode == 255:
             lost += (f"（会话带有 ssh -R 127.0.0.1:{remote.tunnel_port} 反向转发；"
                      "若该端口在执行机器上已被占用，重新启动评测会换一个端口）")

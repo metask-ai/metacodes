@@ -180,6 +180,36 @@ def names_this_machine(host: str, resolve=None) -> bool:
     return any(local_address(str(info[4][0])) for info in infos)
 
 
+class LocalUpstream(OSError):
+    pass
+
+
+def connect_not_local(address: Tuple[str, int], timeout: Optional[float] = None,
+                      source_address: Optional[Tuple[str, int]] = None, resolve=None) -> socket.socket:
+    host, port = address
+    try:
+        infos = (resolve or socket.getaddrinfo)(host, port, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise LocalUpstream(f"cannot resolve {host}") from exc
+    if not infos or any(local_address(str(info[4][0])) for info in infos):
+        raise LocalUpstream(f"{host} resolves to this machine")
+    error: OSError = LocalUpstream(f"cannot connect to {host}")
+    for family, kind, proto, _name, sockaddr in infos:
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            error = exc
+    raise error
+
+
 def address_allowed(address: str) -> bool:
     """Whether the proxy may connect to `address`: globally routable unicast
     only (see allow_policy for the configured exceptions)."""

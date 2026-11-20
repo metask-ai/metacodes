@@ -285,6 +285,58 @@ class ProviderStoreTest(unittest.TestCase):
             self.assertTrue(providers.loopback('http://[::ffff:127.0.0.1]:8000'))
             self.assertFalse(providers.loopback('https://gw.example/v1'))
 
+    def test_each_upstream_connection_dials_only_an_address_it_just_checked(self):
+        from scripts.eval.harbor.bench import egress
+        answers = [['203.0.113.7'], ['127.0.0.1'], ['203.0.113.8', '::ffff:127.0.0.1'], OSError('no answer')]
+        dialed = []
+
+        def resolve(host, port, *_args):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return [(egress.socket.AF_INET, egress.socket.SOCK_STREAM, 6, '', (ip, port)) for ip in answer]
+
+        class Socket:
+            def __init__(self, *_args):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, sockaddr):
+                dialed.append(sockaddr)
+
+        with patch.object(egress.socket, 'socket', Socket):
+            egress.connect_not_local(('gw.example', 80), 5, resolve=resolve)
+            for _ in range(3):
+                with self.assertRaises(egress.LocalUpstream):
+                    egress.connect_not_local(('gw.example', 80), 5, resolve=resolve)
+        self.assertEqual(dialed, [('203.0.113.7', 80)])
+
+    def test_a_candidate_whose_socket_cannot_be_created_falls_through_to_the_next_checked_one(self):
+        from scripts.eval.harbor.bench import egress
+        AF_INET, AF_INET6 = egress.socket.AF_INET, egress.socket.AF_INET6
+        dialed = []
+
+        def resolve(host, port, *_args):
+            return [(AF_INET6, egress.socket.SOCK_STREAM, 6, '', ('2001:db8::7', port, 0, 0)),
+                    (AF_INET, egress.socket.SOCK_STREAM, 6, '', ('203.0.113.7', port))]
+
+        class Socket:
+            def __init__(self, family, *_args):
+                if family == AF_INET6:
+                    raise OSError(97, 'Address family not supported by protocol')
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, sockaddr):
+                dialed.append(sockaddr)
+
+        with patch.object(egress.socket, 'socket', Socket):
+            egress.connect_not_local(('gw.example', 80), 5, resolve=resolve)
+        self.assertEqual(dialed, [('203.0.113.7', 80)])
+
     def test_the_executor_refuses_an_imported_upstream_that_resolves_to_itself(self):
         from scripts.eval.harbor.bench import remote
         runtime = str(Path(__file__).resolve().parents[3])

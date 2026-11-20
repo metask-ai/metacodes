@@ -318,7 +318,7 @@ def subject_alt_names(*hosts):
 class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
                  auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None,
-                 token=None, record=True, judge_token=None, judge_credential=None):
+                 token=None, record=True, judge_token=None, judge_credential=None, connect=None):
         # `credential` is the real upstream credential (a string or a source
         # with current()/refresh(stale)); `token` is the placeholder the
         # containers present (a fresh one when omitted). `record=False`
@@ -465,6 +465,8 @@ class TimingRelay:
                     if not reused:
                         cls = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
                         self.upstream = cls(origin.hostname, origin.port, timeout=1800)
+                        if connect:
+                            self.upstream._create_connection = connect
                     try:
                         self.upstream.request(self.command, upstream_path, body=body,
                                               headers={**headers, auth_header: auth_prefix + secret})

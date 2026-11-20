@@ -1,6 +1,7 @@
 """Metric math and an actual streaming HTTP relay; no paid providers."""
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import ssl
@@ -96,6 +97,54 @@ class RelayTest(unittest.TestCase):
                     # Leave the idle peer connected while shutting down.
                     relay.server.shutdown()
                     idle.shutdown(socket.SHUT_RDWR)
+
+    def test_upstream_connections_go_through_the_connect_hook_and_keep_the_host_name(self):
+        from scripts.eval.harbor.bench import egress
+        seen = []
+
+        class Provider(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                seen.append((self.headers['Host'], self.headers['Authorization']))
+                self.send_response(200)
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        port = upstream.server_port
+        target = f'http://gw.example:{port}'
+
+        def to_upstream(address, timeout=None, source_address=None):
+            self.assertEqual(address, ('gw.example', port))
+            return socket.create_connection(('127.0.0.1', port), timeout)
+
+        def resolves_here(host, port, *_args):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+
+        def checked(address, timeout=None, source_address=None):
+            return egress.connect_not_local(address, timeout, source_address, resolve=resolves_here)
+
+        for connect, reached in ((to_upstream, True), (checked, False)):
+            with self.subTest(reached=reached), tempfile.TemporaryDirectory() as temp, TimingRelay(
+                    target, 'private-key', temp, bind='127.0.0.1', record=False, connect=connect) as relay:
+                seen.clear()
+                request = urllib.request.Request(relay.url + '/t/v1/models', headers={'Authorization': 'Bearer ' + relay.token})
+                if reached:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.read(), b'{}')
+                    self.assertEqual(seen, [(f'gw.example:{port}', 'Bearer private-key')])
+                else:
+                    with self.assertRaises((urllib.error.URLError, ConnectionError, http.client.HTTPException)):
+                        urllib.request.urlopen(request, timeout=5).close()
+                    self.assertEqual(seen, [])
 
     def test_real_stream_is_preserved_and_numeric_sidecar_has_no_secrets(self):
         chunks = [sse({'type': 'ping'}), sse({'type': 'message_start', 'message': {'usage': {'input_tokens': 50}}}),

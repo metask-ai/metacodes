@@ -111,8 +111,10 @@ def run(spec_path):
             sys.path.insert(0, runtime)
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
+            connect = None
             if options.get("refuse_local_upstream"):
-                from scripts.eval.harbor.bench.egress import names_this_machine
+                from scripts.eval.harbor.bench.egress import connect_not_local, names_this_machine
+                connect = connect_not_local
                 if names_this_machine(urlsplit(options["upstream"]).hostname or ""):
                     # This machine resolves the imported address to itself:
                     # never send the key to whatever listens here.
@@ -132,7 +134,7 @@ def run(spec_path):
                                 bind=options.get("bind") or "172.17.0.1", auth_header=options["auth_header"],
                                 auth_prefix=options["auth_prefix"], tls=True, token=token,
                                 record=options.get("record", True), judge_token=judge_token,
-                                judge_credential=judge_real).__enter__()
+                                judge_credential=judge_real, connect=connect).__enter__()
             argv += ["--ak", "metrics_proxy=" + relay.url, "--ak", "metrics_ca=" + str(relay.ca_path)]
             if judge:
                 argv += judge_argv(judge, relay.url)
