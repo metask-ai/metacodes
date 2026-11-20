@@ -631,6 +631,7 @@ pub const TuiBackend = struct {
                     // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
                     self.cancelInFlightIfAborted(app);
+                    if (self.region.pickerOpen()) _ = picker_host.renote(app, .of(self.region));
                     self.region.tickSpinner(app);
                 }
                 continue;

@@ -134,6 +134,58 @@ pub const ProviderNote = struct {
     }
 };
 
+pub const ListNote = struct {
+    provider: Slug,
+    name_buffer: [MAX_PROVIDER_NAME]u8 = undefined,
+    name_len: usize = 0,
+    state: State,
+
+    pub const State = union(enum) {
+        downloading: u64,
+        failed: Failure,
+    };
+
+    pub const Failure = enum {
+        connection,
+        interrupted,
+        refused,
+        busy,
+        server_error,
+        not_a_list,
+        too_large,
+        stalled,
+        other,
+    };
+
+    pub fn init(provider: Slug, display_name: []const u8, state: State) ListNote {
+        var note = ListNote{ .provider = provider, .state = state };
+        const len = @min(display_name.len, MAX_PROVIDER_NAME);
+        @memcpy(note.name_buffer[0..len], display_name[0..len]);
+        note.name_len = len;
+        return note;
+    }
+
+    pub fn name(self: *const ListNote) []const u8 {
+        return self.name_buffer[0..self.name_len];
+    }
+
+    pub fn retryable(self: ListNote) bool {
+        return switch (self.state) {
+            .downloading => false,
+            .failed => |failure| failure != .refused,
+        };
+    }
+
+    pub fn eql(self: *const ListNote, other: *const ListNote) bool {
+        if (!self.provider.eql(other.provider)) return false;
+        if (!std.mem.eql(u8, self.name(), other.name())) return false;
+        return switch (self.state) {
+            .downloading => |bytes| other.state == .downloading and other.state.downloading == bytes,
+            .failed => |failure| other.state == .failed and other.state.failed == failure,
+        };
+    }
+};
+
 /// What the list is showing right now. `stale` and `failed` are states a client
 /// must be able to render: a picker that silently shows an out-of-date catalog
 /// invites committing to a route that no longer exists.
@@ -178,6 +230,7 @@ pub const Outcome = union(enum) {
     ignored,
     closed,
     commit: Commit,
+    retry_list: Slug,
 };
 
 pub const Key = union(enum) {
@@ -199,6 +252,7 @@ pub const Key = union(enum) {
     /// Cycles session → global → once. Session is the default, so any other
     /// scope is always an explicit act.
     cycle_scope,
+    retry,
     char: u8,
 };
 
@@ -292,8 +346,24 @@ pub const Picker = struct {
     intents: controls_mod.ControlValues = .{},
     scope: Scope = .session,
 
+    list_note: ?ListNote = null,
+
     pub fn init(allocator: std.mem.Allocator) Picker {
         return .{ .allocator = allocator };
+    }
+
+    pub fn setListNote(self: *Picker, note: ?ListNote) bool {
+        if (self.list_note) |*shown| {
+            if (note) |*wanted| if (shown.eql(wanted)) return false;
+        } else if (note == null) return false;
+        self.list_note = note;
+        return true;
+    }
+
+    pub fn shownListNote(self: *const Picker) ?*const ListNote {
+        const note = if (self.list_note) |*value| value else return null;
+        if (self.noteFor(note.provider) == null) return null;
+        return note;
     }
 
     pub fn deinit(self: *Picker) void {
@@ -826,6 +896,11 @@ pub const Picker = struct {
                 };
                 return .redraw;
             },
+            .retry => {
+                const note = self.shownListNote() orelse return .ignored;
+                if (!note.retryable()) return .ignored;
+                return .{ .retry_list = note.provider };
+            },
             .backspace => {
                 if (self.filter_len == 0) return .ignored;
                 self.filter_len -= 1;
@@ -834,9 +909,6 @@ pub const Picker = struct {
             },
             .escape => return self.back(),
             .char => |byte| {
-                // `q` closes only on an empty filter, so it stays typeable in a
-                // model name. Same rule the `?` help key already uses.
-                if (byte == 'q' and self.filter_len == 0) return .closed;
                 if (byte < 0x20 or byte == 0x7f) return .ignored;
                 if (self.filter_len == MAX_FILTER) return .ignored;
                 self.filter_buffer[self.filter_len] = byte;
@@ -1462,16 +1534,36 @@ test "a typed filter lists the models that hold it whole before the ones that on
     try testing.expectEqualStrings("glm-5.3", picker.focusedOffer().?.request_model_id);
 }
 
-test "q types into a non-empty filter and closes only when the filter is empty" {
+test "q is a filter letter like any other, the first one too (#599)" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
-    const offers = [_]OfferSummary{fixtureOffer("qwen", "default", "Qwen3", null, "qwen3", "openai_chat")};
+    const offers = [_]OfferSummary{
+        fixtureOffer("deepseek", "default", "DeepSeek V4 Pro", null, "deepseek-v4-pro", "openai_chat"),
+        fixtureOffer("qwen", "default", "Qwen3", null, "qwen3", "openai_chat"),
+        fixtureOffer("qwen", "default", "QwQ 32B", null, "qwq-32b", "openai_chat"),
+    };
     try loadFixture(&picker, &offers, null);
     picker.restart();
-    _ = picker.onKey(.{ .char = 'w' });
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .redraw);
-    try testing.expectEqualStrings("wq", picker.filter());
-    _ = picker.onKey(.escape);
+    try testing.expectEqualStrings("q", picker.filter());
+    try testing.expectEqual(Stage.list, picker.stage);
+    for ("wq") |byte| try testing.expect(picker.onKey(.{ .char = byte }) == .redraw);
+    try testing.expectEqualStrings("qwq", picker.filter());
+    try testing.expectEqualStrings("qwq-32b", picker.focusedOffer().?.request_model_id);
+    try testing.expect(picker.onKey(.escape) == .redraw);
+    try testing.expectEqualStrings("", picker.filter());
+    try testing.expect(picker.onKey(.escape) == .closed);
+}
+
+test "the setup stage, which takes no typing, still closes on q (#599)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{fixtureOffer("kimi", "default", "K3", null, "k3", "openai_chat")};
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    picker.enterSetup(.{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" });
+    try testing.expect(picker.onKey(.{ .char = 'a' }) == .ignored);
+    try testing.expectEqual(Stage.setup, picker.stage);
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .closed);
 }
 
@@ -1801,4 +1893,56 @@ test "a provider note keeps its name when what it was read from is freed" {
     @memset(&name, 'x');
     try testing.expectEqualStrings("DeepSeek", note.name());
     try testing.expectEqualStrings("key from .env", note.originText().?);
+}
+
+fn openRouterNote(state: ListNote.State) ListNote {
+    return ListNote.init(Slug.lit("openrouter"), "OpenRouter", state);
+}
+
+test "Ctrl+R asks for a list again only when it did not come, and not for a refused key (#572)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{fixtureOffer("openrouter", "auto", "Auto Router", "openrouter/auto", "openrouter/auto", "openai_chat")};
+    try loadFixture(&picker, &offers, null);
+    try picker.setReadiness(&.{true}, &.{ProviderNote.init(Slug.lit("openrouter"), "OpenRouter", .saved_key)});
+    picker.restart();
+    try testing.expect(picker.onKey(.retry) == .ignored);
+    try testing.expect(picker.setListNote(openRouterNote(.{ .downloading = 1024 })));
+    try testing.expect(picker.onKey(.retry) == .ignored);
+    try testing.expect(picker.setListNote(openRouterNote(.{ .failed = .refused })));
+    try testing.expect(picker.onKey(.retry) == .ignored);
+    for (":free") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expect(picker.setListNote(openRouterNote(.{ .failed = .connection })));
+    const outcome = picker.onKey(.retry);
+    try testing.expect(outcome == .retry_list);
+    try testing.expect(outcome.retry_list.eqlText("openrouter"));
+    try testing.expectEqualStrings(":free", picker.filter());
+    picker.enterSetup(.{ .provider = Slug.lit("openrouter"), .sign_in = true });
+    try testing.expect(picker.onKey(.retry) == .ignored);
+}
+
+test "a line about a list is said once, kept across snapshots, and only for a provider the picker lists (#572)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const auto = fixtureOffer("openrouter", "auto", "Auto Router", "openrouter/auto", "openrouter/auto", "openai_chat");
+    const flash = fixtureOffer("openrouter", "auto", "DeepSeek V4.1 Flash", "deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash", "openai_chat");
+    try loadFixture(&picker, &.{auto}, null);
+    const notes = [_]ProviderNote{ProviderNote.init(Slug.lit("openrouter"), "OpenRouter", .saved_key)};
+    try picker.setReadiness(&.{true}, &notes);
+    picker.restart();
+    for ("deep") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expect(picker.setListNote(openRouterNote(.{ .downloading = 0 })));
+    try testing.expect(!picker.setListNote(openRouterNote(.{ .downloading = 0 })));
+    try testing.expect(picker.setListNote(openRouterNote(.{ .downloading = 4096 })));
+    try testing.expect(picker.shownListNote() != null);
+    try loadFixture(&picker, &.{ auto, flash }, null);
+    try picker.setReadiness(&.{ true, true }, &notes);
+    try testing.expectEqualStrings("deep", picker.filter());
+    try testing.expectEqualStrings("DeepSeek V4.1 Flash", picker.focusedOffer().?.display_name);
+    try testing.expect(picker.shownListNote() != null);
+    try testing.expect(picker.setListNote(null));
+    try testing.expect(!picker.setListNote(null));
+    try testing.expect(picker.setListNote(openRouterNote(.{ .failed = .connection })));
+    try picker.setReadiness(&.{ false, false }, &.{});
+    try testing.expect(picker.shownListNote() == null);
 }

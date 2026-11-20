@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "teamwork": {
+      "type": "stdio",
+      "command": "/absolute/path/to/metacodes",
+      "args": [
+        "--preview",
+        "teamwork",
+        "mcp",
+        "--request-file",
+        "/absolute/path/to/user-approved-request.md",
+        "--approve",
+        "--budget-usd",
+        "5"
+      ]
+    }
+  }
+}
