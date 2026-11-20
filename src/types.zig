@@ -18,6 +18,21 @@ pub const PreviewSetting = enum {
     }
 };
 
+/// Only configuration may inherit preview opt-in; execution receives a bool.
+pub const PreviewSetting = enum {
+    inherit,
+    disabled,
+    enabled,
+
+    pub fn resolve(self: PreviewSetting, persisted: ?bool) PreviewSetting {
+        return if (self != .inherit) self else if (persisted orelse false) .enabled else .disabled;
+    }
+
+    pub fn isEnabled(self: PreviewSetting) bool {
+        return self == .enabled;
+    }
+};
+
 /// 通用配置
 pub const Config = struct {
     /// 第一个无法识别的命令行参数(fail-closed:main 检查后报错退出)。
