@@ -115,6 +115,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/retry", .desc = "Resend the last message" },
     .{ .name = "/review", .desc = "Review the current diff" },
     .{ .name = "/skills", .desc = "List available skills" },
+    .{ .name = "/teamwork", .desc = "Interview, approve and run a teamwork task (preview)", .hint = "[skip-interview] <request> | status", .takes_args = true },
     .{ .name = "/terminal-setup", .desc = "Make Shift+Enter insert a newline in this terminal" },
     .{ .name = "/theme", .desc = "Show or switch the color theme" },
     .{ .name = "/tools", .desc = "List available tools" },

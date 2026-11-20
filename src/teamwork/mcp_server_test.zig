@@ -89,7 +89,7 @@ const Fixture = struct {
 
     fn start(self: *Fixture, seats: *Seats, auditor: audit.CompletionAuditor) !*runtime.Run {
         const cfg = (try config.validate(try config.parse(self.arena.allocator(), "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"" ++ check ++ "\"}", null), null)).enabled;
-        return runtime.Run.start(gpa, .{ .preview = true, .seats = .{ .custom = .{ .ctx = seats, .driverFn = Seats.driver } }, .auditor = auditor }, .{ .text = request }, cfg, .{
+        return runtime.Run.start(gpa, .{ .preview = true, .seats = .{ .custom = .{ .ctx = seats, .driverFn = Seats.driver } }, .auditor = auditor }, .{ .text = request, .source = .request_file }, cfg, .{
             .workspace = self.repo,
             .state_root = self.state,
             .run_id = try types.RunId.parse("run-mcp-test"),

@@ -5887,6 +5887,8 @@ test {
     _ = &@import("teamwork/swe_loop.zig");
     _ = &@import("teamwork/verifier_auditor.zig");
     _ = &@import("teamwork/runtime_test.zig");
+    _ = &@import("teamwork/interview.zig");
+    _ = &@import("repl/teamwork.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");
     _ = &@import("core/memory/user_context.zig");
