@@ -18,6 +18,25 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 ```
 退出码:0 全过 / 1 有失败(打印期望 vs 实际屏幕 diff)/ 2 环境错误。
 
+**本机并行**(#588):套件几乎全部时间在等屏幕静默,不是在算;`--jobs N` 在本机同时跑 N 片,
+按完成顺序打印每条结果,最后合并成一份汇总(退出码同上):
+
+```bash
+TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --jobs 3
+```
+
+- 分片与 CI 相同(`select_shard`,见下);每片是一个子进程,完整输出写在临时目录 `tty-jobs-*`
+  里,开头打印路径,有失败时保留。可与 `-k` 同用,不能与 `--shard` 同用。
+- 占用本机固定资源的用例(固定端口、固定路径)用 `tty_driver.runs_alone("占的是什么")` 标记,
+  `--jobs` 把它们留到并行阶段之后单独逐个跑;现有的是 `test_login` 里断言 OAuth 回调端口
+  1455/1457 的两条。用例的临时目录(`case_tmpdir`)、HOME(`run()` 的临时 HOME)和 mock server
+  端口(绑 0)本来就各用各的,不用标。新用例要用固定端口或固定路径,就标上它。
+- 每条用例有时限:`--jobs` 下默认 300s(`--case-timeout S` 可改;串行默认不限,与以前一样)。
+  POSIX 上到点打断该用例、杀掉它起的程序、判失败,接着跑下一条;打断不了的,父进程再等 60s
+  杀掉整片,它跑着的和没跑的用例都判失败。一个挂死的用例(#569)拖不住整个套件。
+- 断言 pty 时序的用例在多片同时跑时也要稳;某条只在 `--jobs` 下失败,先单独重跑它
+  (`-k`)确认,再当作时序脆弱的用例修。
+
 `TTY_SKIP_MODEL=1` 是离线跑法:打真实模型的用例(`test_e2e_*`、`test_generating`、
 `test_slash_menu` 的 T17/T19)经 `e2e_helpers.require_model()` 报 skip,不计为通过。
 
@@ -66,7 +85,8 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 - `cases/*.py` —— T01-T13 用例(每个 `def test_*(bin_path)`)。用例自建的临时目录(工作目录、
   指定的 HOME)用 `tty_driver.case_tmpdir(prefix)`,runner 在每个用例结束后删,失败也删;
   缺依赖(replay_server、mock_mcp_server)时 `raise SkipTest`,不要 `return`。
-- `run_tty_tests.py` —— 收集 cases、跑、屏幕 diff、汇总。
+- `run_tty_tests.py` —— 收集 cases、跑、屏幕 diff、汇总;`--shard K/N` 跑一片,`--jobs N` 在本机
+  并行跑 N 片并合并结果(`cases/test_runner_shards.py` 钉死分片与合并:每条用例恰好跑一次、计一次)。
 
 ## 用例(对齐 Claude Code 布局/交互)
 

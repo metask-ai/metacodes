@@ -17,7 +17,9 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.eval.harbor.viewer import data, server
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.viewer import server
 
 
 def _write(path: Path, value) -> None:
@@ -184,7 +186,7 @@ class ServerTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         job = _job(self.root, "pilot", "m", planned=1)
         _trial(job, "task__aaa", reward=1.0, steps=[{"step_id": 1, "source": "agent", "message": "hi"}])
-        self.server = server.make_server(data.Library([self.root]), "127.0.0.1", 0)
+        self.server = server.make_server(Workbench(data.Library([self.root])), "127.0.0.1", 0)
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(self.server.server_close)
@@ -201,7 +203,7 @@ class ServerTest(unittest.TestCase):
 
     def test_public_bind_serves_http_without_reverse_dns(self):
         with patch('socket.getfqdn', side_effect=AssertionError('startup must not depend on reverse DNS')):
-            http = server.make_server(data.Library([self.root]), '0.0.0.0', 0)
+            http = server.make_server(Workbench(data.Library([self.root])), '0.0.0.0', 0)
             self.addCleanup(http.server_close)
             self.assertEqual(http.server_name, '0.0.0.0')
             threading.Thread(target=http.serve_forever, daemon=True).start()
@@ -209,13 +211,20 @@ class ServerTest(unittest.TestCase):
             with urllib.request.urlopen(f'http://127.0.0.1:{http.server_port}/api/jobs', timeout=2) as response:
                 self.assertEqual(response.status, 200)
 
-    def test_page_and_assets_with_a_strict_policy(self):
-        for path, mime in (("/", "text/html"), ("/viewer.js", "text/javascript"), ("/viewer.css", "text/css")):
+    def test_page_and_assets_allow_annotation_overlays(self):
+        for path, mime in (
+            ("/", "text/html"),
+            ("/index.html", "text/html"),
+            ("/viewer.js", "text/javascript"),
+            ("/viewer.css", "text/css"),
+        ):
             with self.subTest(path=path):
                 status, headers, body = self.get(path)
                 self.assertEqual(status, 200)
                 self.assertTrue(headers["Content-Type"].startswith(mime))
-                self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+                self.assertNotIn("Content-Security-Policy", headers)
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(headers["X-Frame-Options"], "DENY")
                 self.assertTrue(body)
 
     def test_api(self):

@@ -398,7 +398,7 @@ test "kimi-code: the key pages are the Console, checked on each host's model lis
     try std.testing.expectEqual(profile.CredentialKind.kimi_code_api_key, setup.kind);
     try std.testing.expectEqual(@as(usize, 2), setup.pages.len);
     for (setup.pages) |page| {
-        try std.testing.expectEqualStrings(CONSOLE_URL, page.url);
+        try std.testing.expectEqualStrings(CONSOLE_URL, page.url.?);
         try std.testing.expect(std.mem.endsWith(u8, page.check_url.?, CODING_FRAGMENT ++ "/models"));
         try std.testing.expect(std.mem.indexOf(u8, page.check_url.?, "moonshot") == null);
     }

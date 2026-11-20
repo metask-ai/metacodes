@@ -807,6 +807,319 @@ pub const MockServer = struct {
     }
 };
 
+/// A server behind a proxy that loses the end of an answer when the server
+/// closes the connection right after it (#573).
+///
+/// A request whose head asks for `connection: close` is answered the way such
+/// a server and proxy answered it: `body` goes out up to `cut_at` bytes,
+/// inside a chunk (or under a `content-length`) that announced all of it, and
+/// the connection is closed. Any other request gets all of `body`, and the
+/// connection then stays open, as a server that keeps connections alive leaves
+/// it, until the client closes it or `HOLD_MS` passes. A request that arrives
+/// on a connection that already answered one is answered too and counted as
+/// reuse. One connection is served at a time.
+pub const LossyProxy = struct {
+    pub const Framing = enum {
+        /// `transfer-encoding: chunked`, the whole body in one chunk.
+        chunked,
+        content_length,
+        /// No length and no body (a 204).
+        none,
+    };
+
+    pub const Options = struct {
+        status_line: []const u8 = "HTTP/1.1 200 OK",
+        content_type: []const u8 = "text/event-stream",
+        framing: Framing = .chunked,
+        /// Bytes of `body` a cut answer carries; null = no answer is cut.
+        cut_at: ?usize = null,
+        /// Cut every answer, whatever its request asked for: a stream cut
+        /// short is incomplete however the connection was meant to end.
+        cut_always: bool = false,
+    };
+
+    pub const MAX_REQUESTS: usize = 16;
+    /// How long a connection is held open after an answer sent whole.
+    pub const HOLD_MS: i64 = 5_000;
+
+    listen_sock: net.Socket,
+    port: u16,
+    thread: std.Thread,
+    body: []const u8,
+    options: Options,
+    closing: std.atomic.Value(bool) = .init(false),
+    mutex: psync.Mutex = .{},
+    requests: [MAX_REQUESTS][]u8 = undefined,
+    request_count: usize = 0,
+    accepted: usize = 0,
+    reused: usize = 0,
+    cut: usize = 0,
+    /// For each answer sent whole and held: ms from its last byte to the
+    /// client's close, or null when the hold ran out (or `stop`) first.
+    close_ms: [MAX_REQUESTS]?i64 = undefined,
+    close_count: usize = 0,
+
+    pub fn start(body: []const u8, options: Options) !*LossyProxy {
+        if (options.cut_at) |at| std.debug.assert(at < body.len);
+        const listener = try net.listenLoopback(0, 16);
+        errdefer net.closeSocket(listener.sock);
+        const self = try std.heap.page_allocator.create(LossyProxy);
+        errdefer std.heap.page_allocator.destroy(self);
+        self.* = .{
+            .listen_sock = listener.sock,
+            .port = listener.port,
+            .thread = undefined,
+            .body = body,
+            .options = options,
+        };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return self;
+    }
+
+    /// Stops the server (as `MockServer.stop`: the flag, a self-connect to
+    /// wake `accept`, then join) and frees it.
+    pub fn stop(self: *LossyProxy) void {
+        self.closing.store(true, .release);
+        var wake_try: u8 = 0;
+        while (wake_try < 3) : (wake_try += 1) {
+            if (net.connectLoopback(self.port)) |wake| {
+                net.closeSocket(wake);
+                break;
+            } else |_| {}
+        }
+        net.closeSocket(self.listen_sock);
+        self.thread.join();
+        for (self.requests[0..self.request_count]) |raw| std.heap.page_allocator.free(raw);
+        std.heap.page_allocator.destroy(self);
+    }
+
+    /// "http://127.0.0.1:<port>/v1/messages" (allocator-owned), as `MockServer.urlOwned`.
+    pub fn urlOwned(self: *const LossyProxy, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/messages", .{self.port});
+    }
+
+    pub fn requestCount(self: *LossyProxy) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.request_count;
+    }
+
+    /// A request as received (head and body), borrowed until `stop`.
+    pub fn requestAt(self: *LossyProxy, index: usize) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.request_count) return null;
+        return self.requests[index];
+    }
+
+    /// TCP connections accepted.
+    pub fn acceptedCount(self: *LossyProxy) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.accepted;
+    }
+
+    /// Requests that arrived on a connection that had answered one already.
+    pub fn reusedCount(self: *LossyProxy) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.reused;
+    }
+
+    /// Answers sent cut.
+    pub fn cutCount(self: *LossyProxy) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.cut;
+    }
+
+    /// The close time recorded for the `index`th held answer (see `close_ms`):
+    /// null when none is recorded yet, or the hold ran out first.
+    pub fn closeLatencyMs(self: *LossyProxy, index: usize) ?i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.close_count) return null;
+        return self.close_ms[index];
+    }
+
+    /// Waits until `n` held answers have an outcome (the client closed, or the
+    /// hold ran out), at most `timeout_ms`. False on timeout.
+    pub fn waitForCloses(self: *LossyProxy, n: usize, timeout_ms: i64) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const begun = std.Io.Timestamp.now(io, .awake);
+        while (true) {
+            self.mutex.lock();
+            const have = self.close_count;
+            self.mutex.unlock();
+            if (have >= n) return true;
+            if (begun.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() >= timeout_ms) return false;
+            psync.sleepMs(5);
+        }
+    }
+
+    /// The `connection` header lines of a request head; with `option`, only
+    /// those that name it (`close`, `keep-alive`), whatever its case.
+    pub fn connectionHeaders(raw: []const u8, option: ?[]const u8) usize {
+        const head_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse raw.len;
+        var lines = std.mem.splitSequence(u8, raw[0..head_end], "\r\n");
+        _ = lines.next(); // request line
+        var count: usize = 0;
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "connection")) continue;
+            const wanted = option orelse {
+                count += 1;
+                continue;
+            };
+            var named = std.mem.splitScalar(u8, line[colon + 1 ..], ',');
+            while (named.next()) |name| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t"), wanted)) {
+                    count += 1;
+                    break;
+                }
+            }
+        }
+        return count;
+    }
+
+    fn serve(self: *LossyProxy) void {
+        const buf = std.heap.page_allocator.alloc(u8, MockServer.MAX_REQUEST_BYTES) catch return;
+        defer std.heap.page_allocator.free(buf);
+        while (true) {
+            const conn = net.acceptConn(self.listen_sock) orelse return;
+            if (self.closing.load(.acquire)) {
+                net.closeSocket(conn);
+                return;
+            }
+            self.mutex.lock();
+            self.accepted += 1;
+            self.mutex.unlock();
+            self.serveConnection(conn, buf);
+            net.closeSocket(conn);
+        }
+    }
+
+    fn serveConnection(self: *LossyProxy, conn: net.Socket, buf: []u8) void {
+        var have: usize = 0;
+        var answered: usize = 0;
+        while (true) {
+            const total = readRequestFrom(conn, buf, have);
+            if (total == 0) return;
+            const raw = buf[0..total];
+            self.capture(raw, answered > 0);
+            const asks_close = connectionHeaders(raw, "close") > 0;
+            if (self.options.cut_at) |cut_at| if (asks_close or self.options.cut_always) {
+                self.mutex.lock();
+                self.cut += 1;
+                self.mutex.unlock();
+                // The proxy passed the server's close on before the last bytes.
+                _ = self.sendAnswer(conn, cut_at, true, true);
+                return;
+            };
+            if (!self.sendAnswer(conn, self.body.len, false, asks_close)) return;
+            answered += 1;
+            if (asks_close) return;
+            switch (self.hold(conn, buf)) {
+                .closed => return,
+                .next_request => |n| have = n,
+            }
+        }
+    }
+
+    const Hold = union(enum) { closed, next_request: usize };
+
+    /// Wait for the client's close, or its next request on this connection.
+    fn hold(self: *LossyProxy, conn: net.Socket, buf: []u8) Hold {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const sent = std.Io.Timestamp.now(io, .awake);
+        while (!self.closing.load(.acquire)) {
+            const waited = sent.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+            if (waited >= HOLD_MS) break;
+            if (!net.pollReadable(conn, 20)) continue;
+            const n = net.recv(conn, buf);
+            if (n > 0) return .{ .next_request = @intCast(n) };
+            // 0: the client closed; < 0: it reset the connection. Either way it
+            // let go of the connection, which is what is measured.
+            self.noteClose(sent.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds());
+            return .closed;
+        }
+        self.noteClose(null);
+        return .closed;
+    }
+
+    fn noteClose(self: *LossyProxy, ms: ?i64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.close_count == MAX_REQUESTS) return;
+        self.close_ms[self.close_count] = ms;
+        self.close_count += 1;
+    }
+
+    fn capture(self: *LossyProxy, raw: []const u8, on_used_connection: bool) void {
+        const owned = std.heap.page_allocator.dupe(u8, raw) catch return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (on_used_connection) self.reused += 1;
+        if (self.request_count == MAX_REQUESTS) {
+            std.heap.page_allocator.free(owned);
+            return;
+        }
+        self.requests[self.request_count] = owned;
+        self.request_count += 1;
+    }
+
+    /// The head, then `sent` bytes of the body inside framing that announces
+    /// all of it; an answer not `cut` ends with the terminating chunk. False
+    /// when the client hung up first.
+    fn sendAnswer(self: *LossyProxy, conn: net.Socket, sent: usize, cut: bool, closes: bool) bool {
+        const connection = if (closes) "connection: close\r\n" else "";
+        var head_buf: [512]u8 = undefined;
+        const head = switch (self.options.framing) {
+            .chunked => std.fmt.bufPrint(&head_buf, "{s}\r\ncontent-type: {s}\r\ntransfer-encoding: chunked\r\n{s}\r\n", .{ self.options.status_line, self.options.content_type, connection }),
+            .content_length => std.fmt.bufPrint(&head_buf, "{s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\n{s}\r\n", .{ self.options.status_line, self.options.content_type, self.body.len, connection }),
+            .none => std.fmt.bufPrint(&head_buf, "{s}\r\n{s}\r\n", .{ self.options.status_line, connection }),
+        } catch return false;
+        if (!trySendAll(conn, head)) return false;
+        switch (self.options.framing) {
+            .chunked => {
+                if (self.body.len > 0) {
+                    var size_buf: [32]u8 = undefined;
+                    const size = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{self.body.len}) catch return false;
+                    if (!trySendAll(conn, size)) return false;
+                    if (!trySendAll(conn, self.body[0..sent])) return false;
+                    if (cut) return true;
+                    if (!trySendAll(conn, "\r\n")) return false;
+                }
+                return trySendAll(conn, "0\r\n\r\n");
+            },
+            .content_length => return trySendAll(conn, self.body[0..sent]),
+            .none => return true,
+        }
+    }
+
+    /// Reads one request (head, then a `content-length` body) into `buf`,
+    /// whose first `have` bytes were read already. 0 = the client closed
+    /// before a whole head.
+    fn readRequestFrom(conn: net.Socket, buf: []u8, have: usize) usize {
+        var total = have;
+        const head_end = while (true) {
+            if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |i| break i + 4;
+            if (total == buf.len) return 0;
+            const n = net.recv(conn, buf[total..]);
+            if (n <= 0) return 0;
+            total += @intCast(n);
+        };
+        const length = MockServer.parseContentLength(buf[0 .. head_end - 4]);
+        const end = @min(buf.len, head_end + length);
+        while (total < end) {
+            const n = net.recv(conn, buf[total..end]);
+            if (n <= 0) break;
+            total += @intCast(n);
+        }
+        return total;
+    }
+};
+
 /// 发完整 buffer(send 可能部分写,循环补齐)。失败(对端断开)静默返回——mock 语境
 /// 下客户端提前断开是合法场景;只有逐事件滴流的循环要知道(trySendAll),好不再睡完余下的事件。
 fn sendAll(conn: net.Socket, bytes: []const u8) void {

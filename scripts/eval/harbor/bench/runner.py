@@ -19,8 +19,8 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor.command import check_bundle
-from scripts.eval.harbor.viewer import data
-from scripts.eval.harbor.viewer.account import Account
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.account import Account
 
 DATASET = "terminal-bench/terminal-bench-2-1"
 SAMPLE_TASKS = ["kv-store-grpc", "pypi-server", "fix-git", "git-multibranch",
@@ -199,7 +199,7 @@ class RunManager:
             atomic_json(spec_path, spec)
             try:
                 with (self.records / (name + ".log")).open("wb") as log:
-                    process = subprocess.Popen([sys.executable, "-m", "scripts.eval.harbor.viewer.worker", str(spec_path)],
+                    process = subprocess.Popen([sys.executable, "-m", "scripts.eval.harbor.bench.worker", str(spec_path)],
                                                cwd=str(Path(__file__).resolve().parents[4]), env=runtime_env(),
                                                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
                     threading.Thread(target=process.wait, daemon=True).start()

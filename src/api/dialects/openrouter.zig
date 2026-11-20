@@ -6,14 +6,24 @@
 //!
 //! ## 接入点
 //!
-//! - 没有静态 profile:由 `provider_catalogs` 导入目录生成(`src/provider/openrouter.zig`
-//!   解析 `GET /models` 与 `GET /models/{id}/endpoints`,`src/provider/host.zig` 的
-//!   `ingestOpenRouter` 注册)。每个 endpoint 是一个渠道,渠道的路由声明本方言(`.openrouter`)。
-//! - 端点:`https://openrouter.ai/api/v1`。环境变量:`OPENROUTER_API_KEY`。
+//! - 内置 profile `openrouter`(`src/provider/profiles/openrouter.zig`):一个渠道 `auto`,
+//!   请求不带 `provider` 对象,由 OpenRouter 的默认路由挑上游(价格、速度、可用性,失败自动换)。
+//!   模型来自账户自己的列表 `GET /api/v1/models/user`(`src/api/openrouter_catalog.zig`,
+//!   只留走聊天接口且支持工具的),由 `Host.ingestOpenRouterBuiltin` 导入。
+//! - 凭据:浏览器登录换来的 key(`ProviderProfile.key_grant`,`src/api/openrouter_login.zig`,
+//!   官方 PKCE)、粘贴的 key,或 `OPENROUTER_API_KEY`;都按普通 API key 存在
+//!   `keys/openrouter.json`。
+//! - `provider_catalogs` 导入的目录(`ingestOpenRouter`,每个 endpoint 一个渠道,按 tag 命名)
+//!   仍可用,但不能用内置的 id `openrouter`。
+//! - 端点:`https://openrouter.ai/api/v1`;`METACODES_OPENROUTER_URL` 把所有地址整体换到
+//!   https 或本机明文地址(开发、测试)。
 //!
 //! ## 协议
 //!
 //! - `openai_chat`。鉴权:Bearer。
+//! - 署名(`ATTRIBUTION_HEADERS`,本方言的每个请求都带):`HTTP-Referer` 写项目主页,
+//!   `X-OpenRouter-Title` 写 `metacodes`,`X-OpenRouter-Categories` 写 `cli-agent`。
+//!   不发 `X-OpenRouter-App-Visibility`:应用在 OpenRouter 的排行里公开。
 //!
 //! ## 思考与推理
 //!
@@ -41,6 +51,10 @@
 //! - https://openrouter.ai/docs/use-cases/reasoning-tokens(2026-11 核对:reasoning
 //!   对象、effort 取值、流式字段、回传方式)
 //! - https://openrouter.ai/docs/api-reference/list-endpoints-for-a-model(目录形态)
+//! - https://openrouter.ai/docs/app-attribution(2026-11-18 核对:`HTTP-Referer` 必需、
+//!   `X-OpenRouter-Title`(`X-Title` 兼容)、`X-OpenRouter-Categories`、新建应用时的可见性)
+//! - https://openrouter.ai/docs/guides/overview/auth/oauth(2026-11-18 核对:PKCE、任意端口的
+//!   本机回调、无回调方式、`POST /api/v1/auth/keys`)
 
 const std = @import("std");
 const types = @import("../../types.zig");
@@ -56,6 +70,17 @@ const ProviderKind = model_adapter.ProviderKind;
 const ReasoningEffort = types.ReasoningEffort;
 
 pub const vendor: Vendor = .openrouter;
+
+/// Who is calling, said as it is (https://openrouter.ai/docs/app-attribution,
+/// 2026-11-18): the project's address identifies the app, the title names
+/// it, the category is OpenRouter's for a terminal coding agent. Every
+/// request on a route that declares this dialect carries them; none carries
+/// anything about the user.
+pub const ATTRIBUTION_HEADERS = [_]std.http.Header{
+    .{ .name = "HTTP-Referer", .value = "https://github.com/metask-ai/metacodes" },
+    .{ .name = "X-OpenRouter-Title", .value = "metacodes" },
+    .{ .name = "X-OpenRouter-Categories", .value = "cli-agent" },
+};
 
 /// OpenRouter 只能由路由声明,不能从模型名推断(`vendor/model` 形式的名字也可能来自
 /// 别的聚合网关)。

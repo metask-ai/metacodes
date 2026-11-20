@@ -55,6 +55,7 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const openrouter_dialect = @import("dialects/openrouter.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
@@ -387,7 +388,14 @@ pub const OpenAIClient = struct {
             const callback = self.refresh_fn orelse return error.Unauthorized;
             const ctx = self.refresh_ctx orelse return error.Unauthorized;
             const stale = self.credential.lendable() orelse return error.Unauthorized;
+            // As in `Client.refreshExpiredToken`: a token refreshed while the
+            // route moved is for the route the request was sent on, not this one.
+            const sent_to = self.base_url orelse "";
             const token = callback(ctx, stale) catch return error.Unauthorized;
+            if (self.refresh_fn == null or !std.mem.eql(u8, sent_to, self.base_url orelse "")) {
+                secureFree(self.allocator, token);
+                return error.Unauthorized;
+            }
             self.replaceRefreshToken(token) catch {
                 secureFree(self.allocator, token);
                 return error.Unauthorized;
@@ -405,12 +413,17 @@ pub const OpenAIClient = struct {
     /// ChatGPT workspace.
     const MAX_PROFILE_HEADERS = 4;
 
-    /// The request's extra headers: content type and credential, then what
-    /// the route's request profile adds. Slices borrow `auth`, the profile's
-    /// static data and `scratch`.
+    /// Content type, credential, OpenRouter's app attribution and what a
+    /// request profile adds.
+    const REQUEST_HEADERS_CAPACITY = 2 + openrouter_dialect.ATTRIBUTION_HEADERS.len + MAX_PROFILE_HEADERS;
+
+    /// The request's extra headers: content type and credential; on a route
+    /// in OpenRouter's dialect, who is calling (its app attribution, which no
+    /// other route carries); then what the route's request profile adds.
+    /// Slices borrow `auth`, the profile's static data and `scratch`.
     fn requestHeaders(
         self: *const OpenAIClient,
-        buffer: *[2 + MAX_PROFILE_HEADERS]http.Header,
+        buffer: *[REQUEST_HEADERS_CAPACITY]http.Header,
         auth: auth_header_mod.Header,
         scratch: std.mem.Allocator,
         rid: log.RequestId,
@@ -418,6 +431,11 @@ pub const OpenAIClient = struct {
         buffer[0] = .{ .name = "content-type", .value = "application/json" };
         buffer[1] = .{ .name = auth.name, .value = auth.value };
         var len: usize = 2;
+        if (self.declared_dialect.vendorFor(self.model, self.model) == .openrouter) {
+            const attribution = openrouter_dialect.ATTRIBUTION_HEADERS;
+            @memcpy(buffer[len..][0..attribution.len], &attribution);
+            len += attribution.len;
+        }
         const profile = self.declared_dialect.request_profile orelse return buffer[0..len];
         for (profile.headers()) |header| {
             if (len == buffer.len) break;
@@ -460,8 +478,9 @@ pub const OpenAIClient = struct {
         // What the route's endpoint requires besides (`request_profile.zig`):
         // fixed headers, and the ChatGPT workspace the token is for, read
         // from the very token this request carries so a refresh can never
-        // pair one account's token with another's id.
-        var headers_buffer: [2 + MAX_PROFILE_HEADERS]http.Header = undefined;
+        // pair one account's token with another's id; on a route in
+        // OpenRouter's dialect, its app attribution.
+        var headers_buffer: [REQUEST_HEADERS_CAPACITY]http.Header = undefined;
         var account_scratch: [8 * 1024]u8 = undefined;
         var account_fba = std.heap.FixedBufferAllocator.init(&account_scratch);
         const extra_headers = self.requestHeaders(&headers_buffer, auth, account_fba.allocator(), rid);
@@ -480,6 +499,9 @@ pub const OpenAIClient = struct {
             // req_ptr.* 未初始化, errdefer destroy 即可
             return client_mod.requestSetupFailure("openai", rid, err);
         };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
         var registered = false;
         errdefer {
             if (registered) self.abort_registry.unregister(req_ptr);
@@ -641,6 +663,9 @@ const OpenAIStream = struct {
     /// 下一次 next() 经 takeQueued 紧接着吐出。单槽即可:每个 chunk 至多一个 usage
     /// 对象,且槽在读下一行之前必被 takeQueued 清空。
     pending_usage: ?UsageDelta = null,
+    /// 本响应已报告的 usage。chat 的 usage 对象是整条响应的累计值,部分兼容端在多个
+    /// chunk 上重复它;Responses 的终止事件也是累计值。经 cursor 只发新增部分。
+    usage_reports: api_stream.UsageReportCursor = .{},
     /// chat 协议:这条路由的方言怎么读 list 型 `delta.content`(`ModelProfile.content_chunks`,
     /// 建流时从方言 profile 取,没有默认值)。`.none` 时 list 整个忽略,与引入前相同。
     content_chunks: dialect_mod.ContentChunks,
@@ -861,7 +886,7 @@ const OpenAIStream = struct {
                     client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
                 }
-                log.warnId("openai", self.id, "stream read failed: {s}", .{@errorName(err)});
+                log.warnId("openai", self.id, "stream read failed: {s} ({f})", .{ @errorName(err), client_mod.ReadFailure.of(self.request, &self.response.head) });
                 return api_stream.midStreamReadError(err);
             };
             const line = line_opt orelse {
@@ -920,7 +945,8 @@ const OpenAIStream = struct {
         // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
         // chunk 都带 `"usage":null`——旧实现按 substring `"usage"` 判存在并立即 return,
         // 把这些 chunk 的文本/推理/tool_call 增量/finish_reason 全部吞掉(issue #258)。
-        const usage: ?UsageDelta = if (chatUsageObject(data)) |obj| chatUsageDelta(obj) else null;
+        const report: ?api_stream.UsageReport = if (chatUsageObject(data)) |obj| chatUsageReport(obj) else null;
+        const usage: ?UsageDelta = if (report) |r| self.usage_reports.increment(r) else null;
         // 内容侧照常处理。同 chunk 既有内容事件又有 usage 对象时,两个都发且顺序固定:
         // 先内容、后 usage(存 pending_usage,下一次 next() 经 takeQueued 吐出)。
         // tool_call 增量本身不产事件(终止时才 flush),故"tool_calls + usage 同 chunk"时
@@ -1144,7 +1170,7 @@ const OpenAIStream = struct {
         self.buildFlush();
         self.flushed = true;
         self.pending_done = true;
-        if (responsesUsageObject(data)) |usage_obj| return StreamEvent{ .usage = responsesUsageDelta(usage_obj) };
+        if (responsesUsageObject(data)) |usage_obj| return StreamEvent{ .usage = self.usage_reports.increment(responsesUsageReport(usage_obj)) };
         // 无 usage 对象(缺失或 `"usage":null`):不伪造全零 usage——那会把"未计量"
         // 报成"已计量为 0"(cache_break.ResponseUsage.reported)。直接吐队首事件。
         return self.takeQueued();
@@ -1499,9 +1525,9 @@ fn chatUsageObject(data: []const u8) ?[]const u8 {
     return null;
 }
 
-/// OpenAI chat usage 对象 → 中立 UsageDelta。数值只从 usage 对象本身读,不扫整个 chunk。
-/// 语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens
-/// (prompt_tokens_details 下,经 cache.parseOpenAICacheUsage),中立 UsageDelta 约定
+/// OpenAI chat usage 对象 → 中立 UsageReport(整条响应的累计值)。数值只从 usage 对象本身读,
+/// 不扫整个 chunk。语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens
+/// (prompt_tokens_details 下,经 cache.parseOpenAICacheUsage),中立 usage 约定
 /// input_tokens 不含 cache。消费方(usage 锚点/成本累计)按 in+cache_r+cache_w 求和——
 /// 不减会把缓存双计。`"prompt_tokens":` 含闭引号+冒号,不会命中 `prompt_tokens_details`。
 /// Read a required non-negative integer from a usage object without collapsing
@@ -1509,7 +1535,7 @@ fn chatUsageObject(data: []const u8) ?[]const u8 {
 /// historical absent-is-zero behavior; prompt/completion counters are the
 /// contract's required pair, so an unreadable one makes the whole sample
 /// unavailable and lets the caller preserve `metering:unknown`.
-fn chatUsageDelta(usage_obj: []const u8) ?UsageDelta {
+fn chatUsageReport(usage_obj: []const u8) ?api_stream.UsageReport {
     const prompt_tokens = usageIntField(usage_obj, "prompt_tokens") orelse return null;
     const completion_tokens = usageIntField(usage_obj, "completion_tokens") orelse return null;
     const cu = cache.parseOpenAICacheUsage(usage_obj);
@@ -1538,10 +1564,10 @@ fn responsesUsageObject(data: []const u8) ?[]const u8 {
     return util_json.topLevelObjectField(response, "usage");
 }
 
-/// Responses usage 对象 → 中立 UsageDelta(归一同 chatUsageDelta:input_tokens **包含**
+/// Responses usage 对象 → 中立 UsageReport(归一同 chatUsageReport:input_tokens **包含**
 /// input_tokens_details.cached_tokens,减掉防双计)。`"input_tokens":` 含闭引号+冒号,
 /// 不会命中 `"input_tokens_details"`。
-fn responsesUsageDelta(usage_obj: []const u8) UsageDelta {
+fn responsesUsageReport(usage_obj: []const u8) api_stream.UsageReport {
     const cached = util_json.extractIntField(usage_obj, "cached_tokens");
     return .{
         .input_tokens = util_json.extractIntField(usage_obj, "input_tokens") -| cached,
@@ -3123,6 +3149,28 @@ test "issue #258: choices[i].usage(兼容端位置)按 object 才计,null 不计
 }
 
 // Responses:usage 只在 `response.usage` 是 object 时发,数值只从该对象读。
+test "chat usage repeated on every chunk is a running total: usage events carry increments" {
+    // Some OpenAI-compatible servers attach the response's usage-so-far to every
+    // chunk. Each is a total, so adding them would count the prompt three times.
+    const a = std.testing.allocator;
+    var got = try replaySse(
+        a,
+        "gpt-4o",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualStrings("Hello", got.text.items);
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{ .input_tokens = 20, .output_tokens = 1, .cache_read_input_tokens = 80 },
+        .{ .output_tokens = 1 },
+        .{ .output_tokens = 1 },
+    }, got.usages.items);
+}
+
 test "issue #258 Responses: usage 从 response.usage 读——回显的 tools schema 里同名属性不干扰" {
     const a = std.testing.allocator;
     var got = try replaySse(

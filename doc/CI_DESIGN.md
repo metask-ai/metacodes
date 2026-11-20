@@ -5,8 +5,10 @@ offline TTY suites. This document covers how a required job skips work (§1),
 which of that work a change has to pay for (§2), how approved PRs
 land after validation against current main (§3), and how one
 platform's work is spread over several runners so that a run takes about as
-long as its longest leg rather than the sum of a platform's steps (§4), and
-which run writes the caches the others read (§5).
+long as its longest leg rather than the sum of a platform's steps (§4),
+which run writes the caches the others read (§5), and where the macOS and
+Windows gates run: a self-hosted VM pool first, the hosted legs as the
+fallback (§6).
 
 ## 1. Required checks and how a job skips work
 
@@ -151,7 +153,8 @@ ordering checks; it is not the normal delivery path.
 ### Reusable full-CI evidence
 
 `Full PR evidence` waits for every CI suite, including SDK and Windows TTY,
-to succeed. Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
+to succeed; macOS and Windows through `Gates (macOS)` and `Gates (Windows)`,
+wherever the gates ran (§6). Only full-scope, non-fast-path PR runs upload `pr-ci-evidence`:
 the tested merge commit/tree, head/base, repository, run ID and attempt.
 The release fast path finds a merged PR for the exact base commit, requires
 a successful run of `ci.yml`, and compares downloaded evidence with the base's
@@ -195,7 +198,9 @@ over its platform's share:
 |---|---|---|
 | `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
 | `gates-macos` | `units-checks`, `product`, `release` | `units` and `checks` on one; one flag each on the others |
+| `gates-macos-vm` | `all`, on a pool VM (§6) | Every flag of the `gates-macos` legs in one job |
 | `windows-gates` | `units`, `integration`, `product`, `release` | One flag each |
+| `windows-gates-vm` | `all`, on a pool VM (§6) | Every flag of the `windows-gates` legs in one job |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
 | `tty-windows` | eight shards | Every eighth case, under ConPTY |
 
@@ -208,7 +213,18 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `integration` | Windows only: `zig build test:integration`, whose integration suite waits five minutes for the ReleaseSmall app there |
 | `product` | `zig build test:product` (the smokes, and the evaluation suite as three shards), with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
 | `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on macOS also its native ARM64 executable built for the release target and held to it (`scripts/check_binary_baseline.py`); on Windows also the version state gate and the Windows script suites |
-| `checks` | `zig fmt`, the linters (`scripts/lint.py`, Linux), the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
+| `checks` | The linters (`scripts/lint.py`, Linux), the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
+
+Before any of these, every leg on every platform runs `zig build
+gate:static`: `zig fmt --check`, the scans of `http-status:gate` and
+`subsystem:boundary`, the `scripts/tests/test_*_discipline.py` scans and
+`git diff --check`, the guards that only read the source. It compiles only
+the two small scanners: the boundary gates' self-tests are test binaries,
+which install the fs-helper, so they stay in `test:units`. They take seconds, and the build runner
+has no fail-fast: inside a suite step a failed guard is reported only when
+the whole step has finished, minutes later (#587). The boundary gates and
+the discipline scans stay in `test:units` as well, so `zig build test`
+alone still runs them.
 
 The rules that keep the split from dropping coverage:
 
@@ -237,8 +253,15 @@ The rules that keep the split from dropping coverage:
 - **The TTY shards partition the cases.** `run_tty_tests.py --shard K/N`
   (or `TTY_SHARD`) runs the cases whose index in the sorted list is `K-1`
   modulo `N`; a TTY case checks that the shards cover the list exactly once.
-  Shards run on separate runners, not concurrently on one, because the
-  cases assert pty timing.
+  In CI, shards run on separate runners, not concurrently on one, because
+  the cases assert pty timing. Locally, `run_tty_tests.py --jobs N` runs N
+  of these shards at once on one machine and merges their results (#588):
+  the cases mostly wait for the screen to go quiet, so the wall time drops
+  with the shard count. A case that holds a fixed host resource (the OAuth
+  callback ports of `test_login`) is marked `tty_driver.runs_alone` and runs
+  by itself after the shards; every case has a time limit there, so one
+  hang (#569) fails that case instead of stalling the run
+  ([tests/tty/README.md](../tests/tty/README.md)).
 
 What it costs:
 
@@ -250,7 +273,8 @@ What it costs:
   macOS jobs at once. A run uses about thirty jobs, four of them on macOS
   (three gate legs and `SDK bindings (macOS)`), so macOS groups the flags
   instead of giving each its own runner. Runs that overlap can still queue
-  macOS jobs.
+  macOS jobs; the self-hosted pool (§6), when it is on, takes the gates off
+  that limit.
 - **Cache lines.** Each gate leg keeps its own Zig cache line
   (`gates-<leg>`, §5), since each builds a different share of the graph. The
   TTY shards build the same binaries and share one.
@@ -281,8 +305,9 @@ ones that land nowhere:
 | A Zig test in an existing root (`src/**`, `tests/component`, the integration inventory) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
 | A new test binary or build step | `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
-| A case under `tests/tty/cases/` | Nothing to wire | A TTY shard | The TTY case `test_runner_shards` |
+| A case under `tests/tty/cases/` | Nothing to wire, unless it holds a fixed host resource (a fixed port or path) that another case also uses: then mark it `tty_driver.runs_alone`, and local `--jobs` runs it by itself | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |
+| A guard that only reads the source (a `test_*_discipline.py` scan, a boundary gate) | `test:units`, and also `gate:static` in `build.zig` | First on every gate leg, and in `test:units` | `test_gate_manifest.py`: every discipline scan is in `gate:static`; `test_ci_scope.py`: every gate leg runs it before anything else that builds |
 | A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
 | A smoke or another long command in `test:product` | Captured output (`expectExitCode(0)`) when it should overlap the rest; inheriting the terminal, it waits for every other such command | The product legs | Build Summary durations |
 
@@ -379,3 +404,115 @@ their own settings.
 the warm run saves; each restore key is its save key without the run ID, and
 both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
 scheduled or dispatched run.
+
+## 6. The macOS and Windows gates: a self-hosted runner first, hosted legs as the fallback
+
+Each of the two platforms has a self-hosted runner for this repository:
+macOS on the organization's Mac Studio, Windows on AIPC. The gates of an
+organization member's pull request try it first; every other pull request
+stays on hosted runners.
+
+**For now, a runner on the host.** Since 2026-11-19 macOS uses
+`MacStudio-metacodes`, a runner on the Mac Studio's own `ci-host` account (no
+VM: an idle macOS guest took all 32 GB), in the runner group
+`metacodes-public-ephemeral` with the label `metacodes-macos-vm`, one job at
+a time (`slots: 1`). Windows stays switched off until AIPC has a runner.
+Nothing isolates one job from the next or from the host account, so the
+guard is who gets there, in two places:
+
+- **The plan** sends a pull request to the runner only when GitHub reports
+  its author as an organization `MEMBER` or `OWNER`, or as a `COLLABORATOR`;
+  everyone else, and an unknown association, goes `hosted` ("external
+  contributor"). It never decides by fork: most members open pull requests
+  from their own forks.
+- **The runner**, whatever a pull request's own `ci.yml` asks for: a hook
+  before every job lets through only the authors on the host's allowlist,
+  which holds the organization's members, and fails any other job, outside
+  collaborators included whatever their access. That is the boundary, since a
+  pull request runs its own copy of this plan; the plan only keeps external
+  pull requests from turning red there. Outside contributors' fork pull
+  requests also wait for a maintainer's approval before any workflow runs.
+
+`COLLABORATOR` counts because GitHub reports a member whose membership is
+private that way when they have direct access to the repository. The
+repository has no outside collaborators (checked 2026-11-19); the plan would
+send one's pull request to the runner and the hook would fail it, so an
+outside collaborator's gates turn red there until they join the allowlist.
+The same holds for a new member until the allowlist is updated. A private member without
+direct access shows as `CONTRIBUTOR` and stays on hosted runners until they
+make the membership public. The single-use VM pools
+([VM_POOLS.md](VM_POOLS.md)) are kept for AIPC or a later host and would
+serve the same labels and wiring. Below, "pool" means whichever runner
+serves a platform's label.
+
+Hosted macOS is the bottleneck: five jobs at once for the organization, three
+cores and 7 GB each. On 2026-11-17/18 a macOS job waited a median 7.5 minutes
+for a runner (p90 27.8) while Linux and Windows waited seconds, and macOS
+finished last in 38 of 39 runs. Hosted Windows does not queue (median 0.1
+minutes; the legs ran a median 7.2 minutes); its pool can win only on a job's
+own speed, so each platform has its own switch and its own measurements.
+
+**One job on a VM, legs on hosted runners.** A pool VM has the cores and
+memory a hosted runner lacks, so `gates-macos-vm` and `windows-gates-vm` run
+every flag of their hosted legs in one job (`Gates (macOS) / all`, `Gates
+(Windows) / all`, the platform's shared step list, its own cache line
+`gates-all`), without the legs' repeated checkout, setup and compilation.
+Hosted runners keep the split legs of §4. TTY (Windows), the SDK jobs and
+AgentCore Windows stay on hosted runners.
+
+**The switch.** `.github/runner-pools.json` holds, per platform, `self_hosted`
+(on or off), the pool's `label`, its `slots`, the `pickup_timeout_minutes`,
+the pool job's `zig_build_jobs` and `timeout_minutes`. A file, not a
+repository variable: vars and secrets do not reach a fork's pull request,
+which most pull requests here are, while every pull request's merge commit
+carries `main`'s switch. Switching a pool off is a pull request whose own run
+already obeys it.
+
+**Where a run goes** (`runner-plan`, `scripts/ci_pool_plan.py plan`). With the
+run's read-only token it lists this repository's other CI jobs once, counts
+per platform those that hold or wait for one of its pool's VMs, and decides
+each platform, first match wins:
+
+| Situation | Mode |
+|---|---|
+| Switch off, unreadable or invalid | `hosted` |
+| Release fast path, or a documentation-only change | `hosted` (the gates only check out) |
+| `main`'s warm run (§5) | `both`, so both cache lines stay warm |
+| Not a pull request, or its author is not an organization `MEMBER`, `OWNER` or `COLLABORATOR` | `hosted` |
+| Running plus waiting pool jobs fill the slots | `hosted` |
+| A pool job has waited longer than the pickup timeout | `hosted`: the pool may be down |
+| Otherwise | `self-hosted` |
+| Any error reading GitHub | `hosted` |
+
+**Falling back after dispatch.** Two runs can see the same free slot, and a
+pool can fail after a run chose it. `gates-macos-watch` and
+`windows-gates-watch` (`… watch`) follow their run's pool job: a VM that
+takes it within the pickup timeout is followed to the end and its conclusion
+reported; otherwise `fallback=true`, and the hosted legs, which wait for the
+watch on `self-hosted`, run. If a VM takes the pool job after that, its
+stand-down step sees the finished watch and sets `FAST_PATH=true`, so every
+later step skips (the pool job's env leaves `FAST_PATH` to that step).
+
+**The required checks** (`gates-macos-result`, `gates-windows-result`, `…
+verdict`) never need a pool job: a pool that is down would keep it queued for
+GitHub's 24 hours. Each reads its platform's plan, watch and hosted legs:
+
+| Mode | `Gates (macOS)` / `Gates (Windows)` passes when |
+|---|---|
+| `hosted`, or no plan | the hosted legs succeeded |
+| `self-hosted` | the watch reports the pool job succeeded; after a fallback, the hosted legs succeeded |
+| `both` | the hosted legs succeeded, and the pool job succeeded or no VM took it |
+
+A pool job that fails (a test, or its VM) is a failure, not a fallback;
+rerunning the run decides again. Costs: the plan adds a few seconds before
+the macOS and Windows gates; a run on a pool keeps an ubuntu watch job beside
+it; a fallback after dispatch costs the pickup timeout; on the nightly `both`
+run the hosted legs start after the pool job ends, since they wait for the
+watch; a pool job no VM ever takes stays queued in its run until a VM takes
+it (and stands down) or GitHub's 24 hours pass, without affecting the
+required check.
+
+`scripts/tests/test_ci_pool_plan.py` pins the decisions, the watch, the
+stand-down and the verdict for both platforms, and the wiring: each pool job
+is every hosted leg of its platform in one, the required checks never need
+them, and only they use the pools' labels (no workflow uses `self-hosted`).

@@ -18,8 +18,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.eval.harbor.viewer import data, server  # noqa: E402
-from scripts.eval.harbor.viewer.runner import RunManager  # noqa: E402
+from scripts.eval.harbor.bench import data  # noqa: E402
+from scripts.eval.harbor.bench.workbench import Workbench  # noqa: E402
+from scripts.eval.harbor.viewer import server  # noqa: E402
+from scripts.eval.harbor.bench.runner import RunManager  # noqa: E402
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run  # noqa: E402
 
 
@@ -34,7 +36,7 @@ def main():
         manager = RunManager(root / 'jobs', config)
         with patch.dict(os.environ, {'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                                      'TOKENJOY_API_KEY': 'private-ui-fixture'}):
-            http = server.make_server(data.Library([manager.jobs_dir]), '127.0.0.1', 0, manager, 'ui-fixture')
+            http = server.make_server(Workbench(data.Library([manager.jobs_dir]), manager), '127.0.0.1', 0, 'ui-fixture')
             threading.Thread(target=http.serve_forever, daemon=True).start()
             try:
                 with sync_playwright() as playwright:

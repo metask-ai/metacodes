@@ -27,6 +27,7 @@ const ids = @import("ids.zig");
 const offer = @import("offer.zig");
 const controls_mod = @import("controls.zig");
 const profile_mod = @import("profile.zig");
+const model_listing = @import("model_listing.zig");
 
 pub const Slug = ids.Slug;
 pub const ProviderProfile = profile_mod.ProviderProfile;
@@ -181,6 +182,13 @@ fn buildProfile(
     const oauth = try parseOAuth(arena, value.object.get("oauth"));
     if (oauth.token_url != null and !acceptsOAuthKind(kinds))
         return error.OAuthWithoutOAuthCredentialKind;
+    const key_setup = try pastedKeySetup(arena, display, kinds, channelNamed(channels, default_channel));
+    // A coding plan the user defined (Bailian's, Ark's) is one as much as a
+    // built-in plan is: a start with nobody at the keyboard says so.
+    const subscription_plan = if (value.object.get("subscription_plan")) |flag| switch (flag) {
+        .bool => |set| set,
+        else => return error.InvalidDocument,
+    } else false;
 
     const built = ProviderProfile{
         .id = id,
@@ -199,12 +207,52 @@ fn buildProfile(
         .oauth_device_authorization_url = oauth.device_authorization_url,
         .oauth_client_id = oauth.client_id,
         .oauth_scope = oauth.scope,
+        .api_key_setup = key_setup,
+        .subscription_plan = subscription_plan,
     };
     // The same structural validation a built-in profile goes through. Doing it
     // here means a malformed definition fails at parse time rather than at the
     // first request.
     profile_mod.validateProfile(built) catch return error.InvalidDocument;
     return built;
+}
+
+fn channelNamed(channels: []const ChannelDescriptor, id: ?Slug) ChannelDescriptor {
+    if (id) |wanted| for (channels) |candidate| {
+        if (candidate.id.eql(wanted)) return candidate;
+    };
+    return channels[0];
+}
+
+/// How a key for a configured provider is stored (`/login <id>`, `metacodes
+/// login --provider <id>`): pasted, because there is no page to create it on
+/// — whoever runs the relay or the server hands it out — and checked with
+/// the model listing of `channel` (the default one; `model_listing.zig`),
+/// sent the way the provider's requests carry the key. A Bedrock Converse
+/// channel lists nothing to check against, so its key is stored unchecked,
+/// as the built-in Bedrock's is. Null when the definition accepts no API key
+/// at all (an OAuth-only gateway).
+fn pastedKeySetup(
+    arena: std.mem.Allocator,
+    display: []const u8,
+    kinds: []const profile_mod.CredentialKind,
+    channel: ChannelDescriptor,
+) DefinitionError!?profile_mod.ApiKeySetup {
+    const accepts_key = for (kinds) |kind| {
+        if (kind == .api_key) break true;
+    } else false;
+    if (!accepts_key) return null;
+    const wire = channel.routes[0].protocol.wire();
+    const check_url = if (wire) |known| try model_listing.listingUrl(arena, channel.base_url, known) else null;
+    const pages = try arena.alloc(profile_mod.KeyPage, 1);
+    pages[0] = .{
+        .id = Slug.lit("key"),
+        .label = display,
+        .url = null,
+        .check_url = check_url,
+        .check_wire = if (check_url != null) wire else null,
+    };
+    return .{ .kind = .api_key, .pages = pages };
 }
 
 const OAuthDefinition = struct {
@@ -595,6 +643,242 @@ fn parseValues(arena: std.mem.Allocator, value: ?std.json.Value) DefinitionError
     return out;
 }
 
+// ── writing a definition (`metacodes providers add`) ─────────────────────────
+
+/// The part of the schema a command line can say. Everything else — prices,
+/// limits beyond what a listing reports, controls, regions, an `oauth`
+/// block — is the user's to add to `config.json` by hand, and a later
+/// `--replace` keeps it (`patchEntry`).
+pub const Draft = struct {
+    display_name: ?[]const u8 = null,
+    /// A subscription plan licensed for interactive use
+    /// (`ProviderProfile.subscription_plan`): `-p`, `serve` and CI starts
+    /// on it say so once.
+    subscription_plan: bool = false,
+    /// Null keeps the schema default, a bearer token.
+    auth: ?profile_mod.AuthScheme = null,
+    /// The environment variable the key is read from (`env_aliases`), in the
+    /// shell or in `<state root>/.env`.
+    key_env: ?[]const u8 = null,
+    channels: []const DraftChannel,
+    models: []const DraftModel,
+};
+
+pub const DraftChannel = struct {
+    id: []const u8,
+    /// As stored: `model_listing.channelBase` of what the user typed.
+    base_url: []const u8,
+    wire: Protocol.Wire,
+    dialect: ?Vendor = null,
+};
+
+pub const DraftModel = struct {
+    request_model_id: []const u8,
+    display_name: ?[]const u8 = null,
+    context_window: ?u32 = null,
+    max_output_tokens: ?u32 = null,
+};
+
+/// The JSON object `custom_providers.<id>` holds for `draft` — the same text a
+/// person would write by hand, and nothing a person would not.
+pub fn renderDraft(allocator: std.mem.Allocator, draft: Draft) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    writeDraft(&json, draft) catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
+fn writeDraft(json: *std.json.Stringify, draft: Draft) std.Io.Writer.Error!void {
+    try json.beginObject();
+    if (draft.display_name) |name| {
+        try json.objectField("display_name");
+        try json.write(name);
+    }
+    if (draft.subscription_plan) {
+        try json.objectField("subscription_plan");
+        try json.write(true);
+    }
+    if (draft.auth) |auth| {
+        try json.objectField("auth");
+        try writeAuth(json, auth);
+    }
+    if (draft.key_env) |name| {
+        try json.objectField("env_aliases");
+        try writeEnvAliases(json, name);
+    }
+    try json.objectField("channels");
+    try json.beginArray();
+    for (draft.channels) |channel| try writeChannel(json, channel);
+    try json.endArray();
+    try json.objectField("models");
+    try json.beginArray();
+    for (draft.models) |model| try writeModel(json, model);
+    try json.endArray();
+    try json.endObject();
+}
+
+fn writeAuth(json: *std.json.Stringify, auth: profile_mod.AuthScheme) std.Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("kind");
+    switch (auth) {
+        .bearer => try json.write("bearer"),
+        .api_key_header => |header| {
+            try json.write("api_key_header");
+            try json.objectField("header");
+            try json.write(header);
+        },
+        .custom_header => |custom| {
+            try json.write("custom_header");
+            try json.objectField("header");
+            try json.write(custom.name);
+            try json.objectField("value_prefix");
+            try json.write(custom.value_prefix);
+        },
+        // Not configurable (`parseAuth`); a draft never holds one.
+        .signed_adapter => unreachable,
+    }
+    try json.endObject();
+}
+
+fn writeEnvAliases(json: *std.json.Stringify, name: []const u8) std.Io.Writer.Error!void {
+    try json.beginArray();
+    try json.beginObject();
+    try json.objectField("name");
+    try json.write(name);
+    try json.objectField("kind");
+    try json.write("api_key");
+    try json.objectField("canonical");
+    try json.write(true);
+    try json.endObject();
+    try json.endArray();
+}
+
+fn writeChannel(json: *std.json.Stringify, channel: DraftChannel) std.Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("id");
+    try json.write(channel.id);
+    try json.objectField("base_url");
+    try json.write(channel.base_url);
+    try json.objectField("protocol");
+    try json.write(@tagName(channel.wire));
+    if (channel.dialect) |dialect| {
+        try json.objectField("dialect");
+        try json.write(dialect.name());
+    }
+    try json.endObject();
+}
+
+fn writeModel(json: *std.json.Stringify, model: DraftModel) std.Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("request_model_id");
+    try json.write(model.request_model_id);
+    if (model.display_name) |name| {
+        try json.objectField("display_name");
+        try json.write(name);
+    }
+    if (model.context_window != null or model.max_output_tokens != null) {
+        try json.objectField("limits");
+        try json.beginObject();
+        if (model.context_window) |window| {
+            try json.objectField("context_window");
+            try json.write(window);
+        }
+        if (model.max_output_tokens) |tokens| {
+            try json.objectField("max_output_tokens");
+            try json.write(tokens);
+        }
+        try json.endObject();
+    }
+    try json.endObject();
+}
+
+/// What `metacodes providers add <id> --replace` changes in an existing
+/// definition. A null field is left exactly as it is, hand-written
+/// additions and all.
+pub const Patch = struct {
+    display_name: ?[]const u8 = null,
+    subscription_plan: ?bool = null,
+    auth: ?profile_mod.AuthScheme = null,
+    key_env: ?[]const u8 = null,
+    /// Replaces the channel list.
+    channels: ?[]const DraftChannel = null,
+    /// Sets the dialect on every channel the definition keeps (with
+    /// `channels`, give it there instead).
+    dialect: ?Vendor = null,
+    /// Replaces the model list. A model that stays keeps its object — the
+    /// price, limits and controls someone wrote for it — and a new one is
+    /// written as `renderDraft` writes it.
+    models: ?[]const DraftModel = null,
+};
+
+pub const PatchError = error{ OutOfMemory, InvalidDocument };
+
+/// `existing` (one `custom_providers` member, as JSON) with `patch` applied.
+/// Keys keep their order; a key a patch adds goes at the end.
+pub fn patchEntry(allocator: std.mem.Allocator, existing: []const u8, patch: Patch) PatchError![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var root = std.json.parseFromSliceLeaky(std.json.Value, arena, existing, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidDocument,
+    };
+    if (root != .object) return error.InvalidDocument;
+    const object = &root.object;
+
+    if (patch.display_name) |name| try object.put(arena, "display_name", .{ .string = name });
+    if (patch.subscription_plan) |set| try object.put(arena, "subscription_plan", .{ .bool = set });
+    if (patch.auth) |auth| try object.put(arena, "auth", try valueOf(arena, auth, writeAuth));
+    if (patch.key_env) |name| try object.put(arena, "env_aliases", try valueOf(arena, name, writeEnvAliases));
+    if (patch.channels) |channels| {
+        var list = std.json.Array.init(arena);
+        for (channels) |channel| try list.append(try valueOf(arena, channel, writeChannel));
+        try object.put(arena, "channels", .{ .array = list });
+    } else if (patch.dialect) |dialect| {
+        if (object.getPtr("channels")) |channels| if (channels.* == .array) {
+            for (channels.array.items) |*channel| {
+                if (channel.* == .object) try channel.object.put(arena, "dialect", .{ .string = dialect.name() });
+            }
+        };
+    }
+    if (patch.models) |models| {
+        var list = std.json.Array.init(arena);
+        for (models) |model| {
+            const kept = if (object.get("models")) |current| keptModel(current, model.request_model_id) else null;
+            try list.append(kept orelse try valueOf(arena, model, writeModel));
+        }
+        try object.put(arena, "models", .{ .array = list });
+    }
+    return std.json.Stringify.valueAlloc(allocator, root, .{}) catch error.OutOfMemory;
+}
+
+/// The model object `models` already holds for `request_model_id`.
+fn keptModel(models: std.json.Value, request_model_id: []const u8) ?std.json.Value {
+    if (models != .array) return null;
+    for (models.array.items) |model| {
+        if (model != .object) continue;
+        const id = stringOf(model.object.get("request_model_id")) orelse continue;
+        if (std.mem.eql(u8, id, request_model_id)) return model;
+    }
+    return null;
+}
+
+/// `value` written by `write`, read back as a tree in `arena`.
+fn valueOf(
+    arena: std.mem.Allocator,
+    value: anytype,
+    comptime write: fn (*std.json.Stringify, @TypeOf(value)) std.Io.Writer.Error!void,
+) PatchError!std.json.Value {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    write(&json, value) catch return error.OutOfMemory;
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidDocument,
+    };
+}
+
 // ── small helpers ────────────────────────────────────────────────────────────
 
 fn dupe(arena: std.mem.Allocator, text: []const u8) DefinitionError![]const u8 {
@@ -976,4 +1260,150 @@ test "a non-finite or out-of-range price is rejected, not converted" {
     }) |text| {
         try testing.expectError(error.InvalidPrice, parse(a, text));
     }
+}
+
+test "a configured provider's key is pasted and checked with its default channel's model listing" {
+    const a = testing.allocator;
+    var definitions = try parse(a,
+        \\{"custom_providers": {
+        \\  "relay": {"display_name": "House relay",
+        \\    "channels": [{"id":"anthropic","base_url":"https://relay.example.com","protocol":"anthropic_messages"},
+        \\                 {"id":"openai","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\    "models": [{"request_model_id":"m"}]},
+        \\  "local": {"channels": [{"id":"openai","base_url":"http://127.0.0.1:11434/v1","protocol":"openai_chat"}],
+        \\    "models": [{"request_model_id":"qwen3"}]},
+        \\  "bedrock-relay": {"channels": [{"id":"bedrock","base_url":"https://bedrock.example.com","protocol":"bedrock_converse"}],
+        \\    "models": [{"request_model_id":"anthropic.claude"}]},
+        \\  "sso-only": {"credential_kinds": ["openai_oauth"],
+        \\    "oauth": {"token_url":"https://sso.example.com/token","authorize_url":"https://sso.example.com/authorize","client_id":"c"},
+        \\    "channels": [{"id":"openai","base_url":"https://sso.example.com/v1","protocol":"openai_chat"}],
+        \\    "models": [{"request_model_id":"m"}]}}}
+    );
+    defer definitions.deinit();
+
+    const relay = definitions.find("relay").?.api_key_setup.?;
+    try testing.expectEqual(profile_mod.CredentialKind.api_key, relay.kind);
+    try testing.expectEqual(@as(usize, 1), relay.pages.len);
+    // No page to send anyone to; the check is the first channel's listing.
+    try testing.expect(relay.pages[0].url == null);
+    try testing.expectEqualStrings("House relay", relay.pages[0].label);
+    try testing.expectEqualStrings("https://relay.example.com/v1/models?limit=1000", relay.pages[0].check_url.?);
+    try testing.expectEqual(Protocol.Wire.anthropic_messages, relay.pages[0].check_wire.?);
+
+    // A loopback server is checked where its requests go, in plain HTTP.
+    try testing.expectEqualStrings("http://127.0.0.1:11434/v1/models", definitions.find("local").?.api_key_setup.?.pages[0].check_url.?);
+    // Nothing to check a Bedrock key with: stored as it is pasted.
+    try testing.expect(definitions.find("bedrock-relay").?.api_key_setup.?.pages[0].check_url == null);
+    // A gateway that takes only its own sign-in takes no pasted key.
+    try testing.expect(definitions.find("sso-only").?.api_key_setup == null);
+}
+
+test "a draft renders the schema a person writes, and parses back to the same provider" {
+    const a = testing.allocator;
+    const channels = [_]DraftChannel{
+        .{ .id = "openai", .base_url = "https://relay.example.com/v1", .wire = .openai_chat },
+        .{ .id = "anthropic", .base_url = "https://relay.example.com", .wire = .anthropic_messages, .dialect = .glm },
+    };
+    const models = [_]DraftModel{
+        .{ .request_model_id = "glm-4.6" },
+        .{ .request_model_id = "kimi-k2", .display_name = "Kimi K2", .context_window = 256_000, .max_output_tokens = 32_000 },
+    };
+    const text = try renderDraft(a, .{
+        .display_name = "House relay",
+        .auth = .{ .custom_header = .{ .name = "X-Relay-Token", .value_prefix = "Token " } },
+        .key_env = "HOUSE_RELAY_KEY",
+        .channels = &channels,
+        .models = &models,
+    });
+    defer a.free(text);
+    try testing.expectEqualStrings(
+        "{\"display_name\":\"House relay\",\"auth\":{\"kind\":\"custom_header\",\"header\":\"X-Relay-Token\",\"value_prefix\":\"Token \"}," ++
+            "\"env_aliases\":[{\"name\":\"HOUSE_RELAY_KEY\",\"kind\":\"api_key\",\"canonical\":true}]," ++
+            "\"channels\":[{\"id\":\"openai\",\"base_url\":\"https://relay.example.com/v1\",\"protocol\":\"openai_chat\"}," ++
+            "{\"id\":\"anthropic\",\"base_url\":\"https://relay.example.com\",\"protocol\":\"anthropic_messages\",\"dialect\":\"glm\"}]," ++
+            "\"models\":[{\"request_model_id\":\"glm-4.6\"},{\"request_model_id\":\"kimi-k2\",\"display_name\":\"Kimi K2\",\"limits\":{\"context_window\":256000,\"max_output_tokens\":32000}}]}",
+        text,
+    );
+
+    const document = try std.fmt.allocPrint(a, "{{\"custom_providers\":{{\"house-relay\":{s}}}}}", .{text});
+    defer a.free(document);
+    var definitions = try parse(a, document);
+    defer definitions.deinit();
+    const built = definitions.find("house-relay").?;
+    try testing.expectEqualStrings("House relay", built.display_name);
+    try testing.expectEqualStrings("HOUSE_RELAY_KEY", built.canonicalEnvAlias(.api_key).?);
+    try testing.expectEqualStrings("Token ", built.auth.custom_header.value_prefix);
+    try testing.expectEqual(@as(usize, 2), built.channels.len);
+    try testing.expectEqual(Vendor.glm, built.channels[1].routes[0].dialect.?);
+    try testing.expectEqual(@as(?u32, 256_000), built.models[1].limits.context_window);
+
+    // The plain case is plain: no auth, no variable, no display name.
+    const minimal = try renderDraft(a, .{ .channels = channels[0..1], .models = models[0..1] });
+    defer a.free(minimal);
+    try testing.expectEqualStrings(
+        "{\"channels\":[{\"id\":\"openai\",\"base_url\":\"https://relay.example.com/v1\",\"protocol\":\"openai_chat\"}],\"models\":[{\"request_model_id\":\"glm-4.6\"}]}",
+        minimal,
+    );
+}
+
+test "a patch changes what it names and keeps what a person wrote by hand" {
+    const a = testing.allocator;
+    const existing =
+        \\{"display_name":"Old","endpoint_policy":{"required_path_fragments":["/relay"]},
+        \\ "channels":[{"id":"openai","base_url":"https://relay.example.com/relay/v1","protocol":"openai_chat","region":"eu"}],
+        \\ "models":[{"request_model_id":"glm-4.6","price":{"currency":"EUR","input":2.5}},{"request_model_id":"gone"}]}
+    ;
+    const renamed = try patchEntry(a, existing, .{ .display_name = "New" });
+    defer a.free(renamed);
+    // Only the name moved; the policy, the region and the price are as written.
+    try testing.expect(std.mem.indexOf(u8, renamed, "\"display_name\":\"New\"") != null);
+    try testing.expect(std.mem.indexOf(u8, renamed, "\"region\":\"eu\"") != null);
+    try testing.expect(std.mem.indexOf(u8, renamed, "\"required_path_fragments\":[\"/relay\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, renamed, "\"input\":2.5") != null);
+    try testing.expect(std.mem.startsWith(u8, renamed, "{\"display_name\":\"New\",\"endpoint_policy\""));
+
+    const models = [_]DraftModel{ .{ .request_model_id = "glm-4.6" }, .{ .request_model_id = "glm-5", .context_window = 200_000 } };
+    const listed = try patchEntry(a, existing, .{ .models = &models, .dialect = .glm });
+    defer a.free(listed);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, listed, .{});
+    defer parsed.deinit();
+    const kept = parsed.value.object.get("models").?.array.items;
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    // The model that stays keeps its price; the new one is written fresh;
+    // the one left out is gone.
+    try testing.expect(kept[0].object.get("price") != null);
+    try testing.expectEqualStrings("glm-5", kept[1].object.get("request_model_id").?.string);
+    try testing.expectEqual(@as(i64, 200_000), kept[1].object.get("limits").?.object.get("context_window").?.integer);
+    const channel = parsed.value.object.get("channels").?.array.items[0].object;
+    try testing.expectEqualStrings("glm", channel.get("dialect").?.string);
+    try testing.expectEqualStrings("eu", channel.get("region").?.string);
+
+    try testing.expectError(error.InvalidDocument, patchEntry(a, "[1]", .{}));
+}
+
+test "a definition may say it is a subscription plan, and only with a boolean" {
+    const a = testing.allocator;
+    var definitions = try parse(a,
+        \\{"custom_providers": {"coding-plan": {"subscription_plan": true,
+        \\  "channels": [{"id":"anthropic","base_url":"https://plan.example.com","protocol":"anthropic_messages"}],
+        \\  "models": [{"request_model_id":"m"}]},
+        \\ "metered": {"channels": [{"id":"openai","base_url":"https://metered.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m"}]}}}
+    );
+    defer definitions.deinit();
+    try testing.expect(definitions.find("coding-plan").?.subscription_plan);
+    try testing.expect(!definitions.find("metered").?.subscription_plan);
+    try testing.expectError(error.InvalidDocument, parse(a,
+        \\{"custom_providers": {"x": {"subscription_plan": "yes",
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"m"}]}}}
+    ));
+    const channels = [_]DraftChannel{.{ .id = "anthropic", .base_url = "https://plan.example.com", .wire = .anthropic_messages }};
+    const models = [_]DraftModel{.{ .request_model_id = "m" }};
+    const text = try renderDraft(a, .{ .display_name = "Plan", .subscription_plan = true, .channels = &channels, .models = &models });
+    defer a.free(text);
+    try testing.expect(std.mem.startsWith(u8, text, "{\"display_name\":\"Plan\",\"subscription_plan\":true,"));
+    const unmarked = try patchEntry(a, text, .{ .subscription_plan = false });
+    defer a.free(unmarked);
+    try testing.expect(std.mem.indexOf(u8, unmarked, "\"subscription_plan\":false") != null);
 }

@@ -296,6 +296,22 @@ def release_case_dirs():
 atexit.register(release_case_dirs)
 
 
+def runs_alone(reason):
+    """标记一个用例占用本机固定资源(固定端口、固定路径),不能与别的用例同时跑。
+
+    `run_tty_tests.py --jobs N` 把这样的用例从并行分片里拿出来,并行阶段结束后单独逐个跑;
+    串行和 `--shard` 照旧按顺序跑。reason 写明占的是什么,也就是不能并行的原因。
+    用例的临时目录(case_tmpdir)、HOME(run() 的 ephemeral home)和 mock server 的
+    端口(绑 0,系统分配)本来就各用各的,不需要标。"""
+    if not reason:
+        raise ValueError("runs_alone needs the shared resource as its reason")
+
+    def mark(fn):
+        fn.tty_runs_alone = reason
+        return fn
+    return mark
+
+
 def _set_winsize(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
@@ -572,8 +588,23 @@ def _run_posix(bin_path, key_events, term_size, full_env,
             except ValueError:
                 os.kill(pid, getattr(signal, "SIG" + token))
 
-    cap.drain(startup_drain)
-    _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue, send_signal=send_signal)
+    try:
+        cap.drain(startup_drain)
+        _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue, send_signal=send_signal)
+    except BaseException:
+        # 用例被打断(runner 的用例时限 SIGALRM、Ctrl+C)或驱动出错:别把程序留在后台
+        # 占着 pty 跑下去,杀掉、回收后再把异常交给 runner。
+        import signal
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
 
     cap.finish()
     try:
