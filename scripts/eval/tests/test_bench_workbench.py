@@ -10,6 +10,7 @@ import ast
 import json
 import concurrent.futures
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -605,6 +606,26 @@ class WorkbenchTest(unittest.TestCase):
         # The port now belongs to a workbench of another state directory.
         self.assertIsNone(cli.receipt_client(saved, self.root / 'other' / 'workbench.json'))
         self.assertIsNone(cli.receipt_client({}, self.manager.config_path))
+        # Ownership does not depend on the database statistics.
+        with patch.object(Workbench, 'store_status', side_effect=RuntimeError('database busy')):
+            self.assertIsNotNone(cli.receipt_client(saved, self.manager.config_path))
+
+    def test_a_service_that_cannot_tell_whose_it_is_keeps_its_receipt(self):
+        root = self.root / 'state' / 'bench'
+        root.mkdir(parents=True)
+        url = f'http://127.0.0.1:{self.http.server_address[1]}/'
+        receipt = {'url': url, 'listen_url': url, 'jobs_dir': str(self.manager.jobs_dir)}
+        atomic_json(root / 'service.json', receipt)
+        with patch.object(cli.Client, 'request', side_effect=ValueError('internal error')):
+            with self.assertRaisesRegex(ValueError, '无法确认'):
+                cli.receipt_client(receipt, self.manager.config_path)
+            self.assertEqual(cli.main(['stop', '--state-root', str(root.parent)]), 1)
+        self.assertEqual(json.loads((root / 'service.json').read_text()), receipt)
+        closed = socket.socket()
+        closed.bind(('127.0.0.1', 0))
+        gone = f'http://127.0.0.1:{closed.getsockname()[1]}/'
+        closed.close()
+        self.assertIsNone(cli.receipt_client({'url': gone}, self.manager.config_path))
 
     def test_replacing_a_running_service_keeps_its_entry(self):
         def args(**given):
@@ -620,6 +641,9 @@ class WorkbenchTest(unittest.TestCase):
         direct = {'url': 'http://10.0.0.2:18766/', 'listen_url': 'http://10.0.0.2:18766/'}
         self.assertEqual(cli.service_entry(args(), direct), ('10.0.0.2', 18766, None))
         self.assertEqual(cli.service_entry(args(port=9000), direct), ('10.0.0.2', 9000, None))
+        # An older service bound to a host name gave that name as its page.
+        named = {'url': 'http://devbox:18766/', 'listen_url': 'http://devbox:18766/'}
+        self.assertEqual(cli.service_entry(args(), named), ('devbox', 18766, 'http://devbox:18766/'))
 
     def test_unknown_models_shell_fragments_and_bad_ranges_are_refused_before_spawn(self):
         for override in ({'tasks': ['--path /etc']}, {'tasks': ['fix-git;touch /tmp/x']},
@@ -1217,14 +1241,14 @@ class ServiceReuseTest(unittest.TestCase):
         records = iter([{'url': 'http://127.0.0.1:1/', 'jobs_dir': '/jobs/a', 'store': self.STORE},
                         {'url': 'http://127.0.0.1:2/', 'jobs_dir': '/jobs/b', 'store': self.STORE}])
         with patch.object(cli, 'settings', side_effect=lambda _path: next(records)), \
-                patch.object(cli.Client, 'request', return_value={'config_path': str(self.CONFIG.resolve())}):
+                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}):
             client = cli.running_service(Path('/state/bench'), self.CONFIG, '/jobs/a', self.store())
         self.assertEqual(client.url, 'http://127.0.0.1:1/')
 
     def test_service_for_another_directory_is_not_reused(self):
         record = {'url': 'http://127.0.0.1:2/', 'jobs_dir': '/jobs/b', 'store': self.STORE}
         with patch.object(cli, 'settings', return_value=record), \
-                patch.object(cli.Client, 'request', return_value={'config_path': str(self.CONFIG.resolve())}):
+                patch.object(cli.Client, 'request', return_value={'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}):
             self.assertIsNone(cli.running_service(Path('/state/bench'), self.CONFIG, '/jobs/a', self.store()))
 
 

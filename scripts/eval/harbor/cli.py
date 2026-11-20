@@ -10,6 +10,7 @@ only on the machine executing trials. No repository checkout is required.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import shlex
@@ -60,16 +61,40 @@ def same_service(saved, jobs_dir, store):
 
 def receipt_client(saved, config):
     """A client for the receipt's service while that service still serves
-    this workbench. Another workbench may have taken the port since."""
+    this workbench; None when nothing listens there any more or another
+    workbench has taken the port. A service that answers without telling
+    whose it is raises: the receipt stays, nothing is stopped or started."""
     if not saved.get("url"):
         return None
     client = local_client(saved)
     try:
-        if client.request("api/store").get("config_path") == str(Path(config).resolve()):
-            return client
-    except (OSError, ValueError):
-        pass
-    return None
+        catalog = client.request("api/workbench")
+        if catalog.get("service") != "metacodes-bench":
+            return None
+        owner = catalog.get("config_path")
+        if owner is None:  # a service from before the catalog named its workbench
+            owner = client.request("api/store").get("config_path")
+    except OSError as exc:
+        if isinstance(getattr(exc, "reason", exc), ConnectionRefusedError):
+            return None
+        raise ValueError(unconfirmed(saved, exc)) from None
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(unconfirmed(saved, exc)) from None
+    return client if owner == str(Path(config).resolve()) else None
+
+
+def unconfirmed(saved, error):
+    return ("无法确认 " + saved["url"] + " 上的工作台是否属于本状态目录（" + str(error) + "），"
+            "已保留回执，没有停止或启动服务；请稍后重试")
+
+
+def named_host(url):
+    host = urllib.parse.urlsplit(url).hostname or ""
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        return host != "localhost"
 
 
 def running_service(root, config, jobs_dir, store):
@@ -86,7 +111,9 @@ def previous_entry(saved):
     listen_url = saved.get("listen_url") or saved["url"]
     listen = urllib.parse.urlsplit(listen_url)
     bind = saved.get("bind") or (None if listen.hostname == "127.0.0.1" else listen.hostname)
-    public_url = saved["url"] if saved["url"] != listen_url else None
+    # A service started with only `--bind <host name>` gave that name as
+    # its page; the replacement keeps it as the public URL.
+    public_url = saved["url"] if saved["url"] != listen_url or named_host(saved["url"]) else None
     return bind, listen.port, public_url
 
 

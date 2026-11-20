@@ -113,7 +113,9 @@ class Workbench:
         return self.manager.runs() if self.manager else []
 
     def catalog(self) -> Dict[str, Any]:
-        return self.manager.catalog() if self.manager else dict(READ_ONLY_CATALOG)
+        if not self.manager:
+            return dict(READ_ONLY_CATALOG)
+        return {**self.manager.catalog(), "config_path": str(self.manager.config_path)}
 
     def suite_tasks(self, suite_id) -> Dict[str, Any]:
         if not self.manager:
