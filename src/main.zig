@@ -5850,6 +5850,7 @@ test {
     _ = &@import("permission/rule_spec.zig");
     _ = &@import("permission/bash_parser.zig");
     _ = &@import("permission/bash_readonly.zig");
+    _ = &@import("core/mcp_session.zig");
     _ = &@import("permission/settings.zig");
     _ = &@import("permission/loader.zig");
     _ = &@import("permission/hooks.zig");

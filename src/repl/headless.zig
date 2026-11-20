@@ -665,6 +665,7 @@ pub fn buildOptions(
         .parent_model = app.activeModel(),
         .skills_set = &app.skills,
         .mcp_sessions = &app.mcp_sessions.items,
+        .mcp_unavailable = app.mcp_unavailable,
         .cron_registry = &app.cron_registry,
     };
 }

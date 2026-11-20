@@ -1103,6 +1103,14 @@ fn admitProjectExactEdit(ctx: *const ToolContext, args: []const u8) anyerror!voi
     try validateTypes("Edit", args);
 }
 
+pub fn unavailableMcpNotice(ctx: *const ToolContext, name: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (!std.mem.startsWith(u8, name, "mcp__") or ctx.mcp_unavailable.len == 0) return allocator.dupe(u8, "");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try @import("core/mcp_session.zig").writeUnavailable(&out.writer, ctx.mcp_unavailable);
+    return out.toOwnedSlice();
+}
+
 /// 逗号分隔的所有真实工具名(静态 + dyn),供 UnknownTool 错误引导模型。caller free。
 pub fn availableToolNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;
