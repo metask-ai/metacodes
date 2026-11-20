@@ -349,7 +349,8 @@ pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Drive
 `MetacodesDriver.init(deps: metacodes.Deps, binding)`,`Deps` 显式给出 provider、Anthropic
 client(可空)、宿主工具定义、宿主权限上下文、宿主沙箱设置(可空)、home、state root、artifact
 root、session、`max_turns`。可选字段 `tool_observer` 接一个额外的工具观测 sink(reviewer seat 接
-`reviewer.BashCallLog.sink()`)。经 `subagent.spawnAgentSink` 运行:系统提示词 = 宪章;cwd =
+`reviewer.BashCallLog.sink()`)。经 `subagent.spawnAgentSink` 运行:系统提示词 = 宪章加 preview 注释指导
+(`COMMENT_GUIDANCE`);cwd =
 工作区且 `resolve_relative_paths = true`;额外目录 = seat 目录;`cost_budget_usd =
 ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `WriterBackend` 的 usage
 累加器收集,结束后按模型单价折算,以 `provider_estimate` 入账。
@@ -429,9 +430,9 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 - 硬超时 → `failed.timed_out`、wallclock 预算 → `budget_exhausted`、中止 → `aborted`;三种情况下
   CLI 留下的孙进程都随进程组消失,花费以 `wallclock_only` 入账。
 - metacodes seat 写工作区/seat 目录之外(绝对路径、`../` 相对路径、`ORIGINAL_REQUEST.md`、别的
-  seat 的 handoff)全部被拒且磁盘上不存在;系统提示词恰为宪章;首条用户消息以 bootstrap 开头,
+  seat 的 handoff)全部被拒且磁盘上不存在;系统提示词恰为宪章、一个空行和注释指导;首条用户消息以 bootstrap 开头,
   bootstrap 部分不含 run id 与状态路径。
-- metacodes reviewer seat:系统提示词为 `reviewer.charter`,外接观测 sink 收到 Bash 分派,Write/Edit
+- metacodes reviewer seat:系统提示词为 `reviewer.charter` 加注释指导,外接观测 sink 收到 Bash 分派,Write/Edit
   进不了工作区。
 
 ## 8. 公共面

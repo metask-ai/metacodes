@@ -1,7 +1,8 @@
 //! The metacodes seat driver (#515): a seat run as an in-process metacodes
 //! subagent (`core/subagent.zig` `spawnAgentSink`).
 //!
-//! - System prompt: the role charter (`charters.forRole`), nothing else.
+//! - System prompt: the role charter (`charters.forRole`), then the preview
+//!   comment guidance (`system_prompt.COMMENT_GUIDANCE`).
 //! - First user message: the fixed `common.bootstrap` text, then an
 //!   environment block naming the workspace and the seat directory (the
 //!   counterpart of Claude Code's `--add-dir` environment section). Run ids,
