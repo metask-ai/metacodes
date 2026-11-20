@@ -26,6 +26,7 @@ const drivers_test = @import("drivers/drivers_test.zig");
 const reviewer = @import("reviewer.zig");
 const merge_back = @import("merge_back.zig");
 const interview = @import("interview.zig");
+const progress = @import("progress.zig");
 
 const testing = std.testing;
 const PathBuf = [std.fs.max_path_bytes]u8;
@@ -1452,4 +1453,99 @@ test "teamwork interview L2: a skip-interview request is recorded as such and su
     defer run.destroy();
     try testing.expectEqual(runtime.RequestSource.skip_interview, run.request_source);
     try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
+}
+
+const Recorder = struct {
+    text: std.ArrayList(u8) = .empty,
+    board: progress.Board = .init(testing.allocator),
+
+    fn deinit(self: *Recorder) void {
+        self.text.deinit(testing.allocator);
+        self.board.deinit();
+    }
+
+    fn observer(self: *Recorder) progress.Observer {
+        return .{ .ctx = self, .notifyFn = notify };
+    }
+
+    fn notify(ctx: *anyopaque, event: *const progress.Event) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        var out: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &self.text);
+        defer self.text = out.toArrayList();
+        const w = &out.writer;
+        const snapshot = event.snapshot;
+        switch (event.change) {
+            .seat => |seat| w.print("{s} {s}>{s}", .{ seat.id.slice(), if (seat.from) |from| from.name() else "-", seat.to.name() }) catch unreachable,
+            .phase => |phase| w.print("phase {s}>{s}", .{ @tagName(phase.from), @tagName(phase.to) }) catch unreachable,
+        }
+        w.print(" @{s} {d}/{d}\n", .{ @tagName(snapshot.phase), snapshot.seatsDone(), snapshot.seats.len }) catch unreachable;
+        self.board.observer().notify(event);
+    }
+};
+
+test "teamwork progress L2: the host observer gets every seat and phase change, the interviewer waits as needs_you" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-progress");
+    defer fx.deinit();
+    const draft_handoff = "## Observation\no\n## Reasoning\nr\n## Caveats\nc\n## Conclusion\nAdd feature.txt.\n## Verification\ntest -f feature.txt\n";
+    const plans = [_]Plan{
+        .{ .seat = "interviewer-1", .handoff = draft_handoff, .charge_usd = 0.25 },
+        .{ .seat = "implementer-1", .files = &.{feature}, .charge_usd = 0.5 },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    const cfg = try fx.cfg("");
+    var abort = types.AbortSignal.init();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor(), .observer = recorder.observer() };
+
+    var drafted = try interview.draft(testing.allocator, deps, cfg, fx.options(), "add a feature\n", &abort);
+    defer drafted.deinit(testing.allocator);
+    var dir = try run_dir.RunDir.open(testing.allocator, fx.state(), fx.options().run_id);
+    defer dir.deinit(testing.allocator);
+    const interviewer = types.SeatId.parse(interview.interviewer_seat) catch unreachable;
+    try testing.expectEqual(types.SeatStatus.needs_you, (try dir.readSeatRecord(interviewer)).status);
+    {
+        var waiting = (try recorder.board.read(testing.allocator)).?;
+        defer waiting.deinit();
+        try testing.expectEqual(progress.Phase.interviewing, waiting.snapshot().phase);
+        try testing.expectEqualStrings("add a feature", waiting.snapshot().goal);
+        try testing.expectEqual(@as(f64, 0.25), waiting.snapshot().budget.spent_usd);
+    }
+    try interview.finishApproval(testing.allocator, deps, cfg, fx.options(), "add a feature\n");
+    try testing.expectEqual(types.SeatStatus.done, (try dir.readSeatRecord(interviewer)).status);
+
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = drafted.text, .source = .interview }, cfg, fx.options());
+    defer run.destroy();
+    try testing.expectEqual(runtime.Phase.done, (try swe_loop.drive(run)).phase());
+    try testing.expectEqualStrings(
+        \\interviewer-1 ->queued @interviewing 0/1
+        \\interviewer-1 queued>working @interviewing 0/1
+        \\interviewer-1 working>needs_you @interviewing 0/1
+        \\interviewer-1 needs_you>done @interviewing 1/1
+        \\implementer-1 ->queued @approved 0/1
+        \\phase approved>implementing @implementing 0/1
+        \\implementer-1 queued>working @implementing 0/1
+        \\implementer-1 working>done @implementing 1/1
+        \\phase implementing>reviewing @reviewing 1/1
+        \\reviewer-1 ->queued @reviewing 1/2
+        \\reviewer-1 queued>working @reviewing 1/2
+        \\reviewer-1 working>done @reviewing 2/2
+        \\phase reviewing>review_approved @review_approved 2/2
+        \\phase review_approved>auditing @auditing 2/2
+        \\phase auditing>merging @merging 2/2
+        \\phase merging>done @done 2/2
+        \\
+    , recorder.text.items);
+    var final = (try recorder.board.read(testing.allocator)).?;
+    defer final.deinit();
+    try testing.expectEqual(progress.Phase.done, final.snapshot().phase);
+    try testing.expectEqual(@as(f64, 0.75), final.snapshot().budget.spent_usd);
+    try testing.expectEqualStrings("Add feature.txt.", final.snapshot().goal);
 }

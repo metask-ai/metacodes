@@ -10,6 +10,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **Teamwork progress.** A teamwork run reports every seat status change and
+  phase change with a snapshot of the run: the REPL draws a panel above the
+  input box (goal, `N/M done · $spent / $cap`, one line per seat with its
+  harness) and `/teamwork status` prints the same summary; the interviewer
+  shows `needs_you` while the approval prompt waits. `teamwork run|resume
+  --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
+  stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
+
 ### Changed
 
 - **Each preview feature has its own switch.** `execute_code`, `teamwork` and

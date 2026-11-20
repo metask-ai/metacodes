@@ -30,6 +30,7 @@ const REQUESTS_FIXTURE = @embedFile("../fixtures/wire/v1/requests.jsonl");
 const HOST_FIXTURE = @embedFile("../fixtures/wire/v1/host_events.jsonl");
 const FRAMES_FIXTURE = @embedFile("../fixtures/wire/v1/capability_frames.jsonl");
 const REPLIES_FIXTURE = @embedFile("../fixtures/wire/v1/capability_replies.jsonl");
+const TEAMWORK_FIXTURE = @embedFile("../fixtures/wire/v1/teamwork.jsonl");
 
 const trace: [12]u8 = "0123456789ab".*;
 
@@ -353,4 +354,43 @@ test "wire_contract: every v1 request line parses as JSON and names its kind" {
         defer parsed.deinit();
         try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("v").?.integer);
     }
+}
+
+test "wire_contract: teamwork snapshot and event lines, every change kind, are pinned" {
+    const a = std.testing.allocator;
+    const progress = cc.teamwork_progress;
+    const types = cc.teamwork_types;
+    const seats = [_]cc.teamwork_runtime.SeatSnapshot{
+        .{ .id = types.seatIdFor(.implementer, 1), .role = .implementer, .harness = .metacodes, .status = .done },
+        .{ .id = types.seatIdFor(.reviewer, 1), .role = .reviewer, .harness = .claude_code, .status = .working },
+        .{ .id = types.seatIdFor(.implementer, 2), .role = .implementer, .harness = .claude_code, .status = .needs_you },
+    };
+    const snapshot: progress.Snapshot = .{
+        .run_id = try types.RunId.parse("run-7"),
+        .goal = "Add \"feature\".txt",
+        .phase = .reviewing,
+        .seats = &seats,
+        .budget = .{ .cap_usd = 5, .spent_usd = 0.75, .remaining_usd = 4.25, .charges = 2 },
+        .audit = .{ .used = 1, .last = .fail },
+    };
+    const teamwork_changes = [_]progress.Change{
+        .{ .seat = .{ .id = seats[2].id, .from = null, .to = .queued } },
+        .{ .seat = .{ .id = seats[1].id, .from = .queued, .to = .working } },
+        .{ .phase = .{ .from = .implementing, .to = .reviewing } },
+    };
+    var lines: [teamwork_changes.len + 1][]u8 = undefined;
+    var written: usize = 0;
+    defer for (lines[0..written]) |line| a.free(line);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try progress.writeSnapshotLine(&out.writer, snapshot);
+    lines[0] = try a.dupe(u8, std.mem.trimEnd(u8, out.written(), "\n"));
+    written += 1;
+    for (teamwork_changes, 1..) |change, index| {
+        out.clearRetainingCapacity();
+        try progress.writeEventLine(&out.writer, &.{ .change = change, .snapshot = snapshot });
+        lines[index] = try a.dupe(u8, std.mem.trimEnd(u8, out.written(), "\n"));
+        written += 1;
+    }
+    try compareOrDump(a, &lines, TEAMWORK_FIXTURE, "teamwork.jsonl");
 }

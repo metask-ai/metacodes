@@ -412,8 +412,13 @@ seat fills the cap) and leaves the next message unaffected. No
 implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
 approval; the approved bytes are written to `ORIGINAL_REQUEST.md` unchanged,
 then the run continues on a background thread with its own provider client,
-and the REPL stays available. `/teamwork status [<id>]` prints the same JSON
-as `teamwork status`. One run per REPL session at a time; leaving the REPL
+and the REPL stays available. While a run is live, the TUI panel above the
+input box shows its goal, `N/M done · $spent / $cap · <phase>` and one line
+per seat with its harness and status (`queued`, `working`, `needs_you`,
+`waiting`, `done`, `failed`); the interviewer is `needs_you` while the
+approval prompt waits. `/teamwork status` prints that progress summary for
+the session's run; `/teamwork status <id>` prints the same JSON as
+`teamwork status`. One run per REPL session at a time; leaving the REPL
 cancels an unfinished run, which `teamwork resume <id> --approve` continues
 under the same permission mode and sandbox settings. `[skip-interview]` skips
 the interviewer: the same prompt shows the request text itself for approval.
@@ -438,6 +443,20 @@ credentials/endpoint can be supplied again. Resume also accepts the originally
 saved repository when invoked elsewhere. An OS lifetime lock permits one
 driver per run. Ctrl-C forwards cancellation to the run. Exit codes are 0 for
 done/status/help, 1 for runtime failure and 2 for invalid input/refusal.
+
+`teamwork run` and `teamwork resume` take `--events`: stdout then carries one
+`teamwork.snapshot` wire line once the run is open, a `teamwork.event` line
+for every seat status change and phase change, and finally the status JSON
+(which has no `v`). The lines are specified in
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#16-teamwork-progress-lines) and pinned by
+`tests/fixtures/wire/v1/teamwork.jsonl`. A Zig host gets the same events
+in-process by setting `teamwork_runtime.Deps.observer` to a
+`teamwork_progress.Observer`; each `Event` carries the change and the
+`Snapshot` after it, and `teamwork_progress.Board` keeps the latest snapshot
+for a host that renders from another thread (`publish`, `read`,
+`currentRevision`). `interview.draft` reports the interviewer seat the same
+way and `interview.finishApproval` moves it from `needs_you` to `done`. The
+AgentCore C ABI has no teamwork entry point, so it carries no teamwork events.
 
 `teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
 the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)

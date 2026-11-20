@@ -29,6 +29,7 @@ const SLASH_MENU_MAX_ROWS: usize = 10;
 const model_command = @import("../model_command.zig");
 const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
+const teamwork_progress = @import("../../teamwork/progress.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
 const task_store = @import("../../core/task_store.zig");
 const ui_mod = @import("ui.zig");
@@ -163,6 +164,8 @@ pub const RenderRegion = struct {
     /// Component tests run the region on fd -1, which has no size, so this is
     /// how they resize it. Null in the product.
     size_override: ?term.TermSize = null,
+    teamwork_board: ?*teamwork_progress.Board = null,
+    teamwork_revision: u64 = 0,
 
     fn lock(self: *RenderRegion) void {
         _ = self.mutex.lock();
@@ -811,6 +814,8 @@ pub const RenderRegion = struct {
             return used;
         }
 
+        used += self.drawTeamwork(w, budget - used);
+
         // ---- agent 进度树 ----
         // 用 App.agentJobsPtr()(指向 App 字段本身),不要 `if (app.agent_jobs) |reg|`
         // 捕获——那是值拷贝,listLock 会锁栈副本的 mutex 而非真 registry 的(race)。
@@ -837,6 +842,25 @@ pub const RenderRegion = struct {
             used += self.drawTaskList(w, app, budget - used);
         }
         return used;
+    }
+
+    fn drawTeamwork(self: *RenderRegion, w: *std.Io.Writer, max_lines: u16) u16 {
+        const board = self.teamwork_board orelse return 0;
+        self.teamwork_revision = board.currentRevision();
+        var copy = (board.read(self.allocator) catch return 0) orelse return 0;
+        defer copy.deinit();
+        const snapshot = copy.snapshot();
+        if (snapshot.phase.isTerminal()) return 0;
+        const text = agent_tree.renderTeamwork(self.allocator, self.theme, snapshot, self.cols -| 1) catch return 0;
+        defer self.allocator.free(text);
+        return self.writePanelLines(w, text, max_lines);
+    }
+
+    pub fn teamworkChanged(self: *RenderRegion) bool {
+        self.lock();
+        defer self.unlock();
+        const board = self.teamwork_board orelse return false;
+        return board.currentRevision() != self.teamwork_revision;
     }
 
     /// 把多行文本(已含 ANSI)逐行写入区,每行前 clear.line + \r\n。最多 max_lines 行。

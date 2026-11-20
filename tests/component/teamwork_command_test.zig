@@ -538,6 +538,54 @@ test "teamwork command: request segments skip the interview and override seats f
     try testing.expectEqualStrings("skip_interview", value.object.get("request_source").?.string);
 }
 
+test "teamwork command: --events streams the snapshot, then every seat and phase change, as wire lines" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    const text = start ++ "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"No handoff in this fixture\"}}\n\n" ++ stop;
+    var server = try harness.MockServer.startCassette(&.{text}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    const refused = try c.cliEnabled(&.{ "status", "ev1", "--events" });
+    try testing.expectEqual(@as(i32, 2), refused.exit_code);
+    try c.write("request.md", "[skip-interview] Add feature.txt containing feature.\n");
+    const out = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--id", "ev1", "--events", "--approve", "--budget-usd", "2", "--max-rounds", "1", "--model", "fixture", "--api-key", "fixture-key", "--base-url", url });
+    if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) return;
+    try testing.expectEqual(@as(i32, 1), out.exit_code);
+    var transcript: std.Io.Writer.Allocating = .init(a);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.stdout, "\n"), '\n');
+    while (lines.next()) |line| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{});
+        const version = value.object.get("v") orelse {
+            try testing.expectEqualStrings("ev1", value.object.get("run_id").?.string);
+            try testing.expect(lines.next() == null);
+            break;
+        };
+        try testing.expectEqual(@as(i64, 1), version.integer);
+        const data = value.object.get("data").?.object;
+        const snapshot = if (data.get("snapshot")) |inner| inner.object else data;
+        try testing.expectEqualStrings("ev1", snapshot.get("run_id").?.string);
+        try testing.expectEqualStrings("Add feature.txt containing feature.", snapshot.get("goal").?.string);
+        const w = &transcript.writer;
+        try w.print("{s}", .{value.object.get("type").?.string});
+        if (data.get("change")) |change| {
+            const from = change.object.get("from").?;
+            try w.print(" {s} {s}>{s}", .{ if (change.object.get("seat")) |seat| seat.string else "phase", if (from == .string) from.string else "-", change.object.get("to").?.string });
+        }
+        try w.print(" @{s} {d}/{d}\n", .{ snapshot.get("phase").?.string, snapshot.get("done").?.integer, snapshot.get("total").?.integer });
+    }
+    try testing.expectEqualStrings(
+        \\teamwork.snapshot @approved 0/0
+        \\teamwork.event implementer-1 ->queued @approved 0/1
+        \\teamwork.event phase approved>implementing @implementing 0/1
+        \\teamwork.event implementer-1 queued>working @implementing 0/1
+        \\teamwork.event implementer-1 working>failed @implementing 0/1
+        \\teamwork.event phase implementing>failed @failed 0/1
+        \\
+    , transcript.written());
+}
+
 const fake_claude =
     \\#!/bin/sh
     \\case "$1" in

@@ -4,6 +4,8 @@ const cmd_output = @import("cmd_output.zig");
 const command = @import("../teamwork/command.zig");
 const interview = @import("../teamwork/interview.zig");
 const types = @import("../teamwork/types.zig");
+const progress = @import("../teamwork/progress.zig");
+const agent_tree = @import("tui/widget/agent_tree.zig");
 
 pub const LineReader = struct {
     ctx: *anyopaque,
@@ -16,8 +18,10 @@ pub const LineReader = struct {
 
 pub const Session = struct {
     job: ?*command.Background = null,
+    board: progress.Board = .init(std.heap.c_allocator),
 
     pub fn deinit(self: *Session) void {
+        defer self.board.deinit();
         const job = self.job orelse return;
         self.job = null;
         if (!job.finished()) cmd_output.print("Teamwork run {s} was cancelled with this session. Continue it with: metacodes --preview teamwork resume {s} --approve (under the same permission mode and sandbox settings)\n", .{ job.id.slice(), job.id.slice() });
@@ -53,10 +57,11 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
         job.stop();
         session.job = null;
     }
+    session.board.clear();
     var prompter_state: Prompter = .{ .app = app, .allocator = allocator, .reader = reader };
     defer prompter_state.deinit();
     cmd_output.print("Preparing the teamwork run; unless the request says [skip-interview], the interviewer drafts the task first…\n", .{});
-    const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter());
+    const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter(), &session.board);
     app.abort.reset();
     const outcome = result catch |err| {
         cmd_output.print("{s}/teamwork failed: {s}{s}\n", .{ theme.danger, @errorName(err), theme.reset });
@@ -78,7 +83,10 @@ fn ended(app: *app_mod.App, what: []const u8, id: types.RunId) void {
     cmd_output.print("{s} Nothing was started. Any interview spend is recorded in {s}/teamwork/{s}/budget.jsonl.\n", .{ what, app.stateRoot(), id.slice() });
 }
 
-fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *const Session, explicit: []const u8) void {
+fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session, explicit: []const u8) void {
+    if (explicit.len == 0 and session.job != null) {
+        if (showProgress(app, allocator, &session.board)) return;
+    }
     const id = if (explicit.len != 0)
         types.RunId.parse(explicit) catch {
             cmd_output.print("{s}Invalid run id: {s}{s}\n", .{ app.theme.danger, explicit, app.theme.reset });
@@ -94,6 +102,15 @@ fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *const S
     command.status(arena_state.allocator(), app.stateRoot(), id) catch |err| {
         cmd_output.print("{s}/teamwork status {s}: {s}{s}\n", .{ app.theme.danger, id.slice(), @errorName(err), app.theme.reset });
     };
+}
+
+fn showProgress(app: *app_mod.App, allocator: std.mem.Allocator, board: *progress.Board) bool {
+    var copy = (board.read(allocator) catch return false) orelse return false;
+    defer copy.deinit();
+    const text = agent_tree.renderTeamwork(allocator, app.theme, copy.snapshot(), null) catch return false;
+    defer allocator.free(text);
+    cmd_output.print("{s}", .{text});
+    return true;
 }
 
 const Prompter = struct {
