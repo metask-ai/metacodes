@@ -12,6 +12,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
+  `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after
+  Codex's; `"mcpImport": {"metacode": false}` in `<state root>/config.json`
+  turns it off. Its stdio servers start with every session, as Codex's do.
+
+- **`metacodes mcp login` succeeds only when the server takes the token.** The
+  new token is tried with one authenticated request before it is stored; a
+  401/403 fails the login, stores nothing and prints the server's answer with
+  the scope requested and granted. Registration and token errors print the
+  authorization server's `error`/`error_description`.
+
+- **A configured MCP server that did not connect is reported** to the model
+  (ToolSearch misses and calls to its tools name it, its cause and the fix), on
+  stderr by `-p`, and in `--json` as `mcp_unavailable`.
+
+- **Reading a credential store from Bash always asks.** A command that runs
+  `security find-generic-password`/`find-internet-password`/`dump-keychain` or
+  `secret-tool` prompts even under an allow rule for `Bash` or in
+  `bypassPermissions`; a deny rule still denies.
+
 - **Preview features require opt-in.** `--preview` enables them; `--no-preview`
   overrides a saved root `"preview": true` in the installation's `config.json`.
   ExecuteCode JavaScript orchestration is a preview feature and is hidden and

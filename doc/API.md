@@ -529,7 +529,12 @@ includes `usage_status:"known"|"unknown"`: `unknown` means the successful
 provider response supplied no readable usage object (including a usage tail
 lost after a reported stop), so its numeric usage and cost fields are
 placeholders rather than a claim of free work. Explicit numeric zero usage is
-`known`. Flag removals or semantic changes require a changelog entry.
+`known`. When a configured MCP server did not connect, the result line carries
+`mcp_unavailable: [{"name", "detail"}]` (the reason `/mcp` shows, with the
+`metacodes mcp login` command for a server that answered 401), and the run
+writes one `warning: MCP server '<name>' did not connect: <detail>` line per
+server to stderr before it starts; with every server connected, neither
+appears. Flag removals or semantic changes require a changelog entry.
 
 ### System-One memory advisor (optional)
 

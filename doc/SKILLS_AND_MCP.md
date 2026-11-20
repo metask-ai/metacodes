@@ -2,7 +2,8 @@
 
 metacodes keeps its own Skills and MCP configuration under its state root
 (`~/.metacodes` unless `--state-dir`, `METACODES_HOME` or the install manifest
-chooses another), and also reads what Claude Code and Codex users already have,
+chooses another), and also reads what Claude Code, Codex and Metacode users
+already have,
 with each tool's own semantics. This page is the contract for the CLI hosts
 (terminal REPL, `--web`, `serve`). AgentCore keeps the narrower,
 `.agents/skills`-only policy described in
@@ -209,8 +210,10 @@ whole entry from the highest source (fields never merge):
 | `~/.claude.json` `mcpServers` | Claude Code user scope | inherited | yes |
 | `<dir>/.codex/config.toml` `[mcp_servers.*]` | Codex project layer, trusted projects only | Codex allowlist | no |
 | `$CODEX_HOME/config.toml` `[mcp_servers.*]` | Codex user layer | Codex allowlist | no |
+| `~/.metacode/config.toml` `[mcp_servers.*]` | Metacode user layer (Codex format) | Codex allowlist | no |
 
-`"mcpImport": {"claude": false, "codex": false}` turns the foreign sources off;
+`"mcpImport": {"claude": false, "codex": false, "metacode": false}` turns the
+foreign sources off;
 an entry `{"enabled": false}` without a command or URL disables that name in
 every lower source.
 
@@ -459,7 +462,10 @@ an `mcp__…` tool that does not exist, the result names the configured servers
 that did not connect with the reason `/mcp` shows (for a 401, the
 `metacodes mcp login` command), says that a new session picks them up, and
 asks the model to tell the user instead of reaching the server another way.
-Nothing about them enters the system prompt.
+Nothing about them enters the system prompt. A `-p` run prints one
+`warning: MCP server '<name>' did not connect: <reason>` line per such server
+to stderr before it starts, and `--json` adds them to the result line as
+`mcp_unavailable`.
 The tool list is fixed for a session (it is part of the cached prompt); when a
 server announces `notifications/tools/list_changed`, `/mcp` says so and the new
 list applies after a restart.
