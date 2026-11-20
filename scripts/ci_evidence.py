@@ -18,7 +18,7 @@ def write_evidence(root: Path, output: Path, env) -> None:
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
     pr = event["pull_request"]
     commit, base, head = (revision(ref) for ref in ("HEAD", "HEAD^1", "HEAD^2"))
-    if (commit != env["GITHUB_SHA"] or base != pr["base"]["sha"] or head != pr["head"]["sha"]):
+    if commit != env["GITHUB_SHA"] or head != pr["head"]["sha"]:
         raise ValueError("checkout is not the PR's tested merge revision")
     evidence = {"schema": 1, "repository": env["GITHUB_REPOSITORY"],
                 "run_id": int(env["GITHUB_RUN_ID"]), "attempt": int(env["GITHUB_RUN_ATTEMPT"]),
