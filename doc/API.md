@@ -1081,6 +1081,19 @@ position without an epoch, or lies past the journal's end, the server sends
 and replays from the oldest event it kept; when old events were evicted under
 the cursor, the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
 
+The UDS transport of `serve` takes the frontend's two lines, the answer and
+the capability frame, as NDJSON ops, so a UDS-only frontend needs no HTTP side
+channel for either. `{"op":"respond","session":"<id>","id":N,...}` answers the
+pending `ui_request` N with the same answer fields `POST /respond` takes
+beside the routing fields (`{"ok":true}`; a stale or unknown id replies
+`{"ok":false,"error":"no pending request with this id"}`, the 409 of the HTTP
+surface, and a line without `id` replies `{"ok":false,"error":"missing id"}`).
+`{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` is
+the capability frame itself
+([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#23-transports)) beside the routing
+fields, answered with the `capabilities_accepted` acknowledgement line (also
+journaled, like the HTTP route) or `capabilities_refused`.
+
 ### Web and daemon messages: `POST /message` and `GET /state`
 
 `--web` and `serve` take a message at `POST /message`, `serve --sessions N`
@@ -1092,18 +1105,7 @@ at `POST /s/<id>/message`:
 
 The UDS transport's `{"op":"message","session":"<id>",...}` reads the same
 three fields with the same checks (replies `{"ok":true}` or
-`{"ok":false,"error":"..."}`). The other interactive routes have UDS ops too,
-so a UDS-only frontend needs no HTTP side channel:
-`{"op":"respond","session":"<id>","id":N,...}` answers the pending
-`ui_request` N with the same answer fields `POST /respond` takes beside the
-routing fields (`{"ok":true}`; a stale or unknown id replies
-`{"ok":false,"error":"no pending request with this id"}`, the 409 of the HTTP
-surface, and a line without `id` replies `{"ok":false,"error":"missing id"}`),
-and `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}`
-is the capability frame itself
-([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#23-transports)) beside the routing
-fields, answered with the `capabilities_accepted` acknowledgement line (also
-journaled, like the HTTP route) or `capabilities_refused`.
+`{"ok":false,"error":"..."}`).
 
 - `text` is required and must not be empty after trimming. A body that is not
   a JSON object is the text itself.
