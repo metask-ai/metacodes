@@ -327,12 +327,18 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v rg >/dev/null 2>&1; then
-            if [[ "$RUNNER_OS" == "macOS" ]]; then
-              brew install ripgrep
-            else
-              sudo apt-get update
-              sudo apt-get install -y ripgrep
-            fi
+            case "$RUNNER_ARCH" in
+              X64) arch=x86_64 ;;
+              ARM64) arch=aarch64 ;;
+              *) echo "no vendored ripgrep for runner arch $RUNNER_ARCH" >&2; exit 1 ;;
+            esac
+            case "$RUNNER_OS" in
+              Linux) os=linux ;;
+              macOS) os=macos ;;
+              *) echo "no vendored ripgrep for runner OS $RUNNER_OS" >&2; exit 1 ;;
+            esac
+            python3 scripts/stage_ripgrep_binary.py "$arch" "$os" "$RUNNER_TEMP/ripgrep"
+            echo "$RUNNER_TEMP/ripgrep" >> "$GITHUB_PATH"
           fi
       # scripts/build_project_rule.py isolates a candidate rule's Lean build in
       # bubblewrap on Linux (sandbox-exec on macOS); the native project-Harness

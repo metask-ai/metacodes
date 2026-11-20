@@ -242,7 +242,7 @@ fn expectAsksKeepAlive(raw: []const u8) !void {
 /// after the answer, without waiting for the server.
 fn expectClientClosed(proxy: *LossyProxy, index: usize) !void {
     try std.testing.expect(proxy.waitForCloses(index + 1, CLOSE_WAIT_MS));
-    const ms = proxy.closeLatencyMs(index) orelse return error.TestClientKeptConnectionOpen;
+    const ms = try proxy.closeLatencyMs(index);
     try std.testing.expect(ms < CLOSE_WITHIN_MS);
 }
 

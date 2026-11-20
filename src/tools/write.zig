@@ -65,6 +65,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         else => null,
     };
 
+    if (before != .unknown) try @import("comment_check.zig").checkFile(ctx, path, old_content orelse "", content);
     const write_flags: pfs.O = if (ctx.project_write_exclusive_create)
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .EXCL = true }
     else
@@ -343,6 +344,34 @@ test "WriteTool not-read-first rejects existing file" {
     var abuf: [320]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"new\"}}", .{path});
     try std.testing.expectError(error.NotRead, execute(&ctx, args));
+}
+
+test "comment preview checks Write and Edit before touching the file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = tt.normalizeSlashes(buf[0..try tmp.dir.realPath(io, &buf)]);
+    var ctx: ToolContext = .{ .allocator = a, .cwd_abs = root, .resolve_relative_paths = true, .preview = true };
+    const args =
+        \\{"path":"code.py","content":"x = 1  # existing\n"}
+    ;
+    try std.testing.expectError(error.AddedCodeComment, execute(&ctx, args));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "code.py", .{}));
+    ctx.preview = false;
+    a.free(try execute(&ctx, args));
+    ctx.preview = true;
+    const edit = @import("edit.zig").execute;
+    a.free(try edit(&ctx,
+        \\{"file_path":"code.py","old_string":"x = 1","new_string":"x = 2"}
+    ));
+    try std.testing.expectError(error.AddedCodeComment, edit(&ctx,
+        \\{"file_path":"code.py","old_string":"# existing","new_string":"# rewritten"}
+    ));
+    const bytes = try tmp.dir.readFileAlloc(io, "code.py", a, .limited(128));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("x = 2  # existing\n", bytes);
 }
 
 test "WriteTool creating new file does not require read" {

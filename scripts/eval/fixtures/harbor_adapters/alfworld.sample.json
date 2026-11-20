@@ -1,0 +1,10 @@
+{
+ "_comment": "Synthetic entries in the json_2.1.2_tw-pddl.zip layout; game bodies are placeholders, not playable games.",
+ "games": {
+  "json_2.1.1/valid_unseen/look_at_obj_in_light-Book-None-DeskLamp-308/trial_T20190908_000000_000001/game.tw-pddl": {"pddl_domain": "(define (domain alfred))", "grammar": "grammar :: \"\"", "pddl_problem": "(define (problem p1))", "solvable": true, "walkthrough": ["go to desk 1", "use desklamp 1"]},
+  "json_2.1.1/valid_unseen/pick_and_place_simple-Pen-None-Desk-308/trial_T20190908_000000_000002/game.tw-pddl": {"pddl_domain": "(define (domain alfred))", "grammar": "grammar :: \"\"", "pddl_problem": "(define (problem p2))", "solvable": true, "walkthrough": ["go to desk 1"]},
+  "json_2.1.1/valid_unseen/pick_and_place_simple-Pen-None-Desk-308/trial_T20190908_000000_000003/game.tw-pddl": {"pddl_domain": "(define (domain alfred))", "grammar": "grammar :: \"\"", "pddl_problem": "(define (problem p3))", "solvable": false, "walkthrough": []},
+  "json_2.1.1/valid_unseen/pick_and_place_with_movable_recep-Pen-Bowl-Desk-308/trial_T20190908_000000_000004/game.tw-pddl": {"pddl_domain": "(define (domain alfred))", "grammar": "grammar :: \"\"", "pddl_problem": "(define (problem p4))", "solvable": true, "walkthrough": []},
+  "json_2.1.1/valid_seen/pick_and_place_simple-Pen-None-Desk-301/trial_T20190908_000000_000005/game.tw-pddl": {"pddl_domain": "(define (domain alfred))", "grammar": "grammar :: \"\"", "pddl_problem": "(define (problem p5))", "solvable": true, "walkthrough": []}
+ }
+}

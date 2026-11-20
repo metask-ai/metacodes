@@ -85,6 +85,31 @@ pub fn sameArgs(scratch: std.mem.Allocator, a: []const u8, b: []const u8) error{
 /// both receive these bytes, so they read the same value for every key
 /// whatever whitespace or escapes the model used (issue #494).
 pub fn canonicalizeArgs(allocator: std.mem.Allocator, args: []const u8) ArgsError![]u8 {
+    return canonicalizeArgsWithAliases(allocator, args, &.{});
+}
+
+pub const PathAlias = struct {
+    name: []const u8,
+    target: []const u8,
+};
+
+pub const workspace_alias = "WORKSPACE";
+pub const seat_alias = "SEAT";
+
+pub const path_argument_keys = [_][]const u8{ "file_path", "path", "notebook_path" };
+
+pub fn expandPathAlias(allocator: std.mem.Allocator, aliases: []const PathAlias, path: []const u8) error{OutOfMemory}!?[]u8 {
+    if (path.len == 0 or path[0] != '$') return null;
+    for (aliases) |alias| {
+        if (!std.mem.startsWith(u8, path[1..], alias.name)) continue;
+        const rest = path[1 + alias.name.len ..];
+        if (rest.len == 0) return try allocator.dupe(u8, alias.target);
+        if (rest[0] == '/') return try std.mem.concat(allocator, u8, &.{ alias.target, rest });
+    }
+    return null;
+}
+
+pub fn canonicalizeArgsWithAliases(allocator: std.mem.Allocator, args: []const u8, aliases: []const PathAlias) ArgsError![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -100,6 +125,11 @@ pub fn canonicalizeArgs(allocator: std.mem.Allocator, args: []const u8) ArgsErro
         else => error.InvalidArgumentsJson,
     };
     if (value != .object) return error.InvalidArgumentsJson;
+    if (aliases.len > 0) for (path_argument_keys) |key| {
+        const member = value.object.getPtr(key) orelse continue;
+        if (member.* != .string) continue;
+        if (try expandPathAlias(arena, aliases, member.string)) |expanded| member.* = .{ .string = expanded };
+    };
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
@@ -576,6 +606,29 @@ test "sameArgs: raw and canonical spellings of one call match; different calls d
     try std.testing.expect(!try sameArgs(a, "{\"a\":1,\"b\":2}", "{\"b\":2,\"a\":1}"));
     try std.testing.expect(!try sameArgs(a, "{\"k\":1,\"k\":1}", "{\"k\":1}"));
     try std.testing.expect(try sameArgs(a, "not json", "not json"));
+}
+
+test "canonicalizeArgsWithAliases: a leading alias in a path argument becomes its target" {
+    const a = std.testing.allocator;
+    const aliases = [_]PathAlias{ .{ .name = "SEAT", .target = "/state/seats/a-1" }, .{ .name = "WORKSPACE", .target = "/ws" } };
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "{\"file_path\":\"$SEAT/handoff.md\",\"content\":\"$SEAT/x\"}", .out = "{\"file_path\":\"/state/seats/a-1/handoff.md\",\"content\":\"$SEAT/x\"}" },
+        .{ .in = "{\"pattern\":\"x\",\"path\":\"$WORKSPACE\"}", .out = "{\"pattern\":\"x\",\"path\":\"/ws\"}" },
+        .{ .in = "{\"notebook_path\":\"$WORKSPACE/n.ipynb\"}", .out = "{\"notebook_path\":\"/ws/n.ipynb\"}" },
+        .{ .in = "{\"file_path\":\"$SEAT/../b-1/handoff.md\"}", .out = "{\"file_path\":\"/state/seats/a-1/../b-1/handoff.md\"}" },
+        .{ .in = "{\"file_path\":\"$SEATS/x\"}", .out = "{\"file_path\":\"$SEATS/x\"}" },
+        .{ .in = "{\"file_path\":\"a/$SEAT/x\"}", .out = "{\"file_path\":\"a/$SEAT/x\"}" },
+        .{ .in = "{\"command\":\"cat $SEAT/packet.md\"}", .out = "{\"command\":\"cat $SEAT/packet.md\"}" },
+        .{ .in = "{\"o\":{\"file_path\":\"$SEAT/x\"}}", .out = "{\"o\":{\"file_path\":\"$SEAT/x\"}}" },
+    };
+    for (cases) |case| {
+        const out = try canonicalizeArgsWithAliases(a, case.in, &aliases);
+        defer a.free(out);
+        try std.testing.expectEqualStrings(case.out, out);
+    }
+    const plain = try canonicalizeArgs(a, "{\"file_path\":\"$SEAT/x\"}");
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("{\"file_path\":\"$SEAT/x\"}", plain);
 }
 
 test "canonicalizeArgs: duplicate keys at any level are refused" {

@@ -683,6 +683,21 @@ pub fn send(s: Socket, buf: []const u8) isize {
     return std.c.write(s, buf.ptr, buf.len);
 }
 
+pub fn lastSocketFailure() enum { interrupted, peer_closed, other } {
+    if (is_windows) {
+        const WSAEINTR = 10004;
+        const WSAECONNRESET = 10054;
+        return switch (sys.WSAGetLastError()) {
+            WSAEINTR => .interrupted,
+            WSAECONNRESET => .peer_closed,
+            else => .other,
+        };
+    }
+    if (pfs.lastErrnoIs(.INTR)) return .interrupted;
+    if (pfs.lastErrnoIs(.PIPE) or pfs.lastErrnoIs(.CONNRESET)) return .peer_closed;
+    return .other;
+}
+
 pub fn closeSocket(s: Socket) void {
     if (is_windows) {
         _ = sys.closesocket(s);

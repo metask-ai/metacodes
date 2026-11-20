@@ -559,6 +559,7 @@ pub const Environment = struct {
             .{
                 .max_turns = self.max_turns,
                 .system_prompt = subagent_system_prompt,
+                .preview = self.session.runtime.preview,
                 .session = self.identity.session_id,
                 .agent_depth = child_depth,
                 .tool_dispatcher = child_surface.dispatcher,

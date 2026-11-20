@@ -486,7 +486,7 @@ fn applyProviderRoute(
 /// than the one the user chose, which is the exact substitution the offer model
 /// exists to prevent.
 pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
-    var store = provider_config_store.Store.initHome(allocator, hostRoot()) catch return false;
+    var store = provider_config_store.Store.initHome(allocator, config.state_root) catch return false;
     defer store.deinit();
 
     var document = store.load() catch |err| {
@@ -508,12 +508,93 @@ pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.A
     };
     defer host.destroy();
 
-    const outcome = provider_startup.resolveSelection(allocator, &host.registry, selection) catch {
+    var outcome = resolveStoredSelection(allocator, host, selection);
+    if (outcome == .failure and outcome.failure == .unresolved_selection) {
+        switch (fetchMissingOpenRouterListing(allocator, config.*)) {
+            .skipped => {},
+            .kept => {
+                _ = openrouter_catalog.adoptKept(host, allocator, config.state_root);
+                outcome = resolveStoredSelection(allocator, host, selection);
+            },
+            .failed => |failure| failMissingOpenRouterListing(allocator, failure),
+            .timed_out => failMissingOpenRouterListing(allocator, null),
+        }
+    }
+    applyStartupOutcome(config, allocator, outcome);
+    return true;
+}
+
+fn resolveStoredSelection(
+    allocator: std.mem.Allocator,
+    host: *provider_host.Host,
+    selection: provider_selection.RuntimeSelection,
+) provider_startup.Outcome {
+    return provider_startup.resolveSelection(allocator, &host.registry, selection) catch {
         std.debug.print("error: out of memory while resolving the stored provider selection\n", .{});
         std.process.exit(2);
     };
-    applyStartupOutcome(config, allocator, outcome);
-    return true;
+}
+
+pub const MissingListing = union(enum) {
+    skipped,
+    kept,
+    failed: openrouter_catalog.Failure,
+    timed_out,
+};
+
+pub const MISSING_LISTING_WAIT_MS: u64 = 30_000;
+
+pub fn fetchMissingOpenRouterListing(allocator: std.mem.Allocator, config: types.Config) MissingListing {
+    if (std.c.getenv("METACODES_NO_PROBE") != null) return .skipped;
+    if (openrouter_catalog.keptAge(allocator, config.state_root) != .none) return .skipped;
+    const credential = resolveProviderScopedCredentialReporting(allocator, config, "openrouter", .keys_only) catch return .skipped;
+    defer {
+        std.crypto.secureZero(u8, credential.secret);
+        allocator.free(credential.secret);
+    }
+    std.debug.print("Downloading OpenRouter's model list for the stored default model…\n", .{});
+    const refresh = openrouter_catalog.Refresh.start(credential.secret, config.state_root, .{}) catch return .{ .failed = .other };
+    defer refresh.release();
+    var waited_ms: u64 = 0;
+    while (!refresh.finished()) {
+        if (waited_ms >= MISSING_LISTING_WAIT_MS) {
+            refresh.supersede();
+            return .timed_out;
+        }
+        util_time.sleepMs(100);
+        waited_ms += 100;
+    }
+    return if (refresh.kept()) .kept else .{ .failed = refresh.failureReason() };
+}
+
+fn failMissingOpenRouterListing(allocator: std.mem.Allocator, failure: ?openrouter_catalog.Failure) noreturn {
+    const command = invokedCommand(allocator);
+    if (failure != null and failure.? == .refused) {
+        std.debug.print(
+            "error: the stored default model was not found, and OpenRouter refused the key when its model list was requested; sign in again: {s} login --provider openrouter\n",
+            .{command},
+        );
+        std.process.exit(2);
+    }
+    std.debug.print(
+        "error: the stored default model was not found, and OpenRouter's model list, which is not on this machine, could not be downloaded ({s}); `{s} --provider openrouter` starts without that model and downloads the list, or pass --provider/--model to choose another route\n",
+        .{ missingListingWords(failure), command },
+    );
+    std.process.exit(2);
+}
+
+fn missingListingWords(failure: ?openrouter_catalog.Failure) []const u8 {
+    const known = failure orelse return "no answer within 30 s";
+    return switch (known) {
+        .connection => "no connection",
+        .interrupted => "answer cut off",
+        .refused => "key refused",
+        .busy => "rate limited",
+        .server_error => "server error",
+        .not_a_list => "not a model list",
+        .too_large => "list too large",
+        .other => "unexpected error",
+    };
 }
 
 /// `<state root>/.env` (#486), read once at startup. The provider runtime
@@ -1925,19 +2006,8 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
 /// in render order, each with its id, order, class, origin, size and digest,
 /// then the prompt digest checked against the prompt App actually built.
 fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
-    const system_prompt_mod = @import("core/system_prompt.zig");
     const cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
-    const listing = system_prompt_mod.listFullWithDefs(
-        app.allocator,
-        app.promptModelName(),
-        &app.skills,
-        &app.agents,
-        app.enabled_tool_names,
-        app.memdir_abs,
-        app.kgReady(),
-        cwd,
-        app.tool_defs,
-    ) catch |err| {
+    const listing = app.cliPromptInput(cwd).list(app.allocator) catch |err| {
         var buf: [96]u8 = undefined;
         dumpWrite(std.fmt.bufPrint(&buf, "prompt sections unavailable: {s}\n", .{@errorName(err)}) catch "prompt sections unavailable\n");
         std.process.exit(1);
@@ -5464,9 +5534,10 @@ fn printHelp() void {
         \\  teamwork status <id> [--json] | teamwork resume <id> --approve
         \\                        Approved SWE loop with required sandbox; teamwork --help for options
         \\  --version             Print version and build identity and exit (--json: one JSON document)
-        \\  bench [open|info|list|run] [--url <workbench>] [--no-open]
-        \\                        Open Bench workbench; select tasks/models and run evaluations.
-        \\                        bench run --task <name> --wait prints the result link when done.
+        \\  bench [open|info|list|run|prepare|setup|db] [--url <workbench>] [--no-open]
+        \\                        Open Bench workbench; pick a benchmark suite, tasks and model, run evaluations.
+        \\                        bench run [--suite <id>] [--executor <name>] --task <name> --wait prints the result link.
+        \\                        bench setup prepares an execution machine; bench db status|import|migrate.
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]

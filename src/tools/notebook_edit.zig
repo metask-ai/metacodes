@@ -85,13 +85,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var old_src: []const u8 = "";
     var new_src: []const u8 = "";
     var is_markdown = std.mem.eql(u8, cell_type, "markdown");
+    var was_code = false;
+    var is_code = std.mem.eql(u8, cell_type, "code");
     switch (mode) {
         .replace => {
             const idx = findCellById(cells_list.items, cell_id.?) orelse return error.CellNotFound;
             // 改前抓旧 source(供 diff);cell_type 未显式改时沿用原 cell 类型判 markdown。
             old_src = try cellSourceDup(a, cells_list.items[idx]);
+            was_code = cellHasType(cells_list.items[idx], "code");
             if (cell_type_raw == null) {
-                is_markdown = cellIsMarkdown(cells_list.items[idx]);
+                is_markdown = cellHasType(cells_list.items[idx], "markdown");
+                is_code = was_code;
             }
             try setCellSource(parsed.arena.allocator(), &cells_list.items[idx], new_source);
             if (cell_type_raw != null) {
@@ -112,19 +116,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .delete => {
             const idx = findCellById(cells_list.items, cell_id.?) orelse return error.CellNotFound;
             old_src = try cellSourceDup(a, cells_list.items[idx]); // new="" → 纯删除
-            is_markdown = cellIsMarkdown(cells_list.items[idx]);
+            is_markdown = cellHasType(cells_list.items[idx], "markdown");
             _ = cells_list.orderedRemove(idx);
         },
     }
     defer if (old_src.len > 0) a.free(old_src);
 
-    // 写回
+    const lang: []const u8 = if (is_markdown) "" else notebookLang(root);
+    if (is_code) try @import("comment_check.zig").checkCell(ctx, path, lang, if (was_code) old_src else "", new_src);
     const out_json = try serializeNotebook(a, root);
     defer a.free(out_json);
     try writeFile(ctx, path, out_json);
-
-    // cell 语言(供高亮):markdown cell 不高亮代码;code cell 用 notebook language_info.name(默认 python)。
-    const lang: []const u8 = if (is_markdown) "" else notebookLang(root);
 
     // 旁路缓存 cell 新旧 source(供工具卡 hl-zig 高亮;不进对话历史)。
     if (ctx.edit_hl_cache) |cache| {
@@ -189,10 +191,10 @@ fn cellSourceDup(allocator: std.mem.Allocator, cell: std.json.Value) ![]const u8
     }
 }
 
-fn cellIsMarkdown(cell: std.json.Value) bool {
+fn cellHasType(cell: std.json.Value, name: []const u8) bool {
     if (cell != .object) return false;
     const ct = cell.object.get("cell_type") orelse return false;
-    return ct == .string and std.mem.eql(u8, ct.string, "markdown");
+    return ct == .string and std.mem.eql(u8, ct.string, name);
 }
 
 /// notebook 的 metadata.language_info.name(默认 "python")。
@@ -300,6 +302,27 @@ fn writeNb(path: []const u8, body: []const u8) !void {
     const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = pfs.write(fd, body);
     _ = pfs.close(fd);
+}
+
+test "comment preview checks notebook code and preserves markdown headings" {
+    const a = testing.allocator;
+    var path_buf: [512]u8 = undefined;
+    const path = tt.path(&path_buf, "comment-preview.ipynb");
+    defer pfs.unlinkPath(path.ptr) catch {};
+    try writeNb(path, SAMPLE_NB);
+    const ctx: ToolContext = .{ .allocator = a, .preview = true };
+    for ([_][]const u8{ "c1", "m1" }) |id| {
+        const args = try std.json.Stringify.valueAlloc(a, .{ .notebook_path = path, .cell_id = id, .new_source = "# heading" }, .{});
+        defer a.free(args);
+        if (std.mem.eql(u8, id, "c1")) {
+            try testing.expectError(error.AddedCodeComment, execute(&ctx, args));
+            const unchanged = try readFile(&ctx, a, path);
+            defer a.free(unchanged);
+            try testing.expectEqualStrings(SAMPLE_NB, unchanged);
+        } else {
+            a.free(try execute(&ctx, args));
+        }
+    }
 }
 
 test "NotebookEdit: missing path" {

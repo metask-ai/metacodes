@@ -1291,14 +1291,14 @@ test "teamwork runtime L2: the isolated verifier audits the result; its FAIL rep
     var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
     defer seats.deinit();
     const Event = drivers_test.ScriptedProvider.Event;
-    const probe = "{\"command\":\"cat feature.txt\"}";
+    const probe = "{\"command\":\"cat $WORKSPACE/feature.txt\"}";
     const turns = [_][]const Event{
         // audit 1
-        &.{.{ .tool = .{ .name = "Bash", .input = probe } }},
-        &.{.{ .text = "REQUIREMENT: feature.txt must exist and say \"feature\"\nSUBSTITUTE: a feature.txt with other content\nPROBE: cat feature.txt\nOBSERVED: wrong\nVERDICT: FAIL" }},
+        &.{ .{ .tool = .{ .name = "Bash", .input = probe } }, .{ .tool = .{ .name = "Read", .input = "{\"file_path\":\"$WORKSPACE/feature.txt\"}" } } },
+        &.{.{ .text = "REQUIREMENT: feature.txt must exist and say \"feature\"\nSUBSTITUTE: a feature.txt with other content\nPROBE: cat $WORKSPACE/feature.txt\nOBSERVED: wrong\nVERDICT: FAIL" }},
         // audit 2
         &.{.{ .tool = .{ .name = "Bash", .input = probe } }},
-        &.{.{ .text = "REQUIREMENT: feature.txt must exist and say \"feature\"\nSUBSTITUTE: a feature.txt with other content\nPROBE: cat feature.txt\nOBSERVED: feature\nVERDICT: PASS" }},
+        &.{.{ .text = "REQUIREMENT: feature.txt must exist and say \"feature\"\nSUBSTITUTE: a feature.txt with other content\nPROBE: cat $WORKSPACE/feature.txt\nOBSERVED: feature\nVERDICT: PASS" }},
     };
     var scripted: drivers_test.ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
     defer scripted.deinit();
@@ -1330,13 +1330,14 @@ test "teamwork runtime L2: the isolated verifier audits the result; its FAIL rep
     try expectFile(fx.repo(), "feature.txt", "feature\n");
     // The verifier's packet is the recorded request, verbatim.
     try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, request_text) != null);
-    try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, "path: . (your working directory)") != null);
+    try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, "path: $WORKSPACE (your working directory)") != null);
     try testing.expect(std.mem.indexOf(u8, scripted.first_user.?, fx.root.slice()) == null);
     var run_buf: PathBuf = undefined;
     const report = readFile(fx.runFile(&run_buf, ""), "audits/audit-1.md") orelse return error.NoReport;
     defer testing.allocator.free(report);
     try testing.expect(std.mem.startsWith(u8, report, "# Completion audit 1: fail\n\nIsolated verifier verdict: FAIL\n"));
-    try testing.expect(std.mem.indexOf(u8, report, "  Probe: `cat feature.txt`\n  Observed: wrong\n") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "  Probe: `cat $WORKSPACE/feature.txt`\n  Observed: wrong\n") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, scripted.tool_results.items, "wrong"));
     try testing.expect(std.mem.indexOf(u8, seats.packetOf("implementer-2"), run_dir.seat_relative_first_audit_report) != null);
     // Both audits were charged to the run ledger.
     const ledger_text = readFile(fx.runFile(&run_buf, ""), "budget.jsonl") orelse return error.NoLedger;

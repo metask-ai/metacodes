@@ -24,7 +24,9 @@ from scripts.eval.harbor.viewer import server
 
 def _write(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+    # Bytes, not text mode: trial files come from Linux containers with LF
+    # line ends, and Windows text mode would turn them into CRLF.
+    path.write_bytes((value if isinstance(value, str) else json.dumps(value)).encode("utf-8"))
 
 
 def _span(start: str, end: str) -> dict:

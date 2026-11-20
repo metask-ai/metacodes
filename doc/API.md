@@ -50,6 +50,17 @@ Python uses `Runtime(preview=True)` and Node.js uses
 `new Runtime({ preview: true })`. The SDKs include `ExecuteCode` when enabled.
 Selecting a preview built-in by name while preview is disabled is rejected.
 
+Preview also instructs agents to express intent in code and avoid adding
+explanatory comments. Built-in Write, Edit, ApplyPatch and NotebookEdit check
+proposed edits before writing. For each recognized language they compare
+comment tokens, including repetitions, with the file or code cell being edited.
+A new token produces a recoverable tool error with the path and line.
+Shebangs and recognized tool directives are allowed. The lexical check covers
+text with a known baseline and up to 512 KiB on each side. It uses the bundled
+highlighter's string and comment rules, so language-specific constructs can be
+misclassified. It skips Bash sources containing `<<`, and YAML and CSS files entirely. Writes by shell commands,
+external tools and edits to unsupported formats rely on the prompt guidance.
+
 ## JavaScript tool orchestration
 
 `ExecuteCode({code, timeout_ms?})` runs JavaScript in a per-session QuickJS
@@ -66,8 +77,12 @@ rules are in [PROGRAMMATIC_TOOL_CALLING.md](PROGRAMMATIC_TOOL_CALLING.md).
 ## Provider selection surface
 
 The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
-launches Harbor trials. Its command, JSON output and HTTP launch contract are
-documented in [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
+launches Harbor trials. Its command, JSON output, HTTP launch contract
+(`suite` and `executor` in `POST /api/runs`, `GET /api/suite`,
+`/api/setup`, `/api/login` and `/api/providers`), `bench setup`, `bench provider`,
+`bench prepare` and
+the `bench db` evaluation-database commands are documented in
+[Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
 AgentCore ABI and SDK layouts are unchanged.
 
 ### Metask device OAuth and gateway

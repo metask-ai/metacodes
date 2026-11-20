@@ -558,6 +558,7 @@ pub const Options = struct {
     /// 相对工具路径是否以 cwd_abs 为基准解析。默认 false 保持 CLI 既有输出/路径语义；
     /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
     resolve_relative_paths: bool = false,
+    path_aliases: []const tools_common.PathAlias = &.{},
     home_dir: []const u8 = "",
     /// Host-injected state root (util/state_root.zig), propagated to every ToolContext.
     state_root: []const u8 = "",
@@ -1305,8 +1306,9 @@ const ArgsAdmission = union(enum) {
 fn admitToolArgs(
     allocator: std.mem.Allocator,
     input: []const u8,
+    path_aliases: []const tools_common.PathAlias,
 ) !ArgsAdmission {
-    const canonical = tools_common.canonicalizeArgs(allocator, input) catch |err| return .{ .rejected = switch (err) {
+    const canonical = tools_common.canonicalizeArgsWithAliases(allocator, input, path_aliases) catch |err| return .{ .rejected = switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DuplicateArgumentKey => try tool_error.errorToJson(
             "DuplicateArgumentKey",
@@ -1434,7 +1436,7 @@ const ToolAdmission = struct {
         }
         // Model calls and JS host requests share argument admission (#494).
         // The slot owns the canonical bytes seen by hooks, permissions and dispatch.
-        var eff_input = switch (try admitToolArgs(allocator, tu.input)) {
+        var eff_input = switch (try admitToolArgs(allocator, tu.input, opts.path_aliases)) {
             .admitted => |canonical| canonical,
             .rejected => |content| return .{
                 .decision = .denied,
@@ -1452,7 +1454,7 @@ const ToolAdmission = struct {
             if (pre.modified_input) |mi| {
                 allocator.free(eff_input);
                 eff_input = mi;
-                switch (try admitToolArgs(allocator, mi)) {
+                switch (try admitToolArgs(allocator, mi, opts.path_aliases)) {
                     .admitted => |canonical| {
                         allocator.free(eff_input);
                         eff_input = canonical;
@@ -2267,6 +2269,14 @@ fn runCounted(
     counters: *RunCounters,
 ) !RunResult {
     const harnessmm_enabled = opts.preview and opts.harnessmm;
+    const comment_guidance = @import("system_prompt.zig").COMMENT_GUIDANCE;
+    const base_prompt = opts.system_prompt orelse "";
+    const preview_prompt = if (opts.preview and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
+        try std.mem.concat(allocator, u8, &.{ base_prompt, if (base_prompt.len > 0) "\n\n" else "", comment_guidance })
+    else
+        null;
+    defer if (preview_prompt) |owned| allocator.free(owned);
+    const run_prompt = preview_prompt orelse opts.system_prompt;
     var harnessmm = harnessmm_mod.State.init(allocator);
     defer harnessmm.deinit();
     var harnessmm_journal: ?harnessmm_mod.Journal = if (harnessmm_enabled)
@@ -2704,11 +2714,11 @@ fn runCounted(
         defer freeOwnedSlice(u8, allocator, sys_prompt_owned);
         const augmented_system_prompt: ?[]const u8 = blk: {
             const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
-            if (!in_swarm) break :blk opts.system_prompt;
-            const base = opts.system_prompt orelse "";
+            if (!in_swarm) break :blk run_prompt;
+            const base = run_prompt orelse "";
             const swarm_seg = "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM;
             sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, swarm_seg }) catch null;
-            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
+            break :blk if (sys_prompt_owned) |p| p else run_prompt;
         };
         var projected_guidance_owned: ?[]u8 = null;
         defer freeOwnedSlice(u8, allocator, projected_guidance_owned);
@@ -3042,6 +3052,7 @@ fn runCounted(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
@@ -3502,7 +3513,7 @@ fn runCounted(
                             // The same argument admission as the authoritative path
                             // (issue #494): rejected arguments are not prefetched, and
                             // admitted ones run in their canonical spelling.
-                            const canonical = tools_common.canonicalizeArgs(allocator, tu.input_json) catch break :prefetch;
+                            const canonical = tools_common.canonicalizeArgsWithAliases(allocator, tu.input_json, opts.path_aliases) catch break :prefetch;
                             var canonical_owned = true;
                             defer if (canonical_owned) allocator.free(canonical);
                             if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
@@ -4619,6 +4630,7 @@ fn runCounted(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,

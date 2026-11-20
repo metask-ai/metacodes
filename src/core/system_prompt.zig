@@ -61,7 +61,10 @@ const DOING_TASKS_IDENTITY_FRAMING =
     \\ - The user will primarily request you to perform software engineering tasks. These may include solving bugs, adding new functionality, refactoring code, explaining code, and more. When given an unclear or generic instruction, consider it in the context of these software engineering tasks and the current working directory. For example, if the user asks you to change "methodName" to snake case, do not reply with just "method_name", instead find the method in the code and modify the code.
 ;
 
-const DOING_TASKS_PRACTICES =
+pub const COMMENT_GUIDANCE = "Do not add explanatory code comments. Express intent through names and structure. Preserve existing comments and necessary tool directives. The built-in file editing tools check for new comments before writing.";
+
+fn doingTasksPractices(comptime preview: bool) []const u8 {
+    return
     \\
     \\ - You are highly capable and often allow users to complete ambitious tasks that would otherwise be too complex or take too long. You should defer to user judgement about whether a task is too large to attempt.
     \\ - In general, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, read it first. Understand existing code before suggesting modifications.
@@ -69,11 +72,13 @@ const DOING_TASKS_PRACTICES =
     \\ - Avoid giving time estimates or predictions for how long tasks will take, whether for your own work or for users planning projects. Focus on what needs to be done, not how long it might take.
     \\ - If an approach fails, diagnose why before switching tactics—read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either. Ask the user only when you're genuinely stuck after investigation, not as a first response to friction.
     \\ - Be careful not to introduce security vulnerabilities such as command injection, XSS, SQL injection, and other OWASP top 10 vulnerabilities. If you notice that you wrote insecure code, immediately fix it. Prioritize writing safe, secure, and correct code.
-    \\ - Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add docstrings, comments, or type annotations to code you didn't change. Only add comments where the logic isn't self-evident.
-    \\ - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs). Don't use feature flags or backwards-compatibility shims when you can just change the code.
-    \\ - Don't create helpers, utilities, or abstractions for one-time operations. Don't design for hypothetical future requirements. The right amount of complexity is what the task actually requires—no speculative abstractions, but no half-finished implementations either. Three similar lines of code is better than a premature abstraction.
-    \\ - Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.
-;
+    \\ - Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add docstrings, comments, or type annotations to code you didn't change.
+    ++ (if (preview) "" else " Only add comments where the logic isn't self-evident.") ++ "\n" ++
+        \\ - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs). Don't use feature flags or backwards-compatibility shims when you can just change the code.
+        \\ - Don't create helpers, utilities, or abstractions for one-time operations. Don't design for hypothetical future requirements. The right amount of complexity is what the task actually requires—no speculative abstractions, but no half-finished implementations either. Three similar lines of code is better than a premature abstraction.
+        \\ - Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.
+    ;
+}
 
 const DOING_TASKS_IDENTITY_HELP =
     \\
@@ -82,8 +87,14 @@ const DOING_TASKS_IDENTITY_HELP =
     \\  - To give feedback, users should open an issue with their feedback to the project maintainer
 ;
 
-const DOING_TASKS_SECTION = DOING_TASKS_HEADER ++ DOING_TASKS_IDENTITY_FRAMING ++ DOING_TASKS_PRACTICES ++ DOING_TASKS_IDENTITY_HELP;
-const DOING_TASKS_WITHOUT_IDENTITY = DOING_TASKS_HEADER ++ DOING_TASKS_PRACTICES;
+fn doingTasks(comptime preview: bool, identity: bool) []const u8 {
+    const practices = comptime doingTasksPractices(preview);
+    if (identity) return DOING_TASKS_HEADER ++ DOING_TASKS_IDENTITY_FRAMING ++ practices ++ DOING_TASKS_IDENTITY_HELP;
+    return DOING_TASKS_HEADER ++ practices;
+}
+
+const DOING_TASKS_SECTION = doingTasks(false, true);
+const DOING_TASKS_WITHOUT_IDENTITY = doingTasks(false, false);
 
 /// getActionsSection。逐字复制，不改动。
 /// v39 G3+G5(codex 基础面对照取证):验证 gate 收尾 + 持续性。终局 sealed
@@ -315,10 +326,15 @@ pub fn renderSubagentPrompt(
     cwd: []const u8,
     profile: prompt_sections.Profile,
 ) !prompt_sections.Rendered {
+    return renderSubagentPromptWithPreview(allocator, model, cwd, profile, false);
+}
+
+pub fn renderSubagentPromptWithPreview(allocator: std.mem.Allocator, model: []const u8, cwd: []const u8, profile: prompt_sections.Profile, preview: bool) !prompt_sections.Rendered {
     const env = try buildEnvSection(allocator, model, cwd, !profile.replaces(KernelSection.identity.spec().id));
     defer allocator.free(env);
     var kernel = [_]prompt_sections.Section{
         kernelSection(.subagent, SUBAGENT_SECTION),
+        kernelSection(.comment_guidance, if (preview) COMMENT_GUIDANCE else ""),
         kernelSection(.env, env),
     };
     return renderProfile(allocator, &kernel, profile, model, cwd, "\n");
@@ -334,6 +350,7 @@ pub fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, model: []const u8
 /// tool surface, edited by the Session's prompt profile. Skills, subagents,
 /// memory and TinyKG sections are CLI-only and stay empty here.
 pub const SessionPromptInput = struct {
+    preview: bool = false,
     model: []const u8,
     cwd: []const u8,
     enabled_tool_names: []const []const u8,
@@ -356,7 +373,7 @@ pub fn renderSessionPrompt(allocator: std.mem.Allocator, input: SessionPromptInp
         kernel_identity,
     );
     defer generated.deinit(allocator);
-    var kernel = kernelSections(&generated, kernel_identity);
+    var kernel = kernelSections(&generated, kernel_identity, input.preview);
     return renderProfile(allocator, &kernel, input.profile, input.model, input.cwd, prompt_sections.separator);
 }
 
@@ -577,7 +594,7 @@ pub fn buildFullWithDefs(
 ) ![]u8 {
     var generated = try GeneratedSections.init(allocator, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, tool_defs, true);
     defer generated.deinit(allocator);
-    return renderKernel(allocator, &generated);
+    return renderKernel(allocator, &generated, false);
 }
 
 /// The sections `buildFullWithDefs` joins, in render order, with the digest of
@@ -593,6 +610,42 @@ pub const SectionListing = struct {
     }
 };
 
+pub const CliPromptInput = struct {
+    model: []const u8,
+    skills: ?*const @import("../skills/skill.zig").SkillSet,
+    agents: ?*const @import("../agents/set.zig").AgentSet,
+    enabled_tool_names: ?[]const []const u8,
+    memdir_abs: []const u8,
+    kg_ready: bool,
+    cwd: []const u8,
+    tool_defs: ?[]const @import("../json.zig").ToolDefinition,
+    preview: bool = false,
+
+    fn generate(input: CliPromptInput, allocator: std.mem.Allocator) !GeneratedSections {
+        return GeneratedSections.init(allocator, input.model, input.skills, input.agents, input.enabled_tool_names, input.memdir_abs, input.kg_ready, input.cwd, input.tool_defs, true);
+    }
+
+    pub fn build(input: CliPromptInput, allocator: std.mem.Allocator) ![]u8 {
+        var generated = try input.generate(allocator);
+        defer generated.deinit(allocator);
+        return renderKernel(allocator, &generated, input.preview);
+    }
+
+    pub fn list(input: CliPromptInput, allocator: std.mem.Allocator) !SectionListing {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const generated = try input.generate(a);
+        var kernel = kernelSections(&generated, true, input.preview);
+        const joined = try prompt_sections.renderWithManifest(a, &kernel, prompt_sections.separator);
+        var listed: std.ArrayList(prompt_sections.Section) = .empty;
+        for (kernel) |section| {
+            if (prompt_sections.isRendered(section)) try listed.append(a, section);
+        }
+        return .{ .arena = arena, .sections = listed.items, .sha256 = joined.manifest.sha256 };
+    }
+};
+
 pub fn listFullWithDefs(
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -604,17 +657,8 @@ pub fn listFullWithDefs(
     cwd: []const u8,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition,
 ) !SectionListing {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-    const generated = try GeneratedSections.init(a, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, tool_defs, true);
-    var kernel = kernelSections(&generated, true);
-    const joined = try prompt_sections.renderWithManifest(a, &kernel, prompt_sections.separator);
-    var listed: std.ArrayList(prompt_sections.Section) = .empty;
-    for (kernel) |section| {
-        if (prompt_sections.isRendered(section)) try listed.append(a, section);
-    }
-    return .{ .arena = arena, .sections = listed.items, .sha256 = joined.manifest.sha256 };
+    const input: CliPromptInput = .{ .model = model, .skills = skills, .agents = agents, .enabled_tool_names = enabled_tool_names, .memdir_abs = memdir_abs, .kg_ready = kg_ready, .cwd = cwd, .tool_defs = tool_defs };
+    return input.list(allocator);
 }
 
 /// The section texts a build derives from Session facts: tool set, Skills,
@@ -696,8 +740,8 @@ const GeneratedSections = struct {
     }
 };
 
-fn renderKernel(allocator: std.mem.Allocator, generated: *const GeneratedSections) ![]u8 {
-    var sections = kernelSections(generated, true);
+fn renderKernel(allocator: std.mem.Allocator, generated: *const GeneratedSections, preview: bool) ![]u8 {
+    var sections = kernelSections(generated, true, preview);
     return prompt_sections.render(allocator, &sections);
 }
 
@@ -705,12 +749,13 @@ fn renderKernel(allocator: std.mem.Allocator, generated: *const GeneratedSection
 /// replaced `metacodes:identity`), the sentences that belong to it leave too:
 /// the doing-tasks framing and help bullets here, the env product line in
 /// `GeneratedSections`.
-fn kernelSections(generated: *const GeneratedSections, kernel_identity: bool) [16]prompt_sections.Section {
+fn kernelSections(generated: *const GeneratedSections, kernel_identity: bool, preview: bool) [17]prompt_sections.Section {
     return .{
         kernelSection(.identity, IDENTITY_SECTION),
         kernelSection(.safety_policy, SAFETY_POLICY_SECTION),
         kernelSection(.system, SYSTEM_SECTION),
-        kernelSection(.doing_tasks, if (kernel_identity) DOING_TASKS_SECTION else DOING_TASKS_WITHOUT_IDENTITY),
+        kernelSection(.doing_tasks, if (preview) doingTasks(true, kernel_identity) else doingTasks(false, kernel_identity)),
+        kernelSection(.comment_guidance, if (preview) COMMENT_GUIDANCE else ""),
         kernelSection(.validation, VALIDATION_SECTION),
         kernelSection(.actions, ACTIONS_SECTION),
         kernelSection(.using_tools, generated.using_tools),
@@ -737,6 +782,7 @@ pub const KernelSection = enum {
     safety_policy,
     system,
     doing_tasks,
+    comment_guidance,
     validation,
     actions,
     using_tools,
@@ -764,6 +810,7 @@ pub const KernelSection = enum {
             .safety_policy => .{ .id = "metacodes:safety-policy", .order = -900, .class = .locked, .join = .always },
             .system => .{ .id = "metacodes:system", .order = 100, .class = .locked, .join = .always },
             .doing_tasks => .{ .id = "metacodes:doing-tasks", .order = 200, .class = .replaceable, .join = .always },
+            .comment_guidance => .{ .id = "metacodes:comment-guidance", .order = 250, .class = .generated, .join = .when_nonempty },
             .validation => .{ .id = "metacodes:validation", .order = 300, .class = .replaceable, .join = .always },
             .actions => .{ .id = "metacodes:actions", .order = 400, .class = .replaceable, .join = .always },
             .using_tools => .{ .id = "metacodes:using-tools", .order = 1000, .class = .replaceable, .join = .always },
@@ -1637,7 +1684,7 @@ test "the section registry renders the pre-#184 prompt byte for byte" {
                             defer generated.deinit(a);
                             const expected = try legacyRender(a, &generated);
                             defer a.free(expected);
-                            const actual = try renderKernel(a, &generated);
+                            const actual = try renderKernel(a, &generated, false);
                             defer a.free(actual);
                             try testing.expectEqualStrings(expected, actual);
                             cases += 1;
@@ -1670,7 +1717,7 @@ test "kernel section ids are unique and the main prompt's orders strictly increa
     }
     var generated = try GeneratedSections.init(testing.allocator, "m", null, null, null, "", false, "/tmp", null, true);
     defer generated.deinit(testing.allocator);
-    const main = kernelSections(&generated, true);
+    const main = kernelSections(&generated, true, false);
     for (main[1..], main[0 .. main.len - 1]) |section, previous| try testing.expect(previous.order < section.order);
     try testing.expectEqual(fields.len, main.len + 1); // every kernel section but `subagent`
 }
@@ -1756,6 +1803,24 @@ test "doing-tasks keeps its pre-#184 bytes" {
     try testing.expectEqualStrings("fe009891060c381ac18090a141778318abf6326cb3207cb69315ca93fdaf513b", &hex);
     try testing.expect(std.mem.indexOf(u8, DOING_TASKS_WITHOUT_IDENTITY, "MetaCode") == null);
     try testing.expect(std.mem.indexOf(u8, DOING_TASKS_WITHOUT_IDENTITY, "software engineering") == null);
+}
+
+test "comment preview reaches session and child prompts with a host profile" {
+    const a = testing.allocator;
+    const profile: prompt_sections.Profile = .{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:doing-tasks", .text = "Plan the task." },
+        .{ .op = .replace, .id = "metacodes:subagent", .text = "Help the parent." },
+    } };
+    for ([_]bool{ false, true }) |enabled| {
+        var session = try renderSessionPrompt(a, .{ .model = "m", .cwd = "/w", .enabled_tool_names = &.{}, .tool_defs = &.{}, .preview = enabled, .profile = profile });
+        defer session.deinit(a);
+        var child = try renderSubagentPromptWithPreview(a, "m", "/w", profile, enabled);
+        defer child.deinit(a);
+        for ([_]prompt_sections.Rendered{ session, child }) |rendered| {
+            try testing.expectEqual(@intFromBool(enabled), std.mem.count(u8, rendered.text, COMMENT_GUIDANCE));
+            try testing.expectEqualSlices(u8, &prompt_sections.sha256(rendered.text), &rendered.manifest.sha256);
+        }
+    }
 }
 
 fn expectAbsentIgnoreCase(haystack: []const u8, needle: []const u8) !void {

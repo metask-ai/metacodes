@@ -139,6 +139,7 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "PreviewFeatureDisabled", .code = .capability_unsupported, .category = .user_error, .recoverable = false },
     .{ .name = "CodeSuspendUnsupported", .code = .capability_unsupported, .category = .user_error, .recoverable = true },
     .{ .name = "NotRead", .code = .not_read, .category = .user_error, .recoverable = true },
+    .{ .name = "AddedCodeComment", .code = .invalid_args, .category = .user_error, .recoverable = true },
     .{ .name = "StaleFile", .code = .stale_file, .category = .user_error, .recoverable = true },
     .{ .name = "Timeout", .code = .timeout, .category = .system_error, .recoverable = true },
     // 用户/宿主中断:不是环境故障(不进 environment_fault 计数),用户再发一次即可重跑。

@@ -1,11 +1,14 @@
 //! The metacodes seat driver (#515): a seat run as an in-process metacodes
 //! subagent (`core/subagent.zig` `spawnAgentSink`).
 //!
-//! - System prompt: the role charter (`charters.forRole`), nothing else.
+//! - System prompt: the role charter (`charters.forRole`), then the preview
+//!   comment guidance (`system_prompt.COMMENT_GUIDANCE`).
 //! - First user message: the fixed `common.bootstrap` text, then an
-//!   environment block naming the workspace and the seat directory (the
-//!   counterpart of Claude Code's `--add-dir` environment section). Run ids,
-//!   timestamps and state paths never enter the bootstrap or the charter.
+//!   environment block naming the workspace and the seat directory by their
+//!   stable aliases `$WORKSPACE` and `$SEAT` (the counterpart of Claude
+//!   Code's `--add-dir` environment section). Tool admission resolves the
+//!   aliases to the real directories, so run ids, timestamps and state paths
+//!   never enter the first message or the charter.
 //! - Working directory: the workspace, with relative paths resolved against
 //!   it; the seat directory is the one additional directory.
 //! - Write isolation: `write_scope.zig` (execution policy, permission scope,
@@ -31,6 +34,7 @@ const sandbox_config = @import("../../sandbox/config.zig");
 const sandbox_exec = @import("../../sandbox/exec.zig");
 const writer_backend = @import("../../core/writer_backend.zig");
 const tool_context = @import("../../tools/context.zig");
+const tools_common = @import("../../tools/common.zig");
 const usage_mod = @import("../../core/usage.zig");
 const SessionId = @import("../../core/session_id.zig").SessionId;
 const util_time = @import("../../util/time.zig");
@@ -127,8 +131,7 @@ pub const MetacodesDriver = struct {
         const additional_dirs = [_][]const u8{seat_dir};
         var perm = seatPermission(self.deps.permission_ctx, paths.workspace, self.deps.home_dir, &additional_dirs, &seat_sandbox);
 
-        const prompt = try firstMessage(gpa, paths.workspace, seat_dir);
-        defer gpa.free(prompt);
+        const path_aliases = seatPathAliases(paths.workspace, seat_dir);
 
         var usage: usage_mod.UsageTotals = .{};
         var sink = writer_backend.WriterBackend.initNullWithUsage(&usage);
@@ -144,7 +147,7 @@ pub const MetacodesDriver = struct {
             tool_defs,
             &perm,
             abort,
-            prompt,
+            first_message,
             .{
                 .preview = self.deps.preview,
                 .max_turns = self.deps.max_turns,
@@ -161,6 +164,7 @@ pub const MetacodesDriver = struct {
                 .sandbox = &seat_sandbox,
                 .cwd_abs = paths.workspace,
                 .resolve_relative_paths = true,
+                .path_aliases = &path_aliases,
                 .home_dir = self.deps.home_dir,
                 .state_root = self.deps.state_root,
                 .artifact_root = self.deps.artifact_root,
@@ -239,14 +243,17 @@ pub fn seatPermission(
 pub const environment_open = "<seat-environment>\n";
 pub const environment_close = "</seat-environment>\n";
 
-/// The seat's first user message: the fixed bootstrap, then the
-/// environment block. Owned by `gpa`.
-pub fn firstMessage(gpa: std.mem.Allocator, workspace: []const u8, seat_dir: []const u8) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(
-        gpa,
-        "{s}\n" ++ environment_open ++ "workspace (current working directory): {s}\nseat directory: {s}\n" ++ environment_close,
-        .{ common.bootstrap, workspace, seat_dir },
-    );
+pub const first_message = common.bootstrap ++ "\n" ++ environment_open ++
+    "workspace (current working directory): $" ++ tools_common.workspace_alias ++ "\n" ++
+    "seat directory: $" ++ tools_common.seat_alias ++ "\n" ++
+    "File tools take these names as the first segment of a path; Bash has them as environment variables.\n" ++
+    environment_close;
+
+pub fn seatPathAliases(workspace: []const u8, seat_dir: []const u8) [2]tools_common.PathAlias {
+    return .{
+        .{ .name = tools_common.workspace_alias, .target = workspace },
+        .{ .name = tools_common.seat_alias, .target = seat_dir },
+    };
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

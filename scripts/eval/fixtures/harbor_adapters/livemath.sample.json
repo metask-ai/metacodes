@@ -1,0 +1,16 @@
+{
+ "_comment": "Synthetic rows in the LiveMathBench v202412 schema (question, options, answer, question_type); not dataset content.",
+ "AMC": [
+  {"question": "What is $\\frac{1}{2} + \\frac{1}{3}$?", "options": null, "answer": "$\\frac{5}{6}$", "question_type": "problem-solving"},
+  {"question": "Compute $2^{10} - 24$.", "options": null, "answer": "$1000$", "question_type": "problem-solving"}
+ ],
+ "CCEE": [
+  {"question": "Which option is the larger number? (A) 1 (B) 2 (C) 0 (D) -1", "options": null, "answer": "B", "question_type": "Multiple-choice"}
+ ],
+ "CNMO": [
+  {"question": "Find all real $x$ with $x^2 = 2$.", "options": null, "answer": "$x = \\pm\\sqrt{2}$", "question_type": "Problem-Solving"}
+ ],
+ "WLPMC": [
+  {"question": "Give the ordered pair $(a, b)$ with $a + b = 3$ and $a - b = 1$.", "options": null, "answer": "$(2, 1)$", "question_type": "Problem-Solving"}
+ ]
+}

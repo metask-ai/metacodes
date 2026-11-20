@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform");
 const assets = @import("bench_assets");
+const version = @import("../version.zig");
 
 fn environmentValue(entries: []const [:0]const u8, key: []const u8) ?[]const u8 {
     for (entries) |entry| {
@@ -71,9 +72,18 @@ pub fn run(args: *std.process.Args.Iterator, gpa: std.mem.Allocator, io: std.Io,
     };
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     const bootstrap = "import sys; sys.path.insert(0, sys.argv.pop(1)); from scripts.eval.harbor.cli import main; sys.exit(main())";
-    for ([_][]const u8{ python, "-c", bootstrap, root, "--state-root", state_root }) |arg| {
+    for ([_][]const u8{ python, "-c", bootstrap, root, "--state-root", state_root, "--metacodes-version", version.semver }) |arg| {
         const z = arena.dupeZ(u8, arg) catch return 1;
         argv.append(arena, z.ptr) catch return 1;
+    }
+    // `bench setup` picks the Linux release matching this executable, and the
+    // page's sign-in runs this executable's `login`.
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (platform.paths.selfExeRealPath(&exe_buf)) |exe| {
+        for ([_][]const u8{ "--metacodes-binary", exe }) |arg| {
+            const z = arena.dupeZ(u8, arg) catch return 1;
+            argv.append(arena, z.ptr) catch return 1;
+        }
     }
     while (args.next()) |arg| {
         const z = arena.dupeZ(u8, arg) catch return 1;

@@ -157,7 +157,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             relay = TimingRelay(f"http://{args.bind}:{server.server_port}", sp.SMOKE_CREDENTIAL,
                                 jobs_dir / job_name / ".bench-metrics", bind=args.bind,
                                 auth_header="Authorization" if args.metask_route else "x-api-key",
-                                auth_prefix="Bearer " if args.metask_route else "", tls=True)
+                                auth_prefix="Bearer " if args.metask_route else "", tls=True,
+                                # The smoke credential is itself a fake: the
+                                # container presents it and the relay forwards it.
+                                token=sp.SMOKE_CREDENTIAL)
             relay.__enter__()
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(

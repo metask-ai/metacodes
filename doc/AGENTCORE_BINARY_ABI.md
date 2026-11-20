@@ -1617,6 +1617,7 @@ sorted by `(order, id)` and joined with a blank line:
 | `metacodes:safety-policy` | -900 | locked |
 | `metacodes:system` | 100 | locked |
 | `metacodes:doing-tasks` | 200 | replaceable |
+| `metacodes:comment-guidance` | 250 | generated for preview Runs and subagents |
 | `metacodes:validation` | 300 | replaceable |
 | `metacodes:actions` | 400 | replaceable |
 | `metacodes:using-tools` | 1000 | replaceable |
@@ -1629,10 +1630,11 @@ sorted by `(order, id)` and joined with a blank line:
 
 `locked` sections (the safety policy and the system rules: permission modes,
 prompt-injection handling, `<system-reminder>` trust, compaction) and
-`generated` sections (the environment facts) never change. A `replaceable`
+`generated` sections (environment facts and preview comment guidance) are
+controlled by the kernel. A `replaceable`
 section takes new non-empty text and cannot be removed; a `removable` section
-takes new text or is removed. Without a profile the prompt is byte-identical to
-Revision 17.
+takes new text or is removed. With preview disabled and an empty profile,
+the prompt is byte-identical to Revision 17.
 
 A `PromptProfileV1` is an ordered list of `PromptSectionV1` edits:
 

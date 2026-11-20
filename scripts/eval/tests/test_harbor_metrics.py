@@ -1,6 +1,7 @@
 """Metric math and an actual streaming HTTP relay; no paid providers."""
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import ssl
@@ -97,6 +98,54 @@ class RelayTest(unittest.TestCase):
                     relay.server.shutdown()
                     idle.shutdown(socket.SHUT_RDWR)
 
+    def test_upstream_connections_go_through_the_connect_hook_and_keep_the_host_name(self):
+        from scripts.eval.harbor.bench import egress
+        seen = []
+
+        class Provider(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                seen.append((self.headers['Host'], self.headers['Authorization']))
+                self.send_response(200)
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        port = upstream.server_port
+        target = f'http://gw.example:{port}'
+
+        def to_upstream(address, timeout=None, source_address=None):
+            self.assertEqual(address, ('gw.example', port))
+            return socket.create_connection(('127.0.0.1', port), timeout)
+
+        def resolves_here(host, port, *_args):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+
+        def checked(address, timeout=None, source_address=None):
+            return egress.connect_not_local(address, timeout, source_address, resolve=resolves_here)
+
+        for connect, reached in ((to_upstream, True), (checked, False)):
+            with self.subTest(reached=reached), tempfile.TemporaryDirectory() as temp, TimingRelay(
+                    target, 'private-key', temp, bind='127.0.0.1', record=False, connect=connect) as relay:
+                seen.clear()
+                request = urllib.request.Request(relay.url + '/t/v1/models', headers={'Authorization': 'Bearer ' + relay.token})
+                if reached:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.read(), b'{}')
+                    self.assertEqual(seen, [(f'gw.example:{port}', 'Bearer private-key')])
+                else:
+                    with self.assertRaises((urllib.error.URLError, ConnectionError, http.client.HTTPException)):
+                        urllib.request.urlopen(request, timeout=5).close()
+                    self.assertEqual(seen, [])
+
     def test_real_stream_is_preserved_and_numeric_sidecar_has_no_secrets(self):
         chunks = [sse({'type': 'ping'}), sse({'type': 'message_start', 'message': {'usage': {'input_tokens': 50}}}),
                   sse({'type': 'content_block_delta', 'delta': {'text': 'private-output'}}),
@@ -124,8 +173,10 @@ class RelayTest(unittest.TestCase):
         self.addCleanup(upstream.shutdown)
         with tempfile.TemporaryDirectory() as temp, TimingRelay(
                 f'http://127.0.0.1:{upstream.server_port}', 'private-key', temp, bind='127.0.0.1') as relay:
+            # The container presents only the relay's placeholder.
+            self.assertTrue(relay.token.startswith('mcb-'))
             request = urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{"private":"input"}',
-                                             headers={'Authorization': 'Bearer private-key', 'Content-Type': 'application/json'})
+                                             headers={'Authorization': 'Bearer ' + relay.token, 'Content-Type': 'application/json'})
             with urllib.request.urlopen(request, timeout=5) as response:
                 self.assertEqual(response.read(), b''.join(chunks))
             deadline = time.monotonic() + 2
@@ -144,13 +195,123 @@ class RelayTest(unittest.TestCase):
             self.assertEqual((metric['input_tokens'], metric['output_tokens']), (50, 20))
             self.assertEqual(seen, [('/v1/messages', 'Bearer private-key', b'{"private":"input"}')])
             text = path.read_text()
-            for secret in ('private-key', 'private-output', '"private"'):
+            for secret in ('private-key', 'private-output', '"private"', relay.token):
                 self.assertNotIn(secret, text)
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}'))
-            self.assertEqual(caught.exception.code, 401)
-            caught.exception.close()
+            # No header, the real key itself, or a wrong placeholder: refused
+            # by the relay, never forwarded.
+            for headers in ({}, {'Authorization': 'Bearer private-key'},
+                            {'Authorization': 'Bearer mcb-other-' + 'x' * 43}):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}',
+                                                                  headers=headers))
+                self.assertEqual(caught.exception.code, 401)
+                caught.exception.close()
             self.assertEqual(len(seen), 1)
+
+    def test_custom_header_route_replaces_the_placeholder_and_metrics_off_still_proxies(self):
+        seen = []
+
+        class Provider(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                seen.append((self.headers.get('x-api-key'), self.headers.get('Authorization')))
+                body = sse({'type': 'message_stop'})
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with tempfile.TemporaryDirectory() as temp, TimingRelay(
+                f'http://127.0.0.1:{upstream.server_port}', 'real-provider-key', Path(temp) / 'metrics',
+                bind='127.0.0.1', auth_header='x-api-key', auth_prefix='', token='mcb-run-placeholder',
+                record=False) as relay:
+            request = urllib.request.Request(relay.url + '/task__one/v1/messages', data=b'{}',
+                                             headers={'x-api-key': 'mcb-run-placeholder'})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response.read()
+            self.assertEqual(seen, [('real-provider-key', None)])
+            self.assertFalse((Path(temp) / 'metrics').exists())
+
+    def test_judge_placeholder_reaches_only_chat_completions_on_its_route(self):
+        seen = []
+
+        class Gateway(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers['Authorization'],
+                             json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                body = json.dumps({'choices': [{'message': {'content': 'yes'}}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with self.assertRaises(ValueError):
+            TimingRelay('http://127.0.0.1:1', 'k', '/nonexistent', bind='127.0.0.1', token='mcb-same',
+                        judge_token='mcb-same')
+        with tempfile.TemporaryDirectory() as temp, TimingRelay(
+                f'http://127.0.0.1:{upstream.server_port}', 'agent-key', temp, bind='127.0.0.1',
+                token='mcb-agent', judge_token='mcb-judge', judge_credential='judge-group-key') as relay:
+            def post(path, token):
+                request = urllib.request.Request(relay.url + path, data=b'{"model":"glm-5.3-flash"}',
+                                                 headers={'Authorization': 'Bearer ' + token})
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        response.read()
+                        return response.status
+                except urllib.error.HTTPError as exc:
+                    exc.close()
+                    return exc.code
+            self.assertEqual(post('/bench-judge/v1/chat/completions', 'mcb-judge'), 200)
+            # The judge's token is for its route and endpoint only; the
+            # agent's token never reaches the judge route.
+            self.assertEqual(post('/bench-judge/v1/messages', 'mcb-judge'), 403)
+            self.assertEqual(post('/task__one/v1/chat/completions', 'mcb-judge'), 403)
+            self.assertEqual(post('/bench-judge/v1/chat/completions', 'mcb-agent'), 403)
+            self.assertEqual(post('/bench-judge/v1/chat/completions', 'judge-group-key'), 401)
+            self.assertEqual(post('/task__one/v1/chat/completions', 'mcb-agent'), 200)
+            self.assertEqual(seen, [('/v1/chat/completions', 'Bearer judge-group-key', {'model': 'glm-5.3-flash'}),
+                                    ('/v1/chat/completions', 'Bearer agent-key', {'model': 'glm-5.3-flash'})])
+            # Only the agent's request is a metric sample.
+            time.sleep(.1)
+            self.assertEqual(sorted(p.name for p in Path(temp).iterdir()), ['task__one.jsonl'])
+
+
+class RouteTest(unittest.TestCase):
+    def test_only_routes_the_relay_can_forward_are_launchable(self):
+        from scripts.eval.harbor.profiling import route_problem, upstream_for
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'provider.json'
+
+            def problem(provider):
+                path.write_text(json.dumps({'custom_providers': {'p': provider}}))
+                return route_problem({'auth_mode': 'provider', 'model': 'p/m', 'provider_config': str(path)})
+
+            good = {'channels': [{'id': 'a', 'protocol': 'openai_chat', 'base_url': 'https://h.example/v1'}]}
+            self.assertIsNone(problem(good))
+            self.assertEqual(upstream_for({'auth_mode': 'provider', 'model': 'p/m', 'provider_config': str(path)}),
+                             'https://h.example/v1')
+            self.assertIn('channels', problem({}))
+            self.assertIn('base_url', problem({'channels': [{'protocol': 'openai_chat', 'base_url': 'https://h.example/api/v4'}]}))
+            self.assertIn('协议', problem({'channels': [{'protocol': 'gemini', 'base_url': 'https://h.example'}]}))
+            self.assertIn('认证', problem({**good, 'auth': {'kind': 'oauth'}}))
+            self.assertIn('不同的主机', problem({'channels': good['channels'] + [
+                {'protocol': 'openai_chat', 'base_url': 'https://other.example'}]}))
+            self.assertIn('provider-config', route_problem({'auth_mode': 'provider', 'model': 'p/m'}))
+            self.assertIsNone(route_problem({'auth_mode': 'metask', 'model': 'metask/x'}))
 
     def test_route_rewrite_preserves_model_protocol_and_original_configuration(self):
         original = {'custom_providers': {'p': {'channels': [{'protocol': 'openai_responses', 'base_url': 'https://provider.example/v1'}]}}}

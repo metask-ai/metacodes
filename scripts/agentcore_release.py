@@ -59,6 +59,7 @@ INPUT_FILES = {
     "scripts/package_agentcore.py",
     "scripts/release_archive.py",
     "scripts/repack_agentcore_macos_archive.sh",
+    "scripts/stage_quickjs_sources.py",
     "scripts/stage_ripgrep_binary.py",
 }
 INPUT_PREFIXES = ("src/", "lib/", "sdk/", "vendor/ripgrep/", "vendor/quickjs/", "deps/")

@@ -652,6 +652,23 @@ fn observesFileChanges(ctx: *const ToolContext, args: []const u8) bool {
     return ctx.file_change_sink != null and !bash_readonly.isReadonlyInput(args);
 }
 
+pub fn withAliasExports(allocator: std.mem.Allocator, aliases: []const common.PathAlias, command: []const u8) error{OutOfMemory}![]u8 {
+    if (aliases.len == 0) return allocator.dupe(u8, command);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "export");
+    for (aliases) |alias| {
+        try out.print(allocator, " {s}='", .{alias.name});
+        for (alias.target) |c| {
+            if (c == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, c);
+        }
+        try out.append(allocator, '\'');
+    }
+    try out.append(allocator, '\n');
+    try out.appendSlice(allocator, command);
+    return out.toOwnedSlice(allocator);
+}
+
 fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_result.SealedHandles) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
@@ -681,18 +698,20 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
     // `sandbox-exec -f <profile> /bin/bash -c <cmd>` 或 `bwrap ... -- /bin/bash -c <cmd>`。dangerouslyDisableSandbox=true 仅在
     // allowUnsandboxedCommands 允许时跳过(sandbox_exec.escapeHatchHonored,权限链同一判定)。
     // sandbox_wrap 非 null 时持有临时 profile 文件,函数返回前 deinit 清理。
+    const aliased_command = try withAliasExports(allocator, ctx.path_aliases, raw_command);
+    defer allocator.free(aliased_command);
     var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;
     defer if (sandbox_wrap) |*sw| sw.deinit();
     const command: []const u8 = blk: {
-        const sb = ctx.sandbox orelse break :blk raw_command;
-        if (!sb.enabled) break :blk raw_command;
+        const sb = ctx.sandbox orelse break :blk aliased_command;
+        if (!sb.enabled) break :blk aliased_command;
         const sandbox_exec = @import("../sandbox/exec.zig");
         const cwd = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else ".";
         // In a linked git worktree, `git commit` writes the main repository's
         // .git, outside the worktree: allow it, as the profile intends.
         const main_git_dir = if (ctx.cwd_abs.len > 0) sandbox_exec.linkedWorktreeGitDir(allocator, ctx.cwd_abs) else null;
         defer if (main_git_dir) |g| allocator.free(g);
-        const maybe = sandbox_exec.wrapAsShellString(allocator, raw_command, .{
+        const maybe = sandbox_exec.wrapAsShellString(allocator, aliased_command, .{
             .cwd = cwd,
             .home = ctx.home_dir,
             .sandbox = sb,
@@ -711,7 +730,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             sandbox_wrap = sw;
             break :blk sw.command;
         }
-        break :blk raw_command;
+        break :blk aliased_command;
     };
 
     // 显式 run_in_background=true：直接丢 job 表立刻返
@@ -1752,4 +1771,15 @@ test "withdrawAttachmentFromJson and appendChannel agree on the two id sites (#7
     try std.testing.expectEqualStrings(stdout_id, object.get("stdout_artifact_id").?.string);
     try std.testing.expect(object.get("stdout_recoverable").?.bool == true);
     try std.testing.expect(object.get("stdout_read") != null);
+}
+
+test "withAliasExports: every alias is exported, single-quoted, ahead of the command" {
+    const a = std.testing.allocator;
+    const aliases = [_]common.PathAlias{ .{ .name = "WORKSPACE", .target = "/w s" }, .{ .name = "SEAT", .target = "/s/it's" } };
+    const out = try withAliasExports(a, &aliases, "cat \"$SEAT/packet.md\"");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("export WORKSPACE='/w s' SEAT='/s/it'\\''s'\ncat \"$SEAT/packet.md\"", out);
+    const plain = try withAliasExports(a, &.{}, "ls");
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("ls", plain);
 }

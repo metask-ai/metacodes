@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **A Bench SSH executor is a `metacodes` node.** The workbench no longer
+  copies a Python runtime to an SSH executor: `metacodes bench setup
+  --executor NAME` installs the bundle's `metacodes` there
+  (`<state_dir>/bin/metacodes`, and `~/.local/bin/metacodes` when free), and
+  every run, copy-back and readiness probe goes through
+  `metacodes bench node …` on that machine. The node reports its own version
+  and the WorkBuddy suites prepared on it, so WorkBuddy Code and Security now
+  run on an SSH executor with that executor's own checkout. `node peers`
+  lists the nodes a machine drives and the workbenches that drove it.
+  Re-run setup for each SSH executor once after upgrading; until then its
+  readiness says the node is missing.
+
 - **Preview features require opt-in.** `--preview` enables them; `--no-preview`
   overrides a saved root `"preview": true` in the installation's `config.json`.
   ExecuteCode JavaScript orchestration is a preview feature and is hidden and
@@ -83,8 +95,8 @@ status, compatibility boundaries, and entry points are defined by
 - **`/model` is one screen, models first** (follow-up to #527). The models of
   every configured provider are listed under a heading per provider that says
   where its key comes from and who bills it, the provider in use first and the
-  cursor on the model in use; typing filters across them all and lists the
-  matches flat. A model served on several routes lists them under it, in
+  cursor on the model in use; typing filters across them all, under the same
+  headings. A model served on several routes lists them under it, in
   words, while the cursor is on it; Enter on the model takes its preferred
   route, Enter on a route takes that one. The reasoning level is a line under
   the list, changed with ←/→ from any row, and kept as the level wanted: each
@@ -110,6 +122,23 @@ status, compatibility boundaries, and entry points are defined by
   level. When `/model` opens, the level the session runs with starts
   selected even when it is `none` or `minimal` (before, only a level that
   thinks did), so DeepSeek's default does not replace thinking turned off.
+- **`/model` keeps the provider headings while you filter, so a match says
+  which route it goes through and who bills it** (#600). Typing used to list
+  the matches flat with the provider's name trailing each row, and OpenRouter
+  lists about 300 models under their makers' names (`DeepSeek: DeepSeek V4
+  Pro 0423`), so its rows and DeepSeek's own read alike. The matches now sit
+  under the same headings as the unfiltered list (`OpenRouter · key from
+  shell · billed to your OpenRouter account`), the providers with a model
+  that holds the typed text whole first; the first row is the one it was.
+  A list scrolled into a group opens with that group's heading in place of
+  its first row, filtered or not, the cursor kept below it; when that row
+  is the model whose routes are listed, the line names the model too.
+  PgDn and PgUp move a row less than the window, so no model is left
+  between two pages. A model's name takes the room the rest of its row
+  leaves instead of a third of the width, measured in terminal columns
+  (a full-width character takes two): at 80 columns the third cut 116 of
+  OpenRouter's 324 names, 46 of them to the same text as another, a free
+  model and its paid one among them.
 
 - **An explicit Skill run takes the Host's context blocks** (#534). An
   AgentCore `RUN_INPUT_SKILL` Run with `RunOptionsV1.context_blocks` used to
@@ -637,6 +666,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A stored default on an OpenRouter model starts when OpenRouter's model
+  list is not on this machine** (#622). A model picked in `/model` for
+  `from now on` is stored as a pin to its offer, and a start resolves that
+  pin against the listing kept in `<state root>/cache/models/`. With no
+  listing kept (the cache deleted, `config.json` copied without it), every
+  start exited 2 with `the stored selection pins offer …`, and only the REPL
+  that could not start would download the listing. Now a start whose pin
+  does not resolve, with an OpenRouter key set and no listing kept, says
+  `Downloading OpenRouter's model list for the stored default model…`,
+  downloads it (30 s at most), keeps it and resolves the pin again. A pin
+  is still never remapped: when the download fails, the start exits 2 and
+  says why, with `--provider openrouter` to start without that model, or
+  `login --provider openrouter` when OpenRouter refused the key. With
+  `METACODES_NO_PROBE` set nothing is downloaded, as before.
+
 - **`/login openrouter` no longer stops the TUI while the account's model
   list downloads, and `/model` says how the download goes** (#572). The list
   (`GET /api/v1/models/user`, about 0.8 MB) was fetched on the REPL's thread
@@ -988,6 +1032,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Security
 
+- **If you used a relay or switched a session between providers, replace
+  your keys and sign in to Metask again.** Before this release a credential
+  could reach a provider it was not issued for: after a `/model` switch (a
+  relay counts as a provider), the Metask sign-in token, a key picked in
+  `/models` or another provider's sign-in token could be sent to the
+  endpoint the session was on, and with credentials for several providers
+  in `config.json` (`providers.<id>.credentials`) one provider's pooled key
+  could be sent to another. Each case is fixed; they are listed under Fixed.
+  Create new keys at the providers whose keys this machine held, delete the
+  old ones there, and sign in to Metask again with `/login` or
+  `metacodes login`, which now revokes the sign-in it replaces (#560).
 - **On `serve` and `--web`, an answer from before a restart no longer
   answers a newer request** (#563). Both numbered UI requests from 1 in every
   process, and again for every session they restored, and `POST /respond`
