@@ -30,6 +30,7 @@ pub const FetchError = error{
     /// Larger than a catalog has any business being. An unbounded read from a
     /// URL in a config file is a memory-exhaustion vector.
     TooLarge,
+    Interrupted,
 };
 
 /// `Request.extra_headers` a GET carries at most.
@@ -52,6 +53,7 @@ pub const Request = struct {
     /// Headers the endpoint needs besides the credential: an Anthropic model
     /// listing's `anthropic-version` (`provider/model_listing.zig`).
     extra_headers: []const std.http.Header = &.{},
+    progress: ?*std.atomic.Value(u64) = null,
 
     /// The credential the request carries, whichever field holds it.
     fn carried(self: Request) ?Credential {
@@ -154,17 +156,57 @@ pub fn fetchAnswer(
     var redirect_buffer: [4096]u8 = undefined;
     const response = http_request.receiveHead(&redirect_buffer) catch return error.RequestFailed;
     const status = http_status.ResponseStatus.capture(&response);
+    const announced = response.head.content_length;
 
     var transfer_buffer: [16384]u8 = undefined;
     const reader = http_request.reader.bodyReader(
         &transfer_buffer,
         response.head.transfer_encoding,
-        response.head.content_length,
+        announced,
     );
-    const body = reader.allocRemaining(allocator, std.Io.Limit.limited(MAX_DOCUMENT_BYTES)) catch
-        return error.TooLarge;
+    var count_buffer: [4096]u8 = undefined;
+    var counting: CountingReader = undefined;
+    const source = if (request.progress) |counter| blk: {
+        counting = .init(reader, counter, &count_buffer);
+        break :blk &counting.interface;
+    } else reader;
+    const body = source.allocRemaining(allocator, std.Io.Limit.limited(MAX_DOCUMENT_BYTES)) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.TooLarge,
+        error.ReadFailed => error.Interrupted,
+    };
+    if (status.code >= 200 and status.code < 300) if (announced) |length| if (body.len < length) {
+        allocator.free(body);
+        return error.Interrupted;
+    };
     return .{ .status = status.code, .body = body };
 }
+
+const CountingReader = struct {
+    inner: *std.Io.Reader,
+    counter: *std.atomic.Value(u64),
+    interface: std.Io.Reader,
+
+    fn init(inner: *std.Io.Reader, counter: *std.atomic.Value(u64), buffer: []u8) CountingReader {
+        return .{
+            .inner = inner,
+            .counter = counter,
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *CountingReader = @fieldParentPtr("interface", r);
+        const n = try self.inner.stream(w, limit);
+        _ = self.counter.fetchAdd(n, .monotonic);
+        return n;
+    }
+};
 
 /// GET a `/v1/models` list and every page after it (`has_more` + `last_id`,
 /// see `models_pages.zig`), as one document. A single-page list comes back
