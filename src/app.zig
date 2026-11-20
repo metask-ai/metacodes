@@ -5714,7 +5714,21 @@ pub const App = struct {
     /// environment section: the one builder every rebuild goes through, so
     /// none can name another model (owned by `app.allocator`).
     fn buildSystemPrompt(app: *const App, cwd: []const u8) ![]u8 {
-        return system_prompt_mod.buildFullWithDefs(app.allocator, app.promptModelName(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cwd, app.tool_defs);
+        return app.cliPromptInput(cwd).build(app.allocator);
+    }
+
+    pub fn cliPromptInput(app: *const App, cwd: []const u8) system_prompt_mod.CliPromptInput {
+        return .{
+            .model = app.promptModelName(),
+            .skills = &app.skills,
+            .agents = &app.agents,
+            .enabled_tool_names = app.enabled_tool_names,
+            .memdir_abs = app.memdir_abs,
+            .kg_ready = app.kgReady(),
+            .cwd = cwd,
+            .tool_defs = app.tool_defs,
+            .preview = app.config.preview.isEnabled(),
+        };
     }
 
     /// Build `tool_defs` (static + dynamic: Skill, process plugins, MCP),

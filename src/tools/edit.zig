@@ -166,6 +166,7 @@ fn finalizeWrite(
     old_content: []const u8,
     content: []const u8,
 ) ![]u8 {
+    try @import("comment_check.zig").checkFile(ctx, file_path, old_content, content);
     const write_fd = filesystem.open(ctx, file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644, false) catch |err| {
         if (filesystem.enabled(ctx)) return err;
         return error.WriteError;
@@ -247,6 +248,7 @@ fn executeWholeFileExact(
         return error.ExactRecoverySourceChanged;
     }
 
+    try @import("comment_check.zig").checkFile(ctx, file_path, observed, new_content);
     replaceWholeFileFd(fd, observed, new_content) catch |err| {
         // A short write may already have changed the inode. Publish the
         // intended mutation so executeOne's mandatory re-observation records

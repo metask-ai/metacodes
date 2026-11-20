@@ -2704,7 +2704,7 @@ pub const AgentSession = struct {
     /// Render this Session's subagent system prompt: `metacodes:subagent` and
     /// the environment, with the Session's prompt profile inherited.
     pub fn renderSubagentPrompt(self: *const AgentSession, allocator: std.mem.Allocator) !prompt_sections.Rendered {
-        return system_prompt_mod.renderSubagentPrompt(allocator, self.model, self.workspace.root, self.promptProfile());
+        return system_prompt_mod.renderSubagentPromptWithPreview(allocator, self.model, self.workspace.root, self.promptProfile(), self.runtime.preview);
     }
 
     /// Record the manifest of the prompt this Run sends and, when it differs
@@ -3266,6 +3266,7 @@ pub const AgentSession = struct {
         defer self.allocator.free(sp_names);
         for (tool_definitions, 0..) |d, i| sp_names[i] = d.name;
         var rendered_prompt = system_prompt_mod.renderSessionPrompt(self.allocator, .{
+            .preview = self.runtime.preview,
             .model = self.model,
             .cwd = self.workspace.root,
             .enabled_tool_names = sp_names,

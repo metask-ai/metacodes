@@ -2006,19 +2006,8 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
 /// in render order, each with its id, order, class, origin, size and digest,
 /// then the prompt digest checked against the prompt App actually built.
 fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
-    const system_prompt_mod = @import("core/system_prompt.zig");
     const cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
-    const listing = system_prompt_mod.listFullWithDefs(
-        app.allocator,
-        app.promptModelName(),
-        &app.skills,
-        &app.agents,
-        app.enabled_tool_names,
-        app.memdir_abs,
-        app.kgReady(),
-        cwd,
-        app.tool_defs,
-    ) catch |err| {
+    const listing = app.cliPromptInput(cwd).list(app.allocator) catch |err| {
         var buf: [96]u8 = undefined;
         dumpWrite(std.fmt.bufPrint(&buf, "prompt sections unavailable: {s}\n", .{@errorName(err)}) catch "prompt sections unavailable\n");
         std.process.exit(1);
