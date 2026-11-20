@@ -93,8 +93,7 @@ fn emptyText(picker: *const Picker, buf: []u8) []const u8 {
 }
 
 /// The list is empty because no provider has a credential, not because of a
-/// filter or the catalog's state (#488). A filter typed there changes
-/// nothing: there is still nothing to apply (#599).
+/// filter or the catalog's state (#488).
 fn noneConfigured(picker: *const Picker) bool {
     switch (picker.status) {
         .ready, .stale => {},
@@ -942,7 +941,6 @@ test "with no provider configured, the list says /login and this install's .env,
     const hint = "no providers configured — /login, or configure /home/u/.metacodes/.env";
     try testing.expect(std.mem.indexOf(u8, text, hint) != null);
     try testing.expect(std.mem.indexOf(u8, text, "esc cancel") != null);
-    // `q` is a filter letter there too (#599): no key but Esc is named.
     for ([_][]const u8{ "enter apply", "m1", "k1", "Not configured", "q close" }) |gone| {
         try testing.expect(std.mem.indexOf(u8, text, gone) == null);
     }
@@ -975,13 +973,10 @@ test "with no provider configured, a filter typed, q first, still names only the
     };
     try seed(&picker, &offers, null);
     try picker.setReadiness(&.{ false, false }, &.{});
-    // The first `q` filters, as anywhere in the list; it does not close.
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .redraw);
     const text = try screen(arena, &picker, 120);
     try testing.expect(std.mem.indexOf(u8, text, "nothing matches this filter — Esc clears it") != null);
     try testing.expect(std.mem.indexOf(u8, text, "esc clear filter") != null);
-    // Nothing can be applied with or without a filter, so Enter and Tab are
-    // not named; the provider without a credential is not found.
     for ([_][]const u8{ "enter apply", "tab scope", "q close", "qwen3" }) |gone| {
         try testing.expect(std.mem.indexOf(u8, text, gone) == null);
     }

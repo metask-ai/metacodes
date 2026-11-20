@@ -834,10 +834,6 @@ pub const Picker = struct {
             },
             .escape => return self.back(),
             .char => |byte| {
-                // Every printable key is the filter, `q` included, even as
-                // the first letter: a search can start with any letter
-                // (qwen, qwq; #599), and Esc is the way out. Only the setup
-                // stage, which takes no typing, closes on `q`.
                 if (byte < 0x20 or byte == 0x7f) return .ignored;
                 if (self.filter_len == MAX_FILTER) return .ignored;
                 self.filter_buffer[self.filter_len] = byte;
@@ -1473,14 +1469,12 @@ test "q is a filter letter like any other, the first one too (#599)" {
     };
     try loadFixture(&picker, &offers, null);
     picker.restart();
-    // The first key of a search filters; it used to close the picker.
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .redraw);
     try testing.expectEqualStrings("q", picker.filter());
     try testing.expectEqual(Stage.list, picker.stage);
     for ("wq") |byte| try testing.expect(picker.onKey(.{ .char = byte }) == .redraw);
     try testing.expectEqualStrings("qwq", picker.filter());
     try testing.expectEqualStrings("qwq-32b", picker.focusedOffer().?.request_model_id);
-    // Esc is the way out: it clears the filter, then closes.
     try testing.expect(picker.onKey(.escape) == .redraw);
     try testing.expectEqualStrings("", picker.filter());
     try testing.expect(picker.onKey(.escape) == .closed);

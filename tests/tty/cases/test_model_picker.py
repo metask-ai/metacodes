@@ -102,10 +102,6 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
 
 
 def test_picker_search_can_start_with_q(bin_path):
-    # #599: `q` on an empty filter used to close the picker, so `qwen` closed
-    # it on the first letter and left `wen` in the input box after the draft.
-    # `q` is a filter letter like any other now. Qwen gets a placeholder key:
-    # a provider without one is not listed (#488).
     raw = run(
         bin_path,
         [READY, "type:explain this", "sleep:0.3", "key:ctrl_o", wait_for(OPEN), "type:qwen", "sleep:0.5"],
@@ -440,7 +436,6 @@ def test_picker_with_no_provider_configured_points_at_login_and_this_installs_en
     )
     _, text = _screen(raw, rows=30, cols=160)
     assert f"no providers configured — /login, or configure {env_file}" in text, text
-    # Esc is the only way out it names: `q` is a filter letter (#599).
     assert "esc cancel" in text, text
     for gone in ("Not configured", "not configured", "credential goes", "enter apply", "switched to", "q close"):
         assert gone not in text, f"{gone!r} 不该出现:\n" + text
