@@ -72,6 +72,10 @@ def receipt_client(saved, config):
         if catalog.get("service") != "metacodes-bench":
             return None
         owner = catalog.get("config_path")
+        if owner is None and client.legacy_token:
+            # A service from before the login was dropped names no config,
+            # but only the receipt that started it holds its capability.
+            return client if catalog.get("can_run") is True else None
         if owner is None:  # a service from before the catalog named its workbench
             owner = client.request("api/store").get("config_path")
     except OSError as exc:

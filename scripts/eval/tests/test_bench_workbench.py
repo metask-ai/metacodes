@@ -627,6 +627,15 @@ class WorkbenchTest(unittest.TestCase):
         closed.close()
         self.assertIsNone(cli.receipt_client({'url': gone}, self.manager.config_path))
 
+    def test_a_login_era_service_is_known_by_its_receipt_capability(self):
+        legacy = {'url': 'http://127.0.0.1:1/', 'token': 'capability'}
+        for can_run, mine in ((True, True), (False, False)):
+            catalog = {'service': 'metacodes-bench', 'can_run': can_run}
+            with self.subTest(can_run=can_run), patch.object(cli.Client, 'request', return_value=catalog) as request:
+                client = cli.receipt_client(legacy, self.manager.config_path)
+                self.assertEqual(client is not None, mine)
+                request.assert_called_once_with('api/workbench')
+
     def test_replacing_a_running_service_keeps_its_entry(self):
         def args(**given):
             return argparse.Namespace(**{'bind': None, 'port': None, 'public_url': None, **given})
