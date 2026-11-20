@@ -198,13 +198,67 @@ def finish(spec):
         atomic_json(result, {**value, "finished_at": now()})
 
 
-def staged_metacodes(ctx) -> Optional[str]:
-    """sha256 of the `metacodes` executable staged in the checkout, or None."""
+# environment_preflight.DEFAULT_HARNESS_IMAGE: the split-mount image every
+# WorkBuddy trial mounts, built from HARNESS_CONTEXT. run.sh reuses the tag
+# whenever it exists, whatever was staged since.
+HARNESS_IMAGE = "workbuddy-bench/harness/metacodes:0.1.0"
+HARNESS_CONTEXT = Path("configs/harnesses/metacodes/docker")
+# Each executable stage_artifacts stages, by the bundle path it comes from.
+BUNDLE_EXECUTABLES = {"metacodes": "bin/metacodes", "tinykg": "vendor/tinykg/tinykg",
+                      "metacodes-formal-kernel": "libexec/metacodes/metacodes-formal-kernel",
+                      "ripgrep": "bin/rg", "metacodes-project-kernel": "libexec/metacodes/metacodes-project-kernel"}
+REQUIRED_EXECUTABLES = ("metacodes", "tinykg", "metacodes-formal-kernel")
+
+
+def staged_executables(ctx) -> Optional[Dict[str, str]]:
+    """{label: sha256} of the executables staged in the checkout (the
+    artifact manifest's), or None when nothing is staged."""
     repo = checkout(ctx)
     manifest = _json(repo / ARTIFACT_MANIFEST) if repo is not None else None
-    executable = ((manifest or {}).get("executables") or {}).get("metacodes") if isinstance(manifest, dict) else None
-    digest = executable.get("sha256") if isinstance(executable, dict) else None
-    return digest if isinstance(digest, str) else None
+    if not isinstance(manifest, dict):
+        return None
+    rows = dict(manifest.get("executables") or {})
+    kernel = (manifest.get("project_control") or {}).get("kernel")
+    if kernel:
+        rows["metacodes-project-kernel"] = kernel
+    return {label: row["sha256"] for label, row in rows.items()
+            if isinstance(row, dict) and isinstance(row.get("sha256"), str)}
+
+
+def bundle_executables(bundle) -> Dict[str, str]:
+    """{label: sha256} of the same executables in a Linux bundle."""
+    import hashlib
+    result = {}
+    for label, relative in BUNDLE_EXECUTABLES.items():
+        path = Path(bundle) / relative
+        if path.is_file():
+            result[label] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def executable_mismatch(staged: Optional[Dict[str, str]], expected: Dict[str, str]) -> List[str]:
+    """Labels whose staged executable is not the expected bundle's (every
+    staged one, and the ones every run uses)."""
+    staged = staged or {}
+    return sorted(label for label in set(staged) | set(REQUIRED_EXECUTABLES)
+                  if staged.get(label) is None or staged.get(label) != expected.get(label))
+
+
+def build_harness_image(repo: Path, docker: str = "docker") -> None:
+    """Build HARNESS_IMAGE from the checkout's staged context, so the tag the
+    run mounts holds exactly what is staged now (Docker's cache keeps an
+    unchanged context cheap). Raises ValueError when the build fails or the
+    staged artifacts changed while it ran."""
+    import subprocess
+    manifest = repo / ARTIFACT_MANIFEST
+    before = manifest.read_bytes()
+    done = subprocess.run([docker, "buildx", "build", "--platform", TARGET_PLATFORM, "--load", "--tag", HARNESS_IMAGE,
+                           str(repo / HARNESS_CONTEXT)], cwd=str(repo), stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=3600)
+    if done.returncode != 0:
+        raise ValueError("构建 WorkBuddy 挂载镜像失败：" + (done.stderr or done.stdout or "").strip()[-300:])
+    if manifest.read_bytes() != before:
+        raise ValueError("构建 WorkBuddy 挂载镜像时暂存制品发生了变化，请重试")
 
 
 def spec_fields(suite, ctx) -> dict:

@@ -253,8 +253,10 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(suites.label("aime-2025")["category_name"], "竞赛数学")
 
     def test_workbuddy_platform_matches_the_stager(self):
+        from scripts.eval.workbuddy.environment_preflight import DEFAULT_HARNESS_IMAGE
         from scripts.eval.workbuddy.stage_artifacts import TARGET_PLATFORM
         self.assertEqual(wb.TARGET_PLATFORM, TARGET_PLATFORM)
+        self.assertEqual(wb.HARNESS_IMAGE, DEFAULT_HARNESS_IMAGE)
 
     def test_binary_carries_every_module_the_workbench_imports(self):
         assets = set(re.findall(r'\.path = "([^"]+)"', (REPO / "scripts/bench_assets.zig").read_text()))

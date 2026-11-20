@@ -32,6 +32,7 @@ import json
 import os
 import platform
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -76,7 +77,7 @@ class Node:
         from scripts.eval.harbor.suites import workbuddy
         return {"protocol": PROTOCOL, "version": self.version, "host": socket.gethostname(),
                 "os": platform.system(), "arch": platform.machine(), "workbuddy": self.workbuddy(),
-                "workbuddy_metacodes_sha256": workbuddy.staged_metacodes(self.context())}
+                "workbuddy_executables": workbuddy.staged_executables(self.context())}
 
     def remember(self, peer: str):
         if not executors.HOST.fullmatch(peer or ""):
@@ -117,10 +118,18 @@ class Node:
             return 2
         suite = suites.get(spec.get("suite"))
         problems = self.workbuddy().get(suite.id, {}).get("reasons") or []
-        staged = workbuddy.staged_metacodes(self.context())
-        if spec.get("metacodes_sha256") and staged != spec["metacodes_sha256"]:
-            problems.append(f"WorkBuddy 暂存的 metacodes（sha256 {(staged or '未知')[:12]}）"
-                            f"不是本次运行的版本（sha256 {spec['metacodes_sha256'][:12]}）")
+        if spec.get("executables") is not None:
+            # The trials mount HARNESS_IMAGE: rebuilt from what is staged
+            # now, which must be the run's bundle, executable by executable.
+            different = workbuddy.executable_mismatch(workbuddy.staged_executables(self.context()),
+                                                      spec["executables"])
+            if different:
+                problems.append("WorkBuddy 暂存的制品不是本次运行的 metacodes 版本：" + "、".join(different))
+            else:
+                try:
+                    workbuddy.build_harness_image(workbuddy.checkout(self.context()))
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    problems.append(str(exc))
         if problems:
             remote.emit("error", message=f"{socket.gethostname()}：" + "；".join(problems))
             return 2

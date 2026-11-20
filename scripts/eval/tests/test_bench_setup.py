@@ -1026,15 +1026,29 @@ class SuiteOnExecutorTest(SetupFixture):
         with self.assertRaisesRegex(ValueError, "没有这些任务"):
             client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                         "tasks": ["not-a-workbuddy-task"], "executor": "relay-4090"})
-        # Staged artifacts of another metacodes than the run's bundle: refused,
-        # so the record never names a version that did not run.
-        with self.assertRaisesRegex(ValueError, "暂存的 metacodes"):
-            client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
-                                        "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
-        staged = json.loads((repo / wb_suite.ARTIFACT_MANIFEST).read_text())
-        staged["executables"] = {"metacodes": {"sha256": sha256_file(self.root / "bundle/bin/metacodes")}}
-        atomic_json(repo / wb_suite.ARTIFACT_MANIFEST, staged)
-        manager.probe_cache.clear()
+        # Staged artifacts of another metacodes than the run's bundle are
+        # refused, executable by executable: the same metacodes beside
+        # another TinyKG is another version.
+        def stage(**executables):
+            manifest = json.loads((repo / wb_suite.ARTIFACT_MANIFEST).read_text())
+            manifest["executables"] = {label: {"sha256": digest} for label, digest in executables.items()}
+            atomic_json(repo / wb_suite.ARTIFACT_MANIFEST, manifest)
+            manager.probe_cache.clear()
+        bundle = sha256_file(self.root / "bundle/bin/metacodes")  # every fixture executable holds the same bytes
+        matching = {"metacodes": bundle, "tinykg": bundle, "metacodes-formal-kernel": bundle}
+        for staged, label in (({**matching, "metacodes": "1" * 64}, "metacodes"),
+                              ({**matching, "tinykg": "0" * 64}, "tinykg"),
+                              ({k: v for k, v in matching.items() if k != "metacodes"}, "metacodes")):
+            stage(**staged)
+            with self.assertRaisesRegex(ValueError, "暂存的制品.*（" + label):
+                client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                            "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
+        stage(**{"metacodes": bundle, "tinykg": bundle, "metacodes-formal-kernel": bundle})
+        # The mount image of an earlier staging is cached under the same tag,
+        # which run.sh would reuse: the node rebuilds it from what is staged.
+        images = Path(os.environ["FAKE_REMOTE_STATE"]) / "images"
+        images.mkdir(parents=True, exist_ok=True)
+        (images / wb_suite.HARNESS_IMAGE.replace("/", "_")).touch()
         run = client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                           "tasks": ["bug_fix-easy-alpha", "data_quality-hard-beta"],
                                           "attempts": 1, "concurrency": 2, "executor": "relay-4090"})
@@ -1057,6 +1071,10 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertFalse((repo / "configs/jobs" / (slug + ".yaml")).exists())
         view = client.request("api/job?name=" + run["name"])
         self.assertEqual((view["summary"]["counts"]["pass"], view["summary"]["counts"]["fail"]), (1, 1))
+        builds = [c[1] for c in self.calls("docker", "remote") if c[1][:2] == ["buildx", "build"]]
+        self.assertEqual(len(builds), 1, builds)
+        self.assertEqual(builds[0][builds[0].index("--tag") + 1], wb_suite.HARNESS_IMAGE)
+        self.assertEqual(Path(builds[0][-1]).resolve(), (repo / wb_suite.HARNESS_CONTEXT).resolve())
         self.assertIsNotNone(json.loads((manager.jobs_dir / run["name"] / "result.json").read_text())["finished_at"])
         remote_files = [p for p in self.remote_home.rglob("*") if p.is_file() and ".metacodes-bench/" in str(p)]
         public = b"".join(p.read_bytes() for p in remote_files + list(manager.records.iterdir())

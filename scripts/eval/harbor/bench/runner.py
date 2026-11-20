@@ -189,23 +189,19 @@ class RunManager:
 
     def staged_metacodes_problem(self, suite, executor_name, bundle):
         """Why an SSH WorkBuddy run would not run the metacodes its record
-        names (the run's bundle): the node's staged executable differs."""
+        names (the run's bundle): an executable the node staged differs."""
         if suite.runner != suites.WORKBUDDY or not bundle:
             return None
         executor = executors.find(settings(self.config_path), executor_name)
         if executor.kind != "ssh":
             return None
-        from scripts.eval.harbor.bench.setup import sha256_file
-        try:
-            expected = sha256_file(Path(bundle) / "bin/metacodes")
-        except OSError:
-            return "所选 metacodes 发行包缺少 bin/metacodes"
-        staged = (self.executor_facts(executor).get("node") or {}).get("workbuddy_metacodes_sha256")
-        if staged == expected:
+        from scripts.eval.harbor.suites import workbuddy
+        staged = (self.executor_facts(executor).get("node") or {}).get("workbuddy_executables")
+        different = workbuddy.executable_mismatch(staged, workbuddy.bundle_executables(bundle))
+        if not different:
             return None
-        return (f"{executor.name} 上 WorkBuddy 暂存的 metacodes（sha256 {(staged or '未知')[:12]}）"
-                f"不是本次选择的版本（sha256 {expected[:12]}）：请在该机器上用这个发行包的 bin/metacodes "
-                "重新运行 scripts.eval.workbuddy.stage_artifacts，或选择与暂存制品一致的版本")
+        return (f"{executor.name} 上 WorkBuddy 暂存的制品不是本次选择的 metacodes 版本（{'、'.join(different)} 不同）："
+                "请在该机器上用这个发行包重新运行 scripts.eval.workbuddy.stage_artifacts，或选择与暂存制品一致的版本")
 
     def suite_tasks(self, suite_id, executor=None):
         suite = suites.resolved(suites.get(suite_id))

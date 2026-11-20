@@ -538,15 +538,19 @@ async function renderNewBatch() {
     boxes.replaceChildren(...(state.batchPick.size ? [...state.batchPick.entries()].map(([id, entry]) => suiteBox(byId.get(id), entry))
       : [h('div', { class: 'empty', text: '在上面点选一个或多个评测集加入批次。' })]));
   }
+  const taskRequests = new Map();
   async function loadTasks(id) {
     const wanted = state.executor;
+    const ticket = (taskRequests.get(id) || 0) + 1;
+    taskRequests.set(id, ticket);
     let entry = { tasks: [], defaults: [], selected: new Set(), error: null };
     try {
       const body = await api('/api/suite?id=' + encodeURIComponent(id) + '&executor=' + encodeURIComponent(wanted || ''));
       entry = { tasks: body.tasks || [], defaults: body.default_tasks || [], selected: new Set(body.default_tasks || []), error: body.error || null };
     } catch (e) { entry.error = e.message; }
-    // A list asked for another executor (switched meanwhile) is not this one's.
-    if (state.batchPick.has(id) && state.executor === wanted) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
+    // Only the suite's latest request counts: an older one may be for another
+    // executor, or for this one before a switch away and back.
+    if (state.batchPick.has(id) && taskRequests.get(id) === ticket) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
   }
   attempts.addEventListener('input', syncSubmit);
 

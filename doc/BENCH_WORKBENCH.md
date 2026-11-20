@@ -685,11 +685,14 @@ suite on an SSH executor runs on the node's own checkout: the workbench
 validates the tasks against the list the node reports and copies the job
 back like a Harbor run. Its readiness there is reaching a compatible node,
 Metask authentication and what the node reports for the suite (an executor
-without the Harbor CLI still runs WorkBuddy, which brings its own). The
-node's staged `metacodes` must be the run's bundle's `bin/metacodes` (by
-sha256, which `node info` reports): otherwise the launch is refused, and the
-node checks again before it starts, so a record never names a version that
-did not run. WorkBuddy's host proxy is given a run-scoped placeholder and a
+without the Harbor CLI still runs WorkBuddy, which brings its own). Every
+executable the node staged for WorkBuddy (`metacodes`, TinyKG, the formal
+kernel, and ripgrep and the project kernel when staged; `node info` reports
+their sha256) must be the run's bundle's: otherwise the launch is refused.
+The node checks again before it starts and then rebuilds the split-mount
+image `workbuddy-bench/harness/metacodes:0.1.0` from the staged context
+(WorkBuddy's `run.sh` reuses that tag whenever it exists), so the trials
+mount what was checked and a record never names a version that did not run. WorkBuddy's host proxy is given a run-scoped placeholder and a
 loopback relay on the node; the relay forwards with the access token from
 the stdin line and swaps in each refreshed one, as for Harbor runs. The node
 removes its transient WorkBuddy configs afterwards.

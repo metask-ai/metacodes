@@ -1034,12 +1034,12 @@ class RemoteRun:
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
         if self.spec.get("runner") == "workbuddy":
-            # The node refuses a checkout whose staged metacodes is not the
-            # executable of the bundle this run's record names.
-            from scripts.eval.harbor.bench.setup import sha256_file
+            # The node refuses a checkout whose staged executables are not
+            # those of the bundle this run's record names.
+            from scripts.eval.harbor.suites import workbuddy
             bundle = self.spec.get("bundle")
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
-                    "metacodes_sha256": sha256_file(Path(bundle) / "bin/metacodes") if bundle else None,
+                    "executables": workbuddy.bundle_executables(bundle) if bundle else None,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
                                                      "reasoning_effort", "account_gateway")}}
         run_dir = self.executor.remote("runs", self.spec["name"])
