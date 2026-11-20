@@ -195,15 +195,17 @@ def connect_not_local(address: Tuple[str, int], timeout: Optional[float] = None,
         raise LocalUpstream(f"{host} resolves to this machine")
     error: OSError = LocalUpstream(f"cannot connect to {host}")
     for family, kind, proto, _name, sockaddr in infos:
-        sock = socket.socket(family, kind, proto)
+        sock = None
         try:
+            sock = socket.socket(family, kind, proto)
             sock.settimeout(timeout)
             if source_address:
                 sock.bind(source_address)
             sock.connect(sockaddr)
             return sock
         except OSError as exc:
-            sock.close()
+            if sock is not None:
+                sock.close()
             error = exc
     raise error
 
