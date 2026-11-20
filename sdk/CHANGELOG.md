@@ -14,6 +14,8 @@ empty `### Migration`.
 
 ## Unreleased
 
+## 0.16.0 — 2026-11-20
+
 ### Changed
 
 - The Teamwork CLI/Manager consumer fixture explicitly opts in with `--preview`;
