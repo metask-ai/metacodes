@@ -695,8 +695,10 @@ the run's own (`workbuddy-bench/harness/metacodes:metacodes-<run>`) and
 names it in a transient harness version (the pinned `0.1.0.yaml` plus
 `mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
 `run.sh` would otherwise reuse, and another workbench on the same Docker
-daemon could move, never reaches the trials; the run's tag and version file
-are removed afterwards. The build sends heartbeats like a running Harbor,
+daemon could move, never reaches the trials; the build checks the staged
+executables in the very manifest it builds from. The run's tag and version
+file are removed (within 60 seconds) under heartbeats before the node
+reports the run's end. The build sends heartbeats like a running Harbor,
 and a cancel (or a closed channel) kills it and ends the run. WorkBuddy's host proxy is given a run-scoped placeholder and a
 loopback relay on the node; the relay forwards with the access token from
 the stdin line and swaps in each refreshed one, as for Harbor runs. The node

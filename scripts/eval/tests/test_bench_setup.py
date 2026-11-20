@@ -104,6 +104,7 @@ elif name == "docker":
             (images / args[args.index("--tag") + 1].replace("/", "_")).touch()
         sys.exit(0)
     if args[:2] == ["image", "rm"]:
+        time.sleep(float(env.get("FAKE_RM_DELAY") or 0))
         (state / "images" / args[2].replace("/", "_")).unlink(missing_ok=True)
         sys.exit(0)
     if args[:1] == ["info"]:
@@ -158,7 +159,8 @@ elif name == "ssh":
               "FAKE_DOCKER_DAEMON": env.get("FAKE_REMOTE_DOCKER_DAEMON", "")}
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
-                "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY"):
+                "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
+                "FAKE_RM_DELAY"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -1150,11 +1152,44 @@ class SuiteOnExecutorTest(SetupFixture):
         process.stdin.write(b"cancel\n")
         process.stdin.flush()
         events = [json.loads(line) for line in process.stdout]
-        process.wait(30)
+        # The process itself ends with the reported code (the stdin reader
+        # never holds up its exit) while the channel is still open.
+        self.assertEqual(process.wait(30), 130)
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(events[-1], {"event": "exit", "code": 130, "cancelled": True})
         self.assertNotIn("started", [e["event"] for e in events])
         self.assertFalse((self.remote_home / "uv-ran").exists())
+
+    def test_cleanup_runs_under_heartbeats_before_the_one_terminal_event(self):
+        """A finished WorkBuddy run removes its tag and transient harness
+        version (slowly here) while heartbeats continue, then reports once."""
+        from scripts.eval.harbor.suites import workbuddy as wb_suite
+        from scripts.eval.tests.test_bench_suites import workbuddy_checkout
+        self.prepare_remote()
+        uv = self.remote_home / ".local/bin/uv"
+        uv.write_text("#!/bin/sh\nexit 0\n")
+        uv.chmod(0o755)
+        repo = self.node_checkout(workbuddy_checkout)
+        spec = {"schema_version": 1, "runner": "workbuddy", "jobs_dir": "jobs", "name": "quick",
+                "suite": "workbuddy-code", "model": "metask/session-model", "tasks": ["bug_fix-easy-alpha"],
+                "attempts": 1, "concurrency": 1, "account_gateway": "http://127.0.0.1:9", "executables": None}
+        (self.remote_home / "spec.json").write_text(json.dumps(spec))
+        relay = executors.find(self.cfg(), "relay-4090")
+        env = {**os.environ, "FAKE_RM_DELAY": "5"}
+        process = subprocess.Popen(executors.node_argv(relay, "run", "spec.json"), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, env=env)
+        self.addCleanup(process.kill)
+        process.stdin.write(b'{"env": {}, "credential": "access"}\n')
+        process.stdin.flush()
+        events = [json.loads(line) for line in process.stdout]
+        self.assertEqual(process.wait(30), 0)
+        kinds = [(e["event"], e.get("phase")) for e in events]
+        exit_at = kinds.index(("exit", None))
+        self.assertEqual(exit_at, len(events) - 1, kinds)
+        self.assertEqual(events[-1], {"event": "exit", "code": 0, "cancelled": False})
+        self.assertGreaterEqual(kinds[kinds.index(("started", None)):].count(("heartbeat", "finish")), 2, kinds)
+        self.assertIn(["image", "rm", wb_suite.run_image_tag("quick")], [c[1] for c in self.calls("docker", "remote")])
+        self.assertFalse((repo / wb_suite.HARNESS_VERSIONS / "metacodes-quick.yaml").exists())
 
     def test_registry_suite_runs_on_ssh_executor_into_the_store(self):
         """A registry suite on an SSH executor is downloaded on the workbench

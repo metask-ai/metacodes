@@ -45,6 +45,8 @@ from scripts.eval.harbor.bench.runner import atomic_json, now, settings
 # `info` or `run`; the workbench refuses a node with another protocol.
 PROTOCOL = 1
 PEERS = "peers.json"
+# How long removing a run's image tag may take before the run ends anyway.
+CLEANUP_TIMEOUT = 60
 
 
 class Node:
@@ -75,15 +77,14 @@ class Node:
                 "或由工作台对它运行 metacodes bench setup --executor <名称>"]
 
     def workbuddy(self):
-        ctx, docker = self.context(), self.docker_reasons()
+        ctx, docker = self.context(), self.docker_reasons() + self.buildx_reasons()
         result = {}
         for suite in suites.WORKBUDDY_SUITES:
             try:
                 tasks = suites.task_ids(suite, ctx)
             except suites.Unavailable:
                 tasks = []
-            result[suite.id] = {"reasons": docker + self.buildx_reasons() + suites.readiness(suite, ctx),
-                                "tasks": tasks}
+            result[suite.id] = {"reasons": docker + suites.readiness(suite, ctx), "tasks": tasks}
         return result
 
     def info(self):
@@ -156,7 +157,7 @@ class Node:
         def prepare(stop):
             nonlocal relay
             try:
-                if not workbuddy.build_harness_image(repo, tag, stop):
+                if not workbuddy.build_harness_image(repo, tag, stop, expected=spec.get("executables")):
                     return None
                 relay = TimingRelay(spec["account_gateway"], credential,
                                     Path(jobs_dir) / spec["name"] / ".bench-metrics",
@@ -166,12 +167,19 @@ class Node:
                 raise ValueError(f"WorkBuddy 启动失败：{exc}") from None
             return argv, child_env, cwd
 
+        def finish():
+            # Before the terminal event, still under heartbeats, and bounded.
+            workbuddy.finish(spec)
+            try:
+                subprocess.run(["docker", "image", "rm", tag], stdin=subprocess.DEVNULL, capture_output=True,
+                               timeout=CLEANUP_TIMEOUT)
+            except (OSError, subprocess.SubprocessError):
+                print(f"未能删除本次运行的镜像标签 {tag}", file=sys.stderr, flush=True)
+
         try:
             return remote.supervise(spec, None, None, credential, threading.Event(), threading.Event(),
-                                    prepare=prepare)
+                                    prepare=prepare, finish=finish)
         finally:
-            workbuddy.finish(spec)
-            subprocess.run(["docker", "image", "rm", tag], stdin=subprocess.DEVNULL, capture_output=True)
             if relay is not None:
                 relay.__exit__(None, None, None)
 
@@ -192,7 +200,13 @@ def main(argv, state_root, version) -> int:
         print(json.dumps(value, ensure_ascii=False) if "--json" in args else render_peers(value))
         return 0
     if action == "run" and len(args) == 1:
-        return node.run(args[0])
+        code = node.run(args[0])
+        # The control channel's reader may still block on stdin, which the
+        # workbench closes only after this process ends: exit without the
+        # interpreter's shutdown waiting on that thread's buffer lock.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     if action in ("manifest", "pack", "egress-probe") and len(args) == 1:
         return remote.main([action, args[0]])
     print("usage: metacodes bench node info [--json] | peers [--json] | run <spec> | manifest <dir> | "

@@ -196,12 +196,14 @@ def cancelled_exit():
     return 130
 
 
-def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None):
+def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None, finish=None):
     """Run Harbor: control channel, heartbeats, cancel; the exit code.
 
     `prepare(stop)`, when given, runs first under heartbeats and with cancel
     already handled; it returns (argv, env, cwd), or None once `stop` is set,
-    and raises ValueError with a user-facing reason."""
+    and raises ValueError with a user-facing reason. `finish()`, when given,
+    runs under heartbeats before the run's one terminal event, however the
+    run ends."""
 
     def control():
         for line in sys.stdin.buffer:
@@ -223,13 +225,23 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
         stop.set()
 
     threading.Thread(target=control, daemon=True).start()
+
+    def finishing():
+        if finish is not None:
+            try:
+                beating("finish", stop, finish)
+            except Exception as exc:  # the run's outcome is reported regardless
+                print(f"清理失败：{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
     if prepare is not None:
         try:
             prepared = beating("prepare", stop, lambda: prepare(stop))
         except ValueError as exc:
+            finishing()
             emit("error", message=str(exc))
             return 2
         if prepared is None or stop.is_set():
+            finishing()
             return cancelled_exit()
         argv, env, cwd = prepared
     dataset, patterns = dataset_selection(argv)
@@ -244,6 +256,7 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
             except (BrokenPipeError, OSError):
                 stop.set()
             if stop.is_set():  # cancelled (or the channel closed) while pulling
+                finishing()
                 return cancelled_exit()
     # Harbor's own output goes to stderr, which SSH carries to the local
     # worker's log; stdout carries only events.
@@ -266,6 +279,7 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
                 stop.set()
             last = time.monotonic()
         time.sleep(0.25)
+    finishing()
     try:
         emit("exit", code=process.returncode, cancelled=interrupted_at is not None)
     except (BrokenPipeError, OSError):

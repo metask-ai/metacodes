@@ -236,7 +236,11 @@ def staged_executables(ctx) -> Optional[Dict[str, str]]:
     """{label: sha256} of the executables staged in the checkout (the
     artifact manifest's), or None when nothing is staged."""
     repo = checkout(ctx)
-    manifest = _json(repo / ARTIFACT_MANIFEST) if repo is not None else None
+    return manifest_executables(_json(repo / ARTIFACT_MANIFEST) if repo is not None else None)
+
+
+def manifest_executables(manifest) -> Optional[Dict[str, str]]:
+    """{label: sha256} of an artifact manifest's executables."""
     if not isinstance(manifest, dict):
         return None
     rows = dict(manifest.get("executables") or {})
@@ -271,11 +275,14 @@ def run_image_tag(name: str) -> str:
     return HARNESS_IMAGE.split(":")[0] + ":" + slug(name)[:128]
 
 
-def build_harness_image(repo: Path, tag: str, stop, docker: str = "docker") -> bool:
+def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str, str]] = None,
+                        docker: str = "docker") -> bool:
     """Build the mount image from the checkout's staged context as `tag`.
-    False when `stop` was set meanwhile (the build is killed). Raises
-    ValueError when the build fails or the staged artifacts changed while
-    it ran."""
+    The manifest read once here is the one checked against `expected` (the
+    run's bundle) and compared after the build. False when `stop` was set
+    meanwhile (the build is killed). Raises ValueError when the staged
+    executables are not the expected ones, the build fails, or the staged
+    artifacts changed while it ran."""
     import os
     import signal
     import subprocess
@@ -283,6 +290,14 @@ def build_harness_image(repo: Path, tag: str, stop, docker: str = "docker") -> b
     import time
     manifest = repo / ARTIFACT_MANIFEST
     before = manifest.read_bytes()
+    if expected is not None:
+        try:
+            staged = manifest_executables(json.loads(before))
+        except ValueError:
+            staged = None
+        different = executable_mismatch(staged, expected)
+        if different:
+            raise ValueError("WorkBuddy 暂存的制品不是本次运行的 metacodes 版本：" + "、".join(different))
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen([docker, "buildx", "build", "--platform", TARGET_PLATFORM, "--load", "--tag", tag,
                                     str(repo / HARNESS_CONTEXT)], cwd=str(repo), stdin=subprocess.DEVNULL,
