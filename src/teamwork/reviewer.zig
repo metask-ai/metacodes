@@ -32,6 +32,7 @@ const sync = @import("platform").sync;
 const swarm_team = @import("../swarm/team.zig");
 const observation = @import("../tools/observation.zig");
 const common = @import("../tools/common.zig");
+const controller_git = @import("../util/controller_git.zig");
 const shell_mod = @import("../core/shell.zig");
 const sandbox_config = @import("../sandbox/config.zig");
 const sandbox_exec = @import("../sandbox/exec.zig");
@@ -272,7 +273,7 @@ pub const Review = struct {
 /// Read and parse a seat's `review.json`.
 pub fn readReview(gpa: std.mem.Allocator, run: *const run_dir.RunDir, seat: types.SeatId) ReadReviewError!Review {
     var buf: run_dir.PathBuf = undefined;
-    const text = swarm_team.readFileAlloc(gpa, try run.seatPath(&buf, seat, .review)) orelse
+    const text = (try run_dir.readSeatOutput(gpa, try run.seatPath(&buf, seat, .review), max_review_bytes + 1)) orelse
         return error.ReviewMissing;
     defer gpa.free(text);
     return Review.parse(gpa, text);
@@ -314,11 +315,18 @@ pub const ObservedCall = struct {
 
 /// The observer adapter for a metacodes reviewer seat. Its `sink()` goes in
 /// the seat's `SpawnOptions.tool_observer`; it records, from the dispatch
-/// seam in `tool_exec`, every authoritative Bash dispatch that returned an
-/// exit code. Events are forwarded unchanged to `next` (the run journal, if
-/// any), so plugging it in changes nothing else. A Bash call that was
+/// seam in `tool_exec`, every Bash dispatch that ran and returned an exit
+/// code. Events are forwarded unchanged to `next` (the run journal, if any),
+/// so plugging it in changes nothing else. A Bash call that was
 /// auto-backgrounded has no exit code yet and is not recorded: evidence must
 /// come from commands that finished in the foreground.
+///
+/// Both origins count. A read-only Bash call (the only kind a seat may run
+/// where there is no sandbox backend) is executed by the stream prefetch as
+/// soon as its `tool_use` arrives, and that `speculative_prefetch` dispatch is
+/// the run whose result the model receives; no authoritative dispatch
+/// follows. Either way the command really ran with that exit code, which is
+/// all a piece of evidence claims.
 pub const BashCallLog = struct {
     arena: std.heap.ArenaAllocator,
     next: ?observation.Sink = null,
@@ -357,7 +365,10 @@ pub const BashCallLog = struct {
     fn tap(ctx: *anyopaque, dispatch: observation.DispatchTap) void {
         const self: *BashCallLog = @ptrCast(@alignCast(ctx));
         if (self.next) |next| next.tap(dispatch);
-        if (!std.mem.eql(u8, dispatch.dispatched_name, "Bash") or dispatch.origin != .authoritative) return;
+        if (!std.mem.eql(u8, dispatch.dispatched_name, "Bash")) return;
+        switch (dispatch.origin) {
+            .authoritative, .speculative_prefetch => {},
+        }
         switch (dispatch.outcome) {
             .succeeded, .tool_error => {},
             .pending, .host_failed, .host_rejected, .host_fatal => return,
@@ -416,6 +427,7 @@ pub const CheckRunner = struct {
     sandbox: ?*const sandbox_config.SandboxSettings = null,
     home: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
+    private_temp: ?[]const u8 = null,
     timeout_ms: u64 = 180_000,
     max_output_bytes: usize = 256 * 1024,
 
@@ -431,12 +443,17 @@ pub const CheckRunner = struct {
         const command: []const u8 = blk: {
             const sb = self.sandbox orelse break :blk check.text;
             if (!sb.enabled) break :blk check.text;
+            var strict = sb.*;
+            if (strict.temp_writes == .isolated) strict.temp_writes = .{ .isolated = self.private_temp };
+            const protection = try @import("drivers/write_scope.zig").GitProtection.init(gpa, workspace, strict.deny_write);
+            defer protection.deinit();
+            strict.deny_write = protection.roots;
             const main_git_dir = sandbox_exec.linkedWorktreeGitDir(gpa, workspace);
             defer if (main_git_dir) |g| gpa.free(g);
             wrap = sandbox_exec.wrapAsShellString(gpa, check.text, .{
                 .cwd = workspace,
                 .home = self.home,
-                .sandbox = sb,
+                .sandbox = &strict,
                 .main_git_dir = main_git_dir,
                 .additional_dirs = self.additional_dirs,
             }) catch |err| switch (err) {
@@ -508,8 +525,18 @@ const git_timeout_ms: u64 = 60_000;
 /// untracked, non-ignored files included, staged or not. Computed with a
 /// throwaway copy of the index under `scratch_dir` (outside the workspace),
 /// so the workspace's own index and files are untouched; the only side
-/// effect is blob objects in the repository's object store.
+/// effect is blob objects in the repository's object store. Repository hooks,
+/// fsmonitor and content filters are disabled for controller invocations.
 pub fn workspaceTree(gpa: std.mem.Allocator, workspace: []const u8, scratch_dir: []const u8, abort: ?*const AbortSignal) TreeError!TreeId {
+    const scratch = try std.fs.path.joinZ(gpa, &.{ scratch_dir, scratch_index_name });
+    defer gpa.free(scratch);
+    defer pfs.unlinkPath(scratch.ptr) catch {};
+    return workspaceTreeWithIndex(gpa, workspace, scratch, abort);
+}
+
+/// Rebuild a caller-owned scratch index and return the tree it describes.
+/// Retaining this index lets merge-back validate the same preimages at apply.
+pub fn workspaceTreeWithIndex(gpa: std.mem.Allocator, workspace: []const u8, scratch: [:0]const u8, abort: ?*const AbortSignal) TreeError!TreeId {
     if (builtin.os.tag == .windows) return error.Unsupported;
     const index_rel = (try git(gpa, workspace, null, &.{ "rev-parse", "--git-path", "index" }, abort)) orelse
         return error.NotARepository;
@@ -521,16 +548,20 @@ pub fn workspaceTree(gpa: std.mem.Allocator, workspace: []const u8, scratch_dir:
         try std.fs.path.join(gpa, &.{ workspace, index_text });
     defer gpa.free(index_path);
 
-    const scratch = try std.fs.path.joinZ(gpa, &.{ scratch_dir, scratch_index_name });
-    defer gpa.free(scratch);
-    defer pfs.unlinkPath(scratch.ptr) catch {};
-    pfs.unlinkPath(scratch.ptr) catch {};
-    // Start from the real index so unchanged files are not rehashed; a
-    // repository without one yet starts empty.
+    pfs.unlinkPath(scratch.ptr) catch |err| switch (err) {
+        error.NotFound => {},
+        error.UnlinkFailed => return error.GitFailed,
+    };
+    // Retain indexed paths (including staged ignored files), but not the
+    // stat cache: copying the index gives it a new timestamp and invalidates
+    // Git's racy-file protection. Re-read tracked bytes before adding new paths.
+    // A repository without an index yet starts empty.
     if (swarm_team.readFileAlloc(gpa, index_path)) |bytes| {
         defer gpa.free(bytes);
         run_dir.writeAtomic(scratch, bytes) catch return error.GitFailed;
     }
+    const rehash = (try git(gpa, workspace, scratch, &.{ "add", "--renormalize", "-A" }, abort)) orelse return error.GitFailed;
+    gpa.free(rehash);
     const add = (try git(gpa, workspace, scratch, &.{ "add", "-A" }, abort)) orelse return error.GitFailed;
     gpa.free(add);
     const tree = (try git(gpa, workspace, scratch, &.{"write-tree"}, abort)) orelse return error.GitFailed;
@@ -541,6 +572,8 @@ pub fn workspaceTree(gpa: std.mem.Allocator, workspace: []const u8, scratch_dir:
 /// Run git in `dir`; stdout on exit 0, null otherwise. `index_file` sets
 /// `GIT_INDEX_FILE`.
 fn git(gpa: std.mem.Allocator, dir: []const u8, index_file: ?[]const u8, args: []const []const u8, abort: ?*const AbortSignal) TreeError!?[]u8 {
+    const prefix = try controller_git.prefix(gpa, dir, abort);
+    defer prefix.deinit(gpa);
     var owned: std.ArrayList([:0]u8) = .empty;
     defer {
         for (owned.items) |arg| gpa.free(arg);
@@ -550,16 +583,16 @@ fn git(gpa: std.mem.Allocator, dir: []const u8, index_file: ?[]const u8, args: [
     defer argv.deinit(gpa);
     try argv.append(gpa, "/usr/bin/env");
     if (index_file) |path| {
-        const assignment = try std.fmt.allocPrintSentinel(gpa, "GIT_INDEX_FILE={s}", .{path}, 0);
-        try owned.append(gpa, assignment);
-        try argv.append(gpa, assignment.ptr);
+        const assignment = try std.fmt.allocPrint(gpa, "GIT_INDEX_FILE={s}", .{path});
+        defer gpa.free(assignment);
+        try appendGitArgument(gpa, &owned, &argv, assignment);
     }
-    try argv.append(gpa, "git");
-    for (args) |arg| {
-        const z = try gpa.dupeZ(u8, arg);
-        try owned.append(gpa, z);
-        try argv.append(gpa, z.ptr);
+    for (prefix.items) |arg| try appendGitArgument(gpa, &owned, &argv, arg);
+    if (index_file != null) {
+        try appendGitArgument(gpa, &owned, &argv, "-c");
+        try appendGitArgument(gpa, &owned, &argv, "core.splitIndex=false");
     }
+    for (args) |arg| try appendGitArgument(gpa, &owned, &argv, arg);
     try argv.append(gpa, null);
     const out = common.spawnCaptureWithStderrTimed(argv.items, gpa, abort, git_timeout_ms, null, 64 * 1024, dir) catch |err| switch (err) {
         error.Aborted => return error.Aborted,
@@ -567,11 +600,20 @@ fn git(gpa: std.mem.Allocator, dir: []const u8, index_file: ?[]const u8, args: [
         else => return error.GitFailed,
     };
     gpa.free(out.stderr);
-    if (out.exit_code != 0) {
+    if (out.exit_code != 0 or !out.capture_complete) {
         gpa.free(out.stdout);
         return null;
     }
     return out.stdout;
+}
+
+fn appendGitArgument(gpa: std.mem.Allocator, owned: *std.ArrayList([:0]u8), argv: *std.ArrayList(?[*:0]const u8), arg: []const u8) error{OutOfMemory}!void {
+    const z = try gpa.dupeZ(u8, arg);
+    owned.append(gpa, z) catch |err| {
+        gpa.free(z);
+        return err;
+    };
+    try argv.append(gpa, z.ptr);
 }
 
 // ── judging a review ────────────────────────────────────────────────────────
@@ -921,6 +963,11 @@ const Fixture = struct {
         testing.allocator.free(out);
     }
 
+    fn gitConfig(self: *const Fixture, key: []const u8, value: []const u8) !void {
+        const out = (try git(testing.allocator, self.workspace(), null, &.{ "config", "--local", key, value }, null)) orelse return error.GitConfigFailed;
+        testing.allocator.free(out);
+    }
+
     fn tree(self: *const Fixture) !TreeId {
         var buf: run_dir.PathBuf = undefined;
         return workspaceTree(testing.allocator, self.workspace(), try self.seatDir(&buf), null);
@@ -1151,6 +1198,151 @@ test "reviewer L2: an approval is stale once the tree changes, and a reviewer ma
     try testing.expectEqualStrings("", status_out);
 
     try testing.expectError(error.NotARepository, workspaceTree(testing.allocator, scratch, scratch, null));
+}
+
+test "reviewer L2: workspace snapshots rehash same-stat tracked edits without modifying the user index" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-review-stat-cache");
+    defer fx.deinit();
+    try fx.gitInit();
+    try fx.gitConfig("core.trustctime", "false");
+    try fx.gitConfig("core.checkStat", "minimal");
+    try fx.workspaceFile("tracked.txt", "old\n");
+    const touch_argv = [_]?[*:0]const u8{ "/usr/bin/touch", "-t", "202001010000", "tracked.txt", null };
+    var touched = try common.spawnCaptureWithStderrTimed(&touch_argv, testing.allocator, null, 30_000, null, 4096, fx.workspace());
+    testing.allocator.free(touched.stdout);
+    testing.allocator.free(touched.stderr);
+    try testing.expectEqual(@as(i32, 0), touched.exit_code);
+    const staged = (try git(testing.allocator, fx.workspace(), null, &.{ "add", "tracked.txt" }, null)).?;
+    testing.allocator.free(staged);
+    var index_buf: run_dir.PathBuf = undefined;
+    const index_path = try std.fmt.bufPrint(&index_buf, "{s}/.git/index", .{fx.workspace()});
+    const original = swarm_team.readFileAlloc(testing.allocator, index_path).?;
+    defer testing.allocator.free(original);
+
+    try fx.workspaceFile("tracked.txt", "new\n");
+    touched = try common.spawnCaptureWithStderrTimed(&touch_argv, testing.allocator, null, 30_000, null, 4096, fx.workspace());
+    testing.allocator.free(touched.stdout);
+    testing.allocator.free(touched.stderr);
+    try testing.expectEqual(@as(i32, 0), touched.exit_code);
+    const tree = try fx.tree();
+    const object = try std.fmt.allocPrint(testing.allocator, "{s}:tracked.txt", .{tree.slice()});
+    defer testing.allocator.free(object);
+    const blob = (try git(testing.allocator, fx.workspace(), null, &.{ "show", object }, null)).?;
+    defer testing.allocator.free(blob);
+    try testing.expectEqualStrings("new\n", blob);
+    try testing.expect(tree.eql(try fx.tree()));
+    const after = swarm_team.readFileAlloc(testing.allocator, index_path).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, original, after);
+}
+
+test "reviewer L2: workspace snapshots disable hooks and fsmonitor without changing repository config" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-review-callbacks");
+    defer fx.deinit();
+    try fx.gitInit();
+    try fx.workspaceFile("tracked.txt", "base\n");
+    const staged = (try git(testing.allocator, fx.workspace(), null, &.{ "add", "tracked.txt" }, null)).?;
+    testing.allocator.free(staged);
+
+    var index_buf: run_dir.PathBuf = undefined;
+    const index_path = try std.fmt.bufPrint(&index_buf, "{s}/.git/index", .{fx.workspace()});
+    const index_before = swarm_team.readFileAlloc(testing.allocator, index_path).?;
+    defer testing.allocator.free(index_before);
+
+    const script = "#!/bin/sh\nprintf called >> callback-ran\n";
+    try fx.workspaceFile(".git/hooks/post-index-change", script);
+    try fx.workspaceFile(".git/fsmonitor", script);
+    for ([_][]const u8{ ".git/hooks/post-index-change", ".git/fsmonitor" }) |name| {
+        const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ fx.workspace(), name }, 0);
+        defer testing.allocator.free(path);
+        try testing.expectEqual(@as(c_int, 0), pfs.chmod(path.ptr, 0o755));
+    }
+    try fx.gitConfig("core.fsmonitor", ".git/fsmonitor");
+    try fx.gitConfig("core.hooksPath", ".git/hooks");
+    const before = try fx.tree();
+    try fx.workspaceFile("tracked.txt", "candidate content\n");
+    const after = try fx.tree();
+    try testing.expect(!before.eql(after));
+
+    const marker = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/callback-ran", .{fx.workspace()}, 0);
+    defer testing.allocator.free(marker);
+    try testing.expect(!pfs.exists(marker.ptr));
+    const index_after = swarm_team.readFileAlloc(testing.allocator, index_path).?;
+    defer testing.allocator.free(index_after);
+    try testing.expectEqualSlices(u8, index_before, index_after);
+    const configured = (try git(testing.allocator, fx.workspace(), null, &.{ "config", "--local", "--get", "core.fsmonitor" }, null)).?;
+    defer testing.allocator.free(configured);
+    try testing.expectEqualStrings(".git/fsmonitor\n", configured);
+}
+
+test "reviewer L2: workspace snapshots bypass clean and process filters from included config" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-review-filters");
+    defer fx.deinit();
+    try fx.gitInit();
+    try fx.workspaceFile(".gitattributes", "*.dat filter=Seat.Mixed\n*.bin filter=persistent\n");
+    try fx.workspaceFile("filter.sh", "#!/bin/sh\nprintf called >> filter-ran\ncat\n");
+    const filter_config =
+        \\[filter "Seat.Mixed"]
+        \\  clean = /bin/sh ./filter.sh
+        \\  smudge = /bin/sh ./filter.sh
+        \\  required = true
+        \\[filter "persistent"]
+        \\  process = /bin/sh ./filter.sh
+        \\  required = true
+        \\
+    ;
+    try fx.workspaceFile("filters.cfg", filter_config);
+    try fx.gitConfig("include.path", "../filters.cfg");
+    try fx.workspaceFile("one.dat", "original bytes\n");
+    try fx.workspaceFile("two.bin", "persistent bytes\n");
+    const before = try fx.tree();
+    try fx.workspaceFile("one.dat", "candidate bytes\n");
+    const after = try fx.tree();
+    try testing.expect(!before.eql(after));
+    const object = try std.fmt.allocPrint(testing.allocator, "{s}:one.dat", .{after.slice()});
+    defer testing.allocator.free(object);
+    const blob = (try git(testing.allocator, fx.workspace(), null, &.{ "show", object }, null)).?;
+    defer testing.allocator.free(blob);
+    try testing.expectEqualStrings("candidate bytes\n", blob);
+    const marker = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/filter-ran", .{fx.workspace()}, 0);
+    defer testing.allocator.free(marker);
+    try testing.expect(!pfs.exists(marker.ptr));
+    const configured = (try git(testing.allocator, fx.workspace(), null, &.{ "config", "--file", "filters.cfg", "--get", "filter.Seat.Mixed.clean" }, null)).?;
+    defer testing.allocator.free(configured);
+    try testing.expectEqualStrings("/bin/sh ./filter.sh\n", configured);
+}
+
+test "reviewer L2: workspace snapshots fail closed on invalid or excessive filter config" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-review-filter-limits");
+    defer fx.deinit();
+    try fx.gitInit();
+    try fx.gitConfig("include.path", "../filters.cfg");
+    try fx.workspaceFile("filters.cfg", "[broken\n");
+    try testing.expectError(error.GitFailed, fx.tree());
+    try fx.workspaceFile("filters.cfg", "[filter \"unsafe=name\"]\nclean = false\n");
+    try testing.expectError(error.GitFailed, fx.tree());
+
+    var cfg: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer cfg.deinit();
+    for (0..129) |i| try cfg.writer.print("[filter \"driver-{d}\"]\nclean = false\n", .{i});
+    try fx.workspaceFile("filters.cfg", cfg.written());
+    try testing.expectError(error.GitFailed, fx.tree());
+
+    // Repeating one driver stays below the driver-count limit, but its key
+    // list exceeds the capture bound. Partial discovery is equally unsafe.
+    cfg.clearRetainingCapacity();
+    try cfg.writer.writeAll("[filter \"repeated\"]\n");
+    for (0..5000) |_| try cfg.writer.writeAll("clean = false\n");
+    try fx.workspaceFile("filters.cfg", cfg.written());
+    try testing.expectError(error.GitFailed, fx.tree());
 }
 
 test "reviewer: built in; a project agent named reviewer does not change the charter" {

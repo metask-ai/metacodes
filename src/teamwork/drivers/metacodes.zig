@@ -38,6 +38,7 @@ const log = @import("../../util/log.zig");
 
 /// What a metacodes seat runs on, all borrowed for the driver's life.
 pub const Deps = struct {
+    preview: bool = false,
     provider: provider_mod.Provider,
     /// For Anthropic server tools; null for any other provider.
     anthropic_client: ?*client_mod.Client = null,
@@ -95,6 +96,7 @@ pub const MetacodesDriver = struct {
         paths: types.SeatPaths,
         abort: *const types.AbortSignal,
     ) types.SeatDriver.Error!types.SeatOutcome {
+        if (!self.deps.preview) return .{ .failed = .spawn_failed };
         if (spec.harness != .metacodes) {
             log.warn("teamwork", "seat {s}: metacodes driver given a {s} seat", .{ self.binding.seat.slice(), spec.harnessKind().name() });
             return .{ .failed = .spawn_failed };
@@ -108,6 +110,10 @@ pub const MetacodesDriver = struct {
 
         const seat_dir = common.seatDir(paths);
         var seat_sandbox = write_scope.seatSandbox(self.deps.host_sandbox);
+        seat_sandbox.temp_writes = .{ .isolated = seat_dir };
+        const git_protection = try write_scope.GitProtection.init(gpa, paths.workspace, seat_sandbox.deny_write);
+        defer git_protection.deinit();
+        seat_sandbox.deny_write = git_protection.roots;
         var scope: write_scope.Scope = undefined;
         scope.init(spec.role, paths.workspace, seat_dir, self.deps.home_dir, &seat_sandbox) catch |err| {
             log.warn("teamwork", "seat {s}: workspace or seat directory unusable: {s}", .{ self.binding.seat.slice(), @errorName(err) });
@@ -128,6 +134,8 @@ pub const MetacodesDriver = struct {
         var sink = writer_backend.WriterBackend.initNullWithUsage(&usage);
         const backend = sink.backend();
 
+        self.binding.ledger.reserve(self.binding.seat, .metacodes) catch return .budget_exhausted;
+
         const started_ms = util_time.nowMs();
         const result = subagent.spawnAgentSink(
             gpa,
@@ -138,6 +146,7 @@ pub const MetacodesDriver = struct {
             abort,
             prompt,
             .{
+                .preview = self.deps.preview,
                 .max_turns = self.deps.max_turns,
                 .system_prompt = charters.forRole(spec.role),
                 .cost_budget_usd = self.binding.ledger.remainingUsd(),
