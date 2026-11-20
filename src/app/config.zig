@@ -44,6 +44,15 @@ pub fn loadFromHome(allocator: std.mem.Allocator, state_root: []const u8) !FileC
     return loadFromFile(allocator, path);
 }
 
+/// Shared by App initialization and command dispatch before App exists.
+/// Explicit CLI settings win; only inherit consults the root FileConfig.
+pub fn resolvePreview(gpa: std.mem.Allocator, state_root: []const u8, setting: @import("../preview.zig").Setting) !@import("../preview.zig").Setting {
+    if (setting != .inherit) return setting;
+    const saved = if (state_root.len > 0) try loadFromHome(gpa, state_root) else FileConfig{};
+    defer saved.deinit(gpa);
+    return setting.resolve(saved.preview);
+}
+
 pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !FileConfig {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);

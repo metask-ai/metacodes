@@ -101,6 +101,20 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
     assert "explain this" in text, "picker 吃掉了输入框里的草稿:\n" + text
 
 
+def test_picker_search_can_start_with_q(bin_path):
+    raw = run(
+        bin_path,
+        [READY, "type:explain this", "sleep:0.3", "key:ctrl_o", wait_for(OPEN), "type:qwen", "sleep:0.5"],
+        term_size=(30, 120),
+        env=_no_vendor_keys(DASHSCOPE_API_KEY="tty-dummy-dashscope-key"),
+        per_key_drain=0.1,
+    )
+    _, text = _screen(raw, rows=30, cols=120)
+    assert "kept " not in text and "enter apply" in text, "第一个 q 不该关掉 picker:\n" + text
+    assert re.search(r"Qwen\d", text), "打 qwen 应该过滤出 Qwen 的模型:\n" + text
+    assert "explain this" in text and "explain thiswen" not in text, "草稿不该被改动:\n" + text
+
+
 def test_picker_escape_clears_filter_then_closes_and_says_what_was_kept(bin_path):
     raw = run(
         bin_path,
@@ -423,8 +437,8 @@ def test_picker_with_no_provider_configured_points_at_login_and_this_installs_en
     )
     _, text = _screen(raw, rows=30, cols=160)
     assert f"no providers configured — /login, or configure {env_file}" in text, text
-    assert "esc cancel · q close" in text, text
-    for gone in ("Not configured", "not configured", "credential goes", "enter apply", "switched to"):
+    assert "esc cancel" in text, text
+    for gone in ("Not configured", "not configured", "credential goes", "enter apply", "switched to", "q close"):
         assert gone not in text, f"{gone!r} 不该出现:\n" + text
 
 

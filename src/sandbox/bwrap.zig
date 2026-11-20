@@ -184,6 +184,7 @@ pub const Request = struct {
     network: Network = .shared,
     /// `$TMPDIR` of the caller; null = unset.
     tmpdir: ?[]const u8 = null,
+    temp_writes: @import("config.zig").SandboxSettings.TempWrites = .system,
 };
 
 /// Linux temp roots every sandboxed command may write, as Seatbelt allows
@@ -221,8 +222,13 @@ pub fn buildArgv(
     try addWritable(alloc, &writable, req, req.cwd);
     for (req.additional_dirs) |d| try addWritable(alloc, &writable, req, d);
     if (req.main_git_dir) |g| try addWritable(alloc, &writable, req, g);
-    if (req.tmpdir) |t| try addWritable(alloc, &writable, req, t);
-    for (temp_roots) |t| try addWritable(alloc, &writable, req, t);
+    switch (req.temp_writes) {
+        .system => {
+            if (req.tmpdir) |t| try addWritable(alloc, &writable, req, t);
+            for (temp_roots) |t| try addWritable(alloc, &writable, req, t);
+        },
+        .isolated => |dir| if (dir) |path| try addWritable(alloc, &writable, req, path),
+    }
     for (req.allow_write) |p| try addWritable(alloc, &writable, req, p);
     for (writable.items) |p| try push(alloc, &argv, &.{ "--bind", p, p });
 
@@ -263,6 +269,9 @@ pub fn buildArgv(
 
     try push(alloc, &argv, &namespace_flags);
     if (req.network == .isolated) try push(alloc, &argv, &.{"--unshare-net"});
+    if (req.temp_writes == .isolated) if (req.temp_writes.isolated) |path| {
+        try push(alloc, &argv, &.{ "--setenv", "TMPDIR", path, "--setenv", "TMP", path, "--setenv", "TEMP", path });
+    };
     // A relative cwd ("." when the caller has none) is where bwrap already is.
     if (std.fs.path.isAbsolute(req.cwd)) try push(alloc, &argv, &.{ "--chdir", req.cwd });
     try push(alloc, &argv, &.{ "--", shell, "-c", command });

@@ -2402,7 +2402,7 @@ fn runCounted(
     var kg_context_repair_attempts: u8 = 0;
     var kg_coverage_borrowed_turns: u32 = 0;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
-    const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
+    const cost_rates = @import("../util/pricing.zig").rateFor(opts.model_override orelse provider.model());
     var run_cost_usd: f64 = 0;
 
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
@@ -3064,6 +3064,12 @@ fn runCounted(
                 rid_for_turn = .{ .bytes = action.id[4..16].* };
                 turn_stop_reason = .tool_use;
                 break :request_recovery;
+            }
+            // A stream may have sent usage before it failed. Reissues must
+            // respect the same dollar cap as the next logical turn.
+            if (opts.cost_budget_usd) |budget| {
+                if (run_cost_usd >= budget)
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
             }
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;

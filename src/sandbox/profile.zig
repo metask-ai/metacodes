@@ -38,6 +38,7 @@ pub const SandboxConfig = struct {
     main_git_dir: ?[]const u8 = null,
     /// 额外工作目录(--add-dir / additionalDirectories,已绝对):与 cwd 同级可写。
     additional_dirs: []const []const u8 = &.{},
+    temp_writes: @import("config.zig").SandboxSettings.TempWrites = .system,
 };
 
 /// 标准可写设备/路径(无论何时都 allow,否则普通命令跑不起来)。
@@ -81,11 +82,14 @@ pub fn generate(alloc: std.mem.Allocator, cfg: SandboxConfig) ![]u8 {
     try buf.appendSlice(alloc, "  (regex #\"^/dev/fd/\")\n");
 
     // TMPDIR / 系统临时
-    if (std.c.getenv("TMPDIR")) |t| {
-        try emitSubpath(alloc, &buf, std.mem.span(t));
+    switch (cfg.temp_writes) {
+        .system => {
+            try emitSubpath(alloc, &buf, @import("platform").paths.tempDir());
+            try emitSubpathRealOrLiteral(alloc, &buf, "/private/tmp", false);
+            try emitSubpathRealOrLiteral(alloc, &buf, "/private/var/folders", false);
+        },
+        .isolated => |dir| if (dir) |path| try emitSubpath(alloc, &buf, path),
     }
-    try emitSubpathRealOrLiteral(alloc, &buf, "/private/tmp", false);
-    try emitSubpathRealOrLiteral(alloc, &buf, "/private/var/folders", false);
 
     // 用户配置的 allowWrite(已是绝对/展开过)
     for (cfg.allow_write) |p| {
