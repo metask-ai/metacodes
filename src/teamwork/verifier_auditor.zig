@@ -102,7 +102,7 @@ pub const VerifierAuditor = struct {
         var result = try iv.verify(gpa, deps, .{
             .task_statement = request.original_request,
             .workspace = .{ .snapshot = &snapshot },
-            .relative_workspace_packet = true,
+            .aliased_workspace_packet = true,
             .pinned_check = pinned,
             .budget = budget,
             .model = self.model,
