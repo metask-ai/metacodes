@@ -716,6 +716,7 @@ pub const App = struct {
     loop_remaining: u32 = 0,
     /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
     system_prompt: ?[]u8 = null,
+    rsi_policy: ?@import("skills/rsi.zig").Loaded = null,
     /// 首条 user-context message(CLAUDE.md 链 + AutoMem + currentDate,`<system-reminder>` 包裹)。
     /// init 时构建一次(memoize),agent_loop 每轮 prepend。owned;deinit free。
     /// null = 无记忆内容 / CLAUDE_CODE_DISABLE_CLAUDE_MDS。
@@ -806,13 +807,15 @@ pub const App = struct {
     ) !*App {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
+        var active_config = config;
+        active_config.preview = try @import("app/config.zig").resolvePreview(allocator, config.state_root, config.preview);
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,
         // 最后 toToolDefinitionsWithDyn 一次性构造给 API 的 tool 清单。
         app.* = .{
             .allocator = allocator,
-            .config = config,
+            .config = active_config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
@@ -860,6 +863,12 @@ pub const App = struct {
         };
         errdefer if (app.state_root_default) |owned| allocator.free(owned);
         errdefer app.tool_defs_arena.deinit();
+
+        if (app.config.preview.isEnabled() and app.config.rsi) {
+            const path = config.rsi_policy_path orelse return error.SkillPolicyRequired;
+            app.rsi_policy = try @import("skills/rsi.zig").Loaded.load(allocator, path);
+        }
+        errdefer if (app.rsi_policy) |*policy| policy.deinit();
 
         // OpenAI 后端:仅当 provider_kind==.openai 才建(chat/completions 或 Responses,
         // 按 config.openai_protocol 显式选择)。base_url 复用 config.base_url(record/replay
@@ -1208,6 +1217,7 @@ pub const App = struct {
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
         app.swarm = .{
             .allocator = allocator,
+            .preview = app.config.preview.isEnabled(),
             .session = app.session_id,
             .state_root = app.stateRoot(),
             .api_key = app.api_key,
@@ -2399,6 +2409,7 @@ pub const App = struct {
         app.retired_workspace_strings.deinit(app.allocator);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
+        if (app.rsi_policy) |*policy| policy.deinit();
         if (app.user_context) |u| app.allocator.free(u);
         app.allocator.destroy(app);
         // Every Run of this App has ended: send what is queued (last App only).
@@ -5444,6 +5455,7 @@ pub const App = struct {
     /// this thread once every server has reported. Failures are recorded per
     /// server (`mcp_report`, `/mcp`) and never stop the App.
     fn beginMcpStartup(app: *App) void {
+        if (app.config.mcp_connect == .disabled) return;
         const log = @import("util/log.zig");
         const arena_state = app.allocator.create(std.heap.ArenaAllocator) catch |err| {
             log.warn("mcp", "no servers connected: {s}", .{@errorName(err)});
@@ -5614,6 +5626,7 @@ pub const App = struct {
         // `--agent-teams` would leave them out of "Using your tools").
         const defs_allocator = app.tool_defs_arena.allocator();
         const probe_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .agent_teams = app.config.agent_teams,
             .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
         };
@@ -5622,6 +5635,7 @@ pub const App = struct {
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
 
         const prompt_ctx = tools_mod.PromptContext{
+            .preview = app.config.preview.isEnabled(),
             .permission_mode = app.config.permission_mode,
             .enabled_tool_names = enabled_names,
             .agent_type = "", // 主对话

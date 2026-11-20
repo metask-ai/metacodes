@@ -10,6 +10,13 @@ with each tool's own semantics. This page is the contract for the CLI hosts
 
 ## Skills
 
+Short procedural instructions can also be evolved offline and gated by a local
+ridge router. Together they form the preview RSI feature (`--preview --rsi`), independent of
+[HarnessMM runtime reuse](HARNESSMM_PROTOCOL.md) and distinct from the
+`SKILL.md` catalog and its activation/tool policy. See
+[Procedural skill RSI](SKILL_RSI_PROTOCOL.md) for switches, training and the
+frozen policy format.
+
 ### Where Skills are found
 
 Every root below is a *compat* source (`catalog.Profile.compat` in

@@ -165,6 +165,7 @@ pub fn main(init: std.process.Init) !void {
         ripgrep_rel,
         sandbox_helper_rel,
         "bin/ripgrep-LICENSE-MIT",
+        "licenses/quickjs-LICENSE",
         "include/metask/agentcore.h",
         "bindings/zig/build.zig",
         "bindings/zig/build.zig.zon",

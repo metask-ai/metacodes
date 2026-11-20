@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
+from collections import Counter as _Counter
 from collections import defaultdict
 from pathlib import Path
 
@@ -46,7 +47,7 @@ def fc_metrics():
     for x in scores:
         dist[min(4, int(x * 5))] += 1
     attempted_path = DATA / "frontierchallenge" / "tasks_attempted.txt"
-    attempted = [l.strip() for l in attempted_path.read_text().splitlines() if l.strip()] if attempted_path.is_file() else []
+    attempted = [line.strip() for line in attempted_path.read_text().splitlines() if line.strip()] if attempted_path.is_file() else []
     present = {r["task_id"] for r in rows}
     absent = [t for t in attempted if not any(i == t or i.startswith(t) or t.startswith(i) for i in present)]
     zeros = sorted({r["task_id"] for r in rows if r.get("scored_zero_missing_artifact")})
@@ -83,7 +84,8 @@ def wb_metrics():
         if p_.get("diagnostic"):
             c["excluded"] = list(p_.get("excluded") or [])
         else:
-            c["planned"] = p_["n"]; c["names"] = list(p_["names"])
+            c["planned"] = p_["n"]
+            c["names"] = list(p_["names"])
         c["slugs"].append(p_["slug"])
     per_slug = {}
     for p_ in plan_rows:
@@ -129,9 +131,12 @@ def wb_metrics():
     by_cohort = defaultdict(lambda: {"planned": 0, "graded": 0, "reward_sum": 0.0, "full_pass": 0})
     for c in cohorts.values():
         for agg in (by_subset[c["subset"]], by_cohort[c["cohort"]]):
-            agg["planned"] += c["planned"] or 0; agg["graded"] += c["graded"]
-            agg["reward_sum"] += c["reward_sum"]; agg["full_pass"] += c["full_pass"]
-        by_subset[c["subset"]]["cost"] += c["cost"]; by_subset[c["subset"]]["out_tok"] += c["out_tok"]
+            agg["planned"] += c["planned"] or 0
+            agg["graded"] += c["graded"]
+            agg["reward_sum"] += c["reward_sum"]
+            agg["full_pass"] += c["full_pass"]
+        by_subset[c["subset"]]["cost"] += c["cost"]
+        by_subset[c["subset"]]["out_tok"] += c["out_tok"]
         by_subset[c["subset"]]["excluded"] += len(c["excluded"])
     return {"per_slug": per_slug, "cohorts": cohorts, "by_subset": dict(by_subset), "by_cohort": dict(by_cohort)}
 
@@ -313,7 +318,6 @@ add("")
 add("</details>")
 add("")
 # ---------------- 第三部分:失败分析 ----------------
-from collections import Counter as _Counter
 add("## 第三部分:失败分析(为什么失败)")
 add("")
 add("本节区分三类失败:**能力性**(agent 跑完但判分低/零)、**基建性**(题目在本环境跑不起来)、**判分口径**(trial 判了分但门禁/judge 收尾另计)。前者反映 metacodes+glm-5.2 的真实短板,后两者是环境与流程约束。")
@@ -322,9 +326,12 @@ _sub_rows = defaultdict(list)   # cohorts are disjoint task sets; collect their 
 for _c in wb["cohorts"].values():
     _sub_rows[_c["subset"]].extend(_c["rows"])
 def _bkt(x):
-    if x is None: return "err"
-    if x == 0: return "zero"
-    if x >= 1.0: return "full"
+    if x is None:
+        return "err"
+    if x == 0:
+        return "zero"
+    if x >= 1.0:
+        return "full"
     return "partial"
 
 add("### 3.1 能力性失败:奖励分布")
@@ -351,10 +358,14 @@ add("")
 
 def _seccat(t):
     t = t.split("/")[-1]
-    if t.startswith("bb-bin"): return "二进制 pwn(bb-bin)"
-    if any(k in t for k in ["overflow","uaf","oob","safe-linking","parse-crash"]): return "内存破坏利用"
-    if any(k in t for k in ["ssrf","cache-","ssti","cms","host-header","deception","poisoning","2fa","-import"]): return "Web/应用漏洞利用"
-    if any(k in t for k in ["dll","loader","stealer","dropper","rat","sideload","rootkit","cryptominer","anti-analysis","rule-gen","yara","detect"]): return "恶意样本分析/检测规则"
+    if t.startswith("bb-bin"):
+        return "二进制 pwn(bb-bin)"
+    if any(k in t for k in ["overflow","uaf","oob","safe-linking","parse-crash"]):
+        return "内存破坏利用"
+    if any(k in t for k in ["ssrf","cache-","ssti","cms","host-header","deception","poisoning","2fa","-import"]):
+        return "Web/应用漏洞利用"
+    if any(k in t for k in ["dll","loader","stealer","dropper","rat","sideload","rootkit","cryptominer","anti-analysis","rule-gen","yara","detect"]):
+        return "恶意样本分析/检测规则"
     return "其他"
 add("### 3.2 security:能力被三层管道缺陷压成假 0,真实短板仅剩 3 道题")
 add("")
@@ -362,10 +373,12 @@ add("| 类别 | 判分 | mean | 0 分 | 满分 |")
 add("|---|---|---|---|---|")
 _cat = defaultdict(list)
 for r in _sub_rows["security"]:
-    if r.get("reward") is not None: _cat[_seccat(r["task"])].append(r["reward"])
+    if r.get("reward") is not None:
+        _cat[_seccat(r["task"])].append(r["reward"])
 for k in ("内存破坏利用","Web/应用漏洞利用","二进制 pwn(bb-bin)","恶意样本分析/检测规则","其他"):
     vs = _cat.get(k) or []
-    if not vs: continue
+    if not vs:
+        continue
     add(f"| {k} | {len(vs)} | {sum(vs)/len(vs):.3f} | {sum(1 for x in vs if x==0)} | {sum(1 for x in vs if x>=1)} |")
 add("")
 add("**结论(经三轮缺陷修复后的定论)**:security 子集经历了本次评测最曲折的更正。初版 0.285、称模型“会分析不会打、内存破坏利用全 0”——**完全错误**,是三层叠加的管道缺陷把能力压成 0/exception,与模型无关:")
@@ -387,11 +400,14 @@ add("| 难度 | 判分 | mean | 满分 |")
 add("|---|---|---|---|")
 _lvl = defaultdict(list)
 for r in _sub_rows["office"]:
-    if r.get("reward") is None: continue
-    m = re.search(r"(L[234])", r["task"]); _lvl[m.group(1) if m else "未标注"].append(r["reward"])
+    if r.get("reward") is None:
+        continue
+    m = re.search(r"(L[234])", r["task"])
+    _lvl[m.group(1) if m else "未标注"].append(r["reward"])
 for k in ("L2","L3","L4","未标注"):
     vs = _lvl.get(k) or []
-    if vs: add(f"| {k} | {len(vs)} | {sum(vs)/len(vs):.3f} | {sum(1 for x in vs if x>=1)} |")
+    if vs:
+        add(f"| {k} | {len(vs)} | {sum(vs)/len(vs):.3f} | {sum(1 for x in vs if x>=1)} |")
 add("")
 add("**结论(已更正)**:L2→L3→L4 均分 0.930→0.790→0.714,仍单调下降但**梯度远比初版平缓**。初版报的是 0.93→0.70→0.49——那个陡峭断崖有相当一部分不是难度,而是 `max_tokens` 缺陷:L4 推理链更长,更容易吃满续写预算后交空答案(见 3.6)。修复后 L4 由 0.49 抬到 0.714。剩下的梯度才是真实难度效应:office 按 rubric 分项判分,模型能完成主体但常漏细项(格式、口径、边界条件),越复杂漏得越多——是**精度**问题而非做不出来。满分仍然极少(50 题仅 1 题),这一点未被修复改变。")
 add("")
@@ -400,16 +416,19 @@ add("### 3.4 code:强于数据/结构化改造,弱于 bug 修复与严格契约"
 add("")
 _cc = defaultdict(list)
 for r in _sub_rows["code"]:
-    if r.get("reward") is None: continue
+    if r.get("reward") is None:
+        continue
     _cc[r["task"].split("/")[-1].split("-")[0]].append(r["reward"])
 _ccs = sorted(((k, sum(v)/len(v), len(v), sum(1 for x in v if x>=1)) for k, v in _cc.items() if len(v) >= 3), key=lambda x: x[1])
 add("最弱 5 类 / 最强 5 类(n≥3):")
 add("")
 add("| 类别 | n | mean | 满分 | |  | 类别 | n | mean | 满分 |")
 add("|---|---|---|---|---|---|---|---|---|---|")
-_weak = _ccs[:5]; _strong = _ccs[::-1][:5]
+_weak = _ccs[:5]
+_strong = _ccs[::-1][:5]
 for i in range(5):
-    w = _weak[i]; s2 = _strong[i]
+    w = _weak[i]
+    s2 = _strong[i]
     add(f"| {w[0]} | {w[2]} | {w[1]:.3f} | {w[3]} | | | {s2[0]} | {s2[2]} | {s2[1]:.3f} | {s2[3]} |")
 add("")
 add("**结论**:最弱是 `bug_fix`(0.45)、`api_contract`(0.45)、`security_hardening`(0.56)——这些题要么要精确定位并**完整**修复缺陷(改一半就过不了测试),要么要求严格符合 API 契约/错误码;模型常改到“部分对”。最强是 `data_reporting`/`feature_pipeline`/`testing`/`data_quality`/`schema_behavior`(0.92–1.00)——数据处理与结构化产出类,规则明确、可测。")
@@ -420,7 +439,8 @@ add("")
 _fcg = [r for r in fc["rows"] if r.get("evaluation_complete") == 1 and r.get("task_score") is not None]
 _fb = _Counter()
 for r in _fcg:
-    s = r["task_score"]; _fb["满分(=1)" if s >= 1 else ("0 分" if s == 0 else ("低分(<0.5)" if s < 0.5 else "中高(0.5–1)"))] += 1
+    s = r["task_score"]
+    _fb["满分(=1)" if s >= 1 else ("0 分" if s == 0 else ("低分(<0.5)" if s < 0.5 else "中高(0.5–1)"))] += 1
 add(f"79 题判分分布:满分 {_fb['满分(=1)']}、中高(0.5–1)**{_fb['中高(0.5–1)']}**、低分(<0.5)**{_fb['低分(<0.5)']}**、0 分 {_fb['0 分']}。")
 add("")
 _z = sorted(r["task_id"] for r in fc["rows"] if r.get("scored_zero_missing_artifact"))

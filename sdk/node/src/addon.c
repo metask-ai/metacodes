@@ -367,11 +367,16 @@ static runtime_t *get_runtime(napi_env env, napi_value value) {
     return runtime;
 }
 
-/* runtimeCreate(tools: string[], hostTools: {name, description, schema}[], dispatch) */
+/* runtimeCreate(tools: string[], hostTools: {name, description, schema}[], dispatch, preview) */
 static napi_value runtime_create(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value argv[3];
+    size_t argc = 4;
+    napi_value argv[4];
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    bool preview = false;
+    if (argc >= 4 && napi_get_value_bool(env, argv[3], &preview) != napi_ok) {
+        napi_throw_type_error(env, NULL, "preview must be a boolean");
+        return NULL;
+    }
     if (g_api == NULL) {
         napi_throw_error(env, "INVALID_STATE", "load() the AgentCore library first");
         return NULL;
@@ -435,6 +440,7 @@ static napi_value runtime_create(napi_env env, napi_callback_info info) {
     config.builtin_tool_count = builtin.count;
     config.host_tools = host_tools;
     config.host_tool_count = host_count;
+    config.preview = preview ? 1 : 0;
     metask_agentcore_owned_bytes_v1 diagnostic = {NULL, 0};
     uint32_t status = g_api->runtime->create(&config, NULL, &runtime->handle, &diagnostic);
     free_list(&builtin);

@@ -16,6 +16,17 @@ empty `### Migration`.
 
 ### Changed
 
+- The Teamwork CLI/Manager consumer fixture explicitly opts in with `--preview`;
+  saved root `preview: true` is equivalent and `--no-preview` overrides it.
+  Direct Zig Teamwork hosts supply current `Deps.preview` separately from saved
+  run data. Task approval and budget remain required. This integration adds no
+  ABI field or offset beyond the shared revision-29 preview setting below.
+- ABI revision 29 adds `RuntimeConfigV1.preview` at offset 72 (0 or 1,
+  default 0), consuming one reserved word without changing the 96-byte struct.
+  Preview built-ins are excluded unless enabled; selecting `ExecuteCode`
+  without opt-in returns `INVALID_ARGUMENT`. Python `Runtime(preview=True)`
+  and Node.js `new Runtime({preview: true})` enable JavaScript orchestration.
+
 - An explicit Skill invocation Run (`RUN_INPUT_SKILL`, `session->run_skill`)
   takes `RunOptionsV1.context_blocks` (#534). It used to refuse any block with
   `INVALID_ARGUMENT` ("context blocks are not accepted with SkillInvocation
@@ -112,6 +123,13 @@ empty `### Migration`.
   send K2.7-code's `"thinking":{"type":"enabled","keep":"all"}` and no
   effort. `kimi-for-coding-highspeed` and the Moonshot open platform's
   models send the bytes they did. No ABI change.
+
+### Migration
+
+- Pin the revision-29 library, manifest, header and SDK together. Initialize
+  `RuntimeConfigV1.preview` to 0 for stable behavior, or 1 to admit preview
+  features. The remaining `reserved[2]` must stay zero; a revision-28 binary
+  cannot consume this setting despite the unchanged struct size.
 
 ## 0.15.0 — 2026-11-13
 

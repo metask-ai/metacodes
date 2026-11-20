@@ -1,7 +1,22 @@
 const std = @import("std");
 
 /// See `Config.mcp_connect`.
-pub const McpConnect = enum { app_init, first_request };
+pub const McpConnect = enum { app_init, first_request, disabled };
+
+/// Only configuration may inherit preview opt-in; execution receives a bool.
+pub const PreviewSetting = enum {
+    inherit,
+    disabled,
+    enabled,
+
+    pub fn resolve(self: PreviewSetting, persisted: ?bool) PreviewSetting {
+        return if (self != .inherit) self else if (persisted orelse false) .enabled else .disabled;
+    }
+
+    pub fn isEnabled(self: PreviewSetting) bool {
+        return self == .enabled;
+    }
+};
 
 /// 通用配置
 pub const Config = struct {
@@ -54,10 +69,17 @@ pub const Config = struct {
     /// interactive REPL). `first_request`: App.init returns while they
     /// connect and the REPL joins them before it assembles its first request
     /// (`App.publishMcpServers`), so its prompt never waits on a server.
+    /// `disabled`: do not discover or launch outbound MCP servers; still
+    /// publish the built-in tool surface during App.init. Teamwork controls
+    /// its own tools and must not recursively import its Manager endpoint.
     mcp_connect: McpConnect = .app_init,
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,
+    /// Independent, opt-in runtime decision reuse and offline learned RSI.
+    harnessmm: bool = false,
+    rsi: bool = false,
+    rsi_policy_path: ?[]const u8 = null,
     /// Long-horizon evaluation ablation. `native` preserves the product's normal
     /// behavior; the three explicit arms are injected only by the evaluation
     /// runner so one binary can be compared without revision drift.
@@ -152,6 +174,8 @@ pub const Config = struct {
     allowed_tools: ?[]const u8 = null,
     /// `--disallowedTools "..."`:逗号分隔,注入 CLI 层 deny。
     disallowed_tools: ?[]const u8 = null,
+    /// User opt-in for preview features, resolved against persisted configuration.
+    preview: PreviewSetting = .inherit,
     /// Experimental, opt-in progress checkpoint for coding evaluations. Kept
     /// out of the default product path until measured on fixed benchmarks.
     verification_checkpoint: bool = false,

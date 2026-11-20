@@ -47,7 +47,6 @@ from scripts.eval.memory_agent_runtime import (
     _verify_scoped_recall_activation,
     _write_failed_validation_checkpoint,
     _xxhash64,
-    run_memory_agent_schedule,
 )
 from scripts.eval.memory_consolidation import commit_execution_episode
 from scripts.eval.memory_budget_journal import (
@@ -57,13 +56,13 @@ from scripts.eval.memory_budget_journal import (
     usd_to_microusd,
     usd_to_microusd_ceiling,
 )
+from scripts.eval.memory_consolidation import SCHEMA_VERSION as CONSOLIDATION_SCHEMA_VERSION
 from scripts.eval.memory_query_plan import SIDECAR_NAME, build_query_plan_trace
 from scripts.eval.memory_replay import (
     LEGACY_RUNNER_SOURCE_MODULES,
     LOOP_BREAKER_FINALIZATION,
     OBSERVATION_SCHEMA_VERSION,
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
-    CONSOLIDATION_SCHEMA_VERSION,
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
@@ -80,7 +79,6 @@ from scripts.eval.memory_replay import (
     PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
     SCOPED_RECALL_PREFIX,
-    RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
     _cassette_memory_activity,
     _cassette_context_cache,

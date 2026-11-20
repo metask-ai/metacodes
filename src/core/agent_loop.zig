@@ -60,6 +60,7 @@ const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 const job_notification_mod = @import("job_notification.zig");
 const run_input_mod = @import("run_input.zig");
+const harnessmm_mod = @import("harnessmm.zig");
 
 /// `stalled`: the stall gate stopped a run whose tool rounds kept returning
 /// nothing new (stall_gate.zig). A controlled stop like `tool_loop`, with its
@@ -375,6 +376,7 @@ pub const JobWaitOptions = struct {
 };
 
 pub const Options = struct {
+    preview: bool = false,
     /// Where to leave the structured detail of this Run's model failure (issue
     /// #408), owned by the caller. Set to a value exactly when the Run stops
     /// with `api_error` or `max_tokens_exhausted`, and to null otherwise, so a
@@ -422,6 +424,12 @@ pub const Options = struct {
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
     system_prompt: ?[]const u8 = null,
+    /// Frozen, host-owned procedural skill. Requires preview and RSI; fresh
+    /// children do not inherit this selection implicitly.
+    rsi_policy: ?*const @import("../skills/rsi.zig").Policy = null,
+    rsi: bool = false,
+    /// EDG / GDR / CCS selection, effective only when preview is also enabled.
+    harnessmm: bool = false,
     /// 首条 user-context message(对齐 cc prependUserContext):CLAUDE.md 链 + AutoMem +
     /// currentDate,`<system-reminder>` 包裹。仅主 session 传(subagent 走 preload 自己的链)。
     /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
@@ -1268,9 +1276,8 @@ fn adoptRunInputs(
 }
 
 const ArgsAdmission = union(enum) {
-    /// The canonical arguments: `input` itself when it already is canonical,
-    /// otherwise a copy owned by the turn's `owned` list.
-    admitted: []const u8,
+    /// Canonical arguments, owned by the admitted slot.
+    admitted: []u8,
     /// The invalid_args tool result for the model (owned by the caller).
     rejected: []u8,
 };
@@ -1281,7 +1288,6 @@ const ArgsAdmission = union(enum) {
 /// executor read is canonical.
 fn admitToolArgs(
     allocator: std.mem.Allocator,
-    owned: *std.ArrayList([]u8),
     input: []const u8,
 ) !ArgsAdmission {
     const canonical = tools_common.canonicalizeArgs(allocator, input) catch |err| return .{ .rejected = switch (err) {
@@ -1299,14 +1305,6 @@ fn admitToolArgs(
             allocator,
         ),
     } };
-    if (std.mem.eql(u8, canonical, input)) {
-        allocator.free(canonical);
-        return .{ .admitted = input };
-    }
-    owned.append(allocator, canonical) catch |err| {
-        allocator.free(canonical);
-        return err;
-    };
     return .{ .admitted = canonical };
 }
 
@@ -1335,6 +1333,392 @@ fn unansweredPromptJson(cause: permission_mod.PromptUnanswered, tool: []const u8
 /// 每轮的 assistant 响应文字也通过 backend 实时输出（便于 REPL 看流）。
 /// backend 是显式 vtable 契约(UiBackend):agent_loop 只发语义 CoreEvent,所有表达
 /// (ANSI 颜色 / 工具卡渲染)由 backend 实现(TuiBackend / WriterBackend)完成。
+/// Shared admission for model-authored calls and JavaScript host requests.
+/// Permissions and PreToolUse execute exactly once, on the calling loop thread.
+const ToolAdmission = struct {
+    opts: Options,
+    permission_ctx: *const permission_mod.PermissionContext,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    rid: log.RequestId,
+    learning_pass: bool,
+    verifier_leads: bool,
+
+    fn admit(self: *const ToolAdmission, tu: msg.ToolUse, allocator: std.mem.Allocator) !tool_exec_mod.Slot {
+        const opts = self.opts;
+        const permission_ctx = self.permission_ctx;
+        const backend = self.backend;
+        const sess = self.sess;
+        const trace_id = self.trace_id;
+        const depth = self.depth;
+        const rid = self.rid;
+        const hookset = permission_ctx.hooks;
+        var pc_nohooks = permission_ctx.scopedDerive(null);
+        pc_nohooks.hooks = null;
+        const tool_exec = tool_exec_mod;
+        // 权限侧真名(review round 2 / R2-3):hook 匹配、分类、规则与 ask 记忆都必须
+        // 看**将被执行的名字**。dispatcher 宇宙 exact-name 不修;遗留分支用与 executeOne
+        // 同一把 P0.6 归一化("bash"→"Bash")——否则 "Bash" 匹配的 block-hook / session
+        // "always deny" 对 case-variant 名一律失配,而 dispatch 仍会修名真执行。
+        // 真未知名保持原名(read 兜底 + UnknownTool 引导)。Slot 仍带 raw 名
+        // (证据契约:requested vs dispatched 归属不糊);PostToolUse 观测 hook 仍按
+        // raw 名匹配(存量,不在本修范围——Pre 侧是安全向,先闭合)。
+        var name_probe_ctx = tools_mod.ToolContext{ .allocator = allocator, .dyn_registry = opts.dyn_registry };
+        const canonical_name = if (opts.tool_dispatcher != null)
+            tu.name // dispatcher universe: exact-name policy, no repair
+        else
+            tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
+        if (self.verifier_leads and !isolated_verifier_mod.allowedDuringLeads(canonical_name)) {
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = tu.id,
+                .tool = tu.name,
+                .decision = "deny",
+                .source = "isolated_verifier",
+                .allowed = false,
+            } });
+            return .{
+                .decision = .denied,
+                .name = tu.name,
+                .id = tu.id,
+                .input = tu.input,
+                .content = try tool_error.errorToJson(
+                    "VerifierLeadsToolUnavailable",
+                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
+                    .{tu.name},
+                    allocator,
+                ),
+                .is_error = true,
+            };
+        }
+        // Learning pass: only read tools and KgRemember run, so the workspace
+        // the check judged is the workspace the run hands back.
+        if (self.learning_pass and !learning_turn_mod.allowedDuringPass(canonical_name)) {
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = tu.id,
+                .tool = tu.name,
+                .decision = "deny",
+                .source = "learning_turn",
+                .allowed = false,
+            } });
+            var lslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
+            lslot.content = try tool_error.errorToJson(
+                "LearningTurnToolUnavailable",
+                "tool '{s}' does not run in a learning turn: only Read, Grep, Glob, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
+                .{tu.name},
+                allocator,
+            );
+            lslot.is_error = true;
+            return lslot;
+        }
+        // Model calls and JS host requests share argument admission (#494).
+        // The slot owns the canonical bytes seen by hooks, permissions and dispatch.
+        var eff_input = switch (try admitToolArgs(allocator, tu.input)) {
+            .admitted => |canonical| canonical,
+            .rejected => |content| return .{
+                .decision = .denied,
+                .name = tu.name,
+                .id = tu.id,
+                .input = tu.input,
+                .content = content,
+                .is_error = true,
+            },
+        };
+        errdefer allocator.free(eff_input);
+        // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
+        if (hookset) |hs| if (hs.hasPre()) {
+            const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, eff_input, opts.abort);
+            if (pre.modified_input) |mi| {
+                allocator.free(eff_input);
+                eff_input = mi;
+                switch (try admitToolArgs(allocator, mi)) {
+                    .admitted => |canonical| {
+                        allocator.free(eff_input);
+                        eff_input = canonical;
+                    },
+                    .rejected => |content| return .{
+                        .decision = .denied,
+                        .name = tu.name,
+                        .id = tu.id,
+                        .input = eff_input,
+                        .admitted_input = eff_input,
+                        .content = content,
+                        .is_error = true,
+                    },
+                }
+            }
+            if (pre.decision == .block) {
+                log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});
+                backend.emitEvent(sess, .{ .policy_decision = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .id = tu.id,
+                    .tool = tu.name,
+                    .decision = "deny",
+                    .source = "pre_tool_use_hook",
+                    .allowed = false,
+                } });
+                var dslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = eff_input };
+                dslot.content = try tool_error.errorToJson("PreToolUseBlocked", "tool '{s}' blocked by PreToolUse hook", .{tu.name}, allocator);
+                dslot.is_error = true;
+                dslot.admitted_input = eff_input;
+                return dslot;
+            }
+        };
+        // With a Session dispatcher present, the directory is the only
+        // classification authority. A name it cannot resolve is not a
+        // known-read tool — default it to `.execute` (deny in dont_ask,
+        // ask in default) instead of the legacy name-based read fallback.
+        // Dispatch of such a name still fails as UnknownTool; note the
+        // deny happens before dispatch, so the UnknownTool "did you
+        // mean X" guidance does not fire on the denied path. The legacy
+        // branch classifies canonical_name (resolved above, same
+        // normalizer as executeOne) so classification can never look at
+        // a different name than what dispatch will actually run.
+        const classified = if (opts.tool_dispatcher) |dispatcher|
+            dispatcher.category(tu.name) orelse .execute
+        else if (opts.dyn_registry) |registry|
+            registry.category(canonical_name)
+        else
+            null;
+        var perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
+        // A confirmation demanded from outside the chain (sealed `confirm:
+        // true`) only tightens: an allow becomes an ask whose prompt skips
+        // "allow always" memory; deny and ask are untouched.
+        const forced_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, canonical_name) else false;
+        if (forced_confirm and perm_result == .allow) perm_result = .ask;
+        log.infoId("permission", rid, "tool={s} decision={s}{s}", .{ tu.name, @tagName(perm_result), if (forced_confirm) " (confirm required)" else "" });
+        var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
+        var policy_allowed = perm_result == .allow;
+        switch (perm_result) {
+            .deny => {
+                log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
+                slot.decision = .denied;
+                slot.content = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or permission mode", .{tu.name}, allocator);
+                slot.is_error = true;
+            },
+            .ask => {
+                // ctx constCast:promptUser 写 session 记忆(有副作用)——agent_loop 持 *const
+                // 但权限交互本就改 per-session 状态(base_ctx.permission_ctx 同理)。
+                // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
+                // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
+                // 查不到,session deny 被 settings allow 越过。
+                // Preserve the unanswered-prompt causes from the ordinary
+                // model tool path (doc/WIRE_PROTOCOL.md §1.4).
+                var unanswered: ?permission_mod.PromptUnanswered = null;
+                const prompted = if (forced_confirm)
+                    permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input)
+                else
+                    permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input);
+                const allowed = prompted catch |err| blk: {
+                    unanswered = err;
+                    break :blk false;
+                };
+                policy_allowed = allowed;
+                log.infoId("permission", rid, "prompt tool={s} user_allowed={} unanswered={s}", .{ tu.name, allowed, if (unanswered) |cause| @errorName(cause) else "-" });
+                if (!allowed) {
+                    slot.decision = .denied;
+                    slot.content = if (unanswered) |cause|
+                        try unansweredPromptJson(cause, tu.name, allocator)
+                    else
+                        try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
+                    slot.is_error = true;
+                }
+            },
+            .allow => {},
+        }
+        backend.emitEvent(sess, .{ .policy_decision = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .id = tu.id,
+            .tool = tu.name,
+            .decision = @tagName(perm_result),
+            .source = if (perm_result == .ask) "user_prompt" else "permission_chain",
+            .allowed = policy_allowed,
+        } });
+        slot.admitted_input = eff_input;
+        // 任务义务观察:获准执行的 Bash 命令喂给义务运行时(needle 子串
+        // 命中即 met)。denied 的调用不算——义务要的是"真的跑过"。
+        // R3-4:按 canonical 名判——"bash" 会被 P0.6 修名真执行,raw 名判失配
+        // 会让真跑过的义务停在 unmet(有界误提醒,同 R2-3 键分裂族)。
+        if (opts.obligations) |obligation_runtime| {
+            if (slot.decision == .run and std.mem.eql(u8, canonical_name, "Bash")) {
+                if (@import("../util/json.zig").extractStringField(slot.input, "command")) |command|
+                    obligation_runtime.observeDispatch(slot.id, command);
+            }
+        }
+        return slot;
+    }
+};
+
+/// One turn's JS bridge. Slot evidence outlives the interpreter call so all
+/// existing run-local sensors see inner mutations and checks, even on failure.
+const CodeBridge = struct {
+    gpa: std.mem.Allocator,
+    scratch: std.heap.ArenaAllocator,
+    conversation: *Conversation,
+    admission: ToolAdmission,
+    start_backend: ?*const UiBackend,
+    result_backend: ?*const UiBackend,
+    total_tool_calls: *u32,
+    slots: std.ArrayList(tool_exec_mod.Slot) = .empty,
+    post_context: std.ArrayList(u8) = .empty,
+    recovery_charged: usize = 0,
+
+    fn deinit(self: *CodeBridge) void {
+        for (self.slots.items) |*slot| slot.deinit(self.gpa);
+        self.slots.deinit(self.gpa);
+        self.post_context.deinit(self.gpa);
+        self.scratch.deinit();
+    }
+
+    const Invocation = struct {
+        bridge: *CodeBridge,
+        tool_ctx: *const tools_mod.ToolContext,
+        deadline_ms: i64,
+
+        fn interrupt(raw: ?*anyopaque) callconv(.c) c_int {
+            const self: *Invocation = @ptrCast(@alignCast(raw.?));
+            if (self.tool_ctx.abort) |abort| if (abort.isAborted()) return 1;
+            return @intFromBool(util_time.nowMs() >= self.deadline_ms);
+        }
+
+        fn call(raw: *anyopaque, name: []const u8, args: []const u8) error{ OutOfMemory, HostToolFatal, Aborted }!@import("code_runtime").HostResult {
+            return callInner(raw, name, args) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Aborted => error.Aborted,
+                else => error.HostToolFatal,
+            };
+        }
+
+        fn callInner(raw: *anyopaque, name: []const u8, args: []const u8) !@import("code_runtime").HostResult {
+            const self: *Invocation = @ptrCast(@alignCast(raw));
+            if (interrupt(raw) != 0) return error.Aborted;
+            const bridge = self.bridge;
+            const scratch = bridge.scratch.allocator();
+            const tu = msg.ToolUse{
+                .id = try std.fmt.allocPrint(scratch, "{s}/js/{d}", .{ self.tool_ctx.progress_tool_id, bridge.slots.items.len }),
+                .name = try scratch.dupe(u8, name),
+                .input = try scratch.dupe(u8, args),
+            };
+            bridge.total_tool_calls.* +|= 1;
+            // The current request's selected menu is a capability ceiling.
+            // A saved JS closure never retains authority from a previous Run.
+            var available = false;
+            if (self.tool_ctx.request_tools) |menu| for (menu.advertised) |definition| {
+                if (std.mem.eql(u8, name, definition.name)) {
+                    available = true;
+                    break;
+                }
+            };
+            var slot = if (!available or std.mem.eql(u8, name, "ExecuteCode") or std.mem.eql(u8, name, "AskUserQuestion"))
+                tool_exec_mod.Slot{
+                    .name = tu.name,
+                    .id = tu.id,
+                    .input = tu.input,
+                    .decision = .denied,
+                    .is_error = true,
+                    .content = try tool_error.errorToJson("CodeToolUnavailable", "tool '{s}' is unavailable inside this script; use the current tools list and call interactive tools outside ExecuteCode", .{name}, bridge.gpa),
+                }
+            else
+                try bridge.admission.admit(tu, bridge.gpa);
+            const index = bridge.slots.items.len;
+            bridge.slots.append(bridge.gpa, slot) catch {
+                slot.deinit(bridge.gpa);
+                return error.OutOfMemory;
+            };
+            const batch = bridge.slots.items[index .. index + 1];
+            const sess = bridge.admission.sess;
+            if (bridge.start_backend) |backend|
+                backend.emitEvent(sess, .{ .tool_start = .{ .id = tu.id, .name = tu.name, .input = batch[0].input } });
+            // ReadArtifact's turn allowance is shared with ordinary calls.
+            if (batch[0].decision == .run and std.mem.eql(u8, name, "ReadArtifact")) {
+                const cost = result_budget_mod.recoveryReadCost(self.tool_ctx.result_budget);
+                const allowance = result_budget_mod.recoveryAllowanceBytes(self.tool_ctx.result_budget);
+                if (bridge.recovery_charged +| cost > allowance) {
+                    batch[0].decision = .deferred;
+                    batch[0].is_error = true;
+                    batch[0].content = try tool_exec_mod.renderRecoveryDeferral(bridge.gpa, batch[0].input, .{
+                        .allowance_bytes = allowance,
+                        .cost_bytes = cost,
+                        .charged_bytes = bridge.recovery_charged,
+                        .deferred_count = 1,
+                    }, bridge.recovery_charged);
+                } else bridge.recovery_charged += cost;
+            }
+            try tool_exec_mod.executeSlots(batch, self.tool_ctx, bridge.gpa, bridge.admission.rid);
+            // The JS heap becomes the reference owner at this commit boundary.
+            try tool_exec_mod.publishSealedResults(batch, bridge.gpa, bridge.admission.rid);
+            const result_slot = &batch[0];
+            if (result_slot.pending) {
+                result_slot.is_error = true;
+                result_slot.content = try tool_error.errorToJson("CodeSuspendUnsupported", "tool '{s}' requested asynchronous UI; call it outside ExecuteCode", .{name}, bridge.gpa);
+            }
+            const content = result_slot.content orelse return error.HostToolFatal;
+            if (bridge.admission.opts.obligations) |obligations| {
+                if (result_slot.decision == .run)
+                    obligations.observeResult(result_slot.id, !result_slot.is_error and std.mem.indexOf(u8, content, "\"exit_code\":0}") != null);
+            }
+            if (result_slot.decision == .run) if (bridge.admission.permission_ctx.hooks) |hooks| if (hooks.hasPost()) {
+                if (hooks_mod.runPostToolUse(hooks, bridge.gpa, result_slot.name, result_slot.input, content, self.tool_ctx.abort)) |context| {
+                    defer bridge.gpa.free(context);
+                    if (bridge.post_context.items.len > 0) try bridge.post_context.append(bridge.gpa, '\n');
+                    try bridge.post_context.appendSlice(bridge.gpa, context);
+                }
+            };
+            if (bridge.result_backend) |backend| backend.emitEvent(sess, .{ .tool_result = .{
+                .id = tu.id,
+                .name = tu.name,
+                .input = result_slot.input,
+                .content = content,
+                .is_error = result_slot.is_error,
+                .elapsed_ms = result_slot.elapsed_ms,
+                .file_refs = result_slot.file_refs,
+            } });
+            return .{ .bytes = content, .is_error = result_slot.is_error };
+        }
+    };
+
+    fn execute(raw: *anyopaque, ctx: *const tools_mod.ToolContext, source: []const u8, timeout_ms: u32) anyerror![]u8 {
+        const self: *CodeBridge = @ptrCast(@alignCast(raw));
+        var nested_ctx = ctx.*;
+        nested_ctx.code_executor = null;
+        // A JS continuation cannot be serialized into suspend.json.
+        nested_ctx.ui_requester = null;
+        var invocation = Invocation{ .bridge = self, .tool_ctx = &nested_ctx, .deadline_ms = util_time.nowMs() + timeout_ms };
+        const runtime = try self.conversation.codeRuntime();
+        const outcome = runtime.evaluate(ctx.allocator, source, .{
+            .ctx = &invocation,
+            .callFn = Invocation.call,
+            .interruptFn = Invocation.interrupt,
+        }) catch |err| {
+            if (err == error.Aborted and (ctx.abort == null or !ctx.abort.?.isAborted())) return error.CodeTimeout;
+            return err;
+        };
+        if (Invocation.interrupt(&invocation) != 0) {
+            switch (outcome) {
+                .ok => |bytes| ctx.allocator.free(bytes),
+                .exception => |detail| ctx.allocator.free(detail),
+            }
+            runtime.healthy = false;
+            if (ctx.abort) |abort| if (abort.isAborted()) return error.Aborted;
+            return error.CodeTimeout;
+        }
+        return switch (outcome) {
+            .ok => |bytes| bytes,
+            .exception => |detail| blk: {
+                if (ctx.error_detail) |slot| slot.* = detail else ctx.allocator.free(detail);
+                break :blk error.JavaScriptError;
+            },
+        };
+    }
+};
+
 pub fn run(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1366,6 +1750,32 @@ pub fn run(
     return result;
 }
 
+fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
+    if (!opts.preview or !opts.rsi) return;
+    const policy = opts.rsi_policy orelse return error.SkillPolicyRequired;
+    const rsi = @import("../skills/rsi.zig");
+    // One persisted host note per participant task. Retrying/resuming does not
+    // append another note or rewrite any earlier provider-visible bytes.
+    var i = conversation.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const message = conversation.messages.items[i];
+        if (conversation_mod.isUserPrompt(message)) break;
+        if (message.origin == .host) for (message.blocks) |block| {
+            if (block == .text and std.mem.startsWith(u8, block.text, rsi.PREFIX)) return;
+        };
+    }
+    const decision = policy.decide(.{ .evolution = true, .routing = true }, model, latestUserText(conversation));
+    switch (decision) {
+        .apply => |instruction| {
+            const note = try std.mem.concat(gpa, u8, &.{ rsi.PREFIX, instruction, rsi.SUFFIX });
+            defer gpa.free(note);
+            try conversation.appendHostText(note);
+        },
+        else => log.debug("skill.rsi", "instruction abstained: {s}", .{@tagName(decision)}),
+    }
+}
+
 fn runCaptured(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1383,6 +1793,7 @@ fn runCaptured(
     // catalog already rejects them; WebSearch keeps its server tool inside its
     // own isolated sub-request.
     try refuseServerTools(tool_defs, opts);
+    try injectProceduralSkill(conversation, opts, opts.model_override orelse provider.model(), allocator);
     // Run-wide counters that every return path reports. They live here rather
     // than in each of the loop's many result literals, so no exit can forget one.
     var counters: RunCounters = .{};
@@ -1839,6 +2250,27 @@ fn runCounted(
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
+    const harnessmm_enabled = opts.preview and opts.harnessmm;
+    var harnessmm = harnessmm_mod.State.init(allocator);
+    defer harnessmm.deinit();
+    var harnessmm_journal: ?harnessmm_mod.Journal = if (harnessmm_enabled)
+        try harnessmm_mod.Journal.open(allocator, opts.artifact_root)
+    else
+        null;
+    defer if (harnessmm_journal) |*journal| journal.deinit();
+    if (harnessmm_enabled) {
+        var present = false;
+        var index = conversation.messages.items.len;
+        while (index > 0) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (conversation_mod.isUserPrompt(message)) break;
+            if (message.origin == .host) for (message.blocks) |block| {
+                if (block == .text and std.mem.startsWith(u8, block.text, harnessmm_mod.AUTHOR_MARKER)) present = true;
+            };
+        }
+        if (!present) try conversation.appendHostText(harnessmm_mod.AUTHOR_PROMPT);
+    }
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
     // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
@@ -1970,7 +2402,7 @@ fn runCounted(
     var kg_context_repair_attempts: u8 = 0;
     var kg_coverage_borrowed_turns: u32 = 0;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
-    const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
+    const cost_rates = @import("../util/pricing.zig").rateFor(opts.model_override orelse provider.model());
     var run_cost_usd: f64 = 0;
 
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
@@ -2192,6 +2624,29 @@ fn runCounted(
             !conversationHasSuccessfulRequiredFirst(conversation, route)
         else
             false;
+        // A retained decision may only cross an ordinary native receipt
+        // boundary. New input, notices and required activations need the actor.
+        // Provider-response observers admit actual Provider responses; hosts
+        // with that extra boundary conservatively retain the slow callback.
+        const hooks_allow_reuse = if (permission_ctx.hooks) |hooks| !hooks.hasPre() else true;
+        const fast_action: ?msg.ToolUse = if (harnessmm_enabled and hooks_allow_reuse and
+            opts.response_observer == null and !required_first_pending and
+            !in_learning_pass and verifier_gate.leads != .active and conversation.messages.items.len > 0)
+        blk: {
+            const action = harnessmm.next(conversation.messages.items[conversation.messages.items.len - 1], gated_tool_defs) orelse break :blk null;
+            // A repeated actor root ID must not reuse a historical native
+            // call ID, even if it authors the same graph again.
+            for (conversation.messages.items) |message| for (message.blocks) |block| {
+                if (block == .tool_use and std.mem.eql(u8, block.tool_use.id, action.id)) {
+                    harnessmm.clear();
+                    break :blk null;
+                }
+            };
+            break :blk action;
+        } else blk: {
+            harnessmm.clear();
+            break :blk null;
+        };
         // The full native Conversation deliberately outlives its compacted
         // provider window. Preserve that Host fact in a turn-local shallow
         // copy so serializers do not re-force activation after the paired
@@ -2277,7 +2732,7 @@ fn runCounted(
         const synthetic_user_input = if (turns == 0) opts.synthetic_user_input else null;
         const model_switch_compact = if (turns == 0) opts.model_switch_compact else null;
         var previous_model_compact_outcome: AutoCompactOutcome = .not_needed;
-        if (model_switch_compact) |msc| {
+        if (fast_action == null) if (model_switch_compact) |msc| {
             if (!std.mem.eql(u8, msc.previous_model, provider.model()) and msc.previous_context_window > msc.current_context_window) {
                 previous_model_compact_outcome = try runAutoCompactControlled(
                     conversation,
@@ -2312,8 +2767,8 @@ fn runCounted(
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
                 }
             }
-        }
-        if (previous_model_compact_outcome != .skipped_no_savings) {
+        };
+        if (fast_action == null and previous_model_compact_outcome != .skipped_no_savings) {
             const pre_sampling_compact = try runAutoCompactControlled(
                 conversation,
                 provider,
@@ -2464,7 +2919,7 @@ fn runCounted(
         // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
         // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
         var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
-        model_error.beginRequest();
+        if (fast_action == null) model_error.beginRequest();
         // Re-issues of this model request under `STREAM_RETRIES_PER_REQUEST`
         // (#461): a fresh allowance for every request, so an earlier turn's
         // re-issue cannot use it up.
@@ -2534,6 +2989,7 @@ fn runCounted(
         // 弹询问,且 tool_start 卡尚未 emit)、hooks(经 pc_prefetch 剥离,PreToolUse 可 ModifyInput)、session/agent_ident(UiRequest 路由/kg
         // claim 身份,并发安全工具不用)。**维护约束**:base_ctx 新增字段若被并发安全工具读,须同步这里。
         var prefetch_ctx = tools_mod.ToolContext{
+            .preview = opts.preview,
             .allocator = allocator,
             .abort = opts.abort,
             .read_state = opts.read_state,
@@ -2598,6 +3054,23 @@ fn runCounted(
         };
 
         request_recovery: while (true) {
+            if (fast_action) |action| {
+                // No provider attempt, usage sample or response-observer event
+                // is fabricated. The exact action enters the common native
+                // slot/permission/sandbox/formal/budget dispatch below.
+                const block = try (msg.Block{ .tool_use = action }).dupe(allocator);
+                errdefer block.deinit(allocator);
+                try assistant_blocks.append(allocator, block);
+                rid_for_turn = .{ .bytes = action.id[4..16].* };
+                turn_stop_reason = .tool_use;
+                break :request_recovery;
+            }
+            // A stream may have sent usage before it failed. Reissues must
+            // respect the same dollar cap as the next logical turn.
+            if (opts.cost_budget_usd) |budget| {
+                if (run_cost_usd >= budget)
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
             // Images bypass the byte budgets (charged at IMAGE_TOKEN_ESTIMATE), but
@@ -2614,7 +3087,10 @@ fn runCounted(
                 // dropping one; the provider's own limit decides the request.
                 log.warn("agent", "image wire cap exceeded by non-trimmable images: over_by={d} cap={d}", .{ image_trim.remaining_over_cap, opts.image_request_bytes_cap });
             }
-            var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
+            var api_messages = try buildApiMessagesWithFeatures(conversation, allocator, opts.inject_user_context, synthetic_user_input, .{
+                .harnessmm = harnessmm_enabled,
+                .rsi = opts.preview and opts.rsi,
+            });
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
                 const max_input_tokens = serializedRequestInputTokenReserve(
@@ -3374,7 +3850,7 @@ fn runCounted(
         // 投影"与"token 估算"就此分叉,估算单调虚高、误触发 auto-compact。何况一个
         // 什么都没产出的回合,它的推理状态也没有可续的下文。这条不变式让
         // buildApiMessages 的 n_substantive 守卫在本进程内不可能被触发。
-        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0;
+        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0 or assistant_blocks.items.len > 0;
         if (!turn_has_content) {
             for (reasoning_items.items) |item| allocator.free(item);
             reasoning_items.clearRetainingCapacity();
@@ -3435,7 +3911,7 @@ fn runCounted(
 
         if (assistant_blocks.items.len > 0) {
             const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
-            try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
+            try conversation.append(.{ .role = .assistant, .blocks = blocks_slice, .origin = if (fast_action != null) .host else .participant });
             settleCandidate(opts.response_observer, &candidate_open, candidate, .committed);
         } else {
             // 空响应，避免 deinit 释放已归还的 slice
@@ -3450,6 +3926,7 @@ fn runCounted(
 
         // 5. 如果这一轮没有 tool_use，整个请求结束
         const last_msg = &conversation.messages.items[conversation.messages.items.len - 1];
+        if (harnessmm_enabled and fast_action == null) try harnessmm.admit(last_msg.*);
         var has_tool_use = false;
         for (last_msg.blocks) |b| if (@as(std.meta.Tag(msg.Block), b) == .tool_use) {
             has_tool_use = true;
@@ -3974,17 +4451,28 @@ fn runCounted(
             for (slots.items) |*s| s.deinit(allocator);
             slots.deinit(allocator);
         }
-        // P0.2 PreToolUse ModifyInput/Block:hook 在此**统一跑一次**(拿 block + updatedInput 改写);
-        // 为避免 checkPermission 内 decision.check 再跑一次 hook(重复副作用),给它一份 hooks=null 的
-        // 上下文副本。改写后的输入(owned)挂 mod_inputs,turn 作用域统一释放;slot.input 指向它。
-        const hookset: ?*const hooks_mod.HookSet = permission_ctx.hooks;
-        var pc_nohooks = permission_ctx.scopedDerive(null); // U4:单 seam 值拷贝+null sink
-        pc_nohooks.hooks = null;
-        var mod_inputs: std.ArrayList([]u8) = .empty;
-        defer {
-            for (mod_inputs.items) |mi| allocator.free(mi);
-            mod_inputs.deinit(allocator);
-        }
+        const hookset = permission_ctx.hooks;
+        const admission = ToolAdmission{
+            .opts = opts,
+            .permission_ctx = permission_ctx,
+            .backend = backend,
+            .sess = sess,
+            .trace_id = trace_id,
+            .depth = depth,
+            .rid = rid,
+            .learning_pass = learning_state.active(),
+            .verifier_leads = verifier_gate.leads == .active,
+        };
+        var code_bridge = CodeBridge{
+            .gpa = allocator,
+            .scratch = std.heap.ArenaAllocator.init(allocator),
+            .conversation = conversation,
+            .admission = admission,
+            .start_backend = if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) backend else span_sink,
+            .result_backend = if (opts.event_projection.emitToolResult(opts.emit_tool_cards)) backend else span_sink,
+            .total_tool_calls = &total_tool_calls,
+        };
+        defer code_bridge.deinit();
         var required_first_accepted = false;
         for (last_msg.blocks) |b| {
             const tu = switch (b) {
@@ -4037,203 +4525,9 @@ fn runCounted(
                 // after the paired successful result is in Conversation.
                 required_first_accepted = true;
             }
-            // 权限侧真名(review round 2 / R2-3):hook 匹配、分类、规则与 ask 记忆都必须
-            // 看**将被执行的名字**。dispatcher 宇宙 exact-name 不修;遗留分支用与 executeOne
-            // 同一把 P0.6 归一化("bash"→"Bash")——否则 "Bash" 匹配的 block-hook / session
-            // "always deny" 对 case-variant 名一律失配,而 dispatch 仍会修名真执行。
-            // 真未知名保持原名(read 兜底 + UnknownTool 引导)。Slot 仍带 raw 名
-            // (证据契约:requested vs dispatched 归属不糊);PostToolUse 观测 hook 仍按
-            // raw 名匹配(存量,不在本修范围——Pre 侧是安全向,先闭合)。
-            var name_probe_ctx = tools_mod.ToolContext{ .allocator = allocator, .dyn_registry = opts.dyn_registry };
-            const canonical_name = if (opts.tool_dispatcher != null)
-                tu.name // dispatcher universe: exact-name policy, no repair
-            else
-                tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
-            // Verifier leads round: only Read, Grep and Glob run, so the
-            // candidate stays the tree the verifier judged (T' = T is
-            // rechecked after the round anyway).
-            if (verifier_gate.leads == .active and !isolated_verifier_mod.allowedDuringLeads(canonical_name)) {
-                backend.emitEvent(sess, .{ .policy_decision = .{
-                    .trace_id = trace_id,
-                    .depth = depth,
-                    .id = tu.id,
-                    .tool = tu.name,
-                    .decision = "deny",
-                    .source = "isolated_verifier",
-                    .allowed = false,
-                } });
-                var vslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
-                vslot.content = try tool_error.errorToJson(
-                    "VerifierLeadsToolUnavailable",
-                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
-                    .{tu.name},
-                    allocator,
-                );
-                vslot.is_error = true;
-                try slots.append(allocator, vslot);
-                continue;
-            }
-            // Learning pass: only read tools and KgRemember run, so the workspace
-            // the check judged is the workspace the run hands back.
-            if (learning_state.active() and !learning_turn_mod.allowedDuringPass(canonical_name)) {
-                backend.emitEvent(sess, .{ .policy_decision = .{
-                    .trace_id = trace_id,
-                    .depth = depth,
-                    .id = tu.id,
-                    .tool = tu.name,
-                    .decision = "deny",
-                    .source = "learning_turn",
-                    .allowed = false,
-                } });
-                var lslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
-                lslot.content = try tool_error.errorToJson(
-                    "LearningTurnToolUnavailable",
-                    "tool '{s}' does not run in a learning turn: only Read, Grep, Glob, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
-                    .{tu.name},
-                    allocator,
-                );
-                lslot.is_error = true;
-                try slots.append(allocator, lslot);
-                continue;
-            }
-            // Argument admission (issue #494): the hook, the permission check
-            // and the executor all read one canonical spelling of the
-            // arguments. Arguments that are not one JSON object, or that name
-            // a key twice, never reach either: the model gets a recoverable
-            // invalid_args instead of a deny it cannot correct.
-            var eff_input: []const u8 = switch (try admitToolArgs(allocator, &mod_inputs, tu.input)) {
-                .admitted => |canonical| canonical,
-                .rejected => |content| {
-                    log.warnId("agent", rid, "tool={s} arguments rejected", .{tu.name});
-                    var rejected = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
-                    rejected.content = content;
-                    rejected.is_error = true;
-                    try slots.append(allocator, rejected);
-                    continue;
-                },
-            };
-            // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
-            if (hookset) |hs| if (hs.hasPre()) {
-                const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, eff_input, opts.abort);
-                if (pre.modified_input) |mi| {
-                    mod_inputs.append(allocator, mi) catch allocator.free(mi);
-                    // append 成功才用改写值;失败(OOM)已 free,退回原 input。
-                    if (mod_inputs.items.len > 0 and mod_inputs.items[mod_inputs.items.len - 1].ptr == mi.ptr) {
-                        // A rewritten input passes the same admission as the model's.
-                        switch (try admitToolArgs(allocator, &mod_inputs, mi)) {
-                            .admitted => |canonical| eff_input = canonical,
-                            .rejected => |content| {
-                                var rejected = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = mi };
-                                rejected.content = content;
-                                rejected.is_error = true;
-                                try slots.append(allocator, rejected);
-                                continue;
-                            },
-                        }
-                    }
-                }
-                if (pre.decision == .block) {
-                    log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});
-                    backend.emitEvent(sess, .{ .policy_decision = .{
-                        .trace_id = trace_id,
-                        .depth = depth,
-                        .id = tu.id,
-                        .tool = tu.name,
-                        .decision = "deny",
-                        .source = "pre_tool_use_hook",
-                        .allowed = false,
-                    } });
-                    var dslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = eff_input };
-                    dslot.content = try tool_error.errorToJson("PreToolUseBlocked", "tool '{s}' blocked by PreToolUse hook", .{tu.name}, allocator);
-                    dslot.is_error = true;
-                    try slots.append(allocator, dslot);
-                    continue;
-                }
-            };
-            // With a Session dispatcher present, the directory is the only
-            // classification authority. A name it cannot resolve is not a
-            // known-read tool — default it to `.execute` (deny in dont_ask,
-            // ask in default) instead of the legacy name-based read fallback.
-            // Dispatch of such a name still fails as UnknownTool; note the
-            // deny happens before dispatch, so the UnknownTool "did you
-            // mean X" guidance does not fire on the denied path. The legacy
-            // branch classifies canonical_name (resolved above, same
-            // normalizer as executeOne) so classification can never look at
-            // a different name than what dispatch will actually run.
-            const classified = if (opts.tool_dispatcher) |dispatcher|
-                dispatcher.category(tu.name) orelse .execute
-            else if (opts.dyn_registry) |registry|
-                registry.category(canonical_name)
-            else
-                null;
-            var perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
-            // A confirmation demanded from outside the chain (sealed `confirm:
-            // true`) only tightens: an allow becomes an ask whose prompt skips
-            // "allow always" memory; deny and ask are untouched.
-            const forced_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, canonical_name) else false;
-            if (forced_confirm and perm_result == .allow) perm_result = .ask;
-            log.infoId("permission", rid, "tool={s} decision={s}{s}", .{ tu.name, @tagName(perm_result), if (forced_confirm) " (confirm required)" else "" });
-            var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
-            var policy_allowed = perm_result == .allow;
-            switch (perm_result) {
-                .deny => {
-                    log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
-                    slot.decision = .denied;
-                    slot.content = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or permission mode", .{tu.name}, allocator);
-                    slot.is_error = true;
-                },
-                .ask => {
-                    // ctx constCast:promptUser 写 session 记忆(有副作用)——agent_loop 持 *const
-                    // 但权限交互本就改 per-session 状态(base_ctx.permission_ctx 同理)。
-                    // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
-                    // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
-                    // 查不到,session deny 被 settings allow 越过。
-                    // Every failure denies. `false` is a person's deny; an
-                    // error is a deny nobody gave, and the model is told why
-                    // instead of that the user declined (#463,
-                    // doc/WIRE_PROTOCOL.md §1.4).
-                    var unanswered: ?permission_mod.PromptUnanswered = null;
-                    const prompted = if (forced_confirm)
-                        permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input)
-                    else
-                        permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input);
-                    const allowed = prompted catch |err| blk: {
-                        unanswered = err;
-                        break :blk false;
-                    };
-                    policy_allowed = allowed;
-                    log.infoId("permission", rid, "prompt tool={s} user_allowed={} unanswered={s}", .{ tu.name, allowed, if (unanswered) |cause| @errorName(cause) else "-" });
-                    if (!allowed) {
-                        slot.decision = .denied;
-                        slot.content = if (unanswered) |cause|
-                            try unansweredPromptJson(cause, tu.name, allocator)
-                        else
-                            try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
-                        slot.is_error = true;
-                    }
-                },
-                .allow => {},
-            }
-            backend.emitEvent(sess, .{ .policy_decision = .{
-                .trace_id = trace_id,
-                .depth = depth,
-                .id = tu.id,
-                .tool = tu.name,
-                .decision = @tagName(perm_result),
-                .source = if (perm_result == .ask) "user_prompt" else "permission_chain",
-                .allowed = policy_allowed,
-            } });
-            try slots.append(allocator, slot);
-            // 任务义务观察:获准执行的 Bash 命令喂给义务运行时(needle 子串
-            // 命中即 met)。denied 的调用不算——义务要的是"真的跑过"。
-            // R3-4:按 canonical 名判——"bash" 会被 P0.6 修名真执行,raw 名判失配
-            // 会让真跑过的义务停在 unmet(有界误提醒,同 R2-3 键分裂族)。
-            if (opts.obligations) |obligation_runtime| {
-                if (slot.decision == .run and std.mem.eql(u8, canonical_name, "Bash")) {
-                    if (@import("../util/json.zig").extractStringField(slot.input, "command")) |command|
-                        obligation_runtime.observeDispatch(slot.id, command);
-                }
-            }
+            var admitted = try admission.admit(tu, allocator);
+            errdefer admitted.deinit(allocator);
+            try slots.append(allocator, admitted);
         }
 
         // AgentDef/skill execution ceilings are a distinct, final policy
@@ -4366,6 +4660,8 @@ fn runCounted(
         base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
         base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
         base_ctx.kg_agent_ident = opts.kg_agent_ident;
+        base_ctx.preview = opts.preview;
+        if (opts.preview) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
@@ -4408,6 +4704,7 @@ fn runCounted(
         // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
         // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
         const recovery_plan = tool_exec_mod.planRecoveryAllowance(slots.items, base_ctx.result_budget);
+        code_bridge.recovery_charged = recovery_plan.charged_bytes;
         const deferred_recovery: usize = recovery_plan.deferred_count;
         for (slots.items) |*s| {
             if (s.decision != .deferred) continue;
@@ -4434,6 +4731,20 @@ fn runCounted(
         }
         if (deferred_recovery > 0) log.info("agent", "recovery allowance: charged={d} allowance={d} deferred={d}", .{ recovery_plan.charged_bytes, recovery_plan.allowance_bytes, deferred_recovery });
         const exec_outcome = tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // Merge borrowed evidence only. Inner tool bytes never enter Conversation.
+        const combined_slots = if (code_bridge.slots.items.len == 0) null else allocator.alloc(tool_exec.Slot, slots.items.len + code_bridge.slots.items.len) catch {
+            // Allocation failure cannot erase evidence of tools already run.
+            drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+            drainFileChanges(code_bridge.slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+            try exec_outcome;
+            return error.OutOfMemory;
+        };
+        defer if (combined_slots) |combined| allocator.free(combined);
+        const observed_slots = if (combined_slots) |combined| blk: {
+            @memcpy(combined[0..code_bridge.slots.items.len], code_bridge.slots.items);
+            @memcpy(combined[code_bridge.slots.items.len..], slots.items);
+            break :blk combined;
+        } else slots.items;
         // Delivery-cadence sensor: observe every executed slot now, before the
         // suspend and host-fatal paths return without reaching the turn's
         // tail (Codex review 2026-09-21: a suspended sibling batch used to
@@ -4441,27 +4752,47 @@ fn runCounted(
         // A learning pass is outside the attempt (in_learning_pass): the
         // process sensors below neither count it nor can end it. Only its
         // lesson refusals are counted.
-        if (in_learning_pass) learning_state.lessons_refused +|= countRefusedLessons(slots.items);
+        if (in_learning_pass) learning_state.lessons_refused +|= countRefusedLessons(observed_slots);
         if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe))
-            delivery_cadence_state.observeSlots(allocator, slots.items);
+            delivery_cadence_state.observeSlots(allocator, observed_slots);
         // Host-check-gate sensor, same placement and reason: a delivery-capable
         // action must mark the run dirty before any early return.
-        if (!in_learning_pass and opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
-        if (!in_learning_pass and test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
+        if (!in_learning_pass and opts.check_gate != null) check_gate_state.observeSlots(allocator, observed_slots);
+        if (!in_learning_pass and test_integrity_state.armed) test_integrity_state.observeSlots(allocator, observed_slots);
         // Stall-gate sensor, same placement: the content is still on the slots
         // (it moves into result_blocks below). First forget what the model can
         // no longer see — compaction or microcompaction since the last round —
         // so a re-read of a cleared result counts as news.
         if (!in_learning_pass) if (stall_state) |state| {
             state.forgetInvisible(conversation.messages.items, conversation.activeStart());
-            _ = state.observeSlots(slots.items);
+            _ = state.observeSlots(observed_slots);
         };
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+        drainFileChanges(code_bridge.slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+        if (!in_learning_pass) for (code_bridge.slots.items) |inner| {
+            const content = inner.content orelse continue;
+            if (!inner.is_error or !isEnvironmentFault(content)) continue;
+            environment_faults +|= 1;
+            backend.emitEvent(sess, .{ .environment_fault = .{
+                .tool = inner.name,
+                .code = util_json.extractStringField(content, "code") orelse "",
+                .detail = util_json.extractStringField(content, "detail") orelse "",
+                .count = environment_faults,
+                .limit = MAX_ENVIRONMENT_FAULTS,
+            } });
+        };
         try exec_outcome;
         // Execution completed without a fatal host result: this is the batch
         // commit boundary, so sealed artifacts and their references commit together.
         try tool_exec.publishSealedResults(slots.items, allocator, rid);
+        // Publication can replace an outer slot's content (inline fallback or
+        // withdrawn attachments). Refresh the borrowed view before late sensors
+        // read it, also dropping file-change records already drained above.
+        if (combined_slots) |combined| {
+            @memcpy(combined[0..code_bridge.slots.items.len], code_bridge.slots.items);
+            @memcpy(combined[code_bridge.slots.items.len..], slots.items);
+        }
         // 成功条件义务 2.0:结果侧回填 met——只有执行成功(!is_error 且
         // exit_code=0,bash.zig 序列化以 `"exit_code":N}` 收尾)才算履约。
         if (opts.obligations) |obligation_runtime| {
@@ -4612,11 +4943,11 @@ fn runCounted(
         // 失败"——必须取 observeTurn 之前的位;本轮自己的验证结果属于下一轮。
         const pre_turn_verification_failed = verification_progress.last_verification_failed;
         const inject_verification_checkpoint = observe_verification and
-            verification_progress.observeTurn(allocator, slots.items) and
+            verification_progress.observeTurn(allocator, observed_slots) and
             opts.verification_checkpoint;
         if (observe_verification) {
             if (opts.tool_observer) |observer| {
-                for (slots.items) |slot| {
+                for (observed_slots) |slot| {
                     if (slot.decision != .run or slot.is_error) continue;
                     const is_file_edit = std.mem.eql(u8, slot.name, "Edit") or
                         std.mem.eql(u8, slot.name, "Write") or
@@ -4641,6 +4972,7 @@ fn runCounted(
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
         var post_ctx: std.ArrayList(u8) = .empty;
         defer post_ctx.deinit(allocator);
+        try post_ctx.appendSlice(allocator, code_bridge.post_context.items);
         for (slots.items) |*s| {
             // takeContent:ownership 转移给 result_blocks 并置空 slot 字段——
             // 顶部 defer 的 Slot.deinit 不会再碰它(双释放防线)。
@@ -4805,6 +5137,11 @@ fn runCounted(
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
+        if (harnessmm_enabled) {
+            var certificate = try harnessmm.observe(conversation.messages.items[conversation.messages.items.len - 1], turns + 1);
+            defer if (certificate) |*value| value.deinit();
+            if (certificate) |*value| try harnessmm_journal.?.append(allocator, value);
+        }
         // The round's results are now the last message, one block per slot:
         // the stall gate anchors each key to the block the model will see.
         if (!in_learning_pass) if (stall_state) |state| state.anchorRound(conversation.messages.items);
@@ -5062,6 +5399,20 @@ fn buildApiMessages(
     inject_user_context: ?[]const u8,
     synthetic_user_input: ?[]const u8,
 ) !std.ArrayList(types.ApiMessage) {
+    // Estimates conservatively include historical notes. Actual requests use
+    // the resolved run selections below, without rewriting durable history.
+    return buildApiMessagesWithFeatures(conversation, allocator, inject_user_context, synthetic_user_input, .{ .harnessmm = true, .rsi = true });
+}
+
+const OptimizationNotes = struct { harnessmm: bool, rsi: bool };
+
+fn buildApiMessagesWithFeatures(
+    conversation: *const Conversation,
+    allocator: std.mem.Allocator,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    notes: OptimizationNotes,
+) !std.ArrayList(types.ApiMessage) {
     var out = std.ArrayList(types.ApiMessage).empty;
     errdefer {
         freeApiMessages(&out, allocator);
@@ -5090,6 +5441,14 @@ fn buildApiMessages(
     }
 
     for (conversation.activeMessages()) |m| {
+        // A restored host instruction cannot reactivate a disabled feature.
+        // Keep message positions, native calls/results and transcript bytes;
+        // only omit our standalone guidance from this provider projection.
+        if (m.origin == .host and m.blocks.len == 1 and m.blocks[0] == .text) {
+            const text = m.blocks[0].text;
+            if ((!notes.harnessmm and std.mem.startsWith(u8, text, harnessmm_mod.AUTHOR_MARKER)) or
+                (!notes.rsi and std.mem.startsWith(u8, text, @import("../skills/rsi.zig").PREFIX))) continue;
+        }
         // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
         // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
         // 它和 reasoning_item 一样**不足以**撑起一条消息。

@@ -50,7 +50,8 @@ url="$DAEMON_URL"
 grep -q "daemon (2 sessions): $url" "$TMP/multi.out" || fail "unexpected startup line"
 if grep -qF "$token" "$TMP/multi.out"; then fail "the token was printed"; fi
 # Both session ids (each printed as "session <id> ready"). bash 3.2 compatible.
-sids=($(grep -oE "session [0-9a-f]{24} ready" "$TMP/multi.out" | awk '{print $2}' | sort -u))
+sids=()
+while IFS= read -r sid; do sids+=("$sid"); done < <(grep -oE "session [0-9a-f]{24} ready" "$TMP/multi.out" | awk '{print $2}' | sort -u)
 [[ "${#sids[@]}" -eq 2 ]] || fail "expected 2 sessions, got ${#sids[@]}"
 A="${sids[0]}"
 B="${sids[1]}"

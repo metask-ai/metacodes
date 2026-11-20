@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 28);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 29);
         assert_eq!(raw::METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1, 16_384);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);

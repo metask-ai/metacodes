@@ -528,6 +528,9 @@ const GeminiStream = struct {
     /// 一个 chunk 只能 emit 一个 StreamEvent,故先 emit 内容、把 usage 存这里,下次 next() 先吐它。
     /// 不这样做 → usage 在最常见的"内容+usage 同 chunk"路径被静默丢(E 类 bug)。
     pending_usage: ?UsageDelta = null,
+    /// 本响应已报告的 usage:usageMetadata 是截至该 chunk 的累计值,且可能出现在多个
+    /// chunk 上。经 cursor 只发新增部分。
+    usage_reports: api_stream.UsageReportCursor = .{},
 
     fn handle(self: *GeminiStream) StreamHandle {
         return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
@@ -680,12 +683,12 @@ const GeminiStream = struct {
             // 语义归一(Anthropic-exclusive):Gemini 的 promptTokenCount **包含**
             // cachedContentTokenCount;中立 UsageDelta 的 input_tokens 不含 cache,
             // 消费方按 in+cache_r+cache_w 求和(usage 锚点/成本)——不减会双计。
-            const usage = UsageDelta{
+            const usage = self.usage_reports.increment(.{
                 .input_tokens = util_json.extractIntField(usage_obj, "promptTokenCount") -| cu.read_tokens,
                 .output_tokens = util_json.extractIntField(usage_obj, "candidatesTokenCount"),
                 .cache_read_input_tokens = cu.read_tokens,
                 .cache_creation_input_tokens = cu.creation_tokens,
-            };
+            });
             const has_text = util_json.extractStringField(data, "text") != null;
             const has_fc = std.mem.indexOf(u8, data, "\"functionCall\"") != null;
             if (!has_text and !has_fc) return StreamEvent{ .usage = usage }; // 纯 usage chunk → 直接吐
@@ -1670,6 +1673,54 @@ fn replayGemini(a: std.mem.Allocator, sse: []const u8, stop: *StopReason) ![]u8 
     };
     stop.* = stream.last_stop;
     return text.toOwnedSlice(a);
+}
+
+/// Replays one Gemini SSE response and returns the usage events it emitted.
+fn replayGeminiUsage(a: std.mem.Allocator, sse: []const u8, out: []UsageDelta) ![]UsageDelta {
+    var stream = GeminiStream{
+        .allocator = a,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
+    };
+    defer {
+        for (stream.fc_queue.items[stream.fc_pos..]) |ev| freeToolUseStart(a, ev);
+        stream.fc_queue.deinit(a);
+    }
+    var body = std.Io.Reader.fixed(sse);
+    stream.reader = &body;
+    var n: usize = 0;
+    while (try stream.next()) |ev| switch (ev) {
+        .text => |t| a.free(t),
+        .thinking, .reasoning_item, .web_search_query => |bytes| a.free(bytes),
+        .tool_use_start => freeToolUseStart(a, ev),
+        .web_search_result => |w| {
+            a.free(w.ui_text);
+            a.free(w.content_json);
+        },
+        .usage => |u| {
+            out[n] = u;
+            n += 1;
+        },
+        .done => {},
+    };
+    return out[0..n];
+}
+
+test "Gemini: usageMetadata repeated on several chunks is a running total, events carry increments" {
+    var buf: [4]UsageDelta = undefined;
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{ .input_tokens = 10, .output_tokens = 1 },
+        .{ .output_tokens = 3 },
+    }, try replayGeminiUsage(
+        std.testing.allocator,
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel\"}],\"role\":\"model\"},\"index\":0}]," ++
+            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1}}\n\n" ++
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]," ++
+            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":4}}\n\n",
+        &buf,
+    ));
 }
 
 test "issue #269 Gemini: EOF before any finishReason is StreamIncomplete" {

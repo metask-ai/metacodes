@@ -17,10 +17,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from e2e_helpers import (  # noqa: E402
-    RETRIES, SkipTest, fresh_home, run_e2e_tool, run_live, read_tool_uses,
-    tool_called, any_tool_called, require_model,
+    RETRIES, SkipTest, fresh_home, run_e2e_tool, run_live, tool_called, any_tool_called, require_model,
 )
-from tty_driver import run  # noqa: E402
 from asserts import split_frames, TTYAssert  # noqa: E402
 
 # 去 ANSI/CSI(SGR 颜色、光标移动);⏺ ✓ ✗ ▶ 是普通 codepoint,strip 不掉,保留。

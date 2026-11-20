@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 28;
+pub const ABI_REVISION: u32 = 29;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 28 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 29 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -703,7 +703,9 @@ pub const RuntimeConfigV1 = extern struct {
     /// TeamDelete / SendMessage / SpawnTeammate) into the catalog so a team
     /// Session can select them. Teams are opt-in; zero keeps them out.
     enable_teams: u64,
-    reserved: [3]u64,
+    /// Revision 29: 0 disables preview features; 1 explicitly opts in.
+    preview: u64,
+    reserved: [2]u64,
 };
 
 /// Explicit executable authority supplied by the embedding Host. `root` is an
@@ -1586,6 +1588,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(RuntimeConfigV1, "mcp_servers"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RuntimeConfigV1, "mcp_catalog_limits"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(RuntimeConfigV1, "enable_teams"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(RuntimeConfigV1, "preview"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(RuntimeConfigV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ProcessPluginSourceV1, "root"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RuntimePluginConfigV1, "process_plugins"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RuntimePluginConfigV1, "host_stream_tools"));
@@ -1715,9 +1719,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 28 keeps MCP wire codes stable" {
+test "Revision 29 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 28), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 29), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

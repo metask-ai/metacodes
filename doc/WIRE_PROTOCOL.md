@@ -18,6 +18,15 @@ In-process frontends (the TUI, headless runs, the AgentCore C ABI's
 directly. They never serialize, never declare capabilities, and behave as
 before this exchange existed.
 
+`ExecuteCode` is a preview feature, disabled by default. The Host's preview
+configuration controls its availability: without opt-in it is absent from the
+tool menu and direct invocation is rejected before VM creation. Model input
+cannot enable preview. When enabled it is an ordinary model tool on this wire. Its inner tool invocations
+emit ordinary tool lifecycle, policy and file-change evidence, but do not create
+additional provider tool-use/result messages. Runtime state is ephemeral and
+never part of a transcript or wire checkpoint. See the normative
+[JavaScript execution contract](PROGRAMMATIC_TOOL_CALLING.md).
+
 ## 1. Lines
 
 Every line is one JSON object with the schema version `v` (currently `1`) and
@@ -441,7 +450,7 @@ already announced stays pending and is answered or cancelled as before.
 | `--web`, `serve` | `POST /capabilities` | `200` `capabilities_accepted`, `400` `capabilities_refused` |
 | `serve --sessions N` | `POST /s/<id>/capabilities` | the same, per Session |
 | `SessionHost` | `HostedSession.declareCapabilities(allocator, frame)` | the acknowledgement line, or a `DeclareError` |
-| UDS (`serve --uds`) | the frame itself as one NDJSON line, with the routing fields beside it: `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` | the acknowledgement line |
+| UDS (`serve --uds`) | the frame itself as one NDJSON line, with the routing fields beside it: `{"op":"capabilities","session":"<id>","v":1,"type":"capabilities",...}` | the acknowledgement line, or the `capabilities_refused` line |
 
 UDS is a full UI frontend: it carries answers too. `{"op":"respond","session":
 "<id>","id":N,...}` answers UI request `N` with the same answer fields

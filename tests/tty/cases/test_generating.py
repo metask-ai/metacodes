@@ -434,7 +434,6 @@ def test_logs_never_leak_into_tui_render_stream(bin_path):
     import http.server
     import socketserver
     import threading
-    from asserts import split_frames
 
     OK_SSE = (
         b'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
@@ -479,9 +478,9 @@ def test_logs_never_leak_into_tui_render_stream(bin_path):
     det = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
     # 核心:任何日志前缀都不得出现在 TUI 渲染流里(否则注入固定区 → 残影)。
     assert "[ERROR" not in det, "err 日志泄漏进 TUI 渲染流(会注入固定区致残影):\n" + \
-        "\n".join(l for l in det.split("\n") if "ERROR" in l)[:600]
+        "\n".join(line for line in det.split("\n") if "ERROR" in line)[:600]
     assert "[WARN" not in det, "warn 日志泄漏进 TUI 渲染流:\n" + \
-        "\n".join(l for l in det.split("\n") if "WARN" in l)[:600]
+        "\n".join(line for line in det.split("\n") if "WARN" in line)[:600]
 
 
 def test_A6_narrow_terminal_no_wrap(bin_path):

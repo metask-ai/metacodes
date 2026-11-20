@@ -106,8 +106,10 @@ def main():
                         continue
                     if body.get('exit_code') == 0:
                         for line in body.get('stdout', '').splitlines():
-                            try: value = json.loads(line)
-                            except ValueError: continue
+                            try:
+                                value = json.loads(line)
+                            except ValueError:
+                                continue
                             if isinstance(value, dict) and value.get('cwe') == ['SAFE']:
                                 recovered = value
             assert recovered is not None

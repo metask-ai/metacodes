@@ -1,0 +1,4 @@
+paths:
+  .github/workflows/ci.yml:
+    ignore:
+      - shell name "cmd" is invalid on macOS or Linux

@@ -31,7 +31,8 @@
 //!   as bwrap's exit 128+N, mapped back to the signal
 //!   (`WrappedCommand.childExitCode`).
 //! - Result: stdout is read only for the last `result` event (status and
-//!   `total_cost_usd`, charged as `harness_reported`); a `wallclock_only`
+//!   `total_cost_usd`, charged as `harness_reported`). A missing cost report
+//!   on a cost-bounded seat consumes its allowance as `reserved`; a `wallclock_only`
 //!   seat is charged its wallclock. The handoff decides a clean exit
 //!   (`run_dir.collectHandoff`); the transcript is never parsed.
 
@@ -43,6 +44,8 @@ const types = @import("../types.zig");
 const run_dir = @import("../run_dir.zig");
 const ledger_mod = @import("../ledger.zig");
 const common = @import("common.zig");
+const charters = @import("../charters.zig");
+const write_scope = @import("write_scope.zig");
 const sandbox_config = @import("../../sandbox/config.zig");
 const worker_sandbox = @import("../../sandbox/worker.zig");
 const util_time = @import("../../util/time.zig");
@@ -66,6 +69,9 @@ pub const required_help_text = [_][]const u8{
     "--model",
     "--effort",
     "--max-budget-usd",
+    "--append-system-prompt",
+    "--strict-mcp-config",
+    "--mcp-config",
 };
 
 /// The variables passed to the CLI, by name; every other variable of the
@@ -102,9 +108,10 @@ pub const env_allowlist = [_][]const u8{
 pub const harness_log_file = "harness.log";
 
 /// Claude Code's own state, writable inside the sandbox.
-const claude_state_roots = [_][]const u8{ "~/.claude", "~/.claude.json", "~/.claude.json.backup", "~/.claude.json.lock" };
+pub const claude_state_roots = [_][]const u8{ "~/.claude", "~/.claude.json", "~/.claude.json.backup", "~/.claude.json.lock" };
 
 pub const Options = struct {
+    preview: bool = false,
     /// The runtime's environment as `KEY=VALUE` entries
     /// (`platform.paths.environment`), borrowed; filtered by `env_allowlist`.
     parent_env: []const [:0]const u8,
@@ -168,6 +175,7 @@ pub const ClaudeCodeDriver = struct {
         paths: types.SeatPaths,
         abort: *const types.AbortSignal,
     ) types.SeatDriver.Error!types.SeatOutcome {
+        if (!self.options.preview) return .{ .failed = .spawn_failed };
         const external = switch (spec.harness) {
             .claude_code => |external| external,
             .metacodes => {
@@ -203,7 +211,16 @@ pub const ClaudeCodeDriver = struct {
             .cost => self.binding.ledger.remainingUsd(),
             .wallclock_only => null,
         };
-        const cli_argv = try buildArgv(arena, external.command.bytes, seat_dir, spec.model, spec.effort, remaining);
+        const base_argv = try buildArgv(arena, external.command.bytes, seat_dir, spec.model, spec.effort, remaining);
+        const cli_argv = try arena.alloc([]const u8, base_argv.len + 5);
+        @memcpy(cli_argv[0..base_argv.len], base_argv);
+        cli_argv[base_argv.len] = "--append-system-prompt";
+        cli_argv[base_argv.len + 1] = charters.forRole(spec.role);
+        // Workers receive no orchestration channel from the user's own
+        // Claude Code config, in particular no copy of the Manager endpoint.
+        cli_argv[base_argv.len + 2] = "--strict-mcp-config";
+        cli_argv[base_argv.len + 3] = "--mcp-config";
+        cli_argv[base_argv.len + 4] = "{\"mcpServers\":{}}";
 
         var launch = self.prepareLaunch(gpa, cli_argv, paths.workspace, seat_dir) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -219,6 +236,7 @@ pub const ClaudeCodeDriver = struct {
         };
         var sink: LineSink = .{ .gpa = gpa, .mode = .result_events };
         defer sink.deinit();
+        if (external.budget == .cost) self.binding.ledger.reserve(self.binding.seat, .claude_code) catch return .budget_exhausted;
         const supervised = supervise(argv, env, paths.workspace, harness_log.fd, abort, .{
             .budget_ms = wallclock_deadline_ms,
             .timeout_ms = self.options.timeout_ms,
@@ -235,9 +253,9 @@ pub const ClaudeCodeDriver = struct {
         const cost: ledger_mod.Cost = switch (external.budget) {
             .wallclock_only => .wallclock_only,
             .cost => if (sink.result) |result|
-                (if (result.cost_usd) |usd| .{ .harness_reported = usd } else .wallclock_only)
+                (if (result.cost_usd) |usd| .{ .harness_reported = usd } else .{ .reserved = remaining.? })
             else
-                .wallclock_only,
+                .{ .reserved = remaining.? },
         };
         const charged = common.charge(self.binding, .claude_code, supervised.elapsed_ms, cost);
 
@@ -257,6 +275,18 @@ pub const ClaudeCodeDriver = struct {
         if (code != 0) {
             if (builtin.os.tag != .windows and code < 0) return .{ .failed = .{ .signaled = @intCast(-code) } };
             return .{ .failed = .{ .exited = @truncate(@as(u32, @bitCast(code))) } };
+        }
+        if (external.budget == .cost and cost == .reserved) {
+            harness_log.print("no usable cost report; the remaining dollar cap was reserved, not treated as zero spend\n", .{});
+            return .budget_exhausted;
+        }
+        const result = sink.result orelse {
+            harness_log.print("missing terminal result event\n", .{});
+            return .{ .failed = .spawn_failed };
+        };
+        if (result.is_error or result.subtype != .success) {
+            harness_log.print("CLI reported an unsuccessful terminal result\n", .{});
+            return .{ .failed = .spawn_failed };
         }
         return run_dir.collectHandoff(gpa, paths.handoff);
     }
@@ -336,6 +366,7 @@ pub const ClaudeCodeDriver = struct {
             .allow_unsandboxed_commands = false,
             .auto_allow_bash_if_sandboxed = false,
             .allow_write = &claude_state_roots,
+            .temp_writes = .{ .isolated = seat_dir },
         };
         if (self.options.host_sandbox) |host| {
             settings.deny_read = host.deny_read;
@@ -344,6 +375,9 @@ pub const ClaudeCodeDriver = struct {
             settings.allowed_domains = host.allowed_domains;
             settings.denied_domains = host.denied_domains;
         }
+        const git_protection = try write_scope.GitProtection.init(gpa, cwd, settings.deny_write);
+        defer git_protection.deinit();
+        settings.deny_write = git_protection.roots;
         return worker_sandbox.prepare(gpa, argv, .{
             .cwd = cwd,
             .home = self.options.home_dir,
@@ -655,7 +689,7 @@ const HarnessLog = struct {
 
     fn open(arena: std.mem.Allocator, seat_dir: []const u8) HarnessLog {
         const path = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ seat_dir, harness_log_file }, 0) catch return .{ .fd = null };
-        const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+        const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
         return .{ .fd = if (fd < 0) null else fd };
     }
 

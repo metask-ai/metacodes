@@ -92,7 +92,7 @@ L: list[str] = []
 add = L.append
 add(f"# 评测报告:{meta['round']}")
 add("")
-add(f"> 本文件由 `generate_report.py` 从 `data/` 自动生成,请勿手改。")
+add("> 本文件由 `generate_report.py` 从 `data/` 自动生成,请勿手改。")
 add("")
 add("## 概要")
 add("")

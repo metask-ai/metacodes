@@ -4,7 +4,7 @@ import http.server
 import threading
 import json
 
-from tty_driver import READY, WAIT_S, run, submit, wait_for
+from tty_driver import READY, run, submit, wait_for
 from asserts import TTYAssert
 
 

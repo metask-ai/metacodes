@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Preview features require opt-in.** `--preview` enables them; `--no-preview`
+  overrides a saved root `"preview": true` in the installation's `config.json`.
+  ExecuteCode JavaScript orchestration is a preview feature and is hidden and
+  refused by default. Child agents inherit the setting. Python and Node.js
+  expose a Runtime `preview` option; AgentCore ABI revision 29 consumes a
+  reserved RuntimeConfig word for the boolean, with unchanged struct sizes.
+
 - **The CLI no longer consults a built-in System-One advisor** (#474). Until
   now every host built on the CLI (the TUI, `-p`, `--web`, `serve`) fell back
   to the team's `metask-jev-4b` at `http://58.211.6.133:10420` whenever
@@ -630,6 +637,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Token and cost totals no longer count part of a streamed response
+  twice.** A provider reports a response's usage as a running total:
+  Anthropic's `message_delta.usage` is cumulative and follows a
+  `message_start` that already counted the prompt and the first output
+  tokens, some OpenAI-compatible servers attach the usage so far to every
+  chunk, and Gemini repeats `usageMetadata`. Each report was added to the
+  totals as if it were an increment. On the streaming documentation's own
+  examples that is 16 output tokens for a response of 15, and 13361 input /
+  513 output for one of 10682 / 510, about 20% more cost. `/cost`, the token
+  and cost fields of `--json`, the cost budget, the goal meter and AgentCore
+  `usage` events all read those totals. Each provider stream (Messages,
+  Chat Completions, Responses, Gemini, Bedrock Converse) now hands on only
+  what a report adds to the highest count the response has reported so far,
+  so a response's `usage` events add up to the provider's totals however
+  many reports carried them. The per-request view behind the context anchor
+  and the prompt-cache diagnostics already took the highest report and does
+  not change.
+
 - **Behind a proxy, the end of a model's answer is no longer lost, and the
   turn is no longer sent again for it** (#573). Every request to a model
   provider said `connection: close`, so the server closed the connection
@@ -719,6 +744,16 @@ status, compatibility boundaries, and entry points are defined by
   ended the line typed so far was sent as the next message. It now inserts
   a newline in the draft, as it does at the prompt; Enter still queues the
   whole draft, newline included, as one message.
+- **A `/model` search can start with `q`** (#599). On an empty filter `q`
+  closed the picker, so typing `qwen` closed the list on its first letter
+  and left `wen` in the input box: no model whose name starts with `q`
+  could be searched for. `q` is now a filter letter like any other, as the
+  list's `type to filter` says, and Esc is the way out (it clears the filter
+  first). The list no longer shows `q close`, and when no provider is
+  configured it names only the ways out with a filter typed too (it said
+  `enter apply · tab scope`, though there was nothing to apply). The screen
+  that says where a provider's key goes has nothing to type into and still
+  closes on `q`.
 - **`/model` names the variable and the file for a provider without a key**
   (#483). A route of Kimi (Moonshot's open platform), Gemini, Qwen or MiniMax
   chosen without its key ended in `switch failed (MissingCredentials)`: these

@@ -2,7 +2,12 @@
 # PTY 驱动 cc-zig 验证 TUI 输入框渲染(headless 真 tty)。
 # 起一个 pty,让 metacodes 以为连了真终端(isatty=true)→ 触发 RenderRegion 输入框。
 # 喂几个字符 + /exit,捕获原始 ANSI 输出,打印可读化(转义可见)供核查跳动。
-import os, pty, sys, time, select, re
+import os
+import pty
+import sys
+import time
+import select
+import re
 
 BIN = sys.argv[1] if len(sys.argv) > 1 else "zig-out/bin/metacodes-debug"
 keys = sys.argv[2] if len(sys.argv) > 2 else "hi"
