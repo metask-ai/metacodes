@@ -37,6 +37,7 @@ LISTING = {"data": [
      "endpoints": ["/api/v1/chat/completions"]},
 ]}
 DESCRIBED = {"data": {"label": "sk-or-v1-0e6...1c96", "limit": None, "expires_at": None, "is_free_tier": False}}
+LISTING_LARGE = {"data": [dict(LISTING["data"][0], description="x" * 96 * 1024)] + LISTING["data"][1:]}
 
 VENDOR_KEYS = ["OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODE_API_KEY",
                "ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
@@ -81,23 +82,48 @@ class _OpenRouter(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/v1/key":
             self._send(200, {"data": dict(DESCRIBED["data"], is_free_tier=self.server.free_tier)})
         elif self.path == "/api/v1/models/user":
-            self._send(200, LISTING)
+            self._answer_listing()
         else:
             self.send_error(404)
+
+    def _answer_listing(self):
+        if self.server.drop_listing > 0:
+            self.server.drop_listing -= 1
+            self.close_connection = True
+            return
+        if not self.server.hold_listing_s:
+            self._send(200, self.server.listing)
+            return
+        body = json.dumps(self.server.listing).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body[:len(body) // 2])
+        self.wfile.flush()
+        time.sleep(self.server.hold_listing_s)
+        self.wfile.write(body[len(body) // 2:])
 
 
 class _Case:
     """A scratch HOME, an OpenRouter mock every address is moved onto, and a
     $BROWSER that records the URL it is asked to open."""
 
-    def __init__(self, free_tier=False):
+    def __init__(self, free_tier=False, listing=None, hold_listing_s=0.0, drop_listing=0):
         self.free_tier = free_tier
+        self.listing = listing or LISTING
+        self.hold_listing_s = hold_listing_s
+        self.drop_listing = drop_listing
 
     def __enter__(self):
         self.home = case_tmpdir("cc-tty-openrouter-")
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OpenRouter)
         self.server.seen = []
         self.server.free_tier = self.free_tier
+        self.server.listing = self.listing
+        self.server.hold_listing_s = self.hold_listing_s
+        self.server.drop_listing = self.drop_listing
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.opened = os.path.join(self.home, "opened.txt")
@@ -122,6 +148,13 @@ class _Case:
     def stored(self):
         with open(self.key_file()) as f:
             return json.load(f)
+
+    def store_key(self):
+        keys = os.path.join(self.home, ".metacodes", "keys")
+        os.makedirs(keys, exist_ok=True)
+        with open(self.key_file(), "w") as f:
+            json.dump({"schema_version": 1, "kind": "api_key", "key": KEY}, f)
+        os.chmod(self.key_file(), 0o600)
 
     def seen(self, method, path):
         return [entry for entry in self.server.seen if entry[0] == method and entry[1] == path]
@@ -288,3 +321,75 @@ def test_login_openrouter_takes_a_key_the_user_already_has(bin_path):
         assert case.seen("POST", "/api/v1/auth/keys") == [], "a pasted key needs no exchange"
         stored = case.stored()
         assert stored["key"] == PASTED_KEY and stored["obtained"] == "pasted", stored
+
+
+def _sign_in_on_another_device():
+    return [READY, "type:/login openrouter --device-code", "key:enter",
+            wait_for("Paste the code here", 10),
+            f"type:{SHOWN_CODE}", wait_for(f"({len(SHOWN_CODE)} characters)", 10),
+            "key:enter", wait_for("Signed in to OpenRouter", WAIT_S)]
+
+
+def test_login_openrouter_opens_the_picker_at_once_and_fills_it_in_when_the_list_comes(bin_path):
+    with _Case(free_tier=True, listing=LISTING_LARGE, hold_listing_s=5.0) as case:
+        events = _sign_in_on_another_device() + [
+            wait_for("Downloading the models your OpenRouter account can use", 10),
+            wait_for("nothing matches yet", 10),
+            wait_for("inclusionAI: Ling 3.2 Flash (free)", 20), "sleep:0.3"]
+        raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
+        a, _ = _screen(raw, 40, 140)
+        waiting = a.screens_with("Downloading the models your OpenRouter account can use")
+        if not waiting:
+            a._fail("the picker should say the list is on its way")
+        text = "\n".join(waiting[-1].line_text(r) for r in range(waiting[-1].rows))
+        assert "[from now on]" in text and ":free" in text, text
+        assert " KB" in text, text
+        assert "nothing matches yet — OpenRouter's models are still downloading" in text, text
+        assert "nothing matches this filter" not in text, text
+        filled = a.screens_with("inclusionAI: Ling 3.2 Flash (free)")
+        last = "\n".join(filled[-1].line_text(r) for r in range(filled[-1].rows))
+        assert ":free" in last and "[from now on]" in last, last
+        assert "Downloading the models" not in last, last
+        assert "DeepSeek: DeepSeek V4.1 Flash" not in last, last
+        assert len(case.seen("GET", "/api/v1/models/user")) == 1, case.server.seen
+        assert KEY.encode() not in raw, "the key reached the terminal"
+
+
+def test_a_list_that_did_not_come_says_why_and_ctrl_r_fetches_it_again(bin_path):
+    with _Case(free_tier=True, drop_listing=2) as case:
+        events = _sign_in_on_another_device() + [
+            wait_for("did not download (no connection) · ctrl+r retries", 20),
+            "key:ctrl_r",
+            wait_for("inclusionAI: Ling 3.2 Flash (free)", 20), "sleep:0.3"]
+        raw = run(bin_path, events, term_size=(40, 140), env=case.env(), per_key_drain=0.05)
+        a, _ = _screen(raw, 40, 140)
+        failed = a.screens_with("OpenRouter's model list did not download (no connection) · ctrl+r retries")
+        if not failed:
+            a._fail("a list that did not come should say why and that ctrl+r retries")
+        text = "\n".join(failed[-1].line_text(r) for r in range(failed[-1].rows))
+        assert "nothing matches this filter — Esc clears it" in text, text
+        filled = a.screens_with("inclusionAI: Ling 3.2 Flash (free)")
+        last = "\n".join(filled[-1].line_text(r) for r in range(filled[-1].rows))
+        assert "did not download" not in last, last
+        assert len(case.seen("GET", "/api/v1/models/user")) == 3, case.server.seen
+
+
+def test_a_start_with_a_key_and_no_list_downloads_it_and_model_says_so(bin_path):
+    with _Case(listing=LISTING_LARGE, hold_listing_s=5.0) as case:
+        case.store_key()
+        env = case.env()
+        env["METACODES_NO_PROBE"] = None
+        events = [READY, "type:/model", "key:enter",
+                  wait_for("Downloading the models your OpenRouter account can use", 10),
+                  wait_for("DeepSeek: DeepSeek V4.1 Flash", 20), "sleep:0.3"]
+        raw = run(bin_path, events, term_size=(40, 140), env=env, per_key_drain=0.05)
+        a, _ = _screen(raw, 40, 140)
+        waiting = a.screens_with("Downloading the models your OpenRouter account can use")
+        if not waiting:
+            a._fail("/model should say the list is on its way")
+        text = "\n".join(waiting[-1].line_text(r) for r in range(waiting[-1].rows))
+        assert "Auto Router" in text, text
+        filled = a.screens_with("DeepSeek: DeepSeek V4.1 Flash")
+        last = "\n".join(filled[-1].line_text(r) for r in range(filled[-1].rows))
+        assert "Downloading the models" not in last, last
+        assert [entry[2] for entry in case.seen("GET", "/api/v1/models/user")] == [f"Bearer {KEY}"], case.server.seen

@@ -155,7 +155,10 @@ of models under a heading per provider (where its key comes from, who bills
 it), the cursor on the model in use; a model served on several routes lists
 them under it while the cursor is on it, the reasoning level is a line under
 the list changed with ←/→, the three scopes are named in the header (`Tab`
-cycles them), typing filters across every provider, and closing without a
+cycles them), typing filters across every provider, a line under the header
+says that OpenRouter's model list is still downloading (how much has come)
+or why it did not come (`Ctrl+R` downloads it again) and the list fills in
+when it comes, and closing without a
 choice prints `kept <model>` (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`

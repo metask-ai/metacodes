@@ -81,7 +81,11 @@ fn emptyText(picker: *const Picker, buf: []u8) []const u8 {
         .failed => "model catalog unavailable — Esc to close",
         .empty => "no models configured",
         .ready, .stale => if (picker.filter_len > 0)
-            "nothing matches this filter — Esc clears it"
+            (if (stillDownloading(picker)) |name|
+                std.fmt.bufPrint(buf, "nothing matches yet — {s}'s models are still downloading", .{name}) catch
+                    "nothing matches yet — models are still downloading"
+            else
+                "nothing matches this filter — Esc clears it")
         else
             // No provider has a credential (#488): where one comes from, as
             // the banner of a start with nothing configured says it, with
@@ -90,6 +94,11 @@ fn emptyText(picker: *const Picker, buf: []u8) []const u8 {
                 if (picker.local_config_path_len > 0) picker.localConfigPath() else ".env",
             }) catch "no providers configured — /login, or configure .env",
     };
+}
+
+fn stillDownloading(picker: *const Picker) ?[]const u8 {
+    const note = picker.shownListNote() orelse return null;
+    return if (note.state == .downloading) note.name() else null;
 }
 
 /// The list is empty because no provider has a credential, not because of a
@@ -142,8 +151,61 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 
     if (picker.stage == .list) writeScopes(w, th, picker.scope, cols, used);
     newline(w);
     var count: u16 = 1;
+    if (picker.stage == .list) count += listNote(picker, w, th, cols);
     if (picker.notice_len > 0) count += writeWrapped(w, th.warn, th.reset, picker.notice(), cols);
     return count;
+}
+
+fn listNote(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
+    const note = picker.shownListNote() orelse return 0;
+    var text_buf: [256]u8 = undefined;
+    return switch (note.state) {
+        .downloading => writeWrapped(w, th.dim, th.reset, downloadingText(note, &text_buf), cols),
+        .failed => writeWrapped(w, th.warn, th.reset, failedText(note, &text_buf), cols),
+    };
+}
+
+fn downloadingText(note: *const picker_mod.ListNote, buf: []u8) []const u8 {
+    var out: std.Io.Writer = .fixed(buf);
+    out.print("Downloading the models your {s} account can use…", .{note.name()}) catch {};
+    writeSize(&out, note.state.downloading);
+    return out.buffered();
+}
+
+fn failedText(note: *const picker_mod.ListNote, buf: []u8) []const u8 {
+    var out: std.Io.Writer = .fixed(buf);
+    const failure = note.state.failed;
+    if (failure == .refused) {
+        out.print("{s} refused the key · /login {s}", .{ note.name(), note.provider.slice() }) catch {};
+        return out.buffered();
+    }
+    out.print("{s}'s model list did not download ({s}) · ctrl+r retries", .{ note.name(), failureText(failure) }) catch {};
+    return out.buffered();
+}
+
+fn failureText(failure: picker_mod.ListNote.Failure) []const u8 {
+    return switch (failure) {
+        .connection => "no connection",
+        .interrupted => "answer cut off",
+        .refused => "key refused",
+        .busy => "rate limited",
+        .server_error => "server error",
+        .not_a_list => "not a model list",
+        .too_large => "list too large",
+        .stalled => "no data for 60 s",
+        .other => "unexpected error",
+    };
+}
+
+fn writeSize(w: *std.Io.Writer, bytes: u64) void {
+    if (bytes == 0) return;
+    const mib: u64 = 1024 * 1024;
+    if (bytes < mib) {
+        w.print(" {d} KB", .{@max(bytes / 1024, 1)}) catch {};
+        return;
+    }
+    const tenths = bytes * 10 / mib;
+    w.print(" {d}.{d} MB", .{ tenths / 10, tenths % 10 }) catch {};
 }
 
 /// The three scopes, the one Enter applies to bracketed: a commit that
@@ -1158,4 +1220,111 @@ test "an empty result explains itself instead of drawing a blank box" {
     try seed(&picker, &offers, null);
     for ("zzz") |byte| _ = picker.onKey(.{ .char = byte });
     try testing.expect(std.mem.indexOf(u8, try screen(arena, &picker, 120), "nothing matches this filter — Esc clears it") != null);
+}
+
+fn seedWaitingForOpenRouter(picker: *Picker) !void {
+    const offers = [_]control_plane.OfferSummary{
+        offerOf("openrouter", "auto", "Auto Router", "openai_chat"),
+        offerOf("deepseek", "default", "deepseek-v4-pro", "openai_chat"),
+    };
+    try seed(picker, &offers, null);
+    const notes = [_]picker_mod.ProviderNote{
+        picker_mod.ProviderNote.init(ids.Slug.lit("openrouter"), "OpenRouter", .saved_key),
+        picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .local_config),
+    };
+    try picker.setReadiness(&.{ true, true }, &notes);
+}
+
+fn openRouterNote(state: picker_mod.ListNote.State) picker_mod.ListNote {
+    return picker_mod.ListNote.init(ids.Slug.lit("openrouter"), "OpenRouter", state);
+}
+
+fn expectRowsFit(text: []const u8, cols: usize) !void {
+    var rows = std.mem.splitScalar(u8, text, '\n');
+    while (rows.next()) |row| try testing.expect(textWidth(row) <= cols - 1);
+}
+
+test "a list on its way says how much has come under the title, and a filter that finds nothing yet says so (#572)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try seedWaitingForOpenRouter(&picker);
+    _ = picker.setListNote(openRouterNote(.{ .downloading = 0 }));
+    var text = try screen(arena, &picker, 80);
+    var rows = std.mem.splitScalar(u8, text, '\n');
+    try testing.expect(std.mem.startsWith(u8, rows.next().?, "  Model"));
+    try testing.expectEqualStrings("  Downloading the models your OpenRouter account can use…", rows.next().?);
+    try testing.expect(std.mem.indexOf(u8, text, "Auto Router") != null);
+    try expectRowsFit(text, 80);
+
+    _ = picker.setListNote(openRouterNote(.{ .downloading = 319 * 1024 + 500 }));
+    text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "Downloading the models your OpenRouter account can use… 319 KB") != null);
+    _ = picker.setListNote(openRouterNote(.{ .downloading = 1024 * 1024 + 512 * 1024 }));
+    text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "can use… 1.5 MB") != null);
+
+    for (":free") |byte| _ = picker.onKey(.{ .char = byte });
+    text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing matches yet — OpenRouter's models are still downloading") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing matches this filter") == null);
+    try expectRowsFit(text, 80);
+}
+
+test "a list that did not come says why and that ctrl+r retries; a refused key says /login instead (#572)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try seedWaitingForOpenRouter(&picker);
+    _ = picker.setListNote(openRouterNote(.{ .failed = .connection }));
+    var text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "  OpenRouter's model list did not download (no connection) · ctrl+r retries") != null);
+    try expectRowsFit(text, 80);
+
+    _ = picker.setListNote(openRouterNote(.{ .failed = .stalled }));
+    text = try screen(arena, &picker, 120);
+    try testing.expect(std.mem.indexOf(u8, text, "did not download (no data for 60 s) · ctrl+r retries") != null);
+    for ([_]picker_mod.ListNote.Failure{ .connection, .interrupted, .busy, .server_error, .not_a_list, .too_large, .stalled, .other }) |failure| {
+        _ = picker.setListNote(openRouterNote(.{ .failed = failure }));
+        text = try screen(arena, &picker, 80);
+        var line_buf: [128]u8 = undefined;
+        const wanted = try std.fmt.bufPrint(&line_buf, "\n  OpenRouter's model list did not download ({s}) · ctrl+r retries\n", .{failureText(failure)});
+        try testing.expect(std.mem.indexOf(u8, text, wanted) != null);
+    }
+    _ = picker.setListNote(openRouterNote(.{ .failed = .interrupted }));
+    text = try screen(arena, &picker, 60);
+    try testing.expect(std.mem.indexOf(u8, text, "did not download (answer cut off)") != null);
+    try expectRowsFit(text, 60);
+
+    _ = picker.setListNote(openRouterNote(.{ .failed = .refused }));
+    text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "  OpenRouter refused the key · /login openrouter") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ctrl+r") == null);
+
+    _ = picker.setListNote(openRouterNote(.{ .failed = .connection }));
+    for (":free") |byte| _ = picker.onKey(.{ .char = byte });
+    text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing matches this filter — Esc clears it") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing matches yet") == null);
+}
+
+test "no line about a list the picker does not show: no provider listed, or the setup stage (#572)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    try seedWaitingForOpenRouter(&picker);
+    try picker.setReadiness(&.{ false, true }, &.{picker_mod.ProviderNote.init(ids.Slug.lit("deepseek"), "DeepSeek", .local_config)});
+    _ = picker.setListNote(openRouterNote(.{ .failed = .connection }));
+    var text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "OpenRouter") == null);
+    try seedWaitingForOpenRouter(&picker);
+    picker.enterSetup(.{ .provider = ids.Slug.lit("openrouter"), .sign_in = true });
+    text = try screen(arena, &picker, 80);
+    try testing.expect(std.mem.indexOf(u8, text, "did not download") == null);
 }
