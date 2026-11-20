@@ -110,6 +110,7 @@ cd metacodes
 zig build dev                                   # fastest edit loop: Debug app only
 ./zig-out/bin/metacodes --help
 zig build test:lib -Dtfilter="max_turns"        # iterate on the tests you touch
+zig build gate:static                           # the source-level guards, in seconds
 zig build gate:pr                               # the full pre-submit gate
 ```
 

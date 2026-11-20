@@ -707,6 +707,11 @@ pub const WebSearchResultEvent = struct {
     content_json: []u8, // owned(原始 content 数组字符串,可能为 "[]")
 };
 
+/// The part of one response's token usage that a `usage` event adds: consumers
+/// (cost, goal and budget meters, `UsageTotals`, AgentCore's public `usage`
+/// event) sum these. A provider never reports one directly; every provider
+/// stream derives it from the response's `UsageReport`s through a
+/// `UsageReportCursor`.
 pub const UsageDelta = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
@@ -714,9 +719,48 @@ pub const UsageDelta = struct {
     cache_creation_input_tokens: u64 = 0,
 };
 
+/// What a provider says one response has used so far: a running total, not an
+/// increment. Anthropic's `message_delta.usage` is cumulative (and a stream may
+/// carry several) after a `message_start` that already counted part of it;
+/// OpenAI-compatible servers may repeat the usage object on several chunks;
+/// Gemini repeats `usageMetadata`. A distinct type, so a report can reach a
+/// `usage` event only through `UsageReportCursor.increment`.
+pub const UsageReport = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_input_tokens: u64 = 0,
+    cache_creation_input_tokens: u64 = 0,
+};
+
+/// Turns one response's reports into the increments its `usage` events carry.
+/// Each counter adds what it grew by since the highest value reported before;
+/// a counter a report leaves out (zero) or reports lower adds nothing. The
+/// increments of a response therefore add up to the per-counter maximum of its
+/// reports, whether the provider sends one report or many. One cursor per
+/// response: a retried or continued request is a new response with its own.
+pub const UsageReportCursor = struct {
+    seen: UsageReport = .{},
+
+    pub fn increment(self: *UsageReportCursor, report: UsageReport) UsageDelta {
+        const out = UsageDelta{
+            .input_tokens = report.input_tokens -| self.seen.input_tokens,
+            .output_tokens = report.output_tokens -| self.seen.output_tokens,
+            .cache_read_input_tokens = report.cache_read_input_tokens -| self.seen.cache_read_input_tokens,
+            .cache_creation_input_tokens = report.cache_creation_input_tokens -| self.seen.cache_creation_input_tokens,
+        };
+        self.seen = .{
+            .input_tokens = @max(self.seen.input_tokens, report.input_tokens),
+            .output_tokens = @max(self.seen.output_tokens, report.output_tokens),
+            .cache_read_input_tokens = @max(self.seen.cache_read_input_tokens, report.cache_read_input_tokens),
+            .cache_creation_input_tokens = @max(self.seen.cache_creation_input_tokens, report.cache_creation_input_tokens),
+        };
+        return out;
+    }
+};
+
 /// 从 usage object JSON（`{"input_tokens":N,"output_tokens":M,...}`）提数值。
 /// 容错：字段缺失返 0；字段存在但非整数返 0。
-fn parseUsageDelta(obj: []const u8) UsageDelta {
+fn parseUsageReport(obj: []const u8) UsageReport {
     return .{
         .input_tokens = parseIntField(obj, "input_tokens"),
         .output_tokens = parseIntField(obj, "output_tokens"),
@@ -726,7 +770,7 @@ fn parseUsageDelta(obj: []const u8) UsageDelta {
 }
 
 /// 从 object string 里抽 `"field":<digits>` 的整数值。委托给 util_json.extractIntField
-/// (单一真相源,见 util/json.zig);此处保留薄包装供本文件 parseUsageDelta 调用。
+/// (单一真相源,见 util/json.zig);此处保留薄包装供本文件 parseUsageReport 调用。
 fn parseIntField(obj: []const u8, field: []const u8) u64 {
     return util_json.extractIntField(obj, field);
 }
@@ -995,6 +1039,8 @@ pub const EventIterator = struct {
     /// 分开:`.unknown` 既可能是"报了个新值",也可能是"根本没报",而流是否完整只看后者。
     /// 没有它的 EOF 不是收尾——丢的那几个字节可能正是 `max_tokens`(issue #269)。
     stop_reported: bool = false,
+    /// 本响应已报告的 usage(message_start + 各 message_delta 的累计值)。
+    usage_reports: UsageReportCursor = .{},
 
     /// 跨多个 SSE 事件累加的 tool_use 状态。
     /// `content_block_start`(tool_use) 时填入 id/name，input_buf 清空。
@@ -1336,9 +1382,10 @@ pub const EventIterator = struct {
                             }
                         }
                     }
-                    // message_delta 的 usage 是 top-level 的 `usage`，不在 delta 里
+                    // message_delta 的 usage 是 top-level 的 `usage`，不在 delta 里,且是本响应的
+                    // 累计值(官方流式文档):经 cursor 只发比之前报告多出的部分。
                     if (findTopLevelObjectField(data, "usage")) |usage_obj| {
-                        return Event{ .usage = parseUsageDelta(usage_obj) };
+                        return Event{ .usage = self.usage_reports.increment(parseUsageReport(usage_obj)) };
                     }
                     continue;
                 },
@@ -1347,7 +1394,7 @@ pub const EventIterator = struct {
                     // message_start 的 usage 嵌在 message 对象里：{"message":{"usage":{...}}}
                     if (findTopLevelObjectField(data, "message")) |msg_obj| {
                         if (findTopLevelObjectField(msg_obj, "usage")) |usage_obj| {
-                            return Event{ .usage = parseUsageDelta(usage_obj) };
+                            return Event{ .usage = self.usage_reports.increment(parseUsageReport(usage_obj)) };
                         }
                     }
                     continue;
@@ -1666,6 +1713,106 @@ test "EventIterator: EOF after message_delta.stop_reason but before message_stop
     try std.testing.expect(try it.next(std.testing.allocator) == null);
     // The reported stop survives, so a max_tokens truncation still continues.
     try std.testing.expect(it.last_stop_reason == .max_tokens);
+}
+
+test "UsageReportCursor: increments add up to the per-counter maximum of the reports" {
+    const cases = [_][]const UsageReport{
+        // Official Anthropic: message_start, then a cumulative message_delta.
+        &.{ .{ .input_tokens = 25, .output_tokens = 1 }, .{ .output_tokens = 15 } },
+        // Zero placeholder, then the whole response.
+        &.{ .{}, .{ .input_tokens = 1200, .output_tokens = 80, .cache_read_input_tokens = 9000 } },
+        // The same report repeated, then grown.
+        &.{ .{ .input_tokens = 10, .output_tokens = 5 }, .{ .input_tokens = 10, .output_tokens = 5 }, .{ .input_tokens = 10, .output_tokens = 9 } },
+        // A lower report adds nothing and does not lower the baseline.
+        &.{ .{ .output_tokens = 9, .cache_creation_input_tokens = 4 }, .{ .output_tokens = 5 }, .{ .output_tokens = 12, .cache_creation_input_tokens = 4 } },
+    };
+    for (cases) |reports| {
+        var cursor = UsageReportCursor{};
+        var sum = UsageDelta{};
+        var max = UsageReport{};
+        for (reports) |r| {
+            const d = cursor.increment(r);
+            sum.input_tokens += d.input_tokens;
+            sum.output_tokens += d.output_tokens;
+            sum.cache_read_input_tokens += d.cache_read_input_tokens;
+            sum.cache_creation_input_tokens += d.cache_creation_input_tokens;
+            max.input_tokens = @max(max.input_tokens, r.input_tokens);
+            max.output_tokens = @max(max.output_tokens, r.output_tokens);
+            max.cache_read_input_tokens = @max(max.cache_read_input_tokens, r.cache_read_input_tokens);
+            max.cache_creation_input_tokens = @max(max.cache_creation_input_tokens, r.cache_creation_input_tokens);
+        }
+        try std.testing.expectEqual(max.input_tokens, sum.input_tokens);
+        try std.testing.expectEqual(max.output_tokens, sum.output_tokens);
+        try std.testing.expectEqual(max.cache_read_input_tokens, sum.cache_read_input_tokens);
+        try std.testing.expectEqual(max.cache_creation_input_tokens, sum.cache_creation_input_tokens);
+    }
+}
+
+/// Replays one Anthropic SSE response and returns the usage events it emitted.
+fn replayUsageEvents(sse: []const u8, out: []UsageDelta) ![]UsageDelta {
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(std.testing.allocator);
+    var n: usize = 0;
+    while (try it.next(std.testing.allocator)) |ev| {
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .usage => |u| {
+                out[n] = u;
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return out[0..n];
+}
+
+const usage_sse_text_block =
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+
+test "EventIterator: message_delta usage is cumulative — its event carries only what it adds" {
+    // The streaming documentation's own example: 25 in / 1 out at message_start,
+    // a final total of 15 out.
+    const sse =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n" ++
+        usage_sse_text_block ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var buf: [4]UsageDelta = undefined;
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{ .input_tokens = 25, .output_tokens = 1 },
+        .{ .output_tokens = 14 },
+    }, try replayUsageEvents(sse, &buf));
+}
+
+test "EventIterator: several cumulative message_deltas with input and cache counters count each token once" {
+    const sse =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"usage\":{\"input_tokens\":2679,\"cache_read_input_tokens\":120,\"output_tokens\":3}}}\n\n" ++
+        usage_sse_text_block ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":200}}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10682,\"cache_read_input_tokens\":120,\"output_tokens\":510}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var buf: [4]UsageDelta = undefined;
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{ .input_tokens = 2679, .cache_read_input_tokens = 120, .output_tokens = 3 },
+        .{ .output_tokens = 197 },
+        .{ .input_tokens = 8003, .output_tokens = 310 },
+    }, try replayUsageEvents(sse, &buf));
+}
+
+test "EventIterator: a zero message_start placeholder leaves the whole message_delta report" {
+    const sse =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_3\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
+        usage_sse_text_block ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1200,\"output_tokens\":80,\"cache_read_input_tokens\":9000}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var buf: [4]UsageDelta = undefined;
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{},
+        .{ .input_tokens = 1200, .output_tokens = 80, .cache_read_input_tokens = 9000 },
+    }, try replayUsageEvents(sse, &buf));
 }
 
 test "EventIterator: an unrecognized stop_reason still counts as reported" {

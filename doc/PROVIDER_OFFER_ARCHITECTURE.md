@@ -386,7 +386,14 @@ separate credential stage: the accounts already are offers.
 
 Because the offer names the credential, binding uses **that** member — not the
 pool's highest-priority one. Resolving to a different account would make the
-offer id identify a route the request does not take.
+offer id identify a route the request does not take. A member whose variable
+is unset leaves its route without a credential (`MissingCredentials`): not the
+next member, not the provider's own variable, not a stored key.
+
+A pool is one provider's. Each member carries the provider whose
+`providers.<id>.credentials[]` declared it, and neither binding nor pool
+selection offers it to another provider's route, whatever kind that
+provider's profile accepts.
 
 Selection among unbound members is deterministic: priority first, then id, so
 configuration order cannot make a failover irreproducible. A member is skipped
@@ -541,7 +548,13 @@ the token that was valid then; a session that runs past its expiry would keep
 presenting it and start failing with 401s that look like a broken key. Single
 flight means concurrent turns still perform one exchange, and every borrower —
 clients, subagent registry, swarm context — is repointed before the old bytes
-are released, because a background request thread reads them.
+are released, because a background request thread reads them. It renews the
+credential of the route the clients are bound to (the last commit's, or the
+one the session started on), and only when that route was bound with its
+OAuth token: the kernel's effective selection can name another route (a
+global or once pick under a session one), and a key or a pool account a route
+was bound with stays. A transport's own refresh on a 401 `token_expired` is
+dropped when the route moved while it ran.
 
 The module performs no I/O. The token exchange is a caller-supplied function, so
 every lifecycle test drives a fake exchange and none needs a network;
@@ -798,7 +811,10 @@ Scope is explicit: `once` applies to the next turn and expires, `session`
 affects one session, `global` is durable after an explicit action. Each turn
 snapshots the committed selection at its start, so a mid-stream commit affects
 only the next turn. Mutations carry expected revisions; a stale write is a
-structured conflict, never last-writer-wins.
+structured conflict, never last-writer-wins. A commit the host cannot bind (no
+credential for the route, say) is reverted: its scope holds what it held
+before (`Kernel.revertCommit`), the journal records `runtime.switch_failed`
+with `binding_failed`, and the session stays on the route it was on.
 
 Event payloads are ids and enums only. There is deliberately no free-form string
 field a prompt, token, or provider body could travel in. An evicted cursor is

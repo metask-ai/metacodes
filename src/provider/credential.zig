@@ -320,7 +320,8 @@ pub const ResolveInput = struct {
     /// Persisted API key and OAuth material from the credential store.
     stored_api_key: ?StoredEntry = null,
     stored_oauth: ?StoredEntry = null,
-    /// Additional credentials for this provider, in no particular order. The
+    /// Additional credentials for this provider, in no particular order; a
+    /// member of another provider's pool is never chosen. The
     /// pool is consulted after the single stored entries above and ordered by
     /// `poolOrder`, so an existing single-credential setup resolves exactly as
     /// it did before this field existed.
@@ -413,6 +414,10 @@ pub fn resolve(input: ResolveInput, ref_id_buffer: []u8) ResolveError!Resolved {
 /// collapse two accounts of the same kind into one reference — which is exactly
 /// what makes a cooldown apply to the wrong credential.
 pub const PoolEntry = struct {
+    /// The provider whose pool holds this member. Resolution offers it to that
+    /// provider's routes only: an API key is one vendor's, whatever kind the
+    /// other vendor's profile happens to accept.
+    provider_id: Slug,
     id: Slug,
     kind: CredentialKind,
     secret: []const u8,
@@ -457,6 +462,7 @@ pub fn poolOrder(a: PoolEntry, b: PoolEntry) bool {
 pub fn selectFromPool(input: ResolveInput) ResolveError!?PoolEntry {
     var best: ?PoolEntry = null;
     for (input.pool) |candidate| {
+        if (!candidate.provider_id.eql(input.provider_id)) continue;
         if (!isAccepted(input.accepted_kinds, candidate.kind)) continue;
         if (!candidate.reference(input.provider_id).isUsableAt(input.now_seconds)) continue;
         if (candidate.expires_at) |expiry| {
@@ -934,9 +940,9 @@ test "the pool picks by priority, then deterministically by id" {
     const provider = Slug.lit("openai");
     const kinds = [_]CredentialKind{.api_key};
     const pool = [_]PoolEntry{
-        .{ .id = Slug.lit("cred-b"), .kind = .api_key, .secret = "sk-b", .priority = 1 },
-        .{ .id = Slug.lit("cred-a"), .kind = .api_key, .secret = "sk-a", .priority = 1 },
-        .{ .id = Slug.lit("cred-first"), .kind = .api_key, .secret = "sk-first", .priority = 0 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-b"), .kind = .api_key, .secret = "sk-b", .priority = 1 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-a"), .kind = .api_key, .secret = "sk-a", .priority = 1 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-first"), .kind = .api_key, .secret = "sk-first", .priority = 0 },
     };
     var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
     const resolved = try resolve(.{
@@ -961,10 +967,10 @@ test "a cooling, invalid, or expired member is skipped, and the next one is used
     const provider = Slug.lit("openai");
     const kinds = [_]CredentialKind{.api_key};
     const pool = [_]PoolEntry{
-        .{ .id = Slug.lit("cred-cooling"), .kind = .api_key, .secret = "sk-cool", .priority = 0, .cooldown_until = 5_000 },
-        .{ .id = Slug.lit("cred-invalid"), .kind = .api_key, .secret = "sk-bad", .priority = 1, .status = .invalid },
-        .{ .id = Slug.lit("cred-expired"), .kind = .api_key, .secret = "sk-old", .priority = 2, .expires_at = 900 },
-        .{ .id = Slug.lit("cred-good"), .kind = .api_key, .secret = "sk-good", .priority = 3 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-cooling"), .kind = .api_key, .secret = "sk-cool", .priority = 0, .cooldown_until = 5_000 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-invalid"), .kind = .api_key, .secret = "sk-bad", .priority = 1, .status = .invalid },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-expired"), .kind = .api_key, .secret = "sk-old", .priority = 2, .expires_at = 900 },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-good"), .kind = .api_key, .secret = "sk-good", .priority = 3 },
     };
     var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
     const resolved = try resolve(.{
@@ -989,7 +995,7 @@ test "a cooling, invalid, or expired member is skipped, and the next one is used
 }
 
 test "a failure class decides cooldown versus invalidation" {
-    const entry = PoolEntry{ .id = Slug.lit("cred-a"), .kind = .api_key, .secret = "sk" };
+    const entry = PoolEntry{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-a"), .kind = .api_key, .secret = "sk" };
 
     const limited = noteFailure(entry, .rate_limited, 1_000, 60);
     try std.testing.expectEqual(@as(?i64, 1_060), limited.cooldown_until);
@@ -1012,7 +1018,7 @@ test "a failure class decides cooldown versus invalidation" {
 test "a pool cannot widen provider scope or supply an unaccepted kind" {
     const kinds = [_]CredentialKind{.metask_oauth};
     const pool = [_]PoolEntry{
-        .{ .id = Slug.lit("cred-openai"), .kind = .api_key, .secret = "sk-openai" },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-openai"), .kind = .api_key, .secret = "sk-openai" },
     };
     var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
     // The pool is provider-scoped input; a kind the profile does not accept is
@@ -1024,12 +1030,39 @@ test "a pool cannot widen provider scope or supply an unaccepted kind" {
     }, &buffer));
 }
 
+test "a pool member answers only for the provider whose pool holds it" {
+    const kinds = [_]CredentialKind{.api_key};
+    const pool = [_]PoolEntry{
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("work"), .kind = .api_key, .secret = "sk-openai-work" },
+    };
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    // DeepSeek takes a plain API key too. The kind matching is not enough: the
+    // key is OpenAI's, and DeepSeek with no key of its own has none.
+    try std.testing.expectError(error.MissingCredentials, resolve(.{
+        .provider_id = Slug.lit("deepseek"),
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+    }, &buffer));
+    try std.testing.expect((try selectFromPool(.{
+        .provider_id = Slug.lit("deepseek"),
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+    })) == null);
+
+    const own = try resolve(.{
+        .provider_id = Slug.lit("openai"),
+        .accepted_kinds = &kinds,
+        .pool = &pool,
+    }, &buffer);
+    try std.testing.expectEqualStrings("sk-openai-work", own.secret);
+}
+
 test "the pool never preempts an explicit or environment credential" {
     const provider = Slug.lit("openai");
     const kinds = [_]CredentialKind{.api_key};
     const aliases = [_]EnvAlias{.{ .name = "OPENAI_API_KEY", .kind = .api_key, .canonical = true }};
     const pool = [_]PoolEntry{
-        .{ .id = Slug.lit("cred-pool"), .kind = .api_key, .secret = "sk-pool" },
+        .{ .provider_id = Slug.lit("openai"), .id = Slug.lit("cred-pool"), .kind = .api_key, .secret = "sk-pool" },
     };
     var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
 

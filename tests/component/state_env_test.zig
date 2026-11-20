@@ -719,9 +719,53 @@ test "state .env: a catalog refresh reads its credential_env from it (#486)" {
 
 /// The picker as it is drawn, monochrome, 160 columns wide.
 fn drawPicker(app: *App, buffer: []u8) []const u8 {
+    return drawPickerAt(app, buffer, 160);
+}
+
+/// The picker as it is drawn, monochrome, `cols` columns wide.
+fn drawPickerAt(app: *App, buffer: []u8, cols: usize) []const u8 {
     var writer = std.Io.Writer.fixed(buffer);
-    _ = cc.repl_model_picker_view.render(&app.model_picker, &writer, cc.tui_theme.monochrome, 160);
+    _ = cc.repl_model_picker_view.render(&app.model_picker, &writer, cc.tui_theme.monochrome, cols);
     return writer.buffered();
+}
+
+/// What a drawn picker shows, as text: every row without its escape
+/// sequences and the blanks around it, and a `\n` after it.
+fn screenOf(arena: std.mem.Allocator, drawn: []const u8) ![]const u8 {
+    const plain = try cc.tui_test_capture.stripAnsi(arena, drawn);
+    var out: std.ArrayList(u8) = .empty;
+    var rows = std.mem.splitSequence(u8, plain, "\r\n");
+    try out.appendSlice(arena, std.mem.trim(u8, rows.first(), " "));
+    while (rows.next()) |row| {
+        try out.append(arena, '\n');
+        try out.appendSlice(arena, std.mem.trim(u8, row, " "));
+    }
+    return out.items;
+}
+
+const Span = struct { start: usize, end: usize };
+
+/// Where `sentence` is on `screen` (`screenOf`), read on over the row ends
+/// as the user reads it. The picker breaks a line at a space, and a word
+/// longer than a row (a path, a link) where the row ends, so a row end
+/// either stands for a space of the sentence or falls inside one of its
+/// words. `null` when it is not there.
+fn findAcrossRows(screen: []const u8, sentence: []const u8) ?Span {
+    for (0..screen.len) |start| {
+        // A sentence starts on a row, not at the end of the one before.
+        if (screen[start] == '\n') continue;
+        var at = start;
+        const found = for (sentence) |byte| {
+            if (at < screen.len and screen[at] == '\n') {
+                at += 1;
+                if (byte == ' ') continue;
+            }
+            if (at >= screen.len or screen[at] != byte) break false;
+            at += 1;
+        } else true;
+        if (found) return .{ .start = start, .end = at };
+    }
+    return null;
 }
 
 /// Filter the picker to `provider`, as a user who types its name, and put
@@ -744,21 +788,54 @@ fn cursorOnProvider(app: *App, ui: *cc.tui_ui_state.UiState, provider: []const u
     return error.ProviderNotListed;
 }
 
-fn expectSetupOf(text: []const u8, variable: []const u8, env_path: []const u8) !void {
-    var expected_buf: [1024]u8 = undefined;
-    for ([_][]const u8{
-        try std.fmt.bufPrint(&expected_buf, "Set {s} in {s}, then restart", .{ variable, env_path }),
-        "How to: https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md",
-        "esc back · q close",
-    }) |needle| {
-        testing.expect(std.mem.indexOf(u8, text, needle) != null) catch |err| {
-            std.debug.print("missing from the picker: {s}\n{s}\n", .{ needle, text });
-            return err;
-        };
+/// The picker is the setup of a provider that has no key (#483): it names
+/// `variable` and the file to put it in, the guide and the keys that leave;
+/// not the bare error name, and no way to type a key in.
+fn expectSetupOf(arena: std.mem.Allocator, app: *App, variable: []const u8, env_path: []const u8) !void {
+    const where_to = try std.fmt.allocPrint(arena, "Set {s} in {s}, then restart", .{ variable, env_path });
+    const guide = "How to: https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md";
+    const keys = "esc back · q close";
+
+    // 160 columns hold what names no path on a row of its own, in any
+    // checkout. The sentence naming this install's `.env` is as long as the
+    // checkout's path makes it (the scratch state root is under its
+    // `.zig-cache`): one row in a short checkout, more in a longer one. So
+    // that sentence is read on over the row ends.
+    var wide_buffer: [16384]u8 = undefined;
+    const wide = try screenOf(arena, drawPicker(app, &wide_buffer));
+    try expectContains(wide, guide);
+    try expectContains(wide, keys);
+    try expectNoErrorNameNoKeyEntry(wide, try expectAcrossRows(wide, where_to));
+
+    // 40 columns hold neither the path nor the link on one row, in any
+    // checkout: the reading a long checkout needs at 160 is exercised in a
+    // short one too.
+    var narrow_buffer: [16384]u8 = undefined;
+    const narrow = try screenOf(arena, drawPickerAt(app, &narrow_buffer, 40));
+    _ = try expectAcrossRows(narrow, guide);
+    try expectContains(narrow, keys);
+    try expectNoErrorNameNoKeyEntry(narrow, try expectAcrossRows(narrow, where_to));
+}
+
+/// `sentence` is on `screen`, whichever rows it is on; returns where.
+fn expectAcrossRows(screen: []const u8, sentence: []const u8) !Span {
+    return findAcrossRows(screen, sentence) orelse {
+        std.debug.print("missing from the picker: {s}\n{s}\n", .{ sentence, screen });
+        return error.TestUnexpectedResult;
+    };
+}
+
+/// Not the bare error name, and no way to type a key in, anywhere on
+/// `screen` but in the sentence at `path_sentence`: that one holds the
+/// checkout's path, and a checkout can be named anything.
+fn expectNoErrorNameNoKeyEntry(screen: []const u8, path_sentence: Span) !void {
+    for ([_][]const u8{ screen[0..path_sentence.start], screen[path_sentence.end..] }) |rest| {
+        for ([_][]const u8{ "MissingCredentials", "paste" }) |gone| {
+            if (findAcrossRows(rest, gone) == null) continue;
+            std.debug.print("`{s}` must not be on the picker:\n{s}\n", .{ gone, screen });
+            return error.TestUnexpectedResult;
+        }
     }
-    // Not the bare error name, and no way to type a key in.
-    try testing.expect(std.mem.indexOf(u8, text, "MissingCredentials") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "paste") == null);
 }
 
 test "state .env: a provider with no key is not listed, and nothing leads to its setup (#483, #488)" {
@@ -852,7 +929,7 @@ test "state .env: a pick whose key went away after the picker opened shows the p
     var buffer: [16384]u8 = undefined;
     const text = drawPicker(app, &buffer);
     try testing.expect(std.mem.indexOf(u8, text, "no credential for kimi; the previous route is still active") != null);
-    try expectSetupOf(text, "MOONSHOT_API_KEY", try std.fs.path.join(a, &.{ case.state, ".env" }));
+    try expectSetupOf(a, app, "MOONSHOT_API_KEY", try std.fs.path.join(a, &.{ case.state, ".env" }));
     try testing.expectEqualStrings("claude-sonnet-4-6", app.activeModel());
     // Esc goes back to the model the user was applying, in the list.
     _ = cc.repl_picker_host.onKey(app, &ui, .escape, .unguarded);

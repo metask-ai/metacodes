@@ -637,6 +637,44 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Token and cost totals no longer count part of a streamed response
+  twice.** A provider reports a response's usage as a running total:
+  Anthropic's `message_delta.usage` is cumulative and follows a
+  `message_start` that already counted the prompt and the first output
+  tokens, some OpenAI-compatible servers attach the usage so far to every
+  chunk, and Gemini repeats `usageMetadata`. Each report was added to the
+  totals as if it were an increment. On the streaming documentation's own
+  examples that is 16 output tokens for a response of 15, and 13361 input /
+  513 output for one of 10682 / 510, about 20% more cost. `/cost`, the token
+  and cost fields of `--json`, the cost budget, the goal meter and AgentCore
+  `usage` events all read those totals. Each provider stream (Messages,
+  Chat Completions, Responses, Gemini, Bedrock Converse) now hands on only
+  what a report adds to the highest count the response has reported so far,
+  so a response's `usage` events add up to the provider's totals however
+  many reports carried them. The per-request view behind the context anchor
+  and the prompt-cache diagnostics already took the highest report and does
+  not change.
+
+- **Behind a proxy, the end of a model's answer is no longer lost, and the
+  turn is no longer sent again for it** (#573). Every request to a model
+  provider said `connection: close`, so the server closed the connection
+  right after the last byte, and behind a transparent proxy that close could
+  overtake bytes the proxy had not forwarded yet. On the Responses wire the
+  last event is the largest (it echoes the instructions and tools, over
+  100 KB), so it was the one cut: the stream counted as incomplete, and the
+  turn was sent again and charged again, twice in the TUI and up to four
+  times with `-p`. On one proxied route on 2026-11-18 this hit 3% to 23% of
+  real streams, and 74% of a large page fetched with `connection: close`
+  against none with keep-alive. The Messages, OpenAI-compatible (Chat
+  Completions and Responses), Gemini and Bedrock requests, and the Messages
+  `/v1/models` list, now say `connection: keep-alive`: the server leaves the
+  connection open, and the client closes it once it has read what it needs,
+  still without reusing it. A `/v1/models` list cut short no longer reads as
+  a complete, shorter one. A stream that ends without its stop report still
+  counts as incomplete. A `204` or `304` error answer is reported at once
+  instead of being read to the end of the connection. Other requests (MCP,
+  TinyKG, sealed skills, the System-One advisor, OTLP export) are unchanged.
+
 - **`/providers remove <id>` no longer leaves a defined provider behind.** For
   a provider defined in `custom_providers` it removed only its settings
   (`providers.<id>`), so the definition stayed in `config.json` and the
@@ -845,6 +883,68 @@ status, compatibility boundaries, and entry points are defined by
   it held from the login replaced: it kept presenting them, even after a
   `/model` pick, and a refresh of them was written over the new login. A
   session on another provider, or on no route, is left as it is.
+
+- **A credential pool member authenticates only its own provider's
+  routes.** `config.json`'s `providers.<id>.credentials[]` were read as one
+  list for every provider, and a member was chosen by kind alone: a provider
+  with no key of its own (DeepSeek, say) was given another provider's member
+  whenever its profile accepted that kind, and its requests carried it to
+  that provider's endpoint. A route that names an account fell back to
+  another credential when that account's variable was unset: another
+  account's, the provider's own variable, or a stored key. Each provider now
+  reads only its own pool, and a route that names an account uses that
+  account or fails with `MissingCredentials`.
+
+- **A `/model` switch that cannot be applied leaves the session's route
+  where it was.** The kernel recorded the new route before the session bound
+  it and kept it when binding failed (no credential, for instance), and the
+  process's OAuth session had already moved to the new provider. The next
+  turn's token refresh read both: once that provider's token endpoint
+  answered, its token went into the clients still pointed at the previous
+  route's endpoint. A failed bind now puts back the kernel's selection
+  (journalled as a failed switch, `binding_failed`) and the previous OAuth
+  session; a resumed session's stored route is restored the same way.
+
+- **The turn's token refresh renews only the credential the session's route
+  was bound with.** It refreshed the provider of the kernel's effective
+  selection and put that token in the clients, whatever route they were on.
+  After a `/model` pick in the global or once scope (Tab), a narrower scope
+  still named the previous route, so a Metask device session that picked a
+  relay that way sent the Metask token to the relay every turn; a route
+  bound to a pool account or to a key had it replaced by the provider's
+  OAuth token. The refresh now follows the route the clients were last bound
+  to (before any pick, the one the session started on) and replaces only an
+  OAuth token that route was bound with.
+
+- **The Metask token refresh runs only on a route the Metask device sign-in
+  authenticates.** The refresh a device-code session installs at startup
+  stayed on the clients after a `/model` switch to another provider, so an
+  endpoint that answered 401 with `"code":"token_expired"` received the
+  request again with the Metask access token. A route switch now installs or
+  removes it with the route, and it answers only while the process's OAuth
+  session is Metask's.
+
+- **A token refreshed while the route moved is not sent on the new route.**
+  When a 401 `token_expired` refresh finished after a `/model` commit (made
+  from the reply's key thread) had moved the client, the refreshed token was
+  installed and the request replayed at the new route. The client now drops
+  it, and the request fails as unauthorized.
+
+- **The `/models` key list is requested only on the Metask API-key route.**
+  It was requested with the Metask sign-in token from `auth.json`, at
+  `/api/v1/keys` under whatever endpoint the session was on: typing `/model`
+  after a switch to another Messages-wire provider, or in a session started
+  on one, sent that token there. Elsewhere the menu now shows the list as
+  unavailable; leaving the Metask route drops a loaded list, and coming back
+  loads it again. A Metask model picked at another Metask gateway (the
+  compiled default, say) is still the Metask route.
+
+- **A key picked in `/models` stays on the Metask route.** The pick was
+  installed in every client and in the background job registry, and its
+  `/v1/models` probe sent, whatever route the session was on. Off the Metask
+  API-key route it is now refused (`NotOnMetaskKeyRoute`), and on it only the
+  route's own client takes it. The key it replaces stays readable for one
+  more pick instead of being freed while a client may still read it.
 
 ### Security
 

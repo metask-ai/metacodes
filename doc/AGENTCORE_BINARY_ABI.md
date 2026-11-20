@@ -546,7 +546,12 @@ No other path emits it (see "Stream retry budget").
 `stream_done` means only that one Provider stream ended; it neither closes nor
 classifies an output segment. Hosts must not reconstruct final-output semantics
 from Tool boundaries or Provider stop edges. Usage events are exact deltas and
-must use checked arithmetic.
+must use checked arithmetic. Providers report a response's usage as running
+totals — Anthropic's cumulative `message_delta` after a `message_start` that
+already counted part of it, OpenAI-compatible usage objects repeated on several
+chunks, repeated Gemini `usageMetadata` — and AgentCore emits only what each
+report adds, so a Run's `usage` events sum to the provider's per-response
+totals, not to the sum of its reports.
 
 `file_changes` is emitted once for each typed file-tool call after the turn's
 Tools have completed and before the corresponding `tool_result`. Its `id` is

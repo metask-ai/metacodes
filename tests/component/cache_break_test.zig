@@ -5,10 +5,18 @@ const cc = @import("cc");
 
 const Detector = cc.cache_break.CacheBreakDetector;
 
+/// Feeds one provider report the way a stream does: through the response's
+/// cursor into the response's usage view.
+fn observeReport(cursor: *cc.api_stream.UsageReportCursor, usage: *cc.cache_break.ResponseUsage, report: cc.api_stream.UsageReport) void {
+    const d = cursor.increment(report);
+    usage.observe(d.input_tokens, d.output_tokens, d.cache_read_input_tokens, d.cache_creation_input_tokens);
+}
+
 test "L2 usage fragments aggregate once per response" {
+    var cursor = cc.api_stream.UsageReportCursor{};
     var usage = cc.cache_break.ResponseUsage{};
-    usage.observe(0, 0, 0, 0); // GLM-compatible message_start placeholder
-    usage.observe(1200, 80, 9000, 0); // complete message_delta snapshot
+    observeReport(&cursor, &usage, .{}); // GLM-compatible message_start placeholder
+    observeReport(&cursor, &usage, .{ .input_tokens = 1200, .output_tokens = 80, .cache_read_input_tokens = 9000 }); // complete message_delta snapshot
     try std.testing.expect(usage.has_metering);
     try std.testing.expectEqual(@as(u64, 1200), usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 80), usage.output_tokens);
@@ -16,9 +24,20 @@ test "L2 usage fragments aggregate once per response" {
     try std.testing.expectEqual(@as(u64, 10200), usage.promptTokens());
 
     // Official Anthropic may split input/cache and output across fragments.
-    usage.observe(0, 120, 0, 0);
+    observeReport(&cursor, &usage, .{ .output_tokens = 120 });
     try std.testing.expectEqual(@as(u64, 120), usage.output_tokens);
     try std.testing.expectEqual(@as(u64, 9000), usage.cache_read_tokens);
+}
+
+test "L2 usage view of a response is the provider's total, not the sum of its reports" {
+    var cursor = cc.api_stream.UsageReportCursor{};
+    var usage = cc.cache_break.ResponseUsage{};
+    // message_start, then cumulative message_deltas (the documented web-search shape).
+    observeReport(&cursor, &usage, .{ .input_tokens = 2679, .output_tokens = 3 });
+    observeReport(&cursor, &usage, .{ .output_tokens = 200 });
+    observeReport(&cursor, &usage, .{ .input_tokens = 10682, .output_tokens = 510 });
+    try std.testing.expectEqual(@as(u64, 10682), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 510), usage.output_tokens);
 }
 
 test "L2 击穿: 首次无基线 → null" {
