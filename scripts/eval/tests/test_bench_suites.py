@@ -137,6 +137,7 @@ class CatalogTest(unittest.TestCase):
         expected = {"humaneval": "代码生成", "mbpp": "基础编程", "alfworld": "交互规划", "searchqa": "问答",
                     "livemath": "数学推理", "aime": "竞赛数学", "aime-2025": "竞赛数学",
                     "terminal-bench-2.0": "终端工程", "terminal-bench-2.1": "终端工程",
+                    "frontier-harness-eval-1.1": "终端工程",
                     "gaia2-cli": "通用 Agent", "workbuddy-code": "办公 Agent"}
         for suite_id, category in expected.items():
             self.assertEqual(categories[suites.get(suite_id).category], category, suite_id)
@@ -149,6 +150,9 @@ class CatalogTest(unittest.TestCase):
         # Hub tasks are matched as org/name, legacy-registry ones by bare name.
         self.assertEqual(suites.task_filters(tb21, ["fix-git"]), ["terminal-bench/fix-git"])
         self.assertEqual(suites.task_filters(tb20, ["fix-git"]), ["fix-git"])
+        fhe = suites.get("frontier-harness-eval-1.1")
+        self.assertEqual((len(fhe.tasks), fhe.dataset), (62, "frontier-harness-eval/frontier-harness-eval@v1.1.0"))
+        self.assertEqual(suites.task_filters(fhe, ["mvcc-lsm-compaction"]), ["terminal-bench/mvcc-lsm-compaction"])
         aime, aime25 = suites.get("aime"), suites.get("aime-2025")
         self.assertEqual((aime.dataset, aime25.dataset), ("aime@1.0", "aime@1.0"))
         self.assertEqual(len(aime.tasks), 60)
