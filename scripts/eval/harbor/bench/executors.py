@@ -334,9 +334,25 @@ def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=F
     return argv
 
 
-def node_argv(executor: SshExecutor, *args: str, reverse: Optional[Tuple[int, int]] = None) -> List[str]:
+def node_prelude(executor: SshExecutor, binary: Optional[str] = None) -> str:
+    """Shell that sets $n to the executor's node and hands it the configured
+    Python. The node is `binary`, else setup's entry, else a `metacodes`
+    already on the executor's PATH; the probe and every node command share
+    this, so whatever the probe found is what runs."""
+    q = shlex.quote
+    find = (f"n={q(binary)}" if binary else
+            f'n={q(executor.node)}; [ -x "$n" ] || n=$(command -v metacodes 2>/dev/null)')
+    return (find + f"; py=$(command -v {q(executor.python)} 2>/dev/null); "
+            'if [ -n "$py" ]; then METACODES_BENCH_PYTHON=$py; export METACODES_BENCH_PYTHON; fi; ')
+
+
+def node_argv(executor: SshExecutor, *args: str, reverse: Optional[Tuple[int, int]] = None,
+              binary: Optional[str] = None) -> List[str]:
     """`ssh` argv running `metacodes bench node <args>` on the executor."""
-    return ssh_argv(executor, [executor.node, "bench", "node", *args], reverse=reverse)
+    script = (path_prefix() + node_prelude(executor, binary) +
+              '[ -n "$n" ] || { echo "metacodes node not found" >&2; exit 127; }; '
+              'exec "$n" bench node ' + shlex.join(args))
+    return ssh_argv(executor, ["sh", "-c", script], reverse=reverse)
 
 
 def shell_argv(executor: Executor, script: str) -> List[str]:
@@ -377,8 +393,8 @@ echo "tar=$(command -v tar 2>/dev/null)"
 echo "brew=$(command -v brew 2>/dev/null)"
 echo "colima=$(command -v colima 2>/dev/null)"
 if sudo -n true 2>/dev/null; then echo "sudo=1"; else echo "sudo=0"; fi
-n=NODE
-if [ -x "$n" ]; then echo "node=$("$n" bench node info --json --peer PEER 2>/dev/null)"; fi
+NODE_PRELUDE
+if [ -n "$n" ] && [ -x "$n" ]; then echo "node=$("$n" bench node info --json --peer PEER 2>/dev/null)"; fi
 if command -v ip >/dev/null 2>&1; then
   echo "docker0=$(ip -4 -o addr show docker0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\).*/\1/p' | head -n 1)"
 fi
@@ -390,9 +406,9 @@ def probe_script(executor: Executor) -> str:
     candidates += ["harbor", "$HOME/.local/bin/harbor"]
     quoted = " ".join(shlex.quote(c) if not c.startswith("$HOME") else '"' + c + '"' for c in candidates)
     python = executor.python if isinstance(executor, SshExecutor) else "python3"
-    node = executor.node if isinstance(executor, SshExecutor) else ""
     script = PROBE.replace("HARBOR_CANDIDATES", quoted).replace("PYTHON", shlex.quote(python))
-    return script.replace("NODE", shlex.quote(node)).replace("PEER", shlex.quote(workbench_name()))
+    script = script.replace("PEER", shlex.quote(workbench_name()))
+    return script.replace("NODE_PRELUDE", node_prelude(executor) if isinstance(executor, SshExecutor) else "n=")
 
 
 def workbench_name() -> str:
@@ -527,6 +543,15 @@ def reasons(executor: Executor, facts: Dict) -> List[str]:
     if not facts.get("openssl"):
         result.append("未找到 OpenSSL（凭据 relay 需要）" + setup)
     return result
+
+
+def reach_reasons(executor: SshExecutor, facts: Dict) -> List[str]:
+    """What keeps the workbench from reaching a compatible node; suites the
+    node prepares itself (WorkBuddy) add only the node's own report."""
+    if facts.get("error"):
+        return reasons(executor, facts)
+    problem = node_problem(executor, facts)
+    return [problem] if problem else []
 
 
 def docker_reasons(facts: Dict, setup: str) -> List[str]:
@@ -1009,7 +1034,12 @@ class RemoteRun:
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
         if self.spec.get("runner") == "workbuddy":
+            # The node refuses a checkout whose staged metacodes is not the
+            # executable of the bundle this run's record names.
+            from scripts.eval.harbor.bench.setup import sha256_file
+            bundle = self.spec.get("bundle")
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
+                    "metacodes_sha256": sha256_file(Path(bundle) / "bin/metacodes") if bundle else None,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
                                                      "reasoning_effort", "account_gateway")}}
         run_dir = self.executor.remote("runs", self.spec["name"])
@@ -1258,6 +1288,11 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
     if record.get("status") in ACTIVE and fresh:
         raise ValueError(name + " 仍在运行；它结束时会自己同步结果")
     remote = RemoteRun(spec, log=log)
+    # Results left by a workbench from before nodes: say how to install one.
+    facts = probe(remote.executor)
+    problem = "；".join(reach_reasons(remote.executor, facts))
+    if problem:
+        raise ValueError(problem)
     job = remote.job_sync()
     deadline = time.monotonic() + (RemoteRun.FINAL_SYNC_TIMEOUT if timeout is None else timeout)
     complete = False

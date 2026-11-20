@@ -445,8 +445,9 @@ async function renderNewBatch() {
   const form = h('form', { class: 'run-form' });
 
   const executor = h('select', { name: 'executor', onchange: () => {
-    state.executor = executor.value; drawNotes(); drawPicker(); drawBoxes(); syncSubmit();
-    for (const id of state.batchPick.keys()) loadTasks(id);
+    state.executor = executor.value;
+    for (const id of state.batchPick.keys()) { state.batchPick.set(id, null); loadTasks(id); }
+    drawNotes(); drawPicker(); drawBoxes(); syncSubmit();
   } }, executorsList.map((e) => h('option', { value: e.name, selected: e.name === state.executor },
     e.label + (e.ready ? '' : ' · 待配置'))));
   const bundles = c.bundles || [];
@@ -538,12 +539,14 @@ async function renderNewBatch() {
       : [h('div', { class: 'empty', text: '在上面点选一个或多个评测集加入批次。' })]));
   }
   async function loadTasks(id) {
+    const wanted = state.executor;
     let entry = { tasks: [], defaults: [], selected: new Set(), error: null };
     try {
-      const body = await api('/api/suite?id=' + encodeURIComponent(id) + '&executor=' + encodeURIComponent(state.executor || ''));
+      const body = await api('/api/suite?id=' + encodeURIComponent(id) + '&executor=' + encodeURIComponent(wanted || ''));
       entry = { tasks: body.tasks || [], defaults: body.default_tasks || [], selected: new Set(body.default_tasks || []), error: body.error || null };
     } catch (e) { entry.error = e.message; }
-    if (state.batchPick.has(id)) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
+    // A list asked for another executor (switched meanwhile) is not this one's.
+    if (state.batchPick.has(id) && state.executor === wanted) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
   }
   attempts.addEventListener('input', syncSubmit);
 

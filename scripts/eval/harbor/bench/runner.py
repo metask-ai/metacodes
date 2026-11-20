@@ -143,6 +143,8 @@ class RunManager:
             states.append({**public, "ready": not problems, "reasons": problems,
                            "default": executor.name == default, "harbor": facts.get("harbor") or None,
                            "node": {k: node.get(k) for k in ("version", "host")} if node else None,
+                           "node_reach": executors.reach_reasons(executor, facts)
+                           if isinstance(executor, executors.SshExecutor) else [],
                            "node_workbuddy": (node or {}).get("workbuddy") or {}})
         # A malformed entry is shown, not ready, without hiding the others.
         for name, problem in invalid:
@@ -185,6 +187,26 @@ class RunManager:
             raise suites.Unavailable(f"{executor.name}：" + "；".join(reasons))
         return list(entry["tasks"])
 
+    def staged_metacodes_problem(self, suite, executor_name, bundle):
+        """Why an SSH WorkBuddy run would not run the metacodes its record
+        names (the run's bundle): the node's staged executable differs."""
+        if suite.runner != suites.WORKBUDDY or not bundle:
+            return None
+        executor = executors.find(settings(self.config_path), executor_name)
+        if executor.kind != "ssh":
+            return None
+        from scripts.eval.harbor.bench.setup import sha256_file
+        try:
+            expected = sha256_file(Path(bundle) / "bin/metacodes")
+        except OSError:
+            return "所选 metacodes 发行包缺少 bin/metacodes"
+        staged = (self.executor_facts(executor).get("node") or {}).get("workbuddy_metacodes_sha256")
+        if staged == expected:
+            return None
+        return (f"{executor.name} 上 WorkBuddy 暂存的 metacodes（sha256 {(staged or '未知')[:12]}）"
+                f"不是本次选择的版本（sha256 {expected[:12]}）：请在该机器上用这个发行包的 bin/metacodes "
+                "重新运行 scripts.eval.workbuddy.stage_artifacts，或选择与暂存制品一致的版本")
+
     def suite_tasks(self, suite_id, executor=None):
         suite = suites.resolved(suites.get(suite_id))
         try:
@@ -215,7 +237,7 @@ class RunManager:
                 if state["kind"] == "ssh":
                     # Prepared on the node itself: its own checkout, Docker
                     # and task list; this machine adds only its sign-in mode.
-                    combo = state["reasons"] + (state["node_workbuddy"].get(suite.id) or {}).get("reasons", [])
+                    combo = state["node_reach"] + (state["node_workbuddy"].get(suite.id) or {}).get("reasons", [])
                     here = [] if ctx.auth_mode() == "metask" else ["WorkBuddy 评测目前只支持 Metask 账号模式（--auth metask）"]
             else:
                 combo = harbor_reasons + state["reasons"]
@@ -305,7 +327,7 @@ class RunManager:
         default_entry = next(e for e in catalog_suites if e["id"] == suites.DEFAULT_SUITE)
         reasons = list(default_entry["reasons"])
         return {"service": "metacodes-bench", "schema_version": 1,
-                "executors": [{k: v for k, v in s.items() if k not in ("harbor", "node_workbuddy")} for s in states],
+                "executors": [{k: v for k, v in s.items() if k not in ("harbor", "node_reach", "node_workbuddy")} for s in states],
                 "default_executor": default_executor, "global_reasons": global_reasons,
                 "harbor_reasons": harbor_reasons,
                 "login": {"available": mode == "metask" and bool((cfg.get("metacodes") or {}).get("binary")),
@@ -426,6 +448,10 @@ class RunManager:
                 raise ValueError(problem)
         ctx = self.suite_context()
         tasks = suites.validate_tasks(suite, ctx, request.get("tasks"), known=self.node_tasks(suite, state["name"]))
+        problem = self.staged_metacodes_problem(suite, state["name"],
+                                                self.run_bundle(settings(self.config_path), frozen, bundle)[0])
+        if problem:
+            raise ValueError(problem)
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
             if type(value) is not int or not 1 <= value <= limit:

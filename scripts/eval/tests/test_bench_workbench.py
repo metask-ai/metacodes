@@ -142,8 +142,9 @@ def node_script() -> bytes:
     """A bundle's `metacodes` as an SSH node runs it: `bench` from this checkout
     (what bench_cli.zig does with the binary's embedded copy)."""
     bootstrap = 'import sys; sys.path.insert(0, sys.argv.pop(1)); from scripts.eval.harbor.cli import main; sys.exit(main())'
-    return (f'#!/bin/sh\n[ "$1" = bench ] || exit 2\nshift\nexec {sys.executable} -c "{bootstrap}" {REPO} '
-            '--state-root "$HOME/.metacodes" --metacodes-version 9.9.9 "$@"\n').encode()
+    # Like bench_cli.zig: METACODES_BENCH_PYTHON, else python3 on PATH.
+    return (f'#!/bin/sh\n[ "$1" = bench ] || exit 2\nshift\nexec "${{METACODES_BENCH_PYTHON:-python3}}" -c "{bootstrap}" '
+            f'{REPO} --state-root "$HOME/.metacodes" --metacodes-version 9.9.9 "$@"\n').encode()
 
 
 def fixture(root):

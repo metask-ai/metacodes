@@ -218,7 +218,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
-| metacodes 节点 (`ssh` executors) | Ships the bundle (below) and installs its `metacodes` as `<state_dir>/bin/metacodes`, and as `~/.local/bin/metacodes` when that name is free; then runs `metacodes bench node info` there and fails when the node's protocol differs from the workbench's (see [Bench nodes](#bench-nodes)) |
+| metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
 | 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy; a failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
@@ -580,9 +580,12 @@ usable. Readiness probes are cached for 15 seconds.
 
 Every machine with `metacodes` installed is a Bench node. A workbench drives
 an SSH executor the way an editor drives a remote host: it runs that host's
-own `metacodes` over SSH, `<state_dir>/bin/metacodes bench node …`, and talks
-to it on the channel's stdin and stdout. Nothing else runs on the executor;
-the bench runtime is the one its `metacodes` carries.
+own `metacodes bench node …` over SSH and talks to it on the channel's stdin
+and stdout. Nothing else runs on the executor; the bench runtime is the one
+its `metacodes` carries. The node is `<state_dir>/bin/metacodes` (setup's
+entry), else a `metacodes` on the executor's PATH; it starts `bench` with the
+entry's `python` (as `METACODES_BENCH_PYTHON`). The readiness probe and every
+node command resolve it the same way.
 
 - `node info --json` is the node describing itself: its version, the node
   protocol, host name, OS and architecture, and the WorkBuddy suites
@@ -679,9 +682,16 @@ its relay listens, and the session login's pushed token serves the judge
 too (a legacy group key for the judge model, when it differs from the run's,
 is sent once on the same line). A WorkBuddy
 suite on an SSH executor runs on the node's own checkout: the workbench
-validates the tasks against the list the node reports, sends only the run's
-secret-free spec and the account key (as `credential` on the stdin line, for
-WorkBuddy's host proxy), and copies the job back like a Harbor run; the node
+validates the tasks against the list the node reports and copies the job
+back like a Harbor run. Its readiness there is reaching a compatible node,
+Metask authentication and what the node reports for the suite (an executor
+without the Harbor CLI still runs WorkBuddy, which brings its own). The
+node's staged `metacodes` must be the run's bundle's `bin/metacodes` (by
+sha256, which `node info` reports): otherwise the launch is refused, and the
+node checks again before it starts, so a record never names a version that
+did not run. WorkBuddy's host proxy is given a run-scoped placeholder and a
+loopback relay on the node; the relay forwards with the access token from
+the stdin line and swaps in each refreshed one, as for Harbor runs. The node
 removes its transient WorkBuddy configs afterwards.
 
 Readiness is per suite and executor: `GET /api/workbench` lists, for every

@@ -73,8 +73,10 @@ class Node:
         return result
 
     def info(self):
+        from scripts.eval.harbor.suites import workbuddy
         return {"protocol": PROTOCOL, "version": self.version, "host": socket.gethostname(),
-                "os": platform.system(), "arch": platform.machine(), "workbuddy": self.workbuddy()}
+                "os": platform.system(), "arch": platform.machine(), "workbuddy": self.workbuddy(),
+                "workbuddy_metacodes_sha256": workbuddy.staged_metacodes(self.context())}
 
     def remember(self, peer: str):
         if not executors.HOST.fullmatch(peer or ""):
@@ -101,34 +103,48 @@ class Node:
         return remote.run(spec_path)
 
     def run_workbuddy(self, spec) -> int:
+        """WorkBuddy on this node's checkout. Its host proxy talks to a
+        loopback relay holding only a placeholder; the relay forwards with the
+        access token from the stdin line and swaps in each refreshed one."""
+        from scripts.eval.harbor.profiling import PushedCredential, TimingRelay, placeholder
         from scripts.eval.harbor.suites import workbuddy
         os.chdir(os.path.expanduser("~"))
         try:
             message = json.loads(sys.stdin.buffer.readline())
-            key = message["credential"]
-            if not isinstance(key, str) or not key:
-                raise ValueError
+            credential = PushedCredential(message["credential"])
         except (ValueError, KeyError, TypeError):
             remote.emit("error", message="missing credential line")
             return 2
         suite = suites.get(spec.get("suite"))
         problems = self.workbuddy().get(suite.id, {}).get("reasons") or []
+        staged = workbuddy.staged_metacodes(self.context())
+        if spec.get("metacodes_sha256") and staged != spec["metacodes_sha256"]:
+            problems.append(f"WorkBuddy 暂存的 metacodes（sha256 {(staged or '未知')[:12]}）"
+                            f"不是本次运行的版本（sha256 {spec['metacodes_sha256'][:12]}）")
         if problems:
             remote.emit("error", message=f"{socket.gethostname()}：" + "；".join(problems))
             return 2
-        spec = {**spec, "jobs_dir": remote.absolute(spec["jobs_dir"]),
+        jobs_dir = remote.absolute(spec["jobs_dir"])
+        token = placeholder(spec["name"])
+        relay = TimingRelay(spec["account_gateway"], credential, Path(jobs_dir) / spec["name"] / ".bench-metrics",
+                            bind="127.0.0.1", token=token, record=False).__enter__()
+        spec = {**spec, "jobs_dir": jobs_dir, "account_gateway": relay.url + "/workbuddy",
                 "workbuddy": workbuddy.spec_fields(suite, self.context())}
         env = dict(os.environ)
-        env["METASK_API_KEY"] = key
+        env["METASK_API_KEY"] = token
         try:
-            argv, cwd, child_env = workbuddy.launch(spec, env)
-        except (OSError, ValueError) as exc:
-            remote.emit("error", message=f"WorkBuddy 启动失败：{exc}")
-            return 2
-        try:
-            return remote.supervise(spec, argv, child_env, None, threading.Event(), threading.Event(), cwd=cwd)
+            try:
+                argv, cwd, child_env = workbuddy.launch(spec, env)
+            except (OSError, ValueError) as exc:
+                remote.emit("error", message=f"WorkBuddy 启动失败：{exc}")
+                return 2
+            try:
+                return remote.supervise(spec, argv, child_env, credential, threading.Event(), threading.Event(),
+                                        cwd=cwd)
+            finally:
+                workbuddy.finish(spec)
         finally:
-            workbuddy.finish(spec)
+            relay.__exit__(None, None, None)
 
 
 def main(argv, state_root, version) -> int:

@@ -204,6 +204,27 @@ elif name == "metacodes":
     print("Open https://example.invalid/device and enter the code ABCD-1234", file=sys.stderr, flush=True)
 '''
 
+# Appended to test_bench_suites.FAKE_UV: WorkBuddy's host proxy making model
+# requests for a while, through whatever endpoint and key it was given.
+FAKE_UV_REQUESTS = r'''
+import time, urllib.error, urllib.request
+statuses = []
+for _ in range(int(os.environ.get('FAKE_RELAY_REQUESTS') or 0)):
+    request = urllib.request.Request(os.environ[spec['backend_url_env']], data=b'{}', method='POST',
+                                     headers={'Authorization': 'Bearer ' + os.environ[spec['backend_key_env']]})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+            statuses.append(response.status)
+    except urllib.error.HTTPError as exc:
+        statuses.append(exc.code)
+    time.sleep(float(os.environ.get('FAKE_RELAY_INTERVAL') or 0))
+(jobs_dir.parent / 'relay-statuses.json').write_text(json.dumps(statuses))
+observed = json.loads((jobs_dir.parent / 'observed.json').read_text())
+observed['key'] = os.environ.get(spec['backend_key_env'])
+(jobs_dir.parent / 'observed.json').write_text(json.dumps(observed))
+'''
+
 SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig", "metacodes", "sysctl",
           "systemctl")
 SYSTEM_TOOLS = ("sh", "env", "mkdir", "tar", "cp", "chmod", "rm", "mv", "mktemp", "touch", "cat", "python3",
@@ -631,6 +652,51 @@ class SshExecutorTest(SetupFixture):
         self.assertEqual(len([c for c in self.calls("ssh") if "tar -xf -" in c[1][-1]]), shipped)
 
 
+    def test_a_failed_node_upgrade_keeps_the_installed_node(self):
+        self.add_ssh_executor(node=False)
+        os.environ.update(FAKE_REMOTE_SUDO="1", FAKE_REMOTE_DOCKER_DAEMON="1")
+        os.symlink(self.templates / "uv", self.local_bin / "uv")
+        self.assertEqual(setup.run_setup(self.config, "relay-4090")["status"], "ready")
+        node = self.remote_home / ".metacodes-bench/bin/metacodes"
+        installed = node.resolve()
+        # A candidate bundle whose metacodes speaks another protocol.
+        candidate = self.root / "candidate-bundle"
+        shutil.copytree(self.cfg()["bundle"], candidate)
+        (candidate / "bin/metacodes").write_text('#!/bin/sh\necho \'{"protocol": 17, "version": "x", "host": "h"}\'\n')
+        cfg = self.cfg()
+        cfg["bundle"] = str(candidate)
+        atomic_json(self.config, cfg)
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "node")
+        self.assertEqual(step["status"], "failed", step)
+        self.assertIn("原有节点保持不变", step["detail"])
+        self.assertEqual(node.resolve(), installed)
+        relay = executors.find(self.cfg(), "relay-4090")
+        info = subprocess.run(executors.node_argv(relay, "info", "--json"), capture_output=True, text=True)
+        self.assertEqual(json.loads(info.stdout)["protocol"], 1, info.stderr)
+
+    def test_a_node_on_the_path_runs_with_the_configured_python(self):
+        """No setup-managed entry: the `metacodes` on the executor's PATH is
+        the node, started with the entry's `python`, for probe and commands."""
+        calls = self.root / "python-calls.log"
+        python = self.remote_home / "opt/bench/bin/python3.12"
+        python.parent.mkdir(parents=True)
+        python.write_text(f'#!/bin/sh\necho "$*" >> {calls}\nexec {sys.executable} "$@"\n')
+        python.chmod(0o755)
+        self.add_ssh_executor(node=False, python=str(python))
+        (self.remote_bin / "metacodes").write_bytes(node_script())
+        (self.remote_bin / "metacodes").chmod(0o755)
+        os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
+        relay = executors.find(self.cfg(), "relay-4090")
+        facts = executors.probe(relay)
+        self.assertEqual(facts["node"]["protocol"], 1, facts)
+        self.assertIsNone(executors.node_problem(relay, facts))
+        self.assertIn("scripts.eval.harbor.cli", calls.read_text())
+        listing = subprocess.run(executors.node_argv(relay, "manifest", "nowhere"), capture_output=True, text=True)
+        self.assertEqual((listing.returncode, json.loads(listing.stdout)), (0, {}), listing.stderr)
+        self.assertEqual(calls.read_text().count("scripts.eval.harbor.cli"), 2)
+
+
 class SshRunTest(SetupFixture):
     def prepare_remote(self, profile=False, gateway=None):
         if gateway is None:
@@ -926,20 +992,31 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertIn("执行机器：relay-4090（SSH bench@10.126.126.1:22） · metacodes 9.9.9：已就绪", text)
 
     def test_workbuddy_runs_on_the_ssh_node_with_the_nodes_own_checkout(self):
-        """The node reports its WorkBuddy checkout, tasks and readiness; a run
-        uses that checkout there, with the account key on the SSH stdin."""
+        """The node reports its WorkBuddy checkout, tasks, readiness and staged
+        metacodes; a run uses that checkout there behind the node's relay,
+        which receives each refreshed session token over the SSH stdin."""
+        from scripts.eval.harbor.bench.setup import sha256_file
+        from scripts.eval.harbor.suites import workbuddy as wb_suite
         from scripts.eval.tests.test_bench_suites import FAKE_UV, workbuddy_checkout
         from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV
-        manager, client, _ = self.prepare_remote()
-        os.environ["FAKE_EXPECT_ACCOUNT_KEY"] = "session-access"
+        gateway = RotatingGateway(self.root, lifetime=4)
+        self.addCleanup(gateway.close)
+        manager, client, _ = self.prepare_remote(gateway=gateway)
+        os.environ.update(METACODES_BENCH_REFRESH_MARGIN="2", METACODES_BENCH_REFRESH_INTERVAL="0.2",
+                          FAKE_RELAY_REQUESTS="30", FAKE_RELAY_INTERVAL="0.3")
         uv = self.remote_home / ".local/bin/uv"
-        uv.write_text(FAKE_UV.format(python=sys.executable, judge=WORKBUDDY_JUDGE_KEY_ENV))
+        uv.write_text(FAKE_UV.format(python=sys.executable, judge=WORKBUDDY_JUDGE_KEY_ENV) + FAKE_UV_REQUESTS)
         uv.chmod(0o755)
+        # WorkBuddy brings its own Harbor: the executor's missing Harbor CLI
+        # keeps Harbor suites from running there, not WorkBuddy.
+        (self.remote_home / ".local/bin/harbor").unlink()
         repo = workbuddy_checkout(self.remote_home)
         atomic_json(self.remote_home / ".metacodes/bench/workbench.json", {"workbuddy_checkout": str(repo)})
         catalog = client.request("api/workbench")
         wb = next(s for s in catalog["suites"] if s["id"] == "workbuddy-code")
+        tb = next(s for s in catalog["suites"] if s["id"] == "terminal-bench-2.1")
         self.assertTrue(wb["executors"]["relay-4090"]["ready"], wb["executors"]["relay-4090"])
+        self.assertFalse(tb["executors"]["relay-4090"]["ready"])
         self.assertFalse(wb["executors"]["devbox-mac"]["ready"])  # no checkout on the workbench machine
         relay = next(e for e in catalog["executors"] if e["name"] == "relay-4090")
         self.assertEqual(relay["node"]["version"], "9.9.9")
@@ -949,23 +1026,43 @@ class SuiteOnExecutorTest(SetupFixture):
         with self.assertRaisesRegex(ValueError, "没有这些任务"):
             client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                         "tasks": ["not-a-workbuddy-task"], "executor": "relay-4090"})
+        # Staged artifacts of another metacodes than the run's bundle: refused,
+        # so the record never names a version that did not run.
+        with self.assertRaisesRegex(ValueError, "暂存的 metacodes"):
+            client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                        "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
+        staged = json.loads((repo / wb_suite.ARTIFACT_MANIFEST).read_text())
+        staged["executables"] = {"metacodes": {"sha256": sha256_file(self.root / "bundle/bin/metacodes")}}
+        atomic_json(repo / wb_suite.ARTIFACT_MANIFEST, staged)
+        manager.probe_cache.clear()
         run = client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                           "tasks": ["bug_fix-easy-alpha", "data_quality-hard-beta"],
                                           "attempts": 1, "concurrency": 2, "executor": "relay-4090"})
         final = wait_run(manager, run["name"], timeout=60)
         self.assertEqual(final["status"], "finished", data.tail(manager.records / (run["name"] + ".log")))
-        observed = json.loads((manager.jobs_dir / run["name"] / "observed.json").read_text())
+        local = manager.jobs_dir / run["name"]
+        observed = json.loads((local / "observed.json").read_text())
         self.assertEqual(Path(observed["cwd"]).resolve(), repo.resolve())
-        self.assertTrue(observed["key_matches"])
-        self.assertEqual(observed["base_url"], os.environ["METASK_SITE_URL"] + "/v1/messages")
+        # WorkBuddy holds a placeholder and talks to the node's loopback relay.
+        self.assertTrue(observed["key"].startswith("mcb-"), observed["key"])
+        self.assertTrue(observed["base_url"].startswith("http://127.0.0.1:"), observed["base_url"])
+        self.assertTrue(observed["base_url"].endswith("/workbuddy/v1/messages"), observed["base_url"])
+        # Every request across 2.5 token lifetimes was authorized upstream with
+        # tokens that could only have arrived over the channel.
+        self.assertEqual(json.loads((local / "relay-statuses.json").read_text()), [200] * 30)
+        self.assertGreaterEqual(len({token for token, _, _ in gateway.requests}), 3)
+        self.assertTrue(all(ok for _, ok, _ in gateway.requests), gateway.requests)
+        self.assertGreaterEqual(final["credential"]["refresh_count"], 2)
         slug = "metacodes-" + run["name"]
         self.assertFalse((repo / "configs/jobs" / (slug + ".yaml")).exists())
         view = client.request("api/job?name=" + run["name"])
         self.assertEqual((view["summary"]["counts"]["pass"], view["summary"]["counts"]["fail"]), (1, 1))
         self.assertIsNotNone(json.loads((manager.jobs_dir / run["name"] / "result.json").read_text())["finished_at"])
-        remote_files = [p for p in self.remote_home.rglob("*") if p.is_file() and ".metacodes-bench/runs" in str(p)]
-        public = b"".join(p.read_bytes() for p in remote_files + list(manager.records.iterdir()))
-        self.assertNotIn(b"session-access", public)
+        remote_files = [p for p in self.remote_home.rglob("*") if p.is_file() and ".metacodes-bench/" in str(p)]
+        public = b"".join(p.read_bytes() for p in remote_files + list(manager.records.iterdir())
+                          + [p for p in local.rglob("*") if p.is_file()])
+        for secret in gateway.issued:
+            self.assertNotIn(secret.encode(), public, secret)
 
     def test_registry_suite_runs_on_ssh_executor_into_the_store(self):
         """A registry suite on an SSH executor is downloaded on the workbench

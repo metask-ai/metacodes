@@ -198,6 +198,15 @@ def finish(spec):
         atomic_json(result, {**value, "finished_at": now()})
 
 
+def staged_metacodes(ctx) -> Optional[str]:
+    """sha256 of the `metacodes` executable staged in the checkout, or None."""
+    repo = checkout(ctx)
+    manifest = _json(repo / ARTIFACT_MANIFEST) if repo is not None else None
+    executable = ((manifest or {}).get("executables") or {}).get("metacodes") if isinstance(manifest, dict) else None
+    digest = executable.get("sha256") if isinstance(executable, dict) else None
+    return digest if isinstance(digest, str) else None
+
+
 def spec_fields(suite, ctx) -> dict:
     return {"checkout": str(checkout(ctx).resolve()), "subset": suite.subset,
             "uv": shutil.which("uv"), "bash": shutil.which("bash")}

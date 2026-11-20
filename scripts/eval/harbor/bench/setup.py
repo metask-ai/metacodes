@@ -796,15 +796,11 @@ def step_node(s: Setup):
         s.note_action(f"ln -sfn <发行包>/bin/metacodes {node}；~/.local/bin/metacodes 未被占用时也指向它")
         return "planned", "发行包将按内容摘要复制，并安装为执行机器上的 metacodes 节点"
     remote_bundle = executors.ship_bundle(s.executor, Path(bundle), log=s.log, runner=s.runner, popen=s.popen)
-    q = shlex.quote
-    link = (f"set -e; mkdir -p {q(str(PurePosixPath(node).parent))}; "
-            f"target=$(cd {q(remote_bundle)}/bin && pwd)/metacodes; ln -sfn \"$target\" {q(node)}; "
-            f"node=$(cd {q(str(PurePosixPath(node).parent))} && pwd)/metacodes; l=\"$HOME/.local/bin/metacodes\"; "
-            "if [ ! -e \"$l\" ] && [ ! -L \"$l\" ]; then mkdir -p \"$HOME/.local/bin\"; ln -s \"$node\" \"$l\"; fi; "
-            "if [ \"$(readlink \"$l\" 2>/dev/null)\" = \"$node\" ]; then echo path=1; fi")
-    linked = s.sh(link, mutate=True, check=True)
-    done = s.run(executors.node_argv(s.executor, "info", "--json", "--peer", executors.workbench_name()),
-                 mutate=False, timeout=300)
+    # The candidate answers first, by its own path; the entry other runs and
+    # copy-backs use is switched (atomically) only once it qualifies.
+    candidate = remote_bundle + "/bin/metacodes"
+    done = s.run(executors.node_argv(s.executor, "info", "--json", "--peer", executors.workbench_name(),
+                                     binary=candidate), mutate=False, timeout=300)
     try:
         info = json.loads((done.stdout or "").strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -812,8 +808,16 @@ def step_node(s: Setup):
     problem = executors.node_problem(s.executor, {"node": info if isinstance(info, dict) else {}})
     if done.returncode != 0 or problem:
         raise Failed((problem or f"节点自检失败（退出码 {done.returncode}）") +
-                     f"。发行包 {bundle} 里的 metacodes 不支持当前的节点协议；"
+                     f"。发行包 {bundle} 里的 metacodes 不支持当前的节点协议，原有节点保持不变；"
                      "请换用与工作台同一版本构建的 Linux 发行包（metacodes bench --bundle <目录>）后重试")
+    q = shlex.quote
+    parent = q(str(PurePosixPath(node).parent))
+    link = (f"set -e; mkdir -p {parent}; target=$(cd {q(remote_bundle)}/bin && pwd)/metacodes; "
+            f"ln -sfn \"$target\" {q(node)}.tmp-$$; mv -f {q(node)}.tmp-$$ {q(node)}; "
+            f"node=$(cd {parent} && pwd)/metacodes; l=\"$HOME/.local/bin/metacodes\"; "
+            "if [ ! -e \"$l\" ] && [ ! -L \"$l\" ]; then mkdir -p \"$HOME/.local/bin\"; ln -s \"$node\" \"$l\"; fi; "
+            "if [ \"$(readlink \"$l\" 2>/dev/null)\" = \"$node\" ]; then echo path=1; fi")
+    linked = s.sh(link, mutate=True, check=True)
     where = "~/.local/bin/metacodes" if "path=1" in (linked.stdout or "") else node
     return "done", f"metacodes {info['version']} 节点（{where}，{info['host']}），发行包 {remote_bundle}"
 
