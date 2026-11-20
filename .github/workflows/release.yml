@@ -144,6 +144,18 @@ jobs:
           fi
           command -v rg
           rg --version
+      - name: Install bubblewrap for the sandboxed suites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sandbox=(--unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp)
+          runtime=(--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
+          bwrap "${sandbox[@]}" "${runtime[@]}" /bin/true
       # The unit ships both Lean kernels (manifest v2, release/LAYOUT.md),
       # built here natively and cold like everything else in a release: the
       # pinned elan, no Lean cache.
