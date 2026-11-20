@@ -25,6 +25,7 @@ const tools_mod = @import("../tools.zig");
 const drivers_test = @import("drivers/drivers_test.zig");
 const reviewer = @import("reviewer.zig");
 const merge_back = @import("merge_back.zig");
+const interview = @import("interview.zig");
 
 const testing = std.testing;
 const PathBuf = [std.fs.max_path_bytes]u8;
@@ -170,6 +171,7 @@ const Plan = struct {
     fail: ?types.SeatError = null,
     /// A file that must already be in the workspace, else the seat fails.
     require: ?[]const u8 = null,
+    handoff: []const u8 = handoff_text,
 };
 
 const ScriptedSeats = struct {
@@ -223,7 +225,7 @@ const ScriptedSeats = struct {
         for (plan.user_files) |f| writeFile(self.user_repo, f.path, f.bytes) catch return .{ .failed = .spawn_failed };
         const seat_dir = common.seatDir(paths);
         if (plan.review) |review| writeFile(seat_dir, "review.json", review) catch return .{ .failed = .spawn_failed };
-        writeFile(seat_dir, "handoff.md", handoff_text) catch return .{ .failed = .spawn_failed };
+        writeFile(seat_dir, "handoff.md", plan.handoff) catch return .{ .failed = .spawn_failed };
         return run_dir.collectHandoff(gpa, paths.handoff);
     }
 };
@@ -274,12 +276,12 @@ test "teamwork preview L2: default-off start and reopen have no execution or rec
     defer auditor.deinit();
     var deps: runtime.Deps = .{ .seats = seats.source(), .auditor = auditor.auditor() };
     const cfg = try fx.cfg("");
-    try testing.expectError(error.PreviewDisabled, runtime.Run.start(testing.allocator, deps, .{ .text = request_text }, cfg, fx.options()));
+    try testing.expectError(error.PreviewDisabled, runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options()));
     try testing.expect(!exists(fx.state(), "teamwork"));
     try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
     try testing.expectEqual(@as(u32, 0), auditor.calls);
     deps.preview = true;
-    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text }, cfg, fx.options());
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
     _ = try run.dispatch(.implementer, "");
     try expectFile(run.status().worktree.?, "feature.txt", "feature\n");
     run.destroy();
@@ -314,7 +316,7 @@ test "teamwork preview L2: opt-out blocks an approved completion but permits can
     const script = [_]audit.StubAuditor.Scripted{.pass};
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     _ = try run.dispatch(.reviewer, "");
@@ -352,7 +354,7 @@ test "teamwork runtime L2: the SWE loop's happy path changes the workspace by ex
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
 
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     try testing.expectEqualStrings("Add a feature file.", run.status().goal);
     const final = try swe_loop.drive(run);
@@ -414,7 +416,7 @@ test "teamwork runtime L2: a review requesting changes sends its open issue into
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
 
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -446,7 +448,7 @@ test "teamwork runtime L2: the operations API refuses illegal steps; a stale app
     const script = [_]audit.StubAuditor.Scripted{.pass};
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
 
     // A manager cannot claim completion, review nothing, or run other roles.
@@ -501,7 +503,7 @@ test "teamwork runtime L2: two failed audits fail the run; the first report reac
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
 
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -539,7 +541,7 @@ test "teamwork runtime L2: an unavailable audit is never a pass" {
     defer seats.deinit();
     // The production default until the verifier adapter is configured.
     var unavailable: audit.UnavailableAuditor = .{};
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = unavailable.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = unavailable.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -567,7 +569,7 @@ test "teamwork runtime L2: reaching the budget aborts the live seat through the 
     const script = [_]audit.StubAuditor.Scripted{.pass};
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(",\"budget_usd\":1"), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(",\"budget_usd\":1"), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -602,7 +604,7 @@ test "teamwork runtime L2: no dispatch without budget left; cancel stops the run
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
     {
-        const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+        const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
         defer run.destroy();
         // Spend recorded elsewhere in the run (an interviewer, say) used it up.
         try testing.expectError(error.BudgetExhausted, run.ledger.charge(.{ .seat_id = try types.SeatId.parse("interviewer-1"), .harness = .metacodes, .wallclock_ms = 0, .cost = .{ .provider_estimate = 5 } }));
@@ -617,7 +619,7 @@ test "teamwork runtime L2: no dispatch without budget left; cancel stops the run
     const other_state = try std.fmt.bufPrint(&other_buf, "{s}/state2", .{fx.root.slice()});
     var options = fx.options();
     options.state_root = other_state;
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), options);
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), options);
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     try run.cancel();
@@ -652,7 +654,7 @@ test "teamwork runtime L2: the round cap ends a review loop that never approves"
     const script = [_]audit.StubAuditor.Scripted{.pass};
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(",\"max_rounds\":3"), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(",\"max_rounds\":3"), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -679,7 +681,7 @@ test "teamwork runtime L2: a user edit to the implementer's file is a conflict; 
     const script = [_]audit.StubAuditor.Scripted{.pass};
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -791,7 +793,7 @@ test "teamwork runtime L2: interrupted admission is retryable before publication
         .cli_approval = .{ .config_json = "{\"enabled\":true,\"budget_usd\":5}", .host_sha256 = @splat(0) },
     };
     const cfg = try fx.cfg("");
-    const run = try runtime.Run.start(gpa, deps, .{ .text = request_text }, cfg, opts);
+    const run = try runtime.Run.start(gpa, deps, .{ .text = request_text, .source = .request_file }, cfg, opts);
     run.destroy();
     var path_buf: PathBuf = undefined;
     const dir = fx.runFile(&path_buf, "");
@@ -835,7 +837,7 @@ test "teamwork runtime L2: abort during the final audit tree read keeps the chec
         .seats = seats.source(),
         .auditor = auditor.auditor(),
         .recheck_audited_tree = Recheck.abortRead,
-    }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     _ = try run.dispatch(.reviewer, "");
@@ -858,7 +860,7 @@ test "teamwork runtime L2: reopening cannot change the approved budget, harness 
     var auditor: audit.UnavailableAuditor = .{};
     const deps: runtime.Deps = .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() };
     const cfg = try fx.cfg("");
-    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text }, cfg, fx.options());
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
     try testing.expectError(error.RunBusy, runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id));
     run.destroy();
     var changed = cfg;
@@ -887,7 +889,7 @@ test "teamwork runtime L2: creating a worktree does not run repository hooks" {
     var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
     defer seats.deinit();
     var auditor: audit.UnavailableAuditor = .{};
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     try testing.expect(!exists(run.status().worktree.?, "hook-ran.txt"));
 }
@@ -910,7 +912,7 @@ test "teamwork runtime L2: candidate clean filters cannot execute code on the co
     var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
     defer seats.deinit();
     var auditor: audit.UnavailableAuditor = .{};
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     _ = try run.dispatch(.reviewer, "");
@@ -931,7 +933,7 @@ test "teamwork runtime L2: initial worktree checkout never invokes configured sm
     var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
     defer seats.deinit();
     var auditor: audit.UnavailableAuditor = .{};
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     try expectFile(run.status().worktree.?, "data.dat", "base bytes\n");
     try testing.expect(!exists(fx.state(), "callback-ran"));
@@ -951,7 +953,7 @@ test "teamwork runtime L2: worktree conditional includes cannot re-enable checko
     var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
     defer seats.deinit();
     var auditor: audit.UnavailableAuditor = .{};
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     try expectFile(run.status().worktree.?, "data.dat", "base bytes\n");
     try testing.expect(!exists(fx.state(), "callback-ran"));
@@ -974,7 +976,7 @@ test "teamwork runtime L2: after a crash, reopen restores seats, counters and bu
     const deps: runtime.Deps = .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() };
     const cfg = try fx.cfg("");
     {
-        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text }, cfg, fx.options());
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
         defer run.destroy();
         _ = try run.dispatch(.implementer, "");
         // The process dies while reviewer-1 runs: its directory and a
@@ -1063,7 +1065,7 @@ test "teamwork runtime L2: the SWE loop through the real metacodes driver: obser
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
     const cfg = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"cat feature.txt\"}", null), null)).enabled;
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = .{ .harness = seat_deps }, .auditor = auditor.auditor() }, .{ .text = request_text }, cfg, fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = .{ .harness = seat_deps }, .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
     defer run.destroy();
     const final = swe_loop.drive(run) catch |err| {
         std.debug.print("tool results:\n{s}\n", .{scripted.tool_results.items});
@@ -1128,7 +1130,7 @@ test "teamwork runtime L2: the same reviewer claim is rejected when the metacode
     var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
     defer auditor.deinit();
     const cfg = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"cat feature.txt\"}", null), null)).enabled;
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = .{ .harness = seat_deps }, .auditor = auditor.auditor() }, .{ .text = request_text }, cfg, fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = .{ .harness = seat_deps }, .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     _ = try run.dispatch(.reviewer, "");
@@ -1167,7 +1169,7 @@ test "teamwork runtime L2: separate audit checkouts send the same initial verifi
                 .permission_ctx = &perm,
                 .state_root = fx.state(),
             } };
-            const run = try runtime.Run.start(gpa, .{ .preview = true, .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+            const run = try runtime.Run.start(gpa, .{ .preview = true, .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
             defer run.destroy();
             try testing.expectEqual(runtime.Phase.done, (try swe_loop.drive(run)).phase());
             const text = scripted.first_user orelse return error.VerifierRequestMissing;
@@ -1221,7 +1223,7 @@ test "teamwork runtime L2: an A to B to A checkout cannot borrow a verifier pass
         .preview = true,
         .seats = seats.source(),
         .auditor = .{ .ptr = &swap, .vtable = &.{ .audit = Switch.run } },
-    }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     _ = try run.dispatch(.reviewer, "");
@@ -1259,7 +1261,7 @@ test "teamwork runtime L2: a verifier PASS cannot complete when its spend is not
         .permission_ctx = &perm,
         .state_root = fx.state(),
     } };
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     _ = try run.dispatch(.implementer, "");
     _ = try run.dispatch(.reviewer, "");
@@ -1310,7 +1312,7 @@ test "teamwork runtime L2: the isolated verifier audits the result; its FAIL rep
         .permission_ctx = &perm,
         .state_root = fx.state(),
     } };
-    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text }, try fx.cfg(""), fx.options());
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = true, .seats = seats.source(), .auditor = verifier.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
@@ -1344,4 +1346,109 @@ test "teamwork runtime L2: the isolated verifier audits the result; its FAIL rep
     try testing.expect(std.mem.indexOf(u8, ledger_text, "\"seat_id\":\"verifier-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, ledger_text, "\"seat_id\":\"verifier-2\"") != null);
     try testing.expectEqual(@as(u8, 2), run.status().audit.used);
+}
+
+const ScriptedVerdicts = struct {
+    decisions: []const interview.Decision,
+    calls: usize = 0,
+
+    fn prompter(self: *ScriptedVerdicts) interview.Prompter {
+        return .{ .ctx = self, .decideFn = decide };
+    }
+
+    fn decide(ctx: *anyopaque, _: []const u8) anyerror!interview.Decision {
+        const self: *ScriptedVerdicts = @ptrCast(@alignCast(ctx));
+        defer self.calls += 1;
+        return self.decisions[self.calls];
+    }
+};
+
+test "teamwork interview L2: no worker before approval, and the edited approval is ORIGINAL_REQUEST byte for byte" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-interview");
+    defer fx.deinit();
+    const draft_handoff = "## Observation\no\n## Reasoning\nr\n## Caveats\nc\n## Conclusion\nAdd feature.txt.\n## Verification\ntest -f feature.txt\n";
+    const plans = [_]Plan{
+        .{ .seat = "interviewer-1", .handoff = draft_handoff, .charge_usd = 0.25, .files = &.{.{ .path = "scratch.txt", .bytes = "scratch\n" }} },
+        .{ .seat = "implementer-1", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const cfg = try fx.cfg("");
+    var abort = types.AbortSignal.init();
+    var deps: runtime.Deps = .{ .seats = seats.source(), .auditor = auditor.auditor() };
+
+    try testing.expectError(error.PreviewDisabled, interview.draft(testing.allocator, deps, cfg, fx.options(), "add a feature\n", &abort));
+    try testing.expect(!exists(fx.state(), "teamwork"));
+    deps.preview = true;
+
+    const before = try fx.workspaceBytes();
+    defer testing.allocator.free(before);
+    var drafted = try interview.draft(testing.allocator, deps, cfg, fx.options(), "add a feature\n", &abort);
+    defer drafted.deinit(testing.allocator);
+    try testing.expectEqualStrings("Add feature.txt.\n\n## Acceptance checks\n\ntest -f feature.txt\n", drafted.text);
+    try testing.expectEqual(@as(usize, 1), seats.ran.items.len);
+    const packet = seats.packetOf("interviewer-1");
+    try testing.expect(std.mem.indexOf(u8, packet, run_id_text) == null);
+    try testing.expect(std.mem.indexOf(u8, packet, fx.root.slice()) == null);
+    try testing.expect(std.mem.endsWith(u8, packet, "## Request\n\nadd a feature\n"));
+    const after = try fx.workspaceBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+    try testing.expect(!exists(fx.state(), "teamwork/" ++ run_id_text ++ "/ORIGINAL_REQUEST.md"));
+    try testing.expect(!exists(fx.state(), "teamwork/" ++ run_id_text ++ "/worktree"));
+    try testing.expect(!exists(fx.state(), "teamwork/" ++ run_id_text ++ "/interview"));
+    try testing.expect(!exists(fx.state(), "teamwork/" ++ run_id_text ++ "/run.json"));
+
+    var rejecting: ScriptedVerdicts = .{ .decisions = &.{ .{ .edit = "something else" }, .reject } };
+    try testing.expect(try interview.approve(drafted.text, rejecting.prompter()) == null);
+    try testing.expectEqual(@as(usize, 1), seats.ran.items.len);
+
+    const edited = "Add feature.txt containing \"feature\".\r\nKeep README.md as it is.  \n";
+    var editing: ScriptedVerdicts = .{ .decisions = &.{ .{ .edit = edited }, .approve } };
+    const approved = (try interview.approve(drafted.text, editing.prompter())).?;
+    try testing.expectEqual(runtime.RequestSource.interview_edited, approved.source);
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = approved.text, .source = approved.source }, cfg, fx.options());
+    defer run.destroy();
+    try expectFile(fx.state(), "teamwork/" ++ run_id_text ++ "/ORIGINAL_REQUEST.md", edited);
+    try testing.expectEqual(@as(f64, 0.25), run.ledger.spent_usd);
+    const saved = readFile(fx.state(), "teamwork/" ++ run_id_text ++ "/run.json") orelse return error.FileMissing;
+    defer testing.allocator.free(saved);
+    try testing.expect(std.mem.indexOf(u8, saved, "\"request_source\":\"interview_edited\"") != null);
+
+    const final = try swe_loop.drive(run);
+    try testing.expectEqual(runtime.Phase.done, final.phase());
+    try testing.expectEqual(@as(usize, 3), seats.ran.items.len);
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+    try testing.expect(!exists(fx.repo(), "scratch.txt"));
+}
+
+test "teamwork interview L2: a skip-interview request is recorded as such and survives reopen" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-skip-interview");
+    defer fx.deinit();
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const cfg = try fx.cfg("");
+    const deps: runtime.Deps = .{ .preview = true, .seats = seats.source(), .auditor = auditor.auditor() };
+    const segments = try interview.parseSegments(fx.arena.allocator(), "[skip-interview] " ++ request_text);
+    try testing.expect(segments.skip_interview);
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = segments.request, .source = .skip_interview }, cfg, fx.options());
+        defer run.destroy();
+    }
+    try expectFile(fx.state(), "teamwork/" ++ run_id_text ++ "/ORIGINAL_REQUEST.md", request_text);
+    const run = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), types.RunId.parse(run_id_text) catch unreachable);
+    defer run.destroy();
+    try testing.expectEqual(runtime.RequestSource.skip_interview, run.request_source);
+    try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
 }

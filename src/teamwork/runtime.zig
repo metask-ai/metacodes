@@ -62,6 +62,14 @@ pub const max_audits: u8 = 2;
 /// records it once as `ORIGINAL_REQUEST.md`; nothing else ever replaces it.
 pub const ApprovedRequest = struct {
     text: []const u8,
+    source: RequestSource,
+};
+
+pub const RequestSource = enum {
+    request_file,
+    skip_interview,
+    interview,
+    interview_edited,
 };
 
 /// Where seat drivers come from.
@@ -356,6 +364,7 @@ pub const Run = struct {
     worktree: []u8,
     worktree_present: bool,
     base: merge_back.Snapshot,
+    request_source: RequestSource,
     /// Seats dispatched per role.
     dispatched: std.EnumArray(Role, u32) = .initFill(0),
     audits: u8 = 0,
@@ -395,7 +404,7 @@ pub const Run = struct {
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
             errdefer gpa.free(worktree);
             // On success `open` owns `repo`, `dir` and `worktree`.
-            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, base, .approved);
+            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, base, .approved, request.source);
         };
         errdefer self.destroy();
         // Publish the approval and base together before creating a worktree.
@@ -449,7 +458,7 @@ pub const Run = struct {
                 .merging => .{ .failed = .merge_interrupted },
                 else => saved.state,
             };
-            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, saved.base, state);
+            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, saved.base, state, saved.request_source);
         };
         errdefer self.destroy();
         self.worktree_present = pfs.exists((try self.dir.path(&buf, .worktree)).ptr);
@@ -493,6 +502,7 @@ pub const Run = struct {
         worktree: []u8,
         base: merge_back.Snapshot,
         state: State,
+        request_source: RequestSource,
     ) StartError!*Run {
         var buf: run_dir.PathBuf = undefined;
         var ledger = try ledger_mod.Ledger.load(gpa, try dir.path(&buf, .budget), cfg.budget_usd);
@@ -519,6 +529,7 @@ pub const Run = struct {
             .worktree = worktree,
             .worktree_present = false,
             .base = base,
+            .request_source = request_source,
             .goal = goal,
         };
         // `self` is heap-allocated, so the ledger may point into it.
@@ -1054,6 +1065,8 @@ pub const Run = struct {
             const host_hex = std.fmt.bytesToHex(approval.host_sha256, .lower);
             try s.write(host_hex[0..]);
         }
+        try s.objectField("request_source");
+        try s.write(@tagName(self.request_source));
         try s.objectField("initial_checkout_pending");
         try s.write(self.state == .approved and !self.worktree_present);
         try s.objectField("state");
@@ -1116,6 +1129,7 @@ const Saved = struct {
     state: State,
     repo: []const u8,
     base: merge_back.Snapshot,
+    request_source: RequestSource,
     dispatched: std.EnumArray(Role, u32),
     audits: u8,
     last_audit: ?audit.VerdictKind,
@@ -1174,6 +1188,10 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
             .commit = try treeOf(obj.get("base_commit") orelse return error.StateCorrupt),
             .tree = try treeOf(obj.get("start_tree") orelse return error.StateCorrupt),
         },
+        .request_source = if (obj.get("request_source")) |value|
+            if (value == .string) std.meta.stringToEnum(RequestSource, value.string) orelse return error.StateCorrupt else return error.StateCorrupt
+        else
+            .request_file,
         .dispatched = dispatched,
         .audits = try intField(u8, obj, "audits"),
         .last_audit = last_audit,

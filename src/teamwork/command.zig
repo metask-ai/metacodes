@@ -14,6 +14,9 @@ const verifier = @import("verifier_auditor.zig");
 const scope = @import("drivers/write_scope.zig");
 const sandbox_exec = @import("../sandbox/exec.zig");
 const util_fs = @import("../util/fs.zig");
+const interview = @import("interview.zig");
+const merge_back = @import("merge_back.zig");
+const provider_factory = @import("../api/provider_factory.zig");
 
 pub const RunId = types.RunId;
 
@@ -29,6 +32,8 @@ pub const help =
     \\Provider options: --provider <profile> --model <model> --base-url <url>
     \\                  --api-key <key> --verbose
     \\Configuration: state/config.json teamwork < project/.metacodes/teamwork.json < CLI.
+    \\The request may start with [skip-interview] and [seats=<role>:<harness>[:<model>],...]
+    \\segments; seats apply to this run only. The rest of the request is approved as is.
     \\A positive dollar cap and explicit --approve are required. Approval covers
     \\the request, configured harnesses/check, spend up to the cap and merge-back.
     \\Teamwork requires preview (off by default). --preview does not approve a task.
@@ -117,6 +122,7 @@ pub const Prepared = struct {
     id: types.RunId,
     cfg: config.Config.Enabled,
     request: []const u8,
+    source: runtime.RequestSource,
     workspace: []const u8,
 };
 
@@ -129,6 +135,7 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
     const generated = @import("../core/session_id.zig").gen();
     const id = options.id orelse try types.RunId.parse(generated.asSlice());
     var request: []const u8 = "";
+    var source: runtime.RequestSource = .request_file;
     var repo: []const u8 = undefined;
     var layer: config.Layer = .{};
     if (options.action == .@"resume") {
@@ -146,38 +153,49 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
         repo = try @import("merge_back.zig").toplevel(arena, saved_repo.string, null);
         if (!eq(repo, saved_repo.string)) return error.StateCorrupt;
     } else {
-        repo = try @import("merge_back.zig").toplevel(arena, workspace, null);
-        const global_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{state_root});
-        if (try readOptional(arena, global_path)) |text| {
-            const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
-            if (value != .object) return error.InvalidJson;
-            if (value.object.get("teamwork")) |teamwork| layer = try config.parseValue(arena, teamwork, null);
-        }
-        const project_path = try std.fmt.allocPrint(arena, "{s}/.metacodes/teamwork.json", .{repo});
-        if (try readOptional(arena, project_path)) |text| layer = config.merge(layer, try config.parse(arena, text, null));
-        layer = config.merge(layer, options.overrides);
-        // Invoking `run` explicitly enables the mode, but not its spend.
-        if (layer.enabled == null) layer.enabled = true;
-        request = try readRequired(arena, options.request_file.?);
-        if (std.mem.trim(u8, request, " \t\r\n").len == 0) return error.EmptyRequest;
+        repo = try merge_back.toplevel(arena, workspace, null);
+        const raw = try readRequired(arena, options.request_file.?);
+        if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return error.EmptyRequest;
+        const segments = try interview.parseSegments(arena, raw);
+        request = segments.request;
+        if (segments.skip_interview) source = .skip_interview;
+        layer = config.merge(config.merge(try configuredLayer(arena, state_root, repo), segments.seats), options.overrides);
     }
+    const cfg = try validated(layer);
+    // Git's toplevel is read-only. Do not let run state become an untracked
+    // input of the workspace snapshot or a writable part of the worker tree.
+    try requireExternalState(arena, state_root, repo);
+    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .source = source, .workspace = repo };
+}
+
+fn configuredLayer(arena: std.mem.Allocator, state_root: []const u8, repo: []const u8) !config.Layer {
+    var layer: config.Layer = .{};
+    const global_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{state_root});
+    if (try readOptional(arena, global_path)) |text| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        if (value != .object) return error.InvalidJson;
+        if (value.object.get("teamwork")) |teamwork| layer = try config.parseValue(arena, teamwork, null);
+    }
+    const project_path = try std.fmt.allocPrint(arena, "{s}/.metacodes/teamwork.json", .{repo});
+    if (try readOptional(arena, project_path)) |text| layer = config.merge(layer, try config.parse(arena, text, null));
+    return layer;
+}
+
+fn validated(merged: config.Layer) !config.Config.Enabled {
+    var layer = merged;
+    if (layer.enabled == null) layer.enabled = true;
     const cfg = switch (try config.validate(layer, null)) {
         .disabled => return error.TeamworkDisabled,
         .enabled => |c| c,
     };
     try supported(cfg);
-    // Git's toplevel is read-only. Do not let run state become an untracked
-    // input of the workspace snapshot or a writable part of the worker tree.
-    try requireExternalState(arena, state_root, repo);
-    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .workspace = repo };
+    return cfg;
 }
 
 fn supported(cfg: config.Config.Enabled) !void {
-    for ([_]types.Role{ .manager, .interviewer }) |role| {
-        const seat = cfg.seats.get(role);
-        if (seat.harnessKind() != .metacodes or seat.model != null or seat.effort != null)
-            return error.UnsupportedManagerOrInterviewer;
-    }
+    const manager = cfg.seats.get(.manager);
+    if (manager.harnessKind() != .metacodes or manager.model != null or manager.effort != null)
+        return error.UnsupportedManager;
     const seat = cfg.seats.get(.verifier);
     if (seat.harnessKind() != .metacodes) return error.ExternalVerifierUnsupported;
     if (seat.effort != null) return error.VerifierEffortUnsupported;
@@ -244,8 +262,24 @@ pub const Host = struct {
     sandbox: @import("../sandbox/config.zig").SandboxSettings,
     auditor: verifier.VerifierAuditor,
     parent_env: []const [:0]const u8,
+    provider: @import("../api/provider.zig").Provider,
+    anthropic_client: ?*@import("../client.zig").Client,
 
     pub fn create(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled) !*Host {
+        return createWith(arena, app, cfg, app.provider(), app.anthropicClientOrNull());
+    }
+
+    pub fn createOwned(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, owned: *provider_factory.OwnedProvider) !*Host {
+        return createWith(arena, app, cfg, owned.provider(), owned.anthropicClient());
+    }
+
+    fn createWith(
+        arena: std.mem.Allocator,
+        app: *App,
+        cfg: config.Config.Enabled,
+        provider: @import("../api/provider.zig").Provider,
+        anthropic_client: ?*@import("../client.zig").Client,
+    ) !*Host {
         if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
@@ -258,12 +292,14 @@ pub const Host = struct {
             .sandbox = scope.seatSandbox(app.sandboxPtr()),
             .auditor = undefined,
             .parent_env = try platform.paths.environment(arena),
+            .provider = provider,
+            .anthropic_client = anthropic_client,
         };
         const check: reviewer.CheckRunner = .{ .sandbox = &self.sandbox, .home = app.homeDir() };
         self.auditor = .{
             .deps = .{
-                .provider = app.provider(),
-                .anthropic_client = app.anthropicClientOrNull(),
+                .provider = provider,
+                .anthropic_client = anthropic_client,
                 .tool_defs = app.tool_defs,
                 .permission_ctx = &app.permission_ctx,
                 .session = app.session_id,
@@ -285,8 +321,8 @@ pub const Host = struct {
             .seats = .{ .harness = .{
                 .metacodes = .{
                     .preview = app.config.preview.isEnabled(),
-                    .provider = app.provider(),
-                    .anthropic_client = app.anthropicClientOrNull(),
+                    .provider = self.provider,
+                    .anthropic_client = self.anthropic_client,
                     .tool_defs = app.tool_defs,
                     .permission_ctx = &app.permission_ctx,
                     .host_sandbox = &self.sandbox,
@@ -356,22 +392,14 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
     if (prepared.action == .mcp and mcp == null) return error.McpHostUnavailable;
     var cfg = prepared.cfg;
-    if (prepared.action != .@"resume") {
-        // Pin inherited models as part of the approval persisted for resume.
-        for ([_]types.Role{ .implementer, .reviewer, .verifier }) |role| {
-            const seat = cfg.seats.getPtr(role);
-            if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = app.activeModel();
-        }
-    }
+    if (prepared.action != .@"resume") pinInheritedModels(&cfg, app.activeModel());
     const host = try Host.create(arena, app, cfg);
-    if (cfg.seats.get(.implementer).harnessKind() == .claude_code or cfg.seats.get(.reviewer).harnessKind() == .claude_code) {
-        try requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), prepared.workspace);
-    }
+    try checkClaudeState(arena, app, cfg, prepared.workspace);
     var deps = host.deps();
     deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
     // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
-        try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
+        try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request, .source = prepared.source }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
     else
         try runtime.Run.reopen(app.allocator, deps, cfg, app.stateRoot(), prepared.id);
     defer run.destroy();
@@ -389,6 +417,110 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     const state = try @import("swe_loop.zig").drive(run);
     try status(arena, app.stateRoot(), prepared.id);
     return if (state == .done) 0 else 1;
+}
+
+fn pinInheritedModels(cfg: *config.Config.Enabled, model: []const u8) void {
+    for ([_]types.Role{ .implementer, .reviewer, .verifier }) |role| {
+        const seat = cfg.seats.getPtr(role);
+        if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = model;
+    }
+}
+
+fn checkClaudeState(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, workspace: []const u8) !void {
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer }) |role| {
+        if (cfg.seats.get(role).harnessKind() == .claude_code)
+            return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
+    }
+}
+
+pub const Interactive = union(enum) {
+    started: *Background,
+    rejected: RunId,
+    interview_failed: RunId,
+    budget_exhausted: RunId,
+    aborted: RunId,
+};
+
+pub const Background = struct {
+    arena_state: std.heap.ArenaAllocator,
+    owned: ?provider_factory.OwnedProvider = null,
+    id: RunId,
+    interview_abort: types.AbortSignal = types.AbortSignal.init(),
+    run: ?*runtime.Run = null,
+    thread: ?std.Thread = null,
+    ended: std.atomic.Value(bool) = .init(false),
+
+    fn create(id: RunId) !*Background {
+        const self = try std.heap.c_allocator.create(Background);
+        self.* = .{ .arena_state = .init(std.heap.c_allocator), .id = id };
+        return self;
+    }
+
+    pub fn finished(self: *const Background) bool {
+        return self.ended.load(.acquire);
+    }
+
+    pub fn stop(self: *Background) void {
+        if (self.run) |run| {
+            if (self.thread) |thread| {
+                run.abort.abort(.user_ctrl_c);
+                thread.join();
+            }
+            run.destroy();
+        }
+        if (self.owned) |*owned| owned.deinit();
+        self.arena_state.deinit();
+        std.heap.c_allocator.destroy(self);
+    }
+
+    fn drive(self: *Background) void {
+        _ = @import("swe_loop.zig").drive(self.run.?) catch |err|
+            @import("../util/log.zig").warn("teamwork", "run {s} stopped: {s}", .{ self.id.slice(), @errorName(err) });
+        self.ended.store(true, .release);
+    }
+};
+
+pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prompter: interview.Prompter) !Interactive {
+    if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
+    const generated = @import("../core/session_id.zig").gen();
+    const job = try Background.create(try types.RunId.parse(generated.asSlice()));
+    var started = false;
+    defer if (!started) job.stop();
+    const arena = job.arena_state.allocator();
+    const gpa = std.heap.c_allocator;
+
+    const segments = try interview.parseSegments(arena, text);
+    const repo = try merge_back.toplevel(arena, workspace, null);
+    var cfg = try validated(config.merge(try configuredLayer(arena, app.stateRoot(), repo), segments.seats));
+    try requireExternalState(arena, app.stateRoot(), repo);
+    pinInheritedModels(&cfg, app.activeModel());
+    const jobs = if (app.agent_jobs) |*registry| registry else return error.TeamworkBackgroundUnavailable;
+    job.owned = try jobs.makeProvider();
+    const host = try Host.createOwned(arena, app, cfg, &job.owned.?);
+    try checkClaudeState(arena, app, cfg, repo);
+    var deps = host.deps();
+    deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
+    const options: runtime.StartOptions = .{ .state_root = app.stateRoot(), .run_id = job.id, .workspace = repo };
+
+    const approved: interview.Approved = if (segments.skip_interview)
+        .{ .text = segments.request, .source = .skip_interview }
+    else blk: {
+        var drafted = try interview.draft(gpa, deps, cfg, options, segments.request, &job.interview_abort);
+        defer drafted.deinit(gpa);
+        switch (drafted) {
+            .text => |proposal| {
+                const verdict = try interview.approve(proposal, prompter) orelse return .{ .rejected = job.id };
+                break :blk .{ .text = try arena.dupe(u8, verdict.text), .source = verdict.source };
+            },
+            .failed => return .{ .interview_failed = job.id },
+            .budget_exhausted => return .{ .budget_exhausted = job.id },
+            .aborted => return .{ .aborted = job.id },
+        }
+    };
+    job.run = try runtime.Run.start(gpa, deps, .{ .text = approved.text, .source = approved.source }, cfg, options);
+    job.thread = try platform.thread.spawn(.full, Background.drive, .{job});
+    started = true;
+    return .{ .started = job };
 }
 
 fn forwardAbort(source: *const types.AbortSignal, dest: *types.AbortSignal, stopped: *std.atomic.Value(bool)) void {
@@ -463,6 +595,8 @@ pub fn status(arena: std.mem.Allocator, state_root: []const u8, id: types.RunId)
         try s.objectField(key);
         try s.write(saved.object.get(key) orelse return error.StateCorrupt);
     }
+    try s.objectField("request_source");
+    try s.write(saved.object.get("request_source") orelse std.json.Value{ .string = @tagName(runtime.RequestSource.request_file) });
     try s.objectField("budget");
     try s.write(.{ .cap_usd = cfg.enabled.budget_usd, .spent_usd = spent, .remaining_usd = @max(0, cfg.enabled.budget_usd - spent), .charges = charges, .torn_tail = torn_tail, .pending = pending });
     try s.objectField("seats");
