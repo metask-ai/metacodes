@@ -55,14 +55,14 @@ metacodes [--state-dir DIR] update [--check] [--version X.Y.Z]
 | Option | Meaning |
 |---|---|
 | (none) | release install: the release `<base>/latest` redirects to. Development install: rebuild the checkout as it is |
-| `--check` | report what would happen and change nothing. Exit 0 when there is nothing to do, 3 when an update or repair is available |
+| `--check` | report what would happen and change nothing. When an update or repair is available it also lists the sessions that would refuse it and the TinyKG service a real run would stop (§4.1 step 4). Exit 0 when there is nothing to do, 3 when an update or repair is available, sessions or not |
 | `--version X.Y.Z` | release install only: that published release instead of the latest |
 | `--release-base URL` | release install only: a mirror of `https://github.com/metask-ai/metacodes/releases` with the same `latest` and `download/<tag>/<asset>` layout. It is recorded, so later updates use it too (§3) |
 | `--pull` | development install only: `git pull --ff-only` in the checkout first |
 | `--allow-downgrade` | let `--version` name an older release, or a checkout carry an older version, than the one installed |
 | `--no-sdk` | do not refresh the AgentCore SDK even though the install has one; the installed SDK stays |
 | `--ignore-running` | update while sessions run from this install (§6). Refused on Windows |
-| `--json` | one result document on stdout: `{action, source, from, to, prefix, origin, sdk, checked_only, stopped_services[], running_sessions[], notes[]}`; a failure prints `{action: "refused", error}` |
+| `--json` | one result document on stdout: `{action, source, from, to, prefix, origin, sdk, checked_only, stopped_services[], running_sessions[], sessions[], services[], notes[]}`; a failure prints `{action: "refused", error}`. `stopped_services` and `running_sessions` are what a real run did: the service pids it stopped and the sessions it left running (`--ignore-running`); they are always empty under `--check`. `sessions` and `services` are what `--check` found: the session pids that would refuse the update and the service pids a real run would stop; they are always empty without `--check` |
 
 `action` is one of `up_to_date`, `newer_installed`, `upgrade`, `downgrade`,
 `repair`, `rebuild` or `refused`. `source` is `release` or `checkout`. `origin`
@@ -186,7 +186,14 @@ or `{"kind": "checkout", "path": "/home/me/src/metacodes"}`.
    digest, and so is every file of `sdk/agentcore/manifest.json` when that
    exists (§8). Keep the old manifest's TinyKG digests for §6.3.
 4. **Plan** per source (§4.2, §4.3). `--check` reports the plan here and
-   stops.
+   stops. When the plan changes the install, it first runs step 5's scan and
+   reports what it found without acting on it: the sessions, listed as a
+   real run lists them, with "the update would be refused until they exit"
+   (POSIX adds "or with --ignore-running"; with `--ignore-running` it says
+   a real run goes ahead), and the TinyKG service pids a real run would
+   stop. It refuses nothing and signals nothing, and the exit code stays 3.
+   The scan is best effort, as in the real run; if it fails, a note says so
+   and the real run would stop with `ProcessScanFailed`.
 5. **Check running processes** (§6). Sessions refuse unless
    `--ignore-running`: once before any download, so a refusal costs nothing,
    and again after this install's TinyKG service has been stopped, which
@@ -591,6 +598,10 @@ child. Every invocation is recorded. The tests assert:
   arguments, and `up_to_date` runs nothing;
 - a running session from the prefix refuses the update, `--ignore-running`
   goes ahead and names it (POSIX), and the service pair is stopped;
+- `--check` names that session (text and `sessions[]`) and the service pid
+  a real run then stops (`services[]`), changes nothing, and leaves
+  `running_sessions` and `stopped_services` empty; with nothing running,
+  all four arrays are empty;
 - the real `install --help` names every flag of the contract, and the real
   `--help` names `update`.
 

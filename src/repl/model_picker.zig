@@ -248,6 +248,7 @@ pub const Key = union(enum) {
     enter,
     /// Clears the filter, then walks back a step, then closes.
     escape,
+    cancel,
     backspace,
     /// Cycles session → global → once. Session is the default, so any other
     /// scope is always an explicit act.
@@ -913,6 +914,7 @@ pub const Picker = struct {
     // ── key handling ────────────────────────────────────────────────────────
 
     pub fn onKey(self: *Picker, key: Key) Outcome {
+        if (key == .cancel) return .closed;
         // The setup stage has no list: Esc goes back, q closes, and nothing
         // else does anything — it starts no sign-in and takes no key (#488).
         if (self.stage == .setup) return switch (key) {
@@ -952,6 +954,7 @@ pub const Picker = struct {
                 return .redraw;
             },
             .escape => return self.back(),
+            .cancel => return .closed,
             .char => |byte| {
                 if (byte < 0x20 or byte == 0x7f) return .ignored;
                 if (self.filter_len == MAX_FILTER) return .ignored;
@@ -1728,6 +1731,31 @@ test "the setup stage, which takes no typing, still closes on q (#599)" {
     try testing.expect(picker.onKey(.{ .char = 'a' }) == .ignored);
     try testing.expectEqual(Stage.setup, picker.stage);
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .closed);
+}
+
+test "cancel closes the picker whatever it shows, even when its rows cannot be built (#607)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "GLM-4.6", null, "glm-4.6", "anthropic_messages"),
+        fixtureOffer("zai", "default", "GLM-4.5", null, "glm-4.5", "openai_chat"),
+    };
+    try loadFixture(&picker, &offers, null);
+
+    picker.restart();
+    for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expect(picker.onKey(.cancel) == .closed);
+
+    picker.restart();
+    picker.enterSetup(.{ .provider = Slug.lit("zai"), .variable = "ZAI_API_KEY" });
+    try testing.expect(picker.onKey(.cancel) == .closed);
+
+    picker.restart();
+    const owned = picker.allocator;
+    picker.allocator = testing.failing_allocator;
+    defer picker.allocator = owned;
+    try testing.expect(picker.onKey(.down) == .ignored);
+    try testing.expect(picker.onKey(.cancel) == .closed);
 }
 
 test "navigation wraps, skips headings, pages, and keeps the cursor inside the window" {

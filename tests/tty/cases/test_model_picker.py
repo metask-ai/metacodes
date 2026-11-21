@@ -207,6 +207,74 @@ def test_picker_takes_a_paste_during_a_reply_as_one_filter_edit_and_applies_noth
     assert OPEN in text and "Model  /zai" in text, "粘贴后 picker 应仍开着、过滤词还在:\n" + text
 
 
+def test_picker_takes_the_keys_with_vim_on_and_esc_twice_closes_it(bin_path):
+    from slow_mock_server import SlowMockServer, simple_text
+
+    with SlowMockServer([simple_text("SHOULD_NOT_REACH")]) as srv:
+        raw = run(
+            bin_path,
+            submit("/vim", "Editor mode: vim") + submit("/model", OPEN) + [
+                "type:zai", wait_for("Model  /zai"),
+                "key:esc", wait_for("esc cancel"),
+                "key:esc", wait_for("kept "),
+                "key:enter", "sleep:0.8",
+            ],
+            base_url=srv.url,
+            env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+            per_key_drain=0.08,
+        )
+        requests = list(srv.requests)
+    a, text = _screen(raw)
+    frames = _frames(a)
+    filtered = [sc for sc in frames if "Model  /zai" in sc]
+    assert filtered and "Z.AI GLM Coding Plan" in filtered[-1], "vim 开着时过滤词没到 picker:\n" + text
+    assert not any("❯ zai" in sc for sc in frames), "过滤词进了输入框:\n" + text
+    assert "kept claude" in text and "enter apply" not in text, "两次 Esc 没有先清过滤再关掉 picker:\n" + text
+    assert not requests and "SHOULD_NOT_REACH" not in text, f"什么都不该提交:{requests!r}\n" + text
+    a.assert_input_echo("")
+
+
+def test_picker_enter_applies_the_model_with_vim_on(bin_path):
+    from slow_mock_server import SlowMockServer, simple_text
+
+    with SlowMockServer([simple_text("SHOULD_NOT_REACH")]) as srv:
+        raw = run(
+            bin_path,
+            submit("/vim", "Editor mode: vim") + submit("/model", OPEN) + [
+                "type:glm-5.3", wait_for("Reasoning effort"),
+                "key:enter", wait_for("switched to glm-5.3"), "sleep:0.4",
+            ],
+            base_url=srv.url,
+            env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+            term_size=(30, 120),
+            per_key_drain=0.1,
+        )
+        requests = list(srv.requests)
+    a, text = _screen(raw, rows=30, cols=120)
+    assert "switched to glm-5.3" in " ".join(text.split()), "vim 开着时 Enter 没有应用光标处的模型:\n" + text
+    assert not requests and "SHOULD_NOT_REACH" not in text, f"Enter 把输入框当提示词发出去了:{requests!r}\n" + text
+    a.assert_input_echo("")
+
+
+def test_picker_ctrl_c_closes_it_and_keeps_the_draft(bin_path):
+    raw = run(
+        bin_path,
+        [READY, "type:explain this", "sleep:0.3", "key:ctrl_o", wait_for(OPEN),
+         "key:ctrl_c", wait_for("kept "),
+         "key:ctrl_c", wait_for("Press Ctrl-C again to exit")],
+        per_key_drain=0.08,
+    )
+    a, text = _screen(raw)
+    frames = _frames(a)
+    at = next((i for i, sc in enumerate(frames) if "kept claude" in sc), None)
+    assert at is not None, "Ctrl+C 没有关掉 picker:\n" + text
+    closed = frames[at]
+    assert "enter apply" not in closed and "❯ explain this" in closed, "Ctrl+C 关掉 picker 时草稿没留住:\n" + closed
+    assert "Press Ctrl-C again" not in closed, "关掉 picker 的那一下不该进入双击退出:\n" + closed
+    assert any("Press Ctrl-C again to exit" in sc for sc in frames[at:]), "关掉 picker 之后再按 Ctrl+C 应进入双击退出:\n" + text
+    a.assert_box_present()
+
+
 def test_picker_tab_cycles_scope_and_shows_it(bin_path):
     raw = run(
         bin_path,

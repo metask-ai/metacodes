@@ -1188,14 +1188,18 @@ by its path.
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
 streaming; a commit during a reply changes the next turn, not the one in flight.
-`Ctrl+C`/`Ctrl+D` deliberately pass through, so there is always an exit that does
-not depend on the picker's own state machine; over a draft that is not empty
-`Ctrl+D` does nothing, so it cannot delete a character of it (#649). Every
-printable key is the filter, `q` included, so a search can start with any
-letter (#599); Esc clears the filter, then closes. A bracketed paste is one
-edit of the filter, at the prompt and during a reply alike: the text up to its
-first line break is appended, control characters dropped, the draft stays as
-it was, and a paste never applies a model (#650).
+With `/vim` on it takes the keys all the same, and vim's keymap returns when
+it closes (#606). At the prompt `Ctrl+C` closes it whatever it shows, like a
+cancel (`kept …`), and leaves the draft; the next `Ctrl+C` arms the exit as
+usual (#607). `Ctrl+D`, and `Ctrl+C` during a reply, deliberately pass through,
+so there is always an exit that does not depend on the picker's own state
+machine; over a draft that is not empty `Ctrl+D` does nothing, so it cannot
+delete a character of it (#649). Every printable key is the filter, `q`
+included, so a search can start with any letter (#599); Esc clears the filter,
+then closes. A bracketed paste is one edit of the filter, at the prompt and
+during a reply alike: the text up to its first line break is appended, control
+characters dropped, the draft stays as it was, and a paste never applies a
+model (#650).
 
 Enter commits at the scope the header brackets. Session is the default, and
 `Tab` cycles session → global → once, so any durable write is an explicit act

@@ -4,6 +4,7 @@
 const std = @import("std");
 const canonical = @import("canonical.zig");
 const json = @import("json_admission.zig");
+const json_util = @import("../util/json.zig");
 
 pub const JSON_RPC_VERSION = "2.0";
 pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -261,6 +262,26 @@ fn encodeFrame(
     try writer.endObject();
 }
 
+pub const RequestId = union(enum) {
+    number: []const u8,
+    string: []const u8,
+
+    fn of(value: std.json.Value) ?RequestId {
+        return switch (value) {
+            .number_string => |lexeme| .{ .number = lexeme },
+            .string => |text| .{ .string = text },
+            else => null,
+        };
+    }
+
+    pub fn write(self: RequestId, writer: *std.Io.Writer) !void {
+        switch (self) {
+            .number => |lexeme| try writer.writeAll(lexeme),
+            .string => |text| try json_util.writeJsonString(writer, text),
+        }
+    }
+};
+
 /// What one received frame is. `error` / `result` stay unparsed here: the
 /// caller parses the frame it was waiting for under its own conformance.
 pub const FrameKind = union(enum) {
@@ -269,7 +290,7 @@ pub const FrameKind = union(enum) {
     /// A server notification.
     notification: []const u8,
     /// A server→client request, to be answered.
-    server_request: struct { id: u64, method: []const u8 },
+    server_request: struct { id: RequestId, method: []const u8 },
     response: Response,
 
     pub const Response = struct {
@@ -296,8 +317,8 @@ pub fn classifyFrame(arena: std.mem.Allocator, frame: []const u8) error{OutOfMem
     const id: ?u64 = if (value.object.get("id")) |id_value| numberAsU64(id_value) else null;
     if (value.object.get("method")) |method| {
         if (method == .string) {
-            if (value.object.get("id") == null) return .{ .notification = method.string };
-            if (id) |request_id| return .{ .server_request = .{ .id = request_id, .method = method.string } };
+            const id_value = value.object.get("id") orelse return .{ .notification = method.string };
+            if (RequestId.of(id_value)) |request_id| return .{ .server_request = .{ .id = request_id, .method = method.string } };
             // A request whose id cannot be echoed cannot be answered.
             return .{ .notification = method.string };
         }
@@ -491,10 +512,15 @@ test "classifyFrame reads top-level members, not nested properties" {
     const a = arena.allocator();
     const elicit = "{\"id\":9,\"method\":\"elicitation/create\",\"params\":{\"requestedSchema\":{\"properties\":{\"result\":{\"type\":\"string\"}}}}}";
     const request = try classifyFrame(a, elicit);
-    try std.testing.expectEqual(@as(u64, 9), request.server_request.id);
+    try std.testing.expectEqualStrings("9", request.server_request.id.number);
     try std.testing.expect((try classifyFrame(a, "{\"method\":\"notifications/x\"}")) == .notification);
     try std.testing.expectEqual(@as(?u64, 4), (try classifyFrame(a, "{\"id\":4,\"result\":{\"method\":\"x\"}}")).response.id);
     try std.testing.expectEqual(@as(?u64, null), (try classifyFrame(a, "{\"id\":\"s\",\"error\":{}}")).response.id);
+    const named = try classifyFrame(a, "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"ping\"}");
+    try std.testing.expectEqualStrings("abc", named.server_request.id.string);
+    try std.testing.expectEqualStrings("-3", (try classifyFrame(a, "{\"id\":-3,\"method\":\"ping\"}")).server_request.id.number);
+    try std.testing.expect((try classifyFrame(a, "{\"id\":null,\"method\":\"ping\"}")) == .notification);
+    try std.testing.expect((try classifyFrame(a, "{\"id\":{},\"method\":\"ping\"}")) == .notification);
     try std.testing.expect((try classifyFrame(a, "not json")) == .malformed);
     try std.testing.expect((try classifyFrame(a, "[1]")) == .malformed);
 }
