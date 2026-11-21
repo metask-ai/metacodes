@@ -78,6 +78,7 @@ pub fn pastedByte(key: Key) ?u8 {
 ///   ESC [ A/B/C/D     ↑↓→←
 ///   ESC [ H / F       Home / End
 ///   ESC [ 3 ~         Delete
+///   ESC [ 1;<mod> A–D/H/F、ESC [ 3/5/6;<mod> ~   <mod> 只带 Caps Lock(64)/Num Lock(128) 时同不带 <mod>
 ///   ESC [ <num>;<mod> u   CSI u（kitty 键盘协议）
 ///   ESC [ 27;<mod>;<num> ~  xterm modifyOtherKeys,与 CSI u 同一张表(decodeModifiedKey)
 ///     - 9;2 = Shift+Tab
@@ -257,14 +258,8 @@ pub const KeyParser = struct {
                 }
                 self.state = .normal;
                 return switch (b) {
-                    'A' => .up,
-                    'B' => .down,
-                    'C' => .right,
-                    'D' => .left,
-                    'H' => .home,
-                    'F' => .end,
                     'Z' => .shift_tab, // ESC [ Z = Shift+Tab(backtab)
-                    else => .unknown,
+                    else => cursorKey(b),
                 };
             },
             .csi_num1 => {
@@ -289,12 +284,9 @@ pub const KeyParser = struct {
                 self.state = .normal;
                 if (b == '~') {
                     return switch (self.num1) {
-                        3 => .delete,
-                        5 => .page_up,
-                        6 => .page_down,
                         200 => .paste_begin,
                         201 => .paste_end,
-                        else => .unknown,
+                        else => tildeKey(self.num1),
                     };
                 }
                 // 无 modifier 的 CSI-u(ESC[<cp>u,无 ;mod):Kitty disambiguate 模式下
@@ -337,8 +329,11 @@ pub const KeyParser = struct {
                     return null;
                 }
                 self.state = .normal;
-                if (b == 'u') return decodeModifiedKey(self.num1, KeyModifier.fromParam(self.num2));
-                return .unknown;
+                const modifier = KeyModifier.fromParam(self.num2);
+                if (b == 'u') return decodeModifiedKey(self.num1, modifier);
+                if (modifier != .none) return .unknown;
+                if (b == '~') return tildeKey(self.num1);
+                return if (self.num1 == 1) cursorKey(b) else .unknown;
             },
             .csi_semi2 => {
                 if (b >= '0' and b <= '9') {
@@ -503,6 +498,27 @@ fn ctrlLetterKey(codepoint: u32) Key {
         119, 87 => .ctrl_w, // 'w'
         121, 89 => .ctrl_y, // 'y'
         95 => .ctrl_underscore, // '_' — undo
+        else => .unknown,
+    };
+}
+
+fn cursorKey(final: u8) Key {
+    return switch (final) {
+        'A' => .up,
+        'B' => .down,
+        'C' => .right,
+        'D' => .left,
+        'H' => .home,
+        'F' => .end,
+        else => .unknown,
+    };
+}
+
+fn tildeKey(number: u32) Key {
+    return switch (number) {
+        3 => .delete,
+        5 => .page_up,
+        6 => .page_down,
         else => .unknown,
     };
 }
@@ -1908,6 +1924,31 @@ test "KeyParser: unknown modifyOtherKeys combos are one .unknown and leave no ch
     const keys = parseAll("a\x1b[27;5;9~b\x1b[27;2;8~c\x1b[28;2;9~d\x1b[27;2;9uf\x1b[27;2;9;1~g", &buf);
     const expected = [_]Key{ .{ .char = 'a' }, .unknown, .{ .char = 'b' }, .unknown, .{ .char = 'c' }, .unknown, .{ .char = 'd' }, .unknown, .{ .char = 'f' }, .unknown, .{ .char = 'g' } };
     try testing.expectEqualSlices(Key, &expected, keys);
+}
+
+test "KeyParser: cursor and editing keys with only Caps Lock or Num Lock on are the plain keys" {
+    const finals = [_]struct { u8, Key }{ .{ 'A', .up }, .{ 'B', .down }, .{ 'C', .right }, .{ 'D', .left }, .{ 'H', .home }, .{ 'F', .end } };
+    const tildes = [_]struct { u32, Key }{ .{ 3, .delete }, .{ 5, .page_up }, .{ 6, .page_down } };
+    var buf: [16]u8 = undefined;
+    for ([_]u32{ 1, 65, 129, 193 }) |modifier| {
+        for (finals) |f| try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[1;{d}{c}", .{ modifier, f[0] }), f[1]);
+        for (tildes) |t| try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[{d};{d}~", .{ t[0], modifier }), t[1]);
+    }
+    var keys_buf: [8]Key = undefined;
+    const keys = parseAll("a\x1b[1;65Db\x1b[3;129~c", &keys_buf);
+    try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .left, .{ .char = 'b' }, .delete, .{ .char = 'c' } }, keys);
+}
+
+test "KeyParser: Shift, Alt or Ctrl next to a lock still keeps a cursor or editing key from being the plain key" {
+    for ([_][]const u8{ "\x1b[1;2A", "\x1b[1;66A", "\x1b[1;5D", "\x1b[1;133D", "\x1b[1;3H", "\x1b[1;67F", "\x1b[3;130~", "\x1b[5;69~", "\x1b[6;2~" }) |seq| {
+        try expectSequence(seq, .unknown);
+    }
+}
+
+test "KeyParser: lock bits make no key of a sequence that has none, and no paste marker" {
+    for ([_][]const u8{ "\x1b[2;65~", "\x1b[200;65~", "\x1b[201;129~", "\x1b[1;65P", "\x1b[2;65A" }) |seq| {
+        try expectSequence(seq, .unknown);
+    }
 }
 
 test "KeyParser: Shift+Tab split across reads still decodes once" {

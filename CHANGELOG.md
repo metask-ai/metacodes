@@ -142,6 +142,17 @@ status, compatibility boundaries, and entry points are defined by
   a dialog: the permission dialog ignores it, and the question dialog types
   it into "Type something" or the note being edited, line breaks as spaces.
 
+- **The arrow keys, Home, End, Delete, Page Up and Page Down work with Caps
+  Lock or Num Lock on** (#658). Under the kitty keyboard protocol a terminal
+  counts the lock keys as modifiers, Caps Lock adding 64 and Num Lock 128:
+  with Caps Lock on, Ghostty sends Up as `ESC [ 1 ; 65 A` and Delete as
+  `ESC [ 3 ; 65 ~`. The key parser read a modifier only in `CSI u` and
+  modifyOtherKeys sequences, so these keys did nothing: Up recalled no
+  history at the prompt, and in the permission dialog Down, Down, Enter,
+  meant to pick "No", approved the write as "Yes once". A modifier that holds
+  only lock bits now leaves the key as it is; with Shift, Alt or Ctrl these
+  keys are still ignored, as before.
+
 ### Fixed
 
 - **A `204` or `304` answer no longer holds a request until the server
