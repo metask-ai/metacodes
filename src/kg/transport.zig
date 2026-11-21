@@ -454,6 +454,7 @@ pub const WebTransport = struct {
             .extra_headers = &.{.{ .name = "x-api-key", .value = self.api_key }},
         }) catch return Error.RequestFailed;
         defer req.deinit();
+        http_connection.keepServerOpen(&req);
         // A bodiless request still has to be written out; without this the
         // probe waited for a reply to a GET that never left the client.
         http_connection.sendBodiless(&req) catch return Error.RequestFailed;
@@ -553,6 +554,7 @@ pub const WebTransport = struct {
             },
         }) catch return Error.RequestFailed;
         defer req.deinit();
+        http_connection.keepServerOpen(&req);
         http_connection.sendBodyComplete(&req, @constCast(body)) catch return Error.RequestFailed;
         var redirect_buffer: [4096]u8 = undefined;
         const head = http_connection.receiveHead(&req, &redirect_buffer) catch return Error.RequestFailed;

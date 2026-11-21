@@ -56,6 +56,11 @@ These rules apply to the entire repository.
   `Response.reader` or `Reader.bodyReader`: Zig 0.16 reads the body of a
   1xx, 204 or 304 answer, and `Request.deinit` drains it, until the server
   closes the connection (`zig build test:http-answer` enforces it, #579).
+- A request in `src/` that sets `keep_alive = false` calls
+  `http_connection.keepServerOpen` before it is sent. Otherwise std writes
+  `connection: close` for it, the server closes right after its last byte,
+  and behind a transparent proxy that close can overtake the end of the
+  answer (`zig build test:keep-server-open` enforces it, #573, #661).
 - Agents do not write comments, doc comments or docstrings. Let names, types
   and structure carry the meaning, and put the reasoning behind a change in
   its commit message or PR description. The exceptions are what this file or
