@@ -111,6 +111,7 @@ pub const teamwork_verifier_auditor = @import("teamwork/verifier_auditor.zig"); 
 pub const teamwork_mcp_server = @import("teamwork/mcp_server.zig"); // approved runtime operations over MCP (#522)
 pub const teamwork_progress = @import("teamwork/progress.zig");
 pub const teamwork_interview = @import("teamwork/interview.zig"); // request segments, interviewer draft and approval (#518)
+pub const teamwork_judge = @import("teamwork/judge.zig"); // parallel candidates: judge packet, judgment and pitfall lessons (#525)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");

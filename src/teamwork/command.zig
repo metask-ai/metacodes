@@ -18,6 +18,7 @@ const interview = @import("interview.zig");
 const merge_back = @import("merge_back.zig");
 const provider_factory = @import("../api/provider_factory.zig");
 const progress = @import("progress.zig");
+const lesson = @import("../kg/lesson.zig");
 
 pub const RunId = types.RunId;
 
@@ -214,25 +215,7 @@ fn supported(cfg: config.Config.Enabled) !void {
 fn policyJson(arena: std.mem.Allocator, cfg: config.Config.Enabled) ![]const u8 {
     var layer: config.Layer = .{ .enabled = true, .budget_usd = cfg.budget_usd, .max_rounds = cfg.max_rounds };
     if (cfg.check_command) |check| layer.check_command = check.text;
-    for (std.enums.values(types.Role)) |role| {
-        const spec = cfg.seats.get(role);
-        var seat: config.SeatLayer = .{ .harness = spec.harnessKind(), .model = spec.model, .effort = spec.effort };
-        switch (spec.harness) {
-            .metacodes => {},
-            .claude_code => |external| {
-                seat.command = external.command.bytes;
-                switch (external.budget) {
-                    .cost => seat.budget_enforcement = .cost,
-                    .wallclock_only => |limit| {
-                        seat.budget_enforcement = .wallclock_only;
-                        seat.wallclock_seconds = limit.seconds;
-                    },
-                }
-                if (external.demote_only) seat.demote_only = true;
-            },
-        }
-        layer.seats.set(role, seat);
-    }
+    for (std.enums.values(types.Role)) |role| layer.seats.set(role, seatLayerOf(cfg.seats.get(role)));
     // EnumArray's JSON is an implementation detail; serialize the public
     // object schema explicitly, with absent optionals omitted.
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -245,6 +228,14 @@ fn policyJson(arena: std.mem.Allocator, cfg: config.Config.Enabled) ![]const u8 
     try s.write(cfg.budget_usd);
     try s.objectField("max_rounds");
     try s.write(cfg.max_rounds);
+    if (cfg.candidate_estimate_usd) |estimate| {
+        try s.objectField("candidates");
+        try s.beginArray();
+        for (cfg.candidates.slice()) |spec| try s.write(seatLayerOf(spec));
+        try s.endArray();
+        try s.objectField("candidate_estimate_usd");
+        try s.write(estimate);
+    }
     if (layer.check_command) |check| {
         try s.objectField("check_command");
         try s.write(check);
@@ -258,6 +249,25 @@ fn policyJson(arena: std.mem.Allocator, cfg: config.Config.Enabled) ![]const u8 
     try s.endObject();
     try s.endObject();
     return out.toOwnedSlice();
+}
+
+fn seatLayerOf(spec: types.SeatSpec) config.SeatLayer {
+    var seat: config.SeatLayer = .{ .harness = spec.harnessKind(), .model = spec.model, .effort = spec.effort };
+    switch (spec.harness) {
+        .metacodes => {},
+        .claude_code => |external| {
+            seat.command = external.command.bytes;
+            switch (external.budget) {
+                .cost => seat.budget_enforcement = .cost,
+                .wallclock_only => |limit| {
+                    seat.budget_enforcement = .wallclock_only;
+                    seat.wallclock_seconds = limit.seconds;
+                },
+            }
+            if (external.demote_only) seat.demote_only = true;
+        },
+    }
+    return seat;
 }
 
 /// Stable host seam for CLI and the incoming MCP server. Heap allocated:
@@ -340,7 +350,15 @@ pub const Host = struct {
             } },
             .auditor = self.auditor.auditor(),
             .check_runner = self.auditor.check_runner,
+            .pitfalls = .{ .ctx = app, .rememberFn = rememberPitfall },
         };
+    }
+
+    fn rememberPitfall(ctx: *anyopaque, text: []const u8) bool {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        const kg = if (app.kg) |*client| client else return false;
+        _ = kg.remember(.observation, text, lesson.SCHEMA_TYPE, false) catch return false;
+        return true;
     }
 
     /// Pin the effective inputs consulted by child tools and pinned checks.
@@ -447,15 +465,21 @@ const LineObserver = struct {
 };
 
 fn pinInheritedModels(cfg: *config.Config.Enabled, model: []const u8) void {
-    for ([_]types.Role{ .implementer, .reviewer, .verifier }) |role| {
-        const seat = cfg.seats.getPtr(role);
-        if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = model;
-    }
+    for ([_]types.Role{ .implementer, .reviewer, .verifier, .judge }) |role| pinModel(cfg.seats.getPtr(role), model);
+    for (cfg.candidates.specs[0..cfg.candidates.len]) |*seat| pinModel(seat, model);
+}
+
+fn pinModel(seat: *types.SeatSpec, model: []const u8) void {
+    if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = model;
 }
 
 fn checkClaudeState(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, workspace: []const u8) !void {
-    for ([_]types.Role{ .interviewer, .implementer, .reviewer }) |role| {
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .judge }) |role| {
         if (cfg.seats.get(role).harnessKind() == .claude_code)
+            return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
+    }
+    for (cfg.candidates.slice()) |spec| {
+        if (spec.harnessKind() == .claude_code)
             return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
     }
 }
@@ -570,15 +594,35 @@ fn draftInterruptibly(app: *App, job: *Background, deps: runtime.Deps, cfg: conf
 fn approvalTerms(arena: std.mem.Allocator, cfg: config.Config.Enabled, repo: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
-    try w.print("Approving also authorizes spend up to ${d} (at most {d} seats per role), these seats:", .{ cfg.budget_usd, cfg.max_rounds });
-    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .verifier }) |role| {
-        const seat = cfg.seats.get(role);
-        try w.print(" {s}={s}", .{ role.name(), seat.harnessKind().name() });
-        if (seat.model) |model| try w.print("/{s}", .{model});
+    const candidates = cfg.candidates.slice();
+    try w.print("Approving also authorizes spend up to ${d} (at most {d} seats per role", .{ cfg.budget_usd, cfg.max_rounds });
+    if (candidates.len != 0) try w.print("; {d} implementer and reviewer seats, and {d} judge seats", .{ cfg.max_rounds + candidates.len - 1, cfg.max_rounds });
+    try w.writeAll("), these seats:");
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .verifier }) |role| try writeSeatTerm(w, role.name(), cfg.seats.get(role));
+    if (candidates.len != 0) {
+        try w.print(", {d} parallel candidates estimated at ${d} each:", .{ candidates.len, cfg.candidate_estimate_usd.? });
+        for (candidates, 1..) |seat, number| {
+            var name_buf: [32]u8 = undefined;
+            try writeSeatTerm(w, std.fmt.bufPrint(&name_buf, "candidate-{d}", .{number}) catch unreachable, seat);
+        }
+        try w.writeAll(", judged by");
+        try writeSeatTerm(w, "judge", cfg.seats.get(.judge));
     }
     if (cfg.check_command) |check| try w.print(", the check `{s}`", .{check.text}) else try w.writeAll(", no pinned check");
     try w.print(", and merging the result into {s} as uncommitted changes.", .{repo});
     return out.toOwnedSlice();
+}
+
+fn writeSeatTerm(w: *std.Io.Writer, name: []const u8, seat: types.SeatSpec) !void {
+    try w.print(" {s}={s}", .{ name, seat.harnessKind().name() });
+    if (seat.model) |model| try w.print("/{s}", .{model});
+    switch (seat.harness) {
+        .metacodes => {},
+        .claude_code => |external| switch (external.budget) {
+            .cost => {},
+            .wallclock_only => |limit| try w.print(" (wallclock only, {d}s, no dollar cap)", .{limit.seconds}),
+        },
+    }
 }
 
 fn forwardAbort(source: *const types.AbortSignal, dest: *types.AbortSignal, stopped: *std.atomic.Value(bool)) void {
@@ -763,4 +807,38 @@ fn requireExternalState(arena: std.mem.Allocator, state_root: []const u8, repo: 
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "teamwork command: the approved policy keeps parallel candidates and the judge for resume" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const claude = if (@import("builtin").os.tag == .windows) "C:/tools/claude.exe" else "/opt/claude/bin/claude";
+    for ([_][]const u8{
+        "{\"enabled\":true,\"budget_usd\":5,\"candidates\":[{\"model\":\"m\"},{\"harness\":\"claude_code\",\"command\":\"" ++ claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}],\"candidate_estimate_usd\":0.5,\"seats\":{\"judge\":{\"model\":\"j\",\"effort\":\"high\"}}}",
+        "{\"enabled\":true,\"budget_usd\":5,\"candidates\":3,\"candidate_estimate_usd\":1,\"check_command\":\"zig build test\"}",
+        "{\"enabled\":true,\"budget_usd\":5}",
+    }) |text| {
+        const cfg = (try config.validate(try config.parse(a, text, null), null)).enabled;
+        const restored = (try config.validate(try config.parse(a, try policyJson(a, cfg), null), null)).enabled;
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, cfg, .{}), try std.json.Stringify.valueAlloc(a, restored, .{}));
+    }
+}
+
+test "teamwork command: approval terms name every candidate, the judge and the raised seat cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const claude = if (@import("builtin").os.tag == .windows) "C:/tools/claude.exe" else "/opt/claude/bin/claude";
+    const text = "{\"enabled\":true,\"budget_usd\":5,\"candidates\":[{\"model\":\"m\"},{\"harness\":\"claude_code\",\"command\":\"" ++ claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}],\"candidate_estimate_usd\":0.5,\"seats\":{\"judge\":{\"model\":\"j\"}}}";
+    const cfg = (try config.validate(try config.parse(a, text, null), null)).enabled;
+    try std.testing.expectEqualStrings(
+        "Approving also authorizes spend up to $5 (at most 3 seats per role; 4 implementer and reviewer seats, and 3 judge seats), these seats: interviewer=metacodes implementer=metacodes reviewer=metacodes verifier=metacodes, 2 parallel candidates estimated at $0.5 each: candidate-1=metacodes/m candidate-2=claude_code (wallclock only, 60s, no dollar cap), judged by judge=metacodes/j, no pinned check, and merging the result into /repo as uncommitted changes.",
+        try approvalTerms(a, cfg, "/repo"),
+    );
+    const single = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":2}", null), null)).enabled;
+    try std.testing.expectEqualStrings(
+        "Approving also authorizes spend up to $2 (at most 3 seats per role), these seats: interviewer=metacodes implementer=metacodes reviewer=metacodes verifier=metacodes, no pinned check, and merging the result into /repo as uncommitted changes.",
+        try approvalTerms(a, single, "/repo"),
+    );
 }

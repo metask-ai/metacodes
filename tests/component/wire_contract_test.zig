@@ -372,6 +372,7 @@ test "wire_contract: teamwork snapshot and event lines, every change kind, are p
         .seats = &seats,
         .budget = .{ .cap_usd = 5, .spent_usd = 0.75, .remaining_usd = 4.25, .charges = 2 },
         .audit = .{ .used = 1, .last = .fail },
+        .candidates = &.{ .{ .status = .approved }, .{ .status = .reviewing } },
     };
     const teamwork_changes = [_]progress.Change{
         .{ .seat = .{ .id = seats[2].id, .from = null, .to = .queued } },

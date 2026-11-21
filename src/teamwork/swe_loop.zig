@@ -27,7 +27,18 @@ pub fn drive(run: *runtime.Run) Error!runtime.State {
     while (true) {
         switch (run.state) {
             .done, .failed, .budget_exhausted, .cancelled => return run.state,
-            .approved, .implementing => _ = run.dispatch(.implementer, "") catch |err| switch (err) {
+            .approved => if (run.cfg.candidates.len != 0) {
+                _ = run.runCandidates() catch |err| switch (err) {
+                    error.RunEnded, error.BudgetExhausted => continue,
+                    else => |e| return e,
+                };
+            } else {
+                _ = run.dispatch(.implementer, "") catch |err| switch (err) {
+                    error.RunEnded, error.RoundsExhausted, error.BudgetExhausted => continue,
+                    else => |e| return e,
+                };
+            },
+            .implementing => _ = run.dispatch(.implementer, "") catch |err| switch (err) {
                 // The run is in a terminal state now; the next turn returns it.
                 error.RunEnded, error.RoundsExhausted, error.BudgetExhausted => continue,
                 else => |e| return e,
@@ -40,8 +51,8 @@ pub fn drive(run: *runtime.Run) Error!runtime.State {
                 error.RunEnded, error.BudgetExhausted => continue,
                 else => |e| return e,
             },
-            // Only inside `requestCompletion`; `Run.reopen` resolves both.
-            .auditing, .merging => return error.IllegalTransition,
+            // Only inside `runCandidates` and `requestCompletion`; `Run.reopen` resolves all three.
+            .candidates, .auditing, .merging => return error.IllegalTransition,
         }
     }
 }

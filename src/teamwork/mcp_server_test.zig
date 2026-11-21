@@ -28,6 +28,8 @@ const review_call = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"p
 const complete = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"teamwork_request_completion\"}}";
 const status_call = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"teamwork_status\"}}";
 const cancel = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"teamwork_cancel\"}}";
+const run_candidates = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"teamwork_run_candidates\"}}";
+const judgment = "{\"selected\":\"candidate-1\",\"eliminated\":[{\"candidate\":\"candidate-2\",\"reason\":\"Same change, judged second.\"}]}";
 
 fn writeFile(dir: []const u8, rel: []const u8, text: []const u8) !void {
     var buf: PathBuf = undefined;
@@ -88,7 +90,11 @@ const Fixture = struct {
     }
 
     fn start(self: *Fixture, seats: *Seats, auditor: audit.CompletionAuditor) !*runtime.Run {
-        const cfg = (try config.validate(try config.parse(self.arena.allocator(), "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"" ++ check ++ "\"}", null), null)).enabled;
+        return self.startWith(seats, auditor, "");
+    }
+
+    fn startWith(self: *Fixture, seats: *Seats, auditor: audit.CompletionAuditor, comptime extra: []const u8) !*runtime.Run {
+        const cfg = (try config.validate(try config.parse(self.arena.allocator(), "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"" ++ check ++ "\"" ++ extra ++ "}", null), null)).enabled;
         return runtime.Run.start(gpa, .{ .preview = .all, .seats = .{ .custom = .{ .ctx = seats, .driverFn = Seats.driver } }, .auditor = auditor }, .{ .text = request, .source = .request_file }, cfg, .{
             .workspace = self.repo,
             .state_root = self.state,
@@ -121,10 +127,10 @@ const Seats = struct {
         if (abort.isAborted()) return .aborted;
         if (self.packet) |p| gpa.free(p);
         self.packet = swarm_team.readFileAlloc(gpa, paths.packet);
-        if (spec.role == .implementer) {
-            writeFile(paths.workspace, "feature.txt", "feature\n") catch return .{ .failed = .spawn_failed };
-        } else {
-            writeFile(common.seatDir(paths), "review.json", review) catch return .{ .failed = .spawn_failed };
+        switch (spec.role) {
+            .implementer => writeFile(paths.workspace, "feature.txt", "feature\n") catch return .{ .failed = .spawn_failed },
+            .judge => writeFile(common.seatDir(paths), "judgment.json", judgment) catch return .{ .failed = .spawn_failed },
+            else => writeFile(common.seatDir(paths), "review.json", review) catch return .{ .failed = .spawn_failed },
         }
         writeFile(common.seatDir(paths), "handoff.md", handoff) catch return .{ .failed = .spawn_failed };
         return run_dir.collectHandoff(allocator, paths.handoff);
@@ -254,6 +260,42 @@ test "teamwork MCP L2: consumer drives real review, charged ledger, audit and un
     try testing.expectEqualStrings("done", saved.value.object.get("state").?.string);
 }
 
+test "teamwork MCP L2: a candidates run is driven through run_candidates before any dispatch, then completes" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var seats: Seats = .{};
+    defer seats.deinit();
+    var auditor: audit.StubAuditor = .{ .gpa = gpa, .script = &.{.pass} };
+    defer auditor.deinit();
+    const run = try fx.startWith(&seats, auditor.auditor(), ",\"candidates\":2,\"candidate_estimate_usd\":1");
+    defer run.destroy();
+    var server = mcp.Server.init(gpa, run);
+    try ready(&server);
+    var pending = try call(&server, implement);
+    defer pending.deinit();
+    try testing.expectEqualStrings("CandidatesPending", payload(pending.value).object.get("error").?.string);
+    try testing.expectEqual(@as(u32, 0), seats.calls);
+    var candidates = try call(&server, run_candidates);
+    defer candidates.deinit();
+    try expectPhase(candidates.value, "review_approved");
+    try testing.expect(!candidates.value.object.get("result").?.object.get("isError").?.bool);
+    const body = payload(candidates.value);
+    try testing.expectEqualStrings("selected", body.object.get("operation").?.object.get("outcome").?.object.get("kind").?.string);
+    const listed = body.object.get("snapshot").?.object.get("candidates").?.array.items;
+    try testing.expectEqual(@as(usize, 2), listed.len);
+    try testing.expectEqualStrings("selected", listed[0].object.get("status").?.string);
+    try testing.expectEqualStrings("eliminated", listed[1].object.get("status").?.string);
+    try testing.expectEqual(@as(u32, 5), seats.calls);
+    var again = try call(&server, run_candidates);
+    defer again.deinit();
+    try testing.expectEqualStrings("NoCandidates", payload(again.value).object.get("error").?.string);
+    var completion = try call(&server, complete);
+    defer completion.deinit();
+    try expectPhase(completion.value, "done");
+    try expectFile(fx.repo, "feature.txt", "feature\n");
+}
+
 test "teamwork MCP L2: no manager approval, config changes, path selection or notification dispatch" {
     var fx: Fixture = undefined;
     try fx.init();
@@ -368,7 +410,7 @@ test "teamwork MCP L2: lifecycle, discovery, ids and malformed input recover wit
     var listing = try call(&server, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/list\"}");
     defer listing.deinit();
     const tools = listing.value.object.get("result").?.object.get("tools").?.array.items;
-    try testing.expectEqual(@as(usize, 4), tools.len);
+    try testing.expectEqual(@as(usize, 5), tools.len);
     for (tools) |tool| {
         const schema = tool.object.get("inputSchema").?.object;
         try testing.expect(!schema.get("additionalProperties").?.bool);
