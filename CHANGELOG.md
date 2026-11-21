@@ -34,6 +34,23 @@ status, compatibility boundaries, and entry points are defined by
   --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
   stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
 
+### Fixed
+
+- **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
+  a draft whose cursor was not at its end, Ctrl+D went past the picker and
+  deleted the character under the cursor, at the prompt and in the box under a
+  reply. Now it does nothing while the draft has text; on an empty prompt it
+  still counts toward the double-press exit, so the picker never traps the
+  session.
+
+- **A paste with the `/model` picker open goes to its filter** (#650). At the
+  prompt the pasted text landed in the draft under the picker; during a reply
+  it reached the picker key by key, so a newline in it was Enter and applied
+  the model under the cursor, moving the bill to that provider. Now, at the
+  prompt and during a reply, the text up to the paste's first line break is
+  added to the filter as one edit, control characters dropped; the draft is
+  untouched and a paste never applies a model.
+
 ## 0.13.0 — 2026-11-20
 
 ### Changed
