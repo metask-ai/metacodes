@@ -572,7 +572,14 @@ the executable belongs to up to date from the source its install record names
   or repair is available.
 - **`--json` result:** one document on stdout,
   `{action, source, from, to, prefix, origin, sdk, checked_only,
-  stopped_services, running_sessions, notes}`.
+  stopped_services, running_sessions, sessions, services, notes}`.
+  - `stopped_services` and `running_sessions` are what a real run did: the
+    TinyKG service pids it stopped and the session pids it left running
+    (`--ignore-running`). They are always empty under `--check`.
+  - `sessions` and `services` are what `--check` found when an update or
+    repair is available: the session pids that would refuse the update and
+    the TinyKG service pids a real run would stop. The exit code stays 3
+    either way. They are always empty without `--check`.
   - `action` is `up_to_date`, `newer_installed`, `upgrade`, `downgrade`,
     `repair` or `rebuild`.
   - `source` is `release` or `checkout`.

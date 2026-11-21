@@ -2658,20 +2658,7 @@ fn runUpdate(args: *std.process.Args.Iterator, init: std.process.Init, allocator
     stderr_writer.interface.flush() catch {};
     if (json) {
         var doc: std.Io.Writer.Allocating = .init(allocator);
-        std.json.Stringify.value(.{
-            .action = @tagName(outcome.action),
-            .source = @tagName(outcome.source),
-            .from = outcome.from,
-            .to = outcome.to,
-            .prefix = outcome.prefix,
-            .origin = outcome.origin,
-            .sdk = outcome.sdk,
-            .checked_only = outcome.checked_only,
-            .stopped_services = outcome.stopped_services,
-            .running_sessions = outcome.running_sessions,
-            .notes = outcome.notes,
-        }, .{}, &doc.writer) catch {};
-        doc.writer.writeByte('\n') catch {};
+        outcome.writeJson(&doc.writer) catch {};
         dumpWrite(doc.written());
     }
     if (outcome.checked_only and outcome.changes()) return 3;
