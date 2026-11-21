@@ -1118,8 +1118,8 @@ async function renderProviders() {
     h('thead', {}, h('tr', {}, h('th', {}, 'Provider'), h('th', {}, '地址'), h('th', {}, '模型'), h('th', {}, '探测'), h('th', {}, ''))),
     h('tbody', {}, rows))) : h('div', { class: 'empty', text: '还没有导入 Provider。' });
 
-  const id = h('input', { type: 'text', required: true, maxlength: 32, pattern: '[a-z0-9][a-z0-9_\\-]{0,31}', placeholder: 'tokenjoy', 'aria-label': 'Provider 标识' });
-  const name = h('input', { type: 'text', maxlength: 80, placeholder: '例如：TokenJoy', 'aria-label': '显示名称' });
+  const id = h('input', { type: 'text', required: true, maxlength: 32, pattern: '[a-z0-9][a-z0-9_\\-]{0,31}', placeholder: 'my-gateway', 'aria-label': 'Provider 标识' });
+  const name = h('input', { type: 'text', maxlength: 80, placeholder: '例如：My Gateway', 'aria-label': '显示名称' });
   const baseUrl = h('input', { type: 'url', required: true, placeholder: 'https://api.example.com/v1', 'aria-label': 'Base URL' });
   const protocol = h('select', { 'aria-label': '协议' }, Object.entries(protocols).map(([value, label]) => h('option', { value }, label)));
   const auth = h('select', { 'aria-label': '认证' }, h('option', { value: '' }, '自动（Anthropic 用 x-api-key，其余 Bearer）'),

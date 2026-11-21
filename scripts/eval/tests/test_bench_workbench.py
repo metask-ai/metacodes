@@ -556,6 +556,30 @@ class WorkbenchTest(unittest.TestCase):
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
 
+    def test_provider_mode_reuses_the_metacodes_config_and_its_key_variable(self):
+        native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']
+        metacodes_config = self.root / 'metacodes-config.json'
+        atomic_json(metacodes_config, {'mcp_servers': [{'name': 'kg', 'command': 'tinykg'}], 'custom_providers': {
+            'gw': {**native, 'env_aliases': [{'name': 'GW_KEY', 'kind': 'api_key', 'canonical': True}]}}})
+        cfg = json.loads(self.manager.config_path.read_text())
+        for name in ('provider_config', 'model', 'key_env'):
+            cfg.pop(name)
+        atomic_json(self.manager.config_path, {**cfg, 'auth_mode': 'provider'})
+        with patch.dict(os.environ, {'METACODES_CONFIG_FILE': str(metacodes_config)}):
+            catalog = self.client.request('api/workbench')
+            self.assertEqual(catalog['reasons'], ['执行服务缺少环境变量 GW_KEY，设置后重启服务'])
+            os.environ['GW_KEY'] = 'private-test-value'
+            catalog = self.client.request('api/workbench')
+            self.assertTrue(catalog['ready'], catalog['reasons'])
+            self.assertEqual([m['id'] for m in catalog['models']], ['gw/test-model'])
+            run = self.client.request('api/runs', {**self.request(), 'model': 'gw/test-model'})
+            final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'finished', final)
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('GW_KEY=${GW_KEY}', argv)
+        shipped = next(a.removeprefix('config=') for a in argv if a.startswith('config='))
+        self.assertEqual(list(json.loads(Path(shipped).read_text())), ['custom_providers'])
+
     def test_no_credential_is_needed_but_cross_origin_is_refused(self):
         import urllib.request
         # An internal-network workbench: the page needs no link capability.

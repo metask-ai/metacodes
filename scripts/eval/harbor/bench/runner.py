@@ -54,6 +54,33 @@ def settings(path):
     return value if isinstance(value, dict) else {}
 
 
+def metacodes_config():
+    if os.environ.get("METACODES_CONFIG_FILE"):
+        return Path(os.environ["METACODES_CONFIG_FILE"])
+    home = os.environ.get("METACODES_HOME")
+    return (Path(home) if home else Path.home() / ".metacodes") / "config.json"
+
+
+def provider_config(cfg):
+    if cfg.get("provider_config"):
+        return cfg["provider_config"]
+    if cfg.get("auth_mode") != "provider":
+        return None
+    native = data.read_json(metacodes_config())
+    if isinstance(native, dict) and native.get("custom_providers"):
+        return str(metacodes_config())
+    return None
+
+
+def provider_key_env(config, model):
+    native = data.read_json(Path(config)) if config else None
+    spec = ((native or {}).get("custom_providers") or {}).get(model.split("/", 1)[0]) if isinstance(native, dict) else None
+    aliases = [a for a in (spec or {}).get("env_aliases") or []
+               if isinstance(a, dict) and a.get("kind", "api_key") == "api_key"]
+    chosen = next((a for a in aliases if a.get("canonical")), aliases[0] if aliases else {})
+    return chosen.get("name") or ""
+
+
 def provider_models(config):
     """Expose only ids/labels, never native configuration or credentials."""
     native = data.read_json(Path(config)) if config else {}
@@ -83,9 +110,18 @@ def ssh_loopback_problem(kind, executor_name, provider_id, base_url):
 def configured_provider_ids(cfg):
     """Provider ids the catalog already lists models under (the
     --provider-config setup); an imported provider may not reuse them."""
-    native = data.read_json(Path(cfg["provider_config"])) if cfg.get("provider_config") else None
+    config = provider_config(cfg)
+    native = data.read_json(Path(config)) if config else None
     providers = (native or {}).get("custom_providers") if isinstance(native, dict) else None
     return set(providers) if isinstance(providers, dict) else set()
+
+
+def key_env_problems(key_env, model):
+    if not key_env:
+        return [f"模型 {model} 的 Provider 没有配置 env_aliases，请用 --key-env 指定 API Key 的环境变量"]
+    if not ENV_NAME.fullmatch(key_env) or not os.environ.get(key_env):
+        return ["执行服务缺少环境变量 " + key_env + "，设置后重启服务"]
+    return []
 
 
 class RunManager:
@@ -269,20 +305,22 @@ class RunManager:
                 (warnings if imported else reasons).append(str(exc))
             key_env = "METASK_API_KEY"
         elif mode == "provider":
-            models = provider_models(cfg.get("provider_config"))
+            config = provider_config(cfg)
+            models = provider_models(config)
             model = cfg.get("model", "")
             if model and not any(m["id"] == model for m in models):
                 models.append({"id": model, "label": model})
-            key_env = cfg.get("key_env") or "TOKENJOY_API_KEY"
             legacy = []
-            if not ENV_NAME.fullmatch(key_env) or not os.environ.get(key_env):
-                legacy.append("执行服务缺少环境变量 " + key_env + "，设置后重启服务")
+            key_env = ""
             if not models:
-                legacy.append("请配置 --model，第三方网关同时设置 --provider-config")
+                legacy.append("没有可用的 custom_providers 模型：用 metacodes providers 添加到 MetaCodes 配置，"
+                              "或用 --provider-config 指定配置")
             else:
+                key_env = cfg.get("key_env") or provider_key_env(config, model or models[0]["id"])
+                legacy += key_env_problems(key_env, model or models[0]["id"])
                 # Containers only ever hold a placeholder; a route the credential
                 # relay cannot forward is refused rather than given the key.
-                problem = route_problem({"auth_mode": mode, "provider_config": cfg.get("provider_config"),
+                problem = route_problem({"auth_mode": mode, "provider_config": config,
                                          "model": model or models[0]["id"]})
                 if problem:
                     legacy.append(problem)
@@ -438,8 +476,11 @@ class RunManager:
             if problem:
                 raise ValueError(problem)
         elif catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
-            problem = route_problem({"auth_mode": "provider", "model": model,
-                                     "provider_config": settings(self.config_path).get("provider_config")})
+            cfg = settings(self.config_path)
+            config = provider_config(cfg)
+            problems = key_env_problems(cfg.get("key_env") or provider_key_env(config, model), model)
+            problem = "；".join(problems) or route_problem({"auth_mode": "provider", "model": model,
+                                                            "provider_config": config})
             if problem:
                 raise ValueError(problem)
         ctx = self.suite_context()
@@ -514,13 +555,18 @@ class RunManager:
                     raise ValueError(problem)
             self.records.mkdir(parents=True, exist_ok=True)
             atomic_json(self.records / (name + ".json"), record)
+            config = provider_config(cfg) if mode == "provider" and not imported else None
+            if config and not cfg.get("provider_config"):
+                native = data.read_json(Path(config)) or {}
+                config = write_config(self.records / (name + ".provider"),
+                                      {"custom_providers": native.get("custom_providers") or {}})
             spec = {**record, "jobs_dir": str(self.jobs_dir), "bundle": used_bundle,
                     "auth_mode": mode, "account_state_dir": cfg.get("account_state_dir") if mode == "metask" else None,
                     "account_gateway": cfg.get("account_gateway") if mode == "metask" else None,
                     "account_key_id": account_key_id,
                     "reasoning_effort": catalog.get("reasoning_effort"),
-                    "provider_config": cfg.get("provider_config") if mode == "provider" else None,
-                    "key_env": catalog["key_env"],
+                    "provider_config": config,
+                    "key_env": cfg.get("key_env") or provider_key_env(config, model) if config else catalog["key_env"],
                     "metrics_enabled": cfg.get("metrics_enabled", True) and suite.runner != suites.WORKBUDDY,
                     "metrics_bind": cfg.get("metrics_bind", "172.17.0.1"),
                     "metrics_host": cfg.get("metrics_host"),
