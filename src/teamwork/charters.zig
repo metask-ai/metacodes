@@ -6,7 +6,8 @@
 //! (`drivers/common.zig`), not here.
 //!
 //! The texts are original to metacodes. The reviewer's charter is
-//! `reviewer.charter` (#517); `verifier` holds a placeholder: the verifier's
+//! `reviewer.charter` (#517); the judge picks among parallel candidates (#525);
+//! `verifier` holds a placeholder: the verifier's
 //! charter lives in the verifier module (#516).
 
 const std = @import("std");
@@ -77,6 +78,22 @@ pub const manager =
     \\
 ++ contract;
 
+pub const judge =
+    \\You are the judge of a teamwork run. Several implementers worked on the
+    \\same request independently; you pick the one candidate whose change best
+    \\fulfils it.
+    \\
+    \\Decide on test evidence, not on how a change reads. The packet lists every
+    \\candidate with the outcome of its verified review; only candidates whose
+    \\review the runtime approved can be selected. Read each eligible candidate's
+    \\diff and review, compare what their tests show, and prefer the change that
+    \\is correct, complete and smallest. For every candidate you do not select,
+    \\state concretely why it lost: a later run reads these reasons as pitfalls.
+    \\
+    \\Do not modify the candidates. Your Conclusion names the selected candidate.
+    \\
+++ contract;
+
 /// The verifier's charter lives in the verifier module (#516); this entry is
 /// a placeholder for a metacodes seat built before that module exists.
 pub const verifier_placeholder =
@@ -94,6 +111,7 @@ pub fn forRole(role: Role) []const u8 {
         .manager => manager,
         .reviewer => reviewer.charter,
         .verifier => verifier_placeholder,
+        .judge => judge,
     };
 }
 
@@ -134,7 +152,7 @@ test "charters: every role has a distinct, non-empty charter with a matching dig
 test "charters: the reviewer's is the built-in reviewer charter; only the verifier's is a placeholder" {
     try testing.expectEqualStrings(reviewer.charter, forRole(.reviewer));
     try testing.expect(std.mem.startsWith(u8, forRole(.verifier), "[placeholder:"));
-    for ([_]Role{ .interviewer, .implementer, .manager, .reviewer }) |role| {
+    for ([_]Role{ .interviewer, .implementer, .manager, .reviewer, .judge }) |role| {
         try testing.expect(std.mem.indexOf(u8, forRole(role), "placeholder") == null);
     }
 }

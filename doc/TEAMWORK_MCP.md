@@ -105,7 +105,7 @@ before initialization. Notifications never execute tools, including malformed
 or id-less `tools/call` messages. Unknown notifications and client responses are
 ignored. An initialized notification with non-object params has no effect.
 Request ids must be strings or integers and are echoed exactly. Batches are
-unsupported. `tools/list` returns all four tools without a pagination cursor.
+unsupported. `tools/list` returns all five tools without a pagination cursor.
 
 ## Tools
 
@@ -117,6 +117,7 @@ in the client. No-argument tools accept omitted arguments or an empty object.
 | --- | --- | --- |
 | `teamwork_status` | none | `Run.status()` |
 | `teamwork_dispatch` | required `role`: `implementer` or `reviewer`; optional string `instructions` | `Run.dispatch(role, instructions)` |
+| `teamwork_run_candidates` | none | `Run.runCandidates()` |
 | `teamwork_request_completion` | none | `Run.requestCompletion()` |
 | `teamwork_cancel` | none | `Run.cancel()` |
 
@@ -127,6 +128,15 @@ through `teamwork_cancel` takes effect between calls. During an active operation
 the host can trip the shared abort signal, which runtime drivers already
 observe. A queued MCP cancellation notification does not preempt synchronous
 work. The adapter does not claim MCP task or progress support.
+
+When the approved configuration has parallel candidates (`candidates`, #525),
+`teamwork_run_candidates` is the first operation: dispatch before it returns
+`CandidatesPending`, and calling it on a run without candidates, or a second
+time, returns `NoCandidates`. It runs every candidate's implementer and
+reviewer and then the judge, and leaves the run in `review_approved` on the
+selected candidate, or ended (`failed`, `budget_exhausted`, `cancelled`).
+Its tagged `operation.outcome` is `selected` (detail: the candidate number) or
+the ending; only `selected` has `isError: false`.
 
 Completion without current verified reviewer approval returns `NotApproved`.
 The runtime rechecks approval against the current tree, independently audits,
@@ -157,7 +167,8 @@ The text is the JSON encoding of the same structured object:
     "audit": {"used": 0, "max": 2, "last": null},
     "max_rounds": 8,
     "worktree": "/host-selected/run/worktree",
-    "merge_conflicts": 0
+    "merge_conflicts": 0,
+    "candidates": []
   },
   "operation": {"kind": "status"},
   "error": null
@@ -172,6 +183,12 @@ details retain their nested union tags. Budget, audit, issue and conflict
 counts are runtime values. Tree ids are hash strings, without backing-buffer
 padding. When supplied by the runtime, each seat's optional `charter_sha256`
 field is forwarded unchanged. Paths are observations, never writable parameters.
+`candidates` lists each configured candidate as `{candidate, status, tree}`
+(`status`: `queued`, `implementing`, `reviewing`, `approved`, `rejected`,
+`selected`, `eliminated`; `tree` is the approved tree or null), and is empty
+without candidates. A judge seat's `result` is `{kind: "judgment", detail}`
+whose detail is `selected` with the candidate number or `invalid` with the
+judgment error.
 Dispatch adds `operation.seat_id`; completion adds a tagged
 `operation.outcome`; cancellation reports `operation.kind == "cancel"`.
 

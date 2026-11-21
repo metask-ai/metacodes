@@ -52,7 +52,14 @@ pub const Layer = struct {
     /// The cap on dispatches per role in one run (#514): the built-in loop
     /// and any manager stop there, so a run always terminates.
     max_rounds: ?u32 = null,
+    candidates: ?CandidatesLayer = null,
+    candidate_estimate_usd: ?f64 = null,
     seats: std.EnumArray(Role, SeatLayer) = .initFill(.{}),
+};
+
+pub const CandidatesLayer = union(enum) {
+    count: u32,
+    seats: []const SeatLayer,
 };
 
 /// Where a parse or validation failed, for the error message.
@@ -111,6 +118,10 @@ pub const ValidateError = error{
     ExternalReviewerWithoutCheck,
     /// `max_rounds` is 0 or above `max_rounds_limit`.
     InvalidMaxRounds,
+    InvalidCandidates,
+    CandidateEstimateMissing,
+    CandidateEstimateWithoutCandidates,
+    InvalidCandidateEstimate,
 };
 
 /// The dispatch cap per role when `max_rounds` is not configured.
@@ -118,6 +129,7 @@ pub const default_max_rounds: u32 = 3;
 /// The largest accepted `max_rounds`: a bound on what one run may spend in
 /// rounds, independent of the dollar cap.
 pub const max_rounds_limit: u32 = 20;
+pub const max_candidates = 4;
 
 /// The host-pinned check command (#517). The runtime runs exactly this
 /// string, in the workspace, through the sandboxed shell path; it never runs
@@ -150,9 +162,24 @@ pub const Config = union(enum) {
         /// `max_rounds_limit`); the runtime fails the run with
         /// `rounds_exhausted` rather than go past it.
         max_rounds: u32 = default_max_rounds,
+        candidates: Candidates = .{},
+        candidate_estimate_usd: ?f64 = null,
         /// One spec per role; strings borrowed from the parse arenas.
         seats: std.EnumArray(Role, types.SeatSpec),
     };
+};
+
+pub const Candidates = struct {
+    specs: [max_candidates]types.SeatSpec = @splat(.{ .role = .implementer, .harness = .metacodes }),
+    len: u8 = 0,
+
+    pub fn slice(self: *const Candidates) []const types.SeatSpec {
+        return self.specs[0..self.len];
+    }
+
+    pub fn jsonStringify(self: Candidates, jw: anytype) !void {
+        try jw.write(self.specs[0..self.len]);
+    }
 };
 
 // ── parse ───────────────────────────────────────────────────────────────────
@@ -187,6 +214,18 @@ pub fn parseValue(arena: std.mem.Allocator, value: std.json.Value, diag: ?*Diagn
         } else if (std.mem.eql(u8, key, "max_rounds")) {
             if (item != .integer or item.integer < 0 or item.integer > std.math.maxInt(u32)) return error.WrongType;
             layer.max_rounds = @intCast(item.integer);
+        } else if (std.mem.eql(u8, key, "candidates")) {
+            layer.candidates = switch (item) {
+                .integer => |n| if (n < 0 or n > std.math.maxInt(u32)) return error.WrongType else .{ .count = @intCast(n) },
+                .array => |list| blk: {
+                    const seats = try arena.alloc(SeatLayer, list.items.len);
+                    for (list.items, seats) |entry, *seat| seat.* = try parseSeat(arena, .implementer, entry, diag);
+                    break :blk .{ .seats = seats };
+                },
+                else => return error.WrongType,
+            };
+        } else if (std.mem.eql(u8, key, "candidate_estimate_usd")) {
+            layer.candidate_estimate_usd = numberOf(item) orelse return error.WrongType;
         } else if (std.mem.eql(u8, key, "seats")) {
             if (item != .object) return error.NotAnObject;
             var seats = item.object.iterator();
@@ -263,6 +302,8 @@ pub fn merge(lower: Layer, upper: Layer) Layer {
     if (upper.budget_usd) |v| out.budget_usd = v;
     if (upper.check_command) |v| out.check_command = v;
     if (upper.max_rounds) |v| out.max_rounds = v;
+    if (upper.candidates) |v| out.candidates = v;
+    if (upper.candidate_estimate_usd) |v| out.candidate_estimate_usd = v;
     for (std.enums.values(Role)) |role| {
         out.seats.set(role, mergeSeat(lower.seats.get(role), upper.seats.get(role)));
     }
@@ -307,6 +348,7 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
     setDiag(diag, null, "max_rounds");
     const max_rounds = layer.max_rounds orelse default_max_rounds;
     if (max_rounds == 0 or max_rounds > max_rounds_limit) return error.InvalidMaxRounds;
+    const candidates = try validateCandidates(layer, seats.get(.implementer), diag);
     setDiag(diag, null, "budget_usd");
     if (layer.budget_usd) |usd| {
         if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidBudget;
@@ -317,7 +359,39 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
     }
     const budget_usd = layer.budget_usd orelse return error.BudgetMissing;
     setDiag(diag, null, null);
-    return .{ .enabled = .{ .budget_usd = budget_usd, .check_command = check_command, .max_rounds = max_rounds, .seats = seats } };
+    return .{ .enabled = .{
+        .budget_usd = budget_usd,
+        .check_command = check_command,
+        .max_rounds = max_rounds,
+        .candidates = candidates,
+        .candidate_estimate_usd = layer.candidate_estimate_usd,
+        .seats = seats,
+    } };
+}
+
+fn validateCandidates(layer: Layer, implementer: types.SeatSpec, diag: ?*Diagnostic) ValidateError!Candidates {
+    setDiag(diag, null, "candidates");
+    var out: Candidates = .{};
+    if (layer.candidates) |requested| switch (requested) {
+        .count => |n| {
+            if (n == 0 or n > max_candidates) return error.InvalidCandidates;
+            if (n > 1) {
+                out.len = @intCast(n);
+                @memset(out.specs[0..out.len], implementer);
+            }
+        },
+        .seats => |list| {
+            if (list.len < 2 or list.len > max_candidates) return error.InvalidCandidates;
+            for (list, 0..) |seat, i| out.specs[i] = try validateSeat(.implementer, seat, diag);
+            out.len = @intCast(list.len);
+        },
+    };
+    setDiag(diag, null, "candidate_estimate_usd");
+    if (layer.candidate_estimate_usd) |usd| {
+        if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidCandidateEstimate;
+        if (out.len == 0) return error.CandidateEstimateWithoutCandidates;
+    } else if (out.len != 0) return error.CandidateEstimateMissing;
+    return out;
 }
 
 fn validateSeat(role: Role, seat: SeatLayer, diag: ?*Diagnostic) ValidateError!types.SeatSpec {
@@ -583,4 +657,43 @@ test "config: switching a seat's harness in a higher layer drops the old harness
     // Re-stating the same harness keeps the lower layer's command.
     const same = try parse(a, "{\"seats\":{\"verifier\":{\"harness\":\"claude_code\"}}}", null);
     try testing.expectEqualStrings(abs_claude, merge(global, same).seats.get(.verifier).command.?);
+}
+
+test "config: candidates are a count or a seat per candidate, bounded, and need an estimate" {
+    var arena = arenaFixture();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const counted = (try load(a, "{\"enabled\":true,\"budget_usd\":5,\"candidates\":3,\"candidate_estimate_usd\":1,\"seats\":{\"implementer\":{\"model\":\"m\"}}}")).enabled;
+    try testing.expectEqual(@as(usize, 3), counted.candidates.slice().len);
+    for (counted.candidates.slice()) |spec| {
+        try testing.expectEqual(Role.implementer, spec.role);
+        try testing.expectEqualStrings("m", spec.model.?);
+    }
+    try testing.expectEqual(@as(f64, 1), counted.candidate_estimate_usd.?);
+
+    const mixed = (try load(a, "{\"enabled\":true,\"budget_usd\":5,\"candidate_estimate_usd\":0.5,\"candidates\":[{},{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\"}]}")).enabled;
+    try testing.expectEqual(Harness.metacodes, mixed.candidates.slice()[0].harnessKind());
+    try testing.expectEqual(Harness.claude_code, mixed.candidates.slice()[1].harnessKind());
+
+    const single = (try load(a, "{\"enabled\":true,\"budget_usd\":5,\"candidates\":1}")).enabled;
+    try testing.expectEqual(@as(usize, 0), single.candidates.slice().len);
+    try testing.expect(single.candidate_estimate_usd == null);
+
+    const project = try parse(a, "{\"enabled\":true,\"budget_usd\":5,\"candidates\":4,\"candidate_estimate_usd\":1}", null);
+    const cli = try parse(a, "{\"candidates\":2}", null);
+    try testing.expectEqual(@as(usize, 2), (try validate(merge(project, cli), null)).enabled.candidates.slice().len);
+
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidCandidates, validate(try parse(a, "{\"candidates\":5,\"candidate_estimate_usd\":1}", null), &diag));
+    try testing.expectEqualStrings("candidates", diag.field.?);
+    try testing.expectError(error.InvalidCandidates, load(a, "{\"candidates\":0}"));
+    try testing.expectError(error.InvalidCandidates, load(a, "{\"candidates\":[{}],\"candidate_estimate_usd\":1}"));
+    try testing.expectError(error.InvalidCandidates, load(a, "{\"candidates\":[{},{},{},{},{}],\"candidate_estimate_usd\":1}"));
+    try testing.expectError(error.CandidateEstimateMissing, load(a, "{\"candidates\":2}"));
+    try testing.expectError(error.CandidateEstimateWithoutCandidates, load(a, "{\"candidate_estimate_usd\":1}"));
+    try testing.expectError(error.InvalidCandidateEstimate, load(a, "{\"candidates\":2,\"candidate_estimate_usd\":0}"));
+    try testing.expectError(error.ExternalCommandMissing, load(a, "{\"candidates\":[{},{\"harness\":\"claude_code\"}],\"candidate_estimate_usd\":1}"));
+    try testing.expectError(error.WrongType, load(a, "{\"candidates\":\"3\"}"));
+    try testing.expectError(error.NotAnObject, load(a, "{\"candidates\":[1,2]}"));
+    try testing.expectError(error.UnknownField, load(a, "{\"candidates\":[{\"harnes\":\"metacodes\"},{}]}"));
 }
