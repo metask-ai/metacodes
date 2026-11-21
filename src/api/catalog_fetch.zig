@@ -154,16 +154,12 @@ pub fn fetchAnswer(
 
     http_connection.sendBodiless(&http_request) catch return error.RequestFailed;
     var redirect_buffer: [4096]u8 = undefined;
-    const response = http_request.receiveHead(&redirect_buffer) catch return error.RequestFailed;
+    const response = http_connection.receiveHead(&http_request, &redirect_buffer) catch return error.RequestFailed;
     const status = http_status.ResponseStatus.capture(&response);
     const announced = response.head.content_length;
 
     var transfer_buffer: [16384]u8 = undefined;
-    const reader = http_request.reader.bodyReader(
-        &transfer_buffer,
-        response.head.transfer_encoding,
-        announced,
-    );
+    const reader = http_connection.bodyReader(&response, &transfer_buffer);
     var count_buffer: [4096]u8 = undefined;
     var counting: CountingReader = undefined;
     const source = if (request.progress) |counter| blk: {

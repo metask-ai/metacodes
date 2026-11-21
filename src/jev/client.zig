@@ -265,14 +265,10 @@ pub const Client = struct {
         defer request.deinit();
         http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.TransportFailed;
         var redirect_buffer: [1024]u8 = undefined;
-        const response = request.receiveHead(&redirect_buffer) catch return error.TransportFailed;
+        const response = http_connection.receiveHead(&request, &redirect_buffer) catch return error.TransportFailed;
         const status = ResponseStatus.capture(&response);
         var transfer_buffer: [8192]u8 = undefined;
-        const reader = request.reader.bodyReader(
-            &transfer_buffer,
-            response.head.transfer_encoding,
-            response.head.content_length,
-        );
+        const reader = http_connection.bodyReader(&response, &transfer_buffer);
         const bytes = reader.allocRemaining(allocator, .limited(MAX_RESPONSE_BYTES)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.TransportFailed,

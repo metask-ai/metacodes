@@ -208,12 +208,12 @@ pub fn fetchInto(
 
     http_connection.sendBodiless(&req) catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
-    const resp = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
+    const resp = http_connection.receiveHead(&req, &redirect_buf) catch return error.RequestFailed;
     const status = ResponseStatus.capture(&resp);
     if (!status.isOk()) return error.HttpError;
 
     var transfer_buf: [8192]u8 = undefined;
-    const body_reader = req.reader.bodyReader(&transfer_buf, resp.head.transfer_encoding, resp.head.content_length);
+    const body_reader = http_connection.bodyReader(&resp, &transfer_buf);
     const body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
     defer allocator.free(body);
     try catalog.loadFromJson(body);

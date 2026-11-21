@@ -404,14 +404,10 @@ fn postJson(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body: []u
     defer request.deinit();
     try http_connection.sendBodyComplete(&request, body);
     var redirect_buffer: [4096]u8 = undefined;
-    const response = try request.receiveHead(&redirect_buffer);
+    const response = try http_connection.receiveHead(&request, &redirect_buffer);
     const status = http_status.ResponseStatus.capture(&response);
     var transfer_buffer: [8192]u8 = undefined;
-    const payload = try request.reader.bodyReader(
-        &transfer_buffer,
-        response.head.transfer_encoding,
-        response.head.content_length,
-    ).allocRemaining(allocator, std.Io.Limit.limited(256 * 1024));
+    const payload = try http_connection.bodyReader(&response, &transfer_buffer).allocRemaining(allocator, std.Io.Limit.limited(256 * 1024));
     return .{ .status = status.code, .body = payload };
 }
 

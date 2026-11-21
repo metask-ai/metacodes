@@ -265,12 +265,12 @@ fn postTask(client: *std.http.Client, url: []const u8, headers: []const std.http
     // A send that fails mid-body must close the connection (http_connection.zig).
     http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.TransportFailed;
     var redirect_buffer: [1024]u8 = undefined;
-    const response = request.receiveHead(&redirect_buffer) catch return error.TransportFailed;
+    const response = http_connection.receiveHead(&request, &redirect_buffer) catch return error.TransportFailed;
     const status = @import("../api/http_status.zig").ResponseStatus.capture(&response).code;
     // Drain a short answer so the connection closes cleanly; its content
     // (a partial-success message at most) is not acted on.
     var transfer_buffer: [4096]u8 = undefined;
-    const reader = request.reader.bodyReader(&transfer_buffer, response.head.transfer_encoding, response.head.content_length);
+    const reader = http_connection.bodyReader(&response, &transfer_buffer);
     _ = reader.discardRemaining() catch {};
     return status;
 }

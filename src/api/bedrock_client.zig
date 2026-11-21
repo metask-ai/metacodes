@@ -342,7 +342,7 @@ pub const BedrockClient = struct {
             if (client_mod.cancelled(abort)) return error.Aborted;
             return client_mod.requestTransportFailure("bedrock", rid, "sendBody", err);
         };
-        const response = req_ptr.receiveHead(&.{}) catch |err| {
+        const response = http_connection.receiveHead(req_ptr, &.{}) catch |err| {
             // Cancelled while the head was awaited: not a network failure.
             if (client_mod.cancelled(abort)) {
                 log.warnId("bedrock", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
@@ -781,7 +781,7 @@ const BedrockStream = struct {
             if (self.done) return null;
             if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
             if (self.reader == null) {
-                const raw = self.response.reader(&self.transfer_buf);
+                const raw = http_connection.bodyReader(&self.response, &self.transfer_buf);
                 self.reader = if (self.abort_registry) |registry| blk: {
                     self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf, .transport_only);
                     break :blk &self.liveness.interface;

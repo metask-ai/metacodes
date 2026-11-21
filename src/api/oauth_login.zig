@@ -474,16 +474,12 @@ fn postFormRaw(
     defer request.deinit();
     http_connection.sendBodyComplete(&request, @constCast(form)) catch return error.OAuthTokenExchangeFailed;
     var redirect_buffer: [4096]u8 = undefined;
-    const head = request.receiveHead(&redirect_buffer) catch return error.OAuthTokenExchangeFailed;
+    const head = http_connection.receiveHead(&request, &redirect_buffer) catch return error.OAuthTokenExchangeFailed;
     // `std.http.Status` is non-exhaustive; capture it before anything can
     // `@tagName` an unnamed-but-valid code.
     const status = http_status.ResponseStatus.capture(&head);
     var transfer_buffer: [8192]u8 = undefined;
-    const reader = request.reader.bodyReader(
-        &transfer_buffer,
-        head.head.transfer_encoding,
-        head.head.content_length,
-    );
+    const reader = http_connection.bodyReader(&head, &transfer_buffer);
     const payload = reader.allocRemaining(allocator, std.Io.Limit.limited(256 * 1024)) catch
         return error.OAuthTokenExchangeFailed;
     // Any 2xx is a successful grant: `isOk()` is 200-only, and a token

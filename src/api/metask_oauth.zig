@@ -361,7 +361,7 @@ const RevokeJob = struct {
         defer request.deinit();
         http_connection.sendBodyComplete(&request, @constCast(body)) catch return false;
         var redirect: [4096]u8 = undefined;
-        const response = request.receiveHead(&redirect) catch return false;
+        const response = http_connection.receiveHead(&request, &redirect) catch return false;
         return http_status.ResponseStatus.capture(&response).code == 200;
     }
 };
@@ -640,10 +640,10 @@ fn postJson(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body: []c
     defer request.deinit();
     http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.RequestFailed;
     var redirect: [4096]u8 = undefined;
-    const response = request.receiveHead(&redirect) catch return error.RequestFailed;
+    const response = http_connection.receiveHead(&request, &redirect) catch return error.RequestFailed;
     const status = http_status.ResponseStatus.capture(&response);
     var transfer: [8192]u8 = undefined;
-    const payload = request.reader.bodyReader(&transfer, response.head.transfer_encoding, response.head.content_length)
+    const payload = http_connection.bodyReader(&response, &transfer)
         .allocRemaining(allocator, std.Io.Limit.limited(256 * 1024)) catch return error.RequestFailed;
     return .{ .ok = status.code >= 200 and status.code < 300, .status = status.code, .body = payload };
 }
