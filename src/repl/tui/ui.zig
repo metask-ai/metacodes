@@ -142,11 +142,12 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
 
     // ── issue #16: model picker 开着时,键盘属于它 ──────────────────────────
     // 对键模态(普通字符是它的过滤器),对会话不模态:草稿不动、生成不停。
-    // 输入期的 Ctrl+C 不管 picker 停在哪一步都直接关掉它(#607),再按才回到提示符的双击退出;
+    // 输入期的 Ctrl+C 不管 picker 停在哪一步都直接关掉它,并算作双击退出的第一下(#607);
     // Ctrl+D 和生成期的 Ctrl+C 不拦——用户永远有一条不依赖本状态机的退出路径。
-    if (ix.picker_open and key == .ctrl_c and state.phase == .input) {
+    if (ix.picker_open and key == .ctrl_c) if (state.inputPhase()) |p| {
+        if (p.press.press(.exit_ctrl_c, now_ms)) return .{ .action = .exit_prompt };
         return .{ .action = .picker_key, .picker_key = .cancel };
-    }
+    };
     if (ix.picker_open and key != .ctrl_c and key != .ctrl_d) {
         const mapped: ?@import("../model_picker.zig").Key = switch (key) {
             .up => .up,
@@ -705,23 +706,47 @@ test "issue #16: an open picker never traps the session" {
     try testing.expect(press(&replying, .ctrl_d).action != .picker_key);
 }
 
-test "Ctrl+C at the prompt closes an open picker and keeps the draft; the next Ctrl+C arms the exit (#607)" {
+fn pressAt(state: *UiState, k: input.Key, now_ms: i64) Effect {
+    return dispatch(state, .{ .key = .{ .key = k, .now_ms = now_ms } });
+}
+
+test "Ctrl+C at the prompt closes an open picker, keeps the draft and arms the exit; a second Ctrl+C exits (#607)" {
     var state = UiState.in(.{ .input = .{} });
     const ix = state.interaction().?;
     ix.editor = .{ .view = "explain this function", .cursor = 4 };
     ix.picker_open = true;
 
-    const cancelled = press(&state, .ctrl_c);
+    const cancelled = pressAt(&state, .ctrl_c, 1000);
     try testing.expectEqual(event.LoopAction.picker_key, cancelled.action);
     try testing.expect(cancelled.picker_key == .cancel);
     try testing.expectEqualStrings("explain this function", ix.editor.view);
     try testing.expectEqual(@as(usize, 4), ix.editor.cursor);
-    try testing.expect(exitHint(&state) == null);
+    try testing.expectEqualStrings("Press Ctrl-C again to exit", exitHint(&state).?);
 
     ix.picker_open = false;
-    try testing.expectEqual(event.LoopAction.discard_draft, press(&state, .ctrl_c).action);
+    try testing.expectEqual(event.LoopAction.exit_prompt, pressAt(&state, .ctrl_c, 1000 + ui_state.DOUBLE_PRESS_MS).action);
+}
+
+test "a Ctrl+C after the window that closing the picker opened works as at the prompt (#607)" {
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    ix.editor = .{ .view = "explain this function", .cursor = 4 };
+    ix.picker_open = true;
+    try testing.expectEqual(event.LoopAction.picker_key, pressAt(&state, .ctrl_c, 1000).action);
+
+    ix.picker_open = false;
+    try testing.expectEqual(event.LoopAction.discard_draft, pressAt(&state, .ctrl_c, 1001 + ui_state.DOUBLE_PRESS_MS).action);
     try testing.expectEqualStrings("Press Ctrl-C again to exit", exitHint(&state).?);
-    try testing.expectEqual(event.LoopAction.exit_prompt, press(&state, .ctrl_c).action);
+}
+
+test "two Ctrl+C presses exit even when the picker opened between them (#607)" {
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    try testing.expectEqual(event.LoopAction.none, pressAt(&state, .ctrl_c, 1000).action);
+    try testing.expectEqualStrings("Press Ctrl-C again to exit", exitHint(&state).?);
+
+    ix.picker_open = true;
+    try testing.expectEqual(event.LoopAction.exit_prompt, pressAt(&state, .ctrl_c, 1200).action);
 }
 
 test "issue #16: `?` help lists both the picker and its replacement binding" {
