@@ -144,6 +144,15 @@ jobs:
           fi
           command -v rg
           rg --version
+      - name: openssl on PATH matches the OpenSSL Python links
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix=$(brew --prefix openssl@3)
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          "$prefix/bin/openssl" version
+          python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
       - name: Install bubblewrap for the sandboxed suites
         if: runner.os == 'Linux'
         shell: bash

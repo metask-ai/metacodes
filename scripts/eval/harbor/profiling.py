@@ -512,11 +512,14 @@ class TimingRelay:
                 self.cert_dir = tempfile.TemporaryDirectory(prefix="metacodes-bench-relay-")
                 self.ca_path = Path(self.cert_dir.name) / "ca.pem"
                 key = Path(self.cert_dir.name) / "key.pem"
-                subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "2", "-nodes",
-                                # Zig 0.16 verifies dNSName SANs only; retain
-                                # the IP SAN for other TLS clients as well.
-                                "-subj", "/CN=metacodes-bench-relay", "-addext", "subjectAltName=" + subject_alt_names(public_host, bind),
-                                "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", str(key), "-out", str(self.ca_path)],
+                config = Path(self.cert_dir.name) / "openssl.cnf"
+                # Zig 0.16 verifies dNSName SANs only; retain
+                # the IP SAN for other TLS clients as well.
+                config.write_text("[req]\ndistinguished_name = dn\nx509_extensions = relay\n[dn]\n[relay]\n"
+                                  "basicConstraints = critical,CA:TRUE\n"
+                                  "subjectAltName = " + subject_alt_names(public_host, bind) + "\n", encoding="ascii")
+                subprocess.run(["openssl", "req", "-x509", "-config", str(config), "-newkey", "rsa:2048", "-sha256", "-days", "2",
+                                "-nodes", "-subj", "/CN=metacodes-bench-relay", "-keyout", str(key), "-out", str(self.ca_path)],
                                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 context.load_cert_chain(str(self.ca_path), str(key))
