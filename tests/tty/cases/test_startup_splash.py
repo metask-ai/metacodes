@@ -12,6 +12,8 @@ ConPTY 会把输出流整屏重合成,原始字节(帧前缀、cursor-up 计数)
 import glob
 import json
 import os
+import shutil
+import subprocess
 
 from tty_driver import IDLE, IS_WINDOWS, READY, arrival_time, case_tmpdir, run, wait_for
 from asserts import TTYAssert
@@ -31,6 +33,10 @@ ON = {"METACODES_NO_STARTUP_ANIMATION": None}
 PALETTE = set("MetaskLb")
 # FIRST_FRAME as a driver event (`waitbytes:` takes \xNN escapes).
 FIRST_FRAME_EVENT = "\\x1b[?25l\\x1b[?2026h\\r"
+LONG_PASTE = ("x" * 49 + "\\r") * 100
+MACOS_PTY_HOLDS = 1024
+BANNER_TOP = "╭─ metacodes v".encode()
+FRAME_BEGIN = b"\x1b[?2026h"
 
 
 def _banner_top(a):
@@ -172,7 +178,7 @@ WINDOWS_TYPES_AFTER_FIRST_FRAME = (
 )
 
 
-def _sent_during_startup(bin_path, raw_text, shown):
+def _sent_during_startup(bin_path, raw_text, shown, cwd=None):
     """`raw_text` arrives after the splash, while App.init still waits for
     `/v1/models` (4 s), on both platforms; then the case waits for `shown`
     and 1.5 s more (a submitted line would be echoed above the box by then)."""
@@ -183,7 +189,8 @@ def _sent_during_startup(bin_path, raw_text, shown):
     server, base_url = SlowModels.serve(4.0)
     try:
         raw = run(bin_path, first + ["raw:" + raw_text, shown, "strictsleep:1.5"],
-                  term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
+                  term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0,
+                  cwd=cwd)
     finally:
         server.shutdown()
     assert SlowModels.answered, "App.init did not wait for /v1/models"
@@ -212,10 +219,45 @@ def test_a_paste_longer_than_4_kib_during_startup_is_one_paste_unsubmitted(bin_p
     """5000 bytes, a hundred lines. Only the first 4 KiB used to make the
     paste; the rest stayed with the terminal as typed keys, and its first
     newline submitted the cut paste with half a line."""
-    a, screen = _sent_during_startup(bin_path, ("x" * 49 + "\\r") * 100, wait_for("[Pasted text #1"))
+    _assert_one_paste_unsubmitted(_sent_during_startup(bin_path, LONG_PASTE, wait_for("[Pasted text #1"))[1])
+
+
+def _assert_one_paste_unsubmitted(screen):
     assert "[Pasted text #1 " in screen and "#2" not in screen, screen
     assert "x" * 20 not in screen, "part of the paste was typed or submitted:\n" + screen
     assert "API request failed" not in screen and "Error" not in screen, "something was submitted:\n" + screen
+
+
+def _plain_commit_repo_with_long_names():
+    repo = case_tmpdir("cc-tty-paste-" + "long-name-" * 10)
+    name = os.path.join("docs", "notes", "startup-output-" + "long-name-" * 8 + "paste.md")
+    os.makedirs(os.path.join(repo, os.path.dirname(name)))
+    with open(os.path.join(repo, name), "w", encoding="utf-8") as f:
+        f.write("one\n")
+    git = ["git", "-C", repo, "-c", "user.name=tty", "-c", "user.email=tty@example.invalid",
+           "-c", "commit.gpgsign=false"]
+    for args in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "plain"]):
+        subprocess.run(git + args, check=True, capture_output=True)
+    subprocess.run(["/usr/bin/env", "git", "log", "-1", "--name-only", "--pretty=format:"],
+                   cwd=repo, env={}, capture_output=True)
+    return repo
+
+
+def test_a_paste_longer_than_4_kib_while_startup_writes_more_than_a_macos_pty_holds(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("ConPTY re-encodes the stream; what the program writes before its first read is not observable")
+    if shutil.which("git") is None:
+        raise SkipTest("git is not installed")
+    a, screen = _sent_during_startup(bin_path, LONG_PASTE, wait_for("[Pasted text #1"),
+                                     cwd=_plain_commit_repo_with_long_names())
+    banner = a.raw.find(BANNER_TOP)
+    first_frame = a.raw.find(FRAME_BEGIN, banner)
+    assert 0 <= banner < first_frame, "no banner followed by a prompt:\n" + screen
+    written = first_frame - banner
+    assert written > MACOS_PTY_HOLDS, (
+        f"only {written} bytes between the banner and the first prompt: the case needs more than "
+        f"{MACOS_PTY_HOLDS} (what a macOS pty holds) written before the program's first read (#569)")
+    _assert_one_paste_unsubmitted(screen)
 
 
 def test_enter_that_skips_the_splash_leaves_the_prompt_empty(bin_path):
