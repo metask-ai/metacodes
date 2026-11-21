@@ -156,8 +156,23 @@ status, compatibility boundaries, and entry points are defined by
   requests answered that way. Every answer is now received and read through
   `api/http_connection.zig`: a body-less answer reads as empty at once, and
   its connection is closed instead of drained, so it is not reused. The
-  System-One advisor, TinyKG, sealed skills and OTLP export still say
+  System-One advisor, TinyKG, sealed skills and OTLP export said
   `connection: close`, so nothing waited there; they no longer depend on it.
+
+- **System-One, TinyKG, sealed skills, OTLP export and the legacy MCP SSE
+  stream no longer ask the server to close the connection** (#661). Like the
+  model requests before #573, they said `connection: close`, and a server
+  told so closes right after its last byte; behind a transparent proxy that
+  close can overtake bytes the proxy has not forwarded yet. An answer cut that
+  way read as malformed from System-One and as invalid from TinyKG, and it
+  failed a sealed skill's call, whose result is the last message of its
+  stream: the part #573 lost. Some MCP hosts drop a request that says
+  `connection: close` without answering, and the legacy SSE stream's GET said
+  it. These requests now ask the server to keep the connection open
+  (`http_connection.keepServerOpen`) and close it themselves once they have
+  the answer; no connection is reused. `zig build test:keep-server-open`, part
+  of `gate:static`, refuses a request with `keep_alive = false` that does not
+  make that call before it is sent.
 
 ## 0.13.0 — 2026-11-20
 

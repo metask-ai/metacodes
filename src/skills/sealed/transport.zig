@@ -149,6 +149,7 @@ pub const Client = struct {
             .extra_headers = extra[0..extra_len],
         }) catch return error.ConnectFailed;
         defer request.deinit();
+        http_connection.keepServerOpen(&request);
         self.registry.registerMonitored(self.allocator, abort, @ptrCast(&request), shutdownRequest, self.idle_limit_ms) catch
             return error.OutOfMemory;
         defer self.registry.unregister(@ptrCast(&request));

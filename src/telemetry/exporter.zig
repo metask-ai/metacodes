@@ -262,6 +262,7 @@ fn postTask(client: *std.http.Client, url: []const u8, headers: []const std.http
         .extra_headers = headers,
     }) catch return error.TransportFailed;
     defer request.deinit();
+    http_connection.keepServerOpen(&request);
     // A send that fails mid-body must close the connection (http_connection.zig).
     http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.TransportFailed;
     var redirect_buffer: [1024]u8 = undefined;
