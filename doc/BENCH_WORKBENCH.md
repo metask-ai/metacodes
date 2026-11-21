@@ -462,15 +462,19 @@ back with `--auth metask`; the third-party configuration will not be used
 for account runs. To use a gateway instead:
 
 ```sh
-export TOKENJOY_API_KEY=...             # or this install's state-root/.env
-metacodes bench --bundle /path/to/linux-release \
-  --provider-config /path/to/config.json \
-  --model tokenjoy/GLM5.3-Flash --key-env TOKENJOY_API_KEY
+export GW_API_KEY=...                   # or this install's state-root/.env
+metacodes bench --bundle /path/to/linux-release --auth provider
 ```
 
-`--provider-config` is a native metacodes configuration with
-`custom_providers`; see [the Harbor adapter](../scripts/eval/harbor/README.md).
-`--key-env` names the credential variable; that key is never accepted as a
+Without `--provider-config` the workbench reuses MetaCodes' own
+configuration (`METACODES_CONFIG_FILE`, else `config.json` in the state
+root the workbench was started with): its `custom_providers` models are the
+models offered, and only that section is passed to a run. Each provider's
+canonical `api_key` entry in `env_aliases` names its key variable.
+`--provider-config /path/to/config.json` selects another native metacodes
+configuration with `custom_providers`; see
+[the Harbor adapter](../scripts/eval/harbor/README.md). `--model` picks the
+default model and `--key-env` overrides the key variable; that key is never accepted as a
 browser field or stored in a run specification (an imported provider's key
 is, once; see below). The relay holds the key;
 Harbor's `${VARIABLE}` reference carries only the run's placeholder. The
