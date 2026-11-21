@@ -425,9 +425,9 @@ fn bashReachesCredentialStore(ctx: *const Context, tool_name: []const u8, args: 
     var fallback_buf: [bash_readonly.MAX_COMMAND_BYTES]u8 = undefined;
     var fallback = std.heap.FixedBufferAllocator.init(&fallback_buf);
     const scratch = ctx.path_check_allocator orelse fallback.allocator();
-    const command = bash_readonly.commandFromInput(scratch, args) orelse return credential_store.mentions(args);
+    const command = bash_readonly.commandFromInput(scratch, args) orelse return credential_store.mentions(scratch, args);
     defer scratch.free(command);
-    return credential_store.mentions(command);
+    return credential_store.mentions(scratch, command);
 }
 
 test "a Bash command that reads a credential store asks, over an allow rule and in every mode" {
@@ -443,10 +443,12 @@ test "a Bash command that reads a credential store asks, over an allow rule and 
 
     const keychain = "{\"command\":\"security find-generic-password -s \\\"Metacode MCP Credentials\\\" -w > /tmp/cred.json\"}";
     const heredoc = "{\"command\":\"python3 << 'EOF'\\nimport subprocess\\nsubprocess.run(['security','find-generic-password','-a','suno','-w'])\\nEOF\"}";
+    const spliced = "{\"command\":\"security find-generic-pass'word' -s example -w\"}";
     for ([_]@import("mode.zig").Mode{ .default, .accept_edits, .auto, .bypass_permissions }) |mode| {
         const allowed = Context{ .mode = mode, .settings = &ms, .path_check_allocator = alloc };
         try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", keychain));
         try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", heredoc));
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", spliced));
         try std.testing.expectEqual(Decision.allow, check(&allowed, "Bash", "{\"command\":\"make test\"}"));
     }
     const bare = Context{ .mode = .bypass_permissions };
