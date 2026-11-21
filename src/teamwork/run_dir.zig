@@ -49,6 +49,8 @@ pub const seat_status_dir = "seat-status";
 pub const state_file = "run.json";
 pub const worktree_dir = "worktree";
 pub const audits_dir = "audits";
+pub const candidates_dir = "candidates";
+pub const judging_dir = "judging";
 pub const merge_patch_file = "merge.patch";
 pub const merge_conflicts_file = "merge-conflicts.txt";
 
@@ -98,6 +100,7 @@ pub const SeatFile = enum {
     review,
     /// The runtime's read-only copy of `open_issues.json` (issues.zig).
     open_issues_copy,
+    judgment,
 
     pub fn name(self: SeatFile) []const u8 {
         return switch (self) {
@@ -107,6 +110,7 @@ pub const SeatFile = enum {
             .status => "status.json",
             .review => "review.json",
             .open_issues_copy => open_issues_file,
+            .judgment => "judgment.json",
         };
     }
 };

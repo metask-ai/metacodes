@@ -110,6 +110,10 @@ pub const Server = struct {
             self.run.cancel() catch |err| return try self.runtimeError(gpa, reply_id, err);
             return try self.toolResult(gpa, reply_id, .{ .kind = "cancel" }, false, null);
         }
+        if (std.mem.eql(u8, name, "teamwork_run_candidates")) {
+            const outcome = self.run.runCandidates() catch |err| return try self.runtimeError(gpa, reply_id, err);
+            return try self.toolResult(gpa, reply_id, .{ .kind = "candidates", .outcome = tagged(outcome) }, outcome != .selected, null);
+        }
         if (std.mem.eql(u8, name, "teamwork_request_completion")) {
             const outcome = self.run.requestCompletion() catch |err| return try self.runtimeError(gpa, reply_id, err);
             const failed = switch (outcome) {
@@ -323,6 +327,7 @@ const Snapshot = struct {
                 switch (result) {
                     .review => |review| try writer.write(.{ .kind = "review", .detail = tagged(review) }),
                     .failed => |err| try writer.write(.{ .kind = "failed", .detail = tagged(err) }),
+                    .judgment => |judgment| try writer.write(.{ .kind = "judgment", .detail = tagged(judgment) }),
                     else => try writer.write(tagged(result)),
                 }
             } else try writer.write(null);
@@ -333,6 +338,12 @@ const Snapshot = struct {
             try writer.objectField(name);
             try writer.write(@field(s, name));
         }
+        try writer.objectField("candidates");
+        try writer.beginArray();
+        for (s.candidates, 1..) |candidate, number| {
+            try writer.write(.{ .candidate = number, .status = candidate.status, .tree = if (candidate.tree) |tree| tree.slice() else null });
+        }
+        try writer.endArray();
         try writer.endObject();
     }
 };
@@ -353,6 +364,7 @@ const tool_list = .{ .tools = .{
             .additionalProperties = false,
         },
     },
+    .{ .name = "teamwork_run_candidates", .description = "When the approved configuration has parallel candidates, run every candidate's implementer and reviewer, then the judge. Must come before any dispatch.", .inputSchema = empty_schema },
     .{ .name = "teamwork_request_completion", .description = "Ask the runtime to verify review approval, audit independently and merge. Only the runtime can mark done.", .inputSchema = empty_schema },
     .{ .name = "teamwork_cancel", .description = "Cancel the run between calls, retaining its worktree. Idempotent for ended runs.", .inputSchema = empty_schema },
 } };

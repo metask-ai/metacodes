@@ -27,6 +27,8 @@ const reviewer = @import("reviewer.zig");
 const merge_back = @import("merge_back.zig");
 const interview = @import("interview.zig");
 const progress = @import("progress.zig");
+const ledger_mod = @import("ledger.zig");
+const lesson = @import("../kg/lesson.zig");
 
 const testing = std.testing;
 const PathBuf = [std.fs.max_path_bytes]u8;
@@ -172,6 +174,7 @@ const Plan = struct {
     fail: ?types.SeatError = null,
     /// A file that must already be in the workspace, else the seat fails.
     require: ?[]const u8 = null,
+    seat_files: []const File = &.{},
     handoff: []const u8 = handoff_text,
 };
 
@@ -226,6 +229,7 @@ const ScriptedSeats = struct {
         for (plan.user_files) |f| writeFile(self.user_repo, f.path, f.bytes) catch return .{ .failed = .spawn_failed };
         const seat_dir = common.seatDir(paths);
         if (plan.review) |review| writeFile(seat_dir, "review.json", review) catch return .{ .failed = .spawn_failed };
+        for (plan.seat_files) |f| writeFile(seat_dir, f.path, f.bytes) catch return .{ .failed = .spawn_failed };
         writeFile(seat_dir, "handoff.md", plan.handoff) catch return .{ .failed = .spawn_failed };
         return run_dir.collectHandoff(gpa, paths.handoff);
     }
@@ -1572,4 +1576,193 @@ test "teamwork progress L2: an interview that spends the budget never leaves its
     defer dir.deinit(testing.allocator);
     try testing.expectEqual(types.SeatStatus.done, (try dir.readSeatRecord(types.SeatId.parse(interview.interviewer_seat) catch unreachable)).status);
     try testing.expect(std.mem.indexOf(u8, recorder.text.items, "needs_you") == null);
+}
+
+const hidden_check = "sh hidden-test.sh";
+const hidden_test = File{ .path = "hidden-test.sh", .bytes = "grep -qx feature feature.txt\n" };
+const approve_hidden = "{\"verdict\":\"approve\",\"evidence\":[{\"command\":\"" ++ hidden_check ++ "\",\"exit_code\":0,\"output_digest\":\"" ++ digest ++ "\",\"output_excerpt\":\"\"}],\"issues\":{\"opened\":[],\"closed\":[],\"still_open\":[]}}";
+
+fn candidatesCfg(fx: *Fixture, extra: []const u8) !config.Config.Enabled {
+    const a = fx.arena.allocator();
+    const text = try std.fmt.allocPrint(a, "{{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"{s}\"{s}}}", .{ hidden_check, extra });
+    return (try config.validate(try config.parse(a, text, null), null)).enabled;
+}
+
+fn judgment(comptime selected: []const u8, comptime others: [2][]const u8) File {
+    return .{ .path = "judgment.json", .bytes = "{\"selected\":\"" ++ selected ++ "\",\"eliminated\":[{\"candidate\":\"" ++ others[0] ++ "\",\"reason\":\"It fails the hidden test.\"},{\"candidate\":\"" ++ others[1] ++ "\",\"reason\":\"It changes the wrong file.\"}]}" };
+}
+
+const Pitfalls = struct {
+    texts: std.ArrayList([]u8) = .empty,
+
+    fn sink(self: *Pitfalls) runtime.PitfallSink {
+        return .{ .ctx = self, .rememberFn = remember };
+    }
+
+    fn remember(ctx: *anyopaque, text: []const u8) bool {
+        const self: *Pitfalls = @ptrCast(@alignCast(ctx));
+        const copy = testing.allocator.dupe(u8, text) catch return false;
+        self.texts.append(testing.allocator, copy) catch {
+            testing.allocator.free(copy);
+            return false;
+        };
+        return true;
+    }
+
+    fn deinit(self: *Pitfalls) void {
+        for (self.texts.items) |text| testing.allocator.free(text);
+        self.texts.deinit(testing.allocator);
+    }
+};
+
+const three_candidates = [_]Plan{
+    .{ .seat = "implementer-1", .require = "hidden-test.sh", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+    .{ .seat = "reviewer-1", .review = approve_hidden },
+    .{ .seat = "implementer-2", .require = "hidden-test.sh", .files = &.{feature} },
+    .{ .seat = "reviewer-2", .review = approve_hidden },
+    .{ .seat = "implementer-3", .files = &.{.{ .path = "other.txt", .bytes = "feature\n" }} },
+    .{ .seat = "reviewer-3", .review = approve_hidden },
+};
+
+test "teamwork candidates L2: of three candidates only the one passing the hidden test is judged eligible, selected and merged back" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    const plans = three_candidates ++ [_]Plan{
+        .{ .seat = "judge-1", .require = "candidate-2.diff", .seat_files = &.{judgment("candidate-2", .{ "candidate-1", "candidate-3" })} },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    var pitfalls: Pitfalls = .{};
+    defer pitfalls.deinit();
+    const cfg = try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":1");
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor(), .pitfalls = pitfalls.sink() };
+
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+    try testing.expect(run.status().worktree == null);
+    try testing.expectError(error.CandidatesPending, run.dispatch(.implementer, ""));
+    try testing.expectEqual(runtime.CandidatesResult{ .selected = 2 }, try run.runCandidates());
+    const statuses = [_]runtime.CandidateStatus{ .rejected, .selected, .rejected };
+    for (run.status().candidates, statuses) |candidate, want| try testing.expectEqual(want, candidate.status);
+    var ids_buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("implementer-1:done,reviewer-1:done,implementer-2:done,reviewer-2:done,implementer-3:done,reviewer-3:done,judge-1:done", seatIds(run.status(), &ids_buf));
+    try testing.expectEqual(runtime.Phase.review_approved, run.status().state.phase());
+    try testing.expect(std.mem.endsWith(u8, run.status().worktree.?, "/candidates/candidate-2"));
+    try expectFile(run.status().worktree.?, "feature.txt", "feature\n");
+    var root_buf: PathBuf = undefined;
+    const root = fx.runFile(&root_buf, "");
+    try testing.expect(!exists(root, "candidates/candidate-1"));
+    try testing.expect(!exists(root, "candidates/candidate-3"));
+    try testing.expect(!exists(root, "judging/candidate-1.diff"));
+
+    const judge_packet = seats.packetOf("judge-1");
+    try testing.expect(std.mem.indexOf(u8, judge_packet, "- `candidate-1` was not approved: the review did not hold up (check_disagrees). Not eligible.") != null);
+    try testing.expect(std.mem.indexOf(u8, judge_packet, "- `candidate-2` passed its verified review. Eligible.") != null);
+    try testing.expect(std.mem.indexOf(u8, judge_packet, "- `candidate-3` was not approved: the review did not hold up (check_disagrees). Not eligible.") != null);
+    try expectCacheSafe(&fx, &seats);
+
+    try testing.expectEqual(@as(usize, 2), pitfalls.texts.items.len);
+    var binding: lesson.Binding = .{ .verdict = .failed, .task = lesson.NO_TASK, .run = run_id_text };
+    for (pitfalls.texts.items) |text| try lesson.checkBinding(try lesson.parse(text), &binding);
+    try testing.expect(std.mem.indexOf(u8, pitfalls.texts.items[0], "lesson: candidate-1 lost to candidate-2: It fails the hidden test.") != null);
+    try testing.expect(std.mem.indexOf(u8, pitfalls.texts.items[1], "lesson: candidate-3 lost to candidate-2: It changes the wrong file.") != null);
+
+    run.destroy();
+    const reopened = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id);
+    defer reopened.destroy();
+    try testing.expect(std.mem.endsWith(u8, reopened.status().worktree.?, "/candidates/candidate-2"));
+    try testing.expectEqual(runtime.CandidateStatus.selected, reopened.status().candidates[1].status);
+    const final = try swe_loop.drive(reopened);
+    try testing.expectEqual(runtime.State{ .done = .{ .files_changed = 1, .worktree_removed = true } }, final);
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+    try testing.expect(!exists(fx.repo(), "other.txt"));
+    try testing.expect(std.mem.endsWith(u8, auditor.last_workspace.?, "/candidates/candidate-2"));
+    const worktrees = try sh(fx.repo(), "git worktree list --porcelain | grep -c '^worktree '");
+    defer testing.allocator.free(worktrees);
+    try testing.expectEqualStrings("1\n", worktrees);
+}
+
+test "teamwork candidates L2: an invalid judgment runs the judge again; no approved candidate fails without a judge" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates-judge");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    const plans = three_candidates ++ [_]Plan{
+        .{ .seat = "judge-1", .seat_files = &.{judgment("candidate-1", .{ "candidate-2", "candidate-3" })} },
+        .{ .seat = "judge-2", .seat_files = &.{judgment("candidate-2", .{ "candidate-3", "candidate-1" })} },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":1"), fx.options());
+    defer run.destroy();
+    try testing.expectEqual(runtime.CandidatesResult{ .selected = 2 }, try run.runCandidates());
+    const seats_now = run.status().seats;
+    try testing.expectEqual(runtime.SeatResult{ .judgment = .{ .invalid = error.NotEligible } }, seats_now[seats_now.len - 2].result.?);
+    try testing.expectEqual(runtime.SeatResult{ .judgment = .{ .selected = 2 } }, seats_now[seats_now.len - 1].result.?);
+    try testing.expectError(error.NoCandidates, run.runCandidates());
+
+    var none: Fixture = undefined;
+    try none.init("cc-zig-teamwork-candidates-none");
+    defer none.deinit();
+    try writeFile(none.repo(), hidden_test.path, hidden_test.bytes);
+    const failing = [_]Plan{
+        .{ .seat = "implementer-1", .fail = .{ .exited = 3 } },
+        .{ .seat = "implementer-2", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+        .{ .seat = "reviewer-1", .review = approve_hidden },
+    };
+    var none_seats: ScriptedSeats = .{ .plans = &failing, .user_repo = none.repo() };
+    defer none_seats.deinit();
+    const before = try none.workspaceBytes();
+    defer testing.allocator.free(before);
+    const lost = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = none_seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try candidatesCfg(&none, ",\"candidates\":2,\"candidate_estimate_usd\":1"), none.options());
+    defer lost.destroy();
+    try testing.expectEqual(runtime.State{ .failed = .no_candidate_approved }, try swe_loop.drive(lost));
+    try testing.expectEqual(runtime.CandidateStatus.rejected, lost.status().candidates[0].status);
+    try testing.expectEqual(runtime.CandidateStatus.rejected, lost.status().candidates[1].status);
+    try testing.expectEqual(@as(usize, 3), none_seats.ran.items.len);
+    const after = try none.workspaceBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "teamwork candidates L2: a start whose candidate estimate exceeds the budget left is refused before anything runs" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates-budget");
+    defer fx.deinit();
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const request: runtime.ApprovedRequest = .{ .text = request_text, .source = .request_file };
+
+    try testing.expectError(error.CandidateBudgetExceeded, runtime.Run.start(testing.allocator, deps, request, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":2"), fx.options()));
+    var root_buf: PathBuf = undefined;
+    const root = fx.runFile(&root_buf, "");
+    try testing.expect(!exists(root, "run.json"));
+    try testing.expect(!exists(root, run_dir.original_request_file));
+
+    var ledger_buf: PathBuf = undefined;
+    const ledger_path = fx.runFile(&ledger_buf, run_dir.budget_file);
+    try util_fs.mkdirParents(std.fs.path.dirname(ledger_path).?);
+    var spent = try ledger_mod.Ledger.load(testing.allocator, ledger_path, 5);
+    try spent.charge(.{ .seat_id = types.seatIdFor(.interviewer, 1), .harness = .metacodes, .wallclock_ms = 1, .cost = .{ .provider_estimate = 3 } });
+    spent.deinit(testing.allocator);
+    try testing.expectError(error.CandidateBudgetExceeded, runtime.Run.start(testing.allocator, deps, request, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":0.8"), fx.options()));
+    try testing.expect(!exists(root, "run.json"));
+    const run = try runtime.Run.start(testing.allocator, deps, request, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":0.6"), fx.options());
+    defer run.destroy();
+    try testing.expectEqual(runtime.Phase.approved, run.status().state.phase());
+    try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
 }

@@ -8,6 +8,10 @@
 //!   reviewing / review_approved
 //!       ── dispatch(reviewer) ─► approved review   ─► review_approved
 //!                              ─► changes / invalid ─► implementing
+//!   approved ── runCandidates() (only with `candidates` configured, #525)
+//!       ─► candidates ─► one implementer + reviewer per candidate worktree
+//!                     ─► judge selects an approved one ─► review_approved
+//!                     ─► none approved ─► failed(no_candidate_approved)
 //!   review_approved ── requestCompletion()
 //!       ─► approval stale        ─► reviewing
 //!       ─► auditing ─► pass      ─► merging ─► done | failed(merge_*)
@@ -49,6 +53,8 @@ const factory = @import("drivers/factory.zig");
 const common = @import("drivers/common.zig");
 const charters = @import("charters.zig");
 const progress = @import("progress.zig");
+const judge = @import("judge.zig");
+const lesson = @import("../kg/lesson.zig");
 
 const Role = types.Role;
 const SeatId = types.SeatId;
@@ -105,6 +111,16 @@ pub const Deps = struct {
     cli_approval: ?CliApproval = null,
     recheck_audited_tree: *const fn (std.mem.Allocator, []const u8, []const u8, ?*const types.AbortSignal) reviewer.TreeError!TreeId = reviewer.workspaceTree,
     observer: ?progress.Observer = null,
+    pitfalls: ?PitfallSink = null,
+};
+
+pub const PitfallSink = struct {
+    ctx: *anyopaque,
+    rememberFn: *const fn (ctx: *anyopaque, text: []const u8) bool,
+
+    pub fn remember(self: PitfallSink, text: []const u8) bool {
+        return self.rememberFn(self.ctx, text);
+    }
 };
 
 /// A CLI host can reopen without loading mutable project configuration. The
@@ -144,6 +160,9 @@ pub const Failure = enum {
     merge_failed,
     /// The runtime stopped during merge-back; the workspace needs a look.
     merge_interrupted,
+    no_candidate_approved,
+    candidates_interrupted,
+    candidate_git_failed,
 
     pub fn parse(text: []const u8) ?Failure {
         return std.meta.stringToEnum(Failure, text);
@@ -162,6 +181,7 @@ pub const Done = struct {
 pub const State = union(Phase) {
     /// The request is recorded; nothing dispatched yet.
     approved,
+    candidates,
     /// An implementer round is due (or running).
     implementing,
     /// The last implementer finished; a review is due (or running).
@@ -186,6 +206,7 @@ pub const State = union(Phase) {
 
 pub const Phase = enum {
     approved,
+    candidates,
     implementing,
     reviewing,
     review_approved,
@@ -216,7 +237,8 @@ pub fn allowed(from: Phase, to: Phase) bool {
         else => false,
     };
     return switch (from) {
-        .approved => live_exits or to == .implementing,
+        .approved => live_exits or to == .implementing or to == .candidates,
+        .candidates => live_exits or to == .review_approved,
         .implementing => live_exits or to == .implementing or to == .reviewing,
         .reviewing => live_exits or to == .reviewing or to == .implementing or to == .review_approved,
         .review_approved => live_exits or to == .implementing or to == .reviewing or to == .auditing,
@@ -245,6 +267,7 @@ pub const SeatResult = union(enum) {
     finished,
     /// A reviewer left a valid handoff; its review as judged.
     review: ReviewResult,
+    judgment: JudgmentResult,
     failed: types.SeatError,
     budget_exhausted,
     aborted,
@@ -252,7 +275,31 @@ pub const SeatResult = union(enum) {
     interrupted,
 };
 
+pub const JudgmentResult = union(enum) {
+    selected: u8,
+    invalid: judge.Invalid,
+};
+
 // ── snapshot ────────────────────────────────────────────────────────────────
+
+pub const CandidateStatus = enum {
+    queued,
+    implementing,
+    reviewing,
+    approved,
+    rejected,
+    selected,
+    eliminated,
+
+    pub fn parse(text: []const u8) ?CandidateStatus {
+        return std.meta.stringToEnum(CandidateStatus, text);
+    }
+};
+
+pub const CandidateSnapshot = struct {
+    status: CandidateStatus = .queued,
+    tree: ?TreeId = null,
+};
 
 pub const SeatSnapshot = struct {
     id: SeatId,
@@ -294,9 +341,17 @@ pub const RunSnapshot = struct {
     worktree: ?[]const u8,
     /// Paths in `merge-conflicts.txt` after a `merge_conflict`.
     merge_conflicts: u32,
+    candidates: []const CandidateSnapshot,
 };
 
 pub const goal_max = 200;
+
+pub const CandidatesResult = union(enum) {
+    selected: u8,
+    failed: Failure,
+    budget_exhausted,
+    cancelled,
+};
 
 pub const CompletionResult = union(enum) {
     /// Audited, merged into the user's workspace, uncommitted.
@@ -326,6 +381,9 @@ pub const Error = run_dir.Error || error{
     RoleNotDispatchable,
     /// A reviewer was asked for before an implementer finished.
     NothingToReview,
+    CandidatesPending,
+    NoCandidates,
+    CandidateBudgetExceeded,
     /// `requestCompletion` without a current review approval.
     NotApproved,
     /// The instructions name the run directory, the worktree, the user's
@@ -372,6 +430,7 @@ pub const Run = struct {
     audits: u8 = 0,
     last_audit: ?audit.VerdictKind = null,
     merge_conflicts: u32 = 0,
+    candidates: [config.max_candidates]CandidateSnapshot = @splat(.{}),
     seats: std.ArrayList(SeatSnapshot) = .empty,
     /// Owned.
     goal: []u8,
@@ -393,6 +452,7 @@ pub const Run = struct {
             errdefer pfs.close(lease);
             var buf: run_dir.PathBuf = undefined;
             if (pfs.exists((try dir.path(&buf, .state)).ptr) or pfs.exists((try dir.path(&buf, .worktree)).ptr)) return error.RunExists;
+            try checkCandidateBudget(gpa, &dir, cfg);
             try dir.initialize();
             dir.writeOriginalRequest(request.text) catch |err| switch (err) {
                 error.OriginalRequestExists => {
@@ -412,7 +472,7 @@ pub const Run = struct {
         // Publish the approval and base together before creating a worktree.
         // Resume can finish an interrupted checkout under the same lease.
         try self.persist();
-        try self.completeInitialCheckout();
+        if (cfg.candidates.len == 0) try self.completeInitialCheckout();
         try self.persist();
         return self;
     }
@@ -458,12 +518,21 @@ pub const Run = struct {
             const state: State = switch (saved.state) {
                 .auditing => |tree| .{ .review_approved = tree },
                 .merging => .{ .failed = .merge_interrupted },
+                .candidates => .{ .failed = .candidates_interrupted },
                 else => saved.state,
             };
             break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, saved.base, state, saved.request_source);
         };
         errdefer self.destroy();
-        self.worktree_present = pfs.exists((try self.dir.path(&buf, .worktree)).ptr);
+        self.candidates = saved.candidates;
+        for (self.candidates[0..cfg.candidates.len], 1..) |candidate, number| {
+            if (candidate.status != .selected) continue;
+            const selected = try self.candidateWorktree(number);
+            gpa.free(self.worktree);
+            self.worktree = selected;
+        }
+        const worktree_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.worktree}) catch return error.PathTooLong;
+        self.worktree_present = pfs.exists(worktree_z.ptr);
         if (saved.initial_checkout_pending) {
             if (self.state != .approved) return error.StateCorrupt;
             try self.completeInitialCheckout();
@@ -579,6 +648,7 @@ pub const Run = struct {
             .max_rounds = self.cfg.max_rounds,
             .worktree = if (self.worktree_present) self.worktree else null,
             .merge_conflicts = self.merge_conflicts,
+            .candidates = self.candidates[0..self.cfg.candidates.len],
         };
     }
 
@@ -593,60 +663,41 @@ pub const Run = struct {
     pub fn dispatch(self: *Run, role: Role, instructions: []const u8) Error!SeatId {
         if (!self.deps.preview.teamwork) return error.PreviewDisabled;
         try self.checkLive();
+        const candidates_pending = self.state == .approved and self.cfg.candidates.len != 0;
         switch (role) {
             .implementer => switch (self.state) {
-                .approved, .implementing, .reviewing, .review_approved => {},
+                .approved => if (candidates_pending) return error.CandidatesPending,
+                .implementing, .reviewing, .review_approved => {},
                 else => return error.RunEnded,
             },
             .reviewer => switch (self.state) {
                 .reviewing, .review_approved => {},
-                .approved, .implementing => return error.NothingToReview,
+                .approved => return if (candidates_pending) error.CandidatesPending else error.NothingToReview,
+                .implementing => return error.NothingToReview,
                 else => return error.RunEnded,
             },
-            .interviewer, .manager, .verifier => return error.RoleNotDispatchable,
+            .interviewer, .manager, .verifier, .judge => return error.RoleNotDispatchable,
         }
         if (self.namesRunState(instructions)) return error.InstructionsNameRunState;
-        if (self.dispatched.get(role) >= self.cfg.max_rounds) {
+        if (self.dispatched.get(role) >= self.dispatchCap(role)) {
             try self.transition(.{ .failed = .rounds_exhausted });
             return error.RoundsExhausted;
         }
 
-        const ordinal = self.dispatched.get(role) + 1;
-        const id = types.seatIdFor(role, ordinal);
         const spec = self.cfg.seats.getPtrConst(role);
-        const charter_digest = std.fmt.bytesToHex(charters.digest(role), .lower);
-        try self.dir.createSeat(.{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
-        self.dispatched.set(role, ordinal);
-        try self.seats.append(self.gpa, .{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
-        self.emit(.{ .seat = .{ .id = id, .from = null, .to = .queued } });
         const packet = try self.renderPacket(role, instructions);
         defer self.gpa.free(packet);
-        try self.dir.writePacket(id, packet);
-        try self.issues.writeSeatCopy(self.gpa, &self.dir, id);
+        const id = try self.openSeat(role, spec, packet);
         if (role == .implementer) try self.transition(.implementing) else try self.transition(.reviewing);
         try self.setSeatStatus(id, .working);
 
         const result: SeatResult = switch (role) {
-            .implementer => try self.runImplementer(id, spec),
-            .reviewer => try self.runReviewer(id, spec, ordinal),
+            .implementer => try self.runImplementer(id, spec, self.worktree),
+            .reviewer => try self.runReviewer(id, spec, self.worktree, .{ .run = self.dispatched.get(.reviewer) }),
             else => unreachable,
         };
-        const seat_index = self.seats.items.len - 1;
-        self.seats.items[seat_index].result = result;
-        try self.setSeatStatus(id, switch (result) {
-            .finished, .review => .done,
-            .failed, .budget_exhausted, .aborted, .interrupted => .failed,
-        });
-
-        // Budget first: a seat finished at the cap still ends the run.
-        if (self.ledger.isExhausted() or result == .budget_exhausted) {
-            try self.endForBudget();
-            return id;
-        }
-        if (result == .aborted or self.abort.isAborted()) {
-            try self.transition(.cancelled);
-            return id;
-        }
+        try self.closeSeat(id, result);
+        if (try self.stopAfterSeat(result)) return id;
         switch (result) {
             .finished => try self.transition(.reviewing),
             .review => |review| switch (review) {
@@ -656,9 +707,293 @@ pub const Run = struct {
             },
             // The same round runs again with a new seat, within the cap.
             .failed, .interrupted => try self.persist(),
-            .budget_exhausted, .aborted => unreachable,
+            .budget_exhausted, .aborted, .judgment => unreachable,
         }
         return id;
+    }
+
+    pub fn runCandidates(self: *Run) Error!CandidatesResult {
+        if (!self.deps.preview.teamwork) return error.PreviewDisabled;
+        try self.checkLive();
+        const count = self.cfg.candidates.len;
+        if (count == 0 or self.state != .approved) return error.NoCandidates;
+        if (candidateEstimate(self.cfg) > self.ledger.remainingUsd()) return error.CandidateBudgetExceeded;
+        try self.transition(.candidates);
+
+        var trials: [config.max_candidates]Trial = @splat(.{});
+        for (self.cfg.candidates.slice(), 1..) |*spec, number| {
+            if (try self.runCandidate(spec, number, &trials[number - 1])) return self.endedResult();
+        }
+
+        var facts: [config.max_candidates][160]u8 = undefined;
+        var entries: [config.max_candidates]judge.Entry = undefined;
+        var any_eligible = false;
+        for (entries[0..count], trials[0..count], 0..) |*entry, trial, index| {
+            const eligible = self.candidates[index].status == .approved;
+            entry.* = .{ .eligible = eligible, .fact = trial.fact(&facts[index], eligible) };
+            any_eligible = any_eligible or eligible;
+        }
+        if (!any_eligible) {
+            try self.transition(.{ .failed = .no_candidate_approved });
+            return self.endedResult();
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const judgment = try self.runJudge(arena_state.allocator(), entries[0..count], trials[0..count]) orelse return self.endedResult();
+        const selected = judgment.selected;
+        for (self.candidates[0..count], 1..) |*candidate, number| {
+            if (number == selected) {
+                candidate.status = .selected;
+                continue;
+            }
+            if (candidate.status == .approved) candidate.status = .eliminated;
+            const path = try self.candidateWorktree(number);
+            defer self.gpa.free(path);
+            _ = merge_back.removeWorktree(self.gpa, self.repo, path);
+        }
+        const path = try self.candidateWorktree(selected);
+        self.gpa.free(self.worktree);
+        self.worktree = path;
+        self.worktree_present = true;
+        try self.recordPitfalls(entries[0..count], judgment);
+        try self.transition(.{ .review_approved = self.candidates[selected - 1].tree.? });
+        return .{ .selected = selected };
+    }
+
+    const Trial = struct {
+        implementer: ?SeatResult = null,
+        review: ?SeatResult = null,
+        reviewer: ?SeatId = null,
+
+        fn fact(self: Trial, buf: []u8, eligible: bool) []const u8 {
+            if (eligible) return "passed its verified review";
+            if (self.review) |result| return switch (result) {
+                .review => |review| switch (review) {
+                    .approved => unreachable,
+                    .changes_requested => |open_issues| std.fmt.bufPrint(buf, "was not approved: the review requested changes ({d} open issues)", .{open_issues}) catch unreachable,
+                    .rejected => |reason| std.fmt.bufPrint(buf, "was not approved: the review did not hold up ({s})", .{@tagName(reason)}) catch unreachable,
+                    .unjudgeable => "was not approved: its review could not be judged",
+                },
+                .failed => |err| std.fmt.bufPrint(buf, "was not approved: its reviewer failed ({s})", .{@tagName(err)}) catch unreachable,
+                else => "was not approved: its reviewer did not finish",
+            };
+            if (self.implementer) |result| return switch (result) {
+                .failed => |err| std.fmt.bufPrint(buf, "was not approved: its implementer failed ({s})", .{@tagName(err)}) catch unreachable,
+                else => "was not approved: its implementer did not finish",
+            };
+            return "was not approved: its worktree could not be created";
+        }
+    };
+
+    fn runCandidate(self: *Run, spec: *const types.SeatSpec, number: usize, trial: *Trial) Error!bool {
+        const candidate = &self.candidates[number - 1];
+        candidate.status = .implementing;
+        const workspace = try self.candidateWorktree(number);
+        defer self.gpa.free(workspace);
+        var dir_buf: run_dir.PathBuf = undefined;
+        const parent = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.dir.root, run_dir.candidates_dir }) catch return error.PathTooLong;
+        util_fs.mkdirParents(parent) catch return error.MkdirFailed;
+        merge_back.addWorktree(self.gpa, self.repo, workspace, self.base.commit, &self.abort) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Aborted => {
+                try self.transition(.cancelled);
+                return true;
+            },
+            else => {
+                log.warn("teamwork", "run {s}: candidate {d} worktree: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+                candidate.status = .rejected;
+                return false;
+            },
+        };
+
+        const implementer_packet = try self.renderPacket(.implementer, "");
+        defer self.gpa.free(implementer_packet);
+        const implementer = try self.openSeat(.implementer, spec, implementer_packet);
+        try self.setSeatStatus(implementer, .working);
+        const built = try self.runImplementer(implementer, spec, workspace);
+        trial.implementer = built;
+        if (built != .finished) candidate.status = .rejected else candidate.status = .reviewing;
+        try self.closeSeat(implementer, built);
+        if (try self.stopAfterSeat(built)) return true;
+        if (built != .finished) return false;
+
+        const reviewer_spec = self.cfg.seats.getPtrConst(.reviewer);
+        const reviewer_packet = try self.renderPacket(.reviewer, "");
+        defer self.gpa.free(reviewer_packet);
+        const review_seat = try self.openSeat(.reviewer, reviewer_spec, reviewer_packet);
+        trial.reviewer = review_seat;
+        try self.setSeatStatus(review_seat, .working);
+        var candidate_issues = issues.Ledger.init(self.gpa);
+        defer candidate_issues.deinit();
+        const reviewed = try self.runReviewer(review_seat, reviewer_spec, workspace, .{ .candidate = &candidate_issues });
+        trial.review = reviewed;
+        switch (reviewed) {
+            .review => |review| switch (review) {
+                .approved => |tree| candidate.* = .{ .status = .approved, .tree = tree },
+                else => candidate.status = .rejected,
+            },
+            else => candidate.status = .rejected,
+        }
+        try self.closeSeat(review_seat, reviewed);
+        return self.stopAfterSeat(reviewed);
+    }
+
+    fn runJudge(self: *Run, arena: std.mem.Allocator, entries: []const judge.Entry, trials: []const Trial) Error!?judge.Judgment {
+        const workspace = try self.prepareJudging(entries, trials) orelse {
+            try self.transition(.{ .failed = .candidate_git_failed });
+            return null;
+        };
+        defer self.gpa.free(workspace);
+        const spec = self.cfg.seats.getPtrConst(.judge);
+        const packet = try judge.renderPacket(self.gpa, self.cfg.check_command, entries);
+        defer self.gpa.free(packet);
+        while (self.dispatched.get(.judge) < self.dispatchCap(.judge)) {
+            const id = try self.openSeat(.judge, spec, packet);
+            try self.setSeatStatus(id, .working);
+            var files: SeatFiles = .{};
+            try files.init(&self.dir, id);
+            var drivers = self.driversFor(spec, id);
+            var outcome = try drivers.driver().run(self.gpa, spec, files.paths(workspace), &self.abort);
+            defer outcome.deinit(self.gpa);
+            var judgment: judge.Judgment = undefined;
+            const result: SeatResult = switch (outcome) {
+                .finished => .{ .judgment = try self.readJudgment(arena, id, entries, &judgment) },
+                .failed => |err| .{ .failed = err },
+                .budget_exhausted => .budget_exhausted,
+                .aborted => .aborted,
+            };
+            try self.closeSeat(id, result);
+            if (try self.stopAfterSeat(result)) return null;
+            if (result == .judgment and result.judgment == .selected) return judgment;
+        }
+        try self.transition(.{ .failed = .rounds_exhausted });
+        return null;
+    }
+
+    fn readJudgment(self: *Run, arena: std.mem.Allocator, id: SeatId, entries: []const judge.Entry, out: *judge.Judgment) error{ OutOfMemory, PathTooLong }!JudgmentResult {
+        var buf: run_dir.PathBuf = undefined;
+        const text = try run_dir.readSeatOutput(self.gpa, try self.dir.seatPath(&buf, id, .judgment), judge.max_judgment_bytes + 1) orelse
+            return .{ .invalid = error.JudgmentMissing };
+        defer self.gpa.free(text);
+        out.* = judge.parse(arena, text, entries) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| return .{ .invalid = e },
+        };
+        return .{ .selected = out.selected };
+    }
+
+    fn prepareJudging(self: *Run, entries: []const judge.Entry, trials: []const Trial) Error!?[]u8 {
+        const workspace = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.dir.root, run_dir.judging_dir });
+        errdefer self.gpa.free(workspace);
+        util_fs.mkdirParents(workspace) catch return error.MkdirFailed;
+        var file_buf: run_dir.PathBuf = undefined;
+        var name_buf: [48]u8 = undefined;
+        for (entries, trials, 0..) |entry, trial, index| {
+            if (!entry.eligible) continue;
+            const number = index + 1;
+            const diff = merge_back.diffPatch(self.gpa, self.repo, self.base.commit, self.candidates[index].tree.?, &self.abort) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.warn("teamwork", "run {s}: candidate {d} diff: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+                    self.gpa.free(workspace);
+                    return null;
+                },
+            };
+            defer self.gpa.free(diff);
+            const diff_path = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ workspace, judge.diffFile(&name_buf, number) }) catch return error.PathTooLong;
+            try run_dir.writeAtomic(diff_path, diff);
+            const review_path = try self.dir.seatPath(&file_buf, trial.reviewer.?, .review);
+            const review = try run_dir.readSeatOutput(self.gpa, review_path, reviewer.max_review_bytes + 1) orelse continue;
+            defer self.gpa.free(review);
+            const copy_path = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ workspace, judge.reviewFile(&name_buf, number) }) catch return error.PathTooLong;
+            try run_dir.writeAtomic(copy_path, review);
+        }
+        return workspace;
+    }
+
+    fn recordPitfalls(self: *Run, entries: []const judge.Entry, judgment: judge.Judgment) error{OutOfMemory}!void {
+        const sink = self.deps.pitfalls orelse return;
+        var binding: lesson.Binding = .{ .verdict = .failed, .task = lesson.NO_TASK, .run = self.dir.run_id.slice() };
+        for (entries, 1..) |entry, number| {
+            const reason = judgment.reasons[number - 1] orelse continue;
+            const text = try judge.renderLesson(self.gpa, .{
+                .run = self.dir.run_id,
+                .goal = self.goal,
+                .number = number,
+                .selected = judgment.selected,
+                .fact = entry.fact,
+                .reason = reason,
+            });
+            defer self.gpa.free(text);
+            const envelope = lesson.parse(text) catch |err| {
+                log.warn("teamwork", "run {s}: candidate {d} lesson refused: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+                continue;
+            };
+            lesson.checkBinding(envelope, &binding) catch |err| {
+                log.warn("teamwork", "run {s}: candidate {d} lesson refused: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+                continue;
+            };
+            if (!binding.reserve()) break;
+            if (!sink.remember(text)) {
+                binding.release();
+                log.warn("teamwork", "run {s}: candidate {d} lesson not stored", .{ self.dir.run_id.slice(), number });
+            }
+        }
+    }
+
+    fn endedResult(self: *const Run) CandidatesResult {
+        return switch (self.state) {
+            .budget_exhausted => .budget_exhausted,
+            .cancelled => .cancelled,
+            .failed => |failure| .{ .failed = failure },
+            else => unreachable,
+        };
+    }
+
+    fn candidateWorktree(self: *const Run, number: usize) error{OutOfMemory}![]u8 {
+        return std.fmt.allocPrint(self.gpa, "{s}/{s}/candidate-{d}", .{ self.dir.root, run_dir.candidates_dir, number });
+    }
+
+    fn dispatchCap(self: *const Run, role: Role) u32 {
+        const extra: u32 = switch (role) {
+            .implementer, .reviewer => self.cfg.candidates.len -| 1,
+            else => 0,
+        };
+        return self.cfg.max_rounds + extra;
+    }
+
+    fn openSeat(self: *Run, role: Role, spec: *const types.SeatSpec, packet: []const u8) Error!SeatId {
+        const ordinal = self.dispatched.get(role) + 1;
+        const id = types.seatIdFor(role, ordinal);
+        const charter_digest = std.fmt.bytesToHex(charters.digest(role), .lower);
+        try self.dir.createSeat(.{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
+        self.dispatched.set(role, ordinal);
+        try self.seats.append(self.gpa, .{ .id = id, .role = role, .harness = spec.harnessKind(), .status = .queued, .charter_sha256 = charter_digest });
+        self.emit(.{ .seat = .{ .id = id, .from = null, .to = .queued } });
+        try self.dir.writePacket(id, packet);
+        try self.issues.writeSeatCopy(self.gpa, &self.dir, id);
+        return id;
+    }
+
+    fn closeSeat(self: *Run, id: SeatId, result: SeatResult) Error!void {
+        self.seats.items[self.seats.items.len - 1].result = result;
+        try self.setSeatStatus(id, switch (result) {
+            .finished, .review, .judgment => .done,
+            .failed, .budget_exhausted, .aborted, .interrupted => .failed,
+        });
+    }
+
+    fn stopAfterSeat(self: *Run, result: SeatResult) Error!bool {
+        if (self.ledger.isExhausted() or result == .budget_exhausted) {
+            try self.endForBudget();
+            return true;
+        }
+        if (result == .aborted or self.abort.isAborted()) {
+            try self.transition(.cancelled);
+            return true;
+        }
+        return false;
     }
 
     /// Ask the runtime to complete the run. Only from `review_approved`; the
@@ -787,11 +1122,11 @@ pub const Run = struct {
         }
     };
 
-    fn runImplementer(self: *Run, id: SeatId, spec: *const types.SeatSpec) Error!SeatResult {
+    fn runImplementer(self: *Run, id: SeatId, spec: *const types.SeatSpec, workspace: []const u8) Error!SeatResult {
         var files: SeatFiles = .{};
         try files.init(&self.dir, id);
         var drivers = self.driversFor(spec, id);
-        var outcome = try drivers.driver().run(self.gpa, spec, files.paths(self.worktree), &self.abort);
+        var outcome = try drivers.driver().run(self.gpa, spec, files.paths(workspace), &self.abort);
         defer outcome.deinit(self.gpa);
         return switch (outcome) {
             .finished => .finished,
@@ -801,10 +1136,15 @@ pub const Run = struct {
         };
     }
 
-    fn runReviewer(self: *Run, id: SeatId, spec: *const types.SeatSpec, round: u32) Error!SeatResult {
+    const ReviewLedger = union(enum) {
+        run: u32,
+        candidate: *issues.Ledger,
+    };
+
+    fn runReviewer(self: *Run, id: SeatId, spec: *const types.SeatSpec, workspace: []const u8, ledger: ReviewLedger) Error!SeatResult {
         var files: SeatFiles = .{};
         try files.init(&self.dir, id);
-        const before = reviewer.workspaceTree(self.gpa, self.worktree, self.dir.root, &self.abort) catch |err| switch (err) {
+        const before = reviewer.workspaceTree(self.gpa, workspace, self.dir.root, &self.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Aborted => return .aborted,
             else => return .{ .review = .unjudgeable },
@@ -825,7 +1165,7 @@ pub const Run = struct {
             },
             .custom => false,
         };
-        var outcome = try drivers.driver().run(self.gpa, spec, files.paths(self.worktree), &self.abort);
+        var outcome = try drivers.driver().run(self.gpa, spec, files.paths(workspace), &self.abort);
         defer outcome.deinit(self.gpa);
         switch (outcome) {
             .finished => {},
@@ -833,7 +1173,7 @@ pub const Run = struct {
             .budget_exhausted => return .budget_exhausted,
             .aborted => return .aborted,
         }
-        const after = reviewer.workspaceTree(self.gpa, self.worktree, self.dir.root, &self.abort) catch |err| switch (err) {
+        const after = reviewer.workspaceTree(self.gpa, workspace, self.dir.root, &self.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Aborted => return .aborted,
             else => return .{ .review = .unjudgeable },
@@ -847,16 +1187,23 @@ pub const Run = struct {
             if (pfs.mkdir(check_tmp.ptr, 0o700) != 0) return error.MkdirFailed;
             check_runner.private_temp = check_tmp;
         }
-        const judged = reviewer.judgeSeat(self.gpa, &self.dir, id, &self.issues, .{
+        const context: reviewer.Context = .{
             .observed = if (observable) .{ .calls = calls.calls() } else .unobservable,
             .check = self.cfg.check_command,
             .runner = check_runner,
-            .workspace = self.worktree,
+            .workspace = workspace,
             .tree_before = before,
             .tree_after = after,
-            .round = round,
+            .round = switch (ledger) {
+                .run => |round| round,
+                .candidate => 1,
+            },
             .abort = &self.abort,
-        }) catch |err| switch (err) {
+        };
+        const judged = switch (ledger) {
+            .run => reviewer.judgeSeat(self.gpa, &self.dir, id, &self.issues, context),
+            .candidate => |candidate_issues| reviewer.judgeSeatReview(self.gpa, &self.dir, id, candidate_issues, context),
+        } catch |err| switch (err) {
             error.Aborted => return .aborted,
             else => |e| return e,
         };
@@ -1081,7 +1428,7 @@ pub const Run = struct {
         try s.objectField("request_source");
         try s.write(@tagName(self.request_source));
         try s.objectField("initial_checkout_pending");
-        try s.write(self.state == .approved and !self.worktree_present);
+        try s.write(self.state == .approved and !self.worktree_present and self.cfg.candidates.len == 0);
         try s.objectField("state");
         try s.write(@tagName(self.state.phase()));
         try s.objectField("detail");
@@ -1096,7 +1443,7 @@ pub const Run = struct {
                 try s.write(done.worktree_removed);
                 try s.endObject();
             },
-            .approved, .implementing, .reviewing, .budget_exhausted, .cancelled => try s.write(null),
+            .approved, .candidates, .implementing, .reviewing, .budget_exhausted, .cancelled => try s.write(null),
         }
         try s.objectField("repo");
         try s.write(self.repo);
@@ -1117,10 +1464,33 @@ pub const Run = struct {
         if (self.last_audit) |kind| try s.write(@tagName(kind)) else try s.write(null);
         try s.objectField("merge_conflicts");
         try s.write(self.merge_conflicts);
+        try s.objectField("candidates");
+        try s.beginArray();
+        for (self.candidates[0..self.cfg.candidates.len]) |candidate| {
+            try s.beginObject();
+            try s.objectField("status");
+            try s.write(@tagName(candidate.status));
+            try s.objectField("tree");
+            if (candidate.tree) |tree| try s.write(tree.slice()) else try s.write(null);
+            try s.endObject();
+        }
+        try s.endArray();
         try s.endObject();
         try w.writeAll("\n");
     }
 };
+
+fn candidateEstimate(cfg: config.Config.Enabled) f64 {
+    return @as(f64, @floatFromInt(cfg.candidates.len)) * (cfg.candidate_estimate_usd orelse 0);
+}
+
+fn checkCandidateBudget(gpa: std.mem.Allocator, dir: *const run_dir.RunDir, cfg: config.Config.Enabled) StartError!void {
+    if (cfg.candidates.len == 0) return;
+    var buf: run_dir.PathBuf = undefined;
+    var ledger = try ledger_mod.Ledger.load(gpa, try dir.path(&buf, .budget), cfg.budget_usd);
+    defer ledger.deinit(gpa);
+    if (candidateEstimate(cfg) > ledger.remainingUsd()) return error.CandidateBudgetExceeded;
+}
 
 fn acquireLease(dir: *const run_dir.RunDir) Error!pfs.Fd {
     var buf: run_dir.PathBuf = undefined;
@@ -1147,6 +1517,7 @@ const Saved = struct {
     audits: u8,
     last_audit: ?audit.VerdictKind,
     merge_conflicts: u32,
+    candidates: [config.max_candidates]CandidateSnapshot,
 };
 
 fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
@@ -1157,6 +1528,7 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
     const detail = obj.get("detail") orelse return error.StateCorrupt;
     const state: State = switch (phase) {
         .approved => .approved,
+        .candidates => .candidates,
         .implementing => .implementing,
         .reviewing => .reviewing,
         .budget_exhausted => .budget_exhausted,
@@ -1179,7 +1551,24 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
     var dispatched: std.EnumArray(Role, u32) = .initFill(0);
     const counts = obj.get("dispatched") orelse return error.StateCorrupt;
     if (counts != .object) return error.StateCorrupt;
-    for (std.enums.values(Role)) |role| dispatched.set(role, try intField(u32, counts.object, role.name()));
+    for (std.enums.values(Role)) |role| {
+        if (role == .judge and counts.object.get(role.name()) == null) continue;
+        dispatched.set(role, try intField(u32, counts.object, role.name()));
+    }
+    var candidates: [config.max_candidates]CandidateSnapshot = @splat(.{});
+    if (obj.get("candidates")) |list| {
+        if (list != .array or list.array.items.len > config.max_candidates) return error.StateCorrupt;
+        for (list.array.items, candidates[0..list.array.items.len]) |item, *candidate| {
+            if (item != .object) return error.StateCorrupt;
+            candidate.* = .{
+                .status = CandidateStatus.parse(try stringField(item.object, "status")) orelse return error.StateCorrupt,
+                .tree = switch (item.object.get("tree") orelse return error.StateCorrupt) {
+                    .null => null,
+                    else => |tree| try treeOf(tree),
+                },
+            };
+        }
+    }
     const last_audit: ?audit.VerdictKind = switch (obj.get("last_audit") orelse return error.StateCorrupt) {
         .null => null,
         .string => |name| std.meta.stringToEnum(audit.VerdictKind, name) orelse return error.StateCorrupt,
@@ -1209,11 +1598,33 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
         .audits = try intField(u8, obj, "audits"),
         .last_audit = last_audit,
         .merge_conflicts = try intField(u32, obj, "merge_conflicts"),
+        .candidates = candidates,
     };
 }
 
+const roles_before_candidates = @intFromEnum(Role.judge);
+
+const SingleLinePolicy = struct {
+    budget_usd: f64,
+    check_command: ?config.CheckCommand,
+    max_rounds: u32,
+    seats: struct { values: [roles_before_candidates]types.SeatSpec },
+
+    fn of(cfg: config.Config.Enabled) SingleLinePolicy {
+        return .{
+            .budget_usd = cfg.budget_usd,
+            .check_command = cfg.check_command,
+            .max_rounds = cfg.max_rounds,
+            .seats = .{ .values = cfg.seats.values[0..roles_before_candidates].* },
+        };
+    }
+};
+
 fn configFingerprint(gpa: std.mem.Allocator, cfg: config.Config.Enabled) error{OutOfMemory}![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(gpa, cfg, .{});
+    const bytes = if (cfg.candidates.len == 0)
+        try std.json.Stringify.valueAlloc(gpa, SingleLinePolicy.of(cfg), .{})
+    else
+        try std.json.Stringify.valueAlloc(gpa, cfg, .{});
     defer gpa.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -1299,4 +1710,20 @@ test "runtime: seat ids and goals" {
     const goal = goalOf(long);
     try testing.expect(goal.len <= goal_max);
     try testing.expect(std.unicode.utf8ValidateSlice(goal));
+}
+
+test "runtime: a run approved before parallel candidates keeps its fingerprint and state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "{\"enabled\":true,\"check_command\":\"test -f feature.txt\",\"budget_usd\":5,\"seats\":{\"implementer\":{\"model\":\"m\"},\"reviewer\":{\"harness\":\"claude_code\",\"command\":\"/opt/claude/bin/claude\"}}}";
+    const cfg = (try config.validate(try config.parse(a, text, null), null)).enabled;
+    const fingerprint = std.fmt.bytesToHex(try configFingerprint(testing.allocator, cfg), .lower);
+    try testing.expectEqualStrings("23d722bfcb25e9ecc9670f4df0d65322477ce0229f114e903e0b0dce2dd30409", &fingerprint);
+
+    const tree = "b" ** 40;
+    const saved = try parseSaved(a, "{\"config_sha256\":\"" ++ "c" ** 64 ++ "\",\"request_source\":\"request_file\",\"state\":\"implementing\",\"detail\":null,\"repo\":\"/r\",\"base_commit\":\"" ++ tree ++ "\",\"start_tree\":\"" ++ tree ++ "\",\"dispatched\":{\"manager\":0,\"interviewer\":0,\"implementer\":2,\"reviewer\":1,\"verifier\":0},\"audits\":0,\"last_audit\":null,\"merge_conflicts\":0}");
+    try testing.expectEqual(@as(u32, 0), saved.dispatched.get(.judge));
+    try testing.expectEqual(@as(u32, 2), saved.dispatched.get(.implementer));
+    try testing.expectEqual(CandidateStatus.queued, saved.candidates[0].status);
 }

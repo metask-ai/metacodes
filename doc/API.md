@@ -1902,7 +1902,8 @@ stdin/stdout, and `serveFds(self, input: platform.fs.Fd, output: platform.fs.Fd)
 uses bounded NDJSON with protocol-only stdout and cancels live runs on EOF.
 
 The tools are `teamwork_status`, synchronous `teamwork_dispatch` (only
-implementer/reviewer and optional instructions), `teamwork_request_completion`
+implementer/reviewer and optional instructions), `teamwork_run_candidates`
+(parallel candidates and the judge, #525), `teamwork_request_completion`
 and `teamwork_cancel`. No tool starts or approves a run, replaces the approved
 request, changes configuration/budget/check command, or chooses a workspace.
 The runtime alone verifies review approval, independently audits and merges;
