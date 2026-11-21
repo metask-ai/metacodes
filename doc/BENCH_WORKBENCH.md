@@ -892,6 +892,21 @@ configured bundle in place or switching `workbench.json` to another version
 never changes a batch already created; before each launch the copy is checked
 against its digest, and a modified copy fails the dataset instead of running.
 
+The 高级功能 section of the 新建 page switches on metacodes features that are
+off by default, all off unless ticked. Each one adds a single metacodes flag to
+every trial of the batch: the Lean-modelled run gates
+`verification_final_gate` (`--verification-final-gate`), `requirement_ledger`
+(`--requirement-ledger`), `test_integrity` (`--test-integrity`),
+`delivery_cadence` (`--delivery-cadence`) and `stall_gate` (`--stall-gate`),
+and the preview features `execute_code` (`--preview=execute_code`),
+`comment_guard` (`--preview=comment_guard`) and `harnessmm` (`--harnessmm`).
+`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The batch
+and each of its runs record the chosen names (`features`), and the run passes
+them to the adapter as `--ak features=<names>`. An unknown name is refused, and
+so is any choice for a WorkBuddy suite, whose overlay launches metacodes
+itself. The frozen bundle has to know the flags: a release older than a
+feature fails its trials with a usage error.
+
 The datasets run one after another, each as an ordinary workbench run (one
 Harbor job) whose record names the batch and its frozen version. The durable
 state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
@@ -1129,7 +1144,7 @@ Jobs refresh every ten seconds while active; per-trial trajectories become
 available when Harbor copies the agent logs back from the container.
 
 The run endpoint (`POST /api/runs`) accepts `suite`, `tasks`, `model`,
-`attempts` and `concurrency`; the original `dataset:
+`attempts`, `concurrency` and `features` (names from the 高级功能 list); the original `dataset:
 "terminal-bench/terminal-bench-2-1"` field is still accepted and means
 `suite: "terminal-bench-2.1"`. It takes task/model selections, not shell
 commands, paths, keys, or arbitrary Harbor flags. Full task names are passed as separate argv

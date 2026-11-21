@@ -315,6 +315,7 @@ async function renderBatch(id) {
     h('dt', { text: '模型' }), h('dd', { text: b.model || '—' }),
     h('dt', { text: '执行机器' }), h('dd', { text: b.executor || '—' }),
     h('dt', { text: '每题次数 / 并发' }), h('dd', { text: `${b.attempts} 次 · 并发 ${b.concurrency}（不超过各评测集上限）` }),
+    h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: (b.features || []).join(', ') || '未开启' }),
     h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 开始 ${when(b.started_at)} · 结束 ${when(b.finished_at)}` })),
     h('p', { class: 'muted', text: '批次创建时复制并锁定这个 metacodes 发行包；之后重新构建或切换工作台的版本不影响本批次。各评测集依次运行，每个评测集一个作业。' }));
 
@@ -461,6 +462,16 @@ async function renderNewBatch() {
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: runDefaults.attempts, min: 1, max: 5, step: 1, required: true });
   const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: runDefaults.concurrency, min: 1, max: 16, step: 1, required: true });
+  const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
+    input: h('input', { type: 'checkbox', name: 'features', value: f.id }), label: f.label }));
+  const featureGroup = (group, title) => {
+    const boxes = featureBoxes.filter((f) => f.group === group);
+    return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),
+      ...boxes.map((f) => h('label', { class: 'check' }, f.input, h('span', { text: f.label }), h('small', { class: 'mono muted', text: f.id })))) : null;
+  };
+  const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: '高级功能（可选，默认全部关闭）' }),
+    featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性'),
+    h('small', { class: 'muted', text: '只对 Harbor 评测集生效；所选发行包须支持这些开关。' })) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
   const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '创建批次');
 
@@ -573,6 +584,7 @@ async function renderNewBatch() {
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency, h('small', { text: '每个评测集按自己的上限截断。' }))),
+    features,
     h('p', { class: 'muted', text: '评测会调用所选模型。各评测集依次运行；创建后可在批次页持续查看进度、逐任务轨迹、Token 分布和耗时。' }), feedback, submit);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -584,6 +596,8 @@ async function renderNewBatch() {
       if (bundle.value) request.bundle = bundle.value;
       if (name.value.trim()) request.name = name.value.trim();
       if (executorsList.length) request.executor = executor.value;
+      const chosen = featureBoxes.filter((f) => f.input.checked).map((f) => f.id);
+      if (chosen.length) request.features = chosen;
       const record = await api('/api/batches', request);
       state.batchPick = null;
       state.scope = record.id;
