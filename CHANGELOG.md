@@ -67,6 +67,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Shift+Tab cycles the permission mode in terminals that report modified
+  keys.** iTerm2 3.7.7 and later, Ghostty, kitty, Alacritty and tmux with
+  `extended-keys` send Shift+Tab as the kitty protocol's `ESC [ 9 ; 2 u` or
+  xterm modifyOtherKeys' `ESC [ 27 ; 2 ; 9 ~` instead of `ESC [ Z`, and the
+  TUI ignored both. The key parser now reads both forms through one table, so
+  modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
+  their CSI u forms do (#643).
+
 - **`/logout` and the notice under the banner follow `.env`'s
   `METACODES_PRESET`** (#489). Signed in to Metask with a `.env` that names a
   preset, `/logout` moved the session to the file's `METACODES_PROVIDER` (or

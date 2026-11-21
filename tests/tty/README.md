@@ -73,6 +73,10 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
   只为收齐已在路上的字节。断言哪一刻的画面由用例的事件写明——#220 之前 POSIX 固定收 0.5s、
   ConPTY 等静默,同一用例在两个平台上断言的是不同时刻。POSIX 关掉终端后至多等子进程 15s,
   不退出就 SIGKILL 并判该用例失败(以前无超时 `waitpid`,会挂死整个 runner)。
+  POSIX **写入**时一直读程序的输出:macOS 的 pty 每个方向只缓冲约 1 KiB,程序在读输入之前先写出
+  更多时,只写不读的驱动和它会互相等、永远卡住(#569);程序 `WAIT_S`(20s)内一个字节也不读,
+  该用例失败。用例出错或被打断时(收尾、等子进程退出的时候也算),驱动先关掉终端,再杀掉并回收
+  程序(终端开着时,macOS 上输出没被读走的程序退不干净),然后把异常交出去。
 - `asserts.py` —— 切帧(`ESC[?25l`..`ESC[?25h` 光标对)+ `TTYAssert`
   (box_at_bottom/single_box/no_jitter/input_echo/border_class/footer_mode/box_height/clean_exit/...)。
 - **resize 回放**:默认整条流按最终尺寸回放,看不到 resize 那一刻终端对旧画面做了什么。
