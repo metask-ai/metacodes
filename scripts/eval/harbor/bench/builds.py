@@ -538,6 +538,8 @@ def _node_build(executor, ref, repo, cancelled, popen):
 
 
 def _close(stream):
+    if stream is None:
+        return
     try:
         stream.close()
     except (BrokenPipeError, OSError):
@@ -554,9 +556,8 @@ def _stop(process):
         else:
             process.kill()
         process.wait()
-    for stream in (process.stdout, process.stderr):
-        if stream is not None:
-            _close(stream)
+    _close(process.stdout)
+    _close(process.stderr)
 
 
 def _fetch_unit(executor, remote_unit, unit, commit, repo, cancelled, popen):

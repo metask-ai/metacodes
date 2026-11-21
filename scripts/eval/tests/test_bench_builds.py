@@ -250,6 +250,20 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertFalse(local.exists())
         self.assertEqual(list(local.parent.glob('.fetch-*')), [])
 
+    def test_a_remote_unit_with_a_disallowed_entry_is_refused_with_its_reason(self):
+        executor = self.remote_executor()
+        commit = self.git('rev-parse', 'HEAD')
+        builds.build_on(executor, 'main', self.bench, str(self.repo))
+        remote = builds.unit_path(self.root / 'remote-state' / 'bench', commit)
+        (remote / 'bin' / 'escape').symlink_to('/etc/passwd')
+        local = builds.unit_path(self.bench, commit)
+        shutil.rmtree(local)
+        (local.parent / (local.name + '.json')).unlink()
+        with self.assertRaisesRegex(builds.BuildError, '不允许的条目'):
+            builds._fetch_unit(executor, str(remote), local, commit, str(self.repo), lambda: False, subprocess.Popen)
+        self.assertFalse(local.exists())
+        self.assertEqual(list(local.parent.glob('.fetch-*')), [])
+
     def test_fetched_archive_may_hold_only_the_unit_and_its_record(self):
         for name, kind in (('../escape', tarfile.REGTYPE), ('unit/link', tarfile.SYMTYPE), ('other', tarfile.REGTYPE)):
             with self.subTest(name=name):
