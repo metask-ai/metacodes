@@ -76,6 +76,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The TUI's start waits at most 1.5 s for the model list** (#666). With no
+  kept copy of the route's `/v1/models` (the first start for an endpoint and
+  key, the first after a key or route change, the first after a day), the
+  start fetched it before it showed the prompt, with no time limit: a gateway
+  that answered after 5 s held the prompt back 5 s, and one that never
+  answered kept it away. A Metask device sign-in's catalog, fetched on every
+  start, did the same. Now the start waits at most 1.5 s
+  (`METACODES_STARTUP_MODELS_WAIT_MS` sets another bound in milliseconds;
+  `0` does not wait). A `/v1/models` answer that comes later is taken before
+  the next turn and kept for the next start; a session whose Metask catalog
+  does not come in time runs on the built-in Metask models, as when the
+  catalog cannot be fetched.
+
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a

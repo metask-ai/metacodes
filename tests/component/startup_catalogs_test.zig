@@ -9,12 +9,15 @@
 //!     outright when only an API key could be sent to the account endpoint,
 //!     and is fetched with the login token (or with the API key from a named
 //!     `METACODE_API_KEYS_URL`) when there is one;
-//!   - with the REPL's `models_cache`, a cold start fetches `/v1/models` before
-//!     init returns, exactly as without the cache, and stores it; a warm start
-//!     sends nothing before init returns, answers from the stored copy, and a
-//!     background refresh that the REPL adopts updates both the catalog and
-//!     the copy; an expired copy is a cold start; an answer for a credential
-//!     the session has since left is dropped.
+//!   - with the REPL's `models_cache`, a cold start waits for `/v1/models` at
+//!     most the startup bound (#666): an answer in time is taken before init
+//!     returns and stored, a later one is taken at the REPL's idle point and
+//!     stored; a warm start sends nothing before init returns, answers from
+//!     the stored copy, and a background refresh that the REPL adopts updates
+//!     both the catalog and the copy; an expired copy is a cold start; an
+//!     answer for a credential the session has since left is dropped;
+//!   - a Metask device sign-in's catalog gets the same bound: in time it is
+//!     the session's, late the session starts on the compiled route.
 
 const std = @import("std");
 const cc = @import("cc");
@@ -53,6 +56,10 @@ const MODELS_B =
 const MODELS_C =
     \\{"data":[{"id":"claude-sonnet-4-5","max_tokens":33333,"max_input_tokens":300000}]}
 ;
+const METASK_ACCESS = "metask-access-l2";
+const METASK_MODELS =
+    \\{"object":"list","data":[{"id":"glm-5.3-flash","display_name":"glm-5.3-flash","max_tokens":12345}]}
+;
 const KEYS =
     \\{"code":0,"data":{"items":[
     \\{"id":1,"name":"Prod key","key":"sk-prod-1111","status":"active"},
@@ -65,7 +72,7 @@ const Fixture = struct {
     tmp: std.testing.TmpDir,
     arena: std.heap.ArenaAllocator,
     io_rt: std.Io.Threaded,
-    guards: [8]EnvGuard,
+    guards: [10]EnvGuard,
     guard_count: usize = 0,
     home: []const u8,
     state: []const u8,
@@ -93,6 +100,8 @@ const Fixture = struct {
         try self.guard("METACODES_KG_AUTOSTART", "0");
         try self.guard("METACODE_API_KEYS_URL", null);
         try self.guard("METACODES_JEV_URL", "");
+        try self.guard(cc.models_cache.STARTUP_WAIT_ENV, null);
+        try self.guard("METASK_GATEWAY_URL", null);
         self.io_rt = @import("platform").signal.threadedIo(arena, .{});
     }
 
@@ -132,6 +141,29 @@ const Fixture = struct {
         return cc.app_module.App.initWithOptions(std.testing.allocator, self.io_rt.io(), config, "test-key", options);
     }
 
+    fn startMetaskDevice(self: *Fixture, origin: []const u8, options: cc.app_module.App.InitOptions) !*cc.app_module.App {
+        const a = std.testing.allocator;
+        const arena = self.arena.allocator();
+        var session = try cc.provider_oauth.Session.initHome(a, self.state, try cc.provider_ids.Slug.parse("metask"));
+        defer session.deinit();
+        try session.importOutcome(.{
+            .access_token = METASK_ACCESS,
+            .refresh_token = "metask-refresh-l2",
+            .expires_in_seconds = 3600,
+            .gateway_url = origin,
+        }, cc.util_time.nowUnix());
+        const argv = [_][*:0]const u8{ "metacodes", "--provider", "metask" };
+        var config = cc.parseArgsForTest(&argv, arena);
+        try std.testing.expect(config.parse_error == null);
+        config.state_root = self.state;
+        config.metask_oauth_selected = true;
+        config.resolved_provider_id = "metask";
+        config.base_url = try std.fmt.allocPrint(arena, "{s}/v1/messages", .{origin});
+        config.model = "glm-5.3-flash";
+        config.model_explicit = true;
+        return cc.app_module.App.initWithOptions(a, self.io_rt.io(), config, METASK_ACCESS, options);
+    }
+
     /// The stored `/v1/models` copy for this fixture's route, if any.
     fn cached(self: *Fixture, url: []const u8, api_key: []const u8) ?[]u8 {
         const a = std.testing.allocator;
@@ -141,6 +173,11 @@ const Fixture = struct {
         return cc.models_cache.load(a, self.state, key, url, cc.util_time.nowUnix(), cc.models_cache.TTL_SECONDS);
     }
 };
+
+fn originOf(allocator: std.mem.Allocator, srv: *harness.MockServer) ![]const u8 {
+    const url = try srv.urlOwned(allocator);
+    return url[0 .. url.len - "/v1/messages".len];
+}
 
 fn requestLine(srv: *harness.MockServer, index: usize) []const u8 {
     const req = srv.requestAt(index) orelse return "";
@@ -152,6 +189,29 @@ fn hasHeader(srv: *harness.MockServer, index: usize, line: []const u8) bool {
     const req = srv.requestAt(index) orelse return false;
     return std.ascii.indexOfIgnoreCase(req.raw, line) != null;
 }
+
+const GateWatchdog = struct {
+    srv: *harness.MockServer,
+    after_ms: i64,
+    disarmed: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn arm(self: *GateWatchdog) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *GateWatchdog) void {
+        const deadline = cc.util_time.nowMs() + self.after_ms;
+        while (!self.disarmed.load(.acquire) and cc.util_time.nowMs() < deadline) cc.util_time.sleepMs(10);
+        self.srv.releaseGatedResponse();
+    }
+
+    fn disarm(self: *GateWatchdog) void {
+        self.disarmed.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+};
 
 /// Wait for the background refresh to settle (it talks to a local mock).
 fn waitRefresh(app: *cc.app_module.App) !void {
@@ -266,6 +326,98 @@ test "L2 startup: with the models cache, a cold start fetches /v1/models before 
     try std.testing.expectEqualStrings(MODELS_A, stored);
     // Keyed by credential: another key has no copy.
     try std.testing.expect(fx.cached(url, "other-key") == null);
+}
+
+test "L2 startup: a cold start whose /v1/models does not answer in time starts on the local table and takes the answer at the idle point (#666)" {
+    var fx: Fixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&.{MODELS_A}, 0);
+    defer srv.stop();
+    srv.gateResponseAt(0);
+    var watchdog: GateWatchdog = .{ .srv = srv, .after_ms = 10_000 };
+    try watchdog.arm();
+    defer watchdog.disarm();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    const started = cc.util_time.nowMs();
+    const app = try fx.start(url, .{ .models_cache = true });
+    defer app.deinit();
+    try std.testing.expect(cc.util_time.nowMs() - started < 10_000);
+    try srv.waitUntilResponseGated();
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expect(app.models_refresh != null);
+    try std.testing.expect(app.api_client.resolveMaxTokens() != 11111);
+    try std.testing.expect(fx.cached(url, "test-key") == null);
+
+    srv.releaseGatedResponse();
+    try waitRefresh(app);
+    app.adoptModelCatalogRefresh();
+    try std.testing.expect(app.models_refresh == null);
+    try std.testing.expectEqual(@as(u32, 11111), app.api_client.resolveMaxTokens());
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    const stored = fx.cached(url, "test-key") orelse return error.NotStored;
+    defer a.free(stored);
+    try std.testing.expectEqualStrings(MODELS_A, stored);
+}
+
+test "L2 startup: METACODES_STARTUP_MODELS_WAIT_MS sets how long a cold start waits for /v1/models (#666)" {
+    var fx: Fixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const a = std.testing.allocator;
+    try fx.guard(cc.models_cache.STARTUP_WAIT_ENV, "60000");
+    var srv = try harness.MockServer.startCassette(&.{MODELS_A}, 0);
+    defer srv.stop();
+    srv.gateResponseAt(0);
+    var watchdog: GateWatchdog = .{ .srv = srv, .after_ms = cc.models_cache.STARTUP_WAIT_MS + 1_000 };
+    try watchdog.arm();
+    defer watchdog.disarm();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    const app = try fx.start(url, .{ .models_cache = true });
+    defer app.deinit();
+    try std.testing.expect(app.models_refresh == null);
+    try std.testing.expectEqual(@as(u32, 11111), app.api_client.resolveMaxTokens());
+}
+
+test "L2 startup: a Metask device sign-in's catalog that answers in time is the session's (#666)" {
+    var fx: Fixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    var srv = try harness.MockServer.startCassette(&.{METASK_MODELS}, 0);
+    defer srv.stop();
+
+    const app = try fx.startMetaskDevice(try originOf(fx.arena.allocator(), srv), .{ .models_cache = true });
+    defer app.deinit();
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expect(std.mem.startsWith(u8, requestLine(srv, 0), "GET /v1/models "));
+    try std.testing.expect(hasHeader(srv, 0, "authorization: Bearer " ++ METASK_ACCESS));
+    try std.testing.expectEqual(@as(u32, 12345), app.api_client.resolveMaxTokens());
+}
+
+test "L2 startup: a Metask device sign-in whose catalog does not answer in time starts on the compiled route (#666)" {
+    var fx: Fixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    try fx.guard(cc.models_cache.STARTUP_WAIT_ENV, "200");
+    var srv = try harness.MockServer.startCassette(&.{METASK_MODELS}, 0);
+    defer srv.stop();
+    srv.gateResponseAt(0);
+    var watchdog: GateWatchdog = .{ .srv = srv, .after_ms = 10_000 };
+    try watchdog.arm();
+    defer watchdog.disarm();
+
+    const started = cc.util_time.nowMs();
+    const app = try fx.startMetaskDevice(try originOf(fx.arena.allocator(), srv), .{ .models_cache = true });
+    defer app.deinit();
+    try std.testing.expect(cc.util_time.nowMs() - started < 10_000);
+    try srv.waitUntilResponseGated();
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    try std.testing.expect(app.api_client.resolveMaxTokens() != 12345);
 }
 
 test "L2 startup: a warm start answers from the stored copy and adopts the background refresh at the REPL's idle point" {

@@ -58,7 +58,7 @@ def _slow_startup(bin_path, events, env, **kw):
     before the REPL takes the terminal."""
     server, base_url = SlowModels.serve(2.5)
     try:
-        return _run(bin_path, events, env, base_url=base_url, **kw)
+        return _run(bin_path, events, dict(env, **SlowModels.HOLD_STARTUP), base_url=base_url, **kw)
     finally:
         server.shutdown()
 

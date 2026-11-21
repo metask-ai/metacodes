@@ -1,13 +1,14 @@
 //! The route's `/v1/models` answer kept between starts.
 //!
-//! The answer decides max_tokens, the context window and image input, so the
-//! REPL cannot start without one, but waiting for it cost every interactive
-//! start a round trip (~0.25 s on the Metask gateway, 2026-10-23). It changes
-//! rarely. A start that finds a fresh copy for the same endpoint and
-//! credential uses it and refreshes it in the background (`Refresh`); the REPL
-//! takes the refreshed answer at its next idle point. A missing, unreadable,
-//! foreign or expired copy is a miss: the caller fetches synchronously, as it
-//! did before the cache existed, so a cold start sends exactly what it sent.
+//! The answer decides max_tokens, the context window and image input, but
+//! waiting for it cost every interactive start a round trip (~0.25 s on the
+//! Metask gateway, 2026-10-23). It changes rarely. A start that finds a fresh
+//! copy for the same endpoint and credential uses it and refreshes it in the
+//! background (`Refresh`); the REPL takes the refreshed answer at its next
+//! idle point. A missing, unreadable, foreign or expired copy is a miss: the
+//! same refresh fetches it, and the start waits for it at most
+//! `startupWaitMs` (#666); an answer that comes later is taken at the next
+//! idle point.
 //!
 //! One file per endpoint and credential, `<state root>/cache/models/<key>.json`:
 //! `{"schema_version":1,"fetched_at":<unix s>,"base_url":"…","body":"<answer>"}`.
@@ -32,6 +33,14 @@ pub const TTL_SECONDS: i64 = 24 * std.time.s_per_hour;
 /// Larger answers are neither read nor written (the probe itself reads at most
 /// 1 MiB of body; the envelope escapes it).
 pub const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+pub const STARTUP_WAIT_MS: u32 = 1500;
+pub const STARTUP_WAIT_ENV = "METACODES_STARTUP_MODELS_WAIT_MS";
+
+pub fn startupWaitMs() u32 {
+    const raw = std.c.getenv(STARTUP_WAIT_ENV) orelse return STARTUP_WAIT_MS;
+    return std.fmt.parseInt(u32, std.mem.span(raw), 10) catch STARTUP_WAIT_MS;
+}
 
 /// What a stored answer answers: the endpoint and the credential header the
 /// request carried.
@@ -165,15 +174,18 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// One background `/v1/models` fetch that replaces a stored answer a warm start
-/// used. It runs detached, on copies it owns, `std.heap.c_allocator` and an I/O
-/// runtime of its own: the session neither waits for it nor keeps the process
-/// alive for it (a fetch stuck in connect must not hold up exit, and the
-/// process's own I/O runtime and allocator are torn down when `main` returns).
+/// One background `/v1/models` fetch that stores the answer for the next
+/// start. It runs detached, on copies it owns, `std.heap.c_allocator` and an
+/// I/O runtime of its own: the session waits for it at most a bound
+/// (`waitSettled`) and never keeps the process alive for it (a fetch stuck in
+/// connect must not hold up exit, and the process's own I/O runtime and
+/// allocator are torn down when `main` returns).
 /// The session and the thread each hold a reference; the last to let go frees it.
 pub const Refresh = struct {
     refs: std.atomic.Value(u8) = .init(2),
     state: std.atomic.Value(State) = .init(.running),
+    settle_lock: platform.sync.Mutex = .{},
+    settled: platform.sync.Condition = .{},
     key: Key,
     /// The fetched answer. Written by the thread before it publishes
     /// `.fetched`; the session's from then on (`take`).
@@ -215,6 +227,18 @@ pub const Refresh = struct {
         return self.state.load(.acquire) != .running;
     }
 
+    pub fn waitSettled(self: *Refresh, timeout_ms: u32) bool {
+        const deadline = time.nowMs() + timeout_ms;
+        self.settle_lock.lock();
+        defer self.settle_lock.unlock();
+        while (!self.finished()) {
+            const left = deadline - time.nowMs();
+            if (left <= 0) return false;
+            _ = self.settled.timedWait(&self.settle_lock, @as(u64, @intCast(left)) * std.time.ns_per_ms);
+        }
+        return true;
+    }
+
     /// The fetched answer, owned by the caller (`std.heap.c_allocator`), once;
     /// null while the fetch runs, after it failed, or once taken.
     pub fn take(self: *Refresh) ?[]u8 {
@@ -239,11 +263,17 @@ pub const Refresh = struct {
         defer self.release();
         const body = self.fetch() catch |err| {
             log.debug("catalog", "background /v1/models refresh failed: {s}", .{@errorName(err)});
-            self.state.store(.failed, .release);
-            return;
+            return self.settle(.failed);
         };
         self.body = body;
-        self.state.store(.fetched, .release);
+        self.settle(.fetched);
+    }
+
+    fn settle(self: *Refresh, outcome: State) void {
+        self.settle_lock.lock();
+        defer self.settle_lock.unlock();
+        self.state.store(outcome, .release);
+        self.settled.broadcast();
     }
 
     fn fetch(self: *Refresh) ![]u8 {

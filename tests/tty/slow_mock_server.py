@@ -134,10 +134,12 @@ def _json_str(s):
 
 
 class SlowModels(http.server.BaseHTTPRequestHandler):
-    """`/v1/models` that answers after DELAY_S. With the probe on and no cached
-    copy, App.init waits for it: a startup that is visibly slow."""
+    """`/v1/models` that answers after DELAY_S. With the probe on, no cached
+    copy and HOLD_STARTUP in the environment, App.init waits for it: a startup
+    that is visibly slow."""
 
     DELAY_S = 2.5
+    HOLD_STARTUP = {"METACODES_STARTUP_MODELS_WAIT_MS": "60000"}
     answered = []
 
     @classmethod

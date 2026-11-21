@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 
 from tty_driver import IDLE, IS_WINDOWS, READY, arrival_time, case_tmpdir, run, wait_for
 from asserts import TTYAssert
@@ -137,7 +138,7 @@ def test_splash_plays_while_startup_waits(bin_path):
     server, base_url = SlowModels.serve(2.5)
     timeline = []
     try:
-        raw = run(bin_path, [IDLE], term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None),
+        raw = run(bin_path, [IDLE], term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None, **SlowModels.HOLD_STARTUP),
                   base_url=base_url, timeline=timeline)
     finally:
         server.shutdown()
@@ -153,6 +154,25 @@ def test_splash_plays_while_startup_waits(bin_path):
     assert banner >= answered, "banner drawn before App.init finished"
 
 
+def test_the_prompt_comes_without_a_models_list_that_does_not_answer(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("ConPTY re-encodes the stream; byte arrival times are not observable")
+    server, base_url = SlowModels.serve(15.0)
+    timeline = []
+    try:
+        started = time.monotonic()
+        raw = run(bin_path, [IDLE], term_size=SIZE, env={"METACODES_NO_PROBE": None},
+                  base_url=base_url, timeline=timeline)
+    finally:
+        server.shutdown()
+    a = TTYAssert(raw, *SIZE)
+    a.assert_box_present()
+    assert not SlowModels.answered, "/v1/models answered before the case ended"
+    box = arrival_time(timeline, raw, b'Try "fix typecheck errors"')
+    assert box is not None
+    assert box - started < 6.0, f"the prompt came {box - started:.2f}s after the start"
+
+
 def _typed_during_startup(bin_path, env, first_key_after):
     """Start with `/v1/models` answering after 2.5 s (App.init waits for it),
     type `a`, then `b` 0.6 s later while App.init still waits, and return the
@@ -161,7 +181,8 @@ def _typed_during_startup(bin_path, env, first_key_after):
     server, base_url = SlowModels.serve(2.5)
     try:
         raw = run(bin_path, [first_key_after, "raw:a", "strictsleep:0.6", "raw:b", wait_for("❯ ab"), IDLE],
-                  term_size=SIZE, env=dict(env, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
+                  term_size=SIZE, env=dict(env, METACODES_NO_PROBE=None, **SlowModels.HOLD_STARTUP), base_url=base_url,
+                  startup_drain=0)
     finally:
         server.shutdown()
     assert SlowModels.answered, "App.init did not wait for /v1/models: nothing was typed during startup"
@@ -189,8 +210,8 @@ def _sent_during_startup(bin_path, raw_text, shown, cwd=None):
     server, base_url = SlowModels.serve(4.0)
     try:
         raw = run(bin_path, first + ["raw:" + raw_text, shown, "strictsleep:1.5"],
-                  term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0,
-                  cwd=cwd)
+                  term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None, **SlowModels.HOLD_STARTUP), base_url=base_url,
+                  startup_drain=0, cwd=cwd)
     finally:
         server.shutdown()
     assert SlowModels.answered, "App.init did not wait for /v1/models"

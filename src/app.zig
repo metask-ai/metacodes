@@ -437,8 +437,8 @@ pub const App = struct {
     /// When `api_key_catalog` is filled: never on this route, or once, the
     /// first time the `/models` key menu needs it (`ensureApiKeyCatalog`).
     api_key_catalog_load: ApiKeyCatalogLoad = .off,
-    /// The background `/v1/models` fetch a cache-served start runs, until the
-    /// REPL takes its answer (`adoptModelCatalogRefresh`) or the App ends.
+    /// The background `/v1/models` fetch a start runs, until the REPL takes
+    /// its answer (`adoptModelCatalogRefresh`) or the App ends.
     models_refresh: ?*models_cache_mod.Refresh = null,
     /// A background fetch of OpenRouter's listing, for a start that found
     /// none kept or a day-old one, a sign-in in the TUI, or a retry from
@@ -1092,10 +1092,7 @@ pub const App = struct {
                     break :metask_catalog;
                 };
                 defer app.allocator.free(models_url);
-                const fetched = @import("api/catalog_fetch.zig").fetchModelPages(app.allocator, io, .{
-                    .url = models_url,
-                    .bearer = app.api_key,
-                }) catch |err| {
+                const fetched = app.fetchMetaskCatalog(io, models_url, options.models_cache) catch |err| {
                     @import("util/log.zig").warn("catalog", "Metask /v1/models fetch failed: {s}", .{@errorName(err)});
                     break :metask_catalog;
                 };
@@ -2482,9 +2479,10 @@ pub const App = struct {
 
     /// Fill `api_client.catalog` from the route's `/v1/models`. With the cache
     /// on, a fresh stored answer for this endpoint and credential answers now
-    /// and a background refresh fetches the current one; otherwise (and on
-    /// any miss) the answer is fetched before init returns, as it always was,
-    /// and stored for the next start.
+    /// and a background refresh fetches the current one; on a miss the same
+    /// refresh fetches it, init waits for it at most `startupWaitMs`, and a
+    /// later answer is taken at the REPL's next idle point. Without the cache
+    /// the answer is fetched before init returns.
     fn loadModelCatalog(app: *App, use_cache: bool) void {
         if (!use_cache) return app.probeModelCatalog();
         const log = @import("util/log.zig");
@@ -2512,19 +2510,28 @@ pub const App = struct {
             }
         }
 
-        const body = app.api_client.fetchModelsList() catch |err| {
-            log.debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
+        const refresh = models_cache_mod.Refresh.start(key, base_url, header, app.stateRoot()) catch |err| {
+            log.debug("catalog", "/v1/models fetch not started: {s} (falling back to local table)", .{@errorName(err)});
             return;
         };
-        defer app.allocator.free(body);
-        app.api_client.catalog.loadFromModelsListJson(body) catch |err| {
-            log.debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
+        app.models_refresh = refresh;
+        const wait_ms = models_cache_mod.startupWaitMs();
+        if (!refresh.waitSettled(wait_ms)) {
+            log.debug("catalog", "/v1/models not answered within {d}ms; the local table answers until it is", .{wait_ms});
             return;
-        };
-        app.adoptMetaskKeyModels(base_url, body);
-        models_cache_mod.store(app.allocator, app.stateRoot(), key, base_url, body, now) catch |err| {
-            log.debug("catalog", "models cache not written: {s}", .{@errorName(err)});
-        };
+        }
+        _ = app.takeModelCatalogRefresh();
+    }
+
+    fn fetchMetaskCatalog(app: *App, io: std.Io, models_url: []const u8, bounded: bool) !@import("api/catalog_fetch.zig").Response {
+        const catalog_fetch = @import("api/catalog_fetch.zig");
+        if (!bounded) return catalog_fetch.fetchModelPages(app.allocator, io, .{ .url = models_url, .bearer = app.api_key });
+        const pending = try catalog_fetch.Detached.start(models_url, app.api_key);
+        defer pending.release();
+        const answer = pending.wait(models_cache_mod.startupWaitMs()) orelse return error.NotAnsweredInTime;
+        const body = try answer;
+        defer std.heap.c_allocator.free(body);
+        return .{ .body = try app.allocator.dupe(u8, body) };
     }
 
     /// The credential header the Anthropic client's requests carry now
@@ -2546,35 +2553,40 @@ pub const App = struct {
     /// dropped; the answer it would replace was fetched for the current one.
     pub fn adoptModelCatalogRefresh(app: *App) void {
         app.adoptOpenRouterRefresh();
-        const refresh = app.models_refresh orelse return;
-        if (!refresh.finished()) return;
+        if (!app.takeModelCatalogRefresh()) return;
+        app.refreshChildCatalogSnapshots() catch |err| {
+            @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn takeModelCatalogRefresh(app: *App) bool {
+        const refresh = app.models_refresh orelse return false;
+        if (!refresh.finished()) return false;
         app.models_refresh = null;
         const key = refresh.key;
         const body = refresh.take();
         refresh.release();
-        const fresh_body = body orelse return;
+        const fresh_body = body orelse return false;
         defer std.heap.c_allocator.free(fresh_body);
         const log = @import("util/log.zig");
 
-        const auth = app.routeAuthHeader() orelse return;
+        const auth = app.routeAuthHeader() orelse return false;
         defer app.freeRouteAuthHeader(auth);
         if (!key.eql(models_cache_mod.Key.of(app.api_client.base_url, .{ .name = auth.name, .value = auth.value }))) {
             log.debug("catalog", "background /v1/models answer is for another route; dropped", .{});
-            return;
+            return false;
         }
         var fresh = @import("api/catalog.zig").Catalog.init(app.allocator);
         fresh.loadFromModelsListJson(fresh_body) catch |err| {
             fresh.deinit();
             log.debug("catalog", "background /v1/models answer unusable: {s}", .{@errorName(err)});
-            return;
+            return false;
         };
         app.api_client.catalog.deinit();
         app.api_client.catalog = fresh;
         app.adoptMetaskKeyModels(app.api_client.base_url, fresh_body);
-        app.refreshChildCatalogSnapshots() catch |err| {
-            log.warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
-        };
         log.debug("catalog", "adopted the background /v1/models answer ({d} models)", .{app.api_client.catalog.entries.items.len});
+        return true;
     }
 
     /// GET the route's `/v1/models` into the client catalog. Failure is silent:
