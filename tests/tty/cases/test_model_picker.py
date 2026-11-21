@@ -148,7 +148,7 @@ def test_picker_ctrl_d_leaves_the_draft_under_it_alone(bin_path):
 def test_picker_ctrl_d_during_a_reply_leaves_the_queued_draft_alone(bin_path):
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
-    with SlowMockServer([slow_text_then_end(n_chunks=14, delay=0.4)]) as srv:
+    with SlowMockServer([slow_text_then_end(n_chunks=60, delay=0.4)]) as srv:
         raw = run(
             bin_path,
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "type:queued draft", "sleep:0.3"]
@@ -161,7 +161,8 @@ def test_picker_ctrl_d_during_a_reply_leaves_the_queued_draft_alone(bin_path):
         )
     a, text = _screen(raw)
     frames = _frames(a)
-    assert any("kept claude" in sc and "queued draft" in sc for sc in frames), "picker 关掉后草稿不在:\n" + text
+    assert any("kept claude" in sc and "queued draft" in sc and "esc to interrupt" in sc for sc in frames), \
+        "回复期间关掉 picker 后草稿不在:\n" + text
     assert not any("queued raft" in sc for sc in frames), "Ctrl+D 删掉了回复期草稿里的字:\n" + text
 
 
@@ -188,11 +189,11 @@ def test_picker_takes_a_paste_during_a_reply_as_one_filter_edit_and_applies_noth
     # newline was Enter: it applied the model under the cursor.
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
-    with SlowMockServer([slow_text_then_end(n_chunks=10, delay=0.4)]) as srv:
+    with SlowMockServer([slow_text_then_end(n_chunks=20, delay=0.4)]) as srv:
         raw = run(
             bin_path,
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o", wait_for(OPEN),
-             "raw:\\x1b[200~zai\\x0d\\x1b[201~", wait_for("Model  /zai"), "sleep:8", IDLE],
+             "raw:\\x1b[200~zai\\x0d\\x1b[201~", wait_for("Model  /zai"), "sleep:12", IDLE],
             base_url=srv.url,
             env={"ZAI_API_KEY": "tty-dummy-zai-key"},
             startup_drain=0.8,
