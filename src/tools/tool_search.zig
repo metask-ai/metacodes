@@ -14,6 +14,7 @@ const json_mod = @import("../json.zig");
 const capability = @import("../api/capability.zig");
 const DynRegistry = @import("dynamic.zig").DynRegistry;
 const ToolContext = @import("context.zig").ToolContext;
+const mcp_session = @import("../core/mcp_session.zig");
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -217,6 +218,7 @@ fn setMissDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, query: [
         try w.writeAll(" Use the tools already in your tool list.");
     }
     if (deferred.len > 0) try w.print(" Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{deferred});
+    try mcp_session.writeUnavailable(w, ctx.mcp_unavailable);
     slot.* = try out.toOwnedSlice();
 }
 
@@ -328,6 +330,26 @@ test "ToolSearch: 无匹配 → NoToolMatch + detail" {
     try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"select:NoSuchToolXYZ\"}"));
     try testing.expect(detail != null);
     if (detail) |d| a.free(d);
+}
+
+test "ToolSearch: a miss names the configured MCP servers that did not connect and why" {
+    const a = testing.allocator;
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const unavailable = [_]@import("../core/mcp_session.zig").McpUnavailable{
+        .{ .name = "suno", .detail = "the server requires authorization (401/403); run `metacodes mcp login suno`" },
+    };
+    const ctx = ToolContext{ .allocator = a, .error_detail = &detail, .mcp_unavailable = &unavailable };
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"suno\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    try testing.expect(std.mem.indexOf(u8, d, "No deferred tool matched query \"suno\"") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "'suno' (the server requires authorization (401/403); run `metacodes mcp login suno`)") != null);
+
+    var plain_detail: ?[]const u8 = null;
+    defer if (plain_detail) |pd| a.free(pd);
+    const plain = ToolContext{ .allocator = a, .error_detail = &plain_detail };
+    try testing.expectError(error.NoToolMatch, execute(&plain, "{\"query\":\"suno\"}"));
+    try testing.expect(std.mem.indexOf(u8, plain_detail.?, "did not connect") == null);
 }
 
 test "ToolSearch: 落空时 detail 列出当前可激活的 deferred 工具名(含 MCP)" {

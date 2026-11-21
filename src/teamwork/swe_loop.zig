@@ -8,7 +8,7 @@
 //! implementer ─► reviewer ─┬─ changes requested / review invalid ─► implementer (open issues carried)
 //!                          └─ approved ─► requestCompletion
 //!                                          ├─ approval stale ─► reviewer
-//!                                          ├─ 1st audit fail ─► implementer (audit report forwarded)
+//!                                          ├─ 1st audit fail / unverified ─► implementer (audit report forwarded)
 //!                                          └─ pass ─► merge-back ─► done
 //! ```
 //!

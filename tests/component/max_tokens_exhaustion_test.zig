@@ -264,7 +264,7 @@ fn runWireTurns(a: std.mem.Allocator, wire: Wire, bodies: []const []const u8, ma
     // The tail of headless `run`: the ledger decides text and text_kind.
     const projected = headless.projectRunText(&ledger);
     const usage = cc.app_module.UsageTotals{};
-    const line = try headless.buildResultLine(a, projected.text orelse "", projected.kind, null, null, result, &usage, "model");
+    const line = try headless.buildResultLine(a, projected.text orelse "", projected.kind, null, null, &.{}, result, &usage, "model");
     defer a.free(line);
     const result_line = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
 

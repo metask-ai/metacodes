@@ -24,13 +24,23 @@ OAuth (2025-11-25 authorization):
   POST /oauth-mcp      Classic server that answers 401 with
                        WWW-Authenticate resource_metadata=... unless the
                        bearer is a live access token.
+  POST /scoped-mcp     Like /oauth-mcp, but its challenge names no scope and
+                       it accepts only a token granted mcp:tools (a token
+                       granted less is refused with invalid_token); an
+                       initialize answer carries Mcp-Session-Id scoped-<n>.
+  DELETE /scoped-mcp   ends that session.
   GET  /.well-known/oauth-protected-resource/oauth-mcp   (and /sse-oauth)
   GET  /.well-known/oauth-authorization-server/as
   POST /as/register    RFC 7591
   GET  /as/authorize   302 to the redirect URI with code and state
   POST /as/token       authorization_code (PKCE S256 + resource checked) and
-                       refresh_token (rotates the refresh token)
+                       refresh_token (rotates the refresh token); the token
+                       is granted exactly the scope the authorization asked
+                       for ("" when it asked for none)
   POST /control/revoke every access token issued so far stops working
+  POST /control/unavailable  /scoped-mcp answers 503 to a valid token
+  POST /control/hugeerror  /scoped-mcp's 401 to a token it refuses carries a
+                       300 KiB body
 
 GET /log returns every observation as JSON lines (for assertions).
 """
@@ -52,7 +62,11 @@ STATE = {
     "codes": {},
     "access": set(),
     "refresh": {},
+    "scopes": {},
     "issued": 0,
+    "unavailable": False,
+    "huge_error": False,
+    "next_scoped_session": 0,
 }
 RESUME = {}
 
@@ -96,10 +110,18 @@ class Handler(BaseHTTPRequestHandler):
         value = self.headers.get("Authorization") or ""
         return value[7:] if value.startswith("Bearer ") else None
 
-    def challenge(self, resource_path):
+    def challenge(self, resource_path, scope="mcp:tools"):
         metadata = "%s/.well-known/oauth-protected-resource%s" % (self.base(), resource_path)
-        header = 'Bearer error="invalid_token", resource_metadata="%s", scope="mcp:tools"' % metadata
-        self.reply(401, {"error": "invalid_token"}, {"WWW-Authenticate": header})
+        header = 'Bearer error="invalid_token", resource_metadata="%s"' % metadata
+        if scope is not None:
+            header += ', scope="%s"' % scope
+        self.reply(401, {"error": "sign in to use this server"}, {"WWW-Authenticate": header})
+
+    def huge_challenge(self, resource_path):
+        metadata = "%s/.well-known/oauth-protected-resource%s" % (self.base(), resource_path)
+        header = 'Bearer error="invalid_token", resource_metadata="%s"' % metadata
+        body = b'{"error":"sign in to use this server","padding":"' + b"x" * (300 * 1024) + b'"}'
+        self.reply(401, raw=body, headers={"WWW-Authenticate": header, "Content-Type": "application/json"})
 
     # -- GET ---------------------------------------------------------------
 
@@ -193,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
         if client is None or redirect not in client or one("code_challenge_method") != "S256" or one("response_type") != "code":
             return self.reply(400, {"error": "invalid_request"})
         code = "code-%d" % (len(STATE["codes"]) + 1)
-        STATE["codes"][code] = {"challenge": one("code_challenge"), "resource": one("resource"), "redirect": redirect, "client": one("client_id")}
+        STATE["codes"][code] = {"challenge": one("code_challenge"), "resource": one("resource"), "redirect": redirect, "client": one("client_id"), "scope": one("scope") or ""}
         location = "%s?code=%s&state=%s" % (redirect, code, urllib.parse.quote(one("state") or ""))
         self.reply(302, headers={"Location": location})
 
@@ -215,6 +237,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.token(urllib.parse.parse_qs(raw.decode()))
         if path == "/control/revoke":
             STATE["access"].clear()
+            return self.reply(204)
+        if path == "/control/unavailable":
+            STATE["unavailable"] = True
+            return self.reply(204)
+        if path == "/control/hugeerror":
+            STATE["huge_error"] = True
             return self.reply(204)
         message = json.loads(raw)
         method = message.get("method")
@@ -243,6 +271,25 @@ class Handler(BaseHTTPRequestHandler):
             if method == "tools/call":
                 answer["result"]["content"][0]["text"] = "token:" + self.bearer()
             return self.reply(200, answer)
+        if path == "/scoped-mcp":
+            token = self.bearer()
+            if token not in STATE["access"] or "mcp:tools" not in STATE["scopes"].get(token, set()):
+                if token is not None and STATE["huge_error"]:
+                    return self.huge_challenge("/scoped-mcp")
+                return self.challenge("/scoped-mcp", None)
+            if STATE["unavailable"]:
+                return self.reply(503, {"error": "unavailable"})
+            if method is None or method.startswith("notifications/"):
+                return self.reply(202)
+            if method == "server/discover":
+                return self.reply(400, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+            answer = classic(method, rid, params)
+            if method != "initialize":
+                return self.reply(200, answer)
+            with LOCK:
+                STATE["next_scoped_session"] += 1
+                session = "scoped-%d" % STATE["next_scoped_session"]
+            return self.reply(200, answer, {"Mcp-Session-Id": session})
         if path == "/resume":
             if method is None or method.startswith("notifications/"):
                 return self.reply(202)
@@ -279,20 +326,26 @@ class Handler(BaseHTTPRequestHandler):
             challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
             if challenge != entry["challenge"] or one("resource") != entry["resource"] or one("redirect_uri") != entry["redirect"] or one("client_id") != entry["client"]:
                 return self.reply(400, {"error": "invalid_grant", "error_description": "pkce/resource/redirect mismatch"})
-            return self.reply(200, self.issue(one("resource")))
+            return self.reply(200, self.issue(one("resource"), entry["scope"]))
         if grant == "refresh_token":
-            resource = STATE["refresh"].pop(one("refresh_token"), None)
-            if resource is None or resource != one("resource"):
+            grant_entry = STATE["refresh"].pop(one("refresh_token"), None)
+            if grant_entry is None or grant_entry[0] != one("resource"):
                 return self.reply(400, {"error": "invalid_grant"})
-            return self.reply(200, self.issue(resource))
+            return self.reply(200, self.issue(*grant_entry))
         return self.reply(400, {"error": "unsupported_grant_type"})
 
-    def issue(self, resource):
+    def do_DELETE(self):
+        path = urllib.parse.urlparse(self.path).path
+        record(path=path, method="DELETE", session=self.headers.get("Mcp-Session-Id"), authorization=self.headers.get("Authorization"))
+        self.reply(204)
+
+    def issue(self, resource, scope):
         STATE["issued"] += 1
         n = STATE["issued"]
         STATE["access"].add("at-%d" % n)
-        STATE["refresh"]["rt-%d" % n] = resource
-        return {"access_token": "at-%d" % n, "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt-%d" % n, "scope": "mcp:tools"}
+        STATE["scopes"]["at-%d" % n] = set(scope.split())
+        STATE["refresh"]["rt-%d" % n] = (resource, scope)
+        return {"access_token": "at-%d" % n, "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt-%d" % n, "scope": scope}
 
 
 def main():
