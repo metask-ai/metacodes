@@ -125,6 +125,11 @@ runtime 用它核验 reviewer 的批准(§6.2);各层逐字段覆盖,与其他�
 `SeatSpec`)与 `candidate_estimate_usd`。没有候选的配置,配置指纹与引入候选之前逐字节相同,
 旧运行照常恢复。
 
+`manager_budget_usd`(可选,顶层,#545)是外部 Manager 的美元额度,从 `budget_usd` 中划出。
+`seats.manager` 配成 `claude_code` 时必须给出,且只能用 `cost` 预算;此时 runtime 自己启动这个
+Manager(§10.2)。Manager 为默认 `metacodes` 时即内置确定性 SWE loop,不能写这个字段。没有这个
+字段的配置,配置指纹与引入它之前逐字节相同。
+
 **校验规则**(每条一个 error,各有单元测试):
 
 | 规则 | error |
@@ -145,6 +150,8 @@ runtime 用它核验 reviewer 的批准(§6.2);各层逐字段覆盖,与其他�
 | reviewer 是外部 harness 却没有 `check_command`(其工具调用不可观测,批准将永远无法核验) | `ExternalReviewerWithoutCheck` |
 | `candidates` 为 0 或大于 4,或数组少于 2 项、多于 4 项 | `InvalidCandidates` |
 | 有两个以上候选却没有 `candidate_estimate_usd` / 有它却没有候选 / 它不是有限正数 | `CandidateEstimateMissing` / `CandidateEstimateWithoutCandidates` / `InvalidCandidateEstimate` |
+| 外部 Manager 没有 `manager_budget_usd` / 内置 Manager 却有它 / 它不是小于 `budget_usd` 的有限正数 | `ManagerBudgetMissing` / `ManagerBudgetWithoutExternalManager` / `InvalidManagerBudget` |
+| 外部 Manager 是 `wallclock_only`(花费未知,不能当作零) | `ExternalManagerWallclockOnly` |
 
 即使 `enabled` 为假,所有 seat 也照样校验,坏配置在启动时就报错。`Diagnostic` 记录出错的
 角色和字段。类型层面同样排除了非法状态:`HarnessConfig = union(Harness) { metacodes, claude_code: ExternalHarness }`,
@@ -159,8 +166,9 @@ metacodes seat 根本没有放 `command` 的位置;`BudgetEnforcement.wallclock_
 `--config-json` 可覆盖 seat 的 harness/model/effort;`--max-rounds` 与
 `--check-command` 接入 runtime 的真实 dispatch cap / pinned check。
 
-CLI 使用确定性 SWE manager 和请求文件,`--approve` 直接批准请求文件,不执行 interviewer;
-manager 的外部 harness 或 model/effort 配置明确拒绝。
+CLI 使用请求文件,`--approve` 直接批准请求文件,不执行 interviewer。Manager 默认是确定性
+SWE loop(不接受 model/effort);`seats.manager` 为 `claude_code` 时由 runtime 启动外部 Manager
+(§10.2)。`teamwork mcp` 拒绝外部 `seats.manager`(`UnsupportedManager`):那里 MCP 客户端就是 Manager。
 
 **请求参数段与面试(#518)**:`src/teamwork/interview.zig`。请求开头可以有若干方括号参数段:
 `[skip-interview]` 与 `[seats=<role>:<harness>[:<model>],...]`。`parseSegments` 去掉参数段,
@@ -195,6 +203,8 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
   ORIGINAL_REQUEST.md     只写一次;审计的基准(用户批准后才写)
   interview/              面试期间的临时快照 worktree,面试结束即删(#518)
   budget.jsonl            预算账本(§5)
+  budget.jsonl.hold       外部 Manager 的额度保留(§5、§10.2),结算后删除
+  manager-relay.sh        外部 Manager 的 MCP 中继脚本(§10.2),runtime 写
   open_issues.json        评审发现台账(#517),初始为 []
   candidates/candidate-<n>/  并行候选各自的 worktree(#525);选中后只留选中的那个
   judging/                judge 的工作目录:合格候选的 candidate-<n>.diff 与 candidate-<n>.review.json
@@ -258,6 +268,12 @@ packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径
 控制器崩溃后,`Ledger.load` 若只找到预留而没有该 seat 的完成记账,就把预留作为 `reserved`
 入账并停止继续花费;若完成记账已落盘则只清理旧预留,不重复扣除。显式 `wallclock_only` 仍然
 只承诺时间上限。成本模式下,缺少有效结果/花费报告不会被当作零花费后继续重试。
+
+外部 Manager(§10.2)与 worker 同时运行,所以它的额度是另一份回执 `budget.jsonl.hold`
+(`Ledger.hold`),写法与 pending 相同(临时文件 fsync 后不覆盖地安装)。持有期间这笔额度不计入
+`remainingUsd()`,worker 和审计都用不到;`isExhausted()` 按已花加保留计算。Manager 的记账结算并
+删除它;重开时没有结算的保留按 `reserved` 全额入账一次,之后的重开不再重复扣除。额度必须给其他
+seat 留下余量,否则 `BudgetExhausted`。
 
 ## 6. 内置 reviewer 与 open-issues 台账(#517)
 
@@ -416,8 +432,10 @@ ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `Writ
 Linux 上 implementer seat 的 Bash 跑在 bubblewrap 里:根目录只读挂载,工作区和 seat 目录按物理路径可写绑定。
 macOS 和 Linux 均只提供本次调用的私有临时目录。原仓库和控制器文件位于系统临时目录时也受保护。
 
-Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命名空间)的 Linux,在模型请求前
-即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
+Windows 上 teamwork 不启动:`teamwork run`/`resume`/`mcp`、REPL `/teamwork` 与
+`Run.start`/`Run.reopen` 在写入任何运行状态前返回 `UnsupportedPlatform`(Windows 没有 seat
+沙箱后端,也不计算批准、审计与合回所绑定的工作区树 id)。没有可用 bwrap(未安装、或内核/容器
+不允许所需命名空间)的 Linux,在模型请求前即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
 经 `metacodes-fs-helper` 在沙箱内打开文件;Grep/Glob 的搜索命令也经过相同边界。
 两个后端都允许写工作区(构建缓存),所以对非 implementer seat,Bash 挡不住对工作区
 的改动;reviewer 仍由工作区树 id 检查兜底。完整边界见 [沙箱执行](SANDBOX_DESIGN.md)。
@@ -516,15 +534,17 @@ Manager 只驱动 `dispatch(implementer/reviewer)`、`status`、`requestCompleti
 approved -> implementing -> reviewing -> review_approved -> auditing -> merging -> done
                ^               |              |               |
                +-- 修改/拒绝 ---+              +-- 过期 -> reviewing
-               +------------------------- 第一次审计失败 --------+
+               +------------------- 第一次审计 FAIL / UNVERIFIED ---+
 ```
 
 每个角色最多派 `max_rounds` 个 seat(默认 3)。reviewer 的结论经过工具调用记录、台账与固定
 检查命令核验;批准绑定工作区树 id。审计前树变了就重新评审,审计后树变了就终止。
 `VerifierAuditor` 在与批准树一致的独立快照上执行固定检查,然后调用 `core/isolated_verifier.verify`。
 审计请求用 `$WORKSPACE` 标识候选快照,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
-FAIL 第一次进入修复轮、第二次失败终止;
-UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预算账本。
+FAIL 第一次进入修复轮;UNVERIFIED 第一次进入 leads 轮:报告里 verifier 收集的证据和未能确认的项
+作为线索写进下一轮 implementer 与 reviewer 的 packet。两种情况下第二次审计仍不是 PASS 都终止
+(`audit_failed` / `audit_unverified`),不合回;unavailable 直接终止。UNVERIFIED 与 unavailable
+均不会放行。审计花费必须成功写入预算账本。
 
 `merge_back.mergeBack` 生成二进制补丁,比较用户从启动以来的改动与候选改动。两者修改相同或
 包含关系的路径时停在 `merge_conflict`,保留工作区、worktree、`merge.patch` 与冲突列表。
@@ -586,19 +606,71 @@ worktree 里进行。
 阶段崩溃的运行恢复为 `failed(candidates_interrupted)`。快照的 `candidates` 字段(MCP、
 `teamwork.snapshot`、TUI 面板)显示每个候选的状态。MCP manager 用 `teamwork_run_candidates`。
 
+### 10.2 外部 Manager(#545)
+
+`seats.manager` 为 `claude_code` 时,`manager.drive(run, options)` 代替 `swe_loop.drive`;CLI 的
+`teamwork run` / `resume` 与 REPL 的 `/teamwork` 都经这个入口。worker 各 seat 的 harness 照常
+独立配置,与 Manager 的 harness 无关。顺序:
+
+1. `Run.openManager` 登记 `manager-<n>` seat,写 packet(固定说明加批准的请求原文,不含 run id、
+   路径和时间)。剩余额度不大于 `manager_budget_usd` 时运行以 `budget_exhausted` 结束;Manager
+   seat 数同样受 `max_rounds` 限制。
+2. 在 Manager 的沙箱里做兼容性探测(`--version`、`--help` 含 `manager_required_help_text`)。
+   不通过时 seat 为 `failed`,运行以 `failed(manager_unavailable)` 结束,不花钱。
+3. 在 seat 目录建两个 FIFO `mcp.in` / `mcp.out`,控制器以读写方式打开,在运行目录写
+   `manager-relay.sh`。Manager 的 MCP 配置只有一个 stdio 服务 `teamwork`:`/bin/sh
+   manager-relay.sh <mcp.in> <mcp.out>`,中继把 Manager 的请求原样送进 FIFO、把应答送回。
+4. `Run.holdManager` 写入额度保留(§5),之后才启动 Manager:
+   ```
+   <command> -p <manager_bootstrap> --output-format stream-json --verbose
+     --permission-mode default --permission-prompts none --no-session-persistence
+     [--model <m>] [--effort <e>] --max-budget-usd <manager_budget_usd>
+     --append-system-prompt <manager 宪章> --strict-mcp-config --mcp-config <上面的配置>
+     --allowedTools mcp__teamwork
+   ```
+   cwd 与唯一可写根是 Manager 自己的 seat 目录(另有 Claude Code 自己的状态目录),沙箱与 worker
+   相同(macOS Seatbelt / Linux bubblewrap,不可用即拒绝);环境变量按同一白名单过滤。默认权限
+   加 `--permission-prompts none`:编辑和 Bash 需要询问,一律拒绝;只有 teamwork 工具预先放行。
+   所以 Manager 改不了 `ORIGINAL_REQUEST.md`、账本、`run.json`、审计报告、worktree 或用户工作区,
+   也无从直接合回。
+5. 控制器在宿主进程里用 `mcp_server.Server.serveFds` 服务这对 FIFO,不在 Manager 的进程树里;
+   dispatch、审计、合回都由它执行,Manager 只能调用 TEAMWORK_MCP.md 的五个工具,`done` 仍只经
+   `requestCompletion`。另一个线程监督 Manager 进程:Manager 退出时触发运行的 abort,服务循环随之
+   结束,未结束的运行转为 `cancelled`;运行的 abort(宿主 Ctrl+C、预算触顶、`teamwork_cancel`)
+   反过来杀掉 Manager 整个进程组,正在跑的 worker 也经同一信号停止,不合回。
+6. Manager 结束后由主线程记账:结果事件里有花费按 `harness_reported` 记,否则(被停止、崩溃、
+   超时、没有报告)按 `reserved` 记满额度。这笔记账结算保留。
+
+Manager 外面还包了一层 `lifeline_script`:它的 stdin 是只有控制器持有写端的管道,控制器进程一旦
+死掉,读到 EOF 就杀掉整个进程组,所以不会留下孤儿 Manager。控制器崩溃后保留由重开消费(§5),
+Manager seat 标为 interrupted;重开后 `teamwork resume` 启动新的 `manager-<n+1>`,它只能看到快照,
+runtime 不会自行重放任何 dispatch。
+
+缓存契约:`-p` 提示词、宪章与 packet 都不含 run id、路径和时间;MCP 配置里的 FIFO 与中继路径
+随运行变化,但它们只交给 Claude Code 启动中继进程,不进入模型请求;Claude Code 自己生成的环境
+消息与 transcript 不受 runtime 控制(同 §7.1)。Windows 没有外部 Manager(`UnsupportedPlatform`)。
+
+L2(`runtime_test.zig` 的 `teamwork manager L2`,`teamwork_command_test.zig`):假 Manager CLI 读取
+自己的 `--mcp-config`,经真实中继发 MCP 请求派活并完成交付;在沙箱里改受保护文件全部失败;
+先请求完成得到 `NotApproved`;切换 Manager harness 决定是否启动 Manager 进程,切换 implementer
+harness 独立生效;预算触顶与宿主取消都会停掉 Manager 与 worker 且不合回;崩溃后重开只扣一次
+保留;控制器关闭 lifeline 后 Manager 的整个进程组消失。`mcp_server_test.zig` 单独覆盖只用外部
+MCP 客户端时的预算边界(`budget.manager` 为 `outside_ledger`,花费只含 worker)。
+
 ## 11. 实现状态
 
 | Issue | 内容 | 状态 |
 |---|---|---|
 | #515 | runtime / seat 分层、角色配置、worker 契约 | 类型、配置、驱动、runtime、确定性 SWE Manager 已接通(§7、§10)。 |
-| #516 | 独立 verifier / 完成审计 | `VerifierAuditor` 已接隔离 verifier,最多两次审计,失败反馈修复轮;只有 PASS 交付。UNVERIFIED 后的 leads 轮仍待做。 |
-| #517 | reviewer 角色与 open-issues 台账 | runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows `workspaceTree` 尚不支持。 |
+| #516 | 独立 verifier / 完成审计 | 已完成:`VerifierAuditor` 已接隔离 verifier,最多两次审计;第一次 FAIL 反馈修复轮,第一次 UNVERIFIED 把证据与未确认项作为线索反馈 leads 轮,第二次仍非 PASS 即终止且不合回;只有 PASS 交付。 |
+| #517 | reviewer 角色与 open-issues 台账 | 已完成:runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows 不计算 `workspaceTree`(`Unsupported`),teamwork 在 Windows 上启动前即以 `UnsupportedPlatform` 拒绝(§7.3),Windows CI 腿有测试覆盖。 |
 | #518 | `/teamwork` 命令、面试与批准 | 已完成:CLI 显式批准入口、配置加载、状态和恢复;请求参数段 `[skip-interview]` / `[seats=...]`(CLI 与 REPL);REPL `/teamwork` 的 interviewer 面试、批准/修改/拒绝与后台运行;`request_source` 记录批准来源(§3)。 |
 | #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名已由 #544 完成。 |
 | #544 | seat 稳定路径别名 | 已做(§7.1):`$WORKSPACE` / `$SEAT` 在工具准入层解析,隔离 verifier 的快照同样用 `$WORKSPACE`;metacodes seat 的首个 provider 请求跨运行逐字节相同;Claude Code seat 只有 `--add-dir` 取值随运行变化。 |
 | #520 | 运行级预算 | 付费调用前预留、退出记账、丢失报告/崩溃时消耗预留、恢复固定原策略、预算触顶停止且不合回。 |
 | #521 | Claude Code 作为 worker | 已做(§7.4):钉住的 argv 与版本/参数探测、环境白名单、进程组、macOS Seatbelt / Linux bubblewrap 沙箱、结果事件记账、失败映射及 L2(假 CLI)。待做:真实 CLI 的手动 e2e job(需预算上限,不进默认 gate) |
 | #522 | Claude Code 作为 Manager(MCP) | stdio MCP 接口驱动用户预先批准的 Run,复用独立审计和预算规则。详见 [TEAMWORK_MCP.md](TEAMWORK_MCP.md)。 |
+| #545 | 自动启动外部 Manager | 已做(§10.2):`seats.manager` 为 `claude_code` 时 runtime 在沙箱里启动 Manager,经 FIFO 中继服务同一 MCP 接口,控制器留在宿主进程;`manager_budget_usd` 额度启动前 durable 保留、结束结算、丢失结果全额消耗,重开不重复发放;宿主取消、预算触顶停掉 Manager 与 worker 且不合回;lifeline 防止孤儿 Manager;快照 `budget.manager` 标明 Manager 花费是否在账本内。 |
 | #523 | worktree 合回 | 审计通过后补丁合回,保留用户并发修改,冲突时保留两边内容(§10)。 |
 | #524 | 进度面板与 AgentCore 事件 | 已做:runtime 每次 seat 状态或阶段变化都把变化和之后的快照发给 `Deps.observer`;interviewer 在等待批准时为 `needs_you`;REPL 用线程安全的 `progress.Board` 驱动输入框上方的面板与 `/teamwork status` 摘要;`teamwork run/resume --events` 输出 `teamwork.snapshot` / `teamwork.event` 线协议行(WIRE_PROTOCOL §1.6)。AgentCore C ABI 没有 teamwork 入口,不带这些事件。 |
 | #525 | 并行候选与择优 | 已做(§10.1):`candidates`(至多 4 个,可混用 harness)各用独立 worktree 并经 reviewer 核验;judge seat 按核验过的测试证据择一,只有选中的进入审计与合回;未选中的理由按 TinyKG lesson 准入写入 KG;启动前按 N 倍预估检查剩余预算;快照显示各候选状态。候选 seat 按顺序运行(账本一次只预留一个付费 seat)。 |

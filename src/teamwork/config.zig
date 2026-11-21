@@ -54,6 +54,7 @@ pub const Layer = struct {
     max_rounds: ?u32 = null,
     candidates: ?CandidatesLayer = null,
     candidate_estimate_usd: ?f64 = null,
+    manager_budget_usd: ?f64 = null,
     seats: std.EnumArray(Role, SeatLayer) = .initFill(.{}),
 };
 
@@ -122,6 +123,10 @@ pub const ValidateError = error{
     CandidateEstimateMissing,
     CandidateEstimateWithoutCandidates,
     InvalidCandidateEstimate,
+    ManagerBudgetMissing,
+    ManagerBudgetWithoutExternalManager,
+    InvalidManagerBudget,
+    ExternalManagerWallclockOnly,
 };
 
 /// The dispatch cap per role when `max_rounds` is not configured.
@@ -164,6 +169,7 @@ pub const Config = union(enum) {
         max_rounds: u32 = default_max_rounds,
         candidates: Candidates = .{},
         candidate_estimate_usd: ?f64 = null,
+        manager_budget_usd: ?f64 = null,
         /// One spec per role; strings borrowed from the parse arenas.
         seats: std.EnumArray(Role, types.SeatSpec),
     };
@@ -226,6 +232,8 @@ pub fn parseValue(arena: std.mem.Allocator, value: std.json.Value, diag: ?*Diagn
             };
         } else if (std.mem.eql(u8, key, "candidate_estimate_usd")) {
             layer.candidate_estimate_usd = numberOf(item) orelse return error.WrongType;
+        } else if (std.mem.eql(u8, key, "manager_budget_usd")) {
+            layer.manager_budget_usd = numberOf(item) orelse return error.WrongType;
         } else if (std.mem.eql(u8, key, "seats")) {
             if (item != .object) return error.NotAnObject;
             var seats = item.object.iterator();
@@ -304,6 +312,7 @@ pub fn merge(lower: Layer, upper: Layer) Layer {
     if (upper.max_rounds) |v| out.max_rounds = v;
     if (upper.candidates) |v| out.candidates = v;
     if (upper.candidate_estimate_usd) |v| out.candidate_estimate_usd = v;
+    if (upper.manager_budget_usd) |v| out.manager_budget_usd = v;
     for (std.enums.values(Role)) |role| {
         out.seats.set(role, mergeSeat(lower.seats.get(role), upper.seats.get(role)));
     }
@@ -353,6 +362,7 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
     if (layer.budget_usd) |usd| {
         if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidBudget;
     }
+    try validateManagerBudget(layer, seats.get(.manager), diag);
     if (!(layer.enabled orelse false)) {
         setDiag(diag, null, null);
         return .disabled;
@@ -365,8 +375,22 @@ pub fn validate(layer: Layer, diag: ?*Diagnostic) ValidateError!Config {
         .max_rounds = max_rounds,
         .candidates = candidates,
         .candidate_estimate_usd = layer.candidate_estimate_usd,
+        .manager_budget_usd = layer.manager_budget_usd,
         .seats = seats,
     } };
+}
+
+fn validateManagerBudget(layer: Layer, manager: types.SeatSpec, diag: ?*Diagnostic) ValidateError!void {
+    setDiag(diag, null, "manager_budget_usd");
+    switch (manager.harness) {
+        .metacodes => if (layer.manager_budget_usd != null) return error.ManagerBudgetWithoutExternalManager,
+        .claude_code => |external| {
+            if (external.budget != .cost) return fail(diag, .manager, "budget_enforcement", error.ExternalManagerWallclockOnly);
+            const usd = layer.manager_budget_usd orelse return error.ManagerBudgetMissing;
+            if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidManagerBudget;
+            if (layer.budget_usd) |cap| if (usd >= cap) return error.InvalidManagerBudget;
+        },
+    }
 }
 
 fn validateCandidates(layer: Layer, implementer: types.SeatSpec, diag: ?*Diagnostic) ValidateError!Candidates {
@@ -696,4 +720,28 @@ test "config: candidates are a count or a seat per candidate, bounded, and need 
     try testing.expectError(error.WrongType, load(a, "{\"candidates\":\"3\"}"));
     try testing.expectError(error.NotAnObject, load(a, "{\"candidates\":[1,2]}"));
     try testing.expectError(error.UnknownField, load(a, "{\"candidates\":[{\"harnes\":\"metacodes\"},{}]}"));
+}
+
+test "config: a launched manager needs its own cost allowance below the cap" {
+    var arena = arenaFixture();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const manager = "\"seats\":{\"manager\":{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\",\"model\":\"m\"}}";
+    const launched = (try load(a, "{\"enabled\":true,\"budget_usd\":5,\"manager_budget_usd\":1.5," ++ manager ++ "}")).enabled;
+    try testing.expectEqual(Harness.claude_code, launched.seats.get(.manager).harnessKind());
+    try testing.expectEqual(Harness.metacodes, launched.seats.get(.implementer).harnessKind());
+    try testing.expectEqual(@as(f64, 1.5), launched.manager_budget_usd.?);
+
+    const project = try parse(a, "{\"enabled\":true,\"budget_usd\":5," ++ manager ++ "}", null);
+    try testing.expectEqual(@as(f64, 2), (try validate(merge(project, try parse(a, "{\"manager_budget_usd\":2}", null)), null)).enabled.manager_budget_usd.?);
+    try testing.expect((try load(a, "{\"enabled\":true,\"budget_usd\":5}")).enabled.manager_budget_usd == null);
+
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.ManagerBudgetMissing, validate(project, &diag));
+    try testing.expectEqualStrings("manager_budget_usd", diag.field.?);
+    try testing.expectError(error.ManagerBudgetWithoutExternalManager, load(a, "{\"enabled\":true,\"budget_usd\":5,\"manager_budget_usd\":1}"));
+    try testing.expectError(error.InvalidManagerBudget, load(a, "{\"enabled\":true,\"budget_usd\":5,\"manager_budget_usd\":5," ++ manager ++ "}"));
+    try testing.expectError(error.InvalidManagerBudget, load(a, "{\"enabled\":true,\"budget_usd\":5,\"manager_budget_usd\":0," ++ manager ++ "}"));
+    try testing.expectError(error.ExternalManagerWallclockOnly, load(a, "{\"enabled\":true,\"budget_usd\":5,\"manager_budget_usd\":1,\"seats\":{\"manager\":{\"harness\":\"claude_code\",\"command\":\"" ++ abs_claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}}}"));
+    try testing.expectError(error.WrongType, load(a, "{\"manager_budget_usd\":\"1\"}"));
 }

@@ -251,6 +251,13 @@ pub fn mkdir(path: [*:0]const u8, mode: c_uint) c_int {
     }
 }
 
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+pub fn makeFifo(path: [*:0]const u8, mode: c_uint) c_int {
+    if (is_windows) return -1;
+    return mkfifo(path, @intCast(mode & 0o7777));
+}
+
 /// rmdir(2) 形状的删空目录。Windows `_wrmdir`。返回 0 / -1(errno 同各平台 CRT)。
 pub fn rmdir(path: [*:0]const u8) c_int {
     if (is_windows) {

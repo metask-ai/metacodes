@@ -5,12 +5,18 @@ including Claude Code, can drive the same runtime as the built-in SWE manager.
 The manager does not implement review, auditing, budgeting, sandboxing or merge.
 Those remain runtime and driver responsibilities.
 
-The MCP client owns the Manager process and its model billing. The runtime's
-dollar cap covers the workers and audit it launches. It does not account for
-the MCP client's own model usage. Choose the Manager by running the client
-(for example Claude Code); configure worker harnesses independently in the
-teamwork policy. Automatically launching a Manager from `seats.manager` is
-not part of this stdio adapter.
+With `teamwork mcp`, the MCP client owns the Manager process and its model
+billing. The runtime's dollar cap covers the workers and audit it launches. It
+does not account for the MCP client's own model usage, and every snapshot says
+so with `budget.manager: "outside_ledger"`. Choose the Manager by running the
+client (for example Claude Code); configure worker harnesses independently in
+the teamwork policy. `teamwork mcp` refuses an external `seats.manager`.
+
+`teamwork run` launches a configured Claude Code Manager itself (#545,
+[TEAMWORK_DESIGN.md](TEAMWORK_DESIGN.md) §10.2) and serves it this same
+protocol through a relay, so a launched Manager sees exactly these tools,
+results and errors. Its spend is held and charged in the run's ledger
+(`budget.manager: "run_ledger"`).
 
 ## Host authorization and ownership
 
@@ -146,7 +152,8 @@ A passing audit names that tree before the runtime can enter merge-back.
 Merge-back checks target-file preimages using a private Git index and refuses
 submodule commit changes before touching the workspace.
 An unavailable auditor yields `failed/audit_unavailable`, never `done`.
-Stale approval or a first failed audit can request review or repair; callers
+Stale approval, or a first failed or unverified audit, can request review or a
+repair or leads round; callers
 must inspect the returned state. Only `snapshot.state.kind == "done"` means
 completion. Cancel is idempotent on ended runs and retains unfinished work.
 
@@ -162,7 +169,7 @@ The text is the JSON encoding of the same structured object:
     "goal": "The first line of the approved request",
     "state": {"kind": "approved", "detail": null},
     "seats": [],
-    "budget": {"cap_usd": 5, "spent_usd": 0, "remaining_usd": 5, "charges": 0},
+    "budget": {"cap_usd": 5, "spent_usd": 0, "remaining_usd": 5, "charges": 0, "held_usd": 0, "manager": "none"},
     "open_issues": 0,
     "audit": {"used": 0, "max": 2, "last": null},
     "max_rounds": 8,
@@ -180,7 +187,11 @@ invent progress or a passing audit. Runtime tagged unions use `{kind, detail}`
 to retain their discriminators. Seat entries contain string `id`, `role`,
 `harness`, `status` and a nullable tagged `result`. Review and seat failure
 details retain their nested union tags. Budget, audit, issue and conflict
-counts are runtime values. Tree ids are hash strings, without backing-buffer
+counts are runtime values. `budget.held_usd` is a launched Manager's
+outstanding allowance, already excluded from `remaining_usd`; `budget.manager`
+says where the Manager's own spend is accounted: `none` (the built-in loop has
+no model), `run_ledger` (a launched Manager) or `outside_ledger` (an MCP
+client; not in `spent_usd` or under `cap_usd`). Tree ids are hash strings, without backing-buffer
 padding. When supplied by the runtime, each seat's optional `charter_sha256`
 field is forwarded unchanged. Paths are observations, never writable parameters.
 `candidates` lists each configured candidate as `{candidate, status, tree}`

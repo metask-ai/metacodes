@@ -15,8 +15,8 @@
 //!   review_approved ── requestCompletion()
 //!       ─► approval stale        ─► reviewing
 //!       ─► auditing ─► pass      ─► merging ─► done | failed(merge_*)
-//!                   ─► 1st fail  ─► implementing (repair round)
-//!                   ─► 2nd fail / unverified / unavailable ─► failed
+//!                   ─► 1st fail / unverified ─► implementing (repair or leads round)
+//!                   ─► 2nd fail / unverified, or unavailable ─► failed
 //!   any live state ── cancel() ─► cancelled
 //!                  ── budget reached ─► budget_exhausted
 //!                  ── per-role dispatch cap ─► failed(rounds_exhausted)
@@ -62,6 +62,11 @@ const TreeId = reviewer.TreeId;
 
 /// At most this many completion audits per run (#514, #516).
 pub const max_audits: u8 = 2;
+
+/// Windows has no seat sandbox backend, and the workspace tree id that binds
+/// approvals, audits and merge-back is not computed there (#517): a run is
+/// refused before anything is written instead of failing midway.
+pub const platform_supported = @import("builtin").os.tag != .windows;
 
 // ── inputs ──────────────────────────────────────────────────────────────────
 
@@ -112,6 +117,7 @@ pub const Deps = struct {
     recheck_audited_tree: *const fn (std.mem.Allocator, []const u8, []const u8, ?*const types.AbortSignal) reviewer.TreeError!TreeId = reviewer.workspaceTree,
     observer: ?progress.Observer = null,
     pitfalls: ?PitfallSink = null,
+    manager_outside_ledger: bool = false,
 };
 
 pub const PitfallSink = struct {
@@ -145,7 +151,7 @@ pub const Failure = enum {
     rounds_exhausted,
     /// The second completion audit failed.
     audit_failed,
-    /// The auditor could not decide; never a pass.
+    /// The second completion audit could not decide; never a pass.
     audit_unverified,
     /// The auditor could not run; never a pass.
     audit_unavailable,
@@ -163,6 +169,7 @@ pub const Failure = enum {
     no_candidate_approved,
     candidates_interrupted,
     candidate_git_failed,
+    manager_unavailable,
 
     pub fn parse(text: []const u8) ?Failure {
         return std.meta.stringToEnum(Failure, text);
@@ -316,6 +323,14 @@ pub const BudgetSnapshot = struct {
     spent_usd: f64,
     remaining_usd: f64,
     charges: usize,
+    held_usd: f64 = 0,
+    manager: ManagerSpend = .none,
+};
+
+pub const ManagerSpend = enum {
+    none,
+    run_ledger,
+    outside_ledger,
 };
 
 pub const AuditSnapshot = struct {
@@ -359,8 +374,8 @@ pub const CompletionResult = union(enum) {
     /// The worktree changed after the approval; the run is back in
     /// `reviewing`.
     approval_stale,
-    /// The first audit failed; its report is forwarded and the run is back in
-    /// `implementing` for a repair round.
+    /// The first audit failed or was unverified; its report is forwarded and
+    /// the run is back in `implementing` for a repair or leads round.
     repair_requested,
     failed: Failure,
     budget_exhausted,
@@ -373,6 +388,8 @@ pub const Error = run_dir.Error || error{
     PreviewDisabled,
     RunBusy,
     LeaseFailed,
+    /// Teamwork does not run on this platform (`platform_supported`).
+    UnsupportedPlatform,
     /// The run is in a terminal state (or just entered one).
     RunEnded,
     /// Only the implementer and the reviewer are dispatched; the verifier is
@@ -441,6 +458,7 @@ pub const Run = struct {
     /// workspace. `cfg`'s strings must outlive the run.
     pub fn start(gpa: std.mem.Allocator, deps: Deps, request: ApprovedRequest, cfg: config.Config.Enabled, options: StartOptions) StartError!*Run {
         if (!deps.preview.teamwork) return error.PreviewDisabled;
+        if (!platform_supported) return error.UnsupportedPlatform;
         if (std.mem.trim(u8, request.text, " \t\r\n").len == 0) return error.EmptyRequest;
         const self = blk: {
             // Resolve the repository before anything is written.
@@ -489,6 +507,7 @@ pub const Run = struct {
     /// inspect. A terminal run reopens as it ended.
     pub fn reopen(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId) ReopenError!*Run {
         if (!deps.preview.teamwork) return error.PreviewDisabled;
+        if (!platform_supported) return error.UnsupportedPlatform;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         var buf: run_dir.PathBuf = undefined;
@@ -642,6 +661,8 @@ pub const Run = struct {
                 .spent_usd = self.ledger.spent_usd,
                 .remaining_usd = self.ledger.remainingUsd(),
                 .charges = self.ledger.entries,
+                .held_usd = self.ledger.held_usd,
+                .manager = self.managerSpend(),
             },
             .open_issues = self.issues.openCount(),
             .audit = .{ .used = self.audits, .last = self.last_audit },
@@ -977,7 +998,9 @@ pub const Run = struct {
     }
 
     fn closeSeat(self: *Run, id: SeatId, result: SeatResult) Error!void {
-        self.seats.items[self.seats.items.len - 1].result = result;
+        for (self.seats.items) |*seat| {
+            if (seat.id.eql(id)) seat.result = result;
+        }
         try self.setSeatStatus(id, switch (result) {
             .finished, .review, .judgment => .done,
             .failed, .budget_exhausted, .aborted, .interrupted => .failed,
@@ -1048,14 +1071,13 @@ pub const Run = struct {
         if (self.abort.isAborted()) return self.settleAbort();
         switch (verdict) {
             .pass => |tree| if (!tree.eql(approved)) return self.failWith(.audit_changed_worktree),
-            .fail => {
+            .fail, .unverified => {
                 if (attempt < max_audits) {
                     try self.transition(.implementing);
                     return .repair_requested;
                 }
-                return self.failWith(.audit_failed);
+                return self.failWith(if (verdict == .fail) .audit_failed else .audit_unverified);
             },
-            .unverified => return self.failWith(.audit_unverified),
             .unavailable => return self.failWith(.audit_unavailable),
         }
 
@@ -1077,6 +1099,57 @@ pub const Run = struct {
         if (self.state.isTerminal()) return;
         self.abort.abort(.user_interrupt);
         try self.transition(.cancelled);
+    }
+
+    fn managerSpend(self: *const Run) ManagerSpend {
+        if (self.cfg.manager_budget_usd != null) return .run_ledger;
+        return if (self.deps.manager_outside_ledger) .outside_ledger else .none;
+    }
+
+    pub fn openManager(self: *Run) Error!SeatId {
+        if (!self.deps.preview.teamwork) return error.PreviewDisabled;
+        try self.checkLive();
+        const allowance = self.cfg.manager_budget_usd orelse return error.RoleNotDispatchable;
+        if (allowance >= self.ledger.remainingUsd()) {
+            try self.endForBudget();
+            return error.BudgetExhausted;
+        }
+        if (self.dispatched.get(.manager) >= self.dispatchCap(.manager)) {
+            try self.transition(.{ .failed = .rounds_exhausted });
+            return error.RoundsExhausted;
+        }
+        const packet = try self.renderManagerPacket();
+        defer self.gpa.free(packet);
+        const id = try self.openSeat(.manager, self.cfg.seats.getPtrConst(.manager), packet);
+        try self.setSeatStatus(id, .working);
+        return id;
+    }
+
+    pub fn holdManager(self: *Run, id: SeatId) Error!void {
+        self.ledger.hold(id, self.cfg.seats.get(.manager).harnessKind(), self.cfg.manager_budget_usd.?) catch {
+            try self.closeSeat(id, .budget_exhausted);
+            try self.endForBudget();
+            return error.BudgetExhausted;
+        };
+    }
+
+    pub fn failManager(self: *Run, id: SeatId) Error!void {
+        if (self.abort.isAborted()) {
+            try self.closeSeat(id, .aborted);
+            try self.transition(.cancelled);
+            return;
+        }
+        try self.closeSeat(id, .{ .failed = .spawn_failed });
+        try self.transition(.{ .failed = .manager_unavailable });
+    }
+
+    pub fn finishManager(self: *Run, id: SeatId, wallclock_ms: u64, cost: ledger_mod.Cost, result: SeatResult) Error!void {
+        _ = common.charge(.{ .ledger = &self.ledger, .seat = id }, self.cfg.seats.get(.manager).harnessKind(), wallclock_ms, cost);
+        try self.closeSeat(id, result);
+    }
+
+    pub fn seatDir(self: *const Run, buf: *run_dir.PathBuf, id: SeatId) Error![]const u8 {
+        return std.fs.path.dirname(try self.dir.seatPath(buf, id, .packet)).?;
     }
 
     // ── seats ───────────────────────────────────────────────────────────────
@@ -1243,15 +1316,23 @@ pub const Run = struct {
             },
             else => self.writeImplementerPacket(w) catch return error.OutOfMemory,
         }
-        if (self.last_audit != null and self.last_audit.? == .fail) {
-            w.print(
+        if (self.last_audit) |kind| switch (kind) {
+            .fail => w.print(
                 \\
                 \\## Completion audit
                 \\
                 \\The completion audit found that the result does not yet fulfil the request. Its report is `{s}` (relative to the directory of this packet). Every finding in it must be addressed; a second failed audit ends the run.
                 \\
-            , .{run_dir.seat_relative_first_audit_report}) catch return error.OutOfMemory;
-        }
+            , .{run_dir.seat_relative_first_audit_report}) catch return error.OutOfMemory,
+            .unverified => w.print(
+                \\
+                \\## Completion audit
+                \\
+                \\The completion audit could not confirm that the result fulfils the request. Its report is `{s}` (relative to the directory of this packet): the evidence it gathered and what it could not establish are your leads. Make every requirement it could not establish demonstrable in the workspace, for example with a test that exercises it, and fix what the leads show missing; a second audit that does not pass ends the run.
+                \\
+            , .{run_dir.seat_relative_first_audit_report}) catch return error.OutOfMemory,
+            .pass, .unavailable => {},
+        };
         const notes = std.mem.trim(u8, instructions, " \t\r\n");
         if (notes.len != 0) {
             w.print("\n## Notes from the manager\n\n{s}\n", .{notes}) catch return error.OutOfMemory;
@@ -1286,6 +1367,37 @@ pub const Run = struct {
             \\Next to this packet write `handoff.md` with the sections `## Observation`, `## Reasoning`, `## Caveats`, `## Conclusion` and `## Verification`.
             \\
         , .{run_dir.seat_relative_open_issues_copy});
+    }
+
+    fn renderManagerPacket(self: *const Run) Error![]u8 {
+        const request = try self.dir.readOriginalRequest(self.gpa);
+        defer self.gpa.free(request);
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        const w = &out.writer;
+        w.writeAll(
+            \\# Manage
+            \\
+            \\Drive the run below to completion through the teamwork tools. The approved request is fixed for the run:
+            \\
+            \\
+        ) catch return error.OutOfMemory;
+        w.writeAll(request) catch return error.OutOfMemory;
+        w.writeAll(
+            \\
+            \\
+            \\## How the run moves
+            \\
+            \\- `teamwork_status` returns the run's snapshot. Every other tool returns it too; read its `state` after each call.
+            \\- `teamwork_dispatch` runs one implementer or reviewer seat to its end. Your `instructions` become notes in that seat's packet.
+            \\- An implementer round is followed by a review. A review that requests changes needs another implementer round; an approval allows `teamwork_request_completion`.
+            \\- With parallel candidates configured, `teamwork_run_candidates` comes first.
+            \\- Only the runtime ends the run as done, after its own audit and merge. `teamwork_cancel` stops it.
+            \\
+            \\Stop once the state is `done`, `failed`, `budget_exhausted` or `cancelled`.
+            \\
+        ) catch return error.OutOfMemory;
+        return out.toOwnedSlice() catch error.OutOfMemory;
     }
 
     fn namesRunState(self: *const Run, text: []const u8) bool {
@@ -1607,7 +1719,7 @@ const roles_before_candidates = @intFromEnum(Role.judge);
 comptime {
     std.debug.assert(roles_before_candidates + 1 == std.enums.values(Role).len);
     const fields = std.meta.fieldNames(config.Config.Enabled);
-    const expected = [_][]const u8{ "budget_usd", "check_command", "max_rounds", "candidates", "candidate_estimate_usd", "seats" };
+    const expected = [_][]const u8{ "budget_usd", "check_command", "max_rounds", "candidates", "candidate_estimate_usd", "manager_budget_usd", "seats" };
     std.debug.assert(fields.len == expected.len);
     for (fields, expected) |field, name| std.debug.assert(std.mem.eql(u8, field, name));
     std.debug.assert(std.mem.eql(u8, std.meta.fieldNames(std.EnumArray(Role, types.SeatSpec))[0], "values"));
@@ -1629,15 +1741,39 @@ const SingleLinePolicy = struct {
     }
 };
 
+const CandidatePolicy = struct {
+    budget_usd: f64,
+    check_command: ?config.CheckCommand,
+    max_rounds: u32,
+    candidates: config.Candidates,
+    candidate_estimate_usd: ?f64,
+    seats: std.EnumArray(Role, types.SeatSpec),
+
+    fn of(cfg: config.Config.Enabled) CandidatePolicy {
+        return .{
+            .budget_usd = cfg.budget_usd,
+            .check_command = cfg.check_command,
+            .max_rounds = cfg.max_rounds,
+            .candidates = cfg.candidates,
+            .candidate_estimate_usd = cfg.candidate_estimate_usd,
+            .seats = cfg.seats,
+        };
+    }
+};
+
 fn configFingerprint(gpa: std.mem.Allocator, cfg: config.Config.Enabled) error{OutOfMemory}![32]u8 {
     const bytes = if (cfg.candidates.len == 0)
         try std.json.Stringify.valueAlloc(gpa, SingleLinePolicy.of(cfg), .{})
     else
-        try std.json.Stringify.valueAlloc(gpa, cfg, .{});
+        try std.json.Stringify.valueAlloc(gpa, CandidatePolicy.of(cfg), .{});
     defer gpa.free(bytes);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    return digest;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(bytes);
+    if (cfg.manager_budget_usd) |usd| {
+        var buf: [64]u8 = undefined;
+        hash.update(std.fmt.bufPrint(&buf, "\nmanager_budget_usd={d}", .{usd}) catch unreachable);
+    }
+    return hash.finalResult();
 }
 
 fn parseFingerprint(text: []const u8) error{StateCorrupt}![32]u8 {
