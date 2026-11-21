@@ -29,7 +29,7 @@ from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
 from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
-from scripts.eval.harbor.bench.account import Account
+from scripts.eval.harbor.bench.account import Account, refresh_lock
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
 
@@ -1253,6 +1253,26 @@ class AccountTest(unittest.TestCase):
                     Account(state).credential()
 
 
+def hold_byte_lock(fd):
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def release_byte_lock(fd):
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 class AccountInventoryTest(unittest.TestCase):
     def setup_account(self, **kwargs):
         tmp = tempfile.TemporaryDirectory()
@@ -1272,6 +1292,33 @@ class AccountInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '已不可用'):
             account.credential('metask/claude-test', key_id='glm-key')
         self.assertEqual(len([c for c in calls if c[0] == 'refresh']), 1)
+
+    def test_a_refresh_waits_for_the_holder_of_an_empty_lock_file_and_writes_nothing_into_it(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = Path(tmp.name)
+        path = state / 'bench-oauth.lock'
+        held = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, held)
+        hold_byte_lock(held)
+        entered, errors = threading.Event(), []
+
+        def refresh():
+            try:
+                with refresh_lock(state):
+                    entered.set()
+            except OSError as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=refresh, daemon=True)
+        worker.start()
+        time.sleep(0.3)
+        self.assertFalse(entered.is_set())
+        release_byte_lock(held)
+        worker.join(15)
+        self.assertEqual(errors, [])
+        self.assertTrue(entered.is_set())
+        self.assertEqual(path.stat().st_size, 0)
 
     def test_concurrent_refresh_rotates_privately_and_preserves_cli_selection(self):
         account, calls = self.setup_account()
