@@ -424,14 +424,15 @@ test "MCP P0.3: elicitation 往返 — server 发 elicitation/create,client hand
     const a = std.testing.allocator;
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
     const argv = [_]?[*:0]const u8{ mock_path, null };
-    var client = cc.mcp_client.McpClient.connect(a, argv[0..]) catch |err| {
+    var handler_called = false;
+    var client = cc.mcp_client.McpClient.connectWith(a, .{
+        .spawn = .{ .argv = argv[0..] },
+        .elicit = .{ .ctx = @ptrCast(&handler_called), .handleFn = elicitAcceptHandler },
+    }) catch |err| {
         std.debug.print("connect failed: {s}\n", .{@errorName(err)});
         return err;
     };
     defer client.close();
-
-    var handler_called = false;
-    client.elicit = .{ .ctx = @ptrCast(&handler_called), .handleFn = elicitAcceptHandler };
     // callTool "elicit" → server 中途发 elicitation/create → client handler 应答 accept → server 回结果。
     const result = try client.callTool("elicit", "{}");
     defer a.free(result);

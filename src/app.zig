@@ -5800,9 +5800,9 @@ pub const App = struct {
         client_heap.* = client.*;
 
         // **诚实登记(elicitation UI 未接线)**:client.elicit 回调机制已实现+测试(见 mcp/client.zig),
-        // 但此处**不设** handler → 生产中 MCP server 发 elicitation 一律安全 decline(协议正确闭合,
-        // tool 继续/优雅失败,不 hang)。接真 UI 需一个 elicitation 渲染器(同 custom UiRequest,TUI 暂无);
-        // 有渲染器后在此 per-session 设 client_heap.elicit=路由到 ui_requester 即可,MCP 层零改。
+        // 但连接时**不传** handler → 不声明 elicitation 能力;server 仍发 elicitation 时一律安全 decline
+        // (协议正确闭合,tool 继续/优雅失败,不 hang)。接真 UI 需一个 elicitation 渲染器(同 custom
+        // UiRequest,TUI 暂无);有渲染器后在 app/mcp_startup.zig 经 ConnectOptions.elicit 传入(声明随之打开)。
         var session = McpSession.init(app.allocator, client_heap);
         errdefer session.deinit();
         try session.registerToolsFromJsonFiltered(&app.dyn_registry, name_owned, tools_json, .{

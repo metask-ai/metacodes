@@ -128,6 +128,7 @@ pub const HttpTransport = struct {
     reuse_idle_ms: i64 = REUSE_IDLE_MS,
     /// The last SSE event id seen on the open response, for `Last-Event-ID`.
     last_event_id: ?[]u8 = null,
+    event_id_changes: u64 = 0,
     /// The server's `retry:` delay for that stream (ms).
     retry_ms: ?u64 = null,
     /// The last POST's body went out whole, so the server may have acted on it.
@@ -281,6 +282,7 @@ pub const HttpTransport = struct {
     pub fn recvLine(self: *HttpTransport) ![]u8 {
         if (self.queue.items.len != 0) return self.queue.orderedRemove(0);
         var resumes: usize = 0;
+        var progress = self.event_id_changes;
         while (true) {
             const exchange = self.stream orelse return error.Eof;
             const failure: anyerror = blk: {
@@ -291,6 +293,10 @@ pub const HttpTransport = struct {
             self.closeStream();
             // Interrupted, or not a dropped connection: nothing to resume.
             if (failure != error.Eof and failure != error.McpConnectFailed) return failure;
+            if (self.event_id_changes != progress) {
+                progress = self.event_id_changes;
+                resumes = 0;
+            }
             // The stream ended without the awaited response. Classic servers
             // that numbered their events replay the rest on a GET with
             // `Last-Event-ID`; in 2026-07-28 the answer is lost, and whether
@@ -365,6 +371,7 @@ pub const HttpTransport = struct {
         const owned = self.allocator.dupe(u8, id) catch return;
         self.forgetEventId();
         self.last_event_id = owned;
+        self.event_id_changes +%= 1;
     }
 
     fn forgetEventId(self: *HttpTransport) void {
@@ -403,6 +410,12 @@ pub const HttpTransport = struct {
         pool.mutex.lockUncancelable(self.client.io);
         defer pool.mutex.unlock(self.client.io);
         return pool.free_len;
+    }
+
+    pub fn forgetSession(self: *HttpTransport) void {
+        if (self.session_id) |id| self.allocator.free(id);
+        self.session_id = null;
+        self.protocol_version = null;
     }
 
     fn deleteSession(self: *HttpTransport) !void {
