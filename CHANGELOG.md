@@ -67,6 +67,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`/logout` and the notice under the banner follow `.env`'s
+  `METACODES_PRESET`** (#489). Signed in to Metask with a `.env` that names a
+  preset, `/logout` moved the session to the file's `METACODES_PROVIDER` (or
+  the one provider whose key it holds), or left it without a model when the
+  file named only the preset, while the next start used the preset (level 6
+  of the startup order). The notice under the banner named that provider, or
+  nothing. Both now take the file's choice as a start does: its preset when
+  `config.json` defines it, with the preset's reasoning effort and the file's
+  `METACODES_MODEL` if it sets one, else its provider. The notice reads
+  `.env configures the preset fast (DeepSeek · deepseek-v4-pro); the default
+  is Metask. To use it: /model, or /logout`. A preset whose provider has no
+  key leaves the session without a model after `/logout`, as a start on it
+  does, instead of falling to the file's provider.
+
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
   instead of the filter, Esc only switched the editor to NORMAL mode, and

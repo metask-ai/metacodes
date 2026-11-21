@@ -117,6 +117,7 @@ const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
 const sign_out_mod = @import("app/sign_out.zig");
+const presets_mod = @import("app/presets.zig");
 const providers_cli_mod = @import("app/providers_cli.zig");
 const provider_startup_mod = @import("provider/startup.zig");
 const kg_provider_audit = @import("kg/provider_audit.zig");
@@ -472,9 +473,10 @@ pub const App = struct {
     /// Providers `<state root>/.env` holds keys for while naming none of them
     /// (#486), for the unbound reminder. Borrowed from the host.
     unchosen_local_providers: []const []const u8 = &.{},
-    /// The provider `<state root>/.env` configures, which `/logout` falls
-    /// back to (#485). Borrowed from the host; null when it configures none.
-    local_provider: ?LocalProvider = null,
+    /// The route `<state root>/.env` configures, which `/logout` falls back
+    /// to (#485): its preset, else its provider (#489). Borrowed from the
+    /// host; null when it configures none.
+    local_route: ?LocalRoute = null,
     /// Said once under the banner, one notice per line: a stored default
     /// passed over for want of a credential (#485), `.env`'s provider ranked
     /// below Metask, `.env` keys of several providers and none chosen (#486).
@@ -782,20 +784,13 @@ pub const App = struct {
         route_state: route_state_mod.RouteState = .{ .bound = .unknown },
         /// `App.unchosen_local_providers`; borrowed for the App's life.
         unchosen_local_providers: []const []const u8 = &.{},
-        /// `App.local_provider`; borrowed for the App's life.
-        local_provider: ?LocalProvider = null,
+        /// `App.local_route`; borrowed for the App's life.
+        local_route: ?LocalRoute = null,
         /// `App.startup_notice`; borrowed for the App's life.
         startup_notice: ?[]const u8 = null,
     };
 
-    /// The provider `<state root>/.env` configures (#486): its
-    /// `METACODES_PROVIDER`, or the one provider whose key it holds, and its
-    /// `METACODES_MODEL`.
-    pub const LocalProvider = struct {
-        /// A provider id or alias, as `--provider` takes it.
-        name: []const u8,
-        model: ?[]const u8 = null,
-    };
+    pub const LocalRoute = presets_mod.LocalRoute;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -830,7 +825,7 @@ pub const App = struct {
             .route_strings = route_strings_mod.RouteStrings.init(allocator),
             .route_state = options.route_state,
             .unchosen_local_providers = options.unchosen_local_providers,
-            .local_provider = options.local_provider,
+            .local_route = options.local_route,
             .startup_notice = options.startup_notice,
             .openrouter_background = options.models_cache and std.c.getenv("METACODES_NO_PROBE") == null,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
@@ -1964,7 +1959,7 @@ pub const App = struct {
         pub const SessionAfter = union(enum) {
             /// The session was not on Metask; it stays where it is.
             kept,
-            /// On the provider `.env` configures.
+            /// On the route `.env` configures.
             switched: Switched,
             /// Nothing to fall back to: unbound (`signed_out`).
             unbound,
@@ -1982,7 +1977,7 @@ pub const App = struct {
     /// Metask key stored with `login --provider metask`), forget a stored
     /// default that is Metask's, and drop every Metask credential this
     /// process holds, so nothing is sent with one again. A session on Metask
-    /// then moves to the provider `.env` configures, or becomes unbound.
+    /// then moves to the route `.env` configures, or becomes unbound.
     /// Keys of other providers are not touched.
     pub fn signOutOfMetask(app: *App) !SignOut {
         const root = app.stateRoot();
@@ -2018,11 +2013,12 @@ pub const App = struct {
         var session: SignOut.SessionAfter = .kept;
         if (on_metask) {
             session = .unbound;
-            if (app.local_provider) |local| {
-                if (app.bindLocalProvider(host, local)) |switched| {
+            if (app.local_route) |local| {
+                if (app.bindLocalRoute(host, local)) |switched| {
                     session = .{ .switched = switched };
-                } else |err| {
-                    @import("util/log.zig").warn("provider", "the .env provider {s} could not be used: {s}", .{ local.name, @errorName(err) });
+                } else |err| switch (local) {
+                    .provider => |chosen| @import("util/log.zig").warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
+                    .preset => |preset| @import("util/log.zig").warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
                 }
             }
             if (session == .unbound) app.unbindRoute(.signed_out);
@@ -2230,27 +2226,22 @@ pub const App = struct {
         app.route_state = .{ .unbound = reason };
     }
 
-    /// Bind the provider `.env` configures, on its default route (or the
-    /// model the file names), for this session: what a start with only that
-    /// file resolves to. Returns its display name and where its key came
-    /// from.
+    /// Bind the route `.env` configures for this session: its preset, as
+    /// level 6 of a start applies it (#489), else its provider on its
+    /// default route; the model the file names refines either. That is what a
+    /// start with only that file resolves to. Returns the provider's display
+    /// name and where its key came from.
     ///
     /// When that provider is Metask, the key is `.env`'s and no other
     /// (#485): the session signed out of everything else Metask's, and a
     /// key in the shell is not what `.env` configures. It becomes the
     /// session's Metask API-key route, as a start on that file has.
-    fn bindLocalProvider(app: *App, host: *provider_host_mod.Host, local: LocalProvider) !SignOut.Switched {
-        const profile = host.registry.find(local.name) orelse return error.UnknownProvider;
+    fn bindLocalRoute(app: *App, host: *provider_host_mod.Host, local: LocalRoute) !SignOut.Switched {
         var arena_state = std.heap.ArenaAllocator.init(app.allocator);
         defer arena_state.deinit();
-        const outcome = try provider_startup_mod.resolve(arena_state.allocator(), &host.registry, .{
-            .provider = local.name,
-            .model = local.model,
-        });
-        const route = switch (outcome) {
-            .route => |value| value,
-            .failure => return error.NoRoute,
-        };
+        const resolved = (try presets_mod.resolveLocal(arena_state.allocator(), &host.registry, local)) orelse return error.NoRoute;
+        const route = resolved.route;
+        const profile = host.registry.findById(route.provider_id) orelse return error.UnknownProvider;
         const offer = host.kernel.catalogSnapshot().find(route.offer_id) orelse return error.OfferUnavailable;
         const metask = profile.id.eqlText("metask");
         if (metask) {
@@ -2271,6 +2262,9 @@ pub const App = struct {
             .scope = .session,
         });
         if (committed != .committed) return error.SelectionRefused;
+        if (resolved.reasoning_effort) |effort| app.setReasoningEffort(effort) catch |err| {
+            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+        };
         return .{
             .name = profile.display_name,
             // A Metask binding is labelled Metask's (`bindingOrigin`); the
