@@ -5,7 +5,7 @@
 //!     kind 供 U4 派生 config-change 事件，data 是结构化载荷，**渲染归各 UI**（render(buf)
 //!     是共享格式化助手，消除 loop/web 消息重复）。
 //!   - **借 *App，不持 backend**（Linus 定）。所有方法只在 driver 线程调（TUI run 循环 /
-//!     web cmdbox popFront 后）；App arena 非线程安全，绝不跨线程调。
+//!     web inbox popCommand 后）；App arena 非线程安全，绝不跨线程调。
 //!   - **是所有 config 轴 mutation 的唯一写侧**（choke point）。会话轴 mutation
 //!     (/resume /retry /goal) 显式排除，归 U5/U8（见 doc §1.5）。
 //!   - U4 在 mutation 方法里接 event_sink（本模块不含 emit，只把 kind/data 结构就位）。
