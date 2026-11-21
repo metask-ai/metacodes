@@ -15,6 +15,7 @@ const http_status = @import("http_status.zig");
 const http_connection = @import("http_connection.zig");
 const models_pages = @import("models_pages.zig");
 const auth_header = @import("auth_header.zig");
+const deadline_race = @import("deadline_race.zig");
 
 pub const FetchError = error{
     OutOfMemory,
@@ -31,7 +32,10 @@ pub const FetchError = error{
     /// URL in a config file is a memory-exhaustion vector.
     TooLarge,
     Interrupted,
+    TimedOut,
 };
+
+pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
 
 /// `Request.extra_headers` a GET carries at most.
 pub const MAX_EXTRA_HEADERS = 2;
@@ -54,6 +58,7 @@ pub const Request = struct {
     /// listing's `anthropic-version` (`provider/model_listing.zig`).
     extra_headers: []const std.http.Header = &.{},
     progress: ?*std.atomic.Value(u64) = null,
+    timeout_ms: u32 = DEFAULT_TIMEOUT_MS,
 
     /// The credential the request carries, whichever field holds it.
     fn carried(self: Request) ?Credential {
@@ -105,6 +110,23 @@ pub fn fetch(
 /// included. Errors are the ones no status explains: the URL, the transport,
 /// the size, the credential's placement.
 pub fn fetchAnswer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: Request,
+) FetchError!Answer {
+    const answer = deadline_race.run(io, request.timeout_ms, exchange, .{ allocator, io, request }, discardLate) catch |err| return switch (err) {
+        error.TimedOut => error.TimedOut,
+        error.Unavailable => error.RequestFailed,
+    };
+    return answer;
+}
+
+fn discardLate(args: deadline_race.Args(exchange), late: deadline_race.Answer(exchange)) void {
+    const answer = late catch return;
+    args[0].free(answer.body);
+}
+
+fn exchange(
     allocator: std.mem.Allocator,
     io: std.Io,
     request: Request,
@@ -228,7 +250,7 @@ pub fn fetchModelPages(
         defer allocator.free(cursor);
         const url = try models_pages.continuationUrl(allocator, request.url, cursor);
         defer allocator.free(url);
-        const next = fetch(allocator, io, .{ .url = url, .bearer = request.bearer, .credential = request.credential, .extra_headers = request.extra_headers }) catch break;
+        const next = fetch(allocator, io, .{ .url = url, .bearer = request.bearer, .credential = request.credential, .extra_headers = request.extra_headers, .timeout_ms = request.timeout_ms }) catch break;
         pages.append(allocator, next.body) catch {
             allocator.free(next.body);
             return error.OutOfMemory;

@@ -343,7 +343,7 @@ test "L2 #573 ③: the models list asks to keep the connection open and is read 
     var http_client: std.http.Client = .{ .allocator = a, .io = io_rt.io() };
     defer http_client.deinit();
     var status: u16 = 0;
-    const got = try cc.client_mod.getModelsList(a, &http_client, url, .{ .header = .{ .name = "x-api-key", .value = KEY } }, &status);
+    const got = try cc.client_mod.getModelsList(a, &http_client, url, .{ .header = .{ .name = "x-api-key", .value = KEY } }, &status, cc.client_mod.MODELS_PAGE_TIMEOUT_MS);
     defer a.free(got);
     try std.testing.expectEqualStrings(list, got);
     try std.testing.expectEqual(@as(u16, 200), status);

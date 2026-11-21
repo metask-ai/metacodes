@@ -10,6 +10,7 @@ const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
 const no_redirects = @import("api/http_status.zig").no_redirects;
 const copyRedirectLocation = @import("api/http_status.zig").copyRedirectLocation;
 const error_class = @import("api/error_class.zig");
+const deadline_race = @import("api/deadline_race.zig");
 const last_error = @import("api/last_error.zig");
 const model_error = @import("api/model_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
@@ -1076,7 +1077,7 @@ pub const Client = struct {
         return getModelsList(client.allocator, &client.http_client, client.base_url, .{ .credential = .{
             .credential = client.credential,
             .scheme = client.auth_scheme,
-        } }, &status);
+        } }, &status, MODELS_PAGE_TIMEOUT_MS);
     }
 
     /// 发送非流式消息请求
@@ -1555,12 +1556,15 @@ pub const ModelsAuth = union(enum) {
     },
 };
 
+pub const MODELS_PAGE_TIMEOUT_MS: u32 = 10_000;
+
 pub fn getModelsList(
     allocator: std.mem.Allocator,
     http_client: *http.Client,
     messages_url: []const u8,
     auth: ModelsAuth,
     status: *u16,
+    page_timeout_ms: u32,
 ) ![]u8 {
     const suffix = "/v1/messages";
     if (!std.mem.endsWith(u8, messages_url, suffix)) return error.UnexpectedUrl;
@@ -1572,7 +1576,7 @@ pub fn getModelsList(
     // key's models over several, and the first alone drops the rest. A
     // single page comes back byte for byte; a continuation that fails keeps
     // the pages already read.
-    const first = try getModelsPage(allocator, http_client, url, auth, status);
+    const first = try getModelsPageWithin(allocator, http_client, url, auth, status, page_timeout_ms);
     var pages: std.ArrayList([]u8) = .empty;
     defer {
         for (pages.items) |page| allocator.free(page);
@@ -1588,7 +1592,7 @@ pub fn getModelsList(
         const next_url = try models_pages.continuationUrl(allocator, url, cursor);
         defer allocator.free(next_url);
         var page_status: u16 = 0;
-        const page = getModelsPage(allocator, http_client, next_url, auth, &page_status) catch break;
+        const page = getModelsPageWithin(allocator, http_client, next_url, auth, &page_status, page_timeout_ms) catch break;
         pages.append(allocator, page) catch {
             allocator.free(page);
             return error.OutOfMemory;
@@ -1600,6 +1604,22 @@ pub fn getModelsList(
         return only;
     }
     return models_pages.merge(allocator, pages.items);
+}
+
+fn getModelsPageWithin(
+    allocator: std.mem.Allocator,
+    http_client: *http.Client,
+    url: []const u8,
+    auth: ModelsAuth,
+    status: *u16,
+    limit_ms: u32,
+) ![]u8 {
+    return deadline_race.run(http_client.io, limit_ms, getModelsPage, .{ allocator, http_client, url, auth, status }, discardLatePage) catch |err| return err;
+}
+
+fn discardLatePage(args: deadline_race.Args(getModelsPage), late: deadline_race.Answer(getModelsPage)) void {
+    const page = late catch return;
+    args[0].free(page);
 }
 
 /// One GET of a `/v1/models` page at `url`.

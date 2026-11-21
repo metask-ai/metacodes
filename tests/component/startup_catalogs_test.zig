@@ -9,8 +9,8 @@
 //!     outright when only an API key could be sent to the account endpoint,
 //!     and is fetched with the login token (or with the API key from a named
 //!     `METACODE_API_KEYS_URL`) when there is one;
-//!   - with the REPL's `models_cache`, a cold start fetches `/v1/models` before
-//!     init returns, exactly as without the cache, and stores it; a warm start
+//!   - with the REPL's `models_cache`, a cold start fetches `/v1/models` and
+//!     waits for it at most the startup wait, and stores it; a warm start
 //!     sends nothing before init returns, answers from the stored copy, and a
 //!     background refresh that the REPL adopts updates both the catalog and
 //!     the copy; an expired copy is a cold start; an answer for a credential
@@ -154,6 +154,24 @@ fn hasHeader(srv: *harness.MockServer, index: usize, line: []const u8) bool {
 }
 
 /// Wait for the background refresh to settle (it talks to a local mock).
+fn waitTaken(app: *cc.app_module.App, comptime taken: fn (*cc.app_module.App) bool) !void {
+    var waited_ms: u32 = 0;
+    while (!taken(app)) : (waited_ms += 5) {
+        if (waited_ms > 20_000) return error.WaitTimedOut;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+}
+
+fn loadApiKeyCatalog(app: *cc.app_module.App) !void {
+    app.ensureApiKeyCatalog();
+    try waitTaken(app, cc.app_module.App.takeApiKeyCatalog);
+}
+
+fn pickApiKey(app: *cc.app_module.App, index: usize) !void {
+    try app.selectApiKeyForModels(index);
+    try waitTaken(app, cc.app_module.App.takeModelsRefresh);
+}
+
 fn waitRefresh(app: *cc.app_module.App) !void {
     const refresh = app.models_refresh orelse return error.NoRefresh;
     var waited_ms: u32 = 0;
@@ -182,7 +200,7 @@ test "L2 startup: init asks only for /v1/models; a plain API key never reaches t
 
     // The key menu needs the list: no login token, no named endpoint → no request,
     // and the key in use is the one entry.
-    app.ensureApiKeyCatalog();
+    try loadApiKeyCatalog(app);
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
     try std.testing.expectEqual(@as(usize, 1), app.api_key_catalog.entries.items.len);
     try std.testing.expectEqualStrings("Current API key", app.api_key_catalog.entries.items[0].label);
@@ -207,7 +225,7 @@ test "L2 startup: a named key endpoint gets the API key when the key menu first 
     defer app.deinit();
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
 
-    app.ensureApiKeyCatalog();
+    try loadApiKeyCatalog(app);
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     try std.testing.expect(std.mem.startsWith(u8, requestLine(srv, 1), "GET /api/v1/keys?page=1&page_size=100 "));
     try std.testing.expect(hasHeader(srv, 1, "authorization: Bearer test-key"));
@@ -237,7 +255,7 @@ test "L2 startup: a stored login token lists the account's keys, still only when
     defer app.deinit();
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
 
-    app.ensureApiKeyCatalog();
+    try loadApiKeyCatalog(app);
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     try std.testing.expect(std.mem.startsWith(u8, requestLine(srv, 1), "GET /api/v1/keys?page=1&page_size=100 "));
     try std.testing.expect(hasHeader(srv, 1, "authorization: Bearer login-token-l2"));
@@ -341,8 +359,8 @@ test "L2 startup: a refresh for a key the session has since left is dropped" {
     defer app.deinit();
     try waitRefresh(app);
     // `/models`: pick the Dev key; its own probe answers C.
-    app.ensureApiKeyCatalog();
-    try app.selectApiKeyForModels(1);
+    try loadApiKeyCatalog(app);
+    try pickApiKey(app, 1);
     try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
     try std.testing.expect(hasHeader(srv, 2, "authorization: Bearer sk-dev-2222"));
     try std.testing.expectEqual(@as(u32, 33333), app.api_client.resolveMaxTokens());

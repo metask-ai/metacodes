@@ -224,6 +224,24 @@ fn sentBearer(server: *harness.MockServer, index: usize, secret: []const u8) boo
 }
 
 /// Send one turn on whatever route the session is on now.
+fn waitTaken(app: *cc.app_module.App, comptime taken: fn (*cc.app_module.App) bool) !void {
+    var waited_ms: u32 = 0;
+    while (!taken(app)) : (waited_ms += 5) {
+        if (waited_ms > 20_000) return error.WaitTimedOut;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+}
+
+fn loadApiKeyCatalog(app: *cc.app_module.App) !void {
+    app.ensureApiKeyCatalog();
+    try waitTaken(app, cc.app_module.App.takeApiKeyCatalog);
+}
+
+fn pickApiKey(app: *cc.app_module.App, index: usize) !void {
+    try app.selectApiKeyForModels(index);
+    try waitTaken(app, cc.app_module.App.takeModelsRefresh);
+}
+
 fn sendOneTurn(app: *App) !void {
     const messages = [_]cc.types_mod.ApiMessage{
         .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
@@ -1033,7 +1051,7 @@ test "L2 credential scope: the account's key list is asked for only on the Metas
     const metask_offer = try offerIdText(app, "metask", "glm-5.3-flash", null);
     try std.testing.expect(cc.repl_picker_host.useSelector(app, &metask_offer) == .switched);
     try std.testing.expect(app.onMetaskKeyRoute());
-    app.ensureApiKeyCatalog();
+    try loadApiKeyCatalog(app);
     try std.testing.expectEqual(@as(usize, 2), gateway.requestCount());
     try std.testing.expect(std.mem.startsWith(u8, requestLine(gateway.requestAt(1).?), "GET /api/v1/keys?"));
     try std.testing.expect(sentBearer(gateway, 1, LOGIN_TOKEN));
@@ -1112,14 +1130,14 @@ test "L2 credential scope: the key list follows the session onto another Metask 
 
     // Still a Metask gateway, with a Metask key: the list and a pick work.
     try std.testing.expect(app.onMetaskKeyRoute());
-    app.ensureApiKeyCatalog();
+    try loadApiKeyCatalog(app);
     try std.testing.expect(std.mem.startsWith(u8, requestLine(other.requestAt(0) orelse return error.NoKeyList), "GET /api/v1/keys?"));
     try std.testing.expect(sentBearer(other, 0, LOGIN_TOKEN));
     var prod: ?usize = null;
     for (app.api_key_catalog.entries.items, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.secret, KEY_PROD)) prod = index;
     }
-    try app.selectApiKeyForModels(prod orelse return error.NoProdKey);
+    try pickApiKey(app, prod orelse return error.NoProdKey);
     try std.testing.expect(sentBearer(other, 1, KEY_PROD));
 }
 
@@ -1146,23 +1164,23 @@ test "L2 credential scope: a key picked in /models stays on the Metask route" {
     const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
     defer app.deinit();
 
-    app.ensureApiKeyCatalog();
+    try loadApiKeyCatalog(app);
     var prod: ?usize = null;
     var dev: ?usize = null;
     for (app.api_key_catalog.entries.items, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.secret, KEY_PROD)) prod = index;
         if (std.mem.eql(u8, entry.secret, KEY_DEV)) dev = index;
     }
-    try app.selectApiKeyForModels(dev.?);
+    try pickApiKey(app, dev.?);
     try std.testing.expect(sentBearer(gateway, 2, KEY_DEV));
-    try app.selectApiKeyForModels(prod.?);
+    try pickApiKey(app, prod.?);
     try std.testing.expect(sentBearer(gateway, 3, KEY_PROD));
     // The key it replaced is retired, not freed: a client may still be
     // reading it.
     const retired = app.retired_api_key orelse return error.PreviousKeyNotRetired;
     try std.testing.expectEqualStrings(KEY_DEV, retired);
     // A third pick retires prod and frees dev, retired two picks ago.
-    try app.selectApiKeyForModels(dev.?);
+    try pickApiKey(app, dev.?);
     try std.testing.expect(sentBearer(gateway, 4, KEY_DEV));
     try std.testing.expectEqualStrings(KEY_PROD, app.retired_api_key orelse return error.PreviousKeyNotRetired);
 
