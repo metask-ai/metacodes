@@ -278,7 +278,6 @@ def release_fixture(root, version="9.9.9", corrupt=False):
     return http, digest
 
 
-@unittest.skipUnless(POSIX, "fake executables are POSIX shell scripts")
 class NodeProtocolTest(unittest.TestCase):
     def test_a_node_from_before_run_features_is_refused(self):
         relay = executors.SshExecutor(name="relay", host="relay.invalid")
@@ -290,6 +289,7 @@ class NodeProtocolTest(unittest.TestCase):
         self.assertIsNone(executors.node_problem(relay, {"node": {"protocol": node_protocol.PROTOCOL}}))
 
 
+@unittest.skipUnless(POSIX, "fake executables are POSIX shell scripts")
 class SetupFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
