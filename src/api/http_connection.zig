@@ -99,8 +99,10 @@ pub fn receiveHead(request: *Request, redirect_buffer: []u8) Request.ReceiveHead
 
 pub fn bodyReader(response: *const Response, transfer_buffer: []u8) *std.Io.Reader {
     const request = response.request;
-    if (!request.method.responseHasBody() or !http_status.answerHasBody(&response.head)) return std.Io.Reader.ending;
-    return request.reader.bodyReader(transfer_buffer, response.head.transfer_encoding, response.head.content_length);
+    const head = &response.head;
+    if (!request.method.responseHasBody() or !http_status.answerHasBody(head))
+        return request.reader.bodyReader(transfer_buffer, .none, 0);
+    return request.reader.bodyReader(transfer_buffer, head.transfer_encoding, head.content_length);
 }
 
 /// Make a request say `connection: keep-alive` while its `keep_alive = false`

@@ -334,6 +334,52 @@ test "L2 #579: a 304 that names a content-length, and the answer to a HEAD, read
     try server.expectClientClosed(0);
 }
 
+fn answerNoContentOrHead(request: []const u8) Answer {
+    if (std.mem.startsWith(u8, request, "HEAD ")) return .{ .bytes = HEAD_ANSWER_WITH_LENGTH };
+    return .{ .bytes = NO_CONTENT };
+}
+
+test "L2 #579: each body-less answer is read through a reader of its own, never std's shared read-only ending reader" {
+    const a = std.testing.allocator;
+    var server = try HeldServer.start(answerNoContentOrHead);
+    defer server.stop();
+    var io_runtime = platform.signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = io_runtime.io() };
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(server.url(&url_buf, "/no-content"));
+    var redirect: [1024]u8 = undefined;
+    var transfer: [3][256]u8 = undefined;
+
+    var first = try client.request(.GET, uri, .{ .redirect_behavior = .unhandled });
+    defer first.deinit();
+    try http_connection.sendBodiless(&first);
+    const first_response = try http_connection.receiveHead(&first, &redirect);
+    const first_reader = http_connection.bodyReader(&first_response, &transfer[0]);
+
+    var second = try client.request(.GET, uri, .{ .redirect_behavior = .unhandled });
+    defer second.deinit();
+    try http_connection.sendBodiless(&second);
+    const second_response = try http_connection.receiveHead(&second, &redirect);
+    const second_reader = http_connection.bodyReader(&second_response, &transfer[1]);
+
+    var head = try client.request(.HEAD, uri, .{ .redirect_behavior = .unhandled });
+    defer head.deinit();
+    try http_connection.sendBodiless(&head);
+    const head_response = try http_connection.receiveHead(&head, &redirect);
+    const head_reader = http_connection.bodyReader(&head_response, &transfer[2]);
+
+    for ([_]*std.Io.Reader{ first_reader, second_reader, head_reader }) |reader| {
+        try std.testing.expect(reader != std.Io.Reader.ending);
+    }
+    try std.testing.expect(first_reader != second_reader);
+    try std.testing.expectEqual(@as(usize, 0), try first_reader.discardRemaining());
+    var dest: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try second_reader.readSliceShort(&dest));
+    try std.testing.expectEqual(@as(usize, 0), try head_reader.discardRemaining());
+}
+
 test "L2 #579 control: without http_connection, std reads a 204 to the end of the connection and deinit drains one" {
     const a = std.testing.allocator;
     var server = try HeldServer.startHolding(answerNoContent, CONTROL_HOLD_MS);
