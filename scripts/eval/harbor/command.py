@@ -51,6 +51,25 @@ DEFAULT_DISALLOWED_TOOLS = (
 # `metacodes --reasoning-effort` accepts exactly these (src/core/types.zig).
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
+ADVANCED_FEATURES = {
+    "verification_final_gate": {"group": "formal", "flag": "--verification-final-gate",
+                                "label": "结束前验证义务（VerificationGate）"},
+    "requirement_ledger": {"group": "formal", "flag": "--requirement-ledger",
+                           "label": "需求台账闭合（RequirementLedger）"},
+    "test_integrity": {"group": "formal", "flag": "--test-integrity",
+                       "label": "测试完整性（TestIntegrity）"},
+    "delivery_cadence": {"group": "formal", "flag": "--delivery-cadence",
+                         "label": "交付节奏提醒（DeliveryCadence）"},
+    "stall_gate": {"group": "formal", "flag": "--stall-gate",
+                   "label": "停滞门（StallGate）"},
+    "execute_code": {"group": "preview", "flag": "--preview=execute_code",
+                     "label": "ExecuteCode JavaScript 工具编排"},
+    "comment_guard": {"group": "preview", "flag": "--preview=comment_guard",
+                      "label": "不写注释约束与编辑检查"},
+    "harnessmm": {"group": "preview", "flag": "--harnessmm",
+                  "label": "HarnessMM 决策复用与回调证书"},
+}
+
 # A trial must not reach a TinyKG store outside its own container: these
 # would point metacodes at a shared or remote store.
 REMOTE_TINYKG_ENV = (
@@ -181,6 +200,7 @@ def metacodes_flags(
     disallowed_tools: str,
     reasoning_effort: Optional[str],
     max_tokens: Optional[int],
+    features: Iterable[str] = (),
 ) -> List[str]:
     """The metacodes arguments for one headless trial, unquoted."""
 
@@ -200,6 +220,12 @@ def metacodes_flags(
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         flags += ["--max-tokens", str(max_tokens)]
+    for feature in features:
+        if feature not in ADVANCED_FEATURES:
+            raise ValueError(
+                "unknown feature " + repr(feature) + "; known: " + ",".join(ADVANCED_FEATURES)
+            )
+        flags.append(ADVANCED_FEATURES[feature]["flag"])
     return flags
 
 
