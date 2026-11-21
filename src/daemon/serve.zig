@@ -69,12 +69,12 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mo
 
     // ── transport(复用 WebServer,绑本 session)──────────────────────────────
     // U11(原 U10-C 待补项/task#22):rich /state + /command 都经 web_session.StateSource
-    // ——与 --web 完全同一份(seq/roster/config 快照;命令 HTTP 线程只入 host.cmdbox,
+    // ——与 --web 完全同一份(seq/roster/config 快照;命令 HTTP 线程只入 host.inbox,
     // driver 独占执行)。
     var state_src = web_session.StateSource{
         .app = app,
         .wb = &wb,
-        .cmdbox = &host.cmdbox,
+        .inbox = &host.inbox,
         .journal = &host.journal,
         .generating = &host.generating,
     };

@@ -82,13 +82,13 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
     var lead_mail = @import("../session_service.zig").LeadMail{};
 
     while (!host.stopRequested()) {
-        // U11:斜杠命令(host.cmdbox,transport 只入队)在 driver 独占点执行——与 web run()
+        // U11:斜杠命令(host.inbox,transport 只入队)在 driver 独占点执行——与 web run()
         // 同一 execCommand(execLine canonical 命令面)。带 run 计划的命令(/commit /review
         // /init /retry;append 已在 service 内完成)→ 本轮直接跑 agent_loop,不等 inbox;
         // 这一批命令全部跑完才 beginPlannedRun(Run 的行连续,见 web_session.CommandBatch)。
         var batch: web_session.CommandBatch = .{};
         defer batch.deinit(infra);
-        while (host.cmdbox.popFront()) |c| {
+        while (host.inbox.popCommand()) |c| {
             defer infra.free(c);
             // 命令执行期也亮 generating(对齐 web run):`!cmd` 可长时间阻塞,不亮则
             // /interrupt 被 409 门挡死——daemon session 没有终端 SIGINT 兜底,必须能中断。
