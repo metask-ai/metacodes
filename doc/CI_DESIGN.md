@@ -503,8 +503,11 @@ GitHub's 24 hours. Each reads its platform's plan, watch and hosted legs:
 | `self-hosted` | the watch reports the pool job succeeded; after a fallback, the hosted legs succeeded |
 | `both` | the hosted legs succeeded, and the pool job succeeded or no VM took it |
 
-A pool job that fails (a test, or its VM) is a failure, not a fallback;
-rerunning the run decides again. Costs: the plan adds a few seconds before
+A pool job that fails (a test, or its VM) is a failure, not a fallback, and
+its watch fails with it after writing its outputs, so `gh run rerun --failed`
+reruns the pool job, the watch and the jobs that need it, and the gate decides
+on the new pool job instead of the old `vm_result`; a watch that falls back
+succeeds. Costs: the plan adds a few seconds before
 the macOS and Windows gates; a run on a pool keeps an ubuntu watch job beside
 it; a fallback after dispatch costs the pickup timeout; on the nightly `both`
 run the hosted legs start after the pool job ends, since they wait for the

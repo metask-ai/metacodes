@@ -329,17 +329,29 @@ class CommandTest(unittest.TestCase):
                        "--github-output", str(self.output)], api, now=lambda: next(clock), sleep=lambda _: None)
         self.assertEqual(self.outputs(), {"fallback": "false", "vm_result": "success"})
 
+    def test_watch_fails_with_the_pool_job_so_rerun_failed_reruns_it(self) -> None:
+        for conclusion in ("success", "failure", "cancelled", None):
+            with self.subTest(conclusion=conclusion):
+                api = FakeAPI({ATTEMPT_JOBS: [{"jobs": [job("completed", name=MACOS.pool_job,
+                                                            conclusion=conclusion)]}]})
+                code = self.run_main(["watch", "--platform", "macos", "--pickup-timeout-minutes", "5",
+                                      "--github-output", str(self.output)], api, now=lambda: NOW,
+                                     sleep=lambda _: None)
+                self.assertEqual(code, 0 if conclusion == "success" else 1)
+                self.assertEqual(self.outputs(), {"fallback": "false", "vm_result": conclusion or "failure"})
+                self.output.unlink()
+
     def test_watch_hands_over_when_no_vm_comes_or_github_cannot_be_read(self) -> None:
         clock = iter(NOW + 60 * i for i in range(100))
-        self.run_main(["watch", "--platform", "macos", "--pickup-timeout-minutes", "5", "--github-output",
-                       str(self.output)], FakeAPI({ATTEMPT_JOBS: [{"jobs": [job("queued", created=NOW)]}]}),
-                      now=lambda: next(clock), sleep=lambda _: None)
-        self.assertEqual(self.outputs()["fallback"], "true")
+        code = self.run_main(["watch", "--platform", "macos", "--pickup-timeout-minutes", "5", "--github-output",
+                              str(self.output)], FakeAPI({ATTEMPT_JOBS: [{"jobs": [job("queued", created=NOW)]}]}),
+                             now=lambda: next(clock), sleep=lambda _: None)
+        self.assertEqual((code, self.outputs()["fallback"]), (0, "true"))
         self.output.unlink()
-        self.run_main(["watch", "--platform", "macos", "--pickup-timeout-minutes", "5", "--github-output",
-                       str(self.output)], FakeAPI({ATTEMPT_JOBS: [OSError("timeout")]}), now=lambda: NOW,
-                      sleep=lambda _: None)
-        self.assertEqual(self.outputs()["fallback"], "true")
+        code = self.run_main(["watch", "--platform", "macos", "--pickup-timeout-minutes", "5", "--github-output",
+                              str(self.output)], FakeAPI({ATTEMPT_JOBS: [OSError("timeout")]}), now=lambda: NOW,
+                             sleep=lambda _: None)
+        self.assertEqual((code, self.outputs()["fallback"]), (0, "true"))
 
     def test_stand_down_sets_fast_path(self) -> None:
         for platform in plan.PLATFORMS.values():
