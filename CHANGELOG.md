@@ -76,6 +76,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The TTY relogin revocation cases replay the screen with line wrap**
+  (#673). The `/login` dialog shows a sign-in URL wider than the terminal and
+  climbs over the rows a real terminal wraps it into; the cases replayed the
+  output on a screen that cuts long lines instead, so each redraw seemed to
+  climb two rows too far and erased the sign-in lines above the dialog. When
+  the dialog redrew twice with the URL up, that reached the HTTP 500 notice
+  and the case failed. Both relogin cases now replay with wrap, and the
+  refused/unanswered case checks the whole sign-in transcript in order.
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a
