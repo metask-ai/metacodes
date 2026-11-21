@@ -67,6 +67,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
+  a draft whose cursor was not at its end, Ctrl+D went past the picker and
+  deleted the character under the cursor, at the prompt and in the box under a
+  reply. Now it does nothing while the draft has text; on an empty prompt it
+  still counts toward the double-press exit, so the picker never traps the
+  session.
+
+- **A paste with the `/model` picker open goes to its filter** (#650). At the
+  prompt the pasted text landed in the draft under the picker; during a reply
+  it reached the picker key by key, so a newline in it was Enter and applied
+  the model under the cursor, moving the bill to that provider. Now, at the
+  prompt and during a reply, the text up to the paste's first line break is
+  added to the filter as one edit, control characters dropped; the draft is
+  untouched and a paste never applies a model.
+
 - **Shift+Tab cycles the permission mode in terminals that report modified
   keys.** iTerm2 3.7.7 and later, Ghostty, kitty, Alacritty and tmux with
   `extended-keys` send Shift+Tab as the kitty protocol's `ESC [ 9 ; 2 u` or
@@ -90,8 +105,8 @@ status, compatibility boundaries, and entry points are defined by
   under a picker that stayed open, and a second Ctrl+C left metacodes. Now
   the first Ctrl+C at the prompt closes the picker whatever it shows, as Esc
   does on an empty filter (`kept …`), and the draft stays; the next Ctrl+C
-  arms the exit as before. During a reply Ctrl+C still interrupts it, and
-  Ctrl+D is unchanged.
+  arms the exit as before. During a reply Ctrl+C still interrupts it. Ctrl+D
+  leaves a non-empty draft alone, as described above.
 
 ### Fixed
 

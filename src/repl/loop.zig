@@ -1496,10 +1496,9 @@ fn readLineBuffered(allocator: std.mem.Allocator, fd: c_int) ![]u8 {
 }
 
 /// 处理一次括号粘贴：从 paste_begin 之后读到 paste_end，累积原始文本。
-/// 小粘贴内联插入；大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
 fn handlePaste(
     fd: c_int,
-    editor: *input.LineEditor,
+    target: PasteTarget,
     parser: *input.KeyParser,
     allocator: std.mem.Allocator,
     state_root: []const u8,
@@ -1523,22 +1522,34 @@ fn handlePaste(
         var k: ?input.Key = key;
         var done = false;
         while (k) |kk| {
-            switch (kk) {
-                .paste_end => {
-                    done = true;
-                    break;
-                },
-                .char => |c| try pasted.append(allocator, c),
-                .enter => try pasted.append(allocator, '\n'),
-                .tab => try pasted.append(allocator, '\t'),
-                else => {}, // 粘贴里的其它控制序列忽略
+            if (kk == .paste_end) {
+                done = true;
+                break;
             }
+            if (input.pastedByte(kk)) |byte| try pasted.append(allocator, byte);
             k = parser.drain();
         }
         if (done) break;
     }
 
-    try insertPaste(editor, allocator, state_root, pasted.items);
+    try routePaste(target, allocator, state_root, pasted.items);
+}
+
+const PasteTarget = union(enum) {
+    editor: *input.LineEditor,
+    picker: struct { app: *app_mod.App, region: *render_region_mod.RenderRegion },
+};
+
+fn pasteTarget(app: *app_mod.App, region: *render_region_mod.RenderRegion, editor: *input.LineEditor) PasteTarget {
+    if (region.pickerOpen()) return .{ .picker = .{ .app = app, .region = region } };
+    return .{ .editor = editor };
+}
+
+fn routePaste(target: PasteTarget, allocator: std.mem.Allocator, state_root: []const u8, text: []const u8) !void {
+    switch (target) {
+        .editor => |editor| try insertPaste(editor, allocator, state_root, text),
+        .picker => |p| picker_host.onPaste(p.app, &p.region.ui, text, .of(p.region)),
+    }
 }
 
 /// 插入一段粘贴的文字:小粘贴内联;大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
@@ -2044,7 +2055,7 @@ fn readLineRaw(
 
         // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
         if (key == .paste_begin) {
-            try handlePaste(fd, &editor, &parser, allocator, app.stateRoot());
+            try handlePaste(fd, pasteTarget(app, region, &editor), &parser, allocator, app.stateRoot());
             redraw(region, &editor, app);
             continue;
         }
@@ -2602,6 +2613,26 @@ test "/login: the model choice replaces an older key in auth.json, and a copy th
     // Every allocation fails in turn; the testing allocator reports a double
     // free or a leak in any of them.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "a paste at the prompt goes to an open /model picker, and to the draft once it closes (#650)" {
+    const a = std.testing.allocator;
+    var region = render_region_mod.RenderRegion.init(a, 2, tui_theme.monochrome, .none);
+    defer region.deinit();
+    region.beginInput(.builtin);
+    var editor = input.LineEditor.init(a);
+    defer editor.deinit();
+    try editor.setLine("draft");
+    const app: *app_mod.App = undefined;
+
+    region.ui.interaction().?.picker_open = true;
+    try std.testing.expect(pasteTarget(app, &region, &editor) == .picker);
+
+    region.ui.interaction().?.picker_open = false;
+    const target = pasteTarget(app, &region, &editor);
+    try std.testing.expect(target == .editor);
+    try routePaste(target, a, "", "zai");
+    try std.testing.expectEqualStrings("draftzai", editor.view());
 }
 
 test "insertStartupText: memory running out drops the startup text with a notice, and the prompt comes up" {

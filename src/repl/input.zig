@@ -63,6 +63,15 @@ pub const Key = union(enum) {
     unknown,
 };
 
+pub fn pastedByte(key: Key) ?u8 {
+    return switch (key) {
+        .char => |c| c,
+        .enter => '\n',
+        .tab => '\t',
+        else => null,
+    };
+}
+
 /// 按字节喂的 CSI 状态机解析器（见 M4.1 spike）。
 ///
 /// 支持的 CSI 序列：
