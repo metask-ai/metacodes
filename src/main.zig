@@ -32,7 +32,8 @@ pub const app_sign_out = @import("app/sign_out.zig"); // pub: component tests si
 const sign_out_mod = app_sign_out;
 const app_startup_order = @import("app/startup_order.zig");
 const startup_order = app_startup_order;
-const presets_mod = @import("app/presets.zig");
+pub const app_presets = @import("app/presets.zig");
+const presets_mod = app_presets;
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
@@ -1015,6 +1016,28 @@ fn providerIsMetask(allocator: std.mem.Allocator, name: []const u8) bool {
     return profile.id.eqlText("metask");
 }
 
+fn shadowedLocalNotice(arena: std.mem.Allocator, local: presets_mod.LocalRoute) ?[]const u8 {
+    switch (local) {
+        .provider => |chosen| {
+            if (providerIsMetask(arena, chosen.name)) return null;
+            const name = providerDisplayName(arena, chosen.name);
+            return std.fmt.allocPrint(arena, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
+        },
+        .preset => |preset| {
+            const route_label: []const u8 = label: {
+                const host = buildProviderHost(arena) orelse break :label "";
+                defer host.destroy();
+                const resolved = (presets_mod.resolveLocal(arena, &host.registry, local) catch null) orelse break :label "";
+                const route = resolved.route;
+                if (route.provider_id.eqlText("metask")) return null;
+                const provider_name = if (host.registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
+                break :label std.fmt.allocPrint(arena, " ({s} · {s})", .{ provider_name, route.request_model_id }) catch "";
+            };
+            return std.fmt.allocPrint(arena, ".env configures the preset {s}{s}; the default is Metask. To use it: /model, or /logout", .{ preset.name, route_label }) catch null;
+        },
+    }
+}
+
 /// `METASK_API_KEY` in `<state root>/.env`, for the historical path: it
 /// counts as the environment variable only while the file names no provider
 /// other than Metask (#486). A file that says METACODES_PROVIDER=deepseek
@@ -1758,18 +1781,14 @@ pub fn main(init: std.process.Init) !void {
         if (subscriptionPlanName(allocator, config.resolved_provider_id orelse config.provider_profile.?)) |plan|
             std.debug.print("warning: {s} is a subscription plan for interactive use; its terms may not cover -p, serve or CI. Use a pay-as-you-go key for automation.\n", .{plan});
     }
-    // 第七节第 3 条 (#485): `.env` configures a provider, yet the start is on
-    // Metask, which ranks above it (a sign-in or a stored default). Said once
-    // under the TUI's banner, with the two ways to the file's provider.
+    const local_route = presets_mod.localRoute(&preset_facts, local_choice, local_config.get(state_env_mod.model_variable));
+    // 第七节第 3 条 (#485): `.env` configures a preset or a provider (#489),
+    // yet the start is on Metask, which ranks above it (a sign-in or a stored
+    // default). Said once under the TUI's banner, with the two ways to the
+    // file's route.
     const shadowed_local_notice: ?[]const u8 = shadowed: {
         if (!interactive_tui or named_at_start or unbound != null or credential_origin != .metask) break :shadowed null;
-        const chosen = switch (local_choice) {
-            .provider => |value| value,
-            else => break :shadowed null,
-        };
-        if (providerIsMetask(allocator, chosen.name)) break :shadowed null;
-        const name = providerDisplayName(allocator, chosen.name);
-        break :shadowed std.fmt.allocPrint(allocator, ".env configures {s}; the default is Metask. To use {s}: /model, or /logout", .{ name, name }) catch null;
+        break :shadowed shadowedLocalNotice(allocator, local_route orelse break :shadowed null);
     };
     // `.env` holds keys of several providers and names none, and nothing
     // above it decided (#486): the TUI opens without a model, as with nothing
@@ -1809,12 +1828,10 @@ pub fn main(init: std.process.Init) !void {
             .several => |ids| ids,
             else => unchosen_local_providers,
         },
-        // What `/logout` falls back to (#485): the provider `.env`
-        // configures, whatever this start was decided by.
-        .local_provider = switch (local_choice) {
-            .provider => |chosen| .{ .name = chosen.name, .model = local_config.get(state_env_mod.model_variable) },
-            else => null,
-        },
+        // What `/logout` falls back to (#485): the route `.env` configures,
+        // its preset before its provider (#489), whatever this start was
+        // decided by.
+        .local_route = local_route,
         .startup_notice = startup_notice,
     };
     if (interactive_tui) {
