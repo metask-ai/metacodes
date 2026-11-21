@@ -76,6 +76,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A stalled HTTP MCP server no longer holds `/exit` or the first message**
+  (#671). The session DELETE a Streamable HTTP client sends at close now has
+  1 s and goes through the abort registry, so a server that never answers it
+  delays the exit by about that much instead of forever. Connecting (DNS, TCP,
+  TLS) now races the startup timeout and the interrupt: an `https://` server
+  that accepts TCP and stalls the TLS handshake fails at its startup timeout,
+  and leaving while it connects returns at once.
+- **The final OTLP flush at exit is bounded** (#672). The last flush, an
+  export already in flight included, gets at most 1 s (or the export timeout
+  when it is shorter) instead of `OTEL_EXPORTER_OTLP_TIMEOUT` (10 s by
+  default); spans it cuts off are dropped and counted. Exports during the
+  session keep the configured timeout.
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a
