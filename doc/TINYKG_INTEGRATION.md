@@ -283,6 +283,20 @@ state appears in the startup line, `/kg`, and `metacodes doctor`, whose `kg`
 object names the configuration source (`METACODES_KG_CONFIG`, `env` for the
 `METACODES_KG_*` triple, or the default `daemon.json` path).
 
+The interactive REPL does not wait for TinyKG before its prompt (#667). The
+readiness probe, the startup summary and the task mirror run on a worker
+thread while the input box is up, and the REPL adopts their outcome at its
+first request, together with the MCP join: a message sent earlier waits on the
+spinner (`Starting TinyKG`; Esc stops the wait and nothing is sent). The
+summary and the system prompt are therefore built from the settled outcome,
+never from how quickly the service answered. Until then the startup line
+leaves the KG state out and `/kg` says that TinyKG is still starting. Every
+other frontend probes in `App.init` as before. A read sent to the service gives
+way to the session's abort signal instead of waiting out the 35 s transport
+deadline (writes keep the full deadline, so their commit state stays known),
+so leaving the REPL, or Esc during the recall before a turn, does not wait on
+a service that accepts and never answers.
+
 ### Autostart
 
 A CLI session needs no `metacodes kgd`. When its readiness probe finds the

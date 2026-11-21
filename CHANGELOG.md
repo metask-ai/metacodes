@@ -86,6 +86,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A TinyKG service that does not answer no longer holds the prompt**
+  (#667). The interactive REPL probed TinyKG, built its summary and mirrored
+  its tasks before drawing the input box, so a service that accepted the
+  connection and never answered cost every start the transport's 35 s
+  deadline. That work now runs in the background and the REPL adopts its
+  outcome before the first request (the spinner reads `Starting TinyKG`; Esc
+  stops the wait), so what the model sees does not depend on the timing.
+  TinyKG reads give way to the session's abort signal, so leaving the REPL or
+  pressing Esc during the recall before a turn no longer waits out the
+  deadline.
+
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a

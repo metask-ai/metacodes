@@ -3999,7 +3999,7 @@ def observe_daemon_transport(repo: Path) -> Observation:
         )),
         "request_identity_and_no_write_retry": all(marker in policy + parse + sources["runtime"] for marker in (
             "max_attempts: u8 = if (mutates) 1 else 2",
-            "self.postBeforeDeadline(url, body, request_id, remaining_ms)",
+            "self.postBeforeDeadline(url, body, request_id, remaining_ms, abort)",
             "RequestIdConflict", '"conflict=observed"', "write_transport_retries=0",
         )),
         "ambiguous_write_outcome": all(marker in policy + sources["transport"] + sources["probe"] + sources["runtime"] for marker in (
