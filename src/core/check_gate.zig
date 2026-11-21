@@ -198,10 +198,11 @@ pub const State = struct {
             if (delivery_cadence.classify(allocator, slot.name, slot.input) != .mutation) continue;
             // No realized change on record. A file tool reports every change
             // it makes, so a failed one changed nothing (a Write refused for
-            // an unread file must not re-run the same check). Bash cannot
-            // report what it touched, and a failing command may still have
-            // written files, so it stays dirty either way; so does any other
-            // delivery-capable tool that succeeded.
+            // an unread file must not re-run the same check). Bash's records
+            // cover only what its workspace observation can see (not ignored
+            // files, not paths outside the root), and a failing command may
+            // still have written there, so it stays dirty either way; so does
+            // any other delivery-capable tool that succeeded.
             if (slot.is_error and !std.mem.eql(u8, slot.name, "Bash")) continue;
             self.dirty = true;
         }

@@ -155,7 +155,7 @@ pub const Client = struct {
 
         http_connection.sendBodyComplete(&request, @constCast(json)) catch return self.transportError(abort, &request);
         var redirect: [4096]u8 = undefined;
-        var response = request.receiveHead(&redirect) catch return self.transportError(abort, &request);
+        const response = http_connection.receiveHead(&request, &redirect) catch return self.transportError(abort, &request);
         const status = http_status.ResponseStatus.capture(&response).code;
         self.last_http_status = status;
         const content_type = response.head.content_type orelse "";
@@ -171,7 +171,7 @@ pub const Client = struct {
             }
         }
         var transfer: [16 * 1024]u8 = undefined;
-        const reader = response.reader(&transfer);
+        const reader = http_connection.bodyReader(&response, &transfer);
         const bytes = reader.allocRemaining(self.allocator, .limited(protocol.MAX_MESSAGE_BYTES)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.StreamTooLong => return error.ResponseTooLarge,

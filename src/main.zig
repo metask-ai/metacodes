@@ -222,6 +222,7 @@ pub const jev_client = @import("jev/client.zig");
 pub const jev_advisor = @import("jev/advisor.zig");
 pub const jev_runtime = @import("jev/runtime.zig");
 pub const jev_excerpt = @import("jev/excerpt.zig");
+pub const telemetry = @import("telemetry/telemetry.zig");
 pub const core_goal = @import("core/goal.zig");
 pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");

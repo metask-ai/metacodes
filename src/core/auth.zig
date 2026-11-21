@@ -893,10 +893,10 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
     defer req.deinit();
     http_connection.sendBodyComplete(&req, @constCast(form)) catch return error.OAuthTokenExchangeFailed;
     var redirect_buf: [4096]u8 = undefined;
-    const http_response = req.receiveHead(&redirect_buf) catch return error.OAuthTokenExchangeFailed;
+    const http_response = http_connection.receiveHead(&req, &redirect_buf) catch return error.OAuthTokenExchangeFailed;
     const status = ResponseStatus.capture(&http_response);
     var transfer_buf: [8192]u8 = undefined;
-    const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+    const body_reader = http_connection.bodyReader(&http_response, &transfer_buf);
     const response_body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(256 * 1024)) catch return error.OAuthTokenExchangeFailed;
     errdefer secureFree(allocator, response_body);
     if (!status.isOk()) {
@@ -1097,11 +1097,11 @@ fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredent
 
     http_connection.sendBodyComplete(&req, @constCast(body)) catch return error.OAuthRefreshFailed;
     var redirect_buf: [4096]u8 = undefined;
-    const http_response = req.receiveHead(&redirect_buf) catch return error.OAuthRefreshFailed;
+    const http_response = http_connection.receiveHead(&req, &redirect_buf) catch return error.OAuthRefreshFailed;
     const status = ResponseStatus.capture(&http_response);
 
     var transfer_buf: [8192]u8 = undefined;
-    const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+    const body_reader = http_connection.bodyReader(&http_response, &transfer_buf);
     const response_body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(256 * 1024)) catch return error.OAuthRefreshFailed;
     defer secureFree(allocator, response_body);
 

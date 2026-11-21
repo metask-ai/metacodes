@@ -217,7 +217,12 @@ pub const CoreEvent = union(enum) {
     },
 
     /// **文件修改结果**(见 core/file_change.zig)。**无条件发**(它是证据不是渲染,headless/
-    /// subagent/关工具卡时同样发),每个产生了文件修改的 slot 一条。
+    /// subagent/关工具卡时同样发),每个产生了文件修改的 slot 一条;报告不完整的 slot 即使
+    /// 一条记录也没有,也照发一条(`changes` 为空、`lost`/`overflow` 置位)。
+    ///
+    /// 来源:类型化文件工具(Write/Edit/NotebookEdit/ApplyPatch)逐文件自报;非只读的前台
+    /// `Bash` 由宿主在命令前后观测工作区得出(见 core/command_file_changes.zig),那是命令
+    /// 执行窗口内工作区发生的变化,同窗口的其他写者也会出现在里面。
     ///
     /// **时序**:本轮工具**全部执行完后一次性发**,早于本轮任何 `tool_result`——不是紧邻配对。
     /// 这是刻意的:挂起(UiPending)、host fatal、结果组装失败都可能发生在盘已经真的改过之后,
@@ -226,8 +231,9 @@ pub const CoreEvent = union(enum) {
     /// `changes` 是借用切片,emit 同步消费;跨线程留存须逐条 `Record.clone`。上层据此展示每个
     /// 文件的实际修改,不必解析 tool_result.content 里的工具私有 `gitDiff`。
     ///
-    /// `overflow`/`lost` 说明本次 dispatch 报告不完整(超单次上限 / 复制失败),消费者应显示
-    /// "不完整"而不是把少报当成少改。
+    /// `overflow`/`lost` 说明本次 dispatch 报告不完整(超单次上限 / 复制失败 / Bash 的观测
+    /// 没能覆盖这次调用:工作区过大、列举失败、命令转入后台仍在运行),消费者应显示"不完整"
+    /// 而不是把少报当成少改。
     file_changes: struct {
         id: []const u8,
         name: []const u8,

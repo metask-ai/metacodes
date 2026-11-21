@@ -90,80 +90,71 @@ pub const Hunk = struct {
     ops: []DiffLine,
 };
 
-/// 把连续的非 keep 变更合并成 hunk（带 CONTEXT_LINES 上下文）。
+/// 把变更合并成 unified-diff hunk:前后各带至多 CONTEXT_LINES 行上下文,两处变更之间
+/// 未变行数 ≤ 2×CONTEXT_LINES 时并进同一个 hunk(否则两个 hunk 的上下文会重叠)。
+///
+/// 每个 hunk 的头部行数严格等于正文里对应侧的行数——`git apply` 按头部计数读正文,
+/// 二者不一致就是一份坏补丁。某一侧行数为 0 时,起始行号按 unified-diff 约定写"其前
+/// 一行"(新建文件是 `-0,0`)。
 fn buildHunks(allocator: std.mem.Allocator, ops: []DiffLine) ![]Hunk {
     var hunks = std.ArrayList(Hunk).empty;
     errdefer hunks.deinit(allocator);
 
+    // ops[i] 处的 1-based 行号;每轮循环结束时与 i 同步。
     var old_ln: usize = 1;
     var new_ln: usize = 1;
-    var k: usize = 0;
-    while (k < ops.len) {
-        if (ops[k].op == .keep) {
+    var i: usize = 0;
+    var prev_end: usize = 0; // 上一个 hunk 的 ops 终点:前置上下文不得回退越过它
+    while (i < ops.len) {
+        if (ops[i].op == .keep) {
             old_ln += 1;
             new_ln += 1;
-            k += 1;
+            i += 1;
             continue;
         }
-        // 变更块起点：回退最多 CONTEXT_LINES 个 keep 作为前置上下文
-        var ctx_back: usize = 0;
-        var p = k;
-        while (p > 0 and ops[p - 1].op == .keep and ctx_back < CONTEXT_LINES) {
-            p -= 1;
-            ctx_back += 1;
-        }
-        const hunk_start = p;
-        const h_old_start = old_ln - ctx_back;
-        const h_new_start = new_ln - ctx_back;
+        const lead = @min(CONTEXT_LINES, i - prev_end);
+        const start = i - lead;
 
-        // 向后扫描直到出现 > CONTEXT_LINES 连续 keep 或结束
-        var q = k;
-        var trailing_keep: usize = 0;
-        var o_cnt: usize = ctx_back; // 已纳入的前置上下文都计入 old
-        var n_cnt: usize = ctx_back;
-        while (q < ops.len) {
-            const op = ops[q];
-            if (op.op == .keep) {
-                trailing_keep += 1;
-                o_cnt += 1;
-                n_cnt += 1;
-                if (trailing_keep > CONTEXT_LINES) break;
-            } else {
-                trailing_keep = 0;
-                if (op.op == .del) o_cnt += 1;
-                if (op.op == .add) n_cnt += 1;
-            }
-            q += 1;
+        // 吞并后续变更,直到一段未变行长到足以把下一处变更分成独立 hunk。
+        var last_change = i;
+        var j = i;
+        while (j < ops.len) : (j += 1) {
+            if (ops[j].op != .keep) {
+                last_change = j;
+            } else if (j - last_change > 2 * CONTEXT_LINES) break;
         }
-        // 去掉多扫的尾部 keep（保留至多 CONTEXT_LINES）
-        var hunk_end = q;
-        var extra = trailing_keep;
-        while (extra > CONTEXT_LINES) : (extra -= 1) {
-            hunk_end -= 1;
-            o_cnt -= 1;
-            n_cnt -= 1;
-        }
+        const end = @min(last_change + 1 + CONTEXT_LINES, ops.len);
 
+        var old_count: usize = 0;
+        var new_count: usize = 0;
+        for (ops[start..end]) |op| switch (op.op) {
+            .keep => {
+                old_count += 1;
+                new_count += 1;
+            },
+            .del => old_count += 1,
+            .add => new_count += 1,
+        };
+        const old_start = old_ln - lead;
+        const new_start = new_ln - lead;
         try hunks.append(allocator, .{
-            .old_start = h_old_start,
-            .old_lines = o_cnt,
-            .new_start = h_new_start,
-            .new_lines = n_cnt,
-            .ops = ops[hunk_start..hunk_end],
+            .old_start = if (old_count == 0) old_start - 1 else old_start,
+            .old_lines = old_count,
+            .new_start = if (new_count == 0) new_start - 1 else new_start,
+            .new_lines = new_count,
+            .ops = ops[start..end],
         });
 
-        // 推进行号到 hunk_end（按 hunk 内 op 统计）
-        for (ops[k..hunk_end]) |op| {
-            switch (op.op) {
-                .keep => {
-                    old_ln += 1;
-                    new_ln += 1;
-                },
-                .del => old_ln += 1,
-                .add => new_ln += 1,
-            }
-        }
-        k = hunk_end;
+        for (ops[i..end]) |op| switch (op.op) {
+            .keep => {
+                old_ln += 1;
+                new_ln += 1;
+            },
+            .del => old_ln += 1,
+            .add => new_ln += 1,
+        };
+        i = end;
+        prev_end = end;
     }
     return try hunks.toOwnedSlice(allocator);
 }
@@ -189,6 +180,39 @@ pub fn compute(allocator: std.mem.Allocator, old_text: []const u8, new_text: []c
     defer allocator.free(b);
     const ops = try diffLines(allocator, a, b);
     errdefer allocator.free(ops);
+    const hunks = try buildHunks(allocator, ops);
+    return .{ .ops = ops, .hunks = hunks };
+}
+
+/// `compute` for inputs whose size the caller does not control. The LCS table
+/// is O(n·m) cells, so a one-line change in a 3 000-line file costs 9 M cells
+/// (72 MiB) there. Here the common leading and trailing lines are matched
+/// directly and only the differing middle builds a table; null means that
+/// middle alone would still exceed `max_cells`. The result has the same shape
+/// and line numbering as `compute`'s; where several minimal diffs exist it may
+/// pick a different one.
+pub fn computeBounded(allocator: std.mem.Allocator, old_text: []const u8, new_text: []const u8, max_cells: usize) !?Patch {
+    const a = try splitLines(allocator, old_text);
+    defer allocator.free(a);
+    const b = try splitLines(allocator, new_text);
+    defer allocator.free(b);
+
+    var prefix: usize = 0;
+    while (prefix < a.len and prefix < b.len and std.mem.eql(u8, a[prefix], b[prefix])) prefix += 1;
+    var suffix: usize = 0;
+    while (suffix < a.len - prefix and suffix < b.len - prefix and
+        std.mem.eql(u8, a[a.len - 1 - suffix], b[b.len - 1 - suffix])) suffix += 1;
+    const mid_a = a[prefix .. a.len - suffix];
+    const mid_b = b[prefix .. b.len - suffix];
+    if ((mid_a.len +| 1) *| (mid_b.len +| 1) > max_cells) return null;
+
+    const middle = try diffLines(allocator, mid_a, mid_b);
+    defer allocator.free(middle);
+    const ops = try allocator.alloc(DiffLine, prefix + middle.len + suffix);
+    errdefer allocator.free(ops);
+    for (a[0..prefix], ops[0..prefix]) |line, *op| op.* = .{ .op = .keep, .text = line };
+    @memcpy(ops[prefix..][0..middle.len], middle);
+    for (a[a.len - suffix ..], ops[prefix + middle.len ..]) |line, *op| op.* = .{ .op = .keep, .text = line };
     const hunks = try buildHunks(allocator, ops);
     return .{ .ops = ops, .hunks = hunks };
 }
@@ -285,4 +309,154 @@ test "no change yields no hunks" {
     var patch = try compute(a, "same\n", "same\n");
     defer patch.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), patch.hunks.len);
+}
+
+test "computeBounded diffs a one-line change in a large file inside a small table" {
+    const a = std.testing.allocator;
+    var old_text: std.Io.Writer.Allocating = .init(a);
+    defer old_text.deinit();
+    var new_text: std.Io.Writer.Allocating = .init(a);
+    defer new_text.deinit();
+    for (0..3000) |i| {
+        try old_text.writer.print("line {d}\n", .{i});
+        try new_text.writer.print("line {d}{s}\n", .{ i, if (i == 1500) " changed" else "" });
+    }
+    // The whole-file table would be 3001² ≈ 9 M cells; the differing middle is 2×2.
+    var patch = (try computeBounded(a, old_text.written(), new_text.written(), 16)) orelse
+        return error.TestUnexpectedResult;
+    defer patch.deinit(a);
+    const d = try toGitDiff(a, "big.txt", patch.hunks);
+    defer a.free(d);
+    try std.testing.expectEqualStrings(
+        "--- a/big.txt\n+++ b/big.txt\n@@ -1498,7 +1498,7 @@\n" ++
+            " line 1497\n line 1498\n line 1499\n-line 1500\n+line 1500 changed\n line 1501\n line 1502\n line 1503\n",
+        d,
+    );
+}
+
+test "computeBounded agrees with compute on small inputs and refuses an oversized middle" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "a\nb\nc\n", "a\nB\nc\n" },
+        .{ "one\ntwo\n", "one\ntwo\nthree\n" },
+        .{ "", "x\ny\n" },
+        .{ "x\ny\n", "" },
+        .{ "same\n", "same\n" },
+    };
+    for (cases) |case| {
+        var full = try compute(a, case[0], case[1]);
+        defer full.deinit(a);
+        var bounded = (try computeBounded(a, case[0], case[1], 1 << 20)) orelse return error.TestUnexpectedResult;
+        defer bounded.deinit(a);
+        const want = try toGitDiff(a, "f", full.hunks);
+        defer a.free(want);
+        const got = try toGitDiff(a, "f", bounded.hunks);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
+    // Every line differs: trimming cannot help, so the bound decides.
+    try std.testing.expect((try computeBounded(a, "a\nb\nc\n", "x\ny\nz\n", 15)) == null);
+    var fits = (try computeBounded(a, "a\nb\nc\n", "x\ny\nz\n", 16)) orelse return error.TestUnexpectedResult;
+    fits.deinit(a);
+}
+
+/// Every hunk header's counts must equal its body, and hunks must not overlap:
+/// that is what `git apply` checks before it touches a file.
+fn expectWellFormed(diff: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, diff, '\n');
+    var want_old: usize = 0;
+    var want_new: usize = 0;
+    var seen_old: usize = 0;
+    var seen_new: usize = 0;
+    var next_free_old: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "@@ ")) {
+            try std.testing.expectEqual(want_old, seen_old);
+            try std.testing.expectEqual(want_new, seen_new);
+            var it = std.mem.tokenizeAny(u8, line, "@ -+,");
+            const old_start = try std.fmt.parseInt(usize, it.next().?, 10);
+            want_old = try std.fmt.parseInt(usize, it.next().?, 10);
+            _ = it.next();
+            want_new = try std.fmt.parseInt(usize, it.next().?, 10);
+            seen_old = 0;
+            seen_new = 0;
+            try std.testing.expect(old_start + 1 > next_free_old or want_old == 0);
+            next_free_old = old_start + want_old;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "--- ") or std.mem.startsWith(u8, line, "+++ ") or line.len == 0) continue;
+        switch (line[0]) {
+            ' ' => {
+                seen_old += 1;
+                seen_new += 1;
+            },
+            '-' => seen_old += 1,
+            '+' => seen_new += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(want_old, seen_old);
+    try std.testing.expectEqual(want_new, seen_new);
+}
+
+fn numbered(a: std.mem.Allocator, n: usize, changed: []const usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    for (1..n + 1) |i| {
+        const mark = std.mem.indexOfScalar(usize, changed, i) != null;
+        try out.writer.print("l{d}{s}\n", .{ i, if (mark) "*" else "" });
+    }
+    return out.toOwnedSlice();
+}
+
+test "hunk headers count exactly the lines they carry" {
+    const a = std.testing.allocator;
+    const old = try numbered(a, 30, &.{});
+    defer a.free(old);
+    // Gaps of 3, 4, 6 and 7 unchanged lines between changes: ≤ 6 merges, 7 splits.
+    const layouts = [_][]const usize{ &.{10}, &.{ 10, 14 }, &.{ 10, 15 }, &.{ 10, 17 }, &.{ 10, 18 }, &.{ 1, 30 }, &.{2} };
+    for (layouts) |changed| {
+        const new = try numbered(a, 30, changed);
+        defer a.free(new);
+        var patch = try compute(a, old, new);
+        defer patch.deinit(a);
+        const d = try toGitDiff(a, "f", patch.hunks);
+        defer a.free(d);
+        try expectWellFormed(d);
+    }
+
+    // One change with more than CONTEXT_LINES unchanged lines after it.
+    const one = try numbered(a, 30, &.{10});
+    defer a.free(one);
+    var single = try compute(a, old, one);
+    defer single.deinit(a);
+    const d = try toGitDiff(a, "f", single.hunks);
+    defer a.free(d);
+    try std.testing.expectEqualStrings("--- a/f\n+++ b/f\n@@ -7,7 +7,7 @@\n l7\n l8\n l9\n-l10\n+l10*\n l11\n l12\n l13\n", d);
+
+    // A gap of 6 is one hunk, a gap of 7 is two.
+    const six = try numbered(a, 30, &.{ 10, 17 });
+    defer a.free(six);
+    var merged = try compute(a, old, six);
+    defer merged.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), merged.hunks.len);
+    const seven = try numbered(a, 30, &.{ 10, 18 });
+    defer a.free(seven);
+    var split = try compute(a, old, seven);
+    defer split.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), split.hunks.len);
+}
+
+test "a side with no lines starts at the line before it" {
+    const a = std.testing.allocator;
+    var created = try compute(a, "", "x\ny\n");
+    defer created.deinit(a);
+    const c = try toGitDiff(a, "f", created.hunks);
+    defer a.free(c);
+    try std.testing.expectEqualStrings("--- a/f\n+++ b/f\n@@ -0,0 +1,2 @@\n+x\n+y\n", c);
+    var deleted = try compute(a, "x\ny\n", "");
+    defer deleted.deinit(a);
+    const d = try toGitDiff(a, "f", deleted.hunks);
+    defer a.free(d);
+    try std.testing.expectEqualStrings("--- a/f\n+++ b/f\n@@ -1,2 +0,0 @@\n-x\n-y\n", d);
 }

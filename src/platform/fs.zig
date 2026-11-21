@@ -1236,6 +1236,167 @@ pub fn statMode(path_z: [*:0]const u8, follow: bool) ?u32 {
     return @intCast(st.mode);
 }
 
+/// What one path names, observed **without following** a final symlink.
+/// Built for change detection: two observations of the same path compare
+/// equal only if nothing about the file's identity, size, or timestamps moved.
+/// A field the platform cannot supply is zero on every observation, so it can
+/// never make two observations differ (Windows: `changed_ns`, `device`, `inode`).
+pub const PathStat = struct {
+    pub const Kind = enum { regular, directory, symlink, other };
+
+    kind: Kind,
+    size: u64,
+    /// Last data modification, nanoseconds since the Unix epoch.
+    modified_ns: i128,
+    /// POSIX status change (ctime): moves on every write and on metadata
+    /// changes a tool may hide from `modified_ns` (restoring mtime with
+    /// `touch -r`, `cp -p`). Zero on Windows.
+    changed_ns: i128,
+    device: u64,
+    inode: u64,
+    /// Creation time, nanoseconds since the Unix epoch. Windows only, where it
+    /// stands in for the missing ctime; zero elsewhere.
+    created_ns: i128 = 0,
+
+    pub fn eql(a: PathStat, b: PathStat) bool {
+        return a.kind == b.kind and a.size == b.size and a.modified_ns == b.modified_ns and
+            a.changed_ns == b.changed_ns and a.device == b.device and a.inode == b.inode and
+            a.created_ns == b.created_ns;
+    }
+};
+
+pub const StatError = error{
+    /// Nothing is at the path (or a directory along it is missing).
+    NotFound,
+    /// Something may be there but could not be observed: permission, a name
+    /// the platform rejects, an unavailable syscall. Callers that must not
+    /// mistake "could not look" for "absent" keep the two apart.
+    Unavailable,
+};
+
+/// lstat-semantics observation of `path_z`. Windows reads the directory entry
+/// itself (`FindFirstFileW`), which describes a link rather than its target.
+pub fn statNoFollow(path_z: [*:0]const u8) StatError!PathStat {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wide = toWide(std.mem.span(path_z), &wbuf) catch return error.Unavailable;
+        var data: WIN32_FIND_DATAW = undefined;
+        const handle = FindFirstFileW(wide.ptr, &data);
+        if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+            const code = GetLastError();
+            return if (code == 2 or code == 3) error.NotFound else error.Unavailable;
+        }
+        _ = FindClose(handle);
+        const is_link = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 and
+            (data.dwReserved0 == IO_REPARSE_TAG_SYMLINK or data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT);
+        const ticks = (@as(i128, data.ftLastWriteTime[1]) << 32) | data.ftLastWriteTime[0];
+        const born = (@as(i128, data.ftCreationTime[1]) << 32) | data.ftCreationTime[0];
+        return .{
+            .kind = if (is_link)
+                .symlink
+            else if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                .directory
+            else
+                .regular,
+            .size = (@as(u64, data.nFileSizeHigh) << 32) | data.nFileSizeLow,
+            // FILETIME counts 100 ns ticks from 1601-01-01.
+            .modified_ns = (ticks - 116_444_736_000_000_000) * 100,
+            .changed_ns = 0,
+            .device = 0,
+            .inode = 0,
+            .created_ns = (born - 116_444_736_000_000_000) * 100,
+        };
+    }
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const AT_FDCWD: i32 = -100;
+        const rc = std.os.linux.statx(AT_FDCWD, path_z, 0x100, std.os.linux.STATX.BASIC_STATS, &stx);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            const code: c_int = @intCast(-signed);
+            return if (code == @intFromEnum(std.c.E.NOENT) or code == @intFromEnum(std.c.E.NOTDIR))
+                error.NotFound
+            else
+                error.Unavailable;
+        }
+        return .{
+            .kind = posixKind(stx.mode),
+            .size = stx.size,
+            .modified_ns = @as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec,
+            .changed_ns = @as(i128, stx.ctime.sec) * std.time.ns_per_s + stx.ctime.nsec,
+            .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor),
+            .inode = stx.ino,
+        };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, path_z, &st, @as(u32, std.c.AT.SYMLINK_NOFOLLOW)) != 0) {
+        const code = std.c._errno().*;
+        return if (code == @intFromEnum(std.c.E.NOENT) or code == @intFromEnum(std.c.E.NOTDIR))
+            error.NotFound
+        else
+            error.Unavailable;
+    }
+    if (st.size < 0) return error.Unavailable;
+    return .{
+        .kind = posixKind(@intCast(st.mode)),
+        .size = @intCast(st.size),
+        .modified_ns = @as(i128, st.mtime().sec) * std.time.ns_per_s + st.mtime().nsec,
+        .changed_ns = @as(i128, st.ctime().sec) * std.time.ns_per_s + st.ctime().nsec,
+        .device = @intCast(st.dev),
+        .inode = @intCast(st.ino),
+    };
+}
+
+fn posixKind(mode: u32) PathStat.Kind {
+    return switch (mode & S_IFMT) {
+        S_IFREG => .regular,
+        S_IFDIR => .directory,
+        S_IFLNK => .symlink,
+        else => .other,
+    };
+}
+
+test "statNoFollow sees a rewrite and does not follow a symlink" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const file = try std.fmt.allocPrintSentinel(allocator, "{s}/f", .{root}, 0);
+    defer allocator.free(file);
+    const missing = try std.fmt.allocPrintSentinel(allocator, "{s}/missing", .{root}, 0);
+    defer allocator.free(missing);
+
+    try std.testing.expectError(error.NotFound, statNoFollow(missing.ptr));
+    const fd = open(file.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try std.testing.expect(fd >= 0);
+    try std.testing.expect(writeAll(fd, "one"));
+    close(fd);
+    const first = try statNoFollow(file.ptr);
+    try std.testing.expectEqual(PathStat.Kind.regular, first.kind);
+    try std.testing.expectEqual(@as(u64, 3), first.size);
+    try std.testing.expect(first.eql(try statNoFollow(file.ptr)));
+
+    // A rewrite to a new length is visible on every platform. (A same-length
+    // rewrite is visible only through timestamps, whose granularity is the
+    // filesystem's — Linux stamps inodes from a coarse clock — so it is not
+    // asserted back-to-back here.)
+    const again = open(file.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true }, 0);
+    try std.testing.expect(again >= 0);
+    try std.testing.expect(writeAll(again, "three"));
+    close(again);
+    const second = try statNoFollow(file.ptr);
+    try std.testing.expectEqual(@as(u64, 5), second.size);
+    try std.testing.expect(!first.eql(second));
+
+    if (!is_windows) {
+        const link = try std.fmt.allocPrintSentinel(allocator, "{s}/link", .{root}, 0);
+        defer allocator.free(link);
+        if (std.c.symlink(file.ptr, link.ptr) != 0) return error.SymlinkFailed;
+        try std.testing.expectEqual(PathStat.Kind.symlink, (try statNoFollow(link.ptr)).kind);
+    }
+}
+
 /// path 是否 symlink（**不跟随**，lstat 语义；防 symlink 逃逸）。
 /// Windows:symlink 或 junction(按 reparse tag,见 windowsIsLink;不跟随,等价 lstat 语义)。
 pub fn isSymlink(path_z: [*:0]const u8) bool {

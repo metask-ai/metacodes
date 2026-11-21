@@ -32,6 +32,7 @@ test {
     _ = @import("component/kimi_code_provider_test.zig");
     _ = @import("component/redirect_credential_test.zig");
     _ = @import("component/http_send_failure_test.zig");
+    _ = @import("component/http_bodyless_answer_test.zig");
     _ = @import("component/connection_keepalive_test.zig");
     _ = @import("component/stream_read_failure_log_test.zig");
     _ = @import("component/subagent_model_test.zig");

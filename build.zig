@@ -2735,6 +2735,16 @@ pub fn build(b: *std.Build) void {
     const builtin_egress_test_step = b.step("test:builtin-egress", "Test that no default-on built-in destination is cleartext to a public host");
     builtin_egress_test_step.dependOn(&builtin_egress_test_cmd.step);
     units_test_step.dependOn(&builtin_egress_test_cmd.step);
+    const http_answer_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_http_answer_discipline",
+        "-v",
+    });
+    const http_answer_test_step = b.step("test:http-answer", "Test that every HTTP response head and body in src is read through api/http_connection");
+    http_answer_test_step.dependOn(&http_answer_test_cmd.step);
+    units_test_step.dependOn(&http_answer_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2821,6 +2831,7 @@ pub fn build(b: *std.Build) void {
     gate_static_step.dependOn(&terminal_io_test_cmd.step);
     gate_static_step.dependOn(&scrollback_test_cmd.step);
     gate_static_step.dependOn(&builtin_egress_test_cmd.step);
+    gate_static_step.dependOn(&http_answer_test_cmd.step);
     gate_static_step.dependOn(&gate_diff_check.step);
     const gate_lint = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",

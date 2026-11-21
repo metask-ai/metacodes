@@ -340,7 +340,7 @@ pub const HttpTransport = struct {
         errdefer exchange.destroy(self);
         http_connection.sendBodiless(&exchange.request) catch return self.transportError();
         var redirect: [1024]u8 = undefined;
-        exchange.response = exchange.request.receiveHead(&redirect) catch return self.transportError();
+        exchange.response = http_connection.receiveHead(&exchange.request, &redirect) catch return self.transportError();
         exchange.has_response = true;
         const status = http_status.ResponseStatus.capture(&exchange.response).code;
         exchange.status = status;
@@ -430,7 +430,7 @@ pub const HttpTransport = struct {
         defer request.deinit();
         try http_connection.sendBodiless(&request);
         var redirect: [1024]u8 = undefined;
-        _ = try request.receiveHead(&redirect);
+        _ = try http_connection.receiveHead(&request, &redirect);
     }
 
     fn appendCommonHeaders(self: *HttpTransport, list: *std.ArrayList(std.http.Header), meta: SendMeta) !void {
@@ -628,7 +628,7 @@ const Exchange = struct {
     fn exchangeHead(self: *Exchange, json: []const u8, redirect: []u8) !void {
         try http_connection.sendBodyComplete(&self.request, @constCast(json));
         self.body_written = true;
-        self.response = try self.request.receiveHead(redirect);
+        self.response = try http_connection.receiveHead(&self.request, redirect);
         self.has_response = true;
     }
 
@@ -664,7 +664,7 @@ const Exchange = struct {
 
     fn reader(self: *Exchange) *std.Io.Reader {
         if (self.body) |body| return body;
-        self.body = self.response.reader(&self.transfer);
+        self.body = http_connection.bodyReader(&self.response, &self.transfer);
         return self.body.?;
     }
 

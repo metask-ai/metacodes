@@ -176,7 +176,7 @@ pub const SseTransport = struct {
                 defer self.registry.unregister(ctx);
                 http_connection.sendBodiless(&self.stream_request) catch return self.transportError();
                 var redirect: [4096]u8 = undefined;
-                self.stream_response = self.stream_request.receiveHead(&redirect) catch return self.transportError();
+                self.stream_response = http_connection.receiveHead(&self.stream_request, &redirect) catch return self.transportError();
                 break :head http_status.ResponseStatus.capture(&self.stream_response).code;
             };
             const content_type = self.stream_response.head.content_type orelse "";
@@ -211,7 +211,7 @@ pub const SseTransport = struct {
 
     fn readerMain(self: *SseTransport) void {
         const allocator = self.allocator;
-        const input = self.stream_response.reader(&self.stream_transfer);
+        const input = http_connection.bodyReader(&self.stream_response, &self.stream_transfer);
         var event: std.ArrayList(u8) = .empty;
         defer event.deinit(allocator);
         var data: std.ArrayList(u8) = .empty;
@@ -352,13 +352,13 @@ pub const SseTransport = struct {
         http_connection.sendBodyComplete(&request, @constCast(json)) catch return self.transportError();
         self.request_written = true;
         var redirect: [1024]u8 = undefined;
-        var response = request.receiveHead(&redirect) catch return self.transportError();
+        const response = http_connection.receiveHead(&request, &redirect) catch return self.transportError();
         const status = http_status.ResponseStatus.capture(&response).code;
         // "Accepted" and the like: read it so the connection can be reused.
         var transfer: [1024]u8 = undefined;
         const head = response.head;
         if (status != 204 and (head.transfer_encoding == .chunked or head.content_length != null)) {
-            _ = response.reader(&transfer).discardRemaining() catch {};
+            _ = http_connection.bodyReader(&response, &transfer).discardRemaining() catch {};
         }
         return status;
     }

@@ -9,7 +9,6 @@ const api_stream = @import("api/stream.zig");
 const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
 const no_redirects = @import("api/http_status.zig").no_redirects;
 const copyRedirectLocation = @import("api/http_status.zig").copyRedirectLocation;
-const answerHasBody = @import("api/http_status.zig").answerHasBody;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
 const model_error = @import("api/model_error.zig");
@@ -654,12 +653,9 @@ test "ReadFailure names each layer, and an unknown TLS end as an end" {
 /// apart) had each later piece decoded onto the front of `dest`, over what had
 /// already been read, and came out scrambled (#565).
 pub fn readErrorBody(request: *http.Client.Request, head: http.Client.Response.Head, dest: []u8) []const u8 {
-    // A 1xx, 204 or 304 answer has no body, but std 0.16 reads one to the end
-    // of the connection, and a server asked to keep it open (#573) leaves it
-    // open: the read would last until the idle monitor fires.
-    if (!answerHasBody(&head)) return dest[0..0];
+    const response: http.Client.Response = .{ .request = request, .head = head };
     var transfer_buf: [8192]u8 = undefined;
-    const body_reader = request.reader.bodyReader(&transfer_buf, head.transfer_encoding, head.content_length);
+    const body_reader = http_connection.bodyReader(&response, &transfer_buf);
     const n = body_reader.readSliceShort(dest) catch 0;
     return dest[0..n];
 }
@@ -1430,7 +1426,7 @@ pub const Client = struct {
 
         // 读取响应头
         var redirect_buf: [4096]u8 = undefined;
-        const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
+        const http_response = http_connection.receiveHead(req_ptr, &redirect_buf) catch |err| {
             // 等响应头时被取消:cancel 关闭了 socket,不是网络故障(issue #434)。
             if (cancelled(abort)) {
                 log.warnId("client", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
@@ -1519,7 +1515,7 @@ pub const Client = struct {
 
         // 非流式：读取完整 body；结束后立即 deinit+destroy req_ptr（不再返回）
         var transfer_buf: [8192]u8 = undefined;
-        const raw_body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+        const raw_body_reader = http_connection.bodyReader(&http_response, &transfer_buf);
         // 字节级续命(同流式路径):大 body 分多次 recv 到达,每次都是活着的证据。
         var liveness_buf: [8192]u8 = undefined;
         // 非流式 body 里没有保活,每个字节都是进展。
@@ -1642,14 +1638,14 @@ fn getModelsPage(
 
     http_connection.sendBodiless(&req) catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
-    const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
+    const http_response = http_connection.receiveHead(&req, &redirect_buf) catch return error.RequestFailed;
     const response_status = ResponseStatus.capture(&http_response);
     status.* = response_status.code;
     connection_lease.release();
     if (!response_status.isOk()) return error.HttpError;
 
     var transfer_buf: [8192]u8 = undefined;
-    const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+    const body_reader = http_connection.bodyReader(&http_response, &transfer_buf);
     return body_reader.allocRemaining(allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
 }
 
@@ -1986,7 +1982,7 @@ pub const StreamResponse = struct {
         if (self.done) return null;
 
         if (!self.iter_initialized) {
-            const raw_reader = self.stream_result.response.reader(&self.stream_result.transfer_buf);
+            const raw_reader = http_connection.bodyReader(&self.stream_result.response, &self.stream_result.transfer_buf);
             // 字节级续命:每次 recv 到字节就 touch——tool_use 参数的 input_json_delta 串、ping、
             // unknown 事件都不再是"沉默"。无注册表(纯测试构造)时直接用裸 reader。
             // 传输层字节只更新"最近字节"时间戳(stall 报告用);进展由下面的钩子按非保活行续。

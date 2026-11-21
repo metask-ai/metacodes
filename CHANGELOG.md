@@ -82,6 +82,14 @@ status, compatibility boundaries, and entry points are defined by
   added to the filter as one edit, control characters dropped; the draft is
   untouched and a paste never applies a model.
 
+- **Shift+Tab cycles the permission mode in terminals that report modified
+  keys.** iTerm2 3.7.7 and later, Ghostty, kitty, Alacritty and tmux with
+  `extended-keys` send Shift+Tab as the kitty protocol's `ESC [ 9 ; 2 u` or
+  xterm modifyOtherKeys' `ESC [ 27 ; 2 ; 9 ~` instead of `ESC [ Z`, and the
+  TUI ignored both. The key parser now reads both forms through one table, so
+  modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
+  their CSI u forms do (#643).
+
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
   instead of the filter, Esc only switched the editor to NORMAL mode, and
@@ -99,6 +107,23 @@ status, compatibility boundaries, and entry points are defined by
   does on an empty filter (`kept …`), and the draft stays; the next Ctrl+C
   arms the exit as before. During a reply Ctrl+C still interrupts it. Ctrl+D
   leaves a non-empty draft alone, as described above.
+
+### Fixed
+
+- **A `204` or `304` answer no longer holds a request until the server
+  closes the connection** (#579). Zig 0.16's HTTP client reads the body of a
+  1xx, 204 or 304 answer, which has none, to the end of the connection, and
+  `Request.deinit` does the same for a GET or DELETE whose connection it
+  could reuse. On a connection the server keeps open (HTTP/1.1's default),
+  ending an MCP Streamable HTTP session the server answers with
+  `204 No Content` waited in its `DELETE`, with no deadline, until the server
+  dropped the idle connection; so did an MCP stream resumption, MCP OAuth
+  discovery, the API key list, catalog downloads and the OAuth token
+  requests answered that way. Every answer is now received and read through
+  `api/http_connection.zig`: a body-less answer reads as empty at once, and
+  its connection is closed instead of drained, so it is not reused. The
+  System-One advisor, TinyKG, sealed skills and OTLP export still say
+  `connection: close`, so nothing waited there; they no longer depend on it.
 
 ## 0.13.0 — 2026-11-20
 

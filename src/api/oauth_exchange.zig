@@ -61,18 +61,14 @@ pub const HttpExchange = struct {
 
         http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.RefreshFailed;
         var redirect_buffer: [4096]u8 = undefined;
-        const response = request.receiveHead(&redirect_buffer) catch return error.RefreshFailed;
+        const response = http_connection.receiveHead(&request, &redirect_buffer) catch return error.RefreshFailed;
         // The wire status crosses into process code only through this boundary:
         // `std.http.Status` is non-exhaustive, and an unnamed-but-valid status
         // would panic on `@tagName`.
         const status = http_status.ResponseStatus.capture(&response);
 
         var transfer_buffer: [8192]u8 = undefined;
-        const reader = request.reader.bodyReader(
-            &transfer_buffer,
-            response.head.transfer_encoding,
-            response.head.content_length,
-        );
+        const reader = http_connection.bodyReader(&response, &transfer_buffer);
         const payload = reader.allocRemaining(arena, std.Io.Limit.limited(256 * 1024)) catch
             return error.RefreshFailed;
 
@@ -111,10 +107,10 @@ pub const MetaskHttpExchange = struct {
         defer request.deinit();
         http_connection.sendBodyComplete(&request, body) catch return error.RefreshFailed;
         var redirect: [4096]u8 = undefined;
-        const response = request.receiveHead(&redirect) catch return error.RefreshFailed;
+        const response = http_connection.receiveHead(&request, &redirect) catch return error.RefreshFailed;
         const status = http_status.ResponseStatus.capture(&response);
         var transfer: [8192]u8 = undefined;
-        const payload = request.reader.bodyReader(&transfer, response.head.transfer_encoding, response.head.content_length)
+        const payload = http_connection.bodyReader(&response, &transfer)
             .allocRemaining(arena, std.Io.Limit.limited(256 * 1024)) catch return error.RefreshFailed;
         if (status.code < 200 or status.code >= 300) return oauth.classifyTokenError(status.code, payload);
         const outcome = try oauth.parseTokenResponse(arena, payload);
