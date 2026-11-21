@@ -100,6 +100,20 @@ status, compatibility boundaries, and entry points are defined by
   modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
   their CSI u forms do (#643).
 
+- **`/logout` and the notice under the banner follow `.env`'s
+  `METACODES_PRESET`** (#489). Signed in to Metask with a `.env` that names a
+  preset, `/logout` moved the session to the file's `METACODES_PROVIDER` (or
+  the one provider whose key it holds), or left it without a model when the
+  file named only the preset, while the next start used the preset (level 6
+  of the startup order). The notice under the banner named that provider, or
+  nothing. Both now take the file's choice as a start does: its preset when
+  `config.json` defines it, with the preset's reasoning effort and the file's
+  `METACODES_MODEL` if it sets one, else its provider. The notice reads
+  `.env configures the preset fast (DeepSeek · deepseek-v4-pro); the default
+  is Metask. To use it: /model, or /logout`. A preset whose provider has no
+  key leaves the session without a model after `/logout`, as a start on it
+  does, instead of falling to the file's provider.
+
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
   instead of the filter, Esc only switched the editor to NORMAL mode, and
@@ -152,8 +166,23 @@ status, compatibility boundaries, and entry points are defined by
   requests answered that way. Every answer is now received and read through
   `api/http_connection.zig`: a body-less answer reads as empty at once, and
   its connection is closed instead of drained, so it is not reused. The
-  System-One advisor, TinyKG, sealed skills and OTLP export still say
+  System-One advisor, TinyKG, sealed skills and OTLP export said
   `connection: close`, so nothing waited there; they no longer depend on it.
+
+- **System-One, TinyKG, sealed skills, OTLP export and the legacy MCP SSE
+  stream no longer ask the server to close the connection** (#661). Like the
+  model requests before #573, they said `connection: close`, and a server
+  told so closes right after its last byte; behind a transparent proxy that
+  close can overtake bytes the proxy has not forwarded yet. An answer cut that
+  way read as malformed from System-One and as invalid from TinyKG, and it
+  failed a sealed skill's call, whose result is the last message of its
+  stream: the part #573 lost. Some MCP hosts drop a request that says
+  `connection: close` without answering, and the legacy SSE stream's GET said
+  it. These requests now ask the server to keep the connection open
+  (`http_connection.keepServerOpen`) and close it themselves once they have
+  the answer; no connection is reused. `zig build test:keep-server-open`, part
+  of `gate:static`, refuses a request with `keep_alive = false` that does not
+  make that call before it is sent.
 
 ## 0.13.0 — 2026-11-20
 

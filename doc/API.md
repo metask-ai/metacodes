@@ -212,8 +212,9 @@ both Metask sign-ins (`auth.json` and the session `oauth/metask.json`) and a
 Metask key
 stored with `login --provider metask`, forgets a stored default that resolves
 to Metask, drops every Metask credential the process holds (nothing is sent
-with one again), and moves a session on Metask to the provider `.env`
-configures (`Switched to <provider> (from .env)`) or leaves it unbound;
+with one again), and moves a session on Metask to what `.env` chooses at
+level 6 of the startup order, its `METACODES_PRESET` before its provider
+(`Switched to <provider> (from .env)`), or leaves it unbound;
 `/logout <id>` removes `keys/<id>.json`, and a session that ran on that key
 holds no credential afterwards. Neither runs in the middle of a turn: a
 command typed then waits in the queue until the turn ends.

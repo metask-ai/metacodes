@@ -305,6 +305,64 @@ pub fn apply(
     return .{ .applied = .{ .provider = provider } };
 }
 
+pub const LocalRoute = union(enum) {
+    preset: LocalPreset,
+    provider: LocalProvider,
+};
+
+pub const LocalPreset = struct {
+    name: []const u8,
+    selection: config_doc.RuntimeSelection,
+    model: ?[]const u8 = null,
+};
+
+pub const LocalProvider = struct {
+    name: []const u8,
+    model: ?[]const u8 = null,
+};
+
+pub fn localRoute(facts: *const Facts, choice: state_env.Choice, model: ?[]const u8) ?LocalRoute {
+    if (facts.decided(.local_preset)) |found| if (facts.selection(found.name)) |selection|
+        return .{ .preset = .{ .name = found.name, .selection = selection.*, .model = model } };
+    return switch (choice) {
+        .provider => |chosen| .{ .provider = .{ .name = chosen.name, .model = model } },
+        .none, .several => null,
+    };
+}
+
+pub const LocalResolved = struct {
+    route: provider_startup.StartupRoute,
+    reasoning_effort: ?types.ReasoningEffort = null,
+};
+
+pub fn resolveLocal(
+    arena: std.mem.Allocator,
+    registry: *const registry_mod.ProviderRegistry,
+    local: LocalRoute,
+) error{OutOfMemory}!?LocalResolved {
+    var lowered: types.Config = .{};
+    const request: provider_startup.StartupRequest = switch (local) {
+        .provider => |provider| .{ .provider = provider.name, .model = provider.model },
+        .preset => |preset| request: {
+            if (preset.model) |model| {
+                lowered.model = model;
+                lowered.model_explicit = true;
+            }
+            if ((try apply(arena, registry, preset.selection, &lowered)) == .refused) return null;
+            break :request .{
+                .provider = lowered.provider_profile,
+                .channel = lowered.provider_channel,
+                .offer_id = lowered.provider_offer,
+                .model = lowered.model,
+            };
+        },
+    };
+    return switch (try provider_startup.resolve(arena, registry, request)) {
+        .failure => null,
+        .route => |route| .{ .route = route, .reasoning_effort = lowered.reasoning_effort },
+    };
+}
+
 // ── what the start says about a preset it cannot find ──────────────────────
 
 /// One line per preset this start must report (`startup_order.Unknown`),
@@ -513,4 +571,83 @@ test "a preset lowers into the fields the flags would set, and a flag keeps its 
         "the preset k in /s/config.json asks for 'no-such-model-489', which matches no route this install has; edit it there, or pass --provider/--model",
         try unresolved.refused.message(arena, "k", "/s/config.json"),
     );
+}
+
+test "what .env falls back to: its preset when config.json defines it, else the provider it configures (#489)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var document = config_doc.Document.init(testing.allocator);
+    defer document.deinit();
+    try document.upsertPreset("fast", try config_doc.RuntimeSelection.auto("deepseek-v4-pro", .{}, .session));
+    const named: state_env.Choice = .{ .provider = .{ .name = "kimi", .named = true } };
+    const several: state_env.Choice = .{ .several = &.{ "kimi", "deepseek" } };
+
+    const Tag = std.meta.Tag(LocalRoute);
+    const defined = try gather(arena, .{ .local = "fast", .document = .{ .read = &document } });
+    const chosen = localRoute(&defined, named, "deepseek-flash") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Tag.preset, std.meta.activeTag(chosen));
+    try testing.expectEqualStrings("fast", chosen.preset.name);
+    try testing.expect(chosen.preset.selection.target.auto_route.selector.eqlText("deepseek-v4-pro"));
+    try testing.expectEqualStrings("deepseek-flash", chosen.preset.model orelse "");
+    for ([_]state_env.Choice{ several, .none }) |choice| {
+        const other = localRoute(&defined, choice, null) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(Tag.preset, std.meta.activeTag(other));
+        try testing.expectEqualStrings("fast", other.preset.name);
+    }
+
+    const undefined_preset = try gather(arena, .{ .local = "typo", .document = .{ .read = &document } });
+    const provider = localRoute(&undefined_preset, named, "k2") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Tag.provider, std.meta.activeTag(provider));
+    try testing.expectEqualStrings("kimi", provider.provider.name);
+    try testing.expectEqualStrings("k2", provider.provider.model orelse "");
+    try testing.expect(localRoute(&undefined_preset, .none, null) == null);
+
+    const unreadable = try gather(arena, .{ .local = "fast", .document = .{ .unreadable = "InvalidPreset" } });
+    try testing.expectEqual(Tag.provider, std.meta.activeTag(localRoute(&unreadable, named, null) orelse return error.TestUnexpectedResult));
+
+    const unnamed = try gather(arena, .{ .document = .{ .read = &document } });
+    try testing.expectEqual(Tag.provider, std.meta.activeTag(localRoute(&unnamed, named, null) orelse return error.TestUnexpectedResult));
+    try testing.expect(localRoute(&unnamed, several, null) == null);
+}
+
+test "the preset .env falls back to resolves as level 6 of a start does (#489)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const host = try @import("../provider/host.zig").Host.create(testing.allocator);
+    defer host.destroy();
+    const registry = &host.registry;
+
+    var auto = try config_doc.RuntimeSelection.auto("deepseek-v4-pro", .{}, .session);
+    try auto.controls.set("reasoning_effort", try @import("../provider/controls.zig").Value.fromText("high"));
+    const plain = (try resolveLocal(arena, registry, .{ .preset = .{ .name = "fast", .selection = auto } })) orelse return error.TestUnexpectedResult;
+    try testing.expect(plain.route.provider_id.eqlText("deepseek"));
+    try testing.expectEqualStrings("deepseek-v4-pro", plain.route.request_model_id);
+    try testing.expectEqual(@as(?types.ReasoningEffort, .high), plain.reasoning_effort);
+
+    const refined = (try resolveLocal(arena, registry, .{ .preset = .{ .name = "fast", .selection = auto, .model = "deepseek-flash" } })) orelse return error.TestUnexpectedResult;
+    try testing.expect(refined.route.provider_id.eqlText("deepseek"));
+    try testing.expectEqualStrings("deepseek-flash", refined.route.request_model_id);
+    try testing.expectEqual(@as(?types.ReasoningEffort, .high), refined.reasoning_effort);
+
+    var catalog = try registry.buildCatalog(testing.allocator, .{ .only_provider = @import("../provider/ids.zig").Slug.lit("deepseek") });
+    defer catalog.deinit();
+    const pro = for (catalog.items()) |*offer| {
+        if (std.mem.eql(u8, offer.request_model_id, "deepseek-v4-pro")) break offer;
+    } else return error.TestUnexpectedResult;
+    const pinned = config_doc.RuntimeSelection.pinned(pro.offer_id, pro.offer_revision, .session);
+    const exact = (try resolveLocal(arena, registry, .{ .preset = .{ .name = "pinned", .selection = pinned } })) orelse return error.TestUnexpectedResult;
+    try testing.expect(exact.route.offer_id.eql(pro.offer_id));
+    try testing.expect(exact.reasoning_effort == null);
+    const given_way = (try resolveLocal(arena, registry, .{ .preset = .{ .name = "pinned", .selection = pinned, .model = "deepseek-flash" } })) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("deepseek-flash", given_way.route.request_model_id);
+    try testing.expect(!given_way.route.offer_id.eql(pro.offer_id));
+
+    const by_provider = (try resolveLocal(arena, registry, .{ .provider = .{ .name = "deepseek", .model = "deepseek-flash" } })) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("deepseek-flash", by_provider.route.request_model_id);
+    try testing.expect(by_provider.reasoning_effort == null);
+
+    try testing.expect((try resolveLocal(arena, registry, .{ .preset = .{ .name = "gone", .selection = try config_doc.RuntimeSelection.auto("no-such-model-489", .{}, .session) } })) == null);
+    try testing.expect((try resolveLocal(arena, registry, .{ .provider = .{ .name = "no-such-provider-489" } })) == null);
 }

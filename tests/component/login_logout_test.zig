@@ -45,6 +45,8 @@ const App = cc.app_module.App;
 const METASK_KEY = "sk-metask-login-key";
 const RELAY_KEY = "sk-relay-env-key";
 const RELAY_ENV = "HOUSE_RELAY_TOKEN";
+const PRESET_KEY = "sk-preset-env-key";
+const PRESET_ENV = "PROV_B_TOKEN";
 
 const ANTHROPIC_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -88,6 +90,7 @@ const cleared = [_][*:0]const u8{
     "MINIMAX_API_KEY",     "AWS_BEARER_TOKEN_BEDROCK", "METACODES_PROVIDER",    "METACODES_MODEL",
     "METACODES_BASE_URL",  "METASK_GATEWAY_URL",       "METACODES_CONFIG_FILE", "METACODES_AUTH_FILE",
     "METACODES_OAUTH_DIR", "METASK_SITE_URL",          "OPENROUTER_API_KEY",    RELAY_ENV,
+    PRESET_ENV,            "METACODES_PRESET",
 };
 
 /// A state root, a working directory and a home; keys cleared, no probe, no
@@ -201,6 +204,38 @@ fn relayConfig(a: std.mem.Allocator, origin: []const u8) ![]const u8 {
     , .{ RELAY_ENV, origin });
 }
 
+fn presetRelayConfig(a: std.mem.Allocator, relay_origin: []const u8, preset_origin: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"custom_providers": {{"house-relay": {{
+        \\  "display_name": "House relay",
+        \\  "credential_kinds": ["api_key"],
+        \\  "env_aliases": [{{"name": "{s}", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/relay/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "relay-model", "display_name": "Relay model"}}]}},
+        \\ "prov-b": {{
+        \\  "display_name": "Prov B",
+        \\  "credential_kinds": ["api_key"],
+        \\  "env_aliases": [{{"name": "{s}", "kind": "api_key", "canonical": true}}],
+        \\  "channels": [{{"id": "primary", "base_url": "{s}/b/v1", "protocol": "openai_chat"}}],
+        \\  "models": [{{"request_model_id": "b-model", "display_name": "B model"}}]}}}},
+        \\ "presets": {{"fast": {{"target": {{"kind": "auto_route", "selector": "b-model"}}, "controls": {{"reasoning_effort": {{"text": "high"}}}}}}}}}}
+    , .{ RELAY_ENV, relay_origin, PRESET_ENV, preset_origin });
+}
+
+fn envLocalRoute(case: *Case, layer: *const cc.app_state_env.Loaded) !?App.LocalRoute {
+    const a = case.arena();
+    var store = try cc.provider_config_store.Store.initHome(a, case.state);
+    defer store.deinit();
+    var document = try store.load();
+    defer document.deinit();
+    const facts = try cc.app_presets.gather(a, .{
+        .local = layer.get(cc.app_state_env.preset_variable),
+        .config_path = store.path,
+        .document = .{ .read = &document },
+    });
+    return cc.app_presets.localRoute(&facts, layer.choice(), layer.get(cc.app_state_env.model_variable));
+}
+
 fn requestLine(captured: harness.CapturedRequest) []const u8 {
     const end = std.mem.indexOf(u8, captured.raw, "\r\n") orelse captured.raw.len;
     return captured.raw[0..end];
@@ -291,6 +326,10 @@ fn sendOneTurn(app: *App) !void {
 /// A session started on the Metask sign-in (the historical route, as `main`
 /// builds it from auth.json), at `gateway`; `.env` configures the relay.
 fn signedInApp(case: *Case, io: std.Io, gateway: []const u8, layer: ?*const cc.app_state_env.Loaded) !*App {
+    return signedInAppFallingBackTo(case, io, gateway, layer, if (layer != null) .{ .provider = .{ .name = "house-relay" } } else null);
+}
+
+fn signedInAppFallingBackTo(case: *Case, io: std.Io, gateway: []const u8, layer: ?*const cc.app_state_env.Loaded, local_route: ?App.LocalRoute) !*App {
     const a = case.arena();
     var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", (try std.fmt.allocPrintSentinel(a, "{s}/v1/messages", .{gateway}, 0)).ptr, "--model", "glm-5" }, a);
     try testing.expect(config.parse_error == null);
@@ -298,7 +337,7 @@ fn signedInApp(case: *Case, io: std.Io, gateway: []const u8, layer: ?*const cc.a
     config.credential_env_fallback = if (layer) |loaded| loaded.lookup() else null;
     return App.initWithOptions(testing.allocator, io, config, METASK_KEY, .{
         .route_state = .{ .bound = .metask },
-        .local_provider = if (layer != null) .{ .name = "house-relay" } else null,
+        .local_route = local_route,
     });
 }
 
@@ -355,6 +394,115 @@ test "/logout: a session on Metask moves to the .env provider and never sends th
     // And Metask is not usable any more: its key went with the sign-in.
     try expectMetaskPickRefused(app);
     try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+}
+
+test "/logout: .env's METACODES_PRESET comes before the file's provider, as at level 6 of a start (#489)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var preset_relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer preset_relay.stop();
+    try case.write("state/config.json", try presetRelayConfig(a, try originOf(a, relay), try originOf(a, preset_relay)));
+    try case.write("state/.env", RELAY_ENV ++ "=" ++ RELAY_KEY ++ "\n" ++ PRESET_ENV ++ "=" ++ PRESET_KEY ++ "\nMETACODES_PROVIDER=house-relay\nMETACODES_PRESET=fast\n");
+    try case.writeSignedIn();
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{ .{ .name = RELAY_ENV, .provider = "house-relay" }, .{ .name = PRESET_ENV, .provider = "prov-b" } },
+    });
+    defer layer.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+
+    const local_route = (try envLocalRoute(&case, &layer)) orelse return error.NoLocalRoute;
+    try testing.expect(local_route == .preset);
+    try testing.expectEqualStrings("fast", local_route.preset.name);
+    const app = try signedInAppFallingBackTo(&case, io_runtime.io(), try originOf(a, gateway), &layer, local_route);
+    defer app.deinit();
+    try sendOneTurn(app);
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.session == .switched);
+    try testing.expectEqualStrings("Prov B", done.session.switched.name);
+    try testing.expectEqual(cc.app_route_state.CredentialOrigin.local_config, done.session.switched.origin);
+    var line_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("b-model · from .env", app.bannerModelLine(&line_buf));
+    try testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .high), app.config.reasoning_effort);
+
+    try sendOneTurn(app);
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+    const captured = preset_relay.lastRequest() orelse return error.NoRequestCaptured;
+    try testing.expect(std.mem.startsWith(u8, requestLine(captured), "POST /b/v1/chat/completions "));
+    try testing.expectEqualStrings("Bearer " ++ PRESET_KEY, headerValue(captured, "authorization") orelse "");
+    try testing.expectEqualStrings("\"b-model\"", captured.jsonField("model") orelse "");
+    try testing.expectEqualStrings("\"high\"", captured.jsonField("reasoning_effort") orelse "");
+    try expectNeverSent(preset_relay, METASK_KEY);
+    const current = (try currentOffer(app)) orelse return error.NoCurrentOffer;
+    try testing.expect(current.provider_id.eqlText("prov-b"));
+}
+
+test "/logout: a preset alone in .env is used with its provider's key from the shell, and one without a key is not replaced by the file's provider (#489)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, ANTHROPIC_SSE }, 0);
+    defer gateway.stop();
+    var relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer relay.stop();
+    var preset_relay = try harness.MockServer.startCassette(&.{OPENAI_SSE}, 0);
+    defer preset_relay.stop();
+    try case.write("state/config.json", try presetRelayConfig(a, try originOf(a, relay), try originOf(a, preset_relay)));
+    try case.write("state/.env", "METACODES_PRESET=fast\n");
+    try case.guard(PRESET_ENV, PRESET_KEY);
+    try case.writeSignedIn();
+    var io_runtime = @import("platform").signal.threadedIo(testing.allocator, .{});
+    defer io_runtime.deinit();
+    {
+        var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+            .keys = &.{ .{ .name = RELAY_ENV, .provider = "house-relay" }, .{ .name = PRESET_ENV, .provider = "prov-b" } },
+        });
+        defer layer.deinit();
+        try testing.expect(layer.choice() == .none);
+        const local_route = (try envLocalRoute(&case, &layer)) orelse return error.NoLocalRoute;
+        try testing.expect(local_route == .preset);
+        const app = try signedInAppFallingBackTo(&case, io_runtime.io(), try originOf(a, gateway), &layer, local_route);
+        defer app.deinit();
+        const done = try app.signOutOfMetask();
+        try testing.expect(done.session == .switched);
+        try testing.expectEqualStrings("Prov B", done.session.switched.name);
+        try testing.expectEqual(cc.app_route_state.CredentialOrigin.environment, done.session.switched.origin);
+        try sendOneTurn(app);
+        const captured = preset_relay.lastRequest() orelse return error.NoRequestCaptured;
+        try testing.expectEqualStrings("Bearer " ++ PRESET_KEY, headerValue(captured, "authorization") orelse "");
+        try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+    }
+
+    try case.guard(PRESET_ENV, null);
+    try case.write("state/.env", RELAY_ENV ++ "=" ++ RELAY_KEY ++ "\nMETACODES_PROVIDER=house-relay\nMETACODES_PRESET=fast\n");
+    try case.writeSignedIn();
+    var layer = try cc.app_state_env.load(testing.allocator, case.state, .{
+        .keys = &.{ .{ .name = RELAY_ENV, .provider = "house-relay" }, .{ .name = PRESET_ENV, .provider = "prov-b" } },
+    });
+    defer layer.deinit();
+    const local_route = (try envLocalRoute(&case, &layer)) orelse return error.NoLocalRoute;
+    try testing.expect(local_route == .preset);
+    try testing.expectEqualStrings("fast", local_route.preset.name);
+    const app = try signedInAppFallingBackTo(&case, io_runtime.io(), try originOf(a, gateway), &layer, local_route);
+    defer app.deinit();
+    const done = try app.signOutOfMetask();
+    try testing.expect(done.session == .unbound);
+    try testing.expect(app.unbound().? == .signed_out);
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+    try testing.expectEqual(@as(usize, 1), preset_relay.requestCount());
+    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
 }
 
 test "/logout: with no .env provider the session is unbound and nothing is sent (#485)" {
@@ -940,7 +1088,7 @@ test "/logout with .env configuring Metask: the session goes on with .env's key 
     config.credential_env_fallback = layer.lookup();
     const app = try App.initWithOptions(testing.allocator, io_runtime.io(), config, METASK_KEY, .{
         .route_state = .{ .bound = .metask },
-        .local_provider = .{ .name = "metask" },
+        .local_route = .{ .provider = .{ .name = "metask" } },
     });
     defer app.deinit();
     try case.storeSession(try originOf(a, gateway), SESSION_TOKEN);
