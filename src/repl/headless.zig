@@ -23,6 +23,7 @@ const learning_end_of_run_mod = @import("../core/learning_end_of_run.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
 const stall_gate_mod = @import("../core/stall_gate.zig");
 const output_semantics = @import("../core/output_semantics.zig");
+const McpUnavailable = @import("../core/mcp_session.zig").McpUnavailable;
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
@@ -354,6 +355,7 @@ pub fn run(
     var integrity_report = test_integrity_mod.Report.init(allocator);
     defer integrity_report.deinit();
     if (run_options.test_integrity) |*integrity| integrity.report = &integrity_report;
+    printMcpUnavailableNotice(allocator, app.mcp_unavailable);
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -523,7 +525,7 @@ pub fn run(
     defer if (final_text_owned and final_text.len > 0) allocator.free(final_text);
 
     if (json_output) {
-        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, &integrity_report, result, &app.usage, app.activeModel());
+        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, &integrity_report, app.mcp_unavailable, result, &app.usage, app.activeModel());
     } else {
         // 纯文本：直接打模型最终回复 + 结尾换行
         writeStdout(final_text);
@@ -665,6 +667,7 @@ pub fn buildOptions(
         .parent_model = app.activeModel(),
         .skills_set = &app.skills,
         .mcp_sessions = &app.mcp_sessions.items,
+        .mcp_unavailable = app.mcp_unavailable,
         .cron_registry = &app.cron_registry,
     };
 }
@@ -766,6 +769,7 @@ pub fn resumeSuspended(
     var integrity_report = test_integrity_mod.Report.init(allocator);
     defer integrity_report.deinit();
     if (resume_options.test_integrity) |*integrity| integrity.report = &integrity_report;
+    printMcpUnavailableNotice(allocator, app.mcp_unavailable);
     const result = agent_loop.resumeRun(
         &app.conversation,
         app.provider(),
@@ -803,7 +807,7 @@ pub fn resumeSuspended(
     const text_kind = if (projected.text != null) projected.kind else fallbackTextKind(final_text);
     defer if (final_text_owned and final_text.len > 0) allocator.free(final_text);
     if (json_output) {
-        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, &integrity_report, result, &app.usage, app.activeModel());
+        try emitJson(allocator, final_text, text_kind, &app.file_change_journal, &integrity_report, app.mcp_unavailable, result, &app.usage, app.activeModel());
     } else {
         writeStdout(final_text);
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
@@ -940,11 +944,12 @@ fn emitJson(
     text_kind: []const u8,
     changes: ?*@import("../core/file_change.zig").Journal,
     integrity: ?*const test_integrity_mod.Report,
+    mcp_unavailable: []const McpUnavailable,
     result: agent_loop.RunResult,
     usage: *const app_mod.UsageTotals,
     model: []const u8,
 ) !void {
-    const line = try buildResultLine(allocator, final_text, text_kind, changes, integrity, result, usage, model);
+    const line = try buildResultLine(allocator, final_text, text_kind, changes, integrity, mcp_unavailable, result, usage, model);
     defer allocator.free(line);
     writeStdout(line);
 }
@@ -963,6 +968,7 @@ pub fn buildResultLine(
     /// Test-integrity end state (core/test_integrity.zig). Filled → the line
     /// carries a `test_integrity` object; unfilled or null → no field.
     integrity: ?*const test_integrity_mod.Report,
+    mcp_unavailable: []const McpUnavailable,
     result: agent_loop.RunResult,
     usage: *const app_mod.UsageTotals,
     model: []const u8,
@@ -1020,8 +1026,34 @@ pub fn buildResultLine(
         try aw.writer.writeAll(",\"test_integrity\":");
         try report.writeJson(&aw.writer);
     };
+    if (mcp_unavailable.len != 0) {
+        try aw.writer.writeAll(",\"mcp_unavailable\":[");
+        for (mcp_unavailable, 0..) |server, index| {
+            if (index != 0) try aw.writer.writeByte(',');
+            try aw.writer.writeAll("{\"name\":");
+            try util_json.writeJsonString(&aw.writer, server.name);
+            try aw.writer.writeAll(",\"detail\":");
+            try util_json.writeJsonString(&aw.writer, server.detail);
+            try aw.writer.writeByte('}');
+        }
+        try aw.writer.writeByte(']');
+    }
     try aw.writer.writeAll("}\n");
     return try aw.toOwnedSlice();
+}
+
+pub fn mcpUnavailableNotice(allocator: std.mem.Allocator, servers: []const McpUnavailable) !?[]u8 {
+    if (servers.len == 0) return null;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (servers) |server| try out.writer.print("warning: MCP server '{s}' did not connect: {s}\n", .{ server.name, server.detail });
+    return try out.toOwnedSlice();
+}
+
+fn printMcpUnavailableNotice(allocator: std.mem.Allocator, servers: []const McpUnavailable) void {
+    const notice = (mcpUnavailableNotice(allocator, servers) catch return) orelse return;
+    defer allocator.free(notice);
+    std.debug.print("{s}", .{notice});
 }
 
 fn printStallNotice(allocator: std.mem.Allocator, report: stall_gate_mod.Report) void {

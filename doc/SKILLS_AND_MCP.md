@@ -2,7 +2,8 @@
 
 metacodes keeps its own Skills and MCP configuration under its state root
 (`~/.metacodes` unless `--state-dir`, `METACODES_HOME` or the install manifest
-chooses another), and also reads what Claude Code and Codex users already have,
+chooses another), and also reads what Claude Code, Codex and Metacode users
+already have,
 with each tool's own semantics. This page is the contract for the CLI hosts
 (terminal REPL, `--web`, `serve`). AgentCore keeps the narrower,
 `.agents/skills`-only policy described in
@@ -209,8 +210,10 @@ whole entry from the highest source (fields never merge):
 | `~/.claude.json` `mcpServers` | Claude Code user scope | inherited | yes |
 | `<dir>/.codex/config.toml` `[mcp_servers.*]` | Codex project layer, trusted projects only | Codex allowlist | no |
 | `$CODEX_HOME/config.toml` `[mcp_servers.*]` | Codex user layer | Codex allowlist | no |
+| `~/.metacode/config.toml` `[mcp_servers.*]` | Metacode user layer (Codex format) | Codex allowlist | no |
 
-`"mcpImport": {"claude": false, "codex": false}` turns the foreign sources off;
+`"mcpImport": {"claude": false, "codex": false, "metacode": false}` turns the
+foreign sources off;
 an entry `{"enabled": false}` without a command or URL disables that name in
 every lower source.
 
@@ -334,26 +337,34 @@ the handshake revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   Over stdio, a server that exits or stays silent on the probe is restarted for
   the handshake. Over HTTP, a timeout, a network failure or 401/403 is an error,
   not a reason to fall back.
-- The handshake answers server `ping`s and form-mode elicitation requests;
-  undeclared requests get `method_not_found`. `tools/list` follows
-  `nextCursor` (an empty string is a cursor too).
+- The handshake answers server `ping`s and form-mode elicitation requests,
+  echoing the request's id whether it is a number or a string; undeclared
+  requests get `method_not_found`. Elicitation is declared only when the
+  connection was given a handler: the CLI has no elicitation UI yet, so it
+  declares none and declines an elicitation a server sends anyway.
+  `tools/list` follows `nextCursor` (an empty string is a cursor too).
 - Streamable HTTP POSTs every message with `Accept: application/json,
   text/event-stream`, reads JSON or SSE responses (a mid-stream server request
   is answered on its own POST), keeps the handshake's `MCP-Session-Id` and
-  `MCP-Protocol-Version` (DELETE on close), and sends `Mcp-Method`, `Mcp-Name`
+  `MCP-Protocol-Version` (DELETE on close; a 404 to a request carrying the
+  session id means the server ended the session, so the client sends a new
+  `initialize` without it, adopts the revision the server selects, and repeats
+  the request once in the new session), and sends `Mcp-Method`, `Mcp-Name`
   and `Mcp-Param-*` (from `x-mcp-header`; a tool with an invalid annotation is
   dropped) on 2026-07-28. An SSE response that ends before its answer is
   resumed when the server numbered its events: after the stream's `retry`
   delay (1 s by default, 10 s at most), a GET with `Last-Event-ID` (the id of
   the last event received whole) and the session headers reopens it and the server replays the rest (2025-03-26
-  through 2025-11-25; at most 3 attempts that bring nothing new). On
+  through 2025-11-25; at most 3 consecutive attempts that bring no new event
+  id, so a polling server whose every stream opens with a fresh priming event
+  keeps the call open until it answers or the request times out). On
   2026-07-28 the answer is lost instead, and the client reports the call as
   indeterminate rather than sending it again.
 - A `tools/call` is sent once. A failure after the request left (a timeout, a
   dropped connection, a server exit) tells the model that the call may have
   executed and to check its effect before repeating it. A POST whose body was
-  never fully written, or that a 401 refused, is known not to have run and is
-  retried. A `tools/call` does not reuse an HTTP connection idle for more than
+  never fully written, that a 401 refused, or that a 404 refused for an
+  expired session, is known not to have run and is retried. A `tools/call` does not reuse an HTTP connection idle for more than
   a second, since the race with a server closing it could not be retried.
 - **HTTP+SSE** (`type: "sse"`, revision 2024-11-05, which many hosted
   servers still offer at an `/sse` URL): a long-lived `GET <url>`
@@ -416,7 +427,16 @@ fallback), in `src/mcp/oauth.zig`:
    kernel-chosen port, or `oauth.callbackPort` for a client whose redirect is
    registered in advance.
 4. **Token.** The code is exchanged with its verifier and the same
-   `resource`; the answer is stored in
+   `resource`. Before it is stored, the new token is tried with one
+   authenticated request in the server's own transport (an `initialize`, or
+   the SSE stream's GET; a session it opens is ended with `DELETE`). A 401
+   or 403 fails the login and stores nothing: the CLI prints the server's
+   answer (`error`, `error_description`, the scope it asks for, a body
+   excerpt) and the scope requested and granted. Any other status, or no
+   answer, stores the token and says it is unverified. A token response
+   whose `scope` is `""` is recorded as no scope granted. A refused
+   registration or token request prints the authorization server's `error`
+   and `error_description`. The answer is stored in
    `<state root>/mcp-oauth/<server>-<hash>.json` (mode 0600, written
    atomically), keyed to the server name and URL so a token never reaches
    another URL.
@@ -445,6 +465,15 @@ the negotiated revision, needs authentication — with the `metacodes mcp login`
 command that fixes it — or why it failed), tool count and log, followed by project servers awaiting approval, disabled names and
 configuration problems. While servers are still connecting it shows each one's
 state so far (`connecting… 3s`), without waiting for them.
+The model is told as well: when ToolSearch finds nothing, or the model calls
+an `mcp__…` tool that does not exist, the result names the configured servers
+that did not connect with the reason `/mcp` shows (for a 401, the
+`metacodes mcp login` command), says that a new session picks them up, and
+asks the model to tell the user instead of reaching the server another way.
+Nothing about them enters the system prompt. A `-p` run prints one
+`warning: MCP server '<name>' did not connect: <reason>` line per such server
+to stderr before it starts, and `--json` adds them to the result line as
+`mcp_unavailable`.
 The tool list is fixed for a session (it is part of the cached prompt); when a
 server announces `notifications/tools/list_changed`, `/mcp` says so and the new
 list applies after a restart.

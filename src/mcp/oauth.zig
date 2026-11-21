@@ -48,6 +48,7 @@ pub const REFRESH_MARGIN_SECONDS: i64 = 60;
 /// Silence after which a discovery, registration or token request is cut.
 const HTTP_IDLE_LIMIT_MS: u64 = 30_000;
 const MAX_METADATA_BYTES: usize = 256 * 1024;
+const ERROR_BODY_READ_BYTES: usize = 4096;
 pub const CALLBACK_PATH = "/callback";
 const STORE_DIR = "mcp-oauth";
 const STORE_VERSION: u32 = 1;
@@ -72,6 +73,7 @@ pub const Error = error{
     McpOAuthTokenRequestFailed,
     /// The authorization server refused the grant (`invalid_grant`, …).
     McpOAuthTokenRejected,
+    McpOAuthTokenNotAccepted,
     McpOAuthMalformedResponse,
     McpOAuthNetwork,
     McpOAuthNoStateRoot,
@@ -89,6 +91,7 @@ pub const Challenge = struct {
     resource_metadata: ?[]const u8 = null,
     scope: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+    error_description: ?[]const u8 = null,
 };
 
 /// Parse the `Bearer` challenge (RFC 6750 §3, RFC 9728 §5.1) out of a
@@ -157,6 +160,7 @@ fn parseParams(text: []const u8, start: usize) Challenge {
         if (std.ascii.eqlIgnoreCase(param.key, "resource_metadata")) challenge.resource_metadata = param.value;
         if (std.ascii.eqlIgnoreCase(param.key, "scope")) challenge.scope = param.value;
         if (std.ascii.eqlIgnoreCase(param.key, "error")) challenge.@"error" = param.value;
+        if (std.ascii.eqlIgnoreCase(param.key, "error_description")) challenge.error_description = param.value;
     }
     return challenge;
 }
@@ -176,6 +180,7 @@ const Response = struct {
     /// Empty when not read.
     body: []const u8,
     www_authenticate: ?[]const u8,
+    session_id: ?[]const u8 = null,
 };
 
 /// What may cut a request short: the caller's interrupt and its deadline
@@ -209,6 +214,7 @@ const RequestSpec = struct {
     follow_redirects: bool = false,
     /// A probe of an event stream reads the head only.
     read_body: bool = true,
+    read_error_body: bool = false,
 };
 
 /// One request on a fresh client, cut after `HTTP_IDLE_LIMIT_MS` of silence
@@ -242,16 +248,32 @@ fn send(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, spec: Requ
     var response = request.receiveHead(&redirect) catch return interrupted(interrupt);
     const status = http_status.ResponseStatus.capture(&response).code;
     var www_authenticate: ?[]const u8 = null;
+    var session_id: ?[]const u8 = null;
     var headers = response.head.iterateHeaders();
     while (headers.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "www-authenticate") and www_authenticate == null)
             www_authenticate = try arena.dupe(u8, header.value);
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id") and session_id == null)
+            session_id = try arena.dupe(u8, header.value);
     }
-    if (!spec.read_body) return .{ .status = status, .body = "", .www_authenticate = www_authenticate };
+    const read_body = spec.read_body or (spec.read_error_body and status >= 400);
+    if (!read_body) {
+        if (request.connection) |connection| connection.closing = true;
+        return .{ .status = status, .body = "", .www_authenticate = www_authenticate, .session_id = session_id };
+    }
     var transfer: [8192]u8 = undefined;
     const reader = response.reader(&transfer);
+    if (!spec.read_body) {
+        if (request.connection) |connection| connection.closing = true;
+        var excerpt_buffer: [ERROR_BODY_READ_BYTES]u8 = undefined;
+        const count = reader.readSliceShort(&excerpt_buffer) catch blk: {
+            if (interrupt.abort) |signal| if (signal.isAborted()) return error.Aborted;
+            break :blk 0;
+        };
+        return .{ .status = status, .body = try arena.dupe(u8, excerpt_buffer[0..count]), .www_authenticate = www_authenticate, .session_id = session_id };
+    }
     const body = reader.allocRemaining(arena, .limited(MAX_METADATA_BYTES)) catch return interrupted(interrupt);
-    return .{ .status = status, .body = body, .www_authenticate = www_authenticate };
+    return .{ .status = status, .body = body, .www_authenticate = www_authenticate, .session_id = session_id };
 }
 
 fn interrupted(interrupt: Interrupt) anyerror {
@@ -326,9 +348,14 @@ pub const Target = struct {
 
 /// An unauthenticated request in the server's own transport: the 401 it
 /// earns names the resource metadata and the scopes to ask for.
-fn probe(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, target: Target, abort: ?*const AbortSignal) !Response {
+fn probe(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, target: Target, access_token: ?[]const u8, abort: ?*const AbortSignal) !Response {
     var headers: std.ArrayList(std.http.Header) = .empty;
     try headers.appendSlice(arena, target.headers);
+    if (access_token) |token| try headers.append(arena, .{
+        .name = "Authorization",
+        .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{token}),
+    });
+    const read_error_body = access_token != null;
     switch (target.wire) {
         .streamable => {
             try headers.append(arena, .{ .name = "Accept", .value = "application/json, text/event-stream" });
@@ -342,11 +369,17 @@ fn probe(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, target: T
                 .content_type = "application/json",
                 .body = body,
                 .read_body = false,
+                .read_error_body = read_error_body,
             }, .{ .abort = abort });
         },
         .legacy_sse => {
             try headers.append(arena, .{ .name = "Accept", .value = "text/event-stream" });
-            return send(arena, gpa, io, .{ .url = target.url, .headers = headers.items, .read_body = false }, .{ .abort = abort });
+            return send(arena, gpa, io, .{
+                .url = target.url,
+                .headers = headers.items,
+                .read_body = false,
+                .read_error_body = read_error_body,
+            }, .{ .abort = abort });
         },
     }
 }
@@ -359,7 +392,7 @@ pub fn discover(
     settings: config.OAuthSettings,
     abort: ?*const AbortSignal,
 ) !Plan {
-    const probed = probe(arena, gpa, io, target, abort) catch |err| switch (err) {
+    const probed = probe(arena, gpa, io, target, null, abort) catch |err| switch (err) {
         error.Aborted, error.OutOfMemory => return err,
         else => Response{ .status = 0, .body = "", .www_authenticate = null },
     };
@@ -452,7 +485,11 @@ pub fn discover(
 
     // Scope selection (basic/authorization.mdx): the user's configuration,
     // then the challenge, then everything the resource lists.
-    plan.scope = settings.scopes orelse challenge.scope orelse
+    const challenge_scope: ?[]const u8 = if (challenge.scope) |scope|
+        (if (std.mem.trim(u8, scope, " ").len == 0) null else scope)
+    else
+        null;
+    plan.scope = settings.scopes orelse challenge_scope orelse
         (if (resource_scopes.len != 0) try std.mem.join(arena, " ", resource_scopes) else null);
     return plan;
 }
@@ -600,17 +637,21 @@ fn parseTokenResponse(arena: std.mem.Allocator, body: []const u8) !TokenResponse
         .string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     } else null;
+    const scope: ?[]const u8 = if (object.get("scope")) |value| switch (value) {
+        .string => |text| text,
+        else => null,
+    } else null;
     return .{
         .access_token = access_token,
         .refresh_token = stringField(object, "refresh_token"),
         .expires_in = expires_in,
-        .scope = stringField(object, "scope"),
+        .scope = scope,
     };
 }
 
 /// POST a token request. An `error` the server names (`invalid_grant`,
 /// `invalid_client`) is a rejection; anything else is a failure.
-fn tokenRequest(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoint: []const u8, form: []const u8, interrupt: Interrupt) !TokenResponse {
+fn tokenRequest(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoint: []const u8, form: []const u8, interrupt: Interrupt, failure: *[]const u8) !TokenResponse {
     const response = send(arena, gpa, io, .{
         .method = .POST,
         .url = endpoint,
@@ -622,6 +663,7 @@ fn tokenRequest(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, en
         else => return Error.McpOAuthTokenRequestFailed,
     };
     if (response.status >= 200 and response.status < 300) return parseTokenResponse(arena, response.body);
+    failure.* = try oauthErrorSummary(arena, response.status, response.body);
     if (response.status == 400 or response.status == 401) return Error.McpOAuthTokenRejected;
     return Error.McpOAuthTokenRequestFailed;
 }
@@ -739,13 +781,14 @@ pub const TokenSource = struct {
         auth.appendFormField(&form.writer, "refresh_token", refresh_token, false) catch return false;
         appendClientAuth(&form.writer, self.record.client_id, self.record.client_secret) catch return false;
         auth.appendFormField(&form.writer, "resource", self.record.resource, false) catch return false;
-        const response = tokenRequest(arena, self.gpa, self.io, self.record.token_endpoint, form.written(), interrupt) catch |err| {
+        var failure: []const u8 = "";
+        const response = tokenRequest(arena, self.gpa, self.io, self.record.token_endpoint, form.written(), interrupt, &failure) catch |err| {
             switch (err) {
                 Error.McpOAuthTokenRejected => self.dead = true,
                 error.Aborted => {},
                 else => self.retry_after_ms = util_time.nowMs() + @as(i64, @intCast(HTTP_IDLE_LIMIT_MS)),
             }
-            log.warn("mcp", "OAuth refresh for '{s}' failed: {s}", .{ self.record.server, @errorName(err) });
+            log.warn("mcp", "OAuth refresh for '{s}' failed: {s} {s}", .{ self.record.server, @errorName(err), failure });
             return false;
         };
         var next = self.record;
@@ -841,24 +884,124 @@ pub const Server = struct {
     settings: config.OAuthSettings = .{},
 };
 
+pub const Verification = union(enum) {
+    accepted,
+    unreachable_server,
+    unexpected_status: u16,
+};
+
 pub const LoginResult = struct {
     path: []u8,
     issuer: []u8,
     scope: ?[]u8,
+    requested_scope: ?[]u8,
     expires_at: ?i64,
+    verification: Verification,
 
     pub fn deinit(self: *LoginResult, gpa: std.mem.Allocator) void {
         gpa.free(self.path);
         gpa.free(self.issuer);
         if (self.scope) |scope| gpa.free(scope);
+        if (self.requested_scope) |scope| gpa.free(scope);
         self.* = undefined;
     }
 };
 
+const Refusal = struct {
+    status: u16,
+    challenge: Challenge,
+    body: []const u8,
+};
+
+const TokenCheck = union(enum) {
+    verified: Verification,
+    refused: Refusal,
+};
+
+fn checkToken(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, target: Target, access_token: []const u8, abort: ?*const AbortSignal) !TokenCheck {
+    const response = probe(arena, gpa, io, target, access_token, abort) catch |err| switch (err) {
+        error.Aborted, error.OutOfMemory => return err,
+        else => return .{ .verified = .unreachable_server },
+    };
+    if (response.status == 401 or response.status == 403) return .{ .refused = .{
+        .status = response.status,
+        .challenge = if (response.www_authenticate) |header| parseChallenge(header) orelse .{} else .{},
+        .body = response.body,
+    } };
+    if (response.status < 200 or response.status >= 300) return .{ .verified = .{ .unexpected_status = response.status } };
+    if (response.session_id) |session_id| endProbeSession(arena, gpa, io, target, access_token, session_id, abort);
+    return .{ .verified = .accepted };
+}
+
+fn endProbeSession(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, target: Target, access_token: []const u8, session_id: []const u8, abort: ?*const AbortSignal) void {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    headers.appendSlice(arena, target.headers) catch return;
+    const bearer = std.fmt.allocPrint(arena, "Bearer {s}", .{access_token}) catch return;
+    headers.append(arena, .{ .name = "Authorization", .value = bearer }) catch return;
+    headers.append(arena, .{ .name = "Mcp-Session-Id", .value = session_id }) catch return;
+    _ = send(arena, gpa, io, .{
+        .method = .DELETE,
+        .url = target.url,
+        .headers = headers.items,
+        .read_body = false,
+    }, .{ .abort = abort }) catch {};
+}
+
+const EXCERPT_BYTES: usize = 200;
+
+fn excerpt(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    var end = @min(trimmed.len, EXCERPT_BYTES);
+    while (end > 0 and end < trimmed.len and (trimmed[end] & 0xC0) == 0x80) end -= 1;
+    const cut = trimmed[0..end];
+    const out = try arena.dupe(u8, cut);
+    for (out) |*byte| {
+        if (byte.* < 0x20 or byte.* == 0x7f) byte.* = ' ';
+    }
+    if (trimmed.len > cut.len) return std.fmt.allocPrint(arena, "{s}…", .{out});
+    return out;
+}
+
+fn oauthErrorSummary(arena: std.mem.Allocator, status: u16, body: []const u8) ![]const u8 {
+    if (std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch null) |parsed| {
+        if (parsed == .object) {
+            if (stringField(parsed.object, "error")) |code| {
+                if (stringField(parsed.object, "error_description")) |description|
+                    return std.fmt.allocPrint(arena, "HTTP {d} {s}: {s}", .{ status, code, try excerpt(arena, description) });
+                return std.fmt.allocPrint(arena, "HTTP {d} {s}", .{ status, code });
+            }
+        }
+    }
+    const text = try excerpt(arena, body);
+    if (text.len == 0) return std.fmt.allocPrint(arena, "HTTP {d}", .{status});
+    return std.fmt.allocPrint(arena, "HTTP {d}: {s}", .{ status, text });
+}
+
+fn describeRefusal(arena: std.mem.Allocator, server_name: []const u8, refusal: Refusal, granted: ?[]const u8, requested: ?[]const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.print("MCP server '{s}' did not accept the token its authorization server just issued: HTTP {d}", .{ server_name, refusal.status });
+    if (refusal.challenge.@"error") |code| try w.print(" {s}", .{code});
+    if (refusal.challenge.error_description) |description| try w.print(" ({s})", .{try excerpt(arena, description)});
+    const body = try excerpt(arena, refusal.body);
+    if (body.len != 0) try w.print(": {s}", .{body});
+    try w.writeAll("\n");
+    if (refusal.challenge.scope) |scope| try w.print("The server asks for scope \"{s}\"; set oauth.scopes in its configuration if the authorization server does not offer it by default.\n", .{scope});
+    try w.print("Scope requested: {s}; granted: {s}.\n", .{ scopeLabel(requested), scopeLabel(granted) });
+    try w.writeAll("Nothing was stored.\n");
+    return out.written();
+}
+
+fn scopeLabel(scope: ?[]const u8) []const u8 {
+    const value = scope orelse return "(the authorization server's default)";
+    if (std.mem.trim(u8, value, " ").len == 0) return "none";
+    return value;
+}
+
 const Client = struct { id: []const u8, secret: ?[]const u8 };
 
 /// RFC 7591 registration of a public client for this redirect.
-fn register(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoint: []const u8, redirect_uri: []const u8, scope: ?[]const u8, abort: ?*const AbortSignal) !Client {
+fn register(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoint: []const u8, redirect_uri: []const u8, scope: ?[]const u8, abort: ?*const AbortSignal, notify: ?Notify) !Client {
     const request = .{
         .client_name = "metacodes",
         .redirect_uris = &[_][]const u8{redirect_uri},
@@ -878,7 +1021,13 @@ fn register(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoi
         error.Aborted, error.OutOfMemory => return err,
         else => return Error.McpOAuthRegistrationFailed,
     };
-    if (response.status < 200 or response.status >= 300) return Error.McpOAuthRegistrationFailed;
+    if (response.status < 200 or response.status >= 300) {
+        if (notify) |sink| sink.say(try std.fmt.allocPrint(arena, "The registration endpoint {s} answered {s}\n", .{
+            endpoint,
+            try oauthErrorSummary(arena, response.status, response.body),
+        }));
+        return Error.McpOAuthRegistrationFailed;
+    }
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, response.body, .{}) catch return Error.McpOAuthMalformedResponse;
     if (parsed != .object) return Error.McpOAuthMalformedResponse;
     return .{
@@ -921,7 +1070,7 @@ pub fn login(
     const client: Client = if (server.settings.client_id) |id|
         .{ .id = id, .secret = null }
     else if (plan.registration_endpoint) |endpoint|
-        try register(arena, gpa, io, endpoint, redirect_uri, plan.scope, options.abort)
+        try register(arena, gpa, io, endpoint, redirect_uri, plan.scope, options.abort, options.notify)
     else
         return Error.McpOAuthNoClient;
 
@@ -963,10 +1112,22 @@ pub fn login(
     try auth.appendFormField(&form.writer, "code_verifier", pkce.code_verifier, false);
     try appendClientAuth(&form.writer, client.id, client.secret);
     try auth.appendFormField(&form.writer, "resource", plan.resource, false);
-    const token = try tokenRequest(arena, gpa, io, plan.token_endpoint, form.written(), .{ .abort = options.abort });
+    var token_failure: []const u8 = "";
+    const token = tokenRequest(arena, gpa, io, plan.token_endpoint, form.written(), .{ .abort = options.abort }, &token_failure) catch |err| {
+        if (token_failure.len != 0) if (options.notify) |notify|
+            notify.say(try std.fmt.allocPrint(arena, "The token endpoint answered {s}\n", .{token_failure}));
+        return err;
+    };
 
     const expires_at: ?i64 = if (token.expires_in) |seconds| util_time.nowUnix() + seconds else null;
     const scope = token.scope orelse plan.scope;
+    const verification = switch (try checkToken(arena, gpa, io, server.target, token.access_token, options.abort)) {
+        .verified => |verified| verified,
+        .refused => |refusal| {
+            if (options.notify) |notify| notify.say(try describeRefusal(arena, server.name, refusal, scope, plan.scope));
+            return Error.McpOAuthTokenNotAccepted;
+        },
+    };
     try saveRecord(gpa, path, .{
         .server = server.name,
         .url = server.target.url,
@@ -982,11 +1143,16 @@ pub fn login(
     });
     const issuer = try gpa.dupe(u8, plan.issuer);
     errdefer gpa.free(issuer);
+    const owned_scope = if (scope) |value| try gpa.dupe(u8, value) else null;
+    errdefer if (owned_scope) |value| gpa.free(value);
+    const requested_scope = if (plan.scope) |value| try gpa.dupe(u8, value) else null;
     return .{
         .path = path,
         .issuer = issuer,
-        .scope = if (scope) |value| try gpa.dupe(u8, value) else null,
+        .scope = owned_scope,
+        .requested_scope = requested_scope,
         .expires_at = expires_at,
+        .verification = verification,
     };
 }
 
@@ -1003,6 +1169,7 @@ pub fn describe(err: anyerror) []const u8 {
         Error.McpOAuthRegistrationFailed => "dynamic client registration failed",
         Error.McpOAuthTokenRequestFailed => "the token request failed",
         Error.McpOAuthTokenRejected => "the authorization server rejected the grant",
+        Error.McpOAuthTokenNotAccepted => "the MCP server did not accept the token its authorization server just issued; nothing was stored",
         Error.McpOAuthMalformedResponse => "the authorization server's answer is malformed",
         Error.McpOAuthNetwork => "could not reach the server or its authorization server",
         Error.McpOAuthNoStateRoot => "no state root to store the token in; pass --state-dir or set METACODES_HOME",
@@ -1028,6 +1195,11 @@ test "Bearer challenges are found among several schemes" {
     try testing.expectEqualStrings("https://mcp.example.com/.well-known/oauth-protected-resource/mcp", challenge.resource_metadata.?);
     try testing.expectEqualStrings("files:read files:write", challenge.scope.?);
     try testing.expectEqualStrings("invalid_token", challenge.@"error".?);
+    try testing.expect(challenge.error_description == null);
+    const described = parseChallenge(
+        \\Bearer error="insufficient_scope", error_description="needs files:write", scope="files:write"
+    ).?;
+    try testing.expectEqualStrings("needs files:write", described.error_description.?);
 
     const bare = parseChallenge("Bearer").?;
     try testing.expect(bare.resource_metadata == null);
@@ -1046,8 +1218,31 @@ test "token responses: bearer only, lifetime optional, rotation kept apart" {
     try testing.expectEqualStrings("rt", full.refresh_token.?);
     const minimal = try parseTokenResponse(a, "{\"access_token\":\"at\"}");
     try testing.expect(minimal.refresh_token == null and minimal.expires_in == null);
+    try testing.expect(minimal.scope == null);
+    const none_granted = try parseTokenResponse(a, "{\"access_token\":\"at\",\"token_type\":\"bearer\",\"scope\":\"\"}");
+    try testing.expectEqualStrings("", none_granted.scope.?);
     try testing.expectError(Error.McpOAuthMalformedResponse, parseTokenResponse(a, "{\"access_token\":\"at\",\"token_type\":\"mac\"}"));
     try testing.expectError(Error.McpOAuthMalformedResponse, parseTokenResponse(a, "{\"token_type\":\"bearer\"}"));
+}
+
+test "an authorization server's refusal is summarized from its JSON, else from a short, whole-character excerpt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "HTTP 400 invalid_client_metadata: grant_types must be authorization_code and refresh_token",
+        try oauthErrorSummary(a, 400, "{\"error\":\"invalid_client_metadata\",\"error_description\":\"grant_types must be authorization_code and refresh_token\"}"),
+    );
+    try testing.expectEqualStrings("HTTP 400 invalid_grant", try oauthErrorSummary(a, 400, "{\"error\": \"invalid_grant\"}"));
+    try testing.expectEqualStrings("HTTP 502", try oauthErrorSummary(a, 502, "  \r\n"));
+    try testing.expectEqualStrings("HTTP 403: error code: 1010", try oauthErrorSummary(a, 403, "error code: 1010\n"));
+
+    const wide = "授" ** 100;
+    const cut = try excerpt(a, wide);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expect(std.mem.endsWith(u8, cut, "…"));
+    try testing.expect(cut.len <= EXCERPT_BYTES + "…".len);
+    try testing.expectEqualStrings("a b", try excerpt(a, "a\nb"));
 }
 
 test "stored records round-trip, stay private and are keyed to their URL" {

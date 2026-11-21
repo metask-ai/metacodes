@@ -19,16 +19,32 @@ The groups (a module without the attribute is a group of its own), in the
 order `unittest discover` finds their first module, are dealt round-robin: the
 K-th shard of N takes every N-th group from the K-th, so N shards run every
 module exactly once (test_run_shard.py). A module that fails to import is a
-group of its own and fails its shard. Python 3.9, stdlib only.
+group of its own and fails its shard.
+
+A shard runs under a watchdog. zig's --test-timeout covers zig test runners,
+not these commands, so a hung case used to hold its CI leg until the job's
+45-minute timeout, and the cancelled job showed no output from the shard. After
+SHARD_TIMEOUT_S the watchdog prints every thread's stack, naming the hung case,
+and exits non-zero. Python 3.9, stdlib only.
 """
 from __future__ import annotations
 
+import faulthandler
 import sys
 import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
+# The slowest shard takes about 5 minutes on a Linux CI runner and up to about
+# 10.5 minutes on macOS. 20 minutes leaves room for the slowest runner and still
+# fails well before the job's own 45-minute timeout.
+SHARD_TIMEOUT_S = 20 * 60
+
+
+def arm_watchdog(seconds: float) -> None:
+    """After `seconds`, dump every thread's stack to stderr and exit with 1."""
+    faulthandler.dump_traceback_later(seconds, exit=True)
 
 
 def parse_shard(text: str) -> tuple[int, int] | None:
@@ -97,6 +113,7 @@ def main(argv: list[str]) -> int:
         print("this shard selects no tests", file=sys.stderr)
         return 1
     verbosity = 2 if "-v" in argv[1:] else 1
+    arm_watchdog(SHARD_TIMEOUT_S)
     result = unittest.TextTestRunner(verbosity=verbosity).run(selected)
     return 0 if result.wasSuccessful() else 1
 

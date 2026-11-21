@@ -7,12 +7,16 @@ checked on synthetic lists and on the suite itself.
 """
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import unittest
 from pathlib import Path
 
 from scripts.eval.tests.run_shard import group_modules, module_group, parse_shard, select_shard
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[2]
 # The modules that share the live checkout's plugin-v1 pinned inputs.
 PLUGIN_V1 = {"test_plugin_frozen_run", "test_plugin_pair_analysis", "test_plugin_pair_runner", "test_plugin_release_gate"}
 
@@ -68,6 +72,26 @@ class RunShardTest(unittest.TestCase):
         for bad in ("0/3", "4/3", "1/0", "1", "a/b", "1/2/3", "", "-1/2"):
             with self.subTest(bad=bad):
                 self.assertIsNone(parse_shard(bad))
+
+    def test_the_watchdog_ends_a_hung_shard_and_names_where_it_hung(self) -> None:
+        hung = textwrap.dedent(
+            """
+            import time
+            from scripts.eval.tests.run_shard import arm_watchdog
+
+            def the_hung_case():
+                time.sleep(60)
+
+            arm_watchdog(1)
+            the_hung_case()
+            """
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", hung], cwd=ROOT, capture_output=True, text=True, timeout=30
+        )
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("Timeout", done.stderr)
+        self.assertIn("the_hung_case", done.stderr)
 
 
 if __name__ == "__main__":

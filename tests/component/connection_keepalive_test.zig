@@ -37,7 +37,7 @@ const MODEL = "keepalive-model";
 const KEY = "keepalive-test-key";
 
 /// How long a test waits for the server to see the client close.
-const CLOSE_WAIT_MS: i64 = 4_000;
+const CLOSE_WAIT_MS: i64 = LossyProxy.HOLD_MS + 1_000;
 /// The client must let go well within the server's hold: it closes when the
 /// stream is released, not when the server gives up.
 const CLOSE_WITHIN_MS: i64 = 2_000;

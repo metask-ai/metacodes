@@ -451,6 +451,10 @@ test "update: --check reports an update and fetches no archive; --version older 
     const checked = try env.run(.{ .check = true });
     try testing.expectEqual(update.Action.upgrade, checked.action);
     try testing.expect(checked.checked_only and checked.changes());
+    try testing.expectEqual(@as(usize, 0), checked.sessions.len);
+    try testing.expectEqual(@as(usize, 0), checked.services.len);
+    try testing.expect(std.mem.indexOf(u8, env.log.written(), "run from") == null);
+    try testing.expect(std.mem.indexOf(u8, try jsonOf(&env, checked), "\"checked_only\":true,\"stopped_services\":[],\"running_sessions\":[],\"sessions\":[],\"services\":[]") != null);
     try testing.expect(!env.mirror.requested("SHA256SUMS"));
     try testing.expectEqualStrings("", env.probeLog());
 
@@ -578,8 +582,22 @@ test "update: a session running from the install refuses the update; this instal
         try testing.expectError(error.SessionsRunning, env.run(.{}));
         try testing.expect(std.mem.indexOf(u8, env.log.written(), "pid ") != null);
         try testing.expect(std.mem.indexOf(u8, env.probeLog(), "--upgrade") == null);
-        // --check looks at nothing that runs.
-        try testing.expect((try env.run(.{ .check = true })).checked_only);
+        env.mirror.clearRequests();
+        const checked = try env.run(.{ .check = true });
+        try testing.expect(checked.checked_only and checked.changes());
+        try testing.expectEqualSlices(update.Pid, &.{pidOf(&session)}, checked.sessions);
+        try testing.expectEqual(@as(usize, 0), checked.services.len);
+        try testing.expectEqual(@as(usize, 0), checked.running_sessions.len);
+        const text = env.log.written();
+        try testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(env.arena(), "pid {d}  {s}", .{ pidOf(&session), exe })) != null);
+        try testing.expect(std.mem.indexOf(u8, text, "the update would be refused until they exit") != null);
+        try testing.expectEqual(!is_windows, std.mem.indexOf(u8, text, "or with --ignore-running") != null);
+        const doc = try jsonOf(&env, checked);
+        try testing.expect(std.mem.indexOf(u8, doc, try std.fmt.allocPrint(env.arena(), "\"sessions\":[{d}],\"services\":[]", .{pidOf(&session)})) != null);
+        try testing.expect(std.mem.indexOf(u8, doc, "\"stopped_services\":[],\"running_sessions\":[]") != null);
+        try testing.expect(!env.mirror.requested("SHA256SUMS"));
+        try testing.expect(std.mem.indexOf(u8, env.probeLog(), "--upgrade") == null);
+        try testing.expectEqualStrings("1.0.0", (try install.measure(env.arena(), testing.io, env.prefix)).record.version);
         if (is_windows) try testing.expectError(error.IgnoreRunningUnsupported, env.run(.{ .ignore_running = true }));
     }
     try waitForProcesses(&env, 0);
@@ -588,9 +606,15 @@ test "update: a session running from the install refuses the update; this instal
     var service = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "kgd" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
     defer service.kill(testing.io);
     try waitForProcesses(&env, 2);
+    const checked = try env.run(.{ .check = true });
+    try testing.expectEqualSlices(update.Pid, &.{pidOf(&service)}, checked.services);
+    try testing.expectEqual(@as(usize, 0), checked.sessions.len);
+    try testing.expect(std.mem.indexOf(u8, env.log.written(), "a real run stops this install's TinyKG service") != null);
+    try testing.expect(std.mem.indexOf(u8, try jsonOf(&env, checked), try std.fmt.allocPrint(env.arena(), "\"sessions\":[],\"services\":[{d}]", .{pidOf(&service)})) != null);
+    try testing.expectEqual(@as(usize, 2), (try platform.process_scan.listUnder(env.arena(), testing.io, env.prefix)).len);
     const outcome = try env.run(.{});
     try testing.expectEqual(update.Action.upgrade, outcome.action);
-    try testing.expectEqual(@as(usize, 1), outcome.stopped_services.len);
+    try testing.expectEqualSlices(update.Pid, checked.services, outcome.stopped_services);
     _ = try service.wait(testing.io);
     // Its tinykgd went with it, and the install went ahead.
     try waitForProcesses(&env, 0);
@@ -613,6 +637,12 @@ test "update: --ignore-running goes ahead and names the sessions left running" {
     try testing.expectEqual(update.Action.upgrade, outcome.action);
     try testing.expectEqual(@as(usize, 1), outcome.running_sessions.len);
     try testing.expectEqual(pidOf(&session), outcome.running_sessions[0]);
+}
+
+fn jsonOf(env: *Env, outcome: update.Outcome) ![]const u8 {
+    var doc: std.Io.Writer.Allocating = .init(env.arena());
+    try outcome.writeJson(&doc.writer);
+    return doc.written();
 }
 
 fn pidOf(child: *const std.process.Child) update.Pid {
