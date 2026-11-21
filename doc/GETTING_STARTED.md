@@ -267,7 +267,11 @@ Set `METACODES_NO_STARTUP_ANIMATION` (to any value, even
 shows where the state root is), to start straight at the prompt. The TUI keeps
 the model route's `/v1/models` answer in `<state root>/cache/models/` for a
 day, so a start does not wait for it; it is refreshed in the background, and
-the directory can be deleted at any time.
+the directory can be deleted at any time. A start without a kept answer, and
+a start on a Metask device sign-in, waits for the model list at most 1.5 s
+(`METACODES_STARTUP_MODELS_WAIT_MS` sets another bound in milliseconds, `0`
+does not wait); a `/v1/models` answer that comes later is taken before the
+next turn and kept.
 
 Leaving a session that has run a turn prints the command that reopens it,
 `metacodes --resume <id>`; inside the TUI, `/resume` lists this directory's

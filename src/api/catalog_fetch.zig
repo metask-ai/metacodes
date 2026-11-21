@@ -15,6 +15,8 @@ const http_status = @import("http_status.zig");
 const http_connection = @import("http_connection.zig");
 const models_pages = @import("models_pages.zig");
 const auth_header = @import("auth_header.zig");
+const platform = @import("platform");
+const time = @import("../util/time.zig");
 
 pub const FetchError = error{
     OutOfMemory,
@@ -241,3 +243,76 @@ pub fn fetchModelPages(
     }
     return .{ .body = try models_pages.merge(allocator, pages.items) };
 }
+
+pub const Detached = struct {
+    refs: std.atomic.Value(u8) = .init(2),
+    lock: platform.sync.Mutex = .{},
+    settled: platform.sync.Condition = .{},
+    outcome: Outcome = .running,
+    url: []u8,
+    bearer: []u8,
+
+    const Outcome = union(enum) { running, fetched: []u8, failed: FetchError, taken };
+
+    const gpa = std.heap.c_allocator;
+
+    pub fn start(url: []const u8, bearer: []const u8) !*Detached {
+        const self = try gpa.create(Detached);
+        errdefer gpa.destroy(self);
+        self.* = .{ .url = try gpa.dupe(u8, url), .bearer = undefined };
+        errdefer gpa.free(self.url);
+        self.bearer = try gpa.dupe(u8, bearer);
+        errdefer secureFree(self.bearer);
+        const thread = try platform.thread.spawn(.full, run, .{self});
+        thread.detach();
+        return self;
+    }
+
+    pub fn wait(self: *Detached, timeout_ms: u32) ?FetchError![]u8 {
+        const deadline = time.nowMs() + timeout_ms;
+        self.lock.lock();
+        defer self.lock.unlock();
+        while (self.outcome == .running) {
+            const left = deadline - time.nowMs();
+            if (left <= 0) return null;
+            _ = self.settled.timedWait(&self.lock, @as(u64, @intCast(left)) * std.time.ns_per_ms);
+        }
+        const outcome = self.outcome;
+        self.outcome = .taken;
+        return switch (outcome) {
+            .fetched => |body| body,
+            .failed => |err| err,
+            .running, .taken => error.RequestFailed,
+        };
+    }
+
+    pub fn release(self: *Detached) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        switch (self.outcome) {
+            .fetched => |body| gpa.free(body),
+            .running, .failed, .taken => {},
+        }
+        gpa.free(self.url);
+        secureFree(self.bearer);
+        gpa.destroy(self);
+    }
+
+    fn run(self: *Detached) void {
+        defer self.release();
+        var threaded = platform.signal.threadedIo(gpa, .{});
+        defer threaded.deinit();
+        const outcome: Outcome = if (fetchModelPages(gpa, threaded.io(), .{ .url = self.url, .bearer = self.bearer })) |response|
+            .{ .fetched = response.body }
+        else |err|
+            .{ .failed = err };
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.outcome = outcome;
+        self.settled.broadcast();
+    }
+
+    fn secureFree(bytes: []u8) void {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+};
