@@ -363,6 +363,12 @@ Bash 观测没能覆盖)也照发一条空 `changes` 的事件,Run 账本同时�
   `diff_complete = false`;行 diff 表达不了的末尾换行变化同样如此(只改末尾换行 → 不带 diff;
   任一侧缺末尾换行 → 带 diff 但 `diff_complete = false`)。能证明内容没变的(`touch`、写回
   相同字节)不算修改,也不占单次 64 条的记录上限。
+- **git status 不重复问**:哪些文件"执行前已与 index 不同"来自 `git --no-optional-locks status`,
+  它从不回写 index,index 的 stat 数据过期时(复制或同步来的工作区)每次都要重新哈希整个工作树
+  (#670)。进程记住最近一个工作区上次的答案和当时的 lstat:index、属性来源、工作区里的 `.gitignore`/
+  `.gitattributes` 都没变时,lstat 与上次一致、且在上次观测开始前(留 2 秒时钟余量)就没动过的
+  文件沿用上次的答案,只把其余文件(最多 256 个、16 KiB 路径)交给 `git status -- <路径>`;一个
+  都没有就不调 status。超出上限或上述任一来源变了,照旧问整个工作区。
 - **沙箱会话走沙箱**:会话启用沙箱时观测完全不调用 git——沙箱内的命令可以写工作区里的
   `.git/config`,而观测在沙箱外运行 git,被植入的 fsmonitor/clean filter 会越过沙箱执行。此时
   修改照报,只是不带 diff。非沙箱会话里也总带 `-c core.fsmonitor=false`。列举也在沙箱里跑

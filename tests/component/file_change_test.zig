@@ -838,3 +838,42 @@ test "L2 后台 Bash 的写入无人观测:报告不完整,而不是报告没改
     try std.testing.expectEqual(@as(usize, 0), scenario.journal.count());
     try std.testing.expect(scenario.journal.truncated);
 }
+
+test "L2 consecutive observed Bash calls keep the before of a file the previous call left dirty (#670)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clean.py", .data = "x = 1\ny = 2\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.py", .data = "z = 1\n" });
+
+    const b0 = try bashSse(a, "b0", "git init -q && git add -A && git -c user.email=t@example.invalid -c user.name=t -c commit.gpgsign=false commit -qm init", false);
+    defer a.free(b0);
+    const b1 = try bashSse(a, "b1", "printf 'x = 1\\ny = 20\\n' > clean.py", false);
+    defer a.free(b1);
+    const b2 = try bashSse(a, "b2", "printf 'x = 1\\ny = 30\\n' > clean.py && printf 'z = 2\\n' > other.py", false);
+    defer a.free(b2);
+
+    var scenario = try runCassette(a, &.{ b0, b1, b2, END_TURN }, root, .bypass_permissions);
+    defer scenario.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 0), scenario.events.lost_ids.items.len);
+
+    var second: ?file_change.Record = null;
+    var other: ?file_change.Record = null;
+    for (scenario.recordsAfterRun()) |rec| {
+        if (!std.mem.eql(u8, rec.tool_use_id, "b2")) continue;
+        if (std.mem.eql(u8, rec.path(), "clean.py")) second = rec;
+        if (std.mem.eql(u8, rec.path(), "other.py")) other = rec;
+    }
+    try std.testing.expectEqualStrings(
+        "--- a/clean.py\n+++ b/clean.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 20\n+y = 30\n",
+        (second orelse return error.TestExpectedRecord).unified_diff orelse return error.TestExpectedDiff,
+    );
+    try std.testing.expectEqualStrings(
+        "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-z = 1\n+z = 2\n",
+        (other orelse return error.TestExpectedRecord).unified_diff orelse return error.TestExpectedDiff,
+    );
+}

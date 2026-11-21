@@ -906,15 +906,14 @@ fn runAutoBackgroundable(
 
     const effective_budget = if (allow_auto_background) @min(timeout_ms, AUTO_BACKGROUND_MS) else timeout_ms;
     const start = nowMs();
+    var polls: u32 = 0;
     // 轮询循环
-    while (true) {
+    while (true) : (polls +|= 1) {
         if (abort) |a| if (a.isAborted()) {
             registry.kill(job_id[0..]) catch {};
             registry.releaseSpool(job_id[0..]);
             return error.Aborted;
         };
-        util_time.sleepMs(100);
-
         registry.reapExited();
         const j = registry.get(job_id[0..]) orelse return error.JobNotFound; // 值快照
         if (j.status != .running) {
@@ -939,7 +938,15 @@ fn runAutoBackgroundable(
             outlived.* = true;
             return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }
+        util_time.sleepMs(@min(foregroundPollDelayMs(polls), effective_budget - elapsed));
     }
+}
+
+const FOREGROUND_POLL_MAX_MS: u64 = 100;
+
+fn foregroundPollDelayMs(polls: u32) u64 {
+    const shift: u6 = @intCast(@min(polls, 7));
+    return @min(FOREGROUND_POLL_MAX_MS, @as(u64, 1) << shift);
 }
 
 fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry, artifact_root: []const u8, budget: result_budget.Budget, metrics: ?*ResultMetrics, attachments: *tool_result.SealedHandles) ![]u8 {
@@ -1112,6 +1119,14 @@ test "BashTool: cwd 存在但进不去(EACCES)→ detail 说的是权限,不编�
     const d = detail orelse return error.TestExpectedDetail;
     try std.testing.expect(std.mem.indexOf(u8, d, "EACCES") != null);
     try std.testing.expect(std.mem.indexOf(u8, d, "renamed or removed") == null);
+}
+
+test "the foreground wait polls at once and backs off to the old 100 ms slice (#670)" {
+    try std.testing.expectEqual(@as(u64, 1), foregroundPollDelayMs(0));
+    try std.testing.expectEqual(@as(u64, 2), foregroundPollDelayMs(1));
+    try std.testing.expectEqual(@as(u64, 64), foregroundPollDelayMs(6));
+    try std.testing.expectEqual(FOREGROUND_POLL_MAX_MS, foregroundPollDelayMs(7));
+    try std.testing.expectEqual(FOREGROUND_POLL_MAX_MS, foregroundPollDelayMs(std.math.maxInt(u32)));
 }
 
 test "BashTool description is parsed without error" {
