@@ -137,6 +137,7 @@ class CatalogTest(unittest.TestCase):
         expected = {"humaneval": "代码生成", "mbpp": "基础编程", "alfworld": "交互规划", "searchqa": "问答",
                     "livemath": "数学推理", "aime": "竞赛数学", "aime-2025": "竞赛数学",
                     "terminal-bench-2.0": "终端工程", "terminal-bench-2.1": "终端工程",
+                    "frontier-harness-eval-1.1": "终端工程",
                     "gaia2-cli": "通用 Agent", "workbuddy-code": "办公 Agent"}
         for suite_id, category in expected.items():
             self.assertEqual(categories[suites.get(suite_id).category], category, suite_id)
@@ -149,6 +150,9 @@ class CatalogTest(unittest.TestCase):
         # Hub tasks are matched as org/name, legacy-registry ones by bare name.
         self.assertEqual(suites.task_filters(tb21, ["fix-git"]), ["terminal-bench/fix-git"])
         self.assertEqual(suites.task_filters(tb20, ["fix-git"]), ["fix-git"])
+        fhe = suites.get("frontier-harness-eval-1.1")
+        self.assertEqual((len(fhe.tasks), fhe.dataset), (62, "frontier-harness-eval/frontier-harness-eval@v1.1.0"))
+        self.assertEqual(suites.task_filters(fhe, ["mvcc-lsm-compaction"]), ["terminal-bench/mvcc-lsm-compaction"])
         aime, aime25 = suites.get("aime"), suites.get("aime-2025")
         self.assertEqual((aime.dataset, aime25.dataset), ("aime@1.0", "aime@1.0"))
         self.assertEqual(len(aime.tasks), 60)
@@ -253,8 +257,10 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(suites.label("aime-2025")["category_name"], "竞赛数学")
 
     def test_workbuddy_platform_matches_the_stager(self):
+        from scripts.eval.workbuddy.environment_preflight import DEFAULT_HARNESS_IMAGE
         from scripts.eval.workbuddy.stage_artifacts import TARGET_PLATFORM
         self.assertEqual(wb.TARGET_PLATFORM, TARGET_PLATFORM)
+        self.assertEqual(wb.HARNESS_IMAGE, DEFAULT_HARNESS_IMAGE)
 
     def test_binary_carries_every_module_the_workbench_imports(self):
         assets = set(re.findall(r'\.path = "([^"]+)"', (REPO / "scripts/bench_assets.zig").read_text()))
@@ -723,6 +729,19 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(trial["row"]["status"], "pass")
         public = json.dumps(catalog) + "".join(p.read_text() for p in self.manager.records.iterdir())
         self.assertNotIn("session-access", public)
+
+    def test_the_mount_image_build_checks_the_manifest_it_builds_from(self):
+        """Staged artifacts swapped after the node's check: the build reads the
+        manifest once and refuses before Docker runs."""
+        import threading
+        repo = workbuddy_checkout(self.root)
+        staged = {"metacodes": "b" * 64, "tinykg": "b" * 64, "metacodes-formal-kernel": "b" * 64, "ripgrep": "b" * 64}
+        manifest = json.loads((repo / wb.ARTIFACT_MANIFEST).read_text())
+        manifest["executables"] = {label: {"sha256": digest} for label, digest in staged.items()}
+        atomic_json(repo / wb.ARTIFACT_MANIFEST, manifest)
+        expected = {**staged, "metacodes": "a" * 64}
+        with self.assertRaisesRegex(ValueError, "metacodes"):
+            wb.build_harness_image(repo, "t:x", threading.Event(), expected=expected, docker=str(self.root / "no-docker"))
 
     def test_workbuddy_readiness_reports_an_unpinned_checkout(self):
         repo = workbuddy_checkout(self.root, head="0" * 40)

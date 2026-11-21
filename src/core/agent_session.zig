@@ -263,8 +263,8 @@ test "minimal and none core profiles retain the mandatory artifact recovery kern
 }
 
 pub const RuntimeConfig = struct {
-    /// Explicit Host opt-in. Profiles remain stable when false.
-    preview: bool = false,
+    /// Explicit Host opt-in per preview feature. Profiles remain stable when none is selected.
+    preview: @import("../preview.zig").Features = .none,
     /// Null selects the first-party `core_profile`. A non-null slice is the
     /// source-compatible explicit/legacy override used by older embedding
     /// adapters and tests; first-party packs are then omitted, while any
@@ -353,7 +353,7 @@ const SessionCreateHooks = struct {
 
 pub const AgentRuntime = struct {
     allocator: std.mem.Allocator,
-    preview: bool,
+    preview: @import("../preview.zig").Features,
     plugin_snapshot: *plugin_runtime.Snapshot,
     catalog: tool_catalog.Catalog,
     mutex: sync.Mutex = .{},
@@ -410,10 +410,9 @@ pub const AgentRuntime = struct {
             }
         }
         try builtin_tools.appendSlice(allocator, plugin_snapshot.builtin_tools);
-        if (config.preview) {
-            for (first_party_plugins.PREVIEW_TOOLS) |name| {
-                if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
-            }
+        for (first_party_plugins.PREVIEW_TOOLS) |name| {
+            const builtin = @import("../tools.zig").getTool(name) orelse return error.UnsupportedBuiltinTool;
+            if (builtin.previewAllowed(config.preview) and !containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
         }
         if (config.enable_teams) {
             for (TEAM_BUILTIN_TOOLS) |name| {
@@ -426,9 +425,8 @@ pub const AgentRuntime = struct {
             }
         }
         for (builtin_tools.items) |name| {
-            if (!config.preview) {
-                const builtin = @import("../tools.zig").getTool(name) orelse return error.UnsupportedBuiltinTool;
-                if (builtin.preview_gated) return error.PreviewFeatureDisabled;
+            if (@import("../tools.zig").getTool(name)) |builtin| {
+                if (!builtin.previewAllowed(config.preview)) return error.PreviewFeatureDisabled;
             }
             if (config.enable_cron and isCronBuiltin(name)) continue;
             if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;

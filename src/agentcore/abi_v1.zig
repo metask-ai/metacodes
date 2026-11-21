@@ -5950,7 +5950,7 @@ fn runtimeCreateImpl(
         .process_plugins = process_plugins,
         // Issue #277: nonzero admits the team tools into the catalog.
         .enable_teams = config.enable_teams != 0,
-        .preview = config.preview == 1,
+        .preview = if (config.preview == 1) .all else .none,
     }) catch |err| {
         // 依赖缺失是宿主可修复的部署问题:诊断必须直接说明缺什么、怎么给。
         if (err == error.ToolDependencyUnavailable)

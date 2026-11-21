@@ -687,7 +687,7 @@ pub fn handleSlash(
         .parent_model = app.activeModel(),
         .skills = &app.skills,
         .api_client = app.anthropicClientOrNull(),
-        .preview = app.config.preview.isEnabled(),
+        .preview = app.config.preview.features(),
     };
     const activation = app.skill_runtime.activate(
         &tool_context,

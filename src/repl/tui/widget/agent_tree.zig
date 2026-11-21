@@ -23,6 +23,8 @@ const term = @import("../term.zig");
 const registry = @import("../../../core/agent_job_registry.zig");
 const tool_card = @import("tool_card.zig");
 const util_time = @import("../../../util/time.zig");
+const progress = @import("../../../teamwork/progress.zig");
+const teamwork_types = @import("../../../teamwork/types.zig");
 
 const JobSnapshot = registry.AgentJobRegistry.JobSnapshot;
 const JobStatus = registry.JobStatus;
@@ -101,6 +103,107 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, jobs: []const JobSnapshot, no
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn renderTeamwork(alloc: std.mem.Allocator, th: Theme, snapshot: progress.Snapshot, max_cols: ?usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    const title = " Teamwork";
+    try out.appendSlice(alloc, th.accent);
+    try out.appendSlice(alloc, th.icon_act);
+    try out.appendSlice(alloc, th.reset);
+    try out.appendSlice(alloc, title);
+    if (snapshot.goal.len > 0) {
+        const separator = " · ";
+        try out.appendSlice(alloc, separator);
+        const used = term.displayWidth(th.icon_act) + title.len + term.displayWidth(separator);
+        try appendGoal(alloc, &out, snapshot.goal, if (max_cols) |cols| cols -| used else null);
+    }
+    try out.append(alloc, '\n');
+
+    try out.appendSlice(alloc, "   ");
+    try out.appendSlice(alloc, th.dim);
+    try out.print(alloc, "{d}/{d} done · ${d:.2} / ${d:.2} · {s}", .{ snapshot.seatsDone(), snapshot.seats.len, snapshot.budget.spent_usd, snapshot.budget.cap_usd, @tagName(snapshot.phase) });
+    try out.appendSlice(alloc, th.reset);
+    try out.append(alloc, '\n');
+
+    if (snapshot.candidates.len != 0) {
+        try out.appendSlice(alloc, "   ");
+        try out.appendSlice(alloc, th.dim);
+        try out.appendSlice(alloc, "candidates");
+        for (snapshot.candidates, 1..) |candidate, number| {
+            try out.print(alloc, " · {d} {s}", .{ number, @tagName(candidate.status) });
+        }
+        try out.appendSlice(alloc, th.reset);
+        try out.append(alloc, '\n');
+    }
+
+    for (snapshot.seats, 0..) |seat, idx| {
+        try out.appendSlice(alloc, "   ");
+        try out.appendSlice(alloc, th.dim);
+        try out.appendSlice(alloc, if (idx + 1 == snapshot.seats.len) th.tree_end else th.tree_branch);
+        try out.appendSlice(alloc, th.reset);
+        try out.print(alloc, " {s} · {s} · ", .{ seat.id.slice(), harnessLabel(seat.harness) });
+        try out.appendSlice(alloc, switch (seat.status) {
+            .working => th.accent,
+            .needs_you => th.warn,
+            .done => th.success,
+            .failed => th.danger,
+            .queued, .waiting => th.dim,
+        });
+        try out.appendSlice(alloc, @tagName(seat.status));
+        try out.appendSlice(alloc, th.reset);
+        try out.append(alloc, '\n');
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn harnessLabel(harness: teamwork_types.Harness) []const u8 {
+    return switch (harness) {
+        .metacodes => "metacodes",
+        .claude_code => "Claude Code",
+    };
+}
+
+fn appendGoal(alloc: std.mem.Allocator, out: *std.ArrayList(u8), goal: []const u8, max_cols: ?usize) !void {
+    const ellipsis = "…";
+    const limit = max_cols orelse std.math.maxInt(usize);
+    const fits = goalWidth(goal) <= limit;
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < goal.len) {
+        const len = goalCharLen(goal, i);
+        const char = goal[i .. i + len];
+        const width = goalCharWidth(char);
+        if (!fits and cols + width + 1 > limit) break;
+        if (isControl(char)) try out.append(alloc, ' ') else try out.appendSlice(alloc, char);
+        cols += width;
+        i += len;
+    }
+    if (!fits and limit > 0) try out.appendSlice(alloc, ellipsis);
+}
+
+fn goalWidth(goal: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < goal.len) {
+        const len = goalCharLen(goal, i);
+        cols += goalCharWidth(goal[i .. i + len]);
+        i += len;
+    }
+    return cols;
+}
+
+fn goalCharLen(goal: []const u8, i: usize) usize {
+    return @min(std.unicode.utf8ByteSequenceLength(goal[i]) catch 1, goal.len - i);
+}
+
+fn goalCharWidth(char: []const u8) usize {
+    return if (isControl(char)) 1 else term.displayWidth(char);
+}
+
+fn isControl(char: []const u8) bool {
+    return char.len == 1 and (char[0] < 0x20 or char[0] == 0x7f);
 }
 
 /// token 数格式化:17300 → "17.3k";<1000 原样。
@@ -341,4 +444,92 @@ test "agent_tree: dark 主题树形字符 ├└⎿" {
     try capture.expectContains(s, "⎿"); // 动作臂
     try capture.expectContains(s, "│"); // 非末枝下竖管
     try capture.expectContains(s, "Read: /x"); // 动作行冒号式带全路径
+}
+
+fn teamworkSeats() [3]@import("../../../teamwork/runtime.zig").SeatSnapshot {
+    return .{
+        .{ .id = teamwork_types.seatIdFor(.implementer, 1), .role = .implementer, .harness = .metacodes, .status = .done },
+        .{ .id = teamwork_types.seatIdFor(.reviewer, 1), .role = .reviewer, .harness = .claude_code, .status = .working },
+        .{ .id = teamwork_types.seatIdFor(.implementer, 2), .role = .implementer, .harness = .metacodes, .status = .needs_you },
+    };
+}
+
+fn teamworkSnapshot(seats: []const @import("../../../teamwork/runtime.zig").SeatSnapshot, goal: []const u8) !progress.Snapshot {
+    return .{
+        .run_id = try teamwork_types.RunId.parse("run-1"),
+        .goal = goal,
+        .phase = .reviewing,
+        .seats = seats,
+        .budget = .{ .cap_usd = 5, .spent_usd = 0.42, .remaining_usd = 4.58, .charges = 2 },
+        .audit = .{ .used = 0, .last = null },
+    };
+}
+
+test "agent_tree teamwork: three seats mixing metacodes and Claude Code" {
+    const seats = teamworkSeats();
+    const s = try renderTeamwork(testing.allocator, theme_mod.dark, try teamworkSnapshot(&seats, "Add feature.txt"), 80);
+    defer testing.allocator.free(s);
+    try capture.expectStrippedEquals(testing.allocator, s,
+        \\⏺ Teamwork · Add feature.txt
+        \\   1/3 done · $0.42 / $5.00 · reviewing
+        \\   ├ implementer-1 · metacodes · done
+        \\   ├ reviewer-1 · Claude Code · working
+        \\   └ implementer-2 · metacodes · needs_you
+        \\
+    );
+}
+
+test "agent_tree teamwork: colours follow the seat status" {
+    const seats = teamworkSeats();
+    const s = try renderTeamwork(testing.allocator, theme_mod.dark, try teamworkSnapshot(&seats, "Add feature.txt"), 80);
+    defer testing.allocator.free(s);
+    const th = theme_mod.dark;
+    const working = try std.mem.concat(testing.allocator, u8, &.{ th.accent, "working", th.reset });
+    defer testing.allocator.free(working);
+    const needs_you = try std.mem.concat(testing.allocator, u8, &.{ th.warn, "needs_you", th.reset });
+    defer testing.allocator.free(needs_you);
+    try capture.expectContains(s, working);
+    try capture.expectContains(s, needs_you);
+}
+
+test "agent_tree teamwork: the goal is cut to the width and never carries control bytes" {
+    const seats = teamworkSeats();
+    const s = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], "Ship\x1b[2Jthe 全角 feature now"), 24);
+    defer testing.allocator.free(s);
+    const title = s[0..std.mem.indexOfScalar(u8, s, '\n').?];
+    try testing.expectEqualStrings("* Teamwork · Ship [2Jth…", title);
+    try testing.expect(term.displayWidth(title) <= 24);
+    const unbounded = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], "Ship the 全角 feature now"), null);
+    defer testing.allocator.free(unbounded);
+    try capture.expectContains(unbounded, "* Teamwork · Ship the 全角 feature now\n");
+}
+
+test "agent_tree teamwork: control bytes count as the spaces they become when fitting the goal" {
+    const seats = teamworkSeats();
+    const goal = "ab\x01\x02\x03\x04";
+    const exact = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], goal), 13 + 6);
+    defer testing.allocator.free(exact);
+    try capture.expectContains(exact, "* Teamwork · ab    \n");
+    const narrow = try renderTeamwork(testing.allocator, theme_mod.monochrome, try teamworkSnapshot(seats[0..1], goal), 13 + 5);
+    defer testing.allocator.free(narrow);
+    const title = narrow[0..std.mem.indexOfScalar(u8, narrow, '\n').?];
+    try testing.expectEqualStrings("* Teamwork · ab  …", title);
+    try testing.expect(term.displayWidth(title) <= 13 + 5);
+}
+
+test "agent_tree teamwork: parallel candidates show their statuses under the summary" {
+    const seats = teamworkSeats();
+    var snapshot = try teamworkSnapshot(seats[0..1], "Add feature.txt");
+    const candidates = [_]@import("../../../teamwork/runtime.zig").CandidateSnapshot{ .{ .status = .rejected }, .{ .status = .selected }, .{ .status = .eliminated } };
+    snapshot.phase = .candidates;
+    snapshot.candidates = &candidates;
+    const s = try renderTeamwork(testing.allocator, theme_mod.dark, snapshot, 80);
+    defer testing.allocator.free(s);
+    try capture.expectStrippedEquals(testing.allocator, s,
+        \\⏺ Teamwork · Add feature.txt
+        \\   1/1 done · $0.42 / $5.00 · candidates
+        \\   candidates · 1 rejected · 2 selected · 3 eliminated
+        \\   └ implementer-1 · metacodes · done
+        \\
+    );
 }

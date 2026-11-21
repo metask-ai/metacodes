@@ -550,7 +550,7 @@ pub fn loopOptions(app: *app_mod.App, sw: *swarm_ctx.SwarmContext, parent_sessio
         .api_client = app.anthropicClientOrNull(),
         .tool_defs = app.tool_defs,
         .system_prompt = app.system_prompt,
-        .preview = app.config.preview.isEnabled(),
+        .preview = app.config.preview.features(),
         .swarm = sw,
         .tasks = &app.tasks,
         .kg = if (app.kg) |*k| k else null,
@@ -664,14 +664,19 @@ pub fn spawnTeammateProcess(
     }
 
     // ③ fork+exec(或 mock)。
-    var flags: [2][]const u8 = undefined;
+    var flags: [3][]const u8 = undefined;
+    var preview_arg: [@import("../preview.zig").Features.max_arg_len]u8 = undefined;
     var flag_count: usize = 0;
     if (!lsp_enabled) {
         flags[flag_count] = "--no-lsp";
         flag_count += 1;
     }
-    flags[flag_count] = if (sw.preview) "--preview" else "--no-preview";
+    flags[flag_count] = "--no-preview";
     flag_count += 1;
+    if (!sw.preview.eql(.none)) {
+        flags[flag_count] = sw.preview.enableArg(&preview_arg);
+        flag_count += 1;
+    }
     const pid = try spawn_fn(a, .{
         .name = name_s,
         .team = sw.team_sanitized,

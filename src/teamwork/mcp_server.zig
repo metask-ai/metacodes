@@ -110,6 +110,10 @@ pub const Server = struct {
             self.run.cancel() catch |err| return try self.runtimeError(gpa, reply_id, err);
             return try self.toolResult(gpa, reply_id, .{ .kind = "cancel" }, false, null);
         }
+        if (std.mem.eql(u8, name, "teamwork_run_candidates")) {
+            const outcome = self.run.runCandidates() catch |err| return try self.runtimeError(gpa, reply_id, err);
+            return try self.toolResult(gpa, reply_id, .{ .kind = "candidates", .outcome = tagged(outcome) }, outcome != .selected, null);
+        }
         if (std.mem.eql(u8, name, "teamwork_request_completion")) {
             const outcome = self.run.requestCompletion() catch |err| return try self.runtimeError(gpa, reply_id, err);
             const failed = switch (outcome) {
@@ -175,7 +179,7 @@ pub const Server = struct {
                         try self.handle(self.gpa, std.mem.trimEnd(u8, buffer[0..len], "\r"));
                     if (out) |bytes| {
                         defer self.gpa.free(bytes);
-                        if (!pfs.writeAll(output, bytes) or !pfs.writeAll(output, "\n")) return error.WriteFailed;
+                        if (!self.writeFrame(output, bytes) or !self.writeFrame(output, "\n")) return error.WriteFailed;
                     }
                     len = 0;
                     oversized = false;
@@ -193,11 +197,30 @@ pub const Server = struct {
         if (!self.run.abort.isAborted() and (len != 0 or oversized)) {
             const bytes = try rpcError(self.gpa, .null, -32700, "Unterminated message");
             defer self.gpa.free(bytes);
-            if (!pfs.writeAll(output, bytes) or !pfs.writeAll(output, "\n")) return error.WriteFailed;
+            if (!self.writeFrame(output, bytes) or !self.writeFrame(output, "\n")) return error.WriteFailed;
         }
         try self.run.cancel();
     }
+
+    fn writeFrame(self: *Server, output: pfs.Fd, bytes: []const u8) bool {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const n = pfs.write(output, rest);
+            if (n > 0) {
+                rest = rest[@intCast(n)..];
+            } else if (builtin.os.tag != .windows and n < 0 and (pfs.lastErrnoIs(.INTR) or pfs.lastErrnoIs(.AGAIN))) {
+                if (self.run.abort.isAborted()) return false;
+                waitForOutput(output);
+            } else return false;
+        }
+        return true;
+    }
 };
+
+fn waitForOutput(output: pfs.Fd) void {
+    var fds = [_]std.c.pollfd{.{ .fd = output, .events = std.c.POLL.OUT, .revents = 0 }};
+    _ = std.c.poll(&fds, 1, 50);
+}
 
 fn waitForInput(input: pfs.Fd) error{ ReadFailed, UnsupportedPlatform }!bool {
     if (builtin.os.tag == .windows) {
@@ -323,6 +346,7 @@ const Snapshot = struct {
                 switch (result) {
                     .review => |review| try writer.write(.{ .kind = "review", .detail = tagged(review) }),
                     .failed => |err| try writer.write(.{ .kind = "failed", .detail = tagged(err) }),
+                    .judgment => |judgment| try writer.write(.{ .kind = "judgment", .detail = tagged(judgment) }),
                     else => try writer.write(tagged(result)),
                 }
             } else try writer.write(null);
@@ -333,6 +357,12 @@ const Snapshot = struct {
             try writer.objectField(name);
             try writer.write(@field(s, name));
         }
+        try writer.objectField("candidates");
+        try writer.beginArray();
+        for (s.candidates, 1..) |candidate, number| {
+            try writer.write(.{ .candidate = number, .status = candidate.status, .tree = if (candidate.tree) |tree| tree.slice() else null });
+        }
+        try writer.endArray();
         try writer.endObject();
     }
 };
@@ -353,6 +383,7 @@ const tool_list = .{ .tools = .{
             .additionalProperties = false,
         },
     },
+    .{ .name = "teamwork_run_candidates", .description = "When the approved configuration has parallel candidates, run every candidate's implementer and reviewer, then the judge. Must come before any dispatch.", .inputSchema = empty_schema },
     .{ .name = "teamwork_request_completion", .description = "Ask the runtime to verify review approval, audit independently and merge. Only the runtime can mark done.", .inputSchema = empty_schema },
     .{ .name = "teamwork_cancel", .description = "Cancel the run between calls, retaining its worktree. Idempotent for ended runs.", .inputSchema = empty_schema },
 } };

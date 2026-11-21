@@ -52,7 +52,7 @@ pub fn toolsFor(role: types.Role) []const []const u8 {
     return switch (role) {
         .implementer => &implementer_tools,
         .reviewer => &reviewer_tools,
-        .interviewer, .manager, .verifier => &planner_tools,
+        .interviewer, .manager, .verifier, .judge => &planner_tools,
     };
 }
 
@@ -424,7 +424,7 @@ test "write scope: seat sandbox drops host write widenings and escape hatches" {
 
 test "write scope: a non-implementer seat writes only its seat directory" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    for ([_]types.Role{ .reviewer, .interviewer, .manager, .verifier }) |role| {
+    for ([_]types.Role{ .reviewer, .interviewer, .manager, .verifier, .judge }) |role| {
         var fx: Fixture = .{ .role = role };
         try fx.init("cc-zig-teamwork-scope-role");
         defer fx.deinit();

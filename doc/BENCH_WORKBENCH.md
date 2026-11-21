@@ -5,7 +5,9 @@ and prints its URL. The executable carries the Python and frontend files, so
 it works outside a checkout. Python 3.9+ must be on PATH; set
 `METACODES_BENCH_PYTHON` to choose an interpreter. Harbor 0.26 and Docker are
 needed on the machine that executes trials. OpenSSL is also needed there for
-the job-local timing relay's ephemeral TLS certificate.
+the job-local timing relay's ephemeral TLS certificate. Another machine
+with `metacodes` installed can run the trials as a Bench node driven over
+SSH (see [Bench nodes](#bench-nodes)).
 
 ```sh
 metacodes bench                         # start/reuse service and open browser
@@ -21,6 +23,8 @@ metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
+metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
+metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
 ```
 
 Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
@@ -52,6 +56,7 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 竞赛数学 | `aime-2025` | harbor-registry | `-d aime@1.0`, 2025 I/II only | 30 (30) |
 | 终端工程 | `terminal-bench-2.1` | harbor-registry | `-d terminal-bench/terminal-bench-2-1` | 89 (89) |
 | 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
+| 终端工程 | `frontier-harness-eval-1.1` | harbor-registry | `-d frontier-harness-eval/frontier-harness-eval@v1.1.0` | 62 (62) |
 | 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
@@ -72,6 +77,14 @@ is in neither registry, so `gaia2-cli` runs a locally generated dataset with
 `-p`. Its tasks reach the agent's tools through an MCP sidecar
 (`[[environment.mcp_servers]]`), which the metacodes Harbor agent writes into
 the trial's `mcpServers`.
+
+`frontier-harness-eval-1.1` is the pinned task set of the
+[FrontierHarness Eval](https://frontierharness.org/) leaderboard (a Hub
+dataset whose 62 tasks are named `terminal-bench/<name>`). The workbench runs
+it on its own Docker executors with the chosen model, so scores are for
+internal comparison: leaderboard results use Runta runtimes, the five Baseten
+models at effort `max` and 4 attempts per task
+([frontier-harness-eval/eval](https://github.com/frontier-harness-eval/eval/tree/release/v1.1)).
 
 `bench prepare --suite gaia2-cli` needs no manual steps on the workbench
 machine: it fetches Harbor v0.26.0 at its pinned commit
@@ -206,15 +219,15 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Step | What it does |
 |---|---|
 | SSH access (`ssh` executors) | Runs a probe over `ssh -o BatchMode=yes`; if the key cannot run commands, it stops here and says so |
-| Python 3.9+ (`ssh` executors) | Needed by the remote driver |
+| Python 3.9+ (`ssh` executors) | Needed by the executor's `metacodes bench` |
 | 网络与镜像 (`ssh` executors) | Probes `pypi.org`, `registry-1.docker.io`, `ghcr.io` and `github.com` from the executor (8 s timeout; over 5 s counts as slow) and fills in what is missing from the entry: `pypi_index`, `docker_mirrors`, `ghcr_mirror` and `"egress": "workbench"` (see [Network-restricted executors](#network-restricted-executors)). A value already in the entry is never replaced; a dry run lists the proposed changes |
 | uv | macOS: `brew install uv` when Homebrew exists; otherwise (and on Linux) the official installer pinned to uv 0.13.9 into `~/.local/bin` |
 | Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12; with an executor's `pypi_index`, prefixed by `env UV_DEFAULT_INDEX=<index>`); the resulting path is saved |
-| Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose plugin when needed |
+| Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose and buildx plugins when needed |
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
-| Copy runtime (`ssh` executors) | Ships the bench runtime and the bundle (below) |
+| metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
 | 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy; a failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
@@ -572,18 +585,52 @@ usable. Readiness probes are cached for 15 seconds.
   and group changes need passwordless sudo, or the user runs the reported
   command.
 
+### Bench nodes
+
+Every machine with `metacodes` installed is a Bench node. A workbench drives
+an SSH executor the way an editor drives a remote host: it runs that host's
+own `metacodes bench node …` over SSH and talks to it on the channel's stdin
+and stdout. Nothing else runs on the executor; the bench runtime is the one
+its `metacodes` carries. The node is `<state_dir>/bin/metacodes` (setup's
+entry), else a `metacodes` on the executor's PATH; it starts `bench` with the
+entry's `python` (as `METACODES_BENCH_PYTHON`). The readiness probe and every
+node command resolve it the same way.
+
+- `node info --json` is the node describing itself: its version, the node
+  protocol, host name, OS and architecture, and the WorkBuddy suites
+  prepared on it (each suite's readiness there and its task ids). The
+  readiness probe asks for it on every check (cached 15 seconds), so the page
+  labels the executor with the node's version (`relay-4090（SSH …） ·
+  metacodes 0.12.1`). A node that is missing, or speaks another protocol, makes
+  the executor not ready, naming `metacodes bench setup --executor NAME`.
+- `--peer NAME` on `info` names the workbench asking; the node remembers it
+  in `<its state root>/bench/peers.json`. `node peers` lists both
+  directions: the SSH executors this node's own `workbench.json` drives and
+  the workbenches that drove it. Either side can therefore see the other,
+  even when only one of them can open an SSH connection.
+- `node run <spec>` executes one run on the node (below); `node manifest`,
+  `node pack` and `node egress-probe` are the job copy-back and setup's
+  container egress check.
+
+A node keeps its own state root (`~/.metacodes` by default) and
+`workbench.json`. What is prepared on the node itself is read from there:
+a WorkBuddy checkout set with `metacodes bench --workbuddy-checkout <dir>`
+on the node (or `METACODES_WORKBUDDY_CHECKOUT`) makes the WorkBuddy Code
+and Security suites ready on that executor, with the node's own task list.
+The credential always comes from the workbench driving the run.
+
 ### How an SSH run works
 
 The local worker stays the durable owner of the run: it resolves the
 account (or provider) credential exactly as for a local run, and keeps
 refreshing a session login, then
 
-1. ships the bench runtime and the Linux bundle as tar streams over SSH into
-   `<state_dir>/runtime/<digest>` and `<state_dir>/bundles/<digest>`, once per
-   content digest (complete directories are marked and reused);
+1. ships the Linux bundle the run evaluates as a tar stream over SSH into
+   `<state_dir>/bundles/<digest>`, once per content digest (complete
+   directories are marked and reused);
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
-3. starts `python3 -m scripts.eval.harbor.bench.remote run …` over SSH and
+3. starts `<state_dir>/bin/metacodes bench node run …` over SSH and
    writes the secrets as the first line on the SSH channel's stdin:
    `{"env": {"METASK_API_KEY": "<placeholder>", …}, "credential": "<access token or key>"}`.
    `env` goes to Harbor's environment (`--ae NAME=${NAME}` as locally), so
@@ -642,10 +689,29 @@ judge uses the executor's relay instead: only its placeholder travels on
 stdin (beside the agent's), the remote driver adds the `--ve` arguments once
 its relay listens, and the session login's pushed token serves the judge
 too (a legacy group key for the judge model, when it differs from the run's,
-is sent once on the same line). WorkBuddy
-suites drive the workbench machine's own checkout and Docker, so they run on
-the `local` executor only; readiness on an SSH executor says so and the
-launch is refused.
+is sent once on the same line). A WorkBuddy
+suite on an SSH executor runs on the node's own checkout: the workbench
+validates the tasks against the list the node reports and copies the job
+back like a Harbor run. Its readiness there is reaching a compatible node,
+Metask authentication and what the node reports for the suite (an executor
+without the Harbor CLI still runs WorkBuddy, which brings its own, but it
+needs `docker buildx`). Every executable the node staged for WorkBuddy
+(`metacodes`, TinyKG, the formal kernel and ripgrep, and the project kernel
+when staged; `node info` reports their sha256) must be the run's bundle's:
+otherwise the launch is refused. The node checks again before it starts,
+then builds the split-mount image from the staged context under a tag of
+the run's own (`workbuddy-bench/harness/metacodes:metacodes-<run>`) and
+names it in a transient harness version (the pinned `0.1.0.yaml` plus
+`mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
+`run.sh` would otherwise reuse, and another workbench on the same Docker
+daemon could move, never reaches the trials; the build checks the staged
+executables in the very manifest it builds from. The run's tag and version
+file are removed (within 60 seconds) under heartbeats before the node
+reports the run's end. The build sends heartbeats like a running Harbor,
+and a cancel (or a closed channel) kills it and ends the run. WorkBuddy's host proxy is given a run-scoped placeholder and a
+loopback relay on the node; the relay forwards with the access token from
+the stdin line and swaps in each refreshed one, as for Harbor runs. The node
+removes its transient WorkBuddy configs afterwards.
 
 Readiness is per suite and executor: `GET /api/workbench` lists, for every
 suite, `executors.<name>.reasons` (service-wide reasons such as sign-in, the

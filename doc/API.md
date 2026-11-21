@@ -36,21 +36,36 @@ surfaces built over the same core protocols.
 
 ## Preview features
 
-Preview features default to disabled. Start with `metacodes --preview` to
-enable them, or save `"preview": true` at the root of the installation's
-`config.json` (`<state root>/config.json`). `--no-preview` disables them for
-one start, including when the saved setting is true. Command-line flags
-override the saved value; the last preview flag wins. Only a root JSON boolean
-is accepted. Child agents inherit the resolved setting. A feature's own
-selection and permission rules still apply after preview is enabled.
+Preview features default to disabled, and each has its own switch:
 
-Source embedders set `AgentRuntime.RuntimeConfig.preview = true`. AgentCore
-ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default 0);
-Python uses `Runtime(preview=True)` and Node.js uses
-`new Runtime({ preview: true })`. The SDKs include `ExecuteCode` when enabled.
-Selecting a preview built-in by name while preview is disabled is rejected.
+| Feature | Enables |
+|---|---|
+| `execute_code` | The `ExecuteCode` JavaScript orchestration tool |
+| `teamwork` | `metacodes teamwork` run, resume and Manager MCP execution |
+| `comment_guard` | The no-comment instruction and the editors' comment check |
 
-Preview also instructs agents to express intent in code and avoid adding
+`--preview` enables every feature and `--no-preview` disables every feature.
+`--preview=<list>` and `--no-preview=<list>` take comma-separated feature names
+and change only those, for example `metacodes --preview=execute_code,teamwork`.
+An unknown name is a usage error. Flags apply left to right, so the last flag
+naming a feature wins. Features no flag names come from the root `"preview"`
+of the installation's `config.json` (`<state root>/config.json`): `true`
+enables all, `false` disables all, and an object such as
+`{"execute_code": true, "comment_guard": false}` enables the features set to
+`true`. Child agents inherit the resolved features. A feature's own selection
+and permission rules still apply after it is enabled. HarnessMM and RSI are
+selected only by their own switches (`--harnessmm`, `--rsi`) and do not depend
+on this setting.
+
+Source embedders set `AgentRuntime.RuntimeConfig.preview`, a
+`preview.Features` value such as `.all` or `.{ .execute_code = true }`.
+AgentCore ABI revision 29 exposes `RuntimeConfigV1.preview` (0 or 1, default
+0), where 1 enables every feature; Python uses `Runtime(preview=True)` and
+Node.js uses `new Runtime({ preview: true })`. The SDKs include `ExecuteCode`
+when enabled. Selecting a preview built-in by name while its feature is
+disabled is rejected.
+
+`comment_guard` instructs agents to express intent in code and avoid adding
 explanatory comments. Built-in Write, Edit, ApplyPatch and NotebookEdit check
 proposed edits before writing. For each recognized language they compare
 comment tokens, including repetitions, with the file or code cell being edited.
@@ -327,16 +342,20 @@ and merge-back. No App/provider, seat or worktree starts before approval.
 The state root must be outside the repository. All workers, pinned checks
 and verifier tools require Sandbox Foundations; an unavailable backend fails
 closed. Native and Claude Code implementer/reviewer seats are supported.
+Windows has no seat sandbox backend and no workspace tree id, so `teamwork
+run`/`resume`/`mcp`, REPL `/teamwork`, `Run.start` and `Run.reopen` fail with
+`UnsupportedPlatform` before any run state is written.
 
-Teamwork is a **preview feature**, disabled by default. It uses the same root
-`"preview": true` in `<state root>/config.json` and the same `--preview` /
-`--no-preview` flags as ExecuteCode. Flags may precede `teamwork` or follow
-the action; the last flag wins and overrides the saved value. CLI dispatch
+Teamwork is the `teamwork` **preview feature**, disabled by default. It uses
+the same root `"preview"` in `<state root>/config.json` and the same
+`--preview`, `--no-preview`, `--preview=teamwork` and `--no-preview=teamwork`
+flags as the other preview features. Flags may precede `teamwork` or follow
+the action; the last flag naming the feature wins and overrides the saved value. CLI dispatch
 before App initialization and App initialization share `app/config.zig`'s
 `resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
 selects the feature; it does not approve a task or authorize spend.
 
-With preview disabled, start/resume and Manager execution fail with
+With the feature disabled, start/resume and Manager execution fail with
 `PreviewDisabled` before App/provider startup, run creation or recovery,
 worker probes, budget admission, auditing or merge-back. A saved approval,
 checkpoint or MCP field cannot grant current preview authorization. Read-only
@@ -344,10 +363,10 @@ CLI status remains available without loading global configuration. Existing
 runtime/MCP handles retain status, cancellation and destruction/cleanup after
 host opt-out; only the host's abort signal is safe to change concurrently.
 
-Zig hosts explicitly supply `teamwork_runtime.Deps.preview` (default false),
+Zig hosts explicitly supply `teamwork_runtime.Deps.preview` (default `.none`),
 independently of the approved task configuration. `Run.start`, `reopen`,
-`dispatch` and `requestCompletion` enforce it. Production hosts project the
-resolved `app.config.preview.isEnabled()` and propagate that bool into native
+`dispatch` and `requestCompletion` require its `teamwork` feature. Production
+hosts project the resolved `app.config.preview.features()` and propagate it into native
 seat and verifier subagents and worker launch admission. Third-party Claude
 Code is gated before probing/launch; it is not passed metacodes-only flags.
 This increment adds no AgentCore ABI field: the shared revision-29 preview
@@ -359,14 +378,64 @@ repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
 `--check-command`. CLI overrides are applied left to right. `--id <id>`
 selects a path-safe run id; otherwise one is generated and printed to stderr.
 Provider options are `--provider`, `--model`, `--base-url`, `--api-key`, and
-`--verbose`. This CLI uses the deterministic manager and an already-written
-request; configured model/effort or external harnesses for manager/interviewer
-are rejected. The verifier must be native; explicit verifier effort and tier
-aliases are rejected until wired. No REPL interviewer is implied.
+`--verbose`. This CLI uses an already-written request that `--approve`
+approves as is, so it runs no interviewer. The Manager is the built-in
+deterministic loop unless `seats.manager` names an external harness (see the
+launched Manager below); model/effort on the built-in manager is rejected. The verifier
+must be native; explicit verifier effort and tier aliases are rejected until
+wired.
+
+The request may start with option segments, each in square brackets:
+`[skip-interview]` and `[seats=<role>:<harness>[:<model>],...]` (for example
+`[seats=reviewer:claude_code,implementer:metacodes:fast]`). Segments are
+removed from the request; the rest is the approved text. `seats` is a
+configuration layer for this run only, above `.metacodes/teamwork.json` and
+below the CLI options; a `claude_code` seat still takes its `command` from a
+lower layer. An unknown, duplicated, unterminated or malformed segment fails
+with `UnknownTeamworkSegment`, `DuplicateTeamworkSegment`,
+`UnterminatedTeamworkSegment` or `InvalidTeamworkSeats` before any state is
+created; a request without leading `[` is used byte for byte. A request file
+whose own text starts with `[` (such as `[WIP] ...`), which earlier versions
+accepted as is, is now refused; start it with any other character. `run.json` and
+`teamwork status` record `request_source`: `request_file` (a CLI request
+file), `skip_interview`, `interview` (the interviewer's draft approved
+unchanged) or `user_edited` (text the user edited, then approved). Runs
+saved before this field report `request_file`.
+
+In the REPL, `/teamwork <request>` accepts the same segments and the same
+configuration layers. With the `teamwork` preview feature off it prints an error and sends nothing
+to the model. Otherwise the interviewer seat (either harness) reads a
+disposable snapshot of the workspace and drafts a task statement, charged to
+the run's budget ledger. The user answers `y` (approve), `e` (type a
+replacement statement, shown again for approval) or `n` (reject). Each prompt
+also states what approval authorizes: the dollar cap and seats per role,
+every seat's harness and model, the pinned check, and merge-back into the
+repository as uncommitted changes. With parallel candidates it also names
+each candidate's seat, the judge, the per-candidate estimate and the raised
+implementer/reviewer cap; a wallclock-only external seat is marked as having
+no dollar cap. Ctrl+C while the interviewer drafts
+cancels that seat (as `aborted`, even when the unreported spend of a killed
+seat fills the cap) and leaves the next message unaffected. No
+implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
+approval; the approved bytes are written to `ORIGINAL_REQUEST.md` unchanged,
+then the run continues on a background thread with its own provider client,
+and the REPL stays available. While a run is live, the TUI panel above the
+input box shows its goal, `N/M done · $spent / $cap · <phase>` and one line
+per seat with its harness and status (`queued`, `working`, `needs_you`,
+`waiting`, `done`, `failed`); the interviewer is `needs_you` while the
+approval prompt waits. `/teamwork status` prints that progress summary for
+the session's run; `/teamwork status <id>` prints the same JSON as
+`teamwork status`. One run per REPL session at a time; leaving the REPL
+cancels an unfinished run, which `teamwork resume <id> --approve` continues
+under the same permission mode and sandbox settings. `[skip-interview]` skips
+the interviewer: the same prompt shows the request text itself for approval.
+After a rejected, failed or cancelled interview nothing has started; the run
+directory then holds only the interviewer seat and its `budget.jsonl`, which
+`teamwork status` does not read (it has no `run.json`).
 
 `metacodes [--state-dir <dir>] teamwork status <id> [--json]` prints JSON
 containing saved state/detail, repository, dispatch counts, audit results,
-merge-conflict count, seats and budget totals. It reads only run files: no
+merge-conflict count, request source, seats and budget totals. It reads only run files: no
 global provider configuration, credentials, startup, state rewrite or ledger
 repair. A missing budget ledger means no charges yet. A torn budget tail is
 reported and excluded from totals; `budget.pending` shows an outstanding
@@ -382,6 +451,45 @@ saved repository when invoked elsewhere. An OS lifetime lock permits one
 driver per run. Ctrl-C forwards cancellation to the run. Exit codes are 0 for
 done/status/help, 1 for runtime failure and 2 for invalid input/refusal.
 
+`teamwork run` and `teamwork resume` take `--events`: stdout then carries one
+`teamwork.snapshot` wire line once the run is open, a `teamwork.event` line
+for every seat status change and phase change, and finally the status JSON
+(which has no `v`). The lines are specified in
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#16-teamwork-progress-lines) and pinned by
+`tests/fixtures/wire/v1/teamwork.jsonl`. A Zig host gets the same events
+in-process by setting `teamwork_runtime.Deps.observer` to a
+`teamwork_progress.Observer`; each `Event` carries the change and the
+`Snapshot` after it, and `teamwork_progress.Board` keeps the latest snapshot
+for a host that renders from another thread (`publish`, `read`,
+`currentRevision`). `interview.draft` reports the interviewer seat the same
+way and `interview.finishApproval` moves it from `needs_you` to `done`. The
+AgentCore C ABI has no teamwork entry point, so it carries no teamwork events.
+
+A launched Manager (#545) is configured with `seats.manager` as a
+`claude_code` seat (absolute `command`, optional `model`/`effort`) and a
+top-level `manager_budget_usd`: its dollar allowance out of `budget_usd`,
+greater than zero and below the cap. `teamwork run`, `teamwork resume` and
+the REPL's `/teamwork` then start the Manager CLI themselves instead of the
+deterministic loop; worker harnesses stay configured per seat, independently
+of the Manager's. Before the Manager starts, `budget.jsonl.hold` durably holds
+its allowance, which workers and the audit cannot spend; the Manager's
+reported cost settles it, and a Manager stopped without a cost report (cancel,
+budget, crash, timeout) is charged the whole allowance as `reserved`. Reopening
+a run whose Manager was live consumes the hold once and never grants it again;
+the next Manager is a new seat (`manager-<n>`) with a new hold. The Manager
+runs in Sandbox Foundations with its seat directory as working directory and
+only writable root, default permissions with prompts refused, and its tools
+limited to the teamwork MCP tools served by the controller in the host
+process. The approval prompt names the Manager and its allowance.
+Validation errors: `ManagerBudgetMissing`, `ManagerBudgetWithoutExternalManager`,
+`InvalidManagerBudget` and `ExternalManagerWallclockOnly`; a Manager CLI that
+fails its compatibility probe ends the run `failed` with
+`manager_unavailable`. `teamwork mcp` with an external `seats.manager` fails
+with `UnsupportedManager`: there the MCP client is the Manager. Windows has no
+launched Manager (`UnsupportedPlatform`). `teamwork status` shows an
+outstanding hold as `budget.manager_hold` and excludes it from
+`remaining_usd`.
+
 `teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
 the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)
 on stdin/stdout. The built CLI binds `Server.init(gpa, run).serve()`. The CLI host exposes
@@ -395,8 +503,9 @@ callback the command refuses before App startup. See
 Budget admission writes `budget.jsonl.pending` before a paid worker/audit
 call. A durable charge settles it; restart consumes an unresolved allowance
 as `reserved` instead of treating unknown spend as zero. `reserved` is cap
-consumption, not a measured bill. The workers/audit cap does not include the
-MCP client's own Manager model calls.
+consumption, not a measured bill. With `teamwork mcp` the cap does not
+include the MCP client's own Manager model calls; snapshots say so with
+`budget.manager: "outside_ledger"`.
 
 The completion auditor's PASS includes the reviewed tree ID. Pinned checks
 and verifier probes run in a disposable checkout of that tree. Merge-back
@@ -466,20 +575,20 @@ The flag surface is fail-closed: an unknown flag or positional argument exits wi
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
-Two independent preview features default to off and require the shared
-`--preview` opt-in (or saved `"preview": true`). `--harnessmm` / `--no-harnessmm`
+Two independent preview features default to off and are selected only by
+their own switches; the shared preview setting neither selects nor blocks them.
+`--harnessmm` / `--no-harnessmm`
 enables bounded runtime EDGs, guarded reuse of decisions through the native
 tool dispatcher, and durable callback-substitution certificates; the
 [HarnessMM protocol](HARNESSMM_PROTOCOL.md) defines supported guards and
 conservative fallback. `--rsi` / `--no-rsi`, with `--rsi-policy <file>`,
 enables the evolved procedural instruction and its own local ridge router
-together. With preview or RSI off, its policy is not opened or required; with
-preview or HarnessMM off, plans are not admitted and certificates are not read
-or written. Preview alone selects neither optimization. Neither runtime switch
+together. With RSI off, its policy is not opened or required; with HarnessMM
+off, plans are not admitted and certificates are not read or written. Neither runtime switch
 starts optimization. The [RSI protocol](SKILL_RSI_PROTOCOL.md) defines offline
 training, budgets, exact features, hash binding and host-origin injection.
 Zig consumers use `harnessmm`, `skill_rsi`, and `agent_loop.Options.harnessmm`,
-`rsi` / `rsi_policy` together with `agent_loop.Options.preview`. Explicit child
+`rsi` / `rsi_policy`. Explicit child
 selections use the matching `subagent.SpawnOptions` fields; fresh children
 default to no selection, while background root continuation retains it.
 The policy is borrowed for the run or job lifetime. Restoring a conversation
@@ -1833,7 +1942,8 @@ stdin/stdout, and `serveFds(self, input: platform.fs.Fd, output: platform.fs.Fd)
 uses bounded NDJSON with protocol-only stdout and cancels live runs on EOF.
 
 The tools are `teamwork_status`, synchronous `teamwork_dispatch` (only
-implementer/reviewer and optional instructions), `teamwork_request_completion`
+implementer/reviewer and optional instructions), `teamwork_run_candidates`
+(parallel candidates and the judge, #525), `teamwork_request_completion`
 and `teamwork_cancel`. No tool starts or approves a run, replaces the approved
 request, changes configuration/budget/check command, or chooses a workspace.
 The runtime alone verifies review approval, independently audits and merges;

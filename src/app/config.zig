@@ -17,6 +17,8 @@ const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并�
 const pfs = @import("platform").fs;
 const util_json = @import("../util/json.zig");
 const json_merge = @import("../util/json_merge.zig");
+const Features = @import("../preview.zig").Features;
+const Feature = @import("../preview.zig").Feature;
 
 pub const FileConfig = struct {
     model: ?[]const u8 = null,
@@ -24,7 +26,7 @@ pub const FileConfig = struct {
     max_turns: ?u32 = null,
     verbose: ?bool = null,
     no_theme: ?bool = null,
-    preview: ?bool = null,
+    preview: ?Features = null,
 
     pub fn deinit(self: FileConfig, allocator: std.mem.Allocator) void {
         if (self.model) |m| allocator.free(m);
@@ -47,7 +49,7 @@ pub fn loadFromHome(allocator: std.mem.Allocator, state_root: []const u8) !FileC
 /// Shared by App initialization and command dispatch before App exists.
 /// Explicit CLI settings win; only inherit consults the root FileConfig.
 pub fn resolvePreview(gpa: std.mem.Allocator, state_root: []const u8, setting: @import("../preview.zig").Setting) !@import("../preview.zig").Setting {
-    if (setting != .inherit) return setting;
+    if (setting.isComplete()) return setting;
     const saved = if (state_root.len > 0) try loadFromHome(gpa, state_root) else FileConfig{};
     defer saved.deinit(gpa);
     return setting.resolve(saved.preview);
@@ -132,7 +134,7 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
         try fields.append(arena, .{ .key = "no_theme", .json = if (v) "true" else "false" });
     }
     if (config.preview) |v| {
-        try fields.append(arena, .{ .key = "preview", .json = if (v) "true" else "false" });
+        try fields.append(arena, .{ .key = "preview", .json = try previewJson(arena, v) });
     }
 
     const merged = json_merge.mergeObjectFields(allocator, existing, fields.items) catch |err| switch (err) {
@@ -186,18 +188,45 @@ fn parseJson(allocator: std.mem.Allocator, data: []const u8) !FileConfig {
     cfg.max_turns = parseUintField(data, "max_turns");
     cfg.verbose = parseBoolField(data, "verbose");
     cfg.no_theme = parseBoolField(data, "no_theme");
-    // Preview opt-in is a root boolean, never a similarly named nested field.
+    // Preview opt-in is a root field, never a similarly named nested one.
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return cfg,
     };
     defer parsed.deinit();
     if (parsed.value == .object) {
-        if (parsed.value.object.get("preview")) |value| {
-            if (value == .bool) cfg.preview = value.bool;
-        }
+        if (parsed.value.object.get("preview")) |value| cfg.preview = parsePreview(value);
     }
     return cfg;
+}
+
+fn parsePreview(value: std.json.Value) ?Features {
+    switch (value) {
+        .bool => |on| return if (on) .all else .none,
+        .object => |object| {
+            var features: Features = .none;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const feature = Feature.parse(entry.key_ptr.*) orelse continue;
+                if (entry.value_ptr.* == .bool) features = features.with(feature, entry.value_ptr.bool);
+            }
+            return features;
+        },
+        else => return null,
+    }
+}
+
+fn previewJson(arena: std.mem.Allocator, features: Features) ![]const u8 {
+    if (features.eql(.all)) return "true";
+    if (features.eql(.none)) return "false";
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '{');
+    for (std.enums.values(Feature), 0..) |feature, i| {
+        if (i > 0) try out.append(arena, ',');
+        try out.print(arena, "\"{s}\":{s}", .{ @tagName(feature), if (features.has(feature)) "true" else "false" });
+    }
+    try out.append(arena, '}');
+    return out.items;
 }
 
 fn parseUintField(data: []const u8, field: []const u8) ?u32 {

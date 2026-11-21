@@ -740,7 +740,7 @@ test "comment preview rejects the entire patch before the first file lands" {
     defer a.free(patch);
     const args = try std.json.Stringify.valueAlloc(a, .{ .patch = patch }, .{});
     defer a.free(args);
-    try testing.expectError(error.AddedCodeComment, execute(&.{ .allocator = a, .preview = true }, args));
+    try testing.expectError(error.AddedCodeComment, execute(&.{ .allocator = a, .preview = .all }, args));
     try testing.expect(!pfs.exists(first.ptr));
     try testing.expect(!pfs.exists(second.ptr));
 }

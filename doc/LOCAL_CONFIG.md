@@ -54,19 +54,22 @@ session uses and with which key.
 
 ## Preview features
 
-The unified preview setting is the root boolean `preview` in the state root's
-`config.json`, rather than a variable in `.env`. It defaults to false. Use
-`--preview` or `--no-preview` to override the saved value for an invocation;
-the last flag wins. For example, `{"preview": true}` opts into preview.
+Preview features are set by the root `preview` field in the state root's
+`config.json`, rather than a variable in `.env`. `{"preview": true}` enables
+every preview feature, `false` (the default) disables them all, and an object
+enables only the features set to `true`, for example
+`{"preview": {"execute_code": true, "teamwork": true}}`. The features are
+`execute_code`, `teamwork` and `comment_guard` (the instruction to avoid adding
+code comments and the matching check in the built-in file editors).
 
-This switch also enables the system instruction to avoid adding code comments
-and the corresponding check in the built-in file editors. Use
-`metacodes --no-preview` to turn both off for one invocation.
+Use `--preview` or `--no-preview` to override every feature for one
+invocation, or `--preview=<list>` / `--no-preview=<list>` to override only the
+listed ones; the last flag naming a feature wins. For example,
+`metacodes --no-preview=comment_guard` keeps the saved features but turns the
+comment check off.
 
-HarnessMM and RSI additionally require their independent selections:
-`--harnessmm` and `--rsi --rsi-policy policy.json`. Preview alone selects
-neither. Without preview, those selections leave the ordinary model/tool
-loop in place and do not open the RSI policy or substitution journal. See
+HarnessMM and RSI have their own switches, `--harnessmm` and
+`--rsi --rsi-policy policy.json`, and do not depend on `preview`. See
 [HarnessMM](HARNESSMM_PROTOCOL.md) and [RSI](SKILL_RSI_PROTOCOL.md).
 
 ## Writing the file

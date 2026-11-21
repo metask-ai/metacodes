@@ -131,7 +131,9 @@ def job_documents(spec) -> Tuple[dict, dict]:
     params = {}
     if spec.get("reasoning_effort"):
         params["METACODES_REASONING_EFFORT"] = spec["reasoning_effort"]
-    job = {"model": slug(spec["name"]), "harness": HARNESS, "dataset": dataset_rel(spec["workbuddy"]["subset"]),
+    # A run with its own mount image names it through its own harness version.
+    harness = "metacodes/" + slug(spec["name"]) if spec["workbuddy"].get("harness_image") else HARNESS
+    job = {"model": slug(spec["name"]), "harness": harness, "dataset": dataset_rel(spec["workbuddy"]["subset"]),
            "harness_backend": "local", "model_connection": "local_proxy",
            "jobs_dir": str(Path(spec["jobs_dir"]) / spec["name"] / RESULTS_DIR),
            "n_attempts": spec["attempts"], "record_full_io": False,
@@ -148,7 +150,22 @@ def job_documents(spec) -> Tuple[dict, dict]:
 def config_paths(spec) -> List[Path]:
     repo = Path(spec["workbuddy"]["checkout"])
     name = slug(spec["name"]) + ".yaml"
-    return [repo / "configs" / "models" / name, repo / "configs" / "jobs" / name]
+    paths = [repo / "configs" / "models" / name, repo / "configs" / "jobs" / name]
+    if spec["workbuddy"].get("harness_image"):
+        paths.append(repo / HARNESS_VERSIONS / name)
+    return paths
+
+
+def harness_version_document(repo: Path, image: str) -> str:
+    """The pinned harness version file (HARNESS) with the mount image set to
+    `image` (`mount.images.local`, which WorkBuddy otherwise derives as the
+    shared HARNESS_IMAGE tag). WorkBuddy deep-merges it over _defaults.yaml."""
+    text = (repo / HARNESS_VERSIONS / (HARNESS.split("/")[1] + ".yaml")).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    tops = [line for line in lines if line.strip() and not line.startswith((" ", "#"))]
+    if tops != ["harness:"] or any(line.startswith("  mount:") for line in lines):
+        raise ValueError("WorkBuddy harness 版本文件的结构与预期不同，无法为本次运行指定挂载镜像")
+    return text.rstrip("\n") + "\n  mount:\n    images:\n      local: " + json.dumps(image) + "\n"
 
 
 def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
@@ -156,10 +173,13 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     from scripts.eval.harbor.bench.runner import atomic_json, now
     wb = spec["workbuddy"]
     model, job = job_documents(spec)
-    for path, document in zip(config_paths(spec), (model, job)):
+    documents = [json.dumps(model, indent=2), json.dumps(job, indent=2)]
+    if wb.get("harness_image"):
+        documents.append(harness_version_document(Path(wb["checkout"]), wb["harness_image"]).rstrip("\n"))
+    for path, document in zip(config_paths(spec), documents):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("x", encoding="utf-8") as output:
-            json.dump(document, output, indent=2)
+            output.write(document)
             output.write("\n")
     root = Path(spec["jobs_dir"]) / spec["name"]
     atomic_json(root / "config.json", {
@@ -183,10 +203,11 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
 
 
 def finish(spec):
-    """Mark the workbench job finished and remove the transient configs."""
+    """Mark the workbench job finished and remove the transient configs
+    (the node that ran it removes them when it ran on an SSH executor)."""
     from scripts.eval.harbor.bench import data
     from scripts.eval.harbor.bench.runner import atomic_json, now
-    for path in config_paths(spec):
+    for path in config_paths(spec) if "checkout" in spec["workbuddy"] else ():
         try:
             path.unlink()
         except FileNotFoundError:
@@ -195,6 +216,107 @@ def finish(spec):
     value = data.read_json(result)
     if isinstance(value, dict) and not value.get("finished_at"):
         atomic_json(result, {**value, "finished_at": now()})
+
+
+# environment_preflight.DEFAULT_HARNESS_IMAGE: the split-mount image every
+# WorkBuddy trial mounts, built from HARNESS_CONTEXT. run.sh reuses the tag
+# whenever it exists, whatever was staged since.
+HARNESS_IMAGE = "workbuddy-bench/harness/metacodes:0.1.0"
+HARNESS_CONTEXT = Path("configs/harnesses/metacodes/docker")
+HARNESS_VERSIONS = Path("configs/harnesses/metacodes/versions")
+# Each executable stage_artifacts stages, by the bundle path it comes from.
+BUNDLE_EXECUTABLES = {"metacodes": "bin/metacodes", "tinykg": "vendor/tinykg/tinykg",
+                      "metacodes-formal-kernel": "libexec/metacodes/metacodes-formal-kernel",
+                      "ripgrep": "bin/rg", "metacodes-project-kernel": "libexec/metacodes/metacodes-project-kernel"}
+# The adapter installs bin/rg beside bin/metacodes in every trial.
+REQUIRED_EXECUTABLES = ("metacodes", "tinykg", "metacodes-formal-kernel", "ripgrep")
+
+
+def staged_executables(ctx) -> Optional[Dict[str, str]]:
+    """{label: sha256} of the executables staged in the checkout (the
+    artifact manifest's), or None when nothing is staged."""
+    repo = checkout(ctx)
+    return manifest_executables(_json(repo / ARTIFACT_MANIFEST) if repo is not None else None)
+
+
+def manifest_executables(manifest) -> Optional[Dict[str, str]]:
+    """{label: sha256} of an artifact manifest's executables."""
+    if not isinstance(manifest, dict):
+        return None
+    rows = dict(manifest.get("executables") or {})
+    kernel = (manifest.get("project_control") or {}).get("kernel")
+    if kernel:
+        rows["metacodes-project-kernel"] = kernel
+    return {label: row["sha256"] for label, row in rows.items()
+            if isinstance(row, dict) and isinstance(row.get("sha256"), str)}
+
+
+def bundle_executables(bundle) -> Dict[str, str]:
+    """{label: sha256} of the same executables in a Linux bundle."""
+    import hashlib
+    result = {}
+    for label, relative in BUNDLE_EXECUTABLES.items():
+        path = Path(bundle) / relative
+        if path.is_file():
+            result[label] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def executable_mismatch(staged: Optional[Dict[str, str]], expected: Dict[str, str]) -> List[str]:
+    """Labels whose staged executable is not the expected bundle's (every
+    staged one, and the ones every run uses)."""
+    staged = staged or {}
+    return sorted(label for label in set(staged) | set(REQUIRED_EXECUTABLES)
+                  if staged.get(label) is None or staged.get(label) != expected.get(label))
+
+
+def run_image_tag(name: str) -> str:
+    """The mount image tag of one run: no other run builds or moves it."""
+    return HARNESS_IMAGE.split(":")[0] + ":" + slug(name)[:128]
+
+
+def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str, str]] = None,
+                        docker: str = "docker") -> bool:
+    """Build the mount image from the checkout's staged context as `tag`.
+    The manifest read once here is the one checked against `expected` (the
+    run's bundle) and compared after the build. False when `stop` was set
+    meanwhile (the build is killed). Raises ValueError when the staged
+    executables are not the expected ones, the build fails, or the staged
+    artifacts changed while it ran."""
+    import os
+    import signal
+    import subprocess
+    import tempfile
+    import time
+    manifest = repo / ARTIFACT_MANIFEST
+    before = manifest.read_bytes()
+    if expected is not None:
+        try:
+            staged = manifest_executables(json.loads(before))
+        except ValueError:
+            staged = None
+        different = executable_mismatch(staged, expected)
+        if different:
+            raise ValueError("WorkBuddy 暂存的制品不是本次运行的 metacodes 版本：" + "、".join(different))
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen([docker, "buildx", "build", "--platform", TARGET_PLATFORM, "--load", "--tag", tag,
+                                    str(repo / HARNESS_CONTEXT)], cwd=str(repo), stdin=subprocess.DEVNULL,
+                                   stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + 3600
+        while process.poll() is None:
+            if stop.is_set() or time.monotonic() > deadline:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                if stop.is_set():
+                    return False
+                raise ValueError("构建 WorkBuddy 挂载镜像超时（1 小时）")
+            time.sleep(0.25)
+        if process.returncode != 0:
+            output.seek(0)
+            raise ValueError("构建 WorkBuddy 挂载镜像失败：" + output.read().decode(errors="replace").strip()[-300:])
+    if manifest.read_bytes() != before:
+        raise ValueError("构建 WorkBuddy 挂载镜像时暂存制品发生了变化，请重试")
+    return True
 
 
 def spec_fields(suite, ctx) -> dict:

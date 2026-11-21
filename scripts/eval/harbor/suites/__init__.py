@@ -125,6 +125,34 @@ TERMINAL_BENCH_SAMPLE = (
     "torch-tensor-parallelism",
 )
 
+# FrontierHarness Eval v1.1 (Hub `frontier-harness-eval/frontier-harness-eval@v1.1.0`,
+# frontier-harness-eval/eval release/v1.1 datasets/dataset.toml): 62 pinned tasks,
+# all named `terminal-bench/<name>`.
+FRONTIER_HARNESS_EVAL_1_1 = (
+    'mvcc-lsm-compaction', 'bun-sourcemap-leak', 'wal-recovery-ordering',
+    'session-window-debug', 'ontology-kg-querying', 'roy-polymorph-cn', 'gsea-proteomics',
+    'foodstuff-beta-activity', 'glycan-ms2-elucidation', 'embedding-drift-monitor',
+    'batched-eval-parity', 'vpp-loss-divergence', 'cargo-flight-dispatch', 'intrastat-meldung',
+    'freecad-impeller', 'html-js-filter', 'music-harmony', 'log-summary-date-ranges',
+    'regex-log', 'sparql-university', 'hf-model-inference', 'mteb-leaderboard',
+    'rstan-to-pystan', 'sam-cell-seg', 'merge-diff-arc-agi-task', 'sqlite-db-truncate',
+    'gcode-to-text', 'large-scale-text-editing', 'chess-best-move', 'caffe-cifar-10',
+    'feal-linear-cryptanalysis', 'model-extraction-relu-logits', 'pytorch-model-cli',
+    'pytorch-model-recovery', 'portfolio-optimization', 'constraints-scheduling',
+    'adaptive-rejection-sampler', 'dna-assembly', 'dna-insert', 'tune-mjcf',
+    'filter-js-from-html', 'fix-code-vulnerability', 'openssl-selfsigned-cert',
+    'vulnerable-secret', 'cancel-async-tasks', 'circuit-fibsqrt', 'code-from-image', 'fix-git',
+    'fix-ocaml-gc', 'kv-store-grpc', 'make-doom-for-mips', 'path-tracing-reverse',
+    'polyglot-c-py', 'polyglot-rust-c', 'prove-plus-comm', 'pypi-server',
+    'schemelike-metacircular-eval', 'install-windows-3.11', 'mailman', 'nginx-request-logging',
+    'sqlite-with-gcov', 'video-processing',
+)
+FRONTIER_HARNESS_EVAL_SAMPLE = (
+    "fix-git", "regex-log", "log-summary-date-ranges", "cancel-async-tasks", "kv-store-grpc",
+    "pypi-server", "sqlite-db-truncate", "wal-recovery-ordering", "session-window-debug",
+    "html-js-filter",
+)
+
 # Legacy registry `aime@1.0` (harbor-datasets @ 414014c2). Harbor's AIME adapter
 # reads GAIR-NLP/AIME-Preview: test2024 ids 60-89, test2025-I I-1..I-15 and
 # test2025-II II-1..II-15, named aime_<id lowercased>.
@@ -167,6 +195,11 @@ SUITES: Tuple[Suite, ...] = (
           "89 道终端工程任务的 2.0 原版，用于与公开榜单对齐",
           HARBOR_REGISTRY, dataset="terminal-bench@2.0", tasks=TERMINAL_BENCH_2,
           default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89),
+    Suite("frontier-harness-eval-1.1", "terminal", "FrontierHarness Eval v1.1",
+          "FrontierHarness 榜单的 62 道固定版本命令行任务（工程、科学、数据、系统、ML、安全），每题独立容器运行并自动判分",
+          HARBOR_REGISTRY, dataset="frontier-harness-eval/frontier-harness-eval@v1.1.0",
+          filter_prefix="terminal-bench/", tasks=FRONTIER_HARNESS_EVAL_1_1,
+          default_tasks=FRONTIER_HARNESS_EVAL_SAMPLE, max_tasks=62),
     Suite("aime", "competition-math", "AIME 2024–2025",
           "60 道 AIME 竞赛题：2024 年 30 道，2025 年 I/II 卷各 15 道",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2024 + AIME_2025,
@@ -341,8 +374,9 @@ def readiness(suite: Suite, ctx: Context) -> List[str]:
     return reasons
 
 
-def validate_tasks(suite: Suite, ctx: Context, tasks) -> List[str]:
-    """The requested ids, refused unless each is one of this suite's tasks."""
+def validate_tasks(suite: Suite, ctx: Context, tasks, known=None) -> List[str]:
+    """The requested ids, refused unless each is one of this suite's tasks
+    (`known`: the executor's own list, when another machine reports it)."""
     if not isinstance(tasks, list) or not 1 <= len(tasks) <= suite.max_tasks:
         raise ValueError(f"请选择 1–{suite.max_tasks} 道任务")
     if suite.filter_prefix:
@@ -350,7 +384,7 @@ def validate_tasks(suite: Suite, ctx: Context, tasks) -> List[str]:
                  for t in tasks]
     if any(not isinstance(t, str) or not TASK.fullmatch(t) for t in tasks) or len(set(tasks)) != len(tasks):
         raise ValueError("任务名无效或重复")
-    known = set(task_ids(suite, ctx))
+    known = set(task_ids(suite, ctx) if known is None else known)
     unknown = [t for t in tasks if t not in known]
     if unknown:
         raise ValueError(f"{suite.name} 中没有这些任务：" + "、".join(unknown[:5]))

@@ -66,6 +66,39 @@ These rules apply to the entire repository.
   by SHA-256. Never add TinyKG source vendoring, download-on-build, `PATH` search,
   sibling-checkout discovery, or stale build-output fallback.
 
+## Preview features
+
+Every preview feature has its own switch; there is no umbrella flag to hide a
+new feature behind. Users pick features one by one with
+`--preview=<list>` / `--no-preview=<list>` or a root `"preview"` object in
+`config.json`, and `--preview` / `--no-preview` / `"preview": true` switch them
+all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
+
+- Add its name to `PreviewFeature` and a field of the same name to
+  `PreviewFeatures` in `src/types.zig`, shrinking `_unused` by one bit; `all`,
+  `has`, `with` and `max_arg_len` derive from the enum, and a field without a
+  matching name fails to compile. The name is what users type, so use
+  `snake_case`.
+- Gate the feature on its own field and nothing else: `opts.preview.<name>`,
+  `ctx.preview.<name>`, or `.preview_feature = .<name>` on a tool's registry
+  entry. Never gate on another feature's field, on "any feature enabled", or on
+  a new `bool`; never require `--preview` in addition to a flag of its own.
+  A feature that already has a dedicated selection flag (HarnessMM's
+  `--harnessmm`, RSI's `--rsi`) is selected by that flag alone.
+- Pass the existing `preview.Features` value through; do not add a parallel
+  field. Child agents, Teamwork seats and teammate processes already inherit
+  the resolved set.
+- Prove independence with an L2 test: `--preview=<name>` enables it,
+  `--preview=<another feature>` and `--no-preview=<name>` leave it off, and a
+  saved `{"preview": {"<name>": true}}` enables it
+  (`tests/component/state_env_test.zig` shows the pattern for the CLI).
+- Document it in the same change: the feature table in
+  [doc/API.md](doc/API.md#preview-features), the feature list in
+  [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#preview-features), the `--preview`
+  help text in `src/main.zig`, and `CHANGELOG.md`.
+- The AgentCore ABI has no per-feature selection: `RuntimeConfigV1.preview = 1`
+  enables every feature. Adding one there is an ABI revision.
+
 ## PR review and repair workflow
 
 The developer starts one local watcher during initial development setup,

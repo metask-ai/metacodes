@@ -95,7 +95,7 @@ pub fn captureTranscript(allocator: std.mem.Allocator, messages: []const msg.Mes
 }
 
 pub const SpawnOptions = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// Explicit host selections, also used when continuing a prebuilt root
     /// conversation. Fresh child calls leave them disabled by default.
     harnessmm: bool = false,
@@ -185,6 +185,7 @@ pub const SpawnOptions = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     cwd_abs: []const u8 = "",
     resolve_relative_paths: bool = false,
+    path_aliases: []const @import("../tools/common.zig").PathAlias = &.{},
     home_dir: []const u8 = "",
     /// Host state root, propagated to the child's ToolContext and KG clone.
     state_root: []const u8 = "",
@@ -351,6 +352,7 @@ pub fn spawnAgentSink(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,

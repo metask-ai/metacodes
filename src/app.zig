@@ -873,7 +873,7 @@ pub const App = struct {
         errdefer if (app.state_root_default) |owned| allocator.free(owned);
         errdefer app.tool_defs_arena.deinit();
 
-        if (app.config.preview.isEnabled() and app.config.rsi) {
+        if (app.config.rsi) {
             const path = config.rsi_policy_path orelse return error.SkillPolicyRequired;
             app.rsi_policy = try @import("skills/rsi.zig").Loaded.load(allocator, path);
         }
@@ -1226,7 +1226,7 @@ pub const App = struct {
         // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
         app.swarm = .{
             .allocator = allocator,
-            .preview = app.config.preview.isEnabled(),
+            .preview = app.config.preview.features(),
             .session = app.session_id,
             .state_root = app.stateRoot(),
             .api_key = app.api_key,
@@ -5727,7 +5727,7 @@ pub const App = struct {
             .kg_ready = app.kgReady(),
             .cwd = cwd,
             .tool_defs = app.tool_defs,
-            .preview = app.config.preview.isEnabled(),
+            .preview = app.config.preview.features(),
         };
     }
 
@@ -5744,7 +5744,7 @@ pub const App = struct {
         // `--agent-teams` would leave them out of "Using your tools").
         const defs_allocator = app.tool_defs_arena.allocator();
         const probe_ctx = tools_mod.PromptContext{
-            .preview = app.config.preview.isEnabled(),
+            .preview = app.config.preview.features(),
             .agent_teams = app.config.agent_teams,
             .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
         };
@@ -5753,7 +5753,7 @@ pub const App = struct {
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
 
         const prompt_ctx = tools_mod.PromptContext{
-            .preview = app.config.preview.isEnabled(),
+            .preview = app.config.preview.features(),
             .permission_mode = app.config.permission_mode,
             .enabled_tool_names = enabled_names,
             .agent_type = "", // 主对话

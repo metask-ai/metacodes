@@ -6,10 +6,13 @@
 //! by fixed rules (runtime.zig):
 //!
 //! - `pass` is the only verdict that lets a run reach merge-back and `done`;
-//! - the first `fail` forwards its report into one repair round; a second
-//!   `fail` ends the run `failed` (at most two audits per run);
-//! - `unverified` and `unavailable` never count as a pass: the run ends
-//!   `failed` with the worktree kept, and the user workspace is untouched.
+//! - the first `fail` forwards its report into one repair round, and the
+//!   first `unverified` forwards its report (the verifier's evidence and
+//!   what it could not establish) into one leads round; a second audit that
+//!   does not pass ends the run `failed` (at most two audits per run);
+//! - `unverified` and `unavailable` never count as a pass: the run never
+//!   merges on them, the worktree is kept, and the user workspace is
+//!   untouched. `unavailable` ends the run at once.
 //!
 //! Implementations:
 //!
@@ -30,7 +33,7 @@ const TreeId = @import("reviewer.zig").TreeId;
 /// What an auditor is given. Every slice and pointer is borrowed for the
 /// call.
 pub const AuditRequest = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// `ORIGINAL_REQUEST.md`, byte for byte: the audit's baseline.
     original_request: []const u8,
     /// The implementer's worktree, holding exactly the tree the reviewer
@@ -61,7 +64,8 @@ pub const AuditVerdict = union(enum) {
     /// The result does not fulfil the request. The report says what is
     /// missing; the runtime forwards it to the repair round.
     fail: []u8,
-    /// The auditor could not decide (inconclusive or demoted evidence).
+    /// The auditor could not decide (inconclusive or demoted evidence). The
+    /// report's evidence and open points are the leads the runtime forwards.
     unverified: []u8,
     /// The auditor could not run at all.
     unavailable: []u8,

@@ -510,9 +510,11 @@ def step_docker_linux(s: Setup):
                 s.log("已加入 docker 组：新的登录会话生效（SSH 执行机器下次连接即生效）")
             else:
                 root("systemctl enable --now docker", "Docker daemon 未运行，需要 root 启动")
-        if s.sh("docker compose version >/dev/null 2>&1").returncode != 0:
-            installer = "apt-get install -y docker-compose-plugin" if s.found("apt-get") else "dnf install -y docker-compose-plugin"
-            root(installer, "缺少 docker compose 插件")
+        for plugin in ("compose", "buildx"):  # buildx: WorkBuddy's mount image
+            if s.sh(f"docker {plugin} version >/dev/null 2>&1").returncode != 0:
+                package = f"docker-{plugin}-plugin"
+                installer = f"apt-get install -y {package}" if s.found("apt-get") else f"dnf install -y {package}"
+                root(installer, f"缺少 docker {plugin} 插件")
     arch = s.out("uname -m")
     if arch not in ("x86_64", "amd64"):
         s.log("注意：执行机器是 " + arch + "，linux/amd64 镜像需要 binfmt 模拟")
@@ -779,21 +781,47 @@ def step_bundle(s: Setup):
     return ("planned" if s.dry_run else "done"), str(path)
 
 
-def step_remote_files(s: Setup):
+def step_node(s: Setup):
+    """Make the executor a Bench node: ship the Linux bundle and install its
+    `metacodes` as <state_dir>/bin/metacodes (and ~/.local/bin/metacodes when
+    that name is free), then ask the node to describe itself."""
     s.require_shell()
     bundle = s.cfg.get("bundle")
+    node = s.executor.node
     if not bundle or not Path(bundle).is_dir():
         if s.dry_run:
-            s.note_action(f"复制 bench 运行时与 Linux 发行包到 {s.executor.name}:{s.executor.remote('runtime')}/ 和 bundles/")
-            return "planned", "发行包就绪后复制"
+            s.note_action(f"复制 Linux 发行包到 {s.executor.name}:{s.executor.remote('bundles')}/，安装 {node}")
+            return "planned", "发行包就绪后安装"
         raise Failed("需要先配置 Linux 发行包")
     if s.dry_run:
-        s.note_action(f"tar | ssh {s.executor.destination} 解压到 {s.executor.remote('runtime', '<digest>')}")
         s.note_action(f"tar | ssh {s.executor.destination} 解压到 {s.executor.remote('bundles', '<digest>')}")
-        return "planned", "运行时和发行包将按内容摘要复制"
-    runtime = executors.ship_runtime(s.executor, log=s.log, runner=s.runner, popen=s.popen)
+        s.note_action(f"ln -sfn <发行包>/bin/metacodes {node}；~/.local/bin/metacodes 未被占用时也指向它")
+        return "planned", "发行包将按内容摘要复制，并安装为执行机器上的 metacodes 节点"
     remote_bundle = executors.ship_bundle(s.executor, Path(bundle), log=s.log, runner=s.runner, popen=s.popen)
-    return "done", f"运行时 {runtime}，发行包 {remote_bundle}"
+    # The candidate answers first, by its own path; the entry other runs and
+    # copy-backs use is switched (atomically) only once it qualifies.
+    candidate = remote_bundle + "/bin/metacodes"
+    done = s.run(executors.node_argv(s.executor, "info", "--json", "--peer", executors.workbench_name(),
+                                     binary=candidate), mutate=False, timeout=300)
+    try:
+        info = json.loads((done.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        info = None
+    problem = executors.node_problem(s.executor, {"node": info if isinstance(info, dict) else {}})
+    if done.returncode != 0 or problem:
+        raise Failed((problem or f"节点自检失败（退出码 {done.returncode}）") +
+                     f"。发行包 {bundle} 里的 metacodes 不支持当前的节点协议，原有节点保持不变；"
+                     "请换用与工作台同一版本构建的 Linux 发行包（metacodes bench --bundle <目录>）后重试")
+    q = shlex.quote
+    parent = q(str(PurePosixPath(node).parent))
+    link = (f"set -e; mkdir -p {parent}; target=$(cd {q(remote_bundle)}/bin && pwd)/metacodes; "
+            f"ln -sfn \"$target\" {q(node)}.tmp-$$; mv -f {q(node)}.tmp-$$ {q(node)}; "
+            f"node=$(cd {parent} && pwd)/metacodes; l=\"$HOME/.local/bin/metacodes\"; "
+            "if [ ! -e \"$l\" ] && [ ! -L \"$l\" ]; then mkdir -p \"$HOME/.local/bin\"; ln -s \"$node\" \"$l\"; fi; "
+            "if [ \"$(readlink \"$l\" 2>/dev/null)\" = \"$node\" ]; then echo path=1; fi")
+    linked = s.sh(link, mutate=True, check=True)
+    where = "~/.local/bin/metacodes" if "path=1" in (linked.stdout or "") else node
+    return "done", f"metacodes {info['version']} 节点（{where}，{info['host']}），发行包 {remote_bundle}"
 
 
 # ----------------------------------------------------------------- network (ssh executors)
@@ -937,11 +965,8 @@ def step_egress(s: Setup):
     options = ({"mode": "workbench", "tunnel_port": secrets.SystemRandom().randrange(20000, 60000),
                 "bind": s.executor.metrics_bind, "external": EGRESS_EXTERNAL_PROBE}
                if mode == "workbench" else {"mode": "proxy", "url": mode["proxy"]})
-    runtime = s.executor.remote("runtime", "<digest>")
     proxy = None
     try:
-        if not s.dry_run:
-            runtime = executors.ship_runtime(s.executor, log=s.log, runner=s.runner, popen=s.popen)
         reverse = None
         if mode == "workbench":
             if not s.dry_run:
@@ -949,9 +974,7 @@ def step_egress(s: Setup):
                 allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
                 proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
             reverse = (options["tunnel_port"], proxy.port if proxy else 0)
-        argv = executors.ssh_argv(s.executor, ["env", "PYTHONPATH=" + runtime, s.executor.python, "-m",
-                                               "scripts.eval.harbor.bench.remote", "egress-probe",
-                                               json.dumps(options)], reverse=reverse)
+        argv = executors.node_argv(s.executor, "egress-probe", json.dumps(options), reverse=reverse)
         done = s.run(argv, mutate=True, timeout=600)
     finally:
         if proxy is not None:
@@ -1043,7 +1066,7 @@ def plan(s: Setup):
         steps.append(("docker_mirrors", "Docker 镜像加速", step_docker_mirrors))
     steps += [("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]
     if s.remote:
-        steps += [("remote_files", "复制运行时和发行包", step_remote_files),
+        steps += [("node", "metacodes 节点", step_node),
                   ("egress", "容器出网（经工作台）", step_egress),
                   ("workbench_harbor", "工作台 Harbor（注册表评测集）", step_workbench_harbor)]
     steps += [("psycopg", "psycopg（PostgreSQL 存储）", step_psycopg), ("login", "Metask 登录", step_login)]

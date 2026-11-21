@@ -14,6 +14,13 @@ const verifier = @import("verifier_auditor.zig");
 const scope = @import("drivers/write_scope.zig");
 const sandbox_exec = @import("../sandbox/exec.zig");
 const util_fs = @import("../util/fs.zig");
+const interview = @import("interview.zig");
+const merge_back = @import("merge_back.zig");
+const provider_factory = @import("../api/provider_factory.zig");
+const progress = @import("progress.zig");
+const lesson = @import("../kg/lesson.zig");
+const manager = @import("manager.zig");
+const claude_code = @import("drivers/claude_code.zig");
 
 pub const RunId = types.RunId;
 
@@ -24,14 +31,19 @@ pub const help =
     \\       metacodes [--state-dir <dir>] teamwork mcp --request-file <file> --approve [options]
     \\
     \\Run options: --id <id> --budget-usd <dollars> --max-rounds <n>
-    \\             --preview | --no-preview (last flag wins; overrides saved preview)
+    \\             --events (run/resume: teamwork.snapshot and teamwork.event lines on stdout)
+    \\             --preview | --no-preview | --preview=teamwork,... | --no-preview=...
+    \\             (last flag wins per feature; overrides saved preview)
     \\             --check-command <command> --config-json <teamwork-object>
     \\Provider options: --provider <profile> --model <model> --base-url <url>
     \\                  --api-key <key> --verbose
     \\Configuration: state/config.json teamwork < project/.metacodes/teamwork.json < CLI.
+    \\The request may start with [skip-interview] and [seats=<role>:<harness>[:<model>],...]
+    \\segments; seats apply to this run only. The rest of the request is approved as is.
     \\A positive dollar cap and explicit --approve are required. Approval covers
     \\the request, configured harnesses/check, spend up to the cap and merge-back.
-    \\Teamwork requires preview (off by default). --preview does not approve a task.
+    \\Teamwork requires the teamwork preview feature (off by default).
+    \\--preview does not approve a task.
     \\Status and cancellation of an existing handle remain available with preview off.
     \\Runs are synchronous. Resume uses the saved approved policy, never new overrides.
     \\Status always emits JSON and starts no provider. Exit: 0 done/status/help,
@@ -45,6 +57,7 @@ pub const Options = struct {
     id: ?types.RunId = null,
     request_file: ?[]const u8 = null,
     approve: bool = false,
+    events: bool = false,
     overrides: config.Layer = .{},
     has_overrides: bool = false,
     host_config: app_types.Config = .{ .prompt = "", .mcp_connect = .disabled },
@@ -59,12 +72,11 @@ pub fn parse(arena: std.mem.Allocator, args: anytype) !Options {
         out.id = try types.RunId.parse(args.next() orelse return error.RunIdMissing);
     }
     while (args.next()) |arg| {
-        if (eq(arg, "--preview")) {
-            out.host_config.preview = .enabled;
-        } else if (eq(arg, "--no-preview")) {
-            out.host_config.preview = .disabled;
-        } else if (eq(arg, "--approve")) {
+        if (try out.host_config.preview.applyArg(arg)) {} else if (eq(arg, "--approve")) {
             out.approve = true;
+        } else if (eq(arg, "--events")) {
+            if (out.action != .run and out.action != .@"resume") return error.UnknownOption;
+            out.events = true;
         } else if (eq(arg, "--json")) {
             if (out.action != .status) return error.UnknownOption;
         } else if (eq(arg, "--verbose")) {
@@ -117,18 +129,22 @@ pub const Prepared = struct {
     id: types.RunId,
     cfg: config.Config.Enabled,
     request: []const u8,
+    source: runtime.RequestSource,
     workspace: []const u8,
+    events: bool = false,
 };
 
 /// Approval is checked before file reads, git, App startup or run creation.
 pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u8, workspace: []const u8) !Prepared {
     if (!options.approve) return error.ApprovalRequired;
     const preview = try @import("../app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
-    if (!preview.isEnabled()) return error.PreviewDisabled;
+    if (!preview.features().teamwork) return error.PreviewDisabled;
+    if (!runtime.platform_supported) return error.UnsupportedPlatform;
     if (options.action != .run and options.action != .@"resume" and options.action != .mcp) return error.UnknownCommand;
     const generated = @import("../core/session_id.zig").gen();
     const id = options.id orelse try types.RunId.parse(generated.asSlice());
     var request: []const u8 = "";
+    var source: runtime.RequestSource = .request_file;
     var repo: []const u8 = undefined;
     var layer: config.Layer = .{};
     if (options.action == .@"resume") {
@@ -146,38 +162,50 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
         repo = try @import("merge_back.zig").toplevel(arena, saved_repo.string, null);
         if (!eq(repo, saved_repo.string)) return error.StateCorrupt;
     } else {
-        repo = try @import("merge_back.zig").toplevel(arena, workspace, null);
-        const global_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{state_root});
-        if (try readOptional(arena, global_path)) |text| {
-            const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
-            if (value != .object) return error.InvalidJson;
-            if (value.object.get("teamwork")) |teamwork| layer = try config.parseValue(arena, teamwork, null);
-        }
-        const project_path = try std.fmt.allocPrint(arena, "{s}/.metacodes/teamwork.json", .{repo});
-        if (try readOptional(arena, project_path)) |text| layer = config.merge(layer, try config.parse(arena, text, null));
-        layer = config.merge(layer, options.overrides);
-        // Invoking `run` explicitly enables the mode, but not its spend.
-        if (layer.enabled == null) layer.enabled = true;
-        request = try readRequired(arena, options.request_file.?);
-        if (std.mem.trim(u8, request, " \t\r\n").len == 0) return error.EmptyRequest;
+        repo = try merge_back.toplevel(arena, workspace, null);
+        const raw = try readRequired(arena, options.request_file.?);
+        if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return error.EmptyRequest;
+        const segments = try interview.parseSegments(arena, raw);
+        request = segments.request;
+        if (segments.skip_interview) source = .skip_interview;
+        layer = config.merge(config.merge(try configuredLayer(arena, state_root, repo), segments.seats), options.overrides);
     }
+    const cfg = try validated(layer);
+    if (options.action == .mcp and cfg.seats.get(.manager).harnessKind() != .metacodes) return error.UnsupportedManager;
+    // Git's toplevel is read-only. Do not let run state become an untracked
+    // input of the workspace snapshot or a writable part of the worker tree.
+    try requireExternalState(arena, state_root, repo);
+    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .source = source, .workspace = repo, .events = options.events };
+}
+
+fn configuredLayer(arena: std.mem.Allocator, state_root: []const u8, repo: []const u8) !config.Layer {
+    var layer: config.Layer = .{};
+    const global_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{state_root});
+    if (try readOptional(arena, global_path)) |text| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        if (value != .object) return error.InvalidJson;
+        if (value.object.get("teamwork")) |teamwork| layer = try config.parseValue(arena, teamwork, null);
+    }
+    const project_path = try std.fmt.allocPrint(arena, "{s}/.metacodes/teamwork.json", .{repo});
+    if (try readOptional(arena, project_path)) |text| layer = config.merge(layer, try config.parse(arena, text, null));
+    return layer;
+}
+
+fn validated(merged: config.Layer) !config.Config.Enabled {
+    var layer = merged;
+    if (layer.enabled == null) layer.enabled = true;
     const cfg = switch (try config.validate(layer, null)) {
         .disabled => return error.TeamworkDisabled,
         .enabled => |c| c,
     };
     try supported(cfg);
-    // Git's toplevel is read-only. Do not let run state become an untracked
-    // input of the workspace snapshot or a writable part of the worker tree.
-    try requireExternalState(arena, state_root, repo);
-    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .workspace = repo };
+    return cfg;
 }
 
 fn supported(cfg: config.Config.Enabled) !void {
-    for ([_]types.Role{ .manager, .interviewer }) |role| {
-        const seat = cfg.seats.get(role);
-        if (seat.harnessKind() != .metacodes or seat.model != null or seat.effort != null)
-            return error.UnsupportedManagerOrInterviewer;
-    }
+    const manager_seat = cfg.seats.get(.manager);
+    if (manager_seat.harnessKind() == .metacodes and (manager_seat.model != null or manager_seat.effort != null))
+        return error.UnsupportedManager;
     const seat = cfg.seats.get(.verifier);
     if (seat.harnessKind() != .metacodes) return error.ExternalVerifierUnsupported;
     if (seat.effort != null) return error.VerifierEffortUnsupported;
@@ -191,25 +219,7 @@ fn supported(cfg: config.Config.Enabled) !void {
 fn policyJson(arena: std.mem.Allocator, cfg: config.Config.Enabled) ![]const u8 {
     var layer: config.Layer = .{ .enabled = true, .budget_usd = cfg.budget_usd, .max_rounds = cfg.max_rounds };
     if (cfg.check_command) |check| layer.check_command = check.text;
-    for (std.enums.values(types.Role)) |role| {
-        const spec = cfg.seats.get(role);
-        var seat: config.SeatLayer = .{ .harness = spec.harnessKind(), .model = spec.model, .effort = spec.effort };
-        switch (spec.harness) {
-            .metacodes => {},
-            .claude_code => |external| {
-                seat.command = external.command.bytes;
-                switch (external.budget) {
-                    .cost => seat.budget_enforcement = .cost,
-                    .wallclock_only => |limit| {
-                        seat.budget_enforcement = .wallclock_only;
-                        seat.wallclock_seconds = limit.seconds;
-                    },
-                }
-                if (external.demote_only) seat.demote_only = true;
-            },
-        }
-        layer.seats.set(role, seat);
-    }
+    for (std.enums.values(types.Role)) |role| layer.seats.set(role, seatLayerOf(cfg.seats.get(role)));
     // EnumArray's JSON is an implementation detail; serialize the public
     // object schema explicitly, with absent optionals omitted.
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -222,6 +232,18 @@ fn policyJson(arena: std.mem.Allocator, cfg: config.Config.Enabled) ![]const u8 
     try s.write(cfg.budget_usd);
     try s.objectField("max_rounds");
     try s.write(cfg.max_rounds);
+    if (cfg.manager_budget_usd) |allowance| {
+        try s.objectField("manager_budget_usd");
+        try s.write(allowance);
+    }
+    if (cfg.candidate_estimate_usd) |estimate| {
+        try s.objectField("candidates");
+        try s.beginArray();
+        for (cfg.candidates.slice()) |spec| try s.write(seatLayerOf(spec));
+        try s.endArray();
+        try s.objectField("candidate_estimate_usd");
+        try s.write(estimate);
+    }
     if (layer.check_command) |check| {
         try s.objectField("check_command");
         try s.write(check);
@@ -237,6 +259,25 @@ fn policyJson(arena: std.mem.Allocator, cfg: config.Config.Enabled) ![]const u8 
     return out.toOwnedSlice();
 }
 
+fn seatLayerOf(spec: types.SeatSpec) config.SeatLayer {
+    var seat: config.SeatLayer = .{ .harness = spec.harnessKind(), .model = spec.model, .effort = spec.effort };
+    switch (spec.harness) {
+        .metacodes => {},
+        .claude_code => |external| {
+            seat.command = external.command.bytes;
+            switch (external.budget) {
+                .cost => seat.budget_enforcement = .cost,
+                .wallclock_only => |limit| {
+                    seat.budget_enforcement = .wallclock_only;
+                    seat.wallclock_seconds = limit.seconds;
+                },
+            }
+            if (external.demote_only) seat.demote_only = true;
+        },
+    }
+    return seat;
+}
+
 /// Stable host seam for CLI and the incoming MCP server. Heap allocated:
 /// runtime dependencies borrow `sandbox` and `auditor` at stable addresses.
 pub const Host = struct {
@@ -244,9 +285,26 @@ pub const Host = struct {
     sandbox: @import("../sandbox/config.zig").SandboxSettings,
     auditor: verifier.VerifierAuditor,
     parent_env: []const [:0]const u8,
+    provider: @import("../api/provider.zig").Provider,
+    anthropic_client: ?*@import("../client.zig").Client,
 
     pub fn create(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled) !*Host {
-        if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
+        return createWith(arena, app, cfg, app.provider(), app.anthropicClientOrNull());
+    }
+
+    pub fn createOwned(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, owned: *provider_factory.OwnedProvider) !*Host {
+        return createWith(arena, app, cfg, owned.provider(), owned.anthropicClient());
+    }
+
+    fn createWith(
+        arena: std.mem.Allocator,
+        app: *App,
+        cfg: config.Config.Enabled,
+        provider: @import("../api/provider.zig").Provider,
+        anthropic_client: ?*@import("../client.zig").Client,
+    ) !*Host {
+        if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+        if (!runtime.platform_supported) return error.UnsupportedPlatform;
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
         // Other embedders can supply an App with deferred MCP publication.
@@ -258,12 +316,14 @@ pub const Host = struct {
             .sandbox = scope.seatSandbox(app.sandboxPtr()),
             .auditor = undefined,
             .parent_env = try platform.paths.environment(arena),
+            .provider = provider,
+            .anthropic_client = anthropic_client,
         };
         const check: reviewer.CheckRunner = .{ .sandbox = &self.sandbox, .home = app.homeDir() };
         self.auditor = .{
             .deps = .{
-                .provider = app.provider(),
-                .anthropic_client = app.anthropicClientOrNull(),
+                .provider = provider,
+                .anthropic_client = anthropic_client,
                 .tool_defs = app.tool_defs,
                 .permission_ctx = &app.permission_ctx,
                 .session = app.session_id,
@@ -281,12 +341,12 @@ pub const Host = struct {
     pub fn deps(self: *Host) runtime.Deps {
         const app = self.app;
         return .{
-            .preview = app.config.preview.isEnabled(),
+            .preview = app.config.preview.features(),
             .seats = .{ .harness = .{
                 .metacodes = .{
-                    .preview = app.config.preview.isEnabled(),
-                    .provider = app.provider(),
-                    .anthropic_client = app.anthropicClientOrNull(),
+                    .preview = app.config.preview.features(),
+                    .provider = self.provider,
+                    .anthropic_client = self.anthropic_client,
                     .tool_defs = app.tool_defs,
                     .permission_ctx = &app.permission_ctx,
                     .host_sandbox = &self.sandbox,
@@ -295,11 +355,23 @@ pub const Host = struct {
                     .artifact_root = app.sessionDir() orelse "",
                     .session = app.session_id,
                 },
-                .claude_code = .{ .parent_env = self.parent_env, .home_dir = app.homeDir(), .sandbox = true, .host_sandbox = &self.sandbox },
+                .claude_code = self.claudeCodeOptions(),
             } },
             .auditor = self.auditor.auditor(),
             .check_runner = self.auditor.check_runner,
+            .pitfalls = .{ .ctx = app, .rememberFn = rememberPitfall },
         };
+    }
+
+    pub fn claudeCodeOptions(self: *Host) claude_code.Options {
+        return .{ .preview = self.app.config.preview.features(), .parent_env = self.parent_env, .home_dir = self.app.homeDir(), .sandbox = true, .host_sandbox = &self.sandbox };
+    }
+
+    fn rememberPitfall(ctx: *anyopaque, text: []const u8) bool {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        const kg = if (app.kg) |*client| client else return false;
+        _ = kg.remember(.observation, text, lesson.SCHEMA_TYPE, false) catch return false;
+        return true;
     }
 
     /// Pin the effective inputs consulted by child tools and pinned checks.
@@ -353,29 +425,28 @@ pub fn execute(arena: std.mem.Allocator, app: *App, prepared: Prepared) !u8 {
 }
 
 pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, mcp: ?McpHost) !u8 {
-    if (!app.config.preview.isEnabled()) return error.PreviewDisabled;
+    if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
     if (prepared.action == .mcp and mcp == null) return error.McpHostUnavailable;
     var cfg = prepared.cfg;
-    if (prepared.action != .@"resume") {
-        // Pin inherited models as part of the approval persisted for resume.
-        for ([_]types.Role{ .implementer, .reviewer, .verifier }) |role| {
-            const seat = cfg.seats.getPtr(role);
-            if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = app.activeModel();
-        }
-    }
+    if (prepared.action != .@"resume") pinInheritedModels(&cfg, app.activeModel());
     const host = try Host.create(arena, app, cfg);
-    if (cfg.seats.get(.implementer).harnessKind() == .claude_code or cfg.seats.get(.reviewer).harnessKind() == .claude_code) {
-        try requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), prepared.workspace);
-    }
+    try checkClaudeState(arena, app, cfg, prepared.workspace);
     var deps = host.deps();
     deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
+    var lines: LineObserver = .{};
+    if (prepared.events) deps.observer = lines.observer();
+    if (prepared.action == .mcp) {
+        if (cfg.seats.get(.manager).harnessKind() != .metacodes) return error.UnsupportedManager;
+        deps.manager_outside_ledger = true;
+    }
     // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
-        try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
+        try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request, .source = prepared.source }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
     else
         try runtime.Run.reopen(app.allocator, deps, cfg, app.stateRoot(), prepared.id);
     defer run.destroy();
     std.debug.print("teamwork run {s}; status: metacodes teamwork status {s}\n", .{ prepared.id.slice(), prepared.id.slice() });
+    if (prepared.events) try lines.snapshot(arena, run.status());
     var stopped = std.atomic.Value(bool).init(false);
     const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &run.abort, &stopped });
     defer {
@@ -386,9 +457,196 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
         try mcp.?.serveFn(app.allocator, run);
         return 0;
     }
-    const state = try @import("swe_loop.zig").drive(run);
+    const state = try manager.drive(run, host.claudeCodeOptions());
     try status(arena, app.stateRoot(), prepared.id);
     return if (state == .done) 0 else 1;
+}
+
+const LineObserver = struct {
+    fn observer(self: *LineObserver) progress.Observer {
+        return .{ .ctx = self, .notifyFn = notify };
+    }
+
+    fn snapshot(_: *LineObserver, arena: std.mem.Allocator, run: runtime.RunSnapshot) !void {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try progress.writeSnapshotLine(&out.writer, .ofRun(run));
+        if (!pfs.writeAll(1, out.written())) return error.WriteFailed;
+    }
+
+    fn notify(_: *anyopaque, event: *const progress.Event) void {
+        var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer out.deinit();
+        progress.writeEventLine(&out.writer, event) catch return;
+        _ = pfs.writeAll(1, out.written());
+    }
+};
+
+fn pinInheritedModels(cfg: *config.Config.Enabled, model: []const u8) void {
+    for ([_]types.Role{ .implementer, .reviewer, .verifier, .judge }) |role| pinModel(cfg.seats.getPtr(role), model);
+    for (cfg.candidates.specs[0..cfg.candidates.len]) |*seat| pinModel(seat, model);
+}
+
+fn pinModel(seat: *types.SeatSpec, model: []const u8) void {
+    if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = model;
+}
+
+fn checkClaudeState(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, workspace: []const u8) !void {
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .judge, .manager }) |role| {
+        if (cfg.seats.get(role).harnessKind() == .claude_code)
+            return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
+    }
+    for (cfg.candidates.slice()) |spec| {
+        if (spec.harnessKind() == .claude_code)
+            return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
+    }
+}
+
+pub const Interactive = union(enum) {
+    started: *Background,
+    rejected: RunId,
+    interview_failed: RunId,
+    budget_exhausted: RunId,
+    aborted: RunId,
+};
+
+pub const Background = struct {
+    arena_state: std.heap.ArenaAllocator,
+    owned: ?provider_factory.OwnedProvider = null,
+    id: RunId,
+    interview_abort: types.AbortSignal = types.AbortSignal.init(),
+    run: ?*runtime.Run = null,
+    manager_options: claude_code.Options = .{ .parent_env = &.{}, .home_dir = "" },
+    thread: ?std.Thread = null,
+    ended: std.atomic.Value(bool) = .init(false),
+
+    fn create(id: RunId) !*Background {
+        const self = try std.heap.c_allocator.create(Background);
+        self.* = .{ .arena_state = .init(std.heap.c_allocator), .id = id };
+        return self;
+    }
+
+    pub fn finished(self: *const Background) bool {
+        return self.ended.load(.acquire);
+    }
+
+    pub fn stop(self: *Background) void {
+        if (self.run) |run| {
+            if (self.thread) |thread| {
+                run.abort.abort(.user_ctrl_c);
+                thread.join();
+            }
+            run.destroy();
+        }
+        if (self.owned) |*owned| owned.deinit();
+        self.arena_state.deinit();
+        std.heap.c_allocator.destroy(self);
+    }
+
+    fn drive(self: *Background) void {
+        _ = manager.drive(self.run.?, self.manager_options) catch |err|
+            @import("../util/log.zig").warn("teamwork", "run {s} stopped: {s}", .{ self.id.slice(), @errorName(err) });
+        self.ended.store(true, .release);
+    }
+};
+
+pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prompter: interview.Prompter, board: *progress.Board) !Interactive {
+    if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+    if (!runtime.platform_supported) return error.UnsupportedPlatform;
+    const generated = @import("../core/session_id.zig").gen();
+    const job = try Background.create(try types.RunId.parse(generated.asSlice()));
+    var started = false;
+    defer if (!started) job.stop();
+    const arena = job.arena_state.allocator();
+    const gpa = std.heap.c_allocator;
+
+    const segments = try interview.parseSegments(arena, text);
+    const repo = try merge_back.toplevel(arena, workspace, null);
+    var cfg = try validated(config.merge(try configuredLayer(arena, app.stateRoot(), repo), segments.seats));
+    try requireExternalState(arena, app.stateRoot(), repo);
+    pinInheritedModels(&cfg, app.activeModel());
+    const jobs = if (app.agent_jobs) |*registry| registry else return error.TeamworkBackgroundUnavailable;
+    job.owned = try jobs.makeProvider();
+    const host = try Host.createOwned(arena, app, cfg, &job.owned.?);
+    try checkClaudeState(arena, app, cfg, repo);
+    var deps = host.deps();
+    deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
+    deps.observer = board.observer();
+    const options: runtime.StartOptions = .{ .state_root = app.stateRoot(), .run_id = job.id, .workspace = repo };
+
+    const terms = try approvalTerms(arena, cfg, repo);
+    const verdict: ?interview.Approved = if (segments.skip_interview)
+        try interview.approve(segments.request, .skip_interview, terms, prompter)
+    else blk: {
+        var drafted = try draftInterruptibly(app, job, deps, cfg, options, segments.request);
+        defer drafted.deinit(gpa);
+        switch (drafted) {
+            .text => |proposal| {
+                const decision = interview.approve(proposal, .interview, terms, prompter);
+                try interview.finishApproval(gpa, deps, cfg, options, segments.request);
+                const decided = try decision orelse break :blk null;
+                break :blk interview.Approved{ .text = try arena.dupe(u8, decided.text), .source = decided.source };
+            },
+            .failed => return .{ .interview_failed = job.id },
+            .budget_exhausted => return .{ .budget_exhausted = job.id },
+            .aborted => return .{ .aborted = job.id },
+        }
+    };
+    const approved = verdict orelse return .{ .rejected = job.id };
+    job.manager_options = host.claudeCodeOptions();
+    job.run = try runtime.Run.start(gpa, deps, .{ .text = approved.text, .source = approved.source }, cfg, options);
+    try board.publish(.ofRun(job.run.?.status()));
+    job.thread = try platform.thread.spawn(.full, Background.drive, .{job});
+    started = true;
+    return .{ .started = job };
+}
+
+fn draftInterruptibly(app: *App, job: *Background, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8) !interview.Draft {
+    var stopped = std.atomic.Value(bool).init(false);
+    const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &job.interview_abort, &stopped });
+    defer {
+        stopped.store(true, .release);
+        watcher.join();
+        app.abort.reset();
+    }
+    return interview.draft(std.heap.c_allocator, deps, cfg, options, request, &job.interview_abort);
+}
+
+fn approvalTerms(arena: std.mem.Allocator, cfg: config.Config.Enabled, repo: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    const candidates = cfg.candidates.slice();
+    try w.print("Approving also authorizes spend up to ${d} (at most {d} seats per role", .{ cfg.budget_usd, cfg.max_rounds });
+    if (candidates.len != 0) try w.print("; {d} implementer and reviewer seats, and {d} judge seats", .{ cfg.max_rounds + candidates.len - 1, cfg.max_rounds });
+    try w.writeAll("), these seats:");
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .verifier }) |role| try writeSeatTerm(w, role.name(), cfg.seats.get(role));
+    if (cfg.manager_budget_usd) |allowance| {
+        try writeSeatTerm(w, "manager", cfg.seats.get(.manager));
+        try w.print(" (up to ${d} of the cap)", .{allowance});
+    }
+    if (candidates.len != 0) {
+        try w.print(", {d} parallel candidates estimated at ${d} each:", .{ candidates.len, cfg.candidate_estimate_usd.? });
+        for (candidates, 1..) |seat, number| {
+            var name_buf: [32]u8 = undefined;
+            try writeSeatTerm(w, std.fmt.bufPrint(&name_buf, "candidate-{d}", .{number}) catch unreachable, seat);
+        }
+        try w.writeAll(", judged by");
+        try writeSeatTerm(w, "judge", cfg.seats.get(.judge));
+    }
+    if (cfg.check_command) |check| try w.print(", the check `{s}`", .{check.text}) else try w.writeAll(", no pinned check");
+    try w.print(", and merging the result into {s} as uncommitted changes.", .{repo});
+    return out.toOwnedSlice();
+}
+
+fn writeSeatTerm(w: *std.Io.Writer, name: []const u8, seat: types.SeatSpec) !void {
+    try w.print(" {s}={s}", .{ name, seat.harnessKind().name() });
+    if (seat.model) |model| try w.print("/{s}", .{model});
+    switch (seat.harness) {
+        .metacodes => {},
+        .claude_code => |external| switch (external.budget) {
+            .cost => {},
+            .wallclock_only => |limit| try w.print(" (wallclock only, {d}s, no dollar cap)", .{limit.seconds}),
+        },
+    }
 }
 
 fn forwardAbort(source: *const types.AbortSignal, dest: *types.AbortSignal, stopped: *std.atomic.Value(bool)) void {
@@ -419,13 +677,8 @@ pub fn status(arena: std.mem.Allocator, state_root: []const u8, id: types.RunId)
     if (cfg != .enabled) return error.StateCorrupt;
     const budget_path = try dir.path(&buf, .budget);
     const budget = try readOptional(arena, budget_path) orelse "";
-    const Pending = struct { seat_id: []const u8, harness: types.Harness, usd: f64, source: []const u8 };
-    const pending: ?Pending = if (try readOptional(arena, try std.fmt.allocPrint(arena, "{s}.pending", .{budget_path}))) |text| blk: {
-        const receipt = try std.json.parseFromSliceLeaky(Pending, arena, text, .{ .ignore_unknown_fields = true });
-        _ = try types.SeatId.parse(receipt.seat_id);
-        if (!eq(receipt.source, "reserved") or !std.math.isFinite(receipt.usd) or receipt.usd < 0) return error.CorruptLedger;
-        break :blk receipt;
-    } else null;
+    const pending = try readReceipt(arena, budget_path, ".pending");
+    const held = try readReceipt(arena, budget_path, @import("ledger.zig").hold_suffix);
     var spent: f64 = 0;
     var charges: usize = 0;
     var torn_tail = false;
@@ -463,8 +716,10 @@ pub fn status(arena: std.mem.Allocator, state_root: []const u8, id: types.RunId)
         try s.objectField(key);
         try s.write(saved.object.get(key) orelse return error.StateCorrupt);
     }
+    try s.objectField("request_source");
+    try s.write(saved.object.get("request_source") orelse std.json.Value{ .string = @tagName(runtime.RequestSource.request_file) });
     try s.objectField("budget");
-    try s.write(.{ .cap_usd = cfg.enabled.budget_usd, .spent_usd = spent, .remaining_usd = @max(0, cfg.enabled.budget_usd - spent), .charges = charges, .torn_tail = torn_tail, .pending = pending });
+    try s.write(.{ .cap_usd = cfg.enabled.budget_usd, .spent_usd = spent, .remaining_usd = @max(0, cfg.enabled.budget_usd - spent - if (held) |receipt| receipt.usd else 0), .charges = charges, .torn_tail = torn_tail, .pending = pending, .manager_hold = held });
     try s.objectField("seats");
     try s.beginArray();
     for (recovery.seats) |seat| {
@@ -492,6 +747,16 @@ pub fn status(arena: std.mem.Allocator, state_root: []const u8, id: types.RunId)
     try s.endObject();
     try out.writer.writeByte('\n');
     if (!pfs.writeAll(1, out.written())) return error.WriteFailed;
+}
+
+const Receipt = struct { seat_id: []const u8, harness: types.Harness, usd: f64, source: []const u8 };
+
+fn readReceipt(arena: std.mem.Allocator, budget_path: []const u8, suffix: []const u8) !?Receipt {
+    const text = try readOptional(arena, try std.fmt.allocPrint(arena, "{s}{s}", .{ budget_path, suffix })) orelse return null;
+    const receipt = try std.json.parseFromSliceLeaky(Receipt, arena, text, .{ .ignore_unknown_fields = true });
+    _ = try types.SeatId.parse(receipt.seat_id);
+    if (!eq(receipt.source, "reserved") or !std.math.isFinite(receipt.usd) or receipt.usd < 0) return error.CorruptLedger;
+    return receipt;
 }
 
 fn readOptional(arena: std.mem.Allocator, path: []const u8) !?[]const u8 {
@@ -571,4 +836,38 @@ fn requireExternalState(arena: std.mem.Allocator, state_root: []const u8, repo: 
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "teamwork command: the approved policy keeps parallel candidates and the judge for resume" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const claude = if (@import("builtin").os.tag == .windows) "C:/tools/claude.exe" else "/opt/claude/bin/claude";
+    for ([_][]const u8{
+        "{\"enabled\":true,\"budget_usd\":5,\"candidates\":[{\"model\":\"m\"},{\"harness\":\"claude_code\",\"command\":\"" ++ claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}],\"candidate_estimate_usd\":0.5,\"seats\":{\"judge\":{\"model\":\"j\",\"effort\":\"high\"}}}",
+        "{\"enabled\":true,\"budget_usd\":5,\"candidates\":3,\"candidate_estimate_usd\":1,\"check_command\":\"zig build test\"}",
+        "{\"enabled\":true,\"budget_usd\":5}",
+    }) |text| {
+        const cfg = (try config.validate(try config.parse(a, text, null), null)).enabled;
+        const restored = (try config.validate(try config.parse(a, try policyJson(a, cfg), null), null)).enabled;
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, cfg, .{}), try std.json.Stringify.valueAlloc(a, restored, .{}));
+    }
+}
+
+test "teamwork command: approval terms name every candidate, the judge and the raised seat cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const claude = if (@import("builtin").os.tag == .windows) "C:/tools/claude.exe" else "/opt/claude/bin/claude";
+    const text = "{\"enabled\":true,\"budget_usd\":5,\"candidates\":[{\"model\":\"m\"},{\"harness\":\"claude_code\",\"command\":\"" ++ claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}],\"candidate_estimate_usd\":0.5,\"seats\":{\"judge\":{\"model\":\"j\"}}}";
+    const cfg = (try config.validate(try config.parse(a, text, null), null)).enabled;
+    try std.testing.expectEqualStrings(
+        "Approving also authorizes spend up to $5 (at most 3 seats per role; 4 implementer and reviewer seats, and 3 judge seats), these seats: interviewer=metacodes implementer=metacodes reviewer=metacodes verifier=metacodes, 2 parallel candidates estimated at $0.5 each: candidate-1=metacodes/m candidate-2=claude_code (wallclock only, 60s, no dollar cap), judged by judge=metacodes/j, no pinned check, and merging the result into /repo as uncommitted changes.",
+        try approvalTerms(a, cfg, "/repo"),
+    );
+    const single = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":2}", null), null)).enabled;
+    try std.testing.expectEqualStrings(
+        "Approving also authorizes spend up to $2 (at most 3 seats per role), these seats: interviewer=metacodes implementer=metacodes reviewer=metacodes verifier=metacodes, no pinned check, and merging the result into /repo as uncommitted changes.",
+        try approvalTerms(a, single, "/repo"),
+    );
 }

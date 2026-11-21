@@ -10,6 +10,30 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **Teamwork launches its own Manager.** Configure `seats.manager` as a
+  `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
+  `resume` and `/teamwork` start that Manager CLI themselves. It runs in the
+  sandbox with only its seat directory writable and only the teamwork MCP
+  tools allowed; the controller that reviews, audits and merges stays in the
+  metacodes process. Its allowance is held in the run's budget before it
+  starts and settled by its reported cost; a Manager stopped without a report
+  is charged the whole allowance, and a crash never grants it twice. Cancel or
+  an exhausted budget stops the Manager and the workers without merging, and
+  the Manager dies with its controller. MCP snapshots now report
+  `budget.held_usd` and `budget.manager` (`none`, `run_ledger`, or
+  `outside_ledger` for a `teamwork mcp` client, whose spend the cap does not
+  include).
+
+- **Teamwork progress.** A teamwork run reports every seat status change and
+  phase change with a snapshot of the run: the REPL draws a panel above the
+  input box (goal, `N/M done · $spent / $cap`, one line per seat with its
+  harness) and `/teamwork status` prints the same summary; the interviewer
+  shows `needs_you` while the approval prompt waits. `teamwork run|resume
+  --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
+  stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
+
 ### Changed
 
 - **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
@@ -31,6 +55,32 @@ status, compatibility boundaries, and entry points are defined by
   `security find-generic-password`/`find-internet-password`/`dump-keychain` or
   `secret-tool` prompts even under an allow rule for `Bash` or in
   `bypassPermissions`; a deny rule still denies.
+
+## 0.13.0 — 2026-11-20
+
+### Changed
+
+- **Each preview feature has its own switch.** `execute_code`, `teamwork` and
+  `comment_guard` can be enabled one by one with `--preview=<list>` /
+  `--no-preview=<list>` or a root `"preview"` object in `config.json`, such as
+  `{"execute_code": true}`. `--preview`, `--no-preview` and `"preview": true`
+  still switch them all. HarnessMM and RSI no longer need `--preview`:
+  `--harnessmm` and `--rsi` alone select them. Zig embedders now set
+  `RuntimeConfig.preview` to a `preview.Features` value (`.all`, `.none` or
+  individual fields); the AgentCore ABI keeps `RuntimeConfigV1.preview` as
+  all-or-nothing.
+
+- **A Bench SSH executor is a `metacodes` node.** The workbench no longer
+  copies a Python runtime to an SSH executor: `metacodes bench setup
+  --executor NAME` installs the bundle's `metacodes` there
+  (`<state_dir>/bin/metacodes`, and `~/.local/bin/metacodes` when free), and
+  every run, copy-back and readiness probe goes through
+  `metacodes bench node …` on that machine. The node reports its own version
+  and the WorkBuddy suites prepared on it, so WorkBuddy Code and Security now
+  run on an SSH executor with that executor's own checkout. `node peers`
+  lists the nodes a machine drives and the workbenches that drove it.
+  Re-run setup for each SSH executor once after upgrading; until then its
+  readiness says the node is missing.
 
 - **Preview features require opt-in.** `--preview` enables them; `--no-preview`
   overrides a saved root `"preview": true` in the installation's `config.json`.

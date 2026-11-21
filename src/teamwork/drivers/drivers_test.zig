@@ -18,6 +18,7 @@ const factory = @import("factory.zig");
 const claude_code = @import("claude_code.zig");
 const metacodes = @import("metacodes.zig");
 const provider_mod = @import("../../api/provider.zig");
+const api_request = @import("../../api/request.zig");
 const api_stream = @import("../../api/stream.zig");
 const json_mod = @import("../../json.zig");
 const app_types = @import("../../types.zig");
@@ -82,13 +83,17 @@ const Fixture = struct {
     };
 
     fn init(self: *Fixture, tag: []const u8, cap_usd: f64) !void {
+        return self.initRun(tag, cap_usd, run_id_text);
+    }
+
+    fn initRun(self: *Fixture, tag: []const u8, cap_usd: f64, run_id: []const u8) !void {
         self.* = .{ .root = run_dir.test_support.TestRoot.init(tag), .run = undefined, .ledger = undefined };
         errdefer self.root.deinit();
         self.state_len = (try std.fmt.bufPrint(&self.state_buf, "{s}/state", .{self.root.slice()})).len;
         self.workspace_len = (try std.fmt.bufPrint(&self.workspace_buf, "{s}/workspace", .{self.root.slice()})).len;
         try util_fs.mkdirParents(self.workspace());
         try util_fs.mkdirParents(self.state());
-        self.run = try run_dir.RunDir.create(testing.allocator, self.state(), try types.RunId.parse(run_id_text));
+        self.run = try run_dir.RunDir.create(testing.allocator, self.state(), try types.RunId.parse(run_id));
         errdefer self.run.deinit(testing.allocator);
         try self.run.writeOriginalRequest("Add a --dry-run flag.\n");
         var budget_buf: run_dir.PathBuf = undefined;
@@ -291,7 +296,7 @@ const parent_env = [_][:0]const u8{
 };
 
 fn claudeOptions() claude_code.Options {
-    return .{ .preview = true, .parent_env = &parent_env, .home_dir = "/nonexistent-home" };
+    return .{ .preview = .all, .parent_env = &parent_env, .home_dir = "/nonexistent-home" };
 }
 
 fn claudeSpec(command: []const u8, budget: types.BudgetEnforcement) !types.SeatSpec {
@@ -341,6 +346,7 @@ pub const ScriptedProvider = struct {
     /// Copies of what the first request carried.
     first_system: ?[]u8 = null,
     first_user: ?[]u8 = null,
+    first_request: ?[]u8 = null,
     /// Every tool result the model was sent, concatenated.
     tool_results: std.ArrayList(u8) = .empty,
 
@@ -352,6 +358,7 @@ pub const ScriptedProvider = struct {
     pub fn deinit(self: *ScriptedProvider) void {
         if (self.first_system) |s| self.allocator.free(s);
         if (self.first_user) |s| self.allocator.free(s);
+        if (self.first_request) |s| self.allocator.free(s);
         self.tool_results.deinit(self.allocator);
     }
 
@@ -386,15 +393,23 @@ pub const ScriptedProvider = struct {
         raw: *anyopaque,
         messages: []const app_types.ApiMessage,
         system: ?[]const u8,
-        _: ?[]const json_mod.ToolDefinition,
+        tools: ?[]const json_mod.ToolDefinition,
         _: ?*const types.AbortSignal,
         model_override: ?[]const u8,
-        _: ?json_mod.ToolChoice,
+        tool_choice: ?json_mod.ToolChoice,
         _: []const u8,
     ) anyerror!provider_mod.StreamHandle {
         const self = cast(raw);
         self.requested_model = model_override;
         if (self.calls == 0) {
+            self.first_request = try api_request.serializeMessagesRequest(.{
+                .model = model_override orelse self.default_model,
+                .messages = messages,
+                .system = system,
+                .stream = true,
+                .tools = tools,
+                .tool_choice = tool_choice,
+            }, self.allocator);
             self.first_system = try self.allocator.dupe(u8, system orelse "");
             for (messages[0].content) |block| switch (block) {
                 .text => |t| {
@@ -528,7 +543,7 @@ const MetacodesHost = struct {
 
     fn deps(self: *const MetacodesHost, prov: provider_mod.Provider, fx: *const Fixture) metacodes.Deps {
         return .{
-            .preview = true,
+            .preview = .all,
             .provider = prov,
             .tool_defs = self.tool_defs,
             .permission_ctx = &self.perm,
@@ -589,8 +604,8 @@ test "teamwork drivers L2: switching a seat's harness in config switches the spa
 
     var abort = types.AbortSignal.init();
     var disabled = deps;
-    disabled.metacodes.preview = false;
-    disabled.claude_code.preview = false;
+    disabled.metacodes.preview = .none;
+    disabled.claude_code.preview = .none;
     for ([_]struct { spec: *const types.SeatSpec, seat: usize }{
         .{ .spec = local_spec, .seat = local_seat },
         .{ .spec = external_spec, .seat = external_seat },
@@ -754,6 +769,142 @@ test "teamwork drivers L2: metacodes seat cannot write outside its workspace and
     try testing.expect(std.mem.indexOf(u8, instruction, fx.root.slice()) == null);
     try testing.expect(std.mem.indexOf(u8, scripted.first_system.?, run_id_text) == null);
     try testing.expect(std.mem.indexOf(u8, first[env_at..], "seat directory: ") != null);
+}
+
+fn writeTestFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (fd < 0) return error.WriteFailed;
+    defer pfs.close(fd);
+    if (!pfs.writeAll(fd, bytes)) return error.WriteFailed;
+}
+
+fn expectFileText(path: [:0]const u8, want: []const u8) !void {
+    const got = swarm_team.readFileAlloc(testing.allocator, path) orelse return error.FileMissing;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+fn runAliasedSeat(tag: []const u8, run_id: []const u8) ![]u8 {
+    var fx: Fixture = undefined;
+    try fx.initRun(tag, 5, run_id);
+    defer fx.deinit();
+    var host: MetacodesHost = undefined;
+    try host.init();
+    defer host.deinit();
+    const seat = try fx.addSeat(.implementer, 1, .metacodes);
+    const other_seat = try fx.addSeat(.reviewer, 1, .metacodes);
+
+    var file_buf: PathBuf = undefined;
+    try writeTestFile(try std.fmt.bufPrintZ(&file_buf, "{s}/check.sh", .{fx.workspace()}), "printf 'check ok\\n'\n");
+    var outside_dir_buf: PathBuf = undefined;
+    const outside_dir = fx.path(&outside_dir_buf, "outside-dir");
+    try util_fs.mkdirParents(outside_dir);
+    var seat_dir_buf: run_dir.PathBuf = undefined;
+    const seat_dir = try fx.run.seatDir(&seat_dir_buf, fx.seats[seat].id);
+    var link_buf: PathBuf = undefined;
+    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/link", .{seat_dir});
+    if (std.c.symlink(outside_dir.ptr, link.ptr) != 0) return error.SymlinkFailed;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const turns = [_][]const ScriptedProvider.Event{
+        &.{
+            .{ .tool = .{ .name = "Read", .input = "{\"file_path\":\"$SEAT/packet.md\"}" } },
+            .{ .tool = .{ .name = "Bash", .input = "{\"command\":\"printf forged > \\\"$SEAT/../reviewer-1/forged\\\"; sh \\\"$WORKSPACE/check.sh\\\" > \\\"$SEAT/check.out\\\"\"}" } },
+        },
+        &.{
+            .{ .tool = .{ .name = "Write", .input = "{\"file_path\":\"$SEAT/../reviewer-1/handoff.md\",\"content\":\"forged\"}" } },
+            .{ .tool = .{ .name = "Write", .input = "{\"file_path\":\"$WORKSPACE/../outside-alias.txt\",\"content\":\"escaped\"}" } },
+            .{ .tool = .{ .name = "Write", .input = "{\"file_path\":\"$SEAT/link/escaped.txt\",\"content\":\"escaped\"}" } },
+            .{ .tool = .{ .name = "Write", .input = "{\"file_path\":\"$WORKSPACE/notes.md\",\"content\":\"inside\"}" } },
+            .{ .tool = .{ .name = "Write", .input = try writeHandoffInput(arena, "$SEAT/handoff.md") } },
+        },
+        &.{.{ .text = "Done." }},
+    };
+    var scripted: ScriptedProvider = .{ .allocator = testing.allocator, .turns = &turns };
+    defer scripted.deinit();
+
+    var driver_impl = metacodes.MetacodesDriver.init(host.deps(scripted.provider(), &fx), fx.binding(seat));
+    const spec: types.SeatSpec = .{ .role = .implementer };
+    var abort = types.AbortSignal.init();
+    var outcome = try driver_impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    try testing.expect(outcome == .finished);
+
+    try testing.expect(std.mem.indexOf(u8, scripted.tool_results.items, packet_text[0 .. packet_text.len - 1]) != null);
+    try expectFileText(try std.fmt.bufPrintZ(&file_buf, "{s}/check.out", .{seat_dir}), "check ok\n");
+    try expectFileText(try std.fmt.bufPrintZ(&file_buf, "{s}/notes.md", .{fx.workspace()}), "inside");
+    var handoff_buf: PathBuf = undefined;
+    try expectFileText(try std.fmt.bufPrintZ(&handoff_buf, "{s}", .{fx.paths(seat).handoff}), handoff_text);
+    try testing.expect(!pfs.exists(try std.fmt.bufPrintZ(&file_buf, "{s}", .{fx.paths(other_seat).handoff})));
+    try testing.expect(!pfs.exists(try std.fmt.bufPrintZ(&file_buf, "{s}/forged", .{std.fs.path.dirname(fx.paths(other_seat).handoff).?})));
+    try testing.expect(!pfs.exists(fx.path(&file_buf, "outside-alias.txt").ptr));
+    try testing.expect(!pfs.exists(try std.fmt.bufPrintZ(&file_buf, "{s}/escaped.txt", .{outside_dir})));
+
+    const request = scripted.first_request orelse return error.NoRequest;
+    try testing.expect(std.mem.indexOf(u8, request, run_id) == null);
+    try testing.expect(std.mem.indexOf(u8, request, fx.root.slice()) == null);
+    try testing.expectEqualStrings(metacodes.first_message, scripted.first_user.?);
+    return testing.allocator.dupe(u8, request);
+}
+
+test "teamwork drivers L2: seat path aliases keep the first provider request identical across runs and resolve to real paths" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const first = try runAliasedSeat("cc-zig-teamwork-alias-a", "r-alias-one");
+    defer testing.allocator.free(first);
+    const second = try runAliasedSeat("cc-zig-teamwork-alias-second-root", "r-alias-two");
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+}
+
+fn claudeSeatArgs(tag: []const u8, run_id: []const u8) ![]u8 {
+    var fx: Fixture = undefined;
+    try fx.initRun(tag, 5, run_id);
+    defer fx.deinit();
+    var fake: FakeCli = .{};
+    try fake.install(&fx, .ok);
+    const seat = try fx.addSeat(.implementer, 1, .claude_code);
+    const spec = try claudeSpec(fake.scriptPath(), .cost);
+    var driver_impl = claude_code.ClaudeCodeDriver.init(claudeOptions(), fx.binding(seat));
+    var abort = types.AbortSignal.init();
+    var outcome = try driver_impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    try testing.expect(outcome == .finished);
+
+    const record = fake.readRecord(testing.allocator) orelse return error.FakeNotRun;
+    defer testing.allocator.free(record);
+    var seat_dir_buf: run_dir.PathBuf = undefined;
+    const seat_dir = try fx.run.seatDir(&seat_dir_buf, fx.seats[seat].id);
+    var args: std.ArrayList(u8) = .empty;
+    errdefer args.deinit(testing.allocator);
+    var after_add_dir = false;
+    var it = std.mem.splitScalar(u8, record, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "arg:")) continue;
+        const arg = line["arg:".len..];
+        if (after_add_dir) {
+            try testing.expectEqualStrings(seat_dir, arg);
+            try args.appendSlice(testing.allocator, "<seat directory>\n");
+        } else {
+            try testing.expect(std.mem.indexOf(u8, arg, run_id) == null);
+            try testing.expect(std.mem.indexOf(u8, arg, fx.root.slice()) == null);
+            try args.appendSlice(testing.allocator, line);
+            try args.append(testing.allocator, '\n');
+        }
+        after_add_dir = std.mem.eql(u8, arg, "--add-dir");
+    }
+    return args.toOwnedSlice(testing.allocator);
+}
+
+test "teamwork drivers L2: a claude seat's argv differs across runs only in the seat directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const first = try claudeSeatArgs("cc-zig-teamwork-claude-stable-a", "r-stable-one");
+    defer testing.allocator.free(first);
+    const second = try claudeSeatArgs("cc-zig-teamwork-claude-stable-second-root", "r-stable-two");
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+    try testing.expect(std.mem.indexOf(u8, first, "<seat directory>\n") != null);
 }
 
 test "teamwork drivers L2: claude seat failures map to outcomes" {

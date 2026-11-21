@@ -38,8 +38,8 @@ from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, RotatingGateway, gaia2_dataset, session_fixture,
-                                                     wait_run)
+from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, REPO, RotatingGateway, gaia2_dataset, node_script,
+                                                     session_fixture, wait_run)
 
 FAKES = r'''
 import json, os, shutil, subprocess, sys, time
@@ -93,6 +93,20 @@ elif name == "sudo":
     rest = args[1:] if args[:1] == ["-n"] else args
     os.execvp(rest[0], rest)
 elif name == "docker":
+    if args[:1] == ["buildx"]:
+        if env.get("FAKE_NO_BUILDX"):
+            print("docker: 'buildx' is not a docker command.", file=sys.stderr)
+            sys.exit(1)
+        if args[1:2] == ["build"]:
+            time.sleep(float(env.get("FAKE_BUILD_DELAY") or 0))
+            images = state / "images"
+            images.mkdir(exist_ok=True)
+            (images / args[args.index("--tag") + 1].replace("/", "_")).touch()
+        sys.exit(0)
+    if args[:2] == ["image", "rm"]:
+        time.sleep(float(env.get("FAKE_RM_DELAY") or 0))
+        (state / "images" / args[2].replace("/", "_")).unlink(missing_ok=True)
+        sys.exit(0)
     if args[:1] == ["info"]:
         running = (state / "colima-running").exists() or env.get("FAKE_DOCKER_DAEMON") == "1"
         if not running:
@@ -145,7 +159,8 @@ elif name == "ssh":
               "FAKE_DOCKER_DAEMON": env.get("FAKE_REMOTE_DOCKER_DAEMON", "")}
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
-                "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST"):
+                "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
+                "FAKE_RM_DELAY"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -204,10 +219,34 @@ elif name == "metacodes":
     print("Open https://example.invalid/device and enter the code ABCD-1234", file=sys.stderr, flush=True)
 '''
 
+# Appended to test_bench_suites.FAKE_UV: WorkBuddy's host proxy making model
+# requests for a while, through whatever endpoint and key it was given.
+FAKE_UV_REQUESTS = r'''
+import time, urllib.error, urllib.request
+statuses = []
+for _ in range(int(os.environ.get('FAKE_RELAY_REQUESTS') or 0)):
+    request = urllib.request.Request(os.environ[spec['backend_url_env']], data=b'{}', method='POST',
+                                     headers={'Authorization': 'Bearer ' + os.environ[spec['backend_key_env']]})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+            statuses.append(response.status)
+    except urllib.error.HTTPError as exc:
+        statuses.append(exc.code)
+    time.sleep(float(os.environ.get('FAKE_RELAY_INTERVAL') or 0))
+(jobs_dir.parent / 'relay-statuses.json').write_text(json.dumps(statuses))
+observed = json.loads((jobs_dir.parent / 'observed.json').read_text())
+observed['key'] = os.environ.get(spec['backend_key_env'])
+version = cwd / 'configs/harnesses/metacodes/versions' / (job['harness'].split('/')[1] + '.yaml')
+observed['harness_version'] = version.read_text() if version.is_file() else None
+(jobs_dir.parent / 'observed.json').write_text(json.dumps(observed))
+'''
+
 SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig", "metacodes", "sysctl",
           "systemctl")
 SYSTEM_TOOLS = ("sh", "env", "mkdir", "tar", "cp", "chmod", "rm", "mv", "mktemp", "touch", "cat", "python3",
-                "openssl", "grep", "sed", "ls", "id", "head", "tail", "dirname", "basename", "true", "false", "git")
+                "openssl", "grep", "sed", "ls", "id", "head", "tail", "dirname", "basename", "true", "false", "git",
+                "ln", "readlink", "bash")
 
 
 def release_fixture(root, version="9.9.9", corrupt=False):
@@ -217,7 +256,7 @@ def release_fixture(root, version="9.9.9", corrupt=False):
     for file in BUNDLE_EXECUTABLES:
         path = unit / file
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"release " + file.encode())
+        path.write_bytes(node_script() if file == "bin/metacodes" else b"release " + file.encode())
         path.chmod(0o755)
     atomic_json(unit / "manifest.json", {"target": {"id": "x86_64-linux-gnu", "os": "linux"},
                                          "release": {"version": version}})
@@ -324,11 +363,17 @@ class SetupFixture(unittest.TestCase):
     def cfg(self):
         return json.loads(self.config.read_text())
 
-    def add_ssh_executor(self, **extra):
+    def add_ssh_executor(self, node=True, **extra):
+        """`node`: the executor already has its metacodes node (as setup leaves it)."""
         cfg = self.cfg()
         cfg["executors"] = [{"name": "devbox-mac", "kind": "local"},
                             {"name": "relay-4090", "kind": "ssh", "host": "10.126.126.1", "user": "bench", **extra}]
         atomic_json(self.config, cfg)
+        if node:
+            path = self.remote_home / (extra.get("state_dir") or ".metacodes-bench") / "bin" / "metacodes"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(node_script())
+            path.chmod(0o755)
 
     def step(self, progress, step_id):
         return next(s for s in progress["steps"] if s["id"] == step_id)
@@ -584,12 +629,12 @@ class SshExecutorTest(SetupFixture):
             progress = setup.run_setup(self.config, "relay-4090")
         ssh = self.step(progress, "ssh")
         self.assertEqual((ssh["status"], ssh["command"]), ("manual", "ssh -p 22 bench@10.126.126.1 true"))
-        for step_id in ("python", "uv", "harbor", "docker", "openssl", "remote_files"):
+        for step_id in ("python", "uv", "harbor", "docker", "openssl", "node"):
             self.assertEqual(self.step(progress, step_id)["status"], "skipped")
         self.assertEqual(self.step(progress, "bundle")["status"], "done")
 
-    def test_remote_setup_installs_over_ssh_and_ships_runtime_once(self):
-        self.add_ssh_executor()
+    def test_remote_setup_installs_the_node_over_ssh_and_ships_the_bundle_once(self):
+        self.add_ssh_executor(node=False)
         os.environ.update(FAKE_REMOTE_SUDO="1", FAKE_REMOTE_DOCKER_DAEMON="1")
         # The workbench machine's own Harbor (registry suites are downloaded
         # here) is installed with this machine's uv.
@@ -605,17 +650,68 @@ class SshExecutorTest(SetupFixture):
         self.assertEqual([c for c in self.calls() if c[0] in ("brew", "colima")], [])
         relay = next(e for e in self.cfg()["executors"] if e["name"] == "relay-4090")
         self.assertEqual(relay["harbor"], str(self.remote_home / ".local/bin/harbor"))
-        runtime = list((self.remote_home / ".metacodes-bench/runtime").iterdir())
         bundles = list((self.remote_home / ".metacodes-bench/bundles").iterdir())
-        self.assertEqual(len(runtime), 1)
-        self.assertTrue((runtime[0] / "scripts/eval/harbor/bench/remote.py").is_file())
+        self.assertFalse((self.remote_home / ".metacodes-bench/runtime").exists())
         self.assertTrue(os.access(bundles[0] / "bin/metacodes", os.X_OK))
+        # The executor's own metacodes, also on its PATH, answers as a node
+        # and remembers the workbench that asked.
+        node = self.remote_home / ".metacodes-bench/bin/metacodes"
+        self.assertEqual(node.resolve(), (bundles[0] / "bin/metacodes").resolve())
+        self.assertEqual(Path(os.readlink(self.remote_home / ".local/bin/metacodes")).resolve(), node.resolve())
+        self.assertIn("metacodes 9.9.9 节点", self.step(progress, "node")["detail"])
+        peers = json.loads((self.remote_home / ".metacodes/bench/peers.json").read_text())
+        self.assertEqual(list(peers), [executors.workbench_name()])
         catalog = RunManager(self.state / "bench/jobs", self.config).catalog()
         relay_state = next(e for e in catalog["executors"] if e["name"] == "relay-4090")
         self.assertTrue(relay_state["ready"], relay_state["reasons"])
         shipped = len([c for c in self.calls("ssh") if "tar -xf -" in c[1][-1]])
         setup.run_setup(self.config, "relay-4090")
         self.assertEqual(len([c for c in self.calls("ssh") if "tar -xf -" in c[1][-1]]), shipped)
+
+
+    def test_a_failed_node_upgrade_keeps_the_installed_node(self):
+        self.add_ssh_executor(node=False)
+        os.environ.update(FAKE_REMOTE_SUDO="1", FAKE_REMOTE_DOCKER_DAEMON="1")
+        os.symlink(self.templates / "uv", self.local_bin / "uv")
+        self.assertEqual(setup.run_setup(self.config, "relay-4090")["status"], "ready")
+        node = self.remote_home / ".metacodes-bench/bin/metacodes"
+        installed = node.resolve()
+        # A candidate bundle whose metacodes speaks another protocol.
+        candidate = self.root / "candidate-bundle"
+        shutil.copytree(self.cfg()["bundle"], candidate)
+        (candidate / "bin/metacodes").write_text('#!/bin/sh\necho \'{"protocol": 17, "version": "x", "host": "h"}\'\n')
+        cfg = self.cfg()
+        cfg["bundle"] = str(candidate)
+        atomic_json(self.config, cfg)
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "node")
+        self.assertEqual(step["status"], "failed", step)
+        self.assertIn("原有节点保持不变", step["detail"])
+        self.assertEqual(node.resolve(), installed)
+        relay = executors.find(self.cfg(), "relay-4090")
+        info = subprocess.run(executors.node_argv(relay, "info", "--json"), capture_output=True, text=True)
+        self.assertEqual(json.loads(info.stdout)["protocol"], 1, info.stderr)
+
+    def test_a_node_on_the_path_runs_with_the_configured_python(self):
+        """No setup-managed entry: the `metacodes` on the executor's PATH is
+        the node, started with the entry's `python`, for probe and commands."""
+        calls = self.root / "python-calls.log"
+        python = self.remote_home / "opt/bench/bin/python3.12"
+        python.parent.mkdir(parents=True)
+        python.write_text(f'#!/bin/sh\necho "$*" >> {calls}\nexec {sys.executable} "$@"\n')
+        python.chmod(0o755)
+        self.add_ssh_executor(node=False, python=str(python))
+        (self.remote_bin / "metacodes").write_bytes(node_script())
+        (self.remote_bin / "metacodes").chmod(0o755)
+        os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
+        relay = executors.find(self.cfg(), "relay-4090")
+        facts = executors.probe(relay)
+        self.assertEqual(facts["node"]["protocol"], 1, facts)
+        self.assertIsNone(executors.node_problem(relay, facts))
+        self.assertIn("scripts.eval.harbor.cli", calls.read_text())
+        listing = subprocess.run(executors.node_argv(relay, "manifest", "nowhere"), capture_output=True, text=True)
+        self.assertEqual((listing.returncode, json.loads(listing.stdout)), (0, {}), listing.stderr)
+        self.assertEqual(calls.read_text().count("scripts.eval.harbor.cli"), 2)
 
 
 class SshRunTest(SetupFixture):
@@ -784,7 +880,6 @@ class SshRunTest(SetupFixture):
     def test_copy_back_is_bounded_per_pass_and_appends_grown_files(self):
         manager, _, _ = self.prepare_remote()
         relay = executors.find(self.cfg(), "relay-4090")
-        runtime = executors.ship_runtime(relay, log=lambda _t: None)
         remote_dir = self.remote_home / "jobs" / "grow"
         (remote_dir / "t__1").mkdir(parents=True)
         for index in range(5):
@@ -792,7 +887,7 @@ class SshRunTest(SetupFixture):
         log = remote_dir / "t__1" / "agent.log"
         log.write_bytes(os.urandom(300 * 1024))
         local = self.root / "local-jobs" / "grow"
-        sync = executors.JobSync(relay, runtime, "jobs/grow", local, log=lambda _t: None)
+        sync = executors.JobSync(relay, "jobs/grow", local, log=lambda _t: None)
         sync.PASS_BYTES = 100 * 1024
         self.assertEqual(sync.sync(), 5)  # the small files first; the log waits
         self.assertEqual(sync.pending, 1)
@@ -833,14 +928,11 @@ class SshRunTest(SetupFixture):
     def test_closed_channel_stops_remote_harbor(self):
         manager, _, _ = self.prepare_remote()
         relay = executors.find(self.cfg(), "relay-4090")
-        runtime = executors.ship_runtime(relay, log=lambda _t: None)
         jobs = self.remote_home / "jobs"
         spec = {"argv": [str(self.remote_home / ".local/bin/harbor"), "run", "-m", "metask/x", "-k", "1",
-                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None,
-                "runtime": runtime}
+                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None}
         (self.remote_home / "spec.json").write_text(json.dumps(spec))
-        argv = executors.ssh_argv(relay, ["env", "PYTHONPATH=" + runtime, "python3", "-m",
-                                          "scripts.eval.harbor.bench.remote", "run", "spec.json"])
+        argv = executors.node_argv(relay, "run", "spec.json")
         env = {**os.environ, "FAKE_BENCH_DELAY": "30"}
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         process.stdin.write(b'{"env": {"METASK_API_KEY": "k"}}\n')
@@ -895,12 +987,14 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertEqual((catalog["ready"], catalog["reasons"]), (False, local["reasons"]))
         self.assertEqual(tb["reasons"], local["reasons"])
         wb = suites_by_id["workbuddy-code"]
+        # On the SSH executor its readiness is what the node reports about
+        # its own WorkBuddy checkout.
         on_ssh = wb["executors"]["relay-4090"]["reasons"]
-        self.assertTrue(any("只能在本机执行器" in r for r in on_ssh), on_ssh)
+        self.assertTrue(any("未配置 WorkBuddy checkout" in r for r in on_ssh), on_ssh)
         # WorkBuddy brings its own Harbor: the local executor's Harbor/Docker
         # probe is not its readiness (it checks its own tools).
         self.assertFalse(set(local["reasons"]) & set(wb["executors"]["devbox-mac"]["reasons"]) - set(wb["suite_reasons"]))
-        with self.assertRaisesRegex(ValueError, "只能在本机执行器"):
+        with self.assertRaisesRegex(ValueError, "未配置 WorkBuddy checkout"):
             client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                         "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
         with self.assertRaisesRegex(ValueError, "Docker"):
@@ -912,7 +1006,190 @@ class SuiteOnExecutorTest(SetupFixture):
         text = out.getvalue()
         self.assertIn("执行机器：relay-4090", text)
         self.assertIn("竞赛数学：", text)
-        self.assertIn("[relay-4090] WorkBuddy 评测只能在本机执行器运行", text)
+        self.assertIn("执行机器：relay-4090（SSH bench@10.126.126.1:22） · metacodes 9.9.9：已就绪", text)
+
+    def test_workbuddy_runs_on_the_ssh_node_with_the_nodes_own_checkout(self):
+        """The node reports its WorkBuddy checkout, tasks, readiness and staged
+        metacodes; a run uses that checkout there behind the node's relay,
+        which receives each refreshed session token over the SSH stdin."""
+        from scripts.eval.harbor.bench.setup import sha256_file
+        from scripts.eval.harbor.suites import workbuddy as wb_suite
+        from scripts.eval.tests.test_bench_suites import FAKE_UV, workbuddy_checkout
+        from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV
+        gateway = RotatingGateway(self.root, lifetime=4)
+        self.addCleanup(gateway.close)
+        manager, client, _ = self.prepare_remote(gateway=gateway)
+        os.environ.update(METACODES_BENCH_REFRESH_MARGIN="2", METACODES_BENCH_REFRESH_INTERVAL="0.2",
+                          FAKE_RELAY_REQUESTS="30", FAKE_RELAY_INTERVAL="0.3")
+        uv = self.remote_home / ".local/bin/uv"
+        uv.write_text(FAKE_UV.format(python=sys.executable, judge=WORKBUDDY_JUDGE_KEY_ENV) + FAKE_UV_REQUESTS)
+        uv.chmod(0o755)
+        # WorkBuddy brings its own Harbor: the executor's missing Harbor CLI
+        # keeps Harbor suites from running there, not WorkBuddy.
+        (self.remote_home / ".local/bin/harbor").unlink()
+        repo = self.node_checkout(workbuddy_checkout)
+        # The mount image is built with buildx: a node without it says so.
+        os.environ["FAKE_NO_BUILDX"] = "1"
+        catalog = client.request("api/workbench")
+        wb = next(s for s in catalog["suites"] if s["id"] == "workbuddy-code")
+        self.assertTrue(any("buildx" in r for r in wb["executors"]["relay-4090"]["reasons"]), wb["executors"])
+        del os.environ["FAKE_NO_BUILDX"]
+        manager.probe_cache.clear()
+        catalog = client.request("api/workbench")
+        wb = next(s for s in catalog["suites"] if s["id"] == "workbuddy-code")
+        tb = next(s for s in catalog["suites"] if s["id"] == "terminal-bench-2.1")
+        self.assertTrue(wb["executors"]["relay-4090"]["ready"], wb["executors"]["relay-4090"])
+        self.assertFalse(tb["executors"]["relay-4090"]["ready"])
+        self.assertFalse(wb["executors"]["devbox-mac"]["ready"])  # no checkout on the workbench machine
+        relay = next(e for e in catalog["executors"] if e["name"] == "relay-4090")
+        self.assertEqual(relay["node"]["version"], "9.9.9")
+        self.assertIn("metacodes 9.9.9", relay["label"])
+        self.assertEqual(len(client.request("api/suite?id=workbuddy-code&executor=relay-4090")["tasks"]), 3)
+        self.assertEqual(client.request("api/suite?id=workbuddy-code")["tasks"], [])
+        with self.assertRaisesRegex(ValueError, "没有这些任务"):
+            client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                        "tasks": ["not-a-workbuddy-task"], "executor": "relay-4090"})
+        # Staged artifacts of another metacodes than the run's bundle are
+        # refused, executable by executable: the same metacodes beside
+        # another TinyKG is another version.
+        def stage(**executables):
+            manifest = json.loads((repo / wb_suite.ARTIFACT_MANIFEST).read_text())
+            manifest["executables"] = {label: {"sha256": digest} for label, digest in executables.items()}
+            atomic_json(repo / wb_suite.ARTIFACT_MANIFEST, manifest)
+            manager.probe_cache.clear()
+        bundle = sha256_file(self.root / "bundle/bin/metacodes")  # every fixture executable holds the same bytes
+        matching = {"metacodes": bundle, "tinykg": bundle, "metacodes-formal-kernel": bundle, "ripgrep": bundle}
+        for staged, label in (({**matching, "metacodes": "1" * 64}, "metacodes"),
+                              ({**matching, "tinykg": "0" * 64}, "tinykg"),
+                              ({k: v for k, v in matching.items() if k != "metacodes"}, "metacodes"),
+                              ({k: v for k, v in matching.items() if k != "ripgrep"}, "ripgrep")):
+            stage(**staged)
+            with self.assertRaisesRegex(ValueError, "暂存的制品.*（" + label):
+                client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                            "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
+        stage(**matching)
+        # The mount image of an earlier staging is cached under the shared
+        # tag, which run.sh would reuse (and another workbench could move):
+        # the run mounts an image of its own tag, built from what is staged.
+        images = Path(os.environ["FAKE_REMOTE_STATE"]) / "images"
+        images.mkdir(parents=True, exist_ok=True)
+        (images / wb_suite.HARNESS_IMAGE.replace("/", "_")).touch()
+        run = client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                          "tasks": ["bug_fix-easy-alpha", "data_quality-hard-beta"],
+                                          "attempts": 1, "concurrency": 2, "executor": "relay-4090"})
+        final = wait_run(manager, run["name"], timeout=60)
+        self.assertEqual(final["status"], "finished", data.tail(manager.records / (run["name"] + ".log")))
+        local = manager.jobs_dir / run["name"]
+        observed = json.loads((local / "observed.json").read_text())
+        self.assertEqual(Path(observed["cwd"]).resolve(), repo.resolve())
+        # WorkBuddy holds a placeholder and talks to the node's loopback relay.
+        self.assertTrue(observed["key"].startswith("mcb-"), observed["key"])
+        self.assertTrue(observed["base_url"].startswith("http://127.0.0.1:"), observed["base_url"])
+        self.assertTrue(observed["base_url"].endswith("/workbuddy/v1/messages"), observed["base_url"])
+        # Every request across 2.5 token lifetimes was authorized upstream with
+        # tokens that could only have arrived over the channel.
+        self.assertEqual(json.loads((local / "relay-statuses.json").read_text()), [200] * 30)
+        self.assertGreaterEqual(len({token for token, _, _ in gateway.requests}), 3)
+        self.assertTrue(all(ok for _, ok, _ in gateway.requests), gateway.requests)
+        self.assertGreaterEqual(final["credential"]["refresh_count"], 2)
+        slug = "metacodes-" + run["name"]
+        self.assertFalse((repo / "configs/jobs" / (slug + ".yaml")).exists())
+        view = client.request("api/job?name=" + run["name"])
+        self.assertEqual((view["summary"]["counts"]["pass"], view["summary"]["counts"]["fail"]), (1, 1))
+        builds = [c[1] for c in self.calls("docker", "remote") if c[1][:2] == ["buildx", "build"]]
+        tag = wb_suite.run_image_tag(run["name"])
+        self.assertEqual(len(builds), 1, builds)
+        self.assertEqual(builds[0][builds[0].index("--tag") + 1], tag)
+        self.assertEqual(Path(builds[0][-1]).resolve(), (repo / wb_suite.HARNESS_CONTEXT).resolve())
+        # WorkBuddy resolved that tag through the run's own harness version,
+        # the pinned one plus the image; both transient files are gone and the
+        # run's tag is removed (the shared one is untouched).
+        self.assertEqual(observed["job"]["harness"], "metacodes/" + slug)
+        pinned = (repo / wb_suite.HARNESS_VERSIONS / "0.1.0.yaml").read_text()
+        self.assertEqual(observed["harness_version"], pinned.rstrip("\n") + f'\n  mount:\n    images:\n      local: "{tag}"\n')
+        self.assertFalse((repo / wb_suite.HARNESS_VERSIONS / (slug + ".yaml")).exists())
+        self.assertIn(["image", "rm", tag], [c[1] for c in self.calls("docker", "remote")])
+        self.assertTrue((images / wb_suite.HARNESS_IMAGE.replace("/", "_")).exists())
+        self.assertIsNotNone(json.loads((manager.jobs_dir / run["name"] / "result.json").read_text())["finished_at"])
+        remote_files = [p for p in self.remote_home.rglob("*") if p.is_file() and ".metacodes-bench/" in str(p)]
+        public = b"".join(p.read_bytes() for p in remote_files + list(manager.records.iterdir())
+                          + [p for p in local.rglob("*") if p.is_file()])
+        for secret in gateway.issued:
+            self.assertNotIn(secret.encode(), public, secret)
+
+    def node_checkout(self, workbuddy_checkout):
+        """A WorkBuddy checkout the node prepared, with the pinned harness version."""
+        repo = workbuddy_checkout(self.remote_home)
+        versions = repo / "configs/harnesses/metacodes/versions"
+        versions.mkdir(parents=True)
+        shutil.copy(REPO / "scripts/eval/workbuddy/overlay/configs/harnesses/metacodes/versions/0.1.0.yaml", versions)
+        atomic_json(self.remote_home / ".metacodes/bench/workbench.json", {"workbuddy_checkout": str(repo)})
+        return repo
+
+    def test_a_slow_mount_image_build_keeps_the_channel_alive_and_cancels(self):
+        """The node builds the run's mount image under heartbeats; a cancel
+        during the build kills it and ends the run before WorkBuddy starts."""
+        from scripts.eval.tests.test_bench_suites import workbuddy_checkout
+        self.prepare_remote()
+        uv = self.remote_home / ".local/bin/uv"
+        uv.write_text("#!/bin/sh\ntouch \"$HOME/uv-ran\"\n")
+        uv.chmod(0o755)
+        self.node_checkout(workbuddy_checkout)
+        spec = {"schema_version": 1, "runner": "workbuddy", "jobs_dir": "jobs", "name": "slow", "suite": "workbuddy-code",
+                "model": "metask/session-model", "tasks": ["bug_fix-easy-alpha"], "attempts": 1, "concurrency": 1,
+                "account_gateway": "http://127.0.0.1:9", "executables": None}
+        (self.remote_home / "spec.json").write_text(json.dumps(spec))
+        relay = executors.find(self.cfg(), "relay-4090")
+        env = {**os.environ, "FAKE_BUILD_DELAY": "60"}
+        process = subprocess.Popen(executors.node_argv(relay, "run", "spec.json"), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, env=env)
+        self.addCleanup(process.kill)
+        process.stdin.write(b'{"env": {}, "credential": "access"}\n')
+        process.stdin.flush()
+        beats = [json.loads(process.stdout.readline()) for _ in range(2)]
+        self.assertEqual([(e["event"], e.get("phase")) for e in beats], [("heartbeat", "prepare")] * 2)
+        started = time.monotonic()
+        process.stdin.write(b"cancel\n")
+        process.stdin.flush()
+        events = [json.loads(line) for line in process.stdout]
+        # The process itself ends with the reported code (the stdin reader
+        # never holds up its exit) while the channel is still open.
+        self.assertEqual(process.wait(30), 130)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(events[-1], {"event": "exit", "code": 130, "cancelled": True})
+        self.assertNotIn("started", [e["event"] for e in events])
+        self.assertFalse((self.remote_home / "uv-ran").exists())
+
+    def test_cleanup_runs_under_heartbeats_before_the_one_terminal_event(self):
+        """A finished WorkBuddy run removes its tag and transient harness
+        version (slowly here) while heartbeats continue, then reports once."""
+        from scripts.eval.harbor.suites import workbuddy as wb_suite
+        from scripts.eval.tests.test_bench_suites import workbuddy_checkout
+        self.prepare_remote()
+        uv = self.remote_home / ".local/bin/uv"
+        uv.write_text("#!/bin/sh\nexit 0\n")
+        uv.chmod(0o755)
+        repo = self.node_checkout(workbuddy_checkout)
+        spec = {"schema_version": 1, "runner": "workbuddy", "jobs_dir": "jobs", "name": "quick",
+                "suite": "workbuddy-code", "model": "metask/session-model", "tasks": ["bug_fix-easy-alpha"],
+                "attempts": 1, "concurrency": 1, "account_gateway": "http://127.0.0.1:9", "executables": None}
+        (self.remote_home / "spec.json").write_text(json.dumps(spec))
+        relay = executors.find(self.cfg(), "relay-4090")
+        env = {**os.environ, "FAKE_RM_DELAY": "5"}
+        process = subprocess.Popen(executors.node_argv(relay, "run", "spec.json"), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, env=env)
+        self.addCleanup(process.kill)
+        process.stdin.write(b'{"env": {}, "credential": "access"}\n')
+        process.stdin.flush()
+        events = [json.loads(line) for line in process.stdout]
+        self.assertEqual(process.wait(30), 0)
+        kinds = [(e["event"], e.get("phase")) for e in events]
+        exit_at = kinds.index(("exit", None))
+        self.assertEqual(exit_at, len(events) - 1, kinds)
+        self.assertEqual(events[-1], {"event": "exit", "code": 0, "cancelled": False})
+        self.assertGreaterEqual(kinds[kinds.index(("started", None)):].count(("heartbeat", "finish")), 2, kinds)
+        self.assertIn(["image", "rm", wb_suite.run_image_tag("quick")], [c[1] for c in self.calls("docker", "remote")])
+        self.assertFalse((repo / wb_suite.HARNESS_VERSIONS / "metacodes-quick.yaml").exists())
 
     def test_registry_suite_runs_on_ssh_executor_into_the_store(self):
         """A registry suite on an SSH executor is downloaded on the workbench
@@ -1416,7 +1693,7 @@ class EgressRunTest(SetupFixture):
                                           "tasks": ["humaneval-7"], "executor": "relay-4090"})
         final = wait_run(manager, run["name"], timeout=60)
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
-        session = next(c[1] for c in self.calls("ssh") if ".remote run " in c[1][-1])
+        session = next(c[1] for c in self.calls("ssh") if " node run " in c[1][-1])
         forward = session[session.index("-R") + 1]
         self.assertRegex(forward, r"^127\.0\.0\.1:\d+:127\.0\.0\.1:\d+$")
         self.assertIn("ExitOnForwardFailure=yes", session)

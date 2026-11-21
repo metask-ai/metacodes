@@ -23,7 +23,7 @@ pub const PromptContext = struct {
     /// SendMessage 不进 advertised tool_defs——避免污染单 agent 会话的工具菜单(对齐 cc
     /// agentSwarmsEnabled 门,Linus/PM SW2 F5)。
     agent_teams: bool = false,
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// Whether TinyKG-specific memory tools are part of this runtime treatment.
     /// Task tools remain common to every arm; without TinyKG they use only the
     /// in-session task store.

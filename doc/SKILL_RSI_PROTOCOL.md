@@ -14,15 +14,13 @@ and feature contract rather than a benchmark reproduction.
 ## Product switches
 
 `--rsi-policy <file>` names a frozen UTF-8 JSON policy. `--rsi` enables the
-complete feature only with the shared preview opt-in; `--no-rsi` disables it.
-RSI defaults to off; the last positive or negative occurrence wins.
-Use `metacodes --preview --rsi --rsi-policy policy.json -p "your task"`.
-Alternatively, save the root boolean `"preview": true` in
-`<state root>/config.json`. `--no-preview` overrides that saved value, and the
-last preview flag wins. Preview alone does not select RSI or HarnessMM.
+complete feature; `--no-rsi` disables it. RSI defaults to off; the last
+positive or negative occurrence wins. The shared preview setting neither
+selects nor blocks RSI or HarnessMM.
+Use `metacodes --rsi --rsi-policy policy.json -p "your task"`.
 
-When either preview or RSI is disabled, the policy is not opened or required,
-and no procedural instruction is added. When both are enabled, the selected evolved instruction is applied only when
+When RSI is disabled, the policy is not opened or required, and no procedural
+instruction is added. When it is enabled, the selected evolved instruction is applied only when
 its own router admits the task. Evolution and routing are internal parts of
 RSI, not separate product switches.
 
@@ -35,9 +33,9 @@ The runtime switch does not run training or make an optimizer/selector request
 at startup. The separate offline evolution/routing options below exist for
 research ablations; an artifact without a router abstains in the product.
 
-The CLI hosts (headless, REPL, web and daemon) pass the resolved preview value
-and the same immutable policy to the kernel. Fresh children do not implicitly
-select RSI; an explicit host selection still requires preview in the child.
+The CLI hosts (headless, REPL, web and daemon) pass the RSI selection and the
+same immutable policy to the kernel. Fresh children do not implicitly select
+RSI; a host selects it explicitly.
 Background continuation of the root preserves its selection and borrowed
 policy. A newly admitted instruction is one
 persisted host-origin user-role note after the current participant task:

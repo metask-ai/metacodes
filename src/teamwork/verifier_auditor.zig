@@ -49,7 +49,7 @@ pub const VerifierAuditor = struct {
 
     fn auditFn(ptr: *anyopaque, gpa: std.mem.Allocator, request: audit.AuditRequest) audit.CompletionAuditor.Error!audit.AuditVerdict {
         const self: *VerifierAuditor = @ptrCast(@alignCast(ptr));
-        if (!request.preview) return .{ .unavailable = try gpa.dupe(u8, "Teamwork preview is disabled.\n") };
+        if (!request.preview.teamwork) return .{ .unavailable = try gpa.dupe(u8, "Teamwork preview is disabled.\n") };
         var snapshot = isolation.Snapshot.create(gpa, request.scratch_dir, request.workspace, request.base, request.abort) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .unavailable = try gpa.dupe(u8, "The approved audit snapshot could not be created.\n") },
@@ -102,7 +102,7 @@ pub const VerifierAuditor = struct {
         var result = try iv.verify(gpa, deps, .{
             .task_statement = request.original_request,
             .workspace = .{ .snapshot = &snapshot },
-            .relative_workspace_packet = true,
+            .aliased_workspace_packet = true,
             .pinned_check = pinned,
             .budget = budget,
             .model = self.model,

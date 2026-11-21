@@ -67,6 +67,7 @@ const model_command = @import("model_command.zig");
 const session_service = @import("../session_service.zig");
 const replay = @import("replay.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
+const teamwork = @import("teamwork.zig");
 
 fn hasPendingRunInput(ctx: *anyopaque) bool {
     const queue: *msg_queue_mod.MsgQueue = @ptrCast(@alignCast(ctx));
@@ -229,6 +230,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         .eval_execution_policy = eval_execution_policy,
         .spawn_tick = spawn_tick,
     };
+
+    var teamwork_session: teamwork.Session = .{};
+    defer teamwork_session.deinit();
+    if (tui_region) |*r| r.teamwork_board = &teamwork_session.board;
+    defer if (tui_region) |*r| {
+        r.teamwork_board = null;
+    };
+    var teamwork_reader: TeamworkReader = .{ .host = &turn_host };
 
     while (true) {
         // SIGTERM or SIGHUP stopped the last Run, which closed its journal on
@@ -658,6 +667,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
             try handleMcp(app);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/teamwork") or std.mem.startsWith(u8, trimmed, "/teamwork ") or std.mem.startsWith(u8, trimmed, "/teamwork\n")) {
+            teamwork.handle(app, allocator, &teamwork_session, std.mem.trim(u8, trimmed["/teamwork".len..], " \t\r\n"), teamwork_reader.reader());
             continue;
         }
         // /btw <question>:侧问,不进对话历史(用临时 conversation 跑一次)
@@ -1390,7 +1403,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
 
     // ② spawnBackground(prebuilt=copy)。consume 语义:成功转移给 job,失败它自己释放 copy。
     _ = try reg.spawnBackground(.{
-        .preview = app.config.preview.isEnabled(),
+        .preview = app.config.preview.features(),
         .harnessmm = app.config.harnessmm,
         .rsi = app.config.rsi,
         .rsi_policy = if (app.rsi_policy) |*policy| &policy.parsed.value else null,
@@ -1822,6 +1835,21 @@ fn printNotice(app: *const app_mod.App, color: []const u8, text: []const u8) voi
     cmd_output.notice(cols, marker, text);
 }
 
+const TeamworkReader = struct {
+    host: *const TurnHost,
+
+    fn reader(self: *TeamworkReader) teamwork.LineReader {
+        return .{ .ctx = self, .readFn = read };
+    }
+
+    fn read(ctx: *anyopaque) ?[]u8 {
+        const self: *TeamworkReader = @ptrCast(@alignCast(ctx));
+        const host = self.host;
+        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region) catch null;
+        return readLineBuffered(host.allocator, host.stdin_fd) catch null;
+    }
+};
+
 /// tty raw mode 下的行编辑器主循环：按键驱动 LineEditor，支持历史 ↑↓。
 /// 返回提交的行（owned，caller free）。Exit and clear keys follow Claude
 /// Code's double press (`ui.dispatch`, `UiState.press`): Ctrl+C, or Ctrl+D on
@@ -1952,6 +1980,7 @@ fn readLineRaw(
                     redraw(region, &editor, app);
                 }
                 if (openRouterTick(app, region)) redraw(region, &editor, app);
+                if (region.teamworkChanged()) redraw(region, &editor, app);
             }
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
@@ -4718,7 +4747,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
         &app.permission_ctx,
         &app.abort,
         prompt,
-        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.isEnabled() }, // 单轮,无工具(纯回答)
+        .{ .max_turns = 1, .agent_depth = 1, .session = app.session_id, .preview = app.config.preview.features() }, // 单轮,无工具(纯回答)
     );
     defer result.deinit();
     return try allocator.dupe(u8, result.final_text);

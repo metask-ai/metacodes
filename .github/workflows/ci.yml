@@ -752,7 +752,8 @@ jobs:
   # that takes it within the pickup timeout is followed to the end; otherwise
   # `fallback=true` hands the gates to the hosted legs. The required check
   # reads this job's outputs instead of waiting for the pool job, which a pool
-  # that is down would keep queued for GitHub's 24 hours.
+  # that is down would keep queued for GitHub's 24 hours. It fails when the
+  # pool job does, so rerunning failed jobs reruns it as well.
   gates-macos-watch:
     name: macOS pool watch
     needs: [runner-plan]

@@ -376,7 +376,7 @@ pub const JobWaitOptions = struct {
 };
 
 pub const Options = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     /// Where to leave the structured detail of this Run's model failure (issue
     /// #408), owned by the caller. Set to a value exactly when the Run stops
     /// with `api_error` or `max_tokens_exhausted`, and to null otherwise, so a
@@ -558,6 +558,7 @@ pub const Options = struct {
     /// 相对工具路径是否以 cwd_abs 为基准解析。默认 false 保持 CLI 既有输出/路径语义；
     /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
     resolve_relative_paths: bool = false,
+    path_aliases: []const tools_common.PathAlias = &.{},
     home_dir: []const u8 = "",
     /// Host-injected state root (util/state_root.zig), propagated to every ToolContext.
     state_root: []const u8 = "",
@@ -1290,8 +1291,9 @@ const ArgsAdmission = union(enum) {
 fn admitToolArgs(
     allocator: std.mem.Allocator,
     input: []const u8,
+    path_aliases: []const tools_common.PathAlias,
 ) !ArgsAdmission {
-    const canonical = tools_common.canonicalizeArgs(allocator, input) catch |err| return .{ .rejected = switch (err) {
+    const canonical = tools_common.canonicalizeArgsWithAliases(allocator, input, path_aliases) catch |err| return .{ .rejected = switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DuplicateArgumentKey => try tool_error.errorToJson(
             "DuplicateArgumentKey",
@@ -1419,7 +1421,7 @@ const ToolAdmission = struct {
         }
         // Model calls and JS host requests share argument admission (#494).
         // The slot owns the canonical bytes seen by hooks, permissions and dispatch.
-        var eff_input = switch (try admitToolArgs(allocator, tu.input)) {
+        var eff_input = switch (try admitToolArgs(allocator, tu.input, opts.path_aliases)) {
             .admitted => |canonical| canonical,
             .rejected => |content| return .{
                 .decision = .denied,
@@ -1437,7 +1439,7 @@ const ToolAdmission = struct {
             if (pre.modified_input) |mi| {
                 allocator.free(eff_input);
                 eff_input = mi;
-                switch (try admitToolArgs(allocator, mi)) {
+                switch (try admitToolArgs(allocator, mi, opts.path_aliases)) {
                     .admitted => |canonical| {
                         allocator.free(eff_input);
                         eff_input = canonical;
@@ -1752,7 +1754,7 @@ pub fn run(
 }
 
 fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
-    if (!opts.preview or !opts.rsi) return;
+    if (!opts.rsi) return;
     const policy = opts.rsi_policy orelse return error.SkillPolicyRequired;
     const rsi = @import("../skills/rsi.zig");
     // One persisted host note per participant task. Retrying/resuming does not
@@ -2251,10 +2253,10 @@ fn runCounted(
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
-    const harnessmm_enabled = opts.preview and opts.harnessmm;
+    const harnessmm_enabled = opts.harnessmm;
     const comment_guidance = @import("system_prompt.zig").COMMENT_GUIDANCE;
     const base_prompt = opts.system_prompt orelse "";
-    const preview_prompt = if (opts.preview and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
+    const preview_prompt = if (opts.preview.comment_guard and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
         try std.mem.concat(allocator, u8, &.{ base_prompt, if (base_prompt.len > 0) "\n\n" else "", comment_guidance })
     else
         null;
@@ -3035,6 +3037,7 @@ fn runCounted(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
@@ -3099,7 +3102,7 @@ fn runCounted(
             }
             var api_messages = try buildApiMessagesWithFeatures(conversation, allocator, opts.inject_user_context, synthetic_user_input, .{
                 .harnessmm = harnessmm_enabled,
-                .rsi = opts.preview and opts.rsi,
+                .rsi = opts.rsi,
             });
             defer freeApiMessages(&api_messages, allocator);
             if (opts.request_gate) |gate| {
@@ -3496,7 +3499,7 @@ fn runCounted(
                             // The same argument admission as the authoritative path
                             // (issue #494): rejected arguments are not prefetched, and
                             // admitted ones run in their canonical spelling.
-                            const canonical = tools_common.canonicalizeArgs(allocator, tu.input_json) catch break :prefetch;
+                            const canonical = tools_common.canonicalizeArgsWithAliases(allocator, tu.input_json, opts.path_aliases) catch break :prefetch;
                             var canonical_owned = true;
                             defer if (canonical_owned) allocator.free(canonical);
                             if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
@@ -4613,6 +4616,7 @@ fn runCounted(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
             .home_dir = opts.home_dir,
             .state_root = opts.state_root,
             .artifact_root = opts.artifact_root,
@@ -4672,7 +4676,7 @@ fn runCounted(
         base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
         base_ctx.kg_agent_ident = opts.kg_agent_ident;
         base_ctx.preview = opts.preview;
-        if (opts.preview) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
+        if (opts.preview.execute_code) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop

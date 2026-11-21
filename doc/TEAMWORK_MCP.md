@@ -5,22 +5,29 @@ including Claude Code, can drive the same runtime as the built-in SWE manager.
 The manager does not implement review, auditing, budgeting, sandboxing or merge.
 Those remain runtime and driver responsibilities.
 
-The MCP client owns the Manager process and its model billing. The runtime's
-dollar cap covers the workers and audit it launches. It does not account for
-the MCP client's own model usage. Choose the Manager by running the client
-(for example Claude Code); configure worker harnesses independently in the
-teamwork policy. Automatically launching a Manager from `seats.manager` is
-not part of this stdio adapter.
+With `teamwork mcp`, the MCP client owns the Manager process and its model
+billing. The runtime's dollar cap covers the workers and audit it launches. It
+does not account for the MCP client's own model usage, and every snapshot says
+so with `budget.manager: "outside_ledger"`. Choose the Manager by running the
+client (for example Claude Code); configure worker harnesses independently in
+the teamwork policy. `teamwork mcp` refuses an external `seats.manager`.
+
+`teamwork run` launches a configured Claude Code Manager itself (#545,
+[TEAMWORK_DESIGN.md](TEAMWORK_DESIGN.md) §10.2) and serves it this same
+protocol through a relay, so a launched Manager sees exactly these tools,
+results and errors. Its spend is held and charged in the run's ledger
+(`budget.manager: "run_ledger"`).
 
 ## Host authorization and ownership
 
-Teamwork uses the shared preview setting and defaults off. The host must
-resolve current preview authorization and supply `runtime.Deps.preview = true`
-before starting or reopening a run. The CLI accepts `--preview` or saved root
-`preview: true`; its final `--no-preview` overrides the saved value. Enabling
-preview is separate from approving the task, configured permissions and spend.
+Teamwork is the `teamwork` preview feature and defaults off. The host must
+resolve current preview authorization and supply a `runtime.Deps.preview` with
+`teamwork` set before starting or reopening a run. The CLI accepts `--preview`,
+`--preview=teamwork`, saved root `preview: true` or `preview: {"teamwork": true}`;
+a later `--no-preview` or `--no-preview=teamwork` overrides the saved value.
+Enabling preview is separate from approving the task, configured permissions and spend.
 
-The runtime checks preview again for dispatch and completion. Disabling it on
+The runtime checks the `teamwork` feature again for dispatch and completion. Disabling it on
 an existing host handle leaves initialize/ping, status, cancellation and
 cleanup available, but execution tools return `isError: true` with
 `error: "PreviewDisabled"` and perform no seat, check, audit or merge action.
@@ -104,7 +111,7 @@ before initialization. Notifications never execute tools, including malformed
 or id-less `tools/call` messages. Unknown notifications and client responses are
 ignored. An initialized notification with non-object params has no effect.
 Request ids must be strings or integers and are echoed exactly. Batches are
-unsupported. `tools/list` returns all four tools without a pagination cursor.
+unsupported. `tools/list` returns all five tools without a pagination cursor.
 
 ## Tools
 
@@ -116,6 +123,7 @@ in the client. No-argument tools accept omitted arguments or an empty object.
 | --- | --- | --- |
 | `teamwork_status` | none | `Run.status()` |
 | `teamwork_dispatch` | required `role`: `implementer` or `reviewer`; optional string `instructions` | `Run.dispatch(role, instructions)` |
+| `teamwork_run_candidates` | none | `Run.runCandidates()` |
 | `teamwork_request_completion` | none | `Run.requestCompletion()` |
 | `teamwork_cancel` | none | `Run.cancel()` |
 
@@ -127,6 +135,15 @@ the host can trip the shared abort signal, which runtime drivers already
 observe. A queued MCP cancellation notification does not preempt synchronous
 work. The adapter does not claim MCP task or progress support.
 
+When the approved configuration has parallel candidates (`candidates`, #525),
+`teamwork_run_candidates` is the first operation: dispatch before it returns
+`CandidatesPending`, and calling it on a run without candidates, or a second
+time, returns `NoCandidates`. It runs every candidate's implementer and
+reviewer and then the judge, and leaves the run in `review_approved` on the
+selected candidate, or ended (`failed`, `budget_exhausted`, `cancelled`).
+Its tagged `operation.outcome` is `selected` (detail: the candidate number) or
+the ending; only `selected` has `isError: false`.
+
 Completion without current verified reviewer approval returns `NotApproved`.
 The runtime rechecks approval against the current tree, independently audits,
 then merges the audited work into the original user workspace, uncommitted.
@@ -135,7 +152,8 @@ A passing audit names that tree before the runtime can enter merge-back.
 Merge-back checks target-file preimages using a private Git index and refuses
 submodule commit changes before touching the workspace.
 An unavailable auditor yields `failed/audit_unavailable`, never `done`.
-Stale approval or a first failed audit can request review or repair; callers
+Stale approval, or a first failed or unverified audit, can request review or a
+repair or leads round; callers
 must inspect the returned state. Only `snapshot.state.kind == "done"` means
 completion. Cancel is idempotent on ended runs and retains unfinished work.
 
@@ -151,12 +169,13 @@ The text is the JSON encoding of the same structured object:
     "goal": "The first line of the approved request",
     "state": {"kind": "approved", "detail": null},
     "seats": [],
-    "budget": {"cap_usd": 5, "spent_usd": 0, "remaining_usd": 5, "charges": 0},
+    "budget": {"cap_usd": 5, "spent_usd": 0, "remaining_usd": 5, "charges": 0, "held_usd": 0, "manager": "none"},
     "open_issues": 0,
     "audit": {"used": 0, "max": 2, "last": null},
     "max_rounds": 8,
     "worktree": "/host-selected/run/worktree",
-    "merge_conflicts": 0
+    "merge_conflicts": 0,
+    "candidates": []
   },
   "operation": {"kind": "status"},
   "error": null
@@ -168,9 +187,19 @@ invent progress or a passing audit. Runtime tagged unions use `{kind, detail}`
 to retain their discriminators. Seat entries contain string `id`, `role`,
 `harness`, `status` and a nullable tagged `result`. Review and seat failure
 details retain their nested union tags. Budget, audit, issue and conflict
-counts are runtime values. Tree ids are hash strings, without backing-buffer
+counts are runtime values. `budget.held_usd` is a launched Manager's
+outstanding allowance, already excluded from `remaining_usd`; `budget.manager`
+says where the Manager's own spend is accounted: `none` (the built-in loop has
+no model), `run_ledger` (a launched Manager) or `outside_ledger` (an MCP
+client; not in `spent_usd` or under `cap_usd`). Tree ids are hash strings, without backing-buffer
 padding. When supplied by the runtime, each seat's optional `charter_sha256`
 field is forwarded unchanged. Paths are observations, never writable parameters.
+`candidates` lists each configured candidate as `{candidate, status, tree}`
+(`status`: `queued`, `implementing`, `reviewing`, `approved`, `rejected`,
+`selected`, `eliminated`; `tree` is the approved tree or null), and is empty
+without candidates. A judge seat's `result` is `{kind: "judgment", detail}`
+whose detail is `selected` with the candidate number or `invalid` with the
+judgment error.
 Dispatch adds `operation.seat_id`; completion adds a tagged
 `operation.outcome`; cancellation reports `operation.kind == "cancel"`.
 

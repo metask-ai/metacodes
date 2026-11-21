@@ -41,7 +41,7 @@ pub const SpawnRequest = struct {
 };
 
 pub const SwarmContext = struct {
-    preview: bool = false,
+    preview: @import("../preview.zig").Features = .none,
     allocator: std.mem.Allocator,
     /// Session that owns this team roster; resume must not address a prior
     /// session's teammates by name.
