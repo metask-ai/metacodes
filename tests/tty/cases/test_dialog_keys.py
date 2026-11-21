@@ -7,6 +7,7 @@ from slow_mock_server import SlowMockServer, slow_text_then_end, slow_text_then_
 
 CSI_U_ESC = "raw:\\x1b[27u"
 CSI_U_CTRL_C = "raw:\\x1b[99;5u"
+CAPS_LOCK_DOWN = "raw:\\x1b[1;65B"
 
 QUESTION = json.dumps({
     "questions": [{
@@ -104,6 +105,10 @@ def test_permission_dialog_down_down_enter_still_picks_no(bin_path):
     _expect_refused(bin_path, ["key:down", "key:down", "key:enter"])
 
 
+def test_permission_dialog_down_down_enter_with_caps_lock_on_picks_no(bin_path):
+    _expect_refused(bin_path, [CAPS_LOCK_DOWN, CAPS_LOCK_DOWN, "key:enter"])
+
+
 def test_permission_dialog_does_not_answer_from_pasted_text(bin_path):
     _expect_refused(bin_path, ["raw:\\x1b[200~yes\\x1b[201~", "strictsleep:0.6", "type:n"])
 
@@ -118,6 +123,10 @@ def test_question_dialog_cancels_on_ctrl_c_sent_as_csi_u(bin_path):
 
 def test_question_dialog_down_enter_still_picks_the_second_option(bin_path):
     _expect_answer(bin_path, ["key:down", "key:enter"], "Amber")
+
+
+def test_question_dialog_down_enter_with_caps_lock_on_picks_the_second_option(bin_path):
+    _expect_answer(bin_path, [CAPS_LOCK_DOWN, "key:enter"], "Amber")
 
 
 def test_question_dialog_keeps_every_character_written_to_other_at_once(bin_path):

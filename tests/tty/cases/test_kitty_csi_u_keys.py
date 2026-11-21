@@ -70,6 +70,19 @@ def test_csi_u_ctrl_t_toggles_task_panel(bin_path):
     assert shown != hidden, "CSI-u Ctrl+T 未改变 task 面板状态(未被识别?):\nshown=\n%s\nhidden=\n%s" % (shown, hidden)
 
 
+def test_lock_bits_leave_cursor_and_editing_keys_as_they_are_at_the_prompt(bin_path):
+    raw = run(bin_path, [READY, "type:hello world", "raw:\\x1b[1;65D", "type:X", "raw:\\x1b[1;129H", "type:Y",
+                         "raw:\\x1b[1;193F", "type:Z", "raw:\\x1b[1;65H", "raw:\\x1b[3;129~", "sleep:0.3"],
+              per_key_drain=0.15)
+    TTYAssert(raw).assert_input_echo("hello worlXdZ")
+
+
+def test_up_with_caps_lock_on_recalls_history_at_the_prompt(bin_path):
+    raw = run(bin_path, [READY, "type:keep me", "key:esc", wait_for("Esc again to clear", 5),
+                         "key:esc", wait_for('Try "fix typecheck errors"', 5), "raw:\\x1b[1;65A", wait_for("keep me", 5)])
+    TTYAssert(raw).assert_input_echo("keep me")
+
+
 # ── 生成期键:CSI-u 在 agent 运行期生效 ─────────────────────────────────────
 
 def _slow_turn():
