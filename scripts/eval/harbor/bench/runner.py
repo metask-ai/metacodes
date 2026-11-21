@@ -54,11 +54,11 @@ def settings(path):
     return value if isinstance(value, dict) else {}
 
 
-def metacodes_config():
+def metacodes_config(cfg):
     if os.environ.get("METACODES_CONFIG_FILE"):
         return Path(os.environ["METACODES_CONFIG_FILE"])
-    home = os.environ.get("METACODES_HOME")
-    return (Path(home) if home else Path.home() / ".metacodes") / "config.json"
+    state_root = cfg.get("account_state_dir") or os.environ.get("METACODES_HOME")
+    return (Path(state_root) if state_root else Path.home() / ".metacodes") / "config.json"
 
 
 def provider_config(cfg):
@@ -66,13 +66,16 @@ def provider_config(cfg):
         return cfg["provider_config"]
     if cfg.get("auth_mode") != "provider":
         return None
-    native = data.read_json(metacodes_config())
+    path = metacodes_config(cfg)
+    native = data.read_json(path)
     if isinstance(native, dict) and native.get("custom_providers"):
-        return str(metacodes_config())
+        return str(path)
     return None
 
 
-def provider_key_env(config, model):
+def provider_key_env(cfg, config, model):
+    if cfg.get("key_env"):
+        return cfg["key_env"]
     native = data.read_json(Path(config)) if config else None
     spec = ((native or {}).get("custom_providers") or {}).get(model.split("/", 1)[0]) if isinstance(native, dict) else None
     aliases = [a for a in (spec or {}).get("env_aliases") or []
@@ -316,7 +319,7 @@ class RunManager:
                 legacy.append("没有可用的 custom_providers 模型：用 metacodes providers 添加到 MetaCodes 配置，"
                               "或用 --provider-config 指定配置")
             else:
-                key_env = cfg.get("key_env") or provider_key_env(config, model or models[0]["id"])
+                key_env = provider_key_env(cfg, config, model or models[0]["id"])
                 legacy += key_env_problems(key_env, model or models[0]["id"])
                 # Containers only ever hold a placeholder; a route the credential
                 # relay cannot forward is refused rather than given the key.
@@ -478,7 +481,7 @@ class RunManager:
         elif catalog["authentication"]["kind"] == "provider" and suite.runner != suites.WORKBUDDY:
             cfg = settings(self.config_path)
             config = provider_config(cfg)
-            problems = key_env_problems(cfg.get("key_env") or provider_key_env(config, model), model)
+            problems = key_env_problems(provider_key_env(cfg, config, model), model)
             problem = "；".join(problems) or route_problem({"auth_mode": "provider", "model": model,
                                                             "provider_config": config})
             if problem:
@@ -566,7 +569,7 @@ class RunManager:
                     "account_key_id": account_key_id,
                     "reasoning_effort": catalog.get("reasoning_effort"),
                     "provider_config": config,
-                    "key_env": cfg.get("key_env") or provider_key_env(config, model) if config else catalog["key_env"],
+                    "key_env": provider_key_env(cfg, config, model) if config else catalog["key_env"],
                     "metrics_enabled": cfg.get("metrics_enabled", True) and suite.runner != suites.WORKBUDDY,
                     "metrics_bind": cfg.get("metrics_bind", "172.17.0.1"),
                     "metrics_host": cfg.get("metrics_host"),

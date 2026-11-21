@@ -449,8 +449,8 @@ metacodes bench --bundle /path/to/linux-release --auth provider
 ```
 
 Without `--provider-config` the workbench reuses MetaCodes' own
-configuration (`METACODES_CONFIG_FILE`, else `$METACODES_HOME/config.json`,
-else `~/.metacodes/config.json`): its `custom_providers` models are the
+configuration (`METACODES_CONFIG_FILE`, else `config.json` in the state
+root the workbench was started with): its `custom_providers` models are the
 models offered, and only that section is passed to a run. Each provider's
 canonical `api_key` entry in `env_aliases` names its key variable.
 `--provider-config /path/to/config.json` selects another native metacodes

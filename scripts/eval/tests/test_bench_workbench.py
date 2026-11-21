@@ -556,6 +556,20 @@ class WorkbenchTest(unittest.TestCase):
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
 
+    def test_provider_mode_reads_the_config_of_the_workbench_state_root(self):
+        native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']
+        state_root = self.root / 'state'
+        atomic_json(state_root / 'config.json', {'custom_providers': {'gw': native}})
+        cfg = json.loads(self.manager.config_path.read_text())
+        for name in ('provider_config', 'model'):
+            cfg.pop(name)
+        atomic_json(self.manager.config_path, {**cfg, 'auth_mode': 'provider', 'account_state_dir': str(state_root)})
+        environ = {k: v for k, v in os.environ.items() if k not in ('METACODES_CONFIG_FILE', 'METACODES_HOME')}
+        with patch.dict(os.environ, environ, clear=True):
+            catalog = self.client.request('api/workbench')
+        self.assertTrue(catalog['ready'], catalog['reasons'])
+        self.assertEqual([m['id'] for m in catalog['models']], ['gw/test-model'])
+
     def test_provider_mode_reuses_the_metacodes_config_and_its_key_variable(self):
         native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']
         metacodes_config = self.root / 'metacodes-config.json'
