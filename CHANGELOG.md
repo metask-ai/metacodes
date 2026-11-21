@@ -67,6 +67,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A language server that never publishes diagnostics no longer slows every
+  Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
+  8 s before the write and 6 s after it, so a server that answered
+  `initialize` but stayed silent (still indexing, publishing only on save, or
+  stuck) added about 15 s to every call. Now, when a wait for a file runs out,
+  metacodes stops waiting for that file, and for the whole server if it has
+  never published anything, until the server publishes diagnostics for the
+  file. A silent server costs one wait of up to 8 s; servers that publish keep
+  getting their diagnostics attached.
+
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a
