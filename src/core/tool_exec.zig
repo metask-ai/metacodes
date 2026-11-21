@@ -997,10 +997,13 @@ pub fn executeOne(
             defer if (names) |nm| parent_allocator.free(nm);
             // 模糊建议(仅提示,不执行):有则加 "Did you mean 'X'?"。
             const guess = tools_mod.suggestToolName(&job_ctx, name);
+            const mcp_notice = tools_mod.unavailableMcpNotice(&job_ctx, name, parent_allocator) catch null;
+            defer if (mcp_notice) |notice| parent_allocator.free(notice);
+            const notice = mcp_notice orelse "";
             break :blk if (guess) |g|
-                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}", .{ name, g, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch return error.OutOfMemory
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}{s}", .{ name, g, if (names) |nm| nm else "(unavailable)", notice }, parent_allocator) catch return error.OutOfMemory
             else
-                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ name, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch return error.OutOfMemory;
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}{s}", .{ name, if (names) |nm| nm else "(unavailable)", notice }, parent_allocator) catch return error.OutOfMemory;
         } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, @errorName(err) }, parent_allocator) catch return error.OutOfMemory;
         // `dispatch_input` may be a host-synthesized exact Edit containing
         // source bytes that were never model-visible. Preserve the historical

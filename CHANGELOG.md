@@ -34,6 +34,29 @@ status, compatibility boundaries, and entry points are defined by
   --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
   stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
 
+### Changed
+
+- **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
+  `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after
+  Codex's; `"mcpImport": {"metacode": false}` in `<state root>/config.json`
+  turns it off. Its stdio servers start with every session, as Codex's do.
+
+- **`metacodes mcp login` succeeds only when the server takes the token.** The
+  new token is tried with one authenticated request before it is stored; a
+  401/403 fails the login, stores nothing and prints the server's answer with
+  the scope requested and granted. Registration and token errors print the
+  authorization server's `error`/`error_description`.
+
+- **A configured MCP server that did not connect is reported** to the model
+  (ToolSearch misses and calls to its tools name it, its cause and the fix), on
+  stderr by `-p`, and in `--json` as `mcp_unavailable`.
+
+- **Reading a credential store from Bash always asks.** A command that runs
+  `security find-generic-password`/`find-internet-password`/`dump-keychain`/
+  `export`, a `security` subcommand the shell computes, or `secret-tool`
+  prompts even under an allow rule for `Bash` or in `bypassPermissions`,
+  however it is quoted or escaped; a deny rule still denies.
+
 ## 0.13.0 — 2026-11-20
 
 ### Changed

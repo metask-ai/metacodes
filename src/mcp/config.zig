@@ -15,9 +15,10 @@
 //! | 4    | `~/.claude.json` `mcpServers`                 | Claude Code user scope |
 //! | 5    | `<dir>/.codex/config.toml` `[mcp_servers]`    | Codex project layer (trusted projects only) |
 //! | 6    | `$CODEX_HOME/config.toml` `[mcp_servers]`     | Codex user layer |
+//! | 7    | `~/.metacode/config.toml` `[mcp_servers]`     | Metacode user layer (Codex format) |
 //!
-//! `"mcpImport": {"claude": false, "codex": false}` in metacodes' config turns
-//! the foreign sources off. A metacodes entry `{"enabled": false}` without a
+//! `"mcpImport": {"claude": false, "codex": false, "metacode": false}` in
+//! metacodes' config turns the foreign sources off. A metacodes entry `{"enabled": false}` without a
 //! transport disables that name in every lower source.
 //!
 //! Project-scoped `.mcp.json` servers run commands from a checked-out
@@ -43,6 +44,7 @@ pub const Origin = enum {
     claude_user,
     codex_project,
     codex_user,
+    metacode_user,
 
     pub fn label(self: Origin) []const u8 {
         return switch (self) {
@@ -53,6 +55,7 @@ pub const Origin = enum {
             .claude_user => "Claude Code user",
             .codex_project => "Codex project",
             .codex_user => "Codex user",
+            .metacode_user => "Metacode user",
         };
     }
 
@@ -64,6 +67,7 @@ pub const Origin = enum {
             .claude_user => 4,
             .codex_project => 5,
             .codex_user => 6,
+            .metacode_user => 7,
         };
     }
 };
@@ -235,6 +239,7 @@ pub const Documents = struct {
     codex_user_config: ?Document = null,
     /// `.codex/config.toml` files from the project root down to cwd.
     codex_project_configs: []const Document = &.{},
+    metacode_user_config: ?Document = null,
 };
 
 pub const Document = struct {
@@ -289,6 +294,7 @@ pub fn resolve(arena: std.mem.Allocator, documents: Documents, context: Context)
     var builder = Builder{ .arena = arena, .context = context };
     var import_claude = true;
     var import_codex = true;
+    var import_metacode = true;
     var approvals = Approvals{};
 
     if (documents.metacodes_config) |document| {
@@ -300,6 +306,9 @@ pub fn resolve(arena: std.mem.Allocator, documents: Documents, context: Context)
                     };
                     if (import_value.object.get("codex")) |value| if (value == .bool) {
                         import_codex = value.bool;
+                    };
+                    if (import_value.object.get("metacode")) |value| if (value == .bool) {
+                        import_metacode = value.bool;
                     };
                 }
             }
@@ -355,6 +364,14 @@ pub fn resolve(arena: std.mem.Allocator, documents: Documents, context: Context)
             }
             if (parseToml(&builder, .codex_project, document)) |root| {
                 if (root.get("mcp_servers")) |servers| try addTomlServers(&builder, .codex_project, document.path, servers);
+            }
+        }
+    }
+
+    if (import_metacode) {
+        if (documents.metacode_user_config) |document| {
+            if (parseToml(&builder, .metacode_user, document)) |root| {
+                if (root.get("mcp_servers")) |servers| try addTomlServers(&builder, .metacode_user, document.path, servers);
             }
         }
     }
@@ -481,7 +498,7 @@ fn parseJsonServer(
         return null;
     }
     const object = value.object;
-    const expand = origin != .codex_user and origin != .codex_project;
+    const expand = origin != .codex_user and origin != .codex_project and origin != .metacode_user;
     const enabled = if (jsonBool(object, &.{"enabled"})) |flag| flag else true;
     if (!enabled and object.get("command") == null and object.get("url") == null) {
         // `{"enabled": false}` alone switches the name off everywhere below.
@@ -1058,6 +1075,7 @@ pub const LoadInputs = struct {
     workspace_root: []const u8,
     /// `$CODEX_HOME`; "" = `<home>/.codex`.
     codex_home: []const u8 = "",
+    metacode_home: []const u8 = "",
     env: Environment,
     /// Override for tests; defaults to the platform file reader.
     read_file: *const fn (std.mem.Allocator, []const u8) ?[]const u8 = readFileOrNull,
@@ -1123,6 +1141,17 @@ pub fn load(arena: std.mem.Allocator, inputs: LoadInputs) Error!Resolved {
         if (read(arena, path)) |bytes| try codex_projects.append(arena, .{ .path = path, .bytes = bytes });
     }
     documents.codex_project_configs = try codex_projects.toOwnedSlice(arena);
+
+    const metacode_home = if (inputs.metacode_home.len != 0)
+        inputs.metacode_home
+    else if (inputs.home.len != 0)
+        try std.fs.path.join(arena, &.{ inputs.home, ".metacode" })
+    else
+        "";
+    if (metacode_home.len != 0) {
+        const path = try std.fs.path.join(arena, &.{ metacode_home, "config.toml" });
+        if (read(arena, path)) |bytes| documents.metacode_user_config = .{ .path = path, .bytes = bytes };
+    }
 
     return resolve(arena, documents, .{
         .cwd = inputs.cwd,
@@ -1288,6 +1317,61 @@ test "Codex project layers load only for trusted projects; imports can be turned
         .codex_user_config = .{ .path = "/home/.codex/config.toml", .bytes = "[mcp_servers.x]\ncommand = \"x\"\n" },
     }, testContext());
     try testing.expectEqual(@as(usize, 0), off.servers.len);
+}
+
+test "Metacode's user config is the lowest layer, read like Codex's, and can be turned off" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const metacode_toml = Document{ .path = "/home/.metacode/config.toml", .bytes =
+        \\[mcp_servers.suno]
+        \\url = "https://api.suno.com/mcp"
+        \\
+        \\[mcp_servers.shared]
+        \\command = "from-metacode"
+        \\
+        \\[mcp_servers.local]
+        \\command = "${HOME}/bin/server"
+    };
+    const resolved = try resolve(arena.allocator(), .{
+        .codex_user_config = .{ .path = "/home/.codex/config.toml", .bytes = "[mcp_servers.shared]\ncommand = \"from-codex\"\n" },
+        .metacode_user_config = metacode_toml,
+    }, testContext());
+    const suno = findServer(resolved, "suno").?;
+    try testing.expectEqual(Origin.metacode_user, suno.origin);
+    try testing.expectEqualStrings("https://api.suno.com/mcp", suno.transport.http.url);
+    try testing.expectEqual(Origin.codex_user, findServer(resolved, "shared").?.origin);
+    const local = findServer(resolved, "local").?.transport.stdio;
+    try testing.expectEqualStrings("${HOME}/bin/server", local.command);
+    try testing.expectEqual(EnvPolicy.allowlist, local.env_policy);
+    try testing.expectEqualStrings("Metacode user", Origin.metacode_user.label());
+
+    const off = try resolve(arena.allocator(), .{
+        .metacodes_config = .{ .path = "/state/config.json", .bytes = "{\"mcpImport\":{\"metacode\":false}}" },
+        .codex_user_config = .{ .path = "/home/.codex/config.toml", .bytes = "[mcp_servers.x]\ncommand = \"x\"\n" },
+        .metacode_user_config = metacode_toml,
+    }, testContext());
+    try testing.expectEqual(@as(usize, 1), off.servers.len);
+    try testing.expectEqual(Origin.codex_user, off.servers[0].origin);
+}
+
+test "load reads Metacode's config from the home directory unless another home is named" {
+    const Reader = struct {
+        fn read(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
+            if (!std.mem.endsWith(u8, path, "config.toml")) return null;
+            if (std.mem.startsWith(u8, path, "/elsewhere"))
+                return arena.dupe(u8, "[mcp_servers.named]\ncommand = \"n\"\n") catch null;
+            if (std.mem.startsWith(u8, path, "/home/u") and std.mem.indexOf(u8, path, ".metacode") != null)
+                return arena.dupe(u8, "[mcp_servers.home]\ncommand = \"h\"\n") catch null;
+            return null;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const by_home = try load(arena.allocator(), .{ .state_root = "", .home = "/home/u", .cwd = "/repo", .workspace_root = "/repo", .env = test_env, .read_file = Reader.read });
+    try testing.expectEqual(Origin.metacode_user, findServer(by_home, "home").?.origin);
+    const named = try load(arena.allocator(), .{ .state_root = "", .home = "/home/u", .cwd = "/repo", .workspace_root = "/repo", .metacode_home = "/elsewhere", .env = test_env, .read_file = Reader.read });
+    try testing.expect(findServer(named, "home") == null);
+    try testing.expectEqual(Origin.metacode_user, findServer(named, "named").?.origin);
 }
 
 test "malformed sources and entries are reported, never silently dropped" {
