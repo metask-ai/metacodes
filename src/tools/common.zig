@@ -231,7 +231,7 @@ pub fn spawnCaptureStdoutCapped(
 /// 24 次/48 trial,无重试直接把瞬时资源竖成模型可见故障)。spawn 层一次
 /// 150ms 退避重试:只针对 SpawnError 类(fork/exec 资源性失败),Timeout/
 /// Abort/OOM 语义不变。
-fn captureWithSpawnRetry(
+pub fn captureWithSpawnRetry(
     argv: []const ?[*:0]const u8,
     allocator: std.mem.Allocator,
     opts: process.CaptureOpts,

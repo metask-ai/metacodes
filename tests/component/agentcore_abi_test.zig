@@ -16800,3 +16800,129 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
         try std.testing.expect(per_session < std.Thread.SpawnConfig.default_stack_size);
     }
 }
+
+const BASH_WRITES_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bash_writes\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_bash\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"printf 'made by a script\\\\\\\\n' > made.txt\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+/// A Host sees what a shell command wrote through the same public
+/// `file_changes` observation the typed file tools use.
+const PublicBashFileChangesProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    events: u32 = 0,
+    matched: u32 = 0,
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        if (run.session != self.expected_session) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        const value = switch (known) {
+            .file_changes => |changes| changes,
+            else => return wire.EVENT_CONTINUE,
+        };
+        self.events += 1;
+        if (!std.mem.eql(u8, value.id, "tu_bash") or
+            !std.mem.eql(u8, value.name, "Bash") or
+            value.changes.len != 1 or value.overflow or value.lost)
+            return wire.EVENT_FATAL;
+        const change = value.changes[0];
+        const path = switch (change.locator) {
+            .workspace_path => |path| path,
+            else => return wire.EVENT_FATAL,
+        };
+        if (!std.mem.eql(u8, path, "made.txt") or
+            !std.mem.eql(u8, change.tool, "Bash") or
+            !std.mem.eql(u8, change.tool_use_id, "tu_bash") or
+            change.kind != .created or change.status != .applied or
+            change.before_bytes != 0 or change.after_bytes != 17 or
+            !change.diff_complete or
+            std.mem.indexOf(u8, change.unified_diff orelse return wire.EVENT_FATAL, "+made by a script") == null)
+            return wire.EVENT_FATAL;
+        self.matched += 1;
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+test "L2 a Host receives a shell command's file writes on the public file_changes observation" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX shell command
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ BASH_WRITES_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("Bash")};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_UNRESTRICTED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &builtins;
+    host_config.allowed_tool_count = builtins.len;
+    var config = sessionCreateConfig(&host_config, "test-model");
+    var probe = PublicBashFileChangesProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = PublicBashFileChangesProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &config, &callbacks, &session, &diagnostic),
+    );
+    probe.expected_session = session;
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, 1, sdk.bytesView("write with a script"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.events);
+    try std.testing.expectEqual(@as(u32, 1), probe.matched);
+}

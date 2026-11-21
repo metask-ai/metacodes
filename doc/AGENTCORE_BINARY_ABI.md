@@ -481,7 +481,7 @@ The v1 observation set is:
 | Tool execution observation | `tool_start` | Tool invocation identity, name, and input |
 | Tool execution observation | `tool_progress` | Incremental progress text for one tool call |
 | Tool execution observation | `tool_result` | Completed tool result, error flag, elapsed time, and optional successful file observations |
-| Workspace modification evidence | `file_changes` | Per-file outcomes, locators, byte counts, and bounded unified diffs from one typed file-tool call |
+| Workspace modification evidence | `file_changes` | Per-file outcomes, locators, byte counts, and bounded unified diffs from one typed file-tool call or one observed `Bash` call |
 | Run state and coarse progress | `run_state` | Root Run phase snapshot, per-Run transition sequence, turn/tool-call sample, and owned in-flight tool identities |
 | Run state and coarse progress | `progress` | Current 1-based turn and cumulative tool-call progress sample; not a lifecycle boundary |
 | Context management and accounting | `usage` | Token-usage delta |
@@ -553,16 +553,33 @@ chunks, repeated Gemini `usageMetadata` — and AgentCore emits only what each
 report adds, so a Run's `usage` events sum to the provider's per-response
 totals, not to the sum of its reports.
 
-`file_changes` is emitted once for each typed file-tool call after the turn's
-Tools have completed and before the corresponding `tool_result`. Its `id` is
-the Tool-use identity used to correlate the two events. Each record carries a
-typed destination locator, an optional source locator for moves, `kind`,
-`status`, Tool identity, agent depth, before/after byte counts, and an optional
-bounded unified diff. `rejected`, `failed`, and `no_change` records are evidence
-of an attempted outcome, not claims that disk contents changed. `overflow` or
-`lost` makes incomplete batch evidence explicit. This contract covers typed
-file Tools only; filesystem mutations performed through `Bash` are not
-observed by it.
+`file_changes` is emitted once for each typed file-tool call that changed or
+attempted files, and once for each `Bash` call whose observed workspace changed
+or whose observation was incomplete, after the turn's Tools have completed and
+before the corresponding `tool_result`. Its `id` is the Tool-use identity used
+to correlate the two events. Each record carries a typed destination locator,
+an optional source locator for moves, `kind`, `status`, Tool identity, agent
+depth, before/after byte counts, and an optional bounded unified diff.
+`rejected`, `failed`, and `no_change` records are evidence of an attempted
+outcome, not claims that disk contents changed. `overflow` or `lost` makes
+incomplete batch evidence explicit; an event may carry `lost` with no record
+at all.
+
+Typed file Tools report their own changes. `Bash` records come from observing
+the workspace before and after a command the read-only classifier does not
+accept: regular, non-ignored files below `workspace_root`, with `.git` and
+other VCS metadata excluded. They describe what changed in the workspace while
+the command ran, so another writer active in the same window can appear in
+them. A modification is reported without a diff (`diff_complete` false) when
+its previous content is unknown — always the case in a Session whose shell is
+sandboxed, where the observation does not run git. In such a Session the
+observation also lists and opens files through the sandbox, so a path the
+sandbox hides from the command (`denyRead`) is never reported, with or without
+its contents, as the new path or the old path of a change, even once the
+command has deleted or moved the file. A call the observation could not cover
+— a workspace too large to list, a listing that could not read every
+directory, a changed file the sandbox would not open, a command that moved to the background or was started with
+`run_in_background` — carries `lost`.
 
 Core file-change evidence may retain arbitrary file bytes, but AgentCore's JSON
 boundary publishes `unified_diff` only as valid UTF-8. A diff whose only

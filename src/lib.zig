@@ -287,4 +287,6 @@ test {
     _ = &@import("teamwork/runtime_test.zig");
     _ = &@import("teamwork/interview.zig");
     _ = &@import("teamwork/progress.zig");
+    // Reached through the Bash tool, not re-exported: name it so its own tests run.
+    _ = &@import("core/command_file_changes.zig");
 }

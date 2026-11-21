@@ -333,13 +333,55 @@ observer 为 null 时行为与从前逐字节一致:不观察、不可否决。
 每条 `Record` 带 locator(与 `FileReference` 同一归一化)、`kind`(created/modified/deleted/
 moved)、`status`(applied/no_change/failed/rejected/partial)、`tool`+`tool_use_id`(与工具卡
 配对)、`agent_depth`(>0 = 子执行)、前后字节数、`unified_diff` 与 `diff_complete`。
-事件的 `overflow`/`lost` 表示本次报告不完整。
+事件的 `overflow`/`lost` 表示本次报告不完整;一条记录都没有但报告不完整的调用(复制失败、
+Bash 观测没能覆盖)也照发一条空 `changes` 的事件,Run 账本同时标 `truncated`。
 
 `Options.file_change_journal: ?*file_change.Journal` 是 Run 级账本,**经 SpawnOptions 下传给
 子执行**(子 agent 的修改仍是本 Run 的修改)。带锁,读用 `acquire()/release()` 成对。
 `file_change.writeJsonEnvelope` 是进程外消费者的稳定线格式(`{schema_version, truncated, changes[]}`——版本由模块自己盖,不靠调用方约定)。
 
-**不覆盖** `Bash` 等任意命令造成的文件系统变化——本契约只管类型化文件工具,并明说这一点。
+**来源有两类。** 类型化文件工具(Write/Edit/NotebookEdit/ApplyPatch)逐文件自报。`Bash`
+报不出任意命令碰了什么,所以 Bash 工具对**非只读的前台命令**在执行前后各观测一次工作区
+(`core/command_file_changes.zig`),把差异发在同一契约上(`tool = "Bash"`,`status = applied`):
+
+- **怎么观测**:内置 ripgrep 列出工作区文件(它的忽略规则;隐藏文件计入,`.git`/`.hg`/`.svn`/
+  `.jj` 排除),逐个 lstat。路径的身份(dev/inode)、大小、mtime、ctime 任一变化即为修改;消失的
+  路径与新出现的、inode/大小/mtime 相同的路径配对成 `moved`。Windows 上的 stat 不带文件身份
+  (没有 inode,也没有 ctime),只看大小与 mtime,改名报成一条 `deleted` 加一条 `created`。
+- **列表的出入不等于文件的出入**:两次列举之间忽略规则可能变了。从列表里消失的路径先 lstat
+  确认:文件还在就不是删除(内容变了报修改);新出现的路径若早在观测开始前(留 2 秒时钟余量)
+  就没动过——POSIX 看 ctime,Windows 看创建与修改时间——就只是重新可见,不算新建。ripgrep
+  遍历出错(退出码 2,例如读不了的子目录)时,列到的照用,并置 `lost`。
+- **diff 从哪来**:新建文件读执行后的内容;修改/删除需要"执行前",git 工作区里执行前已与 index
+  不同(或未跟踪)的文件预先复制(有上限),与 index 一致的文件事后从 index 取——**仅当命令没动过
+  index**(`git add`/`stash`/`checkout` 会把执行后的内容放进 index),且 blob 大小与执行前一致,
+  且该路径没有 `filter`、`working-tree-encoding`、`ident` 属性(`git check-attr`;行尾转换与
+  `ident` 只要改了字节就改了大小,另外两种可以等长换掉每个字节——UTF-16LE 的 `中\n` 和它的
+  UTF-8 blob 都是 4 字节),且命令期间属性与配置的来源都没变(工作区里的 `.gitattributes`、
+  根到仓库顶之间各级的 `.gitattributes`、`info/attributes`、`.git/config`)。取不到"执行前"、
+  二进制、超大文件:照报这次修改,不带 diff,
+  `diff_complete = false`;行 diff 表达不了的末尾换行变化同样如此(只改末尾换行 → 不带 diff;
+  任一侧缺末尾换行 → 带 diff 但 `diff_complete = false`)。能证明内容没变的(`touch`、写回
+  相同字节)不算修改,也不占单次 64 条的记录上限。
+- **沙箱会话走沙箱**:会话启用沙箱时观测完全不调用 git——沙箱内的命令可以写工作区里的
+  `.git/config`,而观测在沙箱外运行 git,被植入的 fsmonitor/clean filter 会越过沙箱执行。此时
+  修改照报,只是不带 diff。非沙箱会话里也总带 `-c core.fsmonitor=false`。列举也在沙箱里跑
+  (与 Glob/Grep 同一个包装),每条变更发布前先经沙箱文件执行器打开、并核对打开的正是 lstat
+  看到的那个文件(bubblewrap 把禁读文件绑成 `/dev/null`),内容也从那个句柄读:沙箱对命令藏起
+  来的(`denyRead`),路径、大小、内容都不进事件和账本,打不开的变更不发布并置 `lost`。命令删掉
+  或移走的文件已无从再打开,改按观测开始时解析好的 `denyRead` 规则判定(两种后端各自的 `~`、相对
+  路径、物理路径解析都算,宁宽勿漏):新旧路径任一落在其下的变更同样不发布并置 `lost`。
+  Seatbelt 拒读的目录让列举出错,同样置 `lost`;bubblewrap 把它显示为空的只读目录,命令也写
+  不进去。沙箱不可用时整次调用 `lost`。每条变更多一次沙箱进程,开销随变更数增长。
+- **范围(明说)**:只覆盖工作区根之下 ripgrep 能列出的普通文件;被忽略的文件、symlink、根之外的
+  路径不在内。记录说的是**命令执行窗口内**工作区的变化,同窗口里的其他写者(后台 subagent、
+  用户的编辑器)也会出现在里面。只读命令(与权限自动放行、并行调度共用同一分类器)不观测。
+- **观测不到时说出来**:列举失败、工作区过大(超过文件数/字节上限立即记住、超时连续两次才
+  记住,本进程内不再重试)、有路径 stat 失败、超过单次检查上限的路径、命令转入后台仍在运行、
+  `run_in_background` 启动的命令——这些都置 `lost`;记录满 64 条后仍有变更则置 `overflow`。
+  不让沉默被读成"没改"。
+
+其他进程或工具(MCP 工具、插件、调用返回之后的后台作业)造成的文件系统变化不在本契约内。
 
 ### 3.3 UiEvent — 前端告诉 core"用户做了什么"
 
@@ -1064,8 +1106,13 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   (`end_turn` / `final`,退出码 0)。完整的 tool_use 照常执行,不算耗尽;续写中途正常收尾
   的仍是一个 `final` 回答。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
-- **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
-  任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。
+- **Bash 的文件修改是工作区观测,不是命令自报**(§3.2.2)。被忽略的文件、symlink、工作区根之外
+  的路径看不见;同一执行窗口里其他写者的修改会算进这次调用(包括此前转入后台、仍在运行的作业);
+  只读分类器放行的命令不观测;同长度改写依赖文件系统时间戳粒度,若该文件恰在观测前同一时钟刻内
+  刚被写过,可能漏报。命令里若有刷新 index 的 git 操作(`git status`/`diff`/`add`),干净文件
+  的"执行前"不再可信,这次调用的修改只报不带 diff。观测本身没能覆盖调用时报 `lost`,不会静默。
+  每次非只读 Bash 约多 75 ms(2 千文件的仓库,ReleaseSafe 实测)。MCP 工具、插件等其他来源的
+  文件修改仍不产生 `file_changes`。
 - **输出段兜底定性排在 `diag_run_end` 之后**(§3.2.1)。所有显式定性路径都在 run 收口前关闭段;
   兜底(`defer` 把仍打开的段记为 `partial`)只在遗漏时生效,顺序因此靠后。
 - **`--stream-json` 已投影输出段定性**(`output_segment_begin/end` 行),但**未投影 file_changes**
