@@ -45,6 +45,10 @@ def bundle_label(path: Path, manifest: Dict[str, Any], source: Optional[Dict[str
     """How the page names a metacodes bundle: a release version, or the
     checkout commit a development overlay was built from."""
     release = (manifest.get("release") or {}).get("version") if isinstance(manifest.get("release"), dict) else None
+    info = builds.build_info(Path(path)) if builds.is_git_unit(path) else None
+    if info and info.get("commit"):
+        at = (info.get("committed_at") or "")[:16].replace("T", " ")
+        return f"git {info['commit'][:8]}" + (f" · {at}" if at else "") + (f"（{release}）" if release else "")
     if isinstance(source, dict) and source.get("kind") == "checkout-overlay":
         base = source.get("base_release") or release
         return f"dev {source.get('commit')}" + (f"（基于 {base}）" if base else "")

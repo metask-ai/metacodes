@@ -1,9 +1,13 @@
 """Linux bundles built from any git revision of metacodes.
 
-`metacodes bench build --ref <ref>` resolves the ref in a mirror of the
-source repository and builds that commit's x86_64 Linux release unit in
-Docker, then publishes it under `<state>/bench/bundles/`, where a batch can
-choose and freeze it like any other bundle.
+`metacodes bench build --ref <ref> [--executor <name>]` builds that commit's
+x86_64 Linux release unit on the executor's node, the machine whose Docker
+also runs the evaluations. Every node builds the same way: it resolves the
+ref in its own mirror of the source repository and builds in its own Docker.
+A remote node's unit is then copied into the workbench's
+`<state>/bench/bundles/`, where a batch can choose and freeze it like any
+other bundle. `commits` lists a branch's history, newest first, for the page
+to pick a commit by its time.
 """
 from __future__ import annotations
 
@@ -12,12 +16,15 @@ import datetime as dt
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +34,7 @@ try:
 except ImportError:
     fcntl = None
 
+from scripts.eval.harbor.bench import executors
 from scripts.eval.harbor.command import check_bundle
 
 DEFAULT_REPO = "https://github.com/metask-ai/metacodes.git"
@@ -38,6 +46,11 @@ TRUST_POLICY = 1
 SOURCE_ID = re.compile(r"^[0-9a-f]{64}$")
 ZIG_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 LEAN_TOOLCHAIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:+-]{0,99}$")
+DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+RECORD_KEYS = ("ref", "commit", "version", "committed_at", "built_at", "source_id", "trust_policy")
+COMMIT_PAGE = 100
+MAX_COMMIT_PAGE = 500
+MIRROR_FRESH_S = 60
 
 DOCKERFILE = """\
 FROM debian:bookworm-slim
@@ -144,7 +157,7 @@ def build_info(unit):
         return None
     if not isinstance(info, dict):
         return None
-    return {key: info.get(key) for key in ("ref", "commit", "version", "built_at", "source_id", "trust_policy")}
+    return {key: info.get(key) for key in RECORD_KEYS}
 
 
 def _built_here(info, commit):
@@ -207,7 +220,8 @@ def _last_line(stderr, repo):
 
 
 @contextlib.contextmanager
-def _locked(cache_dir, cancelled):
+def _locked(cache_dir, cancelled, wait=True):
+    """Holds the build lock; yields False instead of waiting when `wait` is false and another holds it."""
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(cache_dir) / ".lock", "a+") as handle:
         while fcntl:
@@ -215,11 +229,14 @@ def _locked(cache_dir, cancelled):
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                if not wait:
+                    yield False
+                    return
                 if cancelled():
                     raise BuildError("构建已取消") from None
                 time.sleep(0.1)
         try:
-            yield
+            yield True
         finally:
             if fcntl:
                 fcntl.flock(handle, fcntl.LOCK_UN)
@@ -300,6 +317,45 @@ def _named_commit(mirror, ref):
     if len(named) > 1:
         raise BuildError(f"{ref} 同时是分支和 tag 且指向不同提交，请写 refs/heads/{ref} 或 refs/tags/{ref}")
     return named.pop() if named else _commit(mirror, ref)
+
+
+def commits(cache_dir, repo=None, ref="main", until=None, limit=COMMIT_PAGE, cancelled=lambda: False):
+    """`ref`'s history up to the end of day `until` (YYYY-MM-DD), newest first.
+    The mirror is refreshed unless it was a minute ago or a build holds it."""
+    check_ref(ref)
+    if until is not None and (not isinstance(until, str) or not DATE.fullmatch(until)):
+        raise BuildError("日期应为 YYYY-MM-DD")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_COMMIT_PAGE:
+        raise BuildError(f"条数应为 1–{MAX_COMMIT_PAGE}")
+    repo = repo or DEFAULT_REPO
+    mirror = Path(cache_dir) / "source.git"
+    with _locked(cache_dir, cancelled, wait=False) as held:
+        if held and not _fresh(mirror):
+            _refresh_mirror(mirror, repo, cancelled)
+    if not (mirror / "HEAD").is_file():
+        raise BuildError("源码仓库还在更新，请稍后再试")
+    head = _named_commit(mirror, ref)
+    if not head:
+        raise BuildError("源码仓库中找不到 git 版本 " + ref)
+    argv = ["log", "-z", "--format=%H%x1f%cI%x1f%an%x1f%s", "-n", str(limit)]
+    if until:
+        argv.append(f"--until={until}T23:59:59")
+    code, out = _git(*argv, head, cwd=mirror)
+    if code:
+        raise BuildError("无法读取提交历史")
+    found = []
+    for entry in filter(None, out.split("\0")):
+        commit, at, author, subject = (entry.strip("\n").split("\x1f") + ["", "", ""])[:4]
+        if COMMIT.fullmatch(commit):
+            found.append({"commit": commit, "committed_at": at, "author": author, "subject": subject})
+    return found
+
+
+def _fresh(mirror):
+    try:
+        return time.time() - (mirror / "FETCH_HEAD").stat().st_mtime < MIRROR_FRESH_S
+    except OSError:
+        return False
 
 
 def resolve(ref, cache_dir, repo=None, cancelled=lambda: False):
@@ -407,7 +463,8 @@ def _build(ref, bench_dir, cache_dir, repo, cancelled):
         except ValueError as exc:
             raise BuildError(f"git 版本 {ref} 的产物不能用于 Bench：{exc}") from None
         release = manifest.get("release") if isinstance(manifest.get("release"), dict) else {}
-        info = {"ref": ref, "commit": commit, "version": release.get("version"),
+        _, committed_at = _git("show", "-s", "--format=%cI", commit, cwd=mirror)
+        info = {"ref": ref, "commit": commit, "version": release.get("version"), "committed_at": committed_at or None,
                 "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "source_id": source_id(repo), "trust_policy": TRUST_POLICY}
         unit.parent.mkdir(parents=True, exist_ok=True)
@@ -420,3 +477,253 @@ def _build(ref, bench_dir, cache_dir, repo, cancelled):
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return unit, info
+
+
+def build_on(executor, ref, bench_dir, repo=None, cancelled=lambda: False, popen=subprocess.Popen):
+    """The unit of `ref`, built on `executor`'s node; a remote one is copied here."""
+    if not isinstance(executor, executors.SshExecutor):
+        return bundle(ref, bench_dir, repo, cancelled)
+    check_ref(ref)
+    repo = repo or DEFAULT_REPO
+    if COMMIT.fullmatch(ref):
+        info = build_info(unit_path(bench_dir, ref))
+        if _verified_by(info, ref, repo):
+            return unit_path(bench_dir, ref), info
+    with _locked(Path(bench_dir) / "git", cancelled):
+        result = _node_build(executor, ref, repo, cancelled, popen)
+        commit = result.get("commit")
+        if not isinstance(commit, str) or not COMMIT.fullmatch(commit) \
+                or result.get("bundle") != unit_path(bench_dir, commit).name:
+            raise BuildError(f"执行机器 {executor.name} 返回的编译结果无法识别")
+        unit = unit_path(bench_dir, commit)
+        info = build_info(unit)
+        if not _verified_by(info, commit, repo):
+            info = _fetch_unit(executor, result["path"], unit, commit, repo, cancelled, popen)
+        return unit, info
+
+
+def _node_build(executor, ref, repo, cancelled, popen):
+    """`metacodes bench node build` on the executor: the request on stdin,
+    the build log on stderr, the result as the last stdout line. Closing
+    stdin cancels it there."""
+    argv = executors.node_argv(executor, "build")
+    print(f"bench: building metacodes {ref} on {executor.name}", file=sys.stderr, flush=True)
+    process = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+    lines = []
+    reader = threading.Thread(target=lambda: lines.extend(process.stdout), daemon=True)
+    reader.start()
+    try:
+        process.stdin.write((json.dumps({"ref": ref, "repo": repo}) + "\n").encode())
+        process.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    while process.poll() is None:
+        if cancelled():
+            _stop(process)
+            raise BuildError("构建已取消")
+        time.sleep(0.1)
+    reader.join(timeout=5)
+    _close(process.stdin)
+    _close(process.stdout)
+    if process.returncode:
+        raise BuildError(f"执行机器 {executor.name} 上的编译失败（退出码 {process.returncode}），详见上方日志；"
+                         f"节点不认识 build 时，先运行 metacodes bench setup --executor {executor.name} 更新节点")
+    try:
+        result = json.loads(lines[-1])
+    except (IndexError, ValueError):
+        raise BuildError(f"执行机器 {executor.name} 没有返回编译结果") from None
+    if not isinstance(result, dict) or not isinstance(result.get("path"), str):
+        raise BuildError(f"执行机器 {executor.name} 返回的编译结果无法识别")
+    return result
+
+
+def _close(stream):
+    try:
+        stream.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _stop(process):
+    _close(process.stdin)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+        process.wait()
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            _close(stream)
+
+
+def _fetch_unit(executor, remote_unit, unit, commit, repo, cancelled, popen):
+    """Copies the unit and its build record from the executor, accepting only
+    regular files and directories under the unit's own name."""
+    parent, name = posixpath.split(remote_unit)
+    if name != unit.name or not parent:
+        raise BuildError(f"执行机器 {executor.name} 返回的包路径无法识别")
+    record = name + ".json"
+    argv = executors.ssh_argv(executor, ["tar", "-cf", "-", "-C", parent, name, record])
+    print(f"bench: copying {name} from {executor.name}", file=sys.stderr, flush=True)
+    staged = unit.parent / (".fetch-" + uuid.uuid4().hex[:8])
+    staged.mkdir(parents=True)
+    try:
+        process = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        start_new_session=True)
+        try:
+            _extract(process.stdout, staged, name, record, cancelled)
+        except (tarfile.TarError, OSError) as exc:
+            _stop(process)
+            raise BuildError(f"从执行机器 {executor.name} 复制包失败：{exc}") from None
+        except BuildError:
+            _stop(process)
+            raise
+        stderr = process.stderr.read().decode(errors="replace")
+        _close(process.stdout)
+        _close(process.stderr)
+        if process.wait():
+            raise BuildError(f"从执行机器 {executor.name} 复制包失败：" + _last_line(stderr, repo))
+        try:
+            manifest = check_bundle(staged / name)
+            info = json.loads((staged / record).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BuildError(f"执行机器 {executor.name} 上的包不能用于 Bench：{exc}") from None
+        info = {key: info.get(key) for key in RECORD_KEYS} if isinstance(info, dict) else None
+        source = manifest.get("source")
+        if not _verified_by(info, commit, repo) or not isinstance(source, dict) or source.get("commit") != commit:
+            raise BuildError(f"执行机器 {executor.name} 上的包不是由配置的源码仓库验证的提交 {commit[:12]}")
+        if unit.exists():
+            shutil.rmtree(unit)
+        (staged / name).rename(unit)
+        _record_path(unit).write_text(json.dumps(info), encoding="utf-8")
+        return info
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def _extract(stream, staged, name, record, cancelled):
+    with tarfile.open(fileobj=stream, mode="r|") as archive:
+        for member in archive:
+            if cancelled():
+                raise BuildError("构建已取消")
+            path = posixpath.normpath(member.name)
+            inside = path == record or path == name or path.startswith(name + "/")
+            if not inside or path.startswith("/") or ".." in path.split("/") or not (member.isfile() or member.isdir()):
+                raise BuildError("包里有不允许的条目：" + member.name)
+            target = staged / path
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            with open(target, "wb") as out:
+                shutil.copyfileobj(source, out)
+            target.chmod(0o755 if member.mode & 0o111 else 0o644)
+
+
+class BuildManager:
+    """Builds started from the page, one at a time, each in its own process
+    with a progress record and a log beside it."""
+
+    LOG_TAIL = 80
+
+    def __init__(self, config_path):
+        self.config_path = Path(config_path)
+        self.directory = self.config_path.parent / "builds"
+        self.lock = threading.Lock()
+        self.process = None
+
+    def latest(self):
+        files = sorted(self.directory.glob("*.json"), key=lambda p: p.stat().st_mtime) if self.directory.is_dir() else []
+        if not files:
+            return None
+        try:
+            value = json.loads(files[-1].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        alive = self.process is not None and self.process.poll() is None
+        if value.get("status") == "running" and not alive:
+            value = {**value, "status": "interrupted"}
+        try:
+            lines = files[-1].with_suffix(".log").read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        return {**value, "log": lines[-self.LOG_TAIL:]}
+
+    def start(self, request, executor_name, runtime_env, cwd):
+        if not isinstance(request, dict) or set(request) - {"ref", "executor"}:
+            raise ValueError("只接受 ref、executor")
+        ref = check_ref(request.get("ref"))
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                raise ValueError("已有一个编译在进行，请等它结束")
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            ident = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+            progress = self.directory / (ident + ".json")
+            _write(progress, {"id": ident, "ref": ref, "executor": executor_name, "status": "running",
+                              "started_at": _now()})
+            argv = [sys.executable, "-m", "scripts.eval.harbor.bench.builds", "--config", str(self.config_path),
+                    "--executor", executor_name, "--ref", ref, "--progress", str(progress)]
+            with progress.with_suffix(".log").open("wb") as log:
+                self.process = subprocess.Popen(argv, cwd=cwd, env=runtime_env, stdin=subprocess.DEVNULL,
+                                                stdout=log, stderr=log, start_new_session=True)
+            threading.Thread(target=self.process.wait, daemon=True).start()
+            return {"id": ident, "ref": ref, "executor": executor_name, "status": "running"}
+
+    def cancel(self):
+        with self.lock:
+            if self.process is None or self.process.poll() is not None:
+                raise ValueError("没有正在进行的编译")
+            self.process.send_signal(signal.SIGTERM)
+            return {"cancel_requested": True}
+
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _write(path, value):
+    staged = Path(path).with_name(Path(path).name + ".tmp")
+    staged.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    os.replace(staged, path)
+
+
+def main(argv=None):
+    import getopt
+    names = ("config", "executor", "ref", "progress")
+    try:
+        options, rest = getopt.getopt(sys.argv[1:] if argv is None else argv, "", [n + "=" for n in names])
+    except getopt.GetoptError as exc:
+        print("bench build: " + str(exc), file=sys.stderr)
+        return 2
+    options = {key[2:]: value for key, value in options}
+    if rest or set(options) != set(names):
+        print("usage: builds.py --config <workbench.json> --executor NAME --ref REF --progress FILE", file=sys.stderr)
+        return 2
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    progress = Path(options["progress"])
+    value = json.loads(progress.read_text(encoding="utf-8"))
+    os.environ["PATH"] = executors.search_path()
+    try:
+        config = Path(options["config"])
+        cfg = json.loads(config.read_text(encoding="utf-8"))
+        executor = executors.find(cfg, options["executor"])
+        unit, info = build_on(executor, options["ref"], config.parent, cfg.get("source_repo"), cancelled=stop.is_set)
+        value.update(status="done", bundle=unit.name, commit=info["commit"], version=info.get("version"),
+                     committed_at=info.get("committed_at"))
+        code = 0
+    except (BuildError, ValueError, OSError) as exc:
+        value.update(status="cancelled" if stop.is_set() else "failed", error=str(exc))
+        print(f"bench: {exc}", file=sys.stderr, flush=True)
+        code = 1
+    value["finished_at"] = _now()
+    _write(progress, value)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

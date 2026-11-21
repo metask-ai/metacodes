@@ -7,6 +7,7 @@ own `metacodes` over SSH and talks to it on the channel's stdin/stdout.
     metacodes bench node info [--json] [--peer NAME]
     metacodes bench node peers [--json]
     metacodes bench node run <spec.json>
+    metacodes bench node build                   # {"ref", "repo"} on stdin
     metacodes bench node manifest <job-dir>
     metacodes bench node pack <job-dir>          # JSON items on stdin
     metacodes bench node egress-probe <json>
@@ -21,6 +22,9 @@ built (remote.py); a WorkBuddy run uses this node's own WorkBuddy checkout,
 so it runs here exactly as it would on the workbench's own machine. The
 channel protocol is remote.py's: the first stdin line carries the secrets,
 later lines a refreshed token or `cancel`; stdout carries JSON events.
+`build` builds one git revision's Linux unit in this node's own Docker,
+exactly as `metacodes bench build` does on its own machine (builds.py), and
+prints the unit as the last stdout line; closing stdin cancels it.
 `manifest`, `pack` and `egress-probe` are remote.py's job copy-back and
 setup's container egress check.
 
@@ -38,7 +42,7 @@ import threading
 from pathlib import Path
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.bench import executors, remote
+from scripts.eval.harbor.bench import builds, executors, remote
 from scripts.eval.harbor.bench.runner import atomic_json, now, settings
 
 # Raised whenever the workbench and a node stop understanding each other's
@@ -116,6 +120,29 @@ class Node:
         if spec.get("runner") == suites.WORKBUDDY:
             return self.run_workbuddy(spec)
         return remote.run(spec_path)
+
+    def build(self) -> int:
+        try:
+            request = json.loads(sys.stdin.buffer.readline())
+            ref, repo = request["ref"], request.get("repo")
+        except (ValueError, KeyError, TypeError):
+            print("missing build request line", file=sys.stderr)
+            return 2
+        stop = threading.Event()
+
+        def hang_up():
+            while sys.stdin.buffer.read(1 << 16):
+                pass
+            stop.set()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        try:
+            unit, info = builds.bundle(ref, self.root, repo if isinstance(repo, str) else None, cancelled=stop.is_set)
+        except builds.BuildError as exc:
+            print(f"{socket.gethostname()}：{exc}", file=sys.stderr, flush=True)
+            return 1
+        print(json.dumps({"bundle": unit.name, "path": str(unit), **info}, ensure_ascii=False), flush=True)
+        return 0
 
     def run_workbuddy(self, spec) -> int:
         """WorkBuddy on this node's checkout. Its host proxy talks to a
@@ -207,9 +234,14 @@ def main(argv, state_root, version) -> int:
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(code)
+    if action == "build" and not args:
+        code = node.build()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     if action in ("manifest", "pack", "egress-probe") and len(args) == 1:
         return remote.main([action, args[0]])
-    print("usage: metacodes bench node info [--json] | peers [--json] | run <spec> | manifest <dir> | "
+    print("usage: metacodes bench node info [--json] | peers [--json] | run <spec> | build | manifest <dir> | "
           "pack <dir> | egress-probe <json>", file=sys.stderr)
     return 2
 

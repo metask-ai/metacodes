@@ -370,11 +370,12 @@ def show(value, as_json, render, *extra):
 
 
 def build_command(args, root, cfg):
-    from scripts.eval.harbor.bench import builds
+    from scripts.eval.harbor.bench import builds, executors
+    executor = executors.find(cfg, args.executor)
     stop = threading.Event()
     previous = signal.signal(signal.SIGINT, lambda *_: stop.set())
     try:
-        unit, info = builds.bundle(args.ref, root, cfg.get("source_repo"), cancelled=stop.is_set)
+        unit, info = builds.build_on(executor, args.ref, root, cfg.get("source_repo"), cancelled=stop.is_set)
     finally:
         signal.signal(signal.SIGINT, previous)
     value = {"bundle": unit.name, "path": str(unit), "ref": info["ref"], "commit": info["commit"],
@@ -439,7 +440,8 @@ def main(argv=None):
     parser.add_argument("--run", metavar="NAME", help="sync：把这次 SSH 执行机器运行的结果同步回本机")
     parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
     parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
-    parser.add_argument("--ref", help="build：在 Docker 中编译这个 git 版本（提交、分支或 tag）的 Linux 包，供批次选择")
+    parser.add_argument("--ref", help="build：在执行机器（--executor，默认是默认执行机器）的 Docker 中编译这个 git 版本"
+                                      "（提交、分支或 tag）的 Linux 包，供批次选择")
     parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
     parser.add_argument("--id", help="provider：Provider 标识（小写字母、数字、-、_），模型以 <标识>/<模型> 出现")
     parser.add_argument("--name", help="provider add：显示名称")
@@ -524,7 +526,7 @@ def main(argv=None):
         client = Client(args.url) if args.url else None
         if args.action == "build":
             if args.url or args.ref is None:
-                parser.error("bench build 需要 --ref，并在保存这个包的工作台机器上运行")
+                parser.error("bench build 需要 --ref，并在工作台机器上运行")
             return build_command(args, root, cfg)
         if args.action == "prepare":
             if args.url or not args.suite:

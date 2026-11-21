@@ -25,6 +25,7 @@ metacodes bench prepare --suite gaia2-cli             # generate a harbor-local 
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
 metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
 metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
+metacodes bench node build              # build one git revision here ({"ref", "repo"} on stdin)
 ```
 
 Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
@@ -270,9 +271,26 @@ revision with its own kernels, build its full release unit:
 ```sh
 metacodes bench build --ref main          # a branch, tag or commit
 metacodes bench build --ref 54a7a632 --json
+metacodes bench build --ref main --executor relay-4090
 ```
 
-It needs Docker on the machine whose `<state root>` keeps the bundle. The ref
+The build runs on the node of the executor (`--executor`, default the
+default executor), the machine whose Docker also runs the evaluations;
+every node builds the same way. For an `ssh` executor the workbench runs
+`metacodes bench node build` there over SSH (the request on stdin, the build
+log on stderr, the result as the last stdout line; closing stdin cancels
+it), then copies the unit and its build record into its own
+`<state root>/bench/bundles/`, accepting only regular files and directories
+under the unit's name and only a record verified by the same `source_repo`.
+The page does the same from 新建 → 按 commit 编译: it lists a branch's
+commits with their commit time, newest first, up to a chosen day
+(`GET /api/commits?ref=&until=YYYY-MM-DD&limit=`), and builds the chosen one,
+or any pasted commit, branch or tag, in the background (`POST /api/build`
+`{ref, executor}`, `GET /api/build` for its status and log tail,
+`POST /api/build/cancel`), one build at a time. A built unit is named in the
+version list by its commit and commit time.
+
+The node needs Docker; the workbench machine does not. On each node the ref
 is resolved in a mirror of `source_repo` (in `workbench.json`; default the
 GitHub repository) kept at `<state root>/bench/git/source.git`, and a branch
 always means its current head. A branch and a tag of one name on different
