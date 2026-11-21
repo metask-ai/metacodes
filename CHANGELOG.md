@@ -85,6 +85,20 @@ status, compatibility boundaries, and entry points are defined by
   arms the exit as before. During a reply Ctrl+C still interrupts it, and
   Ctrl+D is unchanged.
 
+- **The permission and question dialogs take Esc and Ctrl+C in every
+  encoding** (#657). Both dialogs looked only at the first byte of each read.
+  A terminal with the kitty keyboard protocol on (Alacritty, Windows Terminal
+  and iTerm2 over ssh since metacodes 0.9.0; iTerm2 3.7.7 and later, Ghostty
+  and kitty) sends Ctrl+C as `ESC [ 99 ; 5 u` and Esc as `ESC [ 27 u`, and
+  the dialogs dropped both: Ctrl+C no longer refused in the permission
+  dialog, and neither key cancelled the question dialog, whose footer says
+  `Esc to cancel`. Keys that arrived in one read were cut to the first, so
+  `abc` typed fast into "Type something" was answered as `a`. The dialogs now
+  read keys through the prompt's key parser: these keys act as their one-byte
+  forms do, and every key of a read counts. A bracketed paste never answers
+  a dialog: the permission dialog ignores it, and the question dialog types
+  it into "Type something" or the note being edited, line breaks as spaces.
+
 ### Fixed
 
 - **A `204` or `304` answer no longer holds a request until the server
