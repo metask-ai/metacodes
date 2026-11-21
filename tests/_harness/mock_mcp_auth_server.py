@@ -39,6 +39,8 @@ OAuth (2025-11-25 authorization):
                        for ("" when it asked for none)
   POST /control/revoke every access token issued so far stops working
   POST /control/unavailable  /scoped-mcp answers 503 to a valid token
+  POST /control/hugeerror  /scoped-mcp's 401 to a token it refuses carries a
+                       300 KiB body
 
 GET /log returns every observation as JSON lines (for assertions).
 """
@@ -63,6 +65,7 @@ STATE = {
     "scopes": {},
     "issued": 0,
     "unavailable": False,
+    "huge_error": False,
     "next_scoped_session": 0,
 }
 RESUME = {}
@@ -113,6 +116,12 @@ class Handler(BaseHTTPRequestHandler):
         if scope is not None:
             header += ', scope="%s"' % scope
         self.reply(401, {"error": "sign in to use this server"}, {"WWW-Authenticate": header})
+
+    def huge_challenge(self, resource_path):
+        metadata = "%s/.well-known/oauth-protected-resource%s" % (self.base(), resource_path)
+        header = 'Bearer error="invalid_token", resource_metadata="%s"' % metadata
+        body = b'{"error":"sign in to use this server","padding":"' + b"x" * (300 * 1024) + b'"}'
+        self.reply(401, raw=body, headers={"WWW-Authenticate": header, "Content-Type": "application/json"})
 
     # -- GET ---------------------------------------------------------------
 
@@ -232,6 +241,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/control/unavailable":
             STATE["unavailable"] = True
             return self.reply(204)
+        if path == "/control/hugeerror":
+            STATE["huge_error"] = True
+            return self.reply(204)
         message = json.loads(raw)
         method = message.get("method")
         rid = message.get("id")
@@ -262,6 +274,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/scoped-mcp":
             token = self.bearer()
             if token not in STATE["access"] or "mcp:tools" not in STATE["scopes"].get(token, set()):
+                if token is not None and STATE["huge_error"]:
+                    return self.huge_challenge("/scoped-mcp")
                 return self.challenge("/scoped-mcp", None)
             if STATE["unavailable"]:
                 return self.reply(503, {"error": "unavailable"})

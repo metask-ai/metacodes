@@ -48,6 +48,7 @@ pub const REFRESH_MARGIN_SECONDS: i64 = 60;
 /// Silence after which a discovery, registration or token request is cut.
 const HTTP_IDLE_LIMIT_MS: u64 = 30_000;
 const MAX_METADATA_BYTES: usize = 256 * 1024;
+const ERROR_BODY_READ_BYTES: usize = 4096;
 pub const CALLBACK_PATH = "/callback";
 const STORE_DIR = "mcp-oauth";
 const STORE_VERSION: u32 = 1;
@@ -262,6 +263,15 @@ fn send(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, spec: Requ
     }
     var transfer: [8192]u8 = undefined;
     const reader = response.reader(&transfer);
+    if (!spec.read_body) {
+        if (request.connection) |connection| connection.closing = true;
+        var excerpt_buffer: [ERROR_BODY_READ_BYTES]u8 = undefined;
+        const count = reader.readSliceShort(&excerpt_buffer) catch blk: {
+            if (interrupt.abort) |signal| if (signal.isAborted()) return error.Aborted;
+            break :blk 0;
+        };
+        return .{ .status = status, .body = try arena.dupe(u8, excerpt_buffer[0..count]), .www_authenticate = www_authenticate, .session_id = session_id };
+    }
     const body = reader.allocRemaining(arena, .limited(MAX_METADATA_BYTES)) catch return interrupted(interrupt);
     return .{ .status = status, .body = body, .www_authenticate = www_authenticate, .session_id = session_id };
 }

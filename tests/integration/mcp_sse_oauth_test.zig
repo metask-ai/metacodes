@@ -429,6 +429,27 @@ test "MCP OAuth: a token the server refuses is reported with the server's answer
     try std.testing.expect(!try storedLoginExists(state_root, url));
 }
 
+test "MCP OAuth: a refusal with an oversized body is still a refusal; nothing is stored" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "scoped-mcp");
+
+    try mock.post("control/hugeerror");
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    try std.testing.expectError(
+        error.McpOAuthTokenNotAccepted,
+        scopedLogin(state_root, url, .{ .scopes = "mcp:extra" }, &transcript),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, transcript.text.items, "HTTP 401 invalid_token") != null);
+    try std.testing.expect(!try storedLoginExists(state_root, url));
+}
+
 test "MCP OAuth: a token the server cannot check right now is stored, and the login says it is unverified" {
     var mock = (try Mock.start()) orelse return error.SkipZigTest;
     defer mock.stop();
