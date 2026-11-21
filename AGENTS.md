@@ -50,6 +50,12 @@ These rules apply to the entire repository.
   is for a host that sets `Config.jev_builtin_default`, none here): name a
   service in `config.json` or the environment, or use https
   (`zig build test:builtin-egress` enforces it, #474).
+- Receive an HTTP response in `src/` with `http_connection.receiveHead` and
+  read its body with `http_connection.bodyReader`
+  (`src/api/http_connection.zig`), never with std's `Request.receiveHead`,
+  `Response.reader` or `Reader.bodyReader`: Zig 0.16 reads the body of a
+  1xx, 204 or 304 answer, and `Request.deinit` drains it, until the server
+  closes the connection (`zig build test:http-answer` enforces it, #579).
 - Agents do not write comments, doc comments or docstrings. Let names, types
   and structure carry the meaning, and put the reasoning behind a change in
   its commit message or PR description. The exceptions are what this file or

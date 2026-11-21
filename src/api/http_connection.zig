@@ -53,15 +53,14 @@
 //! requests say `connection: keep-alive` instead: the server leaves the
 //! connection open, the client reads what it needs (a stream's terminal event,
 //! or the end of a framed body) and closes it. Other requests are left as they
-//! are: std 0.16 reads the body of a 204 or 304 answer, which has none, to the
-//! end of the connection (`receiveHead` returns early without marking it
-//! empty), so a request that reads every answer's body would wait on a server
-//! that keeps the connection open after one.
+//! are.
 
 const std = @import("std");
 const version = @import("../version.zig");
+const http_status = @import("http_status.zig");
 
 const Request = std.http.Client.Request;
+const Response = std.http.Client.Response;
 
 /// What a request says it is when its caller names nothing else.
 pub const user_agent = "metacodes/" ++ version.semver;
@@ -88,6 +87,20 @@ pub fn sendBodiless(request: *Request) std.Io.Writer.Error!void {
     acceptIdentityOnly(request);
     identify(request);
     request.sendBodiless() catch |err| return dropConnection(request, err);
+}
+
+pub fn receiveHead(request: *Request, redirect_buffer: []u8) Request.ReceiveHeadError!Response {
+    const response = try request.receiveHead(redirect_buffer);
+    if (!http_status.answerHasBody(&response.head)) {
+        if (request.connection) |connection| connection.closing = true;
+    }
+    return response;
+}
+
+pub fn bodyReader(response: *const Response, transfer_buffer: []u8) *std.Io.Reader {
+    const request = response.request;
+    if (!request.method.responseHasBody() or !http_status.answerHasBody(&response.head)) return std.Io.Reader.ending;
+    return request.reader.bodyReader(transfer_buffer, response.head.transfer_encoding, response.head.content_length);
 }
 
 /// Make a request say `connection: keep-alive` while its `keep_alive = false`

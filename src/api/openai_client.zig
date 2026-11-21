@@ -522,7 +522,7 @@ pub const OpenAIClient = struct {
             if (client_mod.cancelled(abort)) return error.Aborted;
             return client_mod.requestTransportFailure("openai", rid, "sendBody", err);
         };
-        const response = req_ptr.receiveHead(&.{}) catch |err| {
+        const response = http_connection.receiveHead(req_ptr, &.{}) catch |err| {
             // 等响应头时被取消:cancel 关闭了 socket,不是网络故障(issue #434)。
             if (client_mod.cancelled(abort)) {
                 log.warnId("openai", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
@@ -864,7 +864,7 @@ const OpenAIStream = struct {
         if (self.takeQueued()) |ev| return ev;
         if (self.done) return null;
         if (self.reader == null) {
-            const raw = self.response.reader(&self.transfer_buf);
+            const raw = http_connection.bodyReader(&self.response, &self.transfer_buf);
             // 字节级续命:每次 recv 到字节就 touch——tool_calls 参数增量 chunk 不再是"沉默"。
             // 传输层字节只记"最近字节"时间戳;进展按非保活行续(下方)。
             self.reader = if (self.abort_registry) |registry| blk: {

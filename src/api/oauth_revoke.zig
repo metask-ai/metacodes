@@ -193,7 +193,7 @@ const RevokeJob = struct {
         defer request.deinit();
         http_connection.sendBodyComplete(&request, job.body) catch return false;
         var redirect: [4096]u8 = undefined;
-        const response = request.receiveHead(&redirect) catch return false;
+        const response = http_connection.receiveHead(&request, &redirect) catch return false;
         const code = http_status.ResponseStatus.capture(&response).code;
         return code >= 200 and code < 300;
     }

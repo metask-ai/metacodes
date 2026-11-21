@@ -20,6 +20,23 @@ status, compatibility boundaries, and entry points are defined by
   --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
   stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
 
+### Fixed
+
+- **A `204` or `304` answer no longer holds a request until the server
+  closes the connection** (#579). Zig 0.16's HTTP client reads the body of a
+  1xx, 204 or 304 answer, which has none, to the end of the connection, and
+  `Request.deinit` does the same for a GET or DELETE whose connection it
+  could reuse. On a connection the server keeps open (HTTP/1.1's default),
+  ending an MCP Streamable HTTP session the server answers with
+  `204 No Content` waited in its `DELETE`, with no deadline, until the server
+  dropped the idle connection; so did an MCP stream resumption, MCP OAuth
+  discovery, the API key list, catalog downloads and the OAuth token
+  requests answered that way. Every answer is now received and read through
+  `api/http_connection.zig`: a body-less answer reads as empty at once, and
+  its connection is closed instead of drained, so it is not reused. The
+  System-One advisor, TinyKG, sealed skills and OTLP export still say
+  `connection: close`, so nothing waited there; they no longer depend on it.
+
 ## 0.13.0 — 2026-11-20
 
 ### Changed

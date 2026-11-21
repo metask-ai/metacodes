@@ -239,7 +239,7 @@ fn send(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, spec: Requ
         http_connection.sendBodiless(&request) catch return interrupted(interrupt);
     }
     var redirect: [4096]u8 = undefined;
-    var response = request.receiveHead(&redirect) catch return interrupted(interrupt);
+    const response = http_connection.receiveHead(&request, &redirect) catch return interrupted(interrupt);
     const status = http_status.ResponseStatus.capture(&response).code;
     var www_authenticate: ?[]const u8 = null;
     var headers = response.head.iterateHeaders();
@@ -249,7 +249,7 @@ fn send(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, spec: Requ
     }
     if (!spec.read_body) return .{ .status = status, .body = "", .www_authenticate = www_authenticate };
     var transfer: [8192]u8 = undefined;
-    const reader = response.reader(&transfer);
+    const reader = http_connection.bodyReader(&response, &transfer);
     const body = reader.allocRemaining(arena, .limited(MAX_METADATA_BYTES)) catch return interrupted(interrupt);
     return .{ .status = status, .body = body, .www_authenticate = www_authenticate };
 }

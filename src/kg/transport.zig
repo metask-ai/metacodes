@@ -458,10 +458,10 @@ pub const WebTransport = struct {
         // probe waited for a reply to a GET that never left the client.
         http_connection.sendBodiless(&req) catch return Error.RequestFailed;
         var redirect_buffer: [4096]u8 = undefined;
-        const head = req.receiveHead(&redirect_buffer) catch return Error.RequestFailed;
+        const head = http_connection.receiveHead(&req, &redirect_buffer) catch return Error.RequestFailed;
         const status = ResponseStatus.capture(&head);
         var transfer_buffer: [8192]u8 = undefined;
-        const reader = req.reader.bodyReader(&transfer_buffer, head.head.transfer_encoding, head.head.content_length);
+        const reader = http_connection.bodyReader(&head, &transfer_buffer);
         const bytes = reader.allocRemaining(self.allocator, std.Io.Limit.limited(64 * 1024)) catch return Error.ResponseTooLarge;
         if (status.code == 401 or status.code == 403) {
             self.allocator.free(bytes);
@@ -555,10 +555,10 @@ pub const WebTransport = struct {
         defer req.deinit();
         http_connection.sendBodyComplete(&req, @constCast(body)) catch return Error.RequestFailed;
         var redirect_buffer: [4096]u8 = undefined;
-        const head = req.receiveHead(&redirect_buffer) catch return Error.RequestFailed;
+        const head = http_connection.receiveHead(&req, &redirect_buffer) catch return Error.RequestFailed;
         const status = ResponseStatus.capture(&head);
         var transfer_buffer: [8192]u8 = undefined;
-        const reader = req.reader.bodyReader(&transfer_buffer, head.head.transfer_encoding, head.head.content_length);
+        const reader = http_connection.bodyReader(&head, &transfer_buffer);
         const bytes = reader.allocRemaining(self.allocator, std.Io.Limit.limited(max_response_bytes)) catch
             return Error.ResponseTooLarge;
         defer self.allocator.free(bytes);
