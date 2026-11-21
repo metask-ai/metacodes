@@ -27,6 +27,13 @@ const reviewer = @import("reviewer.zig");
 const merge_back = @import("merge_back.zig");
 const interview = @import("interview.zig");
 const progress = @import("progress.zig");
+const ledger_mod = @import("ledger.zig");
+const lesson = @import("../kg/lesson.zig");
+const manager = @import("manager.zig");
+const claude_code = @import("drivers/claude_code.zig");
+const sandbox_exec = @import("../sandbox/exec.zig");
+const pprocess = @import("platform").process;
+const util_time = @import("../util/time.zig");
 
 const testing = std.testing;
 const PathBuf = [std.fs.max_path_bytes]u8;
@@ -172,6 +179,7 @@ const Plan = struct {
     fail: ?types.SeatError = null,
     /// A file that must already be in the workspace, else the seat fails.
     require: ?[]const u8 = null,
+    seat_files: []const File = &.{},
     handoff: []const u8 = handoff_text,
 };
 
@@ -182,7 +190,7 @@ const ScriptedSeats = struct {
     /// Seat id and packet bytes of every seat run, in order; owned.
     ran: std.ArrayList(Ran) = .empty,
 
-    const Ran = struct { seat: types.SeatId, packet: []u8 };
+    const Ran = struct { seat: types.SeatId, packet: []u8, harness: types.Harness = .metacodes, remaining_usd: f64 = 0 };
 
     fn deinit(self: *ScriptedSeats) void {
         for (self.ran.items) |r| testing.allocator.free(r.packet);
@@ -206,11 +214,11 @@ const ScriptedSeats = struct {
 
     const vtable: types.SeatDriver.VTable = .{ .run = run };
 
-    fn run(ptr: *anyopaque, gpa: std.mem.Allocator, _: *const types.SeatSpec, paths: types.SeatPaths, abort: *const types.AbortSignal) types.SeatDriver.Error!types.SeatOutcome {
+    fn run(ptr: *anyopaque, gpa: std.mem.Allocator, spec: *const types.SeatSpec, paths: types.SeatPaths, abort: *const types.AbortSignal) types.SeatDriver.Error!types.SeatOutcome {
         const self: *ScriptedSeats = @ptrCast(@alignCast(ptr));
         const seat = self.binding.seat;
         const packet = swarm_team.readFileAlloc(testing.allocator, paths.packet) orelse try testing.allocator.dupe(u8, "");
-        try self.ran.append(testing.allocator, .{ .seat = seat, .packet = packet });
+        try self.ran.append(testing.allocator, .{ .seat = seat, .packet = packet, .harness = spec.harnessKind(), .remaining_usd = self.binding.ledger.remainingUsd() });
         const plan = for (self.plans) |p| {
             if (std.mem.eql(u8, p.seat, seat.slice())) break p;
         } else {
@@ -226,6 +234,7 @@ const ScriptedSeats = struct {
         for (plan.user_files) |f| writeFile(self.user_repo, f.path, f.bytes) catch return .{ .failed = .spawn_failed };
         const seat_dir = common.seatDir(paths);
         if (plan.review) |review| writeFile(seat_dir, "review.json", review) catch return .{ .failed = .spawn_failed };
+        for (plan.seat_files) |f| writeFile(seat_dir, f.path, f.bytes) catch return .{ .failed = .spawn_failed };
         writeFile(seat_dir, "handoff.md", plan.handoff) catch return .{ .failed = .spawn_failed };
         return run_dir.collectHandoff(gpa, paths.handoff);
     }
@@ -525,6 +534,111 @@ test "teamwork runtime L2: two failed audits fail the run; the first report reac
     }
     try testing.expect(std.mem.indexOf(u8, seats.packetOf("implementer-1"), "audit-1.md") == null);
     try expectCacheSafe(&fx, &seats);
+}
+
+test "teamwork runtime L2: an unverified audit forwards its leads to one more round; a second unverified audit fails the run without merging" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-unverified");
+    defer fx.deinit();
+    const before = try fx.workspaceBytes();
+    defer testing.allocator.free(before);
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+        .{ .seat = "implementer-2", .files = &.{.{ .path = "feature.txt", .bytes = "feature, with a test\n" }} },
+        .{ .seat = "reviewer-2", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{ .{ .unverified = "Not established:\nthe --flag output\n" }, .{ .unverified = "Still not established.\n" } };
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    const final = try swe_loop.drive(run);
+
+    try testing.expectEqual(runtime.State{ .failed = .audit_unverified }, final);
+    try testing.expectEqual(@as(u32, 2), auditor.calls);
+    const after = try fx.workspaceBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+    try expectFile(run.status().worktree.?, "feature.txt", "feature, with a test\n");
+    var report_buf: PathBuf = undefined;
+    try expectFile(fx.runFile(&report_buf, ""), "audits/audit-1.md", "# Completion audit 1: unverified\n\nNot established:\nthe --flag output\n");
+    for ([_][]const u8{ "implementer-2", "reviewer-2" }) |seat| {
+        const packet = seats.packetOf(seat);
+        try testing.expect(std.mem.indexOf(u8, packet, run_dir.seat_relative_first_audit_report) != null);
+        try testing.expect(std.mem.indexOf(u8, packet, "could not confirm") != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, seats.packetOf("implementer-1"), "audit-1.md") == null);
+    try expectCacheSafe(&fx, &seats);
+}
+
+test "teamwork runtime L2: a pass after the leads round merges; a failed second audit after unverified fails the run" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const endings = [_]struct { second: audit.StubAuditor.Scripted, final: runtime.Phase }{
+        .{ .second = .pass, .final = .done },
+        .{ .second = .{ .fail = "The flag is missing.\n" }, .final = .failed },
+    };
+    for (endings) |ending| {
+        var fx: Fixture = undefined;
+        try fx.init("cc-zig-teamwork-rt-leads");
+        defer fx.deinit();
+        const before = try fx.workspaceBytes();
+        defer testing.allocator.free(before);
+        const plans = [_]Plan{
+            .{ .seat = "implementer-1", .files = &.{feature} },
+            .{ .seat = "reviewer-1", .review = approve_review },
+            .{ .seat = "implementer-2", .files = &.{.{ .path = "feature.txt", .bytes = "feature\n" }} },
+            .{ .seat = "reviewer-2", .review = approve_review },
+        };
+        var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+        defer seats.deinit();
+        const script = [_]audit.StubAuditor.Scripted{ .{ .unverified = "Not established: the flag.\n" }, ending.second };
+        var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+        defer auditor.deinit();
+
+        const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
+        defer run.destroy();
+        const final = try swe_loop.drive(run);
+
+        try testing.expectEqual(ending.final, final.phase());
+        try testing.expectEqual(@as(u32, 2), auditor.calls);
+        switch (ending.final) {
+            .done => try expectFile(fx.repo(), "feature.txt", "feature\n"),
+            else => {
+                try testing.expectEqual(runtime.State{ .failed = .audit_failed }, final);
+                const after = try fx.workspaceBytes();
+                defer testing.allocator.free(after);
+                try testing.expectEqualStrings(before, after);
+            },
+        }
+    }
+}
+
+test "teamwork runtime: Windows refuses to start or reopen a run before writing anything (#517)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var root = run_dir.test_support.TestRoot.init("cc-zig-teamwork-rt-windows");
+    defer root.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":5}", null), null)).enabled;
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = root.slice() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const id = try types.RunId.parse(run_id_text);
+
+    try testing.expect(!runtime.platform_supported);
+    try testing.expectError(error.UnsupportedPlatform, runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, .{ .state_root = root.slice(), .run_id = id, .workspace = root.slice() }));
+    try testing.expectError(error.UnsupportedPlatform, runtime.Run.reopen(testing.allocator, deps, cfg, root.slice(), id));
+    try testing.expect(!exists(root.slice(), "teamwork"));
+    try testing.expectError(error.Unsupported, reviewer.workspaceTree(testing.allocator, root.slice(), root.slice(), null));
 }
 
 test "teamwork runtime L2: an unavailable audit is never a pass" {
@@ -1572,4 +1686,546 @@ test "teamwork progress L2: an interview that spends the budget never leaves its
     defer dir.deinit(testing.allocator);
     try testing.expectEqual(types.SeatStatus.done, (try dir.readSeatRecord(types.SeatId.parse(interview.interviewer_seat) catch unreachable)).status);
     try testing.expect(std.mem.indexOf(u8, recorder.text.items, "needs_you") == null);
+}
+
+const hidden_check = "sh hidden-test.sh";
+const hidden_test = File{ .path = "hidden-test.sh", .bytes = "grep -qx feature feature.txt\n" };
+const approve_hidden = "{\"verdict\":\"approve\",\"evidence\":[{\"command\":\"" ++ hidden_check ++ "\",\"exit_code\":0,\"output_digest\":\"" ++ digest ++ "\",\"output_excerpt\":\"\"}],\"issues\":{\"opened\":[],\"closed\":[],\"still_open\":[]}}";
+
+fn candidatesCfg(fx: *Fixture, extra: []const u8) !config.Config.Enabled {
+    const a = fx.arena.allocator();
+    const text = try std.fmt.allocPrint(a, "{{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"{s}\"{s}}}", .{ hidden_check, extra });
+    return (try config.validate(try config.parse(a, text, null), null)).enabled;
+}
+
+fn judgment(comptime selected: []const u8, comptime others: [2][]const u8) File {
+    return .{ .path = "judgment.json", .bytes = "{\"selected\":\"" ++ selected ++ "\",\"eliminated\":[{\"candidate\":\"" ++ others[0] ++ "\",\"reason\":\"It fails the hidden test.\"},{\"candidate\":\"" ++ others[1] ++ "\",\"reason\":\"It changes the wrong file.\"}]}" };
+}
+
+const Pitfalls = struct {
+    texts: std.ArrayList([]u8) = .empty,
+
+    fn sink(self: *Pitfalls) runtime.PitfallSink {
+        return .{ .ctx = self, .rememberFn = remember };
+    }
+
+    fn remember(ctx: *anyopaque, text: []const u8) bool {
+        const self: *Pitfalls = @ptrCast(@alignCast(ctx));
+        const copy = testing.allocator.dupe(u8, text) catch return false;
+        self.texts.append(testing.allocator, copy) catch {
+            testing.allocator.free(copy);
+            return false;
+        };
+        return true;
+    }
+
+    fn deinit(self: *Pitfalls) void {
+        for (self.texts.items) |text| testing.allocator.free(text);
+        self.texts.deinit(testing.allocator);
+    }
+};
+
+const three_candidates = [_]Plan{
+    .{ .seat = "implementer-1", .require = "hidden-test.sh", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+    .{ .seat = "reviewer-1", .review = approve_hidden },
+    .{ .seat = "implementer-2", .require = "hidden-test.sh", .files = &.{feature} },
+    .{ .seat = "reviewer-2", .review = approve_hidden },
+    .{ .seat = "implementer-3", .files = &.{.{ .path = "other.txt", .bytes = "feature\n" }} },
+    .{ .seat = "reviewer-3", .review = approve_hidden },
+};
+
+test "teamwork candidates L2: of three candidates only the one passing the hidden test is judged eligible, selected and merged back" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    const plans = three_candidates ++ [_]Plan{
+        .{ .seat = "judge-1", .require = "candidate-2.diff", .seat_files = &.{judgment("candidate-2", .{ "candidate-1", "candidate-3" })} },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    var pitfalls: Pitfalls = .{};
+    defer pitfalls.deinit();
+    const cfg = try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":1");
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor(), .pitfalls = pitfalls.sink() };
+
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+    try testing.expect(run.status().worktree == null);
+    try testing.expectError(error.CandidatesPending, run.dispatch(.implementer, ""));
+    try testing.expectEqual(runtime.CandidatesResult{ .selected = 2 }, try run.runCandidates());
+    const statuses = [_]runtime.CandidateStatus{ .rejected, .selected, .rejected };
+    for (run.status().candidates, statuses) |candidate, want| try testing.expectEqual(want, candidate.status);
+    var ids_buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("implementer-1:done,reviewer-1:done,implementer-2:done,reviewer-2:done,implementer-3:done,reviewer-3:done,judge-1:done", seatIds(run.status(), &ids_buf));
+    try testing.expectEqual(runtime.Phase.review_approved, run.status().state.phase());
+    try testing.expect(std.mem.endsWith(u8, run.status().worktree.?, "/candidates/candidate-2"));
+    try expectFile(run.status().worktree.?, "feature.txt", "feature\n");
+    var root_buf: PathBuf = undefined;
+    const root = fx.runFile(&root_buf, "");
+    try testing.expect(!exists(root, "candidates/candidate-1"));
+    try testing.expect(!exists(root, "candidates/candidate-3"));
+    try testing.expect(!exists(root, "judging/candidate-1.diff"));
+
+    const judge_packet = seats.packetOf("judge-1");
+    try testing.expect(std.mem.indexOf(u8, judge_packet, "- `candidate-1` was not approved: the review did not hold up (check_disagrees). Not eligible.") != null);
+    try testing.expect(std.mem.indexOf(u8, judge_packet, "- `candidate-2` passed its verified review. Eligible.") != null);
+    try testing.expect(std.mem.indexOf(u8, judge_packet, "- `candidate-3` was not approved: the review did not hold up (check_disagrees). Not eligible.") != null);
+    try expectCacheSafe(&fx, &seats);
+
+    try testing.expectEqual(@as(usize, 2), pitfalls.texts.items.len);
+    var binding: lesson.Binding = .{ .verdict = .failed, .task = lesson.NO_TASK, .run = run_id_text };
+    for (pitfalls.texts.items) |text| try lesson.checkBinding(try lesson.parse(text), &binding);
+    try testing.expect(std.mem.indexOf(u8, pitfalls.texts.items[0], "lesson: candidate-1 lost to candidate-2: It fails the hidden test.") != null);
+    try testing.expect(std.mem.indexOf(u8, pitfalls.texts.items[1], "lesson: candidate-3 lost to candidate-2: It changes the wrong file.") != null);
+
+    run.destroy();
+    const reopened = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id);
+    defer reopened.destroy();
+    try testing.expect(std.mem.endsWith(u8, reopened.status().worktree.?, "/candidates/candidate-2"));
+    try testing.expectEqual(runtime.CandidateStatus.selected, reopened.status().candidates[1].status);
+    const final = try swe_loop.drive(reopened);
+    try testing.expectEqual(runtime.State{ .done = .{ .files_changed = 1, .worktree_removed = true } }, final);
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+    try testing.expect(!exists(fx.repo(), "other.txt"));
+    try testing.expect(std.mem.endsWith(u8, auditor.last_workspace.?, "/candidates/candidate-2"));
+    const worktrees = try sh(fx.repo(), "git worktree list --porcelain | grep -c '^worktree '");
+    defer testing.allocator.free(worktrees);
+    try testing.expectEqualStrings("1\n", worktrees);
+}
+
+test "teamwork candidates L2: an invalid judgment runs the judge again; no approved candidate fails without a judge" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates-judge");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    const plans = three_candidates ++ [_]Plan{
+        .{ .seat = "judge-1", .seat_files = &.{judgment("candidate-1", .{ "candidate-2", "candidate-3" })} },
+        .{ .seat = "judge-2", .seat_files = &.{judgment("candidate-2", .{ "candidate-3", "candidate-1" })} },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":1"), fx.options());
+    defer run.destroy();
+    try testing.expectEqual(runtime.CandidatesResult{ .selected = 2 }, try run.runCandidates());
+    const seats_now = run.status().seats;
+    try testing.expectEqual(runtime.SeatResult{ .judgment = .{ .invalid = error.NotEligible } }, seats_now[seats_now.len - 2].result.?);
+    try testing.expectEqual(runtime.SeatResult{ .judgment = .{ .selected = 2 } }, seats_now[seats_now.len - 1].result.?);
+    try testing.expectError(error.NoCandidates, run.runCandidates());
+
+    var none: Fixture = undefined;
+    try none.init("cc-zig-teamwork-candidates-none");
+    defer none.deinit();
+    try writeFile(none.repo(), hidden_test.path, hidden_test.bytes);
+    const failing = [_]Plan{
+        .{ .seat = "implementer-1", .fail = .{ .exited = 3 } },
+        .{ .seat = "implementer-2", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+        .{ .seat = "reviewer-1", .review = approve_hidden },
+    };
+    var none_seats: ScriptedSeats = .{ .plans = &failing, .user_repo = none.repo() };
+    defer none_seats.deinit();
+    const before = try none.workspaceBytes();
+    defer testing.allocator.free(before);
+    const lost = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = none_seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try candidatesCfg(&none, ",\"candidates\":2,\"candidate_estimate_usd\":1"), none.options());
+    defer lost.destroy();
+    try testing.expectEqual(runtime.State{ .failed = .no_candidate_approved }, try swe_loop.drive(lost));
+    try testing.expectEqual(runtime.CandidateStatus.rejected, lost.status().candidates[0].status);
+    try testing.expectEqual(runtime.CandidateStatus.rejected, lost.status().candidates[1].status);
+    try testing.expectEqual(@as(usize, 3), none_seats.ran.items.len);
+    const after = try none.workspaceBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "teamwork candidates L2: a start whose candidate estimate exceeds the budget left is refused before anything runs" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates-budget");
+    defer fx.deinit();
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const request: runtime.ApprovedRequest = .{ .text = request_text, .source = .request_file };
+
+    try testing.expectError(error.CandidateBudgetExceeded, runtime.Run.start(testing.allocator, deps, request, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":2"), fx.options()));
+    var root_buf: PathBuf = undefined;
+    const root = fx.runFile(&root_buf, "");
+    try testing.expect(!exists(root, "run.json"));
+    try testing.expect(!exists(root, run_dir.original_request_file));
+
+    var ledger_buf: PathBuf = undefined;
+    const ledger_path = fx.runFile(&ledger_buf, run_dir.budget_file);
+    try util_fs.mkdirParents(std.fs.path.dirname(ledger_path).?);
+    var spent = try ledger_mod.Ledger.load(testing.allocator, ledger_path, 5);
+    try spent.charge(.{ .seat_id = types.seatIdFor(.interviewer, 1), .harness = .metacodes, .wallclock_ms = 1, .cost = .{ .provider_estimate = 3 } });
+    spent.deinit(testing.allocator);
+    try testing.expectError(error.CandidateBudgetExceeded, runtime.Run.start(testing.allocator, deps, request, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":0.8"), fx.options()));
+    try testing.expect(!exists(root, "run.json"));
+    const run = try runtime.Run.start(testing.allocator, deps, request, try candidatesCfg(&fx, ",\"candidates\":3,\"candidate_estimate_usd\":0.6"), fx.options());
+    defer run.destroy();
+    try testing.expectEqual(runtime.Phase.approved, run.status().state.phase());
+    try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
+}
+
+const manager_allowance = "1.5";
+
+const mcp_initialize = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"fake-manager\",\"version\":\"1\"}}}";
+const mcp_initialized = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+
+fn mcpCall(comptime id: []const u8, comptime name: []const u8, comptime arguments: []const u8) []const u8 {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" ++ id ++ ",\"method\":\"tools/call\",\"params\":{\"name\":\"" ++ name ++ "\",\"arguments\":" ++ arguments ++ "}}";
+}
+
+const FakeManager = struct {
+    command_buf: PathBuf = undefined,
+    command_len: usize = 0,
+
+    const Ending = enum { reports_cost, hangs };
+
+    fn command(self: *const FakeManager) []const u8 {
+        return self.command_buf[0..self.command_len];
+    }
+
+    fn install(self: *FakeManager, fx: *const Fixture, requests: []const []const u8, replies: usize, ending: Ending) !void {
+        const a = testing.allocator;
+        self.command_len = (try std.fmt.bufPrint(&self.command_buf, "{s}/bin/claude-manager", .{fx.root.slice()})).len;
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(a);
+        var run_buf: PathBuf = undefined;
+        const run_root = fx.runFile(&run_buf, "");
+        try text.print(a,
+            \\#!/bin/sh
+            \\case "$1" in
+            \\--version) echo '2.1.323 (Claude Code)'; exit 0 ;;
+            \\--help) echo '--print --output-format stream-json --verbose --add-dir --permission-mode acceptEdits --permission-prompts --no-session-persistence --model --effort --max-budget-usd --append-system-prompt --strict-mcp-config --mcp-config --allowedTools'; exit 0 ;;
+            \\esac
+            \\printf '%s\n' "$@" > argv.txt
+            \\pwd -P > cwd.txt
+            \\for target in '{0s}ORIGINAL_REQUEST.md' '{0s}budget.jsonl' '{0s}run.json' '{0s}worktree/README.md' '{1s}/README.md'; do
+            \\  if printf tampered >> "$target" 2>/dev/null; then echo "$target" >> breach.txt; fi
+            \\done
+            \\cfg=''
+            \\prev=''
+            \\for a in "$@"; do
+            \\  if [ "$prev" = "--mcp-config" ]; then cfg="$a"; fi
+            \\  prev="$a"
+            \\done
+            \\set -- $(printf '%s' "$cfg" | sed 's/.*"args":\["\([^"]*\)","\([^"]*\)","\([^"]*\)"\].*/\1 \2 \3/')
+            \\: > responses
+            \\
+        , .{ run_root, fx.repo() });
+        switch (ending) {
+            .reports_cost => {
+                try text.appendSlice(a, "{\n  cat <<'REQUESTS'\n");
+                for (requests) |line| try text.print(a, "{s}\n", .{line});
+                try text.print(a, "REQUESTS\n  while [ \"$(wc -l < responses)\" -lt {d} ]; do sleep 0.05; done\n}} | /bin/sh \"$1\" \"$2\" \"$3\" > responses\n", .{replies});
+                try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"total_cost_usd\":0.3}'\nexit 0\n");
+            },
+            .hangs => try text.appendSlice(a, "touch ready\nsleep 300\n"),
+        }
+        var bin_buf: PathBuf = undefined;
+        try util_fs.mkdirParents(try std.fmt.bufPrint(&bin_buf, "{s}/bin", .{fx.root.slice()}));
+        try writeFile(fx.root.slice(), "bin/claude-manager", text.items);
+        var path_buf: PathBuf = undefined;
+        if (pfs.chmod(try std.fmt.bufPrintZ(&path_buf, "{s}", .{self.command()}), 0o755) != 0) return error.ChmodFailed;
+    }
+};
+
+fn managerCfg(fx: *Fixture, fake: *const FakeManager, implementer: []const u8) !config.Config.Enabled {
+    const extra = try std.fmt.allocPrint(fx.arena.allocator(), ",\"budget_usd\":5,\"manager_budget_usd\":" ++ manager_allowance ++ ",\"seats\":{{\"manager\":{{\"harness\":\"claude_code\",\"command\":\"{s}\"}}{s}}}", .{ fake.command(), implementer });
+    return fx.cfg(extra);
+}
+
+fn managerOptions(fx: *Fixture) !claude_code.Options {
+    const a = fx.arena.allocator();
+    const home = try std.fmt.allocPrint(a, "{s}/home", .{fx.root.slice()});
+    try util_fs.mkdirParents(home);
+    const env = try a.alloc([:0]const u8, 3);
+    env[0] = try std.fmt.allocPrintSentinel(a, "HOME={s}", .{home}, 0);
+    env[1] = "PATH=/usr/bin:/bin";
+    env[2] = "ANTHROPIC_API_KEY=sk-ant-secret";
+    return .{ .preview = .all, .parent_env = env, .home_dir = home };
+}
+
+fn managerFile(fx: *const Fixture, seat: []const u8, rel: []const u8) ?[]u8 {
+    var buf: PathBuf = undefined;
+    const dir = std.fmt.bufPrint(&buf, "{s}/teamwork/{s}/seats/{s}", .{ fx.state(), run_id_text, seat }) catch return null;
+    return readFile(dir, rel);
+}
+
+fn replyFor(responses: []const u8, comptime id: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, responses, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"id\":" ++ id ++ ",") != null) return line;
+    }
+    return "";
+}
+
+fn ledgerHas(fx: *const Fixture, line: []const u8) bool {
+    var buf: PathBuf = undefined;
+    const budget = readFile(fx.runFile(&buf, ""), "budget.jsonl") orelse return false;
+    defer testing.allocator.free(budget);
+    return std.mem.indexOf(u8, budget, line) != null;
+}
+
+test "teamwork manager L2: a launched manager drives the run over real MCP requests, inside its sandbox, on the run's budget" {
+    if (builtin.os.tag == .windows or !sandbox_exec.hostSupported()) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-mcp");
+    defer fx.deinit();
+    const requests = [_][]const u8{
+        mcp_initialize,
+        mcp_initialized,
+        mcpCall("2", "teamwork_request_completion", "{}"),
+        mcpCall("3", "teamwork_dispatch", "{\"role\":\"implementer\",\"instructions\":\"see " ++ run_id_text ++ "\"}"),
+        mcpCall("4", "teamwork_dispatch", "{\"role\":\"implementer\",\"instructions\":\"Write feature.txt.\"}"),
+        mcpCall("5", "teamwork_dispatch", "{\"role\":\"reviewer\"}"),
+        mcpCall("6", "teamwork_request_completion", "{}"),
+    };
+    var fake: FakeManager = .{};
+    try fake.install(&fx, &requests, 6, .reports_cost);
+    const plans = [_]Plan{ .{ .seat = "implementer-1", .files = &.{feature}, .charge_usd = 0.5 }, .{ .seat = "reviewer-1", .review = approve_review } };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try managerCfg(&fx, &fake, ""), fx.options());
+    defer run.destroy();
+    const final = try manager.drive(run, try managerOptions(&fx));
+
+    try testing.expectEqual(runtime.Phase.done, final.phase());
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+    try expectFile(fx.repo(), "README.md", "readme\n");
+    var run_buf: PathBuf = undefined;
+    try expectFile(fx.runFile(&run_buf, ""), "ORIGINAL_REQUEST.md", request_text);
+    if (managerFile(&fx, "manager-1", "breach.txt")) |breach| {
+        defer testing.allocator.free(breach);
+        std.debug.print("manager wrote outside its seat: {s}\n", .{breach});
+        return error.ManagerEscapedSandbox;
+    }
+
+    const responses = managerFile(&fx, "manager-1", "responses") orelse return error.NoResponses;
+    defer testing.allocator.free(responses);
+    try testing.expect(std.mem.indexOf(u8, replyFor(responses, "2"), "\"error\":\"NotApproved\"") != null);
+    try testing.expect(std.mem.indexOf(u8, replyFor(responses, "3"), "\"error\":\"InstructionsNameRunState\"") != null);
+    try testing.expect(std.mem.indexOf(u8, replyFor(responses, "4"), "\"seat_id\":\"implementer-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, replyFor(responses, "6"), "\"outcome\":{\"kind\":\"done\"") != null);
+    try testing.expect(std.mem.indexOf(u8, replyFor(responses, "6"), "\"held_usd\":" ++ manager_allowance ++ ",\"manager\":\"run_ledger\"") != null);
+
+    const argv = managerFile(&fx, "manager-1", "argv.txt") orelse return error.NoArgv;
+    defer testing.allocator.free(argv);
+    for ([_][]const u8{ "--permission-mode\n", "default\n", "--max-budget-usd\n", "1.500000\n", "--allowedTools\n", "mcp__teamwork\n", "--strict-mcp-config\n" }) |want| {
+        try testing.expect(std.mem.indexOf(u8, argv, want) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, argv, "--add-dir") == null);
+    try testing.expect(std.mem.indexOf(u8, argv, "sk-ant-secret") == null);
+    try testing.expect(std.mem.indexOf(u8, argv, run_id_text ++ "/worktree") == null);
+
+    try testing.expectEqual(@as(f64, 3.5), seats.ran.items[0].remaining_usd);
+    try testing.expectEqual(types.Harness.metacodes, seats.ran.items[0].harness);
+    try testing.expect(ledgerHas(&fx, "{\"seat_id\":\"manager-1\",\"harness\":\"claude_code\",\"usd\":0.3,"));
+    const snapshot = run.status();
+    try testing.expectEqual(@as(f64, 0), snapshot.budget.held_usd);
+    try testing.expectApproxEqAbs(@as(f64, 0.8), snapshot.budget.spent_usd, 1e-9);
+    try testing.expectEqual(runtime.ManagerSpend.run_ledger, snapshot.budget.manager);
+    var ids_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("manager-1:done,implementer-1:done,reviewer-1:done", seatIds(snapshot, &ids_buf));
+    try testing.expect(!exists(fx.runFile(&run_buf, ""), "budget.jsonl.hold"));
+}
+
+test "teamwork manager L2: the manager and worker harnesses switch independently" {
+    if (builtin.os.tag == .windows or !sandbox_exec.hostSupported()) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |launched| {
+        var fx: Fixture = undefined;
+        try fx.init("cc-zig-teamwork-manager-switch");
+        defer fx.deinit();
+        const requests = [_][]const u8{
+            mcp_initialize,
+            mcp_initialized,
+            mcpCall("2", "teamwork_dispatch", "{\"role\":\"implementer\"}"),
+            mcpCall("3", "teamwork_dispatch", "{\"role\":\"reviewer\"}"),
+            mcpCall("4", "teamwork_request_completion", "{}"),
+        };
+        var fake: FakeManager = .{};
+        try fake.install(&fx, &requests, 4, .reports_cost);
+        const plans = [_]Plan{ .{ .seat = "implementer-1", .files = &.{feature} }, .{ .seat = "reviewer-1", .review = approve_review } };
+        var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+        defer seats.deinit();
+        const script = [_]audit.StubAuditor.Scripted{.pass};
+        var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+        defer auditor.deinit();
+        const claude_implementer = try std.fmt.allocPrint(fx.arena.allocator(), ",\"implementer\":{{\"harness\":\"claude_code\",\"command\":\"{s}/bin/claude\"}}", .{fx.root.slice()});
+        const cfg = if (launched)
+            try managerCfg(&fx, &fake, claude_implementer)
+        else
+            try fx.cfg(try std.fmt.allocPrint(fx.arena.allocator(), ",\"seats\":{{{s}}}", .{claude_implementer[1..]}));
+        const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+        defer run.destroy();
+        try testing.expectEqual(runtime.Phase.done, (try manager.drive(run, try managerOptions(&fx))).phase());
+        try testing.expectEqual(types.Harness.claude_code, seats.ran.items[0].harness);
+        var ids_buf: [256]u8 = undefined;
+        if (launched) {
+            try testing.expectEqualStrings("manager-1:done,implementer-1:done,reviewer-1:done", seatIds(run.status(), &ids_buf));
+            const argv = managerFile(&fx, "manager-1", "argv.txt") orelse return error.NoArgv;
+            testing.allocator.free(argv);
+        } else {
+            try testing.expectEqualStrings("implementer-1:done,reviewer-1:done", seatIds(run.status(), &ids_buf));
+            try testing.expect(managerFile(&fx, "manager-1", "argv.txt") == null);
+            try testing.expectEqual(runtime.ManagerSpend.none, run.status().budget.manager);
+        }
+    }
+}
+
+test "teamwork manager L2: an exhausted budget stops the manager and the workers and merges nothing" {
+    if (builtin.os.tag == .windows or !sandbox_exec.hostSupported()) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-budget");
+    defer fx.deinit();
+    const requests = [_][]const u8{
+        mcp_initialize,
+        mcp_initialized,
+        mcpCall("2", "teamwork_dispatch", "{\"role\":\"implementer\"}"),
+        mcpCall("3", "teamwork_dispatch", "{\"role\":\"reviewer\"}"),
+    };
+    var fake: FakeManager = .{};
+    try fake.install(&fx, &requests, 3, .reports_cost);
+    const plans = [_]Plan{ .{ .seat = "implementer-1", .files = &.{feature}, .charge_usd = 3.5 }, .{ .seat = "reviewer-1", .review = approve_review } };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try managerCfg(&fx, &fake, ""), fx.options());
+    defer run.destroy();
+
+    try testing.expectEqual(runtime.Phase.budget_exhausted, (try manager.drive(run, try managerOptions(&fx))).phase());
+    try testing.expectEqual(@as(usize, 1), seats.ran.items.len);
+    try testing.expectEqual(@as(u32, 0), auditor.calls);
+    try testing.expect(!exists(fx.repo(), "feature.txt"));
+    try testing.expectEqual(runtime.SeatResult.aborted, run.status().seats[0].result.?);
+    try testing.expect(ledgerHas(&fx, "{\"seat_id\":\"manager-1\",\"harness\":\"claude_code\",\"usd\":1.5,\"wallclock_ms\":"));
+    try testing.expect(ledgerHas(&fx, "\"source\":\"reserved\""));
+    try testing.expectEqual(@as(f64, 5), run.status().budget.spent_usd);
+}
+
+const AbortWhenReady = struct {
+    fn wait(fx: *const Fixture, abort: *types.AbortSignal) void {
+        var waited: u32 = 0;
+        while (waited < 2000) : (waited += 1) {
+            if (managerFile(fx, "manager-1", "ready")) |ready| {
+                testing.allocator.free(ready);
+                abort.abort(.user_ctrl_c);
+                return;
+            }
+            util_time.sleepMs(10);
+        }
+    }
+};
+
+test "teamwork manager L2: a host cancel kills a busy manager; its unknown spend consumes the hold" {
+    if (builtin.os.tag == .windows or !sandbox_exec.hostSupported()) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-cancel");
+    defer fx.deinit();
+    var fake: FakeManager = .{};
+    try fake.install(&fx, &.{}, 0, .hangs);
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try managerCfg(&fx, &fake, ""), fx.options());
+    defer run.destroy();
+    const host = try std.Thread.spawn(.{}, AbortWhenReady.wait, .{ &fx, &run.abort });
+    const started = util_time.nowMs();
+    const final = try manager.drive(run, try managerOptions(&fx));
+    host.join();
+
+    try testing.expectEqual(runtime.Phase.cancelled, final.phase());
+    try testing.expect(util_time.nowMs() - started < 60_000);
+    try testing.expectEqual(runtime.SeatResult.aborted, run.status().seats[0].result.?);
+    try testing.expect(ledgerHas(&fx, "{\"seat_id\":\"manager-1\",\"harness\":\"claude_code\",\"usd\":1.5,"));
+    try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
+}
+
+test "teamwork manager L2: a crash while the manager runs consumes its hold once; reopening never grants it again" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-crash");
+    defer fx.deinit();
+    var fake: FakeManager = .{};
+    fake.command_len = (try std.fmt.bufPrint(&fake.command_buf, "{s}/bin/claude-manager", .{fx.root.slice()})).len;
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const cfg = try managerCfg(&fx, &fake, "");
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+        defer run.destroy();
+        const id = try run.openManager();
+        try run.holdManager(id);
+        try testing.expectEqual(@as(f64, 3.5), run.status().budget.remaining_usd);
+    }
+    for (0..2) |_| {
+        const run = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id);
+        defer run.destroy();
+        const snapshot = run.status();
+        try testing.expectEqual(@as(f64, 1.5), snapshot.budget.spent_usd);
+        try testing.expectEqual(@as(f64, 0), snapshot.budget.held_usd);
+        try testing.expectEqual(@as(f64, 3.5), snapshot.budget.remaining_usd);
+        try testing.expectEqual(types.SeatStatus.failed, snapshot.seats[0].status);
+    }
+    const run = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), fx.options().run_id);
+    defer run.destroy();
+    const next = try run.openManager();
+    try testing.expectEqualStrings("manager-2", next.slice());
+    try run.holdManager(next);
+    try testing.expectEqual(@as(f64, 2), run.status().budget.remaining_usd);
+}
+
+test "teamwork manager L2: the controller's death kills the manager's whole process group" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-lifeline");
+    defer fx.deinit();
+    const pidfile = try std.fmt.allocPrintSentinel(fx.arena.allocator(), "{s}/manager.pid", .{fx.root.slice()}, 0);
+    const argv = [_]?[*:0]const u8{ "/bin/sh", "-c", claude_code.lifeline_script, "teamwork-manager", "/bin/sh", "-c", "sleep 300 & echo $! > \"$0\"; wait", pidfile.ptr, null };
+    const child = try pprocess.spawnPipesWith(&argv, .{ .env = &.{"PATH=/usr/bin:/bin"}, .cwd = fx.root.slice() });
+    var pid: ?std.c.pid_t = null;
+    var waited: u32 = 0;
+    while (pid == null and waited < 500) : (waited += 1) {
+        if (swarm_team.readFileAlloc(testing.allocator, pidfile)) |text| {
+            defer testing.allocator.free(text);
+            pid = std.fmt.parseInt(std.c.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+        }
+        if (pid == null) util_time.sleepMs(10);
+    }
+    const grandchild = pid orelse return error.ManagerNotStarted;
+    try testing.expectEqual(@as(c_int, 0), std.c.kill(grandchild, @enumFromInt(0)));
+    child.closeStdin();
+    var alive = true;
+    var reaped = false;
+    waited = 0;
+    while (alive and waited < 500) : (waited += 1) {
+        if (!reaped) reaped = child.tryWait() == .exited;
+        alive = std.c.kill(grandchild, @enumFromInt(0)) == 0;
+        if (alive) util_time.sleepMs(10);
+    }
+    child.closeStdout();
+    try testing.expect(!alive);
 }

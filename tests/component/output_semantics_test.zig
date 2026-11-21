@@ -321,7 +321,7 @@ test "L2 输出语义:max_tokens 续写的多段合成一个 final" {
     // the continuation is counted on the RunResult and carried to `--json`.
     try std.testing.expectEqual(@as(u32, 1), scenario.result.continuations);
     const usage = cc.app_module.UsageTotals{};
-    const line = try cc.repl_headless.buildResultLine(a, scenario.ledger.finalText().?, "final", null, null, scenario.result, &usage, "m");
+    const line = try cc.repl_headless.buildResultLine(a, scenario.ledger.finalText().?, "final", null, null, &.{}, scenario.result, &usage, "m");
     defer a.free(line);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
     defer parsed.deinit();
@@ -344,7 +344,7 @@ test "L2 输出语义:没有续写的 Run 结果行 continuations 为 0" {
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
     try std.testing.expectEqual(@as(u32, 0), scenario.result.continuations);
     const usage = cc.app_module.UsageTotals{};
-    const line = try cc.repl_headless.buildResultLine(a, "whole answer", "final", null, null, scenario.result, &usage, "m");
+    const line = try cc.repl_headless.buildResultLine(a, "whole answer", "final", null, null, &.{}, scenario.result, &usage, "m");
     defer a.free(line);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
     defer parsed.deinit();
@@ -446,6 +446,7 @@ test "L2 输出语义:headless 结果行按 core 的定性给 text_kind" {
         final.kind,
         null,
         null,
+        &.{},
         .{ .stop_reason = .end_turn, .turns = 2, .tool_calls = 0 },
         &usage,
         "m",

@@ -738,6 +738,7 @@ pub const App = struct {
     mcp_sessions: std.ArrayList(McpSessionEntry),
     /// Every configured MCP server and its startup outcome (for /mcp).
     mcp_report: McpReport = .{},
+    mcp_unavailable: []const @import("core/mcp_session.zig").McpUnavailable = &.{},
     /// Owns the resolved MCP configuration, the startup jobs and `mcp_report`
     /// (child of `allocator`, released in deinit). Null until MCP servers are
     /// loaded.
@@ -2384,6 +2385,7 @@ pub const App = struct {
         app.mcp_sessions.deinit(app.allocator);
         if (app.mcp_arena) |arena_state| {
             app.mcp_report = .{};
+            app.mcp_unavailable = &.{};
             arena_state.deinit();
             app.allocator.destroy(arena_state);
             app.mcp_arena = null;
@@ -5686,6 +5688,17 @@ pub const App = struct {
             .disabled = startup.disabled,
             .problems = startup.problems,
         };
+        app.mcp_unavailable = unavailableServers(a, app.mcp_report.servers);
+    }
+
+    fn unavailableServers(a: std.mem.Allocator, servers: []const McpServerStatus) []const @import("core/mcp_session.zig").McpUnavailable {
+        const McpUnavailable = @import("core/mcp_session.zig").McpUnavailable;
+        var list: std.ArrayList(McpUnavailable) = .empty;
+        for (servers) |status| {
+            if (status.state == .connected) continue;
+            list.append(a, .{ .name = status.name, .detail = status.detail }) catch return list.items;
+        }
+        return list.items;
     }
 
     /// The model the system prompt names. `--model-display-name` is the

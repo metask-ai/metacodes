@@ -21,7 +21,7 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
     };
     const result = RunResult{ .stop_reason = .end_turn, .turns = 3, .tool_calls = 2 };
 
-    const line = try headless.buildResultLine(a, "hi \"there\"\nline2", "final", null, null, result, &usage, "claude-sonnet-4-20250514");
+    const line = try headless.buildResultLine(a, "hi \"there\"\nline2", "final", null, null, &.{}, result, &usage, "claude-sonnet-4-20250514");
     defer a.free(line);
 
     // 尾部换行(NDJSON)
@@ -43,6 +43,7 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
     try std.testing.expectEqualStrings("hi \"there\"\nline2", obj.get("text").?.string);
     try std.testing.expectEqual(@as(i64, 3), obj.get("turns").?.integer);
     try std.testing.expectEqualStrings("known", obj.get("usage_status").?.string);
+    try std.testing.expect(obj.get("mcp_unavailable") == null);
 }
 
 test "L2 headless --json: unknown usage is explicit and does not look like known zero" {
@@ -54,7 +55,7 @@ test "L2 headless --json: unknown usage is explicit and does not look like known
         .tool_calls = 0,
         .usage_status = .unknown,
     };
-    const line = try headless.buildResultLine(a, "HELLO", "final", null, null, result, &usage, "gpt-4o");
+    const line = try headless.buildResultLine(a, "HELLO", "final", null, null, &.{}, result, &usage, "gpt-4o");
     defer a.free(line);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
     defer parsed.deinit();
@@ -70,7 +71,7 @@ test "L2 headless --json: stop_reason 各值都能序列化(含 tool_loop、stal
     const a = std.testing.allocator;
     const usage = UsageTotals{};
     for ([_]cc.agent_loop.StopReason{ .end_turn, .max_turns, .aborted, .api_error, .tool_error, .tool_loop, .stalled }) |sr| {
-        const line = try headless.buildResultLine(a, "", "none", null, null, .{ .stop_reason = sr, .turns = 1, .tool_calls = 0 }, &usage, "m");
+        const line = try headless.buildResultLine(a, "", "none", null, null, &.{}, .{ .stop_reason = sr, .turns = 1, .tool_calls = 0 }, &usage, "m");
         defer a.free(line);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
         defer parsed.deinit();
@@ -115,7 +116,7 @@ test "L2 headless --json: text 含非法 UTF-8(二进制工具输出混入)→ r
     // 2026-09-05 WorkBuddy 现场:Read 一个 ReportLab PDF,第二行的二进制标记 %\x93\x8c\x8b\x9e 原样
     // 进了 stdout,trace.py 的 strict decode 把整个 cohort 判废。结尾再补半个"判"(E5 88)当被截断的字符。
     const dirty = "%PDF-1.3\n%\x93\x8c\x8b\x9e ReportLab Generated PDF\n结论:\xe5\x88";
-    const line = try headless.buildResultLine(a, dirty, "final", null, null, result, &usage, "m");
+    const line = try headless.buildResultLine(a, dirty, "final", null, null, &.{}, result, &usage, "m");
     defer a.free(line);
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
     // std.json 的 Scanner 校验字符串内 UTF-8:能 parse 即严格可解码。

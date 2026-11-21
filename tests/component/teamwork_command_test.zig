@@ -417,6 +417,72 @@ fn externalSeatsCase(saved_preview: bool) !void {
     try testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
+test "teamwork command: run launches a configured Claude Code manager on the run's budget; resume keeps it; mcp refuses it" {
+    var c: Case = undefined;
+    try c.init();
+    defer c.deinit();
+    const a = c.arena.allocator();
+    const script =
+        \\#!/bin/sh
+        \\case "$1" in
+        \\--version) echo '2.1.323 (Claude Code)'; exit 0 ;;
+        \\--help) echo '--print --output-format stream-json --verbose --add-dir --permission-mode acceptEdits --permission-prompts --no-session-persistence --model --effort --max-budget-usd --append-system-prompt --strict-mcp-config --mcp-config --allowedTools'; exit 0 ;;
+        \\esac
+        \\printf '%s\n' "$@" > argv.txt
+        \\cfg=''; prev=''
+        \\for arg in "$@"; do
+        \\  if [ "$prev" = '--mcp-config' ]; then cfg="$arg"; fi
+        \\  prev="$arg"
+        \\done
+        \\set -- $(printf '%s' "$cfg" | sed 's/.*"args":\["\([^"]*\)","\([^"]*\)","\([^"]*\)"\].*/\1 \2 \3/')
+        \\: > responses
+        \\{
+        \\  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture-manager","version":"1"}}}'
+        \\  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+        \\  echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"teamwork_status"}}'
+        \\  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"teamwork_cancel"}}'
+        \\  while [ "$(wc -l < responses)" -lt 3 ]; do sleep 0.05; done
+        \\} | /bin/sh "$1" "$2" "$3" > responses
+        \\echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.2}'
+        \\
+    ;
+    try c.write("manager-fixture", script);
+    const binary = try std.fmt.allocPrintSentinel(a, "{s}/manager-fixture", .{c.root}, 0);
+    try testing.expectEqual(@as(c_int, 0), pfs.chmod(binary, 0o755));
+    try c.write("state/config.json", try std.fmt.allocPrint(a,
+        \\{{"preview":{{"teamwork":true}},"teamwork":{{"budget_usd":2,"manager_budget_usd":0.5,"seats":{{"manager":{{"harness":"claude_code","command":"{s}"}}}}}}}}
+    , .{binary}));
+
+    const refused = try c.cliEnabled(&.{ "mcp", "--request-file", try c.request(), "--approve" });
+    try testing.expectEqual(@as(i32, 2), refused.exit_code);
+    try testing.expect(std.mem.indexOf(u8, refused.stderr, "UnsupportedManager") != null);
+
+    const out = try c.cliEnabled(&.{ "run", "--request-file", try c.request(), "--id", "mgr1", "--approve", "--api-key", "fixture-key", "--base-url", "http://127.0.0.1:9" });
+    if (std.mem.indexOf(u8, out.stderr, "SandboxUnavailable") != null) {
+        try testing.expect(!try c.exists("state/teamwork/mgr1"));
+        return;
+    }
+    try testing.expectEqual(@as(i32, 1), out.exit_code);
+    try testing.expect(std.mem.indexOf(u8, out.stdout, "\"state\":\"cancelled\"") != null);
+    const responses = try c.read("state/teamwork/mgr1/seats/manager-1/responses");
+    try testing.expect(std.mem.indexOf(u8, responses, "\"id\":3,\"result\":") != null);
+    try testing.expect(std.mem.indexOf(u8, responses, "\"held_usd\":0.5,\"manager\":\"run_ledger\"") != null);
+    const argv = try c.read("state/teamwork/mgr1/seats/manager-1/argv.txt");
+    try testing.expect(std.mem.indexOf(u8, argv, "--max-budget-usd\n0.500000\n") != null);
+    try testing.expect(std.mem.indexOf(u8, argv, "fixture-key") == null);
+    const budget = try c.read("state/teamwork/mgr1/budget.jsonl");
+    try testing.expect(std.mem.indexOf(u8, budget, "{\"seat_id\":\"manager-1\",\"harness\":\"claude_code\",\"usd\":0.5,") != null);
+    try testing.expect(std.mem.indexOf(u8, budget, "\"source\":\"reserved\"") != null);
+    try testing.expect(!try c.exists("state/teamwork/mgr1/budget.jsonl.hold"));
+    const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read("state/teamwork/mgr1/run.json"), .{});
+    const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, saved.object.get("approved_config_json").?.string, .{});
+    try testing.expectEqual(@as(f64, 0.5), policy.object.get("manager_budget_usd").?.float);
+    try testing.expectEqualStrings("claude_code", policy.object.get("seats").?.object.get("manager").?.object.get("harness").?.string);
+    const prepared = try cc.teamwork_command.prepare(a, .{ .action = .@"resume", .host_config = .{ .preview = .enabled }, .approve = true, .id = try cc.teamwork_command.RunId.parse("mgr1") }, c.state, c.repo);
+    try testing.expectEqual(@as(f64, 0.5), prepared.cfg.manager_budget_usd.?);
+    try testing.expectEqual(cc.teamwork_types.Harness.claude_code, prepared.cfg.seats.get(.manager).harnessKind());
+}
+
 test "teamwork command: installed MCP endpoint negotiates on stdio and never self-approves completion" {
     var c: Case = undefined;
     try c.init();
@@ -451,7 +517,7 @@ test "teamwork command: installed MCP endpoint negotiates on stdio and never sel
         count += 1;
     }
     try testing.expectEqual(replies.len, count);
-    try testing.expectEqual(@as(usize, 4), replies[1].object.get("result").?.object.get("tools").?.array.items.len);
+    try testing.expectEqual(@as(usize, 5), replies[1].object.get("result").?.object.get("tools").?.array.items.len);
     const initial = replies[2].object.get("result").?.object.get("structuredContent").?.object.get("snapshot").?;
     try testing.expectEqualStrings("approved", initial.object.get("state").?.object.get("kind").?.string);
     try testing.expectEqual(@as(usize, 0), initial.object.get("seats").?.array.items.len);

@@ -12,6 +12,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Teamwork launches its own Manager.** Configure `seats.manager` as a
+  `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
+  `resume` and `/teamwork` start that Manager CLI themselves. It runs in the
+  sandbox with only its seat directory writable and only the teamwork MCP
+  tools allowed; the controller that reviews, audits and merges stays in the
+  metacodes process. Its allowance is held in the run's budget before it
+  starts and settled by its reported cost; a Manager stopped without a report
+  is charged the whole allowance, and a crash never grants it twice. Cancel or
+  an exhausted budget stops the Manager and the workers without merging, and
+  the Manager dies with its controller. MCP snapshots now report
+  `budget.held_usd` and `budget.manager` (`none`, `run_ledger`, or
+  `outside_ledger` for a `teamwork mcp` client, whose spend the cap does not
+  include).
+
 - **Teamwork progress.** A teamwork run reports every seat status change and
   phase change with a snapshot of the run: the REPL draws a panel above the
   input box (goal, `N/M done · $spent / $cap`, one line per seat with its
@@ -19,6 +33,29 @@ status, compatibility boundaries, and entry points are defined by
   shows `needs_you` while the approval prompt waits. `teamwork run|resume
   --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
   stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
+
+### Changed
+
+- **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
+  `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after
+  Codex's; `"mcpImport": {"metacode": false}` in `<state root>/config.json`
+  turns it off. Its stdio servers start with every session, as Codex's do.
+
+- **`metacodes mcp login` succeeds only when the server takes the token.** The
+  new token is tried with one authenticated request before it is stored; a
+  401/403 fails the login, stores nothing and prints the server's answer with
+  the scope requested and granted. Registration and token errors print the
+  authorization server's `error`/`error_description`.
+
+- **A configured MCP server that did not connect is reported** to the model
+  (ToolSearch misses and calls to its tools name it, its cause and the fix), on
+  stderr by `-p`, and in `--json` as `mcp_unavailable`.
+
+- **Reading a credential store from Bash always asks.** A command that runs
+  `security find-generic-password`/`find-internet-password`/`dump-keychain`/
+  `export`, a `security` subcommand the shell computes, or `secret-tool`
+  prompts even under an allow rule for `Bash` or in `bypassPermissions`,
+  however it is quoted or escaped; a deny rule still denies.
 
 ### Fixed
 

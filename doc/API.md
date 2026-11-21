@@ -342,6 +342,9 @@ and merge-back. No App/provider, seat or worktree starts before approval.
 The state root must be outside the repository. All workers, pinned checks
 and verifier tools require Sandbox Foundations; an unavailable backend fails
 closed. Native and Claude Code implementer/reviewer seats are supported.
+Windows has no seat sandbox backend and no workspace tree id, so `teamwork
+run`/`resume`/`mcp`, REPL `/teamwork`, `Run.start` and `Run.reopen` fail with
+`UnsupportedPlatform` before any run state is written.
 
 Teamwork is the `teamwork` **preview feature**, disabled by default. It uses
 the same root `"preview"` in `<state root>/config.json` and the same
@@ -375,9 +378,10 @@ repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
 `--check-command`. CLI overrides are applied left to right. `--id <id>`
 selects a path-safe run id; otherwise one is generated and printed to stderr.
 Provider options are `--provider`, `--model`, `--base-url`, `--api-key`, and
-`--verbose`. This CLI uses the deterministic manager and an already-written
-request that `--approve` approves as is, so it runs no interviewer; configured
-model/effort or an external harness for the manager is rejected. The verifier
+`--verbose`. This CLI uses an already-written request that `--approve`
+approves as is, so it runs no interviewer. The Manager is the built-in
+deterministic loop unless `seats.manager` names an external harness (see the
+launched Manager below); model/effort on the built-in manager is rejected. The verifier
 must be native; explicit verifier effort and tier aliases are rejected until
 wired.
 
@@ -406,7 +410,10 @@ the run's budget ledger. The user answers `y` (approve), `e` (type a
 replacement statement, shown again for approval) or `n` (reject). Each prompt
 also states what approval authorizes: the dollar cap and seats per role,
 every seat's harness and model, the pinned check, and merge-back into the
-repository as uncommitted changes. Ctrl+C while the interviewer drafts
+repository as uncommitted changes. With parallel candidates it also names
+each candidate's seat, the judge, the per-candidate estimate and the raised
+implementer/reviewer cap; a wallclock-only external seat is marked as having
+no dollar cap. Ctrl+C while the interviewer drafts
 cancels that seat (as `aborted`, even when the unreported spend of a killed
 seat fills the cap) and leaves the next message unaffected. No
 implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
@@ -458,6 +465,31 @@ for a host that renders from another thread (`publish`, `read`,
 way and `interview.finishApproval` moves it from `needs_you` to `done`. The
 AgentCore C ABI has no teamwork entry point, so it carries no teamwork events.
 
+A launched Manager (#545) is configured with `seats.manager` as a
+`claude_code` seat (absolute `command`, optional `model`/`effort`) and a
+top-level `manager_budget_usd`: its dollar allowance out of `budget_usd`,
+greater than zero and below the cap. `teamwork run`, `teamwork resume` and
+the REPL's `/teamwork` then start the Manager CLI themselves instead of the
+deterministic loop; worker harnesses stay configured per seat, independently
+of the Manager's. Before the Manager starts, `budget.jsonl.hold` durably holds
+its allowance, which workers and the audit cannot spend; the Manager's
+reported cost settles it, and a Manager stopped without a cost report (cancel,
+budget, crash, timeout) is charged the whole allowance as `reserved`. Reopening
+a run whose Manager was live consumes the hold once and never grants it again;
+the next Manager is a new seat (`manager-<n>`) with a new hold. The Manager
+runs in Sandbox Foundations with its seat directory as working directory and
+only writable root, default permissions with prompts refused, and its tools
+limited to the teamwork MCP tools served by the controller in the host
+process. The approval prompt names the Manager and its allowance.
+Validation errors: `ManagerBudgetMissing`, `ManagerBudgetWithoutExternalManager`,
+`InvalidManagerBudget` and `ExternalManagerWallclockOnly`; a Manager CLI that
+fails its compatibility probe ends the run `failed` with
+`manager_unavailable`. `teamwork mcp` with an external `seats.manager` fails
+with `UnsupportedManager`: there the MCP client is the Manager. Windows has no
+launched Manager (`UnsupportedPlatform`). `teamwork status` shows an
+outstanding hold as `budget.manager_hold` and excludes it from
+`remaining_usd`.
+
 `teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
 the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)
 on stdin/stdout. The built CLI binds `Server.init(gpa, run).serve()`. The CLI host exposes
@@ -471,8 +503,9 @@ callback the command refuses before App startup. See
 Budget admission writes `budget.jsonl.pending` before a paid worker/audit
 call. A durable charge settles it; restart consumes an unresolved allowance
 as `reserved` instead of treating unknown spend as zero. `reserved` is cap
-consumption, not a measured bill. The workers/audit cap does not include the
-MCP client's own Manager model calls.
+consumption, not a measured bill. With `teamwork mcp` the cap does not
+include the MCP client's own Manager model calls; snapshots say so with
+`budget.manager: "outside_ledger"`.
 
 The completion auditor's PASS includes the reviewed tree ID. Pinned checks
 and verifier probes run in a disposable checkout of that tree. Merge-back
@@ -533,7 +566,9 @@ configured HTTP or SSE server and stores the token that later sessions send and
 refresh; `metacodes mcp logout <server>` forgets it and `metacodes mcp list`
 prints each configured server's transport and how it authenticates; they exit
 0 on success, 1 when the server is unknown, is not a URL server, already sends
-a configured `Authorization`, or the login fails, and 2 for a usage error
+a configured `Authorization`, or the login fails (including a server that
+answers the new token with 401 or 403; nothing is stored then), and 2 for a
+usage error
 ([SKILLS_AND_MCP.md](SKILLS_AND_MCP.md#authorization-oauth)).
 The flag surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
@@ -603,7 +638,12 @@ includes `usage_status:"known"|"unknown"`: `unknown` means the successful
 provider response supplied no readable usage object (including a usage tail
 lost after a reported stop), so its numeric usage and cost fields are
 placeholders rather than a claim of free work. Explicit numeric zero usage is
-`known`. Flag removals or semantic changes require a changelog entry.
+`known`. When a configured MCP server did not connect, the result line carries
+`mcp_unavailable: [{"name", "detail"}]` (the reason `/mcp` shows, with the
+`metacodes mcp login` command for a server that answered 401), and the run
+writes one `warning: MCP server '<name>' did not connect: <detail>` line per
+server to stderr before it starts; with every server connected, neither
+appears. Flag removals or semantic changes require a changelog entry.
 
 ### System-One memory advisor (optional)
 
@@ -1902,7 +1942,8 @@ stdin/stdout, and `serveFds(self, input: platform.fs.Fd, output: platform.fs.Fd)
 uses bounded NDJSON with protocol-only stdout and cancels live runs on EOF.
 
 The tools are `teamwork_status`, synchronous `teamwork_dispatch` (only
-implementer/reviewer and optional instructions), `teamwork_request_completion`
+implementer/reviewer and optional instructions), `teamwork_run_candidates`
+(parallel candidates and the judge, #525), `teamwork_request_completion`
 and `teamwork_cancel`. No tool starts or approves a run, replaces the approved
 request, changes configuration/budget/check command, or chooses a workspace.
 The runtime alone verifies review approval, independently audits and merges;

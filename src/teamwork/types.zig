@@ -25,6 +25,7 @@ pub const Role = enum {
     implementer,
     reviewer,
     verifier,
+    judge,
 
     pub fn parse(text: []const u8) ?Role {
         return std.meta.stringToEnum(Role, text);

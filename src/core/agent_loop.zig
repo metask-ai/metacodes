@@ -749,6 +749,7 @@ pub const Options = struct {
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
+    mcp_unavailable: []const @import("mcp_session.zig").McpUnavailable = &.{},
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
     /// 是否给每个工具执行 emit tool_start/tool_result 事件(REPL=true)。
@@ -3060,6 +3061,7 @@ fn runCounted(
             .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
+            .mcp_unavailable = opts.mcp_unavailable,
             .cron_registry = opts.cron_registry,
             .spawn_tick_fn = opts.spawn_tick_fn, // Bash/WebFetch 长命令心跳
         };
@@ -4638,6 +4640,7 @@ fn runCounted(
             .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
+            .mcp_unavailable = opts.mcp_unavailable,
             .cron_registry = opts.cron_registry,
         };
 

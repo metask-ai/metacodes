@@ -5840,6 +5840,8 @@ test {
     _ = &@import("permission/rule_spec.zig");
     _ = &@import("permission/bash_parser.zig");
     _ = &@import("permission/bash_readonly.zig");
+    _ = &@import("permission/credential_store.zig");
+    _ = &@import("core/mcp_session.zig");
     _ = &@import("permission/settings.zig");
     _ = &@import("permission/loader.zig");
     _ = &@import("permission/hooks.zig");
@@ -5890,6 +5892,8 @@ test {
     _ = &@import("teamwork/runtime_test.zig");
     _ = &@import("teamwork/interview.zig");
     _ = &@import("teamwork/progress.zig");
+    _ = &@import("teamwork/judge.zig");
+    _ = &@import("teamwork/command.zig");
     _ = &@import("repl/teamwork.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");

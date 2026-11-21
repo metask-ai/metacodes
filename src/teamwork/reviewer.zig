@@ -757,6 +757,12 @@ pub const JudgeSeatError = error{ OutOfMemory, Aborted } || run_dir.Error;
 /// Read `seat`'s `review.json`, judge it, and save the ledger to the run's
 /// `open_issues.json` when the review was valid.
 pub fn judgeSeat(gpa: std.mem.Allocator, run: *const run_dir.RunDir, seat: types.SeatId, ledger: *issues.Ledger, ctx: Context) JudgeSeatError!ReviewOutcome {
+    const outcome = try judgeSeatReview(gpa, run, seat, ledger, ctx);
+    if (outcome != .review_rejected) try ledger.save(gpa, run);
+    return outcome;
+}
+
+pub fn judgeSeatReview(gpa: std.mem.Allocator, run: *const run_dir.RunDir, seat: types.SeatId, ledger: *issues.Ledger, ctx: Context) JudgeSeatError!ReviewOutcome {
     var review = readReview(gpa, run, seat) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.PathTooLong => return error.PathTooLong,
@@ -764,9 +770,7 @@ pub fn judgeSeat(gpa: std.mem.Allocator, run: *const run_dir.RunDir, seat: types
         else => |e| return reject(.{ .review_invalid = e }),
     };
     defer review.deinit();
-    const outcome = try judge(gpa, &review, ledger, ctx);
-    if (outcome != .review_rejected) try ledger.save(gpa, run);
-    return outcome;
+    return judge(gpa, &review, ledger, ctx);
 }
 
 /// Whether `approval` still holds for the workspace as it is now.

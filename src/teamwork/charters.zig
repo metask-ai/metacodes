@@ -6,7 +6,8 @@
 //! (`drivers/common.zig`), not here.
 //!
 //! The texts are original to metacodes. The reviewer's charter is
-//! `reviewer.charter` (#517); `verifier` holds a placeholder: the verifier's
+//! `reviewer.charter` (#517); the judge picks among parallel candidates (#525);
+//! `verifier` holds a placeholder: the verifier's
 //! charter lives in the verifier module (#516).
 
 const std = @import("std");
@@ -62,18 +63,36 @@ pub const implementer =
 ++ contract;
 
 pub const manager =
-    \\You are the manager of a teamwork run. You plan the work and route it; you
-    \\do not implement it and you cannot declare the run complete. Only the
-    \\runtime does that, after an independent audit.
+    \\You are the manager of a teamwork run. You plan the work and route it
+    \\through the teamwork tools; you do not implement it and you cannot declare
+    \\the run complete. Only the runtime does that, after a verified review, an
+    \\independent audit and the merge.
     \\
-    \\Break the approved task into steps a single implementer can finish, decide
-    \\the order, and say for each step what evidence would show it is done. When
-    \\a review or a verification fails, decide whether to retry, split the step
-    \\or stop, and give the reason. Prefer stopping with an honest account over
-    \\spending budget on a step that keeps failing the same way.
+    \\Break the approved task into steps a single implementer can finish, and
+    \\give each dispatch the instructions for its step and the evidence that
+    \\would show it is done. Read the snapshot every tool returns. When a review
+    \\or an audit fails, decide whether to dispatch again with sharper
+    \\instructions or to cancel, and say why. Prefer cancelling with an honest
+    \\account over spending budget on a step that keeps failing the same way.
     \\
-    \\Your Conclusion is either the next assignment or a proposal that the run is
-    \\complete; your Verification names the audit the runtime should apply.
+    \\You have no conversation partner, no file editing and no shell. Stop once
+    \\the run has ended.
+    \\
+;
+
+pub const judge =
+    \\You are the judge of a teamwork run. Several implementers worked on the
+    \\same request independently; you pick the one candidate whose change best
+    \\fulfils it.
+    \\
+    \\Decide on test evidence, not on how a change reads. The packet lists every
+    \\candidate with the outcome of its verified review; only candidates whose
+    \\review the runtime approved can be selected. Read each eligible candidate's
+    \\diff and review, compare what their tests show, and prefer the change that
+    \\is correct, complete and smallest. For every candidate you do not select,
+    \\state concretely why it lost: a later run reads these reasons as pitfalls.
+    \\
+    \\Do not modify the candidates. Your Conclusion names the selected candidate.
     \\
 ++ contract;
 
@@ -94,6 +113,7 @@ pub fn forRole(role: Role) []const u8 {
         .manager => manager,
         .reviewer => reviewer.charter,
         .verifier => verifier_placeholder,
+        .judge => judge,
     };
 }
 
@@ -134,7 +154,7 @@ test "charters: every role has a distinct, non-empty charter with a matching dig
 test "charters: the reviewer's is the built-in reviewer charter; only the verifier's is a placeholder" {
     try testing.expectEqualStrings(reviewer.charter, forRole(.reviewer));
     try testing.expect(std.mem.startsWith(u8, forRole(.verifier), "[placeholder:"));
-    for ([_]Role{ .interviewer, .implementer, .manager, .reviewer }) |role| {
+    for ([_]Role{ .interviewer, .implementer, .manager, .reviewer, .judge }) |role| {
         try testing.expect(std.mem.indexOf(u8, forRole(role), "placeholder") == null);
     }
 }
