@@ -315,6 +315,7 @@ async function renderBatch(id) {
     h('dt', { text: '模型' }), h('dd', { text: b.model || '—' }),
     h('dt', { text: '执行机器' }), h('dd', { text: b.executor || '—' }),
     h('dt', { text: '每题次数 / 并发' }), h('dd', { text: `${b.attempts} 次 · 并发 ${b.concurrency}（不超过各评测集上限）` }),
+    h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: (b.features || []).join(', ') || '未开启' }),
     h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 开始 ${when(b.started_at)} · 结束 ${when(b.finished_at)}` })),
     h('p', { class: 'muted', text: '批次创建时复制并锁定这个 metacodes 发行包；之后重新构建或切换工作台的版本不影响本批次。各评测集依次运行，每个评测集一个作业。' }));
 
@@ -451,8 +452,15 @@ async function renderNewBatch() {
   } }, executorsList.map((e) => h('option', { value: e.name, selected: e.name === state.executor },
     e.label + (e.ready ? '' : ' · 待配置'))));
   const bundles = c.bundles || [];
-  const bundle = h('select', { name: 'bundle' }, bundles.map((b) => h('option', { value: b.id, selected: b.current },
+  const picked = bundles.some((b) => b.id === state.pickBundle) ? state.pickBundle : null;
+  const bundle = h('select', { name: 'bundle' }, bundles.map((b) => h('option', { value: b.id, selected: picked ? b.id === picked : b.current },
     `${b.label}${b.current ? '（当前配置）' : ''}`)));
+  const commitBox = h('div', { class: 'commit-builder', hidden: !state.commitsOpen });
+  const commitToggle = h('button', { type: 'button', class: 'button', onclick: () => {
+    state.commitsOpen = !state.commitsOpen;
+    commitBox.hidden = !state.commitsOpen;
+    if (state.commitsOpen && !commitBox.childElementCount) drawCommits();
+  } }, '按 commit 编译…');
   const name = h('input', { name: 'name', type: 'text', maxlength: 80, placeholder: '例如：v0.12 回归 · DeepSeek' });
   const picker = h('div', { class: 'suite-picker' });
   const boxes = h('div', { class: 'stack' });
@@ -461,6 +469,16 @@ async function renderNewBatch() {
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: runDefaults.attempts, min: 1, max: 5, step: 1, required: true });
   const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: runDefaults.concurrency, min: 1, max: 16, step: 1, required: true });
+  const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
+    input: h('input', { type: 'checkbox', name: 'features', value: f.id }), label: f.label }));
+  const featureGroup = (group, title) => {
+    const boxes = featureBoxes.filter((f) => f.group === group);
+    return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),
+      ...boxes.map((f) => h('label', { class: 'check' }, f.input, h('span', { text: f.label }), h('small', { class: 'mono muted', text: f.id })))) : null;
+  };
+  const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: '高级功能（可选，默认全部关闭）' }),
+    featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性'),
+    h('small', { class: 'muted', text: '只对 Harbor 评测集生效；所选发行包须支持这些开关。' })) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
   const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '创建批次');
 
@@ -561,9 +579,11 @@ async function renderNewBatch() {
   }
   form.append(
     h('div', { class: 'form-row' },
-      h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), bundle,
-        h('small', { text: bundles.length ? '创建时按内容摘要复制并锁定这个发行包；之后重新构建或切换版本不影响本批次。' : '还没有可用的 Linux 发行包，请先运行一键配置。' })),
+      h('div', { class: 'field' }, h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), bundle),
+        h('small', { text: bundles.length ? '创建时按内容摘要复制并锁定这个发行包；之后重新构建或切换版本不影响本批次。' : '还没有可用的 Linux 发行包，请先运行一键配置。' }),
+        c.can_run ? h('div', {}, commitToggle) : null),
       h('label', { class: 'field' }, h('span', { text: '批次名称（可选）' }), name, h('small', { text: '不填则用批次编号。' }))),
+    commitBox,
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('label', { class: 'field' }, h('span', { text: '模型' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
@@ -573,6 +593,7 @@ async function renderNewBatch() {
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency, h('small', { text: '每个评测集按自己的上限截断。' }))),
+    features,
     h('p', { class: 'muted', text: '评测会调用所选模型。各评测集依次运行；创建后可在批次页持续查看进度、逐任务轨迹、Token 分布和耗时。' }), feedback, submit);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -584,6 +605,8 @@ async function renderNewBatch() {
       if (bundle.value) request.bundle = bundle.value;
       if (name.value.trim()) request.name = name.value.trim();
       if (executorsList.length) request.executor = executor.value;
+      const chosen = featureBoxes.filter((f) => f.input.checked).map((f) => f.id);
+      if (chosen.length) request.features = chosen;
       const record = await api('/api/batches', request);
       state.batchPick = null;
       state.scope = record.id;
@@ -661,6 +684,63 @@ async function renderNewBatch() {
     if (active && route().view === 'new') { state.setupWatch = true; setTimeout(drawSetup, 2000); }
     else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(render, 500); }
   }
+  // Any commit of the source repository, picked by its time, built on the
+  // selected executor's node and then offered as a version like any other.
+  const until = h('input', { type: 'date', value: state.commitUntil || '', 'aria-label': '截止日期' });
+  const branch = h('input', { type: 'text', value: state.commitRef || 'main', maxlength: 200, 'aria-label': '分支' });
+  const refInput = h('input', { type: 'text', maxlength: 200, placeholder: '提交编号、分支或 tag', 'aria-label': '直接编译的 git 版本' });
+  const commitList = h('div', { class: 'table-scroll commit-list' });
+  const buildState = h('div', {});
+  async function drawCommits() {
+    state.commitUntil = until.value; state.commitRef = branch.value.trim() || 'main';
+    commitList.replaceChildren(h('div', { class: 'empty', text: '读取提交历史…' }));
+    let body;
+    try {
+      body = await api('/api/commits?ref=' + encodeURIComponent(state.commitRef) + (until.value ? '&until=' + encodeURIComponent(until.value) : ''));
+    } catch (error) { commitList.replaceChildren(h('div', { class: 'callout', text: error.message })); return; }
+    if (!body.commits.length) { commitList.replaceChildren(h('div', { class: 'empty', text: '这个时间之前没有提交' })); return; }
+    commitList.replaceChildren(h('table', {}, h('thead', {}, h('tr', {}, h('th', { text: '提交时间' }), h('th', { text: '提交' }),
+      h('th', { text: '说明' }), h('th', { text: '作者' }), h('th', {}))),
+    h('tbody', {}, body.commits.map((x) => h('tr', {},
+      h('td', { class: 'num', text: new Date(x.committed_at).toLocaleString('zh-CN', { hour12: false }) }),
+      h('td', { class: 'mono', text: x.commit.slice(0, 10) }), h('td', { text: x.subject }), h('td', { text: x.author }),
+      h('td', {}, x.bundle
+        ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = x.bundle; render(); } }, '已编译 · 选用')
+        : h('button', { type: 'button', class: 'button', onclick: () => startBuild(x.commit) }, '编译')))))));
+  }
+  async function startBuild(ref) {
+    try {
+      await api('/api/build', { ref, executor: state.executor });
+      await drawBuild();
+    } catch (error) { buildState.replaceChildren(h('div', { class: 'callout', text: error.message })); }
+  }
+  async function drawBuild() {
+    let latest = null;
+    try { latest = (await api('/api/build')).build; } catch (_) { return; }
+    if (!latest) { buildState.replaceChildren(); return; }
+    const running = latest.status === 'running';
+    const title = { running: '编译中', done: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' }[latest.status] || latest.status;
+    const cancel = running ? h('button', { type: 'button', class: 'button', onclick: async () => {
+      try { await api('/api/build/cancel', {}); } catch (error) { buildState.append(h('div', { class: 'callout', text: error.message })); }
+    } }, '取消编译') : null;
+    buildState.replaceChildren(h('div', { class: 'setup-step' },
+      h('p', {}, h('b', { text: `${title} · ${latest.ref}` }), h('span', { class: 'muted', text: ` · 在 ${latest.executor} 上编译` }),
+        latest.error ? h('span', { text: ' · ' + latest.error }) : null, ' ', cancel,
+        latest.status === 'done' && latest.bundle ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = latest.bundle; render(); } }, '选用这个版本') : null),
+      (latest.log || []).length ? h('pre', { class: 'muted', text: latest.log.join('\n') }) : null));
+    if (running && route().view === 'new' && commitBox.isConnected) setTimeout(drawBuild, 2000);
+    else if (state.buildWatch === latest.id && latest.status === 'done') { state.buildWatch = null; state.pickBundle = latest.bundle; setTimeout(render, 300); }
+    if (running) state.buildWatch = latest.id;
+  }
+  commitBox.append(
+    h('p', { class: 'muted', text: '列出源码仓库的提交，按时间选择；编译在所选执行机器的节点上进行（需要它的 Docker），同一个提交只编译一次，编好后出现在 metacodes 版本里。' }),
+    h('div', { class: 'task-tools' }, h('span', { text: '分支' }), branch, h('span', { text: '截止到' }), until,
+      h('button', { type: 'button', class: 'button', onclick: drawCommits }, '查询'),
+      refInput, h('button', { type: 'button', class: 'button', onclick: () => { if (refInput.value.trim()) startBuild(refInput.value.trim()); } }, '编译这个版本')),
+    buildState, commitList);
+  if (c.can_run && state.commitsOpen) drawCommits();
+  if (c.can_run) drawBuild();
+
   drawPicker();
   drawNotes();
   drawBoxes();

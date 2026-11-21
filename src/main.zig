@@ -1396,6 +1396,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(checkProviders(allocator));
     }
 
+    if (interactiveRepl(config)) offerUpdate(init, allocator, config.state_root);
+
     // --- <state root>/.env (#486) ---
     // The install's local configuration, read once: a layer below the process
     // environment for the names it may set (src/app/state_env.zig), never
@@ -2682,6 +2684,46 @@ fn runUpdate(args: *std.process.Args.Iterator, init: std.process.Init, allocator
     }
     if (outcome.checked_only and outcome.changes()) return 3;
     return 0;
+}
+
+fn offerUpdate(init: std.process.Init, allocator: std.mem.Allocator, state_root: []const u8) void {
+    const update_notice = @import("app/update_notice.zig");
+    if (state_root.len == 0 or !terminal_prompt.interactive()) return;
+    if (std.c.getenv("METACODES_NO_PROBE") != null or std.c.getenv(update_notice.opt_out_env) != null) return;
+    const found = update_notice.releaseInstall(allocator, init.io) orelse return;
+    var cache = update_notice.readCache(allocator, init.io, state_root);
+    if (update_notice.offered(found, cache)) |latest| {
+        std.debug.print(
+            "metacodes {s} is available (this install is {s}).\n  1. Update now\n  2. Skip\n  3. Skip until the next version\nChoice [2]: ",
+            .{ latest, found.version },
+        );
+        var answer_buf: [16]u8 = undefined;
+        const len = terminal_prompt.readLine(&answer_buf) catch 0;
+        switch (update_notice.parseChoice(answer_buf[0..len])) {
+            .update => if (installOfferedUpdate(init, allocator, found.prefix, state_root)) std.process.exit(0),
+            .skip_version => {
+                cache.skipped = latest;
+                update_notice.writeCache(allocator, state_root, cache);
+            },
+            .skip => {},
+        }
+    }
+    if (update_notice.due(found, cache, util_time.nowUnix())) update_notice.startCheck(found, state_root, cache);
+}
+
+fn installOfferedUpdate(init: std.process.Init, allocator: std.mem.Allocator, prefix: []const u8, state_root: []const u8) bool {
+    const update = @import("app/update.zig");
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buf);
+    const outcome = update.run(allocator, init.io, .{ .prefix = prefix, .state_dir = state_root, .environ = init.environ_map }, &stderr_writer.interface) catch |err| {
+        stderr_writer.interface.flush() catch {};
+        std.debug.print("error: update failed ({s}){s}{s}\n", .{ @errorName(err), if (updateHint(err).len > 0) ": " else "", updateHint(err) });
+        return false;
+    };
+    stderr_writer.interface.flush() catch {};
+    if (!outcome.changes()) return false;
+    std.debug.print("metacodes is now {s}; run `{s}` again to start it.\n", .{ outcome.to, invokedCommand(allocator) });
+    return true;
 }
 
 fn updateHint(err: anyerror) []const u8 {
@@ -5922,6 +5964,7 @@ test {
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");
     _ = &@import("app/update.zig");
+    _ = &@import("app/update_notice.zig");
     _ = &@import("app/kg_autostart.zig");
     _ = &@import("app/terminal_setup/jsonc.zig");
     _ = &@import("app/terminal_setup/files.zig");

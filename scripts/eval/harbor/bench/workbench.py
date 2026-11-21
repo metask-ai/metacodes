@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.batches import BATCH_ACTIVE, BatchManager, public as public_batch
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
@@ -86,6 +86,7 @@ class Workbench:
         self.manager = manager
         self.setups = SetupManager(manager.config_path) if manager else None
         self.logins = LoginManager(manager.config_path) if manager else None
+        self.builds = builds.BuildManager(manager.config_path) if manager else None
         if manager is not None:
             manager.setup_running = self.setups.mutating
             if getattr(manager, "batches", None) is None:
@@ -323,6 +324,43 @@ class Workbench:
 
     def setup_status(self) -> Dict[str, Any]:
         return {"setup": self.setups.latest() if self.setups else None}
+
+    def commits(self, query) -> Dict[str, Any]:
+        """A branch's commits by time, each with the bundle already built from it."""
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        cfg = settings(self.manager.config_path)
+        bench_dir = self.manager.config_path.parent
+        ref = query.get("ref") or "main"
+        until = query.get("until") or None
+        try:
+            limit = int(query.get("limit") or builds.COMMIT_PAGE)
+        except ValueError:
+            raise ValueError("limit 应为整数") from None
+        repo = cfg.get("source_repo")
+        found = builds.commits(bench_dir / "git", repo, ref, until, limit)
+        for entry in found:
+            unit = builds.unit_path(bench_dir, entry["commit"])
+            entry["bundle"] = unit.name if unit.is_dir() and builds.selectable(unit, repo) else None
+        return {"ref": ref, "until": until, "commits": found}
+
+    def start_build(self, request) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        if not isinstance(request, dict):
+            raise ValueError("请求应为对象")
+        executor = executors.find(settings(self.manager.config_path), request.get("executor"))
+        return self.builds.start(request, executor.name, runtime_env(), str(RUNTIME_ROOT))
+
+    def build_status(self) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return {"build": self.builds.latest()}
+
+    def cancel_build(self) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.builds.cancel()
 
     def start_login(self) -> Dict[str, Any]:
         if not self.manager:

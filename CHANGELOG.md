@@ -12,6 +12,25 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A bench batch can switch on advanced features.** The 新建 page of the
+  bench workbench has a 高级功能 section: the Lean-modelled run gates
+  (`--verification-final-gate`, `--requirement-ledger`, `--test-integrity`,
+  `--delivery-cadence`, `--stall-gate`) and the preview features
+  `execute_code`, `comment_guard` and `harnessmm`, all off by default. Every
+  trial of the batch runs with the ticked flags, and the batch page lists them.
+  `POST /api/batches` and `POST /api/runs` take them as `features`.
+  The bench node protocol is now 2: rerun `metacodes bench setup --executor
+  <name>` for each SSH executor.
+
+- **An interactive start offers a newer release.** Like Codex, `metacodes`
+  started as the TUI from a release install checks for a newer release in the
+  background at most once a day, and on a later start offers it: update now
+  (runs `metacodes update`, then exits so the new version starts next), skip,
+  or skip until the next version. `-p`, `serve`, `--web`, teammates and
+  development installs never check; `METACODES_NO_UPDATE_CHECK=1` or
+  `METACODES_NO_PROBE=1` turns it off. The state is
+  `<state root>/update-check.json`.
+
 - **`metacodes mcp add`, `mcp add-json` and `mcp remove`.** Install an MCP
   server from the command line: `mcp add <name> <url>` (or `-- <command>
   [<arg>...]` for a stdio server) writes it into `mcpServers` of
