@@ -193,8 +193,6 @@ const Breaker = struct {
 
 var breaker: Breaker = .{};
 
-// ── Process-wide memory of git's last answer ───────────────────────────────
-
 const StatusScope = union(enum) { everything, paths: usize };
 
 const StatusMemo = struct {
