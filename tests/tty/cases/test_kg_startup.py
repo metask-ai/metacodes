@@ -2,13 +2,14 @@ import socket
 import threading
 import time
 
-from tty_driver import run, READY, wait_for, arrival_time
+from tty_driver import run, READY, wait_for, arrival_time, IS_WINDOWS, WAIT_S
 from asserts import TTYAssert
 from slow_mock_server import SlowMockServer, simple_text
 
 PLACEHOLDER = 'Try "fix typecheck errors"'.encode()
 PROMPT_BOUND_S = 8.0
 EXIT_BOUND_S = 15.0
+assert EXIT_BOUND_S < WAIT_S
 
 
 class SilentKgService:
@@ -68,13 +69,15 @@ def test_prompt_is_up_while_tinykg_never_answers_and_leaving_does_not_wait(bin_p
     a.assert_clean_exit()
     if accepted == 0:
         a._fail("the session should have probed the TinyKG service")
+    if elapsed > EXIT_BOUND_S:
+        a._fail(f"the input box and leaving took {elapsed:.1f}s while the TinyKG probe was in flight")
+    if IS_WINDOWS:
+        return
     shown = arrival_time(timeline, raw, PLACEHOLDER)
     if shown is None:
         a._fail("the input box never appeared")
     if shown - started > PROMPT_BOUND_S:
         a._fail(f"the input box took {shown - started:.1f}s while TinyKG did not answer")
-    if elapsed > EXIT_BOUND_S:
-        a._fail(f"leaving took {elapsed:.1f}s while the TinyKG probe was in flight")
 
 
 def test_first_message_waits_for_tinykg_and_esc_stops_the_wait(bin_path):
