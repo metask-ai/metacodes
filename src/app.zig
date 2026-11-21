@@ -482,6 +482,7 @@ pub const App = struct {
     /// below Metask, `.env` keys of several providers and none chosen (#486).
     /// Borrowed from the host.
     startup_notice: ?[]const u8 = null,
+    command_name: []const u8 = "",
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -788,6 +789,7 @@ pub const App = struct {
         local_route: ?LocalRoute = null,
         /// `App.startup_notice`; borrowed for the App's life.
         startup_notice: ?[]const u8 = null,
+        command_name: []const u8 = "",
     };
 
     pub const LocalRoute = presets_mod.LocalRoute;
@@ -827,6 +829,7 @@ pub const App = struct {
             .unchosen_local_providers = options.unchosen_local_providers,
             .local_route = options.local_route,
             .startup_notice = options.startup_notice,
+            .command_name = options.command_name,
             .openrouter_background = options.models_cache and std.c.getenv("METACODES_NO_PROBE") == null,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
@@ -5632,13 +5635,104 @@ pub const App = struct {
         }
     }
 
+    pub fn beginMcpReconnect(app: *App, target: McpReconnectTarget) McpReconnectError!McpReconnectStart {
+        if (app.config.mcp_connect == .disabled) return error.McpDisabled;
+        if (app.tool_surface == .connecting) return error.McpStartupInProgress;
+        if (app.backgroundAgentsRunning()) return error.BackgroundAgentsRunning;
+        const arena_state = app.mcp_arena orelse blk: {
+            const created = try app.allocator.create(std.heap.ArenaAllocator);
+            created.* = std.heap.ArenaAllocator.init(app.allocator);
+            app.mcp_arena = created;
+            break :blk created;
+        };
+        const a = arena_state.allocator();
+        const select: mcp_startup.Select = switch (target) {
+            .server => |name| .{ .one = try a.dupe(u8, name) },
+            .unconnected => blk: {
+                const connected = try a.alloc([]const u8, app.mcp_sessions.items.len);
+                for (app.mcp_sessions.items, connected) |entry, *name| name.* = try a.dupe(u8, entry.name);
+                break :blk .{ .all_except = connected };
+            },
+        };
+        const startup = try mcp_startup.Startup.prepare(a, &app.mcp_status, .{
+            .io = app.io,
+            .state_root = app.stateRoot(),
+            .home = app.homeDir(),
+            .cwd = app.cwdAbs(),
+            .workspace_root = app.project_dir_or_empty(),
+            .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
+            .select = select,
+        });
+        if (startup.connecting == 0) switch (target) {
+            .server => |name| {
+                for (startup.pending) |pending| if (std.mem.eql(u8, pending.name, name))
+                    return .{ .not_configured = if (pending.reason == .needs_approval) .awaiting_approval else .rejected };
+                for (startup.disabled) |disabled| if (std.mem.eql(u8, disabled, name))
+                    return .{ .not_configured = .disabled };
+                return .{ .not_configured = .unknown };
+            },
+            .unconnected => {
+                app.registerMcpOutcomes(startup);
+                return .all_connected;
+            },
+        };
+        if (target == .server) app.disconnectMcpServer(target.server);
+        const names = try a.alloc([]const u8, startup.connecting);
+        var named: usize = 0;
+        for (startup.jobs) |*job| if (job.result != .kept) {
+            names[named] = job.server.name;
+            named += 1;
+        };
+        app.tool_defs = &.{};
+        app.enabled_tool_names = &.{};
+        app.mcp_status.reset();
+        startup.start();
+        app.tool_surface = .{ .connecting = startup };
+        return .{ .connecting = names };
+    }
+
+    pub fn cancelMcpReconnect(app: *App) !void {
+        switch (app.tool_surface) {
+            .connecting => |startup| startup.cancelAndJoin(),
+            .ready, .unbuilt => return,
+        }
+        try app.publishMcpServers();
+    }
+
+    fn backgroundAgentsRunning(app: *App) bool {
+        if (app.agent_jobs) |*jobs| if (jobs.runningCount() != 0) return true;
+        if (app.swarm.teammates) |*teammates| if (teammates.liveCount() != 0) return true;
+        return false;
+    }
+
+    fn disconnectMcpServer(app: *App, name: []const u8) void {
+        for (app.mcp_sessions.items, 0..) |*entry, index| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            app.dyn_registry.removeMcpServer(entry.name);
+            entry.session.deinit();
+            entry.client.close();
+            app.allocator.destroy(entry.client);
+            app.allocator.free(entry.name);
+            _ = app.mcp_sessions.orderedRemove(index);
+            return;
+        }
+    }
+
+    fn previousMcpStatus(previous: []const McpServerStatus, name: []const u8) ?McpServerStatus {
+        for (previous) |status| {
+            if (std.mem.eql(u8, status.name, name)) return status;
+        }
+        return null;
+    }
+
     /// Register every connected server's tools, in configuration order, and
     /// record each server's outcome in `mcp_report`. A client that cannot be
     /// registered is closed here; none is left without an owner.
     fn registerMcpOutcomes(app: *App, startup: *mcp_startup.Startup) void {
         const log = @import("util/log.zig");
         const a = app.mcp_arena.?.allocator();
-        var statuses = std.ArrayList(McpServerStatus).initCapacity(a, startup.jobs.len) catch null;
+        const previous = app.mcp_report.servers;
+        var statuses = std.ArrayList(McpServerStatus).initCapacity(a, startup.jobs.len + previous.len) catch null;
         for (startup.jobs) |*job| {
             var status = McpServerStatus{
                 .name = job.server.name,
@@ -5649,11 +5743,17 @@ pub const App = struct {
             };
             switch (job.result) {
                 .pending => unreachable, // joined: every job has settled
+                .kept => status = previousMcpStatus(previous, job.server.name) orelse .{
+                    .name = job.server.name,
+                    .origin = job.server.origin,
+                    .origin_path = job.server.origin_path,
+                    .detail = std.fmt.allocPrint(a, "configured after this session started; `/mcp reconnect {s}` connects it", .{job.server.name}) catch "configured after this session started",
+                },
                 .failed => |err| {
                     status.detail = mcp_startup.failureDetail(err, job);
                     if (err == error.McpAuthRequired) {
                         status.state = .needs_auth;
-                        status.detail = std.fmt.allocPrint(a, "the server requires authorization (401/403); run `metacodes mcp login {s}`, or configure a bearer token or headers", .{job.server.name}) catch status.detail;
+                        status.detail = std.fmt.allocPrint(a, "the server requires authorization (401/403); run `{s} mcp login {s}` (then `/mcp reconnect {s}`), or configure a bearer token or headers", .{ app.commandName(), job.server.name, job.server.name }) catch status.detail;
                     }
                     log.warn("mcp", "server '{s}' ({s}) failed: {s}", .{ job.server.name, job.server.origin.label(), status.detail });
                 },
@@ -5676,6 +5776,13 @@ pub const App = struct {
             }
             if (statuses) |*list| list.appendAssumeCapacity(status);
         }
+        for (previous) |old| {
+            if (old.state != .connected) continue;
+            const listed = for (startup.jobs) |*job| {
+                if (std.mem.eql(u8, job.server.name, old.name)) break true;
+            } else false;
+            if (!listed) if (statuses) |*list| list.appendAssumeCapacity(old);
+        }
         app.mcp_report = .{
             .servers = if (statuses) |list| list.items else &.{},
             .pending = startup.pending,
@@ -5683,6 +5790,45 @@ pub const App = struct {
             .problems = startup.problems,
         };
         app.mcp_unavailable = unavailableServers(a, app.mcp_report.servers);
+    }
+
+    pub fn mcpLateProbe(app: *App) ?@import("core/mcp_session.zig").McpLateProbe {
+        if (app.config.mcp_connect == .disabled) return null;
+        return .{ .ctx = app, .list = lateMcpServers };
+    }
+
+    fn lateMcpServers(raw: *anyopaque, arena: std.mem.Allocator) []const @import("core/mcp_session.zig").McpLate {
+        const McpLate = @import("core/mcp_session.zig").McpLate;
+        const app: *App = @ptrCast(@alignCast(raw));
+        if (!app.toolSurfaceReady()) return &.{};
+        const mcp_config = @import("mcp/config.zig");
+        const cwd = app.cwdAbs();
+        const workspace_root = app.project_dir_or_empty();
+        const resolved = mcp_config.load(arena, .{
+            .state_root = app.stateRoot(),
+            .home = app.homeDir(),
+            .cwd = cwd,
+            .workspace_root = if (workspace_root.len != 0) workspace_root else cwd,
+            .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
+            .env = mcp_config.Environment.fromProcess(arena) catch return &.{},
+        }) catch return &.{};
+        var late: std.ArrayList(McpLate) = .empty;
+        for (resolved.servers) |server| {
+            const known = previousMcpStatus(app.mcp_report.servers, server.name) orelse {
+                late.append(arena, .{ .name = server.name, .change = .added }) catch return late.items;
+                continue;
+            };
+            if (known.state != .needs_auth) continue;
+            const http = switch (server.transport) {
+                .http => |http| http,
+                .stdio => continue,
+            };
+            const path = @import("mcp/oauth.zig").storePath(arena, app.stateRoot(), server.name, http.url) catch continue;
+            const path_z = arena.dupeZ(u8, path) catch continue;
+            if (@import("platform").fs.exists(path_z.ptr))
+                late.append(arena, .{ .name = server.name, .change = .logged_in }) catch return late.items;
+        }
+        return late.items;
     }
 
     fn unavailableServers(a: std.mem.Allocator, servers: []const McpServerStatus) []const @import("core/mcp_session.zig").McpUnavailable {
@@ -5711,6 +5857,10 @@ pub const App = struct {
         return app.cliPromptInput(cwd).build(app.allocator);
     }
 
+    pub fn commandName(app: *const App) []const u8 {
+        return if (app.command_name.len != 0) app.command_name else @import("app/invocation.zig").default_command;
+    }
+
     pub fn cliPromptInput(app: *const App, cwd: []const u8) system_prompt_mod.CliPromptInput {
         return .{
             .model = app.promptModelName(),
@@ -5722,6 +5872,7 @@ pub const App = struct {
             .cwd = cwd,
             .tool_defs = app.tool_defs,
             .preview = app.config.preview.features(),
+            .command = app.command_name,
         };
     }
 
@@ -5856,6 +6007,24 @@ pub const ToolSurface = union(enum) {
     /// Every server's outcome is registered but the build has not happened
     /// (during `init`, or after it failed for lack of memory).
     unbuilt,
+};
+
+pub const McpReconnectTarget = union(enum) {
+    unconnected,
+    server: []const u8,
+};
+
+pub const McpReconnectStart = union(enum) {
+    connecting: []const []const u8,
+    all_connected,
+    not_configured: enum { unknown, awaiting_approval, rejected, disabled },
+};
+
+pub const McpReconnectError = error{
+    McpDisabled,
+    McpStartupInProgress,
+    BackgroundAgentsRunning,
+    OutOfMemory,
 };
 
 /// One configured MCP server and what became of it at startup (for /mcp).

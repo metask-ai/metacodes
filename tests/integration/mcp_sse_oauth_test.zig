@@ -528,7 +528,7 @@ test "MCP OAuth: configuration reaches the wire — startup connects an sse serv
                 std.debug.print("server {s} failed: {s}\n", .{ job.server.name, @errorName(err) });
                 return error.TestUnexpectedResult;
             },
-            .pending => unreachable,
+            .pending, .kept => unreachable,
         }
     }
     for (startup.jobs) |*job| {

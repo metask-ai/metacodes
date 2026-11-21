@@ -61,6 +61,21 @@ fn startHttpMock(child: *process.PipeChild) !?u16 {
     return std.fmt.parseInt(u16, port_buffer[0..length], 10) catch null;
 }
 
+fn lastToolResult(a: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+    const messages = parsed.object.get("messages").?.array.items;
+    const content = messages[messages.len - 1].object.get("content").?.array.items;
+    for (content) |block| {
+        if (!std.mem.eql(u8, block.object.get("type").?.string, "tool_result")) continue;
+        const result = block.object.get("content").?;
+        if (result == .string) return result.string;
+        var joined: std.ArrayList(u8) = .empty;
+        for (result.array.items) |part| if (part.object.get("text")) |text| try joined.appendSlice(a, text.string);
+        return joined.items;
+    }
+    return error.NoToolResult;
+}
+
 test "L2 a configured MCP server that answered 401 is named, with its remedy, by ToolSearch and by a call to its tool" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (std.c.access(MOCK_HTTP, 1) != 0) return error.SkipZigTest;
@@ -129,11 +144,11 @@ test "L2 a configured MCP server that answered 401 is named, with its remedy, by
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
 
     try std.testing.expectEqual(@as(usize, 3), server.requestCount());
-    const after_search = server.requestAt(1).?.body();
+    const after_search = try lastToolResult(aa, server.requestAt(1).?.body());
     try std.testing.expect(std.mem.indexOf(u8, after_search, "No deferred tool matched query") != null);
     try std.testing.expect(std.mem.indexOf(u8, after_search, NAMED) != null);
     try std.testing.expect(std.mem.indexOf(u8, after_search, REMEDY) != null);
-    const after_call = server.requestAt(2).?.body();
+    const after_call = try lastToolResult(aa, server.requestAt(2).?.body());
     try std.testing.expect(std.mem.indexOf(u8, after_call, "Tool 'mcp__locked__generate' does not exist") != null);
     try std.testing.expect(std.mem.indexOf(u8, after_call, NAMED) != null);
     try std.testing.expect(std.mem.indexOf(u8, after_call, REMEDY) != null);
@@ -229,4 +244,152 @@ test "L2 a server in ~/.metacode/config.toml starts with the session, is reporte
         try std.testing.expectEqual(@as(usize, 0), app.mcp_unavailable.len);
         try std.testing.expect((try cc.repl_headless.mcpUnavailableNotice(a, app.mcp_unavailable)) == null);
     }
+}
+
+const SEARCH_FRESH_SSE = toolUseSse("tu_search", "ToolSearch", "{\\\"query\\\":\\\"fresh\\\"}");
+const CALL_FRESH_SSE = toolUseSse("tu_call", "mcp__fresh__generate", "{}");
+const ADDED = "'fresh' (added to the configuration)";
+const LOGGED_IN = "'locked' (a login has been stored for it)";
+const LOAD = "The user loads one with `/mcp reconnect <name>` in this session, or by starting a new session.";
+
+fn runSearchAndCall(app: *cc.app_module.App, prompt: []const u8) !void {
+    try app.conversation.appendText(.user, prompt);
+    var options = cc.session_service.buildRunOptions(app, null);
+    options.max_turns = 4;
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const backend = render.backend();
+    const result = try cc.agent_loop.run(&app.conversation, app.provider(), app.tool_defs, &app.permission_ctx, options, &backend, app.allocator);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+}
+
+test "L2 a server added to the configuration after the session started is named, with how to load it, by ToolSearch and by a call to its tool" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    try tmp.dir.createDirPath(std.testing.io, ".metacodes");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".metacodes/config.json", .data = "{}" });
+
+    const home_z = try a.dupeZ(u8, root);
+    defer a.free(home_z);
+    var guards = [_]EnvGuard{
+        try EnvGuard.set("HOME", home_z.ptr),
+        try EnvGuard.set("METACODES_NO_PROBE", "1"),
+        try EnvGuard.set("METACODES_KG_AUTOSTART", "0"),
+        try EnvGuard.set("CODEX_HOME", null),
+    };
+    defer {
+        var i = guards.len;
+        while (i > 0) {
+            i -= 1;
+            guards[i].restore();
+        }
+    }
+
+    const bodies = [_][]const u8{ SEARCH_FRESH_SSE, CALL_FRESH_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const url_z = try aa.dupeZ(u8, url);
+    const argv = [_][*:0]const u8{ "metacodes", "--permission", "bypassPermissions", "--base-url", url_z.ptr, "--model", "test-model" };
+    const parsed = cc.parseArgsForTest(&argv, aa);
+    try std.testing.expect(parsed.parse_error == null);
+    var io_rt = @import("platform").signal.threadedIo(aa, .{});
+    defer io_rt.deinit();
+    const app = try cc.app_module.App.init(aa, io_rt.io(), parsed, "test-key");
+    defer app.deinit();
+    try std.testing.expectEqual(@as(usize, 0), app.mcp_report.servers.len);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".metacodes/config.json", .data = "{\"mcpServers\":{\"fresh\":{\"type\":\"http\",\"url\":\"http://127.0.0.1:9/mcp\"}}}" });
+    try runSearchAndCall(app, "make a song with fresh");
+
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    const after_search = try lastToolResult(aa, server.requestAt(1).?.body());
+    try std.testing.expect(std.mem.indexOf(u8, after_search, "No deferred tool matched query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, ADDED) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, LOAD) != null);
+    const after_call = try lastToolResult(aa, server.requestAt(2).?.body());
+    try std.testing.expect(std.mem.indexOf(u8, after_call, "Tool 'mcp__fresh__generate' does not exist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_call, ADDED) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_call, LOAD) != null);
+}
+
+test "L2 a server that needed a login, logged in to after the session started, is named as such instead of with the login command" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (std.c.access(MOCK_HTTP, 1) != 0) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    var child: process.PipeChild = undefined;
+    const port = (try startHttpMock(&child)) orelse return error.SkipZigTest;
+    defer {
+        child.closeStdin();
+        child.closeStdout();
+        child.terminate();
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    try tmp.dir.createDirPath(std.testing.io, ".metacodes/mcp-oauth");
+    const server_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/auth", .{port});
+    defer a.free(server_url);
+    const config = try std.fmt.allocPrint(a, "{{\"mcpServers\":{{\"locked\":{{\"type\":\"http\",\"url\":\"{s}\"}}}}}}", .{server_url});
+    defer a.free(config);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".metacodes/config.json", .data = config });
+
+    const home_z = try a.dupeZ(u8, root);
+    defer a.free(home_z);
+    var guards = [_]EnvGuard{
+        try EnvGuard.set("HOME", home_z.ptr),
+        try EnvGuard.set("METACODES_NO_PROBE", "1"),
+        try EnvGuard.set("METACODES_KG_AUTOSTART", "0"),
+        try EnvGuard.set("CODEX_HOME", null),
+    };
+    defer {
+        var i = guards.len;
+        while (i > 0) {
+            i -= 1;
+            guards[i].restore();
+        }
+    }
+
+    const bodies = [_][]const u8{ SEARCH_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const url_z = try aa.dupeZ(u8, url);
+    const argv = [_][*:0]const u8{ "metacodes", "--permission", "bypassPermissions", "--base-url", url_z.ptr, "--model", "test-model" };
+    const parsed = cc.parseArgsForTest(&argv, aa);
+    try std.testing.expect(parsed.parse_error == null);
+    var io_rt = @import("platform").signal.threadedIo(aa, .{});
+    defer io_rt.deinit();
+    const app = try cc.app_module.App.init(aa, io_rt.io(), parsed, "test-key");
+    defer app.deinit();
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_unavailable.len);
+
+    const state_root = try std.fs.path.join(aa, &.{ root, ".metacodes" });
+    const login_path = try cc.mcp_oauth.storePath(aa, state_root, "locked", server_url);
+    const relative = login_path[root.len + 1 ..];
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = relative, .data = "{}" });
+    try runSearchAndCall(app, "make a song with locked");
+
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const after_search = try lastToolResult(aa, server.requestAt(1).?.body());
+    try std.testing.expect(std.mem.indexOf(u8, after_search, LOGGED_IN) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, LOAD) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, REMEDY) == null);
 }
