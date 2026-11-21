@@ -2317,8 +2317,10 @@ name the model sees.
 3. Core safety (`core_safety`): a `Write` or `Edit` of a protected path
    (`.git/`, `.ssh/`, `.aws/`, `.gnupg/`, `.env`, shell profiles, ...) asks, a
    `Bash` command that reads a credential store (`security
-   find-generic-password`, `find-internet-password` or `dump-keychain`, or
-   `secret-tool`) asks, and MCP arguments that fail the tool's schema deny. Such a prompt never offers
+   find-generic-password`, `find-internet-password`, `dump-keychain` or
+   `export`, a `security` subcommand the shell computes, or `secret-tool`,
+   matched after quote removal) asks, and MCP arguments that fail the tool's
+   schema deny. Such a prompt never offers
    `allow_session`.
 4. A matching Session deny grant (`session_deny`).
 5. Any matching **ask** rule (`explicit_ask`).

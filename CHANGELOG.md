@@ -52,9 +52,10 @@ status, compatibility boundaries, and entry points are defined by
   stderr by `-p`, and in `--json` as `mcp_unavailable`.
 
 - **Reading a credential store from Bash always asks.** A command that runs
-  `security find-generic-password`/`find-internet-password`/`dump-keychain` or
-  `secret-tool` prompts even under an allow rule for `Bash` or in
-  `bypassPermissions`; a deny rule still denies.
+  `security find-generic-password`/`find-internet-password`/`dump-keychain`/
+  `export`, a `security` subcommand the shell computes, or `secret-tool`
+  prompts even under an allow rule for `Bash` or in `bypassPermissions`,
+  however it is quoted or escaped; a deny rule still denies.
 
 ## 0.13.0 — 2026-11-20
 
