@@ -12,6 +12,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Teamwork launches its own Manager.** Configure `seats.manager` as a
+  `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
+  `resume` and `/teamwork` start that Manager CLI themselves. It runs in the
+  sandbox with only its seat directory writable and only the teamwork MCP
+  tools allowed; the controller that reviews, audits and merges stays in the
+  metacodes process. Its allowance is held in the run's budget before it
+  starts and settled by its reported cost; a Manager stopped without a report
+  is charged the whole allowance, and a crash never grants it twice. Cancel or
+  an exhausted budget stops the Manager and the workers without merging, and
+  the Manager dies with its controller. MCP snapshots now report
+  `budget.held_usd` and `budget.manager` (`none`, `run_ledger`, or
+  `outside_ledger` for a `teamwork mcp` client, whose spend the cap does not
+  include).
+
 - **Teamwork progress.** A teamwork run reports every seat status change and
   phase change with a snapshot of the run: the REPL draws a panel above the
   input box (goal, `N/M done · $spent / $cap`, one line per seat with its

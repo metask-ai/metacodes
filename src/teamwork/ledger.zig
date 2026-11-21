@@ -85,6 +85,8 @@ pub const Ledger = struct {
     path: [:0]u8,
     pending_path: [:0]u8,
     pending_seat: ?types.SeatId = null,
+    hold_seat: ?types.SeatId = null,
+    held_usd: f64 = 0,
     cap_usd: f64,
     spent_usd: f64 = 0,
     wallclock_ms: u64 = 0,
@@ -105,15 +107,17 @@ pub const Ledger = struct {
         errdefer gpa.free(pending_path);
         var self: Ledger = .{ .path = path_z, .pending_path = pending_path, .cap_usd = cap_usd };
 
-        const pending_bytes = try readAll(gpa, pending_path);
-        defer if (pending_bytes) |bytes| gpa.free(bytes);
-        const pending: ?Entry = if (pending_bytes) |bytes| try parseEntry(gpa, bytes) else null;
-        const entries_before = if (pending_bytes) |bytes| try pendingBefore(gpa, bytes) else 0;
-        if (pending) |entry| {
-            if (entry.cost != .reserved) return error.CorruptLedger;
-            self.pending_seat = entry.seat_id;
+        var hold_buf: PathBuf = undefined;
+        const hold_path = try holdPath(&hold_buf, path_z);
+        const pending = try Receipt.read(gpa, pending_path);
+        const held = try Receipt.read(gpa, hold_path);
+        if (pending) |receipt| self.pending_seat = receipt.entry.seat_id;
+        if (held) |receipt| {
+            self.hold_seat = receipt.entry.seat_id;
+            self.held_usd = receipt.entry.cost.usd().?;
         }
-        var settled = false;
+        var pending_settled = false;
+        var hold_settled = false;
 
         if (try readAll(gpa, path_z)) |bytes| {
             defer gpa.free(bytes);
@@ -123,26 +127,13 @@ pub const Ledger = struct {
                 if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
                 const entry = try parseEntry(gpa, line);
                 self.add(entry);
-                if (pending) |p| if (self.entries > entries_before and p.seat_id.eql(entry.seat_id)) {
-                    settled = true;
-                };
+                if (pending) |receipt| pending_settled = pending_settled or receipt.settledBy(entry, self.entries);
+                if (held) |receipt| hold_settled = hold_settled or receipt.settledBy(entry, self.entries);
             }
             if (complete_len != bytes.len) try truncate(path_z, complete_len);
         }
-        if (pending) |entry| {
-            if (entries_before > self.entries) return error.CorruptLedger;
-            if (settled) {
-                pfs.unlinkPath(pending_path.ptr) catch return error.RepairFailed;
-                self.pending_seat = null;
-            } else {
-                // The controller died after admission but before a durable
-                // result. Never give a fresh dollar allowance to that seat.
-                self.charge(entry) catch |err| switch (err) {
-                    error.BudgetExhausted => {},
-                    else => return error.RepairFailed,
-                };
-            }
-        }
+        if (pending) |receipt| try self.recover(receipt, pending_settled, pending_path);
+        if (held) |receipt| try self.recover(receipt, hold_settled, hold_path);
         return self;
     }
 
@@ -152,38 +143,46 @@ pub const Ledger = struct {
         self.* = undefined;
     }
 
+    /// The controller died after admission but before a durable result.
+    /// Never give a fresh dollar allowance to that seat.
+    fn recover(self: *Ledger, receipt: Receipt, settled: bool, receipt_path: [:0]const u8) LoadError!void {
+        if (receipt.entries_before > self.entries) return error.CorruptLedger;
+        if (settled) {
+            pfs.unlinkPath(receipt_path.ptr) catch return error.RepairFailed;
+            if (self.pending_seat) |id| if (id.eql(receipt.entry.seat_id)) {
+                self.pending_seat = null;
+            };
+            if (self.hold_seat) |id| if (id.eql(receipt.entry.seat_id)) {
+                self.hold_seat = null;
+                self.held_usd = 0;
+            };
+            return;
+        }
+        self.charge(receipt.entry) catch |err| switch (err) {
+            error.BudgetExhausted => {},
+            else => return error.RepairFailed,
+        };
+    }
+
     /// Persist admission before any paid work. An interrupted controller
     /// consumes this allowance on reopen; a durable charge settles it.
     /// The live seat still receives the full remaining cap.
     pub fn reserve(self: *Ledger, seat_id: types.SeatId, harness: types.Harness) ChargeError!void {
         if (self.isExhausted()) return error.BudgetExhausted;
         if (self.pending_seat != null) return error.WriteFailed;
-        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{self.pending_path}) catch return error.WriteFailed;
-        // Installation can leave both names hard-linked after a crash. Never
-        // truncate the stale temp: it may still be the admitted receipt.
-        pfs.unlinkPath(tmp.ptr) catch |err| switch (err) {
-            error.NotFound => {},
-            error.UnlinkFailed => return error.WriteFailed,
-        };
-        defer pfs.unlinkPath(tmp.ptr) catch {};
-        var buf: [1024]u8 = undefined;
-        const bytes = formatEntry(&buf, .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = 0, .cost = .{ .reserved = self.remainingUsd() } });
-        // A verifier may be retried with the same logical seat id after a
-        // crash. Only a charge after this receipt can settle this admission.
-        const suffix = std.fmt.bufPrint(buf[bytes.len - 2 ..], ",\"entries_before\":{d}}}\n", .{self.entries}) catch unreachable;
-        {
-            const fd = pfs.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600);
-            if (fd < 0) return error.WriteFailed;
-            defer pfs.close(fd);
-            if (!pfs.writeAll(fd, buf[0 .. bytes.len - 2 + suffix.len])) return error.WriteFailed;
-            pfs.fsyncChecked(fd) catch return error.WriteFailed;
-        }
-        switch (pfs.installNoReplace(tmp.ptr, self.pending_path.ptr) catch return error.WriteFailed) {
-            .moved, .linked => {},
-            .already_exists => return error.WriteFailed,
-        }
+        try install(self.pending_path, .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = 0, .cost = .{ .reserved = self.remainingUsd() } }, self.entries);
         self.pending_seat = seat_id;
+    }
+
+    pub fn hold(self: *Ledger, seat_id: types.SeatId, harness: types.Harness, usd: f64) ChargeError!void {
+        if (!std.math.isFinite(usd) or usd <= 0) return error.InvalidAmount;
+        if (usd >= self.remainingUsd()) return error.BudgetExhausted;
+        if (self.hold_seat != null) return error.WriteFailed;
+        var hold_buf: PathBuf = undefined;
+        const hold_path = holdPath(&hold_buf, self.path) catch return error.WriteFailed;
+        try install(hold_path, .{ .seat_id = seat_id, .harness = harness, .wallclock_ms = 0, .cost = .{ .reserved = usd } }, self.entries);
+        self.hold_seat = seat_id;
+        self.held_usd = usd;
     }
 
     /// Append `entry` durably, then add it to the totals. Returns
@@ -206,6 +205,13 @@ pub const Ledger = struct {
             pfs.unlinkPath(self.pending_path.ptr) catch return error.WriteFailed;
             self.pending_seat = null;
         };
+        if (self.hold_seat) |hold_id| if (hold_id.eql(entry.seat_id)) {
+            var hold_buf: PathBuf = undefined;
+            const hold_path = holdPath(&hold_buf, self.path) catch return error.WriteFailed;
+            pfs.unlinkPath(hold_path.ptr) catch return error.WriteFailed;
+            self.hold_seat = null;
+            self.held_usd = 0;
+        };
         if (self.isExhausted()) {
             // `host_failure`: a host-side stop, not a user cancellation.
             if (self.abort_on_exhaustion) |signal| signal.abort(.host_failure);
@@ -214,13 +220,14 @@ pub const Ledger = struct {
     }
 
     pub fn isExhausted(self: *const Ledger) bool {
-        return self.spent_usd >= self.cap_usd;
+        return self.spent_usd + self.held_usd >= self.cap_usd;
     }
 
-    /// What is left of the cap, never negative. A metacodes seat receives
-    /// this as its subagent `cost_budget_usd`.
+    /// What is left of the cap after the spend and the hold, never
+    /// negative. A metacodes seat receives this as its subagent
+    /// `cost_budget_usd`.
     pub fn remainingUsd(self: *const Ledger) f64 {
-        return @max(self.cap_usd - self.spent_usd, 0);
+        return @max(self.cap_usd - self.spent_usd - self.held_usd, 0);
     }
 
     fn add(self: *Ledger, entry: Entry) void {
@@ -230,9 +237,62 @@ pub const Ledger = struct {
     }
 };
 
+const PathBuf = [std.fs.max_path_bytes]u8;
+
+pub const hold_suffix = ".hold";
+
+fn holdPath(buf: *PathBuf, path: []const u8) error{PathTooLong}![:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}" ++ hold_suffix, .{path}) catch error.PathTooLong;
+}
+
+const Receipt = struct {
+    entry: Entry,
+    entries_before: usize,
+
+    fn read(gpa: std.mem.Allocator, path: [:0]const u8) LoadError!?Receipt {
+        const bytes = try readAll(gpa, path) orelse return null;
+        defer gpa.free(bytes);
+        const entry = try parseEntry(gpa, bytes);
+        if (entry.cost != .reserved) return error.CorruptLedger;
+        return .{ .entry = entry, .entries_before = try pendingBefore(gpa, bytes) };
+    }
+
+    /// Only a charge after the receipt settles it: a retried seat keeps its
+    /// logical id, so an older charge of the same id does not count.
+    fn settledBy(self: Receipt, entry: Entry, entries: usize) bool {
+        return entries > self.entries_before and self.entry.seat_id.eql(entry.seat_id);
+    }
+};
+
+fn install(receipt_path: [:0]const u8, entry: Entry, entries_before: usize) ChargeError!void {
+    var tmp_buf: PathBuf = undefined;
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{receipt_path}) catch return error.WriteFailed;
+    // Installation can leave both names hard-linked after a crash. Never
+    // truncate the stale temp: it may still be the admitted receipt.
+    pfs.unlinkPath(tmp.ptr) catch |err| switch (err) {
+        error.NotFound => {},
+        error.UnlinkFailed => return error.WriteFailed,
+    };
+    defer pfs.unlinkPath(tmp.ptr) catch {};
+    var buf: [1024]u8 = undefined;
+    const bytes = formatEntry(&buf, entry);
+    const suffix = std.fmt.bufPrint(buf[bytes.len - 2 ..], ",\"entries_before\":{d}}}\n", .{entries_before}) catch unreachable;
+    {
+        const fd = pfs.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600);
+        if (fd < 0) return error.WriteFailed;
+        defer pfs.close(fd);
+        if (!pfs.writeAll(fd, buf[0 .. bytes.len - 2 + suffix.len])) return error.WriteFailed;
+        pfs.fsyncChecked(fd) catch return error.WriteFailed;
+    }
+    switch (pfs.installNoReplace(tmp.ptr, receipt_path.ptr) catch return error.WriteFailed) {
+        .moved, .linked => {},
+        .already_exists => return error.WriteFailed,
+    }
+}
+
 fn pendingBefore(gpa: std.mem.Allocator, bytes: []const u8) LoadError!usize {
-    const Receipt = struct { entries_before: usize };
-    const parsed = std.json.parseFromSlice(Receipt, gpa, bytes, .{ .ignore_unknown_fields = true }) catch |err| return switch (err) {
+    const Before = struct { entries_before: usize };
+    const parsed = std.json.parseFromSlice(Before, gpa, bytes, .{ .ignore_unknown_fields = true }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.CorruptLedger,
     };
@@ -584,4 +644,40 @@ test "ledger: a torn last line is dropped and truncated; a corrupt complete line
 
     try writeRaw(path, "{\"seat_id\":\"reviewer-1\",\"harness\":\"claude_code\",\"usd\":null,\"wallclock_ms\":1,\"source\":\"harness_reported\"}\n");
     try testing.expectError(error.CorruptLedger, Ledger.load(testing.allocator, path, 10));
+}
+
+test "ledger: a manager hold is kept from the other seats, settled by its charge, and consumed once after a crash" {
+    var root = TestRoot.init("cc-zig-teamwork-manager-hold");
+    defer root.deinit();
+    var pbuf: [512]u8 = undefined;
+    const path = ledgerPath(&pbuf, &root);
+    var hold_buf: PathBuf = undefined;
+    const hold_path = try holdPath(&hold_buf, path);
+    {
+        var ledger = try Ledger.load(testing.allocator, path, 5);
+        defer ledger.deinit(testing.allocator);
+        try ledger.hold(seat("manager-1"), .claude_code, 2);
+        try testing.expectEqual(@as(f64, 3), ledger.remainingUsd());
+        try testing.expectError(error.WriteFailed, ledger.hold(seat("manager-2"), .claude_code, 1));
+        try ledger.reserve(seat("implementer-1"), .claude_code);
+        const receipt = (try readAll(testing.allocator, ledger.pending_path)).?;
+        defer testing.allocator.free(receipt);
+        try testing.expectEqual(@as(f64, 3), (try parseEntry(testing.allocator, receipt)).cost.usd().?);
+        try ledger.charge(.{ .seat_id = seat("implementer-1"), .harness = .claude_code, .wallclock_ms = 1, .cost = .{ .harness_reported = 1 } });
+        try testing.expectEqual(@as(f64, 2), ledger.remainingUsd());
+        try ledger.charge(.{ .seat_id = seat("manager-1"), .harness = .claude_code, .wallclock_ms = 1, .cost = .{ .harness_reported = 0.5 } });
+        try testing.expect(!pfs.exists(hold_path.ptr));
+        try testing.expectEqual(@as(f64, 3.5), ledger.remainingUsd());
+        try testing.expectError(error.BudgetExhausted, ledger.hold(seat("manager-2"), .claude_code, 3.5));
+        try ledger.hold(seat("manager-2"), .claude_code, 2);
+    }
+    for (0..2) |_| {
+        var reopened = try Ledger.load(testing.allocator, path, 5);
+        defer reopened.deinit(testing.allocator);
+        try testing.expectEqual(@as(f64, 3.5), reopened.spent_usd);
+        try testing.expectEqual(@as(usize, 3), reopened.entries);
+        try testing.expectEqual(@as(f64, 0), reopened.held_usd);
+        try testing.expect(reopened.hold_seat == null);
+        try testing.expect(!pfs.exists(hold_path.ptr));
+    }
 }
