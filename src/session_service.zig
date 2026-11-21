@@ -679,6 +679,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .skills_set = &app.skills,
         .mcp_sessions = &app.mcp_sessions.items,
         .mcp_unavailable = app.mcp_unavailable,
+        .mcp_late = app.mcpLateProbe(),
         .cron_registry = &app.cron_registry,
         .sandbox = app.sandboxPtr(),
         .cwd_abs = app.cwdAbs(),

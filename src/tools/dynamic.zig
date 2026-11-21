@@ -111,6 +111,20 @@ pub const DynRegistry = struct {
         self.entries.shrinkRetainingCapacity(checkpoint);
     }
 
+    pub fn removeMcpServer(self: *DynRegistry, server: []const u8) void {
+        var kept: usize = 0;
+        for (self.entries.items) |entry| {
+            const owned = if (entry.mcp_server) |name| std.mem.eql(u8, name, server) else false;
+            if (owned) {
+                self.freeEntry(entry);
+                continue;
+            }
+            self.entries.items[kept] = entry;
+            kept += 1;
+        }
+        self.entries.shrinkRetainingCapacity(kept);
+    }
+
     /// 注册（转移字符串所有权）。name 不能与已有冲突。
     /// deferred: MCP 工具传 true(经 ToolSearch 激活才发);Skill 等常驻工具传 false。
     pub fn register(
@@ -418,6 +432,26 @@ test "DynRegistry: MCP provenance is owned and propagated" {
     try r.appendDefinitions(&defs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), defs.items.len);
     try testing.expectEqualStrings("allowed", defs.items[0].mcp_server.?);
+}
+
+test "DynRegistry: removing one MCP server drops exactly its tools and keeps the order" {
+    var r = DynRegistry.init(testing.allocator);
+    defer r.deinit();
+    try r.register("Skill", "skill", &.{}, dummyExec, null, false);
+    try r.registerMcp("mcp__a__one", "a1", &.{"x"}, dummyExec, null, "a");
+    try r.registerMcp("mcp__b__one", "b1", &.{}, dummyExec, null, "b");
+    try r.registerMcp("mcp__a__two", "a2", &.{}, dummyExec, null, "a");
+    try r.registerMcp("mcp__ab__one", "ab1", &.{}, dummyExec, null, "ab");
+    r.removeMcpServer("a");
+    var names: [3][]const u8 = undefined;
+    try testing.expectEqual(names.len, r.entries.items.len);
+    for (r.entries.items, &names) |e, *name| name.* = e.name;
+    try testing.expectEqualStrings("Skill", names[0]);
+    try testing.expectEqualStrings("mcp__b__one", names[1]);
+    try testing.expectEqualStrings("mcp__ab__one", names[2]);
+    try testing.expect(r.find("mcp__a__one") == null);
+    r.removeMcpServer("missing");
+    try testing.expectEqual(@as(usize, 3), r.entries.items.len);
 }
 
 fn dummyExecBody(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror!ToolResultBody {

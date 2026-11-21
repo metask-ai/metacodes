@@ -665,8 +665,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             }
             continue;
         }
-        if (std.mem.eql(u8, trimmed, "/mcp")) {
-            try handleMcp(app);
+        if (std.mem.eql(u8, trimmed, "/mcp") or std.mem.startsWith(u8, trimmed, "/mcp ")) {
+            const rest = std.mem.trim(u8, trimmed["/mcp".len..], " \t");
+            if (rest.len == 0) {
+                try handleMcp(app);
+            } else if (parseMcpReconnect(rest)) |target| {
+                try handleMcpReconnect(&turn_host, target);
+            } else {
+                cmd_output.print("usage: /mcp [reconnect [<server>]]\n", .{});
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/teamwork") or std.mem.startsWith(u8, trimmed, "/teamwork ") or std.mem.startsWith(u8, trimmed, "/teamwork\n")) {
@@ -901,15 +908,20 @@ fn turnBackend(host: *const TurnHost, region: *render_region_mod.RenderRegion) t
 
 /// What the spinner says while a request waits on MCP servers.
 const MCP_WAIT_VERB = "Connecting to MCP servers";
+const MCP_RECONNECT_VERB = "Reconnecting MCP servers";
 
 /// Wait, inside a generating phase, until every MCP server has reported. On
 /// a tty the spinner names the wait and the input watcher keeps Esc, Ctrl+C
 /// and queued typing working; elsewhere SIGINT interrupts it. False when the
 /// user interrupted (the servers go on connecting).
 fn waitForMcpServers(host: *const TurnHost, tb: ?*tui_backend_mod.TuiBackend) bool {
+    return waitForMcpConnects(host, tb, MCP_WAIT_VERB);
+}
+
+fn waitForMcpConnects(host: *const TurnHost, tb: ?*tui_backend_mod.TuiBackend, verb: []const u8) bool {
     const app = host.app;
     if (app.mcpStartupSettled()) return !app.abort.isAborted();
-    const previous_verb: ?[]const u8 = if (host.region) |r| r.setSpinnerVerb(MCP_WAIT_VERB) else null;
+    const previous_verb: ?[]const u8 = if (host.region) |r| r.setSpinnerVerb(verb) else null;
     defer if (host.region) |r| {
         _ = r.setSpinnerVerb(previous_verb.?);
     };
@@ -925,6 +937,12 @@ const MCP_WAIT_POLL_MS = 50;
 /// `runTurn` (`/<skill>`, `/btw`, `/recap`): the spinner shows while servers
 /// still connect. False when the user interrupted the wait (reported here).
 fn awaitMcpServers(host: *const TurnHost) !bool {
+    return awaitMcpConnects(host, .startup);
+}
+
+const McpWait = enum { startup, reconnect };
+
+fn awaitMcpConnects(host: *const TurnHost, wait: McpWait) !bool {
     const app = host.app;
     if (app.toolSurfaceReady()) return true;
     if (!app.mcpStartupSettled()) {
@@ -937,10 +955,20 @@ fn awaitMcpServers(host: *const TurnHost) !bool {
         defer if (raw) |o| input.restoreMode(host.stdin_fd, o);
         var tui_be: ?tui_backend_mod.TuiBackend = if (region) |r| turnBackend(host, r) else null;
         defer if (tui_be) |*tb| tb.deinit();
-        if (!waitForMcpServers(host, if (tui_be) |*tb| tb else null)) {
+        const verb = switch (wait) {
+            .startup => MCP_WAIT_VERB,
+            .reconnect => MCP_RECONNECT_VERB,
+        };
+        if (!waitForMcpConnects(host, if (tui_be) |*tb| tb else null, verb)) {
             if (region) |r| leaveGenerationRegion(app, r);
             app.abort.reset();
-            cmd_output.print("Interrupted · MCP servers are still connecting (see /mcp)\n", .{});
+            switch (wait) {
+                .startup => cmd_output.print("Interrupted · MCP servers are still connecting (see /mcp)\n", .{}),
+                .reconnect => {
+                    try app.cancelMcpReconnect();
+                    cmd_output.print("Interrupted · reconnect canceled (see /mcp)\n", .{});
+                },
+            }
             return false;
         }
     }
@@ -4021,7 +4049,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         cmd_output.print("Skills:           {d}\n", .{app.skills.len()});
         cmd_output.print("Subagents:        {d}\n", .{app.agents.len()});
         if (app.mcpStartupInFlight()) |startup| {
-            cmd_output.print("MCP servers:      {d} connecting (see /mcp)\n", .{startup.jobs.len});
+            cmd_output.print("MCP servers:      {d} connecting (see /mcp)\n", .{startup.connecting});
         } else {
             cmd_output.print("MCP servers:      {d}\n", .{app.mcp_sessions.items.len});
         }
@@ -5151,30 +5179,7 @@ fn handleMcp(app: *app_mod.App) !void {
         return;
     }
     cmd_output.print("MCP servers ({d}):\n", .{report.servers.len});
-    for (report.servers) |server| {
-        switch (server.state) {
-            .connected => cmd_output.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  {d} tools as mcp__{s}__*  \x1b[2m(MCP {s}; {s})\x1b[0m\n", .{
-                server.name, server.tool_count, server.name, server.protocol, server.origin.label(),
-            }),
-            .failed => cmd_output.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
-                server.name, server.detail, server.origin.label(),
-            }),
-            .needs_auth => cmd_output.print("  \x1b[33m!\x1b[0m \x1b[36m{s}\x1b[0m  needs authentication: {s}  \x1b[2m({s})\x1b[0m\n", .{
-                server.name, server.detail, server.origin.label(),
-            }),
-        }
-        cmd_output.print("      \x1b[2m{s}{s}{s}\x1b[0m\n", .{
-            server.origin_path,
-            if (server.log_path.len != 0) "  log: " else "",
-            server.log_path,
-        });
-        // The tool list sent to the model is fixed for the session (it is part
-        // of the cached prompt); a server-announced change applies on restart.
-        for (app.mcp_sessions.items) |entry| {
-            if (std.mem.eql(u8, entry.name, server.name) and entry.client.tools_changed.load(.acquire))
-                cmd_output.print("      \x1b[33mthe server changed its tools; restart the session to use the new list\x1b[0m\n", .{});
-        }
-    }
+    for (report.servers) |server| printMcpServer(app, server);
     for (report.pending) |pending| {
         switch (pending.reason) {
             .needs_approval => cmd_output.print("  \x1b[33m○\x1b[0m \x1b[36m{s}\x1b[0m  awaiting approval (project {s}); add \"{s}\" to \"enabledMcpjsonServers\" in {s}/config.json\n", .{
@@ -5191,6 +5196,80 @@ fn handleMcp(app: *app_mod.App) !void {
             problem.server,
             problem.message,
         });
+    }
+}
+
+fn printMcpServer(app: *const app_mod.App, server: app_mod.McpServerStatus) void {
+    switch (server.state) {
+        .connected => cmd_output.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  {d} tools as mcp__{s}__*  \x1b[2m(MCP {s}; {s})\x1b[0m\n", .{
+            server.name, server.tool_count, server.name, server.protocol, server.origin.label(),
+        }),
+        .failed => cmd_output.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
+            server.name, server.detail, server.origin.label(),
+        }),
+        .needs_auth => cmd_output.print("  \x1b[33m!\x1b[0m \x1b[36m{s}\x1b[0m  needs authentication: {s}  \x1b[2m({s})\x1b[0m\n", .{
+            server.name, server.detail, server.origin.label(),
+        }),
+    }
+    cmd_output.print("      \x1b[2m{s}{s}{s}\x1b[0m\n", .{
+        server.origin_path,
+        if (server.log_path.len != 0) "  log: " else "",
+        server.log_path,
+    });
+    for (app.mcp_sessions.items) |entry| {
+        if (std.mem.eql(u8, entry.name, server.name) and entry.client.tools_changed.load(.acquire))
+            cmd_output.print("      \x1b[33mthe server changed its tools; `/mcp reconnect {s}` uses the new list\x1b[0m\n", .{server.name});
+    }
+}
+
+fn parseMcpReconnect(rest: []const u8) ?app_mod.McpReconnectTarget {
+    var words = std.mem.tokenizeAny(u8, rest, " \t");
+    const verb = words.next() orelse return null;
+    if (!std.mem.eql(u8, verb, "reconnect")) return null;
+    const name = words.next() orelse return .unconnected;
+    if (words.next() != null) return null;
+    return .{ .server = name };
+}
+
+fn handleMcpReconnect(host: *const TurnHost, target: app_mod.McpReconnectTarget) !void {
+    const app = host.app;
+    if (!try awaitMcpServers(host)) return;
+    const begun = app.beginMcpReconnect(target) catch |err| {
+        switch (err) {
+            error.BackgroundAgentsRunning => cmd_output.print("{s}Background agents or teammates are running, and they share this session's MCP tools; reconnect once they have finished.{s}\n", .{ app.theme.warn, app.theme.reset }),
+            error.McpDisabled => cmd_output.print("MCP servers are off in this session.\n", .{}),
+            error.McpStartupInProgress => cmd_output.print("MCP servers are still connecting (see /mcp).\n", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
+        }
+        return;
+    };
+    switch (begun) {
+        .all_connected => {
+            app.mcp_status.acknowledged.store(true, .release);
+            if (app.mcp_report.servers.len == 0)
+                cmd_output.print("No MCP servers configured (see /mcp; `{s} mcp add` adds one).\n", .{app.commandName()})
+            else
+                cmd_output.print("Every configured MCP server is connected; `/mcp reconnect <server>` restarts one.\n", .{});
+        },
+        .not_configured => |reason| {
+            const name = target.server;
+            switch (reason) {
+                .unknown => cmd_output.print("No MCP server named '{s}' is configured (see /mcp; `{s} mcp add` adds one).\n", .{ name, app.commandName() }),
+                .awaiting_approval => cmd_output.print("'{s}' is a project server awaiting approval; add \"{s}\" to \"enabledMcpjsonServers\" in {s}/config.json, then reconnect.\n", .{ name, name, app.stateRoot() }),
+                .rejected => cmd_output.print("'{s}' is rejected by disabledMcpjsonServers.\n", .{name}),
+                .disabled => cmd_output.print("'{s}' is disabled in the MCP configuration.\n", .{name}),
+            }
+        },
+        .connecting => |names| {
+            if (!try awaitMcpConnects(host, .reconnect)) return;
+            app.mcp_status.acknowledged.store(true, .release);
+            cmd_output.print("Reconnected {d} MCP {s}:\n", .{ names.len, if (names.len == 1) "server" else "servers" });
+            for (names) |name| {
+                for (app.mcp_report.servers) |server| {
+                    if (std.mem.eql(u8, server.name, name)) printMcpServer(app, server);
+                }
+            }
+        },
     }
 }
 
@@ -5212,6 +5291,9 @@ fn printMcpConnecting(app: *const app_mod.App, startup: *const @import("../app/m
         }
         switch (job.result) {
             .pending => {},
+            .kept => for (app.mcp_report.servers) |server| {
+                if (std.mem.eql(u8, server.name, name)) printMcpServer(app, server);
+            },
             .connected => cmd_output.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  connected; its tools load with your first message  \x1b[2m({s})\x1b[0m\n", .{ name, origin }),
             .failed => |err| if (err == error.McpAuthRequired)
                 cmd_output.print("  \x1b[33m!\x1b[0m \x1b[36m{s}\x1b[0m  needs authentication: {s}  \x1b[2m({s})\x1b[0m\n", .{ name, failure_detail(err, job), origin })

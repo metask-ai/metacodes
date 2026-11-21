@@ -12,6 +12,25 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`metacodes mcp add`, `mcp add-json` and `mcp remove`.** Install an MCP
+  server from the command line: `mcp add <name> <url>` (or `-- <command>
+  [<arg>...]` for a stdio server) writes it into `mcpServers` of
+  `<state root>/config.json`, changing only that member, atomically and with
+  mode 0600. Claude Code's and Codex's spellings of the command work too. An
+  entry no session could use is refused; a configured name needs `--force`.
+  After writing, `add` connects the server once and says what it found (for a
+  401, the `mcp login` command). `remove` also forgets the server's stored
+  login. `mcp list` now checks each server (`--no-check` skips it) and says
+  `auth: not logged in` instead of `auth: none`.
+
+- **`/mcp reconnect [<name>]`.** A running REPL reads the MCP configuration
+  again and connects every server that is not connected (one added or logged
+  in to since the session started, or one that failed), or restarts the named
+  one. The tool list and system prompt are rebuilt once, so the next request
+  misses the prompt cache once; nothing else changes the tool list mid-session.
+  Esc or Ctrl+C cancels, and a reconnect is refused while a background agent or
+  teammate runs.
+
 - **Teamwork launches its own Manager.** Configure `seats.manager` as a
   `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
   `resume` and `/teamwork` start that Manager CLI themselves. It runs in the
@@ -43,6 +62,20 @@ status, compatibility boundaries, and entry points are defined by
   and stay empty under `--check`. The exit code stays 3 (#646).
 
 ### Changed
+
+- **The CLI tells the model which command it is.** The environment section of
+  the system prompt names the command that started the session (the launcher
+  name, `metacodes-dev` for a side-by-side install), says that `metacode` and
+  other similarly named programs are different products, and how MCP servers
+  are added, logged in to and loaded. A session asked to install an MCP server
+  had run another product's CLI, whose login metacodes cannot use. The `mcp`
+  subcommand's hints, and `/mcp`'s, name the same command.
+
+- **ToolSearch and unknown `mcp__` tools name servers that changed after the
+  session started.** Besides the servers that did not connect, the result now
+  reads the configuration again and names a server added since, or one that
+  needed a login and has one now, with `/mcp reconnect <name>` or a new session
+  as the way to load it; a logged-in server is no longer sent to `mcp login`.
 
 - **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
   `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after

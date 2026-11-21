@@ -302,6 +302,20 @@ fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd
     return try buf.toOwnedSlice(allocator);
 }
 
+const SIMILAR_PRODUCT_COMMAND = "metacode";
+
+fn commandLines(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
+    const others = if (std.mem.eql(u8, command, SIMILAR_PRODUCT_COMMAND))
+        "Other programs with similar names"
+    else
+        "`" ++ SIMILAR_PRODUCT_COMMAND ++ "` and other programs with similar names";
+    return std.fmt.allocPrint(allocator,
+        \\ - Your command is `{[c]s}`: use it for anything about yourself (`{[c]s} --help`). {[o]s} are different products.
+        \\ - MCP servers: `{[c]s} mcp add <name> <url>` (or `{[c]s} mcp add <name> -- <command> [<arg>...]`) adds one, `{[c]s} mcp login <name>` stores an OAuth login for it, `{[c]s} mcp list` shows each one's state. Servers connect when a session starts; one added or logged in to during this session is used after the user runs `/mcp reconnect <name>` or starts a new session.
+        \\
+    , .{ .c = command, .o = others });
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -620,9 +634,18 @@ pub const CliPromptInput = struct {
     cwd: []const u8,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition,
     preview: @import("../preview.zig").Features = .none,
+    command: []const u8 = "",
 
     fn generate(input: CliPromptInput, allocator: std.mem.Allocator) !GeneratedSections {
-        return GeneratedSections.init(allocator, input.model, input.skills, input.agents, input.enabled_tool_names, input.memdir_abs, input.kg_ready, input.cwd, input.tool_defs, true);
+        var generated = try GeneratedSections.init(allocator, input.model, input.skills, input.agents, input.enabled_tool_names, input.memdir_abs, input.kg_ready, input.cwd, input.tool_defs, true);
+        if (input.command.len == 0) return generated;
+        errdefer generated.deinit(allocator);
+        const lines = try commandLines(allocator, input.command);
+        defer allocator.free(lines);
+        const env = try std.mem.concat(allocator, u8, &.{ generated.env, lines });
+        allocator.free(generated.env);
+        generated.env = env;
+        return generated;
     }
 
     pub fn build(input: CliPromptInput, allocator: std.mem.Allocator) ![]u8 {
@@ -1277,6 +1300,20 @@ fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skil
 // ============================================================================
 
 const testing = std.testing;
+
+test "the CLI command lines name the command, and never call the command itself another product" {
+    const lines = try commandLines(testing.allocator, "metacodes-dev");
+    defer testing.allocator.free(lines);
+    try testing.expect(std.mem.startsWith(u8, lines, " - Your command is `metacodes-dev`: use it for anything about yourself (`metacodes-dev --help`)."));
+    try testing.expect(std.mem.indexOf(u8, lines, "`metacode` and other programs with similar names are different products.") != null);
+    try testing.expect(std.mem.indexOf(u8, lines, "`metacodes-dev mcp login <name>`") != null);
+    try testing.expect(std.mem.endsWith(u8, lines, "starts a new session.\n"));
+
+    const same = try commandLines(testing.allocator, "metacode");
+    defer testing.allocator.free(same);
+    try testing.expect(std.mem.indexOf(u8, same, "Other programs with similar names are different products.") != null);
+    try testing.expect(std.mem.indexOf(u8, same, "`metacode` and other") == null);
+}
 
 test "build produces non-empty prompt with MetaCode identity" {
     const s = try build(testing.allocator, "claude-opus-4-7", "/tmp");

@@ -1833,6 +1833,7 @@ pub fn main(init: std.process.Init) !void {
         // decided by.
         .local_route = local_route,
         .startup_notice = startup_notice,
+        .command_name = invokedCommand(allocator),
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
@@ -2795,7 +2796,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
-    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "providers")) return @import("app/providers_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
@@ -5547,8 +5548,10 @@ fn printHelp() void {
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
         \\                        Bind Shift+Enter to a newline in Apple Terminal or VS Code (and forks),
         \\                        after a backup; --restore undoes it (terminal-setup --help for more)
-        \\  mcp login <server> [--no-browser] | mcp logout <server> | mcp list
-        \\                        OAuth login for an HTTP or SSE MCP server (stored, refreshed per session)
+        \\  mcp add <name> --url <url> | mcp add <name> -- <command> [<arg>...] | mcp remove <name>
+        \\  | mcp list | mcp login <server> [--no-browser] | mcp logout <server>
+        \\                        Install an MCP server in config.json (checked on the spot), list each
+        \\                        server's state, OAuth login for HTTP ones; mcp --help for more
         \\  providers add <id> --base-url <url> --protocol <wire> [--model <id>]... [--probe] | providers probe <id>
         \\  | providers list | providers remove <id>
         \\                        A model API of your own (a relay, a gateway, a local server), in config.json;
@@ -6036,6 +6039,7 @@ test {
     _ = &@import("mcp/conformance.zig");
     _ = &@import("mcp/result_commit_test.zig");
     _ = &@import("app/mcp_cli.zig");
+    _ = &@import("app/mcp_config_edit.zig");
     _ = &@import("app/terminal_prompt.zig");
     _ = &@import("app/providers_cli.zig");
     _ = &@import("util/toml.zig");

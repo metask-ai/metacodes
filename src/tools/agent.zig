@@ -538,6 +538,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .additional_dirs = effective_additional_dirs,
             .mcp_sessions = effective_mcp_sessions,
             .mcp_unavailable = ctx.mcp_unavailable,
+            .mcp_late = ctx.mcp_late,
         },
         &be,
     );

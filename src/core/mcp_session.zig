@@ -21,15 +21,60 @@ pub const McpUnavailable = struct {
 const MAX_LISTED_UNAVAILABLE: usize = 8;
 const MAX_DETAIL_BYTES: usize = 300;
 
+pub const McpLate = struct {
+    name: []const u8,
+    change: Change,
+
+    pub const Change = enum { added, logged_in };
+};
+
+pub const McpLateProbe = struct {
+    ctx: *anyopaque,
+    list: *const fn (ctx: *anyopaque, arena: std.mem.Allocator) []const McpLate,
+
+    pub fn late(self: McpLateProbe, arena: std.mem.Allocator) []const McpLate {
+        return self.list(self.ctx, arena);
+    }
+};
+
 pub fn writeUnavailable(w: *std.Io.Writer, servers: []const McpUnavailable) std.Io.Writer.Error!void {
-    if (servers.len == 0) return;
-    try w.writeAll(" MCP servers configured for this session that did not connect, so none of their tools exist here:");
-    for (servers[0..@min(servers.len, MAX_LISTED_UNAVAILABLE)]) |server| {
+    return writeNotice(w, servers, &.{});
+}
+
+pub fn writeNotice(w: *std.Io.Writer, unavailable: []const McpUnavailable, late: []const McpLate) std.Io.Writer.Error!void {
+    var listed: usize = 0;
+    var unlisted: usize = 0;
+    for (unavailable) |server| {
+        if (lateChange(late, server.name) != null) continue;
+        if (listed == MAX_LISTED_UNAVAILABLE) {
+            unlisted += 1;
+            continue;
+        }
+        if (listed == 0) try w.writeAll(" MCP servers configured for this session that did not connect, so none of their tools exist here:");
         const detail = server.detail[0..@min(server.detail.len, MAX_DETAIL_BYTES)];
         try w.print(" '{s}' ({s});", .{ server.name, detail });
+        listed += 1;
     }
-    if (servers.len > MAX_LISTED_UNAVAILABLE) try w.print(" and {d} more;", .{servers.len - MAX_LISTED_UNAVAILABLE});
-    try w.writeAll(" a new session picks them up once fixed. Tell the user what each one needs; do not reach these servers another way (hand-written requests, tokens copied from other programs or credential stores).");
+    if (unlisted != 0) try w.print(" and {d} more;", .{unlisted});
+    if (listed != 0) try w.writeAll(" Once one is fixed, `/mcp reconnect` in this session (or a new session) picks it up.");
+    if (late.len != 0) {
+        try w.writeAll(" MCP servers that changed after this session started, so their tools are not here yet:");
+        for (late[0..@min(late.len, MAX_LISTED_UNAVAILABLE)]) |server| try w.print(" '{s}' ({s});", .{ server.name, switch (server.change) {
+            .added => "added to the configuration",
+            .logged_in => "a login has been stored for it",
+        } });
+        if (late.len > MAX_LISTED_UNAVAILABLE) try w.print(" and {d} more;", .{late.len - MAX_LISTED_UNAVAILABLE});
+        try w.writeAll(" The user loads one with `/mcp reconnect <name>` in this session, or by starting a new session.");
+    }
+    if (listed != 0 or late.len != 0)
+        try w.writeAll(" Tell the user what each one needs; do not reach these servers another way (hand-written requests, tokens copied from other programs or credential stores).");
+}
+
+fn lateChange(late: []const McpLate, name: []const u8) ?McpLate.Change {
+    for (late) |server| {
+        if (std.mem.eql(u8, server.name, name)) return server.change;
+    }
+    return null;
 }
 
 test "unavailable servers are named with their cause and what the user should do" {
@@ -57,4 +102,29 @@ test "a long list of unavailable servers is bounded" {
     try std.testing.expectEqual(MAX_LISTED_UNAVAILABLE, std.mem.count(u8, text, "'s' ("));
     try std.testing.expect(std.mem.indexOf(u8, text, "x" ** (MAX_DETAIL_BYTES + 1)) == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "and 3 more;") != null);
+}
+
+test "servers that changed after the session started are named with the change, and a logged-in one is not sent to log in" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeNotice(&out.writer, &.{
+        .{ .name = "suno", .detail = "the server requires authorization (401/403); run `metacodes mcp login suno`" },
+        .{ .name = "local", .detail = "spawn failed" },
+    }, &.{
+        .{ .name = "suno", .change = .logged_in },
+        .{ .name = "fresh", .change = .added },
+    });
+    const text = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "'local' (spawn failed);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcp login suno") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "'suno' (a login has been stored for it);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "'fresh' (added to the configuration);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`/mcp reconnect <name>`") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Tell the user what each one needs"));
+
+    var only_late: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer only_late.deinit();
+    try writeNotice(&only_late.writer, &.{}, &.{.{ .name = "fresh", .change = .added }});
+    try std.testing.expect(std.mem.indexOf(u8, only_late.written(), "did not connect") == null);
+    try std.testing.expect(std.mem.indexOf(u8, only_late.written(), "'fresh' (added to the configuration);") != null);
 }

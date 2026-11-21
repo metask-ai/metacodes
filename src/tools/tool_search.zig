@@ -218,7 +218,10 @@ fn setMissDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, query: [
         try w.writeAll(" Use the tools already in your tool list.");
     }
     if (deferred.len > 0) try w.print(" Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{deferred});
-    try mcp_session.writeUnavailable(w, ctx.mcp_unavailable);
+    var late_arena = std.heap.ArenaAllocator.init(allocator);
+    defer late_arena.deinit();
+    const late = if (ctx.mcp_late) |probe| probe.late(late_arena.allocator()) else &.{};
+    try mcp_session.writeNotice(w, ctx.mcp_unavailable, late);
     slot.* = try out.toOwnedSlice();
 }
 

@@ -225,6 +225,65 @@ and the shared `.claude/settings.json` can reject but not approve. A Codex
 project layer is read only when `$CODEX_HOME/config.toml` marks the project
 `trust_level = "trusted"`.
 
+### Adding and removing servers
+
+`metacodes mcp add` writes one entry into `mcpServers` of
+`<state root>/config.json`, the first source above, and `metacodes mcp remove`
+takes it out again (`src/app/mcp_config_edit.zig`):
+
+```sh
+metacodes mcp add docs https://example.com/mcp --header X-Team=core
+metacodes mcp add linear --type sse https://mcp.linear.app/sse
+metacodes mcp add github --env 'GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_TOKEN}' -- npx -y @modelcontextprotocol/server-github
+metacodes mcp add-json tracker '{"type":"http","url":"https://t.example/mcp","oauth":{"clientId":"cli"}}'
+metacodes mcp remove docs
+```
+
+A URL (positional or `--url`) makes an HTTP server (Streamable HTTP, or
+`--type sse`) and takes `--header <name>=<value>`; a command makes a stdio
+server and takes `--env <name>=<value>`. Claude Code's and Codex's spellings
+of the same command work as well (`-t/--transport`, `-e`, `-H "Name: value"`,
+`-s user|local`, `--bearer-token-env-var`, `--client-id`, `--callback-port`),
+so a command copied from a server's install page for either of them installs
+the server here. `-s project` is refused with a pointer to `.mcp.json`, and
+`--client-secret` is refused because metacodes logs in as a public client.
+`add-json` takes the whole entry as one JSON object, in the shape of
+[Entry fields](#entry-fields). Values may name `${VAR}`, expanded when a
+session starts, so a token need not be written into the file.
+
+Before writing, `add` reads the entry the way a session will and refuses one
+no session could use (exit 2), naming the loader's problem. The edit is a
+read-modify-write under the file's lock: only that one member changes, every
+other key (`jev`, a legacy `mcp_servers` array, provider settings) keeps its
+value and place, and the file is replaced atomically with mode 0600. A name
+already configured — in that file, its legacy array, or another source the
+entry would shadow — is refused unless `--force`. `remove` edits only
+`mcpServers`: a legacy entry or another program's file is explained, not
+changed. It also forgets the server's stored login, unless a server of the
+same name and URL is still configured.
+
+After writing, `add` connects the server once, as a session would (its stored
+login included, its log left alone), and prints what happened: the number of
+tools, or for a 401 the `mcp login` command to run (`--no-check` skips the
+check). New sessions connect the server; a running REPL connects it with
+`/mcp reconnect <name>`. `metacodes mcp list` shows each configured server, the
+file it comes from, its transport, how a URL server authenticates
+(`auth: configured`, `auth: OAuth (<issuer>)`, an expired login, or
+`auth: not logged in`, which says no credential is stored, not that the server
+needs none) and, unless `--no-check`, whether it connects now. Every hint
+these commands print names the command that ran them (`metacodes-dev mcp login`
+for a side-by-side install), as the other next-step hints do (#482).
+
+The interactive and headless CLI tell the model the same in the environment
+section of the system prompt: that its command is the one that started it
+(not `metacode`, a different product, nor any other similarly named program),
+that `<command> mcp add`, `mcp login` and `mcp list` manage MCP servers, and
+that a server added or logged in to during a session is used after
+`/mcp reconnect <name>` or in a new session. The lines name the command only;
+they carry no path or server, so they stay the same for every session of an
+install. A host that builds an App without the CLI's command name (the daemon,
+an embedder) gets no such lines.
+
 ### Entry fields
 
 ```json
@@ -468,15 +527,33 @@ state so far (`connecting… 3s`), without waiting for them.
 The model is told as well: when ToolSearch finds nothing, or the model calls
 an `mcp__…` tool that does not exist, the result names the configured servers
 that did not connect with the reason `/mcp` shows (for a 401, the
-`metacodes mcp login` command), says that a new session picks them up, and
-asks the model to tell the user instead of reaching the server another way.
-Nothing about them enters the system prompt. A `-p` run prints one
+`metacodes mcp login` command), says that `/mcp reconnect` or a new session
+picks them up, and asks the model to tell the user instead of reaching the
+server another way. The same result reads the configuration again at that
+moment and names the servers that changed since the session's MCP state was
+last published: one added to the configuration (by `mcp add`, an edit, another
+program), and one that needed a login and has a stored login now. A logged-in
+server is not sent to `mcp login` again. Both are loaded by
+`/mcp reconnect <name>` or a new session. Nothing about them enters the
+system prompt. A `-p` run prints one
 `warning: MCP server '<name>' did not connect: <reason>` line per such server
 to stderr before it starts, and `--json` adds them to the result line as
 `mcp_unavailable`.
-The tool list is fixed for a session (it is part of the cached prompt); when a
-server announces `notifications/tools/list_changed`, `/mcp` says so and the new
-list applies after a restart.
+The tool list is part of the cached prompt, so it changes only when the user
+asks: `/mcp reconnect` reads the configuration again and connects every
+configured server that is not connected (one added since the session started,
+one that failed, one logged in to since), and `/mcp reconnect <name>` closes
+that server's connection, if it has one, and connects it again. The spinner
+reads `Reconnecting MCP servers`; Esc or Ctrl+C cancels the connects that have
+not finished, and the outcome is published either way. Servers not named keep
+their connection and their place in `/mcp`, including a connected one whose
+entry has since been removed (it goes when the session ends). The tool list
+and system prompt are rebuilt once, so the next request misses the prompt
+cache once; with every server connected nothing is rebuilt. A reconnect is
+refused while a background agent or an in-process teammate runs, since they
+share the session's MCP tools. When a server announces
+`notifications/tools/list_changed`, `/mcp` says so, and `/mcp reconnect <name>`
+loads the new list.
 
 ## Tests and evaluations
 
