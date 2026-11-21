@@ -52,8 +52,7 @@
 //! turn was sent again and charged again. `keepServerOpen` makes those
 //! requests say `connection: keep-alive` instead: the server leaves the
 //! connection open, the client reads what it needs (a stream's terminal event,
-//! or the end of a framed body) and closes it. Other requests are left as they
-//! are.
+//! or the end of a framed body) and closes it.
 
 const std = @import("std");
 const version = @import("../version.zig");

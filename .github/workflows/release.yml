@@ -26,6 +26,8 @@ on:
         required: true
         type: boolean
         default: true
+  schedule:
+    - cron: "0 17 * * *"
 
 permissions:
   contents: read
@@ -406,7 +408,7 @@ jobs:
   publish:
     name: Draft release
     needs: [build-posix, build-windows, windows-arm-cross]
-    if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
     timeout-minutes: 20
     runs-on: ubuntu-latest
     # The only job that can write to the repository, and only through the

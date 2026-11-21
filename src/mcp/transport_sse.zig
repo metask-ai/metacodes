@@ -170,6 +170,7 @@ pub const SseTransport = struct {
                 .keep_alive = false,
             }) catch return error.McpConnectFailed;
             self.stream_open = true;
+            http_connection.keepServerOpen(&self.stream_request);
             const ctx: *anyopaque = @ptrCast(&self.stream_request);
             try self.registry.registerMonitored(self.allocator, self.abort, ctx, shutdownRequest, self.remainingMs());
             const status = head: {

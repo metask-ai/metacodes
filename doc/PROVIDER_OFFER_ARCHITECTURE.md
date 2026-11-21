@@ -1193,8 +1193,13 @@ it closes (#606). At the prompt `Ctrl+C` closes it whatever it shows, like a
 cancel (`kept …`), and leaves the draft; the next `Ctrl+C` arms the exit as
 usual (#607). `Ctrl+D`, and `Ctrl+C` during a reply, deliberately pass through,
 so there is always an exit that does not depend on the picker's own state
-machine. Every printable key is the filter, `q` included, so a search can
-start with any letter (#599); Esc clears the filter, then closes.
+machine; over a draft that is not empty `Ctrl+D` does nothing, so it cannot
+delete a character of it (#649). Every printable key is the filter, `q`
+included, so a search can start with any letter (#599); Esc clears the filter,
+then closes. A bracketed paste is one edit of the filter, at the prompt and
+during a reply alike: the text up to its first line break is appended, control
+characters dropped, the draft stays as it was, and a paste never applies a
+model (#650).
 
 Enter commits at the scope the header brackets. Session is the default, and
 `Tab` cycles session → global → once, so any durable write is an explicit act

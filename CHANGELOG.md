@@ -67,6 +67,43 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
+  a draft whose cursor was not at its end, Ctrl+D went past the picker and
+  deleted the character under the cursor, at the prompt and in the box under a
+  reply. Now it does nothing while the draft has text; on an empty prompt it
+  still counts toward the double-press exit, so the picker never traps the
+  session.
+
+- **A paste with the `/model` picker open goes to its filter** (#650). At the
+  prompt the pasted text landed in the draft under the picker; during a reply
+  it reached the picker key by key, so a newline in it was Enter and applied
+  the model under the cursor, moving the bill to that provider. Now, at the
+  prompt and during a reply, the text up to the paste's first line break is
+  added to the filter as one edit, control characters dropped; the draft is
+  untouched and a paste never applies a model.
+
+- **Shift+Tab cycles the permission mode in terminals that report modified
+  keys.** iTerm2 3.7.7 and later, Ghostty, kitty, Alacritty and tmux with
+  `extended-keys` send Shift+Tab as the kitty protocol's `ESC [ 9 ; 2 u` or
+  xterm modifyOtherKeys' `ESC [ 27 ; 2 ; 9 ~` instead of `ESC [ Z`, and the
+  TUI ignored both. The key parser now reads both forms through one table, so
+  modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
+  their CSI u forms do (#643).
+
+- **`/logout` and the notice under the banner follow `.env`'s
+  `METACODES_PRESET`** (#489). Signed in to Metask with a `.env` that names a
+  preset, `/logout` moved the session to the file's `METACODES_PROVIDER` (or
+  the one provider whose key it holds), or left it without a model when the
+  file named only the preset, while the next start used the preset (level 6
+  of the startup order). The notice under the banner named that provider, or
+  nothing. Both now take the file's choice as a start does: its preset when
+  `config.json` defines it, with the preset's reasoning effort and the file's
+  `METACODES_MODEL` if it sets one, else its provider. The notice reads
+  `.env configures the preset fast (DeepSeek · deepseek-v4-pro); the default
+  is Metask. To use it: /model, or /logout`. A preset whose provider has no
+  key leaves the session without a model after `/logout`, as a start on it
+  does, instead of falling to the file's provider.
+
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
   instead of the filter, Esc only switched the editor to NORMAL mode, and
@@ -82,8 +119,28 @@ status, compatibility boundaries, and entry points are defined by
   under a picker that stayed open, and a second Ctrl+C left metacodes. Now
   the first Ctrl+C at the prompt closes the picker whatever it shows, as Esc
   does on an empty filter (`kept …`), and the draft stays; the next Ctrl+C
-  arms the exit as before. During a reply Ctrl+C still interrupts it, and
-  Ctrl+D is unchanged.
+  arms the exit as before. During a reply Ctrl+C still interrupts it. Ctrl+D
+  leaves a non-empty draft alone, as described above.
+
+- **Bench listeners stop listening when they are closed** (#659). On Linux,
+  closing a socket does not wake a thread blocked in `accept`, so a closed
+  egress proxy or Docker-gateway forwarder kept its port open and relayed one
+  more connection after its run ended, and the Colima relay check left its
+  probe port open. They are now shut down before they are closed.
+
+- **The permission and question dialogs take Esc and Ctrl+C in every
+  encoding** (#657). Both dialogs looked only at the first byte of each read.
+  A terminal with the kitty keyboard protocol on (Alacritty, Windows Terminal
+  and iTerm2 over ssh since metacodes 0.9.0; iTerm2 3.7.7 and later, Ghostty
+  and kitty) sends Ctrl+C as `ESC [ 99 ; 5 u` and Esc as `ESC [ 27 u`, and
+  the dialogs dropped both: Ctrl+C no longer refused in the permission
+  dialog, and neither key cancelled the question dialog, whose footer says
+  `Esc to cancel`. Keys that arrived in one read were cut to the first, so
+  `abc` typed fast into "Type something" was answered as `a`. The dialogs now
+  read keys through the prompt's key parser: these keys act as their one-byte
+  forms do, and every key of a read counts. A bracketed paste never answers
+  a dialog: the permission dialog ignores it, and the question dialog types
+  it into "Type something" or the note being edited, line breaks as spaces.
 
 - **The prompt's shortcuts work with `/vim` on** (#660). Only Ctrl+C and
   Ctrl+D reached them: in INSERT mode Shift+Tab, Ctrl+O, Ctrl+R, Ctrl+T,
@@ -116,8 +173,23 @@ status, compatibility boundaries, and entry points are defined by
   requests answered that way. Every answer is now received and read through
   `api/http_connection.zig`: a body-less answer reads as empty at once, and
   its connection is closed instead of drained, so it is not reused. The
-  System-One advisor, TinyKG, sealed skills and OTLP export still say
+  System-One advisor, TinyKG, sealed skills and OTLP export said
   `connection: close`, so nothing waited there; they no longer depend on it.
+
+- **System-One, TinyKG, sealed skills, OTLP export and the legacy MCP SSE
+  stream no longer ask the server to close the connection** (#661). Like the
+  model requests before #573, they said `connection: close`, and a server
+  told so closes right after its last byte; behind a transparent proxy that
+  close can overtake bytes the proxy has not forwarded yet. An answer cut that
+  way read as malformed from System-One and as invalid from TinyKG, and it
+  failed a sealed skill's call, whose result is the last message of its
+  stream: the part #573 lost. Some MCP hosts drop a request that says
+  `connection: close` without answering, and the legacy SSE stream's GET said
+  it. These requests now ask the server to keep the connection open
+  (`http_connection.keepServerOpen`) and close it themselves once they have
+  the answer; no connection is reused. `zig build test:keep-server-open`, part
+  of `gate:static`, refuses a request with `keep_alive = false` that does not
+  make that call before it is sent.
 
 ## 0.13.0 — 2026-11-20
 

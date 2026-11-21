@@ -48,6 +48,7 @@ const input = @import("../input.zig");
 const app_mod = @import("../../app.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
 const picker_host = @import("../picker_host.zig");
+const model_picker = @import("../model_picker.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
@@ -613,6 +614,7 @@ pub const TuiBackend = struct {
         // 重启后先把草稿重新交给 region:对话框期间没人动它,框里应该照旧是这份草稿和光标。
         self.region.setGenInput(editor.view(), editor.cursor);
         var dead_reads: u32 = 0; // 连续"poll 可读却读不到字节"计数(终端 hangup 检测)
+        var picker_paste: ?model_picker.PastedLine = null;
 
         while (!self.input_stop.load(.acquire)) {
             _ = input.reconcileAfterResume(fd);
@@ -624,9 +626,9 @@ pub const TuiBackend = struct {
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
-                    self.handleKey(snap, k, editor);
+                    self.routeKey(snap, k, editor, &picker_paste);
                     // Alt+] 兑现成 ESC 后,']'(和其后的数字)在 pending 里。
-                    while (parser.drain()) |k2| self.handleKey(snap, k2, editor);
+                    while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &picker_paste);
                 } else {
                     // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
@@ -662,10 +664,31 @@ pub const TuiBackend = struct {
             dead_reads = 0;
 
             const key = parser.feedRead(fd, b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
-            self.handleKey(snap, key, editor);
+            self.routeKey(snap, key, editor, &picker_paste);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
-            while (parser.drain()) |k2| self.handleKey(snap, k2, editor);
+            while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &picker_paste);
         }
+    }
+
+    fn routeKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor, paste: *?model_picker.PastedLine) void {
+        if (paste.*) |*line| {
+            if (key != .paste_end) {
+                if (input.pastedByte(key)) |byte| line.add(byte);
+                return;
+            }
+            const pasted = line.*;
+            paste.* = null;
+            const app = snap.app orelse return;
+            if (!self.region.pickerOpen()) return;
+            picker_host.onPaste(app, &self.region.ui, pasted.text(), .of(self.region));
+            self.region.redrawGen(app);
+            return;
+        }
+        if (key == .paste_begin and self.region.pickerOpen()) {
+            paste.* = .{};
+            return;
+        }
+        self.handleKey(snap, key, ed);
     }
 
     /// 中断当前推理(Esc / 原始字节 Ctrl+C 共用):置 abort + 真的 shutdown 在飞连接 + 停 agent job。
@@ -847,4 +870,33 @@ test "tool_result(Edit): renderCardResult 用 region.cols(回归:diff 矩形填�
     const opts = backend.cardResultOpts();
     try std.testing.expectEqual(@as(u16, 123), opts.cols); // cols 必须从 region 流入(非 0)
     try std.testing.expectEqual(true, opts.verbose);
+}
+
+test "a paste during a reply reaches an open picker as one event: no key of it, a line break included, is fed on its own (#650)" {
+    const a = std.testing.allocator;
+    var region = RenderRegion.init(a, 2, theme_mod.monochrome, .none);
+    defer region.deinit();
+    region.beginInput(.builtin);
+    var backend = TuiBackend.init(&region);
+    var editor = input.LineEditor.init(a);
+    defer editor.deinit();
+    try editor.setLine("queued draft");
+    const snap: InputCtx.Snapshot = .{ .fd = 0, .app = null, .alloc = a };
+    var paste: ?model_picker.PastedLine = null;
+
+    region.ui.interaction().?.picker_open = true;
+    backend.routeKey(snap, .paste_begin, &editor, &paste);
+    try std.testing.expect(paste != null);
+    for ("zai") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
+    backend.routeKey(snap, .enter, &editor, &paste);
+    backend.routeKey(snap, .{ .char = 'x' }, &editor, &paste);
+    try std.testing.expectEqualStrings("zai", paste.?.text());
+    try std.testing.expect(paste.?.ended);
+    backend.routeKey(snap, .paste_end, &editor, &paste);
+    try std.testing.expect(paste == null);
+    try std.testing.expectEqualStrings("queued draft", editor.view());
+
+    region.ui.interaction().?.picker_open = false;
+    backend.routeKey(snap, .paste_begin, &editor, &paste);
+    try std.testing.expect(paste == null);
 }

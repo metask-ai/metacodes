@@ -1,6 +1,6 @@
 """T08/T10/T11:shift+tab 切模式 / 提交本地命令 / 退出清理。"""
 from tty_driver import run, submit, READY, wait_for
-from asserts import TTYAssert
+from asserts import AssertError, TTYAssert
 
 # /help opens Claude Code's Help pane (tabs General / Commands / Custom
 # commands); Esc closes it and leaves `⎿  Help dialog dismissed` under the echo.
@@ -30,6 +30,21 @@ def test_T08b_shift_tab_cycle_closes_after_accept_edits(bin_path):
         a._fail("无 footer 行")
     if "? for shortcuts" not in a.final.line_text(fr):
         a._fail(f"三下 Shift+Tab 后应回到 default,实际 '{a.final.line_text(fr)}'")
+
+
+SHIFT_TABS = ("shift_tab", "shift_tab_csi_u", "shift_tab_modify_other_keys")
+
+
+def test_T08c_each_shift_tab_encoding_cycles_once_at_the_prompt(bin_path):
+    for key in SHIFT_TABS:
+        raw = run(bin_path, [READY, "type:ab", f"key:{key}", "sleep:0.3"], permission="default")
+        a = TTYAssert(raw)
+        if a.final.find_last_row("accept edits on") is None:
+            a._fail(f"{key}: the mode did not move from default to accept edits")
+        try:
+            a.assert_input_echo("ab")
+        except AssertError as e:
+            raise AssertError(f"{key}: {e}") from e
 
 
 def test_T10_submit_local_command(bin_path):

@@ -12,7 +12,6 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
 const ansi = @import("../ansi.zig");
 const input_mod = @import("../../input.zig");
 const theme_mod = @import("../theme.zig");
@@ -565,6 +564,7 @@ pub fn run(
 
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
+    var parser = input_mod.KeyParser{};
     while (true) {
         for (qs[0..nq], 0..) |s, qi| answered_flags[qi] = s.answered;
         // 单问完成:advanceView 把 view 推过末尾(== nq)→ finalize 返回(无 Submit 视图)。
@@ -610,51 +610,39 @@ pub fn run(
         writeAll(out_fd, r.frame);
         drawn = reflow.Anchor.atEnd(r.frame, frame_cols);
 
-        var buf: [8]u8 = undefined;
-        const n = platform_term.readInput(in_fd, &buf); // decodes a console's key records
-        if (n <= 0) {
-            if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
-            return error.InputAborted;
+        const key = switch (input_mod.readKey(in_fd, &parser)) {
+            .key => |key| key,
+            .interrupted => continue,
+            .closed => return error.InputAborted,
+        };
+        if (key == .paste_begin) {
+            if (on_submit) try readPaste(in_fd, &parser, null, 0) else try readPaste(in_fd, &parser, &qs[view], questions[view].options.len);
+            continue;
         }
-        const b = buf[0];
 
-        // ── Submit 视图键处理。──────────────────────────────────────────
         if (on_submit) {
-            switch (b) {
-                0x03 => return error.InputAborted,
-                0x1b => {
-                    if (n >= 3 and buf[1] == '[') {
-                        switch (buf[2]) {
-                            'A' => submit_sel = if (submit_sel == 0) 1 else 0,
-                            'B' => submit_sel = (submit_sel + 1) % 2,
-                            'D' => view = nq - 1, // ← 回最后一问
-                            else => {},
-                        }
-                        continue;
-                    }
-                    return error.InputAborted;
-                },
-                '\r', '\n' => {
-                    if (submit_sel == 1) { // Cancel → 回最后一问
+            switch (key) {
+                .ctrl_c, .esc => return error.InputAborted,
+                .up => submit_sel = if (submit_sel == 0) 1 else 0,
+                .down => submit_sel = (submit_sel + 1) % 2,
+                .left => view = nq - 1,
+                .enter => {
+                    if (submit_sel == 1) {
                         view = nq - 1;
                         continue;
                     }
-                    // Submit answers:输出所有已答(未答的用首选项兜底,对齐 answer_queue 兜底语义)。
                     return try finalizeAll(alloc, questions[0..nq], qs[0..nq], out);
                 },
-                '1' => {
-                    submit_sel = 0;
-                    continue;
+                .char => |c| switch (c) {
+                    '1' => submit_sel = 0,
+                    '2' => submit_sel = 1,
+                    else => {},
                 },
-                '2' => {
-                    submit_sel = 1;
-                    continue;
-                },
-                else => continue,
+                else => {},
             }
+            continue;
         }
 
-        // ── 问题视图键处理。──────────────────────────────────────────────
         const q = questions[view];
         const st = &qs[view];
         const real_n = q.options.len;
@@ -663,99 +651,109 @@ pub fn run(
         const chat_idx = real_n + 1;
         const has_preview = !q.multi and st.selected < real_n and q.options[st.selected].preview.len > 0;
 
-        // ── note 编辑态:所有输入进 note 缓冲;Esc/enter 退出(保留 note)。──
         if (st.editing_note) {
-            const oi = st.selected; // 编辑的是当前选项的 note
-            if (b == 0x07) { // Ctrl+G:唤起 $EDITOR/Vim 编辑 note(对齐 cc"edit in Vim")。
-                editNoteInEditor(alloc, in_fd, st, oi);
-                continue;
-            }
-            if (b == 0x1b or b == '\r' or b == '\n') {
-                // Esc / enter:退出 note 编辑态(实录:Esc 保留已输入 note)。
-                st.editing_note = false;
-                continue;
-            }
-            if (b == 0x7f) { // backspace
-                if (st.note_len[oi] > 0) st.note_len[oi] -= 1;
-                continue;
-            }
-            if (b >= 0x20 and oi < real_n and st.note_len[oi] + 1 < st.note_buf[oi].len) {
-                st.note_buf[oi][st.note_len[oi]] = b;
-                st.note_len[oi] += 1;
+            switch (key) {
+                .ctrl_g => editNoteInEditor(alloc, in_fd, st, st.selected),
+                .esc, .enter, .up, .down, .left, .right => st.editing_note = false,
+                .backspace => st.note_len[st.selected] -|= 1,
+                .char => |c| appendNote(st, real_n, c),
+                else => {},
             }
             continue;
         }
 
-        // 'n':preview 模式下进 note 编辑态(对齐 cc)。
-        if (b == 'n' and has_preview and st.selected != other_idx) {
-            st.editing_note = true;
-            continue;
-        }
-
-        // Other 项上:可见字符直接内联编辑。
-        if (st.selected == other_idx and b >= 0x20 and b != 0x7f and b != ' ') {
-            if (st.other_len + 1 < st.other_buf.len) {
-                st.other_buf[st.other_len] = b;
-                st.other_len += 1;
-            }
-            continue;
-        }
-
-        switch (b) {
-            0x03 => return error.InputAborted,
-            0x7f => {
-                if (st.selected == other_idx and st.other_len > 0) st.other_len -= 1;
-                continue;
-            },
-            0x1b => {
-                if (n >= 3 and buf[1] == '[') {
-                    switch (buf[2]) {
-                        'A' => st.selected = if (st.selected == 0) total_items - 1 else st.selected - 1, // ↑
-                        'B' => st.selected = (st.selected + 1) % total_items, // ↓
-                        'C' => if (multi_q) { // → 下一视图(问题或 Submit)
-                            view = if (view + 1 <= nq) view + 1 else nq;
-                        },
-                        'D' => if (multi_q and view > 0) { // ← 上一问
-                            view -= 1;
-                        },
-                        else => {},
-                    }
+        switch (key) {
+            .char => |c| {
+                if (c == 'n' and has_preview) {
+                    st.editing_note = true;
                     continue;
                 }
-                return error.InputAborted; // 孤立 ESC
-            },
-            ' ' => {
-                if (st.selected == other_idx) {
-                    if (st.other_len + 1 < st.other_buf.len) {
-                        st.other_buf[st.other_len] = ' ';
-                        st.other_len += 1;
-                    }
-                } else if (q.multi and st.selected != chat_idx) {
-                    st.checked[st.selected] = !st.checked[st.selected];
-                    st.answered = anyChecked(st.checked[0..real_n]);
+                if (st.selected == other_idx and c != ' ') {
+                    appendOther(st, c);
+                    continue;
                 }
-                continue;
             },
-            '\r', '\n' => {
+            else => {},
+        }
+
+        switch (key) {
+            .ctrl_c, .esc => return error.InputAborted,
+            .backspace => if (st.selected == other_idx) {
+                st.other_len -|= 1;
+            },
+            .up => st.selected = if (st.selected == 0) total_items - 1 else st.selected - 1,
+            .down => st.selected = (st.selected + 1) % total_items,
+            .right => if (multi_q) {
+                view = if (view + 1 <= nq) view + 1 else nq;
+            },
+            .left => if (multi_q and view > 0) {
+                view -= 1;
+            },
+            .enter => {
                 try commitQuestion(alloc, q, st, chat_idx, other_idx, real_n);
                 if (st.answered) advanceView(&view, nq, q.multi, multi_q);
-                continue;
             },
-            '1'...'9' => {
-                const idx: usize = b - '1';
-                if (idx < total_items) {
-                    st.selected = idx;
-                    if (q.multi and idx < real_n) {
-                        st.checked[idx] = !st.checked[idx];
+            .char => |c| switch (c) {
+                ' ' => {
+                    if (st.selected == other_idx) {
+                        appendOther(st, ' ');
+                    } else if (q.multi and st.selected != chat_idx) {
+                        st.checked[st.selected] = !st.checked[st.selected];
                         st.answered = anyChecked(st.checked[0..real_n]);
-                    } else if (!q.multi and idx < real_n) {
-                        try commitQuestion(alloc, q, st, chat_idx, other_idx, real_n);
-                        advanceView(&view, nq, q.multi, multi_q);
                     }
-                }
-                continue;
+                },
+                '1'...'9' => {
+                    const idx: usize = c - '1';
+                    if (idx < total_items) {
+                        st.selected = idx;
+                        if (q.multi and idx < real_n) {
+                            st.checked[idx] = !st.checked[idx];
+                            st.answered = anyChecked(st.checked[0..real_n]);
+                        } else if (!q.multi and idx < real_n) {
+                            try commitQuestion(alloc, q, st, chat_idx, other_idx, real_n);
+                            advanceView(&view, nq, q.multi, multi_q);
+                        }
+                    }
+                },
+                else => {},
             },
+            else => {},
+        }
+    }
+}
+
+fn appendOther(st: *QState, c: u8) void {
+    if (st.other_len + 1 >= st.other_buf.len) return;
+    st.other_buf[st.other_len] = c;
+    st.other_len += 1;
+}
+
+fn appendNote(st: *QState, real_n: usize, c: u8) void {
+    const oi = st.selected;
+    if (oi >= real_n or st.note_len[oi] + 1 >= st.note_buf[oi].len) return;
+    st.note_buf[oi][st.note_len[oi]] = c;
+    st.note_len[oi] += 1;
+}
+
+fn readPaste(in_fd: c_int, parser: *input_mod.KeyParser, st: ?*QState, real_n: usize) error{InputAborted}!void {
+    while (true) {
+        const key = switch (input_mod.readKey(in_fd, parser)) {
+            .key => |key| key,
+            .interrupted => continue,
+            .closed => return error.InputAborted,
+        };
+        const c: u8 = switch (key) {
+            .paste_end => return,
+            .ctrl_c => return error.InputAborted,
+            .char => |c| c,
+            .enter, .tab => ' ',
             else => continue,
+        };
+        const s = st orelse continue;
+        if (s.editing_note) {
+            appendNote(s, real_n, c);
+        } else if (s.selected == real_n) {
+            appendOther(s, c);
         }
     }
 }
@@ -1235,4 +1233,65 @@ test "render: note 已输入显文本(非编辑态 → Notes: <text>)" {
     defer testing.allocator.free(r.frame);
     try capture.expectContains(r.frame, "Notes: ");
     try capture.expectContains(r.frame, "my note");
+}
+
+test "run reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at once is kept, a paste only types" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const Later = struct {
+        fn send(fd: c_int, bytes: []const u8) void {
+            @import("platform").sync.sleepMs(300);
+            _ = pfs.writeAll(fd, bytes);
+            _ = std.c.close(fd);
+        }
+    };
+    const opts = [_]ctx.AskOption{ mkOpt("Red", ""), mkOpt("Blue", "") };
+    const one = [_]ctx.AskQuestion{.{ .question = "Color?", .header = "C", .multi = false, .options = &opts }};
+    const two = [_]ctx.AskQuestion{ one[0], .{ .question = "Size?", .header = "S", .multi = false, .options = &opts } };
+    const layouts = [_]ctx.AskOption{
+        .{ .label = "A", .description = "", .preview = "mock" },
+        .{ .label = "B", .description = "", .preview = "other" },
+    };
+    const preview = [_]ctx.AskQuestion{.{ .question = "Layout?", .header = "L", .multi = false, .options = &layouts }};
+    const cases = [_]struct { questions: []const ctx.AskQuestion, now: []const u8, later: []const u8, answers: ?[]const []const u8 }{
+        .{ .questions = &one, .now = "\x1b[27u", .later = "\r", .answers = null },
+        .{ .questions = &one, .now = "\x1b[99;5u", .later = "\r", .answers = null },
+        .{ .questions = &one, .now = "\x1b[B\x1b[Babc\x1b[99;5u", .later = "\r", .answers = null },
+        .{ .questions = &two, .now = "11\x1b[27u", .later = "\r", .answers = null },
+        .{ .questions = &two, .now = "11\x1b[99;5u", .later = "\r", .answers = null },
+        .{ .questions = &preview, .now = "n\x1b[27u", .later = "\r", .answers = &.{"A"} },
+        .{ .questions = &one, .now = "\x1b[B\r", .later = "", .answers = &.{"Blue"} },
+        .{ .questions = &one, .now = "\x1b[B\x1b[Babc\r", .later = "", .answers = &.{"abc"} },
+        .{ .questions = &one, .now = "\x1b[200~2\x1b[201~", .later = "\r", .answers = &.{"Red"} },
+        .{ .questions = &one, .now = "\x1b[B\x1b[B\x1b[200~ab\rcd\x1b[201~", .later = "\r", .answers = &.{"ab cd"} },
+        .{ .questions = &one, .now = "\x1b[200~x\x03", .later = "\x1b[201~\r", .answers = null },
+    };
+    for (cases) |c| {
+        var fds: [2]std.c.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        try testing.expect(pfs.writeAll(fds[1], c.now));
+        const thread = try std.Thread.spawn(.{}, Later.send, .{ fds[1], c.later });
+        var answers: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (answers.items) |it| a.free(@constCast(it));
+            answers.deinit(a);
+        }
+        const saved_fd2 = std.c.dup(2);
+        _ = std.c.dup2(sink, 2);
+        const result = run(a, theme_mod.monochrome, fds[0], c.questions, &answers, 80);
+        _ = std.c.dup2(saved_fd2, 2);
+        _ = std.c.close(saved_fd2);
+        thread.join();
+        if (c.answers) |want| {
+            try result;
+            try testing.expectEqual(want.len, answers.items.len);
+            for (want, answers.items) |w, got| try testing.expectEqualStrings(w, got);
+        } else {
+            try testing.expectError(error.InputAborted, result);
+        }
+    }
 }

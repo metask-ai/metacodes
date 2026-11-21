@@ -130,6 +130,83 @@ def test_picker_escape_clears_filter_then_closes_and_says_what_was_kept(bin_path
     assert "❯" in text, "关闭后应回到输入框:\n" + text
 
 
+def test_picker_ctrl_d_leaves_the_draft_under_it_alone(bin_path):
+    # #649: Ctrl+D over the picker deleted the character under the draft's cursor.
+    raw = run(
+        bin_path,
+        [READY, "type:explain this", "sleep:0.3"] + ["key:left"] * 4 + [
+            "key:ctrl_o", wait_for(OPEN), "key:ctrl_d", "strictsleep:0.4",
+            "key:esc", wait_for("kept "), "sleep:0.3"],
+        per_key_drain=0.08,
+    )
+    a, text = _screen(raw)
+    assert "enter apply" not in text and "kept claude" in text, "Esc 没有关掉 picker:\n" + text
+    assert not any("explain his" in sc for sc in _frames(a)), "Ctrl+D 删掉了草稿里的字:\n" + text
+    a.assert_input_echo("explain this")
+
+
+def test_picker_ctrl_d_during_a_reply_leaves_the_queued_draft_alone(bin_path):
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    with SlowMockServer([slow_text_then_end(n_chunks=60, delay=0.4)]) as srv:
+        raw = run(
+            bin_path,
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "type:queued draft", "sleep:0.3"]
+            + ["key:left"] * 5
+            + ["key:ctrl_o", wait_for(OPEN), "key:ctrl_d", "strictsleep:0.4",
+               "key:esc", wait_for("kept "), "sleep:0.3"],
+            base_url=srv.url,
+            startup_drain=0.8,
+            per_key_drain=0.08,
+        )
+    a, text = _screen(raw)
+    frames = _frames(a)
+    assert any("kept claude" in sc and "queued draft" in sc and "esc to interrupt" in sc for sc in frames), \
+        "回复期间关掉 picker 后草稿不在:\n" + text
+    assert not any("queued raft" in sc for sc in frames), "Ctrl+D 删掉了回复期草稿里的字:\n" + text
+
+
+def test_picker_takes_a_paste_at_the_prompt_as_its_filter_and_leaves_the_draft(bin_path):
+    # #650: at the prompt the paste went into the draft under the picker.
+    raw = run(
+        bin_path,
+        [READY, "type:draft", "sleep:0.3", "key:ctrl_o", wait_for(OPEN),
+         "raw:\\x1b[200~zai\\x1b[201~", wait_for("Model  /zai"),
+         "key:esc", wait_for("esc cancel"), "key:esc", wait_for("kept "), "sleep:0.3"],
+        env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+        per_key_drain=0.08,
+    )
+    a, text = _screen(raw)
+    frames = _frames(a)
+    filtered = [sc for sc in frames if "Model  /zai" in sc]
+    assert filtered and "Z.AI GLM Coding Plan" in filtered[-1], "粘贴没有成为 picker 的过滤词:\n" + text
+    assert not any("draftzai" in sc for sc in frames), "粘贴进了 picker 下面的草稿:\n" + text
+    a.assert_input_echo("draft")
+
+
+def test_picker_takes_a_paste_during_a_reply_as_one_filter_edit_and_applies_nothing(bin_path):
+    # #650: during a reply the paste reached the picker key by key, and its
+    # newline was Enter: it applied the model under the cursor.
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    with SlowMockServer([slow_text_then_end(n_chunks=20, delay=0.4)]) as srv:
+        raw = run(
+            bin_path,
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o", wait_for(OPEN),
+             "raw:\\x1b[200~zai\\x0d\\x1b[201~", wait_for("Model  /zai"), "sleep:12", IDLE],
+            base_url=srv.url,
+            env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+            startup_drain=0.8,
+            per_key_drain=0.08,
+        )
+    a, text = _screen(raw)
+    flat = " ".join(text.split())
+    assert "switched to" not in flat and "from now on billed" not in flat, "粘贴里的换行应用了模型:\n" + text
+    assert any("Model  /zai" in sc and "esc to interrupt" in sc for sc in _frames(a)), \
+        "回复期粘贴没有成为过滤词:\n" + text
+    assert OPEN in text and "Model  /zai" in text, "粘贴后 picker 应仍开着、过滤词还在:\n" + text
+
+
 def test_picker_takes_the_keys_with_vim_on_and_esc_twice_closes_it(bin_path):
     from slow_mock_server import SlowMockServer, simple_text
 

@@ -220,10 +220,13 @@ from the file. `/model` lists a provider only once its key is here (or in
 the environment, or stored by `/login <provider>`); until then it is not
 listed. When no provider is, `/model` says so and points to `/login` and to
 this file, by its path. While the terminal UI starts on Metask instead of this
-file's provider, it says so once under its banner (`.env configures DeepSeek;
-the default is Metask. To use DeepSeek: /model, or /logout`). `/logout` signs you out of
-Metask and switches the session to the provider this file configures
-(`Switched to DeepSeek (from .env)`); later starts use it too.
+file's choice, it says so once under its banner (`.env configures DeepSeek;
+the default is Metask. To use DeepSeek: /model, or /logout`; for the file's
+preset, `.env configures the preset fast (DeepSeek · deepseek-v4-pro); the
+default is Metask. To use it: /model, or /logout`). `/logout` signs you out of
+Metask and switches the session to what this file chooses, as step 6 does: its
+preset, else its provider (`Switched to DeepSeek (from .env)`); later starts
+use it too.
 
 `metacodes login status` shows this decision without starting anything: the
 provider a plain start in the current directory uses, the step that decided,

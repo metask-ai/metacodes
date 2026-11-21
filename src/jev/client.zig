@@ -263,6 +263,7 @@ pub const Client = struct {
             },
         }) catch return error.TransportFailed;
         defer request.deinit();
+        http_connection.keepServerOpen(&request);
         http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.TransportFailed;
         var redirect_buffer: [1024]u8 = undefined;
         const response = http_connection.receiveHead(&request, &redirect_buffer) catch return error.TransportFailed;
