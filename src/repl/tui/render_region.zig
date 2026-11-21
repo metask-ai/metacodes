@@ -588,6 +588,20 @@ pub const RenderRegion = struct {
         return ix.picker_open;
     }
 
+    pub fn escapeClosesOverlay(self: *RenderRegion) bool {
+        self.lock();
+        defer self.unlock();
+        if (self.pickerOpenLocked() or self.helpOpen() or self.agentView() != .closed) return true;
+        return ui_mod.suggestionMenuOpen(&self.ui) and !self.menusDismissed(self.editorView());
+    }
+
+    pub fn cancelCtrlXPrefix(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        const ix = self.ui.interaction() orelse return;
+        ix.ctrl_x_armed = false;
+    }
+
     fn helpOpen(self: *const RenderRegion) bool {
         const ix = self.ui.interactionConst() orelse return false;
         return ix.help_open;
@@ -3086,6 +3100,48 @@ test "#298 parity: nothing a read opened survives into the reply or the next rea
             r.changePhaseLocked(.idle);
         }
     }
+}
+
+test "escapeClosesOverlay holds exactly where Esc does not reach the prompt's own double press (#660)" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .basic_16), .basic_16);
+    defer r.deinit();
+    const Setup = enum { draft, help, slash_menu, dismissed_menu, at_menu, agent_list, agent_viewing, picker };
+    for (std.enums.values(Setup)) |setup| {
+        r.beginInput(.builtin);
+        defer r.endInput();
+        const ip = r.ui.inputPhase().?;
+        r.setInput("draft", 5);
+        switch (setup) {
+            .draft => {},
+            .help => ip.interaction.help_open = true,
+            .slash_menu => r.setInput("/he", 3),
+            .dismissed_menu => {
+                r.setInput("/he", 3);
+                ip.menu_dismissal.dismiss("/he");
+            },
+            .at_menu => r.setInput("see @src", 8),
+            .agent_list => ip.interaction.agents.view = .list,
+            .agent_viewing => ip.interaction.agents.view = .viewing,
+            .picker => ip.interaction.picker_open = true,
+        }
+        const closes = r.escapeClosesOverlay();
+        try std.testing.expectEqual(setup != .draft and setup != .dismissed_menu, closes);
+        _ = ui_mod.dispatch(&r.ui, .{ .key = .{ .key = .esc, .now_ms = 1_000 } });
+        try std.testing.expectEqual(!closes, r.ui.inputPhase().?.press.kind == .clear_input);
+    }
+}
+
+test "cancelCtrlXPrefix ends a pending Ctrl+X the way any key through dispatch does (#660)" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .basic_16), .basic_16);
+    defer r.deinit();
+    r.beginInput(.builtin);
+    defer r.endInput();
+    _ = ui_mod.dispatch(&r.ui, .{ .key = .{ .key = .ctrl_x } });
+    try std.testing.expect(r.ui.interaction().?.ctrl_x_armed);
+    r.cancelCtrlXPrefix();
+    try std.testing.expect(!r.ui.interaction().?.ctrl_x_armed);
+    const after = ui_mod.dispatch(&r.ui, .{ .key = .{ .key = .ctrl_k } });
+    try std.testing.expectEqual(event_mod.LoopAction.pass_to_editor, after.action);
 }
 
 test "input box border is a full-width rule without corners" {
