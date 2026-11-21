@@ -555,10 +555,30 @@ def _run_posix(bin_path, key_events, term_size, full_env,
     cap = _Capture(read_once, rows, cols, timeline, resizes)
 
     def write(b):
+        pending = memoryview(b)
+        stalled_since = time.monotonic()
+        blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
         try:
-            os.write(fd, b)
-        except OSError:
-            pass
+            while pending and not cap.eof:
+                try:
+                    sent = os.write(fd, pending)
+                except BlockingIOError:
+                    sent = 0
+                except OSError:
+                    return
+                if sent:
+                    pending = pending[sent:]
+                    stalled_since = time.monotonic()
+                    continue
+                if time.monotonic() - stalled_since >= WAIT_S:
+                    raise AssertionError(f"the program read none of the last {len(pending)} of {len(b)} bytes "
+                                         f"written to its terminal within {WAIT_S}s")
+                readable, _, _ = select.select([fd], [fd], [], 0.05)
+                if readable:
+                    cap._pump(0)
+        finally:
+            os.set_blocking(fd, blocking)
 
     def set_size(r2, c2):
         try:
@@ -588,32 +608,37 @@ def _run_posix(bin_path, key_events, term_size, full_env,
             except ValueError:
                 os.kill(pid, getattr(signal, "SIG" + token))
 
+    terminal_open = True
     try:
         cap.drain(startup_drain)
         _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue, send_signal=send_signal)
-    except BaseException:
-        # 用例被打断(runner 的用例时限 SIGALRM、Ctrl+C)或驱动出错:别把程序留在后台
-        # 占着 pty 跑下去,杀掉、回收后再把异常交给 runner。
-        import signal
-        try:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
+        cap.finish()
+        terminal_open = False
+        _close(fd)
+        if not _reap(pid, EXIT_GRACE):
+            raise RuntimeError(f"终端关闭后 {EXIT_GRACE:.0f}s 子进程仍未退出(已 SIGKILL)")
+        return bytes(cap.out)
+    finally:
+        if terminal_open:
+            _close(fd)
+        _kill_and_reap(pid)
 
-    cap.finish()
+
+def _close(fd):
     try:
         os.close(fd)
     except OSError:
         pass
-    if not _reap(pid, EXIT_GRACE):
-        raise RuntimeError(f"终端关闭后 {EXIT_GRACE:.0f}s 子进程仍未退出(已 SIGKILL)")
-    return bytes(cap.out)
+
+
+def _kill_and_reap(pid):
+    import signal
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == 0:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+    except OSError:
+        pass
 
 
 def _reap(pid, timeout):
