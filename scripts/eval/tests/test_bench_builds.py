@@ -264,6 +264,21 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertFalse(local.exists())
         self.assertEqual(list(local.parent.glob('.fetch-*')), [])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS tar writes extended attributes as ._ entries')
+    def test_a_remote_unit_with_extended_attributes_comes_back(self):
+        executor = self.remote_executor()
+        commit = self.git('rev-parse', 'HEAD')
+        builds.build_on(executor, 'main', self.bench, str(self.repo))
+        remote = builds.unit_path(self.root / 'remote-state' / 'bench', commit)
+        subprocess.run(['xattr', '-w', 'com.apple.quarantine', '0081;0;bench;', str(remote)], check=True)
+        local = builds.unit_path(self.bench, commit)
+        shutil.rmtree(local)
+        (local.parent / (local.name + '.json')).unlink()
+        with patch('sys.stderr', io.StringIO()):
+            builds._fetch_unit(executor, str(remote), local, commit, str(self.repo), lambda: False, subprocess.Popen)
+        self.assertEqual((local / 'bin' / 'metacodes').read_text(), commit)
+        self.assertEqual(list(local.parent.glob('._*')), [])
+
     def test_fetched_archive_may_hold_only_the_unit_and_its_record(self):
         for name, kind in (('../escape', tarfile.REGTYPE), ('unit/link', tarfile.SYMTYPE), ('other', tarfile.REGTYPE)):
             with self.subTest(name=name):
