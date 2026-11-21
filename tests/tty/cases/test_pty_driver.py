@@ -48,8 +48,8 @@ DRIVER = r"""
 import json, os, signal, sys
 sys.path.insert(0, sys.argv[1])
 import tty_driver
-program, events, arm = sys.argv[2], json.loads(sys.argv[3]), sys.argv[4]
-alarm, wait_s = float(sys.argv[5]), float(sys.argv[6])
+program, events, arm = sys.argv[2], json.load(sys.stdin), sys.argv[3]
+alarm, wait_s = float(sys.argv[4]), float(sys.argv[5])
 if wait_s:
     tty_driver.WAIT_S = wait_s
 
@@ -113,10 +113,9 @@ def _program(mode):
 
 
 def _run_in_a_fresh_process(mode, events, arm="", alarm=0.0, wait_s=0.0):
-    argv = [sys.executable, "-I", "-c", DRIVER, TTY_DIR, _program(mode), json.dumps(events), arm, str(alarm),
-            str(wait_s)]
+    argv = [sys.executable, "-I", "-c", DRIVER, TTY_DIR, _program(mode), arm, str(alarm), str(wait_s)]
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=DRIVER_LIMIT_S)
+        out = subprocess.run(argv, input=json.dumps(events), capture_output=True, text=True, timeout=DRIVER_LIMIT_S)
     except subprocess.TimeoutExpired:
         raise AssertionError(f"the driver hung: it did not return within {DRIVER_LIMIT_S}s (#569)") from None
     assert out.returncode == 0, out.stderr
