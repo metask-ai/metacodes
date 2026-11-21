@@ -45,6 +45,10 @@ def bundle_label(path: Path, manifest: Dict[str, Any], source: Optional[Dict[str
     """How the page names a metacodes bundle: a release version, or the
     checkout commit a development overlay was built from."""
     release = (manifest.get("release") or {}).get("version") if isinstance(manifest.get("release"), dict) else None
+    info = builds.build_info(Path(path)) if builds.is_git_unit(path) else None
+    if info and info.get("commit"):
+        at = (info.get("committed_at") or "")[:16].replace("T", " ")
+        return f"git {info['commit'][:8]}" + (f" · {at}" if at else "") + (f"（{release}）" if release else "")
     if isinstance(source, dict) and source.get("kind") == "checkout-overlay":
         base = source.get("base_release") or release
         return f"dev {source.get('commit')}" + (f"（基于 {base}）" if base else "")
@@ -220,9 +224,9 @@ class BatchManager:
     # ----------------------------------------------------------------- create
 
     def create(self, request: Any) -> Dict[str, Any]:
-        allowed = {"name", "model", "executor", "attempts", "concurrency", "bundle", "items"}
+        allowed = {"name", "model", "executor", "attempts", "concurrency", "bundle", "items", "features"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("批次只接受 name、model、executor、attempts、concurrency、bundle、items")
+            raise ValueError("批次只接受 name、model、executor、attempts、concurrency、bundle、items、features")
         name = request.get("name") or ""
         if not isinstance(name, str) or len(name) > NAME_LIMIT or any(ord(c) < 32 for c in name):
             raise ValueError(f"批次名称最多 {NAME_LIMIT} 个字符")
@@ -251,11 +255,13 @@ class BatchManager:
                            "attempts": attempts, "concurrency": min(concurrency, suite.max_concurrency)}
             if "executor" in request:
                 run_request["executor"] = request["executor"]
+            if "features" in request:
+                run_request["features"] = request["features"]
             try:
                 checked = self.runs.launch(run_request, dry_run=True, bundle=choice["path"])
             except ValueError as exc:
                 raise ValueError(f"{suite.name}：{exc}") from None
-            run_request.update(tasks=checked["tasks"], executor=checked["executor"])
+            run_request.update(tasks=checked["tasks"], executor=checked["executor"], features=checked["features"])
             # The model's route as of creation (source, imported revision);
             # each item's launch must still resolve to it.
             planned.append({"suite": suite.id, **suites.label(suite.id), "tasks": checked["tasks"],
@@ -269,6 +275,7 @@ class BatchManager:
         record = {"id": batch_id, "name": name.strip() or None, "status": "queued", "created_at": now(),
                   "started_at": None, "finished_at": None, "model": request.get("model"),
                   "executor": planned[0]["request"]["executor"], "attempts": attempts, "concurrency": concurrency,
+                  "features": planned[0]["request"]["features"],
                   "metacodes": metacodes, "items": planned, "cancel_requested": False,
                   "url": "/#/batch/" + batch_id}
         with self.lock:

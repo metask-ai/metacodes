@@ -82,6 +82,7 @@ class MetacodesAgent(BaseInstalledAgent):
         metrics_proxy: Optional[str] = None,
         metrics_ca: Optional[str] = None,
         account_gateway: Optional[str] = None,
+        features: Optional[str] = None,
         **kwargs: Any,
     ):
         bundle_path = bundle or os.environ.get(BUNDLE_ENV)
@@ -114,6 +115,7 @@ class MetacodesAgent(BaseInstalledAgent):
             disallowed_tools=self._disallowed_tools,
             reasoning_effort=self._reasoning_effort,
             max_tokens=self._max_tokens,
+            features=[name for name in (features or "").split(",") if name],
         )
 
     @staticmethod

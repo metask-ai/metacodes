@@ -124,6 +124,31 @@ class ModelAndFlagsTest(unittest.TestCase):
                     provider=None, model="m", disallowed_tools="", reasoning_effort=None, max_tokens=bad
                 )
 
+    def test_features_add_their_flags_and_unknown_names_are_refused(self):
+        flags = cmd.metacodes_flags(
+            provider=None, model="m", disallowed_tools="", reasoning_effort=None, max_tokens=None,
+            features=["test_integrity", "execute_code", "harnessmm"],
+        )
+        self.assertEqual(flags[-3:], ["--test-integrity", "--preview=execute_code", "--harnessmm"])
+        with self.assertRaisesRegex(ValueError, "unknown feature 'teamwork'"):
+            cmd.metacodes_flags(
+                provider=None, model="m", disallowed_tools="", reasoning_effort=None, max_tokens=None,
+                features=["teamwork"],
+            )
+
+    def test_every_feature_flag_is_one_metacodes_parses(self):
+        root = Path(__file__).resolve().parents[3]
+        main = (root / "src" / "main.zig").read_text(encoding="utf-8")
+        types = (root / "src" / "types.zig").read_text(encoding="utf-8")
+        preview = types.split("pub const PreviewFeature = enum {", 1)[1].split("pub fn", 1)[0]
+        for name, entry in cmd.ADVANCED_FEATURES.items():
+            flag = entry["flag"]
+            with self.subTest(feature=name):
+                if flag.startswith("--preview="):
+                    self.assertIn(flag[len("--preview="):] + ",", preview)
+                else:
+                    self.assertIn('std.mem.eql(u8, arg, "' + flag + '")', main)
+
 
 class CaBundleTest(unittest.TestCase):
     def test_check_covers_every_path_metacodes_reads(self):

@@ -25,6 +25,7 @@ metacodes bench prepare --suite gaia2-cli             # generate a harbor-local 
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
 metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
 metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
+metacodes bench node build              # build one git revision here ({"ref", "repo"} on stdin)
 ```
 
 Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
@@ -270,9 +271,26 @@ revision with its own kernels, build its full release unit:
 ```sh
 metacodes bench build --ref main          # a branch, tag or commit
 metacodes bench build --ref 54a7a632 --json
+metacodes bench build --ref main --executor relay-4090
 ```
 
-It needs Docker on the machine whose `<state root>` keeps the bundle. The ref
+The build runs on the node of the executor (`--executor`, default the
+default executor), the machine whose Docker also runs the evaluations;
+every node builds the same way. For an `ssh` executor the workbench runs
+`metacodes bench node build` there over SSH (the request on stdin, the build
+log on stderr, the result as the last stdout line; closing stdin cancels
+it), then copies the unit and its build record into its own
+`<state root>/bench/bundles/`, accepting only regular files and directories
+under the unit's name and only a record verified by the same `source_repo`.
+The page does the same from 新建 → 按 commit 编译: it lists a branch's
+commits with their commit time, newest first, up to a chosen day
+(`GET /api/commits?ref=&until=YYYY-MM-DD&limit=`), and builds the chosen one,
+or any pasted commit, branch or tag, in the background (`POST /api/build`
+`{ref, executor}`, `GET /api/build` for its status and log tail,
+`POST /api/build/cancel`), one build at a time. A built unit is named in the
+version list by its commit and commit time.
+
+The node needs Docker; the workbench machine does not. On each node the ref
 is resolved in a mirror of `source_repo` (in `workbench.json`; default the
 GitHub repository) kept at `<state root>/bench/git/source.git`, and a branch
 always means its current head. A branch and a tag of one name on different
@@ -892,6 +910,24 @@ configured bundle in place or switching `workbench.json` to another version
 never changes a batch already created; before each launch the copy is checked
 against its digest, and a modified copy fails the dataset instead of running.
 
+The 高级功能 section of the 新建 page switches on metacodes features that are
+off by default, all off unless ticked. Each one adds a single metacodes flag to
+every trial of the batch: the Lean-modelled run gates
+`verification_final_gate` (`--verification-final-gate`), `requirement_ledger`
+(`--requirement-ledger`), `test_integrity` (`--test-integrity`),
+`delivery_cadence` (`--delivery-cadence`) and `stall_gate` (`--stall-gate`),
+and the preview features `execute_code` (`--preview=execute_code`),
+`comment_guard` (`--preview=comment_guard`) and `harnessmm` (`--harnessmm`).
+`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The batch
+and each of its runs record the chosen names (`features`), and the run passes
+them to the adapter as `--ak features=<names>`. An unknown name is refused, and
+so is any choice for a WorkBuddy suite, whose overlay launches metacodes
+itself. The frozen bundle has to know the flags: a release older than a
+feature fails its trials with a usage error. An SSH executor's node loads the adapter from
+its own checkout, so the node protocol is 2 since features: an older node is
+refused until `metacodes bench setup --executor <name>` updates it, instead of
+running the trials without the chosen flags.
+
 The datasets run one after another, each as an ordinary workbench run (one
 Harbor job) whose record names the batch and its frozen version. The durable
 state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
@@ -1129,7 +1165,7 @@ Jobs refresh every ten seconds while active; per-trial trajectories become
 available when Harbor copies the agent logs back from the container.
 
 The run endpoint (`POST /api/runs`) accepts `suite`, `tasks`, `model`,
-`attempts` and `concurrency`; the original `dataset:
+`attempts`, `concurrency` and `features` (names from the 高级功能 list); the original `dataset:
 "terminal-bench/terminal-bench-2-1"` field is still accepted and means
 `suite: "terminal-bench-2.1"`. It takes task/model selections, not shell
 commands, paths, keys, or arbitrary Harbor flags. Full task names are passed as separate argv

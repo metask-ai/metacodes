@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.command import check_bundle
+from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.bench import builds, data, executors
@@ -340,6 +340,8 @@ class RunManager:
                 "account_groups": account_groups,
                 "providers": {"count": len({m["provider"] for m in imported}), "models": len(imported)},
                 "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
+                "features": [{"id": name, "group": entry["group"], "label": entry["label"]}
+                             for name, entry in ADVANCED_FEATURES.items()],
                 "bundles": [{k: v for k, v in b.items() if k != "source"} for b in choices]}
 
     def add_provider(self, request):
@@ -389,9 +391,9 @@ class RunManager:
         of its dry run); a run whose model now resolves elsewhere — another
         source, or an imported provider at another revision — is refused, so
         one batch never records two upstreams under one model name."""
-        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor"}
+        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor", "features"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor")
+            raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor、features")
         # `dataset` is the original API's only choice, kept for older clients.
         if "dataset" in request and request["dataset"] != DATASET:
             raise ValueError("dataset 只接受 " + DATASET + "；其他评测集请用 suite")
@@ -399,6 +401,9 @@ class RunManager:
         if "dataset" in request and suite_id != suites.DEFAULT_SUITE:
             raise ValueError("suite 与 dataset 不一致")
         suite = suites.resolved(suites.get(suite_id))
+        features = chosen_features(request.get("features"))
+        if features and suite.runner == suites.WORKBUDDY:
+            raise ValueError("WorkBuddy 评测暂不支持选择高级功能，请选择 Harbor 评测集")
         if self.setup_running():  # checked again under the lock below
             raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
         catalog = self.catalog(bundle_supplied=frozen is not None or bundle is not None)
@@ -458,7 +463,7 @@ class RunManager:
                 if problem:
                     raise ValueError(problem)
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
-                    "executor": state["name"]}
+                    "executor": state["name"], "features": features}
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
@@ -497,6 +502,8 @@ class RunManager:
                 record["metacodes"] = metacodes
             if batch:
                 record["batch"] = batch
+            if features:
+                record["features"] = features
             route = None
             if imported:
                 # The run's own config (endpoint, model names, key variable)
@@ -579,6 +586,17 @@ class RunManager:
         if record["status"] in ACTIVE:
             (self.records / (name + ".cancel")).touch()
         return {"name": name, "status": record["status"], "cancel_requested": True}
+
+
+def chosen_features(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        raise ValueError("features 必须是高级功能名称的列表")
+    unknown = [name for name in value if name not in ADVANCED_FEATURES]
+    if unknown:
+        raise ValueError("未知的高级功能：" + "、".join(unknown))
+    return [name for name in ADVANCED_FEATURES if name in value]
 
 
 def runtime_env():
