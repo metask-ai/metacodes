@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -71,6 +72,26 @@ for line in sys.stdin:
 
 def git(cwd, *args):
     return run(["git", *args], cwd=cwd)
+
+
+def hold_byte_lock(fd):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def release_byte_lock(fd):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class FixtureGitHub(GitHub):
@@ -349,6 +370,20 @@ class LoopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.row()["state"], "pending")
         self.assertIsNone(self.row()["report"])
         self.assertFalse(self.github.merged)
+
+    def test_a_watcher_that_finds_an_empty_lock_file_held_is_busy_and_writes_nothing_into_it(self):
+        path = self.store.path.with_suffix(".lock")
+        path.write_bytes(b"")
+        with path.open("a+b") as held:
+            hold_byte_lock(held.fileno())
+            with self.assertRaises(Busy):
+                with self.store.lock():
+                    self.fail("acquired a controller lock another watcher holds")
+            self.assertEqual(path.stat().st_size, 0)
+            release_byte_lock(held.fileno())
+        with self.store.lock():
+            pass
+        self.assertEqual(path.stat().st_size, 0)
 
     def test_second_watcher_cannot_own_the_same_database(self):
         second = Store(self.store.path)
