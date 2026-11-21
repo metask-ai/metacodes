@@ -67,6 +67,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Shift+Tab cycles the permission mode in terminals that report modified
+  keys.** iTerm2 3.7.7 and later, Ghostty, kitty, Alacritty and tmux with
+  `extended-keys` send Shift+Tab as the kitty protocol's `ESC [ 9 ; 2 u` or
+  xterm modifyOtherKeys' `ESC [ 27 ; 2 ; 9 ~` instead of `ESC [ Z`, and the
+  TUI ignored both. The key parser now reads both forms through one table, so
+  modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
+  their CSI u forms do (#643).
+
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
   instead of the filter, Esc only switched the editor to NORMAL mode, and
