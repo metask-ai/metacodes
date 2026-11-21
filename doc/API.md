@@ -617,6 +617,11 @@ the executable belongs to up to date from the source its install record names
     `repair` or `rebuild`.
   - `source` is `release` or `checkout`.
   - A failure prints `{action: "refused", error}` instead.
+- **Update notice:** an interactive TUI start of a release install offers a
+  newer release that a background check, at most once a day, wrote to
+  `<state root>/update-check.json`: `1` runs `update` and exits, `3` skips
+  that version. `METACODES_NO_UPDATE_CHECK` or `METACODES_NO_PROBE` turns both
+  off (doc/UPDATE_DESIGN.md §13).
 `metacodes --resume <id>` starts the interactive REPL as a stored session of
 the working directory (an id or id prefix, the rule `/resume <id>` uses) with
 its conversation, goal and model route restored, and appends to the same

@@ -30,8 +30,9 @@ Goals:
 
 Non-goals:
 
-- **Automatic or background update checks.** Nothing contacts the network
-  unless the user runs `update`. Sessions, evaluation runs and
+- **Automatic updates.** Nothing is installed unless the user runs `update`
+  or picks it at the interactive notice (§13). Only the interactive TUI checks
+  for a newer release; `-p`, `serve`, `--web`, evaluation runs and
   provider-visible bytes stay as they are.
 - **Replacing the prefix in one transaction.** The installer copies file by
   file. Update makes up for this by converging (§8).
@@ -635,3 +636,40 @@ checked by hand against GitHub once two releases that ship `update` exist
    §3), and used by later updates.
 4. **Development installs:** rebuilt from the recorded checkout (§4.3);
    `--pull` is opt-in and fast-forward only.
+
+## 13. The update notice (2026-11-21)
+
+An interactive TUI start of a release install offers a newer release, the way
+Codex does. Nothing else checks: `-p`, `-`, `serve`, `--web`, teammates and a
+start whose stdin or stderr is not a terminal skip it, and so do a
+development install (`update_source.kind = checkout`), an installed version
+with a pre-release part, `METACODES_NO_PROBE` and `METACODES_NO_UPDATE_CHECK`.
+
+- **The check runs in the background, once a day.** It asks the install's
+  release base for `/latest` (§5, without curl's messages, which would draw
+  over the TUI) and writes `<state root>/update-check.json`:
+  `checked_at` (unix seconds), `base`, `latest` and `skipped`. A failed check
+  keeps the last `latest` of the same base and waits a day too. Another base,
+  or a clock that went back, checks at once.
+- **The notice reads only that file**, so the session never waits on the
+  network. A `latest` from the install's base that is newer than the installed
+  version and is not `skipped` is offered before the TUI starts:
+
+  ```text
+  metacodes 0.14.0 is available (this install is 0.13.0).
+    1. Update now
+    2. Skip
+    3. Skip until the next version
+  Choice [2]:
+  ```
+
+  `1` runs `metacodes update` (§4.2) in this process, which is not yet a
+  session, and exits after a successful update so the user starts the new
+  version; a failed or refused update says why and the session starts. `3`
+  records the version in `skipped`. Anything else skips it this time.
+
+| File | Change |
+|---|---|
+| `src/app/update_notice.zig` | which installs are offered what, the cache file, the background check |
+| `src/app/release_fetch.zig` | `Fetcher.echo_errors` |
+| `src/main.zig` | the notice before an interactive session, and `metacodes update` from it |

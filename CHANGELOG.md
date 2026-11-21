@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **An interactive start offers a newer release.** Like Codex, `metacodes`
+  started as the TUI from a release install checks for a newer release in the
+  background at most once a day, and on a later start offers it: update now
+  (runs `metacodes update`, then exits so the new version starts next), skip,
+  or skip until the next version. `-p`, `serve`, `--web`, teammates and
+  development installs never check; `METACODES_NO_UPDATE_CHECK=1` or
+  `METACODES_NO_PROBE=1` turns it off. The state is
+  `<state root>/update-check.json`.
+
 - **Teamwork launches its own Manager.** Configure `seats.manager` as a
   `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
   `resume` and `/teamwork` start that Manager CLI themselves. It runs in the
