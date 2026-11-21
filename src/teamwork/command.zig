@@ -594,15 +594,35 @@ fn draftInterruptibly(app: *App, job: *Background, deps: runtime.Deps, cfg: conf
 fn approvalTerms(arena: std.mem.Allocator, cfg: config.Config.Enabled, repo: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
-    try w.print("Approving also authorizes spend up to ${d} (at most {d} seats per role), these seats:", .{ cfg.budget_usd, cfg.max_rounds });
-    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .verifier }) |role| {
-        const seat = cfg.seats.get(role);
-        try w.print(" {s}={s}", .{ role.name(), seat.harnessKind().name() });
-        if (seat.model) |model| try w.print("/{s}", .{model});
+    const candidates = cfg.candidates.slice();
+    try w.print("Approving also authorizes spend up to ${d} (at most {d} seats per role", .{ cfg.budget_usd, cfg.max_rounds });
+    if (candidates.len != 0) try w.print("; {d} implementer and reviewer seats, and {d} judge seats", .{ cfg.max_rounds + candidates.len - 1, cfg.max_rounds });
+    try w.writeAll("), these seats:");
+    for ([_]types.Role{ .interviewer, .implementer, .reviewer, .verifier }) |role| try writeSeatTerm(w, role.name(), cfg.seats.get(role));
+    if (candidates.len != 0) {
+        try w.print(", {d} parallel candidates estimated at ${d} each:", .{ candidates.len, cfg.candidate_estimate_usd.? });
+        for (candidates, 1..) |seat, number| {
+            var name_buf: [32]u8 = undefined;
+            try writeSeatTerm(w, std.fmt.bufPrint(&name_buf, "candidate-{d}", .{number}) catch unreachable, seat);
+        }
+        try w.writeAll(", judged by");
+        try writeSeatTerm(w, "judge", cfg.seats.get(.judge));
     }
     if (cfg.check_command) |check| try w.print(", the check `{s}`", .{check.text}) else try w.writeAll(", no pinned check");
     try w.print(", and merging the result into {s} as uncommitted changes.", .{repo});
     return out.toOwnedSlice();
+}
+
+fn writeSeatTerm(w: *std.Io.Writer, name: []const u8, seat: types.SeatSpec) !void {
+    try w.print(" {s}={s}", .{ name, seat.harnessKind().name() });
+    if (seat.model) |model| try w.print("/{s}", .{model});
+    switch (seat.harness) {
+        .metacodes => {},
+        .claude_code => |external| switch (external.budget) {
+            .cost => {},
+            .wallclock_only => |limit| try w.print(" (wallclock only, {d}s, no dollar cap)", .{limit.seconds}),
+        },
+    }
 }
 
 fn forwardAbort(source: *const types.AbortSignal, dest: *types.AbortSignal, stopped: *std.atomic.Value(bool)) void {
@@ -803,4 +823,22 @@ test "teamwork command: the approved policy keeps parallel candidates and the ju
         const restored = (try config.validate(try config.parse(a, try policyJson(a, cfg), null), null)).enabled;
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, cfg, .{}), try std.json.Stringify.valueAlloc(a, restored, .{}));
     }
+}
+
+test "teamwork command: approval terms name every candidate, the judge and the raised seat cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const claude = if (@import("builtin").os.tag == .windows) "C:/tools/claude.exe" else "/opt/claude/bin/claude";
+    const text = "{\"enabled\":true,\"budget_usd\":5,\"candidates\":[{\"model\":\"m\"},{\"harness\":\"claude_code\",\"command\":\"" ++ claude ++ "\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}],\"candidate_estimate_usd\":0.5,\"seats\":{\"judge\":{\"model\":\"j\"}}}";
+    const cfg = (try config.validate(try config.parse(a, text, null), null)).enabled;
+    try std.testing.expectEqualStrings(
+        "Approving also authorizes spend up to $5 (at most 3 seats per role; 4 implementer and reviewer seats, and 3 judge seats), these seats: interviewer=metacodes implementer=metacodes reviewer=metacodes verifier=metacodes, 2 parallel candidates estimated at $0.5 each: candidate-1=metacodes/m candidate-2=claude_code (wallclock only, 60s, no dollar cap), judged by judge=metacodes/j, no pinned check, and merging the result into /repo as uncommitted changes.",
+        try approvalTerms(a, cfg, "/repo"),
+    );
+    const single = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":2}", null), null)).enabled;
+    try std.testing.expectEqualStrings(
+        "Approving also authorizes spend up to $2 (at most 3 seats per role), these seats: interviewer=metacodes implementer=metacodes reviewer=metacodes verifier=metacodes, no pinned check, and merging the result into /repo as uncommitted changes.",
+        try approvalTerms(a, single, "/repo"),
+    );
 }

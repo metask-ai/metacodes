@@ -1604,6 +1604,15 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
 
 const roles_before_candidates = @intFromEnum(Role.judge);
 
+comptime {
+    std.debug.assert(roles_before_candidates + 1 == std.enums.values(Role).len);
+    const fields = std.meta.fieldNames(config.Config.Enabled);
+    const expected = [_][]const u8{ "budget_usd", "check_command", "max_rounds", "candidates", "candidate_estimate_usd", "seats" };
+    std.debug.assert(fields.len == expected.len);
+    for (fields, expected) |field, name| std.debug.assert(std.mem.eql(u8, field, name));
+    std.debug.assert(std.mem.eql(u8, std.meta.fieldNames(std.EnumArray(Role, types.SeatSpec))[0], "values"));
+}
+
 const SingleLinePolicy = struct {
     budget_usd: f64,
     check_command: ?config.CheckCommand,
@@ -1713,6 +1722,7 @@ test "runtime: seat ids and goals" {
 }
 
 test "runtime: a run approved before parallel candidates keeps its fingerprint and state" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
