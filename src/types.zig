@@ -3,6 +3,8 @@ const std = @import("std");
 /// See `Config.mcp_connect`.
 pub const McpConnect = enum { app_init, first_request, disabled };
 
+pub const KgConnect = enum { app_init, first_request };
+
 pub const PreviewFeature = enum {
     execute_code,
     teamwork,
@@ -191,6 +193,7 @@ pub const Config = struct {
     /// publish the built-in tool surface during App.init. Teamwork controls
     /// its own tools and must not recursively import its Manager endpoint.
     mcp_connect: McpConnect = .app_init,
+    kg_connect: KgConnect = .app_init,
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,
