@@ -26,7 +26,8 @@
 //! Replay (requirement 6 of #405). Three things look alike and are not:
 //! - a protocol continuation completes the same logical request and may send
 //!   more bytes: an MRTR retry with `inputResponses`, an SSE resumption with
-//!   `Last-Event-ID`, a POST repeated after a 401 refused it;
+//!   `Last-Event-ID`, a POST repeated after a 401 refused it, a request repeated
+//!   once in a new session after a 404 said the old one is gone;
 //! - a retry known not to have been delivered: a POST on a pooled connection
 //!   that failed before its body was fully written;
 //! - an indeterminate outcome: the request left and no answer came. It is
@@ -109,8 +110,6 @@ pub const Profile = struct {
     /// false it is a terminal `input_required_unsupported`, one request, the
     /// connection untouched.
     input_continuation: bool,
-    /// What the client declares to the server.
-    capabilities: wire.ClientCapabilities,
     limits: canonical.Limits,
     /// `tools/list` bound and what happens at it: silently keep what fits
     /// (`truncate_catalog`), or fail.
@@ -122,7 +121,6 @@ pub const Profile = struct {
         .conformance = .interop,
         .probe = .reuse,
         .input_continuation = true,
-        .capabilities = .{ .elicitation = true },
         .limits = .{
             .max_frame_bytes = 128 * 1024 * 1024 + 1024 * 1024,
             .max_tools = 2048,
@@ -146,7 +144,6 @@ pub const Profile = struct {
             .conformance = .strict,
             .probe = .disposable,
             .input_continuation = false,
-            .capabilities = .{},
             .limits = limits,
             .max_list_pages = limits.max_tools +| 1,
             .truncate_catalog = false,
@@ -199,6 +196,7 @@ pub const ConnectOptions = struct {
     /// answers an unknown method at once (or exits); one that ignores it
     /// costs this long before the handshake.
     probe_timeout_ms: u32 = 10_000,
+    elicit: ?ElicitHandler = null,
 };
 
 pub const ServerCapabilities = struct {
@@ -291,6 +289,7 @@ pub const EstablishConfig = struct {
     probe_timeout_ms: u32 = 10_000,
     abort: ?*const AbortSignal = null,
     request_timeout_ms: ?u32 = null,
+    elicit: ?ElicitHandler = null,
 };
 
 pub const EstablishOutcome = union(enum) {
@@ -306,6 +305,7 @@ pub fn establish(gpa: std.mem.Allocator, config: EstablishConfig) EstablishOutco
         .profile = config.profile,
         .client_info = config.client,
         .request_timeout_ms = config.request_timeout_ms,
+        .elicit = config.elicit,
     };
     var state = Negotiator{ .gpa = gpa, .config = &config, .client = &client };
     const selected = negotiation.negotiateWith(
@@ -479,7 +479,7 @@ const Negotiator = struct {
             arena.allocator(),
             id,
             self.config.client,
-            self.profile().capabilities,
+            self.client.declaredCapabilities(),
             self.profile().limits,
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -671,7 +671,7 @@ const Negotiator = struct {
             arena.allocator(),
             id,
             self.config.client,
-            self.profile().capabilities,
+            self.client.declaredCapabilities(),
             self.profile().limits,
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -724,7 +724,7 @@ const Negotiator = struct {
             id,
             offered,
             self.config.client,
-            self.profile().capabilities,
+            self.client.declaredCapabilities(),
             self.profile().limits,
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -880,6 +880,7 @@ pub const McpClient = struct {
     /// False once the connection was closed (`close`, or a connector contract
     /// failure). A retired client refuses further requests.
     connection_live: bool = false,
+    session_lost: bool = false,
     usable: std.atomic.Value(bool) = .init(true),
     next_id: u64 = 1,
     /// A stream transport is one ordered JSON-RPC stream. Parallel agent tools
@@ -922,6 +923,7 @@ pub const McpClient = struct {
             .probe_timeout_ms = options.probe_timeout_ms,
             .abort = options.abort,
             .request_timeout_ms = options.request_timeout_ms,
+            .elicit = options.elicit,
         }));
     }
 
@@ -962,6 +964,7 @@ pub const McpClient = struct {
             .probe_timeout_ms = options.probe_timeout_ms,
             .abort = options.abort,
             .request_timeout_ms = options.request_timeout_ms,
+            .elicit = options.elicit,
         }));
     }
 
@@ -995,6 +998,10 @@ pub const McpClient = struct {
         };
     }
 
+    fn declaredCapabilities(self: *const McpClient) wire.ClientCapabilities {
+        return .{ .elicitation = self.elicit != null and self.profile.input_continuation };
+    }
+
     fn nextId(self: *McpClient) error{McpResourceLimit}!u64 {
         if (self.next_id == std.math.maxInt(u64)) return error.McpResourceLimit;
         const id = self.next_id;
@@ -1008,7 +1015,7 @@ pub const McpClient = struct {
             id,
             self.era,
             self.client_info,
-            self.profile.capabilities,
+            self.declaredCapabilities(),
             method,
             params_json,
             self.profile.limits,
@@ -1031,7 +1038,11 @@ pub const McpClient = struct {
         self.transport.setAbort(abort);
         defer self.transport.setAbort(null);
         var sent = false;
-        self.transport.send(encoded, meta) catch |err| return self.sendFailure(err, &sent);
+        try self.sendRequest(encoded, meta, &sent);
+        return self.awaitResponse(id);
+    }
+
+    fn awaitResponse(self: *McpClient, id: u64) ![]u8 {
         defer self.transport.markAnswered();
         const single = self.transport.singleResponse();
         while (true) {
@@ -1162,6 +1173,65 @@ pub const McpClient = struct {
             => return err,
             else => return error.McpServerCrashed,
         }
+    }
+
+    fn sendRequest(self: *McpClient, encoded: []const u8, meta: transport_mod.SendMeta, sent: *bool) anyerror!void {
+        if (self.session_lost) {
+            self.renewSession() catch |renewal| {
+                sent.* = false;
+                return renewalFailure(renewal);
+            };
+            return self.transport.send(encoded, meta) catch |err| self.sendFailure(err, sent);
+        }
+        self.transport.send(encoded, meta) catch |err| {
+            if (err != error.McpSessionExpired or !self.connection_live or !self.transport.renewsSession())
+                return self.sendFailure(err, sent);
+            self.renewSession() catch |renewal| {
+                sent.* = false;
+                return renewalFailure(renewal);
+            };
+            self.transport.send(encoded, meta) catch |again| return self.sendFailure(again, sent);
+        };
+    }
+
+    fn renewSession(self: *McpClient) !void {
+        const offered = classic.ClassicProfile.forEra(self.era) orelse return error.McpSessionExpired;
+        self.session_lost = true;
+        self.transport.forgetSession();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const id = try self.nextId();
+        const request = classic.encodeInitializeRequest(
+            arena.allocator(),
+            id,
+            offered,
+            self.client_info,
+            self.declaredCapabilities(),
+            self.profile.limits,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidValue, error.ResourceLimit => error.McpResourceLimit,
+        };
+        try self.transport.send(request, .{ .method = "initialize" });
+        const frame = try self.awaitResponse(id);
+        defer self.allocator.free(frame);
+        var handshake = switch (try classic.parseInitializeResponseWith(
+            self.allocator,
+            frame,
+            id,
+            offered,
+            self.profile.limits,
+            self.profile.conformance,
+        )) {
+            .value => |value| value,
+            .diagnostic => return error.McpSessionExpired,
+        };
+        defer handshake.deinit();
+        self.adoptEra(handshake.era, handshake.capabilities);
+        self.transport.setProtocolVersion(self.era.version());
+        const notification = try classic.encodeInitializedNotification(arena.allocator());
+        try self.transport.send(notification, .{ .method = "notifications/initialized", .kind = .notification });
+        self.session_lost = false;
     }
 
     /// A request that did not get its answer from `send`. `sent` records
@@ -1400,7 +1470,7 @@ pub const McpClient = struct {
         defer meta_scratch.deinit();
         var meta = try sendMeta(meta_scratch.allocator(), method, params_json);
         meta.param_headers = options.headers;
-        self.transport.send(encoded, meta) catch |err| return self.sendFailure(err, sent);
+        try self.sendRequest(encoded, meta, sent);
         sent.* = true;
         defer if (self.connection_live) self.transport.markAnswered();
 
@@ -1551,7 +1621,7 @@ pub const McpClient = struct {
     /// 处理 server→client 请求并回复(Classic;Modern server 不发请求)。
     /// ping → 空结果(规范 MUST 及时应答);elicitation/create → 回调(或 decline);
     /// 其余(未声明的 roots/sampling 等)→ method_not_found。
-    fn handleServerRequest(self: *McpClient, server_id: u64, method: []const u8, line: []const u8) void {
+    fn handleServerRequest(self: *McpClient, server_id: protocol.RequestId, method: []const u8, line: []const u8) void {
         if (std.mem.eql(u8, method, "ping")) {
             const reply = protocol.serializeResult(self.allocator, server_id, "{}") catch return;
             defer self.allocator.free(reply);
@@ -1786,6 +1856,14 @@ fn failureOf(err: anyerror, sent: bool, method: []const u8) BodyFailure {
         else => .indeterminate,
     };
     return .{ .failure = failure, .disposition = disposition, .err = err };
+}
+
+fn renewalFailure(err: anyerror) anyerror {
+    return switch (err) {
+        error.OutOfMemory, error.Aborted, error.McpAuthRequired, error.McpRequestTimeout => err,
+        error.Timeout => error.McpRequestTimeout,
+        else => error.McpSessionExpired,
+    };
 }
 
 /// The failure a materialized request reports for a frame the parser refused.

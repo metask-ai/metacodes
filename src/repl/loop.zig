@@ -2006,6 +2006,8 @@ fn readLineRaw(
             if (rc > 0) break; // 有字节可读
         };
 
+        const vim_keys = vimOwnsKeys(app.config.vim_mode, region);
+
         // 取键:合成键(孤立 ESC 超时兑现)优先;否则读一字节喂 parser。
         // parser.feed 返 null = 序列未完成(如刚收 ESC / CSI 中段)→ 回头继续读。
         const key = if (synthetic_key) |sk| sk else blk: {
@@ -2017,7 +2019,7 @@ fn readLineRaw(
             if (n == 0) return error.Eof;
 
             // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
-            if (app.config.vim_mode and vim_state.mode != .insert) {
+            if (vim_keys and vim_state.mode != .insert) {
                 if (b[0] == '\r' or b[0] == '\n') {
                     region.setInput("", 0);
                     region.clear();
@@ -2033,7 +2035,7 @@ fn readLineRaw(
         };
 
         // vim INSERT 模式下 Esc → 回 NORMAL(不走 LineEditor 的 esc 语义)
-        if (app.config.vim_mode and key == .esc) {
+        if (vim_keys and key == .esc) {
             vim_state.mode = .normal;
             if (editor.cursor > 0) editor.cursor -= 1; // vim 习惯:Esc 后光标左移一格
             redraw(region, &editor, app);
@@ -2047,11 +2049,11 @@ fn readLineRaw(
             continue;
         }
 
-        // 阶段1:overlay 分流(? help / Ctrl+O transcript)。非 vim 模式才介入。
+        // 阶段1:overlay 分流(? help / Ctrl+O transcript)。vim 不占键盘时才介入。
         // dispatch 判断"空 buffer + ?"依赖 editor 投影,调前同步。
         // vim mode keeps its own keymap, but the exit keys go through the same
         // double-press state as everywhere else.
-        if (!app.config.vim_mode or key == .ctrl_c or key == .ctrl_d) {
+        if (!vim_keys or key == .ctrl_c or key == .ctrl_d) {
             region.setInput(editor.view(), editor.cursor);
             const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key, .now_ms = util_time.nowMs() } });
             switch (eff.action) {
@@ -2398,6 +2400,10 @@ fn readLineRaw(
             .none => {},
         }
     }
+}
+
+fn vimOwnsKeys(vim_mode: bool, region: *render_region_mod.RenderRegion) bool {
+    return vim_mode and !region.pickerOpen();
 }
 
 /// TAB 补全：算候选，唯一则补全，多个则列出 + 补到公共前缀。
@@ -6190,6 +6196,21 @@ test "/loop command parser covers user input command surface" {
     try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("on 0")));
     try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("on nope")));
     try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("forever")));
+}
+
+test "vim leaves the keys to an open /model picker, and takes them back when it closes (#606)" {
+    var region = render_region_mod.RenderRegion.init(std.testing.allocator, 2, tui_theme.monochrome, .none);
+    defer region.deinit();
+    region.beginInput(.builtin);
+    try std.testing.expect(vimOwnsKeys(true, &region));
+    try std.testing.expect(!vimOwnsKeys(false, &region));
+
+    region.ui.interaction().?.picker_open = true;
+    try std.testing.expect(!vimOwnsKeys(true, &region));
+    try std.testing.expect(!vimOwnsKeys(false, &region));
+
+    region.ui.interaction().?.picker_open = false;
+    try std.testing.expect(vimOwnsKeys(true, &region));
 }
 
 test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随会话)" {

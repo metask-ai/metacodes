@@ -142,7 +142,11 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
 
     // ── issue #16: model picker 开着时,键盘属于它 ──────────────────────────
     // 对键模态(普通字符是它的过滤器),对会话不模态:草稿不动、生成不停。
-    // Ctrl+C/Ctrl+D 故意不拦——用户永远有一条不依赖本状态机的退出路径。
+    // 输入期的 Ctrl+C 不管 picker 停在哪一步都直接关掉它(#607),再按才回到提示符的双击退出;
+    // Ctrl+D 和生成期的 Ctrl+C 不拦——用户永远有一条不依赖本状态机的退出路径。
+    if (ix.picker_open and key == .ctrl_c and state.phase == .input) {
+        return .{ .action = .picker_key, .picker_key = .cancel };
+    }
     if (ix.picker_open and key != .ctrl_c and key != .ctrl_d) {
         const mapped: ?@import("../model_picker.zig").Key = switch (key) {
             .up => .up,
@@ -692,10 +696,32 @@ test "Ctrl+R in an open picker is the picker's: it fetches again a list that did
 test "issue #16: an open picker never traps the session" {
     var state = UiState.in(.{ .input = .{} });
     state.interaction().?.picker_open = true;
-    // Ctrl+C and Ctrl+D keep their normal meaning, so there is always a way
-    // out that does not depend on the picker's own state machine.
-    try testing.expect(press(&state, .ctrl_c).action != .picker_key);
+    // Ctrl+D, and Ctrl+C during a reply, keep their normal meaning, so there
+    // is always a way out that does not depend on the picker's own state machine.
     try testing.expect(press(&state, .ctrl_d).action != .picker_key);
+    var replying = UiState.in(.{ .generating = .{} });
+    replying.interaction().?.picker_open = true;
+    try testing.expect(press(&replying, .ctrl_c).action != .picker_key);
+    try testing.expect(press(&replying, .ctrl_d).action != .picker_key);
+}
+
+test "Ctrl+C at the prompt closes an open picker and keeps the draft; the next Ctrl+C arms the exit (#607)" {
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    ix.editor = .{ .view = "explain this function", .cursor = 4 };
+    ix.picker_open = true;
+
+    const cancelled = press(&state, .ctrl_c);
+    try testing.expectEqual(event.LoopAction.picker_key, cancelled.action);
+    try testing.expect(cancelled.picker_key == .cancel);
+    try testing.expectEqualStrings("explain this function", ix.editor.view);
+    try testing.expectEqual(@as(usize, 4), ix.editor.cursor);
+    try testing.expect(exitHint(&state) == null);
+
+    ix.picker_open = false;
+    try testing.expectEqual(event.LoopAction.discard_draft, press(&state, .ctrl_c).action);
+    try testing.expectEqualStrings("Press Ctrl-C again to exit", exitHint(&state).?);
+    try testing.expectEqual(event.LoopAction.exit_prompt, press(&state, .ctrl_c).action);
 }
 
 test "issue #16: `?` help lists both the picker and its replacement binding" {

@@ -686,10 +686,11 @@ pub fn send(s: Socket, buf: []const u8) isize {
 pub fn lastSocketFailure() enum { interrupted, peer_closed, other } {
     if (is_windows) {
         const WSAEINTR = 10004;
+        const WSAECONNABORTED = 10053;
         const WSAECONNRESET = 10054;
         return switch (sys.WSAGetLastError()) {
             WSAEINTR => .interrupted,
-            WSAECONNRESET => .peer_closed,
+            WSAECONNABORTED, WSAECONNRESET => .peer_closed,
             else => .other,
         };
     }

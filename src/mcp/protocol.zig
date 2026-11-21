@@ -20,7 +20,7 @@ pub const catalog = @import("catalog.zig");
 
 pub const JSONRPC_VERSION = "2.0";
 
-pub const RequestId = u64;
+pub const RequestId = wire.RequestId;
 
 pub const ErrorCode = enum(i32) {
     parse_error = -32700,
@@ -47,16 +47,23 @@ pub fn serializeNotification(
 
 /// 序列化对 server→client 请求的成功响应：`{"jsonrpc","id","result":<result_json>}`。
 pub fn serializeResult(alloc: std.mem.Allocator, id: RequestId, result_json: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"{s}\",\"id\":{d},\"result\":{s}}}", .{ JSONRPC_VERSION, id, result_json });
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("{{\"jsonrpc\":\"{s}\",\"id\":", .{JSONRPC_VERSION});
+    try id.write(&out.writer);
+    try out.writer.print(",\"result\":{s}}}", .{result_json});
+    return out.toOwnedSlice();
 }
 
 /// 序列化错误响应(如 method_not_found)。message 只用 ASCII 简单文本(不转义)。
 pub fn serializeErrorResponse(alloc: std.mem.Allocator, id: RequestId, code: i32, message: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.print("{{\"jsonrpc\":\"{s}\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":", .{ JSONRPC_VERSION, id, code });
+    try out.writer.print("{{\"jsonrpc\":\"{s}\",\"id\":", .{JSONRPC_VERSION});
+    try id.write(&out.writer);
+    try out.writer.print(",\"error\":{{\"code\":{d},\"message\":", .{code});
     try json_util.writeJsonString(&out.writer, message);
-    try out.writer.writeAll("}}}");
+    try out.writer.writeAll("}}");
     return out.toOwnedSlice();
 }
 
@@ -97,6 +104,18 @@ test "serializeNotification no id" {
     defer testing.allocator.free(r);
     try testing.expect(std.mem.indexOf(u8, r, "\"id\"") == null);
     try testing.expect(std.mem.indexOf(u8, r, "initialized") != null);
+}
+
+test "replies to a server request echo its id, number or string" {
+    const numbered = try serializeResult(testing.allocator, .{ .number = "-7" }, "{}");
+    defer testing.allocator.free(numbered);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":-7,\"result\":{}}", numbered);
+    const named = try serializeResult(testing.allocator, .{ .string = "a\"b" }, "{}");
+    defer testing.allocator.free(named);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"result\":{}}", named);
+    const refused = try serializeErrorResponse(testing.allocator, .{ .string = "abc" }, -32601, "not supported");
+    defer testing.allocator.free(refused);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"error\":{\"code\":-32601,\"message\":\"not supported\"}}", refused);
 }
 
 test "callToolParams structure" {

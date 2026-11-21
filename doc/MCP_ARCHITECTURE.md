@@ -36,7 +36,7 @@ machine. Each row is pinned by the named test.
 | Probe fallback | Any completed non-Modern answer falls back | Only validated evidence does | Same | negotiation: "interop falls back…" |
 | Probe connection | `reuse`: one child, one TLS handshake | `disposable`: `purpose` tells the Host | The Connector contract; the CLI's cost | conformance: "profiles differ: who owns the discovery probe's connection" |
 | Input continuation | On, with the host's elicitation handler (declined when none) | Off: terminal `input_required_unsupported`, one request, client unaffected | The ABI has no way to carry an elicitation; turning it on is a separate public API extension | conformance: "input continuation is a policy" (both positions) |
-| Declared capabilities | `elicitation` | None | Follows from the row above | wire: "encodeRequest…" |
+| Declared capabilities | `elicitation` only when the connect names a handler (`ConnectOptions.elicit`); the App names none, so it declares nothing | None | A server may ask only for what the client will answer; follows from the row above | mcp_http_test: "elicitation is declared exactly when the connection has a handler to answer it" |
 | Catalog bound | 2048 tools, 100 pages, truncates | `max_tools`, fails the server | Admission is all-or-nothing under the ABI | conformance: "profiles differ: the catalog bound…" |
 | Catalog admission | Lenient: a malformed tool is skipped with a warning | Canonical: projected, fingerprinted, issue reported | The CLI registers what a server lists; AgentCore binds permission to a schema fingerprint | registry_bridge tests; catalog: "Catalog excludes broken Provider projections…" |
 | Model-facing name | Readable `mcp__<server>__<tool>` | Opaque hashed alias | Provider-visible bytes are a cache contract, on both sides | mcp_session: "the same server through the product registry and the AgentCore overlay…" |
@@ -52,7 +52,7 @@ distinction to the caller.
 
 | Case | Examples | Behaviour |
 |---|---|---|
-| Valid protocol continuation | MRTR retry with `inputResponses` and `requestState`; SSE resumption with `Last-Event-ID`; a POST a 401 refused, repeated after refreshing the token | Completes the one logical request. Never reaches a caller as a failure |
+| Valid protocol continuation | MRTR retry with `inputResponses` and `requestState`; SSE resumption with `Last-Event-ID` (counted as stalled only while no new event id arrives, so a polling server can keep a long call open); a POST a 401 refused, repeated after refreshing the token; a Streamable HTTP request a 404 refused for an expired Classic session, repeated once after a new `initialize` (whose selected revision is adopted, even if it differs from the old one) | Completes the one logical request. Never reaches a caller as a failure |
 | Known not delivered (`not_delivered`) | Interrupted before the send; a POST whose body was never fully written; a pooled connection that failed on write; a 401/403 refusal | May be sent again. The client does so only for a pooled-connection write failure |
 | Indeterminate (`indeterminate`) | No answer after the request left: timeout, dropped connection, server exit, HTTP 5xx, a connector's `indeterminate` | **Never replayed.** Reported with its cause; the product tells the model the call may have executed |
 
@@ -78,7 +78,7 @@ above), **corrected** (see "Behaviour changes"), **evolve** (out of scope, separ
 | Request encoding | `wireParams`, `serializeRequest` | DTO encoders per era | | wire, era tests | One `wire.encodeRequest`. **kept** |
 | Response parsing | Hand-written field scanners (`protocol.parseResponse`) | `wire.parseEnvelope` | | wire tests | One `wire.parseResponseEnvelopeWith`. Scanners deleted. **corrected** |
 | Correlation, stale answers | Skip by id | One exchange per request | | mcp_protocol_test | `exchangeEncoded`, `Transport.singleResponse`. **kept** |
-| Server requests: ping, elicitation | `handleServerRequest` | None (no such frames) | Stream transports | mcp_e2e_test, mcp_http_test | **kept** |
+| Server requests: ping, elicitation | `handleServerRequest`; the reply echoes the request's id, number or string | None (no such frames) | Stream transports | mcp_e2e_test, mcp_http_test | **kept** |
 | `tools/list_changed` | Recorded | None | `/mcp` | New: mcp_http_test | **kept**, now tested |
 | Pagination | Bounded, truncates | Bounded, fails | | mcp_http_test; runtime tests | One `paginateTools` with a page consumer. **policy** |
 | Tool call (materialized) | `callToolAbortable` | `Client.callTool` | Source-level | mcp_e2e_test; runtime tests | One `exchange`. **kept** |
