@@ -350,13 +350,15 @@ under §4's rule 1. They are not Session journal lines and carry no Run
 
 `<snapshot>` is `run_id` (the teamwork run id string), `goal` (the first line
 of the request, at most 200 bytes), `phase` (`interviewing` or a runtime
-phase: `approved`, `implementing`, `reviewing`, `review_approved`,
+phase: `approved`, `candidates`, `implementing`, `reviewing`, `review_approved`,
 `auditing`, `merging`, `done`, `failed`, `budget_exhausted`, `cancelled`),
 `done` and `total` (seats done, seats listed), `seats` (each `id`, `role`,
 `harness`, `status`; `status` is `queued`, `working`, `needs_you`,
 `waiting`, `done` or `failed`), `budget` (`cap_usd`, `spent_usd`) and
 `audit` (`used`, `max`, `last`: null or `pass`, `fail`, `unverified`,
-`unavailable`). `<change>` is `{"kind":"seat","seat":id,"from":status or
+`unavailable`) and `candidates` (each `candidate`, numbered from 1, and
+`status`: `queued`, `implementing`, `reviewing`, `approved`, `rejected`,
+`selected` or `eliminated`; empty when the run has no parallel candidates). `<change>` is `{"kind":"seat","seat":id,"from":status or
 null,"to":status}` (null `from` is a new seat) or
 `{"kind":"phase","from":phase,"to":phase}`; `snapshot` is the state after
 it. A snapshot line answers a query; event lines follow in the order the

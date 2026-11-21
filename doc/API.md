@@ -406,7 +406,10 @@ the run's budget ledger. The user answers `y` (approve), `e` (type a
 replacement statement, shown again for approval) or `n` (reject). Each prompt
 also states what approval authorizes: the dollar cap and seats per role,
 every seat's harness and model, the pinned check, and merge-back into the
-repository as uncommitted changes. Ctrl+C while the interviewer drafts
+repository as uncommitted changes. With parallel candidates it also names
+each candidate's seat, the judge, the per-candidate estimate and the raised
+implementer/reviewer cap; a wallclock-only external seat is marked as having
+no dollar cap. Ctrl+C while the interviewer drafts
 cancels that seat (as `aborted`, even when the unreported spend of a killed
 seat fills the cap) and leaves the next message unaffected. No
 implementer, reviewer, worktree or `ORIGINAL_REQUEST.md` exists before
@@ -1902,7 +1905,8 @@ stdin/stdout, and `serveFds(self, input: platform.fs.Fd, output: platform.fs.Fd)
 uses bounded NDJSON with protocol-only stdout and cancels live runs on EOF.
 
 The tools are `teamwork_status`, synchronous `teamwork_dispatch` (only
-implementer/reviewer and optional instructions), `teamwork_request_completion`
+implementer/reviewer and optional instructions), `teamwork_run_candidates`
+(parallel candidates and the judge, #525), `teamwork_request_completion`
 and `teamwork_cancel`. No tool starts or approves a run, replaces the approved
 request, changes configuration/budget/check command, or chooses a workspace.
 The runtime alone verifies review approval, independently audits and merges;

@@ -117,6 +117,14 @@ pub const SeatOutcome = union(enum) { finished: Handoff, failed: SeatError, budg
 `check_command`(可选,顶层)是宿主钉住的检查命令,`Config.Enabled.check_command: ?CheckCommand`。
 runtime 用它核验 reviewer 的批准(§6.2);各层逐字段覆盖,与其他标量相同。
 
+`candidates`(可选,顶层,#525)开启并行候选:整数 N(1–4,1 即不开启)让每个候选都用
+`seats.implementer`;数组(2–4 项,每项与 seat 对象同格式)给每个候选单独的 implementer seat,
+可以混用 harness。开启时必须同时给 `candidate_estimate_usd`(一个候选的预估花费),runtime 在
+启动前检查 N 倍预估不超过剩余预算(§10.1)。`seats.judge` 配置择优的 judge seat,默认 metacodes。
+两个字段由高层整体覆盖低层。结果是 `Config.Enabled.candidates`(`slice()` 给出每个候选的
+`SeatSpec`)与 `candidate_estimate_usd`。没有候选的配置,配置指纹与引入候选之前逐字节相同,
+旧运行照常恢复。
+
 **校验规则**(每条一个 error,各有单元测试):
 
 | 规则 | error |
@@ -135,6 +143,8 @@ runtime 用它核验 reviewer 的批准(§6.2);各层逐字段覆盖,与其他�
 | `budget_usd` 不是有限正数 | `InvalidBudget` |
 | `check_command` 为空白、超过 1024 字节或含 NUL | `InvalidCheckCommand`(空字符串在解析阶段即 `WrongType`) |
 | reviewer 是外部 harness 却没有 `check_command`(其工具调用不可观测,批准将永远无法核验) | `ExternalReviewerWithoutCheck` |
+| `candidates` 为 0 或大于 4,或数组少于 2 项、多于 4 项 | `InvalidCandidates` |
+| 有两个以上候选却没有 `candidate_estimate_usd` / 有它却没有候选 / 它不是有限正数 | `CandidateEstimateMissing` / `CandidateEstimateWithoutCandidates` / `InvalidCandidateEstimate` |
 
 即使 `enabled` 为假,所有 seat 也照样校验,坏配置在启动时就报错。`Diagnostic` 记录出错的
 角色和字段。类型层面同样排除了非法状态:`HarnessConfig = union(Harness) { metacodes, claude_code: ExternalHarness }`,
@@ -186,12 +196,15 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
   interview/              面试期间的临时快照 worktree,面试结束即删(#518)
   budget.jsonl            预算账本(§5)
   open_issues.json        评审发现台账(#517),初始为 []
+  candidates/candidate-<n>/  并行候选各自的 worktree(#525);选中后只留选中的那个
+  judging/                judge 的工作目录:合格候选的 candidate-<n>.diff 与 candidate-<n>.review.json
   seats/<seat_id>/
     packet.md             runtime 写
     handoff.md            seat 写
     progress.md           seat 写
   seat-status/<id>.json   runtime 写:{seat_id, role, harness, status}，不在 worker 可写目录内
     review.json           reviewer seat 写(§6.1)
+    judgment.json         judge seat 写(§10.1)
     open_issues.json      runtime 写给本 seat 的台账只读副本(§6.3)
     harness.log           Claude Code 驱动写:CLI 的 stderr 与兼容性诊断(§7.4)
 ```
@@ -369,7 +382,7 @@ pub fn forSeat(spec: *const SeatSpec, deps: Deps, binding: common.Binding) Drive
   (`drivers_test` 断言两次运行只有这一项不同)。seat 目录的真实路径和 cwd 由 CLI 自己写进它生成的
   环境消息,再加上它自己的日期、git 状态等;这些内容和 CLI 的 transcript 由 Claude Code 生成,
   runtime 不控制,也不保证它们跨运行稳定。
-- **宪章**(`charters.forRole(role)`):interviewer、implementer、manager 为原创文本;reviewer 即
+- **宪章**(`charters.forRole(role)`):interviewer、implementer、manager、judge 为原创文本;reviewer 即
   `reviewer.charter`(§6);verifier 是标明的占位,真正的宪章在 verifier 模块(#516)。
   两种 harness 都收到同一角色宪章(Claude Code 通过 `--append-system-prompt`)。
   `charters.digest(role)` 是编译期 SHA-256,runtime 将其写入控制器的 seat 状态文件,恢复时保留。
@@ -480,7 +493,7 @@ Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命�
 `src/lib.zig` 导出 `teamwork_types`、`teamwork_config`、`teamwork_run_dir`、`teamwork_ledger`、
 `teamwork_issues`、`teamwork_reviewer`、`teamwork_charters`、`teamwork_drivers`(`drivers/factory.zig`)、
 `teamwork_runtime`、`teamwork_swe_loop`、`teamwork_audit`、`teamwork_merge_back`、
-`teamwork_verifier_auditor`、`teamwork_mcp_server`、`teamwork_progress` 与 `teamwork_interview`
+`teamwork_verifier_auditor`、`teamwork_mcp_server`、`teamwork_progress`、`teamwork_interview` 与 `teamwork_judge`
 (与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
 `zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
 
@@ -528,6 +541,51 @@ UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预�
 L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成功交付、跨轮问题、过期批准、两次
 审计失败、预算中止、冲突保留、恢复与配置变更拒绝。模型调用均用脚本化 provider/假 CLI。
 
+### 10.1 并行候选与择优(#525)
+
+配置了 `candidates` 的运行在 `Run.start` 时不建单线 worktree。`start` 在写任何文件前读出运行目录
+里的预算账本(面试的花费也在其中),候选数乘以 `candidate_estimate_usd` 超过剩余额度即返回
+`CandidateBudgetExceeded`,不写 `ORIGINAL_REQUEST.md`、`run.json`,不启动任何 seat。
+
+`Run.runCandidates()` 只能在 `approved` 调用(之前 `dispatch` 返回 `CandidatesPending`),再检查
+一次预估,然后进入 `candidates` 阶段,按顺序处理每个候选:
+
+1. 在 `candidates/candidate-<n>` 从启动快照建 worktree;
+2. 以该候选的 seat 跑 implementer,再跑 reviewer。评审照常核验(观测到的 Bash、固定检查重跑、
+   零修改),但用候选自己的空台账,不写运行的 `open_issues.json`;
+3. 批准且核验通过的候选为 `approved`(记下批准的树),其余为 `rejected`。
+
+seat 按顺序运行:预算账本一次只预留一个付费 seat(§5)。候选的 implementer 与 reviewer 共用
+`implementer-<k>` / `reviewer-<k>` 序号;每个角色的派发上限因此是 `max_rounds + N - 1`,即全部
+候选算作一轮。预算耗尽或取消时运行照常结束。
+
+没有候选通过时运行以 `no_candidate_approved` 结束,不跑 judge,候选 worktree 保留。否则 runtime
+在 `judging/` 放入每个合格候选的 `candidate-<n>.diff`(相对启动快照)和 review 副本,派出
+judge seat(宪章原创,工具同其他只读角色)。packet 列出每个候选和 runtime 核验过的事实,
+只写 `candidate-<n>` 与相对文件名,不含 run id、路径和时间。judge 写 `judgment.json`:
+
+```json
+{"selected": "candidate-2", "eliminated": [{"candidate": "candidate-1", "reason": "..."}]}
+```
+
+`judge.parse` 严格校验:`selected` 必须是合格候选;其余每个候选恰好出现一次,理由非空且不超过
+1000 字节。不合格的 judgment 记为 `judgment.invalid`,在 judge 的派发上限内换新 judge seat 重来;
+到上限即 `rounds_exhausted`。
+
+选中后,未选中的已批准候选记为 `eliminated`,其余 worktree 都删除,选中的 worktree 成为运行的
+worktree,运行进入 `review_approved`(批准的树)。之后与单线运行相同:`requestCompletion` 复核
+批准、审计(#516)、合回(#523)。所以只有选中的候选会被审计和合回;审计失败的修复轮也在它的
+worktree 里进行。
+
+每个未选中的候选生成一条 TinyKG `lesson`(`kg/lesson.zig`):头部 `verdict=failed task=- run=<run id>`,
+`holds_when` 是请求首行,`uncertain` 写 runtime 核验过的事实,`lesson` 写 judge 的理由。runtime
+按 `KgRemember` 对学习轮的同一条准入规则检查:信封可解析、头部与宿主绑定一致、单次至多 4 条,
+通过后才交给 `Deps.pitfalls`。CLI 与 REPL 接到 `App.kg`;KG 不可用时跳过,不影响运行。
+
+`run.json` 记录每个候选的状态和批准的树。选中后恢复时,worktree 指向选中的候选;在 `candidates`
+阶段崩溃的运行恢复为 `failed(candidates_interrupted)`。快照的 `candidates` 字段(MCP、
+`teamwork.snapshot`、TUI 面板)显示每个候选的状态。MCP manager 用 `teamwork_run_candidates`。
+
 ## 11. 实现状态
 
 | Issue | 内容 | 状态 |
@@ -543,4 +601,4 @@ L2 测试在临时 git 仓库驱动真实 worktree、账本与合回,覆盖成�
 | #522 | Claude Code 作为 Manager(MCP) | stdio MCP 接口驱动用户预先批准的 Run,复用独立审计和预算规则。详见 [TEAMWORK_MCP.md](TEAMWORK_MCP.md)。 |
 | #523 | worktree 合回 | 审计通过后补丁合回,保留用户并发修改,冲突时保留两边内容(§10)。 |
 | #524 | 进度面板与 AgentCore 事件 | 已做:runtime 每次 seat 状态或阶段变化都把变化和之后的快照发给 `Deps.observer`;interviewer 在等待批准时为 `needs_you`;REPL 用线程安全的 `progress.Board` 驱动输入框上方的面板与 `/teamwork status` 摘要;`teamwork run/resume --events` 输出 `teamwork.snapshot` / `teamwork.event` 线协议行(WIRE_PROTOCOL §1.6)。AgentCore C ABI 没有 teamwork 入口,不带这些事件。 |
-| #525 | 并行候选与择优 | 待做 |
+| #525 | 并行候选与择优 | 已做(§10.1):`candidates`(至多 4 个,可混用 harness)各用独立 worktree 并经 reviewer 核验;judge seat 按核验过的测试证据择一,只有选中的进入审计与合回;未选中的理由按 TinyKG lesson 准入写入 KG;启动前按 N 倍预估检查剩余预算;快照显示各候选状态。候选 seat 按顺序运行(账本一次只预留一个付费 seat)。 |

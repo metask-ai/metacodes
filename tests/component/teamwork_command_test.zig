@@ -451,7 +451,7 @@ test "teamwork command: installed MCP endpoint negotiates on stdio and never sel
         count += 1;
     }
     try testing.expectEqual(replies.len, count);
-    try testing.expectEqual(@as(usize, 4), replies[1].object.get("result").?.object.get("tools").?.array.items.len);
+    try testing.expectEqual(@as(usize, 5), replies[1].object.get("result").?.object.get("tools").?.array.items.len);
     const initial = replies[2].object.get("result").?.object.get("structuredContent").?.object.get("snapshot").?;
     try testing.expectEqualStrings("approved", initial.object.get("state").?.object.get("kind").?.string);
     try testing.expectEqual(@as(usize, 0), initial.object.get("seats").?.array.items.len);

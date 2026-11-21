@@ -127,6 +127,17 @@ pub fn renderTeamwork(alloc: std.mem.Allocator, th: Theme, snapshot: progress.Sn
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, '\n');
 
+    if (snapshot.candidates.len != 0) {
+        try out.appendSlice(alloc, "   ");
+        try out.appendSlice(alloc, th.dim);
+        try out.appendSlice(alloc, "candidates");
+        for (snapshot.candidates, 1..) |candidate, number| {
+            try out.print(alloc, " · {d} {s}", .{ number, @tagName(candidate.status) });
+        }
+        try out.appendSlice(alloc, th.reset);
+        try out.append(alloc, '\n');
+    }
+
     for (snapshot.seats, 0..) |seat, idx| {
         try out.appendSlice(alloc, "   ");
         try out.appendSlice(alloc, th.dim);
@@ -504,4 +515,21 @@ test "agent_tree teamwork: control bytes count as the spaces they become when fi
     const title = narrow[0..std.mem.indexOfScalar(u8, narrow, '\n').?];
     try testing.expectEqualStrings("* Teamwork · ab  …", title);
     try testing.expect(term.displayWidth(title) <= 13 + 5);
+}
+
+test "agent_tree teamwork: parallel candidates show their statuses under the summary" {
+    const seats = teamworkSeats();
+    var snapshot = try teamworkSnapshot(seats[0..1], "Add feature.txt");
+    const candidates = [_]@import("../../../teamwork/runtime.zig").CandidateSnapshot{ .{ .status = .rejected }, .{ .status = .selected }, .{ .status = .eliminated } };
+    snapshot.phase = .candidates;
+    snapshot.candidates = &candidates;
+    const s = try renderTeamwork(testing.allocator, theme_mod.dark, snapshot, 80);
+    defer testing.allocator.free(s);
+    try capture.expectStrippedEquals(testing.allocator, s,
+        \\⏺ Teamwork · Add feature.txt
+        \\   1/1 done · $0.42 / $5.00 · candidates
+        \\   candidates · 1 rejected · 2 selected · 3 eliminated
+        \\   └ implementer-1 · metacodes · done
+        \\
+    );
 }

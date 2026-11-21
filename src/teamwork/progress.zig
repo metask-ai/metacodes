@@ -2,11 +2,13 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const types = @import("types.zig");
 const runtime = @import("runtime.zig");
+const config = @import("config.zig");
 const wire = @import("../core/protocol/wire.zig");
 
 pub const Phase = enum {
     interviewing,
     approved,
+    candidates,
     implementing,
     reviewing,
     review_approved,
@@ -38,6 +40,7 @@ pub const Snapshot = struct {
     seats: []const runtime.SeatSnapshot,
     budget: runtime.BudgetSnapshot,
     audit: runtime.AuditSnapshot,
+    candidates: []const runtime.CandidateSnapshot = &.{},
 
     pub fn ofRun(run: runtime.RunSnapshot) Snapshot {
         return .{
@@ -47,6 +50,7 @@ pub const Snapshot = struct {
             .seats = run.seats,
             .budget = run.budget,
             .audit = run.audit,
+            .candidates = run.candidates,
         };
     }
 
@@ -80,6 +84,12 @@ pub const Snapshot = struct {
         try jw.write(.{ .cap_usd = self.budget.cap_usd, .spent_usd = self.budget.spent_usd });
         try jw.objectField("audit");
         try jw.write(.{ .used = self.audit.used, .max = self.audit.max, .last = self.audit.last });
+        try jw.objectField("candidates");
+        try jw.beginArray();
+        for (self.candidates, 1..) |candidate, number| {
+            try jw.write(.{ .candidate = number, .status = candidate.status });
+        }
+        try jw.endArray();
         try jw.endObject();
     }
 };
@@ -152,6 +162,8 @@ pub const Board = struct {
         seats: std.ArrayList(runtime.SeatSnapshot),
         budget: runtime.BudgetSnapshot,
         audit: runtime.AuditSnapshot,
+        candidates: [config.max_candidates]runtime.CandidateSnapshot,
+        candidates_len: usize,
     };
 
     pub const Copy = struct {
@@ -204,8 +216,11 @@ pub const Board = struct {
             .seats = seats,
             .budget = snapshot.budget,
             .audit = snapshot.audit,
+            .candidates = undefined,
+            .candidates_len = @min(snapshot.candidates.len, config.max_candidates),
         };
         @memcpy(held.goal[0..held.goal_len], snapshot.goal[0..held.goal_len]);
+        @memcpy(held.candidates[0..held.candidates_len], snapshot.candidates[0..held.candidates_len]);
         self.held = held;
         _ = self.revision.fetchAdd(1, .release);
     }
@@ -240,6 +255,7 @@ pub const Board = struct {
             .seats = held.seats.items,
             .budget = held.budget,
             .audit = held.audit,
+            .candidates = held.candidates[0..held.candidates_len],
         };
     }
 };
