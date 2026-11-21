@@ -76,6 +76,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A foreground Bash command is collected as soon as it exits** (#670). The
+  wait slept 100 ms before it first looked at the job, so every foreground
+  call, even `true`, cost at least 100 ms. It now checks at once and then
+  polls in steps that grow from 1 ms back to 100 ms, checking abort before
+  each one.
+
+- **A writing Bash command no longer re-hashes a stale-index workspace on
+  every call** (#670). The file-change observation asked `git status` about
+  the whole workspace before each command, and `--no-optional-locks` never
+  writes the refreshed index back, so a copied or synced checkout re-hashed
+  every file each time (about 1 s per call at 20,000 files). Files whose
+  lstat has not moved since the previous observation, with the index,
+  attribute sources and ignore rules unchanged, keep git's previous answer;
+  only the rest are asked, and none at all when nothing moved. The listing
+  before and after the command is unchanged.
+
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a
