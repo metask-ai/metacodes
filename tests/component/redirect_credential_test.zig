@@ -123,6 +123,7 @@ test "L2 redirect: the /v1/models probe does not follow a redirect with its key"
         hop.url,
         .{ .header = .{ .name = "x-api-key", .value = SECRET } },
         &status,
+        cc.client_mod.MODELS_PAGE_TIMEOUT_MS,
     ));
     try std.testing.expectEqual(@as(u16, 302), status);
     try hop.expectHeld();
@@ -382,9 +383,9 @@ test "L2 redirect: the account key list does not follow a redirect with its bear
 
     var hop = try Hop.start(arena, "HTTP/1.1 301 Moved Permanently");
     defer hop.stop();
-    var catalog = cc.api_api_keys.Catalog.init(std.testing.allocator);
-    defer catalog.deinit();
-    try std.testing.expectError(error.HttpError, cc.api_api_keys.fetchInto(&catalog, std.testing.allocator, io_runtime.io(), hop.url, SECRET));
+    const keys_url = try cc.api_api_keys.endpointForMessagesUrl(std.testing.allocator, hop.url);
+    defer std.testing.allocator.free(keys_url);
+    try std.testing.expectError(error.HttpError, cc.api_api_keys.fetchList(std.testing.allocator, io_runtime.io(), keys_url, SECRET, cc.api_api_keys.LIST_TIMEOUT_MS));
     try hop.expectHeld();
 }
 

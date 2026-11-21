@@ -76,6 +76,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A gateway that never answers no longer holds the start or the prompt**
+  (#666, #668). A start with no stored `/v1/models` list (the first for an
+  endpoint and key, or the first after a day) waited for the gateway with no
+  limit, and so did a Metask sign-in session's catalog; a gateway that
+  accepted the connection and stalled kept the prompt from ever appearing. The
+  start now waits at most 5 s, then opens on the local model table and takes
+  the list when it comes. Typing `/model` or `/models` on the Metask key route
+  fetched the account's key list on the input thread, so keys, Esc and Ctrl+C
+  did nothing until it answered; picking a key re-fetched `/v1/models` the same
+  way. Both now load in the background: the menu says `(loading)` and fills in
+  when the answer comes, and the prompt stays live. Every one of these GETs
+  ends at a deadline (connect, head and body together).
+
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a

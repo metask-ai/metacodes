@@ -354,12 +354,13 @@ fn settleTerminal(
 }
 
 /// `App.api_key_catalog_load`.
-pub const ApiKeyCatalogLoad = enum {
+pub const ApiKeyCatalogLoad = union(enum) {
     /// This route has no account key list (not Anthropic, a Metask device
     /// session, or `METACODES_NO_PROBE`): the menu says it is unavailable.
     off,
     /// Not loaded yet; the first key menu loads it.
     deferred,
+    loading: *api_keys_mod.Load,
     loaded,
 };
 
@@ -1095,6 +1096,7 @@ pub const App = struct {
                 const fetched = @import("api/catalog_fetch.zig").fetchModelPages(app.allocator, io, .{
                     .url = models_url,
                     .bearer = app.api_key,
+                    .timeout_ms = models_cache_mod.STARTUP_WAIT_MS,
                 }) catch |err| {
                     @import("util/log.zig").warn("catalog", "Metask /v1/models fetch failed: {s}", .{@errorName(err)});
                     break :metask_catalog;
@@ -1644,8 +1646,7 @@ pub const App = struct {
         if (previous_key) |key| app.retireApiKey(key);
         // The account's key list and the menu's place in it were the
         // previous sign-in's.
-        app.api_key_catalog.clear();
-        app.api_key_catalog_load = .deferred;
+        app.resetApiKeyCatalog(.deferred);
         app.models_picker_key_index = null;
         app.models_picker_model_index = null;
         app.refreshChildCatalogSnapshots() catch |err| {
@@ -1796,8 +1797,7 @@ pub const App = struct {
         app.api_client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
         if (app.openai_client) |*client| client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
         // The session has no account key list (`/models` keys are napi's).
-        app.api_key_catalog.clear();
-        app.api_key_catalog_load = .off;
+        app.resetApiKeyCatalog(.off);
         app.models_picker_key_index = null;
         app.models_picker_model_index = null;
         app.refreshChildCatalogSnapshots() catch |err| {
@@ -2195,8 +2195,7 @@ pub const App = struct {
         app.config.metask_oauth_selected = false;
         if (app.metask_key_route) |*route| route.deinit(app.allocator);
         app.metask_key_route = null;
-        app.api_key_catalog.clear();
-        app.api_key_catalog_load = .off;
+        app.resetApiKeyCatalog(.off);
         app.models_picker_key_index = null;
         app.models_picker_model_index = null;
         if (app.selected_api_key_owned) |old| {
@@ -2319,6 +2318,7 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.deinit();
         app.handed_off_sessions.deinit(app.allocator);
         app.api_client.deinit();
+        app.resetApiKeyCatalog(.off);
         app.api_key_catalog.deinit();
         // A refresh still in flight finishes (and frees itself) on its own thread.
         if (app.models_refresh) |refresh| refresh.release();
@@ -2424,7 +2424,9 @@ pub const App = struct {
     /// the menu is drawn. Startup does not wait for it: only that menu reads
     /// the list, and with a plain API key the account endpoint refuses the
     /// request, so fetching at startup was a failed round trip on every start
-    /// (`api_keys.bearerFor`). Whatever the outcome, an empty list falls back
+    /// (`api_keys.bearerFor`). The menu does not wait for it either: it loads
+    /// on a thread of its own and the input loop takes it
+    /// (`takeApiKeyCatalog`). Whatever the outcome, an empty list falls back
     /// to the key in use.
     pub fn ensureApiKeyCatalog(app: *App) void {
         if (app.api_key_catalog_load != .deferred) return;
@@ -2433,25 +2435,54 @@ pub const App = struct {
         // would carry the Metask token there. The menu says the list is
         // unavailable, and loads it once the session is back.
         if (!app.onMetaskKeyRoute()) return;
-        app.api_key_catalog_load = .loaded;
-        const log = @import("util/log.zig");
-        const login_token = @import("core/auth.zig").resolveStoredOAuthBearer(app.allocator, app.stateRoot()) catch null;
-        defer if (login_token) |token| {
-            std.crypto.secureZero(u8, token);
-            app.allocator.free(token);
+        const load = api_keys_mod.Load.start(app.api_client.base_url, app.api_key, app.stateRoot()) catch |err| {
+            @import("util/log.zig").debug("auth", "api key list not started: {s}", .{@errorName(err)});
+            app.api_key_catalog_load = .loaded;
+            app.fallBackToCurrentApiKey();
+            return;
         };
-        if (api_keys_mod.bearerFor(login_token, app.api_key, api_keys_mod.endpointNamed())) |bearer| {
-            api_keys_mod.fetchInto(&app.api_key_catalog, app.allocator, app.api_client.http_client.io, app.api_client.base_url, bearer) catch |err| {
-                log.debug("auth", "api key list probe failed: {s}", .{@errorName(err)});
+        app.api_key_catalog_load = .{ .loading = load };
+    }
+
+    pub fn apiKeyCatalogLoading(app: *const App) bool {
+        return app.api_key_catalog_load == .loading;
+    }
+
+    pub fn takeApiKeyCatalog(app: *App) bool {
+        const load = switch (app.api_key_catalog_load) {
+            .loading => |load| load,
+            else => return false,
+        };
+        if (!load.finished()) return false;
+        app.api_key_catalog_load = .loaded;
+        defer load.release();
+        if (load.take()) |body| {
+            defer {
+                std.crypto.secureZero(u8, body);
+                std.heap.c_allocator.free(body);
+            }
+            app.api_key_catalog.loadFromJson(body) catch |err| {
+                @import("util/log.zig").debug("auth", "api key list unreadable: {s}", .{@errorName(err)});
             };
-        } else {
-            log.debug("auth", "api key list skipped: no login token for the account endpoint", .{});
         }
-        if (app.api_key_catalog.entries.items.len == 0) {
-            app.api_key_catalog.addCurrentKeyFallback(app.api_key) catch |err| {
-                log.debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
-            };
+        app.fallBackToCurrentApiKey();
+        return true;
+    }
+
+    fn fallBackToCurrentApiKey(app: *App) void {
+        if (app.api_key_catalog.entries.items.len != 0) return;
+        app.api_key_catalog.addCurrentKeyFallback(app.api_key) catch |err| {
+            @import("util/log.zig").debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn resetApiKeyCatalog(app: *App, next: ApiKeyCatalogLoad) void {
+        switch (app.api_key_catalog_load) {
+            .loading => |load| load.release(),
+            else => {},
         }
+        app.api_key_catalog.clear();
+        app.api_key_catalog_load = next;
     }
 
     /// Whether the session runs on its Metask API-key route now: it has one
@@ -2473,18 +2504,19 @@ pub const App = struct {
     /// session has left the Metask route. The menu loads it again when the
     /// session is back (`ensureApiKeyCatalog`).
     fn forgetApiKeyCatalog(app: *App) void {
-        if (app.api_key_catalog_load != .loaded) return;
-        app.api_key_catalog.clear();
-        app.api_key_catalog_load = .deferred;
+        if (app.api_key_catalog_load != .loaded and app.api_key_catalog_load != .loading) return;
+        app.resetApiKeyCatalog(.deferred);
         app.models_picker_key_index = null;
         app.models_picker_model_index = null;
     }
 
     /// Fill `api_client.catalog` from the route's `/v1/models`. With the cache
     /// on, a fresh stored answer for this endpoint and credential answers now
-    /// and a background refresh fetches the current one; otherwise (and on
-    /// any miss) the answer is fetched before init returns, as it always was,
-    /// and stored for the next start.
+    /// and a background refresh fetches the current one; on a miss the same
+    /// fetch starts and init waits for it at most
+    /// `models_cache.STARTUP_WAIT_MS`, after which the session starts on the
+    /// local tables and takes the answer at an idle point. Without the cache
+    /// the answer is fetched before init returns, within the page deadline.
     fn loadModelCatalog(app: *App, use_cache: bool) void {
         if (!use_cache) return app.probeModelCatalog();
         const log = @import("util/log.zig");
@@ -2512,19 +2544,24 @@ pub const App = struct {
             }
         }
 
-        const body = app.api_client.fetchModelsList() catch |err| {
-            log.debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
-            return;
+        const refresh = models_cache_mod.Refresh.start(key, base_url, header, app.stateRoot()) catch |err| {
+            log.debug("catalog", "/v1/models fetch not started: {s}", .{@errorName(err)});
+            return app.probeModelCatalog();
         };
-        defer app.allocator.free(body);
+        app.models_refresh = refresh;
+        if (!refresh.waitFinished(models_cache_mod.STARTUP_WAIT_MS)) {
+            log.debug("catalog", "/v1/models has not answered in {d}ms; starting on the local table", .{models_cache_mod.STARTUP_WAIT_MS});
+            return;
+        }
+        app.models_refresh = null;
+        defer refresh.release();
+        const body = refresh.take() orelse return;
+        defer std.heap.c_allocator.free(body);
         app.api_client.catalog.loadFromModelsListJson(body) catch |err| {
             log.debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
             return;
         };
         app.adoptMetaskKeyModels(base_url, body);
-        models_cache_mod.store(app.allocator, app.stateRoot(), key, base_url, body, now) catch |err| {
-            log.debug("catalog", "models cache not written: {s}", .{@errorName(err)});
-        };
     }
 
     /// The credential header the Anthropic client's requests carry now
@@ -2546,27 +2583,36 @@ pub const App = struct {
     /// dropped; the answer it would replace was fetched for the current one.
     pub fn adoptModelCatalogRefresh(app: *App) void {
         app.adoptOpenRouterRefresh();
-        const refresh = app.models_refresh orelse return;
-        if (!refresh.finished()) return;
+        _ = app.takeModelsRefresh();
+    }
+
+    pub fn modelsRefreshRunning(app: *const App) bool {
+        const refresh = app.models_refresh orelse return false;
+        return !refresh.finished();
+    }
+
+    pub fn takeModelsRefresh(app: *App) bool {
+        const refresh = app.models_refresh orelse return false;
+        if (!refresh.finished()) return false;
         app.models_refresh = null;
         const key = refresh.key;
         const body = refresh.take();
         refresh.release();
-        const fresh_body = body orelse return;
+        const fresh_body = body orelse return false;
         defer std.heap.c_allocator.free(fresh_body);
         const log = @import("util/log.zig");
 
-        const auth = app.routeAuthHeader() orelse return;
+        const auth = app.routeAuthHeader() orelse return false;
         defer app.freeRouteAuthHeader(auth);
         if (!key.eql(models_cache_mod.Key.of(app.api_client.base_url, .{ .name = auth.name, .value = auth.value }))) {
             log.debug("catalog", "background /v1/models answer is for another route; dropped", .{});
-            return;
+            return false;
         }
         var fresh = @import("api/catalog.zig").Catalog.init(app.allocator);
         fresh.loadFromModelsListJson(fresh_body) catch |err| {
             fresh.deinit();
             log.debug("catalog", "background /v1/models answer unusable: {s}", .{@errorName(err)});
-            return;
+            return false;
         };
         app.api_client.catalog.deinit();
         app.api_client.catalog = fresh;
@@ -2575,6 +2621,7 @@ pub const App = struct {
             log.warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
         };
         log.debug("catalog", "adopted the background /v1/models answer ({d} models)", .{app.api_client.catalog.entries.items.len});
+        return true;
     }
 
     /// GET the route's `/v1/models` into the client catalog. Failure is silent:
@@ -3768,9 +3815,19 @@ pub const App = struct {
 
         app.api_client.catalog.deinit();
         app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
-        app.probeModelCatalog();
         try app.refreshChildCatalogSnapshots();
         app.models_picker_key_index = idx;
+        try app.startModelsRefresh();
+    }
+
+    fn startModelsRefresh(app: *App) !void {
+        const auth = app.routeAuthHeader() orelse return error.MissingCredentials;
+        defer app.freeRouteAuthHeader(auth);
+        const header: std.http.Header = .{ .name = auth.name, .value = auth.value };
+        const base_url = app.api_client.base_url;
+        const refresh = try models_cache_mod.Refresh.start(models_cache_mod.Key.of(base_url, header), base_url, header, app.stateRoot());
+        if (app.models_refresh) |previous| previous.release();
+        app.models_refresh = refresh;
     }
 
     /// The OpenAI and Gemini clients keep their own copy of the parent catalog,

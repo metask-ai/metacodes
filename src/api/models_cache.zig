@@ -6,8 +6,9 @@
 //! rarely. A start that finds a fresh copy for the same endpoint and
 //! credential uses it and refreshes it in the background (`Refresh`); the REPL
 //! takes the refreshed answer at its next idle point. A missing, unreadable,
-//! foreign or expired copy is a miss: the caller fetches synchronously, as it
-//! did before the cache existed, so a cold start sends exactly what it sent.
+//! foreign or expired copy is a miss: the same fetch starts, and the start
+//! waits for it at most `STARTUP_WAIT_MS` before it goes on with the local
+//! tables and takes the answer at an idle point like a refresh's.
 //!
 //! One file per endpoint and credential, `<state root>/cache/models/<key>.json`:
 //! `{"schema_version":1,"fetched_at":<unix s>,"base_url":"…","body":"<answer>"}`.
@@ -28,6 +29,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// How long a stored answer may answer a start. Each warm start refreshes it,
 /// so this bounds only a copy nobody has used for a day.
 pub const TTL_SECONDS: i64 = 24 * std.time.s_per_hour;
+
+pub const STARTUP_WAIT_MS: u32 = 5_000;
+
+const WAIT_POLL_MS: u64 = 5;
 
 /// Larger answers are neither read nor written (the probe itself reads at most
 /// 1 MiB of body; the envelope escapes it).
@@ -215,6 +220,15 @@ pub const Refresh = struct {
         return self.state.load(.acquire) != .running;
     }
 
+    pub fn waitFinished(self: *const Refresh, limit_ms: u32) bool {
+        const deadline = time.nowMs() + @as(i64, limit_ms);
+        while (!self.finished()) {
+            if (time.nowMs() >= deadline) return false;
+            time.sleepMs(WAIT_POLL_MS);
+        }
+        return true;
+    }
+
     /// The fetched answer, owned by the caller (`std.heap.c_allocator`), once;
     /// null while the fetch runs, after it failed, or once taken.
     pub fn take(self: *Refresh) ?[]u8 {
@@ -252,7 +266,7 @@ pub const Refresh = struct {
         var http_client = std.http.Client{ .allocator = gpa, .io = threaded.io() };
         defer http_client.deinit();
         var status: u16 = 0;
-        const body = try client_mod.getModelsList(gpa, &http_client, self.messages_url, .{ .header = .{ .name = self.auth_name, .value = self.auth_value } }, &status);
+        const body = try client_mod.getModelsList(gpa, &http_client, self.messages_url, .{ .header = .{ .name = self.auth_name, .value = self.auth_value } }, &status, client_mod.MODELS_PAGE_TIMEOUT_MS);
         errdefer gpa.free(body);
         // Only an answer the catalog accepts replaces the stored one.
         var check = Catalog.init(gpa);

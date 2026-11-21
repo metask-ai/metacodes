@@ -1,8 +1,8 @@
 //! API key catalog for OAuth-backed model selection.
 //!
 //! `/models` first shows the current account's API keys, then uses the chosen
-//! key to query `/v1/models`. The list is loaded when that menu first opens
-//! (`App.ensureApiKeyCatalog`), not at startup. The endpoint is
+//! key to query `/v1/models`. The list is loaded in the background when that
+//! menu first opens (`App.ensureApiKeyCatalog`), not at startup. The endpoint is
 //! Metask-specific, so the URL is env-overridable while the parser accepts a
 //! few common response shapes.
 
@@ -10,6 +10,10 @@ const std = @import("std");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
 const no_redirects = @import("http_status.zig").no_redirects;
 const http_connection = @import("http_connection.zig");
+const deadline_race = @import("deadline_race.zig");
+const auth = @import("../core/auth.zig");
+const log = @import("../util/log.zig");
+const platform = @import("platform");
 
 pub const API_KEYS_URL_ENV = "METACODE_API_KEYS_URL";
 
@@ -184,15 +188,35 @@ pub fn endpointForMessagesUrl(allocator: std.mem.Allocator, messages_url: []cons
     return std.fmt.allocPrint(allocator, "{s}/api/v1/keys?page=1&page_size=100", .{base});
 }
 
-pub fn fetchInto(
-    catalog: *Catalog,
+pub const LIST_TIMEOUT_MS: u32 = 10_000;
+
+pub const FetchError = error{ OutOfMemory, InvalidUrl, RequestFailed, HttpError, TimedOut };
+
+pub fn fetchList(
     allocator: std.mem.Allocator,
     io: std.Io,
-    messages_url: []const u8,
+    url: []const u8,
     bearer_token: []const u8,
-) !void {
-    const url = try endpointForMessagesUrl(allocator, messages_url);
-    defer allocator.free(url);
+    limit_ms: u32,
+) FetchError![]u8 {
+    const answer = deadline_race.run(io, limit_ms, exchange, .{ allocator, io, url, bearer_token }, discardLate) catch |err| return switch (err) {
+        error.TimedOut => error.TimedOut,
+        error.Unavailable => error.RequestFailed,
+    };
+    return answer;
+}
+
+fn discardLate(args: deadline_race.Args(exchange), late: deadline_race.Answer(exchange)) void {
+    const body = late catch return;
+    args[0].free(body);
+}
+
+fn exchange(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    bearer_token: []const u8,
+) FetchError![]u8 {
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
     var http_client = std.http.Client{ .allocator = allocator, .io = io };
@@ -214,10 +238,81 @@ pub fn fetchInto(
 
     var transfer_buf: [8192]u8 = undefined;
     const body_reader = http_connection.bodyReader(&resp, &transfer_buf);
-    const body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
-    defer allocator.free(body);
-    try catalog.loadFromJson(body);
+    return body_reader.allocRemaining(allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
 }
+
+pub const Load = struct {
+    refs: std.atomic.Value(u8) = .init(2),
+    state: std.atomic.Value(State) = .init(.running),
+    body: ?[]u8 = null,
+    url: []u8,
+    api_key: []u8,
+    state_root: []u8,
+    endpoint_named: bool,
+
+    pub const State = enum(u8) { running, answered, failed };
+
+    const gpa = std.heap.c_allocator;
+
+    pub fn start(messages_url: []const u8, api_key: []const u8, state_root: []const u8) !*Load {
+        const self = try gpa.create(Load);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .url = try endpointForMessagesUrl(gpa, messages_url),
+            .api_key = undefined,
+            .state_root = undefined,
+            .endpoint_named = endpointNamed(),
+        };
+        errdefer gpa.free(self.url);
+        self.api_key = try gpa.dupe(u8, api_key);
+        errdefer secureFree(gpa, self.api_key);
+        self.state_root = try gpa.dupe(u8, state_root);
+        errdefer gpa.free(self.state_root);
+        const thread = try platform.thread.spawn(.full, run, .{self});
+        thread.detach();
+        return self;
+    }
+
+    pub fn finished(self: *const Load) bool {
+        return self.state.load(.acquire) != .running;
+    }
+
+    pub fn take(self: *Load) ?[]u8 {
+        if (self.state.load(.acquire) != .answered) return null;
+        const body = self.body;
+        self.body = null;
+        return body;
+    }
+
+    pub fn release(self: *Load) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (self.body) |body| secureFree(gpa, body);
+        gpa.free(self.url);
+        secureFree(gpa, self.api_key);
+        gpa.free(self.state_root);
+        gpa.destroy(self);
+    }
+
+    fn run(self: *Load) void {
+        defer self.release();
+        const body = self.fetch() catch |err| {
+            log.debug("auth", "api key list probe failed: {s}", .{@errorName(err)});
+            self.state.store(.failed, .release);
+            return;
+        };
+        self.body = body;
+        self.state.store(.answered, .release);
+    }
+
+    fn fetch(self: *Load) ![]u8 {
+        const login_token = auth.resolveStoredOAuthBearer(gpa, self.state_root) catch null;
+        defer if (login_token) |token| secureFree(gpa, token);
+        const bearer = bearerFor(login_token, self.api_key, self.endpoint_named) orelse return error.NoAccountBearer;
+        var threaded = platform.signal.threadedIo(gpa, .{});
+        defer threaded.deinit();
+        return fetchList(gpa, threaded.io(), self.url, bearer, LIST_TIMEOUT_MS);
+    }
+};
 
 fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     @memset(buf, 0);
