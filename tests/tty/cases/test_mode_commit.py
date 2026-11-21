@@ -36,9 +36,6 @@ SHIFT_TABS = ("shift_tab", "shift_tab_csi_u", "shift_tab_modify_other_keys")
 
 
 def test_T08c_each_shift_tab_encoding_cycles_once_at_the_prompt(bin_path):
-    """#643: Shift+Tab as ESC [ Z, kitty's ESC [ 9 ; 2 u and xterm
-    modifyOtherKeys' ESC [ 27 ; 2 ; 9 ~ each move default to accept edits
-    (a second cycle would be back at default) and type nothing into the box."""
     for key in SHIFT_TABS:
         raw = run(bin_path, [READY, "type:ab", f"key:{key}", "sleep:0.3"], permission="default")
         a = TTYAssert(raw)

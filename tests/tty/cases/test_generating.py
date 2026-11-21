@@ -605,10 +605,6 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
 
 
 def test_T34b_each_shift_tab_encoding_cycles_once_during_a_reply(bin_path):
-    """#643: during a reply, Shift+Tab as ESC [ Z, kitty's ESC [ 9 ; 2 u and
-    xterm modifyOtherKeys' ESC [ 27 ; 2 ; 9 ~ each move default to accept
-    edits once and type nothing into the draft. Offline T34 against a slow
-    mock stream, so the key lands while the reply streams."""
     from tty_driver import READY, wait_for
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
