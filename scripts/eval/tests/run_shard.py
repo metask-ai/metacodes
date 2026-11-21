@@ -36,9 +36,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-# A whole shard takes about 5 minutes on a Linux CI runner. 15 minutes leaves
-# room for slower runners and still fails well before the job's own timeout.
-SHARD_TIMEOUT_S = 15 * 60
+# The slowest shard takes about 5 minutes on a Linux CI runner and up to about
+# 10.5 minutes on macOS. 20 minutes leaves room for the slowest runner and still
+# fails well before the job's own 45-minute timeout.
+SHARD_TIMEOUT_S = 20 * 60
 
 
 def arm_watchdog(seconds: float) -> None:
