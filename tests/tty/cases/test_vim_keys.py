@@ -10,7 +10,7 @@ NORMAL = ["key:esc", "strictsleep:0.4"]
 PICKER = "apply to"
 HELP = "shift + tab to cycle modes"
 EXIT_C = "Press Ctrl-C again to exit"
-CTRL_C = {"legacy": "raw:\\x03", "kitty": "raw:\\x1b[99;5u"}
+CTRL_C = {"legacy": "raw:\\x03", "kitty": "raw:\\x1b[99;5u", "modifyOtherKeys": "raw:\\x1b[27;5;99~"}
 
 
 def _screen(raw):
