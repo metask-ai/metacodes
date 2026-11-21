@@ -576,3 +576,33 @@ test "teamwork MCP L2: shared abort cancels an idle open input pipe after initia
 test "teamwork MCP L2: shared abort discards a partial frame on an open input pipe" {
     try expectIdleCancellation(initialize ++ "\n" ++ initialized ++ "\n" ++ implement);
 }
+
+test "teamwork MCP L2: a client-owned manager's spend is reported as outside the run's ledger, never as part of its total" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var seats: Seats = .{};
+    defer seats.deinit();
+    var auditor: audit.StubAuditor = .{ .gpa = gpa, .script = &.{.pass} };
+    defer auditor.deinit();
+    for ([_]bool{ true, false }, [_][]const u8{ "outside_ledger", "none" }, [_][]const u8{ "run-mcp-client", "run-mcp-built-in" }) |client_owned, spend, id| {
+        const cfg = (try config.validate(try config.parse(fx.arena.allocator(), "{\"enabled\":true,\"budget_usd\":5,\"check_command\":\"" ++ check ++ "\"}", null), null)).enabled;
+        const run = try runtime.Run.start(gpa, .{
+            .preview = .all,
+            .seats = .{ .custom = .{ .ctx = &seats, .driverFn = Seats.driver } },
+            .auditor = auditor.auditor(),
+            .manager_outside_ledger = client_owned,
+        }, .{ .text = request, .source = .request_file }, cfg, .{ .workspace = fx.repo, .state_root = fx.state, .run_id = try types.RunId.parse(id) });
+        defer run.destroy();
+        var server = mcp.Server.init(gpa, run);
+        try ready(&server);
+        var implementation = try call(&server, implement);
+        defer implementation.deinit();
+        const budget = payload(implementation.value).object.get("snapshot").?.object.get("budget").?.object;
+        try testing.expectEqualStrings(spend, budget.get("manager").?.string);
+        try testing.expectEqual(@as(i64, 5), budget.get("cap_usd").?.integer);
+        try testing.expectApproxEqAbs(@as(f64, 0.1), budget.get("spent_usd").?.float, 0.000001);
+        try testing.expectEqual(@as(i64, 0), budget.get("held_usd").?.integer);
+        try testing.expectEqual(@as(i64, 1), budget.get("charges").?.integer);
+    }
+}

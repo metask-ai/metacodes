@@ -74,6 +74,29 @@ pub const required_help_text = [_][]const u8{
     "--mcp-config",
 };
 
+pub const manager_required_help_text = required_help_text ++ [_][]const u8{"--allowedTools"};
+
+pub const manager_bootstrap =
+    \\You are the manager of a metacodes teamwork run.
+    \\
+    \\Your assignment is the file packet.md in your working directory. Read it
+    \\first. You act on the run only through the teamwork MCP tools; you cannot
+    \\change files or run commands, and any action that would need a
+    \\permission prompt is refused. Nobody answers questions during the run.
+    \\
+;
+
+pub const manager_mcp_server = "teamwork";
+
+pub const lifeline_script =
+    \\exec 3<&0
+    \\"$@" </dev/null 3<&- &
+    \\child=$!
+    \\{ read -r line <&3; kill -KILL 0; } &
+    \\exec 3<&-
+    \\wait "$child"
+;
+
 /// The variables passed to the CLI, by name; every other variable of the
 /// runtime's environment (provider keys above all) is dropped.
 pub const env_allowlist = [_][]const u8{
@@ -197,7 +220,7 @@ pub const ClaudeCodeDriver = struct {
         const env = try filterEnv(arena, self.options.parent_env);
 
         if (self.probed == null) {
-            self.probed = .{ .ok = try self.probe(arena, external.command.bytes, env, paths.workspace, seat_dir, abort, &harness_log) };
+            self.probed = .{ .ok = try self.probe(arena, external.command.bytes, &required_help_text, env, paths.workspace, seat_dir, abort, &harness_log) };
         }
         if (!self.probed.?.ok) {
             if (abort.isAborted()) {
@@ -297,6 +320,7 @@ pub const ClaudeCodeDriver = struct {
         self: *ClaudeCodeDriver,
         arena: std.mem.Allocator,
         command: []const u8,
+        required: []const []const u8,
         env: []const [:0]const u8,
         cwd: []const u8,
         seat_dir: []const u8,
@@ -310,7 +334,7 @@ pub const ClaudeCodeDriver = struct {
             return false;
         };
         const help_out = (try self.capture(arena, &.{ command, "--help" }, env, cwd, seat_dir, abort, harness_log)) orelse return false;
-        for (required_help_text) |needle| {
+        for (required) |needle| {
             if (std.mem.indexOf(u8, help_out, needle) == null) {
                 harness_log.print(
                     "Claude Code {s} at {s} is incompatible: its --help lacks `{s}` (argv pinned against {s})\n",
@@ -359,6 +383,39 @@ pub const ClaudeCodeDriver = struct {
         return sink.captured.items;
     }
 
+    pub fn probeManager(self: *ClaudeCodeDriver, arena: std.mem.Allocator, command: []const u8, seat_dir: []const u8, abort: *const types.AbortSignal, harness_log: *HarnessLog) error{OutOfMemory}!bool {
+        const env = try filterEnv(arena, self.options.parent_env);
+        return self.probe(arena, command, &manager_required_help_text, env, seat_dir, seat_dir, abort, harness_log);
+    }
+
+    pub fn prepareManager(
+        self: *const ClaudeCodeDriver,
+        arena: std.mem.Allocator,
+        spec: *const types.SeatSpec,
+        seat_dir: []const u8,
+        mcp_config: []const u8,
+        allowance_usd: f64,
+    ) !ManagerLaunch {
+        const external = switch (spec.harness) {
+            .claude_code => |external| external,
+            .metacodes => return error.NotExternal,
+        };
+        const cli_argv = try buildManagerArgv(arena, external.command.bytes, spec.model, spec.effort, allowance_usd, mcp_config);
+        var launch = try self.prepareLaunch(arena, cli_argv, seat_dir, seat_dir);
+        errdefer launch.deinit();
+        const confined = launch.argv();
+        const wrapped = try arena.alloc([]const u8, confined.len + 4);
+        wrapped[0..4].* = .{ "/bin/sh", "-c", lifeline_script, "teamwork-manager" };
+        @memcpy(wrapped[4..], confined);
+        return .{
+            .launch = launch,
+            .argv = try nullTerminatedArgv(arena, wrapped),
+            .env = try filterEnv(arena, self.options.parent_env),
+            .cwd = seat_dir,
+            .timeout_ms = self.options.timeout_ms,
+        };
+    }
+
     fn prepareLaunch(self: *const ClaudeCodeDriver, gpa: std.mem.Allocator, argv: []const []const u8, cwd: []const u8, seat_dir: []const u8) !worker_sandbox.Launch {
         var settings: sandbox_config.SandboxSettings = .{
             .enabled = self.options.sandbox,
@@ -387,7 +444,83 @@ pub const ClaudeCodeDriver = struct {
     }
 };
 
+pub const ManagerLaunch = struct {
+    launch: worker_sandbox.Launch,
+    argv: []const ?[*:0]const u8,
+    env: []const [:0]const u8,
+    cwd: []const u8,
+    timeout_ms: ?u64,
+
+    pub const Ended = struct {
+        stop: enum { exited, aborted, timeout, spawn_failed },
+        exit_code: ?i32 = null,
+        elapsed_ms: u64 = 0,
+        result: ?ResultEvent = null,
+        oom: bool = false,
+    };
+
+    pub fn run(self: *const ManagerLaunch, gpa: std.mem.Allocator, stderr_fd: ?c_int, abort: *const types.AbortSignal) Ended {
+        var sink: LineSink = .{ .gpa = gpa, .mode = .result_events };
+        defer sink.deinit();
+        const supervised = supervise(self.argv, self.env, self.cwd, stderr_fd, abort, .{ .timeout_ms = self.timeout_ms, .lifeline = true }, &sink) catch
+            return .{ .stop = .spawn_failed };
+        return .{
+            .stop = switch (supervised.stop) {
+                .exited => .exited,
+                .aborted, .budget => .aborted,
+                .timeout => .timeout,
+            },
+            .exit_code = supervised.exit_code,
+            .elapsed_ms = supervised.elapsed_ms,
+            .result = sink.result,
+            .oom = sink.oom,
+        };
+    }
+
+    pub fn deinit(self: *ManagerLaunch) void {
+        self.launch.deinit();
+    }
+};
+
 // ── argv and environment ────────────────────────────────────────────────────
+
+pub fn buildManagerArgv(
+    arena: std.mem.Allocator,
+    command: []const u8,
+    model: ?[]const u8,
+    effort: ?types.ReasoningEffort,
+    max_budget_usd: f64,
+    mcp_config: []const u8,
+) error{OutOfMemory}![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
+        command,
+        "-p",
+        manager_bootstrap,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "default",
+        "--permission-prompts",
+        "none",
+        "--no-session-persistence",
+    });
+    if (model) |m| try argv.appendSlice(arena, &.{ "--model", m });
+    if (effort) |e| try argv.appendSlice(arena, &.{ "--effort", effortFlag(e) });
+    try argv.appendSlice(arena, &.{
+        "--max-budget-usd",
+        try std.fmt.allocPrint(arena, "{d:.6}", .{max_budget_usd}),
+        "--append-system-prompt",
+        charters.forRole(.manager),
+        "--strict-mcp-config",
+        "--mcp-config",
+        mcp_config,
+        "--allowedTools",
+        "mcp__" ++ manager_mcp_server,
+    });
+    return argv.toOwnedSlice(arena);
+}
 
 /// The CLI argv (see the module comment). Strings live in `arena`.
 pub fn buildArgv(
@@ -579,6 +712,7 @@ const Limits = struct {
     budget_ms: ?u64 = null,
     /// The driver's hard limit, from spawn.
     timeout_ms: ?u64 = null,
+    lifeline: bool = false,
 };
 
 const Supervised = struct {
@@ -604,7 +738,8 @@ fn supervise(
 ) pprocess.CaptureError!Supervised {
     const started = util_time.nowMs();
     const child = try pprocess.spawnPipesWith(argv, .{ .env = env, .cwd = cwd, .stderr_fd = stderr_fd });
-    child.closeStdin(); // the prompt is in argv; stdin is EOF
+    if (!limits.lifeline) child.closeStdin(); // the prompt is in argv; stdin is EOF
+    defer if (limits.lifeline) child.closeStdin();
     var stdout_open = true;
     var exit_code: ?i32 = null;
     var drain_deadline: ?i64 = null;
@@ -684,16 +819,16 @@ fn reapAfterKill(child: *const pprocess.PipeChild) ?i32 {
     return null;
 }
 
-const HarnessLog = struct {
+pub const HarnessLog = struct {
     fd: ?c_int,
 
-    fn open(arena: std.mem.Allocator, seat_dir: []const u8) HarnessLog {
+    pub fn open(arena: std.mem.Allocator, seat_dir: []const u8) HarnessLog {
         const path = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ seat_dir, harness_log_file }, 0) catch return .{ .fd = null };
         const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
         return .{ .fd = if (fd < 0) null else fd };
     }
 
-    fn print(self: *HarnessLog, comptime fmt: []const u8, args: anytype) void {
+    pub fn print(self: *HarnessLog, comptime fmt: []const u8, args: anytype) void {
         const fd = self.fd orelse return;
         var buf: [2048]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -701,7 +836,7 @@ const HarnessLog = struct {
         _ = pfs.writeAll(fd, w.buffered());
     }
 
-    fn close(self: *HarnessLog) void {
+    pub fn close(self: *HarnessLog) void {
         if (self.fd) |fd| pfs.close(fd);
         self.fd = null;
     }

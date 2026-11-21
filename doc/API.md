@@ -375,9 +375,10 @@ repository-root `.metacodes/teamwork.json` (a bare teamwork object), then
 `--check-command`. CLI overrides are applied left to right. `--id <id>`
 selects a path-safe run id; otherwise one is generated and printed to stderr.
 Provider options are `--provider`, `--model`, `--base-url`, `--api-key`, and
-`--verbose`. This CLI uses the deterministic manager and an already-written
-request that `--approve` approves as is, so it runs no interviewer; configured
-model/effort or an external harness for the manager is rejected. The verifier
+`--verbose`. This CLI uses an already-written request that `--approve`
+approves as is, so it runs no interviewer. The Manager is the built-in
+deterministic loop unless `seats.manager` names an external harness (see the
+launched Manager below); model/effort on the built-in manager is rejected. The verifier
 must be native; explicit verifier effort and tier aliases are rejected until
 wired.
 
@@ -461,6 +462,31 @@ for a host that renders from another thread (`publish`, `read`,
 way and `interview.finishApproval` moves it from `needs_you` to `done`. The
 AgentCore C ABI has no teamwork entry point, so it carries no teamwork events.
 
+A launched Manager (#545) is configured with `seats.manager` as a
+`claude_code` seat (absolute `command`, optional `model`/`effort`) and a
+top-level `manager_budget_usd`: its dollar allowance out of `budget_usd`,
+greater than zero and below the cap. `teamwork run`, `teamwork resume` and
+the REPL's `/teamwork` then start the Manager CLI themselves instead of the
+deterministic loop; worker harnesses stay configured per seat, independently
+of the Manager's. Before the Manager starts, `budget.jsonl.hold` durably holds
+its allowance, which workers and the audit cannot spend; the Manager's
+reported cost settles it, and a Manager stopped without a cost report (cancel,
+budget, crash, timeout) is charged the whole allowance as `reserved`. Reopening
+a run whose Manager was live consumes the hold once and never grants it again;
+the next Manager is a new seat (`manager-<n>`) with a new hold. The Manager
+runs in Sandbox Foundations with its seat directory as working directory and
+only writable root, default permissions with prompts refused, and its tools
+limited to the teamwork MCP tools served by the controller in the host
+process. The approval prompt names the Manager and its allowance.
+Validation errors: `ManagerBudgetMissing`, `ManagerBudgetWithoutExternalManager`,
+`InvalidManagerBudget` and `ExternalManagerWallclockOnly`; a Manager CLI that
+fails its compatibility probe ends the run `failed` with
+`manager_unavailable`. `teamwork mcp` with an external `seats.manager` fails
+with `UnsupportedManager`: there the MCP client is the Manager. Windows has no
+launched Manager (`UnsupportedPlatform`). `teamwork status` shows an
+outstanding hold as `budget.manager_hold` and excludes it from
+`remaining_usd`.
+
 `teamwork mcp --request-file <file> --approve --budget-usd <cap>` starts
 the same approved lifecycle and serves the [Manager MCP protocol](TEAMWORK_MCP.md)
 on stdin/stdout. The built CLI binds `Server.init(gpa, run).serve()`. The CLI host exposes
@@ -474,8 +500,9 @@ callback the command refuses before App startup. See
 Budget admission writes `budget.jsonl.pending` before a paid worker/audit
 call. A durable charge settles it; restart consumes an unresolved allowance
 as `reserved` instead of treating unknown spend as zero. `reserved` is cap
-consumption, not a measured bill. The workers/audit cap does not include the
-MCP client's own Manager model calls.
+consumption, not a measured bill. With `teamwork mcp` the cap does not
+include the MCP client's own Manager model calls; snapshots say so with
+`budget.manager: "outside_ledger"`.
 
 The completion auditor's PASS includes the reviewed tree ID. Pinned checks
 and verifier probes run in a disposable checkout of that tree. Merge-back
