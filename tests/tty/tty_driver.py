@@ -117,6 +117,8 @@ SPECIAL = {
     "home": b"\x1b[H",
     "end": b"\x1b[F",
     "shift_tab": b"\x1b[Z",
+    "shift_tab_csi_u": b"\x1b[9;2u",
+    "shift_tab_modify_other_keys": b"\x1b[27;2;9~",
     "tab": b"\t",
     "ctrl_u": b"\x15",
     "ctrl_y": b"\x19",

@@ -604,6 +604,30 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
         a._fail("生成期 Shift+Tab 未切换权限模式(footer 无 accept edits)")
 
 
+def test_T34b_each_shift_tab_encoding_cycles_once_during_a_reply(bin_path):
+    """#643: during a reply, Shift+Tab as ESC [ Z, kitty's ESC [ 9 ; 2 u and
+    xterm modifyOtherKeys' ESC [ 27 ; 2 ; 9 ~ each move default to accept
+    edits once and type nothing into the draft. Offline T34 against a slow
+    mock stream, so the key lands while the reply streams."""
+    from tty_driver import READY, wait_for
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    for key in ("shift_tab", "shift_tab_csi_u", "shift_tab_modify_other_keys"):
+        with SlowMockServer([slow_text_then_end(n_chunks=14, delay=0.3)]) as srv:
+            raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt"),
+                                 "type:ab", f"key:{key}", "strictsleep:0.5", wait_for("tok13"), "sleep:1.0"],
+                      base_url=srv.url, permission="default", startup_drain=0.8, per_key_drain=0.05)
+        a = TTYAssert(raw)
+        during = [sc for sc in a.frame_screens
+                  if sc.find_last_row("accept edits on") is not None and sc.find_last_row("tok13") is None]
+        if not during:
+            a._fail(f"{key}: no frame showed accept edits while the reply streamed")
+        drafts = [_box_rows(a, sc) for sc in during]
+        if ["❯ ab"] not in drafts or any(d not in (None, ["❯ ab"]) for d in drafts):
+            a._fail(f"{key}: the draft should read 'ab' after Shift+Tab, the box held {drafts}")
+        a.assert_footer_mode("accept edits")
+
+
 def test_generation_frames_are_synchronized(bin_path):
     """回归:生成期固定区重画(spinner tick / 文本流入)必须用 DEC 2026 同步输出包裹,
     否则 Windows Terminal 在 erase→draw 两步间呈现空白帧 → 输入框闪烁 + 分隔线分段。

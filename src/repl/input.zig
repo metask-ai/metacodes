@@ -69,17 +69,20 @@ pub const Key = union(enum) {
 ///   ESC [ A/B/C/D     ↑↓→←
 ///   ESC [ H / F       Home / End
 ///   ESC [ 3 ~         Delete
-///   ESC [ <num>;<mod> u   CSI u（xterm modifyOtherKeys kitty 扩展）
-///     - 13;2 u = Shift+Enter
-///     - 13;5 u = Ctrl+Enter
+///   ESC [ <num>;<mod> u   CSI u（kitty 键盘协议）
+///   ESC [ 27;<mod>;<num> ~  xterm modifyOtherKeys,与 CSI u 同一张表(decodeModifiedKey)
+///     - 9;2 = Shift+Tab
+///     - 13;2 = Shift+Enter
+///     - 13;5 = Ctrl+Enter
 ///   ESC CR            Meta+Return = Shift+Enter(/terminal-setup 装进终端的绑定),仅当两字节
 ///                     同批到达(feedRead / feedQueued);一字节一字节的 feed 仍是 Esc + Enter
-/// 其它 CSI(私有前缀、更多参数段)整条吃掉、报一个 .unknown;OSC 应答(`ESC ] 11 ; … BEL`)
+/// 其它 CSI(私有前缀、更多参数段、认不出的组合)整条吃掉、报一个 .unknown;OSC 应答(`ESC ] 11 ; … BEL`)
 /// 同样整条吃掉——终端应答不会漏成字符。
 pub const KeyParser = struct {
     state: State = .normal,
     num1: u32 = 0,
     num2: u32 = 0,
+    num3: u32 = 0,
     // 一字节 feed 偶尔需吐多个键(ESC 后紧跟普通字符 = 孤立 ESC + 该字符;`ESC ]` 后不是
     // OSC 应答 = ESC + ']' + 数字 + 下一个键):feed 返回第一个,其余按序暂存这里,
     // 调用方 feed / flushEsc 后须 while(drain())|k| 排空。
@@ -96,15 +99,15 @@ pub const KeyParser = struct {
     // ']' + 3 位数字 + 截断它的那个键。
     const queue_capacity = 5;
 
-    // csi_skip:一个认不出的 CSI(私有前缀 `?`/`<`/`>`/`=`、三段以上参数、`:` 子参数),
+    // csi_skip:一个认不出的 CSI(私有前缀 `?`/`<`/`>`/`=`、四段以上参数、`:` 子参数),
     // 吃到它的终结字节(0x40-0x7E)为止,整条报一个 .unknown。终端应答(DA1 `ESC[?62c`、
-    // Kitty flags `ESC[?1u`)晚于启动探测才到、xterm 式 `ESC[27;2;13~` 都走这里——
+    // Kitty flags `ESC[?1u`)晚于启动探测才到也走这里——
     // 否则后半截会被当成敲进来的字符("62c" 进了输入框)。
     // osc_seen/osc_ps/osc_body/osc_st:`ESC ] Ps ; Pt (BEL | ESC \)`,终端的 OSC 应答(探测问的
     // 背景色 `ESC]11;rgb:…`)。只认数字编号 + `;` 开头的形状:Alt+] 之后敲别的(包括什么都不敲、
     // 等到 ESC 超时)仍是原来那几个键。迟到的背景色应答以前会变成 Esc、字符、Esc——两次 Esc
     // 连按清空了输入框。
-    const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_skip, osc_seen, osc_ps, osc_body, osc_st };
+    const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, osc_seen, osc_ps, osc_body, osc_st };
 
     /// CSI 的参数/中间字节(0x20-0x3F):数字、`;`、`:`、私有前缀 `<=>?`、空格../。
     fn csiParam(b: u8) bool {
@@ -158,7 +161,7 @@ pub const KeyParser = struct {
                 self.queueOscPrefix();
                 break :blk .esc;
             },
-            .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_skip, .osc_body => null,
+            .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_semi2, .csi_num3, .csi_skip, .osc_body => null,
         };
         self.state = .normal;
         return key;
@@ -201,6 +204,7 @@ pub const KeyParser = struct {
                     self.state = .csi_seen;
                     self.num1 = 0;
                     self.num2 = 0;
+                    self.num3 = 0;
                     return null;
                 }
                 if (b == ']') {
@@ -286,15 +290,7 @@ pub const KeyParser = struct {
                 }
                 // 无 modifier 的 CSI-u(ESC[<cp>u,无 ;mod):Kitty disambiguate 模式下
                 // Enter/Esc/纯文本也可能编成 CSI-u。还原成对应键,避免被当 .unknown 吞掉。
-                if (b == 'u') {
-                    return switch (self.num1) {
-                        13 => .enter, // 无 mod Enter
-                        27 => .esc, // 无 mod Esc
-                        // ASCII 可打印 → char(兼容把纯文本也 CSI-u 编码的终端)。
-                        0x20...0x7e => Key{ .char = @intCast(self.num1) },
-                        else => .unknown,
-                    };
-                }
+                if (b == 'u') return decodeModifiedKey(self.num1, .none);
                 return .unknown;
             },
             .csi_semi => {
@@ -319,6 +315,10 @@ pub const KeyParser = struct {
                     self.num2 = self.num2 *| 10 +| (b - '0');
                     return null;
                 }
+                if (b == ';') {
+                    self.state = .csi_semi2;
+                    return null;
+                }
                 if (rxvtShiftFinal(b)) {
                     self.state = .normal;
                     return .unknown;
@@ -328,60 +328,41 @@ pub const KeyParser = struct {
                     return null;
                 }
                 self.state = .normal;
-                // CSI u：<key_codepoint>;<mod> u。
-                //   key=13 = Enter
-                //   key=99 = 'c'（Ctrl+C 编成 99;5u）
-                //   key=100 = 'd'（Ctrl+D 编成 100;5u）
-                //   key=27 = Esc
-                // 其他组合不识别，返 .unknown（状态已重置，不会污染后续）
-                if (b == 'u') {
-                    // Enter 特化
-                    if (self.num1 == 13) {
-                        return switch (self.num2) {
-                            2 => .shift_enter,
-                            5 => .ctrl_enter,
-                            else => .enter,
-                        };
-                    }
-                    // 带修饰的 Esc(Shift/Ctrl+Esc)仍是 Esc:取消、关闭对它的每个使用方都一样
-                    // (反向搜索、transcript viewer 旧的自解码 CSI-u 就只看 codepoint 27)。
-                    if (self.num1 == 27) return .esc;
-                    // Ctrl+字母：mod=5 表示 Ctrl。Kitty disambiguate 模式下某些终端/tmux 会把
-                    // 普通 Ctrl+letter 也编成 CSI-u(非仅歧义键)→ 必须覆盖 app 用到的全部 Ctrl 组合,
-                    // 否则该键在这些终端上静默丢(实测 bug:Ctrl+O 在发 CSI-u 的终端无反应)。
-                    // 与 byteToKey 的 0x01-0x1f 控制字节集保持一致。
-                    if (self.num2 == 5) {
-                        return switch (self.num1) {
-                            99, 67 => .ctrl_c, // 'c' / 'C'
-                            100, 68 => .ctrl_d, // 'd'
-                            97, 65 => .ctrl_a,
-                            101, 69 => .ctrl_e,
-                            107, 75 => .ctrl_k,
-                            117, 85 => .ctrl_u,
-                            111, 79 => .ctrl_o, // 'o' — transcript viewer(实测漏)
-                            98, 66 => .ctrl_b, // 'b' — 转后台(run in background)
-                            114, 82 => .ctrl_r, // 'r' — reverse search
-                            116, 84 => .ctrl_t, // 't' — task panel toggle
-                            103, 71 => .ctrl_g, // 'g'
-                            120, 88 => .ctrl_x, // 'x' — Ctrl+X 前缀
-                            108, 76 => .ctrl_l, // 'l' — external edit
-                            119, 87 => .ctrl_w, // 'w'
-                            121, 89 => .ctrl_y, // 'y'
-                            95 => .ctrl_underscore, // '_' — undo
-                            else => .unknown,
-                        };
-                    }
-                    // Alt+字母:mod=3。Kitty disambiguate 把 Alt+B/Alt+F 编成 CSI-u(旧编码 ESC b
-                    // 与"ESC 再按 b"有歧义),不认的话开了协议的终端上词跳转就没了。
-                    if (self.num2 == 3) {
-                        return switch (self.num1) {
-                            98, 66 => .alt_b,
-                            102, 70 => .alt_f,
-                            else => .unknown,
-                        };
-                    }
+                if (b == 'u') return decodeModifiedKey(self.num1, KeyModifier.fromParam(self.num2));
+                return .unknown;
+            },
+            .csi_semi2 => {
+                if (b >= '0' and b <= '9') {
+                    self.num3 = b - '0';
+                    self.state = .csi_num3;
+                    return null;
+                }
+                if (rxvtShiftFinal(b)) {
+                    self.state = .normal;
                     return .unknown;
                 }
+                if (csiParam(b)) {
+                    self.state = .csi_skip;
+                    return null;
+                }
+                self.state = .normal;
+                return .unknown;
+            },
+            .csi_num3 => {
+                if (b >= '0' and b <= '9') {
+                    self.num3 = self.num3 *| 10 +| (b - '0');
+                    return null;
+                }
+                if (rxvtShiftFinal(b)) {
+                    self.state = .normal;
+                    return .unknown;
+                }
+                if (csiParam(b)) {
+                    self.state = .csi_skip;
+                    return null;
+                }
+                self.state = .normal;
+                if (b == '~' and self.num1 == 27) return decodeModifiedKey(self.num3, KeyModifier.fromParam(self.num2));
                 return .unknown;
             },
             .csi_skip => {
@@ -440,6 +421,82 @@ pub const KeyParser = struct {
         }
     }
 };
+
+const KeyModifier = enum {
+    none,
+    shift,
+    alt,
+    ctrl,
+    other,
+
+    fn fromParam(param: u32) KeyModifier {
+        if (param <= 1) return .none;
+        const lock_bits: u32 = 64 | 128;
+        return switch ((param - 1) & ~lock_bits) {
+            0 => .none,
+            1 => .shift,
+            2 => .alt,
+            4 => .ctrl,
+            else => .other,
+        };
+    }
+};
+
+fn decodeModifiedKey(codepoint: u32, modifier: KeyModifier) Key {
+    return switch (codepoint) {
+        9 => switch (modifier) {
+            .none => .tab,
+            .shift => .shift_tab,
+            else => .unknown,
+        },
+        13 => switch (modifier) {
+            .shift => .shift_enter,
+            .ctrl => .ctrl_enter,
+            else => .enter,
+        },
+        // 带修饰的 Esc(Shift/Ctrl+Esc)仍是 Esc:取消、关闭对它的每个使用方都一样
+        // (反向搜索、transcript viewer 旧的自解码 CSI-u 就只看 codepoint 27)。
+        27 => .esc,
+        else => switch (modifier) {
+            // ASCII 可打印 → char(兼容把纯文本也 CSI-u 编码的终端)。
+            .none => if (codepoint >= 0x20 and codepoint <= 0x7e) Key{ .char = @intCast(codepoint) } else .unknown,
+            .ctrl => ctrlLetterKey(codepoint),
+            // Alt+字母:Kitty disambiguate 把 Alt+B/Alt+F 编成 CSI-u(旧编码 ESC b
+            // 与"ESC 再按 b"有歧义),不认的话开了协议的终端上词跳转就没了。
+            .alt => switch (codepoint) {
+                98, 66 => .alt_b,
+                102, 70 => .alt_f,
+                else => .unknown,
+            },
+            .shift, .other => .unknown,
+        },
+    };
+}
+
+// Ctrl+字母:Kitty disambiguate 模式下某些终端/tmux 会把普通 Ctrl+letter 也编成 CSI-u
+// (非仅歧义键)→ 必须覆盖 app 用到的全部 Ctrl 组合,否则该键在这些终端上静默丢
+// (实测 bug:Ctrl+O 在发 CSI-u 的终端无反应)。与 byteToKey 的 0x01-0x1f 控制字节集保持一致。
+fn ctrlLetterKey(codepoint: u32) Key {
+    return switch (codepoint) {
+        99, 67 => .ctrl_c, // 'c' / 'C'
+        100, 68 => .ctrl_d, // 'd'
+        97, 65 => .ctrl_a,
+        101, 69 => .ctrl_e,
+        107, 75 => .ctrl_k,
+        117, 85 => .ctrl_u,
+        111, 79 => .ctrl_o, // 'o' — transcript viewer(实测漏)
+        98, 66 => .ctrl_b, // 'b' — 转后台(run in background)
+        114, 82 => .ctrl_r, // 'r' — reverse search
+        116, 84 => .ctrl_t, // 't' — task panel toggle
+        103, 71 => .ctrl_g, // 'g'
+        120, 88 => .ctrl_x, // 'x' — Ctrl+X 前缀
+        108, 76 => .ctrl_l, // 'l' — external edit
+        119, 87 => .ctrl_w, // 'w'
+        121, 89 => .ctrl_y, // 'y'
+        95 => .ctrl_underscore, // '_' — undo
+        else => .unknown,
+    };
+}
 
 fn byteToKey(b: u8) Key {
     return switch (b) {
@@ -1807,6 +1864,77 @@ test "KeyParser: shift_tab via ESC [ Z" {
     try testing.expect(p.feed('Z').? == .shift_tab);
 }
 
+fn expectSequence(seq: []const u8, expected: Key) !void {
+    var p = KeyParser{};
+    for (seq[0 .. seq.len - 1]) |b| try testing.expect(p.feed(b) == null);
+    try testing.expectEqual(expected, p.feed(seq[seq.len - 1]).?);
+    try testing.expect(p.drain() == null);
+    try testing.expect(!p.pendingEsc());
+}
+
+test "KeyParser: Tab and Shift+Tab as kitty CSI u" {
+    try expectSequence("\x1b[9;2u", .shift_tab);
+    try expectSequence("\x1b[9u", .tab);
+    try expectSequence("\x1b[9;1u", .tab);
+    try expectSequence("\x1b[9;66u", .shift_tab);
+    try expectSequence("\x1b[9;5u", .unknown);
+}
+
+test "KeyParser: modifyOtherKeys CSI 27;mod;key~ decodes through the CSI u table" {
+    try expectSequence("\x1b[27;2;9~", .shift_tab);
+    try expectSequence("\x1b[27;1;9~", .tab);
+    try expectSequence("\x1b[27;2;13~", .shift_enter);
+    try expectSequence("\x1b[27;5;13~", .ctrl_enter);
+    try expectSequence("\x1b[27;1;13~", .enter);
+    try expectSequence("\x1b[27;5;27~", .esc);
+    try expectSequence("\x1b[27;5;99~", .ctrl_c);
+    try expectSequence("\x1b[27;5;111~", .ctrl_o);
+    try expectSequence("\x1b[27;5;95~", .ctrl_underscore);
+    try expectSequence("\x1b[27;3;98~", .alt_b);
+    try expectSequence("\x1b[27;3;102~", .alt_f);
+}
+
+test "KeyParser: unknown modifyOtherKeys combos are one .unknown and leave no characters" {
+    var buf: [16]Key = undefined;
+    const keys = parseAll("a\x1b[27;5;9~b\x1b[27;2;8~c\x1b[28;2;9~d\x1b[27;2;9uf\x1b[27;2;9;1~g", &buf);
+    const expected = [_]Key{ .{ .char = 'a' }, .unknown, .{ .char = 'b' }, .unknown, .{ .char = 'c' }, .unknown, .{ .char = 'd' }, .unknown, .{ .char = 'f' }, .unknown, .{ .char = 'g' } };
+    try testing.expectEqualSlices(Key, &expected, keys);
+}
+
+test "KeyParser: Shift+Tab split across reads still decodes once" {
+    for ([_][]const u8{ "\x1b[9;2u", "\x1b[27;2;9~" }) |seq| {
+        for (1..seq.len) |cut| {
+            var p = KeyParser{};
+            var keys: [4]Key = undefined;
+            var n: usize = 0;
+            for ([_][]const u8{ seq[0..cut], seq[cut..] }) |chunk| {
+                for (chunk) |b| {
+                    if (p.feed(b)) |k| {
+                        keys[n] = k;
+                        n += 1;
+                    }
+                    while (p.drain()) |k| {
+                        keys[n] = k;
+                        n += 1;
+                    }
+                }
+                try testing.expectEqual(chunk.ptr == seq.ptr, p.pendingEsc());
+            }
+            try testing.expectEqualSlices(Key, &.{.shift_tab}, keys[0..n]);
+        }
+    }
+}
+
+test "KeyParser: an interrupted modifyOtherKeys sequence is dropped on flush" {
+    var p = KeyParser{};
+    for ("\x1b[27;2;") |b| try testing.expect(p.feed(b) == null);
+    try testing.expect(p.flushEsc() == null);
+    try testing.expect(!p.pendingEsc());
+    for ("\x1b[27;2;9") |b| try testing.expect(p.feed(b) == null);
+    try testing.expect(p.flushEsc() == null);
+    try testing.expectEqual(@as(?Key, .{ .char = '~' }), p.feed('~'));
+}
+
 test "KeyParser: alt_b / alt_f via ESC b / ESC f" {
     var p = KeyParser{};
     try testing.expect(p.feed(0x1b) == null);
@@ -2220,7 +2348,7 @@ test "KeyParser: 迟到的终端应答整条吃掉,不漏成字符" {
     // DA1(Windows Terminal 实测的那条)、Kitty flags、OSC 之外的私有 CSI,以及 xterm 式
     // modifyOtherKeys 三段参数:每条报一个 .unknown,前后敲的字照常。
     var p = KeyParser{};
-    const stream = "a\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52cb\x1b[?1uc\x1b[>4;2md\x1b[27;2;13~e\x1b[1;5Af";
+    const stream = "a\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52cb\x1b[?1uc\x1b[>4;2md\x1b[27;7;120~e\x1b[1;5Af";
     var chars: [8]u8 = undefined;
     var n_chars: usize = 0;
     var unknowns: usize = 0;
