@@ -567,7 +567,7 @@ def _fetch_unit(executor, remote_unit, unit, commit, repo, cancelled, popen):
     if name != unit.name or not parent:
         raise BuildError(f"执行机器 {executor.name} 返回的包路径无法识别")
     record = name + ".json"
-    argv = executors.ssh_argv(executor, ["tar", "-cf", "-", "-C", parent, name, record])
+    argv = executors.ssh_argv(executor, ["env", "COPYFILE_DISABLE=1", "tar", "-cf", "-", "-C", parent, name, record])
     print(f"bench: copying {name} from {executor.name}", file=sys.stderr, flush=True)
     staged = unit.parent / (".fetch-" + uuid.uuid4().hex[:8])
     staged.mkdir(parents=True)
