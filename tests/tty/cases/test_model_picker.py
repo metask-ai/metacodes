@@ -179,20 +179,23 @@ def test_picker_enter_applies_the_model_with_vim_on(bin_path):
     a.assert_input_echo("")
 
 
-def test_picker_ctrl_c_closes_it_keeping_the_draft_and_a_second_ctrl_c_exits(bin_path):
+def test_picker_ctrl_c_closes_it_and_keeps_the_draft(bin_path):
     raw = run(
         bin_path,
         [READY, "type:explain this", "sleep:0.3", "key:ctrl_o", wait_for(OPEN),
-         "key:ctrl_c", "key:ctrl_c", "strictsleep:1.0", "type:after", "strictsleep:0.5"],
+         "key:ctrl_c", wait_for("kept "),
+         "key:ctrl_c", wait_for("Press Ctrl-C again to exit")],
         per_key_drain=0.08,
     )
     a, text = _screen(raw)
-    closed = next((sc for sc in _frames(a) if "kept claude" in sc), None)
-    assert closed is not None, "Ctrl+C 没有关掉 picker:\n" + text
+    frames = _frames(a)
+    at = next((i for i, sc in enumerate(frames) if "kept claude" in sc), None)
+    assert at is not None, "Ctrl+C 没有关掉 picker:\n" + text
+    closed = frames[at]
     assert "enter apply" not in closed and "❯ explain this" in closed, "Ctrl+C 关掉 picker 时草稿没留住:\n" + closed
-    assert "Press Ctrl-C again to exit" in closed, "关掉 picker 的那一下应算作双击退出的第一下:\n" + closed
-    a.assert_clean_exit()
-    assert a.final.find_row("after") is None, "第二下 Ctrl+C 没有退出:\n" + text
+    assert "Press Ctrl-C again" not in closed, "关掉 picker 的那一下不该进入双击退出:\n" + closed
+    assert any("Press Ctrl-C again to exit" in sc for sc in frames[at:]), "关掉 picker 之后再按 Ctrl+C 应进入双击退出:\n" + text
+    a.assert_box_present()
 
 
 def test_picker_tab_cycles_scope_and_shows_it(bin_path):

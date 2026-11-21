@@ -36,10 +36,9 @@ status, compatibility boundaries, and entry points are defined by
   prompt: the draft was discarded, `Press Ctrl-C again to exit` appeared
   under a picker that stayed open, and a second Ctrl+C left metacodes. Now
   the first Ctrl+C at the prompt closes the picker whatever it shows, as Esc
-  does on an empty filter (`kept …`), keeps the draft and shows `Press
-  Ctrl-C again to exit`: a second Ctrl+C inside that window exits, as two
-  presses do at the prompt, and a later one works as it does there. During a
-  reply Ctrl+C still interrupts it, and Ctrl+D is unchanged.
+  does on an empty filter (`kept …`), and the draft stays; the next Ctrl+C
+  arms the exit as before. During a reply Ctrl+C still interrupts it, and
+  Ctrl+D is unchanged.
 
 ## 0.13.0 — 2026-11-20
 
