@@ -314,6 +314,136 @@ pub fn hashFileContent(ctx: *const ToolContext, path: []const u8) !u64 {
     return hash.final();
 }
 
+/// What `denyRead` hides, for a path that can no longer be asked of the
+/// sandbox: a file deleted or moved away since, so there is nothing at the
+/// path for `open` to refuse. Both backends hide a denied path and all below
+/// it (Seatbelt `subpath`; bubblewrap binds `/dev/null` over a file and a
+/// tmpfs over a directory), each in its own resolution of the configured
+/// path: `~` expanded, then the realpath from this process (Seatbelt) or the
+/// path joined to the command's directory, physical when it exists
+/// (bubblewrap). Build it when the command starts, as the backends resolve
+/// theirs: a denied file the command deletes resolves no more.
+///
+/// It decides alone for paths that are gone, so it errs wide: it also keeps
+/// the unresolved forms, and on macOS, whose volumes usually ignore case,
+/// compares ASCII letters without it.
+pub const ReadDenied = struct {
+    allocator: std.mem.Allocator,
+    prefixes: [][]u8 = &.{},
+
+    pub fn init(allocator: std.mem.Allocator, ctx: *const ToolContext) error{OutOfMemory}!ReadDenied {
+        const sb = ctx.sandbox orelse return .{ .allocator = allocator };
+        if (!sb.enabled) return .{ .allocator = allocator };
+        var list: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (list.items) |p| allocator.free(p);
+            list.deinit(allocator);
+        }
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = if (ctx.cwd_abs.len != 0) ctx.cwd_abs else pfs.getCwd(&cwd_buf) orelse "";
+        for (sb.deny_read) |raw| {
+            const expanded = try expandHome(allocator, raw, ctx.home_dir);
+            defer allocator.free(expanded);
+            try appendPhysical(allocator, &list, expanded);
+            if (!std.fs.path.isAbsolute(expanded) and cwd.len == 0) continue;
+            const anchored = try std.fs.path.resolve(allocator, &.{ cwd, expanded });
+            {
+                errdefer allocator.free(anchored);
+                try list.append(allocator, anchored);
+            }
+            try appendPhysical(allocator, &list, anchored);
+        }
+        return .{ .allocator = allocator, .prefixes = try list.toOwnedSlice(allocator) };
+    }
+
+    pub fn deinit(self: *ReadDenied) void {
+        for (self.prefixes) |p| self.allocator.free(p);
+        self.allocator.free(self.prefixes);
+        self.* = undefined;
+    }
+
+    /// `path` (absolute) is a denied path or below one.
+    pub fn covers(self: *const ReadDenied, path: []const u8) bool {
+        for (self.prefixes) |prefix| if (within(prefix, path)) return true;
+        return false;
+    }
+
+    fn within(prefix: []const u8, path: []const u8) bool {
+        if (prefix.len == 0 or path.len < prefix.len) return false;
+        const head = path[0..prefix.len];
+        const same = if (builtin.os.tag == .macos) std.ascii.eqlIgnoreCase(head, prefix) else std.mem.eql(u8, head, prefix);
+        if (!same) return false;
+        return path.len == prefix.len or prefix[prefix.len - 1] == '/' or path[prefix.len] == '/';
+    }
+
+    fn expandHome(allocator: std.mem.Allocator, raw: []const u8, home: []const u8) error{OutOfMemory}![]u8 {
+        if (home.len > 0) {
+            if (std.mem.eql(u8, raw, "~")) return allocator.dupe(u8, home);
+            if (std.mem.startsWith(u8, raw, "~/")) return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw[2..] });
+        }
+        return allocator.dupe(u8, raw);
+    }
+
+    fn appendPhysical(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), path: []const u8) error{OutOfMemory}!void {
+        var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return;
+        var out: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const resolved = pfs.finalPath(z.ptr, &out) orelse return;
+        const owned = try allocator.dupe(u8, std.mem.span(resolved));
+        errdefer allocator.free(owned);
+        try list.append(allocator, owned);
+    }
+};
+
+test "ReadDenied covers a denied path and below it, in every form a backend resolves it to" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no sandbox backend
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    try tmp.dir.createDirPath(std.testing.io, "real");
+    try tmp.dir.symLink(std.testing.io, "real", "link", .{ .is_directory = true });
+    try tmp.dir.createDirPath(std.testing.io, "real2");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real2/f.txt", .data = "" });
+    try tmp.dir.symLink(std.testing.io, "real2", "link2", .{ .is_directory = true });
+    var buf: [6][std.fs.max_path_bytes]u8 = undefined;
+    const p = struct {
+        fn at(b: *[std.fs.max_path_bytes]u8, base: []const u8, rel: []const u8) []const u8 {
+            return std.fmt.bufPrint(b, "{s}/{s}", .{ base, rel }) catch unreachable;
+        }
+    }.at;
+
+    const deny = [_][]const u8{
+        p(&buf[0], root, "secret"), // absolute
+        "~/token.env", // under home
+        "rel.key", // relative to the command's directory
+        p(&buf[1], root, "link"), // through a symlink: matched physically too
+        // Relative and through a symlink: bubblewrap binds the physical path
+        // under the command's directory, which is not this process's.
+        "link2/f.txt",
+    };
+    var sb: @import("config.zig").SandboxSettings = .{ .enabled = true, .deny_read = &deny };
+    var ctx = ToolContext.simple(allocator);
+    ctx.cwd_abs = root;
+    ctx.home_dir = root;
+    ctx.sandbox = &sb;
+    var denied = try ReadDenied.init(allocator, &ctx);
+    defer denied.deinit();
+
+    for ([_][]const u8{ "secret", "secret/a/b.txt", "token.env", "rel.key", "link/x", "real/x", "link2/f.txt", "real2/f.txt" }) |rel|
+        try std.testing.expect(denied.covers(p(&buf[2], root, rel)));
+    for ([_][]const u8{ "secretx", "secret.txt", "token.envx", "other/rel.key", "realx", "real2/g.txt" }) |rel|
+        try std.testing.expect(!denied.covers(p(&buf[3], root, rel)));
+    // Seatbelt matches on volumes that ignore case; the comparison does too.
+    try std.testing.expectEqual(builtin.os.tag == .macos, denied.covers(p(&buf[4], root, "SECRET/a")));
+
+    sb.enabled = false;
+    var off = try ReadDenied.init(allocator, &ctx);
+    defer off.deinit();
+    try std.testing.expect(!off.covers(p(&buf[5], root, "secret")));
+}
+
 const TestFixture = struct {
     tmp: std.testing.TmpDir,
     root: []u8,

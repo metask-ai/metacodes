@@ -89,8 +89,11 @@ pub const Options = struct {
     /// runs inside it and a change is published only if the sandbox lets the
     /// command open the file, whose contents are read through it too: what
     /// the sandbox hides from the command (`denyRead`) stays out of the
-    /// event and the journal. A sandbox that cannot be reached makes the call
-    /// `lost`.
+    /// event and the journal. A path deleted or moved away can no longer be
+    /// opened to ask, so neither the new nor the old path of a change may be
+    /// one `denyRead` covered when the observation began
+    /// (`sandbox_fs.ReadDenied`). A change held back makes the call `lost`,
+    /// as does a sandbox that cannot be reached.
     confined: ?*const ToolContext = null,
 };
 
@@ -750,6 +753,11 @@ pub const Observation = struct {
     limits: Limits,
     /// See `Options.confined`; borrowed for the observation's lifetime.
     confined: ?*const ToolContext = null,
+    /// Under `confined`: what `denyRead` covered when the observation began,
+    /// and the root's physical path (owned; empty when it did not resolve)
+    /// to match a gone path against besides `root`.
+    denied: ?sandbox_fs.ReadDenied = null,
+    physical_root: []u8 = &.{},
     /// Wall clock when the observation began, less `Limits.clock_slack_ms`:
     /// a file untouched since then was not the command's doing.
     since_ns: i128 = 0,
@@ -776,6 +784,21 @@ pub const Observation = struct {
         if (remembered.too_large) {
             self.state = .{ .gap = .workspace_too_large_before };
             return self;
+        }
+        if (options.confined) |ctx| {
+            self.denied = sandbox_fs.ReadDenied.init(gpa, ctx) catch {
+                self.state = .{ .gap = .out_of_memory };
+                return self;
+            };
+            var root_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+            var out: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const z = std.fmt.bufPrintZ(&root_z, "{s}", .{root}) catch "";
+            if (z.len > 0) if (pfs.finalPath(z.ptr, &out)) |resolved| {
+                self.physical_root = gpa.dupe(u8, std.mem.span(resolved)) catch {
+                    self.state = .{ .gap = .out_of_memory };
+                    return self;
+                };
+            };
         }
         const started = util_time.nowMs();
         var snapshot = switch (takeSnapshot(gpa, root, abort, limits, options.confined)) {
@@ -824,6 +847,8 @@ pub const Observation = struct {
             },
             .gap => {},
         }
+        if (self.denied) |*d| d.deinit();
+        if (self.physical_root.len > 0) self.gpa.free(self.physical_root);
         if (self.root.len > 0) self.gpa.free(self.root);
         self.* = undefined;
     }
@@ -897,14 +922,14 @@ pub const Observation = struct {
             const change = changes[next];
             // Under a sandbox, a file the command could not open is not
             // reported at all: its path, size and contents stay inside.
-            var confined_fd: ?pfs.Fd = null;
-            defer if (confined_fd) |fd| pfs.close(fd);
-            if (change.kind != .deleted) if (self.confined) |ctx| {
-                confined_fd = self.openConfined(ctx, per_file, change.rel, change.after.?) orelse {
+            const confined_fd = switch (self.admit(per_file, change)) {
+                .refused => {
                     sink.noteIncomplete();
                     continue;
-                };
+                },
+                .admitted => |fd| fd,
             };
+            defer if (confined_fd) |fd| pfs.close(fd);
             const old: ?[]const u8 = switch (change.kind) {
                 .created => "",
                 .moved => null, // same size and mtime: the move carried the content
@@ -972,13 +997,13 @@ pub const Observation = struct {
                 // The record cap is full and more changed paths remain: one
                 // more publication makes the collector record the overflow.
                 const extra = changes[next];
-                if (extra.kind != .deleted) if (self.confined) |ctx| {
-                    const fd = self.openConfined(ctx, per_file, extra.rel, extra.after.?) orelse {
+                switch (self.admit(per_file, extra)) {
+                    .refused => {
                         sink.noteIncomplete();
                         return;
-                    };
-                    pfs.close(fd);
-                };
+                    },
+                    .admitted => |fd| if (fd) |f| pfs.close(f),
+                }
                 sink.publish(.{
                     .path = try std.fs.path.join(per_file, &.{ self.root, extra.rel }),
                     .kind = extra.kind,
@@ -991,6 +1016,37 @@ pub const Observation = struct {
             }
         }
         log.debug("bash_fc", "after: changes={d} examined={d} published={d}", .{ changes.len, next, published });
+    }
+
+    const Admission = union(enum) {
+        refused,
+        /// The new path opened through the sandbox, to read it from; null
+        /// outside a sandbox and for a deletion.
+        admitted: ?pfs.Fd,
+    };
+
+    /// Under a sandbox no record names a path the command was denied. The
+    /// new path must open through the sandbox as the file seen; neither path
+    /// may be one `denyRead` covered at `begin` — a path deleted or moved
+    /// away has nothing left to open, and opening it would not tell.
+    fn admit(self: *const Observation, scratch: std.mem.Allocator, change: Change) Admission {
+        const ctx = self.confined orelse return .{ .admitted = null };
+        if (self.wasDenied(change.rel)) return .refused;
+        if (change.from_rel) |from| if (self.wasDenied(from)) return .refused;
+        if (change.kind == .deleted) return .{ .admitted = null };
+        return .{ .admitted = self.openConfined(ctx, scratch, change.rel, change.after.?) orelse return .refused };
+    }
+
+    fn wasDenied(self: *const Observation, rel: []const u8) bool {
+        const denied = &(self.denied orelse return false);
+        var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        for ([_][]const u8{ self.root, self.physical_root }) |base| {
+            if (base.len == 0) continue;
+            // Too long to name is too long to tell apart: hold it back.
+            const z = joinZ(&buf, base, rel) orelse return true;
+            if (denied.covers(std.mem.span(z))) return true;
+        }
+        return false;
     }
 
     /// Open `rel` read-only the way the sandboxed command would, and only if
@@ -1768,28 +1824,74 @@ test "under a sandbox the observation reports only what the sandbox lets the com
     if (builtin.os.tag == .macos) try testing.expect(got.incomplete);
 }
 
-test "under a sandbox the overflow signal never names a file the command cannot open" {
+test "under a sandbox a hidden file the command deletes or moves away is never named" {
     var fx = Fixture.init();
     defer fx.deinit();
     try fx.setup();
-    try fx.write("zz.env", "a\n");
+    try fx.write("token.env", "TOKEN=1\n");
+    try fx.write("key.pem", "KEY\n");
+    try fx.write("gone.txt", "visible\n");
     var token_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const hidden = [_][]const u8{try std.fmt.bufPrint(&token_buf, "{s}/zz.env", .{fx.root})};
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const hidden = [_][]const u8{
+        try std.fmt.bufPrint(&token_buf, "{s}/token.env", .{fx.root}),
+        try std.fmt.bufPrint(&key_buf, "{s}/key.pem", .{fx.root}),
+    };
     var sb: @import("../sandbox/config.zig").SandboxSettings = undefined;
     var ctx: ToolContext = undefined;
     try sandboxed(&fx, &ctx, &sb, &hidden);
     tick();
+
     var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried, .git_baselines = false, .confined = &ctx });
     defer obs.deinit();
-    const cap = file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1;
-    var name_buf: [32]u8 = undefined;
-    for (0..cap) |i| try fx.write(try std.fmt.bufPrint(&name_buf, "n{d:0>3}.txt", .{i}), "x\n");
-    try fx.write("zz.env", "changed\n"); // sorts after every n*.txt: the one past the cap
+    try testing.expect(obs.state == .watching);
+    // Seatbelt denies reading these files, not unlinking or renaming them,
+    // so the command's own `rm` and `mv` succeed; afterwards there is no
+    // file left at the old path to try opening through the sandbox.
+    try fx.remove("token.env");
+    try fx.rename("key.pem", "moved.pem");
+    try fx.remove("gone.txt");
+
     var got = Captured{ .allocator = testing.allocator };
     defer got.deinit();
     obs.finish(null, got.sink(), false);
-    try testing.expectEqual(cap, got.records.items.len);
-    try testing.expect(got.find("zz.env") == null);
+    for (got.records.items) |r| for ([_][]const u8{ "token.env", "key.pem" }) |name| {
+        try testing.expect(!std.mem.eql(u8, r.path, name));
+        if (r.from) |f| try testing.expect(!std.mem.eql(u8, f, name));
+    };
+    // A visible file's deletion is still reported.
+    const gone = try got.get("gone.txt");
+    try testing.expectEqual(file_change.Kind.deleted, gone.kind);
+    // Seatbelt lists the hidden names, so their changes were held back.
+    if (builtin.os.tag == .macos) try testing.expect(got.incomplete);
+}
+
+test "under a sandbox the overflow signal never names a file the command cannot open" {
+    // The change past the cap: a hidden file modified, then one deleted.
+    for ([_]bool{ false, true }) |deleted| {
+        var fx = Fixture.init();
+        defer fx.deinit();
+        try fx.setup();
+        try fx.write("zz.env", "a\n");
+        var token_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const hidden = [_][]const u8{try std.fmt.bufPrint(&token_buf, "{s}/zz.env", .{fx.root})};
+        var sb: @import("../sandbox/config.zig").SandboxSettings = undefined;
+        var ctx: ToolContext = undefined;
+        try sandboxed(&fx, &ctx, &sb, &hidden);
+        tick();
+        var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = unhurried, .git_baselines = false, .confined = &ctx });
+        defer obs.deinit();
+        const cap = file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1;
+        var name_buf: [32]u8 = undefined;
+        for (0..cap) |i| try fx.write(try std.fmt.bufPrint(&name_buf, "n{d:0>3}.txt", .{i}), "x\n");
+        // Sorts after every n*.txt: the one past the cap.
+        if (deleted) try fx.remove("zz.env") else try fx.write("zz.env", "changed\n");
+        var got = Captured{ .allocator = testing.allocator };
+        defer got.deinit();
+        obs.finish(null, got.sink(), false);
+        try testing.expectEqual(cap, got.records.items.len);
+        try testing.expect(got.find("zz.env") == null);
+    }
 }
 
 test "a sandbox that cannot be reached makes the call lost" {

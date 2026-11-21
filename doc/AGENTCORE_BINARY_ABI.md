@@ -575,9 +575,10 @@ its previous content is unknown — always the case in a Session whose shell is
 sandboxed, where the observation does not run git. In such a Session the
 observation also lists and opens files through the sandbox, so a path the
 sandbox hides from the command (`denyRead`) is never reported, with or without
-its contents. A call the observation could not cover — a workspace too large to
-list, a listing that could not read every directory, a changed file the sandbox
-would not open, a command that moved to the background or was started with
+its contents, as the new path or the old path of a change, even once the
+command has deleted or moved the file. A call the observation could not cover
+— a workspace too large to list, a listing that could not read every
+directory, a changed file the sandbox would not open, a command that moved to the background or was started with
 `run_in_background` — carries `lost`.
 
 Core file-change evidence may retain arbitrary file bytes, but AgentCore's JSON
