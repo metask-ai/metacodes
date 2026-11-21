@@ -15,8 +15,8 @@
 //!   review_approved ── requestCompletion()
 //!       ─► approval stale        ─► reviewing
 //!       ─► auditing ─► pass      ─► merging ─► done | failed(merge_*)
-//!                   ─► 1st fail  ─► implementing (repair round)
-//!                   ─► 2nd fail / unverified / unavailable ─► failed
+//!                   ─► 1st fail / unverified ─► implementing (repair or leads round)
+//!                   ─► 2nd fail / unverified, or unavailable ─► failed
 //!   any live state ── cancel() ─► cancelled
 //!                  ── budget reached ─► budget_exhausted
 //!                  ── per-role dispatch cap ─► failed(rounds_exhausted)
@@ -62,6 +62,11 @@ const TreeId = reviewer.TreeId;
 
 /// At most this many completion audits per run (#514, #516).
 pub const max_audits: u8 = 2;
+
+/// Windows has no seat sandbox backend, and the workspace tree id that binds
+/// approvals, audits and merge-back is not computed there (#517): a run is
+/// refused before anything is written instead of failing midway.
+pub const platform_supported = @import("builtin").os.tag != .windows;
 
 // ── inputs ──────────────────────────────────────────────────────────────────
 
@@ -146,7 +151,7 @@ pub const Failure = enum {
     rounds_exhausted,
     /// The second completion audit failed.
     audit_failed,
-    /// The auditor could not decide; never a pass.
+    /// The second completion audit could not decide; never a pass.
     audit_unverified,
     /// The auditor could not run; never a pass.
     audit_unavailable,
@@ -369,8 +374,8 @@ pub const CompletionResult = union(enum) {
     /// The worktree changed after the approval; the run is back in
     /// `reviewing`.
     approval_stale,
-    /// The first audit failed; its report is forwarded and the run is back in
-    /// `implementing` for a repair round.
+    /// The first audit failed or was unverified; its report is forwarded and
+    /// the run is back in `implementing` for a repair or leads round.
     repair_requested,
     failed: Failure,
     budget_exhausted,
@@ -383,6 +388,8 @@ pub const Error = run_dir.Error || error{
     PreviewDisabled,
     RunBusy,
     LeaseFailed,
+    /// Teamwork does not run on this platform (`platform_supported`).
+    UnsupportedPlatform,
     /// The run is in a terminal state (or just entered one).
     RunEnded,
     /// Only the implementer and the reviewer are dispatched; the verifier is
@@ -451,6 +458,7 @@ pub const Run = struct {
     /// workspace. `cfg`'s strings must outlive the run.
     pub fn start(gpa: std.mem.Allocator, deps: Deps, request: ApprovedRequest, cfg: config.Config.Enabled, options: StartOptions) StartError!*Run {
         if (!deps.preview.teamwork) return error.PreviewDisabled;
+        if (!platform_supported) return error.UnsupportedPlatform;
         if (std.mem.trim(u8, request.text, " \t\r\n").len == 0) return error.EmptyRequest;
         const self = blk: {
             // Resolve the repository before anything is written.
@@ -499,6 +507,7 @@ pub const Run = struct {
     /// inspect. A terminal run reopens as it ended.
     pub fn reopen(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId) ReopenError!*Run {
         if (!deps.preview.teamwork) return error.PreviewDisabled;
+        if (!platform_supported) return error.UnsupportedPlatform;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         var buf: run_dir.PathBuf = undefined;
@@ -1062,14 +1071,13 @@ pub const Run = struct {
         if (self.abort.isAborted()) return self.settleAbort();
         switch (verdict) {
             .pass => |tree| if (!tree.eql(approved)) return self.failWith(.audit_changed_worktree),
-            .fail => {
+            .fail, .unverified => {
                 if (attempt < max_audits) {
                     try self.transition(.implementing);
                     return .repair_requested;
                 }
-                return self.failWith(.audit_failed);
+                return self.failWith(if (verdict == .fail) .audit_failed else .audit_unverified);
             },
-            .unverified => return self.failWith(.audit_unverified),
             .unavailable => return self.failWith(.audit_unavailable),
         }
 
@@ -1308,15 +1316,23 @@ pub const Run = struct {
             },
             else => self.writeImplementerPacket(w) catch return error.OutOfMemory,
         }
-        if (self.last_audit != null and self.last_audit.? == .fail) {
-            w.print(
+        if (self.last_audit) |kind| switch (kind) {
+            .fail => w.print(
                 \\
                 \\## Completion audit
                 \\
                 \\The completion audit found that the result does not yet fulfil the request. Its report is `{s}` (relative to the directory of this packet). Every finding in it must be addressed; a second failed audit ends the run.
                 \\
-            , .{run_dir.seat_relative_first_audit_report}) catch return error.OutOfMemory;
-        }
+            , .{run_dir.seat_relative_first_audit_report}) catch return error.OutOfMemory,
+            .unverified => w.print(
+                \\
+                \\## Completion audit
+                \\
+                \\The completion audit could not confirm that the result fulfils the request. Its report is `{s}` (relative to the directory of this packet): the evidence it gathered and what it could not establish are your leads. Make every requirement it could not establish demonstrable in the workspace, for example with a test that exercises it, and fix what the leads show missing; a second audit that does not pass ends the run.
+                \\
+            , .{run_dir.seat_relative_first_audit_report}) catch return error.OutOfMemory,
+            .pass, .unavailable => {},
+        };
         const notes = std.mem.trim(u8, instructions, " \t\r\n");
         if (notes.len != 0) {
             w.print("\n## Notes from the manager\n\n{s}\n", .{notes}) catch return error.OutOfMemory;

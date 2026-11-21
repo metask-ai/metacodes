@@ -139,6 +139,7 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
     if (!options.approve) return error.ApprovalRequired;
     const preview = try @import("../app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
     if (!preview.features().teamwork) return error.PreviewDisabled;
+    if (!runtime.platform_supported) return error.UnsupportedPlatform;
     if (options.action != .run and options.action != .@"resume" and options.action != .mcp) return error.UnknownCommand;
     const generated = @import("../core/session_id.zig").gen();
     const id = options.id orelse try types.RunId.parse(generated.asSlice());
@@ -303,6 +304,7 @@ pub const Host = struct {
         anthropic_client: ?*@import("../client.zig").Client,
     ) !*Host {
         if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+        if (!runtime.platform_supported) return error.UnsupportedPlatform;
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
         // Other embedders can supply an App with deferred MCP publication.
@@ -549,6 +551,7 @@ pub const Background = struct {
 
 pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prompter: interview.Prompter, board: *progress.Board) !Interactive {
     if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+    if (!runtime.platform_supported) return error.UnsupportedPlatform;
     const generated = @import("../core/session_id.zig").gen();
     const job = try Background.create(try types.RunId.parse(generated.asSlice()));
     var started = false;

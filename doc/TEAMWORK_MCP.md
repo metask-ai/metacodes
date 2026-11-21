@@ -152,7 +152,8 @@ A passing audit names that tree before the runtime can enter merge-back.
 Merge-back checks target-file preimages using a private Git index and refuses
 submodule commit changes before touching the workspace.
 An unavailable auditor yields `failed/audit_unavailable`, never `done`.
-Stale approval or a first failed audit can request review or repair; callers
+Stale approval, or a first failed or unverified audit, can request review or a
+repair or leads round; callers
 must inspect the returned state. Only `snapshot.state.kind == "done"` means
 completion. Cancel is idempotent on ended runs and retains unfinished work.
 

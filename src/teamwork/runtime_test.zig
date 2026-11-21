@@ -536,6 +536,111 @@ test "teamwork runtime L2: two failed audits fail the run; the first report reac
     try expectCacheSafe(&fx, &seats);
 }
 
+test "teamwork runtime L2: an unverified audit forwards its leads to one more round; a second unverified audit fails the run without merging" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-unverified");
+    defer fx.deinit();
+    const before = try fx.workspaceBytes();
+    defer testing.allocator.free(before);
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+        .{ .seat = "implementer-2", .files = &.{.{ .path = "feature.txt", .bytes = "feature, with a test\n" }} },
+        .{ .seat = "reviewer-2", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{ .{ .unverified = "Not established:\nthe --flag output\n" }, .{ .unverified = "Still not established.\n" } };
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+
+    const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
+    defer run.destroy();
+    const final = try swe_loop.drive(run);
+
+    try testing.expectEqual(runtime.State{ .failed = .audit_unverified }, final);
+    try testing.expectEqual(@as(u32, 2), auditor.calls);
+    const after = try fx.workspaceBytes();
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+    try expectFile(run.status().worktree.?, "feature.txt", "feature, with a test\n");
+    var report_buf: PathBuf = undefined;
+    try expectFile(fx.runFile(&report_buf, ""), "audits/audit-1.md", "# Completion audit 1: unverified\n\nNot established:\nthe --flag output\n");
+    for ([_][]const u8{ "implementer-2", "reviewer-2" }) |seat| {
+        const packet = seats.packetOf(seat);
+        try testing.expect(std.mem.indexOf(u8, packet, run_dir.seat_relative_first_audit_report) != null);
+        try testing.expect(std.mem.indexOf(u8, packet, "could not confirm") != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, seats.packetOf("implementer-1"), "audit-1.md") == null);
+    try expectCacheSafe(&fx, &seats);
+}
+
+test "teamwork runtime L2: a pass after the leads round merges; a failed second audit after unverified fails the run" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const endings = [_]struct { second: audit.StubAuditor.Scripted, final: runtime.Phase }{
+        .{ .second = .pass, .final = .done },
+        .{ .second = .{ .fail = "The flag is missing.\n" }, .final = .failed },
+    };
+    for (endings) |ending| {
+        var fx: Fixture = undefined;
+        try fx.init("cc-zig-teamwork-rt-leads");
+        defer fx.deinit();
+        const before = try fx.workspaceBytes();
+        defer testing.allocator.free(before);
+        const plans = [_]Plan{
+            .{ .seat = "implementer-1", .files = &.{feature} },
+            .{ .seat = "reviewer-1", .review = approve_review },
+            .{ .seat = "implementer-2", .files = &.{.{ .path = "feature.txt", .bytes = "feature\n" }} },
+            .{ .seat = "reviewer-2", .review = approve_review },
+        };
+        var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+        defer seats.deinit();
+        const script = [_]audit.StubAuditor.Scripted{ .{ .unverified = "Not established: the flag.\n" }, ending.second };
+        var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+        defer auditor.deinit();
+
+        const run = try runtime.Run.start(testing.allocator, .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() }, .{ .text = request_text, .source = .request_file }, try fx.cfg(""), fx.options());
+        defer run.destroy();
+        const final = try swe_loop.drive(run);
+
+        try testing.expectEqual(ending.final, final.phase());
+        try testing.expectEqual(@as(u32, 2), auditor.calls);
+        switch (ending.final) {
+            .done => try expectFile(fx.repo(), "feature.txt", "feature\n"),
+            else => {
+                try testing.expectEqual(runtime.State{ .failed = .audit_failed }, final);
+                const after = try fx.workspaceBytes();
+                defer testing.allocator.free(after);
+                try testing.expectEqualStrings(before, after);
+            },
+        }
+    }
+}
+
+test "teamwork runtime: Windows refuses to start or reopen a run before writing anything (#517)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var root = run_dir.test_support.TestRoot.init("cc-zig-teamwork-rt-windows");
+    defer root.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = (try config.validate(try config.parse(a, "{\"enabled\":true,\"budget_usd\":5}", null), null)).enabled;
+    var seats: ScriptedSeats = .{ .plans = &.{}, .user_repo = root.slice() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const id = try types.RunId.parse(run_id_text);
+
+    try testing.expect(!runtime.platform_supported);
+    try testing.expectError(error.UnsupportedPlatform, runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, .{ .state_root = root.slice(), .run_id = id, .workspace = root.slice() }));
+    try testing.expectError(error.UnsupportedPlatform, runtime.Run.reopen(testing.allocator, deps, cfg, root.slice(), id));
+    try testing.expect(!exists(root.slice(), "teamwork"));
+    try testing.expectError(error.Unsupported, reviewer.workspaceTree(testing.allocator, root.slice(), root.slice(), null));
+}
+
 test "teamwork runtime L2: an unavailable audit is never a pass" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;

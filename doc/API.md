@@ -342,6 +342,9 @@ and merge-back. No App/provider, seat or worktree starts before approval.
 The state root must be outside the repository. All workers, pinned checks
 and verifier tools require Sandbox Foundations; an unavailable backend fails
 closed. Native and Claude Code implementer/reviewer seats are supported.
+Windows has no seat sandbox backend and no workspace tree id, so `teamwork
+run`/`resume`/`mcp`, REPL `/teamwork`, `Run.start` and `Run.reopen` fail with
+`UnsupportedPlatform` before any run state is written.
 
 Teamwork is the `teamwork` **preview feature**, disabled by default. It uses
 the same root `"preview"` in `<state root>/config.json` and the same
