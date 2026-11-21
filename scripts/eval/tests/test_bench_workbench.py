@@ -24,6 +24,7 @@ from contextlib import redirect_stderr
 from unittest.mock import patch
 
 from scripts.eval.harbor import cli
+from scripts.eval.harbor.adapters import gaia2_cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
 from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.workbench import Workbench
@@ -145,6 +146,12 @@ def node_script() -> bytes:
     # Like bench_cli.zig: METACODES_BENCH_PYTHON, else python3 on PATH.
     return (f'#!/bin/sh\n[ "$1" = bench ] || exit 2\nshift\nexec "${{METACODES_BENCH_PYTHON:-python3}}" -c "{bootstrap}" '
             f'{REPO} --state-root "$HOME/.metacodes" --metacodes-version 9.9.9 "$@"\n').encode()
+
+
+def offline_hugging_face(case):
+    probe = patch.object(gaia2_cli, 'cached_hf_problem', lambda: None)
+    probe.start()
+    case.addCleanup(probe.stop)
 
 
 def fixture(root):
@@ -507,6 +514,7 @@ class WorkbenchTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         config, binary_dir = fixture(self.root)
+        offline_hugging_face(self)
         self.env = patch.dict(os.environ, {'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                                           'TOKENJOY_API_KEY': 'private-test-value'})
         self.env.start()

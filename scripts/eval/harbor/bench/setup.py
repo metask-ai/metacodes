@@ -425,7 +425,8 @@ def relay_reachable(s: Setup):
                      mutate=True, timeout=300)
         return done is None or done.returncode == 0
     finally:
-        listener.close()
+        from scripts.eval.harbor.bench.egress import stop_listening
+        stop_listening(listener)
 
 
 def step_docker_macos(s: Setup):

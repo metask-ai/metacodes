@@ -35,7 +35,7 @@ from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import fixture, session_fixture, wait_run
+from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, session_fixture, wait_run
 from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV, WORKBUDDY_PINNED_COMMIT
 
 REPO = Path(__file__).resolve().parents[3]
@@ -544,6 +544,7 @@ class SuiteLaunchTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         config, self.binary_dir = fixture(self.root)
+        offline_hugging_face(self)
         uv = self.binary_dir / "uv"
         uv.write_text(FAKE_UV.format(python=sys.executable, judge=WORKBUDDY_JUDGE_KEY_ENV))
         uv.chmod(0o755)

@@ -108,6 +108,12 @@ status, compatibility boundaries, and entry points are defined by
   arms the exit as before. During a reply Ctrl+C still interrupts it. Ctrl+D
   leaves a non-empty draft alone, as described above.
 
+- **Bench listeners stop listening when they are closed** (#659). On Linux,
+  closing a socket does not wake a thread blocked in `accept`, so a closed
+  egress proxy or Docker-gateway forwarder kept its port open and relayed one
+  more connection after its run ended, and the Colima relay check left its
+  probe port open. They are now shut down before they are closed.
+
 ### Fixed
 
 - **A `204` or `304` answer no longer holds a request until the server

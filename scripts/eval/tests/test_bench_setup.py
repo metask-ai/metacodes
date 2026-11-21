@@ -39,7 +39,7 @@ from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, REPO, RotatingGateway, gaia2_dataset, node_script,
-                                                     session_fixture, wait_run)
+                                                     offline_hugging_face, session_fixture, wait_run)
 
 FAKES = r'''
 import json, os, shutil, subprocess, sys, time
@@ -331,6 +331,7 @@ class SetupFixture(unittest.TestCase):
         patcher = patch.dict(os.environ, self.env)
         patcher.start()
         self.addCleanup(patcher.stop)
+        offline_hugging_face(self)
         self.release, self.release_digest = release_fixture(root / "release")
         self.addCleanup(self.release.server_close)
         self.addCleanup(self.release.shutdown)
@@ -1493,7 +1494,8 @@ def echo_server():
                         c.sendall(chunk)
             threading.Thread(target=echo, daemon=True).start()
     threading.Thread(target=serve, daemon=True).start()
-    return listener.getsockname()[1], listener.close
+    from scripts.eval.harbor.bench.egress import stop_listening
+    return listener.getsockname()[1], partial(stop_listening, listener)
 
 
 def proxy_request(port, head, payload=b""):
@@ -1527,6 +1529,19 @@ class EgressUnitTest(unittest.TestCase):
                     received += sock.recv(65536)
                 sender.join()
         self.assertEqual(received, payload)
+
+    def test_a_closed_listener_stops_accepting_and_its_thread_ends(self):
+        import socket
+        from scripts.eval.harbor.bench import egress
+        port, close = echo_server()
+        self.addCleanup(close)
+        forwarder = egress.Forwarder("127.0.0.1", ("127.0.0.1", port)).start()
+        address = forwarder.address
+        forwarder.close()
+        forwarder.thread.join(timeout=5)
+        self.assertFalse(forwarder.thread.is_alive())
+        with self.assertRaises(ConnectionRefusedError):
+            socket.create_connection(address, timeout=5).close()
 
     def test_proxy_tunnels_allowed_ports_and_refuses_the_rest(self):
         from scripts.eval.harbor.bench import egress

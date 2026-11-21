@@ -27,7 +27,7 @@ from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import fixture, wait_run
+from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, wait_run
 
 
 def _write(path: Path, value) -> None:
@@ -141,6 +141,7 @@ class BatchTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         self.config, binary_dir = fixture(self.root)
+        offline_hugging_face(self)
         self.env = patch.dict(os.environ, {'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                                           'TOKENJOY_API_KEY': 'private-test-value'})
         self.env.start()
