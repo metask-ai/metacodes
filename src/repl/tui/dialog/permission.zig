@@ -100,6 +100,7 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
     var selected: usize = 0;
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
+    var parser = input_mod.KeyParser{};
     while (true) {
         const cols: u16 = if (term.getSize(out_fd)) |size| size.cols else 80;
         if (drawn) |anchor| {
@@ -113,30 +114,39 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
         writeAll(out_fd, frame);
         drawn = reflow.Anchor.atEnd(frame, cols);
 
-        var buf: [8]u8 = undefined;
-        const n = platform_term.readInput(in_fd, &buf); // decodes a console's key records
-        if (n <= 0) {
-            if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
-            return .deny_once;
-        }
-        const b = buf[0];
-
-        switch (b) {
-            'y', 'Y' => return .allow_once,
-            'a', 'A' => return .allow_always,
-            'n', 'N' => return .deny_once,
-            'd', 'D' => return .deny_tool_session,
-            0x03 => return .deny_once, // Ctrl+C → 拒绝
-            '\r', '\n' => return options[selected].choice, // Enter 确认高亮
+        const key = switch (input_mod.readKey(in_fd, &parser)) {
+            .key => |key| key,
+            .interrupted => continue,
+            .closed => return .deny_once,
+        };
+        switch (key) {
+            .char => |c| switch (c) {
+                'y', 'Y' => return .allow_once,
+                'a', 'A' => return .allow_always,
+                'n', 'N' => return .deny_once,
+                'd', 'D' => return .deny_tool_session,
+                else => {},
+            },
+            .ctrl_c => return .deny_once,
+            .enter => return options[selected].choice,
+            .up => selected = if (selected == 0) options.len - 1 else selected - 1,
+            .down => selected = (selected + 1) % options.len,
+            .paste_begin => if (skipPaste(in_fd, &parser)) |choice| return choice,
             else => {},
         }
-        // 方向键:ESC [ A/B
-        if (b == 0x1b and n >= 3 and buf[1] == '[') {
-            switch (buf[2]) {
-                'A' => selected = if (selected == 0) options.len - 1 else selected - 1, // up
-                'B' => selected = (selected + 1) % options.len, // down
+    }
+}
+
+fn skipPaste(in_fd: c_int, parser: *input_mod.KeyParser) ?PermissionChoice {
+    while (true) {
+        switch (input_mod.readKey(in_fd, parser)) {
+            .key => |key| switch (key) {
+                .paste_end => return null,
+                .ctrl_c => return .deny_once,
                 else => {},
-            }
+            },
+            .interrupted => {},
+            .closed => return .deny_once,
         }
     }
 }
@@ -227,5 +237,36 @@ test "promptLoop 读 Windows 控制台送来的按键记录:y、n、Ctrl+C 各�
     for (cases) |c| {
         try console.sendChars(c.records);
         try testing.expectEqual(c.choice, promptLoop(testing.allocator, theme_mod.dark, 0, sink, "Write", "{}").?);
+    }
+}
+
+test "promptLoop reads whole keys: Ctrl+C sent as CSI u refuses, keys written together each count, a paste never answers" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const Later = struct {
+        fn send(fd: c_int, bytes: []const u8) void {
+            @import("platform").sync.sleepMs(300);
+            _ = pfs.writeAll(fd, bytes);
+            _ = std.c.close(fd);
+        }
+    };
+    const cases = [_]struct { now: []const u8, later: []const u8, choice: PermissionChoice }{
+        .{ .now = "\x1b[99;5u", .later = "y", .choice = .deny_once },
+        .{ .now = "\x1b[27u", .later = "d", .choice = .deny_tool_session },
+        .{ .now = "\x1b[B\x1b[B\x1b[B\r", .later = "y", .choice = .deny_tool_session },
+        .{ .now = "\x1b[200~yes\x1b[201~", .later = "d", .choice = .deny_tool_session },
+        .{ .now = "\x1b[200~a\x03", .later = "\x1b[201~d", .choice = .deny_once },
+    };
+    for (cases) |c| {
+        var fds: [2]std.c.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        try testing.expect(pfs.writeAll(fds[1], c.now));
+        const thread = try std.Thread.spawn(.{}, Later.send, .{ fds[1], c.later });
+        const got = promptLoop(testing.allocator, theme_mod.monochrome, fds[0], sink, "Write", "{}");
+        thread.join();
+        try testing.expectEqual(c.choice, got.?);
     }
 }

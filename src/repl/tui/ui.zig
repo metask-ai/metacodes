@@ -170,6 +170,7 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
         if (mapped) |picker_key| return .{ .action = .picker_key, .picker_key = picker_key };
         return .{ .redraw_region = false };
     }
+    if (ix.picker_open and key == .ctrl_d and ix.editor.view.len > 0) return .{ .redraw_region = false };
 
     // `?` 帮助(非模态,对齐 cc onChange):空 editor 打 `?` → toggle help_open,`?` 不进 editor。
     if (key == .char and key.char == '?' and ix.editor.view.len == 0) {
@@ -722,6 +723,30 @@ test "Ctrl+C at the prompt closes an open picker and keeps the draft; the next C
     try testing.expectEqual(event.LoopAction.discard_draft, press(&state, .ctrl_c).action);
     try testing.expectEqualStrings("Press Ctrl-C again to exit", exitHint(&state).?);
     try testing.expectEqual(event.LoopAction.exit_prompt, press(&state, .ctrl_c).action);
+}
+
+test "Ctrl+D over an open picker leaves a non-empty draft alone, at the prompt and during a reply (#649)" {
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    ix.editor = .{ .view = "explain this", .cursor = 8 };
+    ix.picker_open = true;
+    const prompt = press(&state, .ctrl_d);
+    try testing.expectEqual(event.LoopAction.none, prompt.action);
+    try testing.expect(exitHint(&state) == null);
+
+    var replying = UiState.in(.{ .generating = .{} });
+    const gen = replying.interaction().?;
+    gen.editor = .{ .view = "queued draft", .cursor = 7 };
+    gen.picker_open = true;
+    try testing.expectEqual(event.LoopAction.none, press(&replying, .ctrl_d).action);
+}
+
+test "Ctrl+D over an open picker on an empty prompt still arms the double-press exit (#649)" {
+    var state = UiState.in(.{ .input = .{} });
+    state.interaction().?.picker_open = true;
+    try testing.expectEqual(event.LoopAction.none, press(&state, .ctrl_d).action);
+    try testing.expect(exitHint(&state) != null);
+    try testing.expectEqual(event.LoopAction.exit_prompt, press(&state, .ctrl_d).action);
 }
 
 test "issue #16: `?` help lists both the picker and its replacement binding" {

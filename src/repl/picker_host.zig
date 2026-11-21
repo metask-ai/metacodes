@@ -215,6 +215,13 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key, guard: Guard) R
     }
 }
 
+pub fn onPaste(app: *app_mod.App, ui: *ui_state.UiState, text: []const u8, guard: Guard) void {
+    guard.lock();
+    defer guard.unlock();
+    app.model_picker.page_rows = pageRowsFor(ui.rows);
+    app.model_picker.onPaste(text);
+}
+
 /// Commit through the kernel (IO, outside the guard), then say how it went
 /// in the picker (under it).
 fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, guard: Guard) Result {

@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -27,7 +28,7 @@ from scripts.eval.harbor.bench.providers import Providers, echoed, normalize_bas
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import fixture, wait_run
+from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, wait_run
 
 KEY = 'imported-secret-key-1234'
 
@@ -269,7 +270,7 @@ class ProviderStoreTest(unittest.TestCase):
     def test_names_resolving_here_and_mapped_addresses_count_as_this_machine(self):
         from scripts.eval.harbor.bench import egress
 
-        def resolve(host, _port):
+        def resolve(host, *_args):
             table = {'devbox-alias': '127.0.1.1', 'v6-alias': '::ffff:127.0.0.1', 'gw.example': '203.0.113.7'}
             if host not in table:
                 raise OSError('unknown host')
@@ -280,7 +281,7 @@ class ProviderStoreTest(unittest.TestCase):
         for host in ('gw.example', 'unknown.example', '::ffff:203.0.113.7'):
             with self.subTest(host=host):
                 self.assertFalse(egress.names_this_machine(host, resolve=resolve))
-        with patch.object(egress.socket, 'getaddrinfo', resolve):
+        with patch.object(egress, 'names_this_machine', partial(egress.names_this_machine, resolve=resolve)):
             self.assertTrue(providers.loopback('http://devbox-alias:8000/v1'))
             self.assertTrue(providers.loopback('http://[::ffff:127.0.0.1]:8000'))
             self.assertFalse(providers.loopback('https://gw.example/v1'))
@@ -467,6 +468,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         config, binary_dir = fixture(self.root)
+        offline_hugging_face(self)
         self.env = patch.dict(os.environ, {'PATH': str(binary_dir) + os.pathsep + os.environ.get('PATH', ''),
                                           'TOKENJOY_API_KEY': 'private-test-value'})
         self.env.start()
@@ -635,13 +637,13 @@ class ImportedProviderRunTest(unittest.TestCase):
                            'models': ['echo'], 'replace': True})
             return real_route(store, model_id)
 
-        def resolve(host, _port):
+        def resolve(host, *_args):
             if host == 'devbox-alias':
                 return [(None, None, None, '', ('127.0.0.1', 0))]
             raise OSError('unknown host')
         with patch.object(executors, 'probe', return_value={}), patch.object(executors, 'reasons', return_value=[]), \
                 patch.object(executors, 'workbench_harbor', return_value='/usr/bin/harbor'), \
-                patch.object(egress.socket, 'getaddrinfo', resolve), \
+                patch.object(egress, 'names_this_machine', partial(egress.names_this_machine, resolve=resolve)), \
                 patch.object(Providers, 'run_route', moved_to_loopback_after_validation):
             with self.assertRaisesRegex(ValueError, '工作台本机'):
                 self.manager.launch({'model': 'gw/echo', 'tasks': ['fix-git']})

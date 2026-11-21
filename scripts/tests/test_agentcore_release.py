@@ -1158,6 +1158,11 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(self.text.count("agentcore_release.py package-languages"), 2)
         self.assertEqual(self.text.count("agentcore_release.py fetch-reused"), 2)
 
+    def test_the_nightly_rehearsal_never_drafts(self) -> None:
+        self.assertIn("  schedule:\n    - cron: ", self.text)
+        self.assertIn("if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}",
+                      self.text)
+
     def test_the_rehearsal_runs_in_ci(self) -> None:
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("agentcore_release.py rehearse", ci)

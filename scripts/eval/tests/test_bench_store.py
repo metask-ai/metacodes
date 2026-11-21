@@ -934,9 +934,10 @@ class MigrationDuringRunTest(StoreCase):
 class WorkerEndToEndTest(StoreCase):
     def test_launched_worker_fills_the_configured_store_before_reporting_done(self):
         from scripts.eval.harbor.bench.runner import RunManager
-        from scripts.eval.tests.test_bench_workbench import fixture, wait_run
+        from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, wait_run
 
         config, binary_dir = fixture(self.temp)
+        offline_hugging_face(self)
         target = self.temp / "chosen.sqlite3"
         atomic_json(config, {**json.loads(config.read_text()), "store": {"backend": "sqlite", "path": str(target)}})
         env = {"PATH": str(binary_dir) + os.pathsep + os.environ.get("PATH", ""), "TOKENJOY_API_KEY": "private"}

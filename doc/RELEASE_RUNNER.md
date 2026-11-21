@@ -26,7 +26,7 @@ job.
 |---|---|
 | Runners | `ubuntu-latest` (x86_64 Linux), `ubuntu-24.04-arm` (aarch64 Linux), `macos-latest` (aarch64 macOS), `macos-15-intel` (x86_64 macOS), `windows-latest`; one job per release unit, each native to its target, `publish` on `ubuntu-latest` |
 | CLI target | An explicit Zig target per unit, never the runner's own: `x86_64-linux-gnu.2.31`, `aarch64-linux-gnu.2.31`, `aarch64-macos.13.0`, `x86_64-macos.13.0`, `x86_64-windows-gnu` (`cli_target` in the matrix, passed to `release:verify` and `release:archive`). It means the baseline CPU and the oldest glibc or macOS the unit supports; `scripts/check_binary_baseline.py` fails a unit whose executable needs more |
-| Trigger | `workflow_dispatch` only, inputs `tag` (bare `X.Y.Z` for the stable channel, a branch or full 40-hex commit SHA for `0.x.y-dev` pre-releases; `actions/checkout` rejects short SHAs) and `dry_run` (default `true`: build, verify, archive and upload artifacts, no draft) |
+| Trigger | `workflow_dispatch`, inputs `tag` (bare `X.Y.Z` for the stable channel, a branch or full 40-hex commit SHA for `0.x.y-dev` pre-releases; `actions/checkout` rejects short SHAs) and `dry_run` (default `true`: build, verify, archive and upload artifacts, no draft); a bare `X.Y.Z` tag push; and a nightly `schedule` (17:00 UTC) that rehearses the pre channel on `main` and never reaches `publish` |
 | Toolchain | Zig 0.16.0 from `mlugg/setup-zig` (no cache); the images' Python and Rust stable (`cargo`); for the test suite's Glob and Grep tests the image's `rg`, or where the image has none (the arm64 Linux runner) the vendored, attested binary the unit ships (`stage_ripgrep_binary.py`); `bindgen` 0.72.1 installed by `cargo install bindgen-cli --locked` in the job for the AgentCore gate's bindings-regen check; PyYAML from `requirements-dev.txt`; elan 4.2.4 from its pinned release asset (`scripts/ci/install-elan.sh`, Git Bash on Windows) and the Lean toolchain `control-plane/lean/lean-toolchain` names, to build both kernels the unit ships (`zig build kernels:stage`, then `scripts/kernel_pins.py`) |
 | Network | `zig build` downloads nothing: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`). The job itself reaches GitHub (checkout, `setup-zig`, artifacts, the elan asset and the Lean toolchain elan resolves) and crates.io (`bindgen`) |
 
@@ -51,7 +51,11 @@ job.
 ## Triggers
 
 `release.yml` runs on a bare `X.Y.Z` tag push and on `workflow_dispatch`
-(`doc/RELEASE_AUTOMATION_DESIGN.md` stage C). The stable path is normally
+(`doc/RELEASE_AUTOMATION_DESIGN.md` stage C). A nightly `schedule` (17:00 UTC)
+also runs it on `main` as a pre-channel rehearsal, so a change that breaks a
+release-only leg (arm64 Linux, Intel macOS, the Windows clean-tree check) shows
+up before the next tag; `publish` runs only on a tag push or a dispatch with
+`dry_run=false`, so the rehearsal never creates a draft. The stable path is normally
 reached through `release-tag.yml`, which tags a merged release PR and
 dispatches `release.yml` explicitly (a tag created with the repository token
 does not fire the push trigger). Pre-releases (`0.x.y-dev+<commit12>`) stay on

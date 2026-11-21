@@ -87,6 +87,17 @@ def pipe(left: socket.socket, right: socket.socket) -> None:
             pass
 
 
+def stop_listening(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
 class _Listener:
     """A TCP listener that hands each connection to `handle` on a thread."""
 
@@ -126,10 +137,7 @@ class _Listener:
 
     def close(self):
         self.closed.set()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        stop_listening(self.sock)
 
     def __enter__(self):
         return self.start()

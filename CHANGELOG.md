@@ -77,6 +77,29 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
+  a draft whose cursor was not at its end, Ctrl+D went past the picker and
+  deleted the character under the cursor, at the prompt and in the box under a
+  reply. Now it does nothing while the draft has text; on an empty prompt it
+  still counts toward the double-press exit, so the picker never traps the
+  session.
+
+- **A paste with the `/model` picker open goes to its filter** (#650). At the
+  prompt the pasted text landed in the draft under the picker; during a reply
+  it reached the picker key by key, so a newline in it was Enter and applied
+  the model under the cursor, moving the bill to that provider. Now, at the
+  prompt and during a reply, the text up to the paste's first line break is
+  added to the filter as one edit, control characters dropped; the draft is
+  untouched and a paste never applies a model.
+
+- **Shift+Tab cycles the permission mode in terminals that report modified
+  keys.** iTerm2 3.7.7 and later, Ghostty, kitty, Alacritty and tmux with
+  `extended-keys` send Shift+Tab as the kitty protocol's `ESC [ 9 ; 2 u` or
+  xterm modifyOtherKeys' `ESC [ 27 ; 2 ; 9 ~` instead of `ESC [ Z`, and the
+  TUI ignored both. The key parser now reads both forms through one table, so
+  modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
+  their CSI u forms do (#643).
+
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
   instead of the filter, Esc only switched the editor to NORMAL mode, and
@@ -92,8 +115,28 @@ status, compatibility boundaries, and entry points are defined by
   under a picker that stayed open, and a second Ctrl+C left metacodes. Now
   the first Ctrl+C at the prompt closes the picker whatever it shows, as Esc
   does on an empty filter (`kept …`), and the draft stays; the next Ctrl+C
-  arms the exit as before. During a reply Ctrl+C still interrupts it, and
-  Ctrl+D is unchanged.
+  arms the exit as before. During a reply Ctrl+C still interrupts it. Ctrl+D
+  leaves a non-empty draft alone, as described above.
+
+- **Bench listeners stop listening when they are closed** (#659). On Linux,
+  closing a socket does not wake a thread blocked in `accept`, so a closed
+  egress proxy or Docker-gateway forwarder kept its port open and relayed one
+  more connection after its run ended, and the Colima relay check left its
+  probe port open. They are now shut down before they are closed.
+
+- **The permission and question dialogs take Esc and Ctrl+C in every
+  encoding** (#657). Both dialogs looked only at the first byte of each read.
+  A terminal with the kitty keyboard protocol on (Alacritty, Windows Terminal
+  and iTerm2 over ssh since metacodes 0.9.0; iTerm2 3.7.7 and later, Ghostty
+  and kitty) sends Ctrl+C as `ESC [ 99 ; 5 u` and Esc as `ESC [ 27 u`, and
+  the dialogs dropped both: Ctrl+C no longer refused in the permission
+  dialog, and neither key cancelled the question dialog, whose footer says
+  `Esc to cancel`. Keys that arrived in one read were cut to the first, so
+  `abc` typed fast into "Type something" was answered as `a`. The dialogs now
+  read keys through the prompt's key parser: these keys act as their one-byte
+  forms do, and every key of a read counts. A bracketed paste never answers
+  a dialog: the permission dialog ignores it, and the question dialog types
+  it into "Type something" or the note being edited, line breaks as spaces.
 
 ### Fixed
 

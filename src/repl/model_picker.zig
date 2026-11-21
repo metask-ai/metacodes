@@ -257,6 +257,28 @@ pub const Key = union(enum) {
     char: u8,
 };
 
+pub const PastedLine = struct {
+    buffer: [MAX_FILTER]u8 = undefined,
+    len: usize = 0,
+    ended: bool = false,
+
+    pub fn add(self: *PastedLine, byte: u8) void {
+        if (self.ended) return;
+        if (byte == '\r' or byte == '\n') {
+            self.ended = true;
+            return;
+        }
+        if (byte < 0x20 or byte == 0x7f) return;
+        if (self.len == MAX_FILTER) return;
+        self.buffer[self.len] = byte;
+        self.len += 1;
+    }
+
+    pub fn text(self: *const PastedLine) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
 /// Which row the cursor is on, by identity rather than position: listing a
 /// model's routes under it moves the rows below, and a refresh can reorder
 /// them, but the cursor stays on the same model or route.
@@ -943,6 +965,18 @@ pub const Picker = struct {
             },
             .enter => return self.advance(visible),
         }
+    }
+
+    pub fn onPaste(self: *Picker, text: []const u8) void {
+        if (self.stage == .setup) return;
+        var line = PastedLine{};
+        for (text) |byte| line.add(byte);
+        const room = MAX_FILTER - self.filter_len;
+        const taken = line.text()[0..@min(line.len, room)];
+        if (taken.len == 0) return;
+        @memcpy(self.filter_buffer[self.filter_len..][0..taken.len], taken);
+        self.filter_len += taken.len;
+        self.focusFirst();
     }
 
     fn focusFirst(self: *Picker) void {
@@ -1648,6 +1682,43 @@ test "q is a filter letter like any other, the first one too (#599)" {
     try testing.expect(picker.onKey(.escape) == .redraw);
     try testing.expectEqualStrings("", picker.filter());
     try testing.expect(picker.onKey(.escape) == .closed);
+}
+
+test "a paste is one filter edit: the text up to its first line break, control characters dropped, and it never commits (#650)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "GLM-4.6", null, "glm-4.6", "anthropic_messages"),
+        fixtureOffer("zai", "default", "GLM-4.5", null, "glm-4.5", "openai_chat"),
+    };
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    _ = picker.onKey(.{ .char = 'g' });
+    picker.onPaste("lm\t-4.\x1b5\nzai\r\n");
+    try testing.expectEqualStrings("glm-4.5", picker.filter());
+    try testing.expectEqual(Stage.list, picker.stage);
+    try testing.expectEqualStrings("glm-4.5", picker.focusedOffer().?.request_model_id);
+
+    picker.onPaste("\nanything");
+    try testing.expectEqualStrings("glm-4.5", picker.filter());
+
+    var long: [MAX_FILTER + 8]u8 = undefined;
+    @memset(&long, 'x');
+    picker.onPaste(&long);
+    try testing.expectEqual(MAX_FILTER, picker.filter().len);
+    try testing.expectEqualStrings("glm-4.5x", picker.filter()[0..8]);
+}
+
+test "the setup stage takes no paste, a q in it included (#650)" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{fixtureOffer("kimi", "default", "K3", null, "k3", "openai_chat")};
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    picker.enterSetup(.{ .provider = Slug.lit("kimi"), .variable = "MOONSHOT_API_KEY" });
+    picker.onPaste("q\n");
+    try testing.expectEqual(Stage.setup, picker.stage);
+    try testing.expectEqualStrings("", picker.filter());
 }
 
 test "the setup stage, which takes no typing, still closes on q (#599)" {
