@@ -19,6 +19,8 @@ status, compatibility boundaries, and entry points are defined by
   `execute_code`, `comment_guard` and `harnessmm`, all off by default. Every
   trial of the batch runs with the ticked flags, and the batch page lists them.
   `POST /api/batches` and `POST /api/runs` take them as `features`.
+  The bench node protocol is now 2: rerun `metacodes bench setup --executor
+  <name>` for each SSH executor.
 
 - **An interactive start offers a newer release.** Like Codex, `metacodes`
   started as the TUI from a release install checks for a newer release in the

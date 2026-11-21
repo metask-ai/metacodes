@@ -905,7 +905,10 @@ and each of its runs record the chosen names (`features`), and the run passes
 them to the adapter as `--ak features=<names>`. An unknown name is refused, and
 so is any choice for a WorkBuddy suite, whose overlay launches metacodes
 itself. The frozen bundle has to know the flags: a release older than a
-feature fails its trials with a usage error.
+feature fails its trials with a usage error. An SSH executor's node loads the adapter from
+its own checkout, so the node protocol is 2 since features: an older node is
+refused until `metacodes bench setup --executor <name>` updates it, instead of
+running the trials without the chosen flags.
 
 The datasets run one after another, each as an ordinary workbench run (one
 Harbor job) whose record names the batch and its frozen version. The durable

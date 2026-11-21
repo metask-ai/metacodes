@@ -43,7 +43,7 @@ from scripts.eval.harbor.bench.runner import atomic_json, now, settings
 
 # Raised whenever the workbench and a node stop understanding each other's
 # `info` or `run`; the workbench refuses a node with another protocol.
-PROTOCOL = 1
+PROTOCOL = 2
 PEERS = "peers.json"
 # How long removing a run's image tag may take before the run ends anyway.
 CLEANUP_TIMEOUT = 60

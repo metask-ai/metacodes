@@ -34,6 +34,7 @@ from unittest.mock import patch
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
 from scripts.eval.harbor.bench import data, executors, setup
+from scripts.eval.harbor.bench import node as node_protocol
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
@@ -278,6 +279,17 @@ def release_fixture(root, version="9.9.9", corrupt=False):
 
 
 @unittest.skipUnless(POSIX, "fake executables are POSIX shell scripts")
+class NodeProtocolTest(unittest.TestCase):
+    def test_a_node_from_before_run_features_is_refused(self):
+        relay = executors.SshExecutor(name="relay", host="relay.invalid")
+        self.assertGreaterEqual(node_protocol.PROTOCOL, 2)
+        facts = {"node": {"protocol": 1, "version": "0.12.0"}}
+        problem = executors.node_problem(relay, facts)
+        self.assertIn("不兼容", problem)
+        self.assertIn(problem, executors.reasons(relay, facts))
+        self.assertIsNone(executors.node_problem(relay, {"node": {"protocol": node_protocol.PROTOCOL}}))
+
+
 class SetupFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -691,7 +703,7 @@ class SshExecutorTest(SetupFixture):
         self.assertEqual(node.resolve(), installed)
         relay = executors.find(self.cfg(), "relay-4090")
         info = subprocess.run(executors.node_argv(relay, "info", "--json"), capture_output=True, text=True)
-        self.assertEqual(json.loads(info.stdout)["protocol"], 1, info.stderr)
+        self.assertEqual(json.loads(info.stdout)["protocol"], node_protocol.PROTOCOL, info.stderr)
 
     def test_a_node_on_the_path_runs_with_the_configured_python(self):
         """No setup-managed entry: the `metacodes` on the executor's PATH is
@@ -707,7 +719,7 @@ class SshExecutorTest(SetupFixture):
         os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
         relay = executors.find(self.cfg(), "relay-4090")
         facts = executors.probe(relay)
-        self.assertEqual(facts["node"]["protocol"], 1, facts)
+        self.assertEqual(facts["node"]["protocol"], node_protocol.PROTOCOL, facts)
         self.assertIsNone(executors.node_problem(relay, facts))
         self.assertIn("scripts.eval.harbor.cli", calls.read_text())
         listing = subprocess.run(executors.node_argv(relay, "manifest", "nowhere"), capture_output=True, text=True)
