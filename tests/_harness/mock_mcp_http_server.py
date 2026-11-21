@@ -21,6 +21,20 @@ Paths select the server:
             closes every one of them, the way a server ends idle keep-alive
             connections. The test asks for it between two requests, so no
             close can land inside an exchange.
+  /strid    /keepalive whose tools/call pings with the string id "abc", asks
+            for roots/list as "r1", and reports whether the replies carried
+            those ids (a result for the ping, method-not-found for the roots).
+  /expire   a Classic server with numbered sessions. GET /forget drops every
+            live session (the next request on one is a 404); GET /failinit
+            makes the next initialize a 503; GET /downgrade makes later
+            initializes select 2025-06-18; GET /refusecalls makes every later
+            tools/call a 404.
+  /elicit   a Classic server whose tools/call asks for input over
+            elicitation/create only when the session declared elicitation.
+  /poll     /keepalive whose tools/call answers over SSE polling: each stream
+            carries a priming event (new id, empty data) and closes, until the
+            fifth GET with Last-Event-ID carries the result.
+  /pollstuck  /poll whose resumed streams never carry a new event id.
 Every observation records the client port (`conn`: one TCP connection each)
 and the request's `Connection` header.
 GET /log returns every observation as JSON lines (for assertions).
@@ -34,6 +48,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG = []
 LOCK = threading.Lock()
 PENDING = {}
+REPLIES = {}
+SESSIONS = {"next": 0, "live": set(), "refuse_calls": False, "declared": {}, "failed_inits": 0, "version": "2025-11-25"}
+POLLS = {"count": 0}
+POLL_ROUNDS = 5
 # Client port -> socket of every /idleclose connection still open.
 IDLECLOSE = {}
 
@@ -82,6 +100,24 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
             return self.reply(200, {"closed": len(connections)})
+        if self.path == "/forget":
+            with LOCK:
+                SESSIONS["live"].clear()
+            return self.reply(200, {})
+        if self.path == "/failinit":
+            with LOCK:
+                SESSIONS["failed_inits"] = 1
+            return self.reply(200, {})
+        if self.path == "/downgrade":
+            with LOCK:
+                SESSIONS["version"] = "2025-06-18"
+            return self.reply(200, {})
+        if self.path == "/refusecalls":
+            with LOCK:
+                SESSIONS["refuse_calls"] = True
+            return self.reply(200, {})
+        if self.path in ("/poll", "/pollstuck"):
+            return self.poll_get()
         self.reply(405)
 
     def do_DELETE(self):
@@ -106,6 +142,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if mode == "noisy" and method == "tools/call":
             return self.noisy(rid, params)
+        if mode in ("strid", "elicit") and method is None:
+            with LOCK:
+                REPLIES[rid] = message
+            event = PENDING.get(rid)
+            if event:
+                event.set()
+            return self.reply(202)
+        if mode == "strid" and method == "tools/call":
+            return self.strid(rid)
+        if mode in ("poll", "pollstuck") and method == "tools/call":
+            return self.poll_call(rid)
+        if mode in ("expire", "elicit"):
+            return self.sessions(mode, method, rid, params, headers)
+        if mode in ("strid", "poll", "pollstuck"):
+            return self.keepalive(mode, method, rid)
         if mode in ("keepalive", "idleclose", "dropcall", "noisy"):
             return self.keepalive(mode, method, rid)
         if mode == "auth":
@@ -182,6 +233,111 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(data), data))
         self.wfile.flush()
 
+    def sse_open(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def sse_chunk(self, data):
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+        self.wfile.flush()
+
+    def sse_close(self):
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def await_reply(self, request_id, request):
+        event = threading.Event()
+        PENDING[request_id] = event
+        self.sse_chunk(b"event: message\ndata: " + json.dumps(request).encode() + b"\n\n")
+        answered = event.wait(3)
+        with LOCK:
+            return REPLIES.pop(request_id, None) if answered else None
+
+    def strid(self, rid):
+        self.sse_open()
+        reply = self.await_reply("abc", {"jsonrpc": "2.0", "id": "abc", "method": "ping"})
+        refusal = self.await_reply("r1", {"jsonrpc": "2.0", "id": "r1", "method": "roots/list"}) or {}
+        text = "strid:%s:%s" % (
+            "answered" if reply == {"jsonrpc": "2.0", "id": "abc", "result": {}} else "unanswered",
+            "refused" if (refusal.get("error") or {}).get("code") == -32601 else "unrefused",
+        )
+        result = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}}
+        self.sse_chunk(b"event: message\ndata: " + json.dumps(result).encode() + b"\n\n")
+        self.sse_close()
+
+    def poll_call(self, rid):
+        with LOCK:
+            POLLS["count"] = 0
+            POLLS["rid"] = rid
+        self.sse_open()
+        self.sse_chunk(b"retry: 50\nid: p0\ndata: \n\n")
+        self.sse_close()
+
+    def poll_get(self):
+        last = self.headers.get("Last-Event-ID")
+        with LOCK:
+            POLLS["count"] += 1
+            count = POLLS["count"]
+            rid = POLLS.get("rid")
+        record(path=self.path, method="GET", last_event_id=last, conn=self.client_address[1])
+        self.sse_open()
+        if self.path == "/pollstuck":
+            self.sse_chunk(b"retry: 50\nid: p0\ndata: \n\n")
+        elif count < POLL_ROUNDS:
+            self.sse_chunk(b"retry: 50\nid: p%d\ndata: \n\n" % count)
+        else:
+            result = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "poll:done"}]}}
+            self.sse_chunk(b"id: p%d\nevent: message\ndata: " % count + json.dumps(result).encode() + b"\n\n")
+        self.sse_close()
+
+    def sessions(self, mode, method, rid, params, headers):
+        session = headers.get("mcp-session-id")
+        if method == "server/discover":
+            return self.reply(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": "Bad Request: Unsupported protocol version: 2026-07-28"}})
+        if method == "initialize":
+            with LOCK:
+                failing = SESSIONS["failed_inits"] > 0
+                if failing:
+                    SESSIONS["failed_inits"] -= 1
+            if failing:
+                return self.reply(503, {"error": "starting"})
+            with LOCK:
+                SESSIONS["next"] += 1
+                assigned = "s%d" % SESSIONS["next"]
+                SESSIONS["live"].add(assigned)
+                SESSIONS["declared"][assigned] = "elicitation" in (params.get("capabilities") or {})
+                version = SESSIONS["version"]
+            record(path=self.path, declared=params.get("capabilities"))
+            result = {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": mode, "version": "1"}}
+            return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": result}, {"Mcp-Session-Id": assigned})
+        with LOCK:
+            live = session in SESSIONS["live"]
+            refused = method == "tools/call" and SESSIONS["refuse_calls"]
+            declared = SESSIONS["declared"].get(session, False)
+        if not live or refused:
+            return self.reply(404, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32001, "message": "Session not found"}})
+        if method is None or method.startswith("notifications/"):
+            return self.reply(202)
+        if method == "tools/list":
+            return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "ask", "inputSchema": {"type": "object"}}]}})
+        if method == "tools/call" and mode == "elicit":
+            if not declared:
+                return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "elicit:undeclared"}]}})
+            self.sse_open()
+            ask = {"jsonrpc": "2.0", "id": "who-1", "method": "elicitation/create", "params": {"message": "who are you", "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}}}
+            reply = self.await_reply("who-1", ask) or {}
+            answer = reply.get("result") or {}
+            text = "elicit:%s:%s" % (answer.get("action"), (answer.get("content") or {}).get("name"))
+            result = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}}
+            self.sse_chunk(b"event: message\ndata: " + json.dumps(result).encode() + b"\n\n")
+            return self.sse_close()
+        if method == "tools/call":
+            return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "expire:%s" % session}]}})
+        return self.reply(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+
     def keepalive(self, mode, method, rid):
         if (self.headers.get("Connection") or "").lower() == "close":
             # Vercel drops these intermittently; here always, so a client that
@@ -206,6 +362,7 @@ class Handler(BaseHTTPRequestHandler):
         meta = params.get("_meta") or {}
         if headers.get("mcp-protocol-version") != "2026-07-28" or headers.get("mcp-method") != method or meta.get("io.modelcontextprotocol/protocolVersion") != "2026-07-28":
             return self.reply(400, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32020, "message": "header mismatch"}})
+        record(path=self.path, declared=meta.get("io.modelcontextprotocol/clientCapabilities"))
         if method == "server/discover":
             return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private"}})
         if method == "tools/list":

@@ -149,6 +149,14 @@ pub const Transport = union(enum) {
         }
     }
 
+    pub fn renewsSession(self: *const Transport) bool {
+        return self.* == .http and !self.http.modern;
+    }
+
+    pub fn forgetSession(self: *Transport) void {
+        if (self.* == .http) self.http.forgetSession();
+    }
+
     /// Mark the open request as a disposable probe (see `HostTransport.probing`).
     pub fn setProbing(self: *Transport, probing: bool) void {
         if (self.* == .host) self.host.probing = probing;

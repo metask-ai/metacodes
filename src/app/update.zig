@@ -95,6 +95,8 @@ pub const Outcome = struct {
     stopped_services: []const Pid = &.{},
     /// Sessions left running (`--ignore-running`).
     running_sessions: []const Pid = &.{},
+    sessions: []const Pid = &.{},
+    services: []const Pid = &.{},
     notes: []const []const u8 = &.{},
     /// `--check` only: nothing was changed.
     checked_only: bool = false,
@@ -105,6 +107,25 @@ pub const Outcome = struct {
             .upgrade, .downgrade, .repair, .rebuild => true,
             .up_to_date, .newer_installed, .refused => false,
         };
+    }
+
+    pub fn writeJson(self: Outcome, w: *std.Io.Writer) !void {
+        try std.json.Stringify.value(.{
+            .action = @tagName(self.action),
+            .source = @tagName(self.source),
+            .from = self.from,
+            .to = self.to,
+            .prefix = self.prefix,
+            .origin = self.origin,
+            .sdk = self.sdk,
+            .checked_only = self.checked_only,
+            .stopped_services = self.stopped_services,
+            .running_sessions = self.running_sessions,
+            .sessions = self.sessions,
+            .services = self.services,
+            .notes = self.notes,
+        }, .{}, w);
+        try w.writeByte('\n');
     }
 };
 
@@ -378,10 +399,7 @@ fn runRelease(
         .upgrade, .downgrade => log.note("metacodes {s} → {s}", .{ installed, plan.tag }),
         .rebuild => unreachable,
     }
-    if (options.check) {
-        outcome.checked_only = true;
-        return outcome;
-    }
+    if (options.check) return checkedOnly(arena, io, prefix, self_pid, options.ignore_running, log, outcome);
     var running = try checkSessions(arena, io, prefix, self_pid, options.ignore_running, log);
 
     // Download, verify and unpack everything before anything changes.
@@ -522,6 +540,49 @@ fn checkSessions(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, self_
     return error.SessionsRunning;
 }
 
+fn checkedOnly(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, self_pid: Pid, ignore: bool, log: Log, plan: Outcome) !Outcome {
+    var outcome = plan;
+    outcome.checked_only = true;
+    const processes = process_scan.listUnder(arena, io, prefix) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => {
+            try appendNote(arena, &outcome, try std.fmt.allocPrint(arena, "the processes that run from {s} could not be listed; a real run stops with ProcessScanFailed", .{prefix}));
+            log.note("{s}", .{outcome.notes[outcome.notes.len - 1]});
+            return outcome;
+        },
+    };
+    const classes = try classify(arena, processes, prefix, self_pid);
+    outcome.sessions = try pidsOf(arena, classes.sessions);
+    outcome.services = try pidsOf(arena, try serviceRoots(arena, classes.services));
+    if (classes.sessions.len > 0) {
+        log.note("these processes run from {s}:", .{prefix});
+        for (classes.sessions) |session| log.note("  pid {d}  {s}", .{ session.pid, session.exe });
+        if (ignore)
+            log.note("a real run goes ahead and leaves them running (--ignore-running)", .{})
+        else
+            log.note("the update would be refused until they exit{s}", .{if (is_windows) "" else ", or with --ignore-running"});
+    }
+    if (outcome.services.len > 0) log.note("a real run stops this install's TinyKG service (pid {any})", .{outcome.services});
+    return outcome;
+}
+
+fn pidsOf(arena: std.mem.Allocator, processes: []const process_scan.Process) ![]const Pid {
+    const pids = try arena.alloc(Pid, processes.len);
+    for (processes, pids) |process, *pid| pid.* = process.pid;
+    return pids;
+}
+
+fn serviceRoots(arena: std.mem.Allocator, services: []const process_scan.Process) ![]const process_scan.Process {
+    var roots: std.ArrayList(process_scan.Process) = .empty;
+    for (services) |service| {
+        const has_parent_in_list = for (services) |other| {
+            if (other.pid == service.ppid) break true;
+        } else false;
+        if (!has_parent_in_list) try roots.append(arena, service);
+    }
+    return roots.items;
+}
+
 /// Stop this install's TinyKG service and wait for both of its processes.
 fn stopServices(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, self_pid: Pid, wait_ms: u64, log: Log) ![]const Pid {
     const processes = process_scan.listUnder(arena, io, prefix) catch |err| switch (err) {
@@ -533,11 +594,7 @@ fn stopServices(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, self_p
     var stopped: std.ArrayList(Pid) = .empty;
     // The supervisor (a parent) is asked first; its tinykgd follows. An
     // orphaned tinykgd is asked directly.
-    for (classes.services) |service| {
-        const has_parent_in_list = for (classes.services) |other| {
-            if (other.pid == service.ppid) break true;
-        } else false;
-        if (has_parent_in_list) continue;
+    for (try serviceRoots(arena, classes.services)) |service| {
         // The pid must still be the same program: never signal a reused pid.
         const now = process_scan.exePath(arena, io, service.pid) orelse continue;
         if (!samePath(now, service.exe)) continue;
@@ -726,10 +783,7 @@ fn runCheckout(
         .rebuild => log.note("rebuilding {s} at {s}{s} (installed: {s}{s})", .{ checkout, shortCommit(head_commit), if (head_dirty) " with local changes" else "", shortCommit(manifest_state.commit), if (manifest_state.dirty) " with local changes" else "" }),
         else => unreachable,
     }
-    if (options.check) {
-        outcome.checked_only = true;
-        return outcome;
-    }
+    if (options.check) return checkedOnly(arena, io, prefix, self_pid, options.ignore_running, log, outcome);
     var running = try checkSessions(arena, io, prefix, self_pid, options.ignore_running, log);
     outcome.stopped_services = try stopServices(arena, io, prefix, self_pid, options.hooks.stop_wait_ms, log);
     running = try checkSessions(arena, io, prefix, self_pid, options.ignore_running, log);

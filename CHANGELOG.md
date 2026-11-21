@@ -33,6 +33,57 @@ status, compatibility boundaries, and entry points are defined by
   shows `needs_you` while the approval prompt waits. `teamwork run|resume
   --events` writes `teamwork.snapshot` and `teamwork.event` wire lines to
   stdout, and Zig hosts subscribe through `teamwork_runtime.Deps.observer`.
+- **`update --check` names the sessions that would block the update.** When
+  an update or repair is available, `--check` now scans the install's
+  processes as a real run does, without refusing or signalling anything: it
+  lists the sessions running from the install and says the update would be
+  refused until they exit, and names the TinyKG service pids a real run would
+  stop. `--json` carries them in the new `sessions` and `services` arrays;
+  `running_sessions` and `stopped_services` still record what a real run did
+  and stay empty under `--check`. The exit code stays 3 (#646).
+
+### Changed
+
+- **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
+  `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after
+  Codex's; `"mcpImport": {"metacode": false}` in `<state root>/config.json`
+  turns it off. Its stdio servers start with every session, as Codex's do.
+
+- **`metacodes mcp login` succeeds only when the server takes the token.** The
+  new token is tried with one authenticated request before it is stored; a
+  401/403 fails the login, stores nothing and prints the server's answer with
+  the scope requested and granted. Registration and token errors print the
+  authorization server's `error`/`error_description`.
+
+- **A configured MCP server that did not connect is reported** to the model
+  (ToolSearch misses and calls to its tools name it, its cause and the fix), on
+  stderr by `-p`, and in `--json` as `mcp_unavailable`.
+
+- **Reading a credential store from Bash always asks.** A command that runs
+  `security find-generic-password`/`find-internet-password`/`dump-keychain`/
+  `export`, a `security` subcommand the shell computes, or `secret-tool`
+  prompts even under an allow rule for `Bash` or in `bypassPermissions`,
+  however it is quoted or escaped; a deny rule still denies.
+
+### Fixed
+
+- **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
+  read every key before the picker did: typing went into the input box
+  instead of the filter, Esc only switched the editor to NORMAL mode, and
+  Enter sent the input box to the model as a prompt while the picker was
+  still drawn. Now an open picker owns the keyboard as it does without vim
+  mode: typing filters, Esc clears the filter and then closes it, Enter
+  applies the model under the cursor, and the input box is left alone. Vim's
+  keymap takes over again once the picker closes.
+
+- **Ctrl+C closes the `/model` picker and keeps the draft** (#607). With the
+  picker open over a draft (Ctrl+O while typing), Ctrl+C went past it to the
+  prompt: the draft was discarded, `Press Ctrl-C again to exit` appeared
+  under a picker that stayed open, and a second Ctrl+C left metacodes. Now
+  the first Ctrl+C at the prompt closes the picker whatever it shows, as Esc
+  does on an empty filter (`kept …`), and the draft stays; the next Ctrl+C
+  arms the exit as before. During a reply Ctrl+C still interrupts it, and
+  Ctrl+D is unchanged.
 
 ### Fixed
 

@@ -432,8 +432,10 @@ ledger.remainingUsd()`;`spec.model`/`spec.effort` 作为覆盖。用量经 `Writ
 Linux 上 implementer seat 的 Bash 跑在 bubblewrap 里:根目录只读挂载,工作区和 seat 目录按物理路径可写绑定。
 macOS 和 Linux 均只提供本次调用的私有临时目录。原仓库和控制器文件位于系统临时目录时也受保护。
 
-Windows,以及没有可用 bwrap(未安装、或内核/容器不允许所需命名空间)的 Linux,在模型请求前
-即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
+Windows 上 teamwork 不启动:`teamwork run`/`resume`/`mcp`、REPL `/teamwork` 与
+`Run.start`/`Run.reopen` 在写入任何运行状态前返回 `UnsupportedPlatform`(Windows 没有 seat
+沙箱后端,也不计算批准、审计与合回所绑定的工作区树 id)。没有可用 bwrap(未安装、或内核/容器
+不允许所需命名空间)的 Linux,在模型请求前即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
 经 `metacodes-fs-helper` 在沙箱内打开文件;Grep/Glob 的搜索命令也经过相同边界。
 两个后端都允许写工作区(构建缓存),所以对非 implementer seat,Bash 挡不住对工作区
 的改动;reviewer 仍由工作区树 id 检查兜底。完整边界见 [沙箱执行](SANDBOX_DESIGN.md)。
@@ -532,15 +534,17 @@ Manager 只驱动 `dispatch(implementer/reviewer)`、`status`、`requestCompleti
 approved -> implementing -> reviewing -> review_approved -> auditing -> merging -> done
                ^               |              |               |
                +-- 修改/拒绝 ---+              +-- 过期 -> reviewing
-               +------------------------- 第一次审计失败 --------+
+               +------------------- 第一次审计 FAIL / UNVERIFIED ---+
 ```
 
 每个角色最多派 `max_rounds` 个 seat(默认 3)。reviewer 的结论经过工具调用记录、台账与固定
 检查命令核验;批准绑定工作区树 id。审计前树变了就重新评审,审计后树变了就终止。
 `VerifierAuditor` 在与批准树一致的独立快照上执行固定检查,然后调用 `core/isolated_verifier.verify`。
 审计请求用 `$WORKSPACE` 标识候选快照,不会包含生成的快照路径。只有绑定到批准树的 PASS 才合回,
-FAIL 第一次进入修复轮、第二次失败终止;
-UNVERIFIED 与 unavailable 均不会放行。审计花费必须成功写入预算账本。
+FAIL 第一次进入修复轮;UNVERIFIED 第一次进入 leads 轮:报告里 verifier 收集的证据和未能确认的项
+作为线索写进下一轮 implementer 与 reviewer 的 packet。两种情况下第二次审计仍不是 PASS 都终止
+(`audit_failed` / `audit_unverified`),不合回;unavailable 直接终止。UNVERIFIED 与 unavailable
+均不会放行。审计花费必须成功写入预算账本。
 
 `merge_back.mergeBack` 生成二进制补丁,比较用户从启动以来的改动与候选改动。两者修改相同或
 包含关系的路径时停在 `merge_conflict`,保留工作区、worktree、`merge.patch` 与冲突列表。
@@ -658,8 +662,8 @@ MCP 客户端时的预算边界(`budget.manager` 为 `outside_ledger`,花费只�
 | Issue | 内容 | 状态 |
 |---|---|---|
 | #515 | runtime / seat 分层、角色配置、worker 契约 | 类型、配置、驱动、runtime、确定性 SWE Manager 已接通(§7、§10)。 |
-| #516 | 独立 verifier / 完成审计 | `VerifierAuditor` 已接隔离 verifier,最多两次审计,失败反馈修复轮;只有 PASS 交付。UNVERIFIED 后的 leads 轮仍待做。 |
-| #517 | reviewer 角色与 open-issues 台账 | runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows `workspaceTree` 尚不支持。 |
+| #516 | 独立 verifier / 完成审计 | 已完成:`VerifierAuditor` 已接隔离 verifier,最多两次审计;第一次 FAIL 反馈修复轮,第一次 UNVERIFIED 把证据与未确认项作为线索反馈 leads 轮,第二次仍非 PASS 即终止且不合回;只有 PASS 交付。 |
+| #517 | reviewer 角色与 open-issues 台账 | 已完成:runtime 已接证据观测、跨轮台账、固定检查重跑与过期批准检查。Windows 不计算 `workspaceTree`(`Unsupported`),teamwork 在 Windows 上启动前即以 `UnsupportedPlatform` 拒绝(§7.3),Windows CI 腿有测试覆盖。 |
 | #518 | `/teamwork` 命令、面试与批准 | 已完成:CLI 显式批准入口、配置加载、状态和恢复;请求参数段 `[skip-interview]` / `[seats=...]`(CLI 与 REPL);REPL `/teamwork` 的 interviewer 面试、批准/修改/拒绝与后台运行;`request_source` 记录批准来源(§3)。 |
 | #519 | 运行状态目录与写入隔离 | 原生工具与外部 Worker 均使用 Sandbox Foundations;无后端就拒绝。增加 `.git` 拒写、宪章摘要、运行锁。稳定路径别名已由 #544 完成。 |
 | #544 | seat 稳定路径别名 | 已做(§7.1):`$WORKSPACE` / `$SEAT` 在工具准入层解析,隔离 verifier 的快照同样用 `$WORKSPACE`;metacodes seat 的首个 provider 请求跨运行逐字节相同;Claude Code seat 只有 `--add-dir` 取值随运行变化。 |

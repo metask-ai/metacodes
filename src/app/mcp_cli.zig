@@ -139,12 +139,28 @@ fn login(
         return 1;
     };
     defer result.deinit(gpa);
-    var out: std.Io.Writer.Allocating = .init(arena);
-    out.writer.print("Logged in to MCP server '{s}' through {s}", .{ name, result.issuer }) catch return 1;
-    if (result.scope) |scope| out.writer.print(" (scope: {s})", .{scope}) catch return 1;
-    out.writer.print(".\nToken stored in {s}; sessions started from now on use it.\n", .{result.path}) catch return 1;
-    stdoutWrite(out.written());
+    stdoutWrite(loginReport(arena, name, result) catch return 1);
     return 0;
+}
+
+fn loginReport(arena: std.mem.Allocator, name: []const u8, result: mcp_oauth.LoginResult) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.print("Logged in to MCP server '{s}' through {s}", .{ name, result.issuer });
+    if (result.scope) |scope| {
+        if (std.mem.trim(u8, scope, " ").len == 0)
+            try w.writeAll(" (no scope granted)")
+        else
+            try w.print(" (scope: {s})", .{scope});
+    }
+    try w.writeAll(".\n");
+    switch (result.verification) {
+        .accepted => try w.writeAll("The server accepted the token.\n"),
+        .unreachable_server => try w.writeAll("Warning: the server could not be reached to check the token; it was stored anyway.\n"),
+        .unexpected_status => |status| try w.print("Warning: the server answered HTTP {d} when the token was tried; it was stored anyway.\n", .{status}),
+    }
+    try w.print("Token stored in {s}; sessions started from now on use it.\n", .{result.path});
+    return out.written();
 }
 
 fn logout(gpa: std.mem.Allocator, state_root: []const u8, name: []const u8, url: []const u8) u8 {

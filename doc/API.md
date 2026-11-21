@@ -342,6 +342,9 @@ and merge-back. No App/provider, seat or worktree starts before approval.
 The state root must be outside the repository. All workers, pinned checks
 and verifier tools require Sandbox Foundations; an unavailable backend fails
 closed. Native and Claude Code implementer/reviewer seats are supported.
+Windows has no seat sandbox backend and no workspace tree id, so `teamwork
+run`/`resume`/`mcp`, REPL `/teamwork`, `Run.start` and `Run.reopen` fail with
+`UnsupportedPlatform` before any run state is written.
 
 Teamwork is the `teamwork` **preview feature**, disabled by default. It uses
 the same root `"preview"` in `<state root>/config.json` and the same
@@ -563,7 +566,9 @@ configured HTTP or SSE server and stores the token that later sessions send and
 refresh; `metacodes mcp logout <server>` forgets it and `metacodes mcp list`
 prints each configured server's transport and how it authenticates; they exit
 0 on success, 1 when the server is unknown, is not a URL server, already sends
-a configured `Authorization`, or the login fails, and 2 for a usage error
+a configured `Authorization`, or the login fails (including a server that
+answers the new token with 401 or 403; nothing is stored then), and 2 for a
+usage error
 ([SKILLS_AND_MCP.md](SKILLS_AND_MCP.md#authorization-oauth)).
 The flag surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
@@ -599,7 +604,14 @@ the executable belongs to up to date from the source its install record names
   or repair is available.
 - **`--json` result:** one document on stdout,
   `{action, source, from, to, prefix, origin, sdk, checked_only,
-  stopped_services, running_sessions, notes}`.
+  stopped_services, running_sessions, sessions, services, notes}`.
+  - `stopped_services` and `running_sessions` are what a real run did: the
+    TinyKG service pids it stopped and the session pids it left running
+    (`--ignore-running`). They are always empty under `--check`.
+  - `sessions` and `services` are what `--check` found when an update or
+    repair is available: the session pids that would refuse the update and
+    the TinyKG service pids a real run would stop. The exit code stays 3
+    either way. They are always empty without `--check`.
   - `action` is `up_to_date`, `newer_installed`, `upgrade`, `downgrade`,
     `repair` or `rebuild`.
   - `source` is `release` or `checkout`.
@@ -633,7 +645,12 @@ includes `usage_status:"known"|"unknown"`: `unknown` means the successful
 provider response supplied no readable usage object (including a usage tail
 lost after a reported stop), so its numeric usage and cost fields are
 placeholders rather than a claim of free work. Explicit numeric zero usage is
-`known`. Flag removals or semantic changes require a changelog entry.
+`known`. When a configured MCP server did not connect, the result line carries
+`mcp_unavailable: [{"name", "detail"}]` (the reason `/mcp` shows, with the
+`metacodes mcp login` command for a server that answered 401), and the run
+writes one `warning: MCP server '<name>' did not connect: <detail>` line per
+server to stderr before it starts; with every server connected, neither
+appears. Flag removals or semantic changes require a changelog entry.
 
 ### System-One memory advisor (optional)
 

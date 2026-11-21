@@ -198,6 +198,7 @@ pub const SpawnOptions = struct {
     additional_dirs: []const []const u8 = &.{},
     /// AgentDef.mcpServers 过滤后的 session 视图。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
+    mcp_unavailable: []const @import("mcp_session.zig").McpUnavailable = &.{},
     /// When set, the child's last assistant message and its Bash commands are
     /// copied here (owned by the spawn allocator) before the conversation is
     /// freed. The isolated verifier reads its token and cross-checks its
@@ -359,6 +360,7 @@ pub fn spawnAgentSink(
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
             .mcp_sessions = opts.mcp_sessions,
+            .mcp_unavailable = opts.mcp_unavailable,
         },
         backend,
         allocator,
