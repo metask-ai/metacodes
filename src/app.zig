@@ -156,6 +156,8 @@ const mcp_hotplug = @import("app/mcp_hotplug.zig");
 const mcp_config_mod = @import("mcp/config.zig");
 const tool_changes_mod = @import("core/tool_changes.zig");
 const util_time_mod = @import("util/time.zig");
+const kg_startup = @import("app/kg_startup.zig");
+const time_context_mod = @import("core/time_context.zig");
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 const AgentSet = @import("agents/set.zig").AgentSet;
@@ -717,6 +719,7 @@ pub const App = struct {
     kg_projects_dir: []u8 = &.{},
     /// KG 启动注入快照(kg/inject.zig;owned)。空串=空态(不注入)。
     kg_summary: []u8 = &.{},
+    kg_startup: ?*kg_startup.Startup = null,
     /// System-One advisor runtime (`src/jev/runtime.zig`); null = not configured.
     jev: ?*@import("jev/runtime.zig").Runtime = null,
     /// 模型长任务 scratchpad（Task* 工具共享）
@@ -741,6 +744,8 @@ pub const App = struct {
     /// Issue #276: the date `user_context` states and the date the model was
     /// last told; runs announce a later local date once (agent_loop).
     time_announcer: ?@import("core/time_context.zig").Announcer = null,
+    session_start: i64 = 0,
+    session_zone: time_context_mod.Zone = .utc_unknown,
     /// 运行时工具表（Skill + MCP 工具都注册到这里）。
     dyn_registry: DynRegistry,
     /// 已连接的 MCP server。每个 owns 一个 McpClient + McpSession（一一对应）。
@@ -1294,9 +1299,29 @@ pub const App = struct {
         // does this at its first join point, before any request is assembled.
         if (!app.mcpJoinDeferred()) try app.publishMcpServers();
 
-        // 构造首条 user-context message(通道 A:CLAUDE.md 链 + currentDate,system-reminder 包裹)。
-        // 向上递归从 cwd 收集 CLAUDE.md;User 级读 ~/.claude/CLAUDE.md。失败仅 log,保持 null。
-        // 通道 B(AutoMem):读 memdir 的 MEMORY.md 索引(已截断)拼进同一 user message。
+        // One instant and zone for the session-start date text and the
+        // announcer that tracks what the model was told since (issue #276).
+        const time_context = @import("core/time_context.zig");
+        app.session_start = @import("util/time.zig").nowUnix();
+        app.session_zone = time_context.systemZone(app.session_start);
+        app.time_announcer = time_context.Announcer.init(app.session_start, &app.session_zone, time_context.Announcer.defaultNow);
+        app.goal_meter = .{
+            .state = &app.goal_state,
+            .observer = .{ .ctx = app, .changed = goalChanged },
+        };
+        app.user_context = app.buildUserContext();
+
+        // The process OTLP exporter lives while any App does; the last
+        // `deinit` flushes it (telemetry.zig). Nothing fails after this point.
+        @import("telemetry/telemetry.zig").acquire(@import("version.zig").semver);
+        return app;
+    }
+
+    // 构造首条 user-context message(通道 A:CLAUDE.md 链 + currentDate,system-reminder 包裹)。
+    // 向上递归从 cwd 收集 CLAUDE.md;User 级读 ~/.claude/CLAUDE.md。失败仅 log,保持 null。
+    // 通道 B(AutoMem):读 memdir 的 MEMORY.md 索引(已截断)拼进同一 user message。
+    fn buildUserContext(app: *App) ?[]u8 {
+        const allocator = app.allocator;
         const auto_mem: []u8 = blk: {
             if (app.memdir_abs.len == 0) break :blk &.{};
             const memdir = @import("core/memory/memdir.zig");
@@ -1304,33 +1329,18 @@ pub const App = struct {
             break :blk (idx orelse &.{});
         };
         defer if (auto_mem.len > 0) allocator.free(auto_mem);
-        // One instant and zone for the session-start date text and the
-        // announcer that tracks what the model was told since (issue #276).
-        const time_context = @import("core/time_context.zig");
-        const session_start = @import("util/time.zig").nowUnix();
-        const session_zone = time_context.systemZone(session_start);
-        app.time_announcer = time_context.Announcer.init(session_start, &session_zone, time_context.Announcer.defaultNow);
-        app.goal_meter = .{
-            .state = &app.goal_state,
-            .observer = .{ .ctx = app, .changed = goalChanged },
-        };
-        app.user_context = @import("core/memory/user_context.zig").build(allocator, .{
+        return @import("core/memory/user_context.zig").build(allocator, .{
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
             .state_root = app.stateRoot(),
             .auto_mem = auto_mem,
             .kg_summary = app.kg_summary,
-            .now = session_start,
-            .zone = session_zone,
+            .now = app.session_start,
+            .zone = app.session_zone,
         }) catch |err| blk: {
             @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;
         };
-
-        // The process OTLP exporter lives while any App does; the last
-        // `deinit` flushes it (telemetry.zig). Nothing fails after this point.
-        @import("telemetry/telemetry.zig").acquire(@import("version.zig").semver);
-        return app;
     }
 
     fn refreshMetaskToken(ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8 {
@@ -4360,6 +4370,7 @@ pub const App = struct {
     /// for the last lease). Idempotent; `deinit` calls it first.
     pub fn stopBackgroundWork(app: *App) void {
         app.cancelMcpStartup();
+        app.cancelKgStartup();
         if (app.agent_jobs) |*jobs| jobs.stop();
         app.swarm.detachTeam();
         if (app.jobs) |*jobs| _ = jobs.killAll();
@@ -4808,8 +4819,6 @@ pub const App = struct {
     }
 
     /// 初始化 TinyKG(设计 v3-final §1 D2、§6)。best-effort:任何步骤失败都不致命。
-    /// P1:同步 ensureReady + 同步注入摘要(本地未竞争 store 为毫秒级)。
-    /// **P2 待办**:移到后台线程(锁竞争最坏 35s;设计 §5 要求启动零阻塞)——已记账。
     fn initKg(app: *App) void {
         if (!app.config.long_horizon_arm.usesTinyKg()) return;
         const state_dir = app.stateRoot();
@@ -4851,62 +4860,95 @@ pub const App = struct {
             .io = app.api_client.http_client.io,
             .autostart = if (app.kg_autostart) |starter| starter.hook() else null,
         }) catch return;
-        client.ensureReady();
-        app.kg = client;
-
-        // 注入摘要(空态零输出)。
-        if (client.ready) {
-            const inject = @import("kg/inject.zig");
-            if (inject.buildSummaryForAgent(app.allocator, &app.kg.?, app.kg_projects_dir, app.session_id.asSlice())) |sum| {
-                app.kg_summary = sum;
+        const identity = app.session_id.asSlice();
+        if (app.config.kg_connect == .first_request) {
+            if (kg_startup.Startup.begin(app.allocator, client, app.kg_projects_dir, identity)) |startup| {
+                app.kg_startup = startup;
+                return;
+            } else |err| {
+                @import("util/log.zig").warn("kg", "background readiness unavailable, probing now: {s}", .{@errorName(err)});
             }
+        }
+        const outcome = kg_startup.prepare(app.allocator, &client, app.kg_projects_dir, identity);
+        app.adoptKg(client, outcome);
+    }
+
+    fn adoptKg(app: *App, client: @import("kg/client.zig").KgClient, outcome: kg_startup.Outcome) void {
+        app.kg = client;
+        const kg = &app.kg.?;
+        if (kg.ready) {
+            app.kg_summary = outcome.summary;
             // 跨会话重建 TaskTab 显示缓存:把 inbox 里未完成的 todo 镜像进内存 store,
             // 让上次会话建的持久任务重启后仍在面板/TaskList 可见(PM P0-A:图为真相,
             // store 为显示缓存;不重建 → 重启后面板空、跨会话连续性只在图里用户看不见)。
-            rebuildInboxMirror(app);
-        } else {
-            // KG 降级:启用 TaskStore 文件镜像,让 swarm teammate 看到 lead 的任务
-            // (Bug ② 修复:KG 降级时 TaskCreate 退内存 store,而内存 store 进程隔离 →
-            // teammate 永远看不到 lead 任务。mirror 文件作 KG 降级时的共享后备)。
-            // 路径与 kg_projects_dir 同目录,文件名 tasks.json。
-            const mirror_path = std.fmt.allocPrint(
-                app.allocator,
-                "{s}/tasks.json",
-                .{app.kg_projects_dir},
-            ) catch return;
-            defer app.allocator.free(mirror_path);
-            app.tasks.setMirror(mirror_path) catch |err| {
-                @import("util/log.zig").warn("kg", "degraded task mirror setup failed: {s}", .{@errorName(err)});
-                return;
-            };
-            // 启动时重开共享 mirror；损坏时保留 mirror 配置，让后续 Task* 在写前
-            // fail closed，而不是用局部状态覆盖仍可取证的坏文件。
-            app.tasks.loadFromMirror() catch |err| {
-                @import("util/log.zig").warn("kg", "degraded task mirror reopen failed: {s}", .{@errorName(err)});
-            };
+            applyInboxMirror(kg, outcome.inbox_rows, &app.tasks);
+            return;
         }
+        var unused = outcome;
+        unused.deinit(app.allocator, kg);
+        // KG 降级:启用 TaskStore 文件镜像,让 swarm teammate 看到 lead 的任务
+        // (Bug ② 修复:KG 降级时 TaskCreate 退内存 store,而内存 store 进程隔离 →
+        // teammate 永远看不到 lead 任务。mirror 文件作 KG 降级时的共享后备)。
+        // 路径与 kg_projects_dir 同目录,文件名 tasks.json。
+        const mirror_path = std.fmt.allocPrint(
+            app.allocator,
+            "{s}/tasks.json",
+            .{app.kg_projects_dir},
+        ) catch return;
+        defer app.allocator.free(mirror_path);
+        app.tasks.setMirror(mirror_path) catch |err| {
+            @import("util/log.zig").warn("kg", "degraded task mirror setup failed: {s}", .{@errorName(err)});
+            return;
+        };
+        // 启动时重开共享 mirror；损坏时保留 mirror 配置，让后续 Task* 在写前
+        // fail closed，而不是用局部状态覆盖仍可取证的坏文件。
+        app.tasks.loadFromMirror() catch |err| {
+            @import("util/log.zig").warn("kg", "degraded task mirror reopen failed: {s}", .{@errorName(err)});
+        };
     }
 
-    /// 从 kg_inbox frontier 重建内存 store 镜像(启动一次)。best-effort。
-    fn rebuildInboxMirror(app: *App) void {
-        mirrorInboxFrontier(app.allocator, &app.kg.?, app.kg_projects_dir, &app.tasks);
+    pub fn kgStarting(app: *const App) bool {
+        return app.kg_startup != null;
     }
 
-    /// rebuildInboxMirror 的本体,入参显式(组件测试用真 TinyKG 直接驱动)。
+    pub fn kgStartupSettled(app: *const App) bool {
+        const startup = app.kg_startup orelse return true;
+        return startup.settled();
+    }
+
+    pub fn joinKgStartup(app: *App) void {
+        const startup = app.kg_startup orelse return;
+        app.kg_startup = null;
+        const result = startup.finish();
+        app.adoptKg(result.client, result.outcome);
+        if (app.kg_summary.len == 0) return;
+        const rebuilt = app.buildUserContext() orelse return;
+        if (app.user_context) |old| app.allocator.free(old);
+        app.user_context = rebuilt;
+    }
+
+    fn cancelKgStartup(app: *App) void {
+        const startup = app.kg_startup orelse return;
+        app.kg_startup = null;
+        startup.cancelAndDestroy();
+    }
+
+    /// 从 kg_inbox frontier 重建内存 store 镜像,入参显式(组件测试用真 TinyKG 直接驱动)。
     pub fn mirrorInboxFrontier(
         allocator: std.mem.Allocator,
         kg: *@import("kg/client.zig").KgClient,
         kg_projects_dir: []const u8,
         tasks: *@import("core/task_store.zig").TaskStore,
     ) void {
-        const inject = @import("kg/inject.zig");
-        const inbox = inject.readIdPointer(allocator, kg_projects_dir, "kg_inbox") orelse return;
-        const rows = kg.frontier(inbox, 50) catch return;
-        defer {
-            // kg 内存契约:kg.allocator 释放(见 KgClient 顶注)。
-            for (rows) |*r| r.deinit(kg.allocator);
-            kg.allocator.free(rows);
-        }
+        applyInboxMirror(kg, kg_startup.readInboxFrontier(allocator, kg, kg_projects_dir), tasks);
+    }
+
+    fn applyInboxMirror(
+        kg: *@import("kg/client.zig").KgClient,
+        rows: []@import("kg/client.zig").FrontierRow,
+        tasks: *@import("core/task_store.zig").TaskStore,
+    ) void {
+        defer kg_startup.freeRows(kg, rows);
         for (rows) |r| {
             if (r.role == .branch) continue; // 复合节点非可执行项,镜像只收叶子
             if (r.status.isTerminal()) continue; // failed 仍在 frontier 作阻塞上下文，不镜像成 pending。
@@ -5686,10 +5728,11 @@ pub const App = struct {
         app.tool_surface = .{ .connecting = startup };
     }
 
-    /// Whether `init` leaves the MCP join to the interactive REPL: only with
-    /// `mcp_connect = .first_request` and at least one server to wait for, so
-    /// a session without MCP builds everything in `init` as before.
+    /// Whether `init` leaves the join to the interactive REPL: TinyKG is
+    /// still coming up, or `mcp_connect = .first_request` with at least one
+    /// server to wait for; otherwise `init` builds everything as before.
     fn mcpJoinDeferred(app: *const App) bool {
+        if (app.kg_startup != null) return true;
         if (app.config.mcp_connect != .first_request) return false;
         return switch (app.tool_surface) {
             .connecting => |startup| startup.jobs.len != 0,
@@ -5700,6 +5743,10 @@ pub const App = struct {
     /// True once the provider-visible tool surface is built.
     pub fn toolSurfaceReady(app: *const App) bool {
         return app.tool_surface == .ready;
+    }
+
+    pub fn startupSettled(app: *const App) bool {
+        return app.mcpStartupSettled() and app.kgStartupSettled();
     }
 
     /// Every MCP server has reported, so `publishMcpServers` will not block
@@ -5722,13 +5769,14 @@ pub const App = struct {
         };
     }
 
-    /// Join the MCP startup (blocking until every server has reported),
-    /// register the connected servers' tools and build the tool surface:
+    /// Join the MCP startup (blocking until every server has reported) and
+    /// the TinyKG startup, register the connected servers' tools, adopt the
+    /// TinyKG outcome and build the tool surface:
     /// `tool_defs`, `enabled_tool_names` and the system prompt. Idempotent.
     /// The one thread that owns the App calls it, with no Run in flight:
     /// `init` for every frontend but the interactive REPL, which calls it
     /// before it assembles its first request. Callers that must stay
-    /// responsive wait for `mcpStartupSettled` first.
+    /// responsive wait for `startupSettled` first.
     pub fn publishMcpServers(app: *App) !void {
         switch (app.tool_surface) {
             .ready => return app.publishHotMcp(),
@@ -5742,6 +5790,7 @@ pub const App = struct {
             },
             .unbuilt => {},
         }
+        app.joinKgStartup();
         try app.buildToolSurface();
         app.tool_surface = .ready;
         app.mcp_status.published.store(true, .release);

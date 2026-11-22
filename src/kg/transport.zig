@@ -14,6 +14,7 @@ const time = @import("../util/time.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 const no_redirects = @import("../api/http_status.zig").no_redirects;
 const http_connection = @import("../api/http_connection.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const protocol_version: u32 = 2;
 pub const control_plane_version: u32 = 1;
@@ -40,6 +41,7 @@ pub const Error = error{
     AmbiguousCommit,
     Backpressure,
     DaemonUnavailable,
+    Interrupted,
     OutOfMemory,
 };
 
@@ -269,6 +271,12 @@ pub const WebTransport = struct {
         return self.runWithRequestId(command, args, mutates, request_id);
     }
 
+    pub fn read(self: *WebTransport, command: []const u8, args: []const []const u8, abort: ?*const AbortSignal) Error!Result {
+        const request_id = try makeIdentifier(self.allocator, "metacodes");
+        defer self.allocator.free(request_id);
+        return self.request(command, args, false, request_id, abort);
+    }
+
     /// Bounded authenticated server health probe. It deliberately parses only
     /// the three readiness booleans so daemon additions remain harmless.
     pub fn ready(self: *WebTransport) Error!Readiness {
@@ -322,6 +330,17 @@ pub const WebTransport = struct {
         mutates: bool,
         request_id: []const u8,
     ) Error!Result {
+        return self.request(command, args, mutates, request_id, null);
+    }
+
+    fn request(
+        self: *WebTransport,
+        command: []const u8,
+        args: []const []const u8,
+        mutates: bool,
+        request_id: []const u8,
+        read_abort: ?*const AbortSignal,
+    ) Error!Result {
         self.request_mu.lockUncancelable(self.http_client.io);
         defer self.request_mu.unlock(self.http_client.io);
         if (!identifierValid(request_id)) return Error.InvalidConfiguration;
@@ -349,7 +368,7 @@ pub const WebTransport = struct {
         };
         const body = try stringifyAlloc(self.allocator, envelope);
         defer self.allocator.free(body);
-        return self.postWithPolicy(self.run_url, body, request_id, mutates);
+        return self.postWithPolicy(self.run_url, body, request_id, mutates, if (mutates) null else read_abort);
     }
 
     /// Markdown bytes are uploaded to the service; a client path is never
@@ -379,7 +398,7 @@ pub const WebTransport = struct {
         };
         const body = try stringifyAlloc(self.allocator, envelope);
         defer self.allocator.free(body);
-        return self.postWithPolicy(self.markdown_url, body, request_id, true);
+        return self.postWithPolicy(self.markdown_url, body, request_id, true, null);
     }
 
     fn postWithPolicy(
@@ -388,6 +407,7 @@ pub const WebTransport = struct {
         body: []const u8,
         request_id: []const u8,
         mutates: bool,
+        abort: ?*const AbortSignal,
     ) Error!Result {
         const started_ms = time.nowMs();
         if (started_ms <= 0) return Error.RequestFailed;
@@ -395,6 +415,7 @@ pub const WebTransport = struct {
         const max_attempts: u8 = if (mutates) 1 else 2;
         var attempt: u8 = 0;
         while (attempt < max_attempts) : (attempt += 1) {
+            if (abort) |signal| if (signal.isAborted()) return Error.Interrupted;
             const remaining_ms = remainingTimeoutMs(deadline_ms) orelse {
                 if (mutates) {
                     self.recordAmbiguousRequestId(request_id);
@@ -402,7 +423,8 @@ pub const WebTransport = struct {
                 }
                 return Error.RequestTimedOut;
             };
-            const response = self.postBeforeDeadline(url, body, request_id, remaining_ms) catch |err| {
+            const response = self.postBeforeDeadline(url, body, request_id, remaining_ms, abort) catch |err| {
+                if (err == Error.Interrupted) return err;
                 if (mutates and provesNoCommit(err)) return err;
                 if (!mutates) {
                     if (attempt + 1 < max_attempts and remainingTimeoutMs(deadline_ms) != null) continue;
@@ -439,6 +461,7 @@ pub const WebTransport = struct {
     const PostRace = union(enum) {
         response: Error!Result,
         deadline: std.Io.Cancelable!void,
+        interrupted: std.Io.Cancelable!void,
     };
 
     const ReadyRace = union(enum) {
@@ -495,34 +518,49 @@ pub const WebTransport = struct {
         body: []const u8,
         request_id: []const u8,
         timeout_ms: u64,
+        abort: ?*const AbortSignal,
     ) Error!Result {
-        var results: [2]PostRace = undefined;
+        var results: [3]PostRace = undefined;
         var race = std.Io.Select(PostRace).init(self.http_client.io, &results);
         errdefer race.cancelDiscard();
         race.concurrent(.response, postTask, .{ self, url, body, request_id }) catch
             return Error.RequestFailed;
         race.concurrent(.deadline, deadlineTask, .{ self.http_client.io, timeout_ms }) catch
             return Error.RequestFailed;
+        if (abort) |signal| race.concurrent(.interrupted, abortTask, .{ self.http_client.io, signal }) catch
+            return Error.RequestFailed;
 
         const first = race.await() catch return Error.RequestFailed;
-        switch (first) {
+        const lost: Error = switch (first) {
             .response => |response| {
                 race.cancelDiscard();
                 return response;
             },
-            .deadline => |deadline| {
+            .deadline => |deadline| blk: {
                 deadline catch return Error.RequestFailed;
-                // The HTTP task can finish at the deadline boundary. Drain a
-                // successful late result instead of leaking its owned bytes.
-                while (race.cancel()) |late| switch (late) {
-                    .response => |response| if (response) |result| {
-                        result.deinit(self.allocator);
-                    } else |_| {},
-                    .deadline => {},
-                };
-                return Error.RequestTimedOut;
+                break :blk Error.RequestTimedOut;
             },
-        }
+            .interrupted => |interrupted| blk: {
+                interrupted catch return Error.RequestFailed;
+                break :blk Error.Interrupted;
+            },
+        };
+        // The HTTP task can finish at the deadline boundary. Drain a
+        // successful late result instead of leaking its owned bytes.
+        while (race.cancel()) |late| switch (late) {
+            .response => |response| if (response) |result| {
+                result.deinit(self.allocator);
+            } else |_| {},
+            .deadline, .interrupted => {},
+        };
+        return lost;
+    }
+
+    const abort_poll_ms: i64 = 20;
+
+    fn abortTask(io: std.Io, signal: *const AbortSignal) std.Io.Cancelable!void {
+        while (!signal.isAborted())
+            try time.sleepAtLeast(io, .{ .raw = .fromMilliseconds(abort_poll_ms), .clock = .awake });
     }
 
     fn postTask(

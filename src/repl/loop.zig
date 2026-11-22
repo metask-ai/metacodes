@@ -353,7 +353,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         if (std.mem.eql(u8, trimmed, "/tools")) {
             // Servers that have all reported are registered first, so their tools are listed.
-            if (app.mcpStartupSettled()) app.publishMcpServers() catch |err| {
+            if (app.startupSettled()) app.publishMcpServers() catch |err| {
                 cmd_output.print("{s}MCP tools could not be registered: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
             };
             for (tools.registry) |*t| cmd_output.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
@@ -909,25 +909,27 @@ fn turnBackend(host: *const TurnHost, region: *render_region_mod.RenderRegion) t
 /// What the spinner says while a request waits on MCP servers.
 const MCP_WAIT_VERB = "Connecting to MCP servers";
 const MCP_RECONNECT_VERB = "Reconnecting MCP servers";
+const KG_WAIT_VERB = "Starting TinyKG";
 
-/// Wait, inside a generating phase, until every MCP server has reported. On
-/// a tty the spinner names the wait and the input watcher keeps Esc, Ctrl+C
-/// and queued typing working; elsewhere SIGINT interrupts it. False when the
-/// user interrupted (the servers go on connecting).
+/// Wait, inside a generating phase, until every MCP server and TinyKG have
+/// reported. On a tty the spinner names the wait and the input watcher keeps
+/// Esc, Ctrl+C and queued typing working; elsewhere SIGINT interrupts it.
+/// False when the user interrupted (the startups go on).
 fn waitForMcpServers(host: *const TurnHost, tb: ?*tui_backend_mod.TuiBackend) bool {
     return waitForMcpConnects(host, tb, MCP_WAIT_VERB);
 }
 
 fn waitForMcpConnects(host: *const TurnHost, tb: ?*tui_backend_mod.TuiBackend, verb: []const u8) bool {
     const app = host.app;
-    if (app.mcpStartupSettled()) return !app.abort.isAborted();
-    const previous_verb: ?[]const u8 = if (host.region) |r| r.setSpinnerVerb(verb) else null;
+    if (app.startupSettled()) return !app.abort.isAborted();
+    const shown = if (app.mcpStartupSettled()) KG_WAIT_VERB else verb;
+    const previous_verb: ?[]const u8 = if (host.region) |r| r.setSpinnerVerb(shown) else null;
     defer if (host.region) |r| {
         _ = r.setSpinnerVerb(previous_verb.?);
     };
     if (host.tty) if (tb) |b| b.startInput(host.stdin_fd, app, host.allocator) catch {};
     defer if (tb) |b| b.stopInput();
-    while (!app.mcpStartupSettled() and !app.abort.isAborted()) util_time.sleepMs(MCP_WAIT_POLL_MS);
+    while (!app.startupSettled() and !app.abort.isAborted()) util_time.sleepMs(MCP_WAIT_POLL_MS);
     return !app.abort.isAborted();
 }
 
@@ -945,7 +947,7 @@ const McpWait = enum { startup, reconnect };
 fn awaitMcpConnects(host: *const TurnHost, wait: McpWait) !bool {
     const app = host.app;
     if (wait == .startup and app.toolSurfaceReady()) return true;
-    if (!app.mcpStartupSettled()) {
+    if (!app.startupSettled()) {
         // A held command echo goes out before the spinner takes the screen.
         cmd_output.flushEcho();
         const region = host.region;
@@ -963,7 +965,12 @@ fn awaitMcpConnects(host: *const TurnHost, wait: McpWait) !bool {
             if (region) |r| leaveGenerationRegion(app, r);
             app.abort.reset();
             switch (wait) {
-                .startup => cmd_output.print("Interrupted · MCP servers are still connecting (see /mcp)\n", .{}),
+                .startup => {
+                    if (app.mcpStartupSettled())
+                        cmd_output.print("Interrupted · TinyKG is still starting (see /kg)\n", .{})
+                    else
+                        cmd_output.print("Interrupted · MCP servers are still connecting (see /mcp)\n", .{});
+                },
                 .reconnect => {
                     try app.cancelMcpReconnect();
                     cmd_output.print("Interrupted · reconnect canceled (see /mcp)\n", .{});
@@ -4139,6 +4146,13 @@ pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
 /// /kg —— KG 用户面(设计 v3-final §7:状态/记忆列表/删除/导出)。
 /// 无参=状态;`mem`=最近记忆;`forget <id>`=删除(投毒自救);`export`=导出 markdown。
 fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    if (app.kgStarting()) {
+        if (!app.kgStartupSettled()) {
+            cmd_output.print("TinyKG is still starting; its state is joined before your first message.\n", .{});
+            return;
+        }
+        app.joinKgStartup();
+    }
     const kg = if (app.kg) |*k| k else {
         cmd_output.print("KG unavailable: not configured\nFix: {s}\n", .{@import("../kg/client.zig").KgClient.hintFor(.unconfigured)});
         return;
@@ -5197,7 +5211,7 @@ fn handleMcp(app: *app_mod.App) !void {
     app.mcp_status.acknowledged.store(true, .release);
     // Every server has reported: register them now (this thread, no Run in
     // flight), so the report below has their tool counts.
-    if (app.mcpStartupSettled()) app.publishMcpServers() catch |err| {
+    if (app.startupSettled()) app.publishMcpServers() catch |err| {
         cmd_output.print("{s}MCP tools could not be registered: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
     };
     if (app.mcpStartupInFlight()) |startup| return printMcpConnecting(app, startup);
@@ -5722,7 +5736,7 @@ fn printBanner(app: *const app_mod.App) void {
     var model_line_buf: [256]u8 = undefined;
     printBannerLine(th, inner, app.bannerModelLine(&model_line_buf));
     printBannerLine(th, inner, app.cwdAbs());
-    if (app.kg == null or !(app.kg.?.ready)) {
+    if (!app.kgStarting() and (app.kg == null or !(app.kg.?.ready))) {
         const kind = if (app.kg) |*kg| @tagName(kg.degradedKind() orelse .unconfigured) else "unconfigured";
         var kg_line: [128]u8 = undefined;
         const text = std.fmt.bufPrint(&kg_line, "KG unavailable: {s} · metacodes doctor", .{kind}) catch "KG unavailable: unconfigured · metacodes doctor";

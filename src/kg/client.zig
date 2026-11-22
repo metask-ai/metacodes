@@ -941,7 +941,7 @@ pub const KgClient = struct {
                     if (net.loopbackListenState(port) == .not_listening and self.tryAutostart(.not_running))
                         return self.ensureReady();
                 }
-                const result = daemon.run("store-info", &.{}, false) catch |first| {
+                const result = daemon.read("store-info", &.{}, self.abort) catch |first| {
                     // Configured but not listening: the host may start it.
                     if (serviceNotRunning(first) and self.tryAutostart(.not_running)) return self.ensureReady();
                     // A local service that refuses this configuration's key may
@@ -3045,7 +3045,7 @@ pub const KgClient = struct {
     fn runRaw(self: *KgClient, args: []const []const u8) !Out {
         if (self.transport == .daemon) {
             if (args.len < 2 or !std.mem.eql(u8, args[1], self.store.argvSlot())) return error.InvalidRemoteCommandShape;
-            const result = try self.transport.daemon.run(args[0], args[2..], false);
+            const result = try self.transport.daemon.read(args[0], args[2..], self.abort);
             return .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
         }
         const bin = self.bin_path orelse return error.NoBin;
@@ -3089,8 +3089,11 @@ pub const KgClient = struct {
         if (self.transport == .daemon) {
             if (args.len < 2 or !std.mem.eql(u8, args[1], self.store.argvSlot()))
                 return self.dataError("invalid remote command shape", .{});
-            const result = self.transport.daemon.run(args[0], args[2..], !retry) catch |err|
-                return self.mapTransportError(err);
+            const sent = if (retry)
+                self.transport.daemon.read(args[0], args[2..], self.abort)
+            else
+                self.transport.daemon.run(args[0], args[2..], true);
+            const result = sent catch |err| return self.mapTransportError(err);
             const out: Out = .{ .stdout = result.stdout, .stderr = result.stderr, .exit_code = result.exit_code };
             if (out.exit_code == 0) return out;
             const err_name = parseCliError(out.stderr);

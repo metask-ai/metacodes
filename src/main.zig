@@ -1626,9 +1626,13 @@ pub fn main(init: std.process.Init) !void {
     const quiet_stderr = interactive_tui and !config.verbose and platform_term.isatty(2);
     if (quiet_stderr) log.setStderrEnabled(false);
     if (quiet_stderr) warnLocalConfig(allocator, &local_config, .log);
-    // The REPL shows its prompt while MCP servers connect and joins them
-    // before its first request; every other frontend connects them in App.init.
-    if (interactive_tui) config.mcp_connect = .first_request;
+    // The REPL shows its prompt while MCP servers connect and TinyKG comes
+    // up, and joins both before its first request; every other frontend
+    // waits for them in App.init.
+    if (interactive_tui) {
+        config.mcp_connect = .first_request;
+        config.kg_connect = .first_request;
+    }
 
     // Introspection builds the same App/Plugin snapshot but cannot issue a
     // provider request, so it neither requires credentials nor consumes the
