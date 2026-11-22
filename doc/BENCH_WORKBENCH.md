@@ -22,6 +22,7 @@ metacodes bench run --suite aime-2025 --wait          # the suite's default samp
 metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
+metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090   # pre-pull task images
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
 metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
 metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
@@ -145,6 +146,33 @@ directories beside it; see the
 [adapter README](../scripts/eval/harbor/adapters/README.md) for sources,
 graders and what only a Docker host can check. A suite's `arch` (from the
 adapter's `SUITE`) is listed in the catalog and on the page.
+
+### Pre-pulling task images
+
+A task whose `task.toml` names a prebuilt image (`[environment]
+docker_image`, as every Terminal-Bench task does) runs in it. Harbor pulls that image
+only when the executor's Docker does not have it, so a registry that is slow
+or unreachable during a batch fails trials as `EnvironmentStartTimeoutError`
+or a `docker compose` error. `metacodes bench pull` moves the pulls ahead of
+the run:
+
+```sh
+metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090 --dry-run   # which images are missing
+metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090             # pull them
+metacodes bench pull --suite terminal-bench-2.1 --task fix-git --task regex-log --json
+```
+
+It runs on the workbench machine. Registry suites are read from the same
+download a run uses (`<state root>/bench/registry-cache/`), harbor-local
+suites from their prepared dataset. Each image is checked with
+`docker image inspect` on the executor (over SSH for an SSH executor) and
+pulled only when missing, up to 3 times with a backoff; an executor's
+`ghcr_mirror` is used for `ghcr.io` images, which are then tagged back, and
+`docker_mirrors` apply through its Docker daemon. `--dry-run` only inspects.
+Without `--task` every task of the suite is covered. Tasks without an image
+are built by Harbor from their Dockerfile and are listed, not pulled.
+WorkBuddy suites prepare their own environments and are refused. The exit
+status is 1 when any image could not be pulled.
 
 ### Adding a harbor-local suite
 
