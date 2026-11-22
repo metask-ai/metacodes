@@ -14,9 +14,10 @@
 //!  - 冷启动误报(Linus #3):大仓首次 spawn(rust-analyzer/gopls 建索引)8s baseline 窗口内诊断
 //!    出不完 → baseline 偏空 → 写后 delta 把文件**存量**错误误算成"本次编辑引入"。warm server(zls
 //!    /pyright ~1s)无此问题;冷启动仅首编辑一次,之后 client 缓存 warm。best-effort 可接受,不漏报。
-//!  - per-edit 延迟税(Linus #4):gated 仓里每次 Edit/Write 在盘写**后**串行阻塞
-//!    snapshotBaseline(≤8s)+getDiagnostics(≤6s);盘写本身不被阻塞(安全第一),但 tool 结果返回
-//!    多等 ≤14s(warm)/≤26s(冷 spawn)。可被 abort 打断。未来若嫌重可换 didChange delta 免全等。
+//!  - per-edit 延迟税(Linus #4):gated 仓里 Edit/Write 在盘写**后**串行等
+//!    snapshotBaseline(≤8s)+getDiagnostics(≤6s);盘写本身不被阻塞(安全第一)。可被 abort 打断。
+//!    某 path 的等待超时未发布 → client 记它静默,之后该 path(从未发布过诊断的 server 则全部
+//!    path)不再等,直到 server 为它发布诊断;静默 server 只付一次 ≤8s(#669)。
 const std = @import("std");
 const time = @import("../util/time.zig");
 const pfs = @import("platform").fs;
@@ -33,6 +34,11 @@ const Client = client_mod.Client;
 
 const BASELINE_WAIT_MS: u64 = 8_000;
 const DIAGNOSTICS_WAIT_MS: u64 = 6_000;
+
+pub const DiagnosticsWaits = struct {
+    baseline_ms: u64 = BASELINE_WAIT_MS,
+    after_write_ms: u64 = DIAGNOSTICS_WAIT_MS,
+};
 const IDLE_TIMEOUT_MS: u64 = 10 * 60 * 1000; // 10 分钟
 const REAP_INTERVAL_MS: u64 = 30 * 1000;
 /// 同时存活的 LSP client 硬上限:root 解析按 marker 上溯(C 项目每子目录 Makefile / JS monorepo
@@ -69,6 +75,7 @@ pub const Service = struct {
     allocator: std.mem.Allocator,
     cwd: []const u8, // owned;git workspace 门用
     abort: ?transport.AbortCheck = null, // M2:透传给每个 client 的等待,Ctrl+C 可中断
+    waits: DiagnosticsWaits = .{},
 
     mutex: sync.Mutex = .{},
     reaper_cond: sync.Condition = .{}, // reaper 间隔等待,shutdown 立即唤醒
@@ -272,7 +279,7 @@ pub const Service = struct {
         };
         const cl = self.getOrSpawn(r.def, r.server_root) orelse return;
         const ver = cl.openFile(path, text) catch return;
-        cl.waitForDiagnostics(ver, BASELINE_WAIT_MS);
+        _ = cl.waitForDiagnostics(path, ver, self.waits.baseline_ms);
         self.storeBaseline(path, cl);
     }
 
@@ -292,7 +299,7 @@ pub const Service = struct {
         };
         const cl = self.getOrSpawn(r.def, r.server_root) orelse return alloc.dupe(u8, "");
         const ver = cl.openFile(path, text) catch return alloc.dupe(u8, "");
-        cl.waitForDiagnostics(ver, DIAGNOSTICS_WAIT_MS);
+        _ = cl.waitForDiagnostics(path, ver, self.waits.after_write_ms);
 
         const diags = try cl.diagnosticsFor(alloc, path);
         defer client_mod.freeDiags(alloc, diags);

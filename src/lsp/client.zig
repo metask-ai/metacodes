@@ -32,6 +32,13 @@ const REQUEST_TIMEOUT_MS: u64 = 10_000;
 /// cond 等待的轮询步长:每步查一次 abort,保证 Ctrl+C 在 ~150ms 内中断(而非死等到 timeout)。
 const WAIT_POLL_MS: u64 = 150;
 
+pub const DiagnosticsWait = enum { published, skipped_silent, timed_out, aborted, server_exited };
+
+pub const WaitToken = struct {
+    pushes: u64,
+    received: u64,
+};
+
 /// 请求的 pending future:reader 填 result 后 broadcast,sendRequest 醒来取走。
 const Pending = struct {
     done: bool = false,
@@ -43,6 +50,7 @@ const DiagSet = struct {
     arena: std.heap.ArenaAllocator,
     diags: []reporter.Diagnostic,
     version: i64,
+    received: u64 = 0,
     fn deinit(self: *DiagSet) void {
         self.arena.deinit();
     }
@@ -62,10 +70,14 @@ pub const Client = struct {
     diagnostics: std.StringHashMap(DiagSet), // path(owned key) → DiagSet
     files: std.StringHashMap(i64), // 已 open 文件 path(owned key) → 当前 version
     push_counter: u64 = 0,
+    received_counter: u64 = 0,
 
     running: bool = true,
     seed_first_push: bool = false, // TS 系:首 push 不 signal
     seeded_paths: std.StringHashMap(void), // 已"吃掉首 push"的 path
+    silent_paths: std.StringHashMap(void),
+    published_any: bool = false,
+    server_silent: bool = false,
     abort: ?transport_mod.AbortCheck = null, // M2:agent 的 abort;等待时轮询,Ctrl+C 可中断
 
     pub fn create(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8, seed_first_push: bool, abort: ?transport_mod.AbortCheck) !*Client {
@@ -78,6 +90,7 @@ pub const Client = struct {
             .diagnostics = std.StringHashMap(DiagSet).init(allocator),
             .files = std.StringHashMap(i64).init(allocator),
             .seeded_paths = std.StringHashMap(void).init(allocator),
+            .silent_paths = std.StringHashMap(void).init(allocator),
             .seed_first_push = seed_first_push,
             .abort = abort,
         };
@@ -158,8 +171,13 @@ pub const Client = struct {
 
         self.lock();
         defer self.unlock();
+        self.received_counter += 1;
+        ds.received = self.received_counter;
         // 存/替换该 path 的诊断(free 旧的)。key 需 owned。
         self.storeDiagnostics(path, &ds);
+        self.published_any = true;
+        self.server_silent = false;
+        if (self.silent_paths.fetchRemove(path)) |kv| self.allocator.free(kv.key);
 
         // seed-on-first-push:首个 push 只存不 signal(防 waiter 命中 pre-edit 基线)。
         if (self.seed_first_push and !self.seeded_paths.contains(path)) {
@@ -265,9 +283,9 @@ pub const Client = struct {
     /// **返回 wait_token = 发送前的 push_counter 快照**——waitForDiagnostics 等 counter 涨过它,
     /// 即"本次 didOpen/didChange 之后到达的新 publishDiagnostics"。不靠 version(zls 等 server 不带 version)。
     /// text 是文件当前全文。
-    pub fn openFile(self: *Client, path: []const u8, text: []const u8) !u64 {
+    pub fn openFile(self: *Client, path: []const u8, text: []const u8) !WaitToken {
         self.lock();
-        const wait_token = self.push_counter; // 发送前快照:之后任何 push 都涨过它
+        const wait_token: WaitToken = .{ .pushes = self.push_counter, .received = self.received_counter }; // 发送前快照:之后任何 push 都涨过它
         const existing = self.files.get(path);
         self.unlock();
 
@@ -355,13 +373,31 @@ pub const Client = struct {
     /// 发送前的快照,故这是"本次 didOpen/didChange 之后的诊断"。到点/超时/server 死 → 返回。
     /// **不靠 version**——zls 等 server 的 publishDiagnostics 不带 version,version 谓词会误命中旧诊断。
     /// 单文件 Edit 场景 push 都是本文件的,counter 即足够;多文件并发是 v1 已知局限(登记)。
-    pub fn waitForDiagnostics(self: *Client, wait_token: u64, timeout_ms: u64) void {
+    pub fn waitForDiagnostics(self: *Client, path: []const u8, wait_token: WaitToken, timeout_ms: u64) DiagnosticsWait {
         self.lock();
         defer self.unlock();
+        if (self.server_silent or self.silent_paths.contains(path)) return .skipped_silent;
         var steps_left = timeout_ms / WAIT_POLL_MS + 1;
-        while (self.running and self.push_counter <= wait_token and steps_left > 0 and !self.abortedDuringWait()) : (steps_left -= 1) {
+        while (self.running and self.push_counter <= wait_token.pushes and steps_left > 0 and !self.abortedDuringWait()) : (steps_left -= 1) {
             _ = self.cond.timedWait(&self.mutex, WAIT_POLL_MS * std.time.ns_per_ms);
         }
+        if (self.push_counter > wait_token.pushes) return .published;
+        if (!self.running) return .server_exited;
+        if (self.abortedDuringWait()) return .aborted;
+        if (!self.receivedSince(path, wait_token)) self.markSilent(path);
+        return .timed_out;
+    }
+
+    fn receivedSince(self: *Client, path: []const u8, wait_token: WaitToken) bool {
+        const ds = self.diagnostics.get(path) orelse return false;
+        return ds.received > wait_token.received;
+    }
+
+    fn markSilent(self: *Client, path: []const u8) void {
+        if (!self.published_any) self.server_silent = true;
+        if (self.silent_paths.contains(path)) return;
+        const k = self.allocator.dupe(u8, path) catch return;
+        self.silent_paths.put(k, {}) catch self.allocator.free(k);
     }
 
     /// 拷贝 path 当前诊断到 caller allocator(owned;调用方 free 每条的 message/code/source + 外层)。
@@ -422,6 +458,9 @@ pub const Client = struct {
         var sit = self.seeded_paths.keyIterator();
         while (sit.next()) |k| self.allocator.free(k.*);
         self.seeded_paths.deinit();
+        var silent_it = self.silent_paths.keyIterator();
+        while (silent_it.next()) |k| self.allocator.free(k.*);
+        self.silent_paths.deinit();
         self.pending.deinit();
         const a = self.allocator;
         a.destroy(self);
@@ -564,7 +603,7 @@ test "Client: initialize + didOpen → publishDiagnostics 端到端(mock LSP ser
     try cl.initialize("file:///tmp/proj");
     const path = "/tmp/proj/foo.zig";
     const ver = try cl.openFile(path, "const x = 1;\nconst y = 2;\nbad line here\n");
-    cl.waitForDiagnostics(ver, 5000);
+    _ = cl.waitForDiagnostics(path, ver, 5000);
 
     const diags = try cl.diagnosticsFor(a, path);
     defer freeDiags(a, diags);
@@ -587,12 +626,12 @@ test "Client: didChange 版本递增 + 诊断刷新(mock)" {
     try cl.initialize("file:///tmp/proj");
     const path = "/tmp/proj/bar.py";
     const t0 = try cl.openFile(path, "line0\nline1\nx\n"); // wait_token(发送前 counter 快照)
-    try testing.expectEqual(@as(u64, 0), t0); // 首次 didOpen 前 counter=0
-    cl.waitForDiagnostics(t0, 5000);
+    try testing.expectEqual(@as(u64, 0), t0.pushes); // 首次 didOpen 前 counter=0
+    _ = cl.waitForDiagnostics(path, t0, 5000);
     // 二次编辑 → didChange → 新 publishDiagnostics 涨 counter。
     const t1 = try cl.openFile(path, "line0\nline1\nyy\n");
-    try testing.expect(t1 >= 1); // 首个 push 后 counter 已涨
-    cl.waitForDiagnostics(t1, 5000);
+    try testing.expect(t1.pushes >= 1); // 首个 push 后 counter 已涨
+    _ = cl.waitForDiagnostics(path, t1, 5000);
     const diags = try cl.diagnosticsFor(a, path);
     defer freeDiags(a, diags);
     try testing.expect(diags.len >= 1); // 刷新后仍有诊断
@@ -608,4 +647,46 @@ test "Client: shutdown 对 ignore-SIGTERM server 升级 SIGKILL 不挂死(Linus 
     // 顽固 server 吞 SIGTERM 且不响应 shutdown:短 deadline 超时 → terminate SIGTERM 被吞 →
     // WNOHANG 查未死 → SIGKILL 强杀 → reader EOF → join **有界返回**。到这行没挂死即证升级生效。
     cl.shutdownWithTimeout(100);
+}
+
+test "Client: a window without a publish silences the path until the server publishes for it (#669)" {
+    const a = testing.allocator;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (std.c.access(MOCK_LSP, X_OK) != 0) return;
+    const argv = [_]?[*:0]const u8{ MOCK_LSP, "--skip-first", null };
+    var cl = Client.create(a, argv[0..], false, null) catch return;
+    defer cl.shutdown();
+    try cl.initialize("file:///tmp/proj");
+    const path = "/tmp/proj/quiet.zig";
+
+    const t0 = try cl.openFile(path, "a\n");
+    try testing.expectEqual(DiagnosticsWait.timed_out, cl.waitForDiagnostics(path, t0, 300));
+    const t1 = try cl.openFile(path, "b\n");
+    try testing.expectEqual(DiagnosticsWait.skipped_silent, cl.waitForDiagnostics(path, t1, 5000));
+    cl.lock();
+    var polls: usize = 0;
+    while (cl.silent_paths.contains(path) and polls < 40) : (polls += 1) {
+        _ = cl.cond.timedWait(&cl.mutex, WAIT_POLL_MS * std.time.ns_per_ms);
+    }
+    const still_silent = cl.silent_paths.contains(path);
+    cl.unlock();
+    try testing.expect(!still_silent);
+    const t2 = try cl.openFile(path, "c\n");
+    try testing.expectEqual(DiagnosticsWait.published, cl.waitForDiagnostics(path, t2, 5000));
+}
+
+test "Client: a seed push swallowed during the window does not silence the path (#669)" {
+    const a = testing.allocator;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (std.c.access(MOCK_LSP, X_OK) != 0) return;
+    const argv = [_]?[*:0]const u8{ MOCK_LSP, null };
+    var cl = Client.create(a, argv[0..], true, null) catch return;
+    defer cl.shutdown();
+    try cl.initialize("file:///tmp/proj");
+    const path = "/tmp/proj/seeded.ts";
+
+    const t0 = try cl.openFile(path, "a\n");
+    try testing.expectEqual(DiagnosticsWait.timed_out, cl.waitForDiagnostics(path, t0, 300));
+    const t1 = try cl.openFile(path, "b\n");
+    try testing.expectEqual(DiagnosticsWait.published, cl.waitForDiagnostics(path, t1, 5000));
 }

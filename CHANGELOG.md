@@ -164,6 +164,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A language server that never publishes diagnostics no longer slows every
+  Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
+  8 s before the write and 6 s after it, so a server that answered
+  `initialize` but stayed silent (still indexing, publishing only on save, or
+  stuck) added about 15 s to every call. Now, when a wait for a file runs out,
+  metacodes stops waiting for that file, and for the whole server if it has
+  never published anything, until the server publishes diagnostics for the
+  file. A silent server costs one wait of up to 8 s; servers that publish keep
+  getting their diagnostics attached.
+
 - **Cancelling a bench build on macOS reports the cancel.** Stopping a
   process group whose leader had just exited raised `PermissionError` on
   macOS, so a cancelled `metacodes bench` build (and the worker's and
