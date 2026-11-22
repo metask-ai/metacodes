@@ -601,6 +601,20 @@ jobs:
       - name: Documentation fact check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_facts.py
+      - name: Changelog entries are unreleased
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
+            *) echo "no base to compare on a $GITHUB_EVENT_NAME run"; exit 0 ;;
+          esac
+          python3 scripts/check_changelog_sections.py --base "$base"
+      - name: Changelog section check unit tests
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
+        run: python3 -m unittest scripts.tests.test_check_changelog_sections -v
       - name: Documentation fact-check unit tests
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v

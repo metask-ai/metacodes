@@ -39,6 +39,8 @@ DOC_STEPS = {
     "Documentation link check",
     "Documentation fact check",
     "Documentation fact-check unit tests",
+    "Changelog entries are unreleased",
+    "Changelog section check unit tests",
     "Gate manifest unit tests",
     "Diff whitespace check",
     "Protocol document references",
