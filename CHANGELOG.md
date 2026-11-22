@@ -152,7 +152,30 @@ status, compatibility boundaries, and entry points are defined by
   prompts even under an allow rule for `Bash` or in `bypassPermissions`,
   however it is quoted or escaped; a deny rule still denies.
 
+- **A `--web` or `serve` session queues at most 64 messages and commands**
+  (#447). Before, its queue had no bound: a client could line up any number
+  of turns, each one a provider request. A `POST /message`, `POST /command`
+  or UDS `message` beyond 64 is refused and queues nothing, over HTTP with
+  `429 {"error":"queue full","max_queued":64}`, over the UDS with
+  `{"ok":false,"error":"queue full","max_queued":64}`. Messages and commands
+  count together and the turn in progress does not count, as in
+  `SessionHost` (`max_queued`). `GET /state` reports `queued` and
+  `max_queued`.
+
 ### Fixed
+
+- **Cancelling a bench build on macOS reports the cancel.** Stopping a
+  process group whose leader had just exited raised `PermissionError` on
+  macOS, so a cancelled `metacodes bench` build (and the worker's and
+  WorkBuddy image build's stops) failed with that error instead of
+  「构建已取消」. An already exited group is now treated as stopped.
+
+- **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
+  a draft whose cursor was not at its end, Ctrl+D went past the picker and
+  deleted the character under the cursor, at the prompt and in the box under a
+  reply. Now it does nothing while the draft has text; on an empty prompt it
+  still counts toward the double-press exit, so the picker never traps the
+  session.
 
 - **A foreground Bash command is collected as soon as it exits** (#670). The
   wait slept 100 ms before it first looked at the job, so every foreground
@@ -169,19 +192,6 @@ status, compatibility boundaries, and entry points are defined by
   attribute sources and ignore rules unchanged, keep git's previous answer;
   only the rest are asked, and none at all when nothing moved. The listing
   before and after the command is unchanged.
-
-- **Cancelling a bench build on macOS reports the cancel.** Stopping a
-  process group whose leader had just exited raised `PermissionError` on
-  macOS, so a cancelled `metacodes bench` build (and the worker's and
-  WorkBuddy image build's stops) failed with that error instead of
-  「构建已取消」. An already exited group is now treated as stopped.
-
-- **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
-  a draft whose cursor was not at its end, Ctrl+D went past the picker and
-  deleted the character under the cursor, at the prompt and in the box under a
-  reply. Now it does nothing while the draft has text; on an empty prompt it
-  still counts toward the double-press exit, so the picker never traps the
-  session.
 
 - **A paste with the `/model` picker open goes to its filter** (#650). At the
   prompt the pasted text landed in the draft under the picker; during a reply

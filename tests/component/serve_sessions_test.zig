@@ -1311,3 +1311,110 @@ test "uds capabilities: a declaration over the socket is acknowledged, journaled
     try attach.waitFor("\"run_done\"");
     try std.testing.expect(!attach.contains("\"type\":\"ui_request\",\"id\":"));
 }
+
+const QUEUE_FULL = "{\"error\":\"queue full\",\"max_queued\":64}";
+const UDS_QUEUE_FULL = "{\"ok\":false,\"error\":\"queue full\",\"max_queued\":64}";
+
+fn sessionState(fx: *Fixture, id: SessionId) !std.json.Parsed(std.json.Value) {
+    var path_buffer: [64]u8 = undefined;
+    const response = try fx.call("GET", Fixture.sessionPath(&path_buffer, id, "/state"), "");
+    defer std.testing.allocator.free(response);
+    try expectStatus(response, "200");
+    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, bodyOf(response), .{});
+}
+
+fn expectSessionQueued(fx: *Fixture, id: SessionId, queued: i64) !void {
+    const state = try sessionState(fx, id);
+    defer state.deinit();
+    try std.testing.expectEqual(queued, state.value.object.get("queued").?.integer);
+    try std.testing.expectEqual(@as(i64, 64), state.value.object.get("max_queued").?.integer);
+}
+
+fn waitSessionRequestOtherThan(fx: *Fixture, id: SessionId, previous: i64) !i64 {
+    const deadline = cc.util_time.nowMs() + 10_000;
+    while (cc.util_time.nowMs() <= deadline) {
+        const state = try sessionState(fx, id);
+        defer state.deinit();
+        const pending = state.value.object.get("pending_request_id").?.integer;
+        if (pending > 0 and pending != previous) return pending;
+        cc.util_time.sleepMs(20);
+    }
+    return error.RequestNeverPending;
+}
+
+fn expectSessionRefused(fx: *Fixture, id: SessionId, comptime route: []const u8, body: []const u8) !void {
+    var path_buffer: [64]u8 = undefined;
+    const response = try fx.call("POST", Fixture.sessionPath(&path_buffer, id, route), body);
+    defer std.testing.allocator.free(response);
+    try expectStatus(response, "429");
+    try std.testing.expectEqualStrings(QUEUE_FULL, bodyOf(response));
+}
+
+fn expectUdsMessageReply(fx: *Fixture, id: SessionId, text: []const u8, want: []const u8) !void {
+    var line_buffer: [160]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buffer, "{{\"op\":\"message\",\"session\":\"{s}\",\"text\":\"{s}\"}}\n", .{ id.asSlice(), text });
+    const reply = try udsRequest(fx.uds_path.?, line);
+    defer std.testing.allocator.free(reply);
+    try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, reply, "\n"));
+}
+
+test "#447 serve --sessions: HTTP and UDS fill one session's 64-item queue; the next is 429 or queue full until its driver takes one; another session is not held to it" {
+    const uds = builtin.os.tag != .windows;
+    var fx: Fixture = undefined;
+    try fx.setup(.{ .uds = uds, .responses = &.{ ASK_SSE, textSse("first answered"), ASK_SSE } });
+    defer fx.deinit();
+    const held = try fx.create("");
+    const other = try fx.create("");
+
+    try expectSessionQueued(&fx, held, 0);
+    try fx.message(held, "hold the driver");
+    const held_request = try waitSessionRequestOtherThan(&fx, held, 0);
+    const requests_while_held = fx.provider.requestCount();
+
+    var text_buffer: [32]u8 = undefined;
+    for (1..63) |n| {
+        const text = try std.fmt.bufPrint(&text_buffer, "queued {d}", .{n});
+        if (uds and n % 2 == 0) {
+            try expectUdsMessageReply(&fx, held, text, "{\"ok\":true}");
+        } else {
+            try fx.message(held, text);
+        }
+    }
+    var path_buffer: [64]u8 = undefined;
+    for (0..2) |_| {
+        const queued_command = try fx.call("POST", Fixture.sessionPath(&path_buffer, held, "/command"), "{\"cmd\":\"/mode bypassPermissions\"}");
+        defer std.testing.allocator.free(queued_command);
+        try expectStatus(queued_command, "200");
+    }
+    try expectSessionQueued(&fx, held, 64);
+
+    try expectSessionRefused(&fx, held, "/message", "{\"text\":\"one too many\"}");
+    try expectSessionRefused(&fx, held, "/command", "{\"cmd\":\"/mode default\"}");
+    if (uds) try expectUdsMessageReply(&fx, held, "one too many", UDS_QUEUE_FULL);
+    try expectSessionQueued(&fx, held, 64);
+
+    try expectSessionQueued(&fx, other, 0);
+    const other_command = try fx.call("POST", Fixture.sessionPath(&path_buffer, other, "/command"), "{\"cmd\":\"/mode default\"}");
+    defer std.testing.allocator.free(other_command);
+    try expectStatus(other_command, "200");
+
+    var answer_buffer: [64]u8 = undefined;
+    const answered = try fx.call("POST", Fixture.sessionPath(&path_buffer, held, "/respond"), try std.fmt.bufPrint(&answer_buffer, "{{\"id\":{d},\"answers\":[\"Red\"]}}", .{held_request}));
+    defer std.testing.allocator.free(answered);
+    try expectStatus(answered, "200");
+    _ = try waitSessionRequestOtherThan(&fx, held, held_request);
+    try expectSessionQueued(&fx, held, 61);
+
+    try fx.message(held, "taken over http");
+    for ([_][]const u8{ "taken once the driver ran", "taken last" }) |text| {
+        if (uds) {
+            try expectUdsMessageReply(&fx, held, text, "{\"ok\":true}");
+        } else {
+            try fx.message(held, text);
+        }
+    }
+    try expectSessionQueued(&fx, held, 64);
+    try expectSessionRefused(&fx, held, "/message", "{\"text\":\"one too many again\"}");
+    try expectSessionQueued(&fx, held, 64);
+    try std.testing.expectEqual(requests_while_held + 2, fx.provider.requestCount());
+}
