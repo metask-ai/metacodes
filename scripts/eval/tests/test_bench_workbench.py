@@ -29,7 +29,7 @@ from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
 from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
-from scripts.eval.harbor.bench.account import Account
+from scripts.eval.harbor.bench.account import Account, refresh_lock
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
 
@@ -379,7 +379,8 @@ class RotatingGateway:
         self.issued = []
         self.revoked = set()
         self.deny_refresh = False
-        self.refreshes = []   # seconds the replaced access token still had
+        self.refreshes = []   # (time, seconds the replaced access token still had)
+        self.first_request_at = None
         self.rejected = []    # refresh tokens refused
         self.requests = []    # (access token, accepted, seconds left)
         self.current_access = self.issue()
@@ -458,8 +459,15 @@ class RotatingGateway:
         with self.lock:
             left = self.expiry.get(token, 0) - time.time()
             ok = token in self.expiry and token not in self.revoked and left > 0
+            if self.first_request_at is None:
+                self.first_request_at = time.time()
             self.requests.append((token, ok, left))
             return ok
+
+    def refreshes_while_serving(self):
+        with self.lock:
+            return [left for at, left in self.refreshes
+                    if self.first_request_at is not None and at > self.first_request_at]
 
     def revoke(self, token):
         with self.lock:
@@ -471,7 +479,7 @@ class RotatingGateway:
                     or body.get('refresh_token') != self.refresh_token):
                 self.rejected.append(body.get('refresh_token'))
                 return {'error': 'invalid_grant'}, 400
-            self.refreshes.append(self.expiry[self.current_access] - time.time())
+            self.refreshes.append((time.time(), self.expiry[self.current_access] - time.time()))
             self.serial += 1
             self.current_access = self.issue()
             self.refresh_token = f'live-refresh-{self.serial}'
@@ -555,6 +563,44 @@ class WorkbenchTest(unittest.TestCase):
         self.assertIn(run['name'], final['url'])
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
+
+    def test_provider_mode_reads_the_config_of_the_workbench_state_root(self):
+        native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']
+        state_root = self.root / 'state'
+        atomic_json(state_root / 'config.json', {'custom_providers': {'gw': native}})
+        cfg = json.loads(self.manager.config_path.read_text())
+        for name in ('provider_config', 'model'):
+            cfg.pop(name)
+        atomic_json(self.manager.config_path, {**cfg, 'auth_mode': 'provider', 'account_state_dir': str(state_root)})
+        environ = {k: v for k, v in os.environ.items() if k not in ('METACODES_CONFIG_FILE', 'METACODES_HOME')}
+        with patch.dict(os.environ, environ, clear=True):
+            catalog = self.client.request('api/workbench')
+        self.assertTrue(catalog['ready'], catalog['reasons'])
+        self.assertEqual([m['id'] for m in catalog['models']], ['gw/test-model'])
+
+    def test_provider_mode_reuses_the_metacodes_config_and_its_key_variable(self):
+        native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']
+        metacodes_config = self.root / 'metacodes-config.json'
+        atomic_json(metacodes_config, {'mcp_servers': [{'name': 'kg', 'command': 'tinykg'}], 'custom_providers': {
+            'gw': {**native, 'env_aliases': [{'name': 'GW_KEY', 'kind': 'api_key', 'canonical': True}]}}})
+        cfg = json.loads(self.manager.config_path.read_text())
+        for name in ('provider_config', 'model', 'key_env'):
+            cfg.pop(name)
+        atomic_json(self.manager.config_path, {**cfg, 'auth_mode': 'provider'})
+        with patch.dict(os.environ, {'METACODES_CONFIG_FILE': str(metacodes_config)}):
+            catalog = self.client.request('api/workbench')
+            self.assertEqual(catalog['reasons'], ['执行服务缺少环境变量 GW_KEY，设置后重启服务'])
+            os.environ['GW_KEY'] = 'private-test-value'
+            catalog = self.client.request('api/workbench')
+            self.assertTrue(catalog['ready'], catalog['reasons'])
+            self.assertEqual([m['id'] for m in catalog['models']], ['gw/test-model'])
+            run = self.client.request('api/runs', {**self.request(), 'model': 'gw/test-model'})
+            final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'finished', final)
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('GW_KEY=${GW_KEY}', argv)
+        shipped = next(a.removeprefix('config=') for a in argv if a.startswith('config='))
+        self.assertEqual(list(json.loads(Path(shipped).read_text())), ['custom_providers'])
 
     def test_no_credential_is_needed_but_cross_origin_is_refused(self):
         import urllib.request
@@ -1059,8 +1105,10 @@ class TokenRefreshRunTest(unittest.TestCase):
         self.assertEqual(len(model_requests), 30)
         self.assertTrue(all(ok for _, ok, _ in model_requests), model_requests)
         self.assertGreaterEqual(len({token for token, _, _ in model_requests}), 3)
-        # Each refresh replaced a token that was still valid: proactive.
-        self.assertTrue(gateway.refreshes and all(left > 0 for left in gateway.refreshes), gateway.refreshes)
+        # Each refresh while the run served requests replaced a token that
+        # was still valid: proactive.
+        during_run = gateway.refreshes_while_serving()
+        self.assertTrue(during_run and all(left > 0 for left in during_run), gateway.refreshes)
         self.assertEqual(gateway.rejected, [])
         credential = final['credential']
         self.assertEqual((credential['container'], credential['refreshing'], credential['error']),
@@ -1215,6 +1263,26 @@ class AccountTest(unittest.TestCase):
                     Account(state).credential()
 
 
+def hold_byte_lock(fd):
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def release_byte_lock(fd):
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 class AccountInventoryTest(unittest.TestCase):
     def setup_account(self, **kwargs):
         tmp = tempfile.TemporaryDirectory()
@@ -1234,6 +1302,33 @@ class AccountInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '已不可用'):
             account.credential('metask/claude-test', key_id='glm-key')
         self.assertEqual(len([c for c in calls if c[0] == 'refresh']), 1)
+
+    def test_a_refresh_waits_for_the_holder_of_an_empty_lock_file_and_writes_nothing_into_it(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = Path(tmp.name)
+        path = state / 'bench-oauth.lock'
+        held = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, held)
+        hold_byte_lock(held)
+        entered, errors = threading.Event(), []
+
+        def refresh():
+            try:
+                with refresh_lock(state):
+                    entered.set()
+            except OSError as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=refresh, daemon=True)
+        worker.start()
+        time.sleep(0.3)
+        self.assertFalse(entered.is_set())
+        release_byte_lock(held)
+        worker.join(15)
+        self.assertEqual(errors, [])
+        self.assertTrue(entered.is_set())
+        self.assertEqual(path.stat().st_size, 0)
 
     def test_concurrent_refresh_rotates_privately_and_preserves_cli_selection(self):
         account, calls = self.setup_account()

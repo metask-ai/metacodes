@@ -80,6 +80,7 @@ pub const ToolDefinition = struct {
     /// Runtime/dialect routing metadata; never serialized as part of the tool
     /// declaration and never treated as permission.
     model_activation: ?ModelToolActivation = null,
+    retired: bool = false,
 };
 
 /// 单个参数的 JSON Schema 描述。comptime 友好（纯字面量），用于内置工具表里

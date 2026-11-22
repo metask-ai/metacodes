@@ -12,6 +12,77 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench batches can be renamed and copied.** A batch page has 重命名
+  (`POST /api/batch/rename`) and 复制为新批次, which fills the 新建 page with
+  the batch's version, datasets, tasks and settings. The overview's batch list
+  copies, stops and deletes a batch in place, stopping asks for confirmation,
+  and the 新建 form keeps what was typed across a refresh.
+
+- **`metacodes bench pull` prepares a suite's task environments.** It pulls
+  the `docker_image` of each selected task and builds the environment of
+  every task without one, the same way Harbor builds it, on the chosen
+  executor, with retries (`--dry-run` only lists what is not ready). Harbor's
+  own build then comes from the build cache, so a flaky registry or package
+  index no longer turns batch trials into invalid environment failures.
+
+- **A bench batch can switch on advanced features.** The 新建 page of the
+  bench workbench has a 高级功能 section: the Lean-modelled run gates
+  (`--verification-final-gate`, `--requirement-ledger`, `--test-integrity`,
+  `--delivery-cadence`, `--stall-gate`) and the preview features
+  `execute_code`, `comment_guard` and `harnessmm`, all off by default. Every
+  trial of the batch runs with the ticked flags, and the batch page lists them.
+  `POST /api/batches` and `POST /api/runs` take them as `features`.
+  The bench node protocol is now 2: rerun `metacodes bench setup --executor
+  <name>` for each SSH executor.
+
+- **An interactive start offers a newer release.** Like Codex, `metacodes`
+  started as the TUI from a release install checks for a newer release in the
+  background at most once a day, and on a later start offers it: update now
+  (runs `metacodes update`, then exits so the new version starts next), skip,
+  or skip until the next version. `-p`, `serve`, `--web`, teammates and
+  development installs never check; `METACODES_NO_UPDATE_CHECK=1` or
+  `METACODES_NO_PROBE=1` turns it off. The state is
+  `<state root>/update-check.json`.
+
+- **`metacodes mcp add`, `mcp add-json` and `mcp remove`.** Install an MCP
+  server from the command line: `mcp add <name> <url>` (or `-- <command>
+  [<arg>...]` for a stdio server) writes it into `mcpServers` of
+  `<state root>/config.json`, changing only that member, atomically and with
+  mode 0600. Claude Code's and Codex's spellings of the command work too. An
+  entry no session could use is refused; a configured name needs `--force`.
+  After writing, `add` connects the server once and says what it found (for a
+  401, the `mcp login` command). `remove` also forgets the server's stored
+  login. `mcp list` now checks each server (`--no-check` skips it) and says
+  `auth: not logged in` instead of `auth: none`.
+
+- **Skills can be added, edited and removed while a session runs.** Before
+  each request of a top-level Run the session checks its Skill roots and each
+  Skill's `SKILL.md`; when one changed it reads the Skills again, so a new
+  Skill can be activated, an edited one runs its new `SKILL.md` and a removed
+  one is refused, with no restart. The listings in the system prompt and the
+  `Skill` tool do not change, so the prompt cache holds; a system reminder
+  tells the model which Skills are new, gone or changed. A session that
+  started without Skills gains the `Skill` tool with the first one. Plugin
+  Skills are not watched.
+
+- **MCP servers can be added, changed and removed while a session runs.**
+  Before each request of a top-level Run, the ones after a tool batch inside a
+  Run included, the session checks the files its MCP configuration comes from
+  and the stored logins. A server added or changed (by `metacodes mcp add`, an
+  edit, another program) connects, one that needed a login connects once
+  `metacodes mcp login` has stored a new one, a removed one is disconnected,
+  and a server that announces `notifications/tools/list_changed` has its tools
+  read again: no restart, no `/mcp reconnect`. The system prompt and the tool
+  schemas already sent stay as they were, so the prompt cache holds; the model
+  learns from a system reminder that lists the new and the gone tools and what
+  happened to each server, told again after compaction and never twice. A
+  server defined inside the working directories (the current directory,
+  `--add-dir` directories, the sandbox's `allowWrite`) is not connected
+  automatically, since a command the session ran could have written it:
+  `/mcp reconnect [<name>]` connects it, and restarts a named server. A
+  reconnect rebuilds nothing, runs while background agents or teammates run,
+  and Esc or Ctrl+C cancels it.
+
 - **Teamwork launches its own Manager.** Configure `seats.manager` as a
   `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
   `resume` and `/teamwork` start that Manager CLI themselves. It runs in the
@@ -20,8 +91,10 @@ status, compatibility boundaries, and entry points are defined by
   metacodes process. Its allowance is held in the run's budget before it
   starts and settled by its reported cost; a Manager stopped without a report
   is charged the whole allowance, and a crash never grants it twice. Cancel or
-  an exhausted budget stops the Manager and the workers without merging, and
-  the Manager dies with its controller. MCP snapshots now report
+  an exhausted budget stops the Manager and the workers without merging, once
+  the Manager's relay has read the replies already written (the cancel answer
+  included) or after waiting at most 2 s, and the Manager dies with its
+  controller. MCP snapshots now report
   `budget.held_usd` and `budget.manager` (`none`, `run_ledger`, or
   `outside_ledger` for a `teamwork mcp` client, whose spend the cap does not
   include).
@@ -43,6 +116,20 @@ status, compatibility boundaries, and entry points are defined by
   and stay empty under `--check`. The exit code stays 3 (#646).
 
 ### Changed
+
+- **The CLI tells the model which command it is.** The environment section of
+  the system prompt names the command that started the session (the launcher
+  name, `metacodes-dev` for a side-by-side install), says that `metacode` and
+  other similarly named programs are different products, and how MCP servers
+  are added, logged in to and loaded. A session asked to install an MCP server
+  had run another product's CLI, whose login metacodes cannot use. The `mcp`
+  subcommand's hints, and `/mcp`'s, name the same command.
+
+- **ToolSearch and unknown `mcp__` tools name servers that changed after the
+  session started.** Besides the servers that did not connect (and the ones
+  still connecting), the result reads the configuration again and names a
+  server added since the session last read it, which is connected before the
+  next request.
 
 - **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
   `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after
@@ -76,6 +163,12 @@ status, compatibility boundaries, and entry points are defined by
   never published anything, until the server publishes diagnostics for the
   file. A silent server costs one wait of up to 8 s; servers that publish keep
   getting their diagnostics attached.
+
+- **Cancelling a bench build on macOS reports the cancel.** Stopping a
+  process group whose leader had just exited raised `PermissionError` on
+  macOS, so a cancelled `metacodes bench` build (and the worker's and
+  WorkBuddy image build's stops) failed with that error instead of
+  「构建已取消」. An already exited group is now treated as stopped.
 
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
