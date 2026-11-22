@@ -97,9 +97,33 @@ dropped (names stay). Activating a Skill returns its rendered body preceded by
 directory.
 
 For compat sources that directory is the live Skill directory, as in Claude
-Code and Codex: only `SKILL.md` and `agents/openai.yaml` are read at startup,
-so Skills that carry a virtualenv, `node_modules` or large assets work.
-(AgentCore's canonical sources still snapshot and materialize the whole tree.)
+Code and Codex: only `SKILL.md` and `agents/openai.yaml` are read when the
+Skills are loaded, so Skills that carry a virtualenv, `node_modules` or large
+assets work. (AgentCore's canonical sources still snapshot and materialize the
+whole tree.)
+
+### Changes during a session
+
+A session watches every compat Skill root (present or not), each entry in it,
+and that entry's `SKILL.md`, `sealed.json` and `agents/openai.yaml`. Before
+each request of a top-level Run (at most once a second, one stat each) it
+reads the Skills again when one of them changed. From then on a new Skill can
+be activated, an edited one runs its new `SKILL.md`, and a removed one is
+refused, with no restart.
+
+The listings in the system prompt and the `Skill` tool stay byte for byte as
+they were, so the prompt cache holds. The model is told in a system reminder
+which Skills are new (with their description), which are gone and which
+changed; like the MCP reminder it is read back from the system prompt and the
+reminders still in the conversation, so compaction and `/clear` tell it again.
+A session that started without a model-invocable Skill gains the `Skill` tool
+when the first one appears, and that request misses the prompt cache once.
+
+Plugin Skills are not watched: their package is a fixed generation. An
+activation already running keeps the Skill it started with, and a background
+agent or teammate keeps the Skill list it started with; nothing they hold is
+freed before the session ends. Completion of `/` commands, `/skills` and
+`/doctor` show the Skills as they are now.
 
 ### `skillOverrides`
 
@@ -224,6 +248,68 @@ per-project state in `~/.claude.json`. `disabledMcpjsonServers` anywhere wins,
 and the shared `.claude/settings.json` can reject but not approve. A Codex
 project layer is read only when `$CODEX_HOME/config.toml` marks the project
 `trust_level = "trusted"`.
+
+### Adding and removing servers
+
+`metacodes mcp add` writes one entry into `mcpServers` of
+`<state root>/config.json`, the first source above, and `metacodes mcp remove`
+takes it out again (`src/app/mcp_config_edit.zig`):
+
+```sh
+metacodes mcp add docs https://example.com/mcp --header X-Team=core
+metacodes mcp add linear --type sse https://mcp.linear.app/sse
+metacodes mcp add github --env 'GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_TOKEN}' -- npx -y @modelcontextprotocol/server-github
+metacodes mcp add-json tracker '{"type":"http","url":"https://t.example/mcp","oauth":{"clientId":"cli"}}'
+metacodes mcp remove docs
+```
+
+A URL (positional or `--url`) makes an HTTP server (Streamable HTTP, or
+`--type sse`) and takes `--header <name>=<value>`; a command makes a stdio
+server and takes `--env <name>=<value>`. Claude Code's and Codex's spellings
+of the same command work as well (`-t/--transport`, `-e`, `-H "Name: value"`,
+`-s user|local`, `--bearer-token-env-var`, `--client-id`, `--callback-port`),
+so a command copied from a server's install page for either of them installs
+the server here. `-s project` is refused with a pointer to `.mcp.json`, and
+`--client-secret` is refused because metacodes logs in as a public client.
+`add-json` takes the whole entry as one JSON object, in the shape of
+[Entry fields](#entry-fields). Values may name `${VAR}`, expanded when a
+session starts, so a token need not be written into the file.
+
+Before writing, `add` reads the entry the way a session will and refuses one
+no session could use (exit 2), naming the loader's problem. The edit is a
+read-modify-write under the file's lock: only that one member changes, every
+other key (`jev`, a legacy `mcp_servers` array, provider settings) keeps its
+value and place, and the file is replaced atomically with mode 0600. A name
+already configured — in that file, its legacy array, or another source the
+entry would shadow — is refused unless `--force`. `remove` edits only
+`mcpServers`: a legacy entry or another program's file is explained, not
+changed. It also forgets the server's stored login, unless a server of the
+same name and URL is still configured.
+
+After writing, `add` connects the server once, as a session would (its stored
+login included, its log left alone), and prints what happened: the number of
+tools, or for a 401 the `mcp login` command to run (`--no-check` skips the
+check). A running session picks the change up before its next request (see
+"Changes during a session"); a new session connects the server when it
+starts. `metacodes mcp list` shows each configured server, the
+file it comes from, its transport, how a URL server authenticates
+(`auth: configured`, `auth: OAuth (<issuer>)`, an expired login, or
+`auth: not logged in`, which says no credential is stored, not that the server
+needs none) and, unless `--no-check`, whether it connects now. Every hint
+these commands print names the command that ran them (`metacodes-dev mcp login`
+for a side-by-side install), as the other next-step hints do (#482).
+
+The interactive and headless CLI tell the model the same in the environment
+section of the system prompt: that its command is the one that started it
+(not `metacode`, a different product, nor any other similarly named program),
+that `<command> mcp add`, `mcp login` and `mcp list` manage MCP servers, and
+that a server added, changed or logged in to during a session is connected
+before the next request, with a system reminder listing its tools, unless it
+is defined inside the working directories, where it waits for the user's
+`/mcp reconnect <name>`. The lines name the command only;
+they carry no path or server, so they stay the same for every session of an
+install. A host that builds an App without the CLI's command name (the daemon,
+an embedder) gets no such lines.
 
 ### Entry fields
 
@@ -467,16 +553,65 @@ configuration problems. While servers are still connecting it shows each one's
 state so far (`connecting… 3s`), without waiting for them.
 The model is told as well: when ToolSearch finds nothing, or the model calls
 an `mcp__…` tool that does not exist, the result names the configured servers
-that did not connect with the reason `/mcp` shows (for a 401, the
-`metacodes mcp login` command), says that a new session picks them up, and
-asks the model to tell the user instead of reaching the server another way.
-Nothing about them enters the system prompt. A `-p` run prints one
+that give no tools with the reason `/mcp` shows (for a 401, the
+`metacodes mcp login` command; for one still connecting, that it is), and asks
+the model to tell the user instead of reaching the server another way. The
+same result reads the configuration again at that moment and names a server
+added since the session last read it; that one is connected before the next
+request. Nothing about them enters the system prompt. A `-p` run prints one
 `warning: MCP server '<name>' did not connect: <reason>` line per such server
 to stderr before it starts, and `--json` adds them to the result line as
 `mcp_unavailable`.
-The tool list is fixed for a session (it is part of the cached prompt); when a
-server announces `notifications/tools/list_changed`, `/mcp` says so and the new
-list applies after a restart.
+
+### Changes during a session
+
+A session watches every file its MCP configuration is read from (each source
+above, present or not) and `<state root>/mcp-oauth`. Before each request of a
+top-level Run (the first request of a Run and every one after a batch of tool
+calls) it looks at them, at most once a second and with one stat each. Only
+when one changed does it read the configuration again and compare it server
+by server with what the session is using:
+
+- A server added, or one whose entry changed (any field that affects how it
+  connects), connects on a worker thread. The request waits up to 5 s for it;
+  one that takes longer is published before a later request.
+- A server that needed a login connects again once its stored login changes
+  (`metacodes mcp login`), not on every later change to the configuration.
+- A server removed from the configuration, or disabled, is disconnected. A
+  call that a background agent has in flight on it finishes first.
+- A server that announces `notifications/tools/list_changed` has its tool list
+  read again.
+
+A configuration file that cannot be parsed as it stands (half written, say)
+holds every change back until it can be; the servers it listed stay as they
+are.
+
+The system prompt and the tool schemas already sent stay byte for byte as they
+were, so the prompt cache holds. The model learns of the change from a system
+reminder appended to the conversation: the new MCP tools with a one-line
+summary each (loaded with ToolSearch, like every deferred tool), the ones that
+are gone, and one line per server whose state changed (connected, failed and
+why, needs a login, not connected automatically). What the model has been told
+is read back from the system prompt and the reminders still in the
+conversation, so after compaction, `/clear` or a resume it is told again, and
+it is never told twice. A tool the model had already loaded keeps its schema
+in the requests after its server goes; calling it fails and says why.
+
+A server added or changed in a file inside the session's working directories
+(the current directory, `--add-dir` directories and the sandbox's
+`allowWrite`) is not connected automatically, because a command the session
+ran could have written that file. The reminder and `/mcp` name
+`/mcp reconnect <name>`, which connects it. Project `.mcp.json` servers still
+need approval first. Removals and logins always apply.
+
+`/mcp reconnect` goes the same way: `/mcp reconnect` connects every configured
+server that is not connected, and `/mcp reconnect <name>` closes that server's
+connection, if it has one, and connects it again. The spinner reads
+`Reconnecting MCP servers`; Esc or Ctrl+C cancels the connects that have not
+finished, and the outcome is published either way. Neither rebuilds the system
+prompt, and both run while a background agent or an in-process teammate runs:
+nothing those hold is freed before the session ends, and a background agent
+keeps the tool list it started with.
 
 ## Tests and evaluations
 

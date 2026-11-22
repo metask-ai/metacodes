@@ -1,5 +1,5 @@
 """T06/T12:窄终端长行软折 / resize 自适应。"""
-from tty_driver import run
+from tty_driver import idle_footer, run
 from asserts import TTYAssert
 
 
@@ -93,7 +93,7 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
     boundary: streamed text remains in scrollback and the generation region is
     redrawn at the new width and still sits at the bottom.
     """
-    from tty_driver import READY, wait_for
+    from tty_driver import IDLE, READY, wait_for
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
     resizes = []
@@ -108,7 +108,7 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
                 "strictsleep:0.35",
                 "resize:24x60",
                 wait_for("tok17", 20),
-                "sleep:1.0",
+                IDLE,
             ],
             term_size=(24, 80),
             base_url=srv.url,
@@ -224,7 +224,7 @@ def test_T14_resize_during_permission_prompt_keeps_waiting(bin_path):
         "Write",
         json.dumps({"file_path": target, "content": "x"}),
         "Permission required",
-        ["type:y", "sleep:1.5"],
+        ["type:y", idle_footer("? for shortcuts")],
         "[a] Yes, always",
     )
     text = _tool_result_text(result)
@@ -254,7 +254,7 @@ def test_T15_resize_during_ask_question_keeps_waiting(bin_path):
         "AskUserQuestion",
         json.dumps(question),
         "Which colour?",
-        ["key:enter", "sleep:1.5"],
+        ["key:enter", idle_footer("? for shortcuts")],
         "☐ Colour",
     )
     text = _tool_result_text(result)
