@@ -91,8 +91,10 @@ status, compatibility boundaries, and entry points are defined by
   metacodes process. Its allowance is held in the run's budget before it
   starts and settled by its reported cost; a Manager stopped without a report
   is charged the whole allowance, and a crash never grants it twice. Cancel or
-  an exhausted budget stops the Manager and the workers without merging, and
-  the Manager dies with its controller. MCP snapshots now report
+  an exhausted budget stops the Manager and the workers without merging, once
+  the Manager's relay has read the replies already written (the cancel answer
+  included) or after waiting at most 2 s, and the Manager dies with its
+  controller. MCP snapshots now report
   `budget.held_usd` and `budget.manager` (`none`, `run_ledger`, or
   `outside_ledger` for a `teamwork mcp` client, whose spend the cap does not
   include).
