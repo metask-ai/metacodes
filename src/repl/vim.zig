@@ -42,6 +42,13 @@ pub const VimState = struct {
     pub fn deinit(self: *VimState) void {
         self.register.deinit(self.allocator);
     }
+
+    pub fn cancelPending(self: *VimState) void {
+        self.pending_op = 0;
+        self.count = 0;
+        self.pending_find = 0;
+        self.g_pending = false;
+    }
 };
 
 /// 处理 NORMAL/VISUAL 模式下的一个字节。返回 true 表示 buffer/cursor 有变更需重绘。
@@ -170,8 +177,6 @@ pub fn handleNormal(
         'D' => {
             const le = lineEnd(items, cursor.*);
             try setRegister(vs, allocator, items[cursor.*..le]);
-            buf.items.len = le;
-            // 不对,需要只删到行尾——若多行,le 是当前行尾
             try deleteRange(buf, cursor.*, le);
         },
         'C' => {
@@ -452,6 +457,42 @@ test "vim: dd deletes line" {
     _ = try handleNormal(&vs, &buf, &cur, a, 'd');
     _ = try handleNormal(&vs, &buf, &cur, a, 'd');
     try testing.expectEqualStrings("", buf.items);
+}
+
+test "vim: D deletes to the end of the cursor's line and keeps the lines below it (#660)" {
+    const a = testing.allocator;
+    var vs = VimState.init(a);
+    defer vs.deinit();
+    var buf = try mkBuf(a, "first line\nsecond line\nthird");
+    defer buf.deinit(a);
+    var cur: usize = 6;
+    _ = try handleNormal(&vs, &buf, &cur, a, 'D');
+    try testing.expectEqualStrings("first \nsecond line\nthird", buf.items);
+    try testing.expectEqualStrings("line", vs.register.items);
+    try testing.expectEqual(@as(usize, 6), cur);
+
+    cur = 9;
+    _ = try handleNormal(&vs, &buf, &cur, a, 'D');
+    try testing.expectEqualStrings("first \nse\nthird", buf.items);
+    try testing.expectEqualStrings("cond line", vs.register.items);
+}
+
+test "vim: cancelPending drops a pending operator and a pending find (#660)" {
+    const a = testing.allocator;
+    var vs = VimState.init(a);
+    defer vs.deinit();
+    var buf = try mkBuf(a, "foo bar");
+    defer buf.deinit(a);
+    var cur: usize = 4;
+    _ = try handleNormal(&vs, &buf, &cur, a, 'd');
+    vs.cancelPending();
+    _ = try handleNormal(&vs, &buf, &cur, a, 'b');
+    try testing.expectEqualStrings("foo bar", buf.items);
+    try testing.expectEqual(@as(usize, 0), cur);
+    _ = try handleNormal(&vs, &buf, &cur, a, 'f');
+    vs.cancelPending();
+    _ = try handleNormal(&vs, &buf, &cur, a, 'l');
+    try testing.expectEqual(@as(usize, 1), cur);
 }
 
 test "vim: dw deletes word" {

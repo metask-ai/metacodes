@@ -787,7 +787,7 @@ const DaemonHost = struct {
         errdefer app.setConfigEventSink(null);
         app.permission_ctx.ui_requester = self.wb.requester();
         errdefer app.permission_ctx.ui_requester = null;
-        self.state_src = .{ .app = app, .wb = &self.wb, .cmdbox = &self.host.cmdbox, .journal = &self.host.journal, .generating = &self.host.generating };
+        self.state_src = .{ .app = app, .wb = &self.wb, .inbox = &self.host.inbox, .journal = &self.host.journal, .generating = &self.host.generating };
         self.srv = try cc.web_server.WebServer.start(a, .{ .version = "0.0.0-test" }, .{
             .journal = &self.host.journal,
             .web_backend = &self.wb,
@@ -974,6 +974,164 @@ fn udsRoundtrip(a: std.mem.Allocator, conn: pnet.Socket, line: []const u8) ![]u8
     const nl = std.mem.indexOfScalar(u8, out.items, '\n').?;
     out.shrinkRetainingCapacity(nl);
     return out.toOwnedSlice(a);
+}
+
+const HOLD_MESSAGE = "{\"text\":\"hold the driver\",\"permission_mode\":\"bypassPermissions\"}";
+const QUEUE_FULL = "{\"error\":\"queue full\",\"max_queued\":64}";
+const UDS_QUEUE_FULL = "{\"ok\":false,\"error\":\"queue full\",\"max_queued\":64}";
+
+fn expectQueued(a: std.mem.Allocator, port: u16, queued: i64) !void {
+    var state = try getState(a, port);
+    defer state.deinit();
+    try std.testing.expectEqual(queued, state.int("queued"));
+    try std.testing.expectEqual(@as(i64, 64), state.int("max_queued"));
+}
+
+fn expectQueueFull(response: []const u8) !void {
+    if (!std.mem.startsWith(u8, response, "HTTP/1.1 429 Too Many Requests\r\n")) {
+        std.debug.print("expected 429, got:\n{s}\n", .{response});
+        return error.TestExpectedQueueFull;
+    }
+    try std.testing.expectEqualStrings(QUEUE_FULL, responseBody(response));
+}
+
+fn expectAccepted(a: std.mem.Allocator, port: u16, body: []const u8) !void {
+    const ack = try postMessage(a, port, body);
+    defer a.free(ack);
+    if (std.mem.indexOf(u8, ack, "200 OK") == null) {
+        std.debug.print("expected 200 for {s}, got:\n{s}\n", .{ body, ack });
+        return error.TestExpectedAccepted;
+    }
+}
+
+fn waitPendingRequestOtherThan(a: std.mem.Allocator, port: u16, previous: i64) !i64 {
+    const deadline = cc.util_time.nowMs() + 10_000;
+    while (cc.util_time.nowMs() <= deadline) {
+        var state = try getState(a, port);
+        defer state.deinit();
+        const id = state.int("pending_request_id");
+        if (id > 0 and id != previous) return id;
+        cc.util_time.sleepMs(20);
+    }
+    return error.TestTimedOutWaitingForRequest;
+}
+
+const UdsMessages = struct {
+    conn: pnet.Socket,
+    session: []const u8,
+
+    fn send(self: UdsMessages, a: std.mem.Allocator, text: []const u8) ![]u8 {
+        var line_buf: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "{{\"op\":\"message\",\"session\":\"{s}\",\"text\":\"{s}\"}}\n", .{ self.session, text });
+        return udsRoundtrip(a, self.conn, line);
+    }
+
+    fn expectReply(self: UdsMessages, a: std.mem.Allocator, text: []const u8, want: []const u8) !void {
+        const reply = try self.send(a, text);
+        defer a.free(reply);
+        try std.testing.expectEqualStrings(want, reply);
+    }
+};
+
+fn expectQueueBound(a: std.mem.Allocator, fx: *AppFixture, port: u16, uds: ?UdsMessages) !void {
+    try expectQueued(a, port, 0);
+    try expectAccepted(a, port, HOLD_MESSAGE);
+    const held_request = try waitPendingRequestOtherThan(a, port, 0);
+    try expectQueued(a, port, 0);
+    const requests_while_held = fx.mock.requestCount();
+
+    var body_buf: [64]u8 = undefined;
+    for (1..62) |n| try expectAccepted(a, port, try std.fmt.bufPrint(&body_buf, "{{\"text\":\"queued {d}\"}}", .{n}));
+    if (uds) |messages| {
+        try messages.expectReply(a, "queued 62", "{\"ok\":true}");
+    } else {
+        try expectAccepted(a, port, "{\"text\":\"queued 62\"}");
+    }
+    for (0..2) |_| {
+        const queued_command = try request(a, port, "POST", "/command", "{\"cmd\":\"/mode bypassPermissions\"}", null);
+        defer a.free(queued_command);
+        try std.testing.expectEqualStrings("{\"ok\":true,\"message\":\"queued\"}", responseBody(queued_command));
+    }
+    try expectQueued(a, port, 64);
+
+    const refused = try postMessage(a, port, "{\"text\":\"one too many\"}");
+    defer a.free(refused);
+    try expectQueueFull(refused);
+    const refused_command = try request(a, port, "POST", "/command", "{\"cmd\":\"/mode default\"}", null);
+    defer a.free(refused_command);
+    try expectQueueFull(refused_command);
+    if (uds) |messages| try messages.expectReply(a, "one too many", UDS_QUEUE_FULL);
+    try expectQueued(a, port, 64);
+
+    var answer_buf: [64]u8 = undefined;
+    const answer = try std.fmt.bufPrint(&answer_buf, "{{\"id\":{d},\"answers\":[\"Red\"]}}", .{held_request});
+    const answered = try request(a, port, "POST", "/respond", answer, null);
+    defer a.free(answered);
+    try std.testing.expect(std.mem.indexOf(u8, answered, "200 OK") != null);
+    _ = try waitPendingRequestOtherThan(a, port, held_request);
+    try expectQueued(a, port, 61);
+
+    if (uds) |messages| try messages.expectReply(a, "taken once the driver ran", "{\"ok\":true}");
+    const freed_over_http: usize = if (uds == null) 3 else 2;
+    for (0..freed_over_http) |n| try expectAccepted(a, port, try std.fmt.bufPrint(&body_buf, "{{\"text\":\"taken {d}\"}}", .{n}));
+    try expectQueued(a, port, 64);
+    const refused_again = try postMessage(a, port, "{\"text\":\"one too many again\"}");
+    defer a.free(refused_again);
+    try expectQueueFull(refused_again);
+    if (uds) |messages| try messages.expectReply(a, "one too many again", UDS_QUEUE_FULL);
+    try expectQueued(a, port, 64);
+
+    try std.testing.expectEqual(requests_while_held + 2, fx.mock.requestCount());
+}
+
+test "L2 web #447: 64 messages and commands queue behind a held Run; the next is 429 until the driver takes one; /state reports queued and max_queued" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setup(&.{ ASK_SSE, TEXT_SSE, ASK_SSE });
+    defer fx.deinit();
+
+    var web = WebRun{ .app = fx.app, .port = try freePort() };
+    try web.start();
+    var stopped = false;
+    defer if (!stopped) web.stop() catch {};
+
+    try expectQueueBound(a, &fx, web.port, null);
+
+    try web.stop();
+    stopped = true;
+}
+
+test "L2 serve #447: HTTP and the UDS message op fill one bound; the next is 429 or queue full until the driver takes one" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setup(&.{ ASK_SSE, TEXT_SSE, ASK_SSE });
+    defer fx.deinit();
+
+    var daemon: DaemonHost = undefined;
+    try daemon.start(fx.app);
+    defer daemon.stop();
+
+    if (builtin.os.tag == .windows) return expectQueueBound(a, &fx, daemon.srv.port, null);
+    var nonce: [6]u8 = undefined;
+    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
+    var path_buf: [256]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&path_buf, "{s}/mc-bound-{s}.sock", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/"), &std.fmt.bytesToHex(nonce, .lower) });
+    const uds = try cc.daemon_uds.UdsServer.start(a, sock_path, .{
+        .allocator = a,
+        .resolver = &DaemonHost.resolve,
+        .resolver_ctx = @ptrCast(&daemon),
+    });
+    defer uds.stop();
+    const conn = try pnet.connectUnix(sock_path);
+    defer pnet.closeSocket(conn);
+    pnet.setRecvTimeoutMs(conn, 500);
+
+    try expectQueueBound(a, &fx, daemon.srv.port, .{ .conn = conn, .session = fx.app.session_id.asSlice() });
+}
+
+test "#447 the daemon's queue bound is SessionHost's max_queued" {
+    const host_options: cc.session_host.Options = .{};
+    try std.testing.expectEqual(host_options.max_queued, cc.web_submission.default_max_queued);
 }
 
 // ── every journal line is wire v1; a Run's lines carry its run_id (#444) ─────

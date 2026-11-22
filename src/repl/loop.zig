@@ -2066,28 +2066,33 @@ fn readLineRaw(
             }
             if (n == 0) return error.Eof;
 
-            // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
-            if (vim_keys and vim_state.mode != .insert) {
-                if (b[0] == '\r' or b[0] == '\n') {
+            break :blk parser.feedRead(fd, b[0]) orelse continue;
+        };
+
+        if (vim_keys) {
+            region.setInput(editor.view(), editor.cursor);
+            switch (vimRoute(vim_state.mode, key, key == .esc and region.escapeClosesOverlay())) {
+                .dispatch => vim_state.cancelPending(),
+                .normal_mode => {
+                    region.cancelCtrlXPrefix();
+                    vim_state.mode = .normal;
+                    if (editor.cursor > 0) editor.cursor -= 1; // vim 习惯:Esc 后光标左移一格
+                    redraw(region, &editor, app);
+                    continue;
+                },
+                .command => |command| {
+                    region.cancelCtrlXPrefix();
+                    if (command.after_esc) vim_state.cancelPending();
+                    if (vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, command.byte) catch false) redraw(region, &editor, app);
+                    continue;
+                },
+                .submit => {
                     region.setInput("", 0);
                     region.clear();
                     region.emitTerminal("\n");
                     return try allocator.dupe(u8, editor.view());
-                }
-                const changed = vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, b[0]) catch false;
-                if (changed) redraw(region, &editor, app);
-                continue;
+                },
             }
-
-            break :blk parser.feedRead(fd, b[0]) orelse continue;
-        };
-
-        // vim INSERT 模式下 Esc → 回 NORMAL(不走 LineEditor 的 esc 语义)
-        if (vim_keys and key == .esc) {
-            vim_state.mode = .normal;
-            if (editor.cursor > 0) editor.cursor -= 1; // vim 习惯:Esc 后光标左移一格
-            redraw(region, &editor, app);
-            continue;
         }
 
         // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
@@ -2097,15 +2102,13 @@ fn readLineRaw(
             continue;
         }
 
-        // 阶段1:overlay 分流(? help / Ctrl+O transcript)。vim 不占键盘时才介入。
+        // 阶段1:overlay 分流(? help / Ctrl+O transcript)。
         // dispatch 判断"空 buffer + ?"依赖 editor 投影,调前同步。
-        // vim mode keeps its own keymap, but the exit keys go through the same
-        // double-press state as everywhere else.
-        if (!vim_keys or key == .ctrl_c or key == .ctrl_d) {
+        {
             region.setInput(editor.view(), editor.cursor);
             const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key, .now_ms = util_time.nowMs() } });
             switch (eff.action) {
-                .pass_to_editor => {}, // 落到下面正常编辑
+                .pass_to_editor => if (vim_keys and vim_state.mode != .insert) continue,
                 .none, .commit, .cancel, .exit => continue, // overlay 消费了(已重画),不喂 editor
                 .exit_prompt => return error.ExitRequested,
                 .discard_draft => {
@@ -2452,6 +2455,35 @@ fn readLineRaw(
 
 fn vimOwnsKeys(vim_mode: bool, region: *render_region_mod.RenderRegion) bool {
     return vim_mode and !region.pickerOpen();
+}
+
+const VimRoute = union(enum) {
+    dispatch,
+    normal_mode,
+    submit,
+    command: VimCommand,
+};
+
+const VimCommand = struct {
+    byte: u8,
+    after_esc: bool = false,
+};
+
+fn vimRoute(mode: @import("vim.zig").Mode, key: input.Key, esc_closes_overlay: bool) VimRoute {
+    if (key == .esc and esc_closes_overlay) return .dispatch;
+    if (mode == .insert) return if (key == .esc) .normal_mode else .dispatch;
+    return switch (key) {
+        .char => |byte| .{ .command = .{ .byte = byte } },
+        .esc => .{ .command = .{ .byte = 0x1b } },
+        .left => .{ .command = .{ .byte = 'h' } },
+        .down => .{ .command = .{ .byte = 'j' } },
+        .up => .{ .command = .{ .byte = 'k' } },
+        .right => .{ .command = .{ .byte = 'l' } },
+        .alt_b => .{ .command = .{ .byte = 'b', .after_esc = true } },
+        .alt_f => .{ .command = .{ .byte = 'f', .after_esc = true } },
+        .enter => .submit,
+        else => .dispatch,
+    };
 }
 
 /// TAB 补全：算候选，唯一则补全，多个则列出 + 补到公共前缀。
@@ -6345,6 +6377,40 @@ test "vim leaves the keys to an open /model picker, and takes them back when it 
 
     region.ui.interaction().?.picker_open = false;
     try std.testing.expect(vimOwnsKeys(true, &region));
+}
+
+test "vim INSERT mode dispatches every key but its Esc; NORMAL mode runs vim's keys and dispatches the rest (#660)" {
+    const Mode = @import("vim.zig").Mode;
+    try std.testing.expect(vimRoute(.insert, .esc, false) == .normal_mode);
+    try std.testing.expect(vimRoute(.insert, .esc, true) == .dispatch);
+    for ([_]input.Key{ .shift_tab, .ctrl_o, .ctrl_r, .ctrl_t, .ctrl_g, .ctrl_x, .ctrl_c, .ctrl_d, .up, .down, .left, .right, .enter, .tab, .{ .char = '?' }, .{ .char = '/' }, .{ .char = '@' } }) |key| {
+        try std.testing.expect(vimRoute(.insert, key, false) == .dispatch);
+    }
+
+    const Command = struct { key: input.Key, byte: u8, after_esc: bool = false };
+    for ([_]Command{
+        .{ .key = .left, .byte = 'h' },
+        .{ .key = .down, .byte = 'j' },
+        .{ .key = .up, .byte = 'k' },
+        .{ .key = .right, .byte = 'l' },
+        .{ .key = .{ .char = 'D' }, .byte = 'D' },
+        .{ .key = .{ .char = '?' }, .byte = '?' },
+        .{ .key = .esc, .byte = 0x1b },
+        .{ .key = .alt_b, .byte = 'b', .after_esc = true },
+        .{ .key = .alt_f, .byte = 'f', .after_esc = true },
+    }) |want| {
+        for ([_]Mode{ .normal, .visual, .visual_line }) |mode| {
+            const route = vimRoute(mode, want.key, false);
+            try std.testing.expect(route == .command);
+            try std.testing.expectEqual(want.byte, route.command.byte);
+            try std.testing.expectEqual(want.after_esc, route.command.after_esc);
+        }
+    }
+    try std.testing.expect(vimRoute(.normal, .enter, false) == .submit);
+    try std.testing.expect(vimRoute(.normal, .esc, true) == .dispatch);
+    for ([_]input.Key{ .ctrl_c, .ctrl_d, .shift_tab, .ctrl_o, .ctrl_r, .ctrl_t, .ctrl_g, .ctrl_x, .ctrl_k, .ctrl_l, .tab, .backspace, .shift_enter, .paste_begin }) |key| {
+        try std.testing.expect(vimRoute(.normal, key, false) == .dispatch);
+    }
 }
 
 test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随会话)" {

@@ -152,6 +152,16 @@ status, compatibility boundaries, and entry points are defined by
   prompts even under an allow rule for `Bash` or in `bypassPermissions`,
   however it is quoted or escaped; a deny rule still denies.
 
+- **A `--web` or `serve` session queues at most 64 messages and commands**
+  (#447). Before, its queue had no bound: a client could line up any number
+  of turns, each one a provider request. A `POST /message`, `POST /command`
+  or UDS `message` beyond 64 is refused and queues nothing, over HTTP with
+  `429 {"error":"queue full","max_queued":64}`, over the UDS with
+  `{"ok":false,"error":"queue full","max_queued":64}`. Messages and commands
+  count together and the turn in progress does not count, as in
+  `SessionHost` (`max_queued`). `GET /state` reports `queued` and
+  `max_queued`.
+
 ### Fixed
 
 - **A TinyKG service that does not answer no longer holds the prompt**
@@ -245,6 +255,23 @@ status, compatibility boundaries, and entry points are defined by
   forms do, and every key of a read counts. A bracketed paste never answers
   a dialog: the permission dialog ignores it, and the question dialog types
   it into "Type something" or the note being edited, line breaks as spaces.
+
+- **The prompt's shortcuts work with `/vim` on** (#660). Only Ctrl+C and
+  Ctrl+D reached them: in INSERT mode Shift+Tab, Ctrl+O, Ctrl+R, Ctrl+T,
+  Ctrl+G, the Ctrl+X prefix, `?` help, the `/` and `@` menus and history on
+  Up/Down did nothing, and NORMAL mode fed the terminal's raw bytes to vim, so
+  Left (`ESC [ D`) deleted to the end of the line, Right changed it, Up
+  appended, a paste ran as vim commands, and Ctrl+C and Ctrl+D did nothing.
+  Now INSERT mode handles every key as the prompt does without vim, except the
+  Esc that switches to NORMAL mode; an open help, menu or agent list takes
+  that Esc first. NORMAL mode reads keys, not bytes: the arrows move the
+  cursor as `h`, `j`, `k` and `l`, Enter submits as before, a paste goes in
+  as text, and the other keys reach the prompt's shortcuts, so Ctrl+C and
+  Ctrl+D arm the exit as in INSERT mode; a key that only edits the line
+  (Backspace, Ctrl+U, Ctrl+W, …) still does nothing there. A command typed
+  within 200 ms of the Esc that left INSERT mode runs; it used to go into the
+  box. `D` deletes to the end of the cursor's line; it used to drop every line
+  below it too.
 
 ### Fixed
 
