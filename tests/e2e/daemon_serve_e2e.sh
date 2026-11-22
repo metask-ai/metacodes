@@ -46,6 +46,7 @@ grep -q "DAEMON_OK" <<<"$events" || fail "SSE has no assistant text (driver did 
 state="$("${CURL[@]}" "$url/state")"
 grep -q '"session_id"' <<<"$state" || fail "/state is not the rich snapshot: $state"
 grep -q '"permission_mode"' <<<"$state" || fail "/state lacks permission_mode: $state"
+grep -q '"queued":0,"max_queued":64' <<<"$state" || fail "/state lacks queued and max_queued: $state"
 cack="$("${CURL[@]}" -X POST "$url/command" -H "Origin: $url" -d '{"cmd":"/mode dont-ask"}')"
 grep -q '"ok":true' <<<"$cack" || fail "/command not queued: $cack"
 events="$(events_until 'permission mode → dont_ask' "$url/events")" || fail "no command_result mode → dont_ask: $events"
