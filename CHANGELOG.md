@@ -146,6 +146,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Cancelling a bench build on macOS reports the cancel.** Stopping a
+  process group whose leader had just exited raised `PermissionError` on
+  macOS, so a cancelled `metacodes bench` build (and the worker's and
+  WorkBuddy image build's stops) failed with that error instead of
+  「构建已取消」. An already exited group is now treated as stopped.
+
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and
   deleted the character under the cursor, at the prompt and in the box under a

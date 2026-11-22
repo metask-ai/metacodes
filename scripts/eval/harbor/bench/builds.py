@@ -260,7 +260,7 @@ def _run(argv, cancelled, name=None, input_text=None, cwd=None, quiet=False):
                 if name:
                     _docker("kill", name)
                 if hasattr(os, "killpg"):
-                    os.killpg(process.pid, signal.SIGKILL)
+                    executors.signal_group(process, signal.SIGKILL)
                 else:
                     process.kill()
                 process.wait()
@@ -552,7 +552,7 @@ def _stop(process):
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
         if hasattr(os, "killpg"):
-            os.killpg(process.pid, signal.SIGKILL)
+            executors.signal_group(process, signal.SIGKILL)
         else:
             process.kill()
         process.wait()

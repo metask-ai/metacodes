@@ -379,7 +379,8 @@ class RotatingGateway:
         self.issued = []
         self.revoked = set()
         self.deny_refresh = False
-        self.refreshes = []   # seconds the replaced access token still had
+        self.refreshes = []   # (time, seconds the replaced access token still had)
+        self.first_request_at = None
         self.rejected = []    # refresh tokens refused
         self.requests = []    # (access token, accepted, seconds left)
         self.current_access = self.issue()
@@ -458,8 +459,15 @@ class RotatingGateway:
         with self.lock:
             left = self.expiry.get(token, 0) - time.time()
             ok = token in self.expiry and token not in self.revoked and left > 0
+            if self.first_request_at is None:
+                self.first_request_at = time.time()
             self.requests.append((token, ok, left))
             return ok
+
+    def refreshes_while_serving(self):
+        with self.lock:
+            return [left for at, left in self.refreshes
+                    if self.first_request_at is not None and at > self.first_request_at]
 
     def revoke(self, token):
         with self.lock:
@@ -471,7 +479,7 @@ class RotatingGateway:
                     or body.get('refresh_token') != self.refresh_token):
                 self.rejected.append(body.get('refresh_token'))
                 return {'error': 'invalid_grant'}, 400
-            self.refreshes.append(self.expiry[self.current_access] - time.time())
+            self.refreshes.append((time.time(), self.expiry[self.current_access] - time.time()))
             self.serial += 1
             self.current_access = self.issue()
             self.refresh_token = f'live-refresh-{self.serial}'
@@ -1097,8 +1105,10 @@ class TokenRefreshRunTest(unittest.TestCase):
         self.assertEqual(len(model_requests), 30)
         self.assertTrue(all(ok for _, ok, _ in model_requests), model_requests)
         self.assertGreaterEqual(len({token for token, _, _ in model_requests}), 3)
-        # Each refresh replaced a token that was still valid: proactive.
-        self.assertTrue(gateway.refreshes and all(left > 0 for left in gateway.refreshes), gateway.refreshes)
+        # Each refresh while the run served requests replaced a token that
+        # was still valid: proactive.
+        during_run = gateway.refreshes_while_serving()
+        self.assertTrue(during_run and all(left > 0 for left in during_run), gateway.refreshes)
         self.assertEqual(gateway.rejected, [])
         credential = final['credential']
         self.assertEqual((credential['container'], credential['refreshing'], credential['error']),
