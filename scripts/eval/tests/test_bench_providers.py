@@ -28,7 +28,7 @@ from scripts.eval.harbor.bench.providers import Providers, echoed, normalize_bas
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, wait_run
+from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_batches_and_workers, wait_run
 
 KEY = 'imported-secret-key-1234'
 
@@ -482,6 +482,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
+        self.addCleanup(stop_batches_and_workers, self.manager)
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def test_imported_model_runs_with_only_a_placeholder_and_the_relay_sends_the_key(self):

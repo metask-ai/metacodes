@@ -26,3 +26,5 @@ vendor/quickjs/*.c linguist-generated
 vendor/quickjs/*.h linguist-generated
 
 sdk/rust/src/raw.rs text eol=lf
+
+CHANGELOG.md merge=union
