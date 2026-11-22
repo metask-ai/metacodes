@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -121,8 +122,12 @@ elif name == "docker":
     if args[:1] == ["run"] and "wget" in args:
         # A container fetching a URL (setup's egress probe): really fetched.
         import urllib.request
+        request = urllib.request.Request(args[-1])
+        container_env = dict(args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == "-e")
+        if "http_proxy" in container_env:
+            request.set_proxy(container_env["http_proxy"].split("://", 1)[-1], "http")
         try:
-            with urllib.request.urlopen(args[-1], timeout=10) as response:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10) as response:
                 sys.stdout.write(response.read().decode())
         except Exception as exc:
             print("wget: " + str(exc), file=sys.stderr)
@@ -251,6 +256,7 @@ SIMPLE = ("uname", "brew", "uv", "curl", "sudo", "docker", "colima", "ssh", "zig
 SYSTEM_TOOLS = ("sh", "env", "mkdir", "tar", "cp", "chmod", "rm", "mv", "mktemp", "touch", "cat", "python3",
                 "openssl", "grep", "sed", "ls", "id", "head", "tail", "dirname", "basename", "true", "false", "git",
                 "ln", "readlink", "bash")
+LOWEST_EPHEMERAL_PORT = 32768
 
 
 def release_fixture(root, version="9.9.9", corrupt=False):
@@ -1879,8 +1885,68 @@ class NetworkSetupTest(SetupFixture):
         os.symlink(self.templates / "docker", self.remote_bin / "docker")
         os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
 
+    def free_tunnel_ports(self):
+        chosen = []
+
+        def randrange(start, stop):
+            candidates = list(range(start, min(stop, LOWEST_EPHEMERAL_PORT)))
+            random.shuffle(candidates)
+            for port in candidates:
+                with socket.socket() as sock:
+                    try:
+                        sock.bind(("127.0.0.1", port))
+                    except OSError:
+                        continue
+                chosen.append(port)
+                return port
+            raise AssertionError(f"no free port in range({start}, {min(stop, LOWEST_EPHEMERAL_PORT)})")
+        patcher = patch.object(setup, "secrets", types.SimpleNamespace(
+            SystemRandom=lambda: types.SimpleNamespace(randrange=randrange)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return chosen
+
+    def local_external_probe(self):
+        from http.server import BaseHTTPRequestHandler
+        from urllib.parse import urlsplit
+        from scripts.eval.harbor.bench import egress
+        probe = types.SimpleNamespace(served=[], proxy_checked=[])
+
+        class Origin(BaseHTTPRequestHandler):
+            def do_GET(self):
+                probe.served.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        threading.Thread(target=origin.serve_forever, daemon=True).start()
+        self.addCleanup(origin.server_close)
+        self.addCleanup(origin.shutdown)
+        probe.port = origin.server_port
+        probe.path = urlsplit(setup.EGRESS_EXTERNAL_PROBE).path
+        probe.url = f"http://127.0.0.1:{probe.port}{probe.path}"
+        public_only = egress.allow_policy
+
+        def admitting_the_origin(networks=egress.DEFAULT_ALLOW_NETWORKS):
+            allowed = public_only(networks)
+
+            def allow(address):
+                probe.proxy_checked.append(address)
+                return address == "127.0.0.1" or allowed(address)
+            return allow
+        for patcher in (patch.object(setup, "EGRESS_EXTERNAL_PROBE", probe.url),
+                        patch.object(egress, "allow_policy", admitting_the_origin)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return probe
+
     def test_blocked_registries_propose_mirrors_and_one_click_applies_them(self):
-        self.add_ssh_executor(metrics_bind="127.0.0.1")
+        probe = self.local_external_probe()
+        tunnel_ports = self.free_tunnel_ports()
+        self.add_ssh_executor(metrics_bind="127.0.0.1", egress_ports=[443, 80, probe.port])
         self.remote_docker()
         os.symlink(self.templates / "uv", self.local_bin / "uv")
         blocked = self.closed_port_url()
@@ -1918,6 +1984,7 @@ class NetworkSetupTest(SetupFixture):
         egress_step = self.step(progress, "egress")
         self.assertEqual(egress_step["status"], "ok", egress_step)
         self.assertIn("ssh -R", egress_step["detail"])
+        self.assertIn(probe.url, egress_step["detail"])
         self.assertTrue(any("-R" in c[1] for c in self.calls("ssh")))
         self.assertTrue(any(c[1][:2] == ["network", "create"] for c in self.calls("docker", "remote")))
         self.assertTrue(any(c[1][:2] == ["network", "rm"] for c in self.calls("docker", "remote")))
@@ -1925,8 +1992,12 @@ class NetworkSetupTest(SetupFixture):
         # Idempotent: nothing more to write or reload.
         again = setup.run_setup(self.config, "relay-4090")
         self.assertEqual(self.step(again, "docker_mirrors")["status"], "ok")
+        self.assertEqual(self.step(again, "egress")["status"], "ok")
         self.assertEqual(len(self.calls("systemctl")), 1)
         self.assertFalse(any("restart" in json.dumps(c) for c in self.calls()))
+        forwarded = {int(c[1][c[1].index("-R") + 1].split(":")[1]) for c in self.calls("ssh") if "-R" in c[1]}
+        self.assertLessEqual(forwarded, set(tunnel_ports))
+        self.assertEqual((probe.served, probe.proxy_checked), ([probe.path] * 2, ["127.0.0.1"] * 2))
 
     def test_docker_mirrors_without_sudo_report_the_command_and_change_nothing(self):
         self.add_ssh_executor(docker_mirrors=["https://docker.m.daocloud.io"])
@@ -1943,6 +2014,7 @@ class NetworkSetupTest(SetupFixture):
         self.assertEqual(self.step(progress, "network")["status"], "ok")
 
     def test_workbench_egress_probe_failure_is_explained(self):
+        self.free_tunnel_ports()
         self.add_ssh_executor(metrics_bind="127.0.0.1", egress="workbench")
         self.remote_docker()
         # A container cannot fetch (no route in this fixture's fake docker).
@@ -1953,6 +2025,7 @@ class NetworkSetupTest(SetupFixture):
         step = self.step(progress, "egress")
         self.assertEqual(step["status"], "failed", step)
         self.assertIn("容器无法经执行机器的 Docker 网关", step["detail"])
+        self.assertIn("wget: timed out", step["detail"])
         self.assertIn("防火墙", step["detail"])
 
     def test_egress_config_is_validated(self):
