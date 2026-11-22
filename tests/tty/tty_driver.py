@@ -80,6 +80,10 @@ def wait_for(pattern, timeout=WAIT_S):
     return f"wait:{pattern}:{timeout}"
 
 
+def idle_footer(footer, timeout=WAIT_S):
+    return f"waitline:{footer}:{timeout}"
+
+
 # 空输入框已画出(灰色 placeholder,render_region.zig)⇒ 这一次 readLineRaw 已进 raw mode,
 # 此后打的字不会被 TCSAFLUSH 丢。不会被旧画面误命中:打字时框里是刚打的字,提交时
 # readLineRaw 擦掉旧框,新框画出来它才再出现。注意生成期的输入框也显示它:模型 turn 结束后
@@ -87,7 +91,7 @@ def wait_for(pattern, timeout=WAIT_S):
 READY = wait_for('Try "fix typecheck errors"')
 # 空闲输入框已画出:footer 整行等于空闲态文案——生成期同一行会多出 ` · esc to interrupt`。
 # 只对 bypassPermissions、没有 agent 的会话成立(footer 文案随 mode 和 agent 入口变)。
-IDLE = f"waitline:⏵⏵ bypass permissions on (shift+tab to cycle):{WAIT_S}"
+IDLE = idle_footer("⏵⏵ bypass permissions on (shift+tab to cycle)")
 
 
 def submit(command, rendered, timeout=WAIT_S):
