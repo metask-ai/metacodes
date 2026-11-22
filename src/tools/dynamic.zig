@@ -524,16 +524,21 @@ test "DynRegistry: a rolled-back batch is retired, not freed" {
 const LookupRace = struct {
     registry: *DynRegistry,
     stop: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(usize) = .init(0),
     found: std.atomic.Value(usize) = .init(0),
 
-    fn run(race: *LookupRace) void {
-        while (!race.stop.load(.acquire)) {
-            if (race.registry.find("mcp__stable__tool")) |entry| {
-                if (std.mem.eql(u8, entry.description, "stable")) _ = race.found.fetchAdd(1, .monotonic);
-            }
-            var index: usize = 0;
-            while (race.registry.entryAt(index)) |entry| : (index += 1) std.mem.doNotOptimizeAway(entry.name.len);
+    fn lookup(race: *LookupRace) void {
+        if (race.registry.find("mcp__stable__tool")) |entry| {
+            if (std.mem.eql(u8, entry.description, "stable")) _ = race.found.fetchAdd(1, .monotonic);
         }
+        var index: usize = 0;
+        while (race.registry.entryAt(index)) |entry| : (index += 1) std.mem.doNotOptimizeAway(entry.name.len);
+    }
+
+    fn run(race: *LookupRace) void {
+        race.lookup();
+        _ = race.started.fetchAdd(1, .release);
+        while (!race.stop.load(.acquire)) race.lookup();
     }
 };
 
@@ -544,6 +549,7 @@ test "DynRegistry: lookups on other threads stay valid while tools are registere
     var race = LookupRace{ .registry = &r };
     var threads: [3]std.Thread = undefined;
     for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, LookupRace.run, .{&race});
+    while (race.started.load(.acquire) < threads.len) std.Thread.yield() catch {};
     var round: usize = 0;
     var name_buf: [64]u8 = undefined;
     while (round < 200) : (round += 1) {
@@ -553,7 +559,7 @@ test "DynRegistry: lookups on other threads stay valid while tools are registere
     }
     race.stop.store(true, .release);
     for (threads) |thread| thread.join();
-    try testing.expect(race.found.load(.monotonic) > 0);
+    try testing.expect(race.found.load(.monotonic) >= threads.len);
     try testing.expect(r.find("mcp__stable__tool") != null);
 }
 
