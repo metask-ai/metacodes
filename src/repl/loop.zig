@@ -2021,6 +2021,8 @@ fn readLineRaw(
                     redraw(region, &editor, app);
                 }
                 if (openRouterTick(app, region)) redraw(region, &editor, app);
+                if (app.takeApiKeyCatalog()) redraw(region, &editor, app);
+                if (app.takeModelsRefresh()) redraw(region, &editor, app);
                 if (region.teamworkChanged()) redraw(region, &editor, app);
             }
             if (rc <= 0) {

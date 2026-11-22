@@ -490,11 +490,11 @@ test "L2 #579 API key list: a 204 is refused at once, not drained from a kept-al
     defer server.stop();
     var io_runtime = platform.signal.threadedIo(a, .{});
     defer io_runtime.deinit();
-    var catalog = cc.api_api_keys.Catalog.init(a);
-    defer catalog.deinit();
     var url_buf: [64]u8 = undefined;
+    const keys_url = try cc.api_api_keys.endpointForMessagesUrl(a, server.url(&url_buf, "/v1/messages"));
+    defer a.free(keys_url);
     const watch = Stopwatch.start();
-    try std.testing.expectError(error.HttpError, cc.api_api_keys.fetchInto(&catalog, a, io_runtime.io(), server.url(&url_buf, "/v1/messages"), "token-579"));
+    try std.testing.expectError(error.HttpError, cc.api_api_keys.fetchList(a, io_runtime.io(), keys_url, "token-579", cc.api_api_keys.LIST_TIMEOUT_MS));
     try expectPrompt(watch);
     try std.testing.expect(std.mem.startsWith(u8, server.requestAt(0).?, "GET /api/v1/keys?"));
     try server.expectClientClosed(0);

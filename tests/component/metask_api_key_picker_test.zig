@@ -173,6 +173,14 @@ fn currentModel(app: *App) ?[]const u8 {
 
 /// Send one turn on whatever route the session is on and return what reached
 /// the gateway.
+fn waitUntil(app: *App, comptime done: fn (*App) bool) !void {
+    var waited_ms: u32 = 0;
+    while (!done(app)) : (waited_ms += 5) {
+        if (waited_ms > 20_000) return error.WaitTimedOut;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+}
+
 fn sendOneTurn(app: *App, server: *harness.MockServer) !harness.CapturedRequest {
     const empty: []const cc.types_mod.ApiMessage = &.{};
     var response = try app.api_client.sendMessageStream(empty, null, null);
@@ -321,14 +329,17 @@ test "L2 metask api-key route: a /models key switch replaces the inventory and i
     var buffer: [64][]const u8 = undefined;
     try std.testing.expect(containsModel(try metaskOffers(app, &buffer), "kimi-k3"));
 
-    // Opening the `/models` key menu loads the account's keys.
+    // Opening the `/models` key menu loads the account's keys, off the input thread.
     app.ensureApiKeyCatalog();
+    try std.testing.expect(app.apiKeyCatalogLoading());
+    try waitUntil(app, App.takeApiKeyCatalog);
     var dev_index: ?usize = null;
     for (app.api_key_catalog.entries.items, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.secret, KEY_DEV)) dev_index = index;
     }
     // The host already exists, so the re-probe has to reach it directly.
     try app.selectApiKeyForModels(dev_index.?);
+    try waitUntil(app, App.takeModelsRefresh);
     try std.testing.expect(std.mem.startsWith(u8, requestLine(server.requestAt(1).?), "GET /api/v1/keys?"));
     try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(2).?));
     try std.testing.expectEqualStrings("Bearer " ++ KEY_DEV, headerValue(server.requestAt(2).?, "authorization").?);
@@ -464,4 +475,139 @@ test "L2 metask api-key route: a --base-url session with no gateway answer marks
     var buffer: [64][]const u8 = undefined;
     try std.testing.expect(containsModel(try metaskOffers(app, &buffer), "claude-sonnet-4-6"));
     try std.testing.expect(currentModel(app) == null);
+}
+
+test "L2 metask api-key route: a cold start waits for a /v1/models that never answers only for the startup wait" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const bodies = [_][]const u8{GATEWAY_MODELS};
+    var server = try harness.MockServer.startCassetteSilentFrom(&bodies, 0);
+    defer server.stop();
+    const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const started = cc.util_time.nowMs();
+    const app = try App.initWithOptions(std.testing.allocator, io_runtime.io(), config, SESSION_KEY, .{ .models_cache = true });
+    defer app.deinit();
+    const waited = cc.util_time.nowMs() - started;
+
+    try std.testing.expect(waited >= cc.models_cache.STARTUP_WAIT_MS - 100);
+    try std.testing.expect(waited < cc.models_cache.STARTUP_WAIT_MS + 3_000);
+    try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(0).?));
+    try std.testing.expect(app.modelsRefreshRunning());
+    try std.testing.expectEqual(@as(usize, 0), app.api_client.catalog.entries.items.len);
+}
+
+test "L2 metask api-key route: opening the key menu returns at once while the account key list never answers" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const bodies = [_][]const u8{ GATEWAY_MODELS, KEYS_BODY };
+    var server = try harness.MockServer.startCassetteSilentFrom(&bodies, 1);
+    defer server.stop();
+    const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+    const origin = cc.app_module.MetaskKeyRoute.gatewayOriginOf(messages_url).?;
+    const keys_url = try allocator.dupeZ(u8, try std.fmt.allocPrint(allocator, "{s}/api/v1/keys?page=1&page_size=100", .{origin}));
+    try case.setEnv("METACODE_API_KEYS_URL", keys_url.ptr);
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    const started = cc.util_time.nowMs();
+    app.ensureApiKeyCatalog();
+    try std.testing.expect(cc.util_time.nowMs() - started < 1_000);
+    try std.testing.expect(app.apiKeyCatalogLoading());
+    try waitForRequests(server, 2);
+    try std.testing.expect(std.mem.startsWith(u8, requestLine(server.requestAt(1).?), "GET /api/v1/keys?"));
+    try std.testing.expect(!app.takeApiKeyCatalog());
+    try std.testing.expect(app.apiKeyCatalogLoading());
+    try std.testing.expectEqual(@as(usize, 0), app.api_key_catalog.entries.items.len);
+}
+
+test "L2 metask api-key route: a key pick returns at once while that key's /v1/models never answers" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const bodies = [_][]const u8{ GATEWAY_MODELS, KEYS_BODY, DEV_MODELS };
+    var server = try harness.MockServer.startCassetteSilentFrom(&bodies, 2);
+    defer server.stop();
+    const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+    const origin = cc.app_module.MetaskKeyRoute.gatewayOriginOf(messages_url).?;
+    const keys_url = try allocator.dupeZ(u8, try std.fmt.allocPrint(allocator, "{s}/api/v1/keys?page=1&page_size=100", .{origin}));
+    try case.setEnv("METACODE_API_KEYS_URL", keys_url.ptr);
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+    app.ensureApiKeyCatalog();
+    try waitUntil(app, App.takeApiKeyCatalog);
+
+    const started = cc.util_time.nowMs();
+    try app.selectApiKeyForModels(1);
+    try std.testing.expect(cc.util_time.nowMs() - started < 1_000);
+    try std.testing.expect(app.modelsRefreshRunning());
+    try waitForRequests(server, 3);
+    try std.testing.expectEqualStrings("Bearer " ++ KEY_DEV, headerValue(server.requestAt(2).?, "authorization").?);
+    try std.testing.expect(!app.takeModelsRefresh());
+}
+
+test "L2 catalog transports: a server that accepts and never answers ends each GET at its deadline" {
+    var server = try harness.MockServer.startCassetteSilentFrom(&.{ GATEWAY_MODELS, GATEWAY_MODELS, KEYS_BODY }, 0);
+    defer server.stop();
+    const allocator = std.testing.allocator;
+    const messages_url = try server.urlOwned(allocator);
+    defer allocator.free(messages_url);
+    const origin = cc.app_module.MetaskKeyRoute.gatewayOriginOf(messages_url).?;
+    const models_url = try std.fmt.allocPrint(allocator, "{s}/v1/models", .{origin});
+    defer allocator.free(models_url);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+    const limit_ms: u32 = 300;
+
+    var started = cc.util_time.nowMs();
+    try std.testing.expectError(error.TimedOut, cc.api_catalog_fetch.fetchAnswer(allocator, io, .{ .url = models_url, .bearer = SESSION_KEY, .timeout_ms = limit_ms }));
+    try expectEndedNear(started, limit_ms);
+
+    var http_client = std.http.Client{ .allocator = allocator, .io = io };
+    defer http_client.deinit();
+    var status: u16 = 0;
+    started = cc.util_time.nowMs();
+    try std.testing.expectError(error.TimedOut, cc.client_mod.getModelsList(allocator, &http_client, messages_url, .{ .header = .{ .name = "authorization", .value = "Bearer " ++ SESSION_KEY } }, &status, limit_ms));
+    try expectEndedNear(started, limit_ms);
+
+    started = cc.util_time.nowMs();
+    try std.testing.expectError(error.TimedOut, cc.api_api_keys.fetchList(allocator, io, models_url, SESSION_KEY, limit_ms));
+    try expectEndedNear(started, limit_ms);
+}
+
+fn expectEndedNear(started: i64, limit_ms: u32) !void {
+    const waited = cc.util_time.nowMs() - started;
+    try std.testing.expect(waited >= limit_ms - 50);
+    try std.testing.expect(waited < limit_ms + 3_000);
+}
+
+fn waitForRequests(server: *harness.MockServer, count: usize) !void {
+    var waited_ms: u32 = 0;
+    while (server.requestAt(count - 1) == null) : (waited_ms += 5) {
+        if (waited_ms > 10_000) return error.WaitTimedOut;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
 }

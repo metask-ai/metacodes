@@ -1263,11 +1263,20 @@ pub const RenderRegion = struct {
         w.print("  {s}API keys for this account{s}", .{ th.accent, th.reset }) catch {};
         if (entries.len > 0) {
             w.print(" {s}({d}){s}", .{ th.dim, entries.len, th.reset }) catch {};
+        } else if (app.apiKeyCatalogLoading()) {
+            w.print(" {s}(loading){s}", .{ th.dim, th.reset }) catch {};
         } else {
             w.print(" {s}(unavailable){s}", .{ th.dim, th.reset }) catch {};
         }
         w.writeAll("\r\n") catch {};
         rows += 1;
+
+        if (entries.len == 0 and app.apiKeyCatalogLoading()) {
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}asking the account for its keys · esc closes{s}", .{ th.dim, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            return rows + 1;
+        }
 
         if (entries.len == 0) {
             w.writeAll(ansi.clear.line) catch {};
@@ -1325,6 +1334,8 @@ pub const RenderRegion = struct {
         w.print("  {s}{s}{s}", .{ th.accent, title, th.reset }) catch {};
         if (entries.len > 0) {
             w.print(" {s}({d}){s}", .{ th.dim, entries.len, th.reset }) catch {};
+        } else if (app.modelsRefreshRunning()) {
+            w.print(" {s}(loading){s}", .{ th.dim, th.reset }) catch {};
         } else {
             w.print(" {s}(unavailable){s}", .{ th.dim, th.reset }) catch {};
         }

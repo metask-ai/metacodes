@@ -273,7 +273,9 @@ Set `METACODES_NO_STARTUP_ANIMATION` (to any value, even
 shows where the state root is), to start straight at the prompt. The TUI keeps
 the model route's `/v1/models` answer in `<state root>/cache/models/` for a
 day, so a start does not wait for it; it is refreshed in the background, and
-the directory can be deleted at any time.
+the directory can be deleted at any time. Without a kept answer a start waits
+for the gateway at most 5 s, then opens on the built-in model table and takes
+the answer when it comes.
 
 Leaving a session that has run a turn prints the command that reopens it,
 `metacodes --resume <id>`; inside the TUI, `/resume` lists this directory's
