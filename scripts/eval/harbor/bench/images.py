@@ -1,4 +1,4 @@
-"""`metacodes bench pull`: pull a suite's task images onto an executor before a run."""
+"""`metacodes bench pull`: pull or build a suite's task images on an executor before a run."""
 from __future__ import annotations
 
 import re
@@ -18,6 +18,9 @@ PULL_ATTEMPTS = 3
 PULL_BACKOFF = (10, 30)
 PULL_TIMEOUT = 3600
 INSPECT_TIMEOUT = 60
+BUILD_TAG = "metacodes-prebuild-"
+BUILD_COMPOSE = ("services:\n  main:\n    build:\n      context: ${CONTEXT_DIR}\n"
+                 "    image: ${MAIN_IMAGE_NAME}\n    pull_policy: build\n")
 
 
 def suite_dataset(suite: suites.Suite, ctx: suites.Context, cache_root: Path, harbor: Optional[str],
@@ -44,14 +47,20 @@ def task_image(task_dir: Path) -> Optional[str]:
 
 def images_of(dataset: Path, tasks: Sequence[str]):
     images: Dict[str, List[str]] = {}
-    built: List[str] = []
+    builds: Dict[str, Dict] = {}
     for task in tasks:
         image = task_image(dataset / task)
         if image:
             images.setdefault(image, []).append(task)
-        else:
-            built.append(task)
-    return images, built
+            continue
+        environment = dataset / task / "environment"
+        names = executors.tree_files(environment)
+        if not names:
+            raise ValueError(f"{task} 既没有 docker_image，也没有 environment 目录")
+        digest = executors.tree_digest(environment, names)
+        build = builds.setdefault(digest, {"environment": environment, "names": names, "tasks": []})
+        build["tasks"].append(task)
+    return images, builds
 
 
 def docker(executor: Executor, script: str, runner, timeout: int):
@@ -87,26 +96,57 @@ def pull_one(executor: Executor, image: str, *, check_only: bool, runner, log, s
     return {"status": "failed", "attempts": PULL_ATTEMPTS, "error": error}
 
 
+def build_one(executor: Executor, digest: str, build: Dict, *, check_only: bool, runner, log, sleep, ship) -> Dict:
+    q = shlex.quote
+    tag = BUILD_TAG + digest
+    if check_only:
+        present, _ = docker(executor, f"docker image inspect {q(tag)} >/dev/null 2>&1", runner, INSPECT_TIMEOUT)
+        return {"status": "present" if present else "missing"}
+    context = str(build["environment"])
+    if isinstance(executor, executors.SshExecutor):
+        context = executor.remote("prebuild", digest)
+        ship(executor, build["environment"], build["names"], context, log=log)
+    task_compose = ' -f "$ctx/docker-compose.yaml"' if "docker-compose.yaml" in build["names"] else ""
+    script = (f'ctx=$(cd {q(context)} && pwd) || exit 1; f=$(mktemp) || exit 1; printf %s {q(BUILD_COMPOSE)} > "$f"; '
+              f'CONTEXT_DIR="$ctx" MAIN_IMAGE_NAME={q(tag)} docker compose -p {q(tag)} --project-directory "$ctx" '
+              f'-f "$f"{task_compose} build; rc=$?; rm -f "$f"; exit $rc')
+    error = ""
+    for attempt in range(1, PULL_ATTEMPTS + 1):
+        log(f"构建 {build['tasks'][0]} 的环境" + (f"（第 {attempt} 次）" if attempt > 1 else ""))
+        ok, error = docker(executor, script, runner, PULL_TIMEOUT)
+        if ok:
+            return {"status": "built", "attempts": attempt}
+        if attempt < PULL_ATTEMPTS:
+            sleep(PULL_BACKOFF[attempt - 1])
+    return {"status": "failed", "attempts": PULL_ATTEMPTS, "error": error}
+
+
 def prepull(cfg: Dict, root: Path, suite_id: str, tasks: Sequence[str], executor_name: Optional[str], *,
             check_only=False, runner=subprocess.run, log: Callable[[str], None] = print,
-            sleep: Optional[Callable[[float], None]] = None) -> Dict:
+            sleep: Optional[Callable[[float], None]] = None, ship=None) -> Dict:
     suite = suites.resolved(suites.get(suite_id))
     ctx = suites.Context(cfg, root)
     executor = executors.find(cfg, executor_name)
     dataset = suite_dataset(suite, ctx, root / "registry-cache", executors.workbench_harbor(cfg), log)
     chosen = suites.validate_tasks(suite, ctx, list(tasks)) if tasks else suites.task_ids(suite, ctx)
-    images, built = images_of(dataset, chosen)
-    if images:
+    images, builds = images_of(dataset, chosen)
+    if images or builds:
         ready, error = docker(executor, "docker info >/dev/null", runner, INSPECT_TIMEOUT)
         if not ready:
             raise ValueError(f"执行机器 {executor.name} 的 Docker 不可用：{error or '无输出'}")
+    sleep = sleep or time.sleep
     rows = []
     for image, users in sorted(images.items()):
-        result = pull_one(executor, image, check_only=check_only, runner=runner, log=log, sleep=sleep or time.sleep)
+        result = pull_one(executor, image, check_only=check_only, runner=runner, log=log, sleep=sleep)
         log(f"{image}：{result['status']}" + (f"（{result['error']}）" if result.get("error") else ""))
-        rows.append({"image": image, "tasks": users, **result})
+        rows.append({"kind": "pull", "image": image, "tasks": users, **result})
+    for digest, build in sorted(builds.items()):
+        result = build_one(executor, digest, build, check_only=check_only, runner=runner, log=log, sleep=sleep,
+                           ship=ship or executors.ship)
+        log(f"{BUILD_TAG + digest}：{result['status']}" + (f"（{result['error']}）" if result.get("error") else ""))
+        rows.append({"kind": "build", "image": BUILD_TAG + digest, "tasks": build["tasks"], **result})
     counts: Dict[str, int] = {}
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     return {"suite": suite.id, "executor": executor.name, "check_only": check_only, "images": rows,
-            "built": built, "counts": counts}
+            "counts": counts}
