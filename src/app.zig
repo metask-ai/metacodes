@@ -145,12 +145,17 @@ const TaskStore = @import("core/task_store.zig").TaskStore;
 const system_prompt_mod = @import("core/system_prompt.zig");
 const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
 const skill_tool_mod = @import("skills/tool.zig");
+const SKILL_TOOL_NAME = @import("skills/runtime/model_tool.zig").TOOL_NAME;
 const skill_cli_adapter = @import("skills/cli_adapter.zig");
 const skill_overrides_mod = @import("skills/overrides.zig");
 const plugin_mod = @import("plugin/root.zig");
 const path_util = @import("util/path.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
 const mcp_startup = @import("app/mcp_startup.zig");
+const mcp_hotplug = @import("app/mcp_hotplug.zig");
+const mcp_config_mod = @import("mcp/config.zig");
+const tool_changes_mod = @import("core/tool_changes.zig");
+const util_time_mod = @import("util/time.zig");
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 const AgentSet = @import("agents/set.zig").AgentSet;
@@ -590,10 +595,11 @@ pub const App = struct {
     /// freed before `deinit`, so this is the only window.
     route_mutex: sync.Mutex = .{},
     /// Built once, after every MCP server has reported (`publishMcpServers`:
-    /// in `init`, or at the interactive REPL's first join point), and kept for
-    /// the whole session, so the slices, the dynamic descriptions
-    /// (`describe_fn`, env overrides) and `enabled_tool_names` live in
-    /// `tool_defs_arena`, released in `deinit`. A description may also be a
+    /// in `init`, or at the interactive REPL's first join point). An MCP
+    /// change during the session publishes a new slice beside it
+    /// (`publishToolGeneration`) and frees nothing, so the slices, the dynamic
+    /// descriptions (`describe_fn`, env overrides) and `enabled_tool_names`
+    /// live in `tool_defs_arena`, released in `deinit`. A description may also be a
     /// static string, so the defs are never freed one by one. Empty while
     /// `tool_surface` is not `.ready`.
     tool_defs: []json_mod.ToolDefinition,
@@ -748,6 +754,25 @@ pub const App = struct {
     mcp_arena: ?*std.heap.ArenaAllocator = null,
     /// MCP startup progress for renderers on any thread (counters only).
     mcp_status: mcp_startup.Status = .{},
+    mcp_watch: ?mcp_hotplug.Watch = null,
+    mcp_watch_dirty: bool = false,
+    mcp_reload_ms: i64 = 0,
+    mcp_known: std.StringHashMapUnmanaged(u64) = .empty,
+    mcp_known_mutex: sync.Mutex = .{},
+    mcp_logins_tried: std.StringHashMapUnmanaged(mcp_hotplug.Observation) = .empty,
+    mcp_reload_blocked: bool = false,
+    mcp_bad_sources: std.ArrayList([]const u8) = .empty,
+    mcp_hot: ?*mcp_startup.Startup = null,
+    mcp_hot_arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+    mcp_events: std.ArrayList([]u8) = .empty,
+    mcp_retired: std.ArrayList(McpSessionEntry) = .empty,
+    mcp_session_configs: std.StringHashMapUnmanaged(mcp_config_mod.Server) = .empty,
+    mcp_relists: std.ArrayList(*McpRelist) = .empty,
+    skills_current: ?*SkillSet = null,
+    skills_generations: std.ArrayList(*SkillSet) = .empty,
+    skill_watch: ?mcp_hotplug.Watch = null,
+    skill_reload_ms: i64 = 0,
+    skill_changed: std.ArrayList([]u8) = .empty,
     /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
     /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
     active_skill: ?ActiveSkillState = null,
@@ -1037,6 +1062,7 @@ pub const App = struct {
                 @import("util/log.zig").warn("skill", "register Skill tool failed: {s}", .{@errorName(err)});
             };
         }
+        app.adoptSkillWatch();
 
         // Process tools enter the CLI through its canonical typed dynamic
         // registry. Definitions borrow the immutable snapshot (destroyed only
@@ -2366,20 +2392,51 @@ pub const App = struct {
         }
         app.skill_runtime.deinit();
         app.skills.deinit();
+        for (app.skills_generations.items) |set| {
+            set.deinit();
+            app.allocator.destroy(set);
+        }
+        app.skills_generations.deinit(app.allocator);
+        if (app.skill_watch) |*watch| watch.deinit();
+        app.clearSkillChanged();
+        app.skill_changed.deinit(app.allocator);
         app.skill_overrides.deinit();
         app.read_state.deinit();
         app.edit_hl_cache.deinit();
         if (app.lsp_service) |svc| svc.shutdown(); // 关所有 language server + reaper 线程
         app.tasks.deinit();
         app.goal_state.deinit();
-        // MCP：先 session（释放 binding 内存）再 client（关 transport + reap 子进程）
-        for (app.mcp_sessions.items) |*entry| {
-            entry.session.deinit();
-            entry.client.close();
-            app.allocator.destroy(entry.client);
-            app.allocator.free(entry.name);
+        if (app.mcp_hot) |startup| {
+            startup.cancelAndJoin();
+            app.mcp_hot = null;
         }
-        app.mcp_sessions.deinit(app.allocator);
+        for (app.mcp_relists.items) |relist| {
+            relist.cancel.abort(.user_interrupt);
+            relist.destroy();
+        }
+        app.mcp_relists.deinit(app.allocator);
+        app.mcp_session_configs.deinit(app.allocator);
+        // MCP：先 session（释放 binding 内存）再 client（关 transport + reap 子进程）
+        for ([_]*std.ArrayList(McpSessionEntry){ &app.mcp_sessions, &app.mcp_retired }) |list| {
+            for (list.items) |*entry| {
+                entry.session.deinit();
+                entry.client.close();
+                app.allocator.destroy(entry.client);
+                app.allocator.free(entry.name);
+            }
+            list.deinit(app.allocator);
+        }
+        if (app.mcp_watch) |*watch| watch.deinit();
+        app.mcp_watch = null;
+        freeStringKeys(app.allocator, &app.mcp_known);
+        {
+            var it = app.mcp_logins_tried.keyIterator();
+            while (it.next()) |key| app.allocator.free(key.*);
+            app.mcp_logins_tried.deinit(app.allocator);
+        }
+        freeStringList(app.allocator, &app.mcp_bad_sources);
+        app.clearMcpEvents();
+        app.mcp_events.deinit(app.allocator);
         if (app.mcp_arena) |arena_state| {
             app.mcp_report = .{};
             app.mcp_unavailable = &.{};
@@ -2387,6 +2444,11 @@ pub const App = struct {
             app.allocator.destroy(arena_state);
             app.mcp_arena = null;
         }
+        for (app.mcp_hot_arenas.items) |arena_state| {
+            arena_state.deinit();
+            app.allocator.destroy(arena_state);
+        }
+        app.mcp_hot_arenas.deinit(app.allocator);
         app.dyn_registry.deinit();
         {
             var it = app.activated_tools.keyIterator();
@@ -5286,7 +5348,7 @@ pub const App = struct {
     pub fn configProblems(app: *const App) ConfigProblems {
         var problems = ConfigProblems{};
         if (app.hook_diagnostics) |*diag| problems.hooks = diag.items().len;
-        if (app.skill_runtime.snapshot) |snapshot| {
+        if (app.skill_runtime.currentSnapshot()) |snapshot| {
             problems.skills = snapshot.issues.len + snapshot.skipped_sources.len;
             for (snapshot.skills) |record| problems.skills += @intFromBool(record.definition.hasDefinitionProblem());
         }
@@ -5586,10 +5648,12 @@ pub const App = struct {
     /// Every MCP server has reported, so `publishMcpServers` will not block
     /// (the workers may still be exiting). True when nothing is connecting.
     pub fn mcpStartupSettled(app: *const App) bool {
-        return switch (app.tool_surface) {
+        const initial = switch (app.tool_surface) {
             .connecting => |startup| startup.settled(),
             .ready, .unbuilt => true,
         };
+        const hot = if (app.mcp_hot) |startup| startup.settled() else true;
+        return initial and hot;
     }
 
     /// The servers still starting, for `/mcp` while they connect (null when
@@ -5610,11 +5674,14 @@ pub const App = struct {
     /// responsive wait for `mcpStartupSettled` first.
     pub fn publishMcpServers(app: *App) !void {
         switch (app.tool_surface) {
-            .ready => return,
+            .ready => return app.publishHotMcp(),
             .connecting => |startup| {
                 startup.join();
                 app.tool_surface = .unbuilt;
                 app.registerMcpOutcomes(startup);
+                app.adoptMcpConfiguration(startup.sources, startup.servers, startup.problems) catch |err| {
+                    @import("util/log.zig").warn("mcp", "configuration changes during this session will not be picked up: {s}", .{@errorName(err)});
+                };
             },
             .unbuilt => {},
         }
@@ -5637,85 +5704,682 @@ pub const App = struct {
 
     pub fn beginMcpReconnect(app: *App, target: McpReconnectTarget) McpReconnectError!McpReconnectStart {
         if (app.config.mcp_connect == .disabled) return error.McpDisabled;
-        if (app.tool_surface == .connecting) return error.McpStartupInProgress;
-        if (app.backgroundAgentsRunning()) return error.BackgroundAgentsRunning;
-        const arena_state = app.mcp_arena orelse blk: {
-            const created = try app.allocator.create(std.heap.ArenaAllocator);
+        if (app.tool_surface == .connecting or app.mcp_hot != null) return error.McpStartupInProgress;
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const environment = try mcp_config_mod.Environment.fromProcess(sa);
+        const resolved = try mcp_config_mod.load(sa, mcp_startup.Startup.loadInputs(app.mcpStartupInputs(), environment));
+        var selected: std.ArrayList(mcp_config_mod.Server) = .empty;
+        switch (target) {
+            .server => |name| {
+                for (resolved.servers) |server| {
+                    if (std.mem.eql(u8, server.name, name)) try selected.append(sa, server);
+                }
+                if (selected.items.len == 0) {
+                    for (resolved.pending) |pending| if (std.mem.eql(u8, pending.name, name))
+                        return .{ .not_configured = if (pending.reason == .needs_approval) .awaiting_approval else .rejected };
+                    for (resolved.disabled) |disabled| if (std.mem.eql(u8, disabled, name))
+                        return .{ .not_configured = .disabled };
+                    return .{ .not_configured = .unknown };
+                }
+            },
+            .unconnected => for (resolved.servers) |server| {
+                if (!app.mcpServerConnected(server.name)) try selected.append(sa, server);
+            },
+        }
+        try app.applyMcpConfiguration(resolved, selected.items);
+        if (app.mcp_hot == null or selected.items.len == 0) return .all_connected;
+        const names = try app.mcpArena().alloc([]const u8, selected.items.len);
+        for (selected.items, names) |server, *name| name.* = try app.mcpArena().dupe(u8, server.name);
+        return .{ .connecting = names };
+    }
+
+    pub fn cancelMcpReconnect(app: *App) !void {
+        const startup = app.mcp_hot orelse return;
+        startup.cancelAndJoin();
+        try app.publishHotMcp();
+    }
+
+    fn mcpArena(app: *App) std.mem.Allocator {
+        if (app.mcp_arena == null) {
+            const created = app.allocator.create(std.heap.ArenaAllocator) catch @panic("OOM");
             created.* = std.heap.ArenaAllocator.init(app.allocator);
             app.mcp_arena = created;
-            break :blk created;
-        };
-        const a = arena_state.allocator();
-        const select: mcp_startup.Select = switch (target) {
-            .server => |name| .{ .one = try a.dupe(u8, name) },
-            .unconnected => blk: {
-                const connected = try a.alloc([]const u8, app.mcp_sessions.items.len);
-                for (app.mcp_sessions.items, connected) |entry, *name| name.* = try a.dupe(u8, entry.name);
-                break :blk .{ .all_except = connected };
-            },
-        };
-        const startup = try mcp_startup.Startup.prepare(a, &app.mcp_status, .{
+        }
+        return app.mcp_arena.?.allocator();
+    }
+
+    fn mcpStartupInputs(app: *const App) mcp_startup.Startup.Inputs {
+        return .{
             .io = app.io,
             .state_root = app.stateRoot(),
             .home = app.homeDir(),
             .cwd = app.cwdAbs(),
             .workspace_root = app.project_dir_or_empty(),
             .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
-            .select = select,
-        });
-        if (startup.connecting == 0) switch (target) {
-            .server => |name| {
-                for (startup.pending) |pending| if (std.mem.eql(u8, pending.name, name))
-                    return .{ .not_configured = if (pending.reason == .needs_approval) .awaiting_approval else .rejected };
-                for (startup.disabled) |disabled| if (std.mem.eql(u8, disabled, name))
-                    return .{ .not_configured = .disabled };
-                return .{ .not_configured = .unknown };
-            },
-            .unconnected => {
-                app.registerMcpOutcomes(startup);
-                return .all_connected;
-            },
         };
-        if (target == .server) app.disconnectMcpServer(target.server);
-        const names = try a.alloc([]const u8, startup.connecting);
-        var named: usize = 0;
-        for (startup.jobs) |*job| if (job.result != .kept) {
-            names[named] = job.server.name;
-            named += 1;
-        };
-        app.tool_defs = &.{};
-        app.enabled_tool_names = &.{};
-        app.mcp_status.reset();
-        startup.start();
-        app.tool_surface = .{ .connecting = startup };
-        return .{ .connecting = names };
     }
 
-    pub fn cancelMcpReconnect(app: *App) !void {
-        switch (app.tool_surface) {
-            .connecting => |startup| startup.cancelAndJoin(),
-            .ready, .unbuilt => return,
+    fn mcpServerConnected(app: *const App, name: []const u8) bool {
+        for (app.mcp_sessions.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return true;
         }
-        try app.publishMcpServers();
-    }
-
-    fn backgroundAgentsRunning(app: *App) bool {
-        if (app.agent_jobs) |*jobs| if (jobs.runningCount() != 0) return true;
-        if (app.swarm.teammates) |*teammates| if (teammates.liveCount() != 0) return true;
         return false;
     }
 
-    fn disconnectMcpServer(app: *App, name: []const u8) void {
-        for (app.mcp_sessions.items, 0..) |*entry, index| {
+    fn retireMcpServer(app: *App, name: []const u8) void {
+        _ = app.dyn_registry.retireMcpServer(name);
+        _ = app.mcp_session_configs.remove(name);
+        for (app.mcp_sessions.items, 0..) |entry, index| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
-            app.dyn_registry.removeMcpServer(entry.name);
-            entry.session.deinit();
-            entry.client.close();
-            app.allocator.destroy(entry.client);
-            app.allocator.free(entry.name);
+            entry.client.retireShared();
+            app.mcp_retired.append(app.allocator, entry) catch return;
             _ = app.mcp_sessions.orderedRemove(index);
             return;
         }
+    }
+
+    pub fn toolChangesHook(app: *App) ?tool_changes_mod.Hook {
+        if (app.config.mcp_connect == .disabled) return null;
+        return .{ .ctx = app, .refresh_fn = refreshToolChanges };
+    }
+
+    fn refreshToolChanges(raw: *anyopaque, allocator: std.mem.Allocator, abort: ?*const AbortSignal) tool_changes_mod.Refresh {
+        const app: *App = @ptrCast(@alignCast(raw));
+        if (!app.toolSurfaceReady()) return .{};
+        const defs_before = app.tool_defs;
+        const unavailable_before = app.mcp_unavailable;
+        const skills_before = app.currentSkills();
+        app.pollSkillChanges();
+        app.pollMcpChanges(abort);
+        var changed: std.ArrayList([]const u8) = .empty;
+        for (app.skill_changed.items) |name| {
+            const copy = allocator.dupe(u8, name) catch break;
+            changed.append(allocator, copy) catch {
+                allocator.free(copy);
+                break;
+            };
+        }
+        app.clearSkillChanged();
+        var events: std.ArrayList([]const u8) = .empty;
+        for (app.mcp_events.items) |line| {
+            const copy = allocator.dupe(u8, line) catch break;
+            events.append(allocator, copy) catch {
+                allocator.free(copy);
+                break;
+            };
+        }
+        app.clearMcpEvents();
+        return .{
+            .tool_defs = if (app.tool_defs.ptr != defs_before.ptr or app.tool_defs.len != defs_before.len) app.tool_defs else null,
+            .unavailable = if (app.mcp_unavailable.ptr != unavailable_before.ptr) app.mcp_unavailable else null,
+            .events = events.toOwnedSlice(allocator) catch blk: {
+                for (events.items) |line| allocator.free(line);
+                events.deinit(allocator);
+                break :blk &.{};
+            },
+            .skills = if (app.currentSkills() != skills_before) app.currentSkills() else null,
+            .changed_skills = changed.toOwnedSlice(allocator) catch blk: {
+                for (changed.items) |name| allocator.free(name);
+                changed.deinit(allocator);
+                break :blk &.{};
+            },
+        };
+    }
+
+    pub fn currentSkills(app: *const App) *const SkillSet {
+        return app.skills_current orelse &app.skills;
+    }
+
+    fn clearSkillChanged(app: *App) void {
+        for (app.skill_changed.items) |name| app.allocator.free(name);
+        app.skill_changed.clearRetainingCapacity();
+    }
+
+    fn adoptSkillWatch(app: *App) void {
+        const paths = app.skill_runtime.watchPaths(app.allocator) catch return;
+        defer {
+            for (paths) |path| app.allocator.free(path);
+            app.allocator.free(paths);
+        }
+        const watch = mcp_hotplug.Watch.init(app.allocator, paths) catch return;
+        if (app.skill_watch) |*old| old.deinit();
+        app.skill_watch = watch;
+    }
+
+    fn pollSkillChanges(app: *App) void {
+        const watch = if (app.skill_watch) |*watch| watch else return;
+        const now = util_time_mod.nowMs();
+        if (now - app.skill_reload_ms < MCP_RELOAD_INTERVAL_MS) return;
+        if (!watch.changed()) return;
+        app.skill_reload_ms = now;
+        app.reloadSkills() catch |err| @import("util/log.zig").warn("skill", "Skills could not be read again: {s}", .{@errorName(err)});
+    }
+
+    fn reloadSkills(app: *App) !void {
+        const cwd = app.cwd_abs orelse return;
+        const next = try app.allocator.create(SkillSet);
+        next.* = SkillSet.init(app.allocator);
+        var adopted = false;
+        defer if (!adopted) {
+            next.deinit();
+            app.allocator.destroy(next);
+        };
+        next.overrides = &app.skill_overrides;
+        try app.skills_generations.ensureUnusedCapacity(app.allocator, 1);
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const add_dirs = cliAddDirs(scratch.allocator(), app.config.add_dirs, cwd) catch &.{};
+        try app.skill_runtime.reloadDefaultWithExtraSources(
+            cwd,
+            @import("platform").paths.homeDir() orelse "",
+            app.stateRoot(),
+            add_dirs,
+            if (app.plugin_snapshot != null) "plugin-generation-1" else "",
+            if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{},
+            next,
+        );
+        const previous = app.currentSkills();
+        for (next.skills.items) |skill| {
+            const before = previous.find(skill.name) orelse continue;
+            if (std.mem.eql(u8, before.description, skill.description) and std.mem.eql(u8, before.when_to_use, skill.when_to_use)) {
+                const old_record = app.skill_runtime.findRetiredRecord(skill.name);
+                const new_record = app.skill_runtime.findRecord(skill.name);
+                if (old_record != null and new_record != null and std.mem.eql(u8, &old_record.?.content_revision, &new_record.?.content_revision)) continue;
+            }
+            const name = try app.allocator.dupe(u8, skill.name);
+            app.skill_changed.append(app.allocator, name) catch app.allocator.free(name);
+        }
+        app.skills_generations.appendAssumeCapacity(next);
+        adopted = true;
+        app.skills_current = next;
+        app.adoptSkillWatch();
+        if (app.dyn_registry.find(SKILL_TOOL_NAME) == null and app.skill_runtime.hasModelInvocable()) {
+            try skill_tool_mod.registerSkillTool(&app.dyn_registry, &app.skill_runtime);
+            try app.publishSkillTool();
+        }
+    }
+
+    fn publishSkillTool(app: *App) !void {
+        const a = app.tool_defs_arena.allocator();
+        const entry = app.dyn_registry.find(SKILL_TOOL_NAME) orelse return;
+        var defs = try std.ArrayList(json_mod.ToolDefinition).initCapacity(a, app.tool_defs.len + 1);
+        defs.appendSliceAssumeCapacity(app.tool_defs);
+        defs.appendAssumeCapacity(entry.definition());
+        _ = try app.skill_runtime.refreshModelTool(defs.items, a);
+        var names = try std.ArrayList([]const u8).initCapacity(a, app.enabled_tool_names.len + 1);
+        names.appendSliceAssumeCapacity(app.enabled_tool_names);
+        names.appendAssumeCapacity(entry.name);
+        app.tool_defs = defs.items;
+        app.enabled_tool_names = names.items;
+    }
+
+    const MCP_RELOAD_INTERVAL_MS: i64 = 1000;
+    const MCP_HOT_WAIT_MS: i64 = 5000;
+    const MCP_HOT_POLL_MS: u64 = 20;
+
+    fn pollMcpChanges(app: *App, abort: ?*const AbortSignal) void {
+        const log = @import("util/log.zig");
+        var started_here = false;
+        if (app.mcp_hot == null) {
+            if (app.startMcpRelists()) app.waitForMcpRelists(abort);
+            app.collectMcpRelists();
+            const now = util_time_mod.nowMs();
+            if (now - app.mcp_reload_ms >= MCP_RELOAD_INTERVAL_MS) if (app.mcp_watch) |*watch| {
+                if (watch.changed() or app.mcp_watch_dirty) {
+                    app.mcp_reload_ms = now;
+                    app.mcp_watch_dirty = false;
+                    app.reloadMcpConfiguration() catch |err| log.warn("mcp", "configuration reload failed: {s}", .{@errorName(err)});
+                    started_here = app.mcp_hot != null;
+                }
+            };
+        }
+        const startup = app.mcp_hot orelse return;
+        if (started_here) {
+            const deadline = util_time_mod.nowMs() + MCP_HOT_WAIT_MS;
+            while (!startup.settled() and util_time_mod.nowMs() < deadline) {
+                if (abort) |signal| if (signal.isAborted()) break;
+                util_time_mod.sleepMs(MCP_HOT_POLL_MS);
+            }
+        }
+        if (startup.settled()) app.publishHotMcp() catch |err| log.warn("mcp", "servers connected during this session could not be registered: {s}", .{@errorName(err)});
+    }
+
+    fn reloadMcpConfiguration(app: *App) !void {
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const environment = try mcp_config_mod.Environment.fromProcess(sa);
+        const resolved = try mcp_config_mod.load(sa, mcp_startup.Startup.loadInputs(app.mcpStartupInputs(), environment));
+        for (resolved.problems) |problem| {
+            if (problem.server.len != 0 or app.mcpSourceWasBad(problem.origin_path)) continue;
+            if (!app.mcp_reload_blocked) @import("util/log.zig").warn("mcp", "{s} cannot be read as it stands ({s}); MCP changes wait until it can", .{ problem.origin_path, problem.message });
+            app.mcp_reload_blocked = true;
+            app.mcp_watch_dirty = true;
+            return;
+        }
+        app.mcp_reload_blocked = false;
+        try app.applyMcpConfiguration(resolved, &.{});
+    }
+
+    fn applyMcpConfiguration(app: *App, resolved: mcp_config_mod.Resolved, forced: []const mcp_config_mod.Server) !void {
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var connect: std.ArrayList(mcp_config_mod.Server) = .empty;
+        for (resolved.servers) |server| {
+            const is_forced = for (forced) |chosen| {
+                if (std.mem.eql(u8, chosen.name, server.name)) break true;
+            } else false;
+            if (is_forced) {
+                app.retireMcpServer(server.name);
+                try connect.append(sa, server);
+                continue;
+            }
+            {
+                const key = mcp_hotplug.serverKey(server);
+                const change: enum { added, changed, logged_in } = if (app.mcp_known.get(server.name)) |known|
+                    (if (known != key) .changed else if (app.mcpAwaitsLogin(server)) .logged_in else continue)
+                else
+                    .added;
+                if (change != .logged_in and app.mcpDefinedInWorkingArea(server.origin_path)) {
+                    try app.noteMcpEvent("'{s}' was {s} in {s}, inside this session's working directories, so it was not connected automatically; the user loads it with `/mcp reconnect {s}`.", .{
+                        server.name,
+                        if (change == .added) "added" else "changed",
+                        server.origin_path,
+                        server.name,
+                    });
+                    if (change == .added) try app.setMcpStatus(.{
+                        .name = server.name,
+                        .origin = server.origin,
+                        .origin_path = server.origin_path,
+                        .state = .not_loaded,
+                        .detail = try std.fmt.allocPrint(sa, "added during this session inside the working directories; `/mcp reconnect {s}` connects it", .{server.name}),
+                    });
+                    continue;
+                }
+                if (change == .changed) app.retireMcpServer(server.name);
+                try connect.append(sa, server);
+            }
+        }
+        var known_it = app.mcp_known.keyIterator();
+        while (known_it.next()) |name| {
+            const still = for (resolved.servers) |server| {
+                if (std.mem.eql(u8, server.name, name.*)) break true;
+            } else false;
+            if (still) continue;
+            const was_connected = app.mcpServerConnected(name.*);
+            app.retireMcpServer(name.*);
+            app.dropMcpStatus(name.*);
+            if (was_connected) try app.noteMcpEvent("'{s}' was removed from the configuration; its tools are gone.", .{name.*});
+        }
+        try app.adoptMcpConfiguration(resolved.sources, resolved.servers, resolved.problems);
+        try app.adoptMcpReportLists(resolved);
+        try app.publishToolGeneration();
+        if (connect.items.len != 0) try app.startHotMcp(connect.items);
+    }
+
+    fn mcpAwaitsLogin(app: *App, server: mcp_config_mod.Server) bool {
+        const status = previousMcpStatus(app.mcp_report.servers, server.name) orelse return false;
+        if (status.state != .needs_auth) return false;
+        const http = switch (server.transport) {
+            .http => |http| http,
+            .stdio => return false,
+        };
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const path = @import("mcp/oauth.zig").storePath(scratch.allocator(), app.stateRoot(), server.name, http.url) catch return false;
+        const seen = mcp_hotplug.observe(path);
+        if (!seen.present) return false;
+        const gop = app.mcp_logins_tried.getOrPut(app.allocator, server.name) catch return false;
+        if (gop.found_existing) {
+            if (gop.value_ptr.eql(seen)) return false;
+        } else {
+            gop.key_ptr.* = app.allocator.dupe(u8, server.name) catch {
+                app.mcp_logins_tried.removeByPtr(gop.key_ptr);
+                return false;
+            };
+        }
+        gop.value_ptr.* = seen;
+        return true;
+    }
+
+    fn noteMcpLoginSeen(app: *App, server: mcp_config_mod.Server) void {
+        const status = previousMcpStatus(app.mcp_report.servers, server.name) orelse return;
+        if (status.state != .needs_auth) return;
+        const http = switch (server.transport) {
+            .http => |http| http,
+            .stdio => return,
+        };
+        if (app.mcp_logins_tried.contains(server.name)) return;
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const path = @import("mcp/oauth.zig").storePath(scratch.allocator(), app.stateRoot(), server.name, http.url) catch return;
+        const key = app.allocator.dupe(u8, server.name) catch return;
+        app.mcp_logins_tried.put(app.allocator, key, mcp_hotplug.observe(path)) catch app.allocator.free(key);
+    }
+
+    fn mcpDefinedInWorkingArea(app: *const App, origin_path: []const u8) bool {
+        var roots: [64][]const u8 = undefined;
+        var count: usize = 0;
+        roots[count] = app.cwdAbs();
+        count += 1;
+        for (app.additionalDirs()) |dir| {
+            if (count == roots.len) break;
+            roots[count] = dir;
+            count += 1;
+        }
+        if (app.sandboxPtr()) |sandbox| for (sandbox.allow_write) |dir| {
+            if (count == roots.len) break;
+            roots[count] = dir;
+            count += 1;
+        };
+        return mcp_hotplug.withinAny(origin_path, roots[0..count]);
+    }
+
+    fn mcpSourceWasBad(app: *const App, path: []const u8) bool {
+        for (app.mcp_bad_sources.items) |bad| {
+            if (std.mem.eql(u8, bad, path)) return true;
+        }
+        return false;
+    }
+
+    fn adoptMcpConfiguration(app: *App, sources: []const []const u8, servers: []const mcp_config_mod.Server, problems: []const mcp_config_mod.Problem) !void {
+        if (app.config.mcp_connect == .disabled) return;
+        const oauth_dir = try std.fs.path.join(app.allocator, &.{ app.stateRoot(), "mcp-oauth" });
+        defer app.allocator.free(oauth_dir);
+        var paths: std.ArrayList([]const u8) = .empty;
+        defer paths.deinit(app.allocator);
+        try paths.appendSlice(app.allocator, sources);
+        try paths.append(app.allocator, oauth_dir);
+        var watch = try mcp_hotplug.Watch.init(app.allocator, paths.items);
+        errdefer watch.deinit();
+
+        var known: std.StringHashMapUnmanaged(u64) = .empty;
+        errdefer freeStringKeys(app.allocator, &known);
+        for (servers) |server| {
+            const gop = try known.getOrPut(app.allocator, server.name);
+            if (gop.found_existing) continue;
+            gop.key_ptr.* = app.allocator.dupe(u8, server.name) catch |err| {
+                known.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = mcp_hotplug.serverKey(server);
+        }
+
+        var bad: std.ArrayList([]const u8) = .empty;
+        errdefer freeStringList(app.allocator, &bad);
+        for (problems) |problem| {
+            if (problem.server.len != 0) continue;
+            try bad.ensureUnusedCapacity(app.allocator, 1);
+            bad.appendAssumeCapacity(try app.allocator.dupe(u8, problem.origin_path));
+        }
+
+        for (servers) |server| app.noteMcpLoginSeen(server);
+        if (app.mcp_watch) |*old| old.deinit();
+        app.mcp_watch = watch;
+        app.mcp_known_mutex.lock();
+        freeStringKeys(app.allocator, &app.mcp_known);
+        app.mcp_known = known;
+        app.mcp_known_mutex.unlock();
+        freeStringList(app.allocator, &app.mcp_bad_sources);
+        app.mcp_bad_sources = bad;
+    }
+
+    fn freeStringKeys(allocator: std.mem.Allocator, map: *std.StringHashMapUnmanaged(u64)) void {
+        var it = map.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        map.deinit(allocator);
+        map.* = .empty;
+    }
+
+    fn freeStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+        list.* = .empty;
+    }
+
+    fn adoptMcpReportLists(app: *App, resolved: mcp_config_mod.Resolved) !void {
+        const a = app.mcpArena();
+        app.mcp_report.pending = try mcp_hotplug.deepCopy(a, []const mcp_config_mod.Pending, resolved.pending);
+        app.mcp_report.disabled = try mcp_hotplug.deepCopy(a, []const []const u8, resolved.disabled);
+        app.mcp_report.problems = try mcp_hotplug.deepCopy(a, []const mcp_config_mod.Problem, resolved.problems);
+    }
+
+    fn setMcpStatus(app: *App, status: McpServerStatus) !void {
+        const a = app.mcpArena();
+        const owned = try mcp_hotplug.deepCopy(a, McpServerStatus, status);
+        var statuses = try std.ArrayList(McpServerStatus).initCapacity(a, app.mcp_report.servers.len + 1);
+        var replaced = false;
+        for (app.mcp_report.servers) |existing| {
+            if (std.mem.eql(u8, existing.name, status.name)) {
+                statuses.appendAssumeCapacity(owned);
+                replaced = true;
+            } else statuses.appendAssumeCapacity(existing);
+        }
+        if (!replaced) statuses.appendAssumeCapacity(owned);
+        app.mcp_report.servers = statuses.items;
+        app.mcp_unavailable = unavailableServers(a, app.mcp_report.servers);
+    }
+
+    fn dropMcpStatus(app: *App, name: []const u8) void {
+        const a = app.mcpArena();
+        var statuses = std.ArrayList(McpServerStatus).initCapacity(a, app.mcp_report.servers.len) catch return;
+        for (app.mcp_report.servers) |existing| {
+            if (!std.mem.eql(u8, existing.name, name)) statuses.appendAssumeCapacity(existing);
+        }
+        app.mcp_report.servers = statuses.items;
+        app.mcp_unavailable = unavailableServers(a, app.mcp_report.servers);
+    }
+
+    fn noteMcpEvent(app: *App, comptime fmt: []const u8, args: anytype) !void {
+        const line = try std.fmt.allocPrint(app.allocator, fmt, args);
+        errdefer app.allocator.free(line);
+        try app.mcp_events.append(app.allocator, line);
+    }
+
+    fn clearMcpEvents(app: *App) void {
+        for (app.mcp_events.items) |line| app.allocator.free(line);
+        app.mcp_events.clearRetainingCapacity();
+    }
+
+    fn startHotMcp(app: *App, servers: []const mcp_config_mod.Server) !void {
+        const arena_state = try app.allocator.create(std.heap.ArenaAllocator);
+        arena_state.* = std.heap.ArenaAllocator.init(app.allocator);
+        var adopted = false;
+        defer if (!adopted) {
+            arena_state.deinit();
+            app.allocator.destroy(arena_state);
+        };
+        try app.mcp_hot_arenas.ensureUnusedCapacity(app.allocator, 1);
+        const a = arena_state.allocator();
+        const copies = try mcp_hotplug.deepCopy(a, []const mcp_config_mod.Server, servers);
+        const environment = try mcp_config_mod.Environment.fromProcess(a);
+        const startup = try mcp_startup.Startup.prepareFrom(a, &app.mcp_status, app.mcpStartupInputs(), .{
+            .servers = copies,
+            .disabled = &.{},
+            .pending = &.{},
+            .problems = &.{},
+        }, environment);
+        app.mcp_hot_arenas.appendAssumeCapacity(arena_state);
+        adopted = true;
+        for (copies) |server| try app.setMcpStatus(.{
+            .name = server.name,
+            .origin = server.origin,
+            .origin_path = server.origin_path,
+            .state = .connecting,
+        });
+        app.mcp_status.reset();
+        startup.start();
+        app.mcp_hot = startup;
+    }
+
+    fn publishHotMcp(app: *App) !void {
+        const startup = app.mcp_hot orelse return;
+        startup.join();
+        app.mcp_hot = null;
+        for (startup.jobs) |*job| {
+            if (job.result == .kept) continue;
+            const status = app.settleMcpJob(job);
+            try app.setMcpStatus(status);
+            switch (status.state) {
+                .connected => try app.noteMcpEvent("'{s}' connected ({d} tools).", .{ status.name, status.tool_count }),
+                .needs_auth => try app.noteMcpEvent("'{s}' needs authorization: the user runs `{s} mcp login {s}`; it connects automatically after that.", .{ status.name, app.commandName(), status.name }),
+                .failed => try app.noteMcpEvent("'{s}' failed to connect: {s}", .{ status.name, status.detail }),
+                .connecting, .not_loaded => {},
+            }
+        }
+        try app.publishToolGeneration();
+        app.mcp_status.published.store(true, .release);
+    }
+
+    fn settleMcpJob(app: *App, job: *mcp_startup.Job) McpServerStatus {
+        const log = @import("util/log.zig");
+        const a = app.mcpArena();
+        var status = McpServerStatus{
+            .name = job.server.name,
+            .origin = job.server.origin,
+            .origin_path = job.server.origin_path,
+            .log_path = job.log_path,
+            .state = .failed,
+        };
+        switch (job.result) {
+            .pending, .kept => unreachable,
+            .failed => |err| {
+                status.detail = mcp_startup.failureDetail(err, job);
+                if (err == error.McpAuthRequired) {
+                    status.state = .needs_auth;
+                    status.detail = std.fmt.allocPrint(a, "the server requires authorization (401/403); run `{s} mcp login {s}` (it connects automatically once the login is stored), or configure a bearer token or headers", .{ app.commandName(), job.server.name }) catch status.detail;
+                }
+                log.warn("mcp", "server '{s}' ({s}) failed: {s}", .{ job.server.name, job.server.origin.label(), status.detail });
+            },
+            .connected => |connected| {
+                var client = connected.client;
+                const tools_json = connected.tools_json;
+                defer std.heap.c_allocator.free(tools_json);
+                status.protocol = client.protocol_version;
+                if (app.registerMcpServer(job.server, &client, tools_json)) |count| {
+                    status.state = .connected;
+                    status.tool_count = count;
+                    log.info("mcp", "connected '{s}' ({s}, {d} tools)", .{ job.server.name, client.protocol_version, count });
+                } else |err| {
+                    client.close();
+                    status.detail = @errorName(err);
+                    log.warn("mcp", "server '{s}' tool registration failed: {s}", .{ job.server.name, @errorName(err) });
+                }
+            },
+        }
+        return status;
+    }
+
+    fn toolGenerationCurrent(app: *App) bool {
+        var listed_live: usize = 0;
+        for (app.tool_defs) |definition| {
+            if (definition.mcp_server == null) continue;
+            const entry = app.dyn_registry.find(definition.name);
+            if (definition.retired != (entry == null)) return false;
+            if (entry) |live| {
+                if (live.name.ptr != definition.name.ptr) return false;
+                listed_live += 1;
+            }
+        }
+        var live_mcp: usize = 0;
+        var index: usize = 0;
+        while (app.dyn_registry.entryAt(index)) |entry| : (index += 1) {
+            if (entry.isLive() and entry.mcp_server != null) live_mcp += 1;
+        }
+        return live_mcp == listed_live;
+    }
+
+    fn publishToolGeneration(app: *App) !void {
+        if (app.toolGenerationCurrent()) return;
+        const a = app.tool_defs_arena.allocator();
+        var defs = try std.ArrayList(json_mod.ToolDefinition).initCapacity(a, app.tool_defs.len);
+        var listed: std.StringHashMapUnmanaged(void) = .empty;
+        defer listed.deinit(app.allocator);
+        for (app.tool_defs) |definition| {
+            var next = definition;
+            if (definition.mcp_server != null) {
+                if (app.dyn_registry.find(definition.name)) |entry| {
+                    if (entry.name.ptr != definition.name.ptr) next = entry.definition();
+                    next.retired = false;
+                } else next.retired = true;
+            }
+            try defs.append(a, next);
+            try listed.put(app.allocator, next.name, {});
+        }
+        var names = try std.ArrayList([]const u8).initCapacity(a, app.enabled_tool_names.len);
+        names.appendSliceAssumeCapacity(app.enabled_tool_names);
+        var index: usize = 0;
+        while (app.dyn_registry.entryAt(index)) |entry| : (index += 1) {
+            if (!entry.isLive() or entry.mcp_server == null) continue;
+            if (listed.contains(entry.name)) continue;
+            try defs.append(a, entry.definition());
+            try names.append(a, entry.name);
+            try listed.put(app.allocator, entry.name, {});
+        }
+        app.tool_defs = defs.items;
+        app.enabled_tool_names = names.items;
+    }
+
+    fn startMcpRelists(app: *App) bool {
+        var started = false;
+        for (app.mcp_sessions.items) |entry| {
+            if (!entry.client.tools_changed.load(.acquire)) continue;
+            const already = for (app.mcp_relists.items) |relist| {
+                if (std.mem.eql(u8, relist.name, entry.name)) break true;
+            } else false;
+            if (already) continue;
+            app.mcp_relists.ensureUnusedCapacity(app.allocator, 1) catch return started;
+            const relist = McpRelist.start(app.allocator, entry.name, entry.client) catch return started;
+            entry.client.tools_changed.store(false, .release);
+            app.mcp_relists.appendAssumeCapacity(relist);
+            started = true;
+        }
+        return started;
+    }
+
+    fn waitForMcpRelists(app: *App, abort: ?*const AbortSignal) void {
+        const deadline = util_time_mod.nowMs() + MCP_HOT_WAIT_MS;
+        while (util_time_mod.nowMs() < deadline) {
+            const pending = for (app.mcp_relists.items) |relist| {
+                if (!relist.done.load(.acquire)) break true;
+            } else false;
+            if (!pending) return;
+            if (abort) |signal| if (signal.isAborted()) return;
+            util_time_mod.sleepMs(MCP_HOT_POLL_MS);
+        }
+    }
+
+    fn collectMcpRelists(app: *App) void {
+        const log = @import("util/log.zig");
+        var index: usize = 0;
+        var changed = false;
+        while (index < app.mcp_relists.items.len) {
+            const relist = app.mcp_relists.items[index];
+            if (!relist.done.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            _ = app.mcp_relists.swapRemove(index);
+            defer relist.destroy();
+            const tools_json = relist.tools_json orelse continue;
+            for (app.mcp_sessions.items) |*entry| {
+                if (entry.client != relist.client) continue;
+                const server = app.mcp_session_configs.get(entry.name) orelse break;
+                _ = app.dyn_registry.retireMcpServer(entry.name);
+                entry.session.registerToolsFromJsonFiltered(&app.dyn_registry, entry.name, tools_json, .{
+                    .enabled = server.enabled_tools,
+                    .disabled = server.disabled_tools,
+                    .http_param_headers = server.transport == .http,
+                }) catch |err| log.warn("mcp", "server '{s}' changed its tools, but they could not be registered: {s}", .{ entry.name, @errorName(err) });
+                app.noteMcpEvent("'{s}' changed its tools.", .{entry.name}) catch {};
+                changed = true;
+                break;
+            }
+        }
+        if (changed) app.publishToolGeneration() catch |err| log.warn("mcp", "changed MCP tools could not be published: {s}", .{@errorName(err)});
     }
 
     fn previousMcpStatus(previous: []const McpServerStatus, name: []const u8) ?McpServerStatus {
@@ -5753,7 +6417,7 @@ pub const App = struct {
                     status.detail = mcp_startup.failureDetail(err, job);
                     if (err == error.McpAuthRequired) {
                         status.state = .needs_auth;
-                        status.detail = std.fmt.allocPrint(a, "the server requires authorization (401/403); run `{s} mcp login {s}` (then `/mcp reconnect {s}`), or configure a bearer token or headers", .{ app.commandName(), job.server.name, job.server.name }) catch status.detail;
+                        status.detail = std.fmt.allocPrint(a, "the server requires authorization (401/403); run `{s} mcp login {s}` (it connects automatically once the login is stored), or configure a bearer token or headers", .{ app.commandName(), job.server.name }) catch status.detail;
                     }
                     log.warn("mcp", "server '{s}' ({s}) failed: {s}", .{ job.server.name, job.server.origin.label(), status.detail });
                 },
@@ -5813,20 +6477,11 @@ pub const App = struct {
             .env = mcp_config.Environment.fromProcess(arena) catch return &.{},
         }) catch return &.{};
         var late: std.ArrayList(McpLate) = .empty;
+        app.mcp_known_mutex.lock();
+        defer app.mcp_known_mutex.unlock();
         for (resolved.servers) |server| {
-            const known = previousMcpStatus(app.mcp_report.servers, server.name) orelse {
-                late.append(arena, .{ .name = server.name, .change = .added }) catch return late.items;
-                continue;
-            };
-            if (known.state != .needs_auth) continue;
-            const http = switch (server.transport) {
-                .http => |http| http,
-                .stdio => continue,
-            };
-            const path = @import("mcp/oauth.zig").storePath(arena, app.stateRoot(), server.name, http.url) catch continue;
-            const path_z = arena.dupeZ(u8, path) catch continue;
-            if (@import("platform").fs.exists(path_z.ptr))
-                late.append(arena, .{ .name = server.name, .change = .logged_in }) catch return late.items;
+            if (app.mcp_known.contains(server.name)) continue;
+            late.append(arena, .{ .name = server.name, .change = .added }) catch return late.items;
         }
         return late.items;
     }
@@ -5836,7 +6491,8 @@ pub const App = struct {
         var list: std.ArrayList(McpUnavailable) = .empty;
         for (servers) |status| {
             if (status.state == .connected) continue;
-            list.append(a, .{ .name = status.name, .detail = status.detail }) catch return list.items;
+            const detail = if (status.state == .connecting) "still connecting; its tools are announced once it has connected" else status.detail;
+            list.append(a, .{ .name = status.name, .detail = detail }) catch return list.items;
         }
         return list.items;
     }
@@ -5864,7 +6520,7 @@ pub const App = struct {
     pub fn cliPromptInput(app: *const App, cwd: []const u8) system_prompt_mod.CliPromptInput {
         return .{
             .model = app.promptModelName(),
-            .skills = &app.skills,
+            .skills = app.currentSkills(),
             .agents = &app.agents,
             .enabled_tool_names = app.enabled_tool_names,
             .memdir_abs = app.memdir_abs,
@@ -5956,11 +6612,13 @@ pub const App = struct {
             .http_param_headers = server.transport == .http,
         });
         const count = session.bindings.items.len;
+        try app.mcp_session_configs.ensureUnusedCapacity(app.allocator, 1);
         app.mcp_sessions.appendAssumeCapacity(.{
             .name = name_owned,
             .client = client_heap,
             .session = session,
         });
+        app.mcp_session_configs.putAssumeCapacity(name_owned, server);
         return count;
     }
 
@@ -6023,8 +6681,38 @@ pub const McpReconnectStart = union(enum) {
 pub const McpReconnectError = error{
     McpDisabled,
     McpStartupInProgress,
-    BackgroundAgentsRunning,
     OutOfMemory,
+};
+
+const McpRelist = struct {
+    allocator: std.mem.Allocator,
+    name: []u8,
+    client: *McpClient,
+    thread: ?std.Thread = null,
+    tools_json: ?[]u8 = null,
+    done: std.atomic.Value(bool) = .init(false),
+    cancel: AbortSignal = AbortSignal.init(),
+
+    fn start(allocator: std.mem.Allocator, name: []const u8, client: *McpClient) !*McpRelist {
+        const relist = try allocator.create(McpRelist);
+        errdefer allocator.destroy(relist);
+        relist.* = .{ .allocator = allocator, .name = try allocator.dupe(u8, name), .client = client };
+        errdefer allocator.free(relist.name);
+        relist.thread = try @import("platform").thread.spawn(.full, run, .{relist});
+        return relist;
+    }
+
+    fn run(relist: *McpRelist) void {
+        relist.tools_json = relist.client.listToolsAbortable(&relist.cancel) catch null;
+        relist.done.store(true, .release);
+    }
+
+    fn destroy(relist: *McpRelist) void {
+        if (relist.thread) |thread| thread.join();
+        if (relist.tools_json) |tools_json| relist.client.allocator.free(tools_json);
+        relist.allocator.free(relist.name);
+        relist.allocator.destroy(relist);
+    }
 };
 
 /// One configured MCP server and what became of it at startup (for /mcp).
@@ -6034,7 +6722,7 @@ pub const McpServerStatus = struct {
     origin_path: []const u8,
     /// `needs_auth`: the server answered 401/403 (a failure with its own
     /// remedy: credentials, not a restart).
-    state: enum { connected, failed, needs_auth } = .failed,
+    state: enum { connected, failed, needs_auth, connecting, not_loaded } = .failed,
     /// Failure reason ("" when connected).
     detail: []const u8 = "",
     /// Negotiated protocol revision ("" when not connected).

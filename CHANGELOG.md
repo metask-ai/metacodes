@@ -18,11 +18,12 @@ status, compatibility boundaries, and entry points are defined by
   copies, stops and deletes a batch in place, stopping asks for confirmation,
   and the 新建 form keeps what was typed across a refresh.
 
-- **`metacodes bench pull` pre-pulls a suite's task images.** It reads the
-  `docker_image` of each selected task and pulls the missing ones on the
-  chosen executor, with retries (`--dry-run` only lists what is missing), so a
-  flaky registry no longer turns batch trials into invalid environment
-  failures.
+- **`metacodes bench pull` prepares a suite's task environments.** It pulls
+  the `docker_image` of each selected task and builds the environment of
+  every task without one, the same way Harbor builds it, on the chosen
+  executor, with retries (`--dry-run` only lists what is not ready). Harbor's
+  own build then comes from the build cache, so a flaky registry or package
+  index no longer turns batch trials into invalid environment failures.
 
 - **A bench batch can switch on advanced features.** The 新建 page of the
   bench workbench has a 高级功能 section: the Lean-modelled run gates
@@ -54,13 +55,33 @@ status, compatibility boundaries, and entry points are defined by
   login. `mcp list` now checks each server (`--no-check` skips it) and says
   `auth: not logged in` instead of `auth: none`.
 
-- **`/mcp reconnect [<name>]`.** A running REPL reads the MCP configuration
-  again and connects every server that is not connected (one added or logged
-  in to since the session started, or one that failed), or restarts the named
-  one. The tool list and system prompt are rebuilt once, so the next request
-  misses the prompt cache once; nothing else changes the tool list mid-session.
-  Esc or Ctrl+C cancels, and a reconnect is refused while a background agent or
-  teammate runs.
+- **Skills can be added, edited and removed while a session runs.** Before
+  each request of a top-level Run the session checks its Skill roots and each
+  Skill's `SKILL.md`; when one changed it reads the Skills again, so a new
+  Skill can be activated, an edited one runs its new `SKILL.md` and a removed
+  one is refused, with no restart. The listings in the system prompt and the
+  `Skill` tool do not change, so the prompt cache holds; a system reminder
+  tells the model which Skills are new, gone or changed. A session that
+  started without Skills gains the `Skill` tool with the first one. Plugin
+  Skills are not watched.
+
+- **MCP servers can be added, changed and removed while a session runs.**
+  Before each request of a top-level Run, the ones after a tool batch inside a
+  Run included, the session checks the files its MCP configuration comes from
+  and the stored logins. A server added or changed (by `metacodes mcp add`, an
+  edit, another program) connects, one that needed a login connects once
+  `metacodes mcp login` has stored a new one, a removed one is disconnected,
+  and a server that announces `notifications/tools/list_changed` has its tools
+  read again: no restart, no `/mcp reconnect`. The system prompt and the tool
+  schemas already sent stay as they were, so the prompt cache holds; the model
+  learns from a system reminder that lists the new and the gone tools and what
+  happened to each server, told again after compaction and never twice. A
+  server defined inside the working directories (the current directory,
+  `--add-dir` directories, the sandbox's `allowWrite`) is not connected
+  automatically, since a command the session ran could have written it:
+  `/mcp reconnect [<name>]` connects it, and restarts a named server. A
+  reconnect rebuilds nothing, runs while background agents or teammates run,
+  and Esc or Ctrl+C cancels it.
 
 - **Teamwork launches its own Manager.** Configure `seats.manager` as a
   `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
@@ -103,10 +124,10 @@ status, compatibility boundaries, and entry points are defined by
   subcommand's hints, and `/mcp`'s, name the same command.
 
 - **ToolSearch and unknown `mcp__` tools name servers that changed after the
-  session started.** Besides the servers that did not connect, the result now
-  reads the configuration again and names a server added since, or one that
-  needed a login and has one now, with `/mcp reconnect <name>` or a new session
-  as the way to load it; a logged-in server is no longer sent to `mcp login`.
+  session started.** Besides the servers that did not connect (and the ones
+  still connecting), the result reads the configuration again and names a
+  server added since the session last read it, which is connected before the
+  next request.
 
 - **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
   `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after
@@ -130,6 +151,12 @@ status, compatibility boundaries, and entry points are defined by
   however it is quoted or escaped; a deny rule still denies.
 
 ### Fixed
+
+- **Cancelling a bench build on macOS reports the cancel.** Stopping a
+  process group whose leader had just exited raised `PermissionError` on
+  macOS, so a cancelled `metacodes bench` build (and the worker's and
+  WorkBuddy image build's stops) failed with that error instead of
+  「构建已取消」. An already exited group is now treated as stopped.
 
 - **Ctrl+D with the `/model` picker open leaves the draft alone** (#649). Over
   a draft whose cursor was not at its end, Ctrl+D went past the picker and

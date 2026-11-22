@@ -205,6 +205,7 @@ pub const Resolved = struct {
     /// Project servers that were not started.
     pending: []const Pending,
     problems: []const Problem,
+    sources: []const []const u8 = &.{},
 };
 
 /// A snapshot of metacodes' own environment (`KEY=VALUE` entries).
@@ -1084,19 +1085,19 @@ pub const LoadInputs = struct {
 /// Read every source from disk and resolve it.
 pub fn load(arena: std.mem.Allocator, inputs: LoadInputs) Error!Resolved {
     var documents = Documents{};
-    const read = inputs.read_file;
+    var reader = SourceReader{ .arena = arena, .read_file = inputs.read_file };
     if (inputs.state_root.len != 0) {
         const path = try std.fs.path.join(arena, &.{ inputs.state_root, "config.json" });
-        if (read(arena, path)) |bytes| documents.metacodes_config = .{ .path = path, .bytes = bytes };
+        if (try reader.read(path)) |bytes| documents.metacodes_config = .{ .path = path, .bytes = bytes };
     }
     if (inputs.home.len != 0) {
         const claude_json = try std.fs.path.join(arena, &.{ inputs.home, ".claude.json" });
-        if (read(arena, claude_json)) |bytes| documents.claude_json = .{ .path = claude_json, .bytes = bytes };
+        if (try reader.read(claude_json)) |bytes| documents.claude_json = .{ .path = claude_json, .bytes = bytes };
     }
     const project_root = if (inputs.workspace_root.len != 0) inputs.workspace_root else inputs.cwd;
     if (project_root.len != 0) {
         const mcp_json = try std.fs.path.join(arena, &.{ project_root, ".mcp.json" });
-        if (read(arena, mcp_json)) |bytes| documents.project_mcp_json = .{ .path = mcp_json, .bytes = bytes };
+        if (try reader.read(mcp_json)) |bytes| documents.project_mcp_json = .{ .path = mcp_json, .bytes = bytes };
     }
 
     var settings: std.ArrayList(SettingsDocument) = .empty;
@@ -1117,7 +1118,7 @@ pub fn load(arena: std.mem.Allocator, inputs: LoadInputs) Error!Resolved {
         if (entry.base.len != 0) try parts.append(arena, entry.base) else if (entry.parts.len > 1) continue;
         try parts.appendSlice(arena, entry.parts);
         const path = try std.fs.path.join(arena, parts.items);
-        if (read(arena, path)) |bytes| try settings.append(arena, .{ .path = path, .bytes = bytes, .may_approve = entry.may_approve });
+        if (try reader.read(path)) |bytes| try settings.append(arena, .{ .path = path, .bytes = bytes, .may_approve = entry.may_approve });
     }
     documents.claude_settings = try settings.toOwnedSlice(arena);
 
@@ -1129,7 +1130,7 @@ pub fn load(arena: std.mem.Allocator, inputs: LoadInputs) Error!Resolved {
         "";
     if (codex_home.len != 0) {
         const path = try std.fs.path.join(arena, &.{ codex_home, "config.toml" });
-        if (read(arena, path)) |bytes| documents.codex_user_config = .{ .path = path, .bytes = bytes };
+        if (try reader.read(path)) |bytes| documents.codex_user_config = .{ .path = path, .bytes = bytes };
     }
     const project_dirs = try projectDirs(arena, project_root, inputs.cwd);
     var codex_projects: std.ArrayList(Document) = .empty;
@@ -1138,7 +1139,7 @@ pub fn load(arena: std.mem.Allocator, inputs: LoadInputs) Error!Resolved {
         // Codex skips a project `.codex` that is CODEX_HOME itself.
         if (std.mem.eql(u8, codex_dir, codex_home)) continue;
         const path = try std.fs.path.join(arena, &.{ codex_dir, "config.toml" });
-        if (read(arena, path)) |bytes| try codex_projects.append(arena, .{ .path = path, .bytes = bytes });
+        if (try reader.read(path)) |bytes| try codex_projects.append(arena, .{ .path = path, .bytes = bytes });
     }
     documents.codex_project_configs = try codex_projects.toOwnedSlice(arena);
 
@@ -1150,16 +1151,29 @@ pub fn load(arena: std.mem.Allocator, inputs: LoadInputs) Error!Resolved {
         "";
     if (metacode_home.len != 0) {
         const path = try std.fs.path.join(arena, &.{ metacode_home, "config.toml" });
-        if (read(arena, path)) |bytes| documents.metacode_user_config = .{ .path = path, .bytes = bytes };
+        if (try reader.read(path)) |bytes| documents.metacode_user_config = .{ .path = path, .bytes = bytes };
     }
 
-    return resolve(arena, documents, .{
+    var resolved = try resolve(arena, documents, .{
         .cwd = inputs.cwd,
         .workspace_root = inputs.workspace_root,
         .project_dirs = project_dirs,
         .env = inputs.env,
     });
+    resolved.sources = reader.tried.items;
+    return resolved;
 }
+
+const SourceReader = struct {
+    arena: std.mem.Allocator,
+    read_file: *const fn (std.mem.Allocator, []const u8) ?[]const u8,
+    tried: std.ArrayList([]const u8) = .empty,
+
+    fn read(self: *SourceReader, path: []const u8) error{OutOfMemory}!?[]const u8 {
+        try self.tried.append(self.arena, path);
+        return self.read_file(self.arena, path);
+    }
+};
 
 fn projectDirs(arena: std.mem.Allocator, root: []const u8, cwd: []const u8) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;

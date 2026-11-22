@@ -258,13 +258,13 @@ def pull_images(args, root, cfg):
     if args.json:
         print(json.dumps(value, ensure_ascii=False))
     else:
-        labels = {"present": "已存在", "pulled": "已拉取", "missing": "未拉取", "failed": "失败"}
+        labels = {"present": "已就绪", "pulled": "已拉取", "built": "已构建", "missing": "未准备", "failed": "失败"}
         for row in value["images"]:
-            print(f"  {labels[row['status']]}  {row['image']}（{len(row['tasks'])} 道任务）"
+            action = "拉取" if row["kind"] == "pull" else "构建"
+            print(f"  {labels[row['status']]}  {action} {row['image']}（{len(row['tasks'])} 道任务）"
                   + (f"：{row['error']}" if row.get("error") else ""))
         summary = "，".join(f"{labels[k]} {n}" for k, n in value["counts"].items())
-        print(f"{value['suite']} @ {value['executor']}：{len(value['images'])} 个镜像" + (f"（{summary}）" if summary else "")
-              + (f"；{len(value['built'])} 道任务由 Harbor 现场构建，未预拉" if value["built"] else ""))
+        print(f"{value['suite']} @ {value['executor']}：{len(value['images'])} 个镜像" + (f"（{summary}）" if summary else ""))
     return 1 if value["counts"].get("failed") else 0
 
 
@@ -456,7 +456,7 @@ def main(argv=None):
     parser.add_argument("--verify", action="store_true", help="bench db import 按内容重新校验每个文件")
     parser.add_argument("--executor", help="执行机器名称（workbench.json 的 executors）")
     parser.add_argument("--run", metavar="NAME", help="sync：把这次 SSH 执行机器运行的结果同步回本机")
-    parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令；pull：只检查哪些镜像还没拉取")
+    parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令；pull：只检查哪些镜像还没拉取或构建")
     parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
     parser.add_argument("--ref", help="build：在执行机器（--executor，默认是默认执行机器）的 Docker 中编译这个 git 版本"
                                       "（提交、分支或 tag）的 Linux 包，供批次选择")
