@@ -138,7 +138,7 @@ def test_resize_during_a_burst_leaves_one_box(bin_path):
     resizes = []
     with SlowMockServer([turn]) as srv:
         raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("row 010 of the burst", 20),
-                             "resize:24x60", wait_for("row %03d of the burst" % (n - 1), 30), "sleep:2"],
+                             "resize:24x60", wait_for("row %03d of the burst" % (n - 1), 30), IDLE],
                   term_size=(24, 80), base_url=srv.url, startup_drain=0.8, per_key_drain=0.05,
                   resizes=resizes)
     problem = _rows_in_order(raw, n)

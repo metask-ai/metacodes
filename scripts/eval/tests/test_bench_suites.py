@@ -607,7 +607,7 @@ class SuiteLaunchTest(unittest.TestCase):
         for override in ({"suite": "aime", "tasks": ["fix-git"]}, {"suite": "nope", "tasks": ["fix-git"]},
                          {"suite": "aime", "dataset": "terminal-bench/terminal-bench-2-1", "tasks": ["aime_60"]},
                          {"dataset": "aime@1.0", "tasks": ["aime_60"]},
-                         {"suite": "terminal-bench-2.1", "tasks": ["fix-git"], "concurrency": 11},
+                         {"suite": "terminal-bench-2.1", "tasks": ["fix-git"], "concurrency": 17},
                          {"suite": "aime-2025", "tasks": list(suites.AIME_2025) + ["aime_60"]},
                          {"suite": "humaneval", "tasks": ["humaneval-0"]},
                          {"suite": "workbuddy-code", "tasks": ["bug_fix-easy-alpha"]}):

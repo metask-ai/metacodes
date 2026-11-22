@@ -142,12 +142,18 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.create_batch(payload), 202)
                 elif path == "/api/batch/cancel" and isinstance(payload, dict):
                     self.send_json(workbench.cancel_batch(payload.get("id")))
+                elif path == "/api/batch/rename" and isinstance(payload, dict):
+                    self.send_json(workbench.rename_batch(payload.get("id"), payload.get("name")))
                 elif path == "/api/batch/delete" and isinstance(payload, dict):
                     self.send_json(workbench.delete_batch(payload.get("id")))
                 elif path == "/api/store":
                     self.send_json(workbench.store_action(payload))
                 elif path == "/api/setup":
                     self.send_json(workbench.start_setup(payload), 202)
+                elif path == "/api/build":
+                    self.send_json(workbench.start_build(payload), 202)
+                elif path == "/api/build/cancel" and payload == {}:
+                    self.send_json(workbench.cancel_build())
                 elif path == "/api/login" and payload == {}:
                     self.send_json(workbench.start_login(), 202)
                 elif path == "/api/providers":
@@ -195,10 +201,17 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.suite_tasks(query.get("id"), query.get("executor")))
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, 404)
-            elif path in ("/api/setup", "/api/login", "/api/providers"):
+            elif path in ("/api/setup", "/api/login", "/api/providers", "/api/build", "/api/commits"):
                 # A plain viewer (no --config) has none of these.
                 if not self.authorized():
                     self.send_json({"error": "当前服务为只读模式"}, 403)
+                elif path == "/api/commits":
+                    try:
+                        self.send_json(workbench.commits(query))
+                    except ValueError as exc:
+                        self.send_json({"error": str(exc)}, 400)
+                elif path == "/api/build":
+                    self.send_json(workbench.build_status())
                 elif path == "/api/providers":
                     self.send_json(workbench.providers())
                 elif path == "/api/setup":
@@ -216,7 +229,7 @@ def make_handler(workbench: Workbench, public_url=None):
             elif path == "/api/run":
                 self.send_found(workbench.run(query.get("name")), "no such run")
             elif path == "/api/jobs":
-                self.send_json(workbench.jobs(query.get("batch") or "all"))
+                self.send_json({**workbench.jobs(query.get("batch") or "all"), "can_run": self.authorized()})
             elif path == "/api/job":
                 self.send_found(workbench.job(query.get("name", "")), "no such job")
             elif path == "/api/trial":
