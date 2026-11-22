@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1605,6 +1606,49 @@ class EgressUnitTest(unittest.TestCase):
         self.assertFalse(forwarder.thread.is_alive())
         with self.assertRaises(ConnectionRefusedError):
             socket.create_connection(address, timeout=5).close()
+
+    @unittest.skipUnless(hasattr(signal, "pthread_kill"), "needs POSIX thread signals")
+    def test_a_closed_listener_never_takes_connections_of_a_socket_that_reuses_its_descriptor(self):
+        import socket
+        from scripts.eval.harbor.bench import egress
+        port, close = echo_server()
+        self.addCleanup(close)
+        forwarder = egress.Forwarder("127.0.0.1", ("127.0.0.1", port)).start()
+        time.sleep(0.2)
+        descriptor = forwarder.sock.fileno()
+        forwarder.close()
+        forwarder.thread.join(timeout=5)
+        held = []
+        self.addCleanup(lambda: [sock.close() for sock in held])
+        later = None
+        for _ in range(1024):
+            sock = socket.socket()
+            held.append(sock)
+            if sock.fileno() == descriptor:
+                later = sock
+                break
+            if sock.fileno() > descriptor:
+                break
+        if later is None:
+            self.skipTest("another thread took the closed listener's descriptor")
+        later.bind(("127.0.0.1", 0))
+        later.listen(1)
+        if forwarder.thread.is_alive():
+            previous = signal.signal(signal.SIGUSR1, lambda *_args: None)
+            self.addCleanup(signal.signal, signal.SIGUSR1, previous)
+            signal.siginterrupt(signal.SIGUSR1, False)
+            with contextlib.suppress(ProcessLookupError):
+                signal.pthread_kill(forwarder.thread.ident, signal.SIGUSR1)
+            time.sleep(0.2)
+        with socket.create_connection(later.getsockname(), timeout=5):
+            time.sleep(0.5)
+            later.setblocking(False)
+            try:
+                conn, _ = later.accept()
+            except BlockingIOError:
+                self.fail("the closed forwarder's accept thread took a connection meant for the socket "
+                          "that reused its descriptor")
+        conn.close()
 
     def test_proxy_tunnels_allowed_ports_and_refuses_the_rest(self):
         from scripts.eval.harbor.bench import egress
