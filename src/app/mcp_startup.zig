@@ -49,6 +49,15 @@ pub const Status = struct {
         }
     };
 
+    pub fn reset(self: *Status) void {
+        self.total.store(0, .release);
+        self.settled.store(0, .release);
+        self.failed.store(0, .release);
+        self.needs_auth.store(0, .release);
+        self.published.store(false, .release);
+        self.acknowledged.store(false, .release);
+    }
+
     pub fn snapshot(self: *const Status) Snapshot {
         return .{
             .total = self.total.load(.acquire),
@@ -114,6 +123,7 @@ pub const Job = struct {
         pending,
         failed: anyerror,
         connected: struct { client: McpClient, tools_json: []u8 },
+        kept,
     };
 
     fn run(job: *Job) void {
@@ -182,7 +192,7 @@ pub const Job = struct {
     fn settle(job: *Job) void {
         const status = job.owner.status;
         switch (job.result) {
-            .pending => unreachable,
+            .pending, .kept => unreachable,
             .connected => {},
             .failed => |err| {
                 _ = status.failed.fetchAdd(1, .release);
@@ -198,12 +208,35 @@ pub const Job = struct {
     }
 };
 
+pub const Select = union(enum) {
+    all,
+    one: []const u8,
+    all_except: []const []const u8,
+    only: []const []const u8,
+
+    pub fn connects(self: Select, name: []const u8) bool {
+        return switch (self) {
+            .all => true,
+            .one => |one| std.mem.eql(u8, one, name),
+            .only => |names| for (names) |other| {
+                if (std.mem.eql(u8, other, name)) break true;
+            } else false,
+            .all_except => |names| for (names) |other| {
+                if (std.mem.eql(u8, other, name)) break false;
+            } else true,
+        };
+    }
+};
+
 pub const Startup = struct {
     jobs: []Job,
     threads: []?std.Thread,
+    connecting: u32 = 0,
     pending: []const mcp_config.Pending,
     disabled: []const []const u8,
     problems: []const mcp_config.Problem,
+    sources: []const []const u8 = &.{},
+    servers: []const mcp_config.Server = &.{},
     /// Stops every connect still in flight (teardown only; never the
     /// session's own abort, which a turn interrupt resets).
     cancel: AbortSignal = AbortSignal.init(),
@@ -216,6 +249,8 @@ pub const Startup = struct {
         cwd: []const u8,
         workspace_root: []const u8,
         codex_home: []const u8,
+        select: Select = .all,
+        server_logs: bool = true,
     };
 
     /// Resolve the configuration, prepare every server and start the
@@ -223,16 +258,36 @@ pub const Startup = struct {
     /// (the App's MCP arena). With no server configured the startup has no
     /// jobs and is settled at once.
     pub fn begin(arena: std.mem.Allocator, status: *Status, inputs: Inputs) !*Startup {
-        const log = @import("../util/log.zig");
+        const startup = try prepare(arena, status, inputs);
+        startup.start();
+        return startup;
+    }
+
+    pub fn prepare(arena: std.mem.Allocator, status: *Status, inputs: Inputs) !*Startup {
         const environment = try mcp_config.Environment.fromProcess(arena);
-        const resolved = try mcp_config.load(arena, .{
+        const resolved = try mcp_config.load(arena, loadInputs(inputs, environment));
+        return prepareFrom(arena, status, inputs, resolved, environment);
+    }
+
+    pub fn loadInputs(inputs: Inputs, environment: mcp_config.Environment) mcp_config.LoadInputs {
+        return .{
             .state_root = inputs.state_root,
             .home = inputs.home,
             .cwd = inputs.cwd,
             .workspace_root = if (inputs.workspace_root.len != 0) inputs.workspace_root else inputs.cwd,
             .codex_home = inputs.codex_home,
             .env = environment,
-        });
+        };
+    }
+
+    pub fn prepareFrom(
+        arena: std.mem.Allocator,
+        status: *Status,
+        inputs: Inputs,
+        resolved: mcp_config.Resolved,
+        environment: mcp_config.Environment,
+    ) !*Startup {
+        const log = @import("../util/log.zig");
         for (resolved.problems) |problem| {
             log.warn("mcp", "{s} ({s}){s}{s}: {s}", .{
                 problem.origin_path,
@@ -254,18 +309,26 @@ pub const Startup = struct {
             .pending = resolved.pending,
             .disabled = resolved.disabled,
             .problems = resolved.problems,
+            .sources = resolved.sources,
+            .servers = resolved.servers,
             .status = status,
         };
         const started = util_time.nowMs();
         for (resolved.servers, startup.jobs) |server, *job| {
             job.* = .{ .server = server, .io = inputs.io, .owner = startup, .started_ms = started };
+            if (!inputs.select.connects(server.name)) {
+                job.result = .kept;
+                job.state.store(.settled, .release);
+                continue;
+            }
+            startup.connecting += 1;
             switch (server.transport) {
                 .stdio => |stdio| {
                     job.launch = mcp_launch.prepare(arena, stdio, environment, inputs.cwd) catch |err| {
                         job.result = .{ .failed = if (err == error.CommandNotFound) error.McpCommandNotFound else err };
                         continue;
                     };
-                    job.log_path = openLog(arena, inputs.state_root, server.name, &job.log_fd);
+                    if (inputs.server_logs) job.log_path = openLog(arena, inputs.state_root, server.name, &job.log_fd);
                 },
                 .http => |http| {
                     job.http_headers = httpHeaders(arena, http, environment) catch |err| {
@@ -277,26 +340,33 @@ pub const Startup = struct {
                 },
             }
         }
-        status.total.store(@intCast(startup.jobs.len), .release);
+        for (startup.threads) |*thread| thread.* = null;
+        return startup;
+    }
+
+    pub fn start(startup: *Startup) void {
+        startup.status.total.store(startup.connecting, .release);
         // A server that failed its preparation is settled before any thread
         // runs; a thread that cannot be spawned runs its connect inline.
         for (startup.jobs, startup.threads) |*job, *thread| {
-            thread.* = null;
-            if (job.result != .pending) {
-                job.settle();
-                continue;
+            switch (job.result) {
+                .kept => continue,
+                .pending => {},
+                else => {
+                    job.settle();
+                    continue;
+                },
             }
             thread.* = @import("platform").thread.spawn(.full, Job.run, .{job}) catch blk: {
                 job.run();
                 break :blk null;
             };
         }
-        return startup;
     }
 
     /// Every server has reported (the workers may still be exiting).
     pub fn settled(self: *const Startup) bool {
-        return self.status.settled.load(.acquire) >= self.jobs.len;
+        return self.status.settled.load(.acquire) >= self.connecting;
     }
 
     /// Wait for every worker. Idempotent; owner thread only.

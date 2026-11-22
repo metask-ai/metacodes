@@ -258,6 +258,52 @@ pub fn makeFifo(path: [*:0]const u8, mode: c_uint) c_int {
     return mkfifo(path, @intCast(mode & 0o7777));
 }
 
+pub fn unreadBytes(fd: Fd) ?usize {
+    if (is_windows) {
+        return null;
+    } else {
+        const fionread: c_int = switch (builtin.os.tag) {
+            .linux => @bitCast(@as(u32, std.os.linux.T.FIONREAD)),
+            .macos, .ios, .tvos, .watchos, .visionos => 0x4004667f,
+            else => @compileError("FIONREAD is not mapped for this target"),
+        };
+        var count: c_int = 0;
+        if (std.c.ioctl(fd, fionread, &count) != 0) return null;
+        return @intCast(@max(count, 0));
+    }
+}
+
+test "unreadBytes on a FIFO's read-only probe follows what another reader takes" {
+    if (is_windows) {
+        return error.SkipZigTest;
+    } else {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = dir_buf[0..try tmp.dir.realPath(std.testing.io, &dir_buf)];
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, "{s}/channel", .{dir});
+        try std.testing.expectEqual(@as(c_int, 0), makeFifo(path.ptr, 0o600));
+        const writer = open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NONBLOCK = true }, 0);
+        try std.testing.expect(writer >= 0);
+        defer close(writer);
+        const probe = open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
+        try std.testing.expect(probe >= 0);
+        defer close(probe);
+        const reader = open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
+        try std.testing.expect(reader >= 0);
+        defer close(reader);
+        try std.testing.expectEqual(@as(?usize, 0), unreadBytes(probe));
+        try std.testing.expect(writeAll(writer, "reply\n"));
+        try std.testing.expectEqual(@as(?usize, 6), unreadBytes(probe));
+        var buf: [16]u8 = undefined;
+        try std.testing.expectEqual(@as(isize, 4), read(reader, buf[0..4]));
+        try std.testing.expectEqual(@as(?usize, 2), unreadBytes(probe));
+        try std.testing.expectEqual(@as(isize, 2), read(reader, &buf));
+        try std.testing.expectEqual(@as(?usize, 0), unreadBytes(probe));
+    }
+}
+
 /// rmdir(2) 形状的删空目录。Windows `_wrmdir`。返回 0 / -1(errno 同各平台 CRT)。
 pub fn rmdir(path: [*:0]const u8) c_int {
     if (is_windows) {

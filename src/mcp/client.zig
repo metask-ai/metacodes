@@ -902,6 +902,7 @@ pub const McpClient = struct {
     request_timeout_ms: ?u32 = null,
     /// Set when the server announces `notifications/tools/list_changed`.
     tools_changed: std.atomic.Value(bool) = .init(false),
+    retire_requested: std.atomic.Value(bool) = .init(false),
 
     /// Historical entry point: empty environment, no deadlines, `.auto` protocol.
     pub fn connect(
@@ -984,6 +985,17 @@ pub const McpClient = struct {
         if (!self.usable.swap(false, .acq_rel)) return;
         self.transport.close();
         self.connection_live = false;
+    }
+
+    pub fn retireShared(self: *McpClient) void {
+        self.retire_requested.store(true, .release);
+        if (!self.request_mutex.tryLock()) return;
+        self.releaseRequest();
+    }
+
+    fn releaseRequest(self: *McpClient) void {
+        if (self.retire_requested.load(.acquire)) self.retire();
+        self.request_mutex.unlock();
     }
 
     fn adoptEra(self: *McpClient, era: canonical.Era, capabilities: canonical.CanonicalCapabilities) void {
@@ -1097,7 +1109,7 @@ pub const McpClient = struct {
     /// re-encoded from the parsed frame (so numbers keep their lexemes and a
     /// string containing `"result":` cannot be mistaken for it).
     fn requestLocked(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
-        if (!self.usable.load(.acquire)) return error.McpInstanceUnavailable;
+        if (!self.usable.load(.acquire) or self.retire_requested.load(.acquire)) return error.McpInstanceUnavailable;
         var params = try self.allocator.dupe(u8, params_json);
         defer self.allocator.free(params);
         var round: usize = 0;
@@ -1132,7 +1144,7 @@ pub const McpClient = struct {
 
     fn requestJson(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
         self.request_mutex.lock();
-        defer self.request_mutex.unlock();
+        defer self.releaseRequest();
         return self.requestLocked(method, params_json, abort) catch |err| {
             if (err == error.McpConnectionFatal) self.retire();
             return err;
@@ -1364,8 +1376,8 @@ pub const McpClient = struct {
             return;
         }
         self.request_mutex.lock();
-        defer self.request_mutex.unlock();
-        if (!self.usable.load(.acquire)) {
+        defer self.releaseRequest();
+        if (!self.usable.load(.acquire) or self.retire_requested.load(.acquire)) {
             out.* = .{ .failed = .{ .failure = .instance_unavailable, .disposition = .not_delivered, .err = error.McpInstanceUnavailable } };
             return;
         }
@@ -1727,8 +1739,8 @@ pub const McpClient = struct {
     /// `tools/list` (every page), interruptible as a whole by `abort`.
     pub fn listToolsAbortable(self: *McpClient, abort: ?*const AbortSignal) ![]u8 {
         self.request_mutex.lock();
-        defer self.request_mutex.unlock();
-        if (!self.usable.load(.acquire)) return error.McpInstanceUnavailable;
+        defer self.releaseRequest();
+        if (!self.usable.load(.acquire) or self.retire_requested.load(.acquire)) return error.McpInstanceUnavailable;
         var tools: std.Io.Writer.Allocating = .init(self.allocator);
         defer tools.deinit();
         try tools.writer.writeAll("{\"tools\":[");

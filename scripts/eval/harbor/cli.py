@@ -251,6 +251,23 @@ def prepare_suite(args, root, config, cfg):
     return {"suite": suite.id, "dataset": str(produced), "task_count": len(tasks)}
 
 
+def pull_images(args, root, cfg):
+    from scripts.eval.harbor.bench import images
+    value = images.prepull(cfg, root, args.suite, args.task, args.executor, check_only=args.dry_run,
+                           log=lambda text: print(text, file=sys.stderr, flush=True))
+    if args.json:
+        print(json.dumps(value, ensure_ascii=False))
+    else:
+        labels = {"present": "已就绪", "pulled": "已拉取", "built": "已构建", "missing": "未准备", "failed": "失败"}
+        for row in value["images"]:
+            action = "拉取" if row["kind"] == "pull" else "构建"
+            print(f"  {labels[row['status']]}  {action} {row['image']}（{len(row['tasks'])} 道任务）"
+                  + (f"：{row['error']}" if row.get("error") else ""))
+        summary = "，".join(f"{labels[k]} {n}" for k, n in value["counts"].items())
+        print(f"{value['suite']} @ {value['executor']}：{len(value['images'])} 个镜像" + (f"（{summary}）" if summary else ""))
+    return 1 if value["counts"].get("failed") else 0
+
+
 PROVIDER_COMMANDS = ["add", "list", "remove", "probe"]
 
 
@@ -370,11 +387,12 @@ def show(value, as_json, render, *extra):
 
 
 def build_command(args, root, cfg):
-    from scripts.eval.harbor.bench import builds
+    from scripts.eval.harbor.bench import builds, executors
+    executor = executors.find(cfg, args.executor)
     stop = threading.Event()
     previous = signal.signal(signal.SIGINT, lambda *_: stop.set())
     try:
-        unit, info = builds.bundle(args.ref, root, cfg.get("source_repo"), cancelled=stop.is_set)
+        unit, info = builds.build_on(executor, args.ref, root, cfg.get("source_repo"), cancelled=stop.is_set)
     finally:
         signal.signal(signal.SIGINT, previous)
     value = {"bundle": unit.name, "path": str(unit), "ref": info["ref"], "commit": info["commit"],
@@ -402,7 +420,8 @@ def main(argv=None):
         return code
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
-                        choices=["open", "info", "list", "run", "stop", "prepare", "setup", "db", "sync", "provider", "build"])
+                        choices=["open", "info", "list", "run", "stop", "prepare", "pull", "setup", "db", "sync", "provider",
+                                 "build"])
     parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"] + PROVIDER_COMMANDS,
                         help="bench db 的子命令（status、import、migrate）或 bench provider 的子命令（add、list、remove、probe）")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
@@ -437,9 +456,10 @@ def main(argv=None):
     parser.add_argument("--verify", action="store_true", help="bench db import 按内容重新校验每个文件")
     parser.add_argument("--executor", help="执行机器名称（workbench.json 的 executors）")
     parser.add_argument("--run", metavar="NAME", help="sync：把这次 SSH 执行机器运行的结果同步回本机")
-    parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令")
+    parser.add_argument("--dry-run", action="store_true", help="setup：只检查并列出将执行的命令；pull：只检查哪些镜像还没拉取或构建")
     parser.add_argument("--bundle-version", help="setup：下载这个发行版本的 Linux 包（X.Y.Z）")
-    parser.add_argument("--ref", help="build：在 Docker 中编译这个 git 版本（提交、分支或 tag）的 Linux 包，供批次选择")
+    parser.add_argument("--ref", help="build：在执行机器（--executor，默认是默认执行机器）的 Docker 中编译这个 git 版本"
+                                      "（提交、分支或 tag）的 Linux 包，供批次选择")
     parser.add_argument("--source", type=Path, help="setup：开发版从这个源码目录交叉编译 Linux 包")
     parser.add_argument("--id", help="provider：Provider 标识（小写字母、数字、-、_），模型以 <标识>/<模型> 出现")
     parser.add_argument("--name", help="provider add：显示名称")
@@ -524,7 +544,7 @@ def main(argv=None):
         client = Client(args.url) if args.url else None
         if args.action == "build":
             if args.url or args.ref is None:
-                parser.error("bench build 需要 --ref，并在保存这个包的工作台机器上运行")
+                parser.error("bench build 需要 --ref，并在工作台机器上运行")
             return build_command(args, root, cfg)
         if args.action == "prepare":
             if args.url or not args.suite:
@@ -533,6 +553,10 @@ def main(argv=None):
             print(json.dumps(value, ensure_ascii=False) if args.json else
                   f"{value['suite']}：{value['task_count']} 道任务 → {value['dataset']}")
             return 0
+        if args.action == "pull":
+            if args.url or not args.suite:
+                parser.error("bench pull 需要 --suite，并在工作台机器上运行")
+            return pull_images(args, root, cfg)
         if args.action == "sync":
             if not args.run:
                 parser.error("bench sync 需要 --run NAME")

@@ -183,3 +183,8 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .suite-box-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap}
 @media(max-width:640px){.kv{grid-template-columns:1fr}.split-row{grid-template-columns:90px 1fr 60px}.form-row{grid-template-columns:1fr}.rail nav a{width:20%}}
 .probe.ok{color:var(--positive)}.probe.bad{color:var(--warning)}.probe small{color:var(--faint)}
+.commit-builder{border:1px solid var(--border);border-radius:6px;padding:12px 14px;margin:0 0 var(--gap)}
+.commit-builder .task-tools input[type=text],.commit-builder .task-tools input[type=date]{background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;padding:7px 10px;font:inherit}
+.commit-list{max-height:420px}
+.row-actions{display:flex;gap:6px}.row-actions .button{height:26px;padding:0 8px}
+.rename{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.rename input{min-width:220px;height:32px;padding:0 10px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;font:inherit}

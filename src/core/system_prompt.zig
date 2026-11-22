@@ -302,6 +302,20 @@ fn buildEnvSection(allocator: std.mem.Allocator, model_identity: []const u8, cwd
     return try buf.toOwnedSlice(allocator);
 }
 
+const SIMILAR_PRODUCT_COMMAND = "metacode";
+
+fn commandLines(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
+    const others = if (std.mem.eql(u8, command, SIMILAR_PRODUCT_COMMAND))
+        "Other programs with similar names"
+    else
+        "`" ++ SIMILAR_PRODUCT_COMMAND ++ "` and other programs with similar names";
+    return std.fmt.allocPrint(allocator,
+        \\ - Your command is `{[c]s}`: use it for anything about yourself (`{[c]s} --help`). {[o]s} are different products.
+        \\ - MCP servers: `{[c]s} mcp add <name> <url>` (or `{[c]s} mcp add <name> -- <command> [<arg>...]`) adds one, `{[c]s} mcp login <name>` stores an OAuth login for it, `{[c]s} mcp list` shows each one's state. A server added, changed or logged in to during this session is connected before your next request, and a system reminder lists its tools; one defined inside the working directories waits for the user's `/mcp reconnect <name>`.
+        \\
+    , .{ .c = command, .o = others });
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -620,9 +634,18 @@ pub const CliPromptInput = struct {
     cwd: []const u8,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition,
     preview: @import("../preview.zig").Features = .none,
+    command: []const u8 = "",
 
     fn generate(input: CliPromptInput, allocator: std.mem.Allocator) !GeneratedSections {
-        return GeneratedSections.init(allocator, input.model, input.skills, input.agents, input.enabled_tool_names, input.memdir_abs, input.kg_ready, input.cwd, input.tool_defs, true);
+        var generated = try GeneratedSections.init(allocator, input.model, input.skills, input.agents, input.enabled_tool_names, input.memdir_abs, input.kg_ready, input.cwd, input.tool_defs, true);
+        if (input.command.len == 0) return generated;
+        errdefer generated.deinit(allocator);
+        const lines = try commandLines(allocator, input.command);
+        defer allocator.free(lines);
+        const env = try std.mem.concat(allocator, u8, &.{ generated.env, lines });
+        allocator.free(generated.env);
+        generated.env = env;
+        return generated;
     }
 
     pub fn build(input: CliPromptInput, allocator: std.mem.Allocator) ![]u8 {
@@ -856,7 +879,7 @@ fn buildDeferredToolsSection(
     // 并截短——MCP server 的描述常常是整段文档,提示词只需要"这是什么"够模型选。
     if (tool_defs) |defs| {
         for (defs) |def| {
-            if (!def.deferred) continue;
+            if (!def.deferred or def.retired) continue;
             if (tools.getTool(def.name) != null) continue; // 静态条目上面已列
             if (!toolNameEnabled(enabled_tool_names, def.name)) continue;
             const summary = try deferredDescriptionSummary(allocator, def.description);
@@ -876,6 +899,52 @@ const DEFERRED_TOOLS_HEADER =
     \\
 ;
 
+pub const DeferredToolNames = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    pub fn next(self: *DeferredToolNames) ?[]const u8 {
+        while (self.lines.next()) |line| {
+            if (line.len == 0) return null;
+            if (!std.mem.startsWith(u8, line, "- ")) continue;
+            const rest = line[2..];
+            const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+            if (end != 0) return rest[0..end];
+        }
+        return null;
+    }
+};
+
+pub const SkillListingNames = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+    started: bool = false,
+
+    pub fn next(self: *SkillListingNames) ?[]const u8 {
+        while (self.lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "- **")) {
+                if (self.started) return null;
+                continue;
+            }
+            self.started = true;
+            const rest = line["- **".len..];
+            const end = std.mem.indexOf(u8, rest, "**") orelse continue;
+            if (end != 0) return rest[0..end];
+        }
+        return null;
+    }
+};
+
+pub fn skillListingNames(prompt: []const u8) SkillListingNames {
+    const header = "# Available skills\n";
+    const start = if (std.mem.indexOf(u8, prompt, header)) |at| at + header.len else prompt.len;
+    return .{ .lines = std.mem.splitScalar(u8, prompt[start..], '\n') };
+}
+
+pub fn deferredToolNames(prompt: []const u8) DeferredToolNames {
+    const header = DEFERRED_TOOLS_HEADER ++ "\n";
+    const start = if (std.mem.indexOf(u8, prompt, header)) |at| at + header.len else prompt.len;
+    return .{ .lines = std.mem.splitScalar(u8, prompt[start..], '\n') };
+}
+
 fn appendDeferredLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), any: *bool, name: []const u8, description: []const u8) !void {
     if (!any.*) {
         try buf.appendSlice(allocator, DEFERRED_TOOLS_HEADER);
@@ -888,7 +957,7 @@ fn appendDeferredLine(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), any
 /// 行内不能出现换行——`projectDeferredToolsForExecution` 按行解析这一段。
 pub const DEFERRED_SUMMARY_MAX_BYTES: usize = 120;
 
-fn deferredDescriptionSummary(allocator: std.mem.Allocator, description: []const u8) ![]u8 {
+pub fn deferredDescriptionSummary(allocator: std.mem.Allocator, description: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var last_space = true; // 吞掉开头空白
@@ -1277,6 +1346,21 @@ fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skil
 // ============================================================================
 
 const testing = std.testing;
+
+test "the CLI command lines name the command, and never call the command itself another product" {
+    const lines = try commandLines(testing.allocator, "metacodes-dev");
+    defer testing.allocator.free(lines);
+    try testing.expect(std.mem.startsWith(u8, lines, " - Your command is `metacodes-dev`: use it for anything about yourself (`metacodes-dev --help`)."));
+    try testing.expect(std.mem.indexOf(u8, lines, "`metacode` and other programs with similar names are different products.") != null);
+    try testing.expect(std.mem.indexOf(u8, lines, "`metacodes-dev mcp login <name>`") != null);
+    try testing.expect(std.mem.endsWith(u8, lines, "waits for the user's `/mcp reconnect <name>`.\n"));
+    try testing.expect(std.mem.indexOf(u8, lines, "is connected before your next request, and a system reminder lists its tools") != null);
+
+    const same = try commandLines(testing.allocator, "metacode");
+    defer testing.allocator.free(same);
+    try testing.expect(std.mem.indexOf(u8, same, "Other programs with similar names are different products.") != null);
+    try testing.expect(std.mem.indexOf(u8, same, "`metacode` and other") == null);
+}
 
 test "build produces non-empty prompt with MetaCode identity" {
     const s = try build(testing.allocator, "claude-opus-4-7", "/tmp");

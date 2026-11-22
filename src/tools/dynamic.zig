@@ -9,6 +9,7 @@
 //! 生命周期：process 级（启动注册，进程退出释放）。字符串字段全部 owned。
 
 const std = @import("std");
+const sync = @import("platform").sync;
 const json = @import("../json.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
@@ -70,6 +71,25 @@ pub const DynToolEntry = struct {
     /// fallback (`permission/category.zig`): the Skill tool, and the
     /// per-server resource tools `McpSession.registerResourceTools` adds.
     category: ?ToolCategory = null,
+    retired: std.atomic.Value(bool) = .init(false),
+
+    pub fn isLive(self: *const DynToolEntry) bool {
+        return !self.retired.load(.acquire);
+    }
+
+    pub fn definition(self: *const DynToolEntry) json.ToolDefinition {
+        return .{
+            .name = self.name,
+            .description = self.description,
+            .input_schema = self.borrowed_input_schema orelse .{
+                .type = "object",
+                .properties = null,
+                .required = self.required_fields,
+            },
+            .deferred = self.deferred,
+            .mcp_server = self.mcp_server,
+        };
+    }
 
     pub fn execute(
         self: *const DynToolEntry,
@@ -82,7 +102,8 @@ pub const DynToolEntry = struct {
 
 pub const DynRegistry = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayList(DynToolEntry),
+    mutex: sync.Mutex = .{},
+    entries: std.ArrayList(*DynToolEntry),
 
     pub fn init(allocator: std.mem.Allocator) DynRegistry {
         return .{ .allocator = allocator, .entries = .empty };
@@ -93,22 +114,49 @@ pub const DynRegistry = struct {
         self.entries.deinit(self.allocator);
     }
 
-    fn freeEntry(self: *DynRegistry, e: DynToolEntry) void {
+    fn freeEntry(self: *DynRegistry, e: *DynToolEntry) void {
         self.allocator.free(e.name);
         self.allocator.free(e.description);
         if (e.mcp_server) |server| self.allocator.free(server);
         for (e.required_fields) |f| self.allocator.free(f);
         self.allocator.free(e.required_fields);
+        self.allocator.destroy(e);
     }
 
-    /// Transaction checkpoint support for multi-tool registrars such as MCP.
-    /// Entries at and after `checkpoint` are owned by this registry and are
-    /// fully destroyed. This prevents a failed registration batch from
-    /// leaving callable definitions whose ctx_ptr ownership was rolled back.
+    pub fn len(self: *const DynRegistry) usize {
+        const mutable: *DynRegistry = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
+        return self.entries.items.len;
+    }
+
+    pub fn entryAt(self: *const DynRegistry, index: usize) ?*const DynToolEntry {
+        const mutable: *DynRegistry = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
+        if (index >= self.entries.items.len) return null;
+        return self.entries.items[index];
+    }
+
     pub fn rollbackTo(self: *DynRegistry, checkpoint: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         std.debug.assert(checkpoint <= self.entries.items.len);
-        for (self.entries.items[checkpoint..]) |e| self.freeEntry(e);
-        self.entries.shrinkRetainingCapacity(checkpoint);
+        for (self.entries.items[checkpoint..]) |e| e.retired.store(true, .release);
+    }
+
+    pub fn retireMcpServer(self: *DynRegistry, server: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var retired: usize = 0;
+        for (self.entries.items) |e| {
+            const owned = if (e.mcp_server) |name| std.mem.eql(u8, name, server) else false;
+            if (owned and e.isLive()) {
+                e.retired.store(true, .release);
+                retired += 1;
+            }
+        }
+        return retired;
     }
 
     /// 注册（转移字符串所有权）。name 不能与已有冲突。
@@ -122,7 +170,7 @@ pub const DynRegistry = struct {
         ctx_ptr: ?*anyopaque,
         deferred: bool,
     ) !void {
-        return self.registerImpl(name, description, required_fields, .{ .legacy_inline = execute }, ctx_ptr, deferred, null);
+        return self.registerImpl(name, description, required_fields, .{ .legacy_inline = execute }, ctx_ptr, deferred, null, .{});
     }
 
     pub fn registerBody(
@@ -134,7 +182,7 @@ pub const DynRegistry = struct {
         ctx_ptr: ?*anyopaque,
         deferred: bool,
     ) !void {
-        return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, deferred, null);
+        return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, deferred, null, .{});
     }
 
     pub fn registerMcp(
@@ -147,7 +195,7 @@ pub const DynRegistry = struct {
         server_name: []const u8,
     ) !void {
         if (server_name.len == 0) return error.InvalidMcpServerName;
-        return self.registerImpl(name, description, required_fields, .{ .legacy_inline = execute }, ctx_ptr, true, server_name);
+        return self.registerImpl(name, description, required_fields, .{ .legacy_inline = execute }, ctx_ptr, true, server_name, .{});
     }
 
     pub fn registerMcpBody(
@@ -160,7 +208,7 @@ pub const DynRegistry = struct {
         server_name: []const u8,
     ) !void {
         if (server_name.len == 0) return error.InvalidMcpServerName;
-        return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, true, server_name);
+        return self.registerImpl(name, description, required_fields, .{ .result_body = execute }, ctx_ptr, true, server_name, .{});
     }
 
     /// MCP 工具带完整 inputSchema 注册:名字/描述/required 拷贝,`input_schema` 的嵌套
@@ -193,10 +241,8 @@ pub const DynRegistry = struct {
             ctx_ptr,
             true,
             server_name,
+            .{ .borrowed_input_schema = definition.input_schema, .category = .execute },
         );
-        const entry = &self.entries.items[self.entries.items.len - 1];
-        entry.borrowed_input_schema = definition.input_schema;
-        entry.category = .execute;
     }
 
     /// Register a definition owned by an immutable plugin snapshot. Strings
@@ -221,10 +267,8 @@ pub const DynRegistry = struct {
             ctx_ptr,
             false,
             null,
+            .{ .borrowed_input_schema = definition.input_schema, .category = native_category },
         );
-        const entry = &self.entries.items[self.entries.items.len - 1];
-        entry.borrowed_input_schema = definition.input_schema;
-        entry.category = native_category;
     }
 
     pub fn registerBorrowedDefinitionBody(
@@ -245,11 +289,14 @@ pub const DynRegistry = struct {
             ctx_ptr,
             false,
             null,
+            .{ .borrowed_input_schema = definition.input_schema, .category = native_category },
         );
-        const entry = &self.entries.items[self.entries.items.len - 1];
-        entry.borrowed_input_schema = definition.input_schema;
-        entry.category = native_category;
     }
+
+    const Extra = struct {
+        borrowed_input_schema: ?json.InputSchema = null,
+        category: ?ToolCategory = null,
+    };
 
     fn registerImpl(
         self: *DynRegistry,
@@ -260,10 +307,14 @@ pub const DynRegistry = struct {
         ctx_ptr: ?*anyopaque,
         deferred: bool,
         mcp_server: ?[]const u8,
+        extra: Extra,
     ) !void {
-        for (self.entries.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) return error.ToolAlreadyRegistered;
-        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.findLocked(name) != null) return error.ToolAlreadyRegistered;
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const entry = try self.allocator.create(DynToolEntry);
+        errdefer self.allocator.destroy(entry);
         const name_owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_owned);
         const desc_owned = try self.allocator.dupe(u8, description);
@@ -279,7 +330,7 @@ pub const DynRegistry = struct {
             req_owned[i] = try self.allocator.dupe(u8, required_fields[i]);
         }
 
-        try self.entries.append(self.allocator, .{
+        entry.* = .{
             .name = name_owned,
             .description = desc_owned,
             .required_fields = req_owned,
@@ -287,14 +338,27 @@ pub const DynRegistry = struct {
             .ctx_ptr = ctx_ptr,
             .deferred = deferred,
             .mcp_server = server_owned,
-        });
+            .borrowed_input_schema = extra.borrowed_input_schema,
+            .category = extra.category,
+        };
+        self.entries.appendAssumeCapacity(entry);
+    }
+
+    fn findLocked(self: *const DynRegistry, name: []const u8) ?*DynToolEntry {
+        var index = self.entries.items.len;
+        while (index > 0) {
+            index -= 1;
+            const e = self.entries.items[index];
+            if (e.isLive() and std.mem.eql(u8, e.name, name)) return e;
+        }
+        return null;
     }
 
     pub fn find(self: *const DynRegistry, name: []const u8) ?*const DynToolEntry {
-        for (self.entries.items) |*e| {
-            if (std.mem.eql(u8, e.name, name)) return e;
-        }
-        return null;
+        const mutable: *DynRegistry = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
+        return self.findLocked(name);
     }
 
     pub fn category(self: *const DynRegistry, name: []const u8) ?ToolCategory {
@@ -309,18 +373,12 @@ pub const DynRegistry = struct {
         defs: *std.ArrayList(json.ToolDefinition),
         allocator: std.mem.Allocator,
     ) !void {
+        const mutable: *DynRegistry = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
         for (self.entries.items) |e| {
-            try defs.append(allocator, .{
-                .name = e.name,
-                .description = e.description,
-                .input_schema = e.borrowed_input_schema orelse .{
-                    .type = "object",
-                    .properties = null,
-                    .required = e.required_fields,
-                },
-                .deferred = e.deferred,
-                .mcp_server = e.mcp_server,
-            });
+            if (!e.isLive()) continue;
+            try defs.append(allocator, e.definition());
         }
     }
 };
@@ -418,6 +476,91 @@ test "DynRegistry: MCP provenance is owned and propagated" {
     try r.appendDefinitions(&defs, testing.allocator);
     try testing.expectEqual(@as(usize, 1), defs.items.len);
     try testing.expectEqualStrings("allowed", defs.items[0].mcp_server.?);
+}
+
+test "DynRegistry: retiring one MCP server hides exactly its tools, keeps the others in order, and frees the names" {
+    var r = DynRegistry.init(testing.allocator);
+    defer r.deinit();
+    try r.register("Skill", "skill", &.{}, dummyExec, null, false);
+    try r.registerMcp("mcp__a__one", "a1", &.{"x"}, dummyExec, null, "a");
+    try r.registerMcp("mcp__b__one", "b1", &.{}, dummyExec, null, "b");
+    try r.registerMcp("mcp__a__two", "a2", &.{}, dummyExec, null, "a");
+    try r.registerMcp("mcp__ab__one", "ab1", &.{}, dummyExec, null, "ab");
+    const before = r.find("mcp__a__one").?;
+    try testing.expectEqual(@as(usize, 2), r.retireMcpServer("a"));
+    try testing.expect(!before.isLive());
+    try testing.expectEqualStrings("a1", before.description);
+
+    var defs = std.ArrayList(json.ToolDefinition).empty;
+    defer defs.deinit(testing.allocator);
+    try r.appendDefinitions(&defs, testing.allocator);
+    try testing.expectEqual(@as(usize, 3), defs.items.len);
+    try testing.expectEqualStrings("Skill", defs.items[0].name);
+    try testing.expectEqualStrings("mcp__b__one", defs.items[1].name);
+    try testing.expectEqualStrings("mcp__ab__one", defs.items[2].name);
+    try testing.expect(r.find("mcp__a__one") == null);
+    try testing.expectEqual(@as(usize, 0), r.retireMcpServer("missing"));
+    try testing.expectEqual(@as(usize, 5), r.len());
+
+    try r.registerMcp("mcp__a__one", "a1 again", &.{}, dummyExec, null, "a");
+    try testing.expectEqualStrings("a1 again", r.find("mcp__a__one").?.description);
+    try testing.expectEqualStrings("a1", before.description);
+}
+
+test "DynRegistry: a rolled-back batch is retired, not freed" {
+    var r = DynRegistry.init(testing.allocator);
+    defer r.deinit();
+    try r.registerMcp("mcp__a__one", "a1", &.{}, dummyExec, null, "a");
+    const checkpoint = r.len();
+    try r.registerMcp("mcp__a__two", "a2", &.{}, dummyExec, null, "a");
+    const found = r.find("mcp__a__two").?;
+    r.rollbackTo(checkpoint);
+    try testing.expect(r.find("mcp__a__two") == null);
+    try testing.expect(r.find("mcp__a__one") != null);
+    try testing.expectEqualStrings("a2", found.description);
+    try testing.expect(!found.isLive());
+}
+
+const LookupRace = struct {
+    registry: *DynRegistry,
+    stop: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(usize) = .init(0),
+    found: std.atomic.Value(usize) = .init(0),
+
+    fn lookup(race: *LookupRace) void {
+        if (race.registry.find("mcp__stable__tool")) |entry| {
+            if (std.mem.eql(u8, entry.description, "stable")) _ = race.found.fetchAdd(1, .monotonic);
+        }
+        var index: usize = 0;
+        while (race.registry.entryAt(index)) |entry| : (index += 1) std.mem.doNotOptimizeAway(entry.name.len);
+    }
+
+    fn run(race: *LookupRace) void {
+        race.lookup();
+        _ = race.started.fetchAdd(1, .release);
+        while (!race.stop.load(.acquire)) race.lookup();
+    }
+};
+
+test "DynRegistry: lookups on other threads stay valid while tools are registered and retired" {
+    var r = DynRegistry.init(testing.allocator);
+    defer r.deinit();
+    try r.registerMcp("mcp__stable__tool", "stable", &.{}, dummyExec, null, "stable");
+    var race = LookupRace{ .registry = &r };
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, LookupRace.run, .{&race});
+    while (race.started.load(.acquire) < threads.len) std.Thread.yield() catch {};
+    var round: usize = 0;
+    var name_buf: [64]u8 = undefined;
+    while (round < 200) : (round += 1) {
+        const name = try std.fmt.bufPrint(&name_buf, "mcp__churn__tool_{d}", .{round % 7});
+        try r.registerMcp(name, "churn", &.{}, dummyExec, null, "churn");
+        if (round % 7 == 6) _ = r.retireMcpServer("churn");
+    }
+    race.stop.store(true, .release);
+    for (threads) |thread| thread.join();
+    try testing.expect(race.found.load(.monotonic) >= threads.len);
+    try testing.expect(r.find("mcp__stable__tool") != null);
 }
 
 fn dummyExecBody(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror!ToolResultBody {

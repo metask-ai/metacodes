@@ -10,10 +10,12 @@ const ledger_mod = @import("ledger.zig");
 const claude_code = @import("drivers/claude_code.zig");
 const mcp_server = @import("mcp_server.zig");
 const log = @import("../util/log.zig");
+const util_time = @import("../util/time.zig");
 
 pub const relay_file = "manager-relay.sh";
 pub const channel_in = "mcp.in";
 pub const channel_out = "mcp.out";
+pub const reply_delivery_ms = 2000;
 
 pub const relay_script =
     \\exec 3>>"$1" 4<"$2"
@@ -80,10 +82,13 @@ fn driveLaunched(run: *runtime.Run, options: claude_code.Options) !void {
     };
 
     var ended: claude_code.ManagerLaunch.Ended = .{ .stop = .spawn_failed };
-    const watcher = try platform.thread.spawn(.full, superviseManager, .{ &launch, run.gpa, harness_log.fd, &run.abort, &ended });
+    var supervised: Supervised = .{ .run_abort = &run.abort };
+    const watcher = try platform.thread.spawn(.full, superviseManager, .{ &launch, run.gpa, harness_log.fd, &supervised, &ended });
     var server = mcp_server.Server.init(run.gpa, run);
     const served = server.serveFds(channel.input, channel.output);
     if (!run.abort.isAborted()) run.abort.abort(.host_failure);
+    channel.awaitRelayRead(&supervised.exited);
+    supervised.stop.abort(run.abort.reason());
     watcher.join();
     if (ended.stop == .spawn_failed) harness_log.print("could not start the manager\n", .{});
     try run.finishManager(id, ended.elapsed_ms, costOf(ended, allowance), resultOf(&launch, ended));
@@ -94,9 +99,16 @@ fn driveLaunched(run: *runtime.Run, options: claude_code.Options) !void {
     };
 }
 
-fn superviseManager(launch: *const claude_code.ManagerLaunch, gpa: std.mem.Allocator, stderr_fd: ?c_int, abort: *types.AbortSignal, ended: *claude_code.ManagerLaunch.Ended) void {
-    ended.* = launch.run(gpa, stderr_fd, abort);
-    if (!abort.isAborted()) abort.abort(.host_failure);
+const Supervised = struct {
+    run_abort: *types.AbortSignal,
+    stop: types.AbortSignal = .init(),
+    exited: std.atomic.Value(bool) = .init(false),
+};
+
+fn superviseManager(launch: *const claude_code.ManagerLaunch, gpa: std.mem.Allocator, stderr_fd: ?c_int, supervised: *Supervised, ended: *claude_code.ManagerLaunch.Ended) void {
+    ended.* = launch.run(gpa, stderr_fd, &supervised.stop);
+    supervised.exited.store(true, .release);
+    if (!supervised.run_abort.isAborted()) supervised.run_abort.abort(.host_failure);
 }
 
 fn costOf(ended: claude_code.ManagerLaunch.Ended, allowance: f64) ledger_mod.Cost {
@@ -128,6 +140,7 @@ const Channel = struct {
     output_path: [:0]const u8,
     input: pfs.Fd = pfs.invalid_fd,
     output: pfs.Fd = pfs.invalid_fd,
+    output_probe: pfs.Fd = pfs.invalid_fd,
 
     fn open(arena: std.mem.Allocator, seat_dir: []const u8) !Channel {
         var self: Channel = .{
@@ -140,14 +153,27 @@ const Channel = struct {
         if (self.input < 0) return error.ChannelFailed;
         self.output = pfs.open(self.output_path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true, .NONBLOCK = true }, 0);
         if (self.output < 0) return error.ChannelFailed;
+        self.output_probe = pfs.open(self.output_path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true, .NONBLOCK = true }, 0);
+        if (self.output_probe < 0) return error.ChannelFailed;
         return self;
+    }
+
+    fn awaitRelayRead(self: *const Channel, manager_exited: *const std.atomic.Value(bool)) void {
+        const deadline = util_time.nowMs() + reply_delivery_ms;
+        while (!manager_exited.load(.acquire) and util_time.nowMs() < deadline) {
+            const unread = pfs.unreadBytes(self.output_probe) orelse return;
+            if (unread == 0) return;
+            util_time.sleepMs(5);
+        }
     }
 
     fn close(self: *Channel) void {
         if (self.input >= 0) pfs.close(self.input);
         if (self.output >= 0) pfs.close(self.output);
+        if (self.output_probe >= 0) pfs.close(self.output_probe);
         self.input = pfs.invalid_fd;
         self.output = pfs.invalid_fd;
+        self.output_probe = pfs.invalid_fd;
         pfs.unlinkPath(self.input_path.ptr) catch {};
         pfs.unlinkPath(self.output_path.ptr) catch {};
     }
