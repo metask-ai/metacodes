@@ -533,3 +533,54 @@ test "L2: retryDelayMs attempt=1 不下溢" {
     const d = cc.client_mod.retryDelayMs(1, 500);
     try std.testing.expect(d >= 500);
 }
+
+test "L2: a provider that rejects cache_control gets the request again without it, for the rest of the session" {
+    const a = std.testing.allocator;
+    const rejected =
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Anthropic feature at \\\"cache_control\\\" (top-level field) is not supported when converting /v1/messages to an OpenAI-compatible upstream\"}}";
+    const bodies = [_][]const u8{ rejected, OK_SSE, OK_SSE };
+    const statuses = [_][]const u8{ "HTTP/1.1 400 Bad Request", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK" };
+    var srv = try harness.MockServer.startHttpCassette(&bodies, &statuses);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    var first = try client.sendMessageStream(empty, null, null);
+    try drainStream(&first);
+    first.deinit();
+    var second = try client.sendMessageStream(empty, null, null);
+    try drainStream(&second);
+    second.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, srv.requestAt(0).?.raw, "\"cache_control\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.requestAt(1).?.raw, "\"cache_control\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.requestAt(2).?.raw, "\"cache_control\"") == null);
+}
+
+test "L2: any other 400 is not resent" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startRepeatingStatus(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"A parameter specified in the request is not valid\"}}",
+        "HTTP/1.1 400 Bad Request",
+        "",
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    try std.testing.expectError(error.HttpError, client.sendMessageStream(empty, null, null));
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+}

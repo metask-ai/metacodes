@@ -806,6 +806,7 @@ pub const Client = struct {
     /// Numbers the last head-phase overflow body carried (cleared on the next
     /// accepted response). Read by the agent loop's context recovery.
     last_context_window_numbers: error_class.ContextWindowNumbers = .{},
+    sends_cache_control: bool = true,
     /// Last gateway request id; overwritten at each response head. Borrowed
     /// metadata is copied so error responses are observable as well.
     server_request_id: [256]u8 = undefined,
@@ -1099,18 +1100,24 @@ pub const Client = struct {
     ) !ApiResponse {
         const effective_model = model_override orelse client.modelSnapshot();
         const max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
-        const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
-            .model = effective_model,
-            .max_tokens = max_tokens,
-            .messages = messages,
-            .system = system,
-            .stream = false,
-            .tools = tools,
-            .reasoning_effort = client.reasoning_effort,
-        }, client.allocator, client.dialectFor(effective_model));
-        defer client.allocator.free(req_body);
-
-        const result = try client.doRequestWithAuthReplay(req_body, false, null, null, max_tokens);
+        const result = while (true) {
+            const sent_cache_control = client.sends_cache_control;
+            const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
+                .model = effective_model,
+                .max_tokens = max_tokens,
+                .messages = messages,
+                .system = system,
+                .stream = false,
+                .tools = tools,
+                .reasoning_effort = client.reasoning_effort,
+                .cache_control = client.cacheControl(),
+            }, client.allocator, client.dialectFor(effective_model));
+            defer client.allocator.free(req_body);
+            break client.doRequestWithAuthReplay(req_body, false, null, null, max_tokens) catch |err| {
+                if (client.retriesWithoutCacheControl(err, sent_cache_control)) continue;
+                return err;
+            };
+        };
         switch (result) {
             .full_body => |fb| {
                 defer client.allocator.free(fb.body);
@@ -1178,20 +1185,28 @@ pub const Client = struct {
         var report = json_mod.SerializationReport{};
         defer report.deinit(client.allocator);
         const max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
-        const req_body = try json_mod.serializeMessagesRequestWithDialectReport(.{
-            .model = effective_model,
-            .max_tokens = max_tokens,
-            .messages = messages,
-            .system = system,
-            .stream = true,
-            .tools = tools,
-            .tool_choice = tool_choice,
-            .reasoning_effort = client.reasoning_effort,
-        }, client.allocator, dialect, &report);
-        // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
-        defer client.allocator.free(req_body);
-
-        const result = try client.doRequestWithAuthReplay(req_body, true, abort, retry_hint, max_tokens);
+        const result = while (true) {
+            const sent_cache_control = client.sends_cache_control;
+            report.deinit(client.allocator);
+            report = .{};
+            const req_body = try json_mod.serializeMessagesRequestWithDialectReport(.{
+                .model = effective_model,
+                .max_tokens = max_tokens,
+                .messages = messages,
+                .system = system,
+                .stream = true,
+                .tools = tools,
+                .tool_choice = tool_choice,
+                .reasoning_effort = client.reasoning_effort,
+                .cache_control = client.cacheControl(),
+            }, client.allocator, dialect, &report);
+            // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
+            defer client.allocator.free(req_body);
+            break client.doRequestWithAuthReplay(req_body, true, abort, retry_hint, max_tokens) catch |err| {
+                if (client.retriesWithoutCacheControl(err, sent_cache_control)) continue;
+                return err;
+            };
+        };
         switch (result) {
             .streaming_response => |r| {
                 var sr = StreamResponse.init(client.allocator, r, abort);
@@ -1203,6 +1218,14 @@ pub const Client = struct {
             },
             .full_body => unreachable,
         }
+    }
+
+    fn cacheControl(client: *const Client) ?json_mod.CacheControl {
+        return if (client.sends_cache_control) .{} else null;
+    }
+
+    fn retriesWithoutCacheControl(client: *const Client, err: anyerror, sent_cache_control: bool) bool {
+        return err == error.HttpError and sent_cache_control and !client.sends_cache_control;
     }
 
     fn doRequestWithAuthReplay(
@@ -1486,6 +1509,10 @@ pub const Client = struct {
                 // Cleanup remains with the surrounding errdefers; do not deinit/destroy here.
                 const body_info = logErrorBody(req_ptr, rid, status, http_response, auth.value);
                 client.last_context_window_numbers = body_info.context_window_numbers;
+                if (body_info.cache_control_rejected and client.sends_cache_control) {
+                    client.sends_cache_control = false;
+                    log.warnId("client", rid, "provider rejected cache_control; resending without it for the rest of the session", .{});
+                }
                 return resolveHttpFailure(failure, body_info);
             },
         }
@@ -1780,6 +1807,8 @@ pub fn errorBodyInfo(status_code: u16, preview: []const u8) ErrorBodyInfo {
         .context_window_exceeded = context_window_exceeded,
         .context_window_numbers = if (context_window_exceeded) error_class.parseContextWindowNumbers(preview) else .{},
         .token_expired = status_code == 401 and containsMetaskTokenExpired(preview),
+        .cache_control_rejected = status_code == 400 and std.mem.indexOf(u8, preview, "cache_control") != null and
+            std.mem.indexOf(u8, preview, "not supported") != null,
     };
 }
 
@@ -1820,6 +1849,7 @@ pub const ErrorBodyInfo = struct {
     context_window_exceeded: bool = false,
     context_window_numbers: error_class.ContextWindowNumbers = .{},
     token_expired: bool = false,
+    cache_control_rejected: bool = false,
 };
 
 test "HTTP status classification is total and preserves provider semantics" {

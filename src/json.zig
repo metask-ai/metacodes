@@ -8,6 +8,7 @@ const util_json = @import("util/json.zig");
 
 // --- api/request.zig 重导出 ---
 pub const MessagesRequest = api_request.MessagesRequest;
+pub const CacheControl = api_request.CacheControl;
 pub const ToolChoice = api_request.ToolChoice;
 pub const ToolDefinition = api_request.ToolDefinition;
 pub const ModelToolActivation = api_request.ModelToolActivation;
