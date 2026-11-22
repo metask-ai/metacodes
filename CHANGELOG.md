@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`metacodes bench pull` pre-pulls a suite's task images.** It reads the
+  `docker_image` of each selected task and pulls the missing ones on the
+  chosen executor, with retries (`--dry-run` only lists what is missing), so a
+  flaky registry no longer turns batch trials into invalid environment
+  failures.
+
 - **A bench batch can switch on advanced features.** The 新建 page of the
   bench workbench has a 高级功能 section: the Lean-modelled run gates
   (`--verification-final-gate`, `--requirement-ledger`, `--test-integrity`,
