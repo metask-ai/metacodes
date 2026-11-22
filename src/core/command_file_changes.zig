@@ -193,6 +193,124 @@ const Breaker = struct {
 
 var breaker: Breaker = .{};
 
+const StatusScope = union(enum) { everything, paths: usize };
+
+const StatusMemo = struct {
+    const MAX_ASKED_PATHS = 256;
+    const MAX_ASKED_BYTES = 16 * 1024;
+
+    mutex: sync.Mutex = .{},
+    held: ?Memo = null,
+
+    const Memo = struct {
+        arena: std.heap.ArenaAllocator,
+        root: []const u8 = "",
+        prefix: []const u8 = "",
+        index_path: []const u8 = "",
+        index_stat: pfs.PathStat,
+        sources: []const ?pfs.PathStat = &.{},
+        since_ns: i128,
+        files: std.StringHashMapUnmanaged(pfs.PathStat) = .empty,
+        dirty: std.StringHashMapUnmanaged(void) = .empty,
+        rules: []const []const u8 = &.{},
+
+        fn deinit(self: *Memo) void {
+            self.arena.deinit();
+        }
+
+        fn trusts(self: *const Memo, rel: []const u8, stat: pfs.PathStat) bool {
+            const known = self.files.get(rel) orelse return false;
+            return known.eql(stat) and untouchedSince(stat, self.since_ns);
+        }
+
+        fn stalePaths(self: *const Memo, a: std.mem.Allocator, before: *const GitBefore, snapshot: *const Snapshot) error{OutOfMemory}!?[]const []const u8 {
+            if (!std.mem.eql(u8, self.prefix, before.prefix) or !std.mem.eql(u8, self.index_path, before.index_path)) return null;
+            const index_now = before.index_stat orelse return null;
+            if (!self.index_stat.eql(index_now)) return null;
+            if (self.sources.len != before.attribute_sources.items.len) return null;
+            for (self.sources, before.attribute_sources.items) |then, src| {
+                if ((then == null) != (src.then == null)) return null;
+                if (then) |t| if (!t.eql(src.then.?)) return null;
+            }
+            for (self.rules) |rule| if (!snapshot.files.contains(rule)) return null;
+            var asked: std.ArrayList([]const u8) = .empty;
+            var bytes: usize = 0;
+            var it = snapshot.files.iterator();
+            while (it.next()) |entry| {
+                if (self.trusts(entry.key_ptr.*, entry.value_ptr.*)) continue;
+                if (decidesStatus(entry.key_ptr.*)) return null;
+                bytes += entry.key_ptr.len + 1;
+                if (asked.items.len == MAX_ASKED_PATHS or bytes > MAX_ASKED_BYTES) return null;
+                try asked.append(a, entry.key_ptr.*);
+            }
+            return asked.items;
+        }
+
+        fn build(root: []const u8, before: *const GitBefore, index_stat: pfs.PathStat, snapshot: *const Snapshot, since_ns: i128) error{OutOfMemory}!Memo {
+            var memo = Memo{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .index_stat = index_stat, .since_ns = since_ns };
+            errdefer memo.arena.deinit();
+            const a = memo.arena.allocator();
+            memo.root = try a.dupe(u8, root);
+            memo.prefix = try a.dupe(u8, before.prefix);
+            memo.index_path = try a.dupe(u8, before.index_path);
+            const sources = try a.alloc(?pfs.PathStat, before.attribute_sources.items.len);
+            for (sources, before.attribute_sources.items) |*then, src| then.* = src.then;
+            memo.sources = sources;
+
+            const listing = try a.dupe(u8, snapshot.listing);
+            const base = @intFromPtr(snapshot.listing.ptr);
+            var rules: std.ArrayList([]const u8) = .empty;
+            try memo.files.ensureTotalCapacity(a, snapshot.files.count());
+            var it = snapshot.files.iterator();
+            while (it.next()) |entry| {
+                const rel = entry.key_ptr.*;
+                const at = @intFromPtr(rel.ptr);
+                const key = if (at >= base and at + rel.len <= base + listing.len) listing[at - base ..][0..rel.len] else try a.dupe(u8, rel);
+                memo.files.putAssumeCapacity(key, entry.value_ptr.*);
+                if (decidesStatus(key)) try rules.append(a, key);
+            }
+            memo.rules = rules.items;
+            var dirty = before.dirty.keyIterator();
+            while (dirty.next()) |rel| try memo.dirty.put(a, try a.dupe(u8, rel.*), {});
+            return memo;
+        }
+    };
+
+    fn take(self: *StatusMemo, root: []const u8) ?Memo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const memo = self.held orelse return null;
+        if (!std.mem.eql(u8, memo.root, root)) return null;
+        self.held = null;
+        return memo;
+    }
+
+    fn remember(self: *StatusMemo, root: []const u8, before: *const GitBefore, snapshot: *const Snapshot, since_ns: i128) void {
+        const index_stat = before.index_stat orelse return;
+        const memo = Memo.build(root, before, index_stat, snapshot, since_ns) catch return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.held) |*old| old.deinit();
+        self.held = memo;
+    }
+
+    fn forget(self: *StatusMemo, root: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.held) |*memo| if (std.mem.eql(u8, memo.root, root)) {
+            memo.deinit();
+            self.held = null;
+        };
+    }
+};
+
+var status_memo: StatusMemo = .{};
+
+fn decidesStatus(rel: []const u8) bool {
+    const name = std.fs.path.basenamePosix(rel);
+    return std.mem.eql(u8, name, ".gitattributes") or std.mem.eql(u8, name, ".gitignore");
+}
+
 fn noteGap(root: []const u8, gap: Gap) void {
     switch (gap) {
         .workspace_too_large => breaker.note(root, .too_large),
@@ -421,6 +539,7 @@ const GitBefore = struct {
     /// of the directories between the repository top and the root. Paired
     /// with their state before the command (null: absent).
     attribute_sources: std.ArrayListUnmanaged(Source) = .empty,
+    asked: StatusScope = .everything,
 
     const Source = struct { path: [:0]const u8, then: ?pfs.PathStat };
 
@@ -508,6 +627,7 @@ fn takeGitBefore(
     gpa: std.mem.Allocator,
     root: []const u8,
     snapshot: *const Snapshot,
+    since_ns: i128,
     abort: ?*const AbortSignal,
     limits: Limits,
 ) error{OutOfMemory}!GitBeforeResult {
@@ -545,23 +665,60 @@ fn takeGitBefore(
     }
     before.index_stat = pfs.statNoFollow(before.index_path.ptr) catch null;
 
-    const status = switch (try runGit(a, root, &.{
-        "--no-optional-locks",   "status",       "--porcelain=v2",          "-z",
-        "--untracked-files=all", "--no-renames", "--ignore-submodules=all", "--",
-        ".",
-    }, abort, limits.git_timeout_ms, limits.max_status_bytes, null)) {
-        .ok => |r| r,
-        .refused, .unavailable => return .none,
-        .timed_out => return .timed_out,
-        .aborted => return .aborted,
-    };
-    // A truncated status cannot say which files are clean; without that,
-    // the index is nobody's trustworthy "before".
-    if (!status.complete) return .too_large;
+    var prior = status_memo.take(root);
+    defer if (prior) |*p| p.deinit();
+    const asked: ?[]const []const u8 = if (prior) |*p| try p.stalePaths(a, &before, snapshot) else null;
+    if (asked) |paths| {
+        var carried = prior.?.dirty.keyIterator();
+        while (carried.next()) |rel| {
+            const stat = snapshot.files.get(rel.*) orelse continue;
+            if (prior.?.trusts(rel.*, stat)) try before.dirty.put(a, try a.dupe(u8, rel.*), {});
+        }
+        before.asked = .{ .paths = paths.len };
+    }
+    if (asked == null or asked.?.len > 0) {
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(a, &.{
+            "--literal-pathspecs",   "--no-optional-locks", "status",                  "--porcelain=v2", "-z",
+            "--untracked-files=all", "--no-renames",        "--ignore-submodules=all", "--",
+        });
+        if (asked) |paths| try args.appendSlice(a, paths) else try args.append(a, ".");
+        const status = switch (try runGit(a, root, args.items, abort, limits.git_timeout_ms, limits.max_status_bytes, null)) {
+            .ok => |r| r,
+            .refused, .unavailable => return .none,
+            .timed_out => return .timed_out,
+            .aborted => return .aborted,
+        };
+        // A truncated status cannot say which files are clean; without that,
+        // the index is nobody's trustworthy "before".
+        if (!status.complete) return .too_large;
+        try noteDirty(&before, status.out);
+    }
 
     var copied_bytes: usize = 0;
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    var entries = std.mem.splitScalar(u8, status.out, 0);
+    var dirty = before.dirty.keyIterator();
+    while (dirty.next()) |rel| {
+        const stat = snapshot.files.get(rel.*) orelse continue;
+        if (before.copies.count() >= limits.max_baseline_files) continue;
+        if (stat.size > limits.max_file_bytes or copied_bytes + stat.size > limits.max_baseline_bytes) continue;
+        const z = joinZ(&path_buf, root, rel.*) orelse continue;
+        switch (try readRegular(a, z, limits.max_file_bytes)) {
+            .bytes => |bytes| {
+                copied_bytes += bytes.len;
+                try before.copies.put(a, rel.*, bytes);
+            },
+            .unavailable => {},
+        }
+    }
+    status_memo.remember(root, &before, snapshot, since_ns);
+    keep = true;
+    return .{ .ok = before };
+}
+
+fn noteDirty(before: *GitBefore, status: []const u8) error{OutOfMemory}!void {
+    const a = before.arena.allocator();
+    var entries = std.mem.splitScalar(u8, status, 0);
     while (entries.next()) |entry| {
         if (entry.len < 2) continue;
         const repo_path: []const u8, const dirty = switch (entry[0]) {
@@ -579,23 +736,8 @@ fn takeGitBefore(
         };
         if (!dirty) continue;
         if (!std.mem.startsWith(u8, repo_path, before.prefix)) continue;
-        const rel = try a.dupe(u8, repo_path[before.prefix.len..]);
-        try before.dirty.put(a, rel, {});
-
-        const stat = snapshot.files.get(rel) orelse continue;
-        if (before.copies.count() >= limits.max_baseline_files) continue;
-        if (stat.size > limits.max_file_bytes or copied_bytes + stat.size > limits.max_baseline_bytes) continue;
-        const z = joinZ(&path_buf, root, rel) orelse continue;
-        switch (try readRegular(a, z, limits.max_file_bytes)) {
-            .bytes => |bytes| {
-                copied_bytes += bytes.len;
-                try before.copies.put(a, rel, bytes);
-            },
-            .unavailable => {},
-        }
+        try before.dirty.put(a, try a.dupe(u8, repo_path[before.prefix.len..]), {});
     }
-    keep = true;
-    return .{ .ok = before };
 }
 
 /// The text after the first `n` space-separated fields.
@@ -811,7 +953,7 @@ pub const Observation = struct {
         };
         var git: ?GitBefore = null;
         if (options.git_baselines and !remembered.git_slow) {
-            const got = takeGitBefore(gpa, root, &snapshot, abort, limits) catch {
+            const got = takeGitBefore(gpa, root, &snapshot, self.since_ns, abort, limits) catch {
                 snapshot.deinit(gpa);
                 self.state = .{ .gap = .out_of_memory };
                 return self;
@@ -828,10 +970,14 @@ pub const Observation = struct {
                 },
             }
         }
-        log.debug("bash_fc", "before: files={d} unobserved={d} git={} dirty_copies={d} ms={d}", .{
+        log.debug("bash_fc", "before: files={d} unobserved={d} git={} status_paths={?d} dirty_copies={d} ms={d}", .{
             snapshot.files.count(),
             snapshot.unobserved,
             git != null,
+            if (git) |g| switch (g.asked) {
+                .everything => null,
+                .paths => |n| n,
+            } else null,
             if (git) |g| g.copies.count() else 0,
             util_time.nowMs() - started,
         });
@@ -1243,6 +1389,7 @@ const Fixture = struct {
 
     fn deinit(self: *Fixture) void {
         breaker.forget(self.root);
+        status_memo.forget(self.root);
         self.tmp.cleanup();
     }
 
@@ -1943,4 +2090,92 @@ test "files of a renamed directory are moves, not files that were already there"
         try testing.expectEqual(@as(usize, 2), kinds.get(.moved));
         try testing.expectEqual(@as(usize, 2), got.records.items.len);
     }
+}
+
+fn observeNothing(fx: *const Fixture, limits: Limits) !void {
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+    defer obs.deinit();
+    try testing.expect(obs.state.watching.git != null);
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expectEqual(@as(usize, 0), got.records.items.len);
+}
+
+test "an unchanged workspace is not handed to git status again on the next observation (#670)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("clean.txt", "one\n");
+    try fx.write("dirty.txt", "a\n");
+    try commitAll(&fx);
+    try fx.write("dirty.txt", "a\nb\n");
+    tick();
+    var limits = unhurried;
+    limits.clock_slack_ms = 0;
+    try observeNothing(&fx, limits);
+
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+    defer obs.deinit();
+    try testing.expectEqual(StatusScope{ .paths = 0 }, obs.state.watching.git.?.asked);
+    try fx.write("clean.txt", "two\n");
+    try fx.write("dirty.txt", "a\nc\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expectEqualStrings("--- a/clean.txt\n+++ b/clean.txt\n@@ -1,1 +1,1 @@\n-one\n+two\n", (try got.get("clean.txt")).diff orelse return error.TestExpectedDiff);
+    try testing.expectEqualStrings("--- a/dirty.txt\n+++ b/dirty.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n", (try got.get("dirty.txt")).diff orelse return error.TestExpectedDiff);
+}
+
+test "a file another writer changed between observations is asked about again (#670)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("a.txt", "one\n");
+    try fx.write("b.txt", "one\n");
+    try commitAll(&fx);
+    tick();
+    var limits = unhurried;
+    limits.clock_slack_ms = 0;
+    try observeNothing(&fx, limits);
+    try fx.write("b.txt", "two\n");
+    tick();
+
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+    defer obs.deinit();
+    try testing.expectEqual(StatusScope{ .paths = 1 }, obs.state.watching.git.?.asked);
+    try fx.write("b.txt", "three\n");
+    var got = Captured{ .allocator = testing.allocator };
+    defer got.deinit();
+    obs.finish(null, got.sink(), false);
+    try testing.expectEqualStrings("--- a/b.txt\n+++ b/b.txt\n@@ -1,1 +1,1 @@\n-two\n+three\n", (try got.get("b.txt")).diff orelse return error.TestExpectedDiff);
+}
+
+test "a moved index or ignore rule sends the whole workspace to git status again (#670)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx = Fixture.init();
+    defer fx.deinit();
+    try fx.setup();
+    try fx.write("a.txt", "one\n");
+    try fx.write("b.txt", "one\n");
+    try commitAll(&fx);
+    tick();
+    var limits = unhurried;
+    limits.clock_slack_ms = 0;
+    try observeNothing(&fx, limits);
+    try fx.write("b.txt", "two\n");
+    try fx.git(&.{ "add", "b.txt" });
+    tick();
+    {
+        var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+        defer obs.deinit();
+        try testing.expectEqual(StatusScope.everything, obs.state.watching.git.?.asked);
+    }
+    try fx.write(".gitignore", "a.txt\n");
+    tick();
+    var obs = Observation.begin(testing.allocator, fx.root, null, .{ .limits = limits });
+    defer obs.deinit();
+    try testing.expectEqual(StatusScope.everything, obs.state.watching.git.?.asked);
 }

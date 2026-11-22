@@ -125,6 +125,7 @@ test {
     _ = @import("component/tool_result_storage_test.zig");
     _ = @import("component/web_fetch_encoding_test.zig");
     _ = @import("component/bash_output_wait_test.zig");
+    _ = @import("component/bash_foreground_wait_test.zig");
     _ = @import("component/sealed_publication_test.zig");
     _ = @import("component/inline_threshold_test.zig");
     _ = @import("component/cache_break_test.zig");
