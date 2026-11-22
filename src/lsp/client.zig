@@ -661,8 +661,12 @@ test "Client: a window without a publish silences the path until the server publ
 
     const t0 = try cl.openFile(path, "a\n");
     try testing.expectEqual(DiagnosticsWait.timed_out, cl.waitForDiagnostics(path, t0, 300));
+    // Nothing is in flight, so the silenced path must be skipped without waiting.
+    try testing.expectEqual(DiagnosticsWait.skipped_silent, cl.waitForDiagnostics(path, t0, 5000));
+    // The mock publishes for "b" at once and may beat the wait, which then sees the publish.
     const t1 = try cl.openFile(path, "b\n");
-    try testing.expectEqual(DiagnosticsWait.skipped_silent, cl.waitForDiagnostics(path, t1, 5000));
+    const after_edit = cl.waitForDiagnostics(path, t1, 5000);
+    try testing.expect(after_edit == .skipped_silent or after_edit == .published);
     cl.lock();
     var polls: usize = 0;
     while (cl.silent_paths.contains(path) and polls < 40) : (polls += 1) {
