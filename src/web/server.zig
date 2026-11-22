@@ -390,7 +390,7 @@ pub const WebServer = struct {
         // 等 detached 连接线程退净。**上限须 > socket 超时(SO_RCVTIMEO/SNDTIMEO=10s)**:
         // 卡在读/写的连接线程最长被超时唤醒需 10s;SSE 阻塞线程由 journal.close 立即唤醒。
         // 12s 覆盖最坏情况 → 正常关停连接线程必然退净,调用方(run())随后 deinit
-        // journal/inbox/cmdbox/wb 才安全(它们在 run() 栈上、无条件释放,连接线程还活着
+        // journal/inbox/wb 才安全(它们在 run() 栈上、无条件释放,连接线程还活着
         // 会 UAF)。3s 旧上限 < 10s socket 超时 = 有漏网窗口,已修。
         var waited_ms: u64 = 0;
         while (self.live_conns.load(.acquire) > 0 and waited_ms < 12_000) {
@@ -583,10 +583,10 @@ pub const WebServer = struct {
                 }
                 return;
             };
-            if (!sv.inbox.push(request)) {
-                writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"queue push failed\"}");
-                return;
-            }
+            sv.inbox.push(request) catch |err| switch (err) {
+                error.QueueFull => return writeQueueFull(fd, sv.inbox.max_queued),
+                error.OutOfMemory => return writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"queue push failed\"}"),
+            };
             writeSimple(fd, "200 OK", "application/json", "{\"ok\":true}");
             return;
         }
@@ -633,7 +633,8 @@ pub const WebServer = struct {
                 writeSimple(fd, "501 Not Implemented", "application/json", "{\"error\":\"commands unavailable\"}");
                 return;
             };
-            const res = cf(sv.state_ctx, self.allocator, cmd) catch {
+            const res = cf(sv.state_ctx, self.allocator, cmd) catch |err| {
+                if (err == error.QueueFull) return writeQueueFull(fd, sv.inbox.max_queued);
                 writeSimple(fd, "500 Internal Server Error", "application/json", "{\"ok\":false,\"message\":\"command failed\"}");
                 return;
             };
@@ -1001,6 +1002,12 @@ fn writeCreateError(fd: net.Socket, err: CreateError, max_sessions: usize) void 
         error.RestoreFailed => writeError(fd, "500 Internal Server Error", "the persisted transcript could not be restored"),
         error.CreateFailed => writeError(fd, "500 Internal Server Error", "session could not be created"),
     }
+}
+
+fn writeQueueFull(fd: net.Socket, max_queued: usize) void {
+    var buffer: [64]u8 = undefined;
+    const json = std.fmt.bufPrint(&buffer, "{{\"error\":\"queue full\",\"max_queued\":{d}}}", .{max_queued}) catch unreachable;
+    writeSimple(fd, "429 Too Many Requests", "application/json", json);
 }
 
 /// `{"error":"<message>"}` with `status`.

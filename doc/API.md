@@ -1077,12 +1077,12 @@ unless noted.
 | `GET /health` | Liveness probe: `200 {"status":"ok","version":"<v>","sessions":N}`. `<v>` is the version `metacodes --version` prints on its first line (the semver, plus `+<commit12>` on a development build); `N` is 1, or the number of live sessions the daemon hosts. Never under `/s/<id>/`, never authenticated, and it reads no session, journal or lock. |
 | `GET /` | The bundled single-session browser UI; in the `/s/<id>/` daemon, a page listing the live session ids and these endpoints. |
 | `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
-| `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
+| `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. `429` when the session's queue is full ([below](#web-and-daemon-messages-post-message-and-get-state)). |
 | `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. Ids are never reused, also across restarts and a session destroyed and restored, so an answer to an earlier process's request is 409 and never answers a newer one ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#15-ui-requests-approvers-expiry-suspended-runs)). |
 | `POST /capabilities` | The frontend's [capability frame](WIRE_PROTOCOL.md#2-capability-exchange): `200` with the `capabilities_accepted` line (also journaled), `400` with `capabilities_refused` (nothing changes). From then on a UI request the frame leaves out is journaled as `ui_request_unavailable` and never announced. |
-| `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
+| `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. `429` when the session's queue is full. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |
-| `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, ...). |
+| `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, queue depth, ...). |
 | `GET /spans` | The session's recorded spans as one OTLP/JSON `ExportTraceServiceRequest` ([Observability](OBSERVABILITY.md#the-web-trace-view)): every Run of the conversation, in the order its spans ended. `404` when the host records no spans. |
 | `GET /trace` | The trace view: the conversation's spans as a waterfall, read from `GET /spans`. |
 
@@ -1377,6 +1377,14 @@ three fields with the same checks (replies `{"ok":true}` or
   (#447; [`SessionHost`](#sessionhost-a-multi-session-service-for-network-hosts)
   takes it).
 
+A session queues at most 64 messages and `POST /command` lines together, the
+bound `SessionHost` keeps (`max_queued`, #447); the turn in progress is not
+one of them. Beyond it a message or a command is refused and nothing is
+queued: `429 {"error":"queue full","max_queued":64}` over HTTP,
+`{"ok":false,"error":"queue full","max_queued":64}` from the UDS `message`
+op. Once the driver takes the next one off the queue, one more fits.
+`/state` reports `queued` and `max_queued`.
+
 The session's driver takes messages one at a time, after the turn in progress
 and after queued `POST /command`s. For each message it checks the permission
 mode (a mode the session's settings disable — `disableBypassPermissionsMode`,
@@ -1448,6 +1456,7 @@ connecting or reconnecting:
 | `model`, `permission_mode` | In force now; the mode as `default`, `accept_edits`, `auto`, `dont_ask` or `bypass_permissions`. |
 | `generating` | A turn or a command is running. |
 | `pending_request_id` | The UI request waiting for `POST /respond`, `0` when none. |
+| `queued`, `max_queued` | Messages and `/command` lines waiting for the driver, and the bound beyond which they are refused with `429`. |
 | `frontend_capabilities` | The declaration in force (the last `capabilities_accepted` object), `null` while no frontend declared: every request is then announced. |
 
 It also carries `session_id`, `additional_dirs`, token usage and cost, the

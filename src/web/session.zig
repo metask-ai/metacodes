@@ -29,7 +29,6 @@ const run_journal = @import("../core/tool_observation_journal.zig");
 const journal_mod = @import("../core/event_journal.zig");
 const backend_mod = @import("backend.zig");
 const server_mod = @import("server.zig");
-const msg_queue_mod = @import("../repl/msg_queue.zig");
 const submission_mod = @import("submission.zig");
 const log = @import("../util/log.zig");
 const util_json = @import("../util/json.zig");
@@ -39,7 +38,6 @@ const model_error = @import("../api/model_error.zig");
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
 const WebServer = server_mod.WebServer;
-const MsgQueue = msg_queue_mod.MsgQueue;
 const Submission = submission_mod.Submission;
 const SubmissionQueue = submission_mod.SubmissionQueue;
 const ui_event = @import("../core/protocol/ui_event.zig");
@@ -83,7 +81,7 @@ pub fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator,
 pub const StateSource = struct {
     app: *app_mod.App,
     wb: *WebBackend,
-    cmdbox: *MsgQueue, // 斜杠命令队列(HTTP 入队,driver 执行)
+    inbox: *SubmissionQueue,
     journal: *EventJournal, // U5 B1:快照带 seq(锁内 count())供附着握手
     /// 生成期标志(driver 维护;web run 持有自己的,daemon 指 host.generating)。
     generating: *std.atomic.Value(bool),
@@ -195,6 +193,8 @@ pub const StateSource = struct {
             .cost_usd = u.costUsd(slices.model),
             .generating = self.generating.load(.acquire),
             .pending_request_id = self.wb.pendingId(),
+            .queued = self.inbox.len(),
+            .max_queued = self.inbox.max_queued,
             .agents = agent_views, // U6 A4:附着 roster
             .tasks = task_views, // task#19:mid-session task 列表进快照
             .plugin_inventory = plugin_inventory.value,
@@ -204,7 +204,7 @@ pub const StateSource = struct {
 
     /// 斜杠命令入口(HTTP 连接线程调)。**只入队,绝不碰 App**:命令要改 conversation/
     /// config/allocator,而这些非线程安全,唯一安全 toucher 是 driver 线程。commandFn 把
-    /// 命令 push 进 cmdbox,driver 在空闲点(它独占 conversation/allocator 时)执行 execCommand,
+    /// 命令 push 进 inbox,driver 在空闲点(它独占 conversation/allocator 时)执行 execCommand,
     /// 结果经 journal command_result 事件异步回浏览器。返回 202 ack。
     ///
     /// **为什么不在 HTTP 线程执行**:generating flag 只保护 agent_loop.run,不保护 driver
@@ -212,7 +212,7 @@ pub const StateSource = struct {
     /// 改 conversation 会与 driver 的 appendText 并发 mutate 同一 ArrayList(堆损坏)。
     pub fn command(ctx: *anyopaque, allocator: std.mem.Allocator, cmd: []const u8) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
-        if (!self.cmdbox.push(cmd)) return reply(allocator, false, "command queue full");
+        try self.inbox.pushCommand(cmd);
         return reply(allocator, true, "queued");
     }
 };
@@ -482,10 +482,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
     wb.usage_totals = &app.usage; // /state 的 token/cost 数据源(backend 累计,全仓惯例)
     var inbox = SubmissionQueue.init(web_alloc);
     defer inbox.deinit();
-    var cmdbox = MsgQueue.init(web_alloc);
-    defer cmdbox.deinit();
     var generating_flag = std.atomic.Value(bool).init(false);
-    var state_src = StateSource{ .app = app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal, .generating = &generating_flag };
+    var state_src = StateSource{ .app = app, .wb = &wb, .inbox = &inbox, .journal = &journal, .generating = &generating_flag };
 
     // U4 A4:装配 config 变更 sink(model/mode/dirs/reasoning 变更 → journal → SSE)。
     // setConfigEventSink 同步设 App sink + permission_ctx.event_sink(mode),并 **seed snapshot_cache**。
@@ -535,7 +533,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         // 这一批命令全部跑完才 beginPlannedRun(Run 的行连续,见 CommandBatch)。
         var batch: CommandBatch = .{};
         defer batch.deinit(web_alloc);
-        while (cmdbox.popFront()) |c| {
+        while (inbox.popCommand()) |c| {
             defer web_alloc.free(c);
             // 命令执行期也亮 generating:`!cmd` 可长时间阻塞 driver,不亮则 /interrupt 被
             // 409 门挡死(浏览器 Stop 失效)。中断的残留 abort 由既有复位路径消化
@@ -807,10 +805,10 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     app.tasks = @import("../core/task_store.zig").TaskStore.init(a);
     defer app.tasks.deinit();
 
-    var cmdbox = MsgQueue.init(a);
-    defer cmdbox.deinit();
+    var inbox = SubmissionQueue.init(a);
+    defer inbox.deinit();
     var generating_flag = std.atomic.Value(bool).init(false);
-    var src = StateSource{ .app = &app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal, .generating = &generating_flag };
+    var src = StateSource{ .app = &app, .wb = &wb, .inbox = &inbox, .journal = &journal, .generating = &generating_flag };
 
     const json = try StateSource.snapshot(@ptrCast(&src), a);
     defer a.free(json);

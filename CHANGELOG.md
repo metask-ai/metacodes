@@ -152,6 +152,16 @@ status, compatibility boundaries, and entry points are defined by
   prompts even under an allow rule for `Bash` or in `bypassPermissions`,
   however it is quoted or escaped; a deny rule still denies.
 
+- **A `--web` or `serve` session queues at most 64 messages and commands**
+  (#447). Before, its queue had no bound: a client could line up any number
+  of turns, each one a provider request. A `POST /message`, `POST /command`
+  or UDS `message` beyond 64 is refused and queues nothing, over HTTP with
+  `429 {"error":"queue full","max_queued":64}`, over the UDS with
+  `{"ok":false,"error":"queue full","max_queued":64}`. Messages and commands
+  count together and the turn in progress does not count, as in
+  `SessionHost` (`max_queued`). `GET /state` reports `queued` and
+  `max_queued`.
+
 ### Fixed
 
 - **Cancelling a bench build on macOS reports the cancel.** Stopping a
@@ -221,6 +231,17 @@ status, compatibility boundaries, and entry points are defined by
   more connection after its run ended, and the Colima relay check left its
   probe port open. They are now shut down before they are closed.
 
+- **The arrow keys, Home, End, Delete, Page Up and Page Down work with Caps
+  Lock or Num Lock on** (#658). Under the kitty keyboard protocol a terminal
+  counts the lock keys as modifiers, Caps Lock adding 64 and Num Lock 128:
+  with Caps Lock on, Ghostty sends Up as `ESC [ 1 ; 65 A` and Delete as
+  `ESC [ 3 ; 65 ~`. The key parser read a modifier only in `CSI u` and
+  modifyOtherKeys sequences, so these keys did nothing: Up recalled no
+  history at the prompt, and in the permission dialog Down, Down, Enter,
+  meant to pick "No", approved the write as "Yes once". A modifier that holds
+  only lock bits now leaves the key as it is; with Shift, Alt or Ctrl these
+  keys are still ignored, as before.
+
 - **The permission and question dialogs take Esc and Ctrl+C in every
   encoding** (#657). Both dialogs looked only at the first byte of each read.
   A terminal with the kitty keyboard protocol on (Alacritty, Windows Terminal
@@ -234,17 +255,6 @@ status, compatibility boundaries, and entry points are defined by
   forms do, and every key of a read counts. A bracketed paste never answers
   a dialog: the permission dialog ignores it, and the question dialog types
   it into "Type something" or the note being edited, line breaks as spaces.
-
-- **The arrow keys, Home, End, Delete, Page Up and Page Down work with Caps
-  Lock or Num Lock on** (#658). Under the kitty keyboard protocol a terminal
-  counts the lock keys as modifiers, Caps Lock adding 64 and Num Lock 128:
-  with Caps Lock on, Ghostty sends Up as `ESC [ 1 ; 65 A` and Delete as
-  `ESC [ 3 ; 65 ~`. The key parser read a modifier only in `CSI u` and
-  modifyOtherKeys sequences, so these keys did nothing: Up recalled no
-  history at the prompt, and in the permission dialog Down, Down, Enter,
-  meant to pick "No", approved the write as "Yes once". A modifier that holds
-  only lock bits now leaves the key as it is; with Shift, Alt or Ctrl these
-  keys are still ignored, as before.
 
 ### Fixed
 
