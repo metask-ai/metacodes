@@ -78,6 +78,12 @@ curl, as `install.sh`'s do, so a proxy set for one works for the other.
 Installs older than the first release with `update` take one more
 `install.sh` run.
 
+When a newer release is out, an interactive `metacodes` start of a release
+install says so and offers to update right there (`1`), skip this time (`2`)
+or skip that version (`3`). It learns about a release from a background check
+at most once a day, so the notice shows from the start after the check.
+`METACODES_NO_UPDATE_CHECK=1` turns it off.
+
 The release unit is complete on every supported platform: the TUI, TinyKG (CLI
 and daemon) and both Lean governance kernels under `libexec/metacodes/`, each
 pinned into the executable ([release/LAYOUT.md](../release/LAYOUT.md)). Runtime

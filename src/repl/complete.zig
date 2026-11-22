@@ -102,7 +102,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/login", .desc = "Sign in to Metask, or to a provider: /login <provider>" },
     .{ .name = "/logout", .desc = "Sign out of Metask, or forget a provider's key" },
     .{ .name = "/loop", .desc = "Control automatic continuation" },
-    .{ .name = "/mcp", .desc = "List MCP servers" },
+    .{ .name = "/mcp", .desc = "List MCP servers, or connect new and failed ones: /mcp reconnect [server]" },
     .{ .name = "/memory", .desc = "List or edit memory files" },
     .{ .name = "/mode", .desc = "Cycle or set the permission mode" },
     .{ .name = "/model", .desc = "Choose a provider, model, and channel (Ctrl+O)" },

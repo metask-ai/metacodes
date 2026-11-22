@@ -96,8 +96,6 @@ def refresh_lock(state_dir):
     try:
         if os.name == "nt":
             import msvcrt
-            if not os.fstat(fd).st_size:
-                os.write(fd, b"\0")
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
         else:

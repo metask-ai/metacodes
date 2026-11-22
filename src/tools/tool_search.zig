@@ -54,8 +54,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             if (matchesKeywords(query, t.name, t.description)) try matched.append(allocator, t.name);
         }
         if (ctx.dyn_registry) |dr| {
-            for (dr.entries.items) |*e| {
-                if (!e.deferred) continue;
+            var index: usize = 0;
+            while (dr.entryAt(index)) |e| : (index += 1) {
+                if (!e.deferred or !e.isLive()) continue;
                 if (!visibleToModel(ctx, e.name, true)) continue;
                 if (matched.items.len >= max_results) break;
                 if (matchesKeywords(query, e.name, e.description)) try matched.append(allocator, e.name);
@@ -176,7 +177,9 @@ fn listNames(ctx: *const ToolContext, allocator: std.mem.Allocator, listing: Lis
         try appendName(allocator, &out, t.name, &count, &omitted);
     }
     if (ctx.dyn_registry) |dr| {
-        for (dr.entries.items) |*e| {
+        var index: usize = 0;
+        while (dr.entryAt(index)) |e| : (index += 1) {
+            if (!e.isLive()) continue;
             if (!listing.admits(e.deferred, e.name)) continue;
             if (!visibleToModel(ctx, e.name, e.deferred)) continue;
             try appendName(allocator, &out, e.name, &count, &omitted);
@@ -218,7 +221,10 @@ fn setMissDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, query: [
         try w.writeAll(" Use the tools already in your tool list.");
     }
     if (deferred.len > 0) try w.print(" Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{deferred});
-    try mcp_session.writeUnavailable(w, ctx.mcp_unavailable);
+    var late_arena = std.heap.ArenaAllocator.init(allocator);
+    defer late_arena.deinit();
+    const late = if (ctx.mcp_late) |probe| probe.late(late_arena.allocator()) else &.{};
+    try mcp_session.writeNotice(w, ctx.mcp_unavailable, late);
     slot.* = try out.toOwnedSlice();
 }
 
