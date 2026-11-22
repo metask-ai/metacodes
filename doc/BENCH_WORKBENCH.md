@@ -63,8 +63,8 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
 
-Each task runs 1–5 times; concurrency is 1–10 (AIME and the small-task
-adapters allow up to 16, GAIA2 and WorkBuddy 2). The page starts at 4 runs
+Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
+and the small-task adapters allow up to 16, GAIA2 and WorkBuddy 2). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
