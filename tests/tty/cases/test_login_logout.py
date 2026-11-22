@@ -442,6 +442,11 @@ def _revocation_of(pair):
     return f"token={pair[1]}&token_type_hint=refresh_token&client_id=metacodes"
 
 
+def _sign_in_transcript(screen):
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    return lines[lines.index("❯ /login"):lines.index("❯ hi")]
+
+
 def _stored_refresh_token(state):
     with open(os.path.join(state, "oauth", "metask.json")) as f:
         return json.load(f)["refresh_token"]
@@ -462,7 +467,7 @@ def test_signing_in_again_revokes_the_session_it_replaced_once_each_time(bin_pat
         raw = run(bin_path, [READY] + _TUI_SIGN_IN + [wait_for("Signed in to Metask", 10)]
                   + [READY] + _TUI_SIGN_IN + [wait_for("Metask revoked the previous sign-in.", 15)]
                   + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(40, 140))
-        screen = _screen(TTYAssert(raw, rows=40, cols=140))
+        screen = _screen(TTYAssert(raw, rows=40, cols=140, autowrap=True))
         # The first /login replaced nothing; the second revoked the first, once,
         # after its own token response, and said so.
         assert mock.revocations == [_revocation_of(first)], mock.revocations
@@ -514,10 +519,18 @@ def test_a_revocation_refused_or_not_answered_leaves_the_login_done_and_says_so(
                   # The TUI waits 3 seconds for the answer that never comes.
                   + [READY] + _TUI_SIGN_IN + [wait_for("did not answer the revocation", 20)]
                   + submit("hi", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(40, 140))
-        screen = _screen(TTYAssert(raw, rows=40, cols=140))
-        assert "Metask could not revoke the previous sign-in; it stays valid there until it expires." in screen, screen
-        assert ("Metask did not answer the revocation of the previous sign-in in time; "
-                "it may stay valid there until it expires.") in screen, screen
+        screen = _screen(TTYAssert(raw, rows=40, cols=140, autowrap=True))
+        signed_in = "⎿  Signed in to Metask as Mock User · glm-5 · reasoning low"
+        assert _sign_in_transcript(screen) == [
+            "❯ /login", signed_in, "New sessions start on Metask too.",
+            "❯ /login", signed_in,
+            "Metask could not revoke the previous sign-in; it stays valid there until it expires.",
+            "New sessions start on Metask too.",
+            "❯ /login", signed_in,
+            "Metask did not answer the revocation of the previous sign-in in time; "
+            "it may stay valid there until it expires.",
+            "New sessions start on Metask too.",
+        ], screen
         assert mock.revocations == [_revocation_of(first), _revocation_of(second)], mock.revocations
         # Both sign-ins stood: the session went on with the third.
         assert mock.messages == [(f"Bearer {third[0]}", MODEL)], mock.messages
