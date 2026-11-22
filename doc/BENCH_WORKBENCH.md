@@ -22,9 +22,11 @@ metacodes bench run --suite aime-2025 --wait          # the suite's default samp
 metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
+metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090   # pre-pull/pre-build task images
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
 metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
 metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
+metacodes bench node build              # build one git revision here ({"ref", "repo"} on stdin)
 ```
 
 Without `--suite`, `run` uses Terminal-Bench 2.1 as before. Without `--task`,
@@ -61,8 +63,8 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
 
-Each task runs 1–5 times; concurrency is 1–10 (AIME and the small-task
-adapters allow up to 16, GAIA2 and WorkBuddy 2). The page starts at 4 runs
+Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
+and the small-task adapters allow up to 16, GAIA2 and WorkBuddy 2). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
@@ -144,6 +146,47 @@ directories beside it; see the
 [adapter README](../scripts/eval/harbor/adapters/README.md) for sources,
 graders and what only a Docker host can check. A suite's `arch` (from the
 adapter's `SUITE`) is listed in the catalog and on the page.
+
+### Pre-pulling and pre-building task images
+
+A task whose `task.toml` names a prebuilt image (`[environment]
+docker_image`, as every Terminal-Bench task does) runs in it, and Harbor
+pulls it only when the executor's Docker does not have it. Every other task
+(AIME and the harbor-local suites) is built by Harbor from its
+`environment/` directory with `docker compose build` before each trial,
+which pulls its base image and runs its `apt-get`/`pip install` steps
+unless Docker's build cache already holds them. A registry or package index
+that is slow or unreachable during a batch then fails trials as
+`EnvironmentStartTimeoutError` or a `docker compose` error.
+`metacodes bench pull` does both ahead of the run:
+
+```sh
+metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090 --dry-run   # what is not ready
+metacodes bench pull --suite alfworld --executor relay-4090                       # pull and build
+metacodes bench pull --suite terminal-bench-2.1 --task fix-git --task regex-log --json
+```
+
+It runs on the workbench machine. Registry suites are read from the same
+download a run uses (`<state root>/bench/registry-cache/`), harbor-local
+suites from their prepared dataset. It first runs `docker info` on the
+executor and stops with its error when Docker cannot be reached. A named
+image is checked with `docker image inspect` (over SSH for an SSH executor)
+and pulled only when missing; an executor's `ghcr_mirror` is used for
+`ghcr.io` images, which are then tagged back, and `docker_mirrors` apply
+through its Docker daemon. Tasks to build are grouped by the content of
+their `environment/` directory, and each distinct one is built once the way
+Harbor builds it: the same build-only compose service (context
+`${CONTEXT_DIR}`) plus the task's own `docker-compose.yaml` and its sidecar
+services, tagged `metacodes-prebuild-<digest>` so the layers are kept. On an
+SSH executor the directory is first copied to
+`<state_dir>/prebuild/<digest>/environment/` (beside its copy marker, not
+inside the build context). Harbor's later build of the same task
+then takes every step from the build cache, without network access. Pulls
+and builds are tried up to 3 times with a backoff. `--dry-run` only
+inspects (a build counts as ready when its tag exists). Without `--task`
+every task of the suite is covered. WorkBuddy suites prepare their own
+environments and are refused. The exit status is 1 when any image could not
+be pulled or built.
 
 ### Adding a harbor-local suite
 
@@ -270,9 +313,26 @@ revision with its own kernels, build its full release unit:
 ```sh
 metacodes bench build --ref main          # a branch, tag or commit
 metacodes bench build --ref 54a7a632 --json
+metacodes bench build --ref main --executor relay-4090
 ```
 
-It needs Docker on the machine whose `<state root>` keeps the bundle. The ref
+The build runs on the node of the executor (`--executor`, default the
+default executor), the machine whose Docker also runs the evaluations;
+every node builds the same way. For an `ssh` executor the workbench runs
+`metacodes bench node build` there over SSH (the request on stdin, the build
+log on stderr, the result as the last stdout line; closing stdin cancels
+it), then copies the unit and its build record into its own
+`<state root>/bench/bundles/`, accepting only regular files and directories
+under the unit's name and only a record verified by the same `source_repo`.
+The page does the same from 新建 → 按 commit 编译: it lists a branch's
+commits with their commit time, newest first, up to a chosen day
+(`GET /api/commits?ref=&until=YYYY-MM-DD&limit=`), and builds the chosen one,
+or any pasted commit, branch or tag, in the background (`POST /api/build`
+`{ref, executor}`, `GET /api/build` for its status and log tail,
+`POST /api/build/cancel`), one build at a time. A built unit is named in the
+version list by its commit and commit time.
+
+The node needs Docker; the workbench machine does not. On each node the ref
 is resolved in a mirror of `source_repo` (in `workbench.json`; default the
 GitHub repository) kept at `<state root>/bench/git/source.git`, and a branch
 always means its current head. A branch and a tag of one name on different
@@ -444,15 +504,19 @@ back with `--auth metask`; the third-party configuration will not be used
 for account runs. To use a gateway instead:
 
 ```sh
-export TOKENJOY_API_KEY=...             # or this install's state-root/.env
-metacodes bench --bundle /path/to/linux-release \
-  --provider-config /path/to/config.json \
-  --model tokenjoy/GLM5.3-Flash --key-env TOKENJOY_API_KEY
+export GW_API_KEY=...                   # or this install's state-root/.env
+metacodes bench --bundle /path/to/linux-release --auth provider
 ```
 
-`--provider-config` is a native metacodes configuration with
-`custom_providers`; see [the Harbor adapter](../scripts/eval/harbor/README.md).
-`--key-env` names the credential variable; that key is never accepted as a
+Without `--provider-config` the workbench reuses MetaCodes' own
+configuration (`METACODES_CONFIG_FILE`, else `config.json` in the state
+root the workbench was started with): its `custom_providers` models are the
+models offered, and only that section is passed to a run. Each provider's
+canonical `api_key` entry in `env_aliases` names its key variable.
+`--provider-config /path/to/config.json` selects another native metacodes
+configuration with `custom_providers`; see
+[the Harbor adapter](../scripts/eval/harbor/README.md). `--model` picks the
+default model and `--key-env` overrides the key variable; that key is never accepted as a
 browser field or stored in a run specification (an imported provider's key
 is, once; see below). The relay holds the key;
 Harbor's `${VARIABLE}` reference carries only the run's placeholder. The
@@ -892,14 +956,36 @@ configured bundle in place or switching `workbench.json` to another version
 never changes a batch already created; before each launch the copy is checked
 against its digest, and a modified copy fails the dataset instead of running.
 
+The 高级功能 section of the 新建 page switches on metacodes features that are
+off by default, all off unless ticked. Each one adds a single metacodes flag to
+every trial of the batch: the Lean-modelled run gates
+`verification_final_gate` (`--verification-final-gate`), `requirement_ledger`
+(`--requirement-ledger`), `test_integrity` (`--test-integrity`),
+`delivery_cadence` (`--delivery-cadence`) and `stall_gate` (`--stall-gate`),
+and the preview features `execute_code` (`--preview=execute_code`),
+`comment_guard` (`--preview=comment_guard`) and `harnessmm` (`--harnessmm`).
+`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The batch
+and each of its runs record the chosen names (`features`), and the run passes
+them to the adapter as `--ak features=<names>`. An unknown name is refused, and
+so is any choice for a WorkBuddy suite, whose overlay launches metacodes
+itself. The frozen bundle has to know the flags: a release older than a
+feature fails its trials with a usage error. An SSH executor's node loads the adapter from
+its own checkout, so the node protocol is 2 since features: an older node is
+refused until `metacodes bench setup --executor <name>` updates it, instead of
+running the trials without the chosen flags.
+
 The datasets run one after another, each as an ordinary workbench run (one
 Harbor job) whose record names the batch and its frozen version. The durable
 state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
 advances what that file says, so a restarted service resumes a batch where it
 stopped. While a batch owns the executor, a single launch (`POST /api/runs`)
 is refused. Stopping a batch cancels its running dataset and skips the rest.
-Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
-page) removes its record, its runs' records and logs, their job directories
+A batch can be renamed at any time (`POST /api/batch/rename` with `id` and
+`name`, 重命名 on its page; an empty name falls back to the batch id), and
+复制为新批次 opens the 新建 page filled with its version, datasets, tasks,
+model, executor, attempts, concurrency and features, to edit and create as a
+new batch. Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
+page or 删除 in the overview's batch list) removes its record, its runs' records and logs, their job directories
 and their rows in the evaluation database; the frozen bundle copy stays, since
 other batches may share it. A batch still running must be stopped first.
 Only a batch recorded in this service's jobs directory is deleted; one ingested
@@ -1129,7 +1215,7 @@ Jobs refresh every ten seconds while active; per-trial trajectories become
 available when Harbor copies the agent logs back from the container.
 
 The run endpoint (`POST /api/runs`) accepts `suite`, `tasks`, `model`,
-`attempts` and `concurrency`; the original `dataset:
+`attempts`, `concurrency` and `features` (names from the 高级功能 list); the original `dataset:
 "terminal-bench/terminal-bench-2-1"` field is still accepted and means
 `suite: "terminal-bench-2.1"`. It takes task/model selections, not shell
 commands, paths, keys, or arbitrary Harbor flags. Full task names are passed as separate argv

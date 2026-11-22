@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -18,7 +19,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.eval.harbor import cli
-from scripts.eval.harbor.bench import builds
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.runner import RunManager
+from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.viewer import server
+from scripts.eval.harbor.bench import builds, executors
 from scripts.eval.harbor.bench.batches import bundle_choices
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
 from scripts.eval.tests.posix_only import POSIX
@@ -49,6 +54,77 @@ for rel in {executables!r}:
 (out / 'manifest.json').write_text(json.dumps({{'target': {{'os': 'linux'}}, 'release': {{'version': '0.0.0-dev+' + commit[:12]}},
                                               'source': {{'commit': commit, 'dirty': False}}}}))
 """
+
+
+# `ssh <options> <host> <command>`: the command runs on this machine, in the
+# fake executor's home directory.
+FAKE_SSH = """#!{python}
+import os, sys
+args = sys.argv[1:]
+i = 0
+while args[i].startswith('-'):
+    i += 2 if args[i] in ('-o', '-p', '-i', '-R') else 1
+os.chdir(os.environ['FAKE_REMOTE_HOME'])
+os.execvp('sh', ['sh', '-c', ' '.join(args[i + 1:])])
+"""
+
+FAKE_MACOS_TAR = """#!{python}
+import io, os, sys, tarfile
+args = sys.argv[1:]
+if args[:2] != ['-cf', '-'] or os.environ.get('COPYFILE_DISABLE') == '1':
+    real = next(p for p in ('/usr/bin/tar', '/bin/tar') if os.path.exists(p))
+    os.execv(real, [real] + args)
+root, names, i = '.', [], 2
+while i < len(args):
+    if args[i] == '-C':
+        root, i = args[i + 1], i + 2
+    else:
+        names.append(args[i])
+        i += 1
+with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:
+    def add(name):
+        parent, base = os.path.split(name)
+        metadata = tarfile.TarInfo(os.path.join(parent, '._' + base))
+        metadata.size = 4
+        archive.addfile(metadata, io.BytesIO(b'\\x00\\x05\\x16\\x07'))
+        archive.add(os.path.join(root, name), name, recursive=False)
+        if os.path.isdir(os.path.join(root, name)):
+            for child in sorted(os.listdir(os.path.join(root, name))):
+                add(os.path.join(name, child))
+    for name in names:
+        add(name)
+"""
+
+# The executor's node: `metacodes bench node ...` with its own state root.
+FAKE_NODE = """#!{python}
+import sys
+sys.path.insert(0, {root!r})
+from scripts.eval.harbor import cli
+from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench.runner import RunManager
+from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.viewer import server
+sys.exit(cli.main(['--state-root', {state!r}] + sys.argv[2:]))
+"""
+
+
+@unittest.skipUnless(POSIX, 'process groups are POSIX')
+class SignalGroupTest(unittest.TestCase):
+    def test_a_group_whose_leader_already_exited_is_not_an_error(self):
+        process = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        self.addCleanup(process.wait)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and 'Z' not in subprocess.run(
+                ['ps', '-o', 'stat=', '-p', str(process.pid)], capture_output=True, text=True).stdout:
+            time.sleep(0.05)
+        executors.signal_group(process, signal.SIGKILL)
+        self.assertEqual(process.wait(), 0)
+
+    def test_a_running_group_is_signalled(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
+        self.addCleanup(process.wait)
+        executors.signal_group(process, signal.SIGKILL)
+        self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
 
 
 @unittest.skipUnless(POSIX, 'fake docker and process groups are POSIX')
@@ -134,6 +210,160 @@ class GitRefBuildTest(unittest.TestCase):
         second = self.git('rev-parse', 'HEAD')
         self.assertEqual((self.build('main')[0] / 'bin' / 'metacodes').read_text(), second)
         self.assertEqual(len(self.builds_run()), 2)
+
+    def remote_executor(self):
+        home = self.root / 'remote-home'
+        node = home / '.metacodes-bench' / 'bin' / 'metacodes'
+        node.parent.mkdir(parents=True)
+        node.write_text(FAKE_NODE.format(python=sys.executable, root=str(Path(__file__).resolve().parents[3]),
+                                         state=str(self.root / 'remote-state')))
+        node.chmod(0o755)
+        ssh = self.root / 'bin' / 'ssh'
+        ssh.write_text(FAKE_SSH.format(python=sys.executable))
+        ssh.chmod(0o755)
+        env = patch.dict(os.environ, {'FAKE_REMOTE_HOME': str(home)})
+        env.start()
+        self.addCleanup(env.stop)
+        return executors.SshExecutor(name='gpu', host='gpu.example')
+
+    def test_commits_are_listed_newest_first_and_up_to_a_day(self):
+        first = self.git('rev-parse', 'HEAD')
+        for day in ('2026-11-01', '2026-11-03'):
+            with patch.dict(os.environ, {'GIT_COMMITTER_DATE': day + 'T12:00:00+00:00'}):
+                self.git('commit', '-q', '--allow-empty', '-m', 'on ' + day)
+        cache = self.bench / 'git'
+        listed = builds.commits(cache, str(self.repo))
+        self.assertEqual([c['subject'] for c in listed], ['on 2026-11-03', 'on 2026-11-01', 'one'])
+        self.assertEqual(listed[0]['committed_at'][:10], '2026-11-03')
+        self.assertEqual(listed[-1]['commit'], first)
+        self.assertEqual([c['subject'] for c in builds.commits(cache, str(self.repo), until='2026-11-02')][:1],
+                         ['on 2026-11-01'])
+        self.assertEqual(len(builds.commits(cache, str(self.repo), limit=1)), 1)
+        for bad in ({'until': '11/02'}, {'limit': 0}, {'limit': 10_000}, {'ref': 'a..b'}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                builds.commits(cache, str(self.repo), **bad)
+
+    def test_ssh_executor_builds_on_its_node_and_the_unit_comes_back(self):
+        executor = self.remote_executor()
+        commit = self.git('rev-parse', 'HEAD')
+        unit, info = builds.build_on(executor, 'main', self.bench, str(self.repo))
+        remote_unit = builds.unit_path(self.root / 'remote-state' / 'bench', commit)
+        self.assertTrue((remote_unit / 'bin' / 'metacodes').is_file())
+        self.assertEqual(unit, builds.unit_path(self.bench, commit))
+        self.assertEqual((unit / 'bin' / 'metacodes').read_text(), commit)
+        self.assertEqual(executors.tree_digest(unit, executors.tree_files(unit)),
+                         executors.tree_digest(remote_unit, executors.tree_files(remote_unit)))
+        self.assertEqual(info['commit'], commit)
+        self.assertTrue(info['committed_at'])
+        self.assertFalse((self.bench / 'git').joinpath('source.git').exists())
+        choices = bundle_choices({'source_repo': str(self.repo)}, self.bench / 'workbench.json')
+        self.assertEqual([c['id'] for c in choices], [unit.name])
+        self.assertTrue(choices[0]['label'].startswith('git ' + commit[:8] + ' · '))
+        self.assertEqual(builds.build_on(executor, commit, self.bench, str(self.repo))[0], unit)
+        self.assertEqual(len(self.builds_run()), 1)
+
+    def test_a_unit_comes_back_from_a_node_whose_tar_adds_macos_metadata(self):
+        executor = self.remote_executor()
+        tar = self.root / 'bin' / 'tar'
+        tar.write_text(FAKE_MACOS_TAR.format(python=sys.executable))
+        tar.chmod(0o755)
+        commit = self.git('rev-parse', 'HEAD')
+        unit, info = builds.build_on(executor, 'main', self.bench, str(self.repo))
+        self.assertEqual((unit / 'bin' / 'metacodes').read_text(), commit)
+        self.assertEqual(info['commit'], commit)
+        self.assertEqual([p for p in unit.rglob('*') if p.name.startswith('._')], [])
+
+    def test_a_failed_node_build_publishes_nothing_here(self):
+        executor = self.remote_executor()
+        with patch.dict(os.environ, {'FAKE_BUILD_FAIL': '1'}), patch('sys.stderr', io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'gpu 上的编译失败'):
+                builds.build_on(executor, 'main', self.bench, str(self.repo))
+        self.assertFalse((self.bench / 'bundles').exists() and any((self.bench / 'bundles').iterdir()))
+
+    def test_cancelling_a_node_build_stops_the_builder_there(self):
+        executor = self.remote_executor()
+        stop = threading.Event()
+        threading.Timer(3.0, stop.set).start()
+        with patch.dict(os.environ, {'FAKE_BUILD_DELAY': '20'}):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ValueError, '取消'):
+                builds.build_on(executor, 'main', self.bench, str(self.repo), cancelled=stop.is_set)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue(any(c[0] == 'kill' for c in self.calls()))
+
+    def test_a_unit_verified_by_another_repository_is_refused(self):
+        executor = self.remote_executor()
+        commit = self.git('rev-parse', 'HEAD')
+        builds.build_on(executor, 'main', self.bench, str(self.repo))
+        record = builds.unit_path(self.root / 'remote-state' / 'bench', commit)
+        record = record.parent / (record.name + '.json')
+        local = builds.unit_path(self.bench, commit)
+        shutil.rmtree(local)
+        (local.parent / (local.name + '.json')).unlink()
+        value = json.loads(record.read_text())
+        record.write_text(json.dumps({**value, 'source_id': builds.source_id('https://example.com/other.git')}))
+        with patch('sys.stderr', io.StringIO()), self.assertRaisesRegex(ValueError, '源码仓库验证'):
+            builds._fetch_unit(executor, str(record.with_suffix('').with_name(local.name)), local, commit,
+                               str(self.repo), lambda: False, subprocess.Popen)
+        self.assertFalse(local.exists())
+        self.assertEqual(list(local.parent.glob('.fetch-*')), [])
+
+    def test_a_remote_unit_with_a_disallowed_entry_is_refused_with_its_reason(self):
+        executor = self.remote_executor()
+        commit = self.git('rev-parse', 'HEAD')
+        builds.build_on(executor, 'main', self.bench, str(self.repo))
+        remote = builds.unit_path(self.root / 'remote-state' / 'bench', commit)
+        (remote / 'bin' / 'escape').symlink_to('/etc/passwd')
+        local = builds.unit_path(self.bench, commit)
+        shutil.rmtree(local)
+        (local.parent / (local.name + '.json')).unlink()
+        with self.assertRaisesRegex(builds.BuildError, '不允许的条目'):
+            builds._fetch_unit(executor, str(remote), local, commit, str(self.repo), lambda: False, subprocess.Popen)
+        self.assertFalse(local.exists())
+        self.assertEqual(list(local.parent.glob('.fetch-*')), [])
+
+    def test_fetched_archive_may_hold_only_the_unit_and_its_record(self):
+        for name, kind in (('../escape', tarfile.REGTYPE), ('unit/link', tarfile.SYMTYPE), ('other', tarfile.REGTYPE)):
+            with self.subTest(name=name):
+                data = io.BytesIO()
+                with tarfile.open(fileobj=data, mode='w') as archive:
+                    info = tarfile.TarInfo(name)
+                    info.type = kind
+                    archive.addfile(info, io.BytesIO(b'') if kind == tarfile.REGTYPE else None)
+                data.seek(0)
+                staged = self.root / ('staged-' + str(abs(hash(name))))
+                staged.mkdir()
+                with self.assertRaisesRegex(ValueError, '不允许'):
+                    builds._extract(data, staged, 'unit', 'unit.json', lambda: False)
+                self.assertFalse((self.root / 'escape').exists())
+
+    def test_page_lists_commits_and_builds_one_in_the_background(self):
+        config = self.bench / 'workbench.json'
+        config.write_text(json.dumps({'source_repo': str(self.repo)}))
+        manager = RunManager(self.bench / 'jobs', config)
+        http = server.make_server(Workbench(data.Library([manager.jobs_dir]), manager), '127.0.0.1', 0)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        client = cli.Client(f'http://127.0.0.1:{http.server_address[1]}/')
+        commit = self.git('rev-parse', 'HEAD')
+        listed = client.request('api/commits?ref=main')['commits']
+        self.assertEqual([(c['commit'], c['bundle']) for c in listed], [(commit, None)])
+        self.assertIsNone(client.request('api/build')['build'])
+        started = client.request('api/build', {'ref': commit[:10]})
+        self.assertEqual(started['status'], 'running')
+        with self.assertRaisesRegex(Exception, '已有一个编译'):
+            client.request('api/build', {'ref': 'main'})
+        deadline = time.monotonic() + 60
+        while (build := client.request('api/build')['build'])['status'] == 'running' and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertEqual(build['status'], 'done', build.get('log'))
+        unit = builds.unit_path(self.bench, commit)
+        self.assertEqual(build['bundle'], unit.name)
+        self.assertEqual(client.request('api/commits')['commits'][0]['bundle'], unit.name)
+        self.assertIn(unit.name, [b['id'] for b in client.request('api/workbench')['bundles']])
+        with self.assertRaisesRegex(Exception, 'YYYY-MM-DD'):
+            client.request('api/commits?until=yesterday')
 
     def test_cli_build_prints_the_bundle_and_refuses_an_empty_ref(self):
         state = self.bench.parent

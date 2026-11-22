@@ -750,6 +750,8 @@ pub const Options = struct {
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
     mcp_unavailable: []const @import("mcp_session.zig").McpUnavailable = &.{},
+    mcp_late: ?@import("mcp_session.zig").McpLateProbe = null,
+    tool_changes: ?@import("tool_changes.zig").Hook = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
     /// 是否给每个工具执行 emit tool_start/tool_result 事件(REPL=true)。
@@ -2259,9 +2261,9 @@ noinline fn freeItemList(allocator: std.mem.Allocator, items: *std.ArrayList([]u
 fn runCounted(
     conversation: *Conversation,
     provider: provider_mod.Provider,
-    tool_defs: []const json_mod.ToolDefinition,
+    initial_tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
-    opts: Options,
+    initial_opts: Options,
     backend: *const UiBackend,
     /// The span recorder alone (already inside `backend` through a tee), for
     /// events the frontend did not ask for but a trace needs. Null: no recording.
@@ -2269,6 +2271,9 @@ fn runCounted(
     allocator: std.mem.Allocator,
     counters: *RunCounters,
 ) !RunResult {
+    var tool_defs = initial_tool_defs;
+    var opts = initial_opts;
+    const tool_changes_hook = if (opts.agent_depth == 0) opts.tool_changes else null;
     const harnessmm_enabled = opts.harnessmm;
     const comment_guidance = @import("system_prompt.zig").COMMENT_GUIDANCE;
     const base_prompt = opts.system_prompt orelse "";
@@ -2628,6 +2633,18 @@ fn runCounted(
         // L4 诊断:turn span 起点。
         backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
 
+        var refresh: @import("tool_changes.zig").Refresh = .{};
+        defer if (tool_changes_hook != null) refresh.deinit(allocator);
+        if (tool_changes_hook) |hook| {
+            refresh = hook.refresh(allocator, opts.abort);
+            if (refresh.tool_defs) |defs| {
+                tool_defs = defs;
+                opts.tool_defs = defs;
+            }
+            if (refresh.unavailable) |unavailable| opts.mcp_unavailable = unavailable;
+            if (refresh.skills) |skills| opts.skills_set = skills;
+        }
+
         // 工具池过滤必须在 prompt 投影和 compact 判断之前完成。App 初始化时构造的
         // prompt 不知道 per-run execution policy；先算真实 pool，才能避免 prompt 广告
         // provider schema 已隐藏的 deferred tool。
@@ -2640,6 +2657,29 @@ fn runCounted(
             provider,
         );
         defer effective_tools.deinit(allocator);
+        // Deferred catalog sees policy + active-skill filtering, but intentionally
+        // precedes activation filtering: unactivated deferred tools are exactly
+        // the tools the catalog exists to advertise.
+        const deferred_catalog_defs = if (effective_tools.discovery_filtered) |defs|
+            defs
+        else if (effective_tools.filtered_pool) |defs|
+            defs
+        else if (effective_tools.policy_filtered) |defs|
+            defs
+        else
+            tool_defs;
+        if (tool_changes_hook != null) {
+            if (try @import("tool_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, refresh.events)) |text| {
+                defer allocator.free(text);
+                try conversation.appendHostText(text);
+            }
+            if (opts.skills_set) |skills| {
+                if (try @import("skill_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, skills, refresh.changed_skills)) |text| {
+                    defer allocator.free(text);
+                    try conversation.appendHostText(text);
+                }
+            }
+        }
         // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。
         // 保留别名减少下游改动,为将来可选 gate 预留。
         const gated_tool_defs: []const json_mod.ToolDefinition = effective_tools.defs;
@@ -2696,17 +2736,6 @@ fn runCounted(
             }
             break :blk copied;
         };
-        // Deferred catalog sees policy + active-skill filtering, but intentionally
-        // precedes activation filtering: unactivated deferred tools are exactly
-        // the tools the catalog exists to advertise.
-        const deferred_catalog_defs = if (effective_tools.discovery_filtered) |defs|
-            defs
-        else if (effective_tools.filtered_pool) |defs|
-            defs
-        else if (effective_tools.policy_filtered) |defs|
-            defs
-        else
-            tool_defs;
 
         // swarm 纪律:有 team 时每轮把 addendum 追加到 system prompt(裸文本对 teammate 不可见,
         // 必须用 SendMessage;对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
@@ -3078,6 +3107,7 @@ fn runCounted(
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
             .mcp_unavailable = opts.mcp_unavailable,
+            .mcp_late = opts.mcp_late,
             .cron_registry = opts.cron_registry,
             .spawn_tick_fn = opts.spawn_tick_fn, // Bash/WebFetch 长命令心跳
         };
@@ -4657,6 +4687,7 @@ fn runCounted(
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
             .mcp_unavailable = opts.mcp_unavailable,
+            .mcp_late = opts.mcp_late,
             .cron_registry = opts.cron_registry,
         };
 
