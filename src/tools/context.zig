@@ -590,6 +590,7 @@ pub const ToolContext = struct {
     /// 不直接 import app.zig(防循环);用 anytype pointer 转译。
     mcp_sessions: ?*const []@import("../core/mcp_session.zig").McpSessionEntry = null,
     mcp_unavailable: []const @import("../core/mcp_session.zig").McpUnavailable = &.{},
+    mcp_late: ?@import("../core/mcp_session.zig").McpLateProbe = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("../core/cron_registry.zig").CronRegistry = null,
     /// 工具执行期进度回调(对齐 cc onProgress):工具(如 WebSearch 子请求)在执行**中**

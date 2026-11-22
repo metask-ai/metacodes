@@ -283,11 +283,11 @@ def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str,
     meanwhile (the build is killed). Raises ValueError when the staged
     executables are not the expected ones, the build fails, or the staged
     artifacts changed while it ran."""
-    import os
     import signal
     import subprocess
     import tempfile
     import time
+    from scripts.eval.harbor.bench.executors import signal_group
     manifest = repo / ARTIFACT_MANIFEST
     before = manifest.read_bytes()
     if expected is not None:
@@ -305,7 +305,7 @@ def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str,
         deadline = time.monotonic() + 3600
         while process.poll() is None:
             if stop.is_set() or time.monotonic() > deadline:
-                os.killpg(process.pid, signal.SIGKILL)
+                signal_group(process, signal.SIGKILL)
                 process.wait()
                 if stop.is_set():
                     return False

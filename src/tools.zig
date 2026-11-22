@@ -818,8 +818,9 @@ pub fn toToolDefinitionsFull(
     }
     if (!has_deferred) {
         if (dyn) |d| {
-            for (d.entries.items) |entry| {
-                if (entry.deferred) {
+            var index: usize = 0;
+            while (d.entryAt(index)) |entry| : (index += 1) {
+                if (entry.deferred and entry.isLive()) {
                     has_deferred = true;
                     break;
                 }
@@ -1109,10 +1110,13 @@ fn admitProjectExactEdit(ctx: *const ToolContext, args: []const u8) anyerror!voi
 }
 
 pub fn unavailableMcpNotice(ctx: *const ToolContext, name: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (!std.mem.startsWith(u8, name, "mcp__") or ctx.mcp_unavailable.len == 0) return allocator.dupe(u8, "");
+    if (!std.mem.startsWith(u8, name, "mcp__")) return allocator.dupe(u8, "");
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const late = if (ctx.mcp_late) |probe| probe.late(arena_state.allocator()) else &.{};
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try @import("core/mcp_session.zig").writeUnavailable(&out.writer, ctx.mcp_unavailable);
+    try @import("core/mcp_session.zig").writeNotice(&out.writer, ctx.mcp_unavailable, late);
     return out.toOwnedSlice();
 }
 
@@ -1246,9 +1250,10 @@ const ToolNameIter = struct {
             return nm;
         }
         if (self.ctx.dyn_registry) |dr| {
-            while (self.dyn_idx < dr.entries.items.len) {
-                const nm = dr.entries.items[self.dyn_idx].name;
+            while (dr.entryAt(self.dyn_idx)) |entry| {
                 self.dyn_idx += 1;
+                if (!entry.isLive()) continue;
+                const nm = entry.name;
                 if (self.ctx.execution_policy) |policy| {
                     if (!policy.allowsTool(nm)) continue;
                 }

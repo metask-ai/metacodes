@@ -637,7 +637,14 @@ worktree 里进行。
    dispatch、审计、合回都由它执行,Manager 只能调用 TEAMWORK_MCP.md 的五个工具,`done` 仍只经
    `requestCompletion`。另一个线程监督 Manager 进程:Manager 退出时触发运行的 abort,服务循环随之
    结束,未结束的运行转为 `cancelled`;运行的 abort(宿主 Ctrl+C、预算触顶、`teamwork_cancel`)
-   反过来杀掉 Manager 整个进程组,正在跑的 worker 也经同一信号停止,不合回。
+   让服务循环结束,正在跑的 worker 也经同一信号停止,不合回。监督线程不直接看运行的 abort,只看
+   控制器的停止信号:服务循环结束后,控制器先等中继读走 `mcp.out` 里已写出的应答(只读探测描述符上
+   `FIONREAD` 为 0,或 Manager 已退出,至多 `reply_delivery_ms` 即 2 秒;macOS 上读写方式打开的 FIFO
+   描述符 `FIONREAD` 恒为 0,所以另开一个只读的),再发停止信号杀掉 Manager 整个进程组。
+   所以停掉 Manager 之前,中继已从 `mcp.out` 取走全部已写出的应答(`teamwork_cancel` 的应答在内),
+   除非 Manager 已经退出或等满 2 秒。这不等于 Manager 一定收到:`cat` 读出之后、写进中继 stdout
+   之前被停,应答仍会丢(监督线程 0–50 ms 的停止检查只是余量,不是上界);运行中止之后,超过
+   FIFO 缓冲的应答在 `writeFrame` 第一次遇到 EAGAIN 时就被放弃。
 6. Manager 结束后由主线程记账:结果事件里有花费按 `harness_reported` 记,否则(被停止、崩溃、
    超时、没有报告)按 `reserved` 记满额度。这笔记账结算保留。
 
@@ -653,7 +660,8 @@ runtime 不会自行重放任何 dispatch。
 L2(`runtime_test.zig` 的 `teamwork manager L2`,`teamwork_command_test.zig`):假 Manager CLI 读取
 自己的 `--mcp-config`,经真实中继发 MCP 请求派活并完成交付;在沙箱里改受保护文件全部失败;
 先请求完成得到 `NotApproved`;切换 Manager harness 决定是否启动 Manager 进程,切换 implementer
-harness 独立生效;预算触顶与宿主取消都会停掉 Manager 与 worker 且不合回;崩溃后重开只扣一次
+harness 独立生效;预算触顶与宿主取消都会停掉 Manager 与 worker 且不合回;Manager 调
+`teamwork_cancel` 后,即使中继读端慢半秒,也先收到全部应答再被停掉、按 `reserved` 记满额度;崩溃后重开只扣一次
 保留;控制器关闭 lifeline 后 Manager 的整个进程组消失。`mcp_server_test.zig` 单独覆盖只用外部
 MCP 客户端时的预算边界(`budget.manager` 为 `outside_ledger`,花费只含 worker)。
 

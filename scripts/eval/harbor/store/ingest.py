@@ -775,8 +775,6 @@ def root_lock(root: Path, wait: bool = True) -> Iterator[None]:
     try:
         if os.name == "nt":
             import msvcrt
-            if not os.fstat(fd).st_size:
-                os.write(fd, b"\0")
             os.lseek(fd, 0, os.SEEK_SET)
             mode = msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK
         else:
