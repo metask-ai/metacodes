@@ -152,6 +152,26 @@ def table_dump(store: Store):
             f"SELECT {', '.join(schema.COLUMNS[table])} FROM {table}")) for table, _ in schema.TABLES}
 
 
+def hold_byte_lock(fd):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def release_byte_lock(fd):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 class StoreCase(unittest.TestCase):
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp())
@@ -290,6 +310,20 @@ class EquivalenceTest(StoreCase):
 
 
 class IngestTest(StoreCase):
+    def test_a_held_jobs_lock_whose_file_is_empty_is_reported_busy_and_left_empty(self):
+        path = self.root / ingest.ROOT_LOCK
+        held = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, held)
+        hold_byte_lock(held)
+        with self.assertRaisesRegex(ValueError, "正在导入或同步"):
+            with ingest.root_lock(self.root, wait=False):
+                self.fail("took a jobs lock another process holds")
+        self.assertEqual(path.stat().st_size, 0)
+        release_byte_lock(held)
+        with ingest.root_lock(self.root, wait=False):
+            pass
+        self.assertEqual(path.stat().st_size, 0)
+
     def test_reingest_is_a_noop_and_changes_update(self):
         build_fixture(self.root)
         store = self.sqlite()

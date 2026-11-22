@@ -142,6 +142,8 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.create_batch(payload), 202)
                 elif path == "/api/batch/cancel" and isinstance(payload, dict):
                     self.send_json(workbench.cancel_batch(payload.get("id")))
+                elif path == "/api/batch/rename" and isinstance(payload, dict):
+                    self.send_json(workbench.rename_batch(payload.get("id"), payload.get("name")))
                 elif path == "/api/batch/delete" and isinstance(payload, dict):
                     self.send_json(workbench.delete_batch(payload.get("id")))
                 elif path == "/api/store":
@@ -227,7 +229,7 @@ def make_handler(workbench: Workbench, public_url=None):
             elif path == "/api/run":
                 self.send_found(workbench.run(query.get("name")), "no such run")
             elif path == "/api/jobs":
-                self.send_json(workbench.jobs(query.get("batch") or "all"))
+                self.send_json({**workbench.jobs(query.get("batch") or "all"), "can_run": self.authorized()})
             elif path == "/api/job":
                 self.send_found(workbench.job(query.get("name", "")), "no such job")
             elif path == "/api/trial":

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -67,6 +68,33 @@ os.chdir(os.environ['FAKE_REMOTE_HOME'])
 os.execvp('sh', ['sh', '-c', ' '.join(args[i + 1:])])
 """
 
+FAKE_MACOS_TAR = """#!{python}
+import io, os, sys, tarfile
+args = sys.argv[1:]
+if args[:2] != ['-cf', '-'] or os.environ.get('COPYFILE_DISABLE') == '1':
+    real = next(p for p in ('/usr/bin/tar', '/bin/tar') if os.path.exists(p))
+    os.execv(real, [real] + args)
+root, names, i = '.', [], 2
+while i < len(args):
+    if args[i] == '-C':
+        root, i = args[i + 1], i + 2
+    else:
+        names.append(args[i])
+        i += 1
+with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:
+    def add(name):
+        parent, base = os.path.split(name)
+        metadata = tarfile.TarInfo(os.path.join(parent, '._' + base))
+        metadata.size = 4
+        archive.addfile(metadata, io.BytesIO(b'\\x00\\x05\\x16\\x07'))
+        archive.add(os.path.join(root, name), name, recursive=False)
+        if os.path.isdir(os.path.join(root, name)):
+            for child in sorted(os.listdir(os.path.join(root, name))):
+                add(os.path.join(name, child))
+    for name in names:
+        add(name)
+"""
+
 # The executor's node: `metacodes bench node ...` with its own state root.
 FAKE_NODE = """#!{python}
 import sys
@@ -78,6 +106,25 @@ from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 sys.exit(cli.main(['--state-root', {state!r}] + sys.argv[2:]))
 """
+
+
+@unittest.skipUnless(POSIX, 'process groups are POSIX')
+class SignalGroupTest(unittest.TestCase):
+    def test_a_group_whose_leader_already_exited_is_not_an_error(self):
+        process = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        self.addCleanup(process.wait)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and 'Z' not in subprocess.run(
+                ['ps', '-o', 'stat=', '-p', str(process.pid)], capture_output=True, text=True).stdout:
+            time.sleep(0.05)
+        executors.signal_group(process, signal.SIGKILL)
+        self.assertEqual(process.wait(), 0)
+
+    def test_a_running_group_is_signalled(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
+        self.addCleanup(process.wait)
+        executors.signal_group(process, signal.SIGKILL)
+        self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
 
 
 @unittest.skipUnless(POSIX, 'fake docker and process groups are POSIX')
@@ -214,6 +261,17 @@ class GitRefBuildTest(unittest.TestCase):
         self.assertTrue(choices[0]['label'].startswith('git ' + commit[:8] + ' · '))
         self.assertEqual(builds.build_on(executor, commit, self.bench, str(self.repo))[0], unit)
         self.assertEqual(len(self.builds_run()), 1)
+
+    def test_a_unit_comes_back_from_a_node_whose_tar_adds_macos_metadata(self):
+        executor = self.remote_executor()
+        tar = self.root / 'bin' / 'tar'
+        tar.write_text(FAKE_MACOS_TAR.format(python=sys.executable))
+        tar.chmod(0o755)
+        commit = self.git('rev-parse', 'HEAD')
+        unit, info = builds.build_on(executor, 'main', self.bench, str(self.repo))
+        self.assertEqual((unit / 'bin' / 'metacodes').read_text(), commit)
+        self.assertEqual(info['commit'], commit)
+        self.assertEqual([p for p in unit.rglob('*') if p.name.startswith('._')], [])
 
     def test_a_failed_node_build_publishes_nothing_here(self):
         executor = self.remote_executor()

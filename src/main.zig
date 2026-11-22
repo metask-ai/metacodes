@@ -136,6 +136,8 @@ pub const api_request = @import("api/request.zig");
 pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
 pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
+pub const tool_changes = @import("core/tool_changes.zig");
+pub const skill_changes = @import("core/skill_changes.zig");
 pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
 pub const model_availability = @import("api/model_availability.zig"); // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
@@ -267,6 +269,7 @@ fn serveTeamworkMcp(gpa: std.mem.Allocator, run: *@import("teamwork/runtime.zig"
 }
 pub const app_route_strings = @import("app/route_strings.zig");
 pub const app_mcp_startup = @import("app/mcp_startup.zig");
+pub const app_mcp_hotplug = @import("app/mcp_hotplug.zig");
 pub const app_install = @import("app/install.zig");
 pub const app_update = @import("app/update.zig");
 pub const app_release_source = @import("app/release_source.zig");
@@ -1835,6 +1838,7 @@ pub fn main(init: std.process.Init) !void {
         // decided by.
         .local_route = local_route,
         .startup_notice = startup_notice,
+        .command_name = invokedCommand(allocator),
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
@@ -2837,7 +2841,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
-    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "providers")) return @import("app/providers_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
@@ -5589,8 +5593,10 @@ fn printHelp() void {
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
         \\                        Bind Shift+Enter to a newline in Apple Terminal or VS Code (and forks),
         \\                        after a backup; --restore undoes it (terminal-setup --help for more)
-        \\  mcp login <server> [--no-browser] | mcp logout <server> | mcp list
-        \\                        OAuth login for an HTTP or SSE MCP server (stored, refreshed per session)
+        \\  mcp add <name> --url <url> | mcp add <name> -- <command> [<arg>...] | mcp remove <name>
+        \\  | mcp list | mcp login <server> [--no-browser] | mcp logout <server>
+        \\                        Install an MCP server in config.json (checked on the spot), list each
+        \\                        server's state, OAuth login for HTTP ones; mcp --help for more
         \\  providers add <id> --base-url <url> --protocol <wire> [--model <id>]... [--probe] | providers probe <id>
         \\  | providers list | providers remove <id>
         \\                        A model API of your own (a relay, a gateway, a local server), in config.json;
@@ -5950,6 +5956,9 @@ test {
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/mcp_startup.zig");
+    _ = &@import("app/mcp_hotplug.zig");
+    _ = &@import("core/tool_changes.zig");
+    _ = &@import("core/skill_changes.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
@@ -6079,6 +6088,7 @@ test {
     _ = &@import("mcp/conformance.zig");
     _ = &@import("mcp/result_commit_test.zig");
     _ = &@import("app/mcp_cli.zig");
+    _ = &@import("app/mcp_config_edit.zig");
     _ = &@import("app/terminal_prompt.zig");
     _ = &@import("app/providers_cli.zig");
     _ = &@import("util/toml.zig");

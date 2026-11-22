@@ -442,13 +442,18 @@ test "teamwork command: run launches a configured Claude Code manager on the run
         \\  echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"teamwork_status"}}'
         \\  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"teamwork_cancel"}}'
         \\  while [ "$(wc -l < responses)" -lt 3 ]; do sleep 0.05; done
-        \\} | /bin/sh "$1" "$2" "$3" > responses
+        \\  sleep 10
+        \\} | PATH="$(dirname "$0")/slow-relay-reader:$PATH" /bin/sh "$1" "$2" "$3" > responses
         \\echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.2}'
         \\
     ;
     try c.write("manager-fixture", script);
     const binary = try std.fmt.allocPrintSentinel(a, "{s}/manager-fixture", .{c.root}, 0);
     try testing.expectEqual(@as(c_int, 0), pfs.chmod(binary, 0o755));
+    try c.tmp.dir.createDirPath(testing.io, "slow-relay-reader");
+    try c.write("slow-relay-reader/cat", "#!/bin/sh\n[ -f /dev/stdout ] && sleep 0.5\nexec /bin/cat \"$@\"\n");
+    const slow_cat = try std.fmt.allocPrintSentinel(a, "{s}/slow-relay-reader/cat", .{c.root}, 0);
+    try testing.expectEqual(@as(c_int, 0), pfs.chmod(slow_cat, 0o755));
     try c.write("state/config.json", try std.fmt.allocPrint(a,
         \\{{"preview":{{"teamwork":true}},"teamwork":{{"budget_usd":2,"manager_budget_usd":0.5,"seats":{{"manager":{{"harness":"claude_code","command":"{s}"}}}}}}}}
     , .{binary}));

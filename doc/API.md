@@ -95,7 +95,7 @@ The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
 launches Harbor trials. Its command, JSON output, HTTP launch contract
 (`suite` and `executor` in `POST /api/runs`, `GET /api/suite`,
 `/api/setup`, `/api/login` and `/api/providers`), `bench setup`, `bench provider`,
-`bench prepare` and
+`bench prepare`, `bench pull` and
 the `bench db` evaluation-database commands are documented in
 [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
 AgentCore ABI and SDK layouts are unchanged.
@@ -562,10 +562,23 @@ an unpinned kernel or daemon may be absent. `metacodes terminal-setup
 or a VS Code build's `keybindings.json` after a backup, and `--restore` undoes
 it; it exits 0 when the terminal is set up or needs nothing, 1 when it left the
 terminal alone or the change failed ([TERMINAL_SETUP.md](TERMINAL_SETUP.md)).
+`metacodes mcp add <name> <url> [--type http|sse] [--header <name>=<value>]... [--force] [--no-check]`,
+`metacodes mcp add <name> [--env <name>=<value>]... [--force] [--no-check] -- <command> [<arg>...]`
+and `metacodes mcp add-json <name> '<json>'` write a server into `mcpServers`
+of `<state root>/config.json` (only that member changes; atomic, mode 0600),
+taking Claude Code's and Codex's spellings of the same options too, and
+`metacodes mcp remove <name>` takes it out. `add` refuses an entry no session
+could use, then connects the server once and prints the outcome (a 401 names
+`mcp login`; `--no-check` skips it). They exit 0 once the file is written,
+whatever the check found; 1 when the name is already configured without
+`--force`, is not in `mcpServers` (for `remove`), or the file cannot be read,
+parsed or written; and 2 for a usage error or an entry no session could use
+([SKILLS_AND_MCP.md](SKILLS_AND_MCP.md#adding-and-removing-servers)).
 `metacodes mcp login <server> [--no-browser]` runs the MCP OAuth flow for a
 configured HTTP or SSE server and stores the token that later sessions send and
 refresh; `metacodes mcp logout <server>` forgets it and `metacodes mcp list`
-prints each configured server's transport and how it authenticates; they exit
+prints each configured server's transport, how it authenticates and, unless
+`--no-check`, whether it connects; they exit
 0 on success, 1 when the server is unknown, is not a URL server, already sends
 a configured `Authorization`, or the login fails (including a server that
 answers the new token with 401 or 403; nothing is stored then), and 2 for a

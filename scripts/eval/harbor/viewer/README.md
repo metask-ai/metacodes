@@ -14,7 +14,7 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 | View | Answers |
 |---|---|
 | 看板 `#/` | metrics scoped to one batch (or all / unbatched jobs), initial context composition, batches, jobs |
-| 批次 `#/batch/<id>` | frozen metacodes version, each dataset's job, every task with its attempts; stop it while running, delete it once ended |
+| 批次 `#/batch/<id>` | frozen metacodes version, each dataset's job, every task with its attempts; rename it, copy it into a new batch, stop it while running, delete it once ended |
 | 任务 `#/batch/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task |
 | 新建 `#/new` | a batch: metacodes version, several suites and their tasks, model, attempts, concurrency |
 | 数据库 `#/settings` | the active store; test, switch and migrate to another SQLite file or PostgreSQL |

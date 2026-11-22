@@ -17,7 +17,7 @@ from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_fo
                                            route_problem, upstream_for)
 from scripts.eval.harbor.bench import credentials
 from scripts.eval.harbor.store.ingest import WorkerSync
-from scripts.eval.harbor.bench.executors import RemoteRun
+from scripts.eval.harbor.bench.executors import RemoteRun, signal_group
 
 
 def command(spec):
@@ -319,12 +319,12 @@ def main(argv=None):
                 if os.name == "nt":
                     process.terminate()
                 else:
-                    os.killpg(process.pid, signal.SIGINT)
+                    signal_group(process, signal.SIGINT)
             if stop_at and time.monotonic() - stop_at > 20:
                 if os.name == "nt":
                     process.kill()
                 else:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    signal_group(process, signal.SIGKILL)
             if time.monotonic() - last_write > 2:
                 stamp_credential(record, source)
                 atomic_json(record_path, record)
