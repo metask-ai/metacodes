@@ -189,7 +189,9 @@ class SshPullTest(unittest.TestCase):
                                       sleep=lambda _: None, ship=lambda *a, **k: shipped.append(a))
         self.assertEqual(result["status"], "built")
         remote = executor.remote("prebuild", digest)
-        self.assertEqual([(a[0], a[2], a[3]) for a in shipped], [(executor, ["Dockerfile"], remote)])
+        self.assertEqual([(a[0], a[1].name, a[2], a[3]) for a in shipped],
+                         [(executor, "task", ["environment/Dockerfile"], remote)])
+        remote += "/environment"
         self.assertIn("relay.example", calls[-1])
         self.assertIn(f"ctx=$(cd {remote} && pwd)", calls[-1][-1])
         self.assertIn(f"docker compose -p {images.BUILD_TAG}{digest}", calls[-1][-1])

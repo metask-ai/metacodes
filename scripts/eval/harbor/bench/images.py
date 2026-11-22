@@ -104,8 +104,10 @@ def build_one(executor: Executor, digest: str, build: Dict, *, check_only: bool,
         return {"status": "present" if present else "missing"}
     context = str(build["environment"])
     if isinstance(executor, executors.SshExecutor):
-        context = executor.remote("prebuild", digest)
-        ship(executor, build["environment"], build["names"], context, log=log)
+        destination = executor.remote("prebuild", digest)
+        ship(executor, build["environment"].parent, ["environment/" + name for name in build["names"]], destination,
+             log=log)
+        context = destination + "/environment"
     task_compose = ' -f "$ctx/docker-compose.yaml"' if "docker-compose.yaml" in build["names"] else ""
     script = (f'ctx=$(cd {q(context)} && pwd) || exit 1; f=$(mktemp) || exit 1; printf %s {q(BUILD_COMPOSE)} > "$f"; '
               f'CONTEXT_DIR="$ctx" MAIN_IMAGE_NAME={q(tag)} docker compose -p {q(tag)} --project-directory "$ctx" '

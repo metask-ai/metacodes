@@ -179,7 +179,8 @@ Harbor builds it: the same build-only compose service (context
 `${CONTEXT_DIR}`) plus the task's own `docker-compose.yaml` and its sidecar
 services, tagged `metacodes-prebuild-<digest>` so the layers are kept. On an
 SSH executor the directory is first copied to
-`<state_dir>/prebuild/<digest>/`. Harbor's later build of the same task
+`<state_dir>/prebuild/<digest>/environment/` (beside its copy marker, not
+inside the build context). Harbor's later build of the same task
 then takes every step from the build cache, without network access. Pulls
 and builds are tried up to 3 times with a backoff. `--dry-run` only
 inspects (a build counts as ready when its tag exists). Without `--task`
