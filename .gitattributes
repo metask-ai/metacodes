@@ -27,9 +27,4 @@ vendor/quickjs/*.h linguist-generated
 
 sdk/rust/src/raw.rs text eol=lf
 
-# Nearly every PR adds an entry at the top of `## Unreleased`, so merging main
-# into a branch conflicted on CHANGELOG.md alone 29 times in two weeks (META-61).
-# union keeps both sides' lines; scripts/check_changelog_sections.py fails a PR
-# whose entry a union merge across a release cut left under a released version.
-# Local merges only: GitHub's "Update branch" does not run merge drivers.
 CHANGELOG.md merge=union

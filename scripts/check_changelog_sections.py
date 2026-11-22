@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""New CHANGELOG entries go under ``## Unreleased``, never a released version.
+"""A change's CHANGELOG entries are its own and sit under ``## Unreleased``.
 
-``.gitattributes`` merges ``CHANGELOG.md`` with git's ``union`` driver, so a
-branch that merges main no longer stops on the entry both sides added at the
-top of ``## Unreleased``. Union keeps both sides' lines without knowing what a
-section is: when main has just cut a release (``## Unreleased`` renamed to
-``## <version> — <date>``, an empty one reinserted), the branch's entry can
-land under the released heading. release.yml takes the release notes from
-that section, so this check stands in for the conflict a person used to see.
+``.gitattributes`` merges ``CHANGELOG.md`` with git's ``union`` driver, which
+keeps both sides' lines where a merge used to conflict. Two things it can get
+wrong are checked here, comparing the candidate with ``--base``:
 
-A section heading present on both the base and the candidate, other than
-``## Unreleased``, must not gain a top-level entry (a line starting ``- ``).
-Rewording an existing entry is still allowed; a release cut adds a heading the
-base does not have, which this check leaves alone.
+- An entry (a line starting ``- ``) a released section gained: across a
+  release cut, union leaves a branch's entry under the released heading.
+- An entry the candidate has more often than the base, beyond what the
+  change wrote itself: when main rewrote, moved or removed an entry next to
+  where the branch added one, union keeps main's old version.
 
 Run from the repository root:
     python3 scripts/check_changelog_sections.py --base <commit>
-Exit status 0 when no released section gained an entry, 1 otherwise.
 """
 from __future__ import annotations
 
 import argparse
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 CHANGELOG = "CHANGELOG.md"
@@ -41,16 +38,41 @@ def sections(text: str) -> dict[str, list[str]]:
     return result
 
 
+def entries(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith("- ")]
+
+
 def misplaced(base: str, candidate: str) -> list[tuple[str, str]]:
-    """(heading, entry) for every entry a released section gained."""
+    """(heading, entry) for the new entries of a released section that gained some."""
     before = sections(base)
     found = []
     for heading, lines in sections(candidate).items():
         if heading == UNRELEASED or heading not in before:
             continue
-        old = {line for line in before[heading] if line.startswith("- ")}
-        found.extend((heading, line) for line in lines if line.startswith("- ") and line not in old)
+        old = entries(before[heading])
+        new = entries(lines)
+        if len(new) > len(old):
+            found.extend((heading, line) for line in new if line not in old)
     return found
+
+
+def stale(base: str, candidate: str, own: Counter[str]) -> list[str]:
+    """Entries the candidate has more often than the base plus the change's own additions."""
+    before = Counter(entries(base.splitlines()))
+    after = Counter(entries(candidate.splitlines()))
+    return [line for line, count in after.items() if count - before[line] > own[line]]
+
+
+def own_additions(base: str, path: str) -> Counter[str]:
+    """Entries ``base..HEAD`` wrote itself: added by a non-merge commit, or by a merge
+    resolution that is in neither parent. Union only ever keeps a parent's line."""
+    def log(*args: str) -> list[str]:
+        return subprocess.run(["git", "log", *args, "--format=", "-p", f"{base}..HEAD", "--", path],
+                              capture_output=True, text=True, encoding="utf-8", check=True).stdout.splitlines()
+
+    added = Counter(line[1:] for line in log("--no-merges") if line.startswith("+- "))
+    added.update(line[2:] for line in log("--merges", "--cc") if line.startswith("++- "))
+    return added
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,11 +85,16 @@ def main(argv: list[str] | None = None) -> int:
     if shown.returncode != 0:
         print(f"{args.file}: cannot read it at {args.base}: {shown.stderr.strip()}", file=sys.stderr)
         return 1
-    found = misplaced(shown.stdout, Path(args.file).read_text(encoding="utf-8"))
+    candidate = Path(args.file).read_text(encoding="utf-8")
+    found = misplaced(shown.stdout, candidate)
     for heading, entry in found:
         print(f"{args.file}: a new entry is under the released section '{heading}'; move it to "
               f"'{UNRELEASED}' (a union merge across a release cut puts it there): {entry[:100]}")
-    return 1 if found else 0
+    leftovers = stale(shown.stdout, candidate, own_additions(args.base, args.file))
+    for entry in leftovers:
+        print(f"{args.file}: this entry was not written by this change, so a union merge of main "
+              f"kept a version main has since rewritten, moved or removed; delete it: {entry[:100]}")
+    return 1 if found or leftovers else 0
 
 
 if __name__ == "__main__":

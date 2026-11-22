@@ -601,9 +601,6 @@ jobs:
       - name: Documentation fact check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_facts.py
-      # A new entry must be under `## Unreleased`: .gitattributes merges
-      # CHANGELOG.md with union, which across a release cut can leave a
-      # branch's entry under the released version (META-61).
       - name: Changelog entries are unreleased
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         env:
