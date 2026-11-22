@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench batches can be renamed and copied.** A batch page has 重命名
+  (`POST /api/batch/rename`) and 复制为新批次, which fills the 新建 page with
+  the batch's version, datasets, tasks and settings. The overview's batch list
+  copies, stops and deletes a batch in place, stopping asks for confirmation,
+  and the 新建 form keeps what was typed across a refresh.
+
 - **A bench batch can switch on advanced features.** The 新建 page of the
   bench workbench has a 高级功能 section: the Lean-modelled run gates
   (`--verification-final-gate`, `--requirement-ledger`, `--test-integrity`,

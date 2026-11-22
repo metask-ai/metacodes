@@ -274,6 +274,11 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.batches.cancel(batch_id)
 
+    def rename_batch(self, batch_id, name) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.batches.rename(batch_id, name)
+
     def delete_batch(self, batch_id) -> Dict[str, Any]:
         manager = self.manager
         if not manager:

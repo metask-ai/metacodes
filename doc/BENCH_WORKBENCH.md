@@ -938,8 +938,12 @@ state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
 advances what that file says, so a restarted service resumes a batch where it
 stopped. While a batch owns the executor, a single launch (`POST /api/runs`)
 is refused. Stopping a batch cancels its running dataset and skips the rest.
-Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
-page) removes its record, its runs' records and logs, their job directories
+A batch can be renamed at any time (`POST /api/batch/rename` with `id` and
+`name`, 重命名 on its page; an empty name falls back to the batch id), and
+复制为新批次 opens the 新建 page filled with its version, datasets, tasks,
+model, executor, attempts, concurrency and features, to edit and create as a
+new batch. Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
+page or 删除 in the overview's batch list) removes its record, its runs' records and logs, their job directories
 and their rows in the evaluation database; the frozen bundle copy stays, since
 other batches may share it. A batch still running must be stopped first.
 Only a batch recorded in this service's jobs directory is deleted; one ingested
