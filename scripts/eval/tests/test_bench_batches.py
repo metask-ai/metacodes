@@ -27,7 +27,7 @@ from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, wait_run
+from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_batches_and_workers, wait_run
 
 
 def _write(path: Path, value) -> None:
@@ -152,6 +152,7 @@ class BatchTest(unittest.TestCase):
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
+        self.addCleanup(stop_batches_and_workers, self.manager)
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self, **override):

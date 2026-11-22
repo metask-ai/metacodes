@@ -968,7 +968,7 @@ class MigrationDuringRunTest(StoreCase):
 class WorkerEndToEndTest(StoreCase):
     def test_launched_worker_fills_the_configured_store_before_reporting_done(self):
         from scripts.eval.harbor.bench.runner import RunManager
-        from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, wait_run
+        from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_batches_and_workers, wait_run
 
         config, binary_dir = fixture(self.temp)
         offline_hugging_face(self)
@@ -977,6 +977,7 @@ class WorkerEndToEndTest(StoreCase):
         env = {"PATH": str(binary_dir) + os.pathsep + os.environ.get("PATH", ""), "TOKENJOY_API_KEY": "private"}
         with patch.dict(os.environ, env):
             manager = RunManager(self.temp / "jobs", config)
+            self.addCleanup(stop_batches_and_workers, manager)
             run = manager.launch({"model": "tokenjoy/test-model", "tasks": ["fix-git"]})
             self.assertEqual(json.loads((manager.records / (run["name"] + ".spec")).read_text())["store"],
                              {"backend": "sqlite", "path": str(target.resolve())})

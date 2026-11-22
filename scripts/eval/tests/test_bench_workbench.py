@@ -30,7 +30,7 @@ from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.account import Account, refresh_lock
-from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
 from scripts.eval.tests.posix_only import POSIX
 
 FAKE_HARBOR = '''#!{python}
@@ -207,6 +207,29 @@ def wait_status(manager, name, status, timeout=6):
         shown = next((r for r in manager.runs() if r['name'] == name), {}).get('status')
         if shown == status or time.monotonic() >= deadline:
             return shown
+        time.sleep(.05)
+
+
+def stop_batches_and_workers(manager, timeout=60):
+    batches = getattr(manager, 'batches', None)
+    if batches is not None:
+        batches.stop()
+        if batches._thread is not None:
+            batches._thread.join(timeout)
+            if batches._thread.is_alive():
+                raise AssertionError('the batch scheduler did not stop')
+
+    def active():
+        receipts = {path.stem: data.read_json(path) for path in manager.records.glob('*.json')}
+        return [name for name, receipt in receipts.items()
+                if isinstance(receipt, dict) and receipt.get('status') in ACTIVE]
+
+    for name in active():
+        manager.cancel(name)
+    deadline = time.monotonic() + timeout
+    while running := active():
+        if time.monotonic() >= deadline:
+            raise AssertionError('workers did not end: ' + ', '.join(running))
         time.sleep(.05)
 
 
@@ -534,6 +557,7 @@ class WorkbenchTest(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
+        self.addCleanup(stop_batches_and_workers, self.manager)
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self):
