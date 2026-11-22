@@ -1890,7 +1890,7 @@ const FakeManager = struct {
     command_buf: PathBuf = undefined,
     command_len: usize = 0,
 
-    const Ending = enum { reports_cost, hangs };
+    const Ending = enum { reports_cost, runs_until_stopped, hangs };
 
     fn command(self: *const FakeManager) []const u8 {
         return self.command_buf[0..self.command_len];
@@ -1925,10 +1925,12 @@ const FakeManager = struct {
             \\
         , .{ run_root, fx.repo() });
         switch (ending) {
-            .reports_cost => {
+            .reports_cost, .runs_until_stopped => {
                 try text.appendSlice(a, "{\n  cat <<'REQUESTS'\n");
                 for (requests) |line| try text.print(a, "{s}\n", .{line});
-                try text.print(a, "REQUESTS\n  while [ \"$(wc -l < responses)\" -lt {d} ]; do sleep 0.05; done\n}} | /bin/sh \"$1\" \"$2\" \"$3\" > responses\n", .{replies});
+                try text.print(a, "REQUESTS\n  while [ \"$(wc -l < responses)\" -lt {d} ]; do sleep 0.05; done\n", .{replies});
+                if (ending == .runs_until_stopped) try text.appendSlice(a, "  sleep 10\n");
+                try text.appendSlice(a, "} | /bin/sh \"$1\" \"$2\" \"$3\" > responses\n");
                 try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"total_cost_usd\":0.3}'\nexit 0\n");
             },
             .hangs => try text.appendSlice(a, "touch ready\nsleep 300\n"),
@@ -2100,7 +2102,7 @@ test "teamwork manager L2: an exhausted budget stops the manager and the workers
         mcpCall("3", "teamwork_dispatch", "{\"role\":\"reviewer\"}"),
     };
     var fake: FakeManager = .{};
-    try fake.install(&fx, &requests, 3, .reports_cost);
+    try fake.install(&fx, &requests, 3, .runs_until_stopped);
     const plans = [_]Plan{ .{ .seat = "implementer-1", .files = &.{feature}, .charge_usd = 3.5 }, .{ .seat = "reviewer-1", .review = approve_review } };
     var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
     defer seats.deinit();
