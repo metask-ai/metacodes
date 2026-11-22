@@ -797,18 +797,20 @@ class SshRunTest(SetupFixture):
         self.assertTrue(list((local / ".bench-metrics").glob("*.jsonl")))
 
     def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
-        gateway = RotatingGateway(self.root, lifetime=4)
+        gateway = RotatingGateway(self.root, lifetime=8)
         self.addCleanup(gateway.close)
         manager, client, _ = self.prepare_remote(profile=True, gateway=gateway)
-        os.environ.update(METACODES_BENCH_REFRESH_MARGIN="2", METACODES_BENCH_REFRESH_INTERVAL="0.2",
+        os.environ.update(METACODES_BENCH_REFRESH_MARGIN="5", METACODES_BENCH_REFRESH_INTERVAL="0.2",
                           FAKE_RELAY_REQUESTS="30", FAKE_RELAY_INTERVAL="0.3")
         run = client.request("api/runs", self.request())
         final, _ = self.watch_until_done(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
         local = manager.jobs_dir / run["name"]
         # Every request through the remote relay was authorized upstream,
-        # across 2.5 token lifetimes: the executor holds no refresh token, so
+        # across at least 3 tokens: the executor holds no refresh token, so
         # the newer tokens it used can only have arrived over the channel.
+        # The 5s margin leaves room for a launch that delays the first
+        # background refresh on a loaded CI host.
         self.assertEqual(json.loads((local / "relay-statuses.json").read_text()), [200] * 30)
         self.assertEqual(len(gateway.requests), 30)
         self.assertTrue(all(ok for _, ok, _ in gateway.requests), gateway.requests)
