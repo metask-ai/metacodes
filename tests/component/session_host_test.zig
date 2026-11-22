@@ -1861,6 +1861,49 @@ test "L2 #445 SessionHost config sink: each accepted configuration command journ
     try std.testing.expect(snapshot.reasoning_effort == null);
 }
 
+test "L2 #445 SessionHost config sink: config_changed{dirs} carries the resolved path, not the argument as given; a relative directory is refused and journals none" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &ws_buf);
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try subdir(&tmp, "home", &home_buf);
+    var extra_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try subdir(&tmp, "extra", &extra_buf);
+    try tmp.dir.createDirPath(std.testing.io, "extra2");
+    const given = try std.fmt.allocPrint(a, "{s}/../extra2", .{extra});
+    defer a.free(given);
+
+    const runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    var host = SessionHost.init(a, runtime, .{ .transcripts = false });
+    defer host.deinit();
+    const hosted = try host.open(.{ .config = baseConfig("http://127.0.0.1:9", workspace, home, &.{}) });
+    defer host.release(hosted);
+
+    try hosted.command(.{ .set_additional_directories = &.{given} });
+    try hosted.command(.{ .set_additional_directories = &.{"../extra2"} });
+    try waitFor(&hosted.journal, "\"type\":\"command_result\"", 2);
+
+    var types_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("config_changed command_result command_result", try hostLineTypes(&hosted.journal, &types_buf));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"command\":\"set_additional_directories\",\"ok\":true"));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "{\"command\":\"set_additional_directories\",\"ok\":false,\"error_name\":\"InvalidAdditionalDirectory\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, "\"type\":\"config_changed\",\"data\":{\"dirs\":"));
+
+    try std.testing.expectEqual(@as(usize, 1), hosted.session.workspace.additional_dirs.len);
+    const resolved = hosted.session.workspace.additional_dirs[0];
+    try std.testing.expect(!std.mem.eql(u8, given, resolved));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "extra2"));
+    const resolved_line = try cc.wire.writeEvent(a, .{ .config_changed = .{ .dirs = resolved } });
+    defer a.free(resolved_line);
+    const given_line = try cc.wire.writeEvent(a, .{ .config_changed = .{ .dirs = given } });
+    defer a.free(given_line);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&hosted.journal, resolved_line));
+    try std.testing.expectEqual(@as(usize, 0), try countLines(&hosted.journal, given_line));
+}
+
 test "L2 #445 SessionHost cron: a CronCreate prompt fires as the Session's next Run once it is idle, after queued work, as the CLI fires it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
