@@ -177,7 +177,7 @@ fn waitForPid(ws: *Workspace) !i32 {
     return error.ServerNeverStarted;
 }
 
-test "L2 /mcp reconnect connects a server added mid-session: the request before it has no such tool, the one after has it" {
+test "L2 a server added mid-session inside the working directories waits for /mcp reconnect: the request before it has no such tool, the one after has it" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!pfs.exists(MOCK_MCP)) return error.SkipZigTest;
     var ws: Workspace = undefined;
@@ -300,8 +300,9 @@ test "L2 /mcp reconnect <name> restarts a connected server: a new process, the o
     try std.testing.expect(std.mem.indexOf(u8, body, GATE_TOOL) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "mcp__other__echo") != null);
     var registered: usize = 0;
-    for (app.dyn_registry.entries.items) |entry| {
-        if (std.mem.startsWith(u8, entry.name, "mcp__gate__")) registered += 1;
+    var index: usize = 0;
+    while (app.dyn_registry.entryAt(index)) |entry| : (index += 1) {
+        if (entry.isLive() and std.mem.startsWith(u8, entry.name, "mcp__gate__")) registered += 1;
     }
     try std.testing.expectEqual(app.mcp_report.servers[1].tool_count, registered);
 }
@@ -338,7 +339,7 @@ test "L2 a server that failed at startup connects on /mcp reconnect once fixed; 
     try std.testing.expect(std.mem.indexOf(u8, srv.lastRequest().?.body(), GATE_TOOL) != null);
 }
 
-test "L2 a stopped reconnect is canceled: the server is reaped and reported, the tool surface is rebuilt" {
+test "L2 a stopped reconnect is canceled: the server is reaped and reported, and the tool surface stays as it was" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!pfs.exists(MOCK_MCP)) return error.SkipZigTest;
     var ws: Workspace = undefined;
@@ -351,45 +352,25 @@ test "L2 a stopped reconnect is canceled: the server is reaped and reported, the
     defer session.deinit();
     const app = session.app;
     try std.testing.expect(app.toolSurfaceReady());
+    const defs = app.tool_defs.ptr;
+    const prompt = app.system_prompt.?.ptr;
 
     try ws.writeGateServer("gate");
     const begun = try app.beginMcpReconnect(.unconnected);
     try std.testing.expectEqual(@as(usize, 1), begun.connecting.len);
     try std.testing.expectEqualStrings("gate", begun.connecting[0]);
-    try std.testing.expect(!app.toolSurfaceReady());
-    try std.testing.expectEqual(@as(usize, 0), app.tool_defs.len);
+    try std.testing.expect(app.toolSurfaceReady());
+    try std.testing.expectEqual(defs, app.tool_defs.ptr);
+    try std.testing.expectEqual(.connecting, app.mcp_report.servers[0].state);
     const pid = try waitForPid(&ws);
 
     try app.cancelMcpReconnect();
     try std.testing.expect(app.toolSurfaceReady());
-    try std.testing.expect(app.tool_defs.len != 0);
+    try std.testing.expectEqual(defs, app.tool_defs.ptr);
+    try std.testing.expectEqual(prompt, app.system_prompt.?.ptr);
     try std.testing.expectEqual(.failed, app.mcp_report.servers[0].state);
     try std.testing.expectEqualStrings("connection canceled", app.mcp_report.servers[0].detail);
     try std.testing.expect(std.c.kill(pid, @enumFromInt(0)) != 0);
-}
-
-test "L2 /mcp reconnect is refused while an agent job runs, and allowed once it has finished" {
-    var ws: Workspace = undefined;
-    try ws.init();
-    defer ws.deinit();
-    try ws.writeConfig("{\"missing\":{\"command\":\"/nonexistent/metacodes-test-mcp-server\"}}");
-
-    var session: Session = undefined;
-    try session.init("http://127.0.0.1:1/v1/messages");
-    defer session.deinit();
-    const app = session.app;
-    try session.waitSettled();
-    try app.publishMcpServers();
-    const jobs = &(app.agent_jobs orelse return error.SkipZigTest);
-    const job = jobs.registerForeground("general-purpose", "busy", "busy") orelse return error.SkipZigTest;
-    try std.testing.expectError(error.BackgroundAgentsRunning, app.beginMcpReconnect(.unconnected));
-    try std.testing.expect(app.toolSurfaceReady());
-    jobs.finishForeground(job, 0, 0, .end_turn);
-    const begun = try app.beginMcpReconnect(.unconnected);
-    try std.testing.expectEqual(@as(usize, 1), begun.connecting.len);
-    try session.waitSettled();
-    try app.publishMcpServers();
-    try std.testing.expectEqual(.failed, app.mcp_report.servers[0].state);
 }
 
 test "L2 /mcp reconnect of a name no session connects says why and changes nothing" {
@@ -417,7 +398,7 @@ fn plainEntry(a: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "\"{s}\":{{\"command\":\"{s}/{s}\"}}", .{ name, cwd, MOCK_MCP });
 }
 
-test "L2 a connected server whose entry was removed stays connected and listed after /mcp reconnect" {
+test "L2 /mcp reconnect disconnects a server whose entry was removed and connects the one added in its place" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!pfs.exists(MOCK_MCP)) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -452,15 +433,15 @@ test "L2 a connected server whose entry was removed stays connected and listed a
     }
     try session.repl(&ws, "/mcp reconnect\nhello\n");
 
-    try std.testing.expectEqual(@as(usize, 2), app.mcp_report.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_report.servers.len);
     try std.testing.expectEqualStrings("new", app.mcp_report.servers[0].name);
     try std.testing.expectEqual(.connected, app.mcp_report.servers[0].state);
-    try std.testing.expectEqualStrings("old", app.mcp_report.servers[1].name);
-    try std.testing.expectEqual(.connected, app.mcp_report.servers[1].state);
-    try std.testing.expectEqual(@as(usize, 2), app.mcp_sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_retired.items.len);
     const body = srv.lastRequest().?.body();
-    try std.testing.expect(std.mem.indexOf(u8, body, "mcp__old__echo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "mcp__new__echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "- mcp__new__echo — echo back input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "are no longer available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "- mcp__old__echo\\n") != null);
 }
 
 const AUTH_MOCK = "tests/_harness/mock_mcp_auth_server.py";
@@ -570,7 +551,7 @@ test "L2 a server that needed a login connects on /mcp reconnect once `mcp login
     try session.waitSettled();
     try app.publishMcpServers();
     try std.testing.expectEqual(.needs_auth, app.mcp_report.servers[0].state);
-    try std.testing.expect(std.mem.indexOf(u8, app.mcp_report.servers[0].detail, "/mcp reconnect authd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.mcp_report.servers[0].detail, "connects automatically once the login is stored") != null);
     try std.testing.expectEqual(@as(usize, 1), app.mcp_unavailable.len);
 
     {
@@ -590,4 +571,96 @@ test "L2 a server that needed a login connects on /mcp reconnect once `mcp login
     try std.testing.expectEqual(.connected, app.mcp_report.servers[0].state);
     try std.testing.expectEqual(@as(usize, 0), app.mcp_unavailable.len);
     try std.testing.expect(std.mem.indexOf(u8, srv.lastRequest().?.body(), "mcp__authd__whoami") != null);
+}
+
+test "L2 a server that needed a login connects before the next request once `mcp login` has stored one, without /mcp reconnect" {
+    var mock = AuthMock.start() orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var ws: Workspace = undefined;
+    try ws.init();
+    defer ws.deinit();
+    var url_buffer: [96]u8 = undefined;
+    const server_url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/oauth-mcp", .{mock.port});
+    {
+        const servers = try std.fmt.allocPrint(a, "{{\"authd\":{{\"type\":\"http\",\"url\":\"{s}\"}}}}", .{server_url});
+        defer a.free(servers);
+        try ws.writeConfig(servers);
+    }
+    var srv = try harness.MockServer.startCassette(&.{REPLY_SSE}, 0);
+    defer srv.stop();
+    const provider_url = try srv.urlOwned(a);
+    defer a.free(provider_url);
+    var session: Session = undefined;
+    try session.init(provider_url);
+    defer session.deinit();
+    const app = session.app;
+    try session.waitSettled();
+    try app.publishMcpServers();
+    try std.testing.expectEqual(.needs_auth, app.mcp_report.servers[0].state);
+    try std.testing.expect(std.mem.indexOf(u8, app.mcp_report.servers[0].detail, "connects automatically once the login is stored") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_unavailable.len);
+
+    {
+        var browser: Browser = .{};
+        var result = cc.mcp_oauth.login(a, std.testing.io, app.stateRoot(), .{
+            .name = "authd",
+            .target = .{ .url = server_url, .wire = .streamable },
+        }, .{ .open_browser = false, .open_url = browser.opener() }) catch |err| {
+            browser.finish();
+            return err;
+        };
+        browser.finish();
+        result.deinit(a);
+    }
+    try session.repl(&ws, "hello\n");
+
+    try std.testing.expectEqual(.connected, app.mcp_report.servers[0].state);
+    try std.testing.expectEqual(@as(usize, 0), app.mcp_unavailable.len);
+    const body = srv.lastRequest().?.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "- mcp__authd__whoami") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "'authd' connected (") != null);
+}
+
+test "L2 a connected server whose entry changes inside the working directories keeps its connection until /mcp reconnect" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!pfs.exists(MOCK_MCP)) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var ws: Workspace = undefined;
+    try ws.init();
+    defer ws.deinit();
+    {
+        const entry = try plainEntry(a, "kept");
+        defer a.free(entry);
+        const servers = try std.fmt.allocPrint(a, "{{{s}}}", .{entry});
+        defer a.free(servers);
+        try ws.writeConfig(servers);
+    }
+    var srv = try harness.MockServer.startCassette(&.{REPLY_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var session: Session = undefined;
+    try session.init(url);
+    defer session.deinit();
+    const app = session.app;
+    try session.waitSettled();
+    try app.publishMcpServers();
+    const client = app.mcp_sessions.items[0].client;
+    {
+        var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = pfs.getCwd(&cwd_buffer) orelse return error.NoCwd;
+        const servers = try std.fmt.allocPrint(a, "{{\"kept\":{{\"command\":\"{s}/{s}\",\"args\":[\"--paginate\"]}}}}", .{ cwd, MOCK_MCP });
+        defer a.free(servers);
+        try ws.writeConfig(servers);
+    }
+
+    try session.repl(&ws, "hello\n");
+
+    const body = srv.lastRequest().?.body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "'kept' was changed in ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "the user loads it with `/mcp reconnect kept`") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_sessions.items.len);
+    try std.testing.expect(app.mcp_sessions.items[0].client == client);
+    try std.testing.expectEqual(.connected, app.mcp_report.servers[0].state);
 }

@@ -25,7 +25,7 @@ pub const McpLate = struct {
     name: []const u8,
     change: Change,
 
-    pub const Change = enum { added, logged_in };
+    pub const Change = enum { added };
 };
 
 pub const McpLateProbe = struct {
@@ -56,15 +56,14 @@ pub fn writeNotice(w: *std.Io.Writer, unavailable: []const McpUnavailable, late:
         listed += 1;
     }
     if (unlisted != 0) try w.print(" and {d} more;", .{unlisted});
-    if (listed != 0) try w.writeAll(" Once one is fixed, `/mcp reconnect` in this session (or a new session) picks it up.");
+    if (listed != 0) try w.writeAll(" One is connected automatically once a login is stored for it or its configuration changes; `/mcp reconnect <name>` retries one at once.");
     if (late.len != 0) {
         try w.writeAll(" MCP servers that changed after this session started, so their tools are not here yet:");
         for (late[0..@min(late.len, MAX_LISTED_UNAVAILABLE)]) |server| try w.print(" '{s}' ({s});", .{ server.name, switch (server.change) {
             .added => "added to the configuration",
-            .logged_in => "a login has been stored for it",
         } });
         if (late.len > MAX_LISTED_UNAVAILABLE) try w.print(" and {d} more;", .{late.len - MAX_LISTED_UNAVAILABLE});
-        try w.writeAll(" The user loads one with `/mcp reconnect <name>` in this session, or by starting a new session.");
+        try w.writeAll(" Each is connected before the next request (a system reminder then lists its tools), unless it is defined inside the working directories: then the user loads it with `/mcp reconnect <name>`.");
     }
     if (listed != 0 or late.len != 0)
         try w.writeAll(" Tell the user what each one needs; do not reach these servers another way (hand-written requests, tokens copied from other programs or credential stores).");
@@ -104,21 +103,20 @@ test "a long list of unavailable servers is bounded" {
     try std.testing.expect(std.mem.indexOf(u8, text, "and 3 more;") != null);
 }
 
-test "servers that changed after the session started are named with the change, and a logged-in one is not sent to log in" {
+test "servers added after the session started are named with what happens to them, and an unavailable one listed again is not repeated" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try writeNotice(&out.writer, &.{
-        .{ .name = "suno", .detail = "the server requires authorization (401/403); run `metacodes mcp login suno`" },
+        .{ .name = "fresh", .detail = "spawn failed" },
         .{ .name = "local", .detail = "spawn failed" },
     }, &.{
-        .{ .name = "suno", .change = .logged_in },
         .{ .name = "fresh", .change = .added },
     });
     const text = out.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "'local' (spawn failed);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "mcp login suno") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "'suno' (a login has been stored for it);") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "'fresh'"));
     try std.testing.expect(std.mem.indexOf(u8, text, "'fresh' (added to the configuration);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "connected before the next request") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`/mcp reconnect <name>`") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Tell the user what each one needs"));
 

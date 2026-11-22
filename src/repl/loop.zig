@@ -944,7 +944,7 @@ const McpWait = enum { startup, reconnect };
 
 fn awaitMcpConnects(host: *const TurnHost, wait: McpWait) !bool {
     const app = host.app;
-    if (app.toolSurfaceReady()) return true;
+    if (wait == .startup and app.toolSurfaceReady()) return true;
     if (!app.mcpStartupSettled()) {
         // A held command echo goes out before the spinner takes the screen.
         cmd_output.flushEcho();
@@ -1404,9 +1404,10 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
 /// 顺序铁律:① clone(registry allocator)② spawnBackground(成功后 copy 所有权转移)③ reset 前台。
 /// 任一步失败 → 不 reset 前台(保留对话让用户重试),copy 在失败路径释放。
 ///
-/// **隐性契约(D)**:后台 job 借用 app.agents/skills/dyn_registry(只读,App 生命周期)。这些在
-/// 后台 job 存活期间(可数分钟)**必须保持不可变**——前台若有运行时写入路径(动态加载 skill /
-/// 注册 agent),与后台读并发就是竞争。当前无此类运行时写入,安全;新增前需重新评估。
+/// **隐性契约(D)**:后台 job 借用 app.agents/skills/dyn_registry(只读,App 生命周期)。agents/skills
+/// 在后台 job 存活期间(可数分钟)**必须保持不可变**——前台若有运行时写入路径(动态加载 skill /
+/// 注册 agent),与后台读并发就是竞争;新增前需重新评估。dyn_registry 有运行时写入(MCP 热插拔):
+/// 它自己加锁,条目只退役不释放。
 /// conversation 是深拷贝(零共享);Client/io_runtime/abort 后台专属;故唯一隐患就是上述借用集。
 ///
 /// **MVP 简化(E)**:单击即转后台,不可逆(无 foreground-back),无双击防抖。误触代价=对话被搬走、
@@ -5210,6 +5211,12 @@ fn printMcpServer(app: *const app_mod.App, server: app_mod.McpServerStatus) void
         .needs_auth => cmd_output.print("  \x1b[33m!\x1b[0m \x1b[36m{s}\x1b[0m  needs authentication: {s}  \x1b[2m({s})\x1b[0m\n", .{
             server.name, server.detail, server.origin.label(),
         }),
+        .connecting => cmd_output.print("  \x1b[2m◌\x1b[0m \x1b[36m{s}\x1b[0m  connecting…  \x1b[2m({s})\x1b[0m\n", .{
+            server.name, server.origin.label(),
+        }),
+        .not_loaded => cmd_output.print("  \x1b[33m○\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
+            server.name, server.detail, server.origin.label(),
+        }),
     }
     cmd_output.print("      \x1b[2m{s}{s}{s}\x1b[0m\n", .{
         server.origin_path,
@@ -5218,7 +5225,7 @@ fn printMcpServer(app: *const app_mod.App, server: app_mod.McpServerStatus) void
     });
     for (app.mcp_sessions.items) |entry| {
         if (std.mem.eql(u8, entry.name, server.name) and entry.client.tools_changed.load(.acquire))
-            cmd_output.print("      \x1b[33mthe server changed its tools; `/mcp reconnect {s}` uses the new list\x1b[0m\n", .{server.name});
+            cmd_output.print("      \x1b[33mthe server changed its tools; the new list is loaded before the next request\x1b[0m\n", .{});
     }
 }
 
@@ -5236,7 +5243,6 @@ fn handleMcpReconnect(host: *const TurnHost, target: app_mod.McpReconnectTarget)
     if (!try awaitMcpServers(host)) return;
     const begun = app.beginMcpReconnect(target) catch |err| {
         switch (err) {
-            error.BackgroundAgentsRunning => cmd_output.print("{s}Background agents or teammates are running, and they share this session's MCP tools; reconnect once they have finished.{s}\n", .{ app.theme.warn, app.theme.reset }),
             error.McpDisabled => cmd_output.print("MCP servers are off in this session.\n", .{}),
             error.McpStartupInProgress => cmd_output.print("MCP servers are still connecting (see /mcp).\n", .{}),
             error.OutOfMemory => return error.OutOfMemory,

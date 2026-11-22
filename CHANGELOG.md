@@ -42,13 +42,23 @@ status, compatibility boundaries, and entry points are defined by
   login. `mcp list` now checks each server (`--no-check` skips it) and says
   `auth: not logged in` instead of `auth: none`.
 
-- **`/mcp reconnect [<name>]`.** A running REPL reads the MCP configuration
-  again and connects every server that is not connected (one added or logged
-  in to since the session started, or one that failed), or restarts the named
-  one. The tool list and system prompt are rebuilt once, so the next request
-  misses the prompt cache once; nothing else changes the tool list mid-session.
-  Esc or Ctrl+C cancels, and a reconnect is refused while a background agent or
-  teammate runs.
+- **MCP servers can be added, changed and removed while a session runs.**
+  Before each request of a top-level Run, the ones after a tool batch inside a
+  Run included, the session checks the files its MCP configuration comes from
+  and the stored logins. A server added or changed (by `metacodes mcp add`, an
+  edit, another program) connects, one that needed a login connects once
+  `metacodes mcp login` has stored a new one, a removed one is disconnected,
+  and a server that announces `notifications/tools/list_changed` has its tools
+  read again: no restart, no `/mcp reconnect`. The system prompt and the tool
+  schemas already sent stay as they were, so the prompt cache holds; the model
+  learns from a system reminder that lists the new and the gone tools and what
+  happened to each server, told again after compaction and never twice. A
+  server defined inside the working directories (the current directory,
+  `--add-dir` directories, the sandbox's `allowWrite`) is not connected
+  automatically, since a command the session ran could have written it:
+  `/mcp reconnect [<name>]` connects it, and restarts a named server. A
+  reconnect rebuilds nothing, runs while background agents or teammates run,
+  and Esc or Ctrl+C cancels it.
 
 - **Teamwork launches its own Manager.** Configure `seats.manager` as a
   `claude_code` seat with a top-level `manager_budget_usd` and `teamwork run`,
@@ -91,10 +101,10 @@ status, compatibility boundaries, and entry points are defined by
   subcommand's hints, and `/mcp`'s, name the same command.
 
 - **ToolSearch and unknown `mcp__` tools name servers that changed after the
-  session started.** Besides the servers that did not connect, the result now
-  reads the configuration again and names a server added since, or one that
-  needed a login and has one now, with `/mcp reconnect <name>` or a new session
-  as the way to load it; a logged-in server is no longer sent to `mcp login`.
+  session started.** Besides the servers that did not connect (and the ones
+  still connecting), the result reads the configuration again and names a
+  server added since the session last read it, which is connected before the
+  next request.
 
 - **MCP servers configured for Metacode are found too.** `~/.metacode/config.toml`
   `[mcp_servers]` (Codex format) is read as the lowest-precedence source, after

@@ -669,6 +669,7 @@ pub fn buildOptions(
         .mcp_sessions = &app.mcp_sessions.items,
         .mcp_unavailable = app.mcp_unavailable,
         .mcp_late = app.mcpLateProbe(),
+        .tool_changes = app.toolChangesHook(),
         .cron_registry = &app.cron_registry,
     };
 }

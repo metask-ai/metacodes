@@ -248,9 +248,7 @@ test "L2 a server in ~/.metacode/config.toml starts with the session, is reporte
 
 const SEARCH_FRESH_SSE = toolUseSse("tu_search", "ToolSearch", "{\\\"query\\\":\\\"fresh\\\"}");
 const CALL_FRESH_SSE = toolUseSse("tu_call", "mcp__fresh__generate", "{}");
-const ADDED = "'fresh' (added to the configuration)";
-const LOGGED_IN = "'locked' (a login has been stored for it)";
-const LOAD = "The user loads one with `/mcp reconnect <name>` in this session, or by starting a new session.";
+const NOT_LOADED = "'fresh' (added during this session inside the working directories; `/mcp reconnect fresh` connects it);";
 
 fn runSearchAndCall(app: *cc.app_module.App, prompt: []const u8) !void {
     try app.conversation.appendText(.user, prompt);
@@ -262,7 +260,7 @@ fn runSearchAndCall(app: *cc.app_module.App, prompt: []const u8) !void {
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
 }
 
-test "L2 a server added to the configuration after the session started is named, with how to load it, by ToolSearch and by a call to its tool" {
+test "L2 a server added inside the working directories after the session started is named, with how to load it, before the next request, by ToolSearch and by a call to its tool" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
 
@@ -312,17 +310,19 @@ test "L2 a server added to the configuration after the session started is named,
     try runSearchAndCall(app, "make a song with fresh");
 
     try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    const first = server.requestAt(0).?.body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "'fresh' was added in ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "inside this session's working directories, so it was not connected automatically; the user loads it with `/mcp reconnect fresh`.") != null);
     const after_search = try lastToolResult(aa, server.requestAt(1).?.body());
     try std.testing.expect(std.mem.indexOf(u8, after_search, "No deferred tool matched query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_search, ADDED) != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_search, LOAD) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, NOT_LOADED) != null);
     const after_call = try lastToolResult(aa, server.requestAt(2).?.body());
     try std.testing.expect(std.mem.indexOf(u8, after_call, "Tool 'mcp__fresh__generate' does not exist") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_call, ADDED) != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_call, LOAD) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_call, NOT_LOADED) != null);
+    try std.testing.expectEqual(@as(usize, 0), app.mcp_sessions.items.len);
 }
 
-test "L2 a server that needed a login, logged in to after the session started, is named as such instead of with the login command" {
+test "L2 a stored login that the server does not accept leaves it needing authorization, said before the next request and by ToolSearch" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (std.c.access(MOCK_HTTP, 1) != 0) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -362,7 +362,7 @@ test "L2 a server that needed a login, logged in to after the session started, i
         }
     }
 
-    const bodies = [_][]const u8{ SEARCH_SSE, FINAL_SSE };
+    const bodies = [_][]const u8{ SEARCH_SSE, FINAL_SSE, FINAL_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -388,8 +388,24 @@ test "L2 a server that needed a login, logged in to after the session started, i
     try runSearchAndCall(app, "make a song with locked");
 
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, server.requestAt(0).?.body(), "'locked' needs authorization: the user runs `metacodes mcp login locked`") != null);
     const after_search = try lastToolResult(aa, server.requestAt(1).?.body());
-    try std.testing.expect(std.mem.indexOf(u8, after_search, LOGGED_IN) != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_search, LOAD) != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_search, REMEDY) == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, NAMED) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_search, REMEDY) != null);
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_unavailable.len);
+
+    const unrelated = try std.fmt.allocPrint(a, "{{\"mcpServers\":{{\"locked\":{{\"type\":\"http\",\"url\":\"{s}\"}},\"off\":{{\"command\":\"x\",\"enabled\":false}}}}}}", .{server_url});
+    defer a.free(unrelated);
+    @import("platform").sync.sleepMs(1100);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".metacodes/config.json", .data = unrelated });
+    try app.conversation.appendText(.user, "again");
+    var options = cc.session_service.buildRunOptions(app, null);
+    options.max_turns = 2;
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const backend = render.backend();
+    _ = try cc.agent_loop.run(&app.conversation, app.provider(), app.tool_defs, &app.permission_ctx, options, &backend, app.allocator);
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), app.mcp_report.disabled.len);
+    try std.testing.expectEqualStrings("off", app.mcp_report.disabled[0]);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, server.requestAt(2).?.body(), "'locked' needs authorization"));
 }

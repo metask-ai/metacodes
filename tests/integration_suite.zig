@@ -97,6 +97,7 @@ test {
     _ = @import("component/mcp_permission_test.zig");
     _ = @import("component/mcp_unavailable_notice_test.zig");
     _ = @import("component/mcp_reconnect_test.zig");
+    _ = @import("component/mcp_hotplug_test.zig");
     _ = @import("component/mcp_add_remove_test.zig");
     _ = @import("component/cli_command_prompt_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");

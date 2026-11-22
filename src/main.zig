@@ -136,6 +136,7 @@ pub const api_request = @import("api/request.zig");
 pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
 pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
+pub const tool_changes = @import("core/tool_changes.zig");
 pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
 pub const model_availability = @import("api/model_availability.zig"); // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
@@ -267,6 +268,7 @@ fn serveTeamworkMcp(gpa: std.mem.Allocator, run: *@import("teamwork/runtime.zig"
 }
 pub const app_route_strings = @import("app/route_strings.zig");
 pub const app_mcp_startup = @import("app/mcp_startup.zig");
+pub const app_mcp_hotplug = @import("app/mcp_hotplug.zig");
 pub const app_install = @import("app/install.zig");
 pub const app_update = @import("app/update.zig");
 pub const app_release_source = @import("app/release_source.zig");
@@ -5953,6 +5955,8 @@ test {
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/mcp_startup.zig");
+    _ = &@import("app/mcp_hotplug.zig");
+    _ = &@import("core/tool_changes.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
