@@ -1650,15 +1650,29 @@ class EgressUnitTest(unittest.TestCase):
                           "that reused its descriptor")
         conn.close()
 
-    def test_connect_through_opens_the_relay_upstream_via_the_egress_proxy(self):
-        from scripts.eval.harbor.bench import egress
+    def test_relay_reaches_a_vetted_provider_through_the_workbench_proxy(self):
+        from scripts.eval.harbor.bench import egress, remote
         port, close = echo_server()
         self.addCleanup(close)
-        self.assertEqual(egress.proxy_address({"mode": "workbench", "tunnel_port": 30776}), ("127.0.0.1", 30776))
-        self.assertEqual(egress.proxy_address({"mode": "proxy", "url": "http://proxy.example:3128"}),
-                         ("proxy.example", 3128))
+
+        def resolve(answer):
+            return lambda host, port, *_: [(2, 1, 6, "", (answer, port))]
+        public = egress.allow_policy()
+        self.assertTrue(egress.proxy_accepts("https://www.metask-ai.com/v1", [443, 80], public,
+                                             resolve("151.101.0.223")))
+        self.assertTrue(egress.proxy_accepts("https://www.metask-ai.com", [443], public, resolve("198.18.3.108")))
+        self.assertFalse(egress.proxy_accepts("https://gw.lan/v1", [443], public, resolve("192.168.10.5")))
+        self.assertFalse(egress.proxy_accepts("http://api.example.com:8000/v1", [443, 80], public,
+                                              resolve("151.101.0.223")))
+        self.assertFalse(egress.proxy_accepts("http://llm:8000/v1", [8000], lambda _a: True, resolve("151.101.0.223")))
+
+        self.assertIsNone(remote.relay_connect({}, None))
+        self.assertIs(remote.relay_connect({"refuse_local_upstream": True}, None), egress.connect_not_local)
+        self.assertIs(remote.relay_connect({"refuse_local_upstream": True, "via_egress": True},
+                                           {"mode": "proxy", "url": "http://p:3128"}), egress.connect_not_local)
         with egress.EgressProxy([port], allow=lambda _a: True) as proxy:
-            connect = egress.connect_through(("127.0.0.1", proxy.port))
+            connect = remote.relay_connect({"refuse_local_upstream": True, "via_egress": True},
+                                           {"mode": "workbench", "tunnel_port": proxy.port})
             sock = connect(("127.0.0.1", port), 10)
             sock.sendall(b"model request")
             self.assertEqual(sock.recv(100), b"model request")

@@ -218,19 +218,23 @@ def connect_not_local(address: Tuple[str, int], timeout: Optional[float] = None,
     raise error
 
 
-def proxy_address(options: Dict) -> Tuple[str, int]:
-    """Where a process on the executor reaches the run's egress proxy: the
-    `ssh -R` loopback end (workbench mode) or the site proxy."""
-    if options["mode"] == "workbench":
-        return "127.0.0.1", int(options["tunnel_port"])
-    if options["mode"] == "proxy":
-        return split_host_port(urlsplit(options["url"]).netloc, 80)
-    raise ValueError("unknown egress mode")
+def proxy_accepts(url: str, ports: Iterable[int], allow: Callable[[str], bool], resolve=socket.getaddrinfo) -> bool:
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return False
+    if port not in set(ports) or ("." not in host and ":" not in host):
+        return False
+    try:
+        infos = resolve(host, port, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    return bool(infos) and all(allow(str(info[4][0])) for info in infos)
 
 
 def connect_through(proxy: Tuple[str, int]) -> Callable[..., socket.socket]:
-    """A `socket.create_connection` stand-in that opens a CONNECT tunnel to
-    the destination through `proxy`, for http.client's `_create_connection`."""
 
     def connect(address: Tuple[str, int], timeout: Optional[float] = None,
                 source_address: Optional[Tuple[str, int]] = None) -> socket.socket:
