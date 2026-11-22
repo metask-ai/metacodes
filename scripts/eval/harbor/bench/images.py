@@ -96,6 +96,10 @@ def prepull(cfg: Dict, root: Path, suite_id: str, tasks: Sequence[str], executor
     dataset = suite_dataset(suite, ctx, root / "registry-cache", executors.workbench_harbor(cfg), log)
     chosen = suites.validate_tasks(suite, ctx, list(tasks)) if tasks else suites.task_ids(suite, ctx)
     images, built = images_of(dataset, chosen)
+    if images:
+        ready, error = docker(executor, "docker info >/dev/null", runner, INSPECT_TIMEOUT)
+        if not ready:
+            raise ValueError(f"执行机器 {executor.name} 的 Docker 不可用：{error or '无输出'}")
     rows = []
     for image, users in sorted(images.items()):
         result = pull_one(executor, image, check_only=check_only, runner=runner, log=log, sleep=sleep or time.sleep)

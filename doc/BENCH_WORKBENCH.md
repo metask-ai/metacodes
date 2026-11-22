@@ -164,7 +164,8 @@ metacodes bench pull --suite terminal-bench-2.1 --task fix-git --task regex-log 
 
 It runs on the workbench machine. Registry suites are read from the same
 download a run uses (`<state root>/bench/registry-cache/`), harbor-local
-suites from their prepared dataset. Each image is checked with
+suites from their prepared dataset. It first runs `docker info` on the
+executor and stops with its error when Docker cannot be reached. Each image is checked with
 `docker image inspect` on the executor (over SSH for an SSH executor) and
 pulled only when missing, up to 3 times with a backoff; an executor's
 `ghcr_mirror` is used for `ghcr.io` images, which are then tagged back, and

@@ -18,6 +18,7 @@ from scripts.eval.tests.posix_only import requires_posix_exec
 FAKE_DOCKER = r'''#!/bin/sh
 echo "$*" >> "$FAKE_DOCKER_LOG"
 case "$1" in
+  info) [ -z "$FAKE_DOCKER_DOWN" ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; } ;;
   image) grep -qx "$3" "$FAKE_DOCKER_IMAGES" ;;
   pull)
     count=$(grep -c "^pull $2\$" "$FAKE_DOCKER_LOG")
@@ -67,11 +68,12 @@ class BenchPullTest(unittest.TestCase):
         self.addCleanup(sleep.stop)
 
     def bench(self, *args):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(["pull", "--state-root", str(self.tmp / "state"), "--suite", "humaneval",
                              "--dataset", f"humaneval={self.dataset}", "--json", *args])
-        return code, json.loads(out.getvalue())
+        self.stderr = err.getvalue()
+        return code, json.loads(out.getvalue()) if out.getvalue() else None
 
     def docker_calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -99,6 +101,14 @@ class BenchPullTest(unittest.TestCase):
         self.assertNotIn("pull alexgshaw/fix-git:20260403", pulls)
         self.assertEqual(pulls.count("pull alexgshaw/overfull-hbox:20251031"), images.PULL_ATTEMPTS)
         self.assertIn("alexgshaw/regex-log:20251031", self.present.read_text().splitlines())
+
+    def test_unreachable_docker_fails_before_any_image(self) -> None:
+        for args in (("--dry-run",), ()):
+            with self.subTest(args=args), patch.dict(os.environ, {"FAKE_DOCKER_DOWN": "1"}):
+                code, value = self.bench(*args)
+                self.assertEqual((code, value), (1, None))
+                self.assertIn("Cannot connect to the Docker daemon", self.stderr)
+        self.assertEqual(self.docker_calls(), ["info", "info"])
 
     def test_selected_tasks_only(self) -> None:
         code, value = self.bench("--task", "regex-log")
