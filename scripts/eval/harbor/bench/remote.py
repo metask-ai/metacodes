@@ -260,8 +260,13 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
                 return cancelled_exit()
     # Harbor's own output goes to stderr, which SSH carries to the local
     # worker's log; stdout carries only events.
-    process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
-                               start_new_session=True)
+    try:
+        process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
+                                   start_new_session=True)
+    except OSError as exc:
+        finishing()
+        emit("error", message=f"启动失败：{exc}")
+        return 2
     emit("started", pid=process.pid)
     interrupted_at = None
     last = 0.0
