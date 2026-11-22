@@ -152,16 +152,17 @@ status, compatibility boundaries, and entry points are defined by
   prompts even under an allow rule for `Bash` or in `bypassPermissions`,
   however it is quoted or escaped; a deny rule still denies.
 
-### Fixed
+- **A `--web` or `serve` session queues at most 64 messages and commands**
+  (#447). Before, its queue had no bound: a client could line up any number
+  of turns, each one a provider request. A `POST /message`, `POST /command`
+  or UDS `message` beyond 64 is refused and queues nothing, over HTTP with
+  `429 {"error":"queue full","max_queued":64}`, over the UDS with
+  `{"ok":false,"error":"queue full","max_queued":64}`. Messages and commands
+  count together and the turn in progress does not count, as in
+  `SessionHost` (`max_queued`). `GET /state` reports `queued` and
+  `max_queued`.
 
-- **The TTY relogin revocation cases replay the screen with line wrap**
-  (#673). The `/login` dialog shows a sign-in URL wider than the terminal and
-  climbs over the rows a real terminal wraps it into; the cases replayed the
-  output on a screen that cuts long lines instead, so each redraw seemed to
-  climb two rows too far and erased the sign-in lines above the dialog. When
-  the dialog redrew twice with the URL up, that reached the HTTP 500 notice
-  and the case failed. Both relogin cases now replay with wrap, and the
-  refused/unanswered case checks the whole sign-in transcript in order.
+### Fixed
 
 - **Cancelling a bench build on macOS reports the cancel.** Stopping a
   process group whose leader had just exited raised `PermissionError` on
@@ -191,6 +192,15 @@ status, compatibility boundaries, and entry points are defined by
   TUI ignored both. The key parser now reads both forms through one table, so
   modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
   their CSI u forms do (#643).
+
+- **The TTY relogin revocation cases replay the screen with line wrap**
+  (#673). The `/login` dialog shows a sign-in URL wider than the terminal and
+  climbs over the rows a real terminal wraps it into; the cases replayed the
+  output on a screen that cuts long lines instead, so each redraw seemed to
+  climb two rows too far and erased the sign-in lines above the dialog. When
+  the dialog redrew twice with the URL up, that reached the HTTP 500 notice
+  and the case failed. Both relogin cases now replay with wrap, and the
+  refused/unanswered case checks the whole sign-in transcript in order.
 
 - **`/logout` and the notice under the banner follow `.env`'s
   `METACODES_PRESET`** (#489). Signed in to Metask with a `.env` that names a
