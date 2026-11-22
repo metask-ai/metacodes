@@ -8,6 +8,7 @@
 const std = @import("std");
 const paths = @import("platform").paths;
 const sync = @import("platform").sync;
+const pdir = @import("platform").dir;
 const runtime = @import("runtime/root.zig");
 const skill_projection = @import("skill.zig");
 const overrides_mod = @import("overrides.zig");
@@ -44,6 +45,8 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     snapshot: ?*runtime.catalog.Snapshot = null,
+    retired_snapshots: std.ArrayList(*runtime.catalog.Snapshot) = .empty,
+    source_roots: [][]const u8 = &.{},
     materializations: ?runtime.materialization.Manager = null,
     root_frame: ?*runtime.policy_frame.PolicyFrame = null,
     contexts_mutex: sync.Mutex = .{},
@@ -65,8 +68,71 @@ pub const Runtime = struct {
         if (self.root_frame) |frame| frame.release();
         if (self.materializations) |*manager| manager.deinitFinal();
         if (self.snapshot) |snapshot| snapshot.deinit();
+        for (self.retired_snapshots.items) |snapshot| snapshot.deinit();
+        self.retired_snapshots.deinit(self.allocator);
+        self.freeSourceRoots();
         self.contexts.deinit();
         self.* = undefined;
+    }
+
+    fn freeSourceRoots(self: *Runtime) void {
+        for (self.source_roots) |root| self.allocator.free(root);
+        self.allocator.free(self.source_roots);
+        self.source_roots = &.{};
+    }
+
+    fn rememberSourceRoots(self: *Runtime, sources: []const runtime.catalog.Source) !void {
+        var roots: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (roots.items) |root| self.allocator.free(root);
+            roots.deinit(self.allocator);
+        }
+        for (sources) |source| {
+            if (source.profile != .compat) continue;
+            try roots.ensureUnusedCapacity(self.allocator, 1);
+            roots.appendAssumeCapacity(try self.allocator.dupe(u8, source.root));
+        }
+        const owned = try roots.toOwnedSlice(self.allocator);
+        self.freeSourceRoots();
+        self.source_roots = owned;
+    }
+
+    pub fn findRetiredRecord(self: *const Runtime, invocation_name: []const u8) ?*const runtime.catalog.SkillRecord {
+        const items = self.retired_snapshots.items;
+        if (items.len == 0) return null;
+        return items[items.len - 1].findByInvocation(invocation_name);
+    }
+
+    pub fn currentSnapshot(self: *const Runtime) ?*runtime.catalog.Snapshot {
+        return @atomicLoad(?*runtime.catalog.Snapshot, &self.snapshot, .acquire);
+    }
+
+    const WATCHED_FILES = [_][]const u8{ "SKILL.md", "sealed.json", "agents/openai.yaml" };
+    const MAX_WATCHED_ENTRIES_PER_ROOT: usize = 256;
+
+    pub fn watchPaths(self: *const Runtime, allocator: std.mem.Allocator) ![][]const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (out.items) |path| allocator.free(path);
+            out.deinit(allocator);
+        }
+        for (self.source_roots) |root| {
+            try out.append(allocator, try allocator.dupe(u8, root));
+            const root_z = try allocator.dupeZ(u8, root);
+            defer allocator.free(root_z);
+            var entries = pdir.open(root_z.ptr) orelse continue;
+            defer pdir.close(&entries);
+            var listed: usize = 0;
+            while (pdir.next(&entries)) |entry| {
+                if (entry.name.len == 0 or entry.name[0] == '.') continue;
+                if (listed == MAX_WATCHED_ENTRIES_PER_ROOT) break;
+                listed += 1;
+                const dir = try std.fs.path.join(allocator, &.{ root, entry.name });
+                try out.append(allocator, dir);
+                for (WATCHED_FILES) |file| try out.append(allocator, try std.fs.path.join(allocator, &.{ dir, file }));
+            }
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     pub fn loadDefault(
@@ -92,6 +158,35 @@ pub const Runtime = struct {
         extra_sources: []const runtime.catalog.Source,
         projection: *skill_projection.SkillSet,
     ) !void {
+        return self.loadDefaultImpl(cwd, home, state_root, additional_dirs, workspace_epoch, extra_sources, projection, .replace);
+    }
+
+    pub fn reloadDefaultWithExtraSources(
+        self: *Runtime,
+        cwd: []const u8,
+        home: []const u8,
+        state_root: []const u8,
+        additional_dirs: []const []const u8,
+        workspace_epoch: []const u8,
+        extra_sources: []const runtime.catalog.Source,
+        projection: *skill_projection.SkillSet,
+    ) !void {
+        return self.loadDefaultImpl(cwd, home, state_root, additional_dirs, workspace_epoch, extra_sources, projection, .keep_previous);
+    }
+
+    const Load = enum { replace, keep_previous };
+
+    fn loadDefaultImpl(
+        self: *Runtime,
+        cwd: []const u8,
+        home: []const u8,
+        state_root: []const u8,
+        additional_dirs: []const []const u8,
+        workspace_epoch: []const u8,
+        extra_sources: []const runtime.catalog.Source,
+        projection: *skill_projection.SkillSet,
+        load: Load,
+    ) !void {
         const workspace_root = skill_projection.findRepoRoot(self.allocator, cwd) catch
             try self.allocator.dupe(u8, cwd);
         defer self.allocator.free(workspace_root);
@@ -109,10 +204,14 @@ pub const Runtime = struct {
         var combined: std.ArrayList(runtime.catalog.Source) = .empty;
         try combined.appendSlice(scratch.allocator(), defaults);
         try combined.appendSlice(scratch.allocator(), extra_sources);
-        try self.loadSources(workspace_root, home, workspace_epoch, combined.items, projection);
+        switch (load) {
+            .replace => try self.loadSources(workspace_root, home, workspace_epoch, combined.items, projection),
+            .keep_previous => try self.swapSources(workspace_root, home, workspace_epoch, combined.items, projection),
+        }
+        try self.rememberSourceRoots(defaults);
     }
 
-    pub fn loadSources(
+    fn swapSources(
         self: *Runtime,
         workspace_root: []const u8,
         workspace_home: []const u8,
@@ -120,6 +219,23 @@ pub const Runtime = struct {
         sources: []const runtime.catalog.Source,
         projection: *skill_projection.SkillSet,
     ) !void {
+        const next_snapshot = try self.buildSnapshot(workspace_root, workspace_home, workspace_epoch, sources);
+        errdefer next_snapshot.deinit();
+        try projection.replaceFromSnapshot(next_snapshot);
+        try self.retired_snapshots.ensureUnusedCapacity(self.allocator, 1);
+        self.contexts_mutex.lock();
+        defer self.contexts_mutex.unlock();
+        if (self.snapshot) |previous| self.retired_snapshots.appendAssumeCapacity(previous);
+        @atomicStore(?*runtime.catalog.Snapshot, &self.snapshot, next_snapshot, .release);
+    }
+
+    fn buildSnapshot(
+        self: *Runtime,
+        workspace_root: []const u8,
+        workspace_home: []const u8,
+        workspace_epoch: []const u8,
+        sources: []const runtime.catalog.Source,
+    ) !*runtime.catalog.Snapshot {
         const scope_id = cliScopeId(workspace_root, workspace_home);
         const next_snapshot = try runtime.catalog.build(
             self.allocator,
@@ -130,6 +246,11 @@ pub const Runtime = struct {
             .{},
         );
         errdefer next_snapshot.deinit();
+        logDefinitionWarnings(next_snapshot);
+        return next_snapshot;
+    }
+
+    fn logDefinitionWarnings(next_snapshot: *const runtime.catalog.Snapshot) void {
         const log = @import("../util/log.zig");
         for (next_snapshot.skills) |record| {
             const definition = &record.definition;
@@ -151,6 +272,18 @@ pub const Runtime = struct {
                 ),
             }
         }
+    }
+
+    pub fn loadSources(
+        self: *Runtime,
+        workspace_root: []const u8,
+        workspace_home: []const u8,
+        workspace_epoch: []const u8,
+        sources: []const runtime.catalog.Source,
+        projection: *skill_projection.SkillSet,
+    ) !void {
+        const next_snapshot = try self.buildSnapshot(workspace_root, workspace_home, workspace_epoch, sources);
+        errdefer next_snapshot.deinit();
 
         var next_materializations: ?runtime.materialization.Manager =
             runtime.materialization.Manager.initWithBorrowedIo(
@@ -171,12 +304,14 @@ pub const Runtime = struct {
         }
         if (self.materializations) |*manager| manager.deinitFinal();
         if (self.snapshot) |snapshot| snapshot.deinit();
-        self.snapshot = next_snapshot;
+        for (self.retired_snapshots.items) |snapshot| snapshot.deinit();
+        self.retired_snapshots.clearRetainingCapacity();
+        @atomicStore(?*runtime.catalog.Snapshot, &self.snapshot, next_snapshot, .release);
         self.materializations = next_materializations;
     }
 
     pub fn findRecord(self: *const Runtime, invocation_name: []const u8) ?*const runtime.catalog.SkillRecord {
-        const snapshot = self.snapshot orelse return null;
+        const snapshot = self.currentSnapshot() orelse return null;
         return snapshot.findByInvocation(invocation_name);
     }
 
@@ -184,7 +319,7 @@ pub const Runtime = struct {
         self: *const Runtime,
         invocation_name: []const u8,
     ) ?*const runtime.catalog.Issue {
-        const snapshot = self.snapshot orelse return null;
+        const snapshot = self.currentSnapshot() orelse return null;
         for (snapshot.issues) |*issue| {
             const name = issue.invocation_name orelse continue;
             if (std.mem.eql(u8, name, invocation_name)) return issue;
@@ -196,7 +331,7 @@ pub const Runtime = struct {
     /// reachable: a compat Skill references its live directory, a snapshot
     /// Skill needs the materialization manager.
     pub fn hasModelInvocable(self: *const Runtime) bool {
-        const snapshot = self.snapshot orelse return false;
+        const snapshot = self.currentSnapshot() orelse return false;
         for (snapshot.skills) |record| {
             if (record.definition.disable_model_invocation) continue;
             if (record.live_dir != null or self.materializations != null) return true;
@@ -208,7 +343,7 @@ pub const Runtime = struct {
     /// immutable model-routing metadata. The exact Skill name is borrowed from
     /// this Runtime snapshot and therefore stays stable for the Session.
     pub fn applyModelToolSchema(self: *const Runtime, definitions: []ToolDefinition) bool {
-        const snapshot = self.snapshot orelse return false;
+        const snapshot = self.currentSnapshot() orelse return false;
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const listings = self.modelListings(scratch.allocator()) catch null;
@@ -234,7 +369,7 @@ pub const Runtime = struct {
     /// snapshot's records; null when no overrides apply.
     pub fn modelListings(self: *const Runtime, allocator: std.mem.Allocator) !?[]runtime.model_tool.Listing {
         const overrides = self.overrides orelse return null;
-        const snapshot = self.snapshot orelse return null;
+        const snapshot = self.currentSnapshot() orelse return null;
         const names = try allocator.alloc([]const u8, snapshot.skills.len);
         defer allocator.free(names);
         for (snapshot.skills, names) |record, *name| name.* = record.invocation_name;
@@ -248,7 +383,7 @@ pub const Runtime = struct {
 
     /// The Skill tool description for the current `skillOverrides`.
     pub fn buildModelToolDescription(self: *const Runtime, allocator: std.mem.Allocator) ![]u8 {
-        const snapshot = self.snapshot orelse return error.SkillUnavailable;
+        const snapshot = self.currentSnapshot() orelse return error.SkillUnavailable;
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const listings = try self.modelListings(scratch.allocator());
@@ -283,7 +418,7 @@ pub const Runtime = struct {
         self.contexts_mutex.lock();
         defer self.contexts_mutex.unlock();
 
-        const snapshot = self.snapshot orelse return error.SkillUnavailable;
+        const snapshot = self.currentSnapshot() orelse return error.SkillUnavailable;
         const materializations: ?*runtime.materialization.Manager = if (self.materializations) |*manager|
             manager
         else
@@ -685,7 +820,7 @@ pub fn handleSlash(
         .state_root = app.stateRoot(),
         .agents = &app.agents,
         .parent_model = app.activeModel(),
-        .skills = &app.skills,
+        .skills = app.currentSkills(),
         .api_client = app.anthropicClientOrNull(),
         .preview = app.config.preview.features(),
     };

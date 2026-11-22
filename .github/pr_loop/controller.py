@@ -57,8 +57,6 @@ class Store:
                     raise Busy("another controller owns this state database") from exc
             else:
                 import msvcrt
-                handle.write(b"\0")
-                handle.flush()
                 handle.seek(0)
                 try:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)

@@ -605,13 +605,14 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
 
 
 def test_T34b_each_shift_tab_encoding_cycles_once_during_a_reply(bin_path):
-    from tty_driver import READY, wait_for
+    from tty_driver import READY, idle_footer, wait_for
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
     for key in ("shift_tab", "shift_tab_csi_u", "shift_tab_modify_other_keys"):
         with SlowMockServer([slow_text_then_end(n_chunks=14, delay=0.3)]) as srv:
             raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt"),
-                                 "type:ab", f"key:{key}", "strictsleep:0.5", wait_for("tok13"), "sleep:1.0"],
+                                 "type:ab", f"key:{key}", "strictsleep:0.5", wait_for("tok13"),
+                                 idle_footer("⏵⏵ accept edits on (shift+tab to cycle)")],
                       base_url=srv.url, permission="default", startup_drain=0.8, per_key_drain=0.05)
         a = TTYAssert(raw)
         during = [sc for sc in a.frame_screens

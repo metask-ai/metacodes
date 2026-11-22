@@ -78,6 +78,14 @@ EGRESS_MODES = ("direct", "workbench")
 EGRESS_HELP = 'egress 只能是 "direct"、"workbench" 或 {"proxy": "http://主机:端口"}'
 
 
+def signal_group(process: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        if process.poll() is None:
+            raise
+
+
 @dataclass(frozen=True)
 class LocalExecutor:
     name: str = DEFAULT_LOCAL
