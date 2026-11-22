@@ -97,6 +97,7 @@ test {
     _ = @import("component/mcp_permission_test.zig");
     _ = @import("component/mcp_unavailable_notice_test.zig");
     _ = @import("component/mcp_reconnect_test.zig");
+    _ = @import("component/mcp_hotplug_test.zig");
     _ = @import("component/mcp_add_remove_test.zig");
     _ = @import("component/cli_command_prompt_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");
@@ -155,6 +156,7 @@ test {
     _ = @import("component/ui_state_test.zig");
     _ = @import("component/tui_clear_conversation_test.zig");
     _ = @import("component/skill_overrides_test.zig");
+    _ = @import("component/skill_hotplug_test.zig");
     _ = @import("component/comment_preview_entry_test.zig");
     _ = @import("component/ui_render_test.zig");
     _ = @import("component/ui_backend_test.zig");

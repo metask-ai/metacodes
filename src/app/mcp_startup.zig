@@ -212,11 +212,15 @@ pub const Select = union(enum) {
     all,
     one: []const u8,
     all_except: []const []const u8,
+    only: []const []const u8,
 
     pub fn connects(self: Select, name: []const u8) bool {
         return switch (self) {
             .all => true,
             .one => |one| std.mem.eql(u8, one, name),
+            .only => |names| for (names) |other| {
+                if (std.mem.eql(u8, other, name)) break true;
+            } else false,
             .all_except => |names| for (names) |other| {
                 if (std.mem.eql(u8, other, name)) break false;
             } else true,
@@ -231,6 +235,8 @@ pub const Startup = struct {
     pending: []const mcp_config.Pending,
     disabled: []const []const u8,
     problems: []const mcp_config.Problem,
+    sources: []const []const u8 = &.{},
+    servers: []const mcp_config.Server = &.{},
     /// Stops every connect still in flight (teardown only; never the
     /// session's own abort, which a turn interrupt resets).
     cancel: AbortSignal = AbortSignal.init(),
@@ -258,16 +264,30 @@ pub const Startup = struct {
     }
 
     pub fn prepare(arena: std.mem.Allocator, status: *Status, inputs: Inputs) !*Startup {
-        const log = @import("../util/log.zig");
         const environment = try mcp_config.Environment.fromProcess(arena);
-        const resolved = try mcp_config.load(arena, .{
+        const resolved = try mcp_config.load(arena, loadInputs(inputs, environment));
+        return prepareFrom(arena, status, inputs, resolved, environment);
+    }
+
+    pub fn loadInputs(inputs: Inputs, environment: mcp_config.Environment) mcp_config.LoadInputs {
+        return .{
             .state_root = inputs.state_root,
             .home = inputs.home,
             .cwd = inputs.cwd,
             .workspace_root = if (inputs.workspace_root.len != 0) inputs.workspace_root else inputs.cwd,
             .codex_home = inputs.codex_home,
             .env = environment,
-        });
+        };
+    }
+
+    pub fn prepareFrom(
+        arena: std.mem.Allocator,
+        status: *Status,
+        inputs: Inputs,
+        resolved: mcp_config.Resolved,
+        environment: mcp_config.Environment,
+    ) !*Startup {
+        const log = @import("../util/log.zig");
         for (resolved.problems) |problem| {
             log.warn("mcp", "{s} ({s}){s}{s}: {s}", .{
                 problem.origin_path,
@@ -289,6 +309,8 @@ pub const Startup = struct {
             .pending = resolved.pending,
             .disabled = resolved.disabled,
             .problems = resolved.problems,
+            .sources = resolved.sources,
+            .servers = resolved.servers,
             .status = status,
         };
         const started = util_time.nowMs();

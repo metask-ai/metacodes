@@ -818,8 +818,9 @@ pub fn toToolDefinitionsFull(
     }
     if (!has_deferred) {
         if (dyn) |d| {
-            for (d.entries.items) |entry| {
-                if (entry.deferred) {
+            var index: usize = 0;
+            while (d.entryAt(index)) |entry| : (index += 1) {
+                if (entry.deferred and entry.isLive()) {
                     has_deferred = true;
                     break;
                 }
@@ -1249,9 +1250,10 @@ const ToolNameIter = struct {
             return nm;
         }
         if (self.ctx.dyn_registry) |dr| {
-            while (self.dyn_idx < dr.entries.items.len) {
-                const nm = dr.entries.items[self.dyn_idx].name;
+            while (dr.entryAt(self.dyn_idx)) |entry| {
                 self.dyn_idx += 1;
+                if (!entry.isLive()) continue;
+                const nm = entry.name;
                 if (self.ctx.execution_policy) |policy| {
                     if (!policy.allowsTool(nm)) continue;
                 }
