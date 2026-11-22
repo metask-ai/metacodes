@@ -152,20 +152,17 @@ status, compatibility boundaries, and entry points are defined by
   prompts even under an allow rule for `Bash` or in `bypassPermissions`,
   however it is quoted or escaped; a deny rule still denies.
 
-### Fixed
+- **A `--web` or `serve` session queues at most 64 messages and commands**
+  (#447). Before, its queue had no bound: a client could line up any number
+  of turns, each one a provider request. A `POST /message`, `POST /command`
+  or UDS `message` beyond 64 is refused and queues nothing, over HTTP with
+  `429 {"error":"queue full","max_queued":64}`, over the UDS with
+  `{"ok":false,"error":"queue full","max_queued":64}`. Messages and commands
+  count together and the turn in progress does not count, as in
+  `SessionHost` (`max_queued`). `GET /state` reports `queued` and
+  `max_queued`.
 
-- **A stalled HTTP MCP server no longer holds `/exit` or the first message**
-  (#671). The session DELETE a Streamable HTTP client sends at close now has
-  1 s and goes through the abort registry, so a server that never answers it
-  delays the exit by about that much instead of forever. Connecting (DNS, TCP,
-  TLS) now races the startup timeout and the interrupt: an `https://` server
-  that accepts TCP and stalls the TLS handshake fails at its startup timeout,
-  and leaving while it connects returns at once.
-- **The final OTLP flush at exit is bounded** (#672). The last flush, an
-  export already in flight included, gets at most 1 s (or the export timeout
-  when it is shorter) instead of `OTEL_EXPORTER_OTLP_TIMEOUT` (10 s by
-  default); spans it cuts off are dropped and counted. Exports during the
-  session keep the configured timeout.
+### Fixed
 
 - **Cancelling a bench build on macOS reports the cancel.** Stopping a
   process group whose leader had just exited raised `PermissionError` on
@@ -218,6 +215,19 @@ status, compatibility boundaries, and entry points are defined by
   mode: typing filters, Esc clears the filter and then closes it, Enter
   applies the model under the cursor, and the input box is left alone. Vim's
   keymap takes over again once the picker closes.
+
+- **A stalled HTTP MCP server no longer holds `/exit` or the first message**
+  (#671). The session DELETE a Streamable HTTP client sends at close now has
+  1 s and goes through the abort registry, so a server that never answers it
+  delays the exit by about that much instead of forever. Connecting (DNS, TCP,
+  TLS) now races the startup timeout and the interrupt: an `https://` server
+  that accepts TCP and stalls the TLS handshake fails at its startup timeout,
+  and leaving while it connects returns at once.
+- **The final OTLP flush at exit is bounded** (#672). The last flush, an
+  export already in flight included, gets at most 1 s (or the export timeout
+  when it is shorter) instead of `OTEL_EXPORTER_OTLP_TIMEOUT` (10 s by
+  default); spans it cuts off are dropped and counted. Exports during the
+  session keep the configured timeout.
 
 - **Ctrl+C closes the `/model` picker and keeps the draft** (#607). With the
   picker open over a draft (Ctrl+O while typing), Ctrl+C went past it to the

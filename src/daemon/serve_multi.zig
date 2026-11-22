@@ -139,7 +139,7 @@ const SessionSlot = struct {
             .inbox = &slot.host.inbox,
             .abort = &slot.app.abort,
             .generating = &slot.host.generating, // S1:/interrupt 生成期门(driver 维护)
-            // U11:rich /state + /command(与 --web 同一份实现;命令 HTTP 线程只入 host.cmdbox)。
+            // U11:rich /state + /command(与 --web 同一份实现;命令 HTTP 线程只入 host.inbox)。
             .state_ctx = @ptrCast(&slot.state_src),
             .state_fn = &web_session.StateSource.snapshot,
             .command_fn = &web_session.StateSource.command,
@@ -641,7 +641,7 @@ pub const MultiDaemon = struct {
         slot.wb.usage_totals = &slot.app.usage;
         slot.dctx = .{ .app = slot.app, .wb = &slot.wb };
         slot.config_sink = .{ .wb = &slot.wb };
-        slot.state_src = .{ .app = slot.app, .wb = &slot.wb, .cmdbox = &host.cmdbox, .journal = &host.journal, .generating = &host.generating };
+        slot.state_src = .{ .app = slot.app, .wb = &slot.wb, .inbox = &host.inbox, .journal = &host.journal, .generating = &host.generating };
         slot.app.setConfigEventSink(slot.config_sink.sink());
         slot.app.permission_ctx.ui_requester = slot.wb.requester();
         slot.wired = true;
@@ -656,7 +656,7 @@ pub const MultiDaemon = struct {
     fn freeSlot(md: *MultiDaemon, slot: *SessionSlot) void {
         std.debug.assert(slot.refs.load(.acquire) == 0);
         if (slot.wired) {
-            slot.host.destroy(); // join (if still running) + journal/inbox/cmdbox
+            slot.host.destroy(); // join (if still running) + journal/inbox
             slot.app.permission_ctx.ui_requester = null;
             slot.app.setConfigEventSink(null);
             slot.wb.deinit();

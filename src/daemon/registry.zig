@@ -32,7 +32,6 @@ const time = @import("../util/time.zig");
 const abort = @import("../util/abort.zig");
 const SessionId = @import("../core/session_id.zig").SessionId;
 const EventJournal = @import("../core/event_journal.zig").EventJournal;
-const MsgQueue = @import("../repl/msg_queue.zig").MsgQueue;
 const SubmissionQueue = @import("../web/submission.zig").SubmissionQueue;
 
 /// 一个 session 的运行时宿主单元。堆分配,registry 持 *SessionHost。
@@ -41,9 +40,6 @@ pub const SessionHost = struct {
     allocator: std.mem.Allocator,
     journal: EventJournal,
     inbox: SubmissionQueue, // 客户端消息(text + 可选 model/permission_mode);driver 线程消费
-    /// U11:斜杠命令队列(transport 线程只入队,driver 线程独占执行——对齐 web
-    /// StateSource.command 的"HTTP 线程绝不碰 App"契约)。
-    cmdbox: MsgQueue,
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// **生成期标志**(driver 维护:一轮 agent_loop.run 期间 true,空闲 false)。transport 的
@@ -72,7 +68,6 @@ pub const SessionHost = struct {
             .allocator = allocator,
             .journal = EventJournal.init(allocator),
             .inbox = SubmissionQueue.init(allocator),
-            .cmdbox = MsgQueue.init(allocator),
             .driver_ctx = driver_ctx,
             .driver_fn = driver_fn,
             .ctx_deinit_fn = ctx_deinit_fn,
@@ -138,7 +133,6 @@ pub const SessionHost = struct {
         if (self.ctx_deinit_fn) |f| f(self.driver_ctx, self.allocator);
         self.journal.deinit();
         self.inbox.deinit();
-        self.cmdbox.deinit();
         const alloc = self.allocator;
         alloc.destroy(self);
     }
@@ -292,8 +286,8 @@ test "U10-A: 两 session 各自 journal 独立,消息不串台" {
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // 测试持有 h1/h2 的直接引用(创建者),直接 push——绑定层的按 id 路由 API 尚未引入(option B)。
-    _ = h1.inbox.push(.{ .text = "hello-A" });
-    _ = h2.inbox.push(.{ .text = "hello-B" });
+    try h1.inbox.push(.{ .text = "hello-A" });
+    try h2.inbox.push(.{ .text = "hello-B" });
 
     var waited: usize = 0;
     while ((h1.journal.count() == 0 or h2.journal.count() == 0) and waited < 500) : (waited += 1) {

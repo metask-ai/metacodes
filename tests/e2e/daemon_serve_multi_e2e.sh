@@ -426,6 +426,81 @@ restored="$(lifecycle POST /sessions/create "{\"session_id\":\"$C\",\"resume\":t
 check_health "$url" "$version" 3
 [[ "$(lifecycle POST "/sessions/$C/destroy")" == *" 200" ]] || fail "destroy of the restored session"
 
+bounded="$(lifecycle POST /sessions/create '{}')"
+[[ "$bounded" == *" 201" ]] || fail "create for the queue bound did not answer 201: $bounded"
+E="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1].rsplit(" ", 1)[0])["session_id"])' "$bounded")"
+cat >"$TMP/bound_check.py" <<'PY'
+import http.client, json, socket, sys, time
+from urllib.parse import urlsplit
+
+url, token, sock_path, sid = sys.argv[1:5]
+parts = urlsplit(url)
+FULL = '{"error":"queue full","max_queued":64}'
+UDS_FULL = '{"ok":false,"error":"queue full","max_queued":64}'
+
+def call(method, route, body=None):
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        conn.request(method, "/s/%s%s" % (sid, route), body=None if body is None else json.dumps(body),
+                     headers={"Authorization": "Bearer " + token, "Origin": url})
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode()
+    finally:
+        conn.close()
+
+def state():
+    status, text = call("GET", "/state")
+    assert status == 200, "GET /state: %d %s" % (status, text)
+    return json.loads(text)
+
+def uds(text):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sock_path); s.settimeout(5)
+    s.sendall((json.dumps({"op": "message", "session": sid, "text": text}) + "\n").encode())
+    buf = b""
+    while b"\n" not in buf:
+        d = s.recv(65536)
+        if not d: break
+        buf += d
+    s.close()
+    return buf.decode().split("\n")[0]
+
+def pending_other_than(previous):
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        st = state()
+        if st["pending_request_id"] not in (0, previous): return st
+        time.sleep(0.1)
+    raise AssertionError("no new pending request; /state: %s" % state())
+
+st = state()
+assert (st["queued"], st["max_queued"]) == (0, 64), st
+assert call("POST", "/message", {"text": "CAPS_ASK hold the queue"})[0] == 200
+held = pending_other_than(0)["pending_request_id"]
+for n in range(1, 64):
+    status, body = call("POST", "/message", {"text": ("CAPS_ASK queued %d" if n == 1 else "queued %d") % n})
+    assert status == 200, "message %d was refused: %d %s" % (n, status, body)
+assert uds("queued 64") == '{"ok":true}', "the UDS did not take the 64th"
+st = state()
+assert (st["queued"], st["max_queued"]) == (64, 64), st
+refused = call("POST", "/message", {"text": "one too many"})
+assert refused == (429, FULL), "the 65th message: %r" % (refused,)
+refused = call("POST", "/command", {"cmd": "/mode default"})
+assert refused == (429, FULL), "a command past the bound: %r" % (refused,)
+refused = uds("one too many")
+assert refused == UDS_FULL, "the 65th over the UDS: " + refused
+assert state()["queued"] == 64
+assert call("POST", "/respond", {"id": held, "answers": ["Red"]})[0] == 200
+st = pending_other_than(held)
+assert st["queued"] == 63, "the driver did not take exactly one: %s" % st
+assert uds("taken once one ran") == '{"ok":true}', "no room after the driver took one"
+assert state()["queued"] == 64
+assert call("POST", "/message", {"text": "one too many again"}) == (429, FULL)
+print("BOUND_OK")
+PY
+bound_out="$(python3 "$TMP/bound_check.py" "$url" "$token" "$usock" "$E" 2>&1)" || fail "queue bound checks failed: $bound_out"
+grep -q "BOUND_OK" <<<"$bound_out" || fail "queue bound checks did not finish: $bound_out"
+[[ "$(lifecycle POST "/sessions/$E/destroy")" == *" 200" ]] || fail "destroy of the full session"
+
 stop_daemon "$TMP/multi.out"
 
 # ── #254: --sessions 0 starts empty; the cap answers 429 ────────────────────
@@ -444,4 +519,4 @@ grep -q '"ok":true' <<<"$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$D/message" 
 events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$D/events" >/dev/null || fail "D produced no run"
 stop_daemon "$TMP/zero.out"
 
-echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt/respond/capabilities, per-session /state·/command, dynamic create/list/resume/destroy/restore (#254), --sessions 0 and the 429 cap, SIGINT shutdown"
+echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt/respond/capabilities, per-session /state·/command, dynamic create/list/resume/destroy/restore (#254), --sessions 0 and the 429 cap, the 64-item queue bound over HTTP and UDS (#447), SIGINT shutdown"
