@@ -453,7 +453,7 @@ fn runRelease(
     return outcome;
 }
 
-const user_agent = "metacodes-update/" ++ @import("../version.zig").semver;
+pub const user_agent = "metacodes-update/" ++ @import("../version.zig").semver;
 
 fn reportFetch(log: Log, report: release_fetch.Report) void {
     if (report.url.len == 0 or report.curl_exit == 0) return;

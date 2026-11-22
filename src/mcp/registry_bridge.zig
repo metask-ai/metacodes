@@ -103,12 +103,8 @@ pub const McpSession = struct {
         filter: ToolFilter,
     ) !void {
         const log = @import("../util/log.zig");
-        const registry_checkpoint = registry.entries.items.len;
-        const bindings_checkpoint = self.bindings.items.len;
-        errdefer {
-            registry.rollbackTo(registry_checkpoint);
-            self.rollbackBindingsTo(bindings_checkpoint);
-        }
+        const registry_checkpoint = registry.len();
+        errdefer registry.rollbackTo(registry_checkpoint);
 
         const a = self.schema_arena.allocator();
         const root = std.json.parseFromSliceLeaky(std.json.Value, a, tools_json, .{
@@ -180,12 +176,8 @@ pub const McpSession = struct {
         registry: *DynRegistry,
         server_prefix: []const u8,
     ) !void {
-        const registry_checkpoint = registry.entries.items.len;
-        const bindings_checkpoint = self.bindings.items.len;
-        errdefer {
-            registry.rollbackTo(registry_checkpoint);
-            self.rollbackBindingsTo(bindings_checkpoint);
-        }
+        const registry_checkpoint = registry.len();
+        errdefer registry.rollbackTo(registry_checkpoint);
         try self.bindings.ensureUnusedCapacity(self.allocator, 2);
         // list_resources
         {
@@ -464,7 +456,7 @@ test "registerResourceTools registers list + read tools" {
     try testing.expect(reg.category("mcp__myserver__read_resource") == null);
 }
 
-test "registerResourceTools rolls back registry and bindings on partial failure" {
+test "registerResourceTools retires what a failed batch registered and keeps its bindings until the session goes" {
     var fake_client: McpClient = undefined;
     var session = McpSession.init(testing.allocator, &fake_client);
     defer session.deinit();
@@ -487,7 +479,8 @@ test "registerResourceTools rolls back registry and bindings on partial failure"
         session.registerResourceTools(&reg, "myserver"),
     );
     try testing.expect(reg.find("mcp__myserver__list_resources") == null);
-    try testing.expect(reg.find("mcp__myserver__read_resource") != null);
-    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
-    try testing.expectEqual(@as(usize, 0), session.bindings.items.len);
+    try testing.expectEqualStrings("preexisting", reg.find("mcp__myserver__read_resource").?.description);
+    try testing.expectEqual(@as(usize, 2), reg.len());
+    try testing.expect(!reg.entryAt(1).?.isLive());
+    try testing.expectEqual(@as(usize, 1), session.bindings.items.len);
 }

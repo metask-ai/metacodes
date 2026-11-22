@@ -15,8 +15,11 @@ the teamwork policy. `teamwork mcp` refuses an external `seats.manager`.
 `teamwork run` launches a configured Claude Code Manager itself (#545,
 [TEAMWORK_DESIGN.md](TEAMWORK_DESIGN.md) §10.2) and serves it this same
 protocol through a relay, so a launched Manager sees exactly these tools,
-results and errors. Its spend is held and charged in the run's ledger
-(`budget.manager: "run_ledger"`).
+results and errors. When the run ends, the controller stops the Manager only
+once the relay has taken every reply already written out of the channel (the
+`teamwork_cancel` answer included), the Manager has exited, or 2 s have passed.
+That covers the channel, not the relay's own copy to the Manager. Its spend is
+held and charged in the run's ledger (`budget.manager: "run_ledger"`).
 
 ## Host authorization and ownership
 

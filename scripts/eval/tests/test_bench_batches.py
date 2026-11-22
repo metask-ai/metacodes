@@ -217,6 +217,50 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(again['metacodes']['bundle'], str(frozen))
         self.wait_batch(again['id'])
 
+    def test_chosen_features_reach_every_trial_of_the_batch(self):
+        listed = [f['id'] for f in self.client.request('api/workbench')['features']]
+        self.assertIn('verification_final_gate', listed)
+        self.assertIn('execute_code', listed)
+        created = self.client.request('api/batches', self.request(features=['execute_code', 'verification_final_gate']))
+        self.assertEqual(created['features'], ['verification_final_gate', 'execute_code'])
+        record = self.wait_batch(created['id'])
+        self.assertEqual([i['status'] for i in record['items']], ['finished', 'finished'])
+        runs = {r['name']: r for r in self.manager.runs()}
+        for item in record['items']:
+            self.assertEqual(runs[item['run']]['features'], ['verification_final_gate', 'execute_code'])
+            argv = json.loads((self.manager.jobs_dir / item['run'] / 'argv.json').read_text())
+            self.assertIn('features=verification_final_gate,execute_code', argv)
+        plain = self.client.request('api/batches', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        self.assertEqual(plain['features'], [])
+        run = self.wait_batch(plain['id'])['items'][0]['run']
+        self.assertNotIn('features', next(r for r in self.manager.runs() if r['name'] == run))
+        argv = json.loads((self.manager.jobs_dir / run / 'argv.json').read_text())
+        self.assertFalse([a for a in argv if a.startswith('features=')])
+
+    def test_a_batch_can_be_renamed_while_running_and_after_it_ends(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.client.request('api/batches', one)
+        self.assertEqual(self.client.request('api/batch/rename', {'id': created['id'], 'name': '  回归  '}),
+                         {'id': created['id'], 'name': '回归'})
+        record = self.wait_batch(created['id'])
+        self.assertEqual((record['name'], record['status']), ('回归', 'finished'))
+        self.client.request('api/batch/rename', {'id': created['id'], 'name': ''})
+        self.assertIsNone(self.client.request('api/batch?id=' + created['id'])['name'])
+        with self.assertRaisesRegex(ValueError, '最多'):
+            self.client.request('api/batch/rename', {'id': created['id'], 'name': 'x' * 81})
+        with self.assertRaisesRegex(ValueError, '不存在'):
+            self.client.request('api/batch/rename', {'id': 'batch-missing', 'name': 'x'})
+        foreign = {'id': 'batch-elsewhere', 'status': 'finished', 'items': [], 'created_at': '2026-01-01T00:00:00Z'}
+        with patch.object(self.workbench.library, 'batch_records', return_value=[foreign]), \
+                self.assertRaisesRegex(ValueError, '其他 jobs 目录'):
+            self.client.request('api/batch/rename', {'id': 'batch-elsewhere', 'name': 'x'})
+        self.assertTrue(self.client.request('api/jobs?batch=all')['can_run'])
+
+    def test_features_are_refused_for_a_workbuddy_suite(self):
+        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持选择高级功能'):
+            self.client.request('api/runs', {'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],
+                                             'attempts': 1, 'concurrency': 1, 'features': ['execute_code']})
+
     def test_single_launch_waits_and_cancel_skips_remaining_datasets(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
             created = self.client.request('api/batches', self.request())
@@ -565,7 +609,7 @@ class BatchTest(unittest.TestCase):
                          {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git;rm -rf /']}]},
                          {'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git'], 'bundle': '/tmp/x'}]},
                          {'bundle': '../elsewhere'}, {'model': 'unknown'}, {'attempts': 9}, {'extra': 1},
-                         {'name': 'x' * 81}):
+                         {'name': 'x' * 81}, {'features': ['bogus']}, {'features': 'execute_code'}):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 self.client.request('api/batches', self.request(**override))
         self.assertEqual(self.manager.batches.records(), [])

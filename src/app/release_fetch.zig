@@ -62,6 +62,7 @@ pub const Fetcher = struct {
     user_agent: []const u8,
     /// curl draws its progress bar on stderr for an archive download.
     progress: bool,
+    echo_errors: bool = true,
 
     /// `curl` is the override, or the one on PATH. `arena` owns the path.
     pub fn init(arena: std.mem.Allocator, base: []const u8, user_agent: []const u8, curl: ?[]const u8) !Fetcher {
@@ -84,7 +85,7 @@ pub const Fetcher = struct {
         const url = try std.fmt.allocPrint(arena, "{s}/latest", .{base});
         var argv = try self.baseArgs(arena);
         try argv.appendSlice(arena, &.{ "-sS", "-L", "-I", "-o", null_device, "-w", "%{url_effective}", url });
-        const out = try captureCurl(arena, argv.items, url, 4096, report);
+        const out = try captureCurl(arena, argv.items, url, 4096, self.echo_errors, report);
         return tagFromLocation(std.mem.trim(u8, out, " \r\n")) orelse error.NoLatestTag;
     }
 
@@ -92,7 +93,7 @@ pub const Fetcher = struct {
     pub fn getSmall(self: *const Fetcher, arena: std.mem.Allocator, url: []const u8, limit: u64, report: *Report) ![]const u8 {
         var argv = try self.baseArgs(arena);
         try argv.appendSlice(arena, &.{ "-sS", "-L", "--max-filesize", try std.fmt.allocPrint(arena, "{d}", .{limit}), url });
-        const out = try captureCurl(arena, argv.items, url, limit + 1, report);
+        const out = try captureCurl(arena, argv.items, url, limit + 1, self.echo_errors, report);
         if (out.len > limit) return error.TooLarge;
         return out;
     }
@@ -134,14 +135,14 @@ pub const Fetcher = struct {
 
 /// Run curl for its stdout; its stderr (the error message under `-sS`) is
 /// passed on.
-fn captureCurl(arena: std.mem.Allocator, argv: []const []const u8, url: []const u8, max_bytes: u64, report: *Report) ![]const u8 {
+fn captureCurl(arena: std.mem.Allocator, argv: []const []const u8, url: []const u8, max_bytes: u64, echo_errors: bool, report: *Report) ![]const u8 {
     report.* = .{ .url = url };
     const captured = platform.process.capture(try zArgv(arena, argv), arena, .{
         .max_bytes = @intCast(max_bytes),
         .inherit_env = true,
         .timeout_ms = 10 * 60_000,
     }) catch return error.CurlUnavailable;
-    if (captured.stderr.len > 0) std.debug.print("{s}", .{captured.stderr});
+    if (echo_errors and captured.stderr.len > 0) std.debug.print("{s}", .{captured.stderr});
     if (captured.exit_code != 0) return curlError(captured.exit_code, report);
     return captured.stdout;
 }

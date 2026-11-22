@@ -136,6 +136,8 @@ pub const api_request = @import("api/request.zig");
 pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
 pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
+pub const tool_changes = @import("core/tool_changes.zig");
+pub const skill_changes = @import("core/skill_changes.zig");
 pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
 pub const model_availability = @import("api/model_availability.zig"); // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
@@ -267,6 +269,7 @@ fn serveTeamworkMcp(gpa: std.mem.Allocator, run: *@import("teamwork/runtime.zig"
 }
 pub const app_route_strings = @import("app/route_strings.zig");
 pub const app_mcp_startup = @import("app/mcp_startup.zig");
+pub const app_mcp_hotplug = @import("app/mcp_hotplug.zig");
 pub const app_install = @import("app/install.zig");
 pub const app_update = @import("app/update.zig");
 pub const app_release_source = @import("app/release_source.zig");
@@ -1396,6 +1399,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(checkProviders(allocator));
     }
 
+    if (interactiveRepl(config)) offerUpdate(init, allocator, config.state_root);
+
     // --- <state root>/.env (#486) ---
     // The install's local configuration, read once: a layer below the process
     // environment for the names it may set (src/app/state_env.zig), never
@@ -1833,6 +1838,7 @@ pub fn main(init: std.process.Init) !void {
         // decided by.
         .local_route = local_route,
         .startup_notice = startup_notice,
+        .command_name = invokedCommand(allocator),
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
@@ -2683,6 +2689,46 @@ fn runUpdate(args: *std.process.Args.Iterator, init: std.process.Init, allocator
     return 0;
 }
 
+fn offerUpdate(init: std.process.Init, allocator: std.mem.Allocator, state_root: []const u8) void {
+    const update_notice = @import("app/update_notice.zig");
+    if (state_root.len == 0 or !terminal_prompt.interactive()) return;
+    if (std.c.getenv("METACODES_NO_PROBE") != null or std.c.getenv(update_notice.opt_out_env) != null) return;
+    const found = update_notice.releaseInstall(allocator, init.io) orelse return;
+    var cache = update_notice.readCache(allocator, init.io, state_root);
+    if (update_notice.offered(found, cache)) |latest| {
+        std.debug.print(
+            "metacodes {s} is available (this install is {s}).\n  1. Update now\n  2. Skip\n  3. Skip until the next version\nChoice [2]: ",
+            .{ latest, found.version },
+        );
+        var answer_buf: [16]u8 = undefined;
+        const len = terminal_prompt.readLine(&answer_buf) catch 0;
+        switch (update_notice.parseChoice(answer_buf[0..len])) {
+            .update => if (installOfferedUpdate(init, allocator, found.prefix, state_root)) std.process.exit(0),
+            .skip_version => {
+                cache.skipped = latest;
+                update_notice.writeCache(allocator, state_root, cache);
+            },
+            .skip => {},
+        }
+    }
+    if (update_notice.due(found, cache, util_time.nowUnix())) update_notice.startCheck(found, state_root, cache);
+}
+
+fn installOfferedUpdate(init: std.process.Init, allocator: std.mem.Allocator, prefix: []const u8, state_root: []const u8) bool {
+    const update = @import("app/update.zig");
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buf);
+    const outcome = update.run(allocator, init.io, .{ .prefix = prefix, .state_dir = state_root, .environ = init.environ_map }, &stderr_writer.interface) catch |err| {
+        stderr_writer.interface.flush() catch {};
+        std.debug.print("error: update failed ({s}){s}{s}\n", .{ @errorName(err), if (updateHint(err).len > 0) ": " else "", updateHint(err) });
+        return false;
+    };
+    stderr_writer.interface.flush() catch {};
+    if (!outcome.changes()) return false;
+    std.debug.print("metacodes is now {s}; run `{s}` again to start it.\n", .{ outcome.to, invokedCommand(allocator) });
+    return true;
+}
+
 fn updateHint(err: anyerror) []const u8 {
     return switch (err) {
         error.NotAnInstall => "this executable has no install record beside it (etc/metacodes/install.json); install with scripts/install.sh, or `metacodes install --prefix <dir>` from a release unit",
@@ -2795,7 +2841,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
-    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "mcp")) return @import("app/mcp_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "providers")) return @import("app/providers_cli.zig").run(&args, allocator, init.io, state_dir, invokedCommand(allocator));
     if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
@@ -5547,8 +5593,10 @@ fn printHelp() void {
         \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
         \\                        Bind Shift+Enter to a newline in Apple Terminal or VS Code (and forks),
         \\                        after a backup; --restore undoes it (terminal-setup --help for more)
-        \\  mcp login <server> [--no-browser] | mcp logout <server> | mcp list
-        \\                        OAuth login for an HTTP or SSE MCP server (stored, refreshed per session)
+        \\  mcp add <name> --url <url> | mcp add <name> -- <command> [<arg>...] | mcp remove <name>
+        \\  | mcp list | mcp login <server> [--no-browser] | mcp logout <server>
+        \\                        Install an MCP server in config.json (checked on the spot), list each
+        \\                        server's state, OAuth login for HTTP ones; mcp --help for more
         \\  providers add <id> --base-url <url> --protocol <wire> [--model <id>]... [--probe] | providers probe <id>
         \\  | providers list | providers remove <id>
         \\                        A model API of your own (a relay, a gateway, a local server), in config.json;
@@ -5908,6 +5956,9 @@ test {
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/mcp_startup.zig");
+    _ = &@import("app/mcp_hotplug.zig");
+    _ = &@import("core/tool_changes.zig");
+    _ = &@import("core/skill_changes.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
@@ -5919,6 +5970,7 @@ test {
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");
     _ = &@import("app/update.zig");
+    _ = &@import("app/update_notice.zig");
     _ = &@import("app/kg_autostart.zig");
     _ = &@import("app/terminal_setup/jsonc.zig");
     _ = &@import("app/terminal_setup/files.zig");
@@ -6036,6 +6088,7 @@ test {
     _ = &@import("mcp/conformance.zig");
     _ = &@import("mcp/result_commit_test.zig");
     _ = &@import("app/mcp_cli.zig");
+    _ = &@import("app/mcp_config_edit.zig");
     _ = &@import("app/terminal_prompt.zig");
     _ = &@import("app/providers_cli.zig");
     _ = &@import("util/toml.zig");
