@@ -95,6 +95,7 @@ test {
     _ = @import("component/message_origin_test.zig");
     _ = @import("component/startup_catalogs_test.zig");
     _ = @import("component/mcp_background_startup_test.zig");
+    _ = @import("component/bounded_exit_test.zig");
     _ = @import("component/mcp_permission_test.zig");
     _ = @import("component/mcp_unavailable_notice_test.zig");
     _ = @import("component/mcp_reconnect_test.zig");

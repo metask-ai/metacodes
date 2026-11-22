@@ -364,8 +364,8 @@ repository may carry, and the flow is PKCE for a public client.
   and the Windows equivalents) plus the CA-bundle variables, then `env_vars`,
   then `env`. A bare command is looked up on the child's own `PATH`; a relative
   path resolves against `cwd` (default: the session's working directory).
-- **Timeouts.** The handshake has 30 s by default; a server that does not
-  answer is reported and the others start anyway (all servers start in
+- **Timeouts.** The handshake has 30 s by default, connecting (DNS, TCP,
+  TLS) included; a server that does not answer is reported and the others start anyway (all servers start in
   parallel). Tool calls are unbounded unless a tool timeout is configured
   (Codex entries default to 300 s); an expired call is cancelled with
   `notifications/cancelled`.
@@ -432,7 +432,7 @@ the handshake revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
 - Streamable HTTP POSTs every message with `Accept: application/json,
   text/event-stream`, reads JSON or SSE responses (a mid-stream server request
   is answered on its own POST), keeps the handshake's `MCP-Session-Id` and
-  `MCP-Protocol-Version` (DELETE on close; a 404 to a request carrying the
+  `MCP-Protocol-Version` (DELETE on close, given at most 1 s; a 404 to a request carrying the
   session id means the server ended the session, so the client sends a new
   `initialize` without it, adopts the revision the server selects, and repeats
   the request once in the new session), and sends `Mcp-Method`, `Mcp-Name`

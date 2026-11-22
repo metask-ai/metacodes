@@ -15,8 +15,11 @@
 //! - A failed export is logged and its batch dropped; the specification
 //!   allows retries, but a retry queue in front of a dead collector only
 //!   delays the drop and holds memory.
-//! - `shutdown` flushes what is queued with the same per-request deadline and
-//!   joins the worker, so a headless `metacodes -p` exits with its spans sent.
+//! - `shutdown` flushes what is queued and joins the worker, so a headless
+//!   `metacodes -p` exits with its spans sent. The whole flush, an export
+//!   already in flight included, gets `SHUTDOWN_FLUSH_BUDGET_MS` (or the
+//!   export timeout when that is shorter); what it cuts off is dropped and
+//!   counted.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -52,6 +55,7 @@ pub const Exporter = struct {
     in_flight: bool = false,
     stats: Stats = .{},
     warned_drop: bool = false,
+    stop_deadline_ms: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
     thread: std.Thread = undefined,
 
     /// Take ownership of `arena` (which holds `config`), on failure too, and
@@ -126,6 +130,7 @@ pub const Exporter = struct {
 
     /// Flush, stop and join the worker, then free everything.
     pub fn shutdown(self: *Exporter) void {
+        self.stop_deadline_ms.store(util_time.nowMs() + SHUTDOWN_FLUSH_BUDGET_MS, .release);
         self.mutex.lock();
         self.stopping = true;
         self.cond.broadcast();
@@ -211,7 +216,7 @@ pub const Exporter = struct {
             return false;
         };
         defer self.gpa.free(body);
-        const status = post(client, self.config.endpoint, self.http_headers, body, self.config.timeout_ms) catch |err| {
+        const status = post(client, self.config.endpoint, self.http_headers, body, self.config.timeout_ms, &self.stop_deadline_ms) catch |err| {
             log.warn("otel", "export to {s} failed: {s}", .{ self.config.endpoint, @errorName(err) });
             return false;
         };
@@ -224,6 +229,9 @@ pub const Exporter = struct {
     }
 };
 
+pub const SHUTDOWN_FLUSH_BUDGET_MS: i64 = 1_000;
+const STOP_POLL_MS: i64 = 50;
+
 const PostError = error{ TransportFailed, TimedOut };
 
 const Race = union(enum) {
@@ -232,13 +240,20 @@ const Race = union(enum) {
 };
 
 /// POST `body` and return the status, or fail once `timeout_ms` has passed.
-fn post(client: *std.http.Client, url: []const u8, headers: []const std.http.Header, body: []const u8, timeout_ms: u32) PostError!u16 {
+fn post(
+    client: *std.http.Client,
+    url: []const u8,
+    headers: []const std.http.Header,
+    body: []const u8,
+    timeout_ms: u32,
+    stop_deadline_ms: *const std.atomic.Value(i64),
+) PostError!u16 {
     const io = client.io;
     var results: [2]Race = undefined;
     var race = std.Io.Select(Race).init(io, &results);
     errdefer race.cancelDiscard();
     race.concurrent(.response, postTask, .{ client, url, headers, body }) catch return error.TransportFailed;
-    race.concurrent(.deadline, deadlineTask, .{ io, timeout_ms }) catch return error.TransportFailed;
+    race.concurrent(.deadline, deadlineTask, .{ io, timeout_ms, stop_deadline_ms }) catch return error.TransportFailed;
     const first = race.await() catch return error.TransportFailed;
     switch (first) {
         .response => |response| {
@@ -276,8 +291,14 @@ fn postTask(client: *std.http.Client, url: []const u8, headers: []const std.http
     return status;
 }
 
-fn deadlineTask(io: std.Io, timeout_ms: u32) std.Io.Cancelable!void {
-    return util_time.sleepAtLeast(io, .{ .raw = .fromMilliseconds(@as(i64, timeout_ms)), .clock = .awake });
+fn deadlineTask(io: std.Io, timeout_ms: u32, stop_deadline_ms: *const std.atomic.Value(i64)) std.Io.Cancelable!void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(@as(i64, timeout_ms)), .clock = .awake });
+    while (std.Io.Clock.Timestamp.now(io, deadline.clock).compare(.lt, deadline)) {
+        const stop_left_ms = stop_deadline_ms.load(.acquire) - util_time.nowMs();
+        if (stop_left_ms <= 0) return;
+        const slice: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(@min(stop_left_ms, STOP_POLL_MS)), .clock = .awake });
+        try (if (slice.compare(.lt, deadline)) slice else deadline).wait(io);
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -481,6 +502,20 @@ test "otel: a collector error status counts a failed batch; a black hole times o
     try testing.expect(util_time.nowMs() - started < 4_000);
     try testing.expectEqual(@as(u64, 1), exp.snapshotStats().failed_batches);
     exp.shutdown();
+}
+
+test "otel: shutdown with a black-holed collector takes the shutdown budget, not the export timeout" {
+    var hole: TestCollector = undefined;
+    try TestCollector.start(testing.allocator, &hole);
+    defer hole.deinit();
+    hole.silent = true;
+    const exp = try startFor(&hole, .http_json, false, 10_000);
+    const s = testSpan("w", &.{});
+    exp.enqueue(&s);
+    exp.enqueue(&s);
+    const started = util_time.nowMs();
+    exp.shutdown();
+    try testing.expect(util_time.nowMs() - started < SHUTDOWN_FLUSH_BUDGET_MS + 2_000);
 }
 
 test "otel: a full queue drops instead of blocking" {

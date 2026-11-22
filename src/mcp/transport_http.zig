@@ -21,7 +21,9 @@
 //! it expires and once after a 401 before the request is retried. A 401
 //! that survives that, and any 403, is `error.McpAuthRequired`.
 //! Cancellation and deadlines shut the connection down through the provider
-//! client's request registry, which also wakes a read blocked in the kernel.
+//! client's request registry, which also wakes a read blocked in the kernel;
+//! connecting (DNS, TCP, TLS) races them before the request exists. The
+//! Classic session DELETE at close gets `SESSION_DELETE_TIMEOUT_MS`.
 //!
 //! An SSE response that ends before the awaited answer is resumed (2025-03-26
 //! through 2025-11-25 "Resumability and Redelivery"): when the stream carried
@@ -97,6 +99,8 @@ const MAX_RESUME_ATTEMPTS: usize = 3;
 /// honored (a `retry:` field is the server's request, not a contract).
 const DEFAULT_RETRY_MS: u64 = 1_000;
 const MAX_RETRY_MS: u64 = 10_000;
+pub const SESSION_DELETE_TIMEOUT_MS: i64 = 1_000;
+const ABORT_POLL_MS: i64 = 50;
 
 pub const HttpTransport = struct {
     allocator: std.mem.Allocator,
@@ -192,6 +196,7 @@ pub const HttpTransport = struct {
         self.closeStream();
         if (self.session_id != null and !self.modern) {
             // Classic: end the session (SHOULD); failures are irrelevant now.
+            self.deadline_ms = util_time.nowMs() + SESSION_DELETE_TIMEOUT_MS;
             self.deleteSession() catch {};
         }
         for (self.queue.items) |message| self.allocator.free(message);
@@ -422,15 +427,12 @@ pub const HttpTransport = struct {
         var extra: std.ArrayList(std.http.Header) = .empty;
         defer extra.deinit(self.allocator);
         try self.appendCommonHeaders(&extra, .{});
-        var request = try self.client.request(.DELETE, self.uri, .{
-            .headers = .{ .accept_encoding = .omit },
-            .redirect_behavior = http_status.no_redirects,
-            .extra_headers = extra.items,
-        });
-        defer request.deinit();
-        try http_connection.sendBodiless(&request);
+        const exchange = try self.openMethod(.DELETE, extra.items);
+        defer exchange.destroy(self);
+        try http_connection.sendBodiless(&exchange.request);
         var redirect: [1024]u8 = undefined;
-        _ = try http_connection.receiveHead(&request, &redirect);
+        exchange.response = try http_connection.receiveHead(&exchange.request, &redirect);
+        exchange.has_response = true;
     }
 
     fn appendCommonHeaders(self: *HttpTransport, list: *std.ArrayList(std.http.Header), meta: SendMeta) !void {
@@ -557,7 +559,7 @@ pub const HttpTransport = struct {
         const exchange = try self.allocator.create(Exchange);
         errdefer self.allocator.destroy(exchange);
         exchange.* = .{ .request = undefined };
-        exchange.request = self.client.request(method, self.uri, .{
+        exchange.request = try self.connect(method, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .content_type = if (method == .POST) .{ .override = "application/json" } else .default,
@@ -566,12 +568,41 @@ pub const HttpTransport = struct {
             // redirect points; a 3xx is the server's answer.
             .redirect_behavior = http_status.no_redirects,
             .extra_headers = extra_headers,
-        }) catch return error.McpConnectFailed;
+        });
         errdefer exchange.request.deinit();
         const remaining: u64 = if (self.deadline_ms) |deadline| @intCast(@max(deadline - util_time.nowMs(), 1)) else 0;
         try self.registry.registerMonitored(self.allocator, self.abort, @ptrCast(&exchange.request), shutdownRequest, remaining);
         exchange.registered = true;
         return exchange;
+    }
+
+    fn connect(self: *HttpTransport, method: std.http.Method, options: std.http.Client.RequestOptions) !std.http.Client.Request {
+        if (self.abort == null and self.deadline_ms == null)
+            return self.client.request(method, self.uri, options) catch error.McpConnectFailed;
+        if (self.interrupted()) return self.transportError();
+        const io = self.client.io;
+        var results: [2]ConnectRace = undefined;
+        var race = std.Io.Select(ConnectRace).init(io, &results);
+        race.concurrent(.connected, connectTask, .{ &self.client, method, self.uri, options }) catch
+            return error.McpConnectFailed;
+        race.concurrent(.interrupted, awaitInterrupt, .{ io, self.abort, self.deadline_ms }) catch {
+            discardConnects(&race);
+            return error.McpConnectFailed;
+        };
+        const first = race.await() catch {
+            discardConnects(&race);
+            return self.transportError();
+        };
+        switch (first) {
+            .connected => |connected| {
+                race.cancelDiscard();
+                return connected;
+            },
+            .interrupted => {
+                discardConnects(&race);
+                return self.transportError();
+            },
+        }
     }
 
     fn interruptOf(self: *const HttpTransport) oauth.Interrupt {
@@ -590,6 +621,43 @@ pub const HttpTransport = struct {
         return error.McpConnectFailed;
     }
 };
+
+const ConnectRace = union(enum) {
+    connected: error{McpConnectFailed}!std.http.Client.Request,
+    interrupted: std.Io.Cancelable!void,
+};
+
+fn connectTask(
+    client: *std.http.Client,
+    method: std.http.Method,
+    uri: std.Uri,
+    options: std.http.Client.RequestOptions,
+) error{McpConnectFailed}!std.http.Client.Request {
+    return client.request(method, uri, options) catch error.McpConnectFailed;
+}
+
+fn awaitInterrupt(io: std.Io, abort: ?*const AbortSignal, deadline_ms: ?i64) std.Io.Cancelable!void {
+    while (true) {
+        if (abort) |signal| if (signal.isAborted()) return;
+        var wait_ms: i64 = if (abort != null) ABORT_POLL_MS else std.math.maxInt(i32);
+        if (deadline_ms) |deadline| {
+            const left = deadline - util_time.nowMs();
+            if (left <= 0) return;
+            wait_ms = @min(wait_ms, left);
+        }
+        try util_time.sleepAtLeast(io, .{ .raw = .fromMilliseconds(wait_ms), .clock = .awake });
+    }
+}
+
+fn discardConnects(race: *std.Io.Select(ConnectRace)) void {
+    while (race.cancel()) |late| switch (late) {
+        .connected => |connected| if (connected) |request| {
+            var owned = request;
+            owned.deinit();
+        } else |_| {},
+        .interrupted => {},
+    };
+}
 
 fn shutdownRequest(raw: *anyopaque) void {
     const request: *std.http.Client.Request = @ptrCast(@alignCast(raw));

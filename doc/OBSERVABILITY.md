@@ -50,7 +50,11 @@ logs where traces go; `otel:debug` logs every export.
 
 The exporter is one per process. It starts when the first session (App) is
 created and is flushed and stopped when the last one ends, so a headless
-`metacodes -p` and a daemon stopped with SIGINT exit with their spans sent. A
+`metacodes -p` and a daemon stopped with SIGINT exit with their spans sent.
+That final flush, an export already in flight included, gets at most 1 s (or
+the export deadline when it is shorter): a collector that does not answer
+delays the exit by that much, not by the full `OTEL_EXPORTER_OTLP_TIMEOUT`,
+and the spans it cuts off are dropped and counted. A
 span is dropped, never waited for, when the queue is full; a collector that
 answers an error or does not answer within the deadline costs one batch, which
 is logged and dropped; nothing is retried.
