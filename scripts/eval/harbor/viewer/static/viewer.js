@@ -587,7 +587,7 @@ async function renderNewBatch() {
       reasons.length ? h('div', { class: 'callout' }, reasons.map((text) => h('p', { text }))) : null);
     if (!entry) { box.append(h('div', { class: 'empty', text: '读取任务列表…' })); return box; }
     if (!entry.tasks.length) { box.append(h('div', { class: 'empty', text: entry.error || '该评测集暂无可选任务' })); return box; }
-    if (entry.missing) box.append(h('div', { class: 'callout', text: `原批次的 ${entry.missing} 道题不在当前执行机器的任务列表里，已略过。` }));
+    if (entry.missing) box.append(h('div', { class: 'callout', text: `${draft.from ? '原批次' : '之前选'}的 ${entry.missing} 道题不在当前执行机器的任务列表里，已略过。` }));
     const list = h('div', { class: 'task-options' });
     const search = h('input', { type: 'search', placeholder: `搜索 ${entry.tasks.length} 道任务`, 'aria-label': '搜索 ' + s.name + ' 的任务' });
     const count = h('span', { class: 'muted num' });

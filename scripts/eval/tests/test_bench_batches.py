@@ -250,6 +250,10 @@ class BatchTest(unittest.TestCase):
             self.client.request('api/batch/rename', {'id': created['id'], 'name': 'x' * 81})
         with self.assertRaisesRegex(ValueError, '不存在'):
             self.client.request('api/batch/rename', {'id': 'batch-missing', 'name': 'x'})
+        foreign = {'id': 'batch-elsewhere', 'status': 'finished', 'items': [], 'created_at': '2026-01-01T00:00:00Z'}
+        with patch.object(self.workbench.library, 'batch_records', return_value=[foreign]), \
+                self.assertRaisesRegex(ValueError, '其他 jobs 目录'):
+            self.client.request('api/batch/rename', {'id': 'batch-elsewhere', 'name': 'x'})
         self.assertTrue(self.client.request('api/jobs?batch=all')['can_run'])
 
     def test_features_are_refused_for_a_workbuddy_suite(self):

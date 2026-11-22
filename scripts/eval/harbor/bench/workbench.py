@@ -277,6 +277,8 @@ class Workbench:
     def rename_batch(self, batch_id, name) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
+        if self.batches.get(batch_id) is None and any(r["id"] == batch_id for r in self.batch_records()):
+            raise ValueError(f"批次 {batch_id} 来自共用数据库里的其他 jobs 目录，请在那个 jobs 目录的工作台重命名")
         return self.batches.rename(batch_id, name)
 
     def delete_batch(self, batch_id) -> Dict[str, Any]:
