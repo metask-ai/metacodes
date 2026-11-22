@@ -223,10 +223,15 @@ pub const UdsServer = struct {
                 _ = self.writeLine(conn, reply);
                 return false;
             };
-            if (!sv.inbox.push(request)) {
-                _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"queue push failed\"}");
+            sv.inbox.push(request) catch |err| {
+                var reply_buf: [96]u8 = undefined;
+                const reply = switch (err) {
+                    error.QueueFull => std.fmt.bufPrint(&reply_buf, "{{\"ok\":false,\"error\":\"queue full\",\"max_queued\":{d}}}", .{sv.inbox.max_queued}) catch unreachable,
+                    error.OutOfMemory => "{\"ok\":false,\"error\":\"queue push failed\"}",
+                };
+                _ = self.writeLine(conn, reply);
                 return false;
-            }
+            };
             _ = self.writeLine(conn, "{\"ok\":true}");
             return false;
         }

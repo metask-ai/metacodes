@@ -117,11 +117,17 @@ fn trimmedText(raw: []const u8) ParseError![]const u8 {
     return text;
 }
 
+pub const default_max_queued: usize = 64;
+
+pub const PushError = error{ QueueFull, OutOfMemory };
+
 /// FIFO from the transport threads (push) to the session driver (popFront).
 pub const SubmissionQueue = struct {
     /// Thread-safe: transport threads allocate concurrently.
     allocator: std.mem.Allocator,
     items: std.ArrayList(Submission) = .empty,
+    commands: std.ArrayList([]u8) = .empty,
+    max_queued: usize = default_max_queued,
     mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) SubmissionQueue {
@@ -131,25 +137,30 @@ pub const SubmissionQueue = struct {
     pub fn deinit(self: *SubmissionQueue) void {
         for (self.items.items) |*s| s.deinit(self.allocator);
         self.items.deinit(self.allocator);
+        for (self.commands.items) |line| self.allocator.free(line);
+        self.commands.deinit(self.allocator);
     }
 
-    /// Queue a copy of `request`. false = out of memory, nothing queued.
-    pub fn push(self: *SubmissionQueue, request: Request) bool {
+    pub fn push(self: *SubmissionQueue, request: Request) PushError!void {
         var owned: Submission = .{
-            .text = self.allocator.dupe(u8, request.text) catch return false,
+            .text = try self.allocator.dupe(u8, request.text),
             .permission_mode = request.permission_mode,
         };
-        if (request.model) |m| owned.model = self.allocator.dupe(u8, m) catch {
-            owned.deinit(self.allocator);
-            return false;
-        };
+        errdefer owned.deinit(self.allocator);
+        if (request.model) |m| owned.model = try self.allocator.dupe(u8, m);
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
-        self.items.append(self.allocator, owned) catch {
-            owned.deinit(self.allocator);
-            return false;
-        };
-        return true;
+        if (self.roomLocked() == 0) return error.QueueFull;
+        try self.items.append(self.allocator, owned);
+    }
+
+    pub fn pushCommand(self: *SubmissionQueue, line: []const u8) PushError!void {
+        const owned = try self.allocator.dupe(u8, line);
+        errdefer self.allocator.free(owned);
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        if (self.roomLocked() == 0) return error.QueueFull;
+        try self.commands.append(self.allocator, owned);
     }
 
     /// The oldest submission; the caller owns it (`deinit` with this queue's
@@ -161,10 +172,25 @@ pub const SubmissionQueue = struct {
         return self.items.orderedRemove(0);
     }
 
+    pub fn popCommand(self: *SubmissionQueue) ?[]u8 {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        if (self.commands.items.len == 0) return null;
+        return self.commands.orderedRemove(0);
+    }
+
     pub fn len(self: *SubmissionQueue) usize {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
-        return self.items.items.len;
+        return self.queuedLocked();
+    }
+
+    fn queuedLocked(self: *const SubmissionQueue) usize {
+        return self.items.items.len + self.commands.items.len;
+    }
+
+    fn roomLocked(self: *const SubmissionQueue) usize {
+        return self.max_queued -| self.queuedLocked();
     }
 };
 
@@ -244,11 +270,12 @@ test "SubmissionQueue: FIFO, owned copies, leftovers freed by deinit" {
     var q = SubmissionQueue.init(testing.allocator);
     defer q.deinit();
     var text_buf = "first".*;
-    try testing.expect(q.push(.{ .text = &text_buf, .model = "m", .permission_mode = .auto }));
-    try testing.expect(q.push(.{ .text = "second" }));
-    try testing.expect(q.push(.{ .text = "left over", .model = "kept" }));
+    try q.push(.{ .text = &text_buf, .model = "m", .permission_mode = .auto });
+    try q.push(.{ .text = "second" });
+    try q.push(.{ .text = "left over", .model = "kept" });
+    try q.pushCommand("/compact");
     text_buf[0] = 'X'; // the queue holds its own copy
-    try testing.expectEqual(@as(usize, 3), q.len());
+    try testing.expectEqual(@as(usize, 4), q.len());
 
     var a = q.popFront().?;
     defer a.deinit(testing.allocator);
@@ -259,6 +286,41 @@ test "SubmissionQueue: FIFO, owned copies, leftovers freed by deinit" {
     defer b.deinit(testing.allocator);
     try testing.expectEqualStrings("second", b.text);
     try testing.expectEqual(@as(?[]u8, null), b.model);
+    try testing.expectEqual(@as(usize, 2), q.len());
+}
+
+test "SubmissionQueue: messages and /command lines share max_queued; a refused push holds nothing; taking one makes room (#447)" {
+    try testing.expectEqual(@as(usize, 64), SubmissionQueue.init(testing.allocator).max_queued);
+    var q = SubmissionQueue.init(testing.allocator);
+    defer q.deinit();
+    q.max_queued = 3;
+    try q.push(.{ .text = "one", .model = "m" });
+    try q.pushCommand("/mode auto");
+    try q.push(.{ .text = "two" });
+    try testing.expectEqual(@as(usize, 3), q.len());
+    try testing.expectError(error.QueueFull, q.push(.{ .text = "refused", .model = "x" }));
+    try testing.expectError(error.QueueFull, q.pushCommand("/compact"));
+    try testing.expectEqual(@as(usize, 3), q.len());
+
+    const command = q.popCommand().?;
+    defer testing.allocator.free(command);
+    try testing.expectEqualStrings("/mode auto", command);
+    try testing.expect(q.popCommand() == null);
+    try q.pushCommand("/compact");
+    try testing.expectError(error.QueueFull, q.push(.{ .text = "refused again" }));
+
+    var first = q.popFront().?;
+    defer first.deinit(testing.allocator);
+    try testing.expectEqualStrings("one", first.text);
+    try q.push(.{ .text = "three" });
+    try testing.expectEqual(@as(usize, 3), q.len());
+    var second = q.popFront().?;
+    defer second.deinit(testing.allocator);
+    try testing.expectEqualStrings("two", second.text);
+    var third = q.popFront().?;
+    defer third.deinit(testing.allocator);
+    try testing.expectEqualStrings("three", third.text);
+    try testing.expect(q.popFront() == null);
     try testing.expectEqual(@as(usize, 1), q.len());
 }
 
@@ -268,7 +330,18 @@ test "SubmissionQueue.push: out of memory queues nothing and leaks nothing" {
         var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
         var q = SubmissionQueue.init(failing.allocator());
         defer q.deinit();
-        try testing.expect(!q.push(.{ .text = "t", .model = "m" }));
+        try testing.expectError(error.OutOfMemory, q.push(.{ .text = "t", .model = "m" }));
+        try testing.expectEqual(@as(usize, 0), q.len());
+    }
+}
+
+test "SubmissionQueue.pushCommand: out of memory queues nothing and leaks nothing" {
+    var fail_index: usize = 0;
+    while (fail_index < 2) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var q = SubmissionQueue.init(failing.allocator());
+        defer q.deinit();
+        try testing.expectError(error.OutOfMemory, q.pushCommand("/compact"));
         try testing.expectEqual(@as(usize, 0), q.len());
     }
 }
