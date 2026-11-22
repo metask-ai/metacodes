@@ -218,6 +218,48 @@ def connect_not_local(address: Tuple[str, int], timeout: Optional[float] = None,
     raise error
 
 
+def proxy_address(options: Dict) -> Tuple[str, int]:
+    """Where a process on the executor reaches the run's egress proxy: the
+    `ssh -R` loopback end (workbench mode) or the site proxy."""
+    if options["mode"] == "workbench":
+        return "127.0.0.1", int(options["tunnel_port"])
+    if options["mode"] == "proxy":
+        return split_host_port(urlsplit(options["url"]).netloc, 80)
+    raise ValueError("unknown egress mode")
+
+
+def connect_through(proxy: Tuple[str, int]) -> Callable[..., socket.socket]:
+    """A `socket.create_connection` stand-in that opens a CONNECT tunnel to
+    the destination through `proxy`, for http.client's `_create_connection`."""
+
+    def connect(address: Tuple[str, int], timeout: Optional[float] = None,
+                source_address: Optional[Tuple[str, int]] = None) -> socket.socket:
+        host, port = address
+        target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        sock = socket.create_connection(proxy, timeout, source_address)
+        try:
+            sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("latin-1"))
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise OSError(f"egress proxy closed the connection before answering CONNECT {target}")
+                head += chunk
+                if len(head) > HEAD_LIMIT:
+                    raise OSError("egress proxy answer too large")
+            status, _, rest = head.partition(b"\r\n\r\n")
+            line = status.split(b"\r\n", 1)[0].decode("latin-1")
+            parts = line.split(" ", 2)
+            if len(parts) < 2 or parts[1] != "200" or rest:
+                raise OSError(f"egress proxy refused CONNECT {target}: {line[:200]}")
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    return connect
+
+
 def address_allowed(address: str) -> bool:
     """Whether the proxy may connect to `address`: globally routable unicast
     only (see allow_policy for the configured exceptions)."""

@@ -1650,6 +1650,23 @@ class EgressUnitTest(unittest.TestCase):
                           "that reused its descriptor")
         conn.close()
 
+    def test_connect_through_opens_the_relay_upstream_via_the_egress_proxy(self):
+        from scripts.eval.harbor.bench import egress
+        port, close = echo_server()
+        self.addCleanup(close)
+        self.assertEqual(egress.proxy_address({"mode": "workbench", "tunnel_port": 30776}), ("127.0.0.1", 30776))
+        self.assertEqual(egress.proxy_address({"mode": "proxy", "url": "http://proxy.example:3128"}),
+                         ("proxy.example", 3128))
+        with egress.EgressProxy([port], allow=lambda _a: True) as proxy:
+            connect = egress.connect_through(("127.0.0.1", proxy.port))
+            sock = connect(("127.0.0.1", port), 10)
+            sock.sendall(b"model request")
+            self.assertEqual(sock.recv(100), b"model request")
+            sock.close()
+            with self.assertRaisesRegex(OSError, "403"):
+                connect(("127.0.0.1", 22), 10)
+            self.assertEqual((proxy.counts["connect"], proxy.counts["refused"]), (1, 1))
+
     def test_proxy_tunnels_allowed_ports_and_refuses_the_rest(self):
         from scripts.eval.harbor.bench import egress
         port, close = echo_server()

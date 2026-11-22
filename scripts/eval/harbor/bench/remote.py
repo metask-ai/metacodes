@@ -112,9 +112,12 @@ def run(spec_path):
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
             connect = None
+            if spec.get("egress"):
+                from scripts.eval.harbor.bench.egress import connect_through, proxy_address
+                connect = connect_through(proxy_address(spec["egress"]))
             if options.get("refuse_local_upstream"):
                 from scripts.eval.harbor.bench.egress import connect_not_local, names_this_machine
-                connect = connect_not_local
+                connect = connect or connect_not_local
                 if names_this_machine(urlsplit(options["upstream"]).hostname or ""):
                     # This machine resolves the imported address to itself:
                     # never send the key to whatever listens here.
