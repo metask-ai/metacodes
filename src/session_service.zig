@@ -676,7 +676,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .parent_model = app.activeModel(),
         .model_tiers = app.activeModelTiers(),
         .model_switch_compact = app.pendingModelSwitchCompact(),
-        .skills_set = &app.skills,
+        .skills_set = app.currentSkills(),
         .mcp_sessions = &app.mcp_sessions.items,
         .mcp_unavailable = app.mcp_unavailable,
         .mcp_late = app.mcpLateProbe(),

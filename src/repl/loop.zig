@@ -464,7 +464,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
             if (shaped) {
-                var dialog = dialogs.SkillsDialog.init(app.allocator, app.skill_runtime.snapshot, &app.skill_overrides, terminalRows()) catch |err| {
+                var dialog = dialogs.SkillsDialog.init(app.allocator, app.skill_runtime.currentSnapshot(), &app.skill_overrides, terminalRows()) catch |err| {
                     cmd_output.print("{s}The dialog failed: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
                     continue;
                 };
@@ -1404,9 +1404,10 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
 /// 顺序铁律:① clone(registry allocator)② spawnBackground(成功后 copy 所有权转移)③ reset 前台。
 /// 任一步失败 → 不 reset 前台(保留对话让用户重试),copy 在失败路径释放。
 ///
-/// **隐性契约(D)**:后台 job 借用 app.agents/skills/dyn_registry(只读,App 生命周期)。agents/skills
-/// 在后台 job 存活期间(可数分钟)**必须保持不可变**——前台若有运行时写入路径(动态加载 skill /
-/// 注册 agent),与后台读并发就是竞争;新增前需重新评估。dyn_registry 有运行时写入(MCP 热插拔):
+/// **隐性契约(D)**:后台 job 借用 app.agents/skills/dyn_registry(只读,App 生命周期)。agents
+/// 在后台 job 存活期间(可数分钟)**必须保持不可变**——前台若有运行时写入路径(注册 agent),
+/// 与后台读并发就是竞争;新增前需重新评估。skills 按代际发布(`App.currentSkills`):热加载另建
+/// 新一代,job 借用的那一代不再改、会话结束才释放。dyn_registry 有运行时写入(MCP 热插拔):
 /// 它自己加锁,条目只退役不释放。
 /// conversation 是深拷贝(零共享);Client/io_runtime/abort 后台专属;故唯一隐患就是上述借用集。
 ///
@@ -1443,7 +1444,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .permission_ctx = app.permission_ctx,
         .agents = &app.agents,
         .dyn_registry = &app.dyn_registry,
-        .skills = &app.skills,
+        .skills = app.currentSkills(),
         .agent_depth = 0,
         .parent_model = app.activeModel(),
         .desc = desc,
@@ -1733,7 +1734,7 @@ fn isSlashCommandLine(line: []const u8) bool {
 /// The `/` catalog for this session: built-ins, then user-invocable Skills
 /// labelled with their tier. Entries live in `arena`.
 fn slashCatalog(arena: std.mem.Allocator, app: *const app_mod.App) complete.SlashCatalog {
-    const base = complete.buildSlashCatalog(arena, app.skills.skills.items) catch return .builtin;
+    const base = complete.buildSlashCatalog(arena, app.currentSkills().skills.items) catch return .builtin;
     var entries = std.ArrayList(complete.SlashCmd).initCapacity(arena, base.entries.len) catch return base;
     for (base.entries) |cmd| {
         var entry = cmd;
@@ -4004,7 +4005,7 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     }
     cmd_output.print("Transcript:       {s}\n", .{if (app.transcript_writer != null) "on" else "off"});
     cmd_output.print("Background jobs:  {s}\n", .{if (app.jobs != null) "on" else "off"});
-    cmd_output.print("Skills:           {d}\n", .{app.skills.len()});
+    cmd_output.print("Skills:           {d}\n", .{app.currentSkills().len()});
     cmd_output.print("Permission rules: {d}\n", .{if (app.rule_set) |r| r.rules.items.len else 0});
     if (problems.len != 0) {
         cmd_output.print("Config problems:  {s}{s}{s}\n", .{ th.warn, problems[CONFIG_PROBLEMS_PREFIX.len..], th.reset });
@@ -4047,7 +4048,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permMode())});
         cmd_output.print("Theme:            {s}\n", .{theme_mod.variantName(app.theme_variant)});
         cmd_output.print("Verbose output:   {}\n", .{app.config.verbose});
-        cmd_output.print("Skills:           {d}\n", .{app.skills.len()});
+        cmd_output.print("Skills:           {d}\n", .{app.currentSkills().len()});
         cmd_output.print("Subagents:        {d}\n", .{app.agents.len()});
         if (app.mcpStartupInFlight()) |startup| {
             cmd_output.print("MCP servers:      {d} connecting (see /mcp)\n", .{startup.connecting});
@@ -4952,7 +4953,7 @@ fn writeCommandList(w: *std.Io.Writer, catalog: complete.SlashCatalog, kind: com
 /// 静默丢 skill 或静默降级正是兼容问题最难排查的形态。
 pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
     const catalog = @import("../skills/runtime/catalog.zig");
-    const snapshot = app.skill_runtime.snapshot orelse {
+    const snapshot = app.skill_runtime.currentSnapshot() orelse {
         try w.writeAll("Skills unavailable (catalog not loaded; run with METACODES_LOG=warn for the reason)\n");
         return;
     };

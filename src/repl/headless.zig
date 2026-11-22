@@ -665,7 +665,7 @@ pub fn buildOptions(
         .file_change_journal = &app.file_change_journal,
         .agents = &app.agents,
         .parent_model = app.activeModel(),
-        .skills_set = &app.skills,
+        .skills_set = app.currentSkills(),
         .mcp_sessions = &app.mcp_sessions.items,
         .mcp_unavailable = app.mcp_unavailable,
         .mcp_late = app.mcpLateProbe(),

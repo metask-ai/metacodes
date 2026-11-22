@@ -2633,17 +2633,16 @@ fn runCounted(
         // L4 诊断:turn span 起点。
         backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
 
-        var tool_events: []const []const u8 = &.{};
-        defer if (tool_changes_hook != null) allocator.free(tool_events);
-        defer for (tool_events) |line| allocator.free(line);
+        var refresh: @import("tool_changes.zig").Refresh = .{};
+        defer if (tool_changes_hook != null) refresh.deinit(allocator);
         if (tool_changes_hook) |hook| {
-            const refresh = hook.refresh(allocator, opts.abort);
+            refresh = hook.refresh(allocator, opts.abort);
             if (refresh.tool_defs) |defs| {
                 tool_defs = defs;
                 opts.tool_defs = defs;
             }
             if (refresh.unavailable) |unavailable| opts.mcp_unavailable = unavailable;
-            tool_events = refresh.events;
+            if (refresh.skills) |skills| opts.skills_set = skills;
         }
 
         // 工具池过滤必须在 prompt 投影和 compact 判断之前完成。App 初始化时构造的
@@ -2670,9 +2669,15 @@ fn runCounted(
         else
             tool_defs;
         if (tool_changes_hook != null) {
-            if (try @import("tool_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, tool_events)) |text| {
+            if (try @import("tool_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, refresh.events)) |text| {
                 defer allocator.free(text);
                 try conversation.appendHostText(text);
+            }
+            if (opts.skills_set) |skills| {
+                if (try @import("skill_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, skills, refresh.changed_skills)) |text| {
+                    defer allocator.free(text);
+                    try conversation.appendHostText(text);
+                }
             }
         }
         // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。

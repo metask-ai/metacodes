@@ -156,6 +156,7 @@ test {
     _ = @import("component/ui_state_test.zig");
     _ = @import("component/tui_clear_conversation_test.zig");
     _ = @import("component/skill_overrides_test.zig");
+    _ = @import("component/skill_hotplug_test.zig");
     _ = @import("component/comment_preview_entry_test.zig");
     _ = @import("component/ui_render_test.zig");
     _ = @import("component/ui_backend_test.zig");

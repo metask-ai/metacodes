@@ -145,6 +145,7 @@ const TaskStore = @import("core/task_store.zig").TaskStore;
 const system_prompt_mod = @import("core/system_prompt.zig");
 const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
 const skill_tool_mod = @import("skills/tool.zig");
+const SKILL_TOOL_NAME = @import("skills/runtime/model_tool.zig").TOOL_NAME;
 const skill_cli_adapter = @import("skills/cli_adapter.zig");
 const skill_overrides_mod = @import("skills/overrides.zig");
 const plugin_mod = @import("plugin/root.zig");
@@ -767,6 +768,11 @@ pub const App = struct {
     mcp_retired: std.ArrayList(McpSessionEntry) = .empty,
     mcp_session_configs: std.StringHashMapUnmanaged(mcp_config_mod.Server) = .empty,
     mcp_relists: std.ArrayList(*McpRelist) = .empty,
+    skills_current: ?*SkillSet = null,
+    skills_generations: std.ArrayList(*SkillSet) = .empty,
+    skill_watch: ?mcp_hotplug.Watch = null,
+    skill_reload_ms: i64 = 0,
+    skill_changed: std.ArrayList([]u8) = .empty,
     /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
     /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
     active_skill: ?ActiveSkillState = null,
@@ -1056,6 +1062,7 @@ pub const App = struct {
                 @import("util/log.zig").warn("skill", "register Skill tool failed: {s}", .{@errorName(err)});
             };
         }
+        app.adoptSkillWatch();
 
         // Process tools enter the CLI through its canonical typed dynamic
         // registry. Definitions borrow the immutable snapshot (destroyed only
@@ -2385,6 +2392,14 @@ pub const App = struct {
         }
         app.skill_runtime.deinit();
         app.skills.deinit();
+        for (app.skills_generations.items) |set| {
+            set.deinit();
+            app.allocator.destroy(set);
+        }
+        app.skills_generations.deinit(app.allocator);
+        if (app.skill_watch) |*watch| watch.deinit();
+        app.clearSkillChanged();
+        app.skill_changed.deinit(app.allocator);
         app.skill_overrides.deinit();
         app.read_state.deinit();
         app.edit_hl_cache.deinit();
@@ -5333,7 +5348,7 @@ pub const App = struct {
     pub fn configProblems(app: *const App) ConfigProblems {
         var problems = ConfigProblems{};
         if (app.hook_diagnostics) |*diag| problems.hooks = diag.items().len;
-        if (app.skill_runtime.snapshot) |snapshot| {
+        if (app.skill_runtime.currentSnapshot()) |snapshot| {
             problems.skills = snapshot.issues.len + snapshot.skipped_sources.len;
             for (snapshot.skills) |record| problems.skills += @intFromBool(record.definition.hasDefinitionProblem());
         }
@@ -5775,7 +5790,18 @@ pub const App = struct {
         if (!app.toolSurfaceReady()) return .{};
         const defs_before = app.tool_defs;
         const unavailable_before = app.mcp_unavailable;
+        const skills_before = app.currentSkills();
+        app.pollSkillChanges();
         app.pollMcpChanges(abort);
+        var changed: std.ArrayList([]const u8) = .empty;
+        for (app.skill_changed.items) |name| {
+            const copy = allocator.dupe(u8, name) catch break;
+            changed.append(allocator, copy) catch {
+                allocator.free(copy);
+                break;
+            };
+        }
+        app.clearSkillChanged();
         var events: std.ArrayList([]const u8) = .empty;
         for (app.mcp_events.items) |line| {
             const copy = allocator.dupe(u8, line) catch break;
@@ -5793,7 +5819,100 @@ pub const App = struct {
                 events.deinit(allocator);
                 break :blk &.{};
             },
+            .skills = if (app.currentSkills() != skills_before) app.currentSkills() else null,
+            .changed_skills = changed.toOwnedSlice(allocator) catch blk: {
+                for (changed.items) |name| allocator.free(name);
+                changed.deinit(allocator);
+                break :blk &.{};
+            },
         };
+    }
+
+    pub fn currentSkills(app: *const App) *const SkillSet {
+        return app.skills_current orelse &app.skills;
+    }
+
+    fn clearSkillChanged(app: *App) void {
+        for (app.skill_changed.items) |name| app.allocator.free(name);
+        app.skill_changed.clearRetainingCapacity();
+    }
+
+    fn adoptSkillWatch(app: *App) void {
+        const paths = app.skill_runtime.watchPaths(app.allocator) catch return;
+        defer {
+            for (paths) |path| app.allocator.free(path);
+            app.allocator.free(paths);
+        }
+        const watch = mcp_hotplug.Watch.init(app.allocator, paths) catch return;
+        if (app.skill_watch) |*old| old.deinit();
+        app.skill_watch = watch;
+    }
+
+    fn pollSkillChanges(app: *App) void {
+        const watch = if (app.skill_watch) |*watch| watch else return;
+        const now = util_time_mod.nowMs();
+        if (now - app.skill_reload_ms < MCP_RELOAD_INTERVAL_MS) return;
+        if (!watch.changed()) return;
+        app.skill_reload_ms = now;
+        app.reloadSkills() catch |err| @import("util/log.zig").warn("skill", "Skills could not be read again: {s}", .{@errorName(err)});
+    }
+
+    fn reloadSkills(app: *App) !void {
+        const cwd = app.cwd_abs orelse return;
+        const next = try app.allocator.create(SkillSet);
+        next.* = SkillSet.init(app.allocator);
+        var adopted = false;
+        defer if (!adopted) {
+            next.deinit();
+            app.allocator.destroy(next);
+        };
+        next.overrides = &app.skill_overrides;
+        try app.skills_generations.ensureUnusedCapacity(app.allocator, 1);
+        var scratch = std.heap.ArenaAllocator.init(app.allocator);
+        defer scratch.deinit();
+        const add_dirs = cliAddDirs(scratch.allocator(), app.config.add_dirs, cwd) catch &.{};
+        try app.skill_runtime.reloadDefaultWithExtraSources(
+            cwd,
+            @import("platform").paths.homeDir() orelse "",
+            app.stateRoot(),
+            add_dirs,
+            if (app.plugin_snapshot != null) "plugin-generation-1" else "",
+            if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{},
+            next,
+        );
+        const previous = app.currentSkills();
+        for (next.skills.items) |skill| {
+            const before = previous.find(skill.name) orelse continue;
+            if (std.mem.eql(u8, before.description, skill.description) and std.mem.eql(u8, before.when_to_use, skill.when_to_use)) {
+                const old_record = app.skill_runtime.findRetiredRecord(skill.name);
+                const new_record = app.skill_runtime.findRecord(skill.name);
+                if (old_record != null and new_record != null and std.mem.eql(u8, &old_record.?.content_revision, &new_record.?.content_revision)) continue;
+            }
+            const name = try app.allocator.dupe(u8, skill.name);
+            app.skill_changed.append(app.allocator, name) catch app.allocator.free(name);
+        }
+        app.skills_generations.appendAssumeCapacity(next);
+        adopted = true;
+        app.skills_current = next;
+        app.adoptSkillWatch();
+        if (app.dyn_registry.find(SKILL_TOOL_NAME) == null and app.skill_runtime.hasModelInvocable()) {
+            try skill_tool_mod.registerSkillTool(&app.dyn_registry, &app.skill_runtime);
+            try app.publishSkillTool();
+        }
+    }
+
+    fn publishSkillTool(app: *App) !void {
+        const a = app.tool_defs_arena.allocator();
+        const entry = app.dyn_registry.find(SKILL_TOOL_NAME) orelse return;
+        var defs = try std.ArrayList(json_mod.ToolDefinition).initCapacity(a, app.tool_defs.len + 1);
+        defs.appendSliceAssumeCapacity(app.tool_defs);
+        defs.appendAssumeCapacity(entry.definition());
+        _ = try app.skill_runtime.refreshModelTool(defs.items, a);
+        var names = try std.ArrayList([]const u8).initCapacity(a, app.enabled_tool_names.len + 1);
+        names.appendSliceAssumeCapacity(app.enabled_tool_names);
+        names.appendAssumeCapacity(entry.name);
+        app.tool_defs = defs.items;
+        app.enabled_tool_names = names.items;
     }
 
     const MCP_RELOAD_INTERVAL_MS: i64 = 1000;
@@ -6401,7 +6520,7 @@ pub const App = struct {
     pub fn cliPromptInput(app: *const App, cwd: []const u8) system_prompt_mod.CliPromptInput {
         return .{
             .model = app.promptModelName(),
-            .skills = &app.skills,
+            .skills = app.currentSkills(),
             .agents = &app.agents,
             .enabled_tool_names = app.enabled_tool_names,
             .memdir_abs = app.memdir_abs,

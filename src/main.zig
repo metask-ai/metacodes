@@ -137,6 +137,7 @@ pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
 pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
 pub const tool_changes = @import("core/tool_changes.zig");
+pub const skill_changes = @import("core/skill_changes.zig");
 pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
 pub const model_availability = @import("api/model_availability.zig"); // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
@@ -5957,6 +5958,7 @@ test {
     _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/mcp_hotplug.zig");
     _ = &@import("core/tool_changes.zig");
+    _ = &@import("core/skill_changes.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");

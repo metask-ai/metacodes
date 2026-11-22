@@ -914,6 +914,31 @@ pub const DeferredToolNames = struct {
     }
 };
 
+pub const SkillListingNames = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+    started: bool = false,
+
+    pub fn next(self: *SkillListingNames) ?[]const u8 {
+        while (self.lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "- **")) {
+                if (self.started) return null;
+                continue;
+            }
+            self.started = true;
+            const rest = line["- **".len..];
+            const end = std.mem.indexOf(u8, rest, "**") orelse continue;
+            if (end != 0) return rest[0..end];
+        }
+        return null;
+    }
+};
+
+pub fn skillListingNames(prompt: []const u8) SkillListingNames {
+    const header = "# Available skills\n";
+    const start = if (std.mem.indexOf(u8, prompt, header)) |at| at + header.len else prompt.len;
+    return .{ .lines = std.mem.splitScalar(u8, prompt[start..], '\n') };
+}
+
 pub fn deferredToolNames(prompt: []const u8) DeferredToolNames {
     const header = DEFERRED_TOOLS_HEADER ++ "\n";
     const start = if (std.mem.indexOf(u8, prompt, header)) |at| at + header.len else prompt.len;

@@ -97,9 +97,33 @@ dropped (names stay). Activating a Skill returns its rendered body preceded by
 directory.
 
 For compat sources that directory is the live Skill directory, as in Claude
-Code and Codex: only `SKILL.md` and `agents/openai.yaml` are read at startup,
-so Skills that carry a virtualenv, `node_modules` or large assets work.
-(AgentCore's canonical sources still snapshot and materialize the whole tree.)
+Code and Codex: only `SKILL.md` and `agents/openai.yaml` are read when the
+Skills are loaded, so Skills that carry a virtualenv, `node_modules` or large
+assets work. (AgentCore's canonical sources still snapshot and materialize the
+whole tree.)
+
+### Changes during a session
+
+A session watches every compat Skill root (present or not), each entry in it,
+and that entry's `SKILL.md`, `sealed.json` and `agents/openai.yaml`. Before
+each request of a top-level Run (at most once a second, one stat each) it
+reads the Skills again when one of them changed. From then on a new Skill can
+be activated, an edited one runs its new `SKILL.md`, and a removed one is
+refused, with no restart.
+
+The listings in the system prompt and the `Skill` tool stay byte for byte as
+they were, so the prompt cache holds. The model is told in a system reminder
+which Skills are new (with their description), which are gone and which
+changed; like the MCP reminder it is read back from the system prompt and the
+reminders still in the conversation, so compaction and `/clear` tell it again.
+A session that started without a model-invocable Skill gains the `Skill` tool
+when the first one appears, and that request misses the prompt cache once.
+
+Plugin Skills are not watched: their package is a fixed generation. An
+activation already running keeps the Skill it started with, and a background
+agent or teammate keeps the Skill list it started with; nothing they hold is
+freed before the session ends. Completion of `/` commands, `/skills` and
+`/doctor` show the Skills as they are now.
 
 ### `skillOverrides`
 

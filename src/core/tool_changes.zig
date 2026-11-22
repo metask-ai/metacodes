@@ -9,10 +9,14 @@ pub const Refresh = struct {
     tool_defs: ?[]const json.ToolDefinition = null,
     unavailable: ?[]const McpUnavailable = null,
     events: []const []const u8 = &.{},
+    skills: ?*const @import("../skills/skill.zig").SkillSet = null,
+    changed_skills: []const []const u8 = &.{},
 
     pub fn deinit(self: Refresh, allocator: std.mem.Allocator) void {
         for (self.events) |line| allocator.free(line);
         allocator.free(self.events);
+        for (self.changed_skills) |name| allocator.free(name);
+        allocator.free(self.changed_skills);
     }
 };
 

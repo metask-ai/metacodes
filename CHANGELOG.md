@@ -42,6 +42,16 @@ status, compatibility boundaries, and entry points are defined by
   login. `mcp list` now checks each server (`--no-check` skips it) and says
   `auth: not logged in` instead of `auth: none`.
 
+- **Skills can be added, edited and removed while a session runs.** Before
+  each request of a top-level Run the session checks its Skill roots and each
+  Skill's `SKILL.md`; when one changed it reads the Skills again, so a new
+  Skill can be activated, an edited one runs its new `SKILL.md` and a removed
+  one is refused, with no restart. The listings in the system prompt and the
+  `Skill` tool do not change, so the prompt cache holds; a system reminder
+  tells the model which Skills are new, gone or changed. A session that
+  started without Skills gains the `Skill` tool with the first one. Plugin
+  Skills are not watched.
+
 - **MCP servers can be added, changed and removed while a session runs.**
   Before each request of a top-level Run, the ones after a tool batch inside a
   Run included, the session checks the files its MCP configuration comes from
