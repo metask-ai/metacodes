@@ -164,17 +164,6 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- **A TinyKG service that does not answer no longer holds the prompt**
-  (#667). The interactive REPL probed TinyKG, built its summary and mirrored
-  its tasks before drawing the input box, so a service that accepted the
-  connection and never answered cost every start the transport's 35 s
-  deadline. That work now runs in the background and the REPL adopts its
-  outcome before the first request (the spinner reads `Starting TinyKG`; Esc
-  stops the wait), so what the model sees does not depend on the timing.
-  TinyKG reads give way to the session's abort signal, so leaving the REPL or
-  pressing Esc during the recall before a turn no longer waits out the
-  deadline.
-
 - **Cancelling a bench build on macOS reports the cancel.** Stopping a
   process group whose leader had just exited raised `PermissionError` on
   macOS, so a cancelled `metacodes bench` build (and the worker's and
@@ -217,6 +206,17 @@ status, compatibility boundaries, and entry points are defined by
   is Metask. To use it: /model, or /logout`. A preset whose provider has no
   key leaves the session without a model after `/logout`, as a start on it
   does, instead of falling to the file's provider.
+
+- **A TinyKG service that does not answer no longer holds the prompt**
+  (#667). The interactive REPL probed TinyKG, built its summary and mirrored
+  its tasks before drawing the input box, so a service that accepted the
+  connection and never answered cost every start the transport's 35 s
+  deadline. That work now runs in the background and the REPL adopts its
+  outcome before the first request (the spinner reads `Starting TinyKG`; Esc
+  stops the wait), so what the model sees does not depend on the timing.
+  TinyKG reads give way to the session's abort signal, so leaving the REPL or
+  pressing Esc during the recall before a turn no longer waits out the
+  deadline.
 
 - **The `/model` picker takes the keys with `/vim` on** (#606). Vim's keymap
   read every key before the picker did: typing went into the input box
