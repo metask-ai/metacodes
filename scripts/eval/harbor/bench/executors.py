@@ -43,7 +43,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import urlsplit
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
@@ -1079,8 +1078,7 @@ class RemoteRun:
                      "record": bool(record),
                      # An imported provider was probed from the workbench; the
                      # executor checks its own resolution before connecting.
-                     "refuse_local_upstream": bool(self.spec.get("imported_provider")),
-                     "via_egress": self.relay_via_egress(upstream)}
+                     "refuse_local_upstream": bool(self.spec.get("imported_provider"))}
         if relay and self.spec.get("judge"):
             # The driver appends the judge's `--ve` once its relay listens.
             relay["judge"] = self.spec["judge"]
@@ -1099,30 +1097,17 @@ class RemoteRun:
             return {"mode": "proxy", "url": executor.egress_proxy, "no_proxy": [executor.metrics_bind]}
         return None
 
-    def egress_policy(self):
-        from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, allow_policy
-        return allow_policy(self.executor.egress_allow if self.executor.egress_allow is not None
-                            else DEFAULT_ALLOW_NETWORKS)
-
-    def relay_via_egress(self, upstream: str) -> bool:
-        if self.tunnel_port is None:
-            return False
-        from scripts.eval.harbor.bench.egress import proxy_accepts
-        accepted = proxy_accepts(upstream, self.executor.egress_ports, self.egress_policy())
-        origin = urlsplit(upstream)._replace(path="", query="", fragment="").geturl()
-        self.log(f"模型请求经工作台出网：{origin}" if accepted else
-                 f"模型请求直连 {origin}：出网代理不接受这个地址或端口（egress_ports "
-                 f"{', '.join(str(p) for p in sorted(self.executor.egress_ports))}、egress_allow 地址策略）")
-        return accepted
-
     def start_egress(self) -> Optional[Tuple[int, int]]:
         """Start this run's workbench proxy; (executor port, local port) of
         the reverse forward the run session carries, or None."""
         if self.tunnel_port is None:
             return None
-        from scripts.eval.harbor.bench.egress import EgressProxy
+        from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
         if self.proxy is None:
-            self.proxy = EgressProxy(self.executor.egress_ports, log=self.log, allow=self.egress_policy()).start()
+            self.proxy = EgressProxy(self.executor.egress_ports, log=self.log,
+                                     allow=allow_policy(self.executor.egress_allow
+                                                        if self.executor.egress_allow is not None
+                                                        else DEFAULT_ALLOW_NETWORKS)).start()
             self.log(f"容器出网经工作台：代理 127.0.0.1:{self.proxy.port}，"
                      f"{self.executor.name} 回环端口 {self.tunnel_port}（ssh -R），"
                      f"允许端口 {', '.join(str(p) for p in sorted(self.executor.egress_ports))}")
