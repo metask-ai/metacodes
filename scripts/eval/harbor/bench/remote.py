@@ -111,10 +111,9 @@ def run(spec_path):
         if spec.get("relay"):
             from scripts.eval.harbor.profiling import JUDGE_TOKEN_ENV, PushedCredential, TimingRelay, judge_argv
             options = spec["relay"]
-            connect = None
+            connect = relay_connect(options, spec.get("egress"))
             if options.get("refuse_local_upstream"):
-                from scripts.eval.harbor.bench.egress import connect_not_local, names_this_machine
-                connect = connect_not_local
+                from scripts.eval.harbor.bench.egress import names_this_machine
                 if names_this_machine(urlsplit(options["upstream"]).hostname or ""):
                     # This machine resolves the imported address to itself:
                     # never send the key to whatever listens here.
@@ -161,6 +160,15 @@ def run(spec_path):
             session.close()
         if relay:
             relay.__exit__(None, None, None)
+
+
+def relay_connect(options, egress_options):
+    from scripts.eval.harbor.bench import egress
+    if options.get("via_egress") and egress_options and egress_options.get("mode") == "workbench":
+        return egress.connect_through(("127.0.0.1", int(egress_options["tunnel_port"])))
+    if options.get("refuse_local_upstream"):
+        return egress.connect_not_local
+    return None
 
 
 def dataset_selection(argv):

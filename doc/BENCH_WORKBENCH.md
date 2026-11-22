@@ -844,6 +844,15 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
   `NO_PROXY`. Only `egress_ports` are served; the proxy needs no credentials
   because only the run's tunnel reaches its loopback port. A workbench
   machine that itself needs a proxy to reach the internet is not supported.
+- The run's model traffic takes the same way out when the proxy would accept
+  it: the workbench checks the provider's origin against `egress_ports` and the
+  address policy (resolving it on the workbench machine) when it builds the
+  run, and the remote driver's timing relay then opens each upstream connection
+  with `CONNECT` through `127.0.0.1:<tunnel port>`. A provider the proxy would
+  refuse (a LAN or CGNAT address, another port) keeps its direct connection.
+  An executor whose own network cuts long-lived connections (the 4090 ends
+  every stream at 600 s) no longer cuts long model responses. `proxy` mode
+  leaves model traffic direct.
 - The remote driver starts a TCP forwarder bound only to the Docker bridge's
   gateway (docker0's address, else `docker network inspect bridge`, else the
   executor's `metrics_bind`), since containers cannot reach the host's
