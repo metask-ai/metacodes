@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -105,6 +106,25 @@ from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 sys.exit(cli.main(['--state-root', {state!r}] + sys.argv[2:]))
 """
+
+
+@unittest.skipUnless(POSIX, 'process groups are POSIX')
+class SignalGroupTest(unittest.TestCase):
+    def test_a_group_whose_leader_already_exited_is_not_an_error(self):
+        process = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        self.addCleanup(process.wait)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and 'Z' not in subprocess.run(
+                ['ps', '-o', 'stat=', '-p', str(process.pid)], capture_output=True, text=True).stdout:
+            time.sleep(0.05)
+        executors.signal_group(process, signal.SIGKILL)
+        self.assertEqual(process.wait(), 0)
+
+    def test_a_running_group_is_signalled(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
+        self.addCleanup(process.wait)
+        executors.signal_group(process, signal.SIGKILL)
+        self.assertEqual(process.wait(timeout=10), -signal.SIGKILL)
 
 
 @unittest.skipUnless(POSIX, 'fake docker and process groups are POSIX')

@@ -813,7 +813,9 @@ class SshRunTest(SetupFixture):
         self.assertEqual(len(gateway.requests), 30)
         self.assertTrue(all(ok for _, ok, _ in gateway.requests), gateway.requests)
         self.assertGreaterEqual(len({token for token, _, _ in gateway.requests}), 3)
-        self.assertTrue(all(left > 0 for left in gateway.refreshes), gateway.refreshes)
+        during_run = gateway.refreshes_while_serving()
+        self.assertGreaterEqual(len(during_run), 2, gateway.refreshes)
+        self.assertTrue(all(left > 0 for left in during_run), gateway.refreshes)
         self.assertGreaterEqual(final["credential"]["refresh_count"], 2)
         self.assertEqual(json.loads((gateway.state / "oauth/metask.json").read_text())["refresh_token"],
                          gateway.refresh_token)
