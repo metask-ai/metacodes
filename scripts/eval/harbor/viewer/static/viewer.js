@@ -137,6 +137,7 @@ function navCurrent(name) {
 async function render() {
   if (state.busy) return;
   state.busy = true;
+  state.editing = false;
   const r = route();
   try {
     let node;
@@ -187,6 +188,43 @@ const BATCH_STATUS = { queued: '排队中', running: '运行中', cancelling: '�
 const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '跳过' };
 const batchActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
 const batchName = (b) => b.name || b.id;
+const batchHref = (b) => '#/batch/' + encodeURIComponent(b.id);
+
+function copyBatch(b) {
+  state.batchDraft = { from: batchName(b), name: '', model: b.model, attempts: b.attempts, concurrency: b.concurrency,
+    features: b.features || [], source: b.metacodes?.source_bundle || null };
+  state.executor = b.executor;
+  state.pickBundle = null;
+  state.batchPick = new Map(b.items.map((i) => [i.suite, null]));
+  state.batchWanted = new Map(b.items.map((i) => [i.suite, i.tasks]));
+  location.hash = '#/new';
+}
+async function deleteBatch(b, button) {
+  if (!confirm(`删除批次 ${batchName(b)}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
+  button.disabled = true;
+  try { await api('/api/batch/delete', { id: b.id }); }
+  catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
+  if (state.scope === b.id) state.scope = null;
+  return true;
+}
+async function stopBatch(b, button) {
+  if (!confirm(`停止批次 ${batchName(b)}？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
+  button.disabled = true;
+  try { await api('/api/batch/cancel', { id: b.id }); state.countdown = 1; }
+  catch (error) { button.disabled = false; setConnection(false, error.message); }
+}
+function batchActions(b, compact) {
+  const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
+  return [
+    h('button', { type: 'button', class: 'button', title: '用这个批次的版本、评测集、题目和参数新建批次', onclick: keep(() => copyBatch(b)) }, compact ? '复制' : '复制为新批次'),
+    batchActive(b)
+      ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopBatch(b, button)) }, compact ? '停止' : '停止批次')
+      : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
+        if (!await deleteBatch(b, button)) return;
+        if (route().view === 'overview') render(); else location.hash = '#/';
+      }) }, compact ? '删除' : '删除批次'),
+  ];
+}
 
 async function renderOverview() {
   navCurrent('overview');
@@ -220,8 +258,8 @@ async function renderOverview() {
     metric('trial', String(all.trials), all.running + ' 个运行中'),
     metric('无效', String(all.invalid), '基础设施原因，不计入通过率'));
 
-  const batchRows = batches.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = '#/batch/' + encodeURIComponent(b.id); } },
-    h('td', {}, h('span', { text: batchName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
+  const batchRows = batches.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = batchHref(b); } },
+    h('td', {}, h('a', { href: batchHref(b), onclick: (e) => e.stopPropagation(), text: batchName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
     h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : '' })),
     h('td', { text: b.model || '—' }),
     h('td', {}, h('span', { text: b.items.map((i) => i.suite_name || i.suite).join('、') }), h('span', { class: 'sub', text: `${b.items.length} 个评测集` })),
@@ -231,10 +269,12 @@ async function renderOverview() {
     h('td', { class: 'num', text: pct(b.summary.first_pass_rate) }),
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
     h('td', { class: 'num', text: dur(b.wall_s) }),
-    h('td', { class: 'num', text: when(b.created_at) })));
+    h('td', { class: 'num', text: when(b.created_at) }),
+    body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, batchActions(b, true))) : null));
+  const batchHeads = ['批次', 'metacodes 版本', '模型', '评测集', '状态', '进度', '结局分布', '首次满分率', '总 Token', '用时', '创建', ...(body.can_run ? ['操作'] : [])];
   const batchPanel = panel('批次', `${batches.length} 个 · 每个批次冻结一个 metacodes 版本`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['批次', 'metacodes 版本', '模型', '评测集', '状态', '进度', '结局分布', '首次满分率', '总 Token', '用时', '创建'].map((t, i) => h('th', { class: i >= 7 ? 'num' : null, text: t })))),
-    h('tbody', {}, batchRows.length ? batchRows : h('tr', {}, h('td', { colspan: 11, class: 'empty' }, '还没有批次。', link('#/new', '新建一个批次'), '：选择一个 metacodes 版本和多个评测集。'))))),
+    h('thead', {}, h('tr', {}, batchHeads.map((t, i) => h('th', { class: i >= 7 && i <= 10 ? 'num' : null, text: t })))),
+    h('tbody', {}, batchRows.length ? batchRows : h('tr', {}, h('td', { colspan: batchHeads.length, class: 'empty' }, '还没有批次。', link('#/new', '新建一个批次'), '：选择一个 metacodes 版本和多个评测集。'))))),
   h('a', { class: 'button', href: '#/new', text: '新建批次' }));
 
   const compareBtn = h('button', { class: 'button primary', type: 'button', disabled: state.selected.size < 2 || null,
@@ -294,20 +334,29 @@ async function renderBatch(id) {
     metric('评测集', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
     metric('无效', String(s.counts.invalid), '基础设施原因，不计入通过率'));
 
-  const stop = batchActive(b) && b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
-    event.currentTarget.disabled = true;
-    try { await api('/api/batch/cancel', { id: b.id }); state.countdown = 1; }
-    catch (error) { event.currentTarget.disabled = false; setConnection(false, error.message); }
-  } }, '停止批次') : null;
-  const remove = !batchActive(b) && b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
-    const button = event.currentTarget;
-    if (!confirm(`删除批次 ${batchName(b)}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
-    button.disabled = true;
-    try { await api('/api/batch/delete', { id: b.id }); location.hash = '#/'; }
-    catch (error) { button.disabled = false; setConnection(false, error.message); }
-  } }, '删除批次') : null;
+  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '批次名称' });
+  const renameFeedback = h('span', { class: 'muted', role: 'status' });
+  const closeRename = () => { state.editing = false; renameForm.hidden = true; nameRow.hidden = false; };
+  const renameForm = h('form', { class: 'rename', hidden: true },
+    nameInput, h('button', { type: 'submit', class: 'button primary' }, '保存'),
+    h('button', { type: 'button', class: 'button', onclick: closeRename }, '取消'), renameFeedback);
+  renameForm.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeRename(); });
+  renameForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    renameFeedback.textContent = '正在保存…';
+    try {
+      await api('/api/batch/rename', { id: b.id, name: nameInput.value });
+      render();
+    } catch (error) { renameFeedback.textContent = error.message; }
+  });
+  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（显示批次编号）' }),
+    b.can_run ? h('button', { type: 'button', class: 'button', onclick: () => {
+      state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
+    } }, '重命名') : null);
   const m = b.metacodes || {};
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
+    h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
+    h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
     h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
     h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
     h('dt', { text: '二进制 SHA-256' }), h('dd', { class: 'mono', text: m.binary_sha256 || '—' }),
@@ -371,7 +420,7 @@ async function renderBatch(id) {
   const tasks = panel('逐任务', `${b.tasks.length} 道 · 点开看每次尝试的轨迹、Token 分布和耗时`, h('div', {}, chips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '各次结局', '通过 / 有效', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 3 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('批次信息', BATCH_STATUS[b.status] || b.status, info, stop || remove), compositionPanel(s, '本批次均值'), items, tasks);
+  return h('div', {}, metrics, panel('批次信息', BATCH_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, batchActions(b, false)) : null), compositionPanel(s, '本批次均值'), items, tasks);
 }
 
 async function renderBatchTask(batchId, jobName, taskName, trialName) {
@@ -444,16 +493,27 @@ async function renderNewBatch() {
   const comboReasons = (s) => ((s.executors || {})[state.executor] || s).reasons || [];
   const comboReady = (s) => !comboReasons(s).length;
   const form = h('form', { class: 'run-form' });
+  const draft = state.batchDraft || (state.batchDraft = {});
+  if (!state.batchWanted) state.batchWanted = new Map();
 
   const executor = h('select', { name: 'executor', onchange: () => {
     state.executor = executor.value;
-    for (const id of state.batchPick.keys()) { state.batchPick.set(id, null); loadTasks(id); }
+    for (const [id, entry] of state.batchPick) {
+      if (entry) state.batchWanted.set(id, [...entry.selected]);
+      state.batchPick.set(id, null);
+      loadTasks(id);
+    }
     drawNotes(); drawPicker(); drawBoxes(); syncSubmit();
   } }, executorsList.map((e) => h('option', { value: e.name, selected: e.name === state.executor },
     e.label + (e.ready ? '' : ' · 待配置'))));
   const bundles = c.bundles || [];
+  if (draft.source) {
+    state.pickBundle = bundles.find((b) => b.path === draft.source)?.id || null;
+    draft.bundleMissing = !state.pickBundle;
+    draft.source = null;
+  }
   const picked = bundles.some((b) => b.id === state.pickBundle) ? state.pickBundle : null;
-  const bundle = h('select', { name: 'bundle' }, bundles.map((b) => h('option', { value: b.id, selected: picked ? b.id === picked : b.current },
+  const bundle = h('select', { name: 'bundle', onchange: () => { state.pickBundle = bundle.value; draft.bundleMissing = false; } }, bundles.map((b) => h('option', { value: b.id, selected: picked ? b.id === picked : b.current },
     `${b.label}${b.current ? '（当前配置）' : ''}`)));
   const commitBox = h('div', { class: 'commit-builder', hidden: !state.commitsOpen });
   const commitToggle = h('button', { type: 'button', class: 'button', onclick: () => {
@@ -461,16 +521,23 @@ async function renderNewBatch() {
     commitBox.hidden = !state.commitsOpen;
     if (state.commitsOpen && !commitBox.childElementCount) drawCommits();
   } }, '按 commit 编译…');
-  const name = h('input', { name: 'name', type: 'text', maxlength: 80, placeholder: '例如：v0.12 回归 · DeepSeek' });
+  const name = h('input', { name: 'name', type: 'text', maxlength: 80, value: draft.name || '', placeholder: '例如：v0.12 回归 · DeepSeek',
+    oninput: () => { draft.name = name.value; } });
   const picker = h('div', { class: 'suite-picker' });
   const boxes = h('div', { class: 'stack' });
-  const model = h('select', { name: 'model', required: true },
-    (c.models || []).map((m) => h('option', { value: m.id, selected: m.id === c.default_model }, m.label)));
+  const models = c.models || [];
+  const modelMissing = draft.model && !models.some((m) => m.id === draft.model);
+  const wantedModel = draft.model && !modelMissing ? draft.model : c.default_model;
+  const model = h('select', { name: 'model', required: true, onchange: () => { draft.model = model.value; } },
+    models.map((m) => h('option', { value: m.id, selected: m.id === wantedModel }, m.label)));
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
-  const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: runDefaults.attempts, min: 1, max: 5, step: 1, required: true });
-  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: runDefaults.concurrency, min: 1, max: 16, step: 1, required: true });
+  const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
+    oninput: () => { draft.attempts = attempts.value; } });
+  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, max: 16, step: 1, required: true,
+    oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
-    input: h('input', { type: 'checkbox', name: 'features', value: f.id }), label: f.label }));
+    input: h('input', { type: 'checkbox', name: 'features', value: f.id, checked: (draft.features || []).includes(f.id),
+      onchange: () => { draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id); } }), label: f.label }));
   const featureGroup = (group, title) => {
     const boxes = featureBoxes.filter((f) => f.group === group);
     return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),
@@ -520,6 +587,7 @@ async function renderNewBatch() {
       reasons.length ? h('div', { class: 'callout' }, reasons.map((text) => h('p', { text }))) : null);
     if (!entry) { box.append(h('div', { class: 'empty', text: '读取任务列表…' })); return box; }
     if (!entry.tasks.length) { box.append(h('div', { class: 'empty', text: entry.error || '该评测集暂无可选任务' })); return box; }
+    if (entry.missing) box.append(h('div', { class: 'callout', text: `${draft.from ? '原批次' : '之前选'}的 ${entry.missing} 道题不在当前执行机器的任务列表里，已略过。` }));
     const list = h('div', { class: 'task-options' });
     const search = h('input', { type: 'search', placeholder: `搜索 ${entry.tasks.length} 道任务`, 'aria-label': '搜索 ' + s.name + ' 的任务' });
     const count = h('span', { class: 'muted num' });
@@ -565,17 +633,33 @@ async function renderNewBatch() {
     let entry = { tasks: [], defaults: [], selected: new Set(), error: null };
     try {
       const body = await api('/api/suite?id=' + encodeURIComponent(id) + '&executor=' + encodeURIComponent(wanted || ''));
-      entry = { tasks: body.tasks || [], defaults: body.default_tasks || [], selected: new Set(body.default_tasks || []), error: body.error || null };
+      const tasks = body.tasks || [];
+      const kept = state.batchWanted.get(id);
+      const selected = kept ? kept.filter((t) => tasks.includes(t)) : body.default_tasks || [];
+      entry = { tasks, defaults: body.default_tasks || [], selected: new Set(selected), error: body.error || null,
+        missing: kept ? kept.length - selected.length : 0 };
     } catch (e) { entry.error = e.message; }
     // Only the suite's latest request counts: an older one may be for another
     // executor, or for this one before a switch away and back.
-    if (state.batchPick.has(id) && state.taskTickets.get(id) === ticket) { state.batchPick.set(id, entry); drawBoxes(); syncSubmit(); }
+    if (state.batchPick.has(id) && state.taskTickets.get(id) === ticket) {
+      if (!entry.error) state.batchWanted.delete(id);
+      state.batchPick.set(id, entry); drawBoxes(); syncSubmit();
+    }
   }
   attempts.addEventListener('input', syncSubmit);
 
   if (executorsList.length) {
     form.append(h('label', { class: 'field' }, h('span', { text: '执行机器' }), executor,
       h('small', { text: '运行 Harbor 和 Docker 的机器。SSH 执行机器的结果会同步回本机作业目录并写入评测数据库。' })));
+  }
+  if (draft.from) {
+    const notes = [`已按批次「${draft.from}」的版本、评测集、题目和参数填好，可以修改后创建。`];
+    if (draft.bundleMissing) notes.push('原批次的 metacodes 版本已不在可选列表中，请重新选择。');
+    if (modelMissing) notes.push(`原批次的模型 ${draft.model} 当前不可用，请重新选择。`);
+    form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
+      h('button', { type: 'button', class: 'button', onclick: () => {
+        state.batchDraft = null; state.batchWanted = null; state.batchPick = null; state.pickBundle = null; render();
+      } }, '清空，从头填写')));
   }
   form.append(
     h('div', { class: 'form-row' },
@@ -609,6 +693,8 @@ async function renderNewBatch() {
       if (chosen.length) request.features = chosen;
       const record = await api('/api/batches', request);
       state.batchPick = null;
+      state.batchDraft = null;
+      state.batchWanted = null;
       state.scope = record.id;
       location.hash = '#/batch/' + encodeURIComponent(record.id);
     } catch (error) {
@@ -1252,6 +1338,7 @@ async function renderProviders() {
 // ------------------------------------------------------------ refresh loop
 function tick() {
   const label = $('#countdown');
+  if (state.editing) { label.textContent = '编辑中'; return; }
   if (!state.auto || !state.live) { label.textContent = state.live ? '已暂停' : '无运行中'; return; }
   state.countdown -= 1;
   label.textContent = state.countdown + 's';

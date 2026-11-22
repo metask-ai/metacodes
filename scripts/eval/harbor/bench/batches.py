@@ -173,6 +173,13 @@ def freeze(choice: Dict[str, Any], config_path: Path) -> Dict[str, Any]:
 # ------------------------------------------------------------------- batches
 
 
+def checked_name(value: Any) -> Optional[str]:
+    name = value or ""
+    if not isinstance(name, str) or len(name) > NAME_LIMIT or any(ord(c) < 32 for c in name):
+        raise ValueError(f"批次名称最多 {NAME_LIMIT} 个字符")
+    return name.strip() or None
+
+
 def _new_id() -> str:
     return "batch-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
 
@@ -227,9 +234,7 @@ class BatchManager:
         allowed = {"name", "model", "executor", "attempts", "concurrency", "bundle", "items", "features"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("批次只接受 name、model、executor、attempts、concurrency、bundle、items、features")
-        name = request.get("name") or ""
-        if not isinstance(name, str) or len(name) > NAME_LIMIT or any(ord(c) < 32 for c in name):
-            raise ValueError(f"批次名称最多 {NAME_LIMIT} 个字符")
+        name = checked_name(request.get("name"))
         items = request.get("items")
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
             raise ValueError(f"批次需要 1–{MAX_ITEMS} 个评测集")
@@ -272,7 +277,7 @@ class BatchManager:
         if git:
             metacodes["git"] = git
         batch_id = _new_id()
-        record = {"id": batch_id, "name": name.strip() or None, "status": "queued", "created_at": now(),
+        record = {"id": batch_id, "name": name, "status": "queued", "created_at": now(),
                   "started_at": None, "finished_at": None, "model": request.get("model"),
                   "executor": planned[0]["request"]["executor"], "attempts": attempts, "concurrency": concurrency,
                   "features": planned[0]["request"]["features"],
@@ -282,6 +287,16 @@ class BatchManager:
             self.save(record)
         self.wake()
         return record
+
+    def rename(self, batch_id: Any, name: Any) -> Dict[str, Any]:
+        name = checked_name(name)
+        with self.lock:
+            record = self.get(batch_id)
+            if record is None:
+                raise ValueError("批次不存在")
+            record["name"] = name
+            self.save(record)
+        return {"id": record["id"], "name": name}
 
     def cancel(self, batch_id: Any) -> Dict[str, Any]:
         with self.lock:

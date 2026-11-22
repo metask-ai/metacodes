@@ -237,6 +237,25 @@ class BatchTest(unittest.TestCase):
         argv = json.loads((self.manager.jobs_dir / run / 'argv.json').read_text())
         self.assertFalse([a for a in argv if a.startswith('features=')])
 
+    def test_a_batch_can_be_renamed_while_running_and_after_it_ends(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.client.request('api/batches', one)
+        self.assertEqual(self.client.request('api/batch/rename', {'id': created['id'], 'name': '  回归  '}),
+                         {'id': created['id'], 'name': '回归'})
+        record = self.wait_batch(created['id'])
+        self.assertEqual((record['name'], record['status']), ('回归', 'finished'))
+        self.client.request('api/batch/rename', {'id': created['id'], 'name': ''})
+        self.assertIsNone(self.client.request('api/batch?id=' + created['id'])['name'])
+        with self.assertRaisesRegex(ValueError, '最多'):
+            self.client.request('api/batch/rename', {'id': created['id'], 'name': 'x' * 81})
+        with self.assertRaisesRegex(ValueError, '不存在'):
+            self.client.request('api/batch/rename', {'id': 'batch-missing', 'name': 'x'})
+        foreign = {'id': 'batch-elsewhere', 'status': 'finished', 'items': [], 'created_at': '2026-01-01T00:00:00Z'}
+        with patch.object(self.workbench.library, 'batch_records', return_value=[foreign]), \
+                self.assertRaisesRegex(ValueError, '其他 jobs 目录'):
+            self.client.request('api/batch/rename', {'id': 'batch-elsewhere', 'name': 'x'})
+        self.assertTrue(self.client.request('api/jobs?batch=all')['can_run'])
+
     def test_features_are_refused_for_a_workbuddy_suite(self):
         with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持选择高级功能'):
             self.client.request('api/runs', {'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],

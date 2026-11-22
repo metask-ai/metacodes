@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench batches can be renamed and copied.** A batch page has 重命名
+  (`POST /api/batch/rename`) and 复制为新批次, which fills the 新建 page with
+  the batch's version, datasets, tasks and settings. The overview's batch list
+  copies, stops and deletes a batch in place, stopping asks for confirmation,
+  and the 新建 form keeps what was typed across a refresh.
+
 - **`metacodes bench pull` prepares a suite's task environments.** It pulls
   the `docker_image` of each selected task and builds the environment of
   every task without one, the same way Harbor builds it, on the chosen
