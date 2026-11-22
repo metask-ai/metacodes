@@ -43,6 +43,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
@@ -1107,7 +1108,12 @@ class RemoteRun:
         if self.tunnel_port is None:
             return False
         from scripts.eval.harbor.bench.egress import proxy_accepts
-        return proxy_accepts(upstream, self.executor.egress_ports, self.egress_policy())
+        accepted = proxy_accepts(upstream, self.executor.egress_ports, self.egress_policy())
+        origin = urlsplit(upstream)._replace(path="", query="", fragment="").geturl()
+        self.log(f"模型请求经工作台出网：{origin}" if accepted else
+                 f"模型请求直连 {origin}：出网代理不接受这个地址或端口（egress_ports "
+                 f"{', '.join(str(p) for p in sorted(self.executor.egress_ports))}、egress_allow 地址策略）")
+        return accepted
 
     def start_egress(self) -> Optional[Tuple[int, int]]:
         """Start this run's workbench proxy; (executor port, local port) of
