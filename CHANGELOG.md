@@ -245,6 +245,23 @@ status, compatibility boundaries, and entry points are defined by
   a dialog: the permission dialog ignores it, and the question dialog types
   it into "Type something" or the note being edited, line breaks as spaces.
 
+- **The prompt's shortcuts work with `/vim` on** (#660). Only Ctrl+C and
+  Ctrl+D reached them: in INSERT mode Shift+Tab, Ctrl+O, Ctrl+R, Ctrl+T,
+  Ctrl+G, the Ctrl+X prefix, `?` help, the `/` and `@` menus and history on
+  Up/Down did nothing, and NORMAL mode fed the terminal's raw bytes to vim, so
+  Left (`ESC [ D`) deleted to the end of the line, Right changed it, Up
+  appended, a paste ran as vim commands, and Ctrl+C and Ctrl+D did nothing.
+  Now INSERT mode handles every key as the prompt does without vim, except the
+  Esc that switches to NORMAL mode; an open help, menu or agent list takes
+  that Esc first. NORMAL mode reads keys, not bytes: the arrows move the
+  cursor as `h`, `j`, `k` and `l`, Enter submits as before, a paste goes in
+  as text, and the other keys reach the prompt's shortcuts, so Ctrl+C and
+  Ctrl+D arm the exit as in INSERT mode; a key that only edits the line
+  (Backspace, Ctrl+U, Ctrl+W, …) still does nothing there. A command typed
+  within 200 ms of the Esc that left INSERT mode runs; it used to go into the
+  box. `D` deletes to the end of the cursor's line; it used to drop every line
+  below it too.
+
 ### Fixed
 
 - **A `204` or `304` answer no longer holds a request until the server
