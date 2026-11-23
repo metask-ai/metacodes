@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **The bench workbench shows public leaderboards next to our runs.** A
+  榜单 page lists, per suite, results other harnesses and models published
+  (FrontierHarness Eval v1.1 per model, Terminal-Bench 2.0/2.1, EvalPlus,
+  Vals.ai and MathArena AIME, LiveMathBench, WorkBuddy-Bench, GAIA2,
+  ALFWorld) with their sources, and ranks this workbench's finished jobs among
+  them. Boards with costs add a pass-rate/cost scatter with the cost-pass
+  frontier; hovering a point or row shows what it beats.
 - **The bench workbench reports FrontierHarness-style statistics.** Every
   summary adds the pass rate's 95% interval, tasks solved at least once, cost
   per task (per-task mean, then mean over tasks) and per pass, the share of

@@ -182,6 +182,59 @@ class LibraryTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith("job,model,task,trial,status"))
 
 
+class LeaderboardTest(unittest.TestCase):
+    BOARD = {"suites": ["terminal-bench-2.1"], "title": "Public board",
+             "source": {"name": "board", "url": "https://example.invalid/", "retrieved": "2026-11-22", "metric": "accuracy"},
+             "entries": [{"harness": "Other", "model": "x", "score": 50.0}]}
+    SUBSET = {**BOARD, "title": "First tasks", "tasks": ["task0", "task1"]}
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        full = _job(self.root, "full", "m", planned=72)
+        for n in range(64):
+            _trial(full, f"task{n}__aaa", reward=1.0 if n % 4 else 0.0)
+        for n in range(64, 72):
+            _trial(full, f"task{n}__aaa", exception="RewardFileNotFoundError")
+        _trial(full, "task0__bbb", reward=0.5)
+        _trial(_job(self.root, "sample", "m", planned=1), "task0__ccc", reward=1.0)
+        _trial(_job(self.root, "live", "m", planned=2, finished=False), "task0__ddd", reward=1.0)
+        patcher = patch("scripts.eval.harbor.suites.leaderboards.boards", return_value=[self.BOARD, self.SUBSET])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.workbench = Workbench(data.Library([self.root]))
+
+    def test_a_job_scores_mean_reward_over_finished_trials_counting_invalid_as_zero(self):
+        board = self.workbench.leaderboard(None)
+        self.assertEqual(board["suite"], "terminal-bench-2.1")
+        self.assertEqual(board["task_count"], 89)
+        whole, subset = board["boards"]
+        jobs = {job["name"]: job for job in whole["jobs"]}
+        self.assertEqual(sorted(jobs), ["full", "sample"])
+        self.assertTrue(jobs["full"]["ranked"])
+        self.assertEqual((jobs["full"]["trials"], jobs["full"]["tasks"]), (73, 72))
+        self.assertAlmostEqual(jobs["full"]["score"], 48.5 / 73)
+        self.assertFalse(jobs["sample"]["ranked"])
+        self.assertEqual([job["name"] for job in board["unranked"]], ["sample"])
+
+    def test_a_board_limited_to_some_tasks_scores_only_those(self):
+        subset = self.workbench.leaderboard(None)["boards"][1]
+        jobs = {job["name"]: job for job in subset["jobs"]}
+        self.assertEqual((jobs["full"]["trials"], jobs["full"]["tasks"]), (3, 2))
+        self.assertAlmostEqual(jobs["full"]["score"], 1.5 / 3)
+        self.assertFalse(jobs["sample"]["ranked"])
+
+    def test_a_suite_without_a_published_board_is_not_found(self):
+        self.assertIsNone(self.workbench.leaderboard("aime"))
+
+    def test_an_invalid_trial_counts_zero_even_with_a_reward(self):
+        job = _job(self.root, "rewarded-crash", "m", planned=2)
+        _trial(job, "task0__eee", reward=1.0, exception="NonZeroAgentExitCodeError", stop="api_error")
+        _trial(job, "task1__eee", reward=0.0)
+        jobs = {job["name"]: job for job in Workbench(data.Library([self.root])).leaderboard(None)["boards"][0]["jobs"]}
+        self.assertEqual(jobs["rewarded-crash"]["score"], 0.0)
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())

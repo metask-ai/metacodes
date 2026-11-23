@@ -1125,6 +1125,26 @@ optionally migrating and verifying the current data first (the same copy as
 and takes effect immediately; switching is refused while a run or a profile's queue
 is active.
 
+### Public leaderboards
+
+The 榜单 page (`#/leaderboard/<suite>`, `GET /api/leaderboard?suite=<id>`)
+shows, per suite, the results other agents and models published for the
+same tasks, and where this workbench's jobs land among them. The boards are
+`scripts/eval/harbor/suites/leaderboards.json`: each names the suites whose
+tasks it scored, its source (name, URL, the date it was read, what its score
+means) and its entries (agent or harness, model, score in percent, and the
+standard error, cost per task and date when the source gives them). A board
+may list `tasks`, the part of the suite it scored (the AIME 2024 board on
+`aime`). On each board a finished job of the suite scores the mean reward of
+its finished trials on the board's tasks, an invalid trial counting 0, with
+cost per task as the mean over tasks of each task's mean priced cost; it is
+ranked when it covers at least 80% of those tasks, and a job ranked on no
+board is listed apart. When a board has
+costs, a scatter plots pass rate against cost per task. Published numbers
+come from other harnesses, runtimes, attempt counts and judges, so a rank is
+a reference, not a like-for-like comparison. To refresh a board, edit its
+entries and `retrieved` date.
+
 ### Metric definitions
 
 | Metric | Calculation |

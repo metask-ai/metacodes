@@ -142,6 +142,7 @@ const GoRepo = struct {
 const Timed = struct {
     result: []u8,
     elapsed_ms: i64,
+    finished_ms: i64,
 
     fn deinit(self: Timed) void {
         std.testing.allocator.free(self.result);
@@ -155,7 +156,8 @@ const Timed = struct {
 fn timed(c: *const ToolContext, name: []const u8, args: []const u8) !Timed {
     const start = cc.util_time.nowMs();
     const result = try dispatchOk(c, name, args);
-    return .{ .result = result, .elapsed_ms = cc.util_time.nowMs() - start };
+    const finished = cc.util_time.nowMs();
+    return .{ .result = result, .elapsed_ms = finished - start, .finished_ms = finished };
 }
 
 fn waitUntilNoSilentPath(svc: *Service) !void {
@@ -184,17 +186,59 @@ fn expectFast(t: Timed, label: []const u8) !void {
     }
 }
 
+const ServerStartWatch = struct {
+    svc: *Service,
+    stop: std.atomic.Value(bool) = .init(false),
+    started_ms: ?i64 = null,
+
+    fn run(self: *ServerStartWatch) void {
+        while (!self.stop.load(.acquire)) {
+            if (self.serverStarted()) {
+                self.started_ms = cc.util_time.nowMs();
+                return;
+            }
+            cc.util_time.sleepMs(1);
+        }
+    }
+
+    fn serverStarted(self: *const ServerStartWatch) bool {
+        _ = self.svc.mutex.lock();
+        defer _ = self.svc.mutex.unlock();
+        return self.svc.clients.count() > 0;
+    }
+};
+
+fn expectOneWindowAfterStart(t: Timed, started_ms: ?i64) !void {
+    const started = started_ms orelse {
+        std.debug.print("the language server never started: no client was cached during the first Edit ({d} ms), so the mock gopls did not start or did not answer initialize\n", .{t.elapsed_ms});
+        return error.LanguageServerNeverStarted;
+    };
+    const waited_ms = t.finished_ms - started;
+    if (waited_ms >= 2 * @as(i64, @intCast(WINDOW_MS))) {
+        std.debug.print("first Edit took {d} ms, {d} ms of it after the language server started, with a {d} ms diagnostics window\n", .{ t.elapsed_ms, waited_ms, WINDOW_MS });
+        return error.WaitedMoreThanOneWindow;
+    }
+}
+
 test "L2 #669: a server that never publishes costs one bounded wait, later Edit and Write calls do not wait" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var repo: GoRepo = undefined;
     try repo.setup("--silent");
     defer repo.deinit();
 
-    const first = try repo.edit("func main() {}", "func main() { _ = 1 }");
+    var watch: ServerStartWatch = .{ .svc = repo.svc };
+    const watcher = try std.Thread.spawn(.{}, ServerStartWatch.run, .{&watch});
+    const first = first: {
+        defer {
+            watch.stop.store(true, .release);
+            watcher.join();
+        }
+        break :first try repo.edit("func main() {}", "func main() { _ = 1 }");
+    };
     defer first.deinit();
     try std.testing.expect(std.mem.indexOf(u8, first.result, "\"success\":true") != null);
     try std.testing.expect(!first.hasDiagnostics());
-    try std.testing.expect(first.elapsed_ms < 2 * @as(i64, @intCast(WINDOW_MS)));
+    try expectOneWindowAfterStart(first, watch.started_ms);
 
     const second = try repo.edit("_ = 1", "_ = 2");
     defer second.deinit();
