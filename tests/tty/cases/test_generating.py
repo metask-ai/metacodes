@@ -428,6 +428,21 @@ def test_a_draft_left_when_a_reply_ends_stays_in_the_box_through_the_queued_repl
         a._fail(f"the queued request should carry the queued message only: {sent!r}")
 
 
+def test_backslash_enter_during_a_reply_starts_a_new_line(bin_path):
+    a, requests = _reply_with_keys(
+        bin_path, ["type:DRAFT_A\\", "key:enter", "type:DRAFT_B", "strictsleep:0.5"],
+        idle=IDLE_UNDER_A_MULTILINE_DRAFT)
+    _assert_draft_held_and_nothing_sent(a, requests, ["❯ DRAFT_A", "DRAFT_B"], "\\ then Enter")
+
+
+def test_enter_after_a_backslash_newline_during_a_reply_sends_one_message(bin_path):
+    a, requests = _reply_with_keys(
+        bin_path, ["type:DRAFT_A\\", "key:enter", "type:DRAFT_B", "key:enter"])
+    sent = _second_request_text(a, requests, "Enter after \\ then Enter")
+    if "DRAFT_A\nDRAFT_B" not in sent or "\\" in sent:
+        a._fail(f"the next request did not carry the draft as one two-line message: {sent!r}")
+
+
 def test_ctrl_l_while_generating_resets_the_screen_in_one_frame(bin_path):
     """Ctrl+L during a reply goes through RenderRegion.resetScreen under the
     render lock: the region is erased, ED 2 clears the screen and the region

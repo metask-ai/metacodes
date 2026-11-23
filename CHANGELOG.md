@@ -221,6 +221,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`\` then Enter starts a new line while the model answers** (#757). At
+  the prompt a `\` at the end of a line followed by Enter is a newline, the
+  way Apple Terminal users start one; during a reply Enter queued the draft
+  with the `\` still in it. It is a newline there as well now.
+
 - **What you type while the model answers is still in the box when it ends**
   (#756). Text typed into the input box during a reply and not sent was
   dropped when the reply ended, and the prompt came back empty. It now stays,

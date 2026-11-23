@@ -782,7 +782,8 @@ pub const TuiBackend = struct {
     /// 全部语义)。watcher 据返回 Effect:
     ///   · action != .pass_to_editor → dispatch 已消费(开关 help/overlay/滚动),内部已重画,不动 editor;
     ///   · action == .pass_to_editor → dispatch 未消费,按键类型决定生成期独有语义:
-    ///       - enter   → 入待发送队列 + clear(dispatch 无"入队"概念,故落 pass_to_editor 由此接);
+    ///       - enter   → 行尾 `\` 时续行(同输入期),否则入待发送队列 + clear(dispatch 无"入队"概念,
+    ///                   故落 pass_to_editor 由此接);
     ///       - esc     → 无弹层,中断推理(入队已打的字 + abort);
     ///       - 其余     → 普通编辑键喂 LineEditor(含 Shift+Enter:插换行,同输入期,#456)。
     /// 关键:enter/esc 也经 dispatch 先过一遍 → overlay/help 开着时它们被 dispatch 路由消费
@@ -870,9 +871,15 @@ pub const TuiBackend = struct {
 
         // 走到这:dispatch 未消费该键(pass_to_editor,无弹层激活)。按键类型决定生成期语义。
         switch (key) {
-            // 只有 Enter 入队。Shift+Enter(CSI-u 13;2u、同批到达的 ESC CR、Windows 带 Shift 的
-            // Enter 记录)落到 else,由 LineEditor 插换行,和输入期一样(#456)。
+            // 只有 Enter 入队,行尾是 `\` 时和输入期一样续行(LineEditor.handle)。Shift+Enter(CSI-u
+            // 13;2u、同批到达的 ESC CR、Windows 带 Shift 的 Enter 记录)落到 else,由 LineEditor 插换行,
+            // 和输入期一样(#456)。
             .enter => {
+                if ((ed.handle(.enter) catch return) != .commit) {
+                    self.region.setGenInput(ed.view(), ed.cursor);
+                    self.region.requestGenRedraw();
+                    return;
+                }
                 // 回车 → 入待发送队列(非空才入)+ clear。不立即发。
                 const v = ed.view();
                 const trimmed = std.mem.trim(u8, v, " \t\r\n");
