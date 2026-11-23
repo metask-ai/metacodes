@@ -18,6 +18,13 @@ status, compatibility boundaries, and entry points are defined by
   cost spent on runs that did not pass, cache hit rate and turns per pass. The
   compare page lists them per job and marks the jobs on the cost-pass
   frontier.
+- **Bench task containers can use package mirrors and a shared apt cache.**
+  `container_mirrors` on an SSH executor (`apt`, `pypi`, `conda`, `go`,
+  `rustup`, `npm`) reaches every run's task containers through a Harbor
+  compose overlay. With `apt`, `bench setup` runs apt-cacher-ng on the
+  executor's Docker gateway (port 3142) with that mirror as its Debian and
+  Ubuntu backend, so packages that trials and verifiers install are
+  downloaded once per executor.
 
 - **Bench batches can be renamed and copied.** A batch page has 重命名
   (`POST /api/batch/rename`) and 复制为新批次, which fills the 新建 page with

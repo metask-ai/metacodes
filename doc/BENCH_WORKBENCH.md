@@ -272,6 +272,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12; with an executor's `pypi_index`, prefixed by `env UV_DEFAULT_INDEX=<index>`); the resulting path is saved |
 | Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose and buildx plugins when needed |
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
+| apt 缓存（任务容器） (`ssh` executors) | With `container_mirrors.apt`: builds `metacodes-apt-cache` and runs it on `<metrics_bind>:3142` with `--restart unless-stopped`, then checks that it answers; a running cache with the same mirror is kept (see [Package mirrors and the apt cache](#package-mirrors-and-the-apt-cache-in-task-containers)) |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
@@ -815,6 +816,7 @@ proposes these when its network probe finds those hosts slow or blocked:
 | `pypi_index` | `UV_DEFAULT_INDEX` for setup's Harbor install on the executor only; it does not reach runs or the bundle |
 | `docker_mirrors` | Added to the daemon's `registry-mirrors` by setup (sudo, reload, never restart). They cover Docker Hub images only |
 | `ghcr_mirror` | Before each run, ghcr.io images the selected tasks name (`FROM` lines of their Dockerfiles, `image:` of their compose files, `docker_image` in `task.toml`) that are missing locally are pulled as `<mirror>/<path>` and tagged back to their `ghcr.io/` name; other registries are left alone. A failed pull is logged and Harbor pulls from ghcr.io itself |
+| `container_mirrors` | Package mirrors and the apt cache for the runs' task containers (see [below](#package-mirrors-and-the-apt-cache-in-task-containers)) |
 
 `"egress": "workbench"` builds this path for each run, and only for it:
 
@@ -873,6 +875,56 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
   and every compose service name of the selected tasks.
 - 一键配置's 容器出网（经工作台） step checks the whole path from a
   container on a fresh user-defined network.
+
+### Package mirrors and the apt cache in task containers
+
+`container_mirrors` on an `ssh` executor points every run's task containers
+at package mirrors, and `apt` adds a shared apt cache on the executor, so
+packages that trials and verifiers install (`apt-get install curl`, `pip`,
+`uv`) are fetched from a nearby mirror and, for apt, once per executor:
+
+```json
+"container_mirrors": {
+  "apt": "http://mirrors.aliyun.com",
+  "pypi": "https://mirrors.aliyun.com/pypi/simple/",
+  "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda",
+  "go": "https://goproxy.cn",
+  "rustup": "https://rsproxy.cn",
+  "npm": "https://registry.npmmirror.com"
+}
+```
+
+| Key | In the task container |
+|---|---|
+| `apt` | `/etc/apt/apt.conf.d/99metacodes-apt-cache` sets `Acquire::http::Proxy` to the apt cache, `http://<metrics_bind>:3142`. An `http://` mirror root holding `debian/` and `ubuntu/`; the cache fetches `deb.debian.org` and the Ubuntu archive from there, and other `http` apt sources (`security.ubuntu.com`) from their own hosts. `https` sources are not cached. Only with `egress` = `direct`, since the cache fetches from the executor's own network |
+| `pypi` | `PIP_INDEX_URL` and `UV_DEFAULT_INDEX` |
+| `conda` | `CONDA_CHANNEL_ALIAS=<root>/cloud`, `CONDA_DEFAULT_CHANNELS=<root>/pkgs/main,<root>/pkgs/r` (an Anaconda mirror root) |
+| `go` | `GOPROXY=<url>,direct` |
+| `rustup` | `RUSTUP_DIST_SERVER=<url>`, `RUSTUP_UPDATE_ROOT=<url>/rustup` (crates still come from crates.io) |
+| `npm` | `NPM_CONFIG_REGISTRY` |
+
+Each run uploads `<state_dir>/runs/<name>/mirrors.compose.json` and passes
+it to Harbor as `--extra-docker-compose`: an overlay of Harbor's `main`
+service with those variables and the apt file (an inline compose `config`,
+read-only). The overlay comes after a task's own `docker-compose.yaml` in
+Harbor's compose order, so before staging the run the worker scans the
+suite's compose files, `task.toml` files and Dockerfiles: a variable (or
+`Acquire::http::Proxy`) that any of them names is left out of the overlay
+for that run and the run log says so. Values baked into a prebuilt image
+that the suite's files do not name are still overridden. Builds are not
+affected: `bench pull` builds task images once and Harbor reuses them.
+
+Setup's apt 缓存 step runs the cache: it builds the image
+`metacodes-apt-cache` (apt-cacher-ng on `debian:bookworm-slim`, with the
+mirror as its Debian and Ubuntu backend) and starts the container of the same
+name with `--restart unless-stopped`, published on
+`<metrics_bind>:3142`, with the named volume `metacodes-apt-cache` for the
+packages, then checks that `/acng-report.html` answers. A running container
+already labeled with the same mirror is kept; another mirror replaces it.
+The volume survives that replacement. The cache answers containers on
+Harbor's compose networks the same way the egress forwarder does. Hugging
+Face is not mirrored: `hf-mirror.com` rate-limits (HTTP 429) where the
+executor reaches `huggingface.co` directly.
 
 ### Colima on Apple Silicon
 
