@@ -329,6 +329,8 @@ fn serializeContent(
     // 前缀契约不变)。**不变式**(buildApiMessages 保证):含 reasoning_item 的
     // 消息一定还有别的 block,故这里不会产出空 `[]`。
     var first = true;
+    var tool_images: std.ArrayList(u8) = .empty;
+    defer tool_images.deinit(allocator);
     for (content) |block| {
         if (block == .reasoning_item) continue;
         // thinking 块只回传给声明了回传的方言(DeepSeek 的 Anthropic 端点收无签名的
@@ -372,15 +374,17 @@ fn serializeContent(
                 //   字节与此前手写形态逐字节相同(prompt cache 前缀契约不变)。
                 // 非 vision(如经 Anthropic 网关的 GLM 文本模型,方言返 false)发短
                 // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
-                var image_after: std.ArrayList(u8) = .empty;
-                defer image_after.deinit(allocator);
                 if (dialect_mod.extractImageResult(tr.content)) |img| image: {
                     report.image_results += 1;
-                    if (profile.tool_result_images_as_blocks and try dialect.serializeImagePart(profile, img, &image_after, allocator)) {
-                        try util_json.serializeString(IMAGE_FOLLOWS_NOTE, buf, allocator);
-                        break :image;
+                    const images_mark = tool_images.items.len;
+                    if (profile.tool_result_images_as_blocks) {
+                        try tool_images.append(allocator, ',');
+                        if (try dialect.serializeImagePart(profile, img, &tool_images, allocator)) {
+                            try util_json.serializeString(IMAGE_FOLLOWS_NOTE, buf, allocator);
+                            break :image;
+                        }
+                        tool_images.shrinkRetainingCapacity(images_mark);
                     }
-                    image_after.clearRetainingCapacity();
                     const mark = buf.items.len;
                     try buf.append(allocator, '[');
                     if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
@@ -400,10 +404,6 @@ fn serializeContent(
                     try buf.appendSlice(allocator, ",\"is_error\":true");
                 }
                 try buf.append(allocator, '}');
-                if (image_after.items.len > 0) {
-                    try buf.append(allocator, ',');
-                    try buf.appendSlice(allocator, image_after.items);
-                }
             },
             .image => |img| {
                 // 一等图像内容(issue #10):wire 形态委托方言(Claude=base64 source block)。
@@ -414,6 +414,7 @@ fn serializeContent(
             },
         }
     }
+    try buf.appendSlice(allocator, tool_images.items);
     try buf.append(allocator, ']');
 }
 
@@ -422,7 +423,7 @@ fn serializeContent(
 /// 这里保留别名:`json.zig` 经此再导出给 agent_loop / conversation / session_budget。
 pub const ImageResult = types.ImageBlock;
 
-const IMAGE_FOLLOWS_NOTE = "[image attached in the next content block]";
+const IMAGE_FOLLOWS_NOTE = "[image attached after the tool results]";
 pub const extractImageResult = dialect_mod.extractImageResult;
 
 fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -920,9 +921,31 @@ test "serializeMessagesRequest: a non-Claude vision model gets a tool's image as
     const req = MessagesRequest{ .model = "gpt-5.2", .messages = &.{msg} };
     const body = try serializeMessagesRequest(req, std.testing.allocator);
     defer std.testing.allocator.free(body);
-    const expected = "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"[image attached in the next content block]\"}," ++
-        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}}," ++
-        "{\"type\":\"text\",\"text\":\"next\"}]";
+    const expected = "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"[image attached after the tool results]\"}," ++
+        "{\"type\":\"text\",\"text\":\"next\"}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}}]";
+    try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+}
+
+test "serializeMessagesRequest: parallel tool results keep every tool_result before the images they returned" {
+    const msg = types.ApiMessage{
+        .role = .user,
+        .content = &.{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUFB\"}", .is_error = false } },
+            .{ .tool_result = .{ .tool_use_id = "t2", .content = "ok", .is_error = false } },
+            .{ .tool_result = .{ .tool_use_id = "t3", .content = "{\"type\":\"image\",\"media_type\":\"image/jpeg\",\"data\":\"QkJC\"}", .is_error = false } },
+        },
+    };
+    const req = MessagesRequest{ .model = "glm-5.3-flash", .messages = &.{msg} };
+    var dialect = dialect_mod.dialectFor(.anthropic, req.model);
+    dialect.profileFn = canonicalProjectionProfile;
+    const body = try serializeMessagesRequestWithDialect(req, std.testing.allocator, dialect);
+    defer std.testing.allocator.free(body);
+    const expected = "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"[image attached after the tool results]\"}," ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"content\":\"ok\"}," ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"content\":\"[image attached after the tool results]\"}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"QUFB\"}}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"QkJC\"}}]";
     try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
 }
 
