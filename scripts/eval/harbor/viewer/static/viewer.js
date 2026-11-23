@@ -78,17 +78,17 @@ function measurementCards(s) {
   return [
     metric('一次性完成率', pct(s.one_shot_pass_rate), `${s.counts.pass} 通过 / ${s.valid || 0} 有效 · 95% 区间 ${ciText(s.pass_rate_ci95)}`, true),
     metric('首轮满分率', pct(s.first_pass_rate), `${s.first_passed || 0} 首次满分 / ${s.first_valid || 0} 首次有效 · 无效 ${s.first_invalid || 0}`),
-    metric('任务总 Token', compact(s.total_tokens), `输入含缓存 + 输出 · ${s.token_trials || 0}/${s.trials || 0} 次有数据${s.partial_token_trials ? ' · 含部分记录' : ''}`),
-    metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), `首个请求完整输入 · ${s.initial_token_trials || 0} 次有数据`, false,
+    metric('任务总 Token', compact(s.total_tokens), `${s.token_trials || 0}/${s.trials || 0} 次有数据${s.partial_token_trials ? ' · 含部分记录' : ''}`),
+    metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), `${s.initial_token_trials || 0} 次有数据`, false,
       s.initial_composition_mean ? stackBar(compositionSegments(s.initial_composition_mean), true) : null),
-    metric('TPS（生成）', tps(s.tps), `${s.profiled_requests || 0}/${s.requests || 0} 个请求有计时与输出用量 · 不含工具执行`),
+    metric('TPS（生成）', tps(s.tps), `${s.profiled_requests || 0}/${s.requests || 0} 个请求`),
     metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_samples_ms?.length || 0} 个请求`),
-    metric('估算成本', usd(s.cost_usd), `metacodes 价目表估算 · ${s.cost_trials || 0}/${s.trials || 0} 次有价格数据`),
-    metric('至少通过一次', pct(s.solved_rate), `${s.tasks_solved || 0} / ${s.tasks_attempted || 0} 道题有有效结局`),
-    metric('每题平均成本', usd(s.cost_per_task), `先对每题有价格的有效 trial 取均值，再对 ${s.task_cost_tasks || 0} 道题取均值`),
-    metric('每次通过成本', usd(s.cost_per_pass), '每题平均成本 ÷ 通过率'),
-    metric('未通过的成本占比', pct(s.non_pass_cost_share), `有效 trial 的估算成本里花在未通过上的部分 · 失败 ${usd(s.cost_by_status?.fail)} · 超时 ${usd(s.cost_by_status?.timeout)}`),
-    metric('缓存命中率', pct(s.cache_hit_rate), '缓存 token ÷ 输入 token（含缓存）'),
+    metric('估算成本', usd(s.cost_usd), `${s.cost_trials || 0}/${s.trials || 0} 次有价格`),
+    metric('至少通过一次', pct(s.solved_rate), `${s.tasks_solved || 0} / ${s.tasks_attempted || 0} 道`),
+    metric('每题平均成本', usd(s.cost_per_task), `${s.task_cost_tasks || 0} 道`),
+    metric('每次通过成本', usd(s.cost_per_pass)),
+    metric('未通过的成本占比', pct(s.non_pass_cost_share), `失败 ${usd(s.cost_by_status?.fail)} · 超时 ${usd(s.cost_by_status?.timeout)}`),
+    metric('缓存命中率', pct(s.cache_hit_rate)),
     metric('通过 trial 平均轮数', fixed(s.turns_per_pass), `工具调用 ${fixed(s.tool_calls_per_pass)} 次 · ${s.passed_turn_trials || 0} 个通过 trial 有数据`),
   ];
 }
@@ -187,9 +187,8 @@ function compositionPanel(summary, scopeText) {
   const c = summary.initial_composition_mean;
   const body = c ? h('div', { class: 'panel-body' },
     stackBar(compositionSegments(c)),
-    h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }), `${l} ${compact(c[k])} · ${pct((c[k] || 0) / Math.max(1, partsTotal(c)))}`))),
-    h('p', { class: 'muted', text: `首个模型请求的完整输入按各部分字节占比分摊实测输入 Token · ${summary.initial_composition_trials} 次有组成数据 / ${summary.initial_token_trials || 0} 次有初始 Token` }))
-    : h('div', { class: 'empty', text: '还没有上下文组成数据：计时代理从本版本起记录每个请求中系统提示、工具定义、消息和工具结果的字节数，新运行会自动出现。' });
+    h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }), `${l} ${compact(c[k])} · ${pct((c[k] || 0) / Math.max(1, partsTotal(c)))}`))))
+    : h('div', { class: 'empty', text: '还没有上下文组成数据' });
   return panel('初始上下文窗口组成', scopeText || '均值', body);
 }
 
@@ -288,7 +287,7 @@ async function renderOverview() {
   const metrics = h('section', { class: 'metrics' }, measurementCards(summary),
     metric('作业', String(jobs.length), jobs.filter((j) => j.running).length + ' 个运行中'),
     metric('trial', String(all.trials), all.running + ' 个运行中'),
-    metric('无效', String(all.invalid), '基础设施原因，不计入通过率'));
+    metric('无效', String(all.invalid)));
 
   const profileRows = profiles.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = profileHref(b); } },
     h('td', {}, h('a', { href: profileHref(b), onclick: (e) => e.stopPropagation(), text: profileName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
@@ -303,9 +302,9 @@ async function renderOverview() {
     h('td', { class: 'num', text: when(b.last_run_at) }),
     body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
   const profileHeads = ['评测配置', 'metacodes 版本', '高级功能', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
-  const profilePanel = panel('评测配置', `${profiles.length} 个 · 每个评测配置固定一个 metacodes 版本和一组高级功能，可以反复运行`, h('div', { class: 'table-scroll' }, h('table', {},
+  const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 7 && i <= 9 ? 'num' : null, text: t })))),
-    h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置。', link('#/new', '发起一次评测'), '：选择 metacodes 版本、高级功能和评测集。'))))),
+    h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
   h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
   const compareBtn = h('button', { class: 'button primary', type: 'button', disabled: state.selected.size < 2 || null,
@@ -343,7 +342,7 @@ async function renderOverview() {
     h('thead', {}, h('tr', {}, ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始'].map((t, i) => h('th', { class: i >= 5 ? 'num' : null, text: t })))),
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 14, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
   const loose = runs.filter((r) => !r.profile && !r.batch);
-  const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次（不属于任何评测配置）`,
+  const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次`,
     h('div', { class: 'launches' }, loose.map((r) => h('a', { class: 'launch', href: '#/run/' + r.name },
       h('b', { text: r.name }), h('span', { class: 'muted', text: [r.suite_name, r.model].filter(Boolean).join(' · ') }),
       h('span', { text: RUN_STATUS[r.status] || r.status })))));
@@ -363,7 +362,7 @@ async function renderProfile(id) {
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
     metric('运行', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
-    metric('无效', String(s.counts.invalid), '基础设施原因，不计入通过率'));
+    metric('无效', String(s.counts.invalid)));
 
   const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
@@ -394,8 +393,7 @@ async function renderProfile(id) {
     h('dt', { text: '冻结副本' }), h('dd', { class: 'mono', text: m.bundle || '—' }),
     h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: featuresText(b) }),
     h('dt', { text: '模型' }), h('dd', { text: b.models.join('、') || '—' }),
-    h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })),
-    h('p', { class: 'muted', text: '评测配置固定一个冻结的 metacodes 发行包和一组高级功能；之后重新构建或切换工作台的版本不影响它。可以反复运行，同一模型同一道题的新结果覆盖旧结果，旧结果留在运行历史里。' }));
+    h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })));
 
   const itemRows = [...b.items].reverse().map((item) => {
     const j = item.job; const js = j?.summary;
@@ -412,7 +410,7 @@ async function renderProfile(id) {
       h('td', { class: 'num', text: when(item.queued_at) }),
       h('td', { class: 'mono', text: item.run || '—' }));
   });
-  const items = panel('运行历史', `${b.items.length} 次 · 新的在前 · 排队的评测集依次运行`, h('div', { class: 'table-scroll' }, h('table', {},
+  const items = panel('运行历史', `${b.items.length} 次`, h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业'].map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, itemRows))));
 
@@ -456,7 +454,7 @@ async function renderProfile(id) {
     }) : [h('tr', {}, h('td', { colspan: 11, class: 'empty', text: '没有符合条件的任务' }))]));
   }
   drawTasks();
-  const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道 · 重跑的题显示最新一次运行 · 点开看每次尝试的轨迹、Token 分布和耗时`, h('div', {}, chips, modelChips,
+  const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
   return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), compositionPanel(s, '最新结果均值'), tasks, items);
@@ -595,8 +593,7 @@ async function renderNewRun() {
       ...boxes.map((f) => h('label', { class: 'check' }, f.input, h('span', { text: f.label }), h('small', { class: 'mono muted', text: f.id })))) : null;
   };
   const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: fixed ? '高级功能（评测配置已固定）' : '高级功能（形式化门控默认开启，Preview 默认关闭）' }),
-    featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性'),
-    h('small', { class: 'muted', text: '只对 Harbor 评测集生效；所选发行包须支持这些开关。同一个 metacodes 版本和同一组高级功能总是同一个评测配置。' })) : '';
+    featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性')) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
   const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
 
@@ -617,7 +614,7 @@ async function renderNewRun() {
       const members = suites.filter((s) => s.category === cat.id);
       if (!members.length) return null;
       return h('div', { class: members.length > 2 ? 'suite-group wide' : 'suite-group' },
-        h('div', { class: 'suite-group-head' }, h('b', { text: cat.name }), h('span', { class: 'muted', text: cat.description })),
+        h('div', { class: 'suite-group-head' }, h('b', { text: cat.name })),
         h('div', { class: 'suite-cards' }, members.map((s) => h('button', {
           type: 'button', class: 'suite-card', 'aria-pressed': String(state.suitePick.has(s.id)), 'data-suite': s.id,
           onclick: () => {
@@ -633,7 +630,7 @@ async function renderNewRun() {
     const shown = new Set(setupReasons());
     const reasons = comboReasons(s).filter((text) => !shown.has(text));
     const remove = h('button', { type: 'button', class: 'button', onclick: () => { state.suitePick.delete(s.id); drawPicker(); drawBoxes(); syncSubmit(); } }, '移出');
-    const head = h('div', { class: 'suite-box-head' }, h('span', { class: 'muted', text: s.description }), remove);
+    const head = h('div', { class: 'suite-box-head' }, h('span', {}), remove);
     const box = h('fieldset', {}, h('legend', { text: `${s.name} · ${(c.categories || []).find((x) => x.id === s.category)?.name || ''}` }), head,
       reasons.length ? h('div', { class: 'callout' }, reasons.map((text) => h('p', { text }))) : null);
     if (!entry) { box.append(h('div', { class: 'empty', text: '读取任务列表…' })); return box; }
@@ -667,13 +664,13 @@ async function renderNewRun() {
           choose(pool.slice(0, n));
         } }, '抽取')),
       h('button', { type: 'button', class: 'button', onclick: () => choose([]) }, '清空'), count),
-      list, h('small', { class: 'muted', text: `每个评测集 1–${s.max_tasks} 道；并发不超过 ${s.max_concurrency}。` }));
+      list);
     drawList();
     return box;
   }
   function drawBoxes() {
     boxes.replaceChildren(...(state.suitePick.size ? [...state.suitePick.entries()].map(([id, entry]) => suiteBox(byId.get(id), entry))
-      : [h('div', { class: 'empty', text: '在上面点选一个或多个评测集。' })]));
+      : [h('div', { class: 'empty', text: '选择评测集' })]));
   }
   async function loadTasks(id) {
     const wanted = state.executor;
@@ -700,11 +697,10 @@ async function renderNewRun() {
   attempts.addEventListener('input', syncSubmit);
 
   if (executorsList.length) {
-    form.append(h('label', { class: 'field' }, h('span', { text: '执行机器' }), executor,
-      h('small', { text: '运行 Harbor 和 Docker 的机器。SSH 执行机器的结果会同步回本机作业目录并写入评测数据库。' })));
+    form.append(h('label', { class: 'field' }, h('span', { text: '执行机器' }), executor));
   }
   if (draft.from) {
-    const notes = [`在评测配置「${draft.from}」上运行：版本和高级功能已固定，评测集、题目和参数按上次填好，可以修改。`];
+    const notes = [`在评测配置「${draft.from}」上运行`];
     if (modelMissing) notes.push(`上次的模型 ${draft.model} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
@@ -714,9 +710,9 @@ async function renderNewRun() {
   form.append(
     h('div', { class: 'form-row' },
       h('div', { class: 'field' }, h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), bundle),
-        h('small', { text: fixed ? '评测配置创建时已按内容摘要复制并锁定。' : bundles.length ? '第一次使用时按内容摘要复制并锁定这个发行包；之后重新构建或切换版本不影响它。' : '还没有可用的 Linux 发行包，请先运行一键配置。' }),
+        fixed || bundles.length ? null : h('small', { text: '还没有可用的 Linux 发行包，请先运行一键配置。' }),
         c.can_run && !fixed ? h('div', {}, commitToggle) : null),
-      fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name, h('small', { text: '只在第一次创建这个评测配置时使用；不填则用编号。' }))),
+      fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name)),
     fixed ? null : commitBox,
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('label', { class: 'field' }, h('span', { text: '模型' }), model,
@@ -726,9 +722,9 @@ async function renderNewRun() {
       c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
-      h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency, h('small', { text: '每个评测集按自己的上限截断。' }))),
+      h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
     features,
-    h('p', { class: 'muted', text: '评测会调用所选模型。各评测集依次运行；之后可在评测配置页持续查看进度、逐任务轨迹、Token 分布和耗时，重跑的题覆盖旧结果。' }), feedback, submit);
+    feedback, submit);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     submit.disabled = true;
@@ -759,12 +755,8 @@ async function renderNewRun() {
   function drawNotes() {
     const reasons = setupReasons();
     const notes = [...reasons, ...(c.warnings || [])];
-    for (const id of state.suitePick.keys()) {
-      const s = byId.get(id);
-      if (s && s.judge) notes.push(s.name + '：' + judgeText(s.judge) + '；分数与使用其他评委（如官方 openai/gpt-4o-mini）的结果不可直接比较');
-    }
     if (!suites.length) notes.push(...(c.reasons || []));
-    if (!c.can_run) notes.push('当前服务为只读模式（未用 metacodes bench 启动），不能发起评测。');
+    if (!c.can_run) notes.push('只读模式，不能发起评测');
     const actions = [];
     if (c.can_run && reasons.length) {
       actions.push(h('button', { type: 'button', class: 'button primary', onclick: () => startSetup(false) }, '一键配置'),
@@ -802,8 +794,7 @@ async function renderNewRun() {
         h('div', { class: 'panel-body run-state' },
           login.verification_uri ? h('p', {}, '在自己的浏览器打开 ',
             h('a', { href: login.verification_uri, target: '_blank', rel: 'noopener noreferrer', text: login.verification_uri }),
-            ' 并输入代码 ', h('b', { class: 'mono', text: login.user_code || '' })) : h('p', { class: 'muted', text: '正在获取设备码…' }),
-          h('p', { class: 'muted', text: '工作台只显示设备码，不接触密码。确认后页面会刷新模型列表。' }))));
+            ' 并输入代码 ', h('b', { class: 'mono', text: login.user_code || '' })) : h('p', { class: 'muted', text: '正在获取设备码…' }))));
     }
     if (latest) {
       const rows = (latest.steps || []).map((step) => h('details', { class: 'setup-step', 'data-key': 'setup-' + step.id },
@@ -871,7 +862,6 @@ async function renderNewRun() {
     if (running) state.buildWatch = latest.id;
   }
   commitBox.append(
-    h('p', { class: 'muted', text: '列出源码仓库的提交，按时间选择；编译在所选执行机器的节点上进行（需要它的 Docker），同一个提交只编译一次，编好后出现在 metacodes 版本里。' }),
     h('div', { class: 'task-tools' }, h('span', { text: '分支' }), branch, h('span', { text: '截止到' }), until,
       h('button', { type: 'button', class: 'button', onclick: drawCommits }, '查询'),
       refInput, h('button', { type: 'button', class: 'button', onclick: () => { if (refInput.value.trim()) startBuild(refInput.value.trim()); } }, '编译这个版本')),
@@ -891,16 +881,15 @@ async function renderNewRun() {
     h('thead', {}, h('tr', {}, h('th', {}, '模型组'), h('th', {}, '凭证状态'))), h('tbody', {}, groupRows)));
   const groups = groupRows.length ? panel('账号可选模型组', `${groupRows.length} 个`,
     h('div', { class: 'panel-body' },
-      h('p', { class: 'muted', text: '模型下拉框合并了已有 Key 的模型目录。其他可选组需要先在 Metask 账号中配置对应 Key，刷新后自动加入。' }),
       groupTable)) : null;
   return h('div', {}, callout, setupBox,
-    panel('发起评测', '评测配置 = 冻结的 metacodes 版本 + 高级功能 · 多个评测集依次运行 · 独立容器 · 完整轨迹 · 自动判分', form), groups);
+    panel('发起评测', null, form), groups);
 }
 
 async function renderRun(name) {
   const run = await api('/api/run?name=' + encodeURIComponent(name));
   let results;
-  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建作业；进度和逐题结果将在这里自动出现。' }); }
+  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建作业' }); }
   state.live = ['queued', 'starting', 'running', 'cancelling'].includes(run.status);
   navCurrent('overview');
   $('#title').textContent = RUN_STATUS[run.status] || run.status;
@@ -917,7 +906,7 @@ async function renderRun(name) {
   } }, '复制结果链接');
   const summary = h('div', { class: 'panel-body run-state' },
     h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}${run.judge ? ' · ' + judgeText(run.judge) : ''}` }),
-    h('p', { class: 'muted', text: run.error || (state.live ? '运行中，页面每 10 秒更新。' : '执行已结束，逐题结果和轨迹已保留。') }),
+    run.error ? h('p', { class: 'muted', text: run.error }) : null,
     h('a', { class: 'mono', href: url, text: url }));
   const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
   return h('div', {}, panel('运行状态', RUN_STATUS[run.status], summary, h('div', { class: 'header-actions' }, copy, stop)), log, results);
@@ -952,10 +941,10 @@ async function renderJob(name) {
   const s = job.summary;
   const causes = Object.entries(s.invalid_causes).map(([k, v]) => `${k} ${v}`).join(' · ');
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
-    metric('平均 reward', s.mean_reward === null ? '—' : s.mean_reward.toFixed(2), '只算有效 trial'),
+    metric('平均 reward', s.mean_reward === null ? '—' : s.mean_reward.toFixed(2)),
     metric('完成', `${s.trials - s.counts.running} / ${job.planned}`, job.running ? '运行中' : '已结束 · ' + dur(job.wall_s)),
     metric('无效', String(s.counts.invalid), causes || '无'),
-    metric('空回复结束', String(s.empty_final), '以空回复收尾的 trial（harness 信号）'),
+    metric('空回复结束', String(s.empty_final)),
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
@@ -1008,8 +997,7 @@ async function renderJob(name) {
   }
   drawRows();
 
-  const keys = h('div', { class: 'panel-body' }, PHASES.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'p-' + k }), l)),
-    h('span', { class: 'faint', text: '时间分段条按本作业最长 trial 归一' }));
+  const keys = h('div', { class: 'panel-body' }, PHASES.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'p-' + k }), l)));
   const table = h('div', {}, h('div', { class: 'panel-body toolbar' }, filters, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, head), tbody)), keys);
   const csv = h('a', { class: 'button', href: '/api/job.csv?name=' + encodeURIComponent(job.name), text: '下载 CSV' });
@@ -1031,7 +1019,7 @@ function keys(items) { return h('div', { class: 'legend keys' }, items.map(([cls
 
 function tokenPanel(t) {
   const reqs = t.requests || [];
-  if (!reqs.length) return panel('Token 分布', null, h('div', { class: 'empty', text: '没有逐请求数据：这次运行没有经过计时代理（历史运行），只有上方的总量。' }));
+  if (!reqs.length) return panel('Token 分布', null, h('div', { class: 'empty', text: '没有逐请求数据' }));
   const withParts = reqs.some((r) => r.composition);
   const title = (r) => [`请求 #${r.seq}${r.offset_s !== null && r.offset_s !== undefined ? ' · +' + dur(r.offset_s) : ''}`,
     `输入 ${int(r.input_tokens)}（缓存 ${int(r.cache_tokens)}）· 输出 ${int(r.output_tokens)}`,
@@ -1057,10 +1045,9 @@ function tokenPanel(t) {
     h('td', { class: 'num', text: r.complete ? String(r.http_status ?? '') : `${r.http_status ?? '—'} 未完成` })));
   return panel('Token 分布', `${reqs.length} 个模型请求 · 输入 ${compact(sum('input_tokens'))}（缓存 ${compact(sum('cache_tokens'))}）· 输出 ${compact(sum('output_tokens'))} · 峰值上下文 ${compact(peak)}`,
     h('div', { class: 'panel-body' },
-      h('p', { class: 'muted', text: withParts ? '每列一个模型请求：该次请求的完整输入上下文，按组成部分分色（按字节占比分摊实测输入 Token）。' : '每列一个模型请求的输入上下文（深色为缓存命中）。这次运行没有记录组成。' }),
       context, withParts ? keys(PARTS.map(([k, l]) => ['c-' + k, l])) : keys([['t-cached', '缓存命中'], ['t-input', '未缓存输入']]),
-      withParts ? h('div', {}, h('p', { class: 'muted', text: '缓存命中（深色）/ 未缓存输入：' }), columns(cache, true)) : null,
-      h('p', { class: 'muted', text: '输出 Token：' }), outputs,
+      withParts ? h('div', {}, h('p', { class: 'muted', text: '缓存命中 / 未缓存输入' }), columns(cache, true)) : null,
+      h('p', { class: 'muted', text: '输出 Token' }), outputs,
       last && last.composition ? h('div', {}, h('p', { class: 'muted', text: `最后一个请求的上下文组成（${int(last.input_tokens)} tok）：` }), stackBar(compositionSegments(last.composition)),
         keys(PARTS.map(([k, l]) => ['c-' + k, `${l} ${compact(last.composition[k])}`]))) : null,
       h('details', { class: 'call', 'data-key': 'requests' }, h('summary', { text: '逐请求明细' }),
@@ -1077,11 +1064,10 @@ function timePanel(t) {
   const agent = split.agent_s;
   const segs = [['t-model', split.model_s, '等待模型'], ['t-tool', split.tool_s, '执行工具'], ['t-other', split.other_s, '其他（harness、I/O）']];
   const agentBlock = agent !== null && agent !== undefined && (split.model_s !== null || split.tool_s !== null) ? h('div', {},
-    h('p', { class: 'muted', text: `agent 阶段 ${dur(agent)} 拆分：` }),
+    h('p', { class: 'muted', text: `agent ${dur(agent)}` }),
     stackBar(segs.map(([c, v, l]) => [c, v || 0, l])),
-    keys(segs.map(([c, v, l]) => [c, `${l} ${dur(v)}${agent ? ' · ' + pct((v || 0) / agent) : ''}`])),
-    h('p', { class: 'faint', text: `模型时间为 ${split.requests} 个请求的总用时（含排队与网络）；工具时间为 ${split.tool_calls} 次调用的实测执行时间。并行工具调用时两者之和可能超过阶段时长。` }))
-    : h('p', { class: 'muted', text: 'agent 阶段没有逐请求或逐工具计时，无法再拆分。' });
+    keys(segs.map(([c, v, l]) => [c, `${l} ${dur(v)}${agent ? ' · ' + pct((v || 0) / agent) : ''}`])))
+    : null;
   const timing = t.tool_timing || [];
   const maxTool = Math.max(1, ...timing.map((x) => x.total_ms || 0));
   const tools = timing.length ? h('div', { class: 'table-scroll' }, h('table', {},
@@ -1103,14 +1089,14 @@ function trialBody(t) {
   const r = t.row;
   const metrics = h('section', { class: 'metrics' },
     h('div', { class: 'metric lead' }, h('span', { text: '结局' }), h('strong', {}, badge(r.status)), h('small', { text: r.cause || (r.reward === null ? '' : 'reward ' + r.reward) })),
-    metric('测试', r.tests ? `${r.tests.passed}/${r.tests.total}` : '—', '判分脚本的测试用例'),
+    metric('测试', r.tests ? `${r.tests.passed}/${r.tests.total}` : '—'),
     metric('轮数 / 工具调用', `${int(r.turns)} / ${int(r.tool_calls)}`, '停止原因 ' + (r.stop_reason || '—')),
     metric('任务总 Token', int(r.total_tokens), `输入 ${int(r.input_tokens)}（含缓存）+ 输出 ${int(r.output_tokens)}${r.tokens_partial ? ' · 部分记录' : ''}`),
-    metric('初始 Token', int(r.initial_input_tokens), '首个模型请求的完整输入上下文', false,
+    metric('初始 Token', int(r.initial_input_tokens), null, false,
       r.initial_composition ? stackBar(compositionSegments(r.initial_composition), true) : null),
-    metric('TPS（生成）', tps(r.tps), '输出 Token / 首输出至响应结束的生成秒数'),
+    metric('TPS（生成）', tps(r.tps)),
     metric('TTFT（均值）', ttft(r.ttft_ms), `P50 ${ttft(r.ttft_p50_ms)} · P95 ${ttft(r.ttft_p95_ms)}`),
-    metric('估算成本', usd(r.cost_usd), 'metacodes 价目表估算，非账单'),
+    metric('估算成本', usd(r.cost_usd)),
     metric('用时', dur(r.elapsed_s), PHASES.map(([k, l]) => `${l} ${dur(r.phases[k])}`).join(' · ')));
   const parts = [metrics];
   if (t.exception_message) parts.push(h('div', { class: 'callout', text: `${r.exception}: ${t.exception_message}` }));
@@ -1151,7 +1137,7 @@ function trialBody(t) {
     }
     return h('div', { class: 'step' }, h('div', { class: 'step-src' }, h('b', { text: s.source === 'agent' ? 'agent' : s.source === 'user' ? '任务' : s.source }), '#' + s.id), body);
   });
-  parts.push(panel('轨迹', `${t.steps.length} 步`, h('div', { class: 'panel-body timeline' }, steps.length ? steps : h('div', { class: 'empty', text: '还没有轨迹（trial 结束后才会写出）' }))));
+  parts.push(panel('轨迹', `${t.steps.length} 步`, h('div', { class: 'panel-body timeline' }, steps.length ? steps : h('div', { class: 'empty', text: '还没有轨迹' }))));
   parts.push(h('div', { class: 'grid-2' },
     panel('判分输出', '末尾', h('div', { class: 'panel-body' }, t.verifier_output ? h('pre', { class: 'block', text: t.verifier_output }) : h('div', { class: 'empty', text: '无' }))),
     panel('metacodes stderr', '末尾', h('div', { class: 'panel-body' }, t.stderr ? h('pre', { class: 'block', text: t.stderr }) : h('div', { class: 'empty', text: '无' })))));
@@ -1175,7 +1161,7 @@ async function renderCompare(names) {
   crumbs([{ text: '看板', href: '#/' }, { text: '对比' }]);
   if (names.length < 2) {
     state.live = false;
-    return panel('对比', null, h('div', { class: 'empty', text: '在总览里勾选两个以上的作业，再点「对比所选」。' }));
+    return panel('对比', null, h('div', { class: 'empty', text: '在看板勾选两个以上的作业' }));
   }
   const jobs = await Promise.all(names.map((n) => api('/api/job?name=' + encodeURIComponent(n))));
   state.live = jobs.some((j) => j.running);
@@ -1188,7 +1174,7 @@ async function renderCompare(names) {
   const tasks = [...new Set(jobs.flatMap((j) => j.rows.map((r) => r.task)))].sort();
   const common = tasks.filter((t) => byJob.every((m) => m.has(t) && ['pass', 'partial', 'fail', 'timeout'].includes(m.get(t).status)));
   const metrics = h('section', { class: 'metrics' },
-    metric('共同首次有效题', String(common.length), '每个作业的首次执行都有有效结局', true),
+    metric('共同首次有效题', String(common.length), null, true),
     ...jobs.map((j, i) => metric(j.model || j.name, pct(common.length ? common.filter((t) => byJob[i].get(t).status === 'pass').length / common.length : null),
       `${j.name} · 共同题首次满分率`)));
   const rows = tasks.map((task) => {
@@ -1206,7 +1192,7 @@ async function renderCompare(names) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'matrix' },
     h('thead', {}, h('tr', {}, h('th', { text: '任务' }), jobs.map((j) => h('th', { class: 'center' }, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name }))))),
     h('tbody', {}, rows)));
-  return h('div', {}, metrics, costPassPanel(jobs, common), panel('逐题对比', '首次执行成绩 · 重跑不回填 · 深色行表示结局不同', table));
+  return h('div', {}, metrics, costPassPanel(jobs, common), panel('逐题对比', null, table));
 }
 function commonCostPass(job, tasks) {
   if (!tasks.length) return null;
@@ -1240,7 +1226,7 @@ function costPassPanel(jobs, common) {
       h('td', { text: frontier ? '是' : point ? '' : '—' }));
   });
   const heads = ['作业', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '共同题通过率 / 成本', '成本-通过率前沿'];
-  return panel('成本与通过率', `前沿只在 ${common.length} 道共同首次有效题上判：没有其他作业在这些题上同时更便宜且通过率更高；某题缺价格的作业不参与 · 参考 FrontierHarness Eval v1.1`,
+  return panel('成本与通过率', `${common.length} 道共同题`,
     h('div', { class: 'table-scroll' }, h('table', {},
       h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 0 || i === heads.length - 1 ? null : 'num', text: t })))),
       h('tbody', {}, rows))));
@@ -1353,7 +1339,7 @@ function costScatter(rows, focus) {
   const legend = h('div', { class: 'legend keys scatter-legend' }, [...new Map(points.map((r) => [rowName(r), r])).values()].map((r) =>
     h('span', { class: 'key', onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null) }, markOf(r), rowName(r))));
   return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '通过率' }), plot,
-    h('div', { class: 'axis-x', text: '每题平均成本（对数坐标）· 橙线为成本-通过率前沿' })));
+    h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
 function focusHub() {
   const listeners = [];
@@ -1379,7 +1365,7 @@ function leaderCards(rows, published, focus, rowNodes) {
     card('通过率最高', best, score(best?.score), best ? `${best.harness} · ${best.model || '—'}` : ''),
     card('成本最低', cheapest, usd(cheapest?.cost_per_task_usd), cheapest ? `${cheapest.harness} · ${cheapest.model || '—'} · ${score(cheapest.score)}` : ''),
     ours ? card('我们的最好名次', ours, `${ours.rank} / ${published + 1}`, `${ours.model || ours.ours.name} · ${score(ours.score)}`)
-      : metric('我们的名次', '—', '还没有可排名的作业', false));
+      : metric('我们的名次', '—'));
 }
 function boardPanel(board, jobs, suiteName) {
   const key = board.suites.join(',') + '|' + board.title;
@@ -1393,8 +1379,7 @@ function boardPanel(board, jobs, suiteName) {
       models.map((m) => h('option', { value: m, selected: m === model, text: m === board.default_model ? `${m}（汇总）` : m })))) : null;
   const head = h('div', { class: 'board-source' },
     h('a', { href: src.url, target: '_blank', rel: 'noopener noreferrer', text: src.name }),
-    h('span', { class: 'muted', text: ` · 读取于 ${src.retrieved} · ${src.metric}` }),
-    src.notes ? h('p', { class: 'muted', text: src.notes }) : null);
+    h('span', { class: 'muted', text: ` · ${src.retrieved}` }));
   const top = Math.max(...rows.map((r) => r.score), 1);
   const rowNodes = new Map(rows.map((r) => [r, h('tr', { class: r.ours ? 'ours link' : null, tabindex: 0,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
@@ -1425,14 +1410,12 @@ async function renderLeaderboard(suiteId) {
   const tabs = h('div', { class: 'chips' }, d.suites.map((s) => h('a', { class: 'chip', href: '#/leaderboard/' + encodeURIComponent(s.suite),
     'aria-pressed': String(s.suite === d.suite), text: s.suite_name })));
   const partial = d.jobs.filter((j) => !j.ranked);
-  const note = h('div', { class: 'callout', text: `公开成绩来自各榜单自己的 harness、运行环境、尝试次数和判分设置，与工作台的运行条件不同，名次只作参考。我们的作业取已结束、有效题覆盖本评测集至少 ${Math.round(d.ranked_coverage * 100)}%（${d.task_count} 题）的，分数为通过率；选了具体模型时只放同一模型的作业。悬停点或行会高亮它，并把被它在成本和通过率上同时超过的点变灰。` });
-  const rest = partial.length ? panel('题目不足、不参与排名的作业', `有效题少于 ${Math.ceil(d.ranked_coverage * d.task_count)} 道`, h('div', { class: 'table-scroll' }, h('table', {},
+  const rest = partial.length ? panel('未参与排名的作业', null, h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, ['作业', '模型', '有效题', '通过率'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
     h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', { text: j.name }), h('td', { text: j.model || '—' }),
       h('td', { class: 'num', text: `${j.summary.tasks_attempted} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.summary.pass_rate, 1) }))))))) : null;
-  const empty = d.jobs.some((j) => j.ranked) ? null : h('div', { class: 'callout', text: `还没有可以排名的 ${d.suite_name} 作业：在「评测」页跑完整个评测集后，这里会出现我们的位置。` });
-  return h('div', {}, tabs, note, empty, d.boards.map((b) => boardPanel(b, d.jobs, d.suite_name)), rest);
+  return h('div', {}, tabs, d.boards.map((b) => boardPanel(b, d.jobs, d.suite_name)), rest);
 }
 
 // ------------------------------------------------------------ settings (database)
@@ -1454,7 +1437,7 @@ async function renderSettings() {
     h('dt', { text: '同步的作业目录' }), h('dd', { class: 'mono', text: (st.jobs_dirs || []).join('\n') || '—' }),
     st.records_dir ? h('dt', { text: '启动记录目录' }) : null, st.records_dir ? h('dd', { class: 'mono', text: st.records_dir }) : null,
     st.config_path ? h('dt', { text: '配置文件' }) : null, st.config_path ? h('dd', { class: 'mono', text: st.config_path }) : null),
-    h('p', { class: 'muted', text: '页面从评测数据库读取：Harbor 作业目录中的成绩、逐次轨迹、判分日志、请求计时（.bench-metrics/）和评测配置记录都会同步进来。首次满分率只看每道题的首次执行，重跑成绩不回填；基础设施无效项单列。' })));
+));
 
   const configured = st.configured || { backend: 'sqlite', path: st.default_sqlite || '' };
   let backend = configured.backend === 'postgres' ? 'postgres' : 'sqlite';
@@ -1469,10 +1452,10 @@ async function renderSettings() {
   const migrate = h('input', { type: 'checkbox' });
   migrate.checked = true;
   const result = h('div', { class: 'result', role: 'status' });
-  const sqliteFields = h('label', { class: 'field' }, h('span', { text: 'SQLite 文件' }), path, h('small', { text: '相对路径以工作台配置目录为基准；不存在时切换时新建。默认：' + (st.default_sqlite || '') }));
+  const sqliteFields = h('label', { class: 'field' }, h('span', { text: 'SQLite 文件' }), path);
   const pgFields = h('div', { class: 'stack' },
-    h('label', { class: 'field' }, h('span', { text: 'PostgreSQL DSN' }), dsn, h('small', { text: '不要在 DSN 里写密码。需要先安装 psycopg' + (st.psycopg ? '（已安装）' : '（未安装，可在新建页运行一键配置）') })),
-    h('label', { class: 'field' }, h('span', { text: '密码环境变量（可选）' }), passwordEnv, h('small', { text: '执行服务启动时的环境变量名；也可以用 PGPASSWORD 或 ~/.pgpass。' })));
+    h('label', { class: 'field' }, h('span', { text: 'PostgreSQL DSN' }), dsn, st.psycopg ? null : h('small', { text: '未安装 psycopg，可在新建页运行一键配置' })),
+    h('label', { class: 'field' }, h('span', { text: '密码环境变量（可选）' }), passwordEnv));
   function draw() { sqliteFields.hidden = backend !== 'sqlite'; pgFields.hidden = backend !== 'postgres'; }
   function target() {
     if (backend === 'sqlite') return { backend: 'sqlite', path: path.value.trim() };
@@ -1505,13 +1488,12 @@ async function renderSettings() {
   const applyBtn = h('button', { type: 'button', class: 'button primary', onclick: (e) => act('apply', e.currentTarget) }, '保存并切换');
   draw();
   const form = st.can_edit ? h('div', { class: 'settings-form' },
-    h('div', { class: 'radio-row' }, radio('sqlite', 'SQLite（单机文件）'), radio('postgres', 'PostgreSQL（团队共享）')),
+    h('div', { class: 'radio-row' }, radio('sqlite', 'SQLite'), radio('postgres', 'PostgreSQL')),
     sqliteFields, pgFields,
-    h('label', { class: 'check' }, migrate, '把当前数据库的数据迁移到新数据库（逐表复制并校验，可重复执行）'),
-    h('div', { class: 'header-actions' }, testBtn, applyBtn), result,
-    h('p', { class: 'muted', text: '有评测运行时不能切换。切换后新数据写入新数据库；不勾选迁移时，作业目录仍会同步进新库，但只存在于旧库的数据不会出现。命令行等价操作：metacodes bench db migrate --to <目标> --switch' }))
-    : h('div', { class: 'empty', text: '当前服务为只读模式（未用 metacodes bench 启动），不能修改数据库。' });
-  return h('div', {}, current, panel('配置数据库', '工作台配置中的 store', form));
+    h('label', { class: 'check' }, migrate, '迁移当前数据'),
+    h('div', { class: 'header-actions' }, testBtn, applyBtn), result)
+    : h('div', { class: 'empty', text: '只读模式' });
+  return h('div', {}, current, panel('配置数据库', null, form));
 }
 
 // ------------------------------------------------------------ providers
@@ -1529,7 +1511,7 @@ async function renderProviders() {
   crumbs([{ text: '看板', href: '#/' }, { text: '用 URL + API Key 导入评测用的模型' }]);
   let list;
   try { list = await api('/api/providers'); } catch (e) {
-    return h('div', { class: 'empty', text: e.message || '当前服务为只读模式（未用 metacodes bench 启动），不能管理 Provider。' });
+    return h('div', { class: 'empty', text: e.message || '只读模式' });
   }
   const protocols = list.protocols || {};
   const result = h('div', { class: 'result', role: 'status' });
@@ -1560,7 +1542,7 @@ async function renderProviders() {
       i ? null : h('button', { type: 'button', class: 'button', onclick: (e) => remove(e.currentTarget, p.id) }, '删除')))));
   const table = rows.length ? h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, h('th', {}, 'Provider'), h('th', {}, '地址'), h('th', {}, '模型'), h('th', {}, '探测'), h('th', {}, ''))),
-    h('tbody', {}, rows))) : h('div', { class: 'empty', text: '还没有导入 Provider。' });
+    h('tbody', {}, rows))) : h('div', { class: 'empty', text: '还没有导入 Provider' });
 
   const id = h('input', { type: 'text', required: true, maxlength: 32, pattern: '[a-z0-9][a-z0-9_\\-]{0,31}', placeholder: 'my-gateway', 'aria-label': 'Provider 标识' });
   const name = h('input', { type: 'text', maxlength: 80, placeholder: '例如：My Gateway', 'aria-label': '显示名称' });
@@ -1576,13 +1558,13 @@ async function renderProviders() {
   const submit = h('button', { type: 'submit', class: 'button primary' }, '导入');
   const form = h('form', { class: 'settings-form' },
     h('div', { class: 'form-row' },
-      h('label', { class: 'field' }, h('span', { text: 'Provider 标识' }), id, h('small', { text: '模型在下拉框里显示为 <标识>/<模型>。小写字母、数字、- 和 _。' })),
+      h('label', { class: 'field' }, h('span', { text: 'Provider 标识' }), id),
       h('label', { class: 'field' }, h('span', { text: '显示名称（可选）' }), name)),
-    h('label', { class: 'field' }, h('span', { text: 'Base URL' }), baseUrl, h('small', { text: 'http(s)://主机 或 http(s)://主机/v1；粘贴完整的 /chat/completions 等地址也可以。' })),
+    h('label', { class: 'field' }, h('span', { text: 'Base URL' }), baseUrl),
     h('div', { class: 'form-row' },
       h('label', { class: 'field' }, h('span', { text: '协议' }), protocol),
       h('label', { class: 'field' }, h('span', { text: '认证' }), auth)),
-    h('label', { class: 'field' }, h('span', { text: 'API Key' }), key, h('small', { text: '只保存在工作台机器的私有文件里（0600），页面和评测容器都拿不到；评测请求经凭据代理转发。覆盖已有 Provider 时留空沿用原 Key。' })),
+    h('label', { class: 'field' }, h('span', { text: 'API Key' }), key),
     h('label', { class: 'field' }, h('span', { text: '模型（可选）' }), models),
     h('label', { class: 'check' }, replace, '覆盖同标识的 Provider'),
     h('label', { class: 'check' }, probeAfter, '导入后立即探测第一个模型（真实发送一次请求）'),
@@ -1608,9 +1590,8 @@ async function renderProviders() {
   });
   return h('div', {},
     panel('已导入的 Provider', `${(list.providers || []).length} 个`, h('div', { class: 'panel-body' },
-      h('p', { class: 'muted', text: '这些模型出现在发起评测的模型下拉框里，和 Metask 账号模型并列。探测会真实发送一次请求：让模型原样返回一个随机字符串，返回一致才算通过。导入的 Provider 不支持 WorkBuddy；带 LLM 评委的评测集（GAIA2）在 Metask 认证下不可用（评委会被转发到导入的上游），在 --auth provider 下评委读取执行机器的环境变量，可以运行。' }),
       table, result)),
-    panel('导入 Provider', 'URL + API Key', form));
+    panel('导入 Provider', null, form));
 }
 
 // ------------------------------------------------------------ refresh loop
