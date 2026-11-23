@@ -42,7 +42,8 @@ from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, REPO, RotatingGateway, gaia2_dataset, node_script,
-                                                     offline_hugging_face, session_fixture, wait_run)
+                                                     offline_hugging_face, session_fixture, stop_batches_and_workers,
+                                                     wait_run)
 
 FAKES = r'''
 import json, os, shutil, subprocess, sys, time
@@ -767,6 +768,7 @@ class SshRunTest(SetupFixture):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
+        self.addCleanup(stop_batches_and_workers, manager)
         return manager, cli.Client(f"http://127.0.0.1:{http.server_address[1]}/"), calls
 
     def request(self):
