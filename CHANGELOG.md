@@ -12,6 +12,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A bench profile can measure teamwork.** The `teamwork` preview feature
+  runs each Harbor task through `metacodes teamwork run`: task containers get
+  the permissions bubblewrap needs, a directory without a commit gets a
+  snapshot commit, the dollar cap follows the task's difficulty and the
+  agent timeout triples. A run in which no implementer seat finished counts
+  as invalid. It runs alone and only on SSH executors; the bench node
+  protocol is now 4 (rerun `metacodes bench setup --executor <name>`).
+
 - **A bench profile runs several models at once.** The 评测 page selects
   several models (`models` in `POST /api/profiles/run`), queuing every
   dataset once per model, and the profile page compares the models' latest

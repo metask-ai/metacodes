@@ -248,6 +248,19 @@ class SshExecutor:
 Executor = Union[LocalExecutor, SshExecutor]
 
 
+def with_teamwork(overlay: Optional[Dict], features) -> Optional[Dict]:
+    """The run's compose overlay, with the container permissions bubblewrap
+    needs on Harbor's `main` service when the run uses teamwork."""
+    from scripts.eval.harbor.command import TEAMWORK, TEAMWORK_CONTAINER
+    if TEAMWORK not in features:
+        return overlay
+    overlay = json.loads(json.dumps(overlay or {}))
+    main = overlay.setdefault("services", {}).setdefault("main", {})
+    for key, values in TEAMWORK_CONTAINER.items():
+        main[key] = list(main.get(key) or []) + [v for v in values if v not in (main.get(key) or [])]
+    return overlay
+
+
 def parse(entry) -> Executor:
     """One validated executor entry; raises ValueError naming the problem."""
     if not isinstance(entry, dict):
@@ -1167,7 +1180,7 @@ class RemoteRun:
             local = Path(self.spec["local_dataset"])
         if local is not None:
             self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
-        self.overlay = self.mirror_overlay(local)
+        self.overlay = with_teamwork(self.mirror_overlay(local), self.spec.get("features") or [])
 
     def mirror_overlay(self, local: Optional[Path]) -> Optional[Dict]:
         """This run's compose overlay: without the settings the dataset's

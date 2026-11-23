@@ -1047,9 +1047,44 @@ record list none, and the profile page marks them; a direct launch that asks
 for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features: an older node is refused until
+features (4 since teamwork): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
+
+#### Teamwork
+
+`teamwork` is a preview feature of its own kind: not a flag of the headless
+run but its entry. A profile with it runs every Harbor task through
+`metacodes --preview=teamwork teamwork run`, the same pipeline as the REPL's
+`/teamwork` (implementer, reviewer, isolated verifier, merge-back), and the
+task's own verifier then scores the merged result. Comparing a profile with
+teamwork against one without on the same version, model and tasks measures
+what turning it on changes. It runs alone, since `teamwork run` takes none of
+the other features' flags, and only on an SSH executor:
+
+- **Container**: teamwork seats run their commands under bubblewrap, which
+  Docker's defaults refuse. A teamwork run's compose overlay gives Harbor's
+  `main` service `cap_add: [SYS_ADMIN, NET_ADMIN]` and unconfined seccomp,
+  AppArmor and `systempaths` (`TEAMWORK_CONTAINER`), and the agent installs
+  git and bubblewrap when the image lacks them.
+- **Repository**: teamwork works in a git worktree and merges back. A task
+  directory without a commit gets one first (`git init` when it is no
+  repository, then a snapshot commit of what the image put there); one with
+  a commit is used as it is.
+- **Request and approval**: the instruction is the approved request
+  (`--approve`); text starting with `[` gets a heading, since a leading
+  bracket would be read as an option segment. Every seat uses metacodes and
+  the trial's model.
+- **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
+  `task.toml` (easy $5, medium $10, hard $20, otherwise $10), and the trial
+  gets `--agent-timeout-multiplier 3`, recorded on the run as
+  `agent_timeout_multiplier`.
+- **Validity**: `teamwork status --json` lands in the trial's agent logs.
+  A run that wrote no status, or in which no implementer seat finished (all
+  failed, as on a provider error), fails the trial with `TeamworkNotEngaged`,
+  so it counts as invalid; a run that worked but did not merge, or merged a
+  wrong change, is scored by the verifier like any other. The trial's cost
+  is the run's ledger spend; per-request tokens and turns are not reported.
 
 `POST /api/profiles/run` queues datasets: on an existing profile with
 `profile` (its version and features cannot be changed), or with `bundle` and

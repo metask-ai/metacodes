@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
+from scripts.eval.harbor.command import ADVANCED_FEATURES, TEAMWORK, TEAMWORK_TIMEOUT_MULTIPLIER, check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.bench import builds, data, executors
@@ -458,6 +458,8 @@ class RunManager:
         problems = entry["executors"][state["name"]]["reasons"]
         if problems:
             raise ValueError("；".join(problems))
+        if TEAMWORK in features and state["kind"] != "ssh":
+            raise ValueError("Teamwork 评测要在 SSH 执行机器（Linux Docker）上运行：任务容器要开放 bubblewrap 需要的权限")
         model = request.get("model")
         chosen = next((m for m in catalog["models"] if m["id"] == model), None)
         if chosen is None:
@@ -550,6 +552,8 @@ class RunManager:
                 record["profile"] = profile
             if features:
                 record["features"] = features
+            if TEAMWORK in features:
+                record["agent_timeout_multiplier"] = TEAMWORK_TIMEOUT_MULTIPLIER
             route = None
             if imported:
                 # The run's own config (endpoint, model names, key variable)
@@ -651,6 +655,8 @@ def chosen_features(value):
     unknown = [name for name in value if name not in ADVANCED_FEATURES]
     if unknown:
         raise ValueError("未知的高级功能：" + "、".join(unknown))
+    if TEAMWORK in value and len(set(value)) > 1:
+        raise ValueError("Teamwork 只能单独开启：teamwork run 不接受其他高级功能的开关")
     return [name for name in ADVANCED_FEATURES if name in value]
 
 

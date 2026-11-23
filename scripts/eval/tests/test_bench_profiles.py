@@ -690,6 +690,16 @@ class ProfileTest(unittest.TestCase):
         self.assertIsNone(common)
         self.assertNotIn('common_summary', by_model[0])
 
+    def test_teamwork_runs_alone_and_only_on_an_ssh_executor(self):
+        listed = {f['id']: f for f in self.client.request('api/workbench')['features']}
+        self.assertEqual(listed['teamwork']['group'], 'preview')
+        self.assertNotIn('teamwork', self.client.request('api/workbench')['default_features'])
+        with self.assertRaisesRegex(ValueError, '只能单独开启'):
+            self.client.request('api/profiles/run', self.request(features=['teamwork', 'execute_code']))
+        with self.assertRaisesRegex(ValueError, 'SSH 执行机器'):
+            self.client.request('api/profiles/run', self.request(features=['teamwork']))
+        self.assertEqual(self.manager.profiles.records(), [])
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
@@ -759,6 +769,29 @@ class ProfileTest(unittest.TestCase):
             store.close()
         same = self.client.request('api/store', {'action': 'apply', 'store': {'backend': 'sqlite', 'path': str(target)}})
         self.assertTrue(same['unchanged'])
+
+
+
+class TeamworkRunTest(unittest.TestCase):
+    def test_the_harbor_command_gives_teamwork_its_longer_agent_timeout(self):
+        from scripts.eval.harbor.bench.worker import command
+        spec = {"harbor": "harbor", "dataset": "d", "model": "m", "bundle": "/b", "key_env": "K", "attempts": 1, "concurrency": 1,
+                "jobs_dir": "/j", "name": "run", "tasks": ["t"], "features": ["teamwork"]}
+        self.assertNotIn("--agent-timeout-multiplier", command(spec))
+        argv = command({**spec, "agent_timeout_multiplier": 3})
+        self.assertEqual(argv[argv.index("--agent-timeout-multiplier") + 1], "3")
+
+    def test_the_compose_overlay_opens_bubblewrap_only_for_teamwork(self):
+        mirrors = {"services": {"main": {"environment": {"GOPROXY": "x"}, "cap_add": ["SYS_ADMIN"]}}}
+        self.assertIs(executors.with_teamwork(mirrors, ["execute_code"]), mirrors)
+        self.assertIsNone(executors.with_teamwork(None, []))
+        merged = executors.with_teamwork(mirrors, ["teamwork"])["services"]["main"]
+        self.assertEqual(merged["environment"], {"GOPROXY": "x"})
+        self.assertEqual(merged["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
+        self.assertIn("systempaths=unconfined", merged["security_opt"])
+        self.assertEqual(mirrors["services"]["main"]["cap_add"], ["SYS_ADMIN"])
+        alone = executors.with_teamwork(None, ["teamwork"])
+        self.assertEqual(alone["services"]["main"]["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
 
 
 if __name__ == '__main__':
