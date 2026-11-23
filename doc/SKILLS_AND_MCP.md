@@ -511,7 +511,16 @@ fallback), in `src/mcp/oauth.zig`:
    `resource` (the canonical server URL). The redirect is
    `http://localhost:<port>/callback`, Claude Code's path, on a
    kernel-chosen port, or `oauth.callbackPort` for a client whose redirect is
-   registered in advance.
+   registered in advance. In an SSH session (`SSH_CONNECTION` or `SSH_TTY`
+   set), where that redirect lands on this machine and the browser is on
+   another one, the CLI prints the forward the callback needs, with the port
+   it bound: `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`. A
+   browser on another computer ends on a page that does not load: paste that
+   page's address at the prompt and the login finishes here. The address is
+   judged as the callback would be (path, `state`, `code`, `error`), so one
+   from another login is refused and the wait goes on. The CLI waits at most
+   `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes by default, `0` for no
+   limit), then exits 1 having stored nothing (#740).
 4. **Token.** The code is exchanged with its verifier and the same
    `resource`. Before it is stored, the new token is tried with one
    authenticated request in the server's own transport (an `initialize`, or

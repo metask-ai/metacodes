@@ -218,6 +218,17 @@ status, compatibility boundaries, and entry points are defined by
   - `metacodes login` stops waiting for the browser after ten minutes
     (`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`, `0` for no limit), stores nothing,
     and names the device-code sign-in.
+- **`metacodes mcp login` over SSH no longer waits forever for a browser that
+  cannot come back** (#740). It sent the browser to
+  `http://localhost:<port>/callback` on the machine it runs on and waited with
+  no limit. As `metacodes login` does since #722:
+  - in an SSH session it prints the forward its callback needs, with the port
+    it bound: `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`;
+  - the address a browser on another computer ended on can be pasted at the
+    prompt, and is judged as the callback would be, so one from another login
+    is refused and the wait goes on;
+  - it stops waiting after `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes
+    by default, `0` for no limit), exits 1 and stores nothing.
 - **A busy tunnel port on an SSH executor no longer fails `egress =
   "workbench"`** (#716). Setup's 容器出网 step and each run picked the
   executor-side port of their `ssh -R` tunnel at random from 20000–59999,

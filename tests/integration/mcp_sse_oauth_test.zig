@@ -19,6 +19,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cc = @import("cc");
 const process = @import("platform").process;
+const ppaths = @import("platform").paths;
 
 const MOCK = "tests/_harness/mock_mcp_auth_server.py";
 
@@ -194,20 +195,8 @@ const Browser = struct {
     fn visit(url: []const u8) void {
         var client: std.http.Client = .{ .allocator = std.heap.c_allocator, .io = std.testing.io };
         defer client.deinit();
-        const uri = std.Uri.parse(url) catch return;
-        var request = client.request(.GET, uri, .{ .redirect_behavior = .unhandled }) catch return;
-        defer request.deinit();
-        request.sendBodiless() catch return;
-        var redirect: [4096]u8 = undefined;
-        const response = request.receiveHead(&redirect) catch return;
         var location_buffer: [2048]u8 = undefined;
-        var headers = response.head.iterateHeaders();
-        const location = while (headers.next()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "location") and header.value.len <= location_buffer.len) {
-                @memcpy(location_buffer[0..header.value.len], header.value);
-                break location_buffer[0..header.value.len];
-            }
-        } else return;
+        const location = finalAddress(&client, url, &location_buffer) orelse return;
         // The callback listens on 127.0.0.1; "localhost" is what the
         // authorization server was told.
         var callback_buffer: [2048]u8 = undefined;
@@ -228,6 +217,102 @@ const Browser = struct {
         return .{ .ctx = self, .open = open };
     }
 };
+
+fn finalAddress(client: *std.http.Client, url: []const u8, out: []u8) ?[]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+    var request = client.request(.GET, uri, .{ .redirect_behavior = .unhandled }) catch return null;
+    defer request.deinit();
+    request.sendBodiless() catch return null;
+    var redirect: [4096]u8 = undefined;
+    const response = request.receiveHead(&redirect) catch return null;
+    var headers = response.head.iterateHeaders();
+    while (headers.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "location") and header.value.len <= out.len) {
+            @memcpy(out[0..header.value.len], header.value);
+            return out[0..header.value.len];
+        }
+    }
+    return null;
+}
+
+const PastingBrowser = struct {
+    box: cc.core_auth.PasteBox = .{},
+    thread: ?std.Thread = null,
+    url: ?[]u8 = null,
+    ended_on: [2048]u8 = undefined,
+    ended_on_len: usize = 0,
+    first_refusal: ?cc.core_auth.PasteRefusal = null,
+
+    fn open(ctx: *anyopaque, url: []const u8) void {
+        const self: *PastingBrowser = @ptrCast(@alignCast(ctx));
+        self.url = std.testing.allocator.dupe(u8, url) catch return;
+        self.thread = std.Thread.spawn(.{}, paste, .{self}) catch null;
+    }
+
+    fn paste(self: *PastingBrowser) void {
+        var client: std.http.Client = .{ .allocator = std.heap.c_allocator, .io = std.testing.io };
+        defer client.deinit();
+        const address = finalAddress(&client, self.url.?, &self.ended_on) orelse return;
+        self.ended_on_len = address.len;
+        const state_at = std.mem.indexOf(u8, address, "state=") orelse return;
+        var other_buffer: [2100]u8 = undefined;
+        const other = std.fmt.bufPrint(&other_buffer, "{s}state=from-another-login", .{address[0..state_at]}) catch return;
+        self.box.submit(other);
+        var spins: usize = 0;
+        while (self.box.refusal() == null and spins < 300) : (spins += 1) cc.util_time.sleepMs(10);
+        self.first_refusal = self.box.refusal();
+        self.box.submit(address);
+    }
+
+    fn endedOn(self: *const PastingBrowser) []const u8 {
+        return self.ended_on[0..self.ended_on_len];
+    }
+
+    fn finish(self: *PastingBrowser) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        if (self.url) |url| std.testing.allocator.free(url);
+        self.url = null;
+    }
+
+    fn opener(self: *PastingBrowser) cc.mcp_oauth.OpenUrl {
+        return .{ .ctx = self, .open = open };
+    }
+
+    fn source(self: *PastingBrowser) cc.core_auth.PasteSource {
+        var pasted = self.box.source();
+        pasted.prompt = cc.core_auth.PASTE_PROMPT;
+        return pasted;
+    }
+};
+
+const EnvGuard = struct {
+    name: [*:0]const u8,
+    previous: ?[:0]u8,
+
+    fn set(name: [*:0]const u8, value: ?[*:0]const u8) !EnvGuard {
+        const previous = if (std.c.getenv(name)) |raw| try std.testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        if (value) |v| ppaths.setEnv(name, v) else ppaths.unsetEnv(name);
+        return .{ .name = name, .previous = previous };
+    }
+
+    fn restore(self: *EnvGuard) void {
+        if (self.previous) |previous| {
+            ppaths.setEnv(self.name, previous.ptr);
+            std.testing.allocator.free(previous);
+        } else ppaths.unsetEnv(self.name);
+    }
+};
+
+fn queryValue(url: []const u8, key: []const u8) ?[]const u8 {
+    const query_at = std.mem.indexOfScalar(u8, url, '?') orelse return null;
+    var pairs = std.mem.splitScalar(u8, url[query_at + 1 ..], '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
+}
 
 fn tmpRoot(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buffer);
@@ -539,4 +624,163 @@ test "MCP OAuth: configuration reaches the wire — startup connects an sse serv
     const streams = try mock.seen(arena.allocator(), "/sse-oauth");
     const last = streams[streams.len - 1];
     try std.testing.expect(std.mem.startsWith(u8, field(last, &.{ "headers", "authorization" }).?, "Bearer at-"));
+}
+
+test "MCP OAuth: the address a browser on another computer ended on, pasted back, finishes the login (#740)" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "oauth-mcp");
+    var ssh_connection = try EnvGuard.set("SSH_CONNECTION", null);
+    defer ssh_connection.restore();
+    var ssh_tty = try EnvGuard.set("SSH_TTY", null);
+    defer ssh_tty.restore();
+
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    var browser: PastingBrowser = .{};
+    var result = cc.mcp_oauth.login(a, std.testing.io, state_root, .{
+        .name = "pasted",
+        .target = .{ .url = url, .wire = .streamable },
+    }, .{
+        .open_browser = false,
+        .open_url = browser.opener(),
+        .notify = transcript.notify(),
+        .paste = browser.source(),
+        .timeout_ms = 10_000,
+    }) catch |err| {
+        browser.finish();
+        std.debug.print("instructions:\n{s}\n", .{transcript.text.items});
+        return err;
+    };
+    browser.finish();
+    defer result.deinit(a);
+
+    try std.testing.expectEqual(@as(?cc.core_auth.PasteRefusal, .other_sign_in), browser.first_refusal);
+    const text = transcript.text.items;
+    try std.testing.expect(std.mem.indexOf(u8, text, cc.core_auth.PASTE_PROMPT) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Over SSH?") == null);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const tokens = try mock.seen(aa, "/as/token");
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqualStrings("authorization_code", field(tokens[0], &.{ "form", "grant_type" }).?);
+    try std.testing.expectEqualStrings(queryValue(browser.endedOn(), "code").?, field(tokens[0], &.{ "form", "code" }).?);
+    var record = (try cc.mcp_oauth.loadRecord(a, result.path, url)) orelse return error.LoginNotStored;
+    defer record.deinit(a);
+    try std.testing.expectEqualStrings("at-1", record.access_token);
+}
+
+const LoginRun = struct {
+    state_root: []const u8,
+    url: []const u8,
+    options: cc.mcp_oauth.LoginOptions,
+    result: ?anyerror!cc.mcp_oauth.LoginResult = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *LoginRun) void {
+        self.result = cc.mcp_oauth.login(std.testing.allocator, std.testing.io, self.state_root, .{
+            .name = "bounded",
+            .target = .{ .url = self.url, .wire = .streamable },
+        }, self.options);
+        self.done.store(true, .release);
+    }
+};
+
+fn ignoreUrl(_: *anyopaque, _: []const u8) void {}
+
+test "MCP OAuth: a login whose browser never comes back ends at its bound and stores nothing (#740)" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "oauth-mcp");
+
+    var abort = cc.util_abort.AbortSignal.init();
+    var nowhere: u8 = 0;
+    var run = LoginRun{ .state_root = state_root, .url = url, .options = .{
+        .open_browser = false,
+        .open_url = .{ .ctx = &nowhere, .open = ignoreUrl },
+        .abort = &abort,
+        .timeout_ms = 300,
+    } };
+    var thread = try std.Thread.spawn(.{}, LoginRun.run, .{&run});
+    var spins: usize = 0;
+    while (!run.done.load(.acquire) and spins < 500) : (spins += 1) cc.util_time.sleepMs(10);
+    const ended = run.done.load(.acquire);
+    if (!ended) abort.abort(.user_interrupt);
+    thread.join();
+    if (!ended) return error.WaitDidNotEndAtTheBound;
+    if (run.result.?) |*stored| {
+        stored.deinit(a);
+        return error.LoginSucceededWithoutABrowser;
+    } else |err| try std.testing.expectEqual(@as(anyerror, error.CallbackTimedOut), err);
+
+    const path = try cc.mcp_oauth.storePath(a, state_root, "bounded", url);
+    defer a.free(path);
+    if (try cc.mcp_oauth.loadRecord(a, path, url)) |found| {
+        var record = found;
+        record.deinit(a);
+        return error.LoginStoredAfterTheBound;
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try mock.seen(arena.allocator(), "/as/token")).len);
+}
+
+test "MCP OAuth: over SSH the instructions name the ssh -L forward for the port the redirect uses (#740)" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "oauth-mcp");
+    var ssh_connection = try EnvGuard.set("SSH_CONNECTION", "192.0.2.10 50022 192.0.2.20 22");
+    defer ssh_connection.restore();
+    var ssh_tty = try EnvGuard.set("SSH_TTY", null);
+    defer ssh_tty.restore();
+
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    var browser: Browser = .{};
+    var result = cc.mcp_oauth.login(a, std.testing.io, state_root, .{
+        .name = "forwarded",
+        .target = .{ .url = url, .wire = .streamable },
+    }, .{ .open_browser = false, .open_url = browser.opener(), .notify = transcript.notify() }) catch |err| {
+        browser.finish();
+        return err;
+    };
+    browser.finish();
+    defer result.deinit(a);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const text = transcript.text.items;
+    const marker = "Waiting for the redirect on http://localhost:";
+    const at = std.mem.indexOf(u8, text, marker) orelse return error.NoRedirectLine;
+    const rest = text[at + marker.len ..];
+    const port = try std.fmt.parseInt(u16, rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse return error.NoRedirectLine], 10);
+    const register = (try mock.seen(aa, "/as/register"))[0];
+    const registered = register.get("body").?.object.get("redirect_uris").?.array.items[0].string;
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(aa, "http://localhost:{d}/callback", .{port}), registered);
+    const forward = try std.fmt.allocPrint(aa, "Over SSH? Forward the port first: ssh -L {d}:127.0.0.1:{d} <you>@<this machine>\n", .{ port, port });
+    if (std.mem.indexOf(u8, text, forward) == null) {
+        std.debug.print("instructions:\n{s}\n", .{text});
+        return error.NoForwardLine;
+    }
 }

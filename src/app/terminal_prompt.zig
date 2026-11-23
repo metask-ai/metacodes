@@ -1,10 +1,11 @@
 //! Reading answers at a terminal for the CLI's line-by-line prompts
-//! (`metacodes login`, `metacodes providers add`). The prompts go to stderr,
-//! the answers come from stdin.
+//! (`metacodes login`, `metacodes mcp login`, `metacodes providers add`). The
+//! prompts go to stderr, the answers come from stdin.
 
 const std = @import("std");
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
+const auth = @import("../core/auth.zig");
 
 /// Both ends a prompt needs are terminals: stdin to answer on, stderr to ask
 /// on. Without them a command takes its answers as arguments instead.
@@ -72,4 +73,54 @@ pub fn readSecretLine(prompt: []const u8, buf: []u8) !usize {
         }
     }
     return len;
+}
+
+pub const StdinPaste = struct {
+    closed: bool = false,
+
+    pub fn source(self: *StdinPaste) auth.PasteSource {
+        return .{ .ctx = self, .take = take, .refused = refused, .prompt = auth.PASTE_PROMPT };
+    }
+
+    fn take(ctx: *anyopaque, out: []u8) ?[]const u8 {
+        const self: *StdinPaste = @ptrCast(@alignCast(ctx));
+        if (self.closed) return null;
+        if (platform_term.waitReadable(0, 0) <= 0) return null;
+        const n = readLine(out) catch {
+            self.closed = true;
+            return null;
+        };
+        if (n == 0) {
+            self.closed = !platform_term.isatty(0);
+            return null;
+        }
+        return out[0..n];
+    }
+
+    fn refused(ctx: *anyopaque, why: auth.PasteRefusal) void {
+        _ = ctx;
+        std.debug.print("{s}\n", .{auth.pasteRefusalText(why)});
+    }
+};
+
+pub fn waitText(buffer: []u8, ms: u64) []const u8 {
+    const minute = std.time.ms_per_min;
+    if (ms >= minute and ms % minute == 0) {
+        const minutes = ms / minute;
+        return std.fmt.bufPrint(buffer, "{d} minute{s}", .{ minutes, if (minutes == 1) "" else "s" }) catch "time";
+    }
+    if (ms % std.time.ms_per_s == 0) {
+        const seconds = ms / std.time.ms_per_s;
+        return std.fmt.bufPrint(buffer, "{d} second{s}", .{ seconds, if (seconds == 1) "" else "s" }) catch "time";
+    }
+    return std.fmt.bufPrint(buffer, "{d} ms", .{ms}) catch "time";
+}
+
+test "waitText names the login wait bound in the largest whole unit (#722)" {
+    var buffer: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("10 minutes", waitText(&buffer, 10 * std.time.ms_per_min));
+    try std.testing.expectEqualStrings("1 minute", waitText(&buffer, std.time.ms_per_min));
+    try std.testing.expectEqualStrings("90 seconds", waitText(&buffer, 90 * std.time.ms_per_s));
+    try std.testing.expectEqualStrings("1 second", waitText(&buffer, std.time.ms_per_s));
+    try std.testing.expectEqualStrings("1500 ms", waitText(&buffer, 1500));
 }

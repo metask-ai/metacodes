@@ -3064,11 +3064,11 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                 return runMetaskDeviceLogin(allocator, init.io, state_dir, false);
             }
             const timeout_ms = auth.loginCallbackTimeoutMs();
-            var stdin_paste: StdinPaste = .{};
+            var stdin_paste: terminal_prompt.StdinPaste = .{};
             const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser, .timeout_ms = timeout_ms, .paste = stdin_paste.source() }) catch |err| {
                 if (err == error.CallbackTimedOut) {
                     var wait_buf: [48]u8 = undefined;
-                    std.debug.print("No answer from the browser in {s}; nothing was stored. Signing in on another computer? Run `metacodes login --provider metask`.\n", .{waitText(&wait_buf, timeout_ms.?)});
+                    std.debug.print("No answer from the browser in {s}; nothing was stored. Signing in on another computer? Run `metacodes login --provider metask`.\n", .{terminal_prompt.waitText(&wait_buf, timeout_ms.?)});
                     return 1;
                 }
                 std.debug.print("OAuth browser login failed: {s}\n", .{@errorName(err)});
@@ -3125,56 +3125,6 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
             return finishMetaskSignIn(allocator, init.io, state_dir, body, "Stored the Metask sign-in from the token response");
         },
     }
-}
-
-const StdinPaste = struct {
-    closed: bool = false,
-
-    fn source(self: *StdinPaste) auth.PasteSource {
-        return .{ .ctx = self, .take = take, .refused = refused, .prompt = auth.PASTE_PROMPT };
-    }
-
-    fn take(ctx: *anyopaque, out: []u8) ?[]const u8 {
-        const self: *StdinPaste = @ptrCast(@alignCast(ctx));
-        if (self.closed) return null;
-        if (platform_term.waitReadable(0, 0) <= 0) return null;
-        const n = terminal_prompt.readLine(out) catch {
-            self.closed = true;
-            return null;
-        };
-        if (n == 0) {
-            self.closed = !platform_term.isatty(0);
-            return null;
-        }
-        return out[0..n];
-    }
-
-    fn refused(ctx: *anyopaque, why: auth.PasteRefusal) void {
-        _ = ctx;
-        std.debug.print("{s}\n", .{auth.pasteRefusalText(why)});
-    }
-};
-
-fn waitText(buffer: []u8, ms: u64) []const u8 {
-    const minute = std.time.ms_per_min;
-    if (ms >= minute and ms % minute == 0) {
-        const minutes = ms / minute;
-        return std.fmt.bufPrint(buffer, "{d} minute{s}", .{ minutes, if (minutes == 1) "" else "s" }) catch "time";
-    }
-    if (ms % std.time.ms_per_s == 0) {
-        const seconds = ms / std.time.ms_per_s;
-        return std.fmt.bufPrint(buffer, "{d} second{s}", .{ seconds, if (seconds == 1) "" else "s" }) catch "time";
-    }
-    return std.fmt.bufPrint(buffer, "{d} ms", .{ms}) catch "time";
-}
-
-test "waitText names the login wait bound in the largest whole unit (#722)" {
-    var buffer: [48]u8 = undefined;
-    try std.testing.expectEqualStrings("10 minutes", waitText(&buffer, 10 * std.time.ms_per_min));
-    try std.testing.expectEqualStrings("1 minute", waitText(&buffer, std.time.ms_per_min));
-    try std.testing.expectEqualStrings("90 seconds", waitText(&buffer, 90 * std.time.ms_per_s));
-    try std.testing.expectEqualStrings("1 second", waitText(&buffer, std.time.ms_per_s));
-    try std.testing.expectEqualStrings("1500 ms", waitText(&buffer, 1500));
 }
 
 fn printLoginHelp() void {
@@ -4422,7 +4372,7 @@ fn runProviderOAuthLogin(
     };
     // Every refusal is decided in the kernel before anything is contacted;
     // this only says which one, in the words the CLI has always used.
-    var stdin_paste: StdinPaste = .{};
+    var stdin_paste: terminal_prompt.StdinPaste = .{};
     const prepared = provider_login.prepareProfileWith(built, .{
         .method = options.method,
         .open_browser = options.open_browser,
