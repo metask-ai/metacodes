@@ -2,9 +2,10 @@
 
 This drives the existing pinned integration (scripts/eval/workbuddy): a
 checkout provisioned by `provision_checkout.sh` (pinned commit, metacodes
-overlay, locked `.venv`), linux/amd64 split-mount artifacts staged by
-`stage_artifacts`, and an official subset fetched by WorkBuddy's
-`scripts/dataset/fetch-dataset.sh`. One launch writes a transient model and
+overlay, locked `.venv`) and an official subset fetched by WorkBuddy's
+`scripts/dataset/fetch-dataset.sh`. Every run mounts an image of its own,
+staged by `stage_artifacts` from the run's metacodes bundle, the same bundle
+a Harbor run of that workbench uses. One launch writes a transient model and
 job configuration into that checkout, runs WorkBuddy's own runner
 (`uv run --frozen bash scripts/run.sh --job <slug>`) under the same durable
 worker as Harbor launches (record/spec/cancel/heartbeat), and removes the
@@ -38,7 +39,6 @@ CHECKOUT_ENV = "METACODES_WORKBUDDY_CHECKOUT"
 TARGET_PLATFORM = "linux/amd64"  # stage_artifacts.TARGET_PLATFORM
 HARNESS = "metacodes/0.1.0"
 OVERLAY = Path("configs/harnesses/metacodes/OVERLAY.json")
-ARTIFACT_MANIFEST = Path("configs/harnesses/metacodes/docker/artifacts/share/metacodes/artifact-manifest.json")
 JUDGED_SUBSETS = ("web", "office")
 DEFAULT_JUDGE_MODEL = "kimi-k3.1-pro"
 BASE_URL_ENV = "METACODES_BENCH_WORKBUDDY_BASE_URL"
@@ -106,12 +106,6 @@ def readiness(suite, ctx) -> List[str]:
                 reasons.append("WorkBuddy checkout 未安装 metacodes overlay：python3 -m scripts.eval.workbuddy.install_overlay <checkout>")
             if not (repo / ".venv").is_dir():
                 reasons.append("WorkBuddy checkout 缺少 .venv：用 provision_checkout.sh 准备（uv sync --frozen）")
-            manifest = _json(repo / ARTIFACT_MANIFEST)
-            if not isinstance(manifest, dict):
-                reasons.append("WorkBuddy 未暂存 metacodes 制品：python3 -m scripts.eval.workbuddy.stage_artifacts --output "
-                               "<checkout>/configs/harnesses/metacodes/docker/artifacts ...")
-            elif manifest.get("target_platform") != TARGET_PLATFORM or manifest.get("synthetic_fixture"):
-                reasons.append("WorkBuddy 暂存制品不是 linux/amd64 正式制品（W0 合成制品不能用于评测）")
     for tool in ("docker", "uv", "bash"):
         if not shutil.which(tool):
             reasons.append(f"未找到 {tool}；WorkBuddy 评测需要它")
@@ -250,56 +244,31 @@ def finish(spec):
         atomic_json(result, {**value, "finished_at": now()})
 
 
-# environment_preflight.DEFAULT_HARNESS_IMAGE: the split-mount image every
-# WorkBuddy trial mounts, built from HARNESS_CONTEXT. run.sh reuses the tag
-# whenever it exists, whatever was staged since.
+# environment_preflight.DEFAULT_HARNESS_IMAGE: the shared split-mount image
+# run.sh derives when a run names no image of its own.
 HARNESS_IMAGE = "workbuddy-bench/harness/metacodes:0.1.0"
 HARNESS_CONTEXT = Path("configs/harnesses/metacodes/docker")
 HARNESS_VERSIONS = Path("configs/harnesses/metacodes/versions")
-# Each executable stage_artifacts stages, by the bundle path it comes from.
-BUNDLE_EXECUTABLES = {"metacodes": "bin/metacodes", "tinykg": "vendor/tinykg/tinykg",
-                      "metacodes-formal-kernel": "libexec/metacodes/metacodes-formal-kernel",
-                      "ripgrep": "bin/rg", "metacodes-project-kernel": "libexec/metacodes/metacodes-project-kernel"}
-# The adapter installs bin/rg beside bin/metacodes in every trial.
-REQUIRED_EXECUTABLES = ("metacodes", "tinykg", "metacodes-formal-kernel", "ripgrep")
+# (component, SPDX, file under the bundle's share/licenses)
+BUNDLE_LICENSES = (("metacodes", "MIT", "metacodes-LICENSE"), ("tinykg", "Apache-2.0", "tinykg-LICENSE"),
+                   ("lean4", "Apache-2.0", "lean4-LICENSE"))
 
 
-def staged_executables(ctx) -> Optional[Dict[str, str]]:
-    """{label: sha256} of the executables staged in the checkout (the
-    artifact manifest's), or None when nothing is staged."""
-    repo = checkout(ctx)
-    return manifest_executables(_json(repo / ARTIFACT_MANIFEST) if repo is not None else None)
-
-
-def manifest_executables(manifest) -> Optional[Dict[str, str]]:
-    """{label: sha256} of an artifact manifest's executables."""
-    if not isinstance(manifest, dict):
-        return None
-    rows = dict(manifest.get("executables") or {})
-    kernel = (manifest.get("project_control") or {}).get("kernel")
-    if kernel:
-        rows["metacodes-project-kernel"] = kernel
-    return {label: row["sha256"] for label, row in rows.items()
-            if isinstance(row, dict) and isinstance(row.get("sha256"), str)}
-
-
-def bundle_executables(bundle) -> Dict[str, str]:
-    """{label: sha256} of the same executables in a Linux bundle."""
-    import hashlib
-    result = {}
-    for label, relative in BUNDLE_EXECUTABLES.items():
-        path = Path(bundle) / relative
-        if path.is_file():
-            result[label] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return result
-
-
-def executable_mismatch(staged: Optional[Dict[str, str]], expected: Dict[str, str]) -> List[str]:
-    """Labels whose staged executable is not the expected bundle's (every
-    staged one, and the ones every run uses)."""
-    staged = staged or {}
-    return sorted(label for label in set(staged) | set(REQUIRED_EXECUTABLES)
-                  if staged.get(label) is None or staged.get(label) != expected.get(label))
+def stage_bundle(bundle: Path, output: Path) -> None:
+    """Stage a Linux bundle's metacodes, TinyKG, formal kernel and ripgrep
+    as split-mount artifacts in `output`."""
+    from scripts.eval.workbuddy.stage_artifacts import StageError, stage
+    bundle = Path(bundle)
+    source = (_json(bundle / "manifest.json") or {}).get("source") or {}
+    tinykg = _json(bundle / "vendor/tinykg/tinykg.provenance.json") or {}
+    licenses = bundle / "share/licenses"
+    try:
+        stage(output=output, metacodes=bundle / "bin/metacodes", tinykg=bundle / "vendor/tinykg/tinykg",
+              formal_kernel=bundle / "libexec/metacodes/metacodes-formal-kernel", ripgrep=bundle / "bin/rg",
+              metacodes_commit=str(source.get("commit") or ""), tinykg_commit=str(tinykg.get("source_commit") or ""),
+              licenses=[(component, spdx, licenses / name) for component, spdx, name in BUNDLE_LICENSES])
+    except StageError as exc:
+        raise ValueError(f"metacodes 包 {bundle.name} 不能用于 WorkBuddy：{exc}") from None
 
 
 RUN_IMAGE_REPOSITORY = "wbm"
@@ -311,32 +280,21 @@ def run_image_tag(name: str) -> str:
     return RUN_IMAGE_REPOSITORY + ":" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
-def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str, str]] = None,
-                        docker: str = "docker") -> bool:
-    """Build the mount image from the checkout's staged context as `tag`.
-    The manifest read once here is the one checked against `expected` (the
-    run's bundle) and compared after the build. False when `stop` was set
-    meanwhile (the build is killed). Raises ValueError when the staged
-    executables are not the expected ones, the build fails, or the staged
-    artifacts changed while it ran."""
+def build_harness_image(repo: Path, bundle: Path, tag: str, stop, docker: str = "docker") -> bool:
+    """Build the mount image of `bundle` as `tag`, from the checkout's
+    Dockerfile and artifacts staged in a context of its own. False when
+    `stop` was set meanwhile (the build is killed). Raises ValueError when
+    the bundle cannot be staged or the build fails."""
     import signal
     import subprocess
     import tempfile
     import time
     from scripts.eval.harbor.bench.executors import signal_group
-    manifest = repo / ARTIFACT_MANIFEST
-    before = manifest.read_bytes()
-    if expected is not None:
-        try:
-            staged = manifest_executables(json.loads(before))
-        except ValueError:
-            staged = None
-        different = executable_mismatch(staged, expected)
-        if different:
-            raise ValueError("WorkBuddy 暂存的制品不是本次运行的 metacodes 版本：" + "、".join(different))
-    with tempfile.TemporaryFile() as output:
+    with tempfile.TemporaryDirectory(prefix="workbuddy-image-") as context, tempfile.TemporaryFile() as output:
+        shutil.copy(repo / HARNESS_CONTEXT / "Dockerfile", Path(context) / "Dockerfile")
+        stage_bundle(bundle, Path(context) / "artifacts")
         process = subprocess.Popen([docker, "buildx", "build", "--platform", TARGET_PLATFORM, "--load", "--tag", tag,
-                                    str(repo / HARNESS_CONTEXT)], cwd=str(repo), stdin=subprocess.DEVNULL,
+                                    context], cwd=str(repo), stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + 3600
         while process.poll() is None:
@@ -350,8 +308,6 @@ def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str,
         if process.returncode != 0:
             output.seek(0)
             raise ValueError("构建 WorkBuddy 挂载镜像失败：" + output.read().decode(errors="replace").strip()[-300:])
-    if manifest.read_bytes() != before:
-        raise ValueError("构建 WorkBuddy 挂载镜像时暂存制品发生了变化，请重试")
     return True
 
 
