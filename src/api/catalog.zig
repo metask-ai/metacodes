@@ -327,6 +327,10 @@ fn extractReasoningMask(obj: []const u8) u8 {
     // The gateway's own list outranks the Anthropic-shaped `effort` block it
     // sends beside it, all false, for every chat model (#527).
     if (gatewayReasoning(caps)) |gateway| return gateway.mask;
+    return effortBlockMask(caps);
+}
+
+fn effortBlockMask(caps: []const u8) u8 {
     const effort = findObjectField(caps, "effort") orelse return 0;
     var mask: u8 = 0;
     if (capSupported(effort, "low")) mask |= reasoningBit(.low);
@@ -355,7 +359,7 @@ const switched_on_or_off = GatewayReasoning{ .mask = reasoningBit(switched_on_le
 fn gatewayReasoning(caps: []const u8) ?GatewayReasoning {
     const reasoning = findObjectField(caps, "reasoning") orelse return null;
     const can_disable = if (findObjectField(reasoning, "disable")) |disable| supportedTrue(disable) else false;
-    const can_switch = can_disable and thinkingTypeSupported(caps, "enabled");
+    const can_switch = can_disable and thinkingTypeSupported(caps, "enabled") and effortBlockMask(caps) == 0;
     const efforts = findObjectField(reasoning, "efforts") orelse return if (can_switch) switched_on_or_off else null;
     var mask: u8 = 0;
     if (listNames(efforts, "low")) mask |= reasoningBit(.low);
@@ -876,7 +880,8 @@ test "a gateway model that names no level is offered off and on only where the c
         \\{"id":"empty-list","capabilities":{"reasoning":{"disable":{"supported":true},"efforts":[],"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}},
         \\{"id":"no-enabled","capabilities":{"reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}}}},
         \\{"id":"always-on","capabilities":{"reasoning":{"disable":{"supported":false},"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}},
-        \\{"id":"clear-thinking-only","capabilities":{"context_management":{"clear_thinking_20251015":{"supported":true}},"reasoning":{"disable":{"supported":true},"supported":true}}}
+        \\{"id":"clear-thinking-only","capabilities":{"context_management":{"clear_thinking_20251015":{"supported":true}},"reasoning":{"disable":{"supported":true},"supported":true}}},
+        \\{"id":"levels-in-effort-block","capabilities":{"effort":{"high":{"supported":true},"max":{"supported":true},"supported":true},"reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}}
         \\]}
     );
     var buf: ReasoningOptions = undefined;
@@ -885,7 +890,10 @@ test "a gateway model that names no level is offered off and on only where the c
         try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_on, switched.thinking_switch);
         try std.testing.expectEqual(EffortVocabulary.on_off, switched.effort_vocabulary);
     }
-    for (catalog.entries.items[2..]) |unswitched| {
+    const effort_block = catalog.entries.items[5];
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .none, .high, .xhigh }, reasoningOptions(effort_block.reasoning_mask, &buf));
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, effort_block.thinking_switch);
+    for (catalog.entries.items[2..5]) |unswitched| {
         try std.testing.expectEqualSlices(types.ReasoningEffort, &.{.none}, reasoningOptions(unswitched.reasoning_mask, &buf));
         try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, unswitched.thinking_switch);
         try std.testing.expectEqualStrings("none", effortLabel(unswitched.effort_vocabulary, .none));

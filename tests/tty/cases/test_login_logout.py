@@ -440,11 +440,10 @@ def test_cli_login_offers_off_and_on_where_the_gateway_names_no_level_and_the_fi
         assert proc.returncode == 0, f"exit {proc.returncode}:\n{said}"
         assert "context blocking limit" not in said, said
         assert "METASK_MOCK_REPLY" in said, said
-        sent = mock.message_bodies[-1]
-        assert sent["model"] == "kimi-k3.1-pro", sent
-        assert sent["max_tokens"] == 524288, sent
-        assert sent["thinking"] == {"type": "enabled"}, sent
-        assert "output_config" not in sent, sent
+        request = mock.message_bodies[-1]
+        sent = {k: request.get(k) for k in ("model", "max_tokens", "thinking", "output_config")}
+        assert sent == {"model": "kimi-k3.1-pro", "max_tokens": 524288, "thinking": {"type": "enabled"},
+                        "output_config": None}, sent
 
 
 def test_cli_login_does_not_ask_for_a_reasoning_effort_a_model_has_one_choice_of(bin_path):

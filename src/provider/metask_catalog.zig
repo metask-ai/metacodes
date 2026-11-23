@@ -122,6 +122,11 @@ fn thinkingOffOrOn(model: std.json.Value, efforts: []const []const u8) bool {
         if (!std.mem.eql(u8, word, "none")) return false;
     }
     const caps = objectIn(model, "capabilities") orelse return false;
+    if (objectIn(caps, "effort")) |effort| {
+        for ([_][]const u8{ "low", "medium", "high", "xhigh", "max" }) |level| {
+            if (supportedIn(effort, level)) return false;
+        }
+    }
     const reasoning = objectIn(caps, "reasoning") orelse return false;
     const thinking = objectIn(caps, "thinking") orelse return false;
     const kinds = objectIn(thinking, "types") orelse return false;
@@ -233,15 +238,21 @@ test "the www gateway's catalog: a model that names no level but switches thinki
         \\ {"id":"no-enabled","capabilities":{"reasoning":{"disable":{"supported":true},"supported":true},
         \\   "thinking":{"types":{"enabled":{"supported":false}}}}},
         \\ {"id":"always-on","capabilities":{"reasoning":{"disable":{"supported":false},"supported":true},
-        \\   "thinking":{"types":{"enabled":{"supported":true}}}}}
+        \\   "thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\ {"id":"levels-in-effort-block","capabilities":{"effort":{"high":{"supported":true},"supported":true},
+        \\   "reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\ {"id":"all-false-effort-block","capabilities":{"effort":{"high":{"supported":false},"supported":false},
+        \\   "reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}}
         \\]}
     );
     defer parsed.deinit();
     const models = parsed.models.items;
-    try std.testing.expectEqual(@as(usize, 6), models.len);
+    try std.testing.expectEqual(@as(usize, 8), models.len);
+    try std.testing.expect(!models[6].thinking_off_or_on);
+    try std.testing.expect(models[7].thinking_off_or_on);
     try std.testing.expect(models[0].thinking_off_or_on);
     try std.testing.expectEqual(@as(usize, 0), models[0].efforts.len);
     try std.testing.expect(models[1].thinking_off_or_on);
-    for (models[2..]) |model| try std.testing.expect(!model.thinking_off_or_on);
+    for (models[2..6]) |model| try std.testing.expect(!model.thinking_off_or_on);
     try std.testing.expectEqual(@as(usize, 3), models[3].efforts.len);
 }
