@@ -307,6 +307,13 @@ class NodeProtocolTest(unittest.TestCase):
         self.assertIn(problem, executors.reasons(relay, facts))
         self.assertIsNone(executors.node_problem(relay, {"node": {"protocol": node_protocol.PROTOCOL}}))
 
+    def test_a_node_that_builds_workbuddy_from_its_staged_checkout_is_refused(self):
+        """Such a node ignores the run's bundle and would mount whatever its
+        checkout staged under the selected version's name."""
+        relay = executors.SshExecutor(name="relay", host="relay.invalid")
+        self.assertIn("不兼容", executors.node_problem(relay, {"node": {"protocol": 4}}))
+        self.assertIn("不兼容", executors.reach_reasons(relay, {"node": {"protocol": 4}})[0])
+
 
 @unittest.skipUnless(POSIX, "fake executables are POSIX shell scripts")
 class SetupFixture(unittest.TestCase):
