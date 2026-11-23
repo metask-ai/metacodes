@@ -141,6 +141,15 @@ class ModelAndFlagsTest(unittest.TestCase):
                 features=["teamwork"],
             )
 
+    def test_teamwork_flags_carry_the_reasoning_effort_to_the_seats_that_take_one(self):
+        self.assertEqual(cmd.teamwork_flags(provider=None, model="m", reasoning_effort=None), ["--model", "m"])
+        flags = cmd.teamwork_flags(provider="p", model="m", reasoning_effort="high")
+        self.assertEqual(flags[:4], ["--provider", "p", "--model", "m"])
+        self.assertEqual(json.loads(flags[flags.index("--config-json") + 1]),
+                         {"seats": {"implementer": {"effort": "high"}, "reviewer": {"effort": "high"}}})
+        with self.assertRaisesRegex(ValueError, "reasoning_effort"):
+            cmd.teamwork_flags(provider=None, model="m", reasoning_effort="turbo")
+
     def test_teamwork_runs_alone(self):
         self.assertEqual(cmd.checked_features(["teamwork"]), ["teamwork"])
         self.assertEqual(cmd.checked_features(["execute_code", "stall_gate"]), ["execute_code", "stall_gate"])

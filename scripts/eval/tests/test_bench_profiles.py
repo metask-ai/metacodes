@@ -696,7 +696,7 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn('teamwork', self.client.request('api/workbench')['default_features'])
         with self.assertRaisesRegex(ValueError, '只能单独开启'):
             self.client.request('api/profiles/run', self.request(features=['teamwork', 'execute_code']))
-        with self.assertRaisesRegex(ValueError, 'SSH 执行机器'):
+        with self.assertRaisesRegex(ValueError, 'teamwork_privileged'):
             self.client.request('api/profiles/run', self.request(features=['teamwork']))
         self.assertEqual(self.manager.profiles.records(), [])
 
@@ -781,16 +781,24 @@ class TeamworkRunTest(unittest.TestCase):
         argv = command({**spec, "agent_timeout_multiplier": 3})
         self.assertEqual(argv[argv.index("--agent-timeout-multiplier") + 1], "3")
 
-    def test_the_compose_overlay_opens_bubblewrap_only_for_teamwork(self):
+    def test_the_compose_overlay_opens_bubblewrap_only_for_teamwork_on_an_opted_in_executor(self):
+        opted = executors.parse({"name": "gpu", "kind": "ssh", "host": "gpu.example", "teamwork_privileged": True})
+        plain = executors.parse({"name": "cpu", "kind": "ssh", "host": "cpu.example"})
+        self.assertEqual((opted.teamwork_privileged, plain.teamwork_privileged), (True, False))
+        self.assertTrue(opted.spec()["teamwork_privileged"])
+        with self.assertRaisesRegex(ValueError, "布尔值"):
+            executors.parse({"name": "gpu", "kind": "ssh", "host": "gpu.example", "teamwork_privileged": "yes"})
         mirrors = {"services": {"main": {"environment": {"GOPROXY": "x"}, "cap_add": ["SYS_ADMIN"]}}}
-        self.assertIs(executors.with_teamwork(mirrors, ["execute_code"]), mirrors)
-        self.assertIsNone(executors.with_teamwork(None, []))
-        merged = executors.with_teamwork(mirrors, ["teamwork"])["services"]["main"]
+        self.assertIs(executors.with_teamwork(mirrors, ["execute_code"], plain), mirrors)
+        self.assertIsNone(executors.with_teamwork(None, [], plain))
+        with self.assertRaisesRegex(ValueError, "teamwork_privileged"):
+            executors.with_teamwork(mirrors, ["teamwork"], plain)
+        merged = executors.with_teamwork(mirrors, ["teamwork"], opted)["services"]["main"]
         self.assertEqual(merged["environment"], {"GOPROXY": "x"})
         self.assertEqual(merged["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
         self.assertIn("systempaths=unconfined", merged["security_opt"])
         self.assertEqual(mirrors["services"]["main"]["cap_add"], ["SYS_ADMIN"])
-        alone = executors.with_teamwork(None, ["teamwork"])
+        alone = executors.with_teamwork(None, ["teamwork"], opted)
         self.assertEqual(alone["services"]["main"]["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
 
 

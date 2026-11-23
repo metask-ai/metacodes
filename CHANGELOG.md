@@ -17,8 +17,11 @@ status, compatibility boundaries, and entry points are defined by
   the permissions bubblewrap needs, a directory without a commit gets a
   snapshot commit, the dollar cap follows the task's difficulty and the
   agent timeout triples. A run in which no implementer seat finished counts
-  as invalid. It runs alone and only on SSH executors; the bench node
-  protocol is now 4 (rerun `metacodes bench setup --executor <name>`).
+  as invalid. It runs alone and only on an SSH executor whose entry sets
+  `teamwork_privileged: true`: the container permissions are close to a
+  privileged container, so only for a disposable node without credentials.
+  The bench node protocol is now 4 (rerun `metacodes bench setup --executor
+  <name>`).
 
 - **A bench profile runs several models at once.** The 评测 page selects
   several models (`models` in `POST /api/profiles/run`), queuing every

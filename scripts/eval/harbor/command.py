@@ -261,6 +261,20 @@ def metacodes_flags(
     return flags
 
 
+def teamwork_flags(*, provider: Optional[str], model: str, reasoning_effort: Optional[str]) -> List[str]:
+    """The `teamwork run` arguments for one trial's model: provider and
+    model, and the reasoning effort on the seats that take one (implementer
+    and reviewer; the verifier resolves its own)."""
+
+    flags = (["--provider", provider] if provider is not None else []) + ["--model", model]
+    if reasoning_effort is not None:
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("reasoning_effort must be one of " + "/".join(REASONING_EFFORTS))
+        seats = {role: {"effort": reasoning_effort} for role in ("implementer", "reviewer")}
+        flags += ["--config-json", json.dumps({"seats": seats}, separators=(",", ":"))]
+    return flags
+
+
 def checked_features(features: Iterable[str]) -> List[str]:
     """The features of one trial; teamwork runs alone, since `teamwork run`
     takes none of the other features' flags."""

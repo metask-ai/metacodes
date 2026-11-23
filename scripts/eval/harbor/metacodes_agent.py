@@ -120,7 +120,8 @@ class MetacodesAgent(BaseInstalledAgent):
         chosen = cmd.checked_features(name for name in (features or "").split(",") if name)
         self._teamwork = cmd.TEAMWORK in chosen
         if self._teamwork:
-            self._flags = (["--provider", self._provider] if self._provider else []) + ["--model", self._model]
+            self._flags = cmd.teamwork_flags(provider=self._provider, model=self._model,
+                                             reasoning_effort=self._reasoning_effort)
         else:
             self._flags = cmd.metacodes_flags(
                 provider=self._provider,

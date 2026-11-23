@@ -1060,13 +1060,21 @@ run but its entry. A profile with it runs every Harbor task through
 task's own verifier then scores the merged result. Comparing a profile with
 teamwork against one without on the same version, model and tasks measures
 what turning it on changes. It runs alone, since `teamwork run` takes none of
-the other features' flags, and only on an SSH executor:
+the other features' flags, and only on an SSH executor whose entry sets
+`"teamwork_privileged": true`:
 
 - **Container**: teamwork seats run their commands under bubblewrap, which
   Docker's defaults refuse. A teamwork run's compose overlay gives Harbor's
   `main` service `cap_add: [SYS_ADMIN, NET_ADMIN]` and unconfined seccomp,
   AppArmor and `systempaths` (`TEAMWORK_CONTAINER`), and the agent installs
-  git and bubblewrap when the image lacks them.
+  git and bubblewrap when the image lacks them. **This is close to a
+  privileged container.** The seats' commands stay inside bubblewrap, but
+  the task's verifier runs as root in the same container, outside it, and
+  executes code the model wrote (a solution module, a `conftest.py`); with
+  these permissions such code can reach the executor host (for example its
+  `core_pattern`, or a cgroup v1 `release_agent`). Set
+  `teamwork_privileged` only on a disposable executor that holds no
+  credentials or other secrets; without it a teamwork launch is refused.
 - **Repository**: teamwork works in a git worktree and merges back. A task
   directory without a commit gets one first (`git init` when it is no
   repository, then a snapshot commit of what the image put there); one with
@@ -1074,7 +1082,8 @@ the other features' flags, and only on an SSH executor:
 - **Request and approval**: the instruction is the approved request
   (`--approve`); text starting with `[` gets a heading, since a leading
   bracket would be read as an option segment. Every seat uses metacodes and
-  the trial's model.
+  the trial's model; the run's reasoning effort reaches the implementer and
+  reviewer seats (`--config-json`), while the verifier keeps its own.
 - **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
   `task.toml` (easy $5, medium $10, hard $20, otherwise $10), and the trial
   gets `--agent-timeout-multiplier 3`, recorded on the run as

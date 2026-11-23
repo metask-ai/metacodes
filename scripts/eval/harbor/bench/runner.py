@@ -458,8 +458,9 @@ class RunManager:
         problems = entry["executors"][state["name"]]["reasons"]
         if problems:
             raise ValueError("；".join(problems))
-        if TEAMWORK in features and state["kind"] != "ssh":
-            raise ValueError("Teamwork 评测要在 SSH 执行机器（Linux Docker）上运行：任务容器要开放 bubblewrap 需要的权限")
+        if TEAMWORK in features and not (state["kind"] == "ssh" and state.get("teamwork_privileged")):
+            raise ValueError("Teamwork 评测只能在开启了 teamwork_privileged 的 SSH 执行机器上运行：任务容器要放开 bubblewrap "
+                             "需要的权限，接近 privileged 容器，只适合用完即弃、没有凭证的专用节点")
         model = request.get("model")
         chosen = next((m for m in catalog["models"] if m["id"] == model), None)
         if chosen is None:
