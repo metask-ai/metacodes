@@ -623,7 +623,11 @@ async function renderNewRun() {
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,
       checked: (draft.features || c.default_features || []).includes(f.id),
-      onchange: () => { draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id); } }), label: f.label }));
+      onchange: (event) => {
+        const teamwork = f.id === 'teamwork';
+        if (event.target.checked) for (const x of featureBoxes) if (x.id !== f.id && (teamwork || x.id === 'teamwork')) x.input.checked = false;
+        draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id);
+      } }), label: f.label }));
   const featureGroup = (group, title) => {
     const boxes = featureBoxes.filter((f) => f.group === group);
     return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),

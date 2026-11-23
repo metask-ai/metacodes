@@ -12,6 +12,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A bench profile can measure teamwork.** The `teamwork` preview feature
+  runs each Harbor task through `metacodes teamwork run`: task containers get
+  the permissions bubblewrap needs, a directory without a commit gets a
+  snapshot commit, the dollar cap follows the task's difficulty and the
+  agent timeout triples. A run in which no implementer seat finished counts
+  as invalid. It runs alone and only on an SSH executor whose entry sets
+  `teamwork_privileged: true`: the container permissions are close to a
+  privileged container, so only for a disposable node without credentials.
+  The bench node protocol is now 4 (rerun `metacodes bench setup --executor
+  <name>`).
+
 - **A bench profile runs several models at once.** The 评测 page selects
   several models (`models` in `POST /api/profiles/run`), queuing every
   dataset once per model, and the profile page compares the models' latest
@@ -203,6 +214,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **On Windows a sign-in opens its whole URL in the browser** (#727). The
+  browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
+  command at the first `&`: the browser got `…/oauth/authorize?response_type=code`
+  without `client_id`, `redirect_uri`, `state` and the rest, and the sign-in
+  page could not go on. The URL now goes to `rundll32.exe
+  url.dll,FileProtocolHandler` from the system directory as one argument, with
+  no shell in between. This covers every place metacodes opens a browser:
+  Metask's sign-in and its device-code page, ChatGPT's and other providers'
+  OAuth, OpenRouter's, an MCP server's, and a provider's page for creating a
+  key.
+
 - **A busy tunnel port on an SSH executor no longer fails `egress =
   "workbench"`** (#716). Setup's 容器出网 step and each run picked the
   executor-side port of their `ssh -R` tunnel at random from 20000–59999,
@@ -213,6 +235,26 @@ status, compatibility boundaries, and entry points are defined by
   executor cannot listen on it, setup and the run try another port, up to 5.
   When none works, they say the tunnel port could not be bound on the
   executor, which may also not allow remote forwarding for the account.
+
+- **A model whose output limit is its whole context window can be used.**
+  Metask's gateway lists kimi-k3.1-pro with a 1,048,576-token window and the
+  same output limit. The request asked for all of it and the whole of it was
+  reserved from the window, which left no room for the input: every message
+  stopped before it was sent (`context blocking limit reached ...
+  effective_window=0`). A request now asks for at most half the model's window
+  as output, and the input keeps the other half; models whose output limit is
+  under half their window (every other model the gateway lists today) send
+  what they did before. An explicit `--max-tokens` is sent as given.
+
+- **Reasoning can be switched off and on for Metask models that name no
+  level.** For DeepSeek-V4.1-Flash-1017, hy4 and kimi-k3.1-pro the gateway
+  says thinking can be turned off and on but lists no levels, and the sign-in
+  offered `none` alone, which sent nothing: thinking was whatever the gateway
+  chose. `metacodes login` and `/login` now offer `off` and `on`, and `/model`
+  offers Thinking `none` or `high`; on sends `thinking: {"type":"enabled"}`
+  and off sends `{"type":"disabled"}`. `none` on a gateway model that lists
+  levels and can be turned off now sends `disabled` as well. A model with a
+  single choice is no longer asked for one.
 
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to

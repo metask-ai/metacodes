@@ -789,7 +789,11 @@ request gate、`canonicalRequestBytes` 三处都这么漏过。`agent_loop.zig` 
 **窗口是上界,墙是测出来的(`core/context_caps.zig`)**。catalog 的 `max_input_tokens` 是服务端的
 自述;真正的拒绝点只有服务端知道,而且同一个模型换一个网关就是另一堵墙(2026-09-22 Metask
 glm-5.3-flash:catalog 推出的可用输入 917,504,实测 ≈883K 就拒)。所以 `agent_loop` 里所有阈值
-都经 `pressureFor` 派生:`effective = min(catalog 可用输入, 学到的上限)`,三个 buffer 按
+都经 `pressureFor` 派生:`effective = min(catalog 可用输入, 学到的上限)`。catalog 可用输入 = 窗口
+减去请求真正要的输出:服务端校验 输入 + max_tokens ≤ 窗口,所以预留的就是请求发的 max_tokens,
+而它取 `min(catalog 输出上限, 窗口 / 2)`(`Client.resolveMaxTokensFor`;显式 `--max-tokens` 原样发)。
+输出上限和窗口一样大的模型(2026-11-23 Metask 网关的 kimi-k3.1-pro,都是 1,048,576)若全额预留,
+可用输入就是 0,每条消息都在本地被拦下。三个 buffer 按
 `effective/200K` 线性放大(`context_pressure.scaledBuffer`,1M 窗口上仍是 6.5%/10%/1.5%,而不是
 1.3%/2%/0.3%)。学到的上限按 (endpoint, model) 记在 `~/.metacodes/context_caps.json`
 (`METACODES_CONTEXT_CAPS_FILE` 覆盖,置空则不落盘;测试构建默认不落盘),下个 session 从第一轮起就
