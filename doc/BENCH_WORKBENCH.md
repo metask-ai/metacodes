@@ -237,7 +237,9 @@ sets the job's `jobs_dir` to `<jobs-dir>/<run>/workbuddy`, whose Harbor
 trials the job view reads. These are ordinary WorkBuddy runs, not
 launch-gate receipts or quality evidence. The Web and Office subsets also
 write a judge model config (`configs/models/metacodes-<run>-judge.yaml`, same
-account route as the agent) and set the job's `llm_judge_override` to
+account key as the agent; WorkBuddy calls its judge as OpenAI passthrough, so
+the config's URL variable holds the account gateway's `/v1` rather than the
+agent's `/v1/messages`) and set the job's `llm_judge_override` to
 `{"enabled": true, "mode": "in_container"}` with it. The judge model is
 `judges.<suite id>.model` in `workbench.json`, default `kimi-k3.1-pro`.
 
