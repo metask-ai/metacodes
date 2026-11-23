@@ -227,6 +227,13 @@ class LeaderboardTest(unittest.TestCase):
     def test_a_suite_without_a_published_board_is_not_found(self):
         self.assertIsNone(self.workbench.leaderboard("aime"))
 
+    def test_an_invalid_trial_counts_zero_even_with_a_reward(self):
+        job = _job(self.root, "rewarded-crash", "m", planned=2)
+        _trial(job, "task0__eee", reward=1.0, exception="NonZeroAgentExitCodeError", stop="api_error")
+        _trial(job, "task1__eee", reward=0.0)
+        jobs = {job["name"]: job for job in Workbench(data.Library([self.root])).leaderboard(None)["boards"][0]["jobs"]}
+        self.assertEqual(jobs["rewarded-crash"]["score"], 0.0)
+
 
 class ServerTest(unittest.TestCase):
     def setUp(self):

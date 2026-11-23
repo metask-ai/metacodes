@@ -89,7 +89,7 @@ def board_job(view, tasks):
             costs.setdefault(row["task"], []).append(row["cost_usd"])
     return {"name": view["name"], "model": view.get("model"), "profile": view.get("profile"),
             "started_at": view.get("started_at"), "trials": len(rows), "tasks": len({r["task"] for r in rows}),
-            "score": sum(r.get("reward") or 0 for r in rows) / len(rows),
+            "score": sum(0 if r["status"] == "invalid" else r.get("reward") or 0 for r in rows) / len(rows),
             "cost_per_task": _mean([sum(c) / len(c) for c in costs.values()])}
 
 
