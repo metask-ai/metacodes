@@ -271,7 +271,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
-| 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy; a failure names the gateway and the firewall to check |
+| 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy. A tunnel port the executor cannot listen on is retried on another one, up to 5 ports, and then the step says the tunnel port could not be bound; any other failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
 | Metask login | Never automated. The step names the command; the page's 登录 button runs `metacodes login --provider metask --no-browser` and shows its device-flow URL and code |
@@ -824,8 +824,13 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
   loopback, on an ephemeral port, before the run session and stops it when
   Harbor has exited. The run's SSH session (only that one) carries
   `-o ExitOnForwardFailure=yes -R 127.0.0.1:<tunnel>:127.0.0.1:<proxy>`,
-  with a random tunnel port in 20000–59999; a port that is already taken
-  fails the session at once and the run says so.
+  with a random tunnel port in 20000–32767, below the ephemeral ranges of
+  Linux (from 32768) and macOS (from 49152). When the executor cannot
+  listen on it (the port is taken, or its sshd does not allow remote
+  forwarding), ssh exits at once with 255 and `remote port forwarding
+  failed`; the worker then uploads the run spec with another port and
+  starts the session again, up to 5 ports, after which the run fails
+  saying the tunnel port could not be bound on the executor.
 - SSRF guard: the proxy connects only to globally routable unicast
   addresses. Loopback, private (RFC 1918, unique-local), link-local, CGNAT
   (100.64/10), multicast, reserved and unspecified addresses are refused

@@ -164,6 +164,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A busy tunnel port on an SSH executor no longer fails `egress =
+  "workbench"`** (#716). Setup's 容器出网 step and each run picked the
+  executor-side port of their `ssh -R` tunnel at random from 20000–59999,
+  mostly inside Linux's ephemeral range, so a port an outgoing connection held
+  made `ssh` exit at once (`ExitOnForwardFailure`): setup then blamed the
+  executor's firewall, and the run failed as a lost SSH connection. The port
+  now comes from 20000–32767, below the ephemeral ranges, and when the
+  executor cannot listen on it, setup and the run try another port, up to 5.
+  When none works, they say the tunnel port could not be bound on the
+  executor, which may also not allow remote forwarding for the account.
+
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
   8 s before the write and 6 s after it, so a server that answered
