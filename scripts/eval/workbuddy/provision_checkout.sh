@@ -35,7 +35,14 @@ dest=$(cd "$dest" && pwd)
 
 git init -q "$dest"
 git -C "$dest" remote add origin "$upstream"
-git -C "$dest" fetch -q --depth 1 "$source" "$commit"
+# A self-hosted CI runner's network drops a connection now and then: try
+# the fetch 3 times before giving up.
+for delay in 10 30 ""; do
+  git -C "$dest" fetch -q --depth 1 "$source" "$commit" && break
+  [[ -n $delay ]] || exit 1
+  echo "git fetch failed; retrying in ${delay}s" >&2
+  sleep "$delay"
+done
 git -C "$dest" checkout -q --detach FETCH_HEAD
 if [[ $(git -C "$dest" rev-parse HEAD) != "$commit" ]]; then
   echo "error: fetched $(git -C "$dest" rev-parse HEAD), expected $commit" >&2
