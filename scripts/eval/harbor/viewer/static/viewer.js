@@ -1296,16 +1296,46 @@ function svg(tag, attrs, ...children) {
   return el;
 }
 const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
+const rowGroup = (r) => (r.ours ? 'metacodes' : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
+const PALETTE = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
+const SHAPES = ['diamond', 'square', 'circle', 'triangle', 'hexagon'];
+function harnessLooks(rows) {
+  const names = [...new Set(rows.filter((r) => !r.ours).map((r) => r.harness))];
+  const looks = new Map(names.map((name, i) => [name, {
+    color: PALETTE[i] || `hsl(${(i * 137.508 + 20) % 360} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
+  looks.set('metacodes', { color: 'var(--accent)', shape: 'star' });
+  return (r) => looks.get(rowGroup(r));
+}
+const glyph = (look) => h('i', { class: 'glyph', 'data-shape': look.shape, style: 'background:' + look.color });
+function niceTicks(lo, hi) {
+  const raw = (hi - lo) / 5;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= raw * 0.7);
+  const ticks = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) ticks.push(+v.toPrecision(12));
+  return { ticks, step };
+}
+function costTicks(lo, hi) {
+  const decades = [];
+  for (let e = Math.floor(Math.log10(lo)); e <= Math.ceil(Math.log10(hi)); e++) decades.push(10 ** e, 2 * 10 ** e, 5 * 10 ** e);
+  const ticks = decades.filter((v) => v >= lo && v <= hi);
+  return ticks.length >= 3 ? ticks : niceTicks(lo, hi).ticks;
+}
 function arrangeLabels(plot) {
   const box = plot.getBoundingClientRect();
   if (!box.width) return;
-  const labels = [...plot.querySelectorAll('.scatter-label')];
-  const dots = [...plot.querySelectorAll('.scatter-point .dot')].map((m) => [m.closest('.scatter-point'), m.getBoundingClientRect()]);
-  const placed = [];
+  const labels = [...plot.querySelectorAll('.scatter-label')]
+    .sort((x, y) => Number(x.closest('.scatter-point').dataset.order) - Number(y.closest('.scatter-point').dataset.order));
+  const marks = [...plot.querySelectorAll('.scatter-point .glyph')].map((m) => [m.closest('.scatter-point'), m.getBoundingClientRect()]);
+  const front = marks.filter(([p]) => p.dataset.frontier).map(([, m]) => [(m.left + m.right) / 2, (m.top + m.bottom) / 2]).sort((a, b) => a[0] - b[0]);
+  const line = front.slice(1).flatMap(([x, y], i) => {
+    const [ax, ay] = front[i]; const n = Math.ceil(Math.hypot(x - ax, y - ay) / 4);
+    return Array.from({ length: n }, (_, j) => { const cx = ax + (x - ax) * j / n; const cy = ay + (y - ay) * j / n; return { left: cx, right: cx, top: cy, bottom: cy }; });
+  });
+  const placed = [...line];
   const overlaps = (a, b) => a.left < b.right + 4 && a.right > b.left - 4 && a.top < b.bottom + 2 && a.bottom > b.top - 2;
-  const tries = [0, -14, 14, -28, 28].flatMap((dy) => [['right', dy], ['left', dy]]);
-  labels.sort((x, y) => Number(y.closest('.scatter-point').dataset.ours) - Number(x.closest('.scatter-point').dataset.ours));
+  const tries = [0, -18, 18, -32, 32].flatMap((dy) => [['right', dy], ['left', dy]]);
   for (const label of labels) {
     const own = label.closest('.scatter-point');
     label.hidden = false;
@@ -1314,13 +1344,13 @@ function arrangeLabels(plot) {
       label.style.setProperty('--dy', dy + 'px');
       const r = label.getBoundingClientRect();
       return r.left >= box.left && r.right <= box.right && r.top >= box.top && r.bottom <= box.bottom
-        && !placed.some((o) => overlaps(r, o)) && !dots.some(([p, m]) => p !== own && overlaps(r, m));
+        && !placed.some((o) => overlaps(r, o)) && !marks.some(([p, m]) => p !== own && overlaps(r, m));
     });
     if (fits) placed.push(label.getBoundingClientRect());
     else label.hidden = true;
   }
 }
-function costScatter(rows, focus) {
+function costScatter(rows, focus, lookOf) {
   const points = rows.filter((r) => r.cost_per_task_usd > 0);
   if (points.length < 2 || !points.some((r) => !r.ours)) return null;
   const costs = points.map((r) => Math.log(r.cost_per_task_usd)); const scores = points.map((r) => r.score);
@@ -1329,27 +1359,28 @@ function costScatter(rows, focus) {
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
   const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
-  const leaders = points.filter((r) => !r.ours).sort((p, q) => q.score - p.score).slice(0, 3);
-  const named = points.filter((r) => frontier.includes(r) || leaders.includes(r));
-  const repeated = new Set(named.filter((r, i) => named.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
-  const label = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const repeated = new Set(points.filter((r, i) => points.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
+  const name = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const order = [...points].sort((p, q) => Boolean(q.ours) - Boolean(p.ours) || frontier.includes(q) - frontier.includes(p) || q.score - p.score);
   const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' },
     svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
-  const ticks = [0, 1, 2].map((i) => 0.12 + i * 0.38);
+  const yTicks = niceTicks(y0, y1);
   const grid = [
-    ...ticks.map((t) => h('div', { class: 'grid-y', style: `bottom:${t * 100}%` }, h('span', { text: (y0 + (y1 - y0) * t).toFixed(0) + '%' }))),
-    ...ticks.map((t) => { const v = Math.exp(x0 + (x1 - x0) * t); return h('div', { class: 'grid-x', style: `left:${t * 100}%` }, h('span', { text: '$' + v.toFixed(v < 1 ? 2 : 1) })); }),
+    ...yTicks.ticks.map((v) => h('div', { class: 'grid-y', style: `bottom:${(v - y0) / (y1 - y0) * 100}%` },
+      h('span', { text: v.toFixed(yTicks.step < 1 ? 1 : 0) + '%' }))),
+    ...costTicks(Math.exp(x0), Math.exp(x1)).map((v) => h('div', { class: 'grid-x', style: `left:${(Math.log(v) - x0) / (x1 - x0) * 100}%` },
+      h('span', { text: '$' + v.toFixed(v < 0.1 ? 3 : 2) }))),
   ];
   const tip = h('div', { class: 'scatter-tip', hidden: true });
-  const dots = new Map(points.map((r) => {
-    const kind = r.ours ? 'ours' : frontier.includes(r) ? 'frontier' : 'other';
-    return [r, h('button', { type: 'button', class: 'scatter-point', 'data-kind': kind, 'data-ours': r.ours ? '1' : '0',
-      style: `left:${px(r)}%;bottom:${py(r)}%`,
-      'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
-      onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
-      onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
-    h('i', { class: 'dot' }), r.ours || named.includes(r) ? h('span', { class: 'scatter-label', text: label(r) }) : null)];
-  }));
+  const dots = new Map(points.map((r) => [r, h('button', { type: 'button', class: 'scatter-point',
+    'data-ours': r.ours ? '1' : null, 'data-frontier': frontier.includes(r) ? '1' : null, 'data-order': order.indexOf(r),
+    style: `left:${px(r)}%;bottom:${py(r)}%`,
+    'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
+    onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
+    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+  glyph(lookOf(r)),
+  h('span', { class: 'scatter-label', style: 'color:' + lookOf(r).color },
+    h('b', { text: name(r) }), h('small', { class: 'num', text: `${score(r.score)} · ${usd(r.cost_per_task_usd)}` })))]));
   const plot = h('div', { class: 'scatter-plot' }, ...grid, layer, ...dots.values(), tip);
   focus.on((active) => {
     const a = dots.has(active) ? active : null;
@@ -1366,9 +1397,15 @@ function costScatter(rows, focus) {
     tip.style.bottom = py(a) + '%';
     tip.dataset.side = px(a) > 60 ? 'left' : 'right';
   });
+  const group = (g) => {
+    plot.toggleAttribute('data-group', Boolean(g));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(g) && rowGroup(r) !== g);
+  };
+  const legend = h('div', { class: 'scatter-legend' }, [...new Map(points.map((r) => [rowGroup(r), r])).values()].map((r) =>
+    h('span', { class: 'key', onmouseenter: () => group(rowGroup(r)), onmouseleave: () => group(null) }, glyph(lookOf(r)), rowGroup(r))));
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
-  return h('div', { class: 'scatter-box' }, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
-    h('div', { class: 'axis-x', text: '每题成本' })));
+  return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
+    h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
 function focusHub() {
   const listeners = [];
@@ -1392,6 +1429,7 @@ function boardPanel(board) {
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
+  const lookOf = harnessLooks(rows);
   const src = board.source;
   const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
   const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
@@ -1404,7 +1442,7 @@ function boardPanel(board) {
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
   h('td', { class: 'num rank', text: String(r.rank) }),
-  h('td', { text: r.ours ? 'metacodes' : r.harness }),
+  h('td', {}, h('span', { class: 'harness' }, glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
   h('td', { class: 'muted', text: r.model || '—' }),
   h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
     h('span', { class: 'num', text: score(r.score) }))),
@@ -1415,7 +1453,7 @@ function boardPanel(board) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
     h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', '每题成本'].map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus), table),
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus, lookOf), table),
     h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {
