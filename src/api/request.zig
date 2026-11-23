@@ -329,6 +329,8 @@ fn serializeContent(
     // 前缀契约不变)。**不变式**(buildApiMessages 保证):含 reasoning_item 的
     // 消息一定还有别的 block,故这里不会产出空 `[]`。
     var first = true;
+    var tool_images: std.ArrayList(u8) = .empty;
+    defer tool_images.deinit(allocator);
     for (content) |block| {
         if (block == .reasoning_item) continue;
         // thinking 块只回传给声明了回传的方言(DeepSeek 的 Anthropic 端点收无签名的
@@ -374,6 +376,15 @@ fn serializeContent(
                 // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
                 if (dialect_mod.extractImageResult(tr.content)) |img| image: {
                     report.image_results += 1;
+                    const images_mark = tool_images.items.len;
+                    if (profile.tool_result_images_as_blocks) {
+                        try tool_images.append(allocator, ',');
+                        if (try dialect.serializeImagePart(profile, img, &tool_images, allocator)) {
+                            try util_json.serializeString(IMAGE_FOLLOWS_NOTE, buf, allocator);
+                            break :image;
+                        }
+                        tool_images.shrinkRetainingCapacity(images_mark);
+                    }
                     const mark = buf.items.len;
                     try buf.append(allocator, '[');
                     if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
@@ -403,6 +414,7 @@ fn serializeContent(
             },
         }
     }
+    try buf.appendSlice(allocator, tool_images.items);
     try buf.append(allocator, ']');
 }
 
@@ -410,6 +422,8 @@ fn serializeContent(
 /// (openai/gemini client) 与投影层(估算/身份/预算)必须用同一嗅探,两份实现会漂移。
 /// 这里保留别名:`json.zig` 经此再导出给 agent_loop / conversation / session_budget。
 pub const ImageResult = types.ImageBlock;
+
+const IMAGE_FOLLOWS_NOTE = "[image attached after the tool results]";
 pub const extractImageResult = dialect_mod.extractImageResult;
 
 fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -890,6 +904,49 @@ test "serializeMessagesRequest with image tool_result emits content block array"
     try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":{\"type\":\"base64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"iVBORw==\"") != null);
+}
+
+test "serializeMessagesRequest: a non-Claude vision model gets a tool's image as the next block, not inside the tool_result" {
+    const msg = types.ApiMessage{
+        .role = .user,
+        .content = &.{
+            .{ .tool_result = .{
+                .tool_use_id = "t1",
+                .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}",
+                .is_error = false,
+            } },
+            .{ .text = "next" },
+        },
+    };
+    const req = MessagesRequest{ .model = "gpt-5.2", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    const expected = "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"[image attached after the tool results]\"}," ++
+        "{\"type\":\"text\",\"text\":\"next\"}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}}]";
+    try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+}
+
+test "serializeMessagesRequest: parallel tool results keep every tool_result before the images they returned" {
+    const msg = types.ApiMessage{
+        .role = .user,
+        .content = &.{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUFB\"}", .is_error = false } },
+            .{ .tool_result = .{ .tool_use_id = "t2", .content = "ok", .is_error = false } },
+            .{ .tool_result = .{ .tool_use_id = "t3", .content = "{\"type\":\"image\",\"media_type\":\"image/jpeg\",\"data\":\"QkJC\"}", .is_error = false } },
+        },
+    };
+    const req = MessagesRequest{ .model = "glm-5.3-flash", .messages = &.{msg} };
+    var dialect = dialect_mod.dialectFor(.anthropic, req.model);
+    dialect.profileFn = canonicalProjectionProfile;
+    const body = try serializeMessagesRequestWithDialect(req, std.testing.allocator, dialect);
+    defer std.testing.allocator.free(body);
+    const expected = "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"[image attached after the tool results]\"}," ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"content\":\"ok\"}," ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"content\":\"[image attached after the tool results]\"}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"QUFB\"}}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"QkJC\"}}]";
+    try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
 }
 
 test "serializeMessagesRequest: 非 vision 模型的图像 tool_result → 占位文本(不发 base64)" {
