@@ -779,6 +779,13 @@ class SuiteLaunchTest(unittest.TestCase):
             wb.launch(unjudged, {"METASK_API_KEY": "k"})
         self.assertFalse(any((repo / "configs/jobs").glob("*.yaml")))
 
+    def test_a_run_mount_image_reference_fits_dockers_image_mount_directory_name(self):
+        name = "bench-20261122-201744-334243" + "-x" * 40
+        tag = wb.run_image_tag(name)
+        self.assertNotEqual(tag, wb.run_image_tag(name + "y"))
+        key = "0" * 64 + ",src=" + tag + ",dst=/opt/metacodes"
+        self.assertLessEqual(len(key.encode().hex()), 255)
+
     def test_workbuddy_judge_model_defaults_and_rejects_other_settings(self):
         self.assertIsNone(wb.judge_model(suites.get("workbuddy-code"), {}))
         self.assertEqual(wb.judge_model(suites.get("workbuddy-office"), {}), wb.DEFAULT_JUDGE_MODEL)
