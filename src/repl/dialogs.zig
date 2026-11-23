@@ -21,6 +21,7 @@ const provider_login = @import("../api/provider_login.zig");
 const login_worker_mod = @import("../api/login_worker.zig");
 const openrouter_login = @import("../api/openrouter_login.zig");
 const metask_sign_in = @import("../api/metask_sign_in.zig");
+const auth = @import("../core/auth.zig");
 const model_catalog = @import("../api/catalog.zig");
 const types = @import("../types.zig");
 const provider_profile = @import("../provider/profile.zig");
@@ -641,6 +642,7 @@ pub const LoginDialog = struct {
     sel: usize = 0,
     stage: Stage = .choose,
     worker: ?*login_worker_mod.LoginWorker = null,
+    pasted: PastedAddress = .{},
     /// A cancelled sign-in whose thread is still in a request; the host
     /// takes it (`takeDetached`) so closing the dialog never waits on it.
     detached: ?*login_worker_mod.LoginWorker = null,
@@ -923,10 +925,16 @@ pub const LoginDialog = struct {
         self.clearKey();
     }
 
+    fn takesPaste(self: *const LoginDialog) bool {
+        const worker = self.worker orelse return false;
+        return worker.takesPastedAddress();
+    }
+
     fn startFlow(self: *LoginDialog, flow: provider_login.Flow) void {
         self.stopWorker();
         self.transcript_len = 0;
         self.failure_len = 0;
+        self.pasted = .{};
         const worker = self.allocator.create(login_worker_mod.LoginWorker) catch {
             self.setFailure("out of memory");
             return;
@@ -1089,6 +1097,7 @@ pub const LoginDialog = struct {
                 try p.blank();
                 try self.drawTranscript(p);
                 try p.blank();
+                if (self.takesPaste()) try self.pasted.draw(p);
                 try p.footer("Esc to cancel");
             },
             .failed => {
@@ -1343,7 +1352,10 @@ pub const LoginDialog = struct {
                     self.outcome = .interrupted;
                     return .done;
                 },
-                else => return .none,
+                else => {
+                    if (!self.takesPaste()) return .none;
+                    return self.pasted.key(k, self.worker.?);
+                },
             },
             .failed => switch (k) {
                 .esc, .ctrl_c => {
@@ -1384,7 +1396,10 @@ pub const LoginDialog = struct {
             self.transcript_len = text.len;
         }
         switch (worker.currentState()) {
-            .idle, .running => return if (changed) .redraw else .none,
+            .idle, .running => {
+                const refused = self.takesPaste() and self.pasted.follow(worker.pasteRefusal());
+                return if (changed or refused) .redraw else .none;
+            },
             .succeeded => {
                 self.stopWorker();
                 self.outcome = if (self.current().method == .api_key or self.pasting)
@@ -1414,6 +1429,60 @@ pub const LoginDialog = struct {
 
 // ── /login: the Metask browser sign-in (#485, #527) ─────────────────────────
 
+const PastedAddress = struct {
+    buffer: [4096]u8 = undefined,
+    len: usize = 0,
+    refusal: ?auth.PasteRefusal = null,
+
+    fn draw(self: *const PastedAddress, p: *Pane) !void {
+        try p.paragraph("", "Browser on another computer? Once you sign in there, it ends on a page that does not load: paste that page's address here and press Enter.");
+        var line_buf: [192]u8 = undefined;
+        try p.text(if (self.len == 0) "Address: (paste it here)" else self.summary(&line_buf));
+        if (self.refusal) |why| try p.paragraph(p.th.warn, auth.pasteRefusalText(why));
+        try p.blank();
+    }
+
+    fn summary(self: *const PastedAddress, buffer: []u8) []const u8 {
+        const text = self.buffer[0..self.len];
+        const head = text[0..@min(std.mem.indexOfScalar(u8, text, '?') orelse text.len, 80)];
+        return std.fmt.bufPrint(buffer, "Address: {s}… ({d} {s}) · Enter to use it", .{ head, self.len, if (self.len == 1) "character" else "characters" }) catch "Address: (pasted) · Enter to use it";
+    }
+
+    fn key(self: *PastedAddress, k: input.Key, target: anytype) Step {
+        switch (k) {
+            .backspace => {
+                if (self.len == 0) return .none;
+                self.len -= 1;
+                return .redraw;
+            },
+            .ctrl_u => {
+                self.len = 0;
+                return .redraw;
+            },
+            .enter => {
+                if (std.mem.trim(u8, self.buffer[0..self.len], " \t").len == 0) return .none;
+                target.pasteAddress(self.buffer[0..self.len]);
+                self.len = 0;
+                self.refusal = null;
+                return .redraw;
+            },
+            .char => |c| {
+                if (c < ' ' or c == 0x7f or self.len == self.buffer.len) return .none;
+                self.buffer[self.len] = c;
+                self.len += 1;
+                return .redraw;
+            },
+            else => return .none,
+        }
+    }
+
+    fn follow(self: *PastedAddress, refusal: ?auth.PasteRefusal) bool {
+        if (std.meta.eql(refusal, self.refusal)) return false;
+        self.refusal = refusal;
+        return true;
+    }
+};
+
 /// `/login` with no provider: the Metask browser sign-in, then the model and
 /// reasoning level `metacodes login` asks for line by line, as choices in the
 /// pane. `/login metask` is the same with the device code (`device_code`).
@@ -1424,6 +1493,7 @@ pub const LoginDialog = struct {
 /// only after `outcome` is `chosen`.
 pub const MetaskSignInDialog = struct {
     pub const Stage = enum {
+        choose_way,
         /// Waiting for the browser to come back (or the code to be
         /// confirmed), then listing the models.
         signing_in,
@@ -1442,7 +1512,9 @@ pub const MetaskSignInDialog = struct {
     /// `/login metask`: a code confirmed on any device, not the browser
     /// coming back here (`metask_sign_in.Options.device_code`).
     device_code: bool = false,
-    over_ssh: bool = false,
+    way_sel: usize = 1,
+    pending: ?Pending = null,
+    pasted: PastedAddress = .{},
     /// The providers `/login <provider>` signs in to, comma-separated, for
     /// the line that says so (borrowed); empty leaves it out.
     others: []const u8 = "",
@@ -1459,13 +1531,32 @@ pub const MetaskSignInDialog = struct {
     effort: ?types.ReasoningEffort = null,
     outcome: Outcome = .cancelled,
 
+    const Pending = struct { io: std.Io, options: metask_sign_in.Options };
+
     pub fn init(allocator: std.mem.Allocator) MetaskSignInDialog {
         return .{ .allocator = allocator, .models = model_catalog.Catalog.init(allocator) };
+    }
+
+    pub fn offerWays(self: *MetaskSignInDialog, io: std.Io, options: metask_sign_in.Options) void {
+        self.pending = .{ .io = io, .options = options };
+        self.way_sel = 1;
+        self.stage = .choose_way;
+    }
+
+    fn chooseWay(self: *MetaskSignInDialog, index: usize) Step {
+        const pending = self.pending orelse return .none;
+        self.pending = null;
+        var options = pending.options;
+        options.device_code = index == 1;
+        options.open_browser = options.open_browser and !options.device_code;
+        self.start(pending.io, options);
+        return .redraw;
     }
 
     /// Start the sign-in. A worker that cannot start is the dialog's failure.
     pub fn start(self: *MetaskSignInDialog, io: std.Io, options: metask_sign_in.Options) void {
         self.device_code = options.device_code;
+        self.pasted = .{};
         const worker = metask_sign_in.Worker.create(self.allocator, io, options) catch {
             self.setFailure("out of memory");
             return;
@@ -1549,6 +1640,14 @@ pub const MetaskSignInDialog = struct {
         try p.title("Sign in to Metask");
         try p.blank();
         switch (self.stage) {
+            .choose_way => {
+                try p.option(1, self.way_sel == 0, "Sign in with the browser on this computer", "");
+                try p.option(2, self.way_sel == 1, "Sign in with a code on another device (SSH, no browser here)", "");
+                try p.blank();
+                try p.paragraph(p.th.dim, "This looks like an SSH session: sign in on another device instead.");
+                try p.blank();
+                try p.footer("↑/↓ to select · Enter to continue · Esc to cancel");
+            },
             .signing_in => {
                 try p.paragraph("", if (self.device_code)
                     "Confirm the code below in a browser on any device; then choose a model and a reasoning level here."
@@ -1560,11 +1659,8 @@ pub const MetaskSignInDialog = struct {
                 // A machine with no browser to come back from (#485): the
                 // device-code sign-in needs only a code typed elsewhere.
                 if (!self.device_code) {
+                    try self.pasted.draw(p);
                     try p.paragraph(p.th.dim, "No browser on this machine? /login metask signs in with a short code instead.");
-                    try p.blank();
-                }
-                if (self.over_ssh) {
-                    try p.paragraph(p.th.dim, "This looks like an SSH session, so this signs in with a code instead of the browser. /login --no-browser keeps the browser sign-in.");
                     try p.blank();
                 }
                 if (self.others.len > 0) {
@@ -1681,7 +1777,23 @@ pub const MetaskSignInDialog = struct {
                 self.start(io, options);
                 return .redraw;
             },
-            .signing_in => return .none,
+            .choose_way => switch (k) {
+                .up, .down => {
+                    self.way_sel = 1 - self.way_sel;
+                    return .redraw;
+                },
+                .enter => return self.chooseWay(self.way_sel),
+                .char => |c| {
+                    if (c != '1' and c != '2') return .none;
+                    return self.chooseWay(c - '1');
+                },
+                else => return .none,
+            },
+            .signing_in => {
+                if (self.device_code) return .none;
+                const worker = self.worker orelse return .none;
+                return self.pasted.key(k, worker);
+            },
         }
     }
 
@@ -1723,7 +1835,10 @@ pub const MetaskSignInDialog = struct {
                     self.outcome = .cancelled;
                     return .done;
                 },
-                else => return if (changed) .redraw else .none,
+                else => {
+                    const refused = !self.device_code and self.pasted.follow(worker.pasteRefusal());
+                    return if (changed or refused) .redraw else .none;
+                },
             },
             else => return .none,
         }
@@ -1999,23 +2114,52 @@ test "metask sign-in: the browser wait names the short-code sign-in for a machin
     try testing.expect(std.mem.indexOf(u8, plain, "Another provider instead: /login <provider> (deepseek, zai-coding-plan)") != null);
 }
 
-test "metask sign-in: over SSH the device code says why and how to keep the browser (#722)" {
-    const ssh_line = "This looks like an SSH session, so this signs in with a code instead of the browser. /login --no-browser keeps the browser sign-in.";
-    var over_ssh = MetaskSignInDialog.init(testing.allocator);
-    defer over_ssh.deinit();
-    over_ssh.device_code = true;
-    over_ssh.over_ssh = true;
-    const ssh_plain = try renderPlain(&over_ssh, 200);
-    defer testing.allocator.free(ssh_plain);
-    try testing.expect(std.mem.indexOf(u8, ssh_plain, ssh_line) != null);
-    try testing.expect(std.mem.indexOf(u8, ssh_plain, "No browser on this machine?") == null);
+test "metask sign-in: over SSH it asks which way, the code first, as OpenRouter's pane does (#722)" {
+    var dialog = MetaskSignInDialog.init(testing.allocator);
+    defer dialog.deinit();
+    dialog.offerWays(undefined, .{ .open_browser = false });
+    try testing.expectEqual(MetaskSignInDialog.Stage.choose_way, dialog.stage);
+    try testing.expectEqual(@as(usize, 1), dialog.way_sel);
+    const first = try renderPlain(&dialog, 120);
+    defer testing.allocator.free(first);
+    try testing.expect(std.mem.indexOf(u8, first, "2. Sign in with a code on another device (SSH, no browser here)") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "1. Sign in with the browser on this computer") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "This looks like an SSH session: sign in on another device instead.") != null);
+    try testing.expectEqual(Step.redraw, dialog.key(.up));
+    try testing.expectEqual(@as(usize, 0), dialog.way_sel);
+    try testing.expectEqual(Step.none, dialog.key(.{ .char = '7' }));
+    try testing.expectEqual(Step.done, dialog.key(.esc));
+    try testing.expectEqual(MetaskSignInDialog.Outcome.cancelled, dialog.outcome);
+}
 
-    var asked = MetaskSignInDialog.init(testing.allocator);
-    defer asked.deinit();
-    asked.device_code = true;
-    const asked_plain = try renderPlain(&asked, 200);
-    defer testing.allocator.free(asked_plain);
-    try testing.expect(std.mem.indexOf(u8, asked_plain, ssh_line) == null);
+test "a pasted address is typed into the pane, summed up without its code, and handed over on Enter (#722)" {
+    const Target = struct {
+        got: [256]u8 = undefined,
+        len: usize = 0,
+        fn pasteAddress(self: *@This(), text: []const u8) void {
+            @memcpy(self.got[0..text.len], text);
+            self.len = text.len;
+        }
+    };
+    var target = Target{};
+    var pasted = PastedAddress{};
+    try testing.expectEqual(Step.none, pasted.key(.enter, &target));
+    const address = "http://localhost:1455/auth/metask/callback?code=secret-code&state=s";
+    for (address) |c| _ = pasted.key(.{ .char = c }, &target);
+    var p = Pane.init(testing.allocator, theme_mod.monochrome, 200);
+    defer p.deinit();
+    try pasted.draw(&p);
+    try testing.expect(std.mem.indexOf(u8, p.bytes.items, "Address: http://localhost:1455/auth/metask/callback… (67 characters) · Enter to use it") != null);
+    try testing.expect(std.mem.indexOf(u8, p.bytes.items, "secret-code") == null);
+    try testing.expectEqual(Step.redraw, pasted.key(.enter, &target));
+    try testing.expectEqualStrings(address, target.got[0..target.len]);
+    try testing.expectEqual(@as(usize, 0), pasted.len);
+    try testing.expect(pasted.follow(.other_sign_in));
+    try testing.expect(!pasted.follow(.other_sign_in));
+    var q = Pane.init(testing.allocator, theme_mod.monochrome, 200);
+    defer q.deinit();
+    try pasted.draw(&q);
+    try testing.expect(std.mem.indexOf(u8, q.bytes.items, "That address is from another sign-in.") != null);
 }
 
 test "login: no provider to sign in to says how keys are configured" {

@@ -115,9 +115,15 @@ AgentCore ABI and SDK layouts are unchanged.
 
 In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set), where a loopback
 redirect lands on this machine and the browser that would follow it is on
-another one, `metacodes login` and `/login` take this flow by themselves,
-say so in one line, and open no browser; `--no-browser` keeps the browser
-sign-in (#722). The browser sign-in of `metacodes login` waits for the
+another one, `metacodes login` takes this flow by itself and says so in one
+line, and `/login` asks which way with this flow selected. Taken there, this
+flow opens no browser on this machine; the browser way, picked in `/login`,
+opens it as it does without SSH. `--no-browser` keeps the browser sign-in
+(#722). A loopback sign-in (Metask's, and `login --provider <id>`'s OAuth)
+also takes the address the browser ended on, pasted at the prompt or into the
+`/login` pane: its path and query are judged as the callback would be (path,
+`state`, `code`, `error`), so an address from another sign-in is refused and
+the wait goes on. The browser sign-in of `metacodes login` waits for the
 callback at most `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (default 600000;
 `0` waits without a limit), then exits 1 having stored nothing and names
 this flow. In an SSH session every loopback sign-in (Metask's, `login
@@ -234,7 +240,7 @@ command typed then waits in the queue until the turn ends.
 `/login metask` is Metask's device grant in the pane `/login` uses: the code
 is confirmed on any device, then the model and reasoning level are chosen,
 and the sign-in is stored and used as `/login`'s (#527). In an SSH session
-`/login` alone is the same device grant, and the pane says why;
+`/login` alone asks which way, the device grant selected, and says why;
 `/login --no-browser` keeps the browser sign-in there (#722).
 `/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts
 another provider's sign-in directly; it

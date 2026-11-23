@@ -279,7 +279,9 @@ On a machine without a browser (a server, an SSH session), sign in with a
 device code instead: `metacodes login --provider metask --no-browser` prints
 a link and a code to confirm on any device, then asks for the model and
 reasoning level (`/login metask` in the TUI). In an SSH session `metacodes
-login` and `/login` take the device code by themselves. Either sign-in is
+login` takes the device code by itself and `/login` offers it first. A browser
+sign-in finished on another computer ends on a page that does not load: paste
+that page's address back into metacodes to finish it here. Either sign-in is
 kept as the Metask session, and a plain `metacodes` uses it.
 
 To use your own provider key instead of signing in, put it in the install's

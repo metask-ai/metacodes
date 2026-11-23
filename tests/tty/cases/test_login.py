@@ -141,9 +141,6 @@ def test_login_chatgpt_codex_takes_1457_when_1455_is_held_and_sends_it_nothing(b
 
 @runs_alone(_CALLBACK_PORTS)
 def test_login_chatgpt_codex_over_ssh_names_the_forward_for_the_port_it_took(bin_path):
-    # Over SSH the browser cannot come back to this machine (#722): the
-    # sign-in names the ssh -L forward its callback needs, for the port it
-    # bound. 1455 held: the forward is for 1457.
     holder = _hold(1455)
     if holder is None:
         raise SkipTest("port 1455 is in use on this machine")
@@ -159,3 +156,19 @@ def test_login_chatgpt_codex_over_ssh_names_the_forward_for_the_port_it_took(bin
     assert "Over SSH? Forward the port first: ssh -L 1457:127.0.0.1:1457 <you>@<this machine>" in text, text[-2000:]
     assert "redirect_uri=http%3A%2F%2Flocalhost%3A1457%2Fauth%2Fcallback&" in url, url
 
+
+@runs_alone(_CALLBACK_PORTS)
+def test_login_chatgpt_codex_pane_takes_a_pasted_address_and_refuses_another_sign_ins(bin_path):
+    free = _hold(1455)
+    if free is None:
+        raise SkipTest("port 1455 is in use on this machine")
+    free.close()
+    raw = run(bin_path, [READY, "type:/login chatgpt-codex --no-browser", "key:enter",
+                         wait_for("paste that page's address here", 15),
+                         "raw:\x1b[200~http://localhost:1455/auth/callback?code=x&state=another-sign-in\x1b[201~",
+                         "key:enter", wait_for("That address is from another sign-in.", 10), "sleep:0.5",
+                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 200),
+              env={"SSH_CONNECTION": None, "SSH_TTY": None}, per_key_drain=0.05)
+    text = _ANSI.sub(b"", raw).decode("utf-8", "replace")
+    assert "That address is from another sign-in. Paste the address from this sign-in's page." in text, text[-2000:]
+    assert "Login interrupted" in text, text[-2000:]

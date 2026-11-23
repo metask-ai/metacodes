@@ -109,6 +109,7 @@ pub const Options = struct {
     force_state: ?[]const u8 = null,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
+    paste: ?auth.PasteSource = null,
 };
 
 pub const Error = error{
@@ -172,6 +173,7 @@ fn acquireByLoopback(
     // the flow ends with it instead of waiting on.
     var refusal: auth.Refusal = .{};
     server.refusal = &refusal;
+    server.paste = options.paste;
 
     const redirect_uri = try std.fmt.allocPrint(
         allocator,
@@ -196,8 +198,14 @@ fn acquireByLoopback(
         var forward_buf: [160]u8 = undefined;
         const text = try std.fmt.allocPrint(
             allocator,
-            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n{s}",
-            .{ endpoints.redirect_host, server.port, url, if (auth.sshSession()) auth.sshForwardLine(&forward_buf, server.port) else "" },
+            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n{s}{s}",
+            .{
+                endpoints.redirect_host,
+                server.port,
+                url,
+                if (auth.sshSession()) auth.sshForwardLine(&forward_buf, server.port) else "",
+                if (options.paste) |source| source.prompt orelse "" else "",
+            },
         );
         defer allocator.free(text);
         notify.say(text);

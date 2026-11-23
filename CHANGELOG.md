@@ -168,9 +168,15 @@ status, compatibility boundaries, and entry points are defined by
   back** (#722). `metacodes login` and `/login` sent the browser back to
   `http://localhost:1455`, which on a machine reached over SSH is not where
   the browser is: the sign-in waited with no limit and said nothing.
-  - In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set) they now take
-    Metask's device code by themselves and say why, as OpenRouter's sign-in
-    already did; `--no-browser` keeps the browser sign-in.
+  - In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set) `metacodes login`
+    takes Metask's device code by itself and says why, and `/login` asks which
+    way with the code selected, as OpenRouter's sign-in already did;
+    `--no-browser` keeps the browser sign-in.
+  - A browser sign-in finished on another computer ends on a page that does
+    not load: paste that page's address at the prompt, or into the `/login`
+    pane, and the sign-in finishes here (Metask's, and another provider's
+    OAuth such as ChatGPT's). An address from another sign-in is refused and
+    the wait goes on.
   - Every sign-in that waits for a localhost callback (Metask's, ChatGPT's,
     another provider's OAuth, OpenRouter's browser way) prints the forward it
     needs over SSH, with the port it bound:

@@ -3064,7 +3064,8 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                 return runMetaskDeviceLogin(allocator, init.io, state_dir, false);
             }
             const timeout_ms = auth.loginCallbackTimeoutMs();
-            const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser, .timeout_ms = timeout_ms }) catch |err| {
+            var stdin_paste: StdinPaste = .{};
+            const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser, .timeout_ms = timeout_ms, .paste = stdin_paste.source() }) catch |err| {
                 if (err == error.CallbackTimedOut) {
                     var wait_buf: [48]u8 = undefined;
                     std.debug.print("No answer from the browser in {s}; nothing was stored. Signing in on another computer? Run `metacodes login --provider metask`.\n", .{waitText(&wait_buf, timeout_ms.?)});
@@ -3126,6 +3127,34 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     }
 }
 
+const StdinPaste = struct {
+    closed: bool = false,
+
+    fn source(self: *StdinPaste) auth.PasteSource {
+        return .{ .ctx = self, .take = take, .refused = refused, .prompt = auth.PASTE_PROMPT };
+    }
+
+    fn take(ctx: *anyopaque, out: []u8) ?[]const u8 {
+        const self: *StdinPaste = @ptrCast(@alignCast(ctx));
+        if (self.closed) return null;
+        if (platform_term.waitReadable(0, 0) <= 0) return null;
+        const n = terminal_prompt.readLine(out) catch {
+            self.closed = true;
+            return null;
+        };
+        if (n == 0) {
+            self.closed = !platform_term.isatty(0);
+            return null;
+        }
+        return out[0..n];
+    }
+
+    fn refused(ctx: *anyopaque, why: auth.PasteRefusal) void {
+        _ = ctx;
+        std.debug.print("{s}\n", .{auth.pasteRefusalText(why)});
+    }
+};
+
 fn waitText(buffer: []u8, ms: u64) []const u8 {
     const minute = std.time.ms_per_min;
     if (ms >= minute and ms % minute == 0) {
@@ -3168,7 +3197,10 @@ fn printLoginHelp() void {
         \\session, where the browser cannot come back to this machine, it signs in
         \\with the device code instead (--no-browser keeps the browser sign-in, and
         \\prints the ssh -L forward it needs). It waits for the browser 10 minutes
-        \\(METACODES_LOGIN_CALLBACK_TIMEOUT_MS; 0 waits without a limit).
+        \\(METACODES_LOGIN_CALLBACK_TIMEOUT_MS; 0 waits without a limit). A browser
+        \\on another computer ends on a page that does not load: paste that page's
+        \\address at the prompt to finish the sign-in here (also for --provider
+        \\sign-ins that wait for a localhost callback).
         \\
         \\`login --provider <id>` signs in to that provider and stores the token
         \\in its own OAuth session, never the Metask credential store. It uses a
@@ -4390,11 +4422,13 @@ fn runProviderOAuthLogin(
     };
     // Every refusal is decided in the kernel before anything is contacted;
     // this only says which one, in the words the CLI has always used.
+    var stdin_paste: StdinPaste = .{};
     const prepared = provider_login.prepareProfileWith(built, .{
         .method = options.method,
         .open_browser = options.open_browser,
         .client_id = options.client_id,
         .state_root = hostRoot(),
+        .paste = if (options.method == .loopback) stdin_paste.source() else null,
     }, host.oauthClientIdFor(built.id)) catch |err| switch (err) {
         error.ProviderHasNoTokenEndpoint, error.ProviderAcceptsNoOAuthKind => {
             _ = requireOAuthCapableProvider(built);

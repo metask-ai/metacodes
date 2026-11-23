@@ -221,7 +221,8 @@ def _cli(bin_path, args, env, answers, timeout=WAIT_S):
     status = None
     while time.monotonic() < deadline:
         if pending and pending[0][0].encode() in out:
-            os.write(fd, pending.pop(0)[1].encode())
+            reply = pending.pop(0)[1]
+            os.write(fd, (reply(out) if callable(reply) else reply).encode())
         r, _, _ = select.select([fd], [], [], 0.1)
         if r:
             try:

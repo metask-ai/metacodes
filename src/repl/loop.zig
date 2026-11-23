@@ -3245,8 +3245,10 @@ fn printLoginUsage() void {
         \\With no provider, sign in to Metask in the browser, as `metacodes login`
         \\does, and choose a model and a reasoning level; the session and new
         \\sessions use it. /login metask does the same with a code confirmed on
-        \\any device, and so does /login in an SSH session (--no-browser keeps the
-        \\browser there). With another provider, sign in to that provider; the login
+        \\any device; in an SSH session /login asks which way, the code first
+        \\(--no-browser keeps the browser there). A browser on another computer
+        \\ends on a page that does not load: paste that page's address into the
+        \\pane to finish the sign-in here. With another provider, sign in to that provider; the login
         \\is stored where `metacodes login --provider <id>` stores it. A provider
         \\whose site creates the key (OpenRouter) asks which way: the browser here,
         \\or another device (--device-code), whose page shows a code to paste back.
@@ -3345,11 +3347,11 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         },
     };
     // `/login` alone (or with `--no-browser`) is the Metask sign-in
-    // `metacodes login` runs (#485), over SSH with the device code (#722);
-    // the provider list is `/login <provider>`.
+    // `metacodes login` runs (#485); over SSH it asks which way, the device
+    // code first (#722); the provider list is `/login <provider>`.
     if (named == null and options.method == .loopback and options.client_id == null) {
         const over_ssh = options.open_browser and auth_mod.sshSession();
-        return handleMetaskSignIn(app, options.open_browser and !over_ssh, over_ssh, over_ssh);
+        return handleMetaskSignIn(app, options.open_browser, false, over_ssh);
     }
     const host = app.providerHost() catch |err| {
         cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
@@ -3547,7 +3549,6 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool, 
     var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
     defer dialog.deinit();
     dialog.term_rows = terminalRows();
-    dialog.over_ssh = over_ssh;
     var others: std.ArrayList(u8) = .empty;
     defer others.deinit(app.allocator);
     if (app.providerHost()) |host| {
@@ -3562,7 +3563,11 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool, 
         }
     } else |_| {}
     dialog.others = others.items;
-    dialog.start(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    if (over_ssh) {
+        dialog.offerWays(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    } else {
+        dialog.start(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    }
     runDialog(dialogs.MetaskSignInDialog, &dialog, app);
     if (dialog.outcome != .chosen) {
         cmd_output.print("Login interrupted · nothing was changed\n", .{});
