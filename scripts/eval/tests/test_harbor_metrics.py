@@ -414,7 +414,7 @@ class MetricProjectionTest(unittest.TestCase):
         s = data.summarize(rows)
         self.assertEqual((s['tasks_solved'], s['tasks_attempted']), (1, 2))
         self.assertEqual(s['cost_per_task'], 3.0)  # mean of task a (2.0) and task b (4.0); invalid c excluded
-        self.assertAlmostEqual(s['cost_per_pass'], 9.0)  # 3.0 / (1 pass / 3 valid)
+        self.assertAlmostEqual(s['cost_per_pass'], 12.0)  # (2.0 + 4.0) / (1/2 + 0) passes over the same priced tasks
         self.assertAlmostEqual(s['non_pass_cost_share'], 7 / 8)
         self.assertEqual((s['turns_per_pass'], s['tool_calls_per_pass']), (10, 4))
         low, high = s['pass_rate_ci95']

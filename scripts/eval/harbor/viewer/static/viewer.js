@@ -1162,16 +1162,27 @@ async function renderCompare(names) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'matrix' },
     h('thead', {}, h('tr', {}, h('th', { text: '任务' }), jobs.map((j) => h('th', { class: 'center' }, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name }))))),
     h('tbody', {}, rows)));
-  return h('div', {}, metrics, costPassPanel(jobs), panel('逐题对比', '首次执行成绩 · 重跑不回填 · 深色行表示结局不同', table));
+  return h('div', {}, metrics, costPassPanel(jobs, common), panel('逐题对比', '首次执行成绩 · 重跑不回填 · 深色行表示结局不同', table));
+}
+function commonCostPass(job, tasks) {
+  if (!tasks.length) return null;
+  let cost = 0; let passed = 0;
+  for (const task of tasks) {
+    const priced = job.rows.filter((r) => r.task === task && ['pass', 'partial', 'fail', 'timeout'].includes(r.status) && r.cost_usd !== null && r.cost_usd !== undefined);
+    if (!priced.length) return null;
+    cost += priced.reduce((sum, r) => sum + r.cost_usd, 0) / priced.length;
+    passed += priced.filter((r) => r.status === 'pass').length / priced.length;
+  }
+  return { cost: cost / tasks.length, pass: passed / tasks.length };
 }
 function dominated(a, b) {
-  return b.cost_per_task <= a.cost_per_task && b.pass_rate >= a.pass_rate && (b.cost_per_task < a.cost_per_task || b.pass_rate > a.pass_rate);
+  return b.cost <= a.cost && b.pass >= a.pass && (b.cost < a.cost || b.pass > a.pass);
 }
-function costPassPanel(jobs) {
-  const ranked = jobs.map((j) => j.summary).filter((s) => s.cost_per_task !== null && s.pass_rate !== null);
-  const rows = jobs.map((j) => {
-    const s = j.summary;
-    const frontier = ranked.includes(s) && !ranked.some((o) => dominated(s, o));
+function costPassPanel(jobs, common) {
+  const points = jobs.map((j) => commonCostPass(j, common));
+  const rows = jobs.map((j, i) => {
+    const s = j.summary; const point = points[i];
+    const frontier = point && !points.some((other) => other && dominated(point, other));
     return h('tr', {},
       h('td', {}, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name })),
       h('td', { class: 'num', text: pct(s.pass_rate) }, h('span', { class: 'sub', text: ciText(s.pass_rate_ci95) })),
@@ -1181,10 +1192,11 @@ function costPassPanel(jobs) {
       h('td', { class: 'num', text: pct(s.non_pass_cost_share) }),
       h('td', { class: 'num', text: pct(s.cache_hit_rate) }),
       h('td', { class: 'num', text: fixed(s.turns_per_pass) }),
-      h('td', { text: frontier ? '是' : ranked.includes(s) ? '' : '—' }));
+      h('td', { class: 'num', text: point ? pct(point.pass) : '—' }, h('span', { class: 'sub', text: point ? usd(point.cost) + ' / 题' : '' })),
+      h('td', { text: frontier ? '是' : point ? '' : '—' }));
   });
-  const heads = ['作业', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '成本-通过率前沿'];
-  return panel('成本与通过率', '前沿：没有其他作业同时更便宜且通过率更高 · 参考 FrontierHarness Eval v1.1',
+  const heads = ['作业', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '共同题通过率 / 成本', '成本-通过率前沿'];
+  return panel('成本与通过率', `前沿只在 ${common.length} 道共同首次有效题上判：没有其他作业在这些题上同时更便宜且通过率更高；某题缺价格的作业不参与 · 参考 FrontierHarness Eval v1.1`,
     h('div', { class: 'table-scroll' }, h('table', {},
       h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 0 || i === heads.length - 1 ? null : 'num', text: t })))),
       h('tbody', {}, rows))));

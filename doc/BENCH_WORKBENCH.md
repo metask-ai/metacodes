@@ -1041,14 +1041,14 @@ active.
 | Generation TPS | Sum of reported output tokens / sum of generation seconds, from first semantic output until response completion. Tool execution and first-token waiting are excluded |
 | TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The global mean and P50/P95 pool request samples across jobs |
 | Estimated cost | The metacodes binary's catalog estimate, including cache pricing. It is not the provider's settlement. Missing/zero unknown prices are shown as unknown with coverage counts |
-| Pass rate 95% interval | Wilson score interval of the single-run full-score rate over valid runs |
+| Pass rate 95% interval | Wilson score interval of the single-run full-score rate over valid runs. It treats every run as independent, so repeated attempts of a task and pooled jobs make it narrower than a task-level interval |
 | Solved at least once | Tasks with at least one passing run / tasks with at least one valid run |
 | Cost per task | Mean estimated cost of each task's priced valid runs, then the mean over those tasks, as in FrontierHarness Eval v1.1 |
-| Cost per pass | Cost per task / single-run full-score rate |
+| Cost per pass | Over the same priced tasks: the sum of per-task mean costs / the sum of per-task pass fractions, so each task weighs the same in both |
 | Non-passing cost share | Estimated cost of valid runs that did not pass / estimated cost of all valid runs; failures and timeouts are also shown separately |
 | Cache hit rate | Cache-read input tokens / all input tokens |
 | Turns per pass | Mean turns (and tool calls) over passing runs |
-| Cost-pass frontier | On the compare page, the jobs that no other compared job beats in both cost per task and pass rate |
+| Cost-pass frontier | On the compare page, judged only on the tasks whose first attempt is valid in every compared job: the jobs that no other job beats in both per-task mean cost and mean pass fraction on those tasks. A job without a priced valid run on one of them is left out |
 
 The credential relay runs on the execution host and forwards streaming
 payloads unchanged; with metrics enabled it also times them. It stores numeric timing/usage records and per-request context part sizes only, under

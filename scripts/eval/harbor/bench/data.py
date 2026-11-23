@@ -641,14 +641,15 @@ def outcome_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     for row in rows:
         if row["status"] in VALID:
             by_task.setdefault(row["task"], []).append(row)
-    task_costs = [[r["cost_usd"] for r in trials if r.get("cost_usd") is not None] for trials in by_task.values()]
-    task_costs = [costs for costs in task_costs if costs]
+    priced = [[r for r in trials if r.get("cost_usd") is not None] for trials in by_task.values()]
+    priced = [trials for trials in priced if trials]
     passed = [r for r in rows if r["status"] == "pass"]
     return {
         "tasks_attempted": len(by_task),
         "tasks_solved": sum(any(r["status"] == "pass" for r in trials) for trials in by_task.values()),
-        "task_cost_sum": sum(sum(costs) / len(costs) for costs in task_costs),
-        "task_cost_tasks": len(task_costs),
+        "task_cost_sum": sum(sum(r["cost_usd"] for r in trials) / len(trials) for trials in priced),
+        "task_pass_sum": sum(sum(r["status"] == "pass" for r in trials) / len(trials) for trials in priced),
+        "task_cost_tasks": len(priced),
         "cost_by_status": {status: sum(r["cost_usd"] for r in rows if r["status"] == status and r.get("cost_usd") is not None)
                            for status in VALID},
         "passed_turns": sum(r["turns"] for r in passed if r.get("turns") is not None),
@@ -680,7 +681,7 @@ def outcome_fields(s: Dict[str, Any]) -> Dict[str, Any]:
         "pass_rate_ci95": wilson_interval(s["counts"]["pass"], s["valid"] or 0),
         "solved_rate": ratio(s["tasks_solved"], s["tasks_attempted"]),
         "cost_per_task": cost_per_task,
-        "cost_per_pass": ratio(cost_per_task, s["pass_rate"]),
+        "cost_per_pass": ratio(s["task_cost_sum"], s["task_pass_sum"]),
         "non_pass_cost_share": 1 - s["cost_by_status"]["pass"] / scored_cost if scored_cost else None,
         "cache_hit_rate": ratio(s["cache_tokens"], s["input_tokens"]),
         "turns_per_pass": ratio(s["passed_turns"], s["passed_turn_trials"]),
@@ -702,7 +703,7 @@ def merge_summaries(summaries):
               "total_tokens", "token_trials", "partial_token_trials", "initial_input_tokens", "initial_token_trials",
               "input_tokens", "cache_tokens", "output_tokens", "cost_usd", "cost_trials", "agent_seconds",
               "requests", "profiled_requests", "tps_output_tokens", "tps_generation_ms",
-              "tasks_attempted", "tasks_solved", "task_cost_sum", "task_cost_tasks",
+              "tasks_attempted", "tasks_solved", "task_cost_sum", "task_pass_sum", "task_cost_tasks",
               "passed_turns", "passed_turn_trials", "passed_tool_calls", "passed_tool_call_trials")
     result = {}
     for field in fields:
