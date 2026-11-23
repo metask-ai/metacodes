@@ -92,10 +92,8 @@ class Node:
         return result
 
     def info(self):
-        from scripts.eval.harbor.suites import workbuddy
         return {"protocol": PROTOCOL, "version": self.version, "host": socket.gethostname(),
-                "os": platform.system(), "arch": platform.machine(), "workbuddy": self.workbuddy(),
-                "workbuddy_executables": workbuddy.staged_executables(self.context())}
+                "os": platform.system(), "arch": platform.machine(), "workbuddy": self.workbuddy()}
 
     def remember(self, peer: str):
         if not executors.HOST.fullmatch(peer or ""):
@@ -159,19 +157,15 @@ class Node:
             return 2
         suite = suites.get(spec.get("suite"))
         problems = self.workbuddy().get(suite.id, {}).get("reasons") or []
-        if spec.get("executables") is not None:
-            # What is staged now must be the run's bundle, executable by executable.
-            different = workbuddy.executable_mismatch(workbuddy.staged_executables(self.context()),
-                                                      spec["executables"])
-            if different:
-                problems.append("WorkBuddy 暂存的制品不是本次运行的 metacodes 版本：" + "、".join(different))
+        if not spec.get("bundle"):
+            problems.append("本次运行没有 metacodes 包；请把工作台和执行节点更新到同一版本")
         if problems:
             remote.emit("error", message=f"{socket.gethostname()}：" + "；".join(problems))
             return 2
         jobs_dir = remote.absolute(spec["jobs_dir"])
         token = placeholder(spec["name"])
-        # The trials mount an image of this run's own tag, built from what was
-        # just checked: run.sh reuses whatever an existing tag holds, and
+        # The trials mount an image of this run's own tag, staged from the
+        # run's bundle: run.sh reuses whatever an existing tag holds, and
         # another workbench on this Docker daemon may move the shared one.
         tag = workbuddy.run_image_tag(spec["name"])
         repo = workbuddy.checkout(self.context())
@@ -184,7 +178,7 @@ class Node:
         def prepare(stop):
             nonlocal relay
             try:
-                if not workbuddy.build_harness_image(repo, tag, stop, expected=spec.get("executables")):
+                if not workbuddy.build_harness_image(repo, remote.absolute(spec["bundle"]), tag, stop):
                     return None
                 relay = TimingRelay(spec["account_gateway"], credential,
                                     Path(jobs_dir) / spec["name"] / ".bench-metrics",

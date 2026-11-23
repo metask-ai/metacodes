@@ -41,7 +41,7 @@ from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, REPO, RotatingGateway, gaia2_dataset, node_script,
+from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, RotatingGateway, gaia2_dataset, node_script,
                                                      offline_hugging_face, session_fixture, stop_profiles_and_workers,
                                                      wait_run)
 
@@ -108,6 +108,9 @@ elif name == "docker":
             images = state / "images"
             images.mkdir(exist_ok=True)
             (images / args[args.index("--tag") + 1].replace("/", "_")).touch()
+            staged = Path(args[-1]) / "artifacts/share/metacodes/artifact-manifest.json"
+            if staged.exists():
+                (images / (args[args.index("--tag") + 1].replace("/", "_") + ".manifest")).write_bytes(staged.read_bytes())
         sys.exit(0)
     if args[:2] == ["image", "rm"]:
         time.sleep(float(env.get("FAKE_RM_DELAY") or 0))
@@ -823,11 +826,8 @@ class SshRunTest(SetupFixture):
         harbor.chmod(0o755)
         os.symlink(self.templates / "docker", self.remote_bin / "docker")
         os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
-        bundle = self.root / "bundle"
-        for file in BUNDLE_EXECUTABLES:
-            (bundle / file).parent.mkdir(parents=True, exist_ok=True)
-            (bundle / file).write_bytes(b"fake")
-        atomic_json(bundle / "manifest.json", {"target": {"os": "linux"}})
+        from scripts.eval.tests.test_bench_suites import workbuddy_bundle
+        bundle = workbuddy_bundle(self.root / "bundle")
         self.add_ssh_executor(metrics_bind="127.0.0.1", metrics_enabled=profile)
         cfg = self.cfg()
         cfg.update(auth_mode="metask", account_state_dir=str(state), bundle=str(bundle), metrics_enabled=profile,
@@ -1122,9 +1122,10 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertIn("执行机器：relay-4090（SSH bench@10.126.126.1:22） · metacodes 9.9.9：已就绪", text)
 
     def test_workbuddy_runs_on_the_ssh_node_with_the_nodes_own_checkout(self):
-        """The node reports its WorkBuddy checkout, tasks, readiness and staged
-        metacodes; a run uses that checkout there behind the node's relay,
-        which receives each refreshed session token over the SSH stdin."""
+        """The node reports its WorkBuddy checkout, tasks and readiness; a run
+        uses that checkout there with an image staged from the run's bundle,
+        behind the node's relay, which receives each refreshed session token
+        over the SSH stdin."""
         from scripts.eval.harbor.bench.setup import sha256_file
         from scripts.eval.harbor.suites import workbuddy as wb_suite
         from scripts.eval.tests.test_bench_suites import FAKE_UV, workbuddy_checkout
@@ -1162,28 +1163,9 @@ class SuiteOnExecutorTest(SetupFixture):
         with self.assertRaisesRegex(ValueError, "没有这些任务"):
             client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                         "tasks": ["not-a-workbuddy-task"], "executor": "relay-4090"})
-        # Staged artifacts of another metacodes than the run's bundle are
-        # refused, executable by executable: the same metacodes beside
-        # another TinyKG is another version.
-        def stage(**executables):
-            manifest = json.loads((repo / wb_suite.ARTIFACT_MANIFEST).read_text())
-            manifest["executables"] = {label: {"sha256": digest} for label, digest in executables.items()}
-            atomic_json(repo / wb_suite.ARTIFACT_MANIFEST, manifest)
-            manager.probe_cache.clear()
-        bundle = sha256_file(self.root / "bundle/bin/metacodes")  # every fixture executable holds the same bytes
-        matching = {"metacodes": bundle, "tinykg": bundle, "metacodes-formal-kernel": bundle, "ripgrep": bundle}
-        for staged, label in (({**matching, "metacodes": "1" * 64}, "metacodes"),
-                              ({**matching, "tinykg": "0" * 64}, "tinykg"),
-                              ({k: v for k, v in matching.items() if k != "metacodes"}, "metacodes"),
-                              ({k: v for k, v in matching.items() if k != "ripgrep"}, "ripgrep")):
-            stage(**staged)
-            with self.assertRaisesRegex(ValueError, "暂存的制品.*（" + label):
-                client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
-                                            "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
-        stage(**matching)
         # The mount image of an earlier staging is cached under the shared
         # tag, which run.sh would reuse (and another workbench could move):
-        # the run mounts an image of its own tag, built from what is staged.
+        # the run mounts an image of its own tag, staged from its bundle.
         images = Path(os.environ["FAKE_REMOTE_STATE"]) / "images"
         images.mkdir(parents=True, exist_ok=True)
         (images / wb_suite.HARNESS_IMAGE.replace("/", "_")).touch()
@@ -1213,7 +1195,14 @@ class SuiteOnExecutorTest(SetupFixture):
         tag = wb_suite.run_image_tag(run["name"])
         self.assertEqual(len(builds), 1, builds)
         self.assertEqual(builds[0][builds[0].index("--tag") + 1], tag)
-        self.assertEqual(Path(builds[0][-1]).resolve(), (repo / wb_suite.HARNESS_CONTEXT).resolve())
+        self.assertNotEqual(Path(builds[0][-1]).resolve(), (repo / wb_suite.HARNESS_CONTEXT).resolve())
+        staged = json.loads((images / (tag + ".manifest").replace("/", "_")).read_text())
+        self.assertEqual({label: row["sha256"] for label, row in staged["executables"].items()},
+                         {"metacodes": sha256_file(self.root / "bundle/bin/metacodes"),
+                          "tinykg": sha256_file(self.root / "bundle/vendor/tinykg/tinykg"),
+                          "metacodes-formal-kernel":
+                              sha256_file(self.root / "bundle/libexec/metacodes/metacodes-formal-kernel"),
+                          "ripgrep": sha256_file(self.root / "bundle/bin/rg")})
         # WorkBuddy resolved that tag through the run's own harness version,
         # the pinned one plus the image; both transient files are gone and the
         # run's tag is removed (the shared one is untouched).
@@ -1231,11 +1220,8 @@ class SuiteOnExecutorTest(SetupFixture):
             self.assertNotIn(secret.encode(), public, secret)
 
     def node_checkout(self, workbuddy_checkout):
-        """A WorkBuddy checkout the node prepared, with the pinned harness version."""
+        """A WorkBuddy checkout the node prepared."""
         repo = workbuddy_checkout(self.remote_home)
-        versions = repo / "configs/harnesses/metacodes/versions"
-        versions.mkdir(parents=True)
-        shutil.copy(REPO / "scripts/eval/workbuddy/overlay/configs/harnesses/metacodes/versions/0.1.0.yaml", versions)
         atomic_json(self.remote_home / ".metacodes/bench/workbench.json", {"workbuddy_checkout": str(repo)})
         return repo
 
@@ -1250,7 +1236,7 @@ class SuiteOnExecutorTest(SetupFixture):
         self.node_checkout(workbuddy_checkout)
         spec = {"schema_version": 1, "runner": "workbuddy", "jobs_dir": "jobs", "name": "slow", "suite": "workbuddy-code",
                 "model": "metask/session-model", "tasks": ["bug_fix-easy-alpha"], "attempts": 1, "concurrency": 1,
-                "account_gateway": "http://127.0.0.1:9", "executables": None}
+                "account_gateway": "http://127.0.0.1:9", "bundle": str(self.root / "bundle")}
         (self.remote_home / "spec.json").write_text(json.dumps(spec))
         relay = executors.find(self.cfg(), "relay-4090")
         env = {**os.environ, "FAKE_BUILD_DELAY": "60"}
@@ -1285,7 +1271,7 @@ class SuiteOnExecutorTest(SetupFixture):
         repo = self.node_checkout(workbuddy_checkout)
         spec = {"schema_version": 1, "runner": "workbuddy", "jobs_dir": "jobs", "name": "quick",
                 "suite": "workbuddy-code", "model": "metask/session-model", "tasks": ["bug_fix-easy-alpha"],
-                "attempts": 1, "concurrency": 1, "account_gateway": "http://127.0.0.1:9", "executables": None}
+                "attempts": 1, "concurrency": 1, "account_gateway": "http://127.0.0.1:9", "bundle": str(self.root / "bundle")}
         (self.remote_home / "spec.json").write_text(json.dumps(spec))
         relay = executors.find(self.cfg(), "relay-4090")
         env = {**os.environ, "FAKE_RM_DELAY": "5"}
@@ -1307,7 +1293,6 @@ class SuiteOnExecutorTest(SetupFixture):
     def test_a_workbuddy_launch_failure_cleans_up_and_reports_the_real_error(self):
         """uv breaks after the readiness check: the node removes the run's tag
         and transient harness versions, then reports why it could not start."""
-        from scripts.eval.harbor.bench.setup import sha256_file
         from scripts.eval.harbor.suites import workbuddy as wb_suite
         from scripts.eval.tests.test_bench_suites import workbuddy_checkout
         manager, client, _ = self.prepare_remote()
@@ -1318,7 +1303,7 @@ class SuiteOnExecutorTest(SetupFixture):
         os.environ["FAKE_BUILD_BREAKS"] = str(uv)
         spec = {"schema_version": 1, "runner": "workbuddy", "jobs_dir": "jobs", "name": "broken",
                 "suite": "workbuddy-code", "model": "metask/session-model", "tasks": ["bug_fix-easy-alpha"],
-                "attempts": 1, "concurrency": 1, "account_gateway": "http://127.0.0.1:9", "executables": None}
+                "attempts": 1, "concurrency": 1, "account_gateway": "http://127.0.0.1:9", "bundle": str(self.root / "bundle")}
         (self.remote_home / "spec.json").write_text(json.dumps(spec))
         relay = executors.find(self.cfg(), "relay-4090")
         process = subprocess.Popen(executors.node_argv(relay, "run", "spec.json"), stdin=subprocess.PIPE,
@@ -1337,12 +1322,6 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertEqual(list((repo / "configs").rglob("metacodes-broken*")), [])
         # Through the worker, the run fails with that reason, not a lost channel.
         uv.chmod(0o755)
-        manifest = json.loads((repo / wb_suite.ARTIFACT_MANIFEST).read_text())
-        bundle = sha256_file(self.root / "bundle/bin/metacodes")
-        manifest["executables"] = {label: {"sha256": bundle}
-                                   for label in ("metacodes", "tinykg", "metacodes-formal-kernel", "ripgrep")}
-        atomic_json(repo / wb_suite.ARTIFACT_MANIFEST, manifest)
-        manager.probe_cache.clear()
         run = client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                           "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090"})
         final = wait_run(manager, run["name"], timeout=60)
