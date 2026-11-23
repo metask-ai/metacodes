@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **The bench workbench reports FrontierHarness-style statistics.** Every
+  summary adds the pass rate's 95% interval, tasks solved at least once, cost
+  per task (per-task mean, then mean over tasks) and per pass, the share of
+  cost spent on runs that did not pass, cache hit rate and turns per pass. The
+  compare page lists them per job and marks the jobs on the cost-pass
+  frontier.
+
 - **Bench batches can be renamed and copied.** A batch page has 重命名
   (`POST /api/batch/rename`) and 复制为新批次, which fills the 新建 page with
   the batch's version, datasets, tasks and settings. The overview's batch list

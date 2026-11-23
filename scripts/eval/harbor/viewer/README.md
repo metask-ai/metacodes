@@ -35,7 +35,9 @@ plain text (no markup from the data).
 
 The overview, job, trial and CSV views expose total/initial tokens, first-attempt
 full-score rate, request-weighted generation TPS, TTFT mean/P50/P95, and cost
-coverage. See [metric definitions and storage](../../../../doc/BENCH_WORKBENCH.md#metric-definitions).
+coverage, plus the pass-rate 95% interval, tasks solved at least once, cost per
+task and per pass, the cost share of non-passing runs, cache hit rate and turns
+per pass. The compare page marks the cost-pass frontier. See [metric definitions and storage](../../../../doc/BENCH_WORKBENCH.md#metric-definitions).
 Historical timings remain unknown; new workbench runs capture numeric
 request metrics through the host streaming relay.
 
