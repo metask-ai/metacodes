@@ -1085,15 +1085,27 @@ the other features' flags, and only on an SSH executor whose entry sets
   the trial's model; the run's reasoning effort reaches the implementer and
   reviewer seats (`--config-json`), while the verifier keeps its own.
 - **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
-  `task.toml` (easy $5, medium $10, hard $20, otherwise $10), and the trial
+  `task.toml` (easy $20, medium $40, hard $80, otherwise $40), and the trial
   gets `--agent-timeout-multiplier 3`, recorded on the run as
-  `agent_timeout_multiplier`.
-- **Validity**: `teamwork status --json` lands in the trial's agent logs.
-  A run that wrote no status, or in which no implementer seat finished (all
-  failed, as on a provider error), fails the trial with `TeamworkNotEngaged`,
-  so it counts as invalid; a run that worked but did not merge, or merged a
-  wrong change, is scored by the verifier like any other. The trial's cost
-  is the run's ledger spend; per-request tokens and turns are not reported.
+  `agent_timeout_multiplier`. The cap is in metacodes' price-table
+  estimate, not a provider bill: a model without its own price (most
+  imported and Metask models) is charged at the Sonnet fallback rates
+  (`src/util/pricing.zig`), so the cap stops far earlier than real spend
+  would. A first real-model run at easy $5 ran out before the reviewer
+  finished.
+- **Validity**: `teamwork status --json` lands in the trial's agent logs,
+  and the run directory without its worktrees (`teamwork-run/`: ledger,
+  seat records and logs) beside it. A run that wrote no status, or in which
+  no implementer seat finished (all failed, as on a provider error), fails
+  the trial with `TeamworkNotEngaged`, so it counts as invalid. A run that
+  spent its budget (`budget_exhausted`), worked but did not merge, or merged
+  a wrong change is scored by the verifier like any other. Its stop reason
+  is `teamwork_<state>`, and summaries count `budget_exhausted` trials
+  apart (预算用完 on the profile page and in 模型对比), since for a model
+  without its own price that is often the fallback estimate rather than the
+  task. The run directory is copied again when the trial is killed on its
+  timeout. The trial's cost is the run's ledger spend; per-request timing
+  and tokens come from the relay's request metrics as for a headless run.
 
 `POST /api/profiles/run` queues datasets: on an existing profile with
 `profile` (its version and features cannot be changed), or with `bundle` and

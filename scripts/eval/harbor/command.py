@@ -78,10 +78,13 @@ ADVANCED_FEATURES = {
 TEAMWORK = "teamwork"
 TEAMWORK_EVENTS_FILENAME = "teamwork-events.jsonl"
 TEAMWORK_STATUS_FILENAME = "teamwork-status.json"
+TEAMWORK_RUN_DIRNAME = "teamwork-run"
 # Dollar cap of one teamwork trial by the task's declared difficulty: ample,
-# so a trial ends on its result rather than its budget.
-TEAMWORK_BUDGET_USD = {"easy": 5.0, "medium": 10.0, "hard": 20.0}
-TEAMWORK_DEFAULT_BUDGET_USD = 10.0
+# so a trial ends on its result rather than its budget. The ledger charges
+# metacodes' price-table estimate, and a model without its own price is
+# charged at the Sonnet fallback rates, far above what a cheap model costs.
+TEAMWORK_BUDGET_USD = {"easy": 20.0, "medium": 40.0, "hard": 80.0}
+TEAMWORK_DEFAULT_BUDGET_USD = 40.0
 # The pipeline runs several seats in turn; its trials get this much more of
 # the task's agent timeout.
 TEAMWORK_TIMEOUT_MULTIPLIER = 3
@@ -427,7 +430,8 @@ def teamwork_run_command(
       first: a snapshot commit of what the task image put there.
     - The instruction is the approved request, read from a file; a leading
       `[` would be parsed as an option segment, so such text gets a heading.
-    - `teamwork status --json` goes to the log mount whatever the run's
+    - The run directory (ledger, seat records and logs, without worktrees)
+      and `teamwork status --json` go to the log mount whatever the run's
       outcome, and the script exits 0 once that status exists: a failed or
       unmerged run is the task's result for the verifier to score, while
       `teamwork_problem` turns a run that never dispatched work into an
@@ -465,6 +469,7 @@ def teamwork_run_command(
         + " ".join(shlex.quote(flag) for flag in flags)
         + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>{logs}/{STDERR_FILENAME}",
         f'echo "teamwork run exited $?" >>{logs}/{STDERR_FILENAME}',
+        teamwork_keep_run_command(state_dir=state_dir, run_id=run_id, logs_dir=logs_dir),
         f"{run} teamwork status {shlex.quote(run_id)} --json"
         f" >{logs}/{TEAMWORK_STATUS_FILENAME} 2>>{logs}/{STDERR_FILENAME} || exit 77",
     ]
@@ -479,6 +484,17 @@ def parse_teamwork_status(text: str) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
+def teamwork_keep_run_command(*, state_dir: str, run_id: str, logs_dir: str = REMOTE_LOGS) -> str:
+    """Shell that copies a teamwork run directory, without worktrees, to the
+    log mount as `teamwork-run/` (the ledger, seat records and seat logs)."""
+
+    run_dir = shlex.quote(f"{state_dir}/teamwork/{run_id}")
+    kept = shlex.quote(f"{logs_dir}/{TEAMWORK_RUN_DIRNAME}")
+    return (f"if [ -d {run_dir} ] && command -v tar >/dev/null 2>&1; then mkdir -p {kept} &&"
+            f" tar -C {run_dir} --exclude=worktree -cf - . | tar -C {kept} -xf -"
+            f" 2>>{shlex.quote(logs_dir + '/' + STDERR_FILENAME)}; fi")
+
+
 def teamwork_status(logs_dir: Path) -> Optional[Dict[str, Any]]:
     try:
         return parse_teamwork_status((Path(logs_dir) / TEAMWORK_STATUS_FILENAME).read_text(encoding="utf-8"))
@@ -490,10 +506,13 @@ def teamwork_problem(status: Optional[Dict[str, Any]]) -> Optional[str]:
     """Why a teamwork trial does not measure teamwork, or None: no status
     (the run never started), or no implementer seat that finished its work
     (every one failed, as on a provider or sandbox error), which the
-    headless run counts as invalid too."""
+    headless run counts as invalid too. A run that spent its budget worked
+    on the task, so it is scored."""
 
     if status is None:
         return "teamwork wrote no status: the run did not start (see " + STDERR_FILENAME + ")"
+    if status.get("state") == "budget_exhausted":
+        return None
     seats = status.get("seats") if isinstance(status.get("seats"), list) else []
     if not any(isinstance(s, dict) and s.get("role") == "implementer" and s.get("status") == "done" for s in seats):
         return f"no teamwork implementer seat finished (state {status.get('state')}, detail {status.get('detail')})"

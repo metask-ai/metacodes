@@ -361,7 +361,8 @@ async function renderProfile(id) {
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
     metric('运行', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
-    metric('无效', String(s.counts.invalid)));
+    metric('无效', String(s.counts.invalid)),
+    s.budget_exhausted ? metric('预算用完', String(s.budget_exhausted), 'teamwork 用完上限后停下的尝试，按判分结果计入') : null);
 
   const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
@@ -464,7 +465,7 @@ async function renderProfile(id) {
 // all of them ran, so a model is not judged on an easier subset.
 function modelsPanel(b) {
   if ((b.by_model || []).length < 2) return null;
-  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '总 Token', '估算成本'];
+  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '预算用完', '总 Token', '估算成本'];
   const row = (model, tasks, m) => h('tr', { class: 'link', onclick: () => { state.profileModel = model; render(); } },
     h('td', { text: model || '—' }),
     h('td', { class: 'num', text: String(tasks) }),
@@ -473,6 +474,7 @@ function modelsPanel(b) {
     h('td', { class: 'num', text: `${m.counts.pass} / ${m.valid || 0}` }),
     h('td', { class: 'num', text: pct(m.first_pass_rate) }),
     h('td', { class: 'num', text: String(m.counts.invalid) }),
+    h('td', { class: 'num', text: String(m.budget_exhausted || 0) }),
     h('td', { class: 'num', text: compact(m.total_tokens) }),
     h('td', { class: 'num', text: usd(m.cost_usd) }));
   const table = (rows) => h('div', { class: 'table-scroll' }, h('table', {},

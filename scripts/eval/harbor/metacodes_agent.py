@@ -28,6 +28,7 @@ through its credential relay (``metrics_proxy``), which holds the real key.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -268,7 +269,14 @@ class MetacodesAgent(BaseInstalledAgent):
                 flags=flags,
                 config_path=remote_config,
             )
-        await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(script)}")
+        try:
+            await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(script)}")
+        finally:
+            if self._teamwork:
+                with contextlib.suppress(Exception):
+                    await environment.exec(
+                        command=cmd.teamwork_keep_run_command(state_dir=f"/tmp/metacodes-state-{trial}", run_id=trial),
+                        user="root", timeout_sec=120)
         if self._teamwork:
             status = await environment.exec(
                 command=f"cat {shlex.quote(cmd.REMOTE_LOGS + '/' + cmd.TEAMWORK_STATUS_FILENAME)}", user="root")
