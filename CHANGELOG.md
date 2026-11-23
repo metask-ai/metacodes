@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Teamwork trials no longer stop at permission prompts.** `teamwork run`
+  has no `--permission`, so its verifier asked for each command and, with
+  nobody to answer, the audit ended unavailable and nothing merged. A
+  teamwork trial now writes user-level allow rules for the built-in tools in
+  its disposable container, as a headless trial runs with
+  `bypassPermissions`.
+
 - **Teamwork trials get a cap that lasts.** The dollar cap now follows the
   difficulty at easy $20, medium $40, hard $80 (otherwise $40), since the
   ledger charges models without their own price at the Sonnet fallback
