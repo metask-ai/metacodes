@@ -510,8 +510,9 @@ pub const JobRegistry = struct {
     }
 
     /// Value snapshot for the in-core wait spinner: how many notify-eligible jobs
-    /// of this owner are still running and the first one's id/preview. Taken under
-    /// the lock so no pointer into `jobs.items` escapes (2026-09-19 wait design).
+    /// of this owner are still running or have ended without being announced, and
+    /// the first one's id/preview. Taken under the lock so no pointer into
+    /// `jobs.items` escapes (2026-09-19 wait design).
     pub const PendingNotifySummary = struct {
         count: u32 = 0,
         first_id: [12]u8 = .{'0'} ** 12,
@@ -529,7 +530,7 @@ pub const JobRegistry = struct {
         self.reapExitedLocked();
         var out: PendingNotifySummary = .{};
         for (self.jobs.items) |entry| {
-            if (!entry.notify_on_exit or entry.status != .running) continue;
+            if (!entry.notify_on_exit or (entry.status != .running and (entry.exit_announced or entry.exit_observed))) continue;
             if (!std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
             if (out.count == 0) {
                 out.first_id = entry.id;

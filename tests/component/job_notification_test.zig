@@ -61,6 +61,7 @@ const FakeProvider = struct {
     /// Index of the first send whose request carried a notification; null = never.
     notification_send_index: ?u8 = null,
     notification_job_id: [12]u8 = "000000000000".*,
+    exit_during_answer: ?ExitDuringAnswer = null,
 
     fn model(_: *anyopaque) []const u8 {
         return "fake";
@@ -70,6 +71,7 @@ const FakeProvider = struct {
         if (self.sends >= self.script.len or self.sends >= self.streams.len) return error.UnexpectedTestCall;
         const index = self.sends;
         self.sends += 1;
+        if (self.exit_during_answer) |exit| if (exit.send_index == index) try exit.run();
         // The job id lives in the Bash tool_result already in the conversation.
         var job_id: ?[]const u8 = null;
         for (messages) |message| {
@@ -187,6 +189,17 @@ const JobExitAwait = struct {
         while (polls < 1000 and self.jobs.hasPendingNotifyJobs(cc.session_id.SessionId.single)) : (polls += 1) {
             cc.util_time.sleepMs(10);
         }
+    }
+};
+
+const ExitDuringAnswer = struct {
+    send_index: u8,
+    gate: *const Gate,
+    jobs: *cc.job_registry.JobRegistry,
+
+    fn run(self: ExitDuringAnswer) !void {
+        try self.gate.open();
+        (JobExitAwait{ .jobs = self.jobs, .turn = 0 }).run();
     }
 };
 
@@ -612,4 +625,54 @@ test "JobWait T9 a job that exits between the wait's two registry checks is stil
         if (!poll.any_running) break;
     }
     try std.testing.expect(delivered);
+}
+
+test "JobWait T10 a job that exits while the model answers is delivered before the run ends" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, SAY_WAITING, SAY_DONE }, .exit_during_answer = .{ .send_index = 1, .gate = &gate, .jobs = &f.jobs } };
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
+        .max_turns = 5,
+        .jobs = &f.jobs,
+        .job_notifications = &f.jobs,
+        .cwd_abs = gate.root(),
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u8, 3), fake.sends);
+    try std.testing.expectEqual(@as(?u8, 2), fake.notification_send_index);
+    try std.testing.expect(!std.mem.eql(u8, fake.notification_job_id[0..], "000000000000"));
+    try std.testing.expectEqual(@as(usize, 1), countPersistedNotifications(&f.conversation));
+}
+
+test "JobWait T11 the wakeup cap holds back an exit that came while the model answered" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, SAY_WAITING, SAY_DONE }, .exit_during_answer = .{ .send_index = 1, .gate = &gate, .jobs = &f.jobs } };
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
+        .max_turns = 5,
+        .jobs = &f.jobs,
+        .job_notifications = &f.jobs,
+        .job_wait = .{ .max_wakeups = 0 },
+        .cwd_abs = gate.root(),
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u8, 2), fake.sends);
+    try std.testing.expectEqual(@as(?u8, null), fake.notification_send_index);
+    const events = try f.jobs.takeUnannouncedExits(cc.session_id.SessionId.single, a);
+    defer cc.job_registry.freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
 }
