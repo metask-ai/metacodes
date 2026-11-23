@@ -6877,7 +6877,8 @@ fn onSigint() void {
 }
 
 /// SIGTERM / SIGHUP (Windows: console close, logoff, shutdown) arrived: the
-/// interactive loop leaves at its next turn boundary instead of reading input.
+/// interactive loop leaves at its next turn boundary, or the prompt it waits
+/// at, instead of reading input.
 pub fn terminateRequested() bool {
     return g_terminate_requested.load(.seq_cst);
 }

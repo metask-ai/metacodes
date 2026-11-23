@@ -123,6 +123,25 @@ def test_terminate_mid_run_closes_the_journal(bin_path):
     _signal_mid_run(bin_path, "term", "TERM")
 
 
+def _signal_at_the_prompt(bin_path, tag, signals):
+    _require_posix()
+    env, cwd = _workspace(tag)
+    with SlowMockServer([simple_text("SEEDED")]) as srv:
+        raw = run(bin_path, [READY, "type:seed", "key:enter", wait_for("SEEDED"), IDLE,
+                             f"signal:{signals}", wait_for("Resume this session with:", 8)],
+                  env=env, cwd=cwd, base_url=srv.url)
+    screen = _screen_text(raw)
+    assert "Resume this session with:" in screen, screen
+
+
+def test_terminate_at_the_prompt_leaves_at_once(bin_path):
+    _signal_at_the_prompt(bin_path, "idle-term", "TERM")
+
+
+def test_closing_terminal_at_the_prompt_leaves_at_once(bin_path):
+    _signal_at_the_prompt(bin_path, "idle-hup2", "HUP+0.02+HUP")
+
+
 def test_killed_mid_run_is_abandoned_on_resume(bin_path):
     """SIGKILL mid-Run leaves the Run open; the next turn closes it as abandoned and runs."""
     _require_posix()

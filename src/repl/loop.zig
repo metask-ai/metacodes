@@ -282,7 +282,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?, &unsent_draft) catch |err| switch (err) {
                 // The double-press exits leave quietly, as Claude Code does;
                 // only `/exit` says goodbye.
-                error.Eof, error.ExitRequested => break,
+                error.Eof, error.ExitRequested, error.TerminateRequested => break,
                 else => return err,
             }
         else
@@ -1979,6 +1979,7 @@ fn readLineRaw(
         // 用 poll 带超时读,而非阻塞 read:超时时检查 SIGWINCH(终端 resize)→ 立即重画
         // 输入框自适应新宽度(否则要等下次按键才更新,真机 resize 卡旧宽)。
         if (synthetic_key == null) while (true) {
+            if (app_mod.terminateRequested()) return error.TerminateRequested;
             _ = input.reconcileAfterResume(fd);
             if (g_winch.swap(false, .acquire)) {
                 redraw(region, &editor, app); // resize → 重测宽度重画

@@ -221,6 +221,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Closing the terminal or `kill` ends an idle metacodes at once** (#758).
+  SIGHUP and SIGTERM were acted on only at a turn boundary, so while the
+  prompt waited for input the process lived on until the 45-second fallback
+  alarm ended it, without the normal shutdown. The prompt now checks for them
+  while it waits and leaves the normal way within a fraction of a second,
+  with the resume hint where the terminal is still open.
+
 - **`\` then Enter starts a new line while the model answers** (#757). At
   the prompt a `\` at the end of a line followed by Enter is a newline, the
   way Apple Terminal users start one; during a reply Enter queued the draft
