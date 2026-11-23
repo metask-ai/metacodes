@@ -156,7 +156,7 @@ pulls it only when the executor's Docker does not have it. Every other task
 `environment/` directory with `docker compose build` before each trial,
 which pulls its base image and runs its `apt-get`/`pip install` steps
 unless Docker's build cache already holds them. A registry or package index
-that is slow or unreachable during a batch then fails trials as
+that is slow or unreachable during a run then fails trials as
 `EnvironmentStartTimeoutError` or a `docker compose` error.
 `metacodes bench pull` does both ahead of the run:
 
@@ -358,18 +358,18 @@ remote URL: the host exports the commit and the tags that point at it as a
 release tag and a token in `source_repo` stays on the host.
 
 The unit is published as `<state root>/bench/bundles/metacodes-git-<commit>-x86_64-linux-gnu/`,
-where the 新建 page offers it as a batch version like any other bundle, but
+where the 评测 page offers it as a profile version like any other bundle, but
 only while the configured `source_repo` is the repository that verified it
 under the current trust rule: after switching repositories, a unit appears
-again once `bench build` has re-verified its commit, and a batch cannot be
+again once `bench build` has re-verified its commit, and a profile cannot be
 created from one that is not listed. The same check covers the bundle a run
 actually uses: a single run (`bench run`) refuses a configured default
-bundle that is such an unverified unit before recording anything, and a batch
-validates its datasets against the bundle it selected, so a workbench whose
-only versions are verified git builds can run batches without a default. A
-single run resolves, checks and records the default bundle from one reading
-of `workbench.json`, by its resolved path. A batch keeps the git provenance
-of the bundle it froze (commit, repository digest, trust rule); each dataset
+bundle that is such an unverified unit before recording anything, and a new
+profile validates its datasets against the bundle it selected, so a
+workbench whose only versions are verified git builds can run profiles
+without a default. A single run resolves, checks and freezes the default
+bundle from one reading of `workbench.json`, by its resolved path. A profile
+keeps the git provenance of the bundle it froze (commit, repository digest, trust rule); each dataset
 checks the frozen copy against that record and the current `source_repo`, so
 it still runs after the original unit is removed and stops before recording
 anything once the repository no longer matches. A
@@ -565,8 +565,8 @@ metacodes bench provider remove --id gw
   gives the entry a new revision. A run records the revision its config was
   generated from; if the entry changed before its worker starts, the run
   fails with a message instead of pairing the old upstream with a new key.
-  A batch pins each model's route (source and revision) when it is created;
-  a later item whose model now resolves elsewhere fails with a message. Two
+  A queued dataset pins its model's route (source and revision) when it is
+  queued; if the model resolves elsewhere by its launch, it fails with a message. Two
   concurrent edits of one entry (page and CLI) cannot undo each other: an
   update based on a revision that changed meanwhile is refused.
 - **Ids**: `metask` and the provider ids of the workbench's
@@ -585,8 +585,8 @@ metacodes bench provider remove --id gw
   loopback or unspecified address, IPv4-mapped included, or a name that
   resolves to one, such as an `/etc/hosts` alias) is refused on SSH
   executors: the workbench probed it on its own machine, but the executor's
-  relay would read it as the executor itself. The check runs at batch
-  creation, at launch on the exact route written to the run, and on the
+  relay would read it as the executor itself. The check runs when a
+  dataset is queued, at launch on the exact route written to the run, and on the
   executor against its own resolution before the relay connects. Import an
   address both machines reach for the same gateway instead. WorkBuddy suites refuse them. A suite with an LLM judge (GAIA2)
   refuses them under Metask authentication, where the judge would go
@@ -942,71 +942,97 @@ treated as stale.
 
 ## Using the page
 
-The rail opens on the dashboard (看板), then 新建 (new batch), 对比 (compare)
-and 数据库 (the evaluation database). The dashboard's 数据范围 selector
-scopes every headline metric to one batch (the newest by default), to all
-jobs, or to jobs launched outside a batch.
+The rail opens on the dashboard (看板), then 评测 (start an evaluation), 对比
+(compare) and 数据库 (the evaluation database). The dashboard's 数据范围
+selector scopes every headline metric to one profile (the newest by default)
+or to all jobs.
 
-### Batches
+### Profiles
 
-A batch evaluates one frozen metacodes version on several datasets. The
-新建 page picks the version (the configured Linux bundle by default, or any
-valid bundle under `<state root>/bench/bundles/`, including those
-`metacodes bench build --ref` builds), several suites with their
-tasks, the model, attempts and concurrency (capped per suite). Creating the
-batch validates every dataset first, then copies the bundle, once per content
-digest, to `<state root>/bench/bundles/frozen/<digest>/` with its files made
-read-only. Every dataset of the batch runs that copy, so rebuilding the
-configured bundle in place or switching `workbench.json` to another version
-never changes a batch already created; before each launch the copy is checked
-against its digest, and a modified copy fails the dataset instead of running.
+A profile (评测配置) is what an evaluation tests: one frozen metacodes version
+with a fixed set of advanced features. Every run belongs to a profile, and a
+profile is run on as often as wanted. The 评测 page picks the version (the
+configured Linux bundle by default, or any valid bundle under
+`<state root>/bench/bundles/`, including those `metacodes bench build --ref`
+builds), the advanced features, several suites with their tasks, the model,
+attempts and concurrency (capped per suite). The profile's id is derived from
+the bundle's content digest and the features, so the same version with the
+same features always lands on the same profile, and changing either is
+another profile. The first run on a profile validates every dataset, then
+copies the bundle, once per content digest, to
+`<state root>/bench/bundles/frozen/<digest>/` with its files made read-only.
+Every run of the profile uses that copy, so rebuilding the configured bundle
+in place or switching `workbench.json` to another version never changes a
+profile already created; before each launch the copy is checked against its
+digest, and a modified copy fails the dataset instead of running.
 
-The 高级功能 section of the 新建 page switches on metacodes features that are
-off by default, all off unless ticked. Each one adds a single metacodes flag to
-every trial of the batch: the Lean-modelled run gates
+The 高级功能 section of the 评测 page switches on metacodes features that are
+off in metacodes by default. The Lean-modelled run gates are ticked by
+default and the preview features are not. Each one adds a single metacodes
+flag to every trial of the profile: the run gates
 `verification_final_gate` (`--verification-final-gate`), `requirement_ledger`
 (`--requirement-ledger`), `test_integrity` (`--test-integrity`),
 `delivery_cadence` (`--delivery-cadence`) and `stall_gate` (`--stall-gate`),
 and the preview features `execute_code` (`--preview=execute_code`),
 `comment_guard` (`--preview=comment_guard`) and `harnessmm` (`--harnessmm`).
-`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The batch
-and each of its runs record the chosen names (`features`), and the run passes
-them to the adapter as `--ak features=<names>`. An unknown name is refused, and
-so is any choice for a WorkBuddy suite, whose overlay launches metacodes
-itself. The frozen bundle has to know the flags: a release older than a
-feature fails its trials with a usage error. An SSH executor's node loads the adapter from
-its own checkout, so the node protocol is 2 since features: an older node is
-refused until `metacodes bench setup --executor <name>` updates it, instead of
-running the trials without the chosen flags.
+`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The
+profile and each of its runs record the chosen names (`features`), and the
+run passes them to the adapter as `--ak features=<names>`. An unknown name is
+refused, and so is any choice for a WorkBuddy suite, whose overlay launches
+metacodes itself. The frozen bundle has to know the flags: a release older
+than a feature fails its trials with a usage error. An SSH executor's node
+loads the adapter from its own checkout, so the node protocol is 2 since
+features: an older node is refused until
+`metacodes bench setup --executor <name>` updates it, instead of running the
+trials without the chosen flags.
 
-The datasets run one after another, each as an ordinary workbench run (one
-Harbor job) whose record names the batch and its frozen version. The durable
-state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
-advances what that file says, so a restarted service resumes a batch where it
-stopped. While a batch owns the executor, a single launch (`POST /api/runs`)
-is refused. Stopping a batch cancels its running dataset and skips the rest.
-A batch can be renamed at any time (`POST /api/batch/rename` with `id` and
-`name`, 重命名 on its page; an empty name falls back to the batch id), and
-复制为新批次 opens the 新建 page filled with its version, datasets, tasks,
-model, executor, attempts, concurrency and features, to edit and create as a
-new batch. Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
-page or 删除 in the overview's batch list) removes its record, its runs' records and logs, their job directories
-and their rows in the evaluation database; the frozen bundle copy stays, since
-other batches may share it. A batch still running must be stopped first.
-Only a batch recorded in this service's jobs directory is deleted; one ingested
-from another jobs directory sharing the database is refused. When a file
-cannot be removed or the database delete fails, the request fails and the
-batch stays for a retry: the manifest goes last, after the rows are gone.
+`POST /api/profiles/run` queues datasets: on an existing profile with
+`profile` (its version and features cannot be changed), or with `bundle` and
+`features`, creating the profile on first use (`name` names a new profile).
+The queued datasets run one after another, each as an ordinary workbench run
+(one Harbor job) whose record names the profile. The durable state is
+`<jobs-dir>/.bench-profiles/<id>.json`; the service's scheduler only advances
+what that file says, so a restarted service resumes a queue where it stopped.
+With several profiles queued, the one whose oldest waiting dataset was queued
+first runs until its queue is empty. A single launch (`POST /api/runs`,
+`metacodes bench run`) runs at once on the profile of the configured bundle
+and its `features`, and is refused while a queue or another run owns the
+executor. Stopping a profile cancels its running dataset and skips the rest
+of its queue.
+
+A rerun replaces the earlier result: per suite, model and task the profile
+counts only the attempts of the latest run that has them, and lists the
+replaced runs as the task's history. The profile page's 再次运行 opens the 评测
+page on that profile with its datasets, tasks and last parameters, and
+重跑未通过的题 keeps only the tasks whose latest attempts did not all pass.
+A profile can be renamed at any time (`POST /api/profile/rename` with `id`
+and `name`, 重命名 on its page; an empty name falls back to the id).
+Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除评测配置
+on its page or 删除 in the overview's list) removes its record, its runs'
+records and logs, their job directories and their rows in the evaluation
+database; the frozen bundle copy stays, since other profiles may share it.
+A profile still running must be stopped first. Only a profile recorded in
+this service's jobs directory is deleted; one ingested from another jobs
+directory sharing the database is refused. When a file cannot be removed or
+the database delete fails, the request fails and the profile stays for a
+retry: the manifest goes last, after the rows are gone.
 Imports of a jobs directory (the service's sync, `bench db import`),
 `bench sync --run` and deletions from it take the same lock,
-`<jobs-dir>/.bench-store.lock`, so none of them can write a deleted batch
+`<jobs-dir>/.bench-store.lock`, so none of them can write a deleted profile
 back. A deletion that finds the lock held fails and can be retried; the
 service's sync skips the directory until its next round.
-Batch records are ingested into the `batches` table of the evaluation
-database (schema v3).
+Profile records are ingested into the `profiles` table of the evaluation
+database (schema v4, which replaces the `batches` table of v3).
 
-The batch page lists each dataset's job and every task across them; a task's
-page shows its attempts side by side, then the selected attempt's detail:
+Earlier versions grouped runs into batches. When the service starts, every
+batch record under `<jobs-dir>/.bench-batches/` is merged into the profile of
+its frozen bundle and features (batches with the same version and features
+become one profile, the earliest batch's name kept), its runs stay with it,
+and the batch record is removed.
+
+The profile page lists every task's latest attempts and the run history; a
+task's page shows its attempts side by side, then the selected attempt's
+detail:
 
 - **Token distribution**: one column per model request, its input context
   split by part (or by cached / uncached input when no composition was
@@ -1027,8 +1053,8 @@ The 数据库 page shows the active store and its contents. It tests a SQLite pa
 DSN; `password_env` names the variable), and switches the service to it,
 optionally migrating and verifying the current data first (the same copy as
 `metacodes bench db migrate`). The new `store` is written to `workbench.json`
-and takes effect immediately; switching is refused while a run or batch is
-active.
+and takes effect immediately; switching is refused while a run or a profile's queue
+is active.
 
 ### Metric definitions
 
@@ -1073,8 +1099,8 @@ there into the evaluation database):
 ```text
 <jobs-dir>/
   .bench-runs/                     # launch receipts, specs, worker logs
-  .bench-batches/<id>.json         # batches: frozen version, datasets, state
-  .bench-store.lock                # serializes imports, result syncs and batch deletions
+  .bench-profiles/<id>.json        # profiles: frozen version, features, queued runs, state
+  .bench-store.lock                # serializes imports, result syncs and profile deletions
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage

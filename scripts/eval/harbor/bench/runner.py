@@ -148,9 +148,9 @@ class RunManager:
         # service replaces this with its own SetupManager's view. A launch
         # and such a setup exclude each other under self.lock.
         self.setup_running = SetupManager(self.config_path).mutating
-        # The id of the batch that owns the executor, or None; a BatchManager
-        # installs its view. A single launch waits for that batch to end.
-        self.batch_guard = lambda: None
+        # The id of the profile whose queue owns the executor, or None; a
+        # ProfileManager installs its view. A single launch waits for it.
+        self.profile_guard = lambda: None
 
     def executor_facts(self, executor):
         """Probe results per executor, reused for 15 s (an SSH probe is a
@@ -288,7 +288,7 @@ class RunManager:
         return entry
 
     def catalog(self, bundle_supplied=False):
-        from scripts.eval.harbor.bench.batches import bundle_choices
+        from scripts.eval.harbor.bench.profiles import bundle_choices
         cfg = settings(self.config_path)
         mode = cfg.get("auth_mode") or ("provider" if cfg.get("provider_config") else "metask")
         reasons = []
@@ -424,14 +424,15 @@ class RunManager:
         resolved = str(Path(path).expanduser().resolve()) if path else None
         return resolved, self.bundle_problem(resolved, cfg)
 
-    def launch(self, request, *, dry_run=False, frozen=None, batch=None, pinned=None, bundle=None):
-        """Start one run. `dry_run` only validates (a batch checks every
-        dataset before it is created); `frozen` is a batch's frozen bundle,
-        which replaces the configured one, and `batch` names that batch.
-        `pinned` is the model route a batch was created with (the `route`
-        of its dry run); a run whose model now resolves elsewhere — another
-        source, or an imported provider at another revision — is refused, so
-        one batch never records two upstreams under one model name."""
+    def launch(self, request, *, dry_run=False, frozen=None, profile=None, pinned=None, bundle=None):
+        """Start one run. `dry_run` only validates (a profile checks every
+        dataset before it queues them); `frozen` is a profile's frozen
+        bundle, which replaces the configured one, and `profile` names that
+        profile. `pinned` is the model route a queued run was checked with
+        (the `route` of its dry run); a run whose model now resolves
+        elsewhere — another source, or an imported provider at another
+        revision — is refused, so one queued run never records an upstream
+        other than the one it was checked against."""
         allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor", "features"}
         if not isinstance(request, dict) or set(request) - allowed:
             raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor、features")
@@ -465,8 +466,8 @@ class RunManager:
         route = ({"source": "imported", "provider": imported, "revision": self.providers.run_route(model)["revision"]}
                  if imported else {"source": catalog["authentication"]["kind"]})
         if pinned is not None and pinned != route:
-            raise ValueError(f"模型 {model} 的来源在批次创建后已变化（导入的 Provider 被修改、删除或与配置重名），"
-                             "本项不再运行；请重新创建批次")
+            raise ValueError(f"模型 {model} 的来源在排队后已变化（导入的 Provider 被修改、删除或与配置重名），"
+                             "本项不再运行；请重新运行")
         if imported:
             if suite.runner == suites.WORKBUDDY:
                 raise ValueError("导入的 Provider 暂不支持 WorkBuddy 评测，请选择 Harbor 评测集")
@@ -511,9 +512,9 @@ class RunManager:
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
-            owner = self.batch_guard() if batch is None else None
+            owner = self.profile_guard() if profile is None else None
             if owner:
-                raise ValueError("批次 " + owner + " 正在运行，请等它结束或先停止该批次")
+                raise ValueError("评测配置 " + owner + " 的队列正在运行，请等它结束或先停止")
             if self.setup_running():
                 raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
             cfg = settings(self.config_path)
@@ -539,13 +540,13 @@ class RunManager:
             shown_judge = suites.judge_label(suite, cfg)
             if shown_judge:
                 record["judge"] = shown_judge  # model id and route only
-            from scripts.eval.harbor.bench.batches import current_metacodes
+            from scripts.eval.harbor.bench.profiles import current_metacodes
             metacodes = ({k: frozen.get(k) for k in ("label", "commit", "digest", "release", "frozen")}
                          if frozen else current_metacodes(cfg, used_bundle))
             if metacodes:
                 record["metacodes"] = metacodes
-            if batch:
-                record["batch"] = batch
+            if profile:
+                record["profile"] = profile
             if features:
                 record["features"] = features
             route = None
@@ -556,7 +557,7 @@ class RunManager:
                 # Resolved before the receipt, so a refusal leaves no run.
                 route = self.providers.run_route(model)
                 if pinned is not None and route["revision"] != pinned.get("revision"):
-                    raise ValueError(f"导入的 Provider {imported} 在批次创建后被修改，本项不再运行；请重新创建批次")
+                    raise ValueError(f"导入的 Provider {imported} 在排队后被修改，本项不再运行；请重新运行")
                 # Again on the snapshot the spec is written from, with the
                 # executor it names (both were read anew since validation).
                 problem = self.imported_route_problem(route) or ssh_loopback_problem(

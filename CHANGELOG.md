@@ -117,6 +117,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Bench profiles replace batches.** A profile (评测配置) is one frozen
+  metacodes version with a fixed set of advanced features, and every run
+  belongs to one; the same version with the same features is always the same
+  profile. Runs are queued on a profile as often as wanted
+  (`POST /api/profiles/run`, 再次运行, 重跑未通过的题), and a rerun of a task
+  replaces its earlier result in the profile's view. The 评测 page ticks the
+  Lean run gates by default and leaves the preview features off. `bench run`
+  runs on the profile of the configured bundle. Existing batches are merged
+  into the profiles of their version and features when the service starts;
+  the evaluation database moves to schema v4 (`profiles` replaces `batches`).
+  `/api/batches` and `/api/batch/*` are gone.
+
 - **The CLI tells the model which command it is.** The environment section of
   the system prompt names the command that started the session (the launcher
   name, `metacodes-dev` for a side-by-side install), says that `metacode` and

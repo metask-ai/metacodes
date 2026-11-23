@@ -7,7 +7,6 @@ and refuses launches. Names are looked up in the store, never used as paths.
 """
 from __future__ import annotations
 
-import datetime as dt
 import os
 import shutil
 from pathlib import Path
@@ -15,7 +14,7 @@ from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.bench import builds, data, executors
-from scripts.eval.harbor.bench.batches import BATCH_ACTIVE, BatchManager, public as public_batch
+from scripts.eval.harbor.bench.profiles import PROFILE_ACTIVE, ProfileManager, public as public_profile, runs_of
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
 from scripts.eval.harbor.store import config as store_config
@@ -37,22 +36,38 @@ def _mean(values):
     return sum(values) / len(values) if values else None
 
 
-def task_groups(view, item):
-    """A job's trials grouped by task, attempts in order, for a batch."""
-    groups = {}
-    for row in view.get("rows") or []:
-        group = groups.setdefault(row["task"], {"task": row["task"], "job": view["name"], "suite": item["suite"],
-                                                "suite_name": item.get("suite_name"), "attempts": []})
-        group["attempts"].append({k: row.get(k) for k in ATTEMPT_FIELDS})
-    for group in groups.values():
-        attempts = sorted(group["attempts"], key=lambda a: a.get("attempt_number") or 0)
-        group["attempts"] = attempts
-        group["first_status"] = attempts[0]["status"] if attempts else None
-        group["passed"] = sum(a["status"] == "pass" for a in attempts)
-        group["valid"] = sum(a["status"] in data.VALID for a in attempts)
-        for key in ("total_tokens", "initial_input_tokens", "elapsed_s", "turns", "tool_calls"):
-            group["mean_" + key] = _mean(a.get(key) for a in attempts)
-    return sorted(groups.values(), key=lambda g: g["task"])
+def task_group(task, rows, item, job):
+    """One task's attempts in one run, in order, for a profile."""
+    attempts = sorted(({k: row.get(k) for k in ATTEMPT_FIELDS} for row in rows),
+                      key=lambda a: a.get("attempt_number") or 0)
+    group = {"task": task, "job": job, "suite": item["suite"], "suite_name": item.get("suite_name"),
+             "model": item.get("model"), "attempts": attempts,
+             "first_status": attempts[0]["status"] if attempts else None,
+             "passed": sum(a["status"] == "pass" for a in attempts),
+             "valid": sum(a["status"] in data.VALID for a in attempts)}
+    for key in ("total_tokens", "initial_input_tokens", "elapsed_s", "turns", "tool_calls"):
+        group["mean_" + key] = _mean(a.get(key) for a in attempts)
+    return group
+
+
+def latest_results(record, views):
+    """Per (suite, model, task), the rows of the last run that has them: a
+    rerun replaces the earlier result, which stays in `history` (job names,
+    oldest first)."""
+    latest, history = {}, {}
+    for item in record.get("items") or []:
+        view = views.get(item.get("run")) if item.get("run") else None
+        if view is None:
+            continue
+        by_task = {}
+        for row in view.get("rows") or []:
+            by_task.setdefault(row["task"], []).append(row)
+        for task, rows in by_task.items():
+            key = (item["suite"], item.get("model"), task)
+            if key in latest:
+                history.setdefault(key, []).append(latest[key][1])
+            latest[key] = (item, view["name"], rows)
+    return latest, history
 
 
 def library_for(roots, manager=None) -> StoreLibrary:
@@ -89,26 +104,26 @@ class Workbench:
         self.builds = builds.BuildManager(manager.config_path) if manager else None
         if manager is not None:
             manager.setup_running = self.setups.mutating
-            if getattr(manager, "batches", None) is None:
-                manager.batches = BatchManager(manager)
-        self.batches = manager.batches if manager is not None else None
+            if getattr(manager, "profiles", None) is None:
+                manager.profiles = ProfileManager(manager)
+        self.profiles = manager.profiles if manager is not None else None
 
     @property
     def can_launch(self) -> bool:
         return self.manager is not None
 
-    def start_batches(self) -> None:
-        """Batches advance on their own: a dataset ends, the next one starts."""
-        if self.batches is not None:
-            self.batches.start()
+    def start_profiles(self) -> None:
+        """Profile queues advance on their own: a dataset ends, the next one starts."""
+        if self.profiles is not None:
+            self.profiles.start()
 
     def sync_in_background(self) -> None:
         """Historical imports can take a while; a service serves meanwhile."""
         self.library.start_background()
 
     def close(self) -> None:
-        if self.batches is not None:
-            self.batches.stop()
+        if self.profiles is not None:
+            self.profiles.stop()
         self.library.close()
 
     def runs(self):
@@ -150,54 +165,61 @@ class Workbench:
             if finished:
                 view["finished_at"] = finished.isoformat()
                 view["wall_s"] = (finished - started).total_seconds() if started else None
-        view["batch"] = (run or {}).get("batch")
+        view["profile"] = (run or {}).get("profile")
         view["metacodes"] = (run or {}).get("metacodes")
         if not with_rows:
             view.pop("rows", None)
         return view
 
-    def batch_records(self):
-        found = {r["id"]: r for r in self.library.batch_records() if isinstance(r, dict) and r.get("id")}
-        if self.batches is not None:
-            found.update((r["id"], r) for r in self.batches.records())
+    def profile_records(self):
+        found = {r["id"]: r for r in self.library.profile_records() if isinstance(r, dict) and r.get("id")}
+        if self.profiles is not None:
+            found.update((r["id"], r) for r in self.profiles.records())
         return sorted(found.values(), key=lambda r: r.get("created_at") or "", reverse=True)
 
-    def batch_summary(self, record, views) -> Dict[str, Any]:
-        """A batch's card: its record, each dataset's job, the pooled summary."""
-        value = public_batch(record)
-        summaries, done, planned = [], 0, 0
+    def profile_summary(self, record, views) -> Dict[str, Any]:
+        """A profile's card: its record, each queued dataset's job, and the
+        summary of every task's latest result. `views` carry their rows."""
+        value = public_profile(record)
+        done, planned = 0, 0
         for item in value["items"]:
             view = views.get(item.get("run")) if item.get("run") else None
-            planned += len(item.get("tasks") or []) * int(record.get("attempts") or 1)
+            waiting = item["status"] in ("pending", "running")
+            if waiting:
+                planned += len(item.get("tasks") or []) * int(item.get("attempts") or 1)
             if view is not None:
-                summaries.append(view["summary"])
-                done += view["summary"]["trials"] - view["summary"]["counts"]["running"]
+                if waiting:
+                    done += view["summary"]["trials"] - view["summary"]["counts"]["running"]
                 item["job"] = {k: view.get(k) for k in ("name", "planned", "running", "wall_s", "started_at",
                                                         "finished_at", "dataset", "execution_status")}
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
-        value["summary"] = data.merge_summaries(summaries)
-        value["progress"] = {"done": done, "planned": planned}
-        started, finished = data.parse_time(record.get("started_at")), data.parse_time(record.get("finished_at"))
-        value["wall_s"] = ((finished or dt.datetime.now(dt.timezone.utc)) - started).total_seconds() \
-            if started else None
+        latest, _ = latest_results(record, views)
+        value["summary"] = data.summarize([row for _, _, rows in latest.values() for row in rows])
+        value["progress"] = {"done": done, "planned": planned} if planned else None
+        value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
+        value["suites"] = sorted({i["suite"] for i in value["items"]})
+        value["last_run_at"] = max((i.get("started_at") or "" for i in value["items"]), default="") or None
         return value
 
     def jobs(self, scope="all") -> Dict[str, Any]:
-        """Every job, newest first; `scope` is a batch id, "none" or "all"."""
+        """Every job, newest first; `scope` is a profile id or "all"."""
         self.library.maybe_sync()
         runs = self.runs()  # one scan of the run records for every job
-        jobs = [view for view in (self.job_view(name, False, runs) for name in self.library.job_names()) if view]
+        jobs = [view for view in (self.job_view(name, True, runs) for name in self.library.job_names()) if view]
         jobs.sort(key=lambda view: view["started_at"] or "", reverse=True)
         views = {view["name"]: view for view in jobs}
-        batches = [self.batch_summary(record, views) for record in self.batch_records()]
-        if scope == "none":
-            shown = [j for j in jobs if not j.get("batch")]
-        elif scope != "all":
-            shown = [j for j in jobs if j.get("batch") == scope]
+        records = self.profile_records()
+        profiles = [self.profile_summary(record, views) for record in records]
+        for view in jobs:
+            view.pop("rows", None)
+        if scope != "all":
+            record = next((r for r in records if r["id"] == scope), None)
+            owned = set(runs_of(record, runs)) if record else set()
+            shown = [j for j in jobs if j["name"] in owned]
         else:
             shown = jobs
         storage = self.library.storage()
-        return {"jobs": shown, "job_total": len(jobs), "scope": scope, "batches": batches, "runs": runs,
+        return {"jobs": shown, "job_total": len(jobs), "scope": scope, "profiles": profiles, "runs": runs,
                 "summary": data.merge_summaries(j["summary"] for j in shown),
                 "storage": {**storage,
                             "records_dir": str(self.manager.records) if self.manager else None,
@@ -224,10 +246,10 @@ class Workbench:
                 break
         return detail
 
-    def batch(self, batch_id) -> Optional[Dict[str, Any]]:
-        """A batch with every dataset's tasks and their attempts."""
+    def profile(self, profile) -> Optional[Dict[str, Any]]:
+        """A profile with every task's latest attempts and earlier runs."""
         self.library.maybe_sync()
-        record = next((r for r in self.batch_records() if r["id"] == batch_id), None)
+        record = next((r for r in self.profile_records() if r["id"] == profile), None)
         if record is None:
             return None
         full = {}
@@ -235,17 +257,17 @@ class Workbench:
             view = self.job_view(item["run"]) if item.get("run") else None
             if view is not None:
                 full[view["name"]] = view
-        value = self.batch_summary(record, full)
-        tasks = []
+        value = self.profile_summary(record, full)
+        latest, history = latest_results(record, full)
+        tasks = [{**task_group(task, rows, item, job), "history": history.get(key, [])}
+                 for key, (item, job, rows) in latest.items() for task in [key[2]]]
         for item in value["items"]:
-            view = full.get(item.get("run"))
-            if view is not None:
-                tasks += task_groups(view, item)
-            else:
+            if item["status"] in ("pending", "running") and item.get("run") not in full:
                 tasks += [{"task": t, "job": None, "suite": item["suite"], "suite_name": item.get("suite_name"),
-                           "attempts": [], "first_status": None, "passed": 0, "valid": 0}
-                          for t in item.get("tasks") or []]
-        value["tasks"] = tasks
+                           "model": item.get("model"), "attempts": [], "first_status": None, "passed": 0,
+                           "valid": 0, "history": []}
+                          for t in item.get("tasks") or [] if (item["suite"], item.get("model"), t) not in latest]
+        value["tasks"] = sorted(tasks, key=lambda t: (t["suite"], t["model"] or "", t["task"]))
         return value
 
     def run(self, name) -> Optional[Dict[str, Any]]:
@@ -257,50 +279,49 @@ class Workbench:
     def launch(self, request) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
-        return self.manager.launch(request)
+        return self.profiles.launch_now(request)
 
     def cancel(self, name) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.manager.cancel(name)
 
-    def create_batch(self, request) -> Dict[str, Any]:
+    def queue_profile(self, request) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
-        return public_batch(self.batches.create(request))
+        return public_profile(self.profiles.queue(request))
 
-    def cancel_batch(self, batch_id) -> Dict[str, Any]:
+    def cancel_profile(self, profile) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
-        return self.batches.cancel(batch_id)
+        return self.profiles.cancel(profile)
 
-    def rename_batch(self, batch_id, name) -> Dict[str, Any]:
+    def rename_profile(self, profile, name) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
-        if self.batches.get(batch_id) is None and any(r["id"] == batch_id for r in self.batch_records()):
-            raise ValueError(f"批次 {batch_id} 来自共用数据库里的其他 jobs 目录，请在那个 jobs 目录的工作台重命名")
-        return self.batches.rename(batch_id, name)
+        if self.profiles.get(profile) is None and any(r["id"] == profile for r in self.profile_records()):
+            raise ValueError(f"评测配置 {profile} 来自共用数据库里的其他 jobs 目录，请在那个 jobs 目录的工作台重命名")
+        return self.profiles.rename(profile, name)
 
-    def delete_batch(self, batch_id) -> Dict[str, Any]:
+    def delete_profile(self, profile) -> Dict[str, Any]:
         manager = self.manager
         if not manager:
             raise ValueError(READ_ONLY)
-        if not isinstance(batch_id, str) or not data.NAME.fullmatch(batch_id):
-            raise ValueError("批次不存在")
-        with self.batches.lock, manager.lock:
-            record = next((r for r in self.batch_records() if r["id"] == batch_id), None)
+        if not isinstance(profile, str) or not data.NAME.fullmatch(profile):
+            raise ValueError("评测配置不存在")
+        self.profiles.advance()
+        with self.profiles.lock, manager.lock:
+            record = next((r for r in self.profile_records() if r["id"] == profile), None)
             if record is None:
-                raise ValueError("批次不存在")
+                raise ValueError("评测配置不存在")
             receipts = manager.runs()
-            names = {item.get("run") for item in record["items"]} | set(self.library.batch_runs(batch_id))
-            names |= {r["name"] for r in receipts if r.get("batch") == batch_id}
-            runs = sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
+            runs = runs_of(record, receipts + self.library.run_records())
             running = {r["name"] for r in receipts if r.get("status") in ACTIVE}
-            if record["status"] in BATCH_ACTIVE or running.intersection(runs):
-                raise ValueError("批次还在运行，请先取消，结束后再删除")
-            self.library.delete_batch(batch_id, runs, manager.jobs_dir, self.batches.path(batch_id),
-                                      lambda: self._remove_run_files(runs))
-        return {"id": batch_id, "deleted": True, "runs": runs}
+            if record["status"] in PROFILE_ACTIVE or running.intersection(runs):
+                raise ValueError("评测配置还在运行，请先停止，结束后再删除")
+            self.library.delete_profile(profile, runs, manager.jobs_dir, self.profiles.path(profile),
+                                        lambda: self._remove_run_files(runs))
+        return {"id": profile, "deleted": True, "runs": runs}
 
     def _remove_run_files(self, runs) -> None:
         manager = self.manager
@@ -447,10 +468,12 @@ class Workbench:
                         "same": probe.same_database(library.store)}
             finally:
                 probe.close()
+        if self.profiles is not None:
+            self.profiles.advance()
         with manager.lock:
             if any(run.get("status") in ACTIVE for run in manager.runs()) or (
-                    self.batches is not None and self.batches.active_id()):
-                raise ValueError("有评测或批次正在运行，结束后再切换数据库")
+                    self.profiles is not None and self.profiles.active_id()):
+                raise ValueError("有评测正在运行，结束后再切换数据库")
             fresh = Store(target)
             try:
                 if fresh.same_database(library.store):
