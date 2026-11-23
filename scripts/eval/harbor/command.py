@@ -10,6 +10,7 @@ Harbor's ``BaseInstalledAgent``.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -68,7 +69,39 @@ ADVANCED_FEATURES = {
                       "label": "不写注释约束与编辑检查"},
     "harnessmm": {"group": "preview", "flag": "--harnessmm",
                   "label": "HarnessMM 决策复用与回调证书"},
+    # An entry, not a flag of the headless run: the trial runs the task
+    # through `metacodes teamwork run` (see teamwork_run_command).
+    "teamwork": {"group": "preview", "flag": "--preview=teamwork", "entry": True,
+                 "label": "Teamwork 流水线（实现 ⇄ 评审 → 审计 → 合回，单独使用）"},
 }
+
+TEAMWORK = "teamwork"
+TEAMWORK_EVENTS_FILENAME = "teamwork-events.jsonl"
+TEAMWORK_STATUS_FILENAME = "teamwork-status.json"
+TEAMWORK_RUN_DIRNAME = "teamwork-run"
+# Dollar cap of one teamwork trial by the task's declared difficulty: ample,
+# so a trial ends on its result rather than its budget. The ledger charges
+# metacodes' price-table estimate, and a model without its own price is
+# charged at the Sonnet fallback rates, far above what a cheap model costs.
+TEAMWORK_BUDGET_USD = {"easy": 20.0, "medium": 40.0, "hard": 80.0}
+TEAMWORK_DEFAULT_BUDGET_USD = 40.0
+# The pipeline runs several seats in turn; its trials get this much more of
+# the task's agent timeout.
+TEAMWORK_TIMEOUT_MULTIPLIER = 3
+# Teamwork seats run their commands under bubblewrap and work in a git
+# worktree; a task image gets both when it lacks them.
+TEAMWORK_PACKAGE_INSTALL = {
+    "apt-get": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git bubblewrap",
+    "dnf": "dnf install -y git bubblewrap",
+    "yum": "yum install -y git bubblewrap",
+    "apk": "apk add --no-cache git bubblewrap",
+}
+TEAMWORK_TOOLS_CHECK = "command -v git >/dev/null 2>&1 && command -v bwrap >/dev/null 2>&1"
+# What a task container needs for bubblewrap to create its namespaces, as
+# root (no user namespace: SYS_ADMIN, NET_ADMIN for the loopback) or as
+# another user (unconfined seccomp, AppArmor and /proc).
+TEAMWORK_CONTAINER = {"cap_add": ["SYS_ADMIN", "NET_ADMIN"],
+                      "security_opt": ["seccomp=unconfined", "apparmor=unconfined", "systempaths=unconfined"]}
 
 # A trial must not reach a TinyKG store outside its own container: these
 # would point metacodes at a shared or remote store.
@@ -225,8 +258,54 @@ def metacodes_flags(
             raise ValueError(
                 "unknown feature " + repr(feature) + "; known: " + ",".join(ADVANCED_FEATURES)
             )
+        if ADVANCED_FEATURES[feature].get("entry"):
+            raise ValueError(f"feature {feature!r} is an entry, not a flag: use teamwork_run_command")
         flags.append(ADVANCED_FEATURES[feature]["flag"])
     return flags
+
+
+def teamwork_flags(*, provider: Optional[str], model: str, reasoning_effort: Optional[str]) -> List[str]:
+    """The `teamwork run` arguments for one trial's model: provider and
+    model, and the reasoning effort on the seats that take one (implementer
+    and reviewer; the verifier resolves its own)."""
+
+    flags = (["--provider", provider] if provider is not None else []) + ["--model", model]
+    if reasoning_effort is not None:
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("reasoning_effort must be one of " + "/".join(REASONING_EFFORTS))
+        seats = {role: {"effort": reasoning_effort} for role in ("implementer", "reviewer")}
+        flags += ["--config-json", json.dumps({"seats": seats}, separators=(",", ":"))]
+    return flags
+
+
+def checked_features(features: Iterable[str]) -> List[str]:
+    """The features of one trial; teamwork runs alone, since `teamwork run`
+    takes none of the other features' flags."""
+
+    names = list(features)
+    for name in names:
+        if name not in ADVANCED_FEATURES:
+            raise ValueError("unknown feature " + repr(name) + "; known: " + ",".join(ADVANCED_FEATURES))
+    if TEAMWORK in names and len(names) > 1:
+        raise ValueError("teamwork runs alone: `teamwork run` takes no other feature flag")
+    return names
+
+
+def task_difficulty(trial_dir: Path) -> str:
+    """The `difficulty` a trial's task.toml declares (Harbor's trial
+    config.json names the task directory), or "unknown"."""
+
+    try:
+        config = json.loads((Path(trial_dir) / "config.json").read_text(encoding="utf-8"))
+        text = (Path(config["task"]["path"]) / "task.toml").read_text(encoding="utf-8")
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unknown"
+    match = re.search(r'^difficulty\s*=\s*"([A-Za-z]+)"', text, re.MULTILINE)
+    return match.group(1).lower() if match else "unknown"
+
+
+def teamwork_budget(difficulty: str) -> float:
+    return TEAMWORK_BUDGET_USD.get(difficulty, TEAMWORK_DEFAULT_BUDGET_USD)
 
 
 def mcp_servers_config(servers: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
@@ -328,6 +407,135 @@ def run_command(
         'exit "$status"',
     ]
     return "\n".join(lines) + "\n"
+
+
+def teamwork_run_command(
+    *,
+    state_dir: str,
+    instruction_path: str,
+    run_id: str,
+    budget_usd: float,
+    flags: Iterable[str],
+    config_path: Optional[str] = None,
+    binary: str = REMOTE_BINARY,
+    kg_bin: str = REMOTE_KG_BIN,
+    logs_dir: str = REMOTE_LOGS,
+) -> str:
+    """The bash script of one teamwork trial: the same state dir, config and
+    TinyKG setup as run_command, then `teamwork run` on the task's working
+    directory, approved with the trial's dollar cap.
+
+    - Teamwork works in a git worktree and merges back into the repository,
+      so a working directory outside any repository with a commit becomes one
+      first: a snapshot commit of what the task image put there.
+    - The instruction is the approved request, read from a file; a leading
+      `[` would be parsed as an option segment, so such text gets a heading.
+    - The run directory (ledger, seat records and logs, without worktrees)
+      and `teamwork status --json` go to the log mount whatever the run's
+      outcome, and the script exits 0 once that status exists: a failed or
+      unmerged run is the task's result for the verifier to score, while
+      `teamwork_problem` turns a run that never dispatched work into an
+      error."""
+
+    state = shlex.quote(state_dir)
+    logs = shlex.quote(logs_dir)
+    run = shlex.quote(binary) + ' --state-dir "$state"'
+    identity = "-c user.name=metacodes-bench -c user.email=bench@metacodes.invalid"
+    lines = [
+        "set -u",
+        f"state={state}",
+        'test ! -e "$state" || { echo "metacodes state dir already exists: $state" >&2; exit 70; }',
+        'mkdir -p "$state" && chmod 700 "$state" || exit 70',
+    ]
+    if config_path is not None:
+        lines.append(f'install -m 600 {shlex.quote(config_path)} "$state/config.json" || exit 71')
+    lines += [
+        f"unset {' '.join(REMOTE_TINYKG_ENV)}",
+        "export METACODES_KG_TRANSPORT=cli-exclusive METACODES_KG_AUTOSTART=0",
+        f"export METACODES_KG_BIN={shlex.quote(kg_bin)}",
+        'export METACODES_KG_STORE="$state/kg-store"',
+        f"mkdir -p {logs} || exit 72",
+        'test "$(pwd)" != / || { echo "teamwork needs a task working directory, not /" >&2; exit 74; }',
+        "git config --global --add safe.directory '*' 2>/dev/null || true",
+        "if ! git rev-parse --verify -q 'HEAD^{commit}' >/dev/null 2>&1; then",
+        "  { git rev-parse --show-toplevel >/dev/null 2>&1 || git init -q; } &&",
+        f"  git add -A && git {identity} commit -q --allow-empty -m 'bench snapshot before teamwork' || exit 75",
+        "fi",
+        'request="$state/request.md"',
+        f'{{ if [ "$(head -c 1 {shlex.quote(instruction_path)})" = "[" ]; then printf "Task:\\n\\n"; fi;'
+        f' cat {shlex.quote(instruction_path)}; }} > "$request" || exit 76',
+        f'{run} --preview=teamwork teamwork run --request-file "$request" --approve'
+        f" --budget-usd {budget_usd:g} --id {shlex.quote(run_id)} --events "
+        + " ".join(shlex.quote(flag) for flag in flags)
+        + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>{logs}/{STDERR_FILENAME}",
+        f'echo "teamwork run exited $?" >>{logs}/{STDERR_FILENAME}',
+        teamwork_keep_run_command(state_dir=state_dir, run_id=run_id, logs_dir=logs_dir),
+        f"{run} teamwork status {shlex.quote(run_id)} --json"
+        f" >{logs}/{TEAMWORK_STATUS_FILENAME} 2>>{logs}/{STDERR_FILENAME} || exit 77",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def parse_teamwork_status(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def teamwork_keep_run_command(*, state_dir: str, run_id: str, logs_dir: str = REMOTE_LOGS) -> str:
+    """Shell that copies a teamwork run directory, without worktrees, to the
+    log mount as `teamwork-run/` (the ledger, seat records and seat logs)."""
+
+    run_dir = shlex.quote(f"{state_dir}/teamwork/{run_id}")
+    kept = shlex.quote(f"{logs_dir}/{TEAMWORK_RUN_DIRNAME}")
+    return (f"if [ -d {run_dir} ] && command -v tar >/dev/null 2>&1; then mkdir -p {kept} &&"
+            f" tar -C {run_dir} --exclude=worktree -cf - . | tar -C {kept} -xf -"
+            f" 2>>{shlex.quote(logs_dir + '/' + STDERR_FILENAME)}; fi")
+
+
+def teamwork_status(logs_dir: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return parse_teamwork_status((Path(logs_dir) / TEAMWORK_STATUS_FILENAME).read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
+def teamwork_problem(status: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why a teamwork trial does not measure teamwork, or None: no status
+    (the run never started), or no implementer seat that finished its work
+    (every one failed, as on a provider or sandbox error), which the
+    headless run counts as invalid too. A run that spent its budget worked
+    on the task, so it is scored."""
+
+    if status is None:
+        return "teamwork wrote no status: the run did not start (see " + STDERR_FILENAME + ")"
+    if status.get("state") == "budget_exhausted":
+        return None
+    seats = status.get("seats") if isinstance(status.get("seats"), list) else []
+    if not any(isinstance(s, dict) and s.get("role") == "implementer" and s.get("status") == "done" for s in seats):
+        return f"no teamwork implementer seat finished (state {status.get('state')}, detail {status.get('detail')})"
+    return None
+
+
+def teamwork_trace(logs_dir: Path) -> Dict[str, Any]:
+    """A teamwork trial's trace: one step summarizing the run, and its spend
+    from the run's budget ledger (seats report no per-request usage here)."""
+
+    status = teamwork_status(logs_dir) or {}
+    budget = status.get("budget") if isinstance(status.get("budget"), dict) else {}
+    spent = float(budget.get("spent_usd") or 0.0)
+    state = str(status.get("state") or "unknown")
+    summary = {k: status.get(k) for k in ("state", "detail", "dispatched", "audits", "merge_conflicts")}
+    return {
+        "result": {"stop_reason": "teamwork_" + state, "turns": 0, "tool_calls": 0, "input_tokens": 0,
+                   "output_tokens": 0, "cost_usd": spent, "text": "", "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 0},
+        "steps": [{"step_id": 1, "source": "agent", "message": "teamwork run " + state,
+                   "reasoning_content": None, "tool_calls": [], "observations": [],
+                   "extra": {"teamwork": summary, "budget": budget}}],
+    }
 
 
 def killed_trace() -> Dict[str, Any]:

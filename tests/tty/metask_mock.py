@@ -111,6 +111,7 @@ class MetaskMock:
         self.reply = reply
         self.requests = []
         self.messages = []  # (authorization, model) of each /v1/messages request
+        self.message_bodies = []
         self.revocations = []  # the body of each /api/oauth/revoke request
         self.device_requests = []  # the body of each /api/oauth/device/code request
         # A userinfo request is held, unanswered, until the mock closes.
@@ -213,11 +214,14 @@ class MetaskMock:
                     return self._send(200, json.dumps(token).encode())
                 if self.path.startswith("/v1/messages"):
                     model = None
+                    request = None
                     try:
-                        model = json.loads(body).get("model")
+                        request = json.loads(body)
+                        model = request.get("model")
                     except ValueError:
                         pass
                     outer.messages.append((self.headers.get("authorization"), model))
+                    outer.message_bodies.append(request)
                     return self._send(200, _sse_text(outer.reply), "text/event-stream")
                 self._send(404, b'{"error":"not found"}')
 

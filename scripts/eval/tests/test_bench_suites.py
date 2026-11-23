@@ -502,7 +502,7 @@ class McpForwardingTest(unittest.TestCase):
             agent.__dict__.update(
                 logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[types.SimpleNamespace(
                     name="are", transport="streamable-http", url="http://are-sidecar:8000/mcp", headers={})],
-                config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None,
+                config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=False,
                 _account_gateway=None)
             environment = CapturingEnvironment()
             asyncio.run(agent.run("solve it", environment, None))
@@ -511,12 +511,35 @@ class McpForwardingTest(unittest.TestCase):
         self.assertTrue(any('/config.json"' in c for c in environment.agent_commands))
 
 
+    def test_a_teamwork_trial_killed_on_timeout_still_keeps_its_run_records(self):
+        with stubbed_harbor() as agent_module, tempfile.TemporaryDirectory() as tmp:
+            agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
+            agent.__dict__.update(
+                logs_dir=Path(tmp) / "trial-x" / "agent", mcp_servers=[], config_source=None,
+                _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=True, _account_gateway=None)
+
+            async def killed(environment, command):
+                raise asyncio.TimeoutError("agent timeout")
+
+            agent.exec_as_agent = killed
+            environment = CapturingEnvironment()
+            with self.assertRaises(asyncio.TimeoutError):
+                asyncio.run(agent.run("solve it", environment, None))
+        kept = [c for c in environment.root_commands if "teamwork-run" in c]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("--exclude=worktree", kept[0])
+
+
 class CapturingEnvironment:
     def __init__(self):
-        self.uploads, self.agent_commands = [], []
+        self.uploads, self.agent_commands, self.root_commands = [], [], []
 
     async def upload_file(self, source, target):
         self.uploads.append((str(target), Path(source).read_bytes()))
+
+    async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
+        self.root_commands.append(command)
+        return types.SimpleNamespace(return_code=0, stdout="", stderr="")
 
 
 @contextlib.contextmanager

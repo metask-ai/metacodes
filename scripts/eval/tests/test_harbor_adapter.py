@@ -130,11 +130,33 @@ class ModelAndFlagsTest(unittest.TestCase):
             features=["test_integrity", "execute_code", "harnessmm"],
         )
         self.assertEqual(flags[-3:], ["--test-integrity", "--preview=execute_code", "--harnessmm"])
-        with self.assertRaisesRegex(ValueError, "unknown feature 'teamwork'"):
+        with self.assertRaisesRegex(ValueError, "unknown feature 'bogus'"):
+            cmd.metacodes_flags(
+                provider=None, model="m", disallowed_tools="", reasoning_effort=None, max_tokens=None,
+                features=["bogus"],
+            )
+        with self.assertRaisesRegex(ValueError, "is an entry"):
             cmd.metacodes_flags(
                 provider=None, model="m", disallowed_tools="", reasoning_effort=None, max_tokens=None,
                 features=["teamwork"],
             )
+
+    def test_teamwork_flags_carry_the_reasoning_effort_to_the_seats_that_take_one(self):
+        self.assertEqual(cmd.teamwork_flags(provider=None, model="m", reasoning_effort=None), ["--model", "m"])
+        flags = cmd.teamwork_flags(provider="p", model="m", reasoning_effort="high")
+        self.assertEqual(flags[:4], ["--provider", "p", "--model", "m"])
+        self.assertEqual(json.loads(flags[flags.index("--config-json") + 1]),
+                         {"seats": {"implementer": {"effort": "high"}, "reviewer": {"effort": "high"}}})
+        with self.assertRaisesRegex(ValueError, "reasoning_effort"):
+            cmd.teamwork_flags(provider=None, model="m", reasoning_effort="turbo")
+
+    def test_teamwork_runs_alone(self):
+        self.assertEqual(cmd.checked_features(["teamwork"]), ["teamwork"])
+        self.assertEqual(cmd.checked_features(["execute_code", "stall_gate"]), ["execute_code", "stall_gate"])
+        with self.assertRaisesRegex(ValueError, "teamwork runs alone"):
+            cmd.checked_features(["teamwork", "execute_code"])
+        with self.assertRaisesRegex(ValueError, "unknown feature"):
+            cmd.checked_features(["bogus"])
 
     def test_every_feature_flag_is_one_metacodes_parses(self):
         root = Path(__file__).resolve().parents[3]
@@ -325,6 +347,133 @@ class RunScriptTest(unittest.TestCase):
         done = self.run_script(state=state)
         self.assertEqual(done.returncode, 70)
         self.assertFalse((self.record / "argv").exists())
+
+
+# A stand-in for `metacodes ... teamwork run|status`: records each call's
+# argv and the request it was given, answers status with $FAKE_TEAMWORK_STATUS.
+FAKE_TEAMWORK = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      if [ "${args[$i]}" = "--request-file" ]; then cp "${args[$((i + 1))]}" "$RECORD/request"; fi
+    done
+    case " $* " in
+      *" teamwork status "*) printf '%s\\n' "$@" > "$RECORD/argv-status"; printf '%s' "${FAKE_TEAMWORK_STATUS:-}"; exit 0 ;;
+      *" teamwork run "*) printf '%s\\n' "$@" > "$RECORD/argv-run"; git log --format=%s > "$RECORD/log"
+        run_dir="${args[1]}/teamwork/trial1"; mkdir -p "$run_dir/worktree" "$run_dir/seats/implementer-1"
+        echo '{"charge":1}' > "$run_dir/budget.jsonl"; echo seat-log > "$run_dir/seats/implementer-1/session.log"
+        echo task-copy > "$run_dir/worktree/main.py"
+        exit "${FAKE_STATUS:-0}" ;;
+    esac
+    exit 9
+    """
+)
+
+
+@unittest.skipIf(BASH is None or not POSIX or shutil.which("git") is None, "the trial script runs in a Linux container")
+class TeamworkScriptTest(unittest.TestCase):
+    STATUS = json.dumps({"state": "done", "detail": None, "dispatched": {"implementer": 2, "reviewer": 1},
+                         "audits": 1, "merge_conflicts": 0, "budget": {"cap_usd": 10, "spent_usd": 1.25},
+                         "seats": [{"role": "implementer", "status": "failed"},
+                                   {"role": "implementer", "status": "done"}, {"role": "reviewer", "status": "done"}]})
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.binary = self.tmp / "metacodes"
+        self.binary.write_text(FAKE_TEAMWORK, encoding="utf-8")
+        self.binary.chmod(self.binary.stat().st_mode | stat.S_IXUSR)
+        self.record = self.tmp / "record"
+        self.record.mkdir()
+        self.logs = self.tmp / "logs"
+        self.work = self.tmp / "app"
+        self.work.mkdir()
+        (self.work / "main.py").write_text("print(1)\n", encoding="utf-8")
+        self.instruction = self.tmp / "instruction.md"
+
+    def run_script(self, instruction="Fix the bug in main.py.\n", status=None, extra_env=None, cwd=None):
+        self.instruction.write_text(instruction, encoding="utf-8")
+        script = cmd.teamwork_run_command(
+            state_dir=str(self.tmp / "state"), instruction_path=str(self.instruction), run_id="trial1",
+            budget_usd=10.0, flags=["--provider", "deepseek", "--model", "deepseek-v4-flash"],
+            binary=str(self.binary), kg_bin="/opt/metacodes/vendor/tinykg/tinykg", logs_dir=str(self.logs))
+        env = {"PATH": os.environ.get("PATH", ""), "RECORD": str(self.record), "HOME": str(self.tmp),
+               "FAKE_TEAMWORK_STATUS": self.STATUS if status is None else status}
+        env.update(extra_env or {})
+        return subprocess.run([BASH, "-c", script], env=env, cwd=str(cwd or self.work), capture_output=True,
+                              text=True, timeout=30)
+
+    def test_a_plain_directory_is_snapshotted_and_run_with_the_approved_request(self):
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.record / "log").read_text(encoding="utf-8").strip(), "bench snapshot before teamwork")
+        tracked = subprocess.run(["git", "ls-files"], cwd=self.work, capture_output=True, text=True).stdout.split()
+        self.assertEqual(tracked, ["main.py"])
+        argv = (self.record / "argv-run").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(argv[:6], ["--state-dir", str(self.tmp / "state"), "--preview=teamwork", "teamwork", "run",
+                                    "--request-file"])
+        for part in (["--approve"], ["--budget-usd", "10"], ["--id", "trial1"], ["--events"],
+                     ["--provider", "deepseek", "--model", "deepseek-v4-flash"]):
+            self.assertIn(" ".join(part), " ".join(argv))
+        self.assertEqual((self.record / "request").read_text(encoding="utf-8"), "Fix the bug in main.py.\n")
+        self.assertEqual(cmd.teamwork_status(self.logs)["dispatched"]["implementer"], 2)
+        self.assertIsNone(cmd.teamwork_problem(cmd.teamwork_status(self.logs)))
+        kept = self.logs / cmd.TEAMWORK_RUN_DIRNAME
+        self.assertEqual((kept / "budget.jsonl").read_text(encoding="utf-8").strip(), '{"charge":1}')
+        self.assertEqual((kept / "seats" / "implementer-1" / "session.log").read_text(encoding="utf-8").strip(), "seat-log")
+        self.assertFalse((kept / "worktree").exists())
+
+    def test_an_existing_commit_is_kept_and_a_bracket_request_gets_a_heading(self):
+        subprocess.run(["git", "init", "-q"], cwd=self.work, check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "task"],
+                       cwd=self.work, check=True)
+        done = self.run_script(instruction="[WIP] fix it\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.record / "log").read_text(encoding="utf-8").strip(), "task")
+        self.assertEqual((self.record / "request").read_text(encoding="utf-8"), "Task:\n\n[WIP] fix it\n")
+
+    def test_a_failed_run_is_scored_and_a_run_that_dispatched_nothing_is_a_problem(self):
+        done = self.run_script(extra_env={"FAKE_STATUS": "3"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("teamwork run exited 3", (self.logs / cmd.STDERR_FILENAME).read_text(encoding="utf-8"))
+        failed = json.dumps({"state": "failed", "detail": "rounds_exhausted", "dispatched": {"implementer": 3},
+                             "seats": [{"role": "implementer", "status": "failed"}] * 3})
+        self.assertIn("no teamwork implementer seat finished", cmd.teamwork_problem(cmd.parse_teamwork_status(failed)))
+        self.assertIn("did not start", cmd.teamwork_problem(cmd.parse_teamwork_status("")))
+        spent = json.dumps({"state": "budget_exhausted", "seats": [{"role": "implementer", "status": "failed"}]})
+        self.assertIsNone(cmd.teamwork_problem(cmd.parse_teamwork_status(spent)))
+        self.assertIn("did not start", cmd.teamwork_problem(None))
+
+    def test_the_root_directory_is_refused(self):
+        done = self.run_script(cwd="/")
+        self.assertEqual(done.returncode, 74)
+        self.assertFalse((self.record / "argv-run").exists())
+
+    def test_trace_carries_the_ledger_spend(self):
+        self.logs.mkdir()
+        (self.logs / cmd.TEAMWORK_STATUS_FILENAME).write_text(self.STATUS, encoding="utf-8")
+        trace = cmd.teamwork_trace(self.logs)
+        self.assertEqual(trace["result"]["cost_usd"], 1.25)
+        self.assertEqual(trace["result"]["stop_reason"], "teamwork_done")
+        self.assertEqual(cmd.final_metrics_fields(trace["result"])["total_cost_usd"], 1.25)
+
+
+class TeamworkBudgetTest(unittest.TestCase):
+    def test_budget_follows_the_difficulty_the_task_declares(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task, trial = root / "task", root / "trial"
+            task.mkdir()
+            trial.mkdir()
+            (trial / "config.json").write_text(json.dumps({"task": {"path": str(task)}}), encoding="utf-8")
+            self.assertEqual(cmd.task_difficulty(trial), "unknown")
+            (task / "task.toml").write_text('[metadata]\nauthor_name = "x"\ndifficulty = "Hard"\n', encoding="utf-8")
+            self.assertEqual(cmd.task_difficulty(trial), "hard")
+        self.assertEqual(cmd.teamwork_budget("hard"), cmd.TEAMWORK_BUDGET_USD["hard"])
+        self.assertEqual(cmd.teamwork_budget("unknown"), cmd.TEAMWORK_DEFAULT_BUDGET_USD)
+        self.assertLess(cmd.TEAMWORK_BUDGET_USD["easy"], cmd.TEAMWORK_BUDGET_USD["medium"])
+        self.assertLess(cmd.TEAMWORK_BUDGET_USD["medium"], cmd.TEAMWORK_BUDGET_USD["hard"])
 
 
 class TraceTest(unittest.TestCase):

@@ -230,6 +230,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          clean: ${{ env.POOL_JOB != 'true' }}
       # The pool job only (POOL_JOB): its env leaves FAST_PATH unset and this
       # step sets it. If the watch already finished, the hosted legs took over
       # before a VM took this job, so FAST_PATH=true and every later step
@@ -240,6 +241,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci_pool_plan.py stand-down --platform macos --github-env "$GITHUB_ENV"
+      - name: Keep the caches on the pool host
+        if: env.POOL_JOB == 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for cache in .zig-cache control-plane/lean/.lake; do
+            if [ -L "$cache" ]; then rm "$cache"; fi
+          done
+          if [ "$WARM_CACHE" = "true" ]; then rm -rf .zig-cache; fi
+          git clean -ffdx -e /.zig-cache -e /control-plane/lean/.lake
+          test -z "$(git status --porcelain --untracked-files=normal)"
       # setup-zig points ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR at
       # .zig-cache. Its own cache stays off, since it saves on every run; the
       # steps below restore and save explicitly (doc/CI_DESIGN.md §5). Zig's
@@ -257,7 +269,7 @@ jobs:
       # prefix of what main saves (its run ID follows), so the newest wins.
       # Each leg builds a different share of the graph and keeps its own line.
       - name: Restore the Zig cache main saved
-        if: env.WARM_CACHE != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.WARM_CACHE != 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
@@ -277,7 +289,7 @@ jobs:
       # run restores; only main's warm run saves (after the kernel build).
       - name: Restore Lean toolchain and build products
         id: lean
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -314,7 +326,7 @@ jobs:
       # One leg saves, once per state of the Lean sources (the key is their
       # hash): an exact hit means main already holds this state.
       - name: Save Lean toolchain and build products
-        if: env.WARM_CACHE == 'true' && matrix.units && steps.lean.outputs.cache-hit != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.WARM_CACHE == 'true' && env.POOL_JOB != 'true' && matrix.units && steps.lean.outputs.cache-hit != 'true' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -706,7 +718,7 @@ jobs:
       # after night. A failed leg saves nothing and the previous night's entry
       # stays. Cache keys are immutable, hence the run ID in each.
       - name: Save the Zig cache for pull requests
-        if: env.WARM_CACHE == 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.WARM_CACHE == 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache

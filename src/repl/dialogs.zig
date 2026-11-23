@@ -1606,10 +1606,11 @@ pub const MetaskSignInDialog = struct {
         };
     }
 
-    fn chooseModel(self: *MetaskSignInDialog, index: usize) void {
+    fn chooseModel(self: *MetaskSignInDialog, index: usize) Step {
         self.model_index = index;
         const entry = self.models.entries.items[index];
         self.efforts_len = model_catalog.reasoningOptions(entry.reasoning_mask, &self.efforts).len;
+        if (self.efforts_len == 1) return self.chooseEffort(0);
         self.stage = .choose_effort;
         // The level a model declares in the middle, as `/models` starts on.
         const preferred = model_catalog.defaultReasoningForMask(entry.reasoning_mask);
@@ -1617,6 +1618,7 @@ pub const MetaskSignInDialog = struct {
         if (preferred) |level| for (self.efforts[0..self.efforts_len], 0..) |candidate, i| {
             if (candidate == level) self.sel = i;
         };
+        return .redraw;
     }
 
     fn chooseEffort(self: *MetaskSignInDialog, index: usize) Step {
@@ -1627,12 +1629,11 @@ pub const MetaskSignInDialog = struct {
 
     fn pick(self: *MetaskSignInDialog, index: usize) Step {
         if (index >= self.choiceCount()) return .none;
-        switch (self.stage) {
+        return switch (self.stage) {
             .choose_model => self.chooseModel(index),
-            .choose_effort => return self.chooseEffort(index),
-            else => return .none,
-        }
-        return .redraw;
+            .choose_effort => self.chooseEffort(index),
+            else => .none,
+        };
     }
 
     pub fn draw(self: *MetaskSignInDialog, p: *Pane) !void {
@@ -2494,4 +2495,35 @@ test "login: a key that was not stored says why and what to do, by provider" {
     const refused = try renderPlain(&dialog, 200);
     defer testing.allocator.free(refused);
     try testing.expect(std.mem.indexOf(u8, refused, "The provider refused this key") != null);
+}
+
+test "metask sign-in: a model the gateway only switches on and off offers off and on, and a model with one choice is not asked" {
+    var dialog = MetaskSignInDialog.init(testing.allocator);
+    defer dialog.deinit();
+    try dialog.models.loadFromModelsListJson(
+        \\{"object":"list","data":[
+        \\{"id":"hy4","capabilities":{"reasoning":{"disable":{"supported":true},"supported":true,"translated":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\{"id":"glm-5-air","capabilities":{"endpoints":{"messages":{"supported":true}}}}
+        \\]}
+    );
+    dialog.stage = .choose_model;
+    try testing.expectEqual(Step.redraw, dialog.key(.{ .char = '1' }));
+    try testing.expectEqual(MetaskSignInDialog.Stage.choose_effort, dialog.stage);
+    const plain = try renderPlain(&dialog, 120);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "1. off") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "2. on") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "none") == null);
+    try testing.expectEqual(@as(usize, 1), dialog.sel);
+    try testing.expectEqual(Step.done, dialog.key(.enter));
+    try testing.expectEqual(MetaskSignInDialog.Outcome.chosen, dialog.outcome);
+    try testing.expectEqual(@as(?types.ReasoningEffort, model_catalog.switched_on_level), dialog.effort);
+
+    dialog.stage = .choose_model;
+    dialog.outcome = .cancelled;
+    dialog.effort = null;
+    try testing.expectEqual(Step.done, dialog.key(.{ .char = '2' }));
+    try testing.expectEqual(MetaskSignInDialog.Outcome.chosen, dialog.outcome);
+    try testing.expectEqualStrings("glm-5-air", dialog.chosenModel().?);
+    try testing.expectEqual(@as(?types.ReasoningEffort, .none), dialog.effort);
 }

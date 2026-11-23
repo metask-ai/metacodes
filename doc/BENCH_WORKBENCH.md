@@ -1047,13 +1047,76 @@ record list none, and the profile page marks them; a direct launch that asks
 for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features: an older node is refused until
+features (4 since teamwork): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
+
+#### Teamwork
+
+`teamwork` is a preview feature of its own kind: not a flag of the headless
+run but its entry. A profile with it runs every Harbor task through
+`metacodes --preview=teamwork teamwork run`, the same pipeline as the REPL's
+`/teamwork` (implementer, reviewer, isolated verifier, merge-back), and the
+task's own verifier then scores the merged result. Comparing a profile with
+teamwork against one without on the same version, model and tasks measures
+what turning it on changes. It runs alone, since `teamwork run` takes none of
+the other features' flags, and only on an SSH executor whose entry sets
+`"teamwork_privileged": true`:
+
+- **Container**: teamwork seats run their commands under bubblewrap, which
+  Docker's defaults refuse. A teamwork run's compose overlay gives Harbor's
+  `main` service `cap_add: [SYS_ADMIN, NET_ADMIN]` and unconfined seccomp,
+  AppArmor and `systempaths` (`TEAMWORK_CONTAINER`), and the agent installs
+  git and bubblewrap when the image lacks them. **This is close to a
+  privileged container.** The seats' commands stay inside bubblewrap, but
+  the task's verifier runs as root in the same container, outside it, and
+  executes code the model wrote (a solution module, a `conftest.py`); with
+  these permissions such code can reach the executor host (for example its
+  `core_pattern`, or a cgroup v1 `release_agent`). Set
+  `teamwork_privileged` only on a disposable executor that holds no
+  credentials or other secrets; without it a teamwork launch is refused.
+- **Repository**: teamwork works in a git worktree and merges back. A task
+  directory without a commit gets one first (`git init` when it is no
+  repository, then a snapshot commit of what the image put there); one with
+  a commit is used as it is.
+- **Request and approval**: the instruction is the approved request
+  (`--approve`); text starting with `[` gets a heading, since a leading
+  bracket would be read as an option segment. Every seat uses metacodes and
+  the trial's model; the run's reasoning effort reaches the implementer and
+  reviewer seats (`--config-json`), while the verifier keeps its own.
+- **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
+  `task.toml` (easy $20, medium $40, hard $80, otherwise $40), and the trial
+  gets `--agent-timeout-multiplier 3`, recorded on the run as
+  `agent_timeout_multiplier`. The cap is in metacodes' price-table
+  estimate, not a provider bill: a model without its own price (most
+  imported and Metask models) is charged at the Sonnet fallback rates
+  (`src/util/pricing.zig`), so the cap stops far earlier than real spend
+  would. A first real-model run at easy $5 ran out before the reviewer
+  finished.
+- **Validity**: `teamwork status --json` lands in the trial's agent logs,
+  and the run directory without its worktrees (`teamwork-run/`: ledger,
+  seat records and logs) beside it. A run that wrote no status, or in which
+  no implementer seat finished (all failed, as on a provider error), fails
+  the trial with `TeamworkNotEngaged`, so it counts as invalid. A run that
+  spent its budget (`budget_exhausted`), worked but did not merge, or merged
+  a wrong change is scored by the verifier like any other. Its stop reason
+  is `teamwork_<state>`, and summaries count `budget_exhausted` trials
+  apart (预算用完 on the profile page and in 模型对比), since for a model
+  without its own price that is often the fallback estimate rather than the
+  task. The run directory is copied again when the trial is killed on its
+  timeout. The trial's cost is the run's ledger spend; per-request timing
+  and tokens come from the relay's request metrics as for a headless run.
 
 `POST /api/profiles/run` queues datasets: on an existing profile with
 `profile` (its version and features cannot be changed), or with `bundle` and
 `features`, creating the profile on first use (`name` names a new profile).
+A profile holds results of any number of models: `models` (up to 8, the
+评测 page's model checkboxes) queues every dataset once per model, `model`
+queues it with one. The profile page compares the models' latest results
+(模型对比, with how many tasks each ran) and filters the task list by model;
+when the models ran different tasks it adds the same comparison over only the
+tasks all of them ran (`common_tasks` and each model's `common_summary` in
+`GET /api/profile`).
 The queued datasets run one after another, each as an ordinary workbench run
 (one Harbor job) whose record names the profile. The durable state is
 `<jobs-dir>/.bench-profiles/<id>.json`; the service's scheduler only advances

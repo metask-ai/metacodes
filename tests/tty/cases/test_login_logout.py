@@ -43,10 +43,10 @@ from test_key_login import _cli  # noqa: E402
 
 RELAY_KEY = "sk-relay-tty-env-0001"
 
-# Windows opens the browser with `cmd /c start` and never reads $BROWSER
+# Windows opens the browser through rundll32 and never reads $BROWSER
 # (`auth.openBrowser`), so the stub that plays the browser never runs there,
 # and a sign-in that needs it waits until the case times out.
-_NO_BROWSER_STUB = "Windows opens the browser with `cmd /c start`, not $BROWSER: the stub cannot play the browser"
+_NO_BROWSER_STUB = "Windows opens the browser through rundll32, not $BROWSER: the stub cannot play the browser"
 
 
 class _Relay:
@@ -404,6 +404,66 @@ def test_cli_device_login_without_a_terminal_stores_the_session_and_says_no_mode
         assert not os.path.exists(os.path.join(state, "auth.json"))
         for secret in (ACCESS_TOKEN, REFRESH_TOKEN, DEVICE_CODE):
             assert secret.encode() not in proc.stdout + proc.stderr, f"{secret} reached the output"
+
+
+_GATEWAY_EFFORT_BLOCK = DEFAULT_MODELS[0]["capabilities"]["effort"]
+_SWITCHED_THINKING = {"reasoning": {"supported": True, "disable": {"supported": True}, "translated": True},
+                      "thinking": {"types": {"enabled": {"supported": True}, "adaptive": {"supported": False}},
+                                   "supported": True}}
+_SWITCHED_MODELS = [
+    {"id": "kimi-k3.1-pro", "max_input_tokens": 1048576, "max_tokens": 1048576,
+     "capabilities": dict({"endpoints": {"messages": {"supported": True, "status": "supported"}},
+                           "effort": _GATEWAY_EFFORT_BLOCK}, **_SWITCHED_THINKING)},
+    {"id": "glm-5-air", "max_input_tokens": 128000, "max_tokens": 16000,
+     "capabilities": {"endpoints": {"messages": {"supported": True, "status": "supported"}},
+                      "effort": _GATEWAY_EFFORT_BLOCK}},
+]
+
+
+def test_cli_login_offers_off_and_on_where_the_gateway_names_no_level_and_the_first_message_goes_out(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock(models=_SWITCHED_MODELS) as mock:
+        home, state, env = _case(mock)
+        code, out = _cli(os.path.abspath(bin_path), ["login", "--provider", "metask", "--no-browser"], _cli_env(env), [
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "2\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "1. off" in text and "2. on" in text and ". none" not in text, text
+        assert f"Signed in to Metask with the device code as {ACCOUNT_NAME}. Model kimi-k3.1-pro, reasoning on." in text, text
+        with open(os.path.join(state, "auth.json")) as f:
+            assert json.load(f) == {"selected_model": "kimi-k3.1-pro", "reasoning_effort": "high"}
+
+        work = case_tmpdir("cc-tty-login-work-")
+        proc = subprocess.run([os.path.abspath(bin_path), "-p", "hello"], stdin=subprocess.DEVNULL,
+                              capture_output=True, env=_cli_env(env), cwd=work, timeout=60)
+        said = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        assert proc.returncode == 0, f"exit {proc.returncode}:\n{said}"
+        assert "context blocking limit" not in said, said
+        assert "METASK_MOCK_REPLY" in said, said
+        request = mock.message_bodies[-1]
+        sent = {k: request.get(k) for k in ("model", "max_tokens", "thinking", "output_config")}
+        assert sent == {"model": "kimi-k3.1-pro", "max_tokens": 524288, "thinking": {"type": "enabled"},
+                        "output_config": None}, sent
+
+
+def test_cli_login_does_not_ask_for_a_reasoning_effort_a_model_has_one_choice_of(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock(models=_SWITCHED_MODELS) as mock:
+        home, state, env = _case(mock)
+        code, out = _cli(os.path.abspath(bin_path), ["login", "--provider", "metask", "--no-browser"], _cli_env(env), [
+            ("Select model:", "2\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "Select reasoning effort:" not in text, text
+        assert "Reasoning effort: none (the only choice glm-5-air offers)" in text, text
+        assert f"Signed in to Metask with the device code as {ACCOUNT_NAME}. Model glm-5-air, reasoning none." in text, text
+        with open(os.path.join(state, "auth.json")) as f:
+            assert json.load(f) == {"selected_model": "glm-5-air", "reasoning_effort": "none"}
 
 
 def test_login_cancelled_with_esc_changes_nothing(bin_path):

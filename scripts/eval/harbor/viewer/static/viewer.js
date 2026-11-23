@@ -185,11 +185,10 @@ function stackBar(segments, mini) {
 function compositionSegments(c) { return PARTS.map(([k, l]) => ['c-' + k, c[k] || 0, l]); }
 function compositionPanel(summary, scopeText) {
   const c = summary.initial_composition_mean;
-  const body = c ? h('div', { class: 'panel-body' },
+  if (!c) return null;
+  return panel('初始上下文窗口组成', scopeText || '均值', h('div', { class: 'panel-body' },
     stackBar(compositionSegments(c)),
-    h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }), `${l} ${compact(c[k])} · ${pct((c[k] || 0) / Math.max(1, partsTotal(c)))}`))))
-    : h('div', { class: 'empty', text: '还没有上下文组成数据' });
-  return panel('初始上下文窗口组成', scopeText || '均值', body);
+    h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }), `${l} ${compact(c[k])} · ${pct((c[k] || 0) / Math.max(1, partsTotal(c)))}`)))));
 }
 
 // ------------------------------------------------------------ overview
@@ -213,7 +212,7 @@ function runAgain(b, onlyUnpassed) {
   const model = runModel(b);
   const lastOfModel = [...b.items].reverse().find((i) => i.model === model) || last;
   state.runDraft = { profile: b.id, from: profileName(b), label: b.metacodes?.label, features: b.features || [],
-    model, attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
+    models: [model], attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
   state.executor = lastOfModel.executor;
   const wanted = new Map();
   const add = (suite, task) => { if (!wanted.has(suite)) wanted.set(suite, []); if (!wanted.get(suite).includes(task)) wanted.get(suite).push(task); };
@@ -291,8 +290,7 @@ async function renderOverview() {
 
   const profileRows = profiles.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = profileHref(b); } },
     h('td', {}, h('a', { href: profileHref(b), onclick: (e) => e.stopPropagation(), text: profileName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
-    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : '' })),
-    h('td', { class: 'mono', text: featuresText(b) }),
+    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: [b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : null, '高级功能 ' + featuresText(b)].filter(Boolean).join(' · ') })),
     h('td', { text: b.models.join('、') || '—' }),
     h('td', {}, h('span', { text: [...new Map(b.items.map((i) => [i.suite, i.suite_name || i.suite])).values()].join('、') }), h('span', { class: 'sub', text: `${b.items.length} 次运行` })),
     h('td', {}, h('span', { text: PROFILE_STATUS[b.status] || b.status }), h('span', { class: 'sub', text: progressText(b) })),
@@ -301,9 +299,9 @@ async function renderOverview() {
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
     h('td', { class: 'num', text: when(b.last_run_at) }),
     body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
-  const profileHeads = ['评测配置', 'metacodes 版本', '高级功能', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
+  const profileHeads = ['评测配置', 'metacodes 版本', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
   const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 7 && i <= 9 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : null, text: t })))),
     h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
   h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
@@ -347,8 +345,9 @@ async function renderOverview() {
       h('b', { text: r.name }), h('span', { class: 'muted', text: [r.suite_name, r.model].filter(Boolean).join(' · ') }),
       h('span', { text: RUN_STATUS[r.status] || r.status })))));
   const jobsTitle = current ? '这个评测配置的作业（每次运行的每个评测集一个）' : '作业';
-  return h('div', {}, scopeBar, metrics, compositionPanel(summary, current ? '本评测配置所有作业均值' : '均值'), profilePanel,
-    panel(jobsTitle, state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn), launches);
+  return h('div', {}, profilePanel, scopeBar, metrics,
+    panel(jobsTitle, state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn),
+    compositionPanel(summary, current ? '本评测配置所有作业均值' : '均值'), launches);
 }
 
 // ------------------------------------------------------------ profile
@@ -362,7 +361,8 @@ async function renderProfile(id) {
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
     metric('运行', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
-    metric('无效', String(s.counts.invalid)));
+    metric('无效', String(s.counts.invalid)),
+    s.budget_exhausted ? metric('预算用完', String(s.budget_exhausted), 'teamwork 用完上限后停下的尝试，按判分结果计入') : null);
 
   const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
@@ -457,7 +457,36 @@ async function renderProfile(id) {
   const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), compositionPanel(s, '最新结果均值'), tasks, items);
+  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, tasks, compositionPanel(s, '最新结果均值'));
+}
+
+// The latest results of each model side by side, when the profile has several:
+// over every task each ran, then, when they ran different tasks, over the tasks
+// all of them ran, so a model is not judged on an easier subset.
+function modelsPanel(b) {
+  if ((b.by_model || []).length < 2) return null;
+  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '预算用完', '总 Token', '估算成本'];
+  const row = (model, tasks, m) => h('tr', { class: 'link', onclick: () => { state.profileModel = model; render(); } },
+    h('td', { text: model || '—' }),
+    h('td', { class: 'num', text: String(tasks) }),
+    h('td', {}, outcomeBar(m.counts, m.trials || 0)),
+    h('td', { class: 'num', text: pct(m.one_shot_pass_rate) }),
+    h('td', { class: 'num', text: `${m.counts.pass} / ${m.valid || 0}` }),
+    h('td', { class: 'num', text: pct(m.first_pass_rate) }),
+    h('td', { class: 'num', text: String(m.counts.invalid) }),
+    h('td', { class: 'num', text: String(m.budget_exhausted || 0) }),
+    h('td', { class: 'num', text: compact(m.total_tokens) }),
+    h('td', { class: 'num', text: usd(m.cost_usd) }));
+  const table = (rows) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 1 || i >= 3 ? 'num' : null, text: t })))),
+    h('tbody', {}, rows)));
+  const mixed = b.common_tasks !== null && b.common_tasks !== undefined;
+  const body = [table(b.by_model.map((x) => row(x.model, x.tasks, x.summary)))];
+  if (mixed) {
+    body.push(h('div', { class: 'callout' }, h('p', { text: `各模型跑过的题不一样，上表不能直接比。下表只算所有模型都跑过的 ${b.common_tasks} 道题。` })),
+      b.common_tasks ? table(b.by_model.map((x) => row(x.model, b.common_tasks, x.common_summary))) : h('div', { class: 'empty', text: '没有所有模型都跑过的题。' }));
+  }
+  return panel('模型对比', `${b.by_model.length} 个模型 · 各自的最新结果 · 点一行只看这个模型的逐任务结果`, h('div', {}, body));
 }
 
 async function renderProfileTask(profileId, jobName, taskName, trialName) {
@@ -574,10 +603,20 @@ async function renderNewRun() {
   const picker = h('div', { class: 'suite-picker' });
   const boxes = h('div', { class: 'stack' });
   const models = c.models || [];
-  const modelMissing = draft.model && !models.some((m) => m.id === draft.model);
-  const wantedModel = draft.model && !modelMissing ? draft.model : c.default_model;
-  const model = h('select', { name: 'model', required: true, onchange: () => { draft.model = model.value; } },
-    models.map((m) => h('option', { value: m.id, selected: m.id === wantedModel }, m.label)));
+  const known = (id) => models.some((m) => m.id === id);
+  const modelMissing = (draft.models || []).find((id) => !known(id));
+  const chosenModels = new Set((draft.models || []).filter(known));
+  if (!chosenModels.size && known(c.default_model)) chosenModels.add(c.default_model);
+  const modelChecks = models.map((m) => {
+    const check = h('input', { type: 'checkbox', name: 'models', value: m.id, onchange: () => {
+      if (check.checked) chosenModels.add(m.id); else chosenModels.delete(m.id);
+      draft.models = models.filter((x) => chosenModels.has(x.id)).map((x) => x.id);
+      syncSubmit();
+    } });
+    check.checked = chosenModels.has(m.id);
+    return h('label', { class: 'task-option' }, check, h('span', { text: m.label }));
+  });
+  const model = h('div', { class: 'task-options', role: 'group', 'aria-label': '模型' }, modelChecks);
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
@@ -586,7 +625,11 @@ async function renderNewRun() {
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,
       checked: (draft.features || c.default_features || []).includes(f.id),
-      onchange: () => { draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id); } }), label: f.label }));
+      onchange: (event) => {
+        const teamwork = f.id === 'teamwork';
+        if (event.target.checked) for (const x of featureBoxes) if (x.id !== f.id && (teamwork || x.id === 'teamwork')) x.input.checked = false;
+        draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id);
+      } }), label: f.label }));
   const featureGroup = (group, title) => {
     const boxes = featureBoxes.filter((f) => f.group === group);
     return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),
@@ -606,8 +649,9 @@ async function renderNewRun() {
     const picked = [...state.suitePick.entries()];
     const total = picked.reduce((acc, [, e]) => acc + (e ? e.selected.size : 0), 0);
     const problems = picked.filter(([id, e]) => !comboReady(byId.get(id)) || !e || !e.selected.size || e.selected.size > byId.get(id).max_tasks);
-    submit.disabled = !picked.length || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
-    submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次）` : '开始评测';
+    submit.disabled = !picked.length || !chosenModels.size || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
+    const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
+    submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '开始评测';
   }
   function drawPicker() {
     picker.replaceChildren(...(c.categories || []).map((cat) => {
@@ -701,7 +745,7 @@ async function renderNewRun() {
   }
   if (draft.from) {
     const notes = [`在评测配置「${draft.from}」上运行`];
-    if (modelMissing) notes.push(`上次的模型 ${draft.model} 当前不可用，请重新选择。`);
+    if (modelMissing) notes.push(`上次的模型 ${modelMissing} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
         state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; render();
@@ -714,23 +758,24 @@ async function renderNewRun() {
         c.can_run && !fixed ? h('div', {}, commitToggle) : null),
       fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name)),
     fixed ? null : commitBox,
-    h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
-    h('label', { class: 'field' }, h('span', { text: '模型' }), model,
+    features,
+    h('div', { class: 'field' }, h('span', { text: '模型（可多选，每个评测集按每个模型各跑一次）' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
       h('small', {}, c.providers?.models ? `另有 ${c.providers.count} 个导入的 Provider · ${c.providers.models} 个模型 · ` : '',
         link('#/providers', '用 URL + API Key 导入 Provider')),
       c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
+    h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
-    features,
-    feedback, submit);
+    h('div', { class: 'form-submit' }, submit, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     submit.disabled = true;
     feedback.textContent = fixed ? '正在排队…' : '正在冻结 metacodes 版本并排队…';
     try {
-      const request = { model: model.value, attempts: Number(attempts.value), concurrency: Number(concurrency.value),
+      const picked = models.filter((m) => chosenModels.has(m.id)).map((m) => m.id);
+      const request = { ...(picked.length > 1 ? { models: picked } : { model: picked[0] }), attempts: Number(attempts.value), concurrency: Number(concurrency.value),
         items: [...state.suitePick.entries()].map(([id, entry]) => ({ suite: id, tasks: entry.tasks.filter((t) => entry.selected.has(t)) })) };
       if (fixed) request.profile = draft.profile;
       else {
@@ -1256,16 +1301,50 @@ function svg(tag, attrs, ...children) {
   return el;
 }
 const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
+const rowGroup = (r) => (r.ours ? 'metacodes' : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
+const PALETTE = ['#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
+const SHAPES = ['diamond', 'square', 'circle', 'triangle', 'hexagon'];
+function spareHue(i) {
+  const hue = (i * 137.508 + 20) % 360;
+  return hue > 185 && hue < 245 ? (hue + 60) % 360 : hue;
+}
+function harnessLooks(rows) {
+  const names = [...new Set(rows.filter((r) => !r.ours).map((r) => r.harness))];
+  const looks = new Map(names.map((name, i) => [name, {
+    color: PALETTE[i] || `hsl(${spareHue(i)} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
+  looks.set('metacodes', { color: 'var(--accent)', shape: 'star' });
+  return (r) => looks.get(rowGroup(r));
+}
+const glyph = (look) => h('i', { class: 'glyph', 'data-shape': look.shape, style: 'background:' + look.color });
+function niceTicks(lo, hi) {
+  const raw = (hi - lo) / 5;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= raw * 0.7);
+  const ticks = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) ticks.push(+v.toPrecision(12));
+  return { ticks, step };
+}
+function costTicks(lo, hi) {
+  const decades = [];
+  for (let e = Math.floor(Math.log10(lo)); e <= Math.ceil(Math.log10(hi)); e++) decades.push(10 ** e, 2 * 10 ** e, 5 * 10 ** e);
+  const ticks = decades.filter((v) => v >= lo && v <= hi);
+  return ticks.length >= 3 ? ticks : niceTicks(lo, hi).ticks;
+}
 function arrangeLabels(plot) {
   const box = plot.getBoundingClientRect();
   if (!box.width) return;
-  const labels = [...plot.querySelectorAll('.scatter-label')];
-  const dots = [...plot.querySelectorAll('.scatter-point .dot')].map((m) => [m.closest('.scatter-point'), m.getBoundingClientRect()]);
-  const placed = [];
+  const labels = [...plot.querySelectorAll('.scatter-label')]
+    .sort((x, y) => Number(x.closest('.scatter-point').dataset.order) - Number(y.closest('.scatter-point').dataset.order));
+  const marks = [...plot.querySelectorAll('.scatter-point .glyph')].map((m) => [m.closest('.scatter-point'), m.getBoundingClientRect()]);
+  const front = marks.filter(([p]) => p.dataset.frontier).map(([, m]) => [(m.left + m.right) / 2, (m.top + m.bottom) / 2]).sort((a, b) => a[0] - b[0]);
+  const line = front.slice(1).flatMap(([x, y], i) => {
+    const [ax, ay] = front[i]; const n = Math.ceil(Math.hypot(x - ax, y - ay) / 4);
+    return Array.from({ length: n }, (_, j) => { const cx = ax + (x - ax) * j / n; const cy = ay + (y - ay) * j / n; return { left: cx, right: cx, top: cy, bottom: cy }; });
+  });
+  const placed = [...line];
   const overlaps = (a, b) => a.left < b.right + 4 && a.right > b.left - 4 && a.top < b.bottom + 2 && a.bottom > b.top - 2;
-  const tries = [0, -14, 14, -28, 28].flatMap((dy) => [['right', dy], ['left', dy]]);
-  labels.sort((x, y) => Number(y.closest('.scatter-point').dataset.ours) - Number(x.closest('.scatter-point').dataset.ours));
+  const tries = [0, -18, 18, -32, 32].flatMap((dy) => [['right', dy], ['left', dy]]);
   for (const label of labels) {
     const own = label.closest('.scatter-point');
     label.hidden = false;
@@ -1274,13 +1353,13 @@ function arrangeLabels(plot) {
       label.style.setProperty('--dy', dy + 'px');
       const r = label.getBoundingClientRect();
       return r.left >= box.left && r.right <= box.right && r.top >= box.top && r.bottom <= box.bottom
-        && !placed.some((o) => overlaps(r, o)) && !dots.some(([p, m]) => p !== own && overlaps(r, m));
+        && !placed.some((o) => overlaps(r, o)) && !marks.some(([p, m]) => p !== own && overlaps(r, m));
     });
     if (fits) placed.push(label.getBoundingClientRect());
     else label.hidden = true;
   }
 }
-function costScatter(rows, focus) {
+function costScatter(rows, focus, lookOf) {
   const points = rows.filter((r) => r.cost_per_task_usd > 0);
   if (points.length < 2 || !points.some((r) => !r.ours)) return null;
   const costs = points.map((r) => Math.log(r.cost_per_task_usd)); const scores = points.map((r) => r.score);
@@ -1289,27 +1368,28 @@ function costScatter(rows, focus) {
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
   const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
-  const leaders = points.filter((r) => !r.ours).sort((p, q) => q.score - p.score).slice(0, 3);
-  const named = points.filter((r) => frontier.includes(r) || leaders.includes(r));
-  const repeated = new Set(named.filter((r, i) => named.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
-  const label = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const repeated = new Set(points.filter((r, i) => points.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
+  const name = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const order = [...points].sort((p, q) => Boolean(q.ours) - Boolean(p.ours) || frontier.includes(q) - frontier.includes(p) || q.score - p.score);
   const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' },
     svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
-  const ticks = [0, 1, 2].map((i) => 0.12 + i * 0.38);
+  const yTicks = niceTicks(y0, y1);
   const grid = [
-    ...ticks.map((t) => h('div', { class: 'grid-y', style: `bottom:${t * 100}%` }, h('span', { text: (y0 + (y1 - y0) * t).toFixed(0) + '%' }))),
-    ...ticks.map((t) => { const v = Math.exp(x0 + (x1 - x0) * t); return h('div', { class: 'grid-x', style: `left:${t * 100}%` }, h('span', { text: '$' + v.toFixed(v < 1 ? 2 : 1) })); }),
+    ...yTicks.ticks.map((v) => h('div', { class: 'grid-y', style: `bottom:${(v - y0) / (y1 - y0) * 100}%` },
+      h('span', { text: v.toFixed(yTicks.step < 1 ? 1 : 0) + '%' }))),
+    ...costTicks(Math.exp(x0), Math.exp(x1)).map((v) => h('div', { class: 'grid-x', style: `left:${(Math.log(v) - x0) / (x1 - x0) * 100}%` },
+      h('span', { text: '$' + v.toFixed(v < 0.1 ? 3 : 2) }))),
   ];
   const tip = h('div', { class: 'scatter-tip', hidden: true });
-  const dots = new Map(points.map((r) => {
-    const kind = r.ours ? 'ours' : frontier.includes(r) ? 'frontier' : 'other';
-    return [r, h('button', { type: 'button', class: 'scatter-point', 'data-kind': kind, 'data-ours': r.ours ? '1' : '0',
-      style: `left:${px(r)}%;bottom:${py(r)}%`,
-      'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
-      onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
-      onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
-    h('i', { class: 'dot' }), r.ours || named.includes(r) ? h('span', { class: 'scatter-label', text: label(r) }) : null)];
-  }));
+  const dots = new Map(points.map((r) => [r, h('button', { type: 'button', class: 'scatter-point',
+    'data-ours': r.ours ? '1' : null, 'data-frontier': frontier.includes(r) ? '1' : null, 'data-order': order.indexOf(r),
+    style: `left:${px(r)}%;bottom:${py(r)}%`,
+    'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
+    onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
+    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+  glyph(lookOf(r)),
+  h('span', { class: 'scatter-label', style: 'color:' + lookOf(r).color },
+    h('b', { text: name(r) }), h('small', { class: 'num', text: `${score(r.score)} · ${usd(r.cost_per_task_usd)}` })))]));
   const plot = h('div', { class: 'scatter-plot' }, ...grid, layer, ...dots.values(), tip);
   focus.on((active) => {
     const a = dots.has(active) ? active : null;
@@ -1326,9 +1406,15 @@ function costScatter(rows, focus) {
     tip.style.bottom = py(a) + '%';
     tip.dataset.side = px(a) > 60 ? 'left' : 'right';
   });
+  const group = (g) => {
+    plot.toggleAttribute('data-group', Boolean(g));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(g) && rowGroup(r) !== g);
+  };
+  const legend = h('div', { class: 'scatter-legend' }, [...new Map(points.map((r) => [rowGroup(r), r])).values()].map((r) =>
+    h('span', { class: 'key', onmouseenter: () => group(rowGroup(r)), onmouseleave: () => group(null) }, glyph(lookOf(r)), rowGroup(r))));
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
-  return h('div', { class: 'scatter-box' }, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
-    h('div', { class: 'axis-x', text: '每题成本' })));
+  return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
+    h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
 function focusHub() {
   const listeners = [];
@@ -1352,6 +1438,7 @@ function boardPanel(board) {
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
+  const lookOf = harnessLooks(rows);
   const src = board.source;
   const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
   const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
@@ -1364,7 +1451,7 @@ function boardPanel(board) {
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
   h('td', { class: 'num rank', text: String(r.rank) }),
-  h('td', { text: r.ours ? 'metacodes' : r.harness }),
+  h('td', {}, h('span', { class: 'harness' }, glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
   h('td', { class: 'muted', text: r.model || '—' }),
   h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
     h('span', { class: 'num', text: score(r.score) }))),
@@ -1375,7 +1462,7 @@ function boardPanel(board) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
     h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', '每题成本'].map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus), table),
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus, lookOf), table),
     h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {

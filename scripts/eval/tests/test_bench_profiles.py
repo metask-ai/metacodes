@@ -650,6 +650,56 @@ class ProfileTest(unittest.TestCase):
             cli.main(['info', '--state-root', str(state), '--bundle', str(self.root / 'bundle'), '--json'])
         self.assertEqual(json.loads((state / 'bench' / 'workbench.json').read_text())['bundle_source'], source)
 
+    def test_one_queue_runs_every_dataset_with_each_model(self):
+        native = self.root / 'provider.json'
+        config = json.loads(native.read_text())
+        config['custom_providers']['tokenjoy']['models'].append({'request_model_id': 'other-model'})
+        atomic_json(native, config)
+        models = ['tokenjoy/test-model', 'tokenjoy/other-model']
+        request = {k: v for k, v in self.request(models=models).items() if k != 'model'}
+        created = self.client.request('api/profiles/run', request)
+        self.assertEqual([(i['suite'], i['model']) for i in created['items']],
+                         [('terminal-bench-2.1', models[0]), ('terminal-bench-2.1', models[1]),
+                          ('terminal-bench-2.0', models[0]), ('terminal-bench-2.0', models[1])])
+        self.wait_profile(created['id'])
+        view = self.client.request('api/profile?id=' + created['id'])
+        self.assertEqual(sorted(m['model'] for m in view['by_model']), sorted(models))
+        self.assertEqual([m['summary']['trials'] for m in view['by_model']], [2, 2])
+        self.assertEqual(len(view['tasks']), 4)
+        for override in ({'models': []}, {'models': models, 'model': models[0]}, {'models': [models[0]] * 2},
+                         {'models': 'tokenjoy/test-model'}, {'models': ['tokenjoy/missing']}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                request = {k: v for k, v in self.request(**override).items() if k != 'model' or 'model' in override}
+                self.client.request('api/profiles/run', request)
+
+    def test_models_that_ran_different_tasks_are_also_compared_on_the_common_ones(self):
+        def entry(status):
+            return (None, 'job', [{'task': 't', 'status': status}])
+        def summarize(rows):
+            return {'trials': len(rows), 'counts': {'pass': sum(r['status'] == 'pass' for r in rows)}}
+        summarized = patch.object(workbench_module.data, 'summarize', side_effect=summarize)
+        summarized.start()
+        self.addCleanup(summarized.stop)
+        latest = {('s', 'a', 'x'): entry('pass'), ('s', 'a', 'y'): entry('fail'), ('s', 'b', 'x'): entry('fail')}
+        by_model, common = workbench_module.model_comparison(latest)
+        self.assertEqual(common, 1)
+        self.assertEqual([(m['model'], m['tasks'], m['summary']['trials']) for m in by_model], [('a', 2, 2), ('b', 1, 1)])
+        self.assertEqual([m['common_summary']['counts']['pass'] for m in by_model], [1, 0])
+        same = {('s', 'a', 'x'): entry('pass'), ('s', 'b', 'x'): entry('fail')}
+        by_model, common = workbench_module.model_comparison(same)
+        self.assertIsNone(common)
+        self.assertNotIn('common_summary', by_model[0])
+
+    def test_teamwork_runs_alone_and_only_on_an_ssh_executor(self):
+        listed = {f['id']: f for f in self.client.request('api/workbench')['features']}
+        self.assertEqual(listed['teamwork']['group'], 'preview')
+        self.assertNotIn('teamwork', self.client.request('api/workbench')['default_features'])
+        with self.assertRaisesRegex(ValueError, '只能单独开启'):
+            self.client.request('api/profiles/run', self.request(features=['teamwork', 'execute_code']))
+        with self.assertRaisesRegex(ValueError, 'teamwork_privileged'):
+            self.client.request('api/profiles/run', self.request(features=['teamwork']))
+        self.assertEqual(self.manager.profiles.records(), [])
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
@@ -719,6 +769,51 @@ class ProfileTest(unittest.TestCase):
             store.close()
         same = self.client.request('api/store', {'action': 'apply', 'store': {'backend': 'sqlite', 'path': str(target)}})
         self.assertTrue(same['unchanged'])
+
+
+
+class TeamworkRunTest(unittest.TestCase):
+    def test_the_harbor_command_gives_teamwork_its_longer_agent_timeout(self):
+        from scripts.eval.harbor.bench.worker import command
+        spec = {"harbor": "harbor", "dataset": "d", "model": "m", "bundle": "/b", "key_env": "K", "attempts": 1, "concurrency": 1,
+                "jobs_dir": "/j", "name": "run", "tasks": ["t"], "features": ["teamwork"]}
+        self.assertNotIn("--agent-timeout-multiplier", command(spec))
+        argv = command({**spec, "agent_timeout_multiplier": 3})
+        self.assertEqual(argv[argv.index("--agent-timeout-multiplier") + 1], "3")
+
+    def test_a_teamwork_trial_is_named_by_its_run_state_and_budget_exhaustion_is_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = Path(tmp) / "prove-plus-comm__abc"
+            _write(trial / "result.json", {"task_name": "prove-plus-comm", "started_at": "2026-11-23T02:02:00Z",
+                                           "finished_at": "2026-11-23T02:10:00Z",
+                                           "verifier_result": {"rewards": {"reward": 0.0}}})
+            _write(trial / "agent" / "teamwork-status.json", {"state": "budget_exhausted", "seats": []})
+            row = data.trial_row(trial)
+            self.assertEqual((row["stop_reason"], row["status"]), ("teamwork_budget_exhausted", "fail"))
+            summary = data.summarize([row])
+            self.assertEqual(summary["budget_exhausted"], 1)
+            self.assertEqual(data.merge_summaries([summary, data.summarize([])])["budget_exhausted"], 1)
+            self.assertEqual(data.summarize([])["budget_exhausted"], 0)
+
+    def test_the_compose_overlay_opens_bubblewrap_only_for_teamwork_on_an_opted_in_executor(self):
+        opted = executors.parse({"name": "gpu", "kind": "ssh", "host": "gpu.example", "teamwork_privileged": True})
+        plain = executors.parse({"name": "cpu", "kind": "ssh", "host": "cpu.example"})
+        self.assertEqual((opted.teamwork_privileged, plain.teamwork_privileged), (True, False))
+        self.assertTrue(opted.spec()["teamwork_privileged"])
+        with self.assertRaisesRegex(ValueError, "布尔值"):
+            executors.parse({"name": "gpu", "kind": "ssh", "host": "gpu.example", "teamwork_privileged": "yes"})
+        mirrors = {"services": {"main": {"environment": {"GOPROXY": "x"}, "cap_add": ["SYS_ADMIN"]}}}
+        self.assertIs(executors.with_teamwork(mirrors, ["execute_code"], plain), mirrors)
+        self.assertIsNone(executors.with_teamwork(None, [], plain))
+        with self.assertRaisesRegex(ValueError, "teamwork_privileged"):
+            executors.with_teamwork(mirrors, ["teamwork"], plain)
+        merged = executors.with_teamwork(mirrors, ["teamwork"], opted)["services"]["main"]
+        self.assertEqual(merged["environment"], {"GOPROXY": "x"})
+        self.assertEqual(merged["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
+        self.assertIn("systempaths=unconfined", merged["security_opt"])
+        self.assertEqual(mirrors["services"]["main"]["cap_add"], ["SYS_ADMIN"])
+        alone = executors.with_teamwork(None, ["teamwork"], opted)
+        self.assertEqual(alone["services"]["main"]["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
 
 
 if __name__ == '__main__':

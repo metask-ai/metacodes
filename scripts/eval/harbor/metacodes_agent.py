@@ -11,7 +11,10 @@ One trial:
    ``metacodes --version --json`` runs there, so a glibc the task image lacks
    fails at install, not as a silent zero-reward trial.
 2. ``run`` uploads the instruction and runs metacodes headless with its own
-   ``--state-dir``; see ``command.run_command`` for the script.
+   ``--state-dir``; see ``command.run_command`` for the script. With the
+   ``teamwork`` feature it runs the task through ``metacodes teamwork run``
+   instead (``command.teamwork_run_command``), with a dollar cap by the task's
+   difficulty, and a run that never dispatched work fails the trial.
 3. ``populate_context_post_run`` turns the NDJSON output and the session
    transcript into an ATIF trajectory and fills Harbor's token and cost
    counters.
@@ -25,6 +28,7 @@ through its credential relay (``metrics_proxy``), which holds the real key.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -53,6 +57,11 @@ from scripts.eval.harbor.profiling import TRUST_BUNDLE, routed_config
 
 # Set instead of `--ak bundle=...` when every trial of a job uses one bundle.
 BUNDLE_ENV = "METACODES_HARBOR_BUNDLE"
+
+
+class TeamworkNotEngaged(RuntimeError):
+    """A teamwork trial whose run never dispatched work: it measures the
+    environment, not teamwork, so the trial is invalid."""
 
 
 def _sha256(path: Path) -> str:
@@ -109,14 +118,20 @@ class MetacodesAgent(BaseInstalledAgent):
         # Validate the model and flags now: a bad value fails the job before
         # any container starts.
         self._provider, self._model = cmd.split_model(self.model_name)
-        self._flags = cmd.metacodes_flags(
-            provider=self._provider,
-            model=self._model,
-            disallowed_tools=self._disallowed_tools,
-            reasoning_effort=self._reasoning_effort,
-            max_tokens=self._max_tokens,
-            features=[name for name in (features or "").split(",") if name],
-        )
+        chosen = cmd.checked_features(name for name in (features or "").split(",") if name)
+        self._teamwork = cmd.TEAMWORK in chosen
+        if self._teamwork:
+            self._flags = cmd.teamwork_flags(provider=self._provider, model=self._model,
+                                             reasoning_effort=self._reasoning_effort)
+        else:
+            self._flags = cmd.metacodes_flags(
+                provider=self._provider,
+                model=self._model,
+                disallowed_tools=self._disallowed_tools,
+                reasoning_effort=self._reasoning_effort,
+                max_tokens=self._max_tokens,
+                features=chosen,
+            )
 
     @staticmethod
     def name() -> str:
@@ -162,6 +177,19 @@ class MetacodesAgent(BaseInstalledAgent):
             destination = "/tmp/metacodes-bench-relay-ca.pem"
             await environment.upload_file(self._metrics_ca, destination)
             await self.exec_as_root(environment, command=cmd.trust_relay_ca(destination, TRUST_BUNDLE))
+        if self._teamwork:
+            await self._ensure_teamwork_tools(environment)
+
+    async def _ensure_teamwork_tools(self, environment: BaseEnvironment) -> None:
+        """Install git and bubblewrap when the image lacks them."""
+        check = await environment.exec(command=cmd.TEAMWORK_TOOLS_CHECK, user="root")
+        if check.return_code == 0:
+            return
+        manager = await self._get_system_package_manager(environment)
+        install = cmd.TEAMWORK_PACKAGE_INSTALL.get(manager or "")
+        if install is None:
+            raise RuntimeError("teamwork needs git and bubblewrap, and the task image has no supported package manager")
+        await self.exec_as_root(environment, command=f"{install} && {cmd.TEAMWORK_TOOLS_CHECK}")
 
     async def _ensure_ca_bundle(self, environment: BaseEnvironment) -> None:
         """Install the system CA bundle when the image has none.
@@ -225,16 +253,39 @@ class MetacodesAgent(BaseInstalledAgent):
             environment,
             command=f"chmod 0444 {' '.join(shlex.quote(p) for p in readable)}",
         )
-        script = cmd.run_command(
-            state_dir=f"/tmp/metacodes-state-{trial}",
-            instruction_path=remote_instruction,
-            flags=flags,
-            config_path=remote_config,
-        )
-        await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(script)}")
+        if self._teamwork:
+            script = cmd.teamwork_run_command(
+                state_dir=f"/tmp/metacodes-state-{trial}",
+                instruction_path=remote_instruction,
+                run_id=trial,
+                budget_usd=cmd.teamwork_budget(cmd.task_difficulty(self.logs_dir.parent)),
+                flags=flags,
+                config_path=remote_config,
+            )
+        else:
+            script = cmd.run_command(
+                state_dir=f"/tmp/metacodes-state-{trial}",
+                instruction_path=remote_instruction,
+                flags=flags,
+                config_path=remote_config,
+            )
+        try:
+            await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(script)}")
+        finally:
+            if self._teamwork:
+                with contextlib.suppress(Exception):
+                    await environment.exec(
+                        command=cmd.teamwork_keep_run_command(state_dir=f"/tmp/metacodes-state-{trial}", run_id=trial),
+                        user="root", timeout_sec=120)
+        if self._teamwork:
+            status = await environment.exec(
+                command=f"cat {shlex.quote(cmd.REMOTE_LOGS + '/' + cmd.TEAMWORK_STATUS_FILENAME)}", user="root")
+            problem = cmd.teamwork_problem(cmd.parse_teamwork_status(status.stdout or ""))
+            if problem:
+                raise TeamworkNotEngaged(problem)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        trace = cmd.load_trace(self.logs_dir)
+        trace = cmd.teamwork_trace(self.logs_dir) if self._teamwork else cmd.load_trace(self.logs_dir)
         trajectory = self._trajectory(trace)
         (self.logs_dir / "trajectory.json").write_text(
             json.dumps(trajectory.to_json_dict(), indent=2, ensure_ascii=False) + "\n",
