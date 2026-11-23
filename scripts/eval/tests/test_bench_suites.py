@@ -797,8 +797,10 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertIsNone(remote["max_tokens"])
         capped = executors.RemoteRun({**spec, "max_tokens": 32000}).remote_spec()
         self.assertEqual(capped["max_tokens"], 32000)
-        self.assertEqual(wb.model_document("m", capped)["model"]["params"]["max_output_tokens"], 32000)
-        self.assertEqual(wb.model_document("m", remote)["model"]["params"]["max_output_tokens"], 32768)
+        model, _ = wb.job_documents({**capped, "jobs_dir": "/j", "workbuddy": {"subset": "web"}})
+        self.assertEqual(model["model"]["params"]["max_output_tokens"], 32000)
+        judge = wb.model_document("judge", capped, "openai", wb.JUDGE_BASE_URL_ENV)
+        self.assertEqual(judge["model"]["params"]["max_output_tokens"], 32768)
         repo = workbuddy_checkout(self.root, subset="web")
         unjudged = {**spec, "workbuddy_judge": None, "jobs_dir": str(self.root / "jobs"),
                     "workbuddy": {"checkout": str(repo), "subset": "web", "uv": "uv", "bash": "bash"}}

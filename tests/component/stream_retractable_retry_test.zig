@@ -442,6 +442,7 @@ test "issue #452: an attempt that showed nothing is still re-issued silently, an
         try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
         try std.testing.expectEqual(@as(usize, 3), out.requests);
         try out.expectReissuedRequests();
+        try std.testing.expectEqualStrings(out.bodies.items[0], out.bodies.items[2]);
         try std.testing.expectEqual(@as(usize, 0), out.events.count("retry "));
         try std.testing.expectEqual(@as(usize, 0), out.events.count("thinking_discarded "));
         try std.testing.expectEqualStrings("complete answer", out.answer);

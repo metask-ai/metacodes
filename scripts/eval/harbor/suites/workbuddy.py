@@ -139,17 +139,18 @@ def judge_slug(spec) -> str:
     return slug(spec["name"]) + "-judge"
 
 
-def model_document(name: str, spec, protocol: str = "anthropic", url_env: str = BASE_URL_ENV) -> dict:
+def model_document(name: str, spec, protocol: str = "anthropic", url_env: str = BASE_URL_ENV,
+                   max_output_tokens: Optional[int] = None) -> dict:
     return {"model": {"name": name, "protocols": [protocol],
                       "backend_url_env": url_env, "backend_key_env": KEY_ENV,
                       "context_window": 200000, "max_concurrent": spec["concurrency"],
-                      "params": {"max_output_tokens": spec.get("max_tokens") or 32768}}}
+                      "params": {"max_output_tokens": max_output_tokens or 32768}}}
 
 
 def job_documents(spec) -> Tuple[dict, dict]:
     """(model config, job config). JSON is valid YAML; WorkBuddy reads YAML."""
     # Account models are listed as `metask/<id>`; the gateway takes the id.
-    model = model_document(split_model(spec["model"])[1], spec)
+    model = model_document(split_model(spec["model"])[1], spec, max_output_tokens=spec.get("max_tokens"))
     params = {}
     if spec.get("reasoning_effort"):
         params["METACODES_REASONING_EFFORT"] = spec["reasoning_effort"]

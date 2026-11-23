@@ -481,6 +481,7 @@ test "issue #461: an attempt that showed nothing is re-issued at once and withou
     const elapsed_ms = @divTrunc(cc.util_time.nowNs() - started, std.time.ns_per_ms);
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, fx.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), fx.requests());
+    try std.testing.expectEqualStrings(try fx.body(0), try fx.body(1));
     try std.testing.expectEqual(@as(usize, 0), fx.events.count("retry "));
     try std.testing.expect(elapsed_ms < 30_000);
 }
