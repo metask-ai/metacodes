@@ -37,6 +37,7 @@ from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.runner import ACTIVE, DEFAULT_FEATURES, atomic_json, chosen_features, now, settings
 
 MAX_ITEMS = 16
+MAX_MODELS = 8
 NAME_LIMIT = 80
 PROFILE_ACTIVE = ("queued", "running", "cancelling")
 LEGACY_BATCHES_DIR = ".bench-batches"
@@ -186,6 +187,18 @@ def checked_name(value: Any) -> Optional[str]:
     return name.strip() or None
 
 
+def checked_models(request: Dict[str, Any]) -> List[Any]:
+    """The models one queue request runs every dataset with, in order."""
+    if "models" not in request:
+        return [request.get("model")]
+    models = request["models"]
+    if "model" in request or not isinstance(models, list) or not 1 <= len(models) <= MAX_MODELS:
+        raise ValueError(f"models 需要 1–{MAX_MODELS} 个模型，并且不能和 model 同时使用")
+    if len(set(map(str, models))) != len(models):
+        raise ValueError("models 里有重复的模型")
+    return models
+
+
 def run_features(features: List[str], suite_id: str) -> List[str]:
     """The profile's features a dataset runs with: none for a WorkBuddy
     suite, whose overlay launches metacodes itself."""
@@ -247,10 +260,13 @@ class ProfileManager:
 
     def queue(self, request: Any) -> Dict[str, Any]:
         """Queue datasets on a profile: an existing one (`profile`), or the
-        one of a listed bundle and `features`, created when first used."""
-        allowed = {"profile", "name", "model", "executor", "attempts", "concurrency", "bundle", "items", "features"}
+        one of a listed bundle and `features`, created when first used.
+        Each dataset is queued once per model (`model`, or several `models`)."""
+        allowed = {"profile", "name", "model", "models", "executor", "attempts", "concurrency", "bundle", "items",
+                   "features"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 profile、name、model、executor、attempts、concurrency、bundle、items、features")
+            raise ValueError("只接受 profile、name、model、models、executor、attempts、concurrency、bundle、items、features")
+        models = checked_models(request)
         items = request.get("items")
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
             raise ValueError(f"每次需要 1–{MAX_ITEMS} 个评测集")
@@ -267,10 +283,12 @@ class ProfileManager:
             if suite.id in seen:
                 raise ValueError("评测集 " + suite.name + " 重复")
             seen.add(suite.id)
-            run_request = {"suite": suite.id, "model": request.get("model"), "tasks": item.get("tasks"),
-                           "attempts": request.get("attempts", 1),
-                           "concurrency": min(concurrency, suite.max_concurrency)}
-            planned.append(self.planned(target, run_request, request.get("executor"), suite.name))
+            for model in models:
+                run_request = {"suite": suite.id, "model": model, "tasks": item.get("tasks"),
+                               "attempts": request.get("attempts", 1),
+                               "concurrency": min(concurrency, suite.max_concurrency)}
+                label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
+                planned.append(self.planned(target, run_request, request.get("executor"), label))
         return self.append(target, name, planned)
 
     def launch_now(self, request: Any) -> Dict[str, Any]:

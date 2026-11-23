@@ -12,6 +12,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A bench profile runs several models at once.** The 评测 page selects
+  several models (`models` in `POST /api/profiles/run`), queuing every
+  dataset once per model, and the profile page compares the models' latest
+  results side by side.
+
 - **The bench workbench shows public leaderboards next to our runs.** A
   榜单 page lists, per suite, results other harnesses and models published
   (FrontierHarness Eval v1.1 per model, Terminal-Bench 2.0/2.1, EvalPlus,

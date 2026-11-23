@@ -93,6 +93,27 @@ def board_job(view, tasks):
             "cost_per_task": _mean([sum(c) / len(c) for c in costs.values()])}
 
 
+def model_comparison(latest):
+    """Each model's latest results: over every task it ran, and, when the
+    models ran different tasks, over the tasks all of them ran."""
+    by_model = {}
+    for (suite, model, task), (_, _, rows) in latest.items():
+        by_model.setdefault(model, {})[(suite, task)] = rows
+
+    def summary(rows):
+        return {k: v for k, v in data.summarize(rows).items() if k != "ttft_samples_ms"}
+
+    task_sets = [set(tasks) for tasks in by_model.values()]
+    common = set.intersection(*task_sets) if len(task_sets) > 1 and len({frozenset(t) for t in task_sets}) > 1 else None
+    result = []
+    for model, tasks in sorted(by_model.items(), key=lambda pair: pair[0] or ""):
+        entry = {"model": model, "tasks": len(tasks), "summary": summary([r for rows in tasks.values() for r in rows])}
+        if common is not None:
+            entry["common_summary"] = summary([r for key in common for r in tasks[key]])
+        result.append(entry)
+    return result, (len(common) if common is not None else None)
+
+
 def library_for(roots, manager=None) -> StoreLibrary:
     """The store a service reads: the workbench's configured store, or a
     private temporary one for a read-only viewer without a workbench."""
@@ -218,6 +239,7 @@ class Workbench:
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
         latest, _ = latest_results(record, views)
         value["summary"] = data.summarize([row for _, _, rows in latest.values() for row in rows])
+        value["by_model"], value["common_tasks"] = model_comparison(latest)
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
         value["suites"] = sorted({i["suite"] for i in value["items"]})
