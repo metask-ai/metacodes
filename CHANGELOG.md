@@ -203,6 +203,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **FindSymbol and CodeMap no longer give up early on a language server
+  that is busy publishing diagnostics, and the LSP waits around Edit and Write
+  end on time** (#741). The LSP client counted its waits in 150 ms steps
+  instead of keeping a deadline, and every response or diagnostics push from
+  the server used up a step. A `documentSymbol` request to a server
+  publishing diagnostics for other files could fail long before its 10 s
+  limit, which FindSymbol and CodeMap reported as a language server that
+  could not be started. A wait that nothing woke ran one step past its limit,
+  plus the scheduling delay of every step: the 8 s diagnostics wait before an
+  Edit or Write took about 8.3 s on an idle machine. Both waits now end at
+  their deadline, and still check for an interrupt every 150 ms.
+
 - **A busy tunnel port on an SSH executor no longer fails `egress =
   "workbench"`** (#716). Setup's 容器出网 step and each run picked the
   executor-side port of their `ssh -R` tunnel at random from 20000–59999,
