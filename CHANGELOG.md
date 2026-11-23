@@ -164,6 +164,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The agent carries on when a background job it waits for finishes**
+  (#714). After the model said it would wait for a background job, the job
+  could finish and the agent stay idle until the next message, which then
+  brought the job's exit along. The wait looked for finished jobs, found
+  none, and then, if the job ended right then, found nothing running and
+  ended the turn. It now checks what is still running before it looks for
+  finished jobs.
+
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
   8 s before the write and 6 s after it, so a server that answered

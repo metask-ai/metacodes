@@ -569,3 +569,47 @@ test "JobWait T8 an exit left over from a previous run is delivered with the nex
     defer cc.job_registry.freeJobExitEvents(a, events);
     try std.testing.expectEqual(@as(usize, 0), events.len);
 }
+
+test "JobWait T9 a job that exits between the wait's two registry checks is still delivered" {
+    const a = std.testing.allocator;
+    const ExitsAfterFirstCheck = struct {
+        checks: u32 = 0,
+        taken: bool = false,
+
+        pub fn hasPendingNotifyJobs(self: *@This(), _: cc.session_id.SessionId) bool {
+            defer self.checks += 1;
+            return self.checks == 0;
+        }
+        pub fn takeUnannouncedExits(self: *@This(), _: cc.session_id.SessionId, allocator: std.mem.Allocator) ![]cc.job_registry.JobExitEvent {
+            defer self.checks += 1;
+            if (self.checks == 0 or self.taken) return allocator.alloc(cc.job_registry.JobExitEvent, 0);
+            const events = try allocator.alloc(cc.job_registry.JobExitEvent, 1);
+            errdefer allocator.free(events);
+            events[0] = .{
+                .id = "000000000001".*,
+                .status = .exited,
+                .exit_code = 0,
+                .started_ms = 0,
+                .ended_ms = 0,
+                .command_preview = try allocator.dupe(u8, "echo done"),
+                .stdout_unread = 0,
+                .stderr_unread = 0,
+            };
+            self.taken = true;
+            return events;
+        }
+    };
+    var registry: ExitsAfterFirstCheck = .{};
+    var delivered = false;
+    var polls: usize = 0;
+    while (polls < 3) : (polls += 1) {
+        const poll = try cc.agent_loop.pollJobWait(&registry, cc.session_id.SessionId.single, a);
+        defer cc.job_registry.freeJobExitEvents(a, poll.events);
+        if (poll.events.len > 0) {
+            delivered = true;
+            break;
+        }
+        if (!poll.any_running) break;
+    }
+    try std.testing.expect(delivered);
+}
