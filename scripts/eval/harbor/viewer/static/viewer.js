@@ -12,7 +12,7 @@ const REFRESH_S = 10;
 
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
   jobFilter: 'all', jobSearch: '', suite: null, category: 'all', sort: { key: 'task', dir: 1 }, selected: new Set(),
-  scope: null, suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '', boardModel: {} };
+  scope: null, suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '', boardModel: {}, boardExpanded: {} };
 
 // ------------------------------------------------------------ DOM helpers
 function h(tag, props, ...children) {
@@ -1235,14 +1235,6 @@ function costPassPanel(jobs, common) {
 // ------------------------------------------------------------ public leaderboards
 function score(x) { return x === null || x === undefined ? '—' : x.toFixed(1) + '%'; }
 function modelKey(m) { return String(m || '').toLowerCase().replace(/^.*\//, '').replace(/[^a-z0-9]/g, ''); }
-function nameHash(name) {
-  let hash = 0;
-  for (const c of name) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
-  return hash;
-}
-function harnessColor(name) { return `hsl(${nameHash(name) % 360} 55% 66%)`; }
-const SHAPES = ['circle', 'square', 'diamond', 'triangle', 'hexagon'];
-function harnessShape(name) { return SHAPES[(nameHash(name) >>> 9) % SHAPES.length]; }
 function boardModels(board) {
   return board.model_filter ? [...new Set(board.entries.map((e) => e.model))] : [];
 }
@@ -1263,19 +1255,16 @@ function svg(tag, attrs, ...children) {
   for (const child of children) if (child) el.append(child instanceof Node ? child : document.createTextNode(String(child)));
   return el;
 }
-const rowColor = (r) => (r.ours ? 'var(--accent)' : harnessColor(r.harness));
-const rowShape = (r) => (r.ours ? 'star' : harnessShape(r.harness));
 const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
-const markOf = (r) => h('i', { class: 'mark', 'data-shape': rowShape(r), style: 'color:' + rowColor(r) });
 function arrangeLabels(plot) {
   const box = plot.getBoundingClientRect();
   if (!box.width) return;
   const labels = [...plot.querySelectorAll('.scatter-label')];
-  const marks = [...plot.querySelectorAll('.scatter-point .mark')].map((m) => [m.closest('.scatter-point'), m.getBoundingClientRect()]);
+  const dots = [...plot.querySelectorAll('.scatter-point .dot')].map((m) => [m.closest('.scatter-point'), m.getBoundingClientRect()]);
   const placed = [];
-  const overlaps = (a, b) => a.left < b.right + 3 && a.right > b.left - 3 && a.top < b.bottom + 2 && a.bottom > b.top - 2;
-  const tries = [0, -16, 16, -32, 32, -48, 48].flatMap((dy) => [['right', dy], ['left', dy]]);
+  const overlaps = (a, b) => a.left < b.right + 4 && a.right > b.left - 4 && a.top < b.bottom + 2 && a.bottom > b.top - 2;
+  const tries = [0, -14, 14, -28, 28].flatMap((dy) => [['right', dy], ['left', dy]]);
   labels.sort((x, y) => Number(y.closest('.scatter-point').dataset.ours) - Number(x.closest('.scatter-point').dataset.ours));
   for (const label of labels) {
     const own = label.closest('.scatter-point');
@@ -1285,7 +1274,7 @@ function arrangeLabels(plot) {
       label.style.setProperty('--dy', dy + 'px');
       const r = label.getBoundingClientRect();
       return r.left >= box.left && r.right <= box.right && r.top >= box.top && r.bottom <= box.bottom
-        && !placed.some((o) => overlaps(r, o)) && !marks.some(([p, m]) => p !== own && overlaps(r, m));
+        && !placed.some((o) => overlaps(r, o)) && !dots.some(([p, m]) => p !== own && overlaps(r, m));
     });
     if (fits) placed.push(label.getBoundingClientRect());
     else label.hidden = true;
@@ -1295,31 +1284,34 @@ function costScatter(rows, focus) {
   const points = rows.filter((r) => r.cost_per_task_usd > 0);
   if (points.length < 2 || !points.some((r) => !r.ours)) return null;
   const costs = points.map((r) => Math.log(r.cost_per_task_usd)); const scores = points.map((r) => r.score);
-  const range = (v) => { const lo = Math.min(...v); const hi = Math.max(...v); const pad = (hi - lo || 1) * 0.06; return [lo - pad, hi + pad]; };
+  const range = (v) => { const lo = Math.min(...v); const hi = Math.max(...v); const pad = (hi - lo || 1) * 0.08; return [lo - pad, hi + pad]; };
   const [x0, x1] = range(costs); const [y0, y1] = range(scores);
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
   const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
-  const shared = new Set(points.filter((r, i) => points.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
-  const pointName = (r) => (!r.ours && shared.has(rowName(r)) ? `${r.harness} · ${r.model}` : rowName(r));
-  const zone = svg('g', {});
-  const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' }, zone,
+  const leaders = points.filter((r) => !r.ours).sort((p, q) => q.score - p.score).slice(0, 3);
+  const named = points.filter((r) => frontier.includes(r) || leaders.includes(r));
+  const repeated = new Set(named.filter((r, i) => named.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
+  const label = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' },
     svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
-  const ticks = [0.1, 0.4, 0.7, 1].map((t) => t * 0.94);
+  const ticks = [0, 1, 2].map((i) => 0.12 + i * 0.38);
   const grid = [
-    ...ticks.map((t) => h('div', { class: 'grid-y', style: `bottom:${t * 100}%` }, h('span', { text: (y0 + (y1 - y0) * t).toFixed(1) + '%' }))),
-    ...ticks.map((t) => { const v = Math.exp(x0 + (x1 - x0) * t); return h('div', { class: 'grid-x', style: `left:${t * 100}%` }, h('span', { text: '$' + v.toFixed(v < 1 ? 3 : 2) })); }),
+    ...ticks.map((t) => h('div', { class: 'grid-y', style: `bottom:${t * 100}%` }, h('span', { text: (y0 + (y1 - y0) * t).toFixed(0) + '%' }))),
+    ...ticks.map((t) => { const v = Math.exp(x0 + (x1 - x0) * t); return h('div', { class: 'grid-x', style: `left:${t * 100}%` }, h('span', { text: '$' + v.toFixed(v < 1 ? 2 : 1) })); }),
   ];
   const tip = h('div', { class: 'scatter-tip', hidden: true });
-  const dots = new Map(points.map((r) => [r, h('button', { type: 'button', class: 'scatter-point', 'data-ours': r.ours ? '1' : '0',
-    'data-frontier': frontier.includes(r) ? '1' : null, style: `left:${px(r)}%;bottom:${py(r)}%`,
-    'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
-    onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
-    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
-  markOf(r), h('span', { class: 'scatter-label', text: pointName(r) }))]));
+  const dots = new Map(points.map((r) => {
+    const kind = r.ours ? 'ours' : frontier.includes(r) ? 'frontier' : 'other';
+    return [r, h('button', { type: 'button', class: 'scatter-point', 'data-kind': kind, 'data-ours': r.ours ? '1' : '0',
+      style: `left:${px(r)}%;bottom:${py(r)}%`,
+      'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
+      onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
+      onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+    h('i', { class: 'dot' }), r.ours || named.includes(r) ? h('span', { class: 'scatter-label', text: label(r) }) : null)];
+  }));
   const plot = h('div', { class: 'scatter-plot' }, ...grid, layer, ...dots.values(), tip);
   focus.on((active) => {
-    zone.replaceChildren();
     const a = dots.has(active) ? active : null;
     plot.toggleAttribute('data-active', Boolean(a));
     for (const [r, dot] of dots) {
@@ -1328,100 +1320,80 @@ function costScatter(rows, focus) {
     }
     tip.hidden = !a;
     if (!a) return;
-    zone.append(svg('rect', { class: 'kill-zone', x: px(a), y: 100 - py(a), width: 100 - px(a), height: py(a) }),
-      svg('path', { class: 'kill-line', d: `M ${px(a)} 100 V ${100 - py(a)} H 100` }));
-    tip.replaceChildren(h('b', { text: rowName(a) }), h('span', { text: a.ours ? a.ours.name : a.model || '—' }),
-      h('span', { text: `分数 ${score(a.score)} · 每题 ${usd(a.cost_per_task_usd)}` }),
-      h('span', { class: 'muted', text: `同时更便宜且更高的点：${points.filter((o) => beats(o, a)).length} 个 · 被它压过：${points.filter((o) => beats(a, o)).length} 个` }));
+    tip.replaceChildren(h('b', { text: a.ours ? 'metacodes（我们）' : a.harness }), h('span', { text: a.model || '—' }),
+      h('span', { class: 'num', text: `${score(a.score)} · ${usd(a.cost_per_task_usd)}` }));
     tip.style.left = px(a) + '%';
     tip.style.bottom = py(a) + '%';
     tip.dataset.side = px(a) > 60 ? 'left' : 'right';
   });
-  const group = (name) => {
-    plot.toggleAttribute('data-group', Boolean(name));
-    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(name) && rowName(r) !== name);
-  };
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
-  const legend = h('div', { class: 'legend keys scatter-legend' }, [...new Map(points.map((r) => [rowName(r), r])).values()].map((r) =>
-    h('span', { class: 'key', onmouseenter: () => group(rowName(r)), onmouseleave: () => group(null) }, markOf(r), rowName(r))));
-  return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
-    h('div', { class: 'axis-x', text: '每题平均成本' })));
+  return h('div', { class: 'scatter-box' }, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
+    h('div', { class: 'axis-x', text: '每题成本' })));
 }
 function focusHub() {
   const listeners = [];
   return { on: (fn) => listeners.push(fn), set: (row) => listeners.forEach((fn) => fn(row)) };
 }
-function leaderCards(rows, published, focus, rowNodes) {
+function leaderCards(rows, published) {
   const pub = rows.filter((r) => !r.ours);
   const priced = pub.filter((r) => r.cost_per_task_usd > 0);
   const best = pub[0];
   const cheapest = priced.length ? [...priced].sort((a, b) => a.cost_per_task_usd - b.cost_per_task_usd || b.score - a.score)[0] : null;
   const ours = rows.find((r) => r.ours);
-  const card = (label, r, value, note) => {
-    if (!r) return null;
-    const el = metric(label, value, note, false);
-    el.classList.add('leader');
-    el.tabIndex = 0;
-    el.addEventListener('mouseenter', () => focus.set(r));
-    el.addEventListener('mouseleave', () => focus.set(null));
-    el.addEventListener('click', () => { rowNodes.get(r).scrollIntoView({ behavior: 'smooth', block: 'center' }); focus.set(r); });
-    return el;
-  };
   return h('section', { class: 'metrics leaders' },
-    card('分数最高', best, score(best?.score), best ? `${best.harness} · ${best.model || '—'}` : ''),
-    card('成本最低', cheapest, usd(cheapest?.cost_per_task_usd), cheapest ? `${cheapest.harness} · ${cheapest.model || '—'} · ${score(cheapest.score)}` : ''),
-    ours ? card('我们的最好名次', ours, `${ours.rank} / ${published + 1}`, `${ours.model || ours.ours.name} · ${score(ours.score)}`)
-      : metric('我们的名次', '—'));
+    best ? metric('最高分', score(best.score), `${best.harness} · ${best.model || '—'}`) : null,
+    cheapest ? metric('最低成本', usd(cheapest.cost_per_task_usd), `${cheapest.harness} · ${score(cheapest.score)}`) : null,
+    metric('我们的名次', ours ? `${ours.rank} / ${published + 1}` : '—', ours ? `${score(ours.score)} · ${ours.model || ''}` : null, true));
 }
-function boardPanel(board, suiteName) {
+const BOARD_TOP = 10;
+function boardPanel(board) {
   const key = board.suites.join(',') + '|' + board.title;
   const models = boardModels(board);
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
   const src = board.source;
-  const picker = models.length ? h('label', { class: 'scope' }, '模型 ',
-    h('select', { onchange: (e) => { state.boardModel[key] = e.target.value; e.target.closest('.panel').replaceWith(boardPanel(board, suiteName)); } },
-      models.map((m) => h('option', { value: m, selected: m === model, text: m === board.default_model ? `${m}（汇总）` : m })))) : null;
-  const head = h('div', { class: 'board-source' },
-    h('a', { href: src.url, target: '_blank', rel: 'noopener noreferrer', text: src.name }),
-    h('span', { class: 'muted', text: ` · ${src.retrieved}` }));
+  const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
+  const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
+    models.map((m) => h('option', { value: m, selected: m === model, text: m === board.default_model ? '全部模型' : m }))) : null;
+  const sourceLink = h('a', { class: 'board-link', href: src.url, target: '_blank', rel: 'noopener noreferrer', title: `${src.name} · ${src.retrieved}`, text: '来源 ↗' });
+  const expanded = Boolean(state.boardExpanded[key]);
+  const shown = expanded ? rows : rows.filter((r, i) => i < BOARD_TOP || r.ours);
   const top = Math.max(...rows.map((r) => r.score), 1);
-  const rowNodes = new Map(rows.map((r) => [r, h('tr', { class: r.ours ? 'ours link' : null, tabindex: 0,
+  const rowNodes = new Map(shown.map((r) => [r, h('tr', { class: r.ours ? 'ours link' : null, title: r.ours ? r.ours.name : null,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
-  h('td', { class: 'num', text: String(r.rank).padStart(2, '0') }),
-  h('td', {}, h('span', { class: 'harness' }, markOf(r), r.ours ? 'metacodes（我们）' : r.harness),
-    r.ours ? h('span', { class: 'sub', text: r.ours.name + (r.ours.profile ? ' · 配置 ' + r.ours.profile : '') }) : null),
-  h('td', { text: r.model || '—' }),
-  h('td', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%;background:${rowColor(r)}` })),
-    h('b', { class: 'num', text: score(r.score) }),
-    r.ours ? h('span', { class: 'sub', text: `${r.ours.tasks} 题 · ${r.ours.trials} 次` })
-      : r.stderr !== null && r.stderr !== undefined ? h('span', { class: 'sub', text: '± ' + r.stderr.toFixed(1) }) : null),
-  h('td', { class: 'num', text: usd(r.cost_per_task_usd) }),
-  h('td', { text: r.date || '—' }))]));
+  h('td', { class: 'num rank', text: String(r.rank) }),
+  h('td', { text: r.ours ? 'metacodes' : r.harness }),
+  h('td', { class: 'muted', text: r.model || '—' }),
+  h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
+    h('span', { class: 'num', text: score(r.score) }))),
+  h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }))]));
   focus.on((active) => { for (const [r, tr] of rowNodes) tr.classList.toggle('active', r === active); });
+  const more = rows.length > shown.length || expanded ? h('button', { type: 'button', class: 'board-more',
+    onclick: (e) => { state.boardExpanded[key] = !expanded; redraw(e); } }, expanded ? '收起' : `全部 ${rows.length} 条`) : null;
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
-    h('thead', {}, h('tr', {}, ['名次', 'Harness / Agent', '模型', '分数', '每题成本', '日期'].map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
-    h('tbody', {}, [...rowNodes.values()])));
-  const sub = `${suiteName} · 公开 ${published} 条 · 我们 ${rows.filter((r) => r.ours).length} 个作业`;
-  return panel(board.title, sub, h('div', {}, head, leaderCards(rows, published, focus, rowNodes), costScatter(rows, focus), table), picker);
+    h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', '每题成本'].map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
+    h('tbody', {}, [...rowNodes.values()])), more);
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus), table),
+    h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {
   state.live = false;
   navCurrent('leaderboard');
   $('#title').textContent = '公开榜单';
   const d = await api('/api/leaderboard' + (suiteId ? '?suite=' + encodeURIComponent(suiteId) : ''));
-  crumbs([{ text: '看板', href: '#/' }, { text: '公开榜单' }, { text: d.suite_name }]);
-  const tabs = h('div', { class: 'chips' }, d.suites.map((s) => h('a', { class: 'chip', href: '#/leaderboard/' + encodeURIComponent(s.suite),
-    'aria-pressed': String(s.suite === d.suite), text: s.suite_name })));
+  crumbs([{ text: '看板', href: '#/' }, { text: '公开榜单' }]);
+  const suitePicker = h('label', { class: 'scope' }, '评测集',
+    h('select', { onchange: (e) => { location.hash = '#/leaderboard/' + encodeURIComponent(e.target.value); } },
+      d.suites.map((s) => h('option', { value: s.suite, selected: s.suite === d.suite, text: s.suite_name }))));
   const partial = d.unranked;
   const rest = partial.length ? panel('未参与排名的作业', null, h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, ['作业', '模型', '题数', '分数'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
     h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', { text: j.name }), h('td', { text: j.model || '—' }),
       h('td', { class: 'num', text: `${j.tasks} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.score, 1) }))))))) : null;
-  return h('div', {}, tabs, d.boards.map((b) => boardPanel(b, d.suite_name)), rest);
+  return h('div', {}, h('div', { class: 'board-bar' }, suitePicker), d.boards.map((b) => boardPanel(b)), rest);
 }
 
 // ------------------------------------------------------------ settings (database)
