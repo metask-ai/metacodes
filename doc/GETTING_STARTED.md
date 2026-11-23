@@ -209,7 +209,9 @@ naming the variable, when one is set.
 at Metask's OAuth server `https://www.metask-ai.com`, as the public client
 `metacodes` asking for `read model:invoke`: the browser returns to
 `http://localhost:<port>/auth/metask/callback`, and you choose a model and a
-reasoning level from the `/v1/models` of the gateway the sign-in names. There
+reasoning level from the `/v1/models` of the gateway the sign-in names. A model
+the gateway can turn thinking off and on for but lists no levels for is offered
+`off` and `on`; a model with a single choice is not asked for one. There
 is no API key to choose: the session calls that gateway with its own access
 token, billed to the account. The access and rotating refresh tokens, with the
 gateway and model URLs, are stored as the Metask session in

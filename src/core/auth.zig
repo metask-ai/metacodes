@@ -927,14 +927,26 @@ pub fn openBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
     const url_z = try allocator.dupeZ(u8, url);
     defer allocator.free(url_z);
     // detached fire-and-forget（关 stdio、不 wait），走可移植 platform/process。
-    // POSIX：/usr/bin/env <opener> <url>；Windows：cmd /c start "" <url>（ShellExecute 语义）。
+    // POSIX：/usr/bin/env <opener> <url>；Windows：系统目录的 rundll32.exe url.dll,FileProtocolHandler <url>，不经 cmd.exe。
     if (builtin.os.tag == .windows) {
-        var argv = [_]?[*:0]const u8{ "cmd.exe", "/c", "start", "", url_z.ptr, null };
+        const launcher = try windowsUrlLauncher(allocator, if (std.c.getenv("SystemRoot")) |root| std.mem.span(root) else null);
+        defer allocator.free(launcher);
+        var argv = windowsOpenUrlArgv(launcher.ptr, url_z.ptr);
         process.spawnDetached(&argv, true) catch return error.ForkFailed;
     } else {
         var argv = [_]?[*:0]const u8{ env_z.ptr, opener_z.ptr, url_z.ptr, null };
         process.spawnDetached(&argv, true) catch return error.ForkFailed;
     }
+}
+
+fn windowsUrlLauncher(allocator: std.mem.Allocator, system_root: ?[]const u8) ![:0]u8 {
+    const root = std.mem.trimEnd(u8, system_root orelse "", "\\");
+    if (root.len == 0) return allocator.dupeZ(u8, "rundll32.exe");
+    return std.fmt.allocPrintSentinel(allocator, "{s}\\System32\\rundll32.exe", .{root}, 0);
+}
+
+fn windowsOpenUrlArgv(launcher: [*:0]const u8, url: [*:0]const u8) [4]?[*:0]const u8 {
+    return .{ launcher, "url.dll,FileProtocolHandler", url, null };
 }
 
 const RefreshTokenPolicy = enum { required, optional_replacement };
@@ -1382,6 +1394,33 @@ test "the loopback wait stops when the signal aborts" {
     const t = try std.Thread.spawn(.{}, Worker.run, .{&signal});
     try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
     t.join();
+}
+
+test "on Windows the whole URL reaches rundll32 as one argument, with no cmd.exe to end it at the first & (#727)" {
+    const a = std.testing.allocator;
+    const launcher = try windowsUrlLauncher(a, "C:\\Windows\\");
+    defer a.free(launcher);
+    const url = "https://www.metask-ai.com/oauth/authorize?response_type=code&client_id=metacodes&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fmetask%2Fcallback&scope=read%20model%3Ainvoke&state=a^b|c<d>e%PATH%";
+    var argv = windowsOpenUrlArgv(launcher.ptr, url);
+    const cmdline = try process.buildWindowsCmdline(a, &argv);
+    defer a.free(cmdline);
+    const expected = try std.unicode.utf8ToUtf16LeAllocZ(a, "C:\\Windows\\System32\\rundll32.exe url.dll,FileProtocolHandler " ++ url);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u16, expected, cmdline);
+
+    const bare = try windowsUrlLauncher(a, null);
+    defer a.free(bare);
+    try std.testing.expectEqualStrings("rundll32.exe", bare);
+}
+
+test "the rundll32 a Windows sign-in hands its URL to is where this machine keeps it (#727)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const root = std.c.getenv("SystemRoot") orelse return error.SkipZigTest;
+    const launcher = try windowsUrlLauncher(a, std.mem.span(root));
+    defer a.free(launcher);
+    try std.testing.expect(std.fs.path.isAbsolute(launcher));
+    try std.testing.expect(pfs.exists(launcher.ptr));
 }
 
 test "the loopback wait keeps serving a wrong-state callback and still aborts" {

@@ -502,7 +502,7 @@ class McpForwardingTest(unittest.TestCase):
             agent.__dict__.update(
                 logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[types.SimpleNamespace(
                     name="are", transport="streamable-http", url="http://are-sidecar:8000/mcp", headers={})],
-                config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None,
+                config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=False,
                 _account_gateway=None)
             environment = CapturingEnvironment()
             asyncio.run(agent.run("solve it", environment, None))

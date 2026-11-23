@@ -13,10 +13,10 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 
 | View | Answers |
 |---|---|
-| 看板 `#/` | metrics scoped to one profile (or all jobs), initial context composition, profiles, jobs |
-| 评测配置 `#/profile/<id>` | frozen metacodes version and advanced features, every task's latest attempts (a rerun replaces the earlier result), the run history; rename it, run it again or rerun its unpassed tasks, stop its queue, delete it once ended |
+| 看板 `#/` | profiles first, then metrics scoped to one profile (or all jobs), its jobs and their initial context composition |
+| 评测配置 `#/profile/<id>` | frozen metacodes version and advanced features, the run history, every task's latest attempts (a rerun replaces the earlier result); rename it, run it again or rerun its unpassed tasks, stop its queue, delete it once ended |
 | 任务 `#/profile/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task and the replaced runs |
-| 评测 `#/new` | a run: metacodes version and advanced features (the profile), several suites and their tasks, model, attempts, concurrency |
+| 评测 `#/new` | a run, top to bottom: metacodes version and advanced features (the profile), models, several suites and their tasks, attempts, concurrency; the start button stays at the bottom of the window |
 | 数据库 `#/settings` | the active store; test, switch and migrate to another SQLite file or PostgreSQL |
 | 作业 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
 | trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |

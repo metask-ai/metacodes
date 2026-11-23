@@ -92,6 +92,8 @@ pub const ContentChunks = enum {
     read_and_echo,
 };
 
+pub const ThinkingSwitch = enum { family, off_or_levels, off_or_on };
+
 /// response_format 支持范围
 pub const ResponseFormatSupport = enum {
     /// 支持 json_schema(OpenAI/Claude/K3)
@@ -171,6 +173,7 @@ pub const ModelProfile = struct {
     /// 保守默认 false。
     supports_multimodal_function_response: bool = false,
     tool_result_images_as_blocks: bool = false,
+    thinking_switch: ThinkingSwitch = .family,
 };
 
 /// provider kind(与 capability.zig 对齐,但本模块独立持有以解耦)
