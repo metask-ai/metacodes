@@ -830,6 +830,7 @@ class CacheTest(unittest.TestCase):
         self.assertTrue(host["if"].startswith("env.POOL_JOB == 'true' && "), host["if"])
         self.assertIn('ln -s "$root/zig-cache" .zig-cache', host["run"])
         self.assertIn('ln -s "$root/lean-lake" control-plane/lean/.lake', host["run"])
+        self.assertTrue(host["run"].rstrip().endswith('test -z "$(git status --porcelain --untracked-files=normal)"'))
         self.assertLess(steps.index(host), next(i for i, step in enumerate(steps)
                                                 if step.get("uses", "").startswith("mlugg/setup-zig@")))
         for step in steps:

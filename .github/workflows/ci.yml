@@ -251,6 +251,7 @@ jobs:
           rm -rf .zig-cache control-plane/lean/.lake
           ln -s "$root/zig-cache" .zig-cache
           ln -s "$root/lean-lake" control-plane/lean/.lake
+          test -z "$(git status --porcelain --untracked-files=normal)"
       # setup-zig points ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR at
       # .zig-cache. Its own cache stays off, since it saves on every run; the
       # steps below restore and save explicitly (doc/CI_DESIGN.md §5). Zig's

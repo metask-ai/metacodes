@@ -1,6 +1,6 @@
 .zig/
-.zig-cache/
-.lake/
+.zig-cache
+.lake
 zig-out/
 # release archives (zig build release:archive / release:sums)
 dist/
