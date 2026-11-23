@@ -133,6 +133,8 @@ elif name == "docker":
         except Exception as exc:
             print("wget: " + str(exc), file=sys.stderr)
             sys.exit(1)
+    if args[:1] == ["inspect"] and env.get("FAKE_DOCKER_INSPECT"):
+        print(env["FAKE_DOCKER_INSPECT"])
     images = state / "images"
     if args[:2] == ["image", "inspect"]:
         sys.exit(0 if (images / args[2].replace("/", "_")).exists() else 1)
@@ -170,7 +172,7 @@ elif name == "ssh":
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
                 "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
-                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS"):
+                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -587,6 +589,70 @@ class ExecutorConfigTest(unittest.TestCase):
         self.assertEqual(executors.configured({})[0][0].name, "local")
 
 
+    def test_container_mirrors_are_validated_and_become_the_compose_overlay(self):
+        base = {"name": "relay", "kind": "ssh", "host": "h"}
+        for bad in ({"apt": "https://mirrors.aliyun.com"}, {"hf": "https://hf-mirror.com"},
+                    {"pypi": "file:///simple"}, ["pypi"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                executors.parse({**base, "container_mirrors": bad})
+        with self.assertRaises(ValueError):
+            executors.parse({**base, "egress": "workbench", "container_mirrors": {"apt": "http://mirrors.aliyun.com"}})
+        self.assertIsNone(executors.parse(base).compose_overlay())
+        mirrors = {"pypi": "https://mirrors.aliyun.com/pypi/simple/", "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/",
+                   "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com"}
+        relay = executors.parse({**base, "egress": "workbench", "container_mirrors": mirrors})
+        self.assertEqual(executors.parse(relay.spec()), relay)
+        self.assertEqual(relay.compose_overlay(), {"services": {"main": {"environment": {
+            "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/",
+            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/",
+            "CONDA_CHANNEL_ALIAS": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud",
+            "CONDA_DEFAULT_CHANNELS": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main,"
+                                      "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r",
+            "GOPROXY": "https://goproxy.cn,direct",
+            "RUSTUP_DIST_SERVER": "https://rsproxy.cn", "RUSTUP_UPDATE_ROOT": "https://rsproxy.cn/rustup",
+            "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}}})
+
+    def test_mirror_settings_a_task_sets_itself_are_left_out(self):
+        relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
+            "apt": "http://mirrors.aliyun.com", "pypi": "https://mirrors.aliyun.com/pypi/simple/",
+            "go": "https://goproxy.cn"}})
+        mirrors = dict(relay.container_mirrors)
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp)
+            (dataset / "offline-go/environment").mkdir(parents=True)
+            (dataset / "offline-go/environment/docker-compose.yaml").write_text(
+                "services:\n  main:\n    environment:\n      - GOPROXY=off\n")
+            (dataset / "apt-proxy/environment").mkdir(parents=True)
+            (dataset / "apt-proxy/environment/Dockerfile").write_text(
+                "FROM debian\nRUN echo 'Acquire::http::Proxy \"http://proxy\";' > /etc/apt/apt.conf.d/01p\n")
+            (dataset / "plain/tests").mkdir(parents=True)
+            (dataset / "plain/tests/test.sh").write_text("export PIP_INDEX_URL=https://example.invalid\n")
+            owned = executors.task_owned_settings(dataset, mirrors)
+        self.assertEqual(owned, ["Acquire::http::Proxy", "GOPROXY"])
+        self.assertEqual(relay.compose_overlay(owned), {"services": {"main": {"environment": {
+            "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/",
+            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/"}}}})
+        self.assertIsNone(relay.compose_overlay(["Acquire::http::Proxy", "GOPROXY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX"]))
+
+    def test_apt_is_left_out_of_a_run_whose_apt_cache_does_not_answer(self):
+        relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
+            "apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}})
+        for code, apt in ((0, True), (1, False)):
+            probes, logged = [], []
+
+            def runner(argv, **_kwargs):
+                probes.append(argv)
+                return subprocess.CompletedProcess(argv, code, "", "")
+            run = executors.RemoteRun({"name": "r", "executor": relay.spec()}, runner=runner, log=logged.append)
+            overlay = run.mirror_overlay(None)
+            with self.subTest(code=code):
+                self.assertEqual(len(probes), 1)
+                self.assertIn("http://172.17.0.1:3142/acng-report.html", probes[0][-1])
+                self.assertEqual("configs" in overlay, apt)
+                self.assertEqual(overlay["services"]["main"]["environment"], {"GOPROXY": "https://goproxy.cn,direct"})
+                self.assertEqual(any("没有响应" in line for line in logged), not apt)
+
+
 class ExecutorEntryTest(SetupFixture):
     def test_harbor_path_with_space_and_at_parses_and_a_bad_entry_spares_the_others(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h",
@@ -810,6 +876,23 @@ class SshRunTest(SetupFixture):
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
         self.assertEqual((view["rows"][0]["requests"], view["rows"][0]["total_tokens"]), (1, 70))
         self.assertTrue(list((local / ".bench-metrics").glob("*.jsonl")))
+
+    def test_container_mirrors_reach_harbor_as_a_compose_overlay(self):
+        manager, client, _ = self.prepare_remote()
+        cfg = self.cfg()
+        entry = next(e for e in cfg["executors"] if e["name"] == "relay-4090")
+        entry["container_mirrors"] = {"apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}
+        atomic_json(self.config, cfg)
+        run = client.request("api/runs", self.request())
+        final = wait_run(manager, run["name"])
+        self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+        argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+        overlay = self.remote_home / ".metacodes-bench/runs" / run["name"] / executors.COMPOSE_OVERLAY
+        self.assertEqual(argv[argv.index("--extra-docker-compose") + 1], str(overlay.resolve()))
+        # Nothing answers as the apt cache here: apt keeps the task's own sources.
+        self.assertEqual(json.loads(overlay.read_text()),
+                         {"services": {"main": {"environment": {"GOPROXY": "https://goproxy.cn,direct"}}}})
+        self.assertIn("apt 缓存 http://127.0.0.1:3142 没有响应", (manager.records / (run["name"] + ".log")).read_text())
 
     def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
         gateway = RotatingGateway(self.root, lifetime=4)
@@ -2048,6 +2131,42 @@ class NetworkSetupTest(SetupFixture):
         self.assertFalse(any("restart" in json.dumps(c) for c in self.calls()))
         self.assertLessEqual(set(self.forwarded_ports()), set(tunnel_ports))
         self.assertEqual((probe.served, probe.proxy_checked), ([probe.path] * 2, ["127.0.0.1"] * 2))
+
+    def test_apt_cache_starts_once_per_mirror_on_the_docker_gateway(self):
+        class Report(SimpleHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/acng-report.html" else 404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+        cache = ThreadingHTTPServer(("127.0.0.1", 0), Report)
+        threading.Thread(target=cache.serve_forever, daemon=True).start()
+        self.addCleanup(cache.server_close)
+        self.addCleanup(cache.shutdown)
+        port = cache.server_port
+        patcher = patch.object(executors, "APT_CACHE_PORT", port)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors={"apt": "http://mirrors.example/"})
+        self.remote_docker()
+        dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(dry, "apt_cache")["status"], "planned", self.step(dry, "apt_cache"))
+        self.assertFalse([c for c in self.calls("docker", "remote") if c[1][:1] in (["build"], ["run"])])
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "apt_cache")
+        self.assertEqual(step["status"], "done", step)
+        docker = [c[1] for c in self.calls("docker", "remote")]
+        self.assertIn(["build", "-q", "-t", setup.APT_CACHE_NAME, "--build-arg", "MIRROR=http://mirrors.example", "-"], docker)
+        started = next(c for c in docker if c[:2] == ["run", "-d"])
+        for flag in (["--restart", "unless-stopped"], ["--label", setup.APT_CACHE_LABEL + "=http://mirrors.example"],
+                     ["-p", f"127.0.0.1:{port}:3142"], ["-v", setup.APT_CACHE_NAME + ":/var/cache/apt-cacher-ng"]):
+            self.assertIn(flag, [started[i:i + 2] for i in range(len(started) - 1)])
+        os.environ["FAKE_DOCKER_INSPECT"] = "http://mirrors.example true"
+        again = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(again, "apt_cache")["status"], "ok", self.step(again, "apt_cache"))
+        self.assertEqual(len([c for c in self.calls("docker", "remote") if c[1][:1] == ["build"]]), 1)
 
     def test_docker_mirrors_without_sudo_report_the_command_and_change_nothing(self):
         self.add_ssh_executor(docker_mirrors=["https://docker.m.daocloud.io"])

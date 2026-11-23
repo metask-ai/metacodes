@@ -43,6 +43,8 @@ def command(spec):
     if spec.get("judge") and spec.get("metrics_proxy"):
         # The verifier's LLM judge: relay route, placeholder *name*, model.
         argv += judge_argv(spec["judge"], spec["metrics_proxy"])
+    if spec.get("compose_overlay"):
+        argv += ["--extra-docker-compose", spec["compose_overlay"]]
     filters = spec.get("task_filters") or ["terminal-bench/" + task for task in spec["tasks"]]
     for pattern in filters:
         argv += ["-i", pattern]

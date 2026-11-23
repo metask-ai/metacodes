@@ -77,6 +77,66 @@ REGISTRY_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]{1,5})?(/[a-
 EGRESS_MODES = ("direct", "workbench")
 EGRESS_HELP = 'egress 只能是 "direct"、"workbench" 或 {"proxy": "http://主机:端口"}'
 
+CONTAINER_MIRRORS = ("apt", "pypi", "conda", "go", "rustup", "npm")
+APT_CACHE_PORT = 3142
+APT_CACHE_CONF = "/etc/apt/apt.conf.d/99metacodes-apt-cache"
+COMPOSE_OVERLAY = "mirrors.compose.json"
+APT_PROXY_SETTING = "Acquire::http::Proxy"
+APT_CACHE_PROBE = r'''
+import sys, time, urllib.request
+for _ in range(int(sys.argv[2])):
+    try:
+        with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+            sys.exit(0 if response.status == 200 else 1)
+    except OSError:
+        time.sleep(0.5)
+sys.exit(1)
+'''
+
+
+def apt_cache_probe(executor: "SshExecutor", attempts: int) -> str:
+    """Shell command on the executor that exits 0 once its apt cache answers."""
+    return " ".join(shlex.quote(part) for part in (executor.python, "-c", APT_CACHE_PROBE,
+                                                    executor.apt_cache_url + "/acng-report.html", str(attempts)))
+
+
+def container_mirror_env(mirrors: Dict[str, str]) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    if "pypi" in mirrors:
+        env.update(PIP_INDEX_URL=mirrors["pypi"], UV_DEFAULT_INDEX=mirrors["pypi"])
+    if "conda" in mirrors:
+        root = mirrors["conda"].rstrip("/")
+        env.update(CONDA_CHANNEL_ALIAS=root + "/cloud",
+                   CONDA_DEFAULT_CHANNELS=root + "/pkgs/main," + root + "/pkgs/r")
+    if "go" in mirrors:
+        env["GOPROXY"] = mirrors["go"] + ",direct"
+    if "rustup" in mirrors:
+        root = mirrors["rustup"].rstrip("/")
+        env.update(RUSTUP_DIST_SERVER=root, RUSTUP_UPDATE_ROOT=root + "/rustup")
+    if "npm" in mirrors:
+        env["NPM_CONFIG_REGISTRY"] = mirrors["npm"]
+    return env
+
+
+def task_owned_settings(dataset: Path, mirrors: Dict[str, str]) -> List[str]:
+    """The mirror settings (environment variables, apt's proxy) that a task
+    of `dataset` names in its compose files, task.toml or Dockerfiles."""
+    wanted = list(container_mirror_env(mirrors)) + ([APT_PROXY_SETTING] if "apt" in mirrors else [])
+    found = set()
+    for path in Path(dataset).rglob("*"):
+        name = path.name.lower()
+        if not (name == "task.toml" or name.startswith("dockerfile") or
+                (name.endswith((".yaml", ".yml")) and "compose" in name)):
+            continue
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        found.update(setting for setting in wanted if setting in text)
+    return sorted(found)
+
 
 def signal_group(process: subprocess.Popen, sig: int) -> None:
     try:
@@ -125,6 +185,7 @@ class SshExecutor:
     pypi_index: Optional[str] = None
     docker_mirrors: Tuple[str, ...] = ()
     ghcr_mirror: Optional[str] = None
+    container_mirrors: Tuple[Tuple[str, str], ...] = ()
 
     kind = "ssh"
 
@@ -144,7 +205,32 @@ class SshExecutor:
                 "egress_ports": list(self.egress_ports),
                 "egress_allow": list(self.egress_allow) if self.egress_allow is not None else None,
                 "pypi_index": self.pypi_index,
-                "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror}
+                "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror,
+                "container_mirrors": dict(self.container_mirrors) or None}
+
+    @property
+    def apt_cache_url(self) -> str:
+        return f"http://{self.metrics_bind}:{APT_CACHE_PORT}"
+
+    def compose_overlay(self, left_out: Collection[str] = ()) -> Optional[Dict]:
+        """The Harbor compose overlay that points a run's task containers at
+        container_mirrors, or None without any. Settings in `left_out`
+        (environment variables, APT_PROXY_SETTING) are not set."""
+        mirrors = dict(self.container_mirrors)
+        if APT_PROXY_SETTING in left_out:
+            mirrors.pop("apt", None)
+        env = {k: v for k, v in container_mirror_env(mirrors).items() if k not in left_out}
+        if not env and "apt" not in mirrors:
+            return None
+        main: Dict = {}
+        overlay = {"services": {"main": main}}
+        if env:
+            main["environment"] = env
+        if "apt" in mirrors:
+            main["configs"] = [{"source": "metacodes_apt_cache", "target": APT_CACHE_CONF}]
+            overlay["configs"] = {"metacodes_apt_cache": {
+                "content": f'Acquire::http::Proxy "{self.apt_cache_url}";\n'}}
+        return overlay
 
     def egress_value(self):
         """The `egress` field as written in workbench.json."""
@@ -178,7 +264,7 @@ def parse(entry) -> Executor:
         raise ValueError(f"{name}: kind 必须是 local 或 ssh")
     allowed = {"name", "kind", "host", "user", "port", "identity_file", "state_dir", "harbor", "python",
                "metrics_bind", "metrics_enabled", "egress", "egress_ports", "egress_allow", "pypi_index", "docker_mirrors",
-               "ghcr_mirror"}
+               "ghcr_mirror", "container_mirrors"}
     extra = set(entry) - allowed
     if extra:
         raise ValueError(f"{name}: 不支持的字段 {', '.join(sorted(extra))}")
@@ -261,6 +347,16 @@ def network_fields(name: str, entry: Dict) -> Dict:
         if not isinstance(ghcr, str) or not REGISTRY_HOST.fullmatch(ghcr):
             raise ValueError(f"{name}: ghcr_mirror 必须是镜像仓库主机名（如 ghcr.nju.edu.cn）")
         values["ghcr_mirror"] = ghcr
+    container = entry.get("container_mirrors")
+    if container is not None:
+        if not isinstance(container, dict) or not set(container) <= set(CONTAINER_MIRRORS) or \
+                not all(isinstance(url, str) and MIRROR_URL.fullmatch(url) for url in container.values()):
+            raise ValueError(f"{name}: container_mirrors 的键只能是 {'、'.join(CONTAINER_MIRRORS)}，值必须是 http(s) 地址")
+        if "apt" in container and not container["apt"].startswith("http://"):
+            raise ValueError(f"{name}: container_mirrors.apt 必须是 http:// 地址（apt 缓存按 HTTP 回源）")
+        if "apt" in container and values["egress"] != "direct":
+            raise ValueError(f"{name}: container_mirrors.apt 只能和 egress = direct 一起用（apt 缓存由执行机器直接回源）")
+        values["container_mirrors"] = tuple(sorted(container.items()))
     return values
 
 
@@ -1021,6 +1117,7 @@ class RemoteRun:
         self.log = log or (lambda text: print(text, flush=True))
         self.bundle = None
         self.dataset = None
+        self.overlay = None
         self.process = None
         self.stdin_lock = threading.Lock()
         self.credential_pushes = 0
@@ -1059,16 +1156,38 @@ class RemoteRun:
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
         registry = self.spec.get("registry_download")
+        local = None
         if registry:
             # harbor-registry suite: downloaded here (the executor may not
             # reach GitHub or the Hub), then shipped like a local dataset.
             local = registry_dataset(registry["ref"], Path(registry["cache"]), registry.get("harbor"),
                                      expected=registry.get("tasks"), log=self.log)
-            self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
         elif self.spec.get("local_dataset"):
             # harbor-local suite: `-p` names this host's prepared directory.
-            self.dataset = ship_dataset(self.executor, Path(self.spec["local_dataset"]), log=self.log,
-                                        runner=self.runner, popen=self.popen)
+            local = Path(self.spec["local_dataset"])
+        if local is not None:
+            self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
+        self.overlay = self.mirror_overlay(local)
+
+    def mirror_overlay(self, local: Optional[Path]) -> Optional[Dict]:
+        """This run's compose overlay: without the settings the dataset's
+        tasks make themselves, and without apt when the executor's apt cache
+        does not answer."""
+        mirrors = dict(self.executor.container_mirrors)
+        left_out = task_owned_settings(local, mirrors) if mirrors and local is not None else []
+        if left_out:
+            self.log("任务自己设置了 " + "、".join(left_out) + "，本次运行不注入这些镜像设置")
+        if "apt" in mirrors and APT_PROXY_SETTING not in left_out:
+            try:
+                answered = self.runner(shell_argv(self.executor, apt_cache_probe(self.executor, 3)),
+                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=60).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                answered = False
+            if not answered:
+                self.log(f"apt 缓存 {self.executor.apt_cache_url} 没有响应：本次运行的任务容器直接使用自己的 apt 源；"
+                         f"运行 metacodes bench setup --executor {self.executor.name} 重新启动缓存")
+                left_out.append(APT_PROXY_SETTING)
+        return self.executor.compose_overlay(left_out)
 
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
@@ -1102,6 +1221,8 @@ class RemoteRun:
         remote.pop("metrics_ca", None)
         if self.spec.get("provider_config"):
             remote["provider_config"] = run_dir + "/provider.json"
+        if self.overlay:
+            remote["compose_overlay"] = run_dir + "/" + COMPOSE_OVERLAY
         relay = None
         if upstream:
             relay = {"upstream": upstream, "bind": self.executor.metrics_bind, "auth_header": auth[0],
@@ -1154,7 +1275,7 @@ class RemoteRun:
             self.proxy = None
 
     def upload_run(self, remote_spec: Dict) -> str:
-        """The run directory holds the remote spec and provider config only."""
+        """The run directory holds the remote spec, provider config and compose overlay only."""
         import tempfile
         self.uploaded = remote_spec
         run_dir = self.executor.remote("runs", self.spec["name"])
@@ -1165,6 +1286,9 @@ class RemoteRun:
             if self.spec.get("provider_config"):
                 shutil.copyfile(self.spec["provider_config"], root / "provider.json")
                 names.append("provider.json")
+            if self.overlay:
+                (root / COMPOSE_OVERLAY).write_text(json.dumps(self.overlay), encoding="utf-8")
+                names.append(COMPOSE_OVERLAY)
             ship(self.executor, root, names, run_dir, log=self.log, runner=self.runner, popen=self.popen, force=True)
         return run_dir + "/spec.json"
 
