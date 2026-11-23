@@ -1099,9 +1099,13 @@ the other features' flags, and only on an SSH executor whose entry sets
   no implementer seat finished (all failed, as on a provider error), fails
   the trial with `TeamworkNotEngaged`, so it counts as invalid. A run that
   spent its budget (`budget_exhausted`), worked but did not merge, or merged
-  a wrong change is scored by the verifier like any other. The trial's cost
-  is the run's ledger spend; per-request timing and tokens come from the
-  relay's request metrics as for a headless run.
+  a wrong change is scored by the verifier like any other. Its stop reason
+  is `teamwork_<state>`, and summaries count `budget_exhausted` trials
+  apart (预算用完 on the profile page and in 模型对比), since for a model
+  without its own price that is often the fallback estimate rather than the
+  task. The run directory is copied again when the trial is killed on its
+  timeout. The trial's cost is the run's ledger spend; per-request timing
+  and tokens come from the relay's request metrics as for a headless run.
 
 `POST /api/profiles/run` queues datasets: on an existing profile with
 `profile` (its version and features cannot be changed), or with `bundle` and

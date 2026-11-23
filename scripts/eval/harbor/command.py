@@ -469,10 +469,7 @@ def teamwork_run_command(
         + " ".join(shlex.quote(flag) for flag in flags)
         + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>{logs}/{STDERR_FILENAME}",
         f'echo "teamwork run exited $?" >>{logs}/{STDERR_FILENAME}',
-        f'run_dir="$state/teamwork/"{shlex.quote(run_id)}',
-        f'if [ -d "$run_dir" ] && command -v tar >/dev/null 2>&1; then mkdir -p {logs}/{TEAMWORK_RUN_DIRNAME} &&'
-        f' tar -C "$run_dir" --exclude=worktree -cf - . | tar -C {logs}/{TEAMWORK_RUN_DIRNAME} -xf -'
-        f' 2>>{logs}/{STDERR_FILENAME}; fi',
+        teamwork_keep_run_command(state_dir=state_dir, run_id=run_id, logs_dir=logs_dir),
         f"{run} teamwork status {shlex.quote(run_id)} --json"
         f" >{logs}/{TEAMWORK_STATUS_FILENAME} 2>>{logs}/{STDERR_FILENAME} || exit 77",
     ]
@@ -485,6 +482,17 @@ def parse_teamwork_status(text: str) -> Optional[Dict[str, Any]]:
     except ValueError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def teamwork_keep_run_command(*, state_dir: str, run_id: str, logs_dir: str = REMOTE_LOGS) -> str:
+    """Shell that copies a teamwork run directory, without worktrees, to the
+    log mount as `teamwork-run/` (the ledger, seat records and seat logs)."""
+
+    run_dir = shlex.quote(f"{state_dir}/teamwork/{run_id}")
+    kept = shlex.quote(f"{logs_dir}/{TEAMWORK_RUN_DIRNAME}")
+    return (f"if [ -d {run_dir} ] && command -v tar >/dev/null 2>&1; then mkdir -p {kept} &&"
+            f" tar -C {run_dir} --exclude=worktree -cf - . | tar -C {kept} -xf -"
+            f" 2>>{shlex.quote(logs_dir + '/' + STDERR_FILENAME)}; fi")
 
 
 def teamwork_status(logs_dir: Path) -> Optional[Dict[str, Any]]:

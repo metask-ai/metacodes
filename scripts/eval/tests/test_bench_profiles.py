@@ -781,6 +781,20 @@ class TeamworkRunTest(unittest.TestCase):
         argv = command({**spec, "agent_timeout_multiplier": 3})
         self.assertEqual(argv[argv.index("--agent-timeout-multiplier") + 1], "3")
 
+    def test_a_teamwork_trial_is_named_by_its_run_state_and_budget_exhaustion_is_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = Path(tmp) / "prove-plus-comm__abc"
+            _write(trial / "result.json", {"task_name": "prove-plus-comm", "started_at": "2026-11-23T02:02:00Z",
+                                           "finished_at": "2026-11-23T02:10:00Z",
+                                           "verifier_result": {"rewards": {"reward": 0.0}}})
+            _write(trial / "agent" / "teamwork-status.json", {"state": "budget_exhausted", "seats": []})
+            row = data.trial_row(trial)
+            self.assertEqual((row["stop_reason"], row["status"]), ("teamwork_budget_exhausted", "fail"))
+            summary = data.summarize([row])
+            self.assertEqual(summary["budget_exhausted"], 1)
+            self.assertEqual(data.merge_summaries([summary, data.summarize([])])["budget_exhausted"], 1)
+            self.assertEqual(data.summarize([])["budget_exhausted"], 0)
+
     def test_the_compose_overlay_opens_bubblewrap_only_for_teamwork_on_an_opted_in_executor(self):
         opted = executors.parse({"name": "gpu", "kind": "ssh", "host": "gpu.example", "teamwork_privileged": True})
         plain = executors.parse({"name": "cpu", "kind": "ssh", "host": "cpu.example"})
