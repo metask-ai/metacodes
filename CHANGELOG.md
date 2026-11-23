@@ -12,6 +12,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A directory can be left without a default** (part of #489). With
+  `"global_default": false` at the top level of `config.json`, the `/model`
+  default, a Metask sign-in and `.env`'s choice (levels 4 to 6 of the startup
+  order) decide for no directory: a start uses what it names (`--provider`,
+  `--offer`, `--preset`, `--api-key`, `METACODES_PROVIDER` or
+  `METACODES_PRESET` in the shell) or the preset its directory remembers. In a
+  directory that remembers none, the TUI opens without a model, and a message
+  gets a red note naming `/model`, the presets and the `directory_presets`
+  entry to add; `-p`, `serve` and `--web` stop with exit code 2 before any
+  request. So an unfamiliar repository uses no account until one is chosen for
+  it. Keys and sign-ins still serve the route that is chosen; `/logout` leaves
+  the session without a model instead of switching to `.env`'s choice, and
+  `metacodes login status` marks the levels left out. A value that is not a
+  boolean fails to load with `InvalidGlobalDefault`; a malformed preset does
+  not hide the setting ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
+
 - **A bench profile runs several models at once.** The 评测 page selects
   several models (`models` in `POST /api/profiles/run`), queuing every
   dataset once per model, and the profile page compares the models' latest

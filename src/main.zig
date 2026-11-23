@@ -803,12 +803,14 @@ fn startupFacts(allocator: std.mem.Allocator, config: types.Config, local: *cons
         .named = named,
         .preset = presets.named,
         .directory_preset = presets.directory_preset,
-        .stored_default = if (above_default) .none else storedDefault(allocator, config, metask_key_requested),
+        .stored_default = if (above_default or !presets.global_default) .none else storedDefault(allocator, config, metask_key_requested),
         .metask_key = metaskSignInPresent(allocator, config, local_metask_key),
         .metask_key_requested = metask_key_requested,
         .metask_session = metaskSessionStored(allocator, config.state_root),
         .local_preset = presets.local_preset,
         .local = local.choice(),
+        .global_default = presets.global_default,
+        .metask_key_handed = config.api_key != null or std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null,
     };
 }
 
@@ -834,6 +836,10 @@ fn presetFacts(arena: std.mem.Allocator, config: types.Config, local: *const sta
         inputs.document = .{ .read = document };
     } else |err| {
         inputs.document = .{ .unreadable = @errorName(err) };
+        if (store.readText() catch null) |text| {
+            defer arena.free(text);
+            inputs.unreadable_global_default = provider_config_doc.globalDefaultIn(arena, text);
+        }
     }
     const host: ?*provider_host.Host = if (with_routes and inputs.document == .read) buildProviderHost(arena) else null;
     defer if (host) |value| value.destroy();
@@ -865,6 +871,18 @@ fn presetNotice(
         std.process.exit(2);
     }
     return std.fmt.allocPrint(allocator, "{s}\nStarted without it.", .{report}) catch report;
+}
+
+fn unchosenDirectoryError(arena: std.mem.Allocator, facts: *const presets_mod.Facts) []const u8 {
+    const directory = if (facts.directory.len > 0) facts.directory else "the working directory";
+    const config_path = if (facts.config_path.len > 0) facts.config_path else "config.json";
+    if (facts.unreadable) |why| return std.fmt.allocPrint(arena, "error: {s} cannot be read ({s}), so no preset can be looked up, and it sets \"global_default\": false, so nothing is chosen for this directory.\n" ++
+        "Name one for this run with --provider <id> or --offer <id>, or correct {s}.\n", .{ config_path, why, config_path }) catch
+        "error: nothing is chosen for this directory (global_default is false in config.json)\n";
+    const listed = if (facts.defined.len == 0) "" else std.fmt.allocPrint(arena, " (presets: {s})", .{std.mem.join(arena, ", ", facts.defined) catch ""}) catch "";
+    return std.fmt.allocPrint(arena, "error: {s} remembers no preset, and {s} sets \"global_default\": false, so nothing is chosen for this directory.\n" ++
+        "Name one for this run with --preset <name>{s}, --provider <id> or --offer <id>, or remember a preset for it under directory_presets.\n", .{ directory, config_path, listed }) catch
+        "error: nothing is chosen for this directory (global_default is false in config.json)\n";
 }
 
 /// Levels 2, 3 and 6 (#489): the preset that decided names the route the
@@ -1495,6 +1513,12 @@ pub fn main(init: std.process.Init) !void {
     // config.json does not define decides nothing (`presetNotice`).
     const preset_notice = presetNotice(allocator, config, &preset_facts, startup_order.unknownPresets(startup_facts, startup_decision), local_config.path);
     const preset_applied = applyDecidedPreset(&config, allocator, &local_config, &preset_facts, startup_decision);
+    if (startup_decision == .directory_unchosen and !(config.dump_prompt or config.dump_plugins) and
+        !(interactiveRepl(config) and platform_term.isatty(0)))
+    {
+        std.debug.print("{s}", .{unchosenDirectoryError(allocator, &preset_facts)});
+        std.process.exit(2);
+    }
     if (metask_session_sign_in) {
         config.provider_profile = "metask";
         // The model and reasoning level the sign-in chose (`auth.json`): the
@@ -1658,8 +1682,14 @@ pub fn main(init: std.process.Init) !void {
     // `-p`, `-`, `serve`, `--web`, resumed suspensions, teammates and a REPL
     // whose input is a pipe stop at once, non-zero, as scripts expect.
     const may_open_unbound = interactive_tui and platform_term.isatty(0);
-    var unbound: ?route_state_mod.Unbound = null;
-    if (!introspection_only and metask_scope and config.provider_profile != null and
+    var unbound: ?route_state_mod.Unbound = if (startup_decision == .directory_unchosen and !introspection_only) .{ .directory_unchosen = .{
+        .directory = preset_facts.directory,
+        .config_path = preset_facts.config_path,
+        .presets = preset_facts.defined,
+        .unreadable = preset_facts.unreadable,
+    } } else null;
+    const resolves_credential = !introspection_only and unbound == null;
+    if (resolves_credential and metask_scope and config.provider_profile != null and
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
         var browser_key = false;
@@ -1687,9 +1717,9 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         metask_oauth_selected = provider_secret != null and !browser_key;
-    } else if (!introspection_only and metask_scope and metask_legacy_explicit) {
+    } else if (resolves_credential and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
-    } else if (!introspection_only and !metask_scope) {
+    } else if (resolves_credential and !metask_scope) {
         // Level 1 (and 2 to 4 and 6, which name their provider the same way): a
         // provider without a key opens the TUI unbound, naming the key it
         // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
@@ -1745,7 +1775,7 @@ pub fn main(init: std.process.Init) !void {
     // The stored Metask login carries a Metask model and reasoning effort;
     // applying it to another provider's route would silently replace the
     // selected model.
-    if (metask_scope) {
+    if (metask_scope and startup_decision != .directory_unchosen) {
         applyStoredLoginSelection(allocator, &config) catch |err| {
             log.debug("auth", "stored model selection unavailable: {s}", .{@errorName(err)});
         };
@@ -1790,7 +1820,7 @@ pub fn main(init: std.process.Init) !void {
         if (subscriptionPlanName(allocator, config.resolved_provider_id orelse config.provider_profile.?)) |plan|
             std.debug.print("warning: {s} is a subscription plan for interactive use; its terms may not cover -p, serve or CI. Use a pay-as-you-go key for automation.\n", .{plan});
     }
-    const local_route = presets_mod.localRoute(&preset_facts, local_choice, local_config.get(state_env_mod.model_variable));
+    const local_route = if (startup_facts.global_default) presets_mod.localRoute(&preset_facts, local_choice, local_config.get(state_env_mod.model_variable)) else null;
     // 第七节第 3 条 (#485): `.env` configures a preset or a provider (#489),
     // yet the start is on Metask, which ranks above it (a sign-in or a stored
     // default). Said once under the TUI's banner, with the two ways to the
@@ -3887,7 +3917,14 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
             else => {},
         },
         .nothing => std.debug.print("This start uses no provider: nothing is set up. Sign in with `{s} login`, or put a provider's key in {s}.\n", .{ invokedCommand(arena), env_path }),
+        .directory_unchosen => std.debug.print("This start uses no provider: {s} remembers no preset, and global_default is false.\n", .{
+            if (preset_facts.directory.len > 0) preset_facts.directory else "the working directory",
+        }),
     }
+    const no_global_default = !facts.global_default;
+    if (no_global_default) std.debug.print("global_default is false in {s}: levels 4 to 6 choose for no directory.\n", .{
+        if (preset_facts.config_path.len > 0) preset_facts.config_path else "config.json",
+    });
     std.debug.print("Level {d} of {d} decided; the first that applies wins:\n", .{ decision.level(), startup_order.levels });
 
     const mark = struct {
@@ -3917,7 +3954,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     }
     // 4. The default stored with /model.
     switch (facts.stored_default) {
-        .none => std.debug.print("{s}4 stored default: {s}\n", .{ mark.at(4, decision), if (facts.named) "not consulted, level 1 names a provider" else if (facts.decidedAboveDefault()) "not consulted, a preset above decides" else "none" }),
+        .none => std.debug.print("{s}4 stored default: {s}\n", .{ mark.at(4, decision), if (no_global_default) "not consulted, global_default is false" else if (facts.named) "not consulted, level 1 names a provider" else if (facts.decidedAboveDefault()) "not consulted, a preset above decides" else "none" }),
         .unreadable => std.debug.print("{s}4 stored default: config.json cannot be read\n", .{mark.at(4, decision)}),
         .usable => |usable| std.debug.print("{s}4 stored default: {s}\n", .{ mark.at(4, decision), usable.label orelse "set" }),
         .lacks_credential => |label| std.debug.print("{s}4 stored default: {s}, which has no key or sign-in: passed over\n", .{ mark.at(4, decision), label }),
@@ -3949,6 +3986,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     } else {
         std.debug.print("      METASK_API_KEY: not set\n", .{});
     }
+    if (no_global_default and decision.level() != 5) std.debug.print("      not consulted: global_default is false\n", .{});
     // 6. The install's .env: names only. Its preset comes before its provider.
     const diagnosis = localConfigDiagnosis(arena, &local_config) catch return;
     std.debug.print("{s}6 {s}: {s}", .{ mark.at(6, decision), env_path, localStateWords(diagnosis.state) });
@@ -3966,6 +4004,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
         .provider => |chosen| std.debug.print("; configures {s}{s}\n", .{ providerDisplayName(arena, chosen.name), if (chosen.named) "" else " (the one provider whose key it holds)" }),
         .several => |ids| std.debug.print("; keys of several providers ({s}) and no {s}\n", .{ std.mem.join(arena, ", ", ids) catch "", state_env_mod.provider_variable }),
     };
+    if (no_global_default) std.debug.print("      not consulted: global_default is false\n", .{});
     // 7. Nothing.
     std.debug.print("{s}7 nothing: the TUI opens without a model; -p and the rest stop\n", .{mark.at(7, decision)});
 

@@ -468,3 +468,143 @@ test "presets: login status shows the preset levels and which one decides (#489)
     try expectContains(elsewhere.stderr, try std.fmt.allocPrint(a, "  2 preset named at start: METACODES_PRESET=nope in the shell, which {s} does not define (presets: a, b): passed over by the TUI, -p and the rest stop\n", .{try case.path("state/config.json")}));
     try testing.expectEqual(@as(usize, 0), mocks.total());
 }
+
+const ANTHROPIC_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const no_global_default =
+    \\, "global_default": false
+;
+
+fn unchosenError(a: std.mem.Allocator, directory: []const u8, config_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "error: {s} remembers no preset, and {s} sets \"global_default\": false, so nothing is chosen for this directory.\n" ++
+        "Name one for this run with --preset <name> (presets: a, b), --provider <id> or --offer <id>, or remember a preset for it under directory_presets.\n", .{ directory, config_path });
+}
+
+test "presets: with global_default false, X and Y keep a and b, Z starts on nothing, and none gets a file (#489)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    var mocks = try Mocks.start();
+    defer mocks.stop();
+    var metask = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer metask.stop();
+    for ([_][]const u8{ "work/x/.git", "work/y/.git", "work/y/src/deep", "work/z/.git" }) |dir| try case.tmp.dir.createDirPath(testing.io, dir);
+    const x = try case.path("work/x");
+    const y = try case.path("work/y");
+    const z = try case.path("work/z");
+    const config_path = try case.path("state/config.json");
+    try case.write("state/config.json", try presetConfig(a, &mocks, try std.fmt.allocPrint(a,
+        \\, "directory_presets": {{"{s}": "a", "{s}": "b"}}{s}{s}
+    , .{ x, y, stored_default_of_c, no_global_default })));
+    try case.write("state/.env", "METACODES_PROVIDER=prov-c\nPROV_C_TOKEN=sk-c\n");
+    const untouched = try case.listing("work");
+
+    try expectRequest(try case.runIn(x, &keys, &.{ "-p", "hi" }), mocks.a, 1, "/a/v1/chat/completions", "sk-a", "a-model");
+    try expectRequest(try case.runIn(try case.path("work/y/src/deep"), &keys, &.{ "-p", "hi" }), mocks.b, 1, "/b/v1/chat/completions", "sk-b", "b-model");
+
+    const metask_url = try metask.urlOwned(a);
+    const every_global_level = [_][]const u8{
+        keys[0],
+        keys[1],
+        keys[2],
+        keys[3],
+        "METASK_API_KEY=mk-never-sent",
+        try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{metask_url}),
+    };
+    const unchosen = try case.runIn(z, &every_global_level, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ unchosen.exit_code, unchosen.stderr });
+    try testing.expectEqual(@as(i32, 2), unchosen.exit_code);
+    try expectContains(unchosen.stderr, try unchosenError(a, z, config_path));
+    try testing.expectEqual(@as(usize, 2), mocks.total());
+    try testing.expectEqual(@as(usize, 0), metask.requestCount());
+
+    try expectRequest(try case.runIn(z, &keys, &.{ "--preset", "a", "-p", "hi" }), mocks.a, 2, "/a/v1/chat/completions", "sk-a", "a-model");
+    try expectRequest(try case.runIn(z, &(keys ++ [_][]const u8{"METACODES_PRESET=b"}), &.{ "-p", "hi" }), mocks.b, 2, "/b/v1/chat/completions", "sk-b", "b-model");
+    try expectRequest(try case.runIn(z, &keys, &.{ "--provider", "prov-b", "-p", "hi" }), mocks.b, 3, "/b/v1/chat/completions", "sk-b", "b-model");
+
+    const handed = try case.runIn(z, &keys, &.{ "--api-key", "mk-handed", "--base-url", metask_url, "--model", "claude-sonnet-4-6", "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ handed.exit_code, handed.stderr });
+    try testing.expectEqual(@as(i32, 0), handed.exit_code);
+    try testing.expectEqual(@as(usize, 1), metask.requestCount());
+    try expectContains((metask.lastRequest() orelse return error.NoRequestCaptured).raw, "mk-handed");
+
+    try testing.expectEqual(@as(usize, 0), mocks.c.requestCount());
+    try testing.expectEqualStrings(untouched, try case.listing("work"));
+}
+
+test "presets: global_default false is read past a malformed preset, and a config.json that is not JSON leaves it off (#489)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    var metask = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    defer metask.stop();
+    try case.tmp.dir.createDirPath(testing.io, "work/z/.git");
+    const z = try case.path("work/z");
+    const config_path = try case.path("state/config.json");
+    const signed_in = [_][]const u8{
+        "METASK_API_KEY=mk-from-shell",
+        try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try metask.urlOwned(a)}),
+    };
+
+    try case.write("state/config.json", "{\"presets\": {\"a\": \"not a selection\"}, \"global_default\": false}");
+    const malformed = try case.runIn(z, &signed_in, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ malformed.exit_code, malformed.stderr });
+    try testing.expectEqual(@as(i32, 2), malformed.exit_code);
+    try expectContains(malformed.stderr, try std.fmt.allocPrint(a, "error: {s} cannot be read (InvalidPreset), so no preset can be looked up, and it sets \"global_default\": false, so nothing is chosen for this directory.\n" ++
+        "Name one for this run with --provider <id> or --offer <id>, or correct {s}.\n", .{ config_path, config_path }));
+    try testing.expectEqual(@as(usize, 0), metask.requestCount());
+
+    try case.write("state/config.json", "{\"global_default\": false");
+    const not_json = try case.runIn(z, &signed_in, &.{ "--model", "claude-sonnet-4-6", "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ not_json.exit_code, not_json.stderr });
+    try testing.expectEqual(@as(i32, 0), not_json.exit_code);
+    try expectContains(not_json.stderr, "config.json could not be read");
+    try testing.expectEqual(@as(usize, 1), metask.requestCount());
+    try expectContains((metask.lastRequest() orelse return error.NoRequestCaptured).raw, "mk-from-shell");
+}
+
+test "presets: login status says global_default is false and which levels it leaves out (#489)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    var mocks = try Mocks.start();
+    defer mocks.stop();
+    for ([_][]const u8{ "work/x/.git", "work/z/.git" }) |dir| try case.tmp.dir.createDirPath(testing.io, dir);
+    const x = try case.path("work/x");
+    const z = try case.path("work/z");
+    const config_path = try case.path("state/config.json");
+    try case.write("state/config.json", try presetConfig(a, &mocks, try std.fmt.allocPrint(a,
+        \\, "directory_presets": {{"{s}": "a"}}{s}{s}
+    , .{ x, stored_default_of_c, no_global_default })));
+    try case.write("state/.env", "METACODES_PROVIDER=prov-c\nPROV_C_TOKEN=sk-c\n");
+    const mode_line = try std.fmt.allocPrint(a, "global_default is false in {s}: levels 4 to 6 choose for no directory.\n", .{config_path});
+
+    const in_z = try case.runIn(z, &.{"METASK_API_KEY=mk-never-sent"}, &.{ "login", "status" });
+    try testing.expectEqual(@as(i32, 0), in_z.exit_code);
+    const out = in_z.stderr;
+    try expectContains(out, try std.fmt.allocPrint(a, "This start uses no provider: {s} remembers no preset, and global_default is false.\n", .{z}));
+    try expectContains(out, mode_line);
+    try expectContains(out, "Level 7 of 7 decided; the first that applies wins:\n");
+    try expectContains(out, try std.fmt.allocPrint(a, "  3 this directory ({s}): remembers no preset\n", .{z}));
+    try expectContains(out, "  4 stored default: not consulted, global_default is false\n");
+    try expectContains(out, "      METASK_API_KEY: set in the shell\n      not consulted: global_default is false\n");
+    try expectContains(out, "; configures Prov C\n      not consulted: global_default is false\n");
+    try expectContains(out, "> 7 nothing: the TUI opens without a model; -p and the rest stop\n");
+    try expectAbsent(out, "mk-never-sent");
+
+    const in_x = try case.runIn(x, &.{"PROV_A_TOKEN=sk-a"}, &.{ "login", "status" });
+    try expectContains(in_x.stderr, try std.fmt.allocPrint(a, "This start uses the preset a, remembered for {s}: Prov A · a-model.\n", .{x}));
+    try expectContains(in_x.stderr, mode_line);
+    try expectContains(in_x.stderr, "Level 3 of 7 decided");
+    try testing.expectEqual(@as(usize, 0), mocks.total());
+}

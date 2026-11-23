@@ -217,6 +217,7 @@ pub const DocumentError = error{
     /// (#489). Read from a file, such an entry is kept: the start that would
     /// use it reports it instead.
     UnknownPreset,
+    InvalidGlobalDefault,
     OutOfMemory,
 };
 
@@ -237,6 +238,7 @@ pub const Document = struct {
     /// Directories that remember a preset (#489), in the order the file
     /// lists them.
     directory_presets: std.ArrayList(DirectoryPreset) = .empty,
+    global_default: ?bool = null,
     /// Idempotency keys of the most recent commits, oldest first. A retry
     /// carrying any retained key is a no-op instead of a second revision bump.
     recent_operations: [MAX_RECENT_OPERATIONS]OperationId = undefined,
@@ -449,6 +451,7 @@ pub const Document = struct {
             .{ .key = "session_selection", .json = session },
             .{ .key = "presets", .json = presets },
             .{ .key = "directory_presets", .json = directory_presets },
+            .{ .key = "global_default", .json = if (self.global_default) |on| (if (on) "true" else "false") else null },
             .{ .key = "recent_operation_ids", .json = operations },
         }, members) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -841,6 +844,7 @@ fn parseInto(document: *Document, allocator: std.mem.Allocator, text: []const u8
 
     if (root.object.get("presets")) |value| try parsePresets(document, allocator, value);
     if (root.object.get("directory_presets")) |value| try parseDirectoryPresets(document, allocator, value);
+    if (root.object.get("global_default")) |value| document.global_default = try parseGlobalDefault(value);
 
     if (root.object.get("recent_operation_ids")) |list| {
         if (list != .array) return error.InvalidDocument;
@@ -887,6 +891,26 @@ fn parseDirectoryPresets(document: *Document, allocator: std.mem.Allocator, valu
         errdefer allocator.free(owned);
         try document.directory_presets.append(allocator, .{ .path = owned, .preset = name });
     }
+}
+
+fn parseGlobalDefault(value: std.json.Value) DocumentError!?bool {
+    return switch (value) {
+        .null => null,
+        .bool => |on| on,
+        else => error.InvalidGlobalDefault,
+    };
+}
+
+pub fn globalDefaultIn(allocator: std.mem.Allocator, text: []const u8) ?bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{}) catch return null;
+    if (root != .object) return null;
+    const value = root.object.get("global_default") orelse return null;
+    return switch (value) {
+        .bool => |on| on,
+        else => null,
+    };
 }
 
 fn parseProvider(key: []const u8, value: std.json.Value) DocumentError!ProviderEntry {
@@ -1823,4 +1847,61 @@ test "an invalid preset or directory entry fails with a typed error" {
     try std.testing.expectError(error.InvalidDirectoryPreset, document.setDirectoryPreset("work/x", "a"));
     try std.testing.expectError(error.InvalidPresetName, parsePresetName("x" ** (MAX_PRESET_NAME_LEN + 1)));
     _ = try parsePresetName("Client_A.v2-1");
+}
+
+test "global_default round-trips as the file has it, and another writer's commit keeps it (#489)" {
+    const a = std.testing.allocator;
+    const original =
+        \\{"theme":"dark","global_default":false,"directory_presets":{"/work/x":"kimi"}}
+    ;
+    var document = try parse(a, original);
+    defer document.deinit();
+    try std.testing.expectEqual(@as(?bool, false), document.global_default);
+
+    document.global_selection = try RuntimeSelection.auto("deepseek-v4-pro", .{}, .global);
+    const merged = try document.merge(original);
+    defer a.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"global_default\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"dark\"") != null);
+    var reloaded = try parse(a, merged);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(?bool, false), reloaded.global_default);
+    try std.testing.expect(reloaded.global_selection != null);
+
+    reloaded.global_default = true;
+    const on = try reloaded.merge(merged);
+    defer a.free(on);
+    try std.testing.expect(std.mem.indexOf(u8, on, "\"global_default\": true") != null);
+
+    reloaded.global_default = null;
+    const removed = try reloaded.merge(on);
+    defer a.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "global_default") == null);
+
+    var absent = try parse(a, "{\"theme\":\"dark\"}");
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(?bool, null), absent.global_default);
+    var spelled_null = try parse(a, "{\"global_default\":null}");
+    defer spelled_null.deinit();
+    try std.testing.expectEqual(@as(?bool, null), spelled_null.global_default);
+}
+
+test "a global_default that is not a boolean fails with a typed error, and is read on its own when the rest is invalid (#489)" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"global_default\":\"false\"}",
+        "{\"global_default\":0}",
+        "{\"global_default\":{}}",
+    }) |text| {
+        try std.testing.expectError(error.InvalidGlobalDefault, parse(a, text));
+        try std.testing.expectEqual(@as(?bool, null), globalDefaultIn(a, text));
+    }
+
+    const broken_preset = "{\"presets\":{\"kimi\":\"kimi-k3.1-pro\"},\"global_default\":false}";
+    try std.testing.expectError(error.InvalidPreset, parse(a, broken_preset));
+    try std.testing.expectEqual(@as(?bool, false), globalDefaultIn(a, broken_preset));
+    try std.testing.expectEqual(@as(?bool, true), globalDefaultIn(a, " {\"global_default\":true}\n"));
+    try std.testing.expectEqual(@as(?bool, null), globalDefaultIn(a, "{\"global_default\":false"));
+    try std.testing.expectEqual(@as(?bool, null), globalDefaultIn(a, "[false]"));
+    try std.testing.expectEqual(@as(?bool, null), globalDefaultIn(a, ""));
 }

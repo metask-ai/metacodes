@@ -70,6 +70,14 @@ pub const Unbound = union(enum) {
     missing_credential: ids.Slug,
     /// `/logout` (#485) left nothing to fall back to: no `.env` provider.
     signed_out,
+    directory_unchosen: DirectoryUnchosen,
+};
+
+pub const DirectoryUnchosen = struct {
+    directory: []const u8 = "",
+    config_path: []const u8 = "",
+    presets: []const []const u8 = &.{},
+    unreadable: ?[]const u8 = null,
 };
 
 pub const RouteState = union(enum) {
@@ -126,6 +134,7 @@ pub const Reminder = struct {
     /// display name: the file does not choose, so the reminder points to
     /// `/model`, where choosing one is the choice.
     unchosen_local: []const []const u8 = &.{},
+    command: []const u8 = "metacodes",
 };
 
 /// The red reminder a submission in the unbound state gets, one line per
@@ -141,6 +150,7 @@ pub fn writeReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void {
         .metask_login_incomplete => try w.writeAll("No model is set up: the Metask sign-in has no API key and model chosen yet.\n"),
         .signed_out => try w.writeAll("No model is set up: you signed out of Metask.\n"),
         .missing_credential => return writeMissingReminder(w, r),
+        .directory_unchosen => |unchosen| return writeDirectoryReminder(w, r, unchosen),
     }
     try w.writeAll("  Sign in to Metask:            /login\n");
     if (r.unchosen_local.len > 0 and r.env_path.len > 0) {
@@ -194,6 +204,31 @@ fn writeMissingReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void
     }
     if (missing.login_id) |id| try w.print("  Or store a key for it:        /login {s}\n", .{id});
     try w.writeAll("  Or choose another model:      /model\n");
+    try w.print("  How to: {s}\n", .{r.guide_url});
+}
+
+fn writeDirectoryReminder(w: *std.Io.Writer, r: Reminder, unchosen: DirectoryUnchosen) std.Io.Writer.Error!void {
+    const config_path = if (unchosen.config_path.len > 0) unchosen.config_path else "config.json";
+    if (unchosen.unreadable) |why| {
+        try w.print("No model is chosen for this directory: {s} cannot be read ({s}), so no preset can be looked up, and global_default is off.\n", .{ config_path, why });
+        try w.writeAll("  Choose one for this session:  /model\n");
+        try w.print("  How to: {s}\n", .{r.guide_url});
+        return;
+    }
+    try w.writeAll("No model is chosen for this directory: it remembers no preset, and global_default is off.\n");
+    try w.writeAll("  Choose one for this session:  /model\n");
+    try w.print("  Or start with a preset:       {s} --preset <name>", .{r.command});
+    if (unchosen.presets.len > 0) {
+        try w.writeAll(" (presets: ");
+        try writeList(w, unchosen.presets);
+        try w.writeAll(")");
+    }
+    try w.writeAll("\n");
+    if (unchosen.directory.len > 0) {
+        try w.writeAll("  Or remember one here:         ");
+        try std.json.Stringify.encodeJsonString(unchosen.directory, .{}, w);
+        try w.print(": \"<name>\" under directory_presets in {s}\n", .{config_path});
+    }
     try w.print("  How to: {s}\n", .{r.guide_url});
 }
 
@@ -394,4 +429,66 @@ test "environment keys: declared aliases the environment sets, once each, Metask
     try testing.expect(std.mem.indexOf(u8, joined.items, "METASK_API_KEY") == null);
     // Each name once, however many profiles declare it.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, joined.items, "DEEPSEEK_API_KEY "));
+}
+
+test "the reminder for a directory global_default leaves unchosen names /model, the presets and where to remember one (#489)" {
+    const text = try reminderText(.{
+        .reason = .{ .directory_unchosen = .{
+            .directory = "/Users/you/src/z",
+            .config_path = "/Users/you/.metacodes/config.json",
+            .presets = &.{ "a", "b" },
+        } },
+        .env_path = "/Users/you/.metacodes/.env",
+        .template = true,
+        .guide_url = "https://guide#presets",
+        .environment_keys = &.{"DEEPSEEK_API_KEY"},
+        .unchosen_local = &.{"DeepSeek"},
+        .command = "metacodes-dev",
+    });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        \\No model is chosen for this directory: it remembers no preset, and global_default is off.
+        \\  Choose one for this session:  /model
+        \\  Or start with a preset:       metacodes-dev --preset <name> (presets: a, b)
+        \\  Or remember one here:         "/Users/you/src/z": "<name>" under directory_presets in /Users/you/.metacodes/config.json
+        \\  How to: https://guide#presets
+        \\
+    , text);
+    var line_buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings(not_set_line, modelLine(&line_buffer, .{ .unbound = .{ .directory_unchosen = .{} } }, "m"));
+
+    const bare = try reminderText(.{
+        .reason = .{ .directory_unchosen = .{ .directory = "C:\\work\\z \"q\"" } },
+        .env_path = "",
+        .template = false,
+        .guide_url = "https://guide#presets",
+    });
+    defer testing.allocator.free(bare);
+    try testing.expectEqualStrings(
+        \\No model is chosen for this directory: it remembers no preset, and global_default is off.
+        \\  Choose one for this session:  /model
+        \\  Or start with a preset:       metacodes --preset <name>
+        \\  Or remember one here:         "C:\\work\\z \"q\"": "<name>" under directory_presets in config.json
+        \\  How to: https://guide#presets
+        \\
+    , bare);
+
+    const nowhere = try reminderText(.{ .reason = .{ .directory_unchosen = .{} }, .env_path = "", .template = false, .guide_url = "g" });
+    defer testing.allocator.free(nowhere);
+    try testing.expect(std.mem.indexOf(u8, nowhere, "Or remember one here") == null);
+    try testing.expect(std.mem.indexOf(u8, nowhere, "/login") == null);
+
+    const unreadable = try reminderText(.{
+        .reason = .{ .directory_unchosen = .{ .directory = "/w/z", .config_path = "/s/config.json", .presets = &.{"a"}, .unreadable = "InvalidPreset" } },
+        .env_path = "/s/.env",
+        .template = false,
+        .guide_url = "https://guide#presets",
+    });
+    defer testing.allocator.free(unreadable);
+    try testing.expectEqualStrings(
+        \\No model is chosen for this directory: /s/config.json cannot be read (InvalidPreset), so no preset can be looked up, and global_default is off.
+        \\  Choose one for this session:  /model
+        \\  How to: https://guide#presets
+        \\
+    , unreadable);
 }
