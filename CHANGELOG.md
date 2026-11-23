@@ -229,6 +229,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A Metask key in `.env` no longer outranks the preset the same file
+  names** (#748, part of #489). A `<state root>/.env` with
+  `METACODES_PRESET=fast` (a DeepSeek preset, say) and `METASK_API_KEY`
+  started on Metask, without a word: the file's key counted as a Metask
+  sign-in (level 5 of the startup order) unless its `METACODES_PROVIDER`
+  named another provider, so the file's own preset (level 6) was never
+  reached. The file's preset now counts as its choice too: the key signs
+  Metask in only when that preset's route is Metask, and otherwise waits
+  until Metask is chosen, as beside `METACODES_PROVIDER`. A preset
+  `config.json` does not define holds the key back as well, so the start
+  reports the name instead of quietly using Metask. `metacodes login
+  status` says why the key waits.
+
 - **On Windows a sign-in opens its whole URL in the browser** (#727). The
   browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
   command at the first `&`: the browser got `…/oauth/authorize?response_type=code`

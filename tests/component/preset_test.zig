@@ -608,3 +608,39 @@ test "presets: login status says global_default is false and which levels it lea
     try expectContains(in_x.stderr, "Level 3 of 7 decided");
     try testing.expectEqual(@as(usize, 0), mocks.total());
 }
+
+test "presets: a Metask key in .env waits while the same file's preset is not on Metask (#748)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena();
+    var mocks = try Mocks.start();
+    defer mocks.stop();
+    const env_path = try case.path("state/.env");
+    const config_path = try case.path("state/config.json");
+    const every_route_at_b = try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}/b/v1", .{try originOf(a, mocks.b)});
+
+    try case.write("state/config.json", try presetConfig(a, &mocks, ""));
+    try case.write("state/.env", "METACODES_PRESET=b\nPROV_B_TOKEN=sk-b\nMETASK_API_KEY=mk-file-key\n");
+    const status = try case.run(&.{}, &.{ "login", "status" });
+    try expectContains(status.stderr, try std.fmt.allocPrint(a, "This start uses the preset b from {s}: Prov B · b-model.\n", .{env_path}));
+    try expectContains(status.stderr, "Level 6 of 7 decided");
+    try expectContains(status.stderr, try std.fmt.allocPrint(a, "      METASK_API_KEY: set in {s}, for when Metask is chosen (the file's preset b is not on Metask)\n", .{env_path}));
+    try expectAbsent(status.stderr, "mk-file-key");
+    try expectRequest(try case.run(&.{ every_route_at_b, "METACODES_LOG=openai:info" }, &.{ "-p", "hi" }), mocks.b, 1, "/b/v1/chat/completions", "sk-b", "b-model");
+
+    try case.write("state/.env", "METACODES_PRESET=nope\nMETASK_API_KEY=mk-file-key\n");
+    const unknown = try case.run(&.{every_route_at_b}, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ unknown.exit_code, unknown.stderr });
+    try testing.expectEqual(@as(i32, 2), unknown.exit_code);
+    try expectContains(unknown.stderr, try std.fmt.allocPrint(a, "error: METACODES_PRESET=nope in {s}: {s} defines no such preset (presets: a, b).", .{ env_path, config_path }));
+    try testing.expectEqual(@as(usize, 1), mocks.total());
+
+    try case.write("state/config.json", "{\"presets\": {\"m\": {\"target\": {\"kind\": \"auto_route\", \"selector\": \"claude-sonnet-4-6\"}}}}");
+    try case.write("state/.env", "METACODES_PRESET=m\nMETASK_API_KEY=mk-file-key\n");
+    const on_metask = try case.run(&.{}, &.{ "login", "status" });
+    try expectContains(on_metask.stderr, "This start uses Metask with METASK_API_KEY from .env.\n");
+    try expectContains(on_metask.stderr, "Level 5 of 7 decided");
+    try expectContains(on_metask.stderr, try std.fmt.allocPrint(a, "      METASK_API_KEY: set in {s}\n", .{env_path}));
+}

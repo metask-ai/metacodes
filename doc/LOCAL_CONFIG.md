@@ -115,7 +115,7 @@ first one is the one to use; the others are accepted too):
 | MiniMax (`minimax`) | `MINIMAX_API_KEY` |
 | Amazon Bedrock (`bedrock`) | `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) |
 | OpenRouter (`openrouter`) | `OPENROUTER_API_KEY` (`/login openrouter` signs in on OpenRouter instead and stores the key it creates) |
-| Metask (`metask`) | `METASK_API_KEY` (see [the order below](#which-provider-and-model-are-used): it counts as a Metask sign-in unless the file names another provider) |
+| Metask (`metask`) | `METASK_API_KEY` (see [the order below](#which-provider-and-model-are-used): it counts as a Metask sign-in unless the file chooses something else, another provider or a preset that is not on Metask) |
 
 A provider you define in `config.json` (`custom_providers`: written by
 `metacodes providers add`, see [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own),
@@ -200,9 +200,11 @@ At start, metacodes takes the first of these that applies:
 5. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, a key in
    `auth.json`, or the Metask session `metacodes login` (or `/login`) stored
    in `oauth/metask.json`; a key comes before the session. `METASK_API_KEY` in this
-   file counts too, unless the file's `METACODES_PROVIDER` names another
-   provider: the provider the file names is its choice, and a Metask key
-   beside it does not overrule that.
+   file counts too, unless the file chooses something else: its
+   `METACODES_PRESET` (a preset whose route is not Metask, or one
+   `config.json` does not define), or a `METACODES_PROVIDER` naming another
+   provider. What the file chooses is its choice, and a Metask key beside it
+   does not overrule that: it is kept for when Metask is chosen.
 6. **What this file chooses**: its `METACODES_PRESET`, else its
    `METACODES_PROVIDER`, or, when it names neither, the one provider whose
    key the file holds.

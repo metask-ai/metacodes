@@ -1060,15 +1060,29 @@ fn shadowedLocalNotice(arena: std.mem.Allocator, local: presets_mod.LocalRoute) 
 }
 
 /// `METASK_API_KEY` in `<state root>/.env`, for the historical path: it
-/// counts as the environment variable only while the file names no provider
-/// other than Metask (#486). A file that says METACODES_PROVIDER=deepseek
-/// chose DeepSeek; a Metask key beside it is there for when Metask is chosen
-/// (`--provider metask`, `/model`), and must not sign the start in, take the
-/// legacy route, or outrank auth.json.
-fn localSignInKey(allocator: std.mem.Allocator, local: *const state_env_mod.Loaded) ?[]const u8 {
+/// counts as the environment variable only while the file chooses nothing
+/// but Metask (#486, #748): its METACODES_PRESET when config.json defines it,
+/// else its METACODES_PROVIDER. A file that says METACODES_PROVIDER=deepseek,
+/// or names a DeepSeek preset, chose DeepSeek; a Metask key beside it is there
+/// for when Metask is chosen (`--provider metask`, `/model`), and must not
+/// sign the start in, take the legacy route, or outrank auth.json.
+fn localSignInKey(allocator: std.mem.Allocator, local: *const state_env_mod.Loaded, presets: *const presets_mod.Facts) ?[]const u8 {
     const key = local.get(auth.METASK_API_KEY_ENV) orelse return null;
+    switch (presets.local_preset) {
+        .none => {},
+        .found => |found| return if (localPresetOnMetask(allocator, presets, found.name)) key else null,
+        .unknown => if (local.get(state_env_mod.provider_variable) == null) return null,
+    }
     const named = local.get(state_env_mod.provider_variable) orelse return key;
     return if (providerIsMetask(allocator, named)) key else null;
+}
+
+fn localPresetOnMetask(allocator: std.mem.Allocator, presets: *const presets_mod.Facts, name: []const u8) bool {
+    const selection = presets.selection(name) orelse return false;
+    const host = buildProviderHost(allocator) orelse return false;
+    defer host.destroy();
+    const resolved = (presets_mod.resolveLocal(allocator, &host.registry, .{ .preset = .{ .name = name, .selection = selection.* } }) catch return false) orelse return false;
+    return resolved.route.provider_id.eqlText("metask");
 }
 
 /// An environment variable's value, with an empty one treated as unset.
@@ -1429,10 +1443,6 @@ pub fn main(init: std.process.Init) !void {
     const tui_owns_stderr = interactiveRepl(config) and !config.verbose and platform_term.isatty(2);
     if (!tui_owns_stderr) warnLocalConfig(allocator, &local_config, .stderr);
     config.credential_env_fallback = local_config.lookup();
-    // The file's METASK_API_KEY as the historical path reads it: everywhere
-    // that path looks (the sign-in check, the legacy route, credential
-    // resolution), or nowhere — never only some of them (localSignInKey).
-    const local_metask_key = localSignInKey(allocator, &local_config);
 
     // --- provider 选择 ---
     // issue #16:命名一个 provider profile 时走 registry 解析出**真实路由**
@@ -1447,7 +1457,7 @@ pub fn main(init: std.process.Init) !void {
     //   4. the default stored by /model (config.json `global_selection`);
     //   5. a Metask sign-in: --api-key, METASK_API_KEY, auth.json — the
     //      historical path. The file's METASK_API_KEY counts only while the
-    //      file names no provider other than Metask;
+    //      file chooses nothing but Metask (its preset or its provider);
     //   6. `<state root>/.env`: its preset, else the provider it configures;
     //   7. none: the historical path stops at credential resolution.
     // A file that simply fed the environment would put its
@@ -1467,6 +1477,10 @@ pub fn main(init: std.process.Init) !void {
     // The levels, decided once from what they read (src/app/startup_order.zig;
     // `metacodes login status` shows the same decision).
     const preset_facts = presetFacts(allocator, config, &local_config, false);
+    // The file's METASK_API_KEY as the historical path reads it: everywhere
+    // that path looks (the sign-in check, the legacy route, credential
+    // resolution), or nowhere — never only some of them (localSignInKey).
+    const local_metask_key = localSignInKey(allocator, &local_config, &preset_facts);
     const startup_facts = startupFacts(allocator, config, &local_config, local_metask_key, &preset_facts);
     const startup_decision = startup_order.decide(startup_facts);
     const metask_legacy_requested = startup_facts.metask_key_requested;
@@ -3845,7 +3859,6 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
 
     var local_config = loadLocalConfig(allocator, arena, state_dir);
     defer local_config.deinit();
-    const local_metask_key = localSignInKey(arena, &local_config);
     // A start with no flag: level 1 is the environment's alone.
     var config: types.Config = .{};
     config.state_root = state_dir;
@@ -3853,6 +3866,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     applyAuthPrecedenceEnv(&config);
     if (std.c.getenv("METACODES_PROVIDER")) |raw| config.provider_profile = std.mem.span(raw);
     const preset_facts = presetFacts(arena, config, &local_config, true);
+    const local_metask_key = localSignInKey(arena, &local_config, &preset_facts);
     const facts = startupFacts(arena, config, &local_config, local_metask_key, &preset_facts);
     const decision = startup_order.decide(facts);
 
@@ -3986,7 +4000,15 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     } else if (local_metask_key != null) {
         std.debug.print("      METASK_API_KEY: set in {s}\n", .{env_path});
     } else if (local_config.get(auth.METASK_API_KEY_ENV) != null) {
-        std.debug.print("      METASK_API_KEY: set in {s}, for when Metask is chosen (the file names another provider)\n", .{env_path});
+        const waits_for: []const u8 = switch (preset_facts.local_preset) {
+            .found => |found| std.fmt.allocPrint(arena, "the file's preset {s} is not on Metask", .{found.name}) catch "the file chooses another provider",
+            .unknown => |name| if (local_config.get(state_env_mod.provider_variable) != null)
+                "the file names another provider"
+            else
+                std.fmt.allocPrint(arena, "the file names the preset {s}", .{name}) catch "the file names a preset",
+            .none => "the file names another provider",
+        };
+        std.debug.print("      METASK_API_KEY: set in {s}, for when Metask is chosen ({s})\n", .{ env_path, waits_for });
     } else {
         std.debug.print("      METASK_API_KEY: not set\n", .{});
     }

@@ -222,3 +222,29 @@ def test_with_global_default_off_logout_leaves_the_session_without_a_model(bin_p
         assert "Switched to" not in screen, screen
         assert [authorization for authorization, _ in mock.messages] == [f"Bearer {ACCESS_TOKEN}"], mock.messages
         assert relay.requests == [], relay.requests
+
+
+FILE_METASK_KEY = "sk-metask-in-env-tty-0003"
+
+
+def test_a_metask_key_beside_the_env_preset_waits_and_the_preset_answers(bin_path):
+    with _Relay() as relay:
+        home = case_tmpdir("cc-tty-preset-")
+        state = os.path.join(home, ".metacodes")
+        os.makedirs(state, exist_ok=True)
+        config = relay.config()
+        config["presets"] = {"fast": {"target": {"kind": "auto_route", "selector": "relay-model"}}}
+        with open(os.path.join(state, "config.json"), "w") as f:
+            json.dump(config, f)
+        with open(os.path.join(state, ".env"), "w") as f:
+            f.write(f"METACODES_PRESET=fast\nHOUSE_RELAY_TOKEN={RELAY_KEY}\nMETASK_API_KEY={FILE_METASK_KEY}\n")
+        env = {name: None for name in KEY_VARIABLES}
+        env.update({"HOME": home, "METACODES_HOME": None, "METACODES_JEV_URL": "off", "HOUSE_RELAY_TOKEN": None})
+        every_route_at_the_relay = config["custom_providers"]["house-relay"]["channels"][0]["base_url"]
+        work = case_tmpdir("cc-tty-preset-work-")
+        raw = run(bin_path, submit("hi", "RELAY_REPLY"), env=env, base_url=every_route_at_the_relay, cwd=work,
+                  term_size=(30, 140))
+        a = TTYAssert(raw, rows=30, cols=140)
+        a.assert_prose_contains("relay-model · from .env")
+        assert relay.requests == [("/relay/v1/chat/completions", f"Bearer {RELAY_KEY}", "relay-model")], relay.requests
+        assert FILE_METASK_KEY.encode() not in raw
