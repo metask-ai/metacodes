@@ -279,6 +279,8 @@ class CatalogTest(unittest.TestCase):
                 self.assertRegex(source["retrieved"], r"^\d{4}-\d{2}-\d{2}$")
                 self.assertTrue(source["name"] and source["metric"])
                 self.assertTrue(board["entries"])
+                for suite_id in board["suites"] if board.get("tasks") else ():
+                    self.assertLessEqual(set(board["tasks"]), set(suites.BY_ID[suite_id].tasks))
                 for entry in board["entries"]:
                     self.assertTrue(entry["harness"])
                     self.assertTrue(0 <= entry["score"] <= 100)

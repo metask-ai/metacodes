@@ -28,7 +28,6 @@ RUNTIME_ROOT = Path(__file__).resolve().parents[4]
 READ_ONLY = "当前服务为只读模式"
 READ_ONLY_CATALOG = {"service": "metacodes-bench", "schema_version": 1, "ready": False,
                      "reasons": [READ_ONLY], "runs": []}
-LEADERBOARD_SUMMARY = ("pass_rate", "pass_rate_ci95", "cost_per_task", "tasks_attempted", "tasks_solved", "trials", "valid")
 RANKED_COVERAGE = 0.8
 ATTEMPT_FIELDS = ("trial", "status", "cause", "reward", "attempt_number", "first_attempt", "total_tokens",
                   "initial_input_tokens", "input_tokens", "output_tokens", "elapsed_s", "turns", "tool_calls", "tests")
@@ -75,6 +74,23 @@ def latest_results(record, views):
                 history.setdefault(key, []).append(latest[key][1])
             latest[key] = (item, view["name"], rows)
     return latest, history
+
+
+def board_job(view, tasks):
+    """A finished job on a published board's tasks (None: all of them): the
+    mean reward of its finished trials, an invalid trial counting 0, and the
+    mean over tasks of each task's mean priced cost."""
+    rows = [r for r in view["rows"] if r["status"] != "running" and (tasks is None or r["task"] in tasks)]
+    if not rows:
+        return None
+    costs: Dict[str, list] = {}
+    for row in rows:
+        if row.get("cost_usd") is not None:
+            costs.setdefault(row["task"], []).append(row["cost_usd"])
+    return {"name": view["name"], "model": view.get("model"), "profile": view.get("profile"),
+            "started_at": view.get("started_at"), "trials": len(rows), "tasks": len({r["task"] for r in rows}),
+            "score": sum(r.get("reward") or 0 for r in rows) / len(rows),
+            "cost_per_task": _mean([sum(c) / len(c) for c in costs.values()])}
 
 
 def library_for(roots, manager=None) -> StoreLibrary:
@@ -239,8 +255,9 @@ class Workbench:
 
     def leaderboard(self, suite_id=None) -> Optional[Dict[str, Any]]:
         """Published boards of one suite (default: the first that has any) and
-        this workbench's finished jobs on it. Jobs that scored at least
-        RANKED_COVERAGE of the suite's tasks are ranked; the rest are listed."""
+        this workbench's finished jobs on each. A job scores the mean reward
+        of its finished trials on the board's tasks, an invalid trial counting
+        0; it is ranked when it covers at least RANKED_COVERAGE of them."""
         published = leaderboards.boards()
         listed = [s.id for s in suites.ALL if any(s.id in b["suites"] for b in published)]
         suite_id = suite_id or (listed[0] if listed else None)
@@ -250,19 +267,21 @@ class Workbench:
         task_count = len(suite.tasks) if suite.tasks else suite.max_tasks
         self.library.maybe_sync()
         runs = self.runs()
-        jobs = []
-        for name in self.library.job_names():
-            view = self.job_view(name, False, runs)
-            if not view or view.get("suite") != suite_id or view["running"] or view["summary"]["pass_rate"] is None:
-                continue
-            summary = {k: view["summary"].get(k) for k in LEADERBOARD_SUMMARY}
-            jobs.append({"name": view["name"], "model": view.get("model"), "profile": view.get("profile"),
-                         "started_at": view.get("started_at"), "summary": summary,
-                         "ranked": (summary["tasks_attempted"] or 0) >= RANKED_COVERAGE * task_count})
-        jobs.sort(key=lambda job: job["summary"]["pass_rate"], reverse=True)
+        views = [view for view in (self.job_view(name, True, runs) for name in self.library.job_names())
+                 if view and view.get("suite") == suite_id and not view["running"]]
+        boards, ranked_anywhere = [], set()
+        for board in (b for b in published if suite_id in b["suites"]):
+            tasks = set(board["tasks"]) if board.get("tasks") else None
+            needed = RANKED_COVERAGE * (len(tasks) if tasks else task_count)
+            jobs = [job for job in (board_job(view, tasks) for view in views) if job]
+            for job in jobs:
+                job["ranked"] = job["tasks"] >= needed
+                if job["ranked"]:
+                    ranked_anywhere.add(job["name"])
+            boards.append({**board, "jobs": sorted(jobs, key=lambda job: job["score"], reverse=True)})
+        unranked = [job for job in (board_job(view, None) for view in views) if job and job["name"] not in ranked_anywhere]
         return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "task_count": task_count,
-                "ranked_coverage": RANKED_COVERAGE, "boards": [b for b in published if suite_id in b["suites"]],
-                "jobs": jobs}
+                "ranked_coverage": RANKED_COVERAGE, "boards": boards, "unranked": unranked}
 
     def job(self, name) -> Optional[Dict[str, Any]]:
         self.library.maybe_sync()

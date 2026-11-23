@@ -2238,11 +2238,42 @@
      "cost_per_task_usd": 0.1418,
      "date": "2026-04-16"
     }
+   ],
+   "tasks": [
+    "aime_60",
+    "aime_61",
+    "aime_62",
+    "aime_63",
+    "aime_64",
+    "aime_65",
+    "aime_66",
+    "aime_67",
+    "aime_68",
+    "aime_69",
+    "aime_70",
+    "aime_71",
+    "aime_72",
+    "aime_73",
+    "aime_74",
+    "aime_75",
+    "aime_76",
+    "aime_77",
+    "aime_78",
+    "aime_79",
+    "aime_80",
+    "aime_81",
+    "aime_82",
+    "aime_83",
+    "aime_84",
+    "aime_85",
+    "aime_86",
+    "aime_87",
+    "aime_88",
+    "aime_89"
    ]
   },
   {
    "suites": [
-    "aime",
     "aime-2025"
    ],
    "title": "Vals.ai AIME 2025",
@@ -2418,7 +2449,6 @@
   },
   {
    "suites": [
-    "aime",
     "aime-2025"
    ],
    "title": "MathArena AIME 2025",

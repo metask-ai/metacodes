@@ -1133,9 +1133,13 @@ same tasks, and where this workbench's jobs land among them. The boards are
 `scripts/eval/harbor/suites/leaderboards.json`: each names the suites whose
 tasks it scored, its source (name, URL, the date it was read, what its score
 means) and its entries (agent or harness, model, score in percent, and the
-standard error, cost per task and date when the source gives them). A
-finished job of the suite whose valid tasks cover at least 80% of it is
-ranked by its pass rate; shorter samples are listed apart. When a board has
+standard error, cost per task and date when the source gives them). A board
+may list `tasks`, the part of the suite it scored (the AIME 2024 board on
+`aime`). On each board a finished job of the suite scores the mean reward of
+its finished trials on the board's tasks, an invalid trial counting 0, with
+cost per task as the mean over tasks of each task's mean priced cost; it is
+ranked when it covers at least 80% of those tasks, and a job ranked on no
+board is listed apart. When a board has
 costs, a scatter plots pass rate against cost per task. Published numbers
 come from other harnesses, runtimes, attempt counts and judges, so a rank is
 a reference, not a like-for-like comparison. To refresh a board, edit its

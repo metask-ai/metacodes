@@ -1246,13 +1246,13 @@ function harnessShape(name) { return SHAPES[(nameHash(name) >>> 9) % SHAPES.leng
 function boardModels(board) {
   return board.model_filter ? [...new Set(board.entries.map((e) => e.model))] : [];
 }
-function boardRows(board, jobs, model) {
+function boardRows(board, model) {
   const pooled = model === board.default_model;
   const published = board.entries.filter((e) => !board.model_filter || e.model === model)
     .map((e, i) => ({ ...e, id: 'p' + i, ours: null }));
-  const ours = jobs.filter((j) => j.ranked && (!board.model_filter || pooled || modelKey(j.model) === modelKey(model)))
-    .map((j) => ({ id: 'o-' + j.name, ours: j, harness: 'metacodes', model: j.model, score: j.summary.pass_rate * 100,
-      stderr: null, cost_per_task_usd: j.summary.cost_per_task, date: (j.started_at || '').slice(0, 10) || null }));
+  const ours = board.jobs.filter((j) => j.ranked && (!board.model_filter || pooled || modelKey(j.model) === modelKey(model)))
+    .map((j) => ({ id: 'o-' + j.name, ours: j, harness: 'metacodes', model: j.model, score: j.score * 100,
+      stderr: null, cost_per_task_usd: j.cost_per_task, date: (j.started_at || '').slice(0, 10) || null }));
   const rows = [...published, ...ours].sort((x, y) => y.score - x.score || Boolean(y.ours) - Boolean(x.ours));
   for (const r of rows) r.rank = 1 + published.filter((o) => o !== r && o.score > r.score).length;
   return { rows, published: published.length };
@@ -1329,7 +1329,7 @@ function costScatter(rows, focus) {
     zone.append(svg('rect', { class: 'kill-zone', x: px(a), y: 100 - py(a), width: 100 - px(a), height: py(a) }),
       svg('path', { class: 'kill-line', d: `M ${px(a)} 100 V ${100 - py(a)} H 100` }));
     tip.replaceChildren(h('b', { text: rowName(a) }), h('span', { text: a.ours ? a.ours.name : a.model || '—' }),
-      h('span', { text: `通过率 ${score(a.score)} · 每题 ${usd(a.cost_per_task_usd)}` }),
+      h('span', { text: `分数 ${score(a.score)} · 每题 ${usd(a.cost_per_task_usd)}` }),
       h('span', { class: 'muted', text: `同时更便宜且更高的点：${points.filter((o) => beats(o, a)).length} 个 · 被它压过：${points.filter((o) => beats(a, o)).length} 个` }));
     tip.style.left = px(a) + '%';
     tip.style.bottom = py(a) + '%';
@@ -1338,7 +1338,7 @@ function costScatter(rows, focus) {
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
   const legend = h('div', { class: 'legend keys scatter-legend' }, [...new Map(points.map((r) => [rowName(r), r])).values()].map((r) =>
     h('span', { class: 'key', onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null) }, markOf(r), rowName(r))));
-  return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '通过率' }), plot,
+  return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
     h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
 function focusHub() {
@@ -1362,20 +1362,20 @@ function leaderCards(rows, published, focus, rowNodes) {
     return el;
   };
   return h('section', { class: 'metrics leaders' },
-    card('通过率最高', best, score(best?.score), best ? `${best.harness} · ${best.model || '—'}` : ''),
+    card('分数最高', best, score(best?.score), best ? `${best.harness} · ${best.model || '—'}` : ''),
     card('成本最低', cheapest, usd(cheapest?.cost_per_task_usd), cheapest ? `${cheapest.harness} · ${cheapest.model || '—'} · ${score(cheapest.score)}` : ''),
     ours ? card('我们的最好名次', ours, `${ours.rank} / ${published + 1}`, `${ours.model || ours.ours.name} · ${score(ours.score)}`)
       : metric('我们的名次', '—'));
 }
-function boardPanel(board, jobs, suiteName) {
+function boardPanel(board, suiteName) {
   const key = board.suites.join(',') + '|' + board.title;
   const models = boardModels(board);
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
-  const { rows, published } = boardRows(board, jobs, model);
+  const { rows, published } = boardRows(board, model);
   const focus = focusHub();
   const src = board.source;
   const picker = models.length ? h('label', { class: 'scope' }, '模型 ',
-    h('select', { onchange: (e) => { state.boardModel[key] = e.target.value; e.target.closest('.panel').replaceWith(boardPanel(board, jobs, suiteName)); } },
+    h('select', { onchange: (e) => { state.boardModel[key] = e.target.value; e.target.closest('.panel').replaceWith(boardPanel(board, suiteName)); } },
       models.map((m) => h('option', { value: m, selected: m === model, text: m === board.default_model ? `${m}（汇总）` : m })))) : null;
   const head = h('div', { class: 'board-source' },
     h('a', { href: src.url, target: '_blank', rel: 'noopener noreferrer', text: src.name }),
@@ -1390,7 +1390,7 @@ function boardPanel(board, jobs, suiteName) {
   h('td', { text: r.model || '—' }),
   h('td', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%;background:${rowColor(r)}` })),
     h('b', { class: 'num', text: score(r.score) }),
-    r.ours ? h('span', { class: 'sub', text: `${ciText(r.ours.summary.pass_rate_ci95)} · ${r.ours.summary.tasks_attempted} 题` })
+    r.ours ? h('span', { class: 'sub', text: `${r.ours.tasks} 题 · ${r.ours.trials} 次` })
       : r.stderr !== null && r.stderr !== undefined ? h('span', { class: 'sub', text: '± ' + r.stderr.toFixed(1) }) : null),
   h('td', { class: 'num', text: usd(r.cost_per_task_usd) }),
   h('td', { text: r.date || '—' }))]));
@@ -1409,13 +1409,13 @@ async function renderLeaderboard(suiteId) {
   crumbs([{ text: '看板', href: '#/' }, { text: '公开榜单' }, { text: d.suite_name }]);
   const tabs = h('div', { class: 'chips' }, d.suites.map((s) => h('a', { class: 'chip', href: '#/leaderboard/' + encodeURIComponent(s.suite),
     'aria-pressed': String(s.suite === d.suite), text: s.suite_name })));
-  const partial = d.jobs.filter((j) => !j.ranked);
+  const partial = d.unranked;
   const rest = partial.length ? panel('未参与排名的作业', null, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['作业', '模型', '有效题', '通过率'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, ['作业', '模型', '题数', '分数'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
     h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', { text: j.name }), h('td', { text: j.model || '—' }),
-      h('td', { class: 'num', text: `${j.summary.tasks_attempted} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.summary.pass_rate, 1) }))))))) : null;
-  return h('div', {}, tabs, d.boards.map((b) => boardPanel(b, d.jobs, d.suite_name)), rest);
+      h('td', { class: 'num', text: `${j.tasks} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.score, 1) }))))))) : null;
+  return h('div', {}, tabs, d.boards.map((b) => boardPanel(b, d.suite_name)), rest);
 }
 
 // ------------------------------------------------------------ settings (database)
