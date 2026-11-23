@@ -698,9 +698,14 @@ The local worker stays the durable owner of the run: it resolves the
 account (or provider) credential exactly as for a local run, and keeps
 refreshing a session login, then
 
-1. ships the Linux bundle the run evaluates as a tar stream over SSH into
-   `<state_dir>/bundles/<digest>`, once per content digest (complete
-   directories are marked and reused);
+1. resolves the node `<state_dir>/bin/metacodes` points at (the physical
+   path inside `<state_dir>/bundles/<digest>`) and runs every node command
+   of the run (`run`, `manifest`, `pack`) with that binary, so a
+   `metacodes bench setup --executor` that switches the node mid-run does
+   not change the driver under a running job; a run without a node stops
+   here. It then ships the Linux bundle the run evaluates as a tar stream
+   over SSH into `<state_dir>/bundles/<digest>`, once per content digest
+   (complete directories are marked and reused);
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
 3. starts `<state_dir>/bin/metacodes bench node run …` over SSH and
@@ -983,18 +988,26 @@ CLI) only need a trusted entry. Open it by IP, `localhost` or the
 viewer) is read-only. The service receipt is
 `<state root>/bench/service.json` (mode 0600 on POSIX).
 
-After upgrading the binary, a running workbench keeps serving the previous
-version. On the service host, use the existing state directory for both
-commands. Run `metacodes bench stop` and wait for the old listener to stop
-responding, then rerun `metacodes bench` with the same jobs directory and any
-bind, port, and public URL options. Active benchmark workers continue through the
-restart. A service from before the login was dropped still requires its
+The workbench updates while benchmarks run. The version a run evaluates is
+its frozen bundle, and each run's worker is a process of its own that runs
+the workbench files it started with (extracted per content digest under
+`<state root>/bench/runtime/`, never removed), so neither depends on the
+service. After upgrading the binary, `metacodes bench` (with the same jobs
+directory and state directory) finds the service of the previous build,
+stops it and starts this build's on the same bind, port and public URL; the
+receipt records the build as `runtime`. Other commands (`run`, `info`, …)
+keep using the running service. Active workers continue through the restart,
+the new service shows their progress and advances profile queues from where
+they stood, and later queue items launch with the new workbench code on the
+same frozen bundle. On an SSH executor, `metacodes bench setup --executor`
+may install the new node while runs are active: each run keeps the node it
+started with (see [How an SSH run works](#how-an-ssh-run-works)). A service from before the login was dropped still requires its
 link: `metacodes bench stop` and `metacodes bench` stop it with the
 capability from this machine's receipt (the only use of it left), and
 `metacodes bench` then starts the login-free service.
 
-When `metacodes bench` replaces a running service (a store change or the
-login-free upgrade), the new service keeps the old bind, port and public
+When `metacodes bench` replaces a running service (another build, a store
+change or the login-free upgrade), the new service keeps the old bind, port and public
 URL unless the command gives them. A receipt from before this release does
 not record the bind, so when the old service listens on 127.0.0.1 (or
 0.0.0.0) the command leaves it running and asks for `--bind`. The CLI acts

@@ -795,6 +795,47 @@ class SshExecutorTest(SetupFixture):
         info = subprocess.run(executors.node_argv(relay, "info", "--json"), capture_output=True, text=True)
         self.assertEqual(json.loads(info.stdout)["protocol"], node_protocol.PROTOCOL, info.stderr)
 
+    def test_a_run_keeps_its_node_when_setup_switches_the_entry(self):
+        self.add_ssh_executor(node=False)
+        entry = self.remote_home / ".metacodes-bench/bin/metacodes"
+        started = self.remote_home / ".metacodes-bench/bundles/old/bin/metacodes"
+        upgraded = self.remote_home / ".metacodes-bench/bundles/new/bin/metacodes"
+        for binary, script in ((started, node_script()), (upgraded, b"#!/bin/sh\nexit 3\n")):
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(script)
+            binary.chmod(0o755)
+        entry.parent.mkdir(parents=True)
+        entry.symlink_to(started)
+        relay = executors.find(self.cfg(), "relay-4090")
+        run = executors.RemoteRun({"name": "pinned", "executor": relay.spec(), "jobs_dir": str(self.root / "jobs")},
+                                  log=lambda _t: None)
+        run.node = executors.resolve_node(relay)
+        self.assertEqual(Path(run.node), started.resolve())
+        entry.unlink()
+        entry.symlink_to(upgraded)
+        self.assertEqual(run.job_sync().manifest(), {})
+        self.assertIn(run.node, executors.node_argv(relay, "run", "spec.json", binary=run.node)[-1])
+
+    def test_a_missing_node_refuses_the_run(self):
+        self.add_ssh_executor(node=False)
+        relay = executors.find(self.cfg(), "relay-4090")
+        with self.assertRaisesRegex(ValueError, "找不到 metacodes 节点"):
+            executors.resolve_node(relay)
+
+    def test_an_unreachable_executor_is_not_reported_as_a_missing_node(self):
+        self.add_ssh_executor()
+        relay = executors.find(self.cfg(), "relay-4090")
+
+        def runner(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 255, "", "ssh: connect to host 10.126.126.1: Connection refused")
+        with self.assertRaisesRegex(ValueError, "连接执行机器 relay-4090.*退出码 255.*Connection refused"):
+            executors.resolve_node(relay, runner)
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        with self.assertRaisesRegex(ValueError, "连接执行机器 relay-4090"):
+            executors.resolve_node(relay, timeout)
+
     def test_a_node_on_the_path_runs_with_the_configured_python(self):
         """No setup-managed entry: the `metacodes` on the executor's PATH is
         the node, started with the entry's `python`, for probe and commands."""
