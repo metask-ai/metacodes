@@ -299,9 +299,13 @@ def executable_mismatch(staged: Optional[Dict[str, str]], expected: Dict[str, st
                   if staged.get(label) is None or staged.get(label) != expected.get(label))
 
 
+RUN_IMAGE_REPOSITORY = "wbm"
+
+
 def run_image_tag(name: str) -> str:
     """The mount image tag of one run: no other run builds or moves it."""
-    return HARNESS_IMAGE.split(":")[0] + ":" + slug(name)[:128]
+    import hashlib
+    return RUN_IMAGE_REPOSITORY + ":" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
 def build_harness_image(repo: Path, tag: str, stop, expected: Optional[Dict[str, str]] = None,

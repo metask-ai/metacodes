@@ -767,7 +767,7 @@ needs `docker buildx`). Every executable the node staged for WorkBuddy
 when staged; `node info` reports their sha256) must be the run's bundle's:
 otherwise the launch is refused. The node checks again before it starts,
 then builds the split-mount image from the staged context under a tag of
-the run's own (`workbuddy-bench/harness/metacodes:metacodes-<run>`) and
+the run's own (`wbm:<first 12 hex of sha256(run name)>`, short because Docker names an image mount's directory after the hex of image id, reference and target, which must fit in 255 bytes) and
 names it in a transient harness version (the pinned `0.1.0.yaml` plus
 `mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
 `run.sh` would otherwise reuse, and another workbench on the same Docker
