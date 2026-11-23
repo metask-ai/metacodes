@@ -246,6 +246,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          for cache in .zig-cache control-plane/lean/.lake; do
+            if [ -L "$cache" ]; then rm "$cache"; fi
+          done
           if [ "$WARM_CACHE" = "true" ]; then rm -rf .zig-cache; fi
           git clean -ffdx -e /.zig-cache -e /control-plane/lean/.lake
           test -z "$(git status --porcelain --untracked-files=normal)"
