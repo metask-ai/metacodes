@@ -650,6 +650,28 @@ class ProfileTest(unittest.TestCase):
             cli.main(['info', '--state-root', str(state), '--bundle', str(self.root / 'bundle'), '--json'])
         self.assertEqual(json.loads((state / 'bench' / 'workbench.json').read_text())['bundle_source'], source)
 
+    def test_one_queue_runs_every_dataset_with_each_model(self):
+        native = self.root / 'provider.json'
+        config = json.loads(native.read_text())
+        config['custom_providers']['tokenjoy']['models'].append({'request_model_id': 'other-model'})
+        atomic_json(native, config)
+        models = ['tokenjoy/test-model', 'tokenjoy/other-model']
+        request = {k: v for k, v in self.request(models=models).items() if k != 'model'}
+        created = self.client.request('api/profiles/run', request)
+        self.assertEqual([(i['suite'], i['model']) for i in created['items']],
+                         [('terminal-bench-2.1', models[0]), ('terminal-bench-2.1', models[1]),
+                          ('terminal-bench-2.0', models[0]), ('terminal-bench-2.0', models[1])])
+        self.wait_profile(created['id'])
+        view = self.client.request('api/profile?id=' + created['id'])
+        self.assertEqual(sorted(m['model'] for m in view['by_model']), sorted(models))
+        self.assertEqual([m['summary']['trials'] for m in view['by_model']], [2, 2])
+        self.assertEqual(len(view['tasks']), 4)
+        for override in ({'models': []}, {'models': models, 'model': models[0]}, {'models': [models[0]] * 2},
+                         {'models': 'tokenjoy/test-model'}, {'models': ['tokenjoy/missing']}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                request = {k: v for k, v in self.request(**override).items() if k != 'model' or 'model' in override}
+                self.client.request('api/profiles/run', request)
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])

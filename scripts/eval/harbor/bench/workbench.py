@@ -218,6 +218,12 @@ class Workbench:
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
         latest, _ = latest_results(record, views)
         value["summary"] = data.summarize([row for _, _, rows in latest.values() for row in rows])
+        by_model = {}
+        for (_, model, _), (_, _, rows) in latest.items():
+            by_model.setdefault(model, []).extend(rows)
+        value["by_model"] = [{"model": model, "summary": {k: v for k, v in data.summarize(rows).items()
+                                                          if k != "ttft_samples_ms"}}
+                             for model, rows in sorted(by_model.items(), key=lambda pair: pair[0] or "")]
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
         value["suites"] = sorted({i["suite"] for i in value["items"]})
