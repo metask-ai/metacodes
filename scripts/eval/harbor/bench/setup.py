@@ -22,7 +22,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import socket
@@ -963,26 +962,36 @@ def step_egress(s: Setup):
     mode = s.effective("egress")
     if mode == "direct":
         raise Skip("egress = direct：任务容器直接使用执行机器的网络")
-    options = ({"mode": "workbench", "tunnel_port": secrets.SystemRandom().randrange(20000, 60000),
+    ports = [executors.tunnel_port()] if mode == "workbench" else []
+    options = ({"mode": "workbench", "tunnel_port": ports[0],
                 "bind": s.executor.metrics_bind, "external": EGRESS_EXTERNAL_PROBE}
                if mode == "workbench" else {"mode": "proxy", "url": mode["proxy"]})
     proxy = None
     try:
         reverse = None
-        if mode == "workbench":
-            if not s.dry_run:
-                from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
-                allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
-                proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
-            reverse = (options["tunnel_port"], proxy.port if proxy else 0)
-        argv = executors.node_argv(s.executor, "egress-probe", json.dumps(options), reverse=reverse)
-        done = s.run(argv, mutate=True, timeout=600)
+        if mode == "workbench" and not s.dry_run:
+            from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
+            allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
+            proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
+        while True:
+            if ports:
+                options["tunnel_port"] = ports[-1]
+                reverse = (ports[-1], proxy.port if proxy else 0)
+            argv = executors.node_argv(s.executor, "egress-probe", json.dumps(options), reverse=reverse)
+            done = s.run(argv, mutate=True, timeout=600)
+            if not (done and ports and len(ports) < executors.TUNNEL_ATTEMPTS
+                    and executors.forward_refused(done.returncode, done.stderr)):
+                break
+            ports.append(executors.tunnel_port(ports))
+            s.log(executors.tunnel_retry_note(s.executor, ports[-2], ports[-1], len(ports)))
     finally:
         if proxy is not None:
             proxy.close()
     if s.dry_run:
         return "planned", ("将验证：自定义网络中的容器经 docker0 网关转发、ssh -R 访问工作台代理" if mode == "workbench"
                            else "将验证：自定义网络中的容器能连到站点代理 " + mode["proxy"])
+    if ports and executors.forward_refused(done.returncode, done.stderr):
+        raise Failed(executors.tunnel_unbound(s.executor, ports))
     lines = (done.stdout or "").strip().splitlines()
     try:
         result = json.loads(lines[-1]) if lines else {}
