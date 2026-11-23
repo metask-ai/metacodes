@@ -101,7 +101,7 @@ TEAMWORK_TOOLS_CHECK = "command -v git >/dev/null 2>&1 && command -v bwrap >/dev
 # bypassPermissions, and teamwork's seats and verifier would otherwise ask,
 # with nobody to answer. User-level allow rules in the disposable container
 # give them the same; their commands still run under bubblewrap.
-TEAMWORK_ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebSearch", "NotebookEdit")
+TEAMWORK_ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookEdit")
 # What a task container needs for bubblewrap to create its namespaces, as
 # root (no user namespace: SYS_ADMIN, NET_ADMIN for the loopback) or as
 # another user (unconfined seccomp, AppArmor and /proc).
@@ -269,6 +269,13 @@ def metacodes_flags(
     return flags
 
 
+def teamwork_allow_rules(mcp_servers: Iterable[str] = ()) -> List[str]:
+    """Allow rules for teamwork's seats and verifier: the built-in tools and
+    every MCP server the task declares."""
+
+    return list(TEAMWORK_ALLOWED_TOOLS) + ["mcp__" + name for name in mcp_servers]
+
+
 def teamwork_flags(*, provider: Optional[str], model: str, reasoning_effort: Optional[str]) -> List[str]:
     """The `teamwork run` arguments for one trial's model: provider and
     model, and the reasoning effort on the seats that take one (implementer
@@ -422,6 +429,7 @@ def teamwork_run_command(
     budget_usd: float,
     flags: Iterable[str],
     config_path: Optional[str] = None,
+    mcp_servers: Iterable[str] = (),
     binary: str = REMOTE_BINARY,
     kg_bin: str = REMOTE_KG_BIN,
     logs_dir: str = REMOTE_LOGS,
@@ -471,7 +479,8 @@ def teamwork_run_command(
         f'  echo "keeping the image\'s own $settings: teamwork seats may ask for permissions" >>{logs}/{STDERR_FILENAME}',
         "else",
         '  mkdir -p "$(dirname "$settings")" &&'
-        f' printf %s {shlex.quote(json.dumps({"permissions": {"allow": list(TEAMWORK_ALLOWED_TOOLS)}}))} > "$settings" || exit 78',
+        f' printf %s {shlex.quote(json.dumps({"permissions": {"allow": teamwork_allow_rules(mcp_servers)}}))}'
+        ' > "$settings" || exit 78',
         "fi",
         'request="$state/request.md"',
         f'{{ if [ "$(head -c 1 {shlex.quote(instruction_path)})" = "[" ]; then printf "Task:\\n\\n"; fi;'

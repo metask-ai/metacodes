@@ -150,6 +150,11 @@ class ModelAndFlagsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             cmd.teamwork_flags(provider=None, model="m", reasoning_effort="turbo")
 
+    def test_teamwork_allows_the_built_in_tools_and_the_tasks_mcp_servers(self):
+        self.assertIn("WebFetch", cmd.teamwork_allow_rules())
+        self.assertEqual(cmd.teamwork_allow_rules(["are"])[-1], "mcp__are")
+        self.assertEqual(cmd.teamwork_allow_rules()[:len(cmd.TEAMWORK_ALLOWED_TOOLS)], list(cmd.TEAMWORK_ALLOWED_TOOLS))
+
     def test_teamwork_runs_alone(self):
         self.assertEqual(cmd.checked_features(["teamwork"]), ["teamwork"])
         self.assertEqual(cmd.checked_features(["execute_code", "stall_gate"]), ["execute_code", "stall_gate"])
