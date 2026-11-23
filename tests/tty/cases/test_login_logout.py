@@ -41,10 +41,10 @@ from test_key_login import _cli  # noqa: E402
 
 RELAY_KEY = "sk-relay-tty-env-0001"
 
-# Windows opens the browser with `cmd /c start` and never reads $BROWSER
+# Windows opens the browser through rundll32 and never reads $BROWSER
 # (`auth.openBrowser`), so the stub that plays the browser never runs there,
 # and a sign-in that needs it waits until the case times out.
-_NO_BROWSER_STUB = "Windows opens the browser with `cmd /c start`, not $BROWSER: the stub cannot play the browser"
+_NO_BROWSER_STUB = "Windows opens the browser through rundll32, not $BROWSER: the stub cannot play the browser"
 
 
 class _Relay:
