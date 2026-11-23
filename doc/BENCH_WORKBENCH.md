@@ -21,6 +21,7 @@ metacodes bench run --task fix-git --task cancel-async-tasks --wait
 metacodes bench run --suite aime-2025 --wait          # the suite's default sample
 metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
+metacodes bench run --task fix-git --features ""      # without the default run gates
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090   # pre-pull/pre-build task images
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
@@ -60,11 +61,11 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
 | 终端工程 | `frontier-harness-eval-1.1` | harbor-registry | `-d frontier-harness-eval/frontier-harness-eval@v1.1.0` | 62 (62) |
 | 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
-| 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
-| 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
+| 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
+| 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
 Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
-and the small-task adapters allow up to 16, GAIA2 and WorkBuddy 2). The page starts at 4 runs
+the WorkBuddy subsets and the small-task adapters allow up to 16, GAIA2 2). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
@@ -156,7 +157,7 @@ pulls it only when the executor's Docker does not have it. Every other task
 `environment/` directory with `docker compose build` before each trial,
 which pulls its base image and runs its `apt-get`/`pip install` steps
 unless Docker's build cache already holds them. A registry or package index
-that is slow or unreachable during a batch then fails trials as
+that is slow or unreachable during a run then fails trials as
 `EnvironmentStartTimeoutError` or a `docker compose` error.
 `metacodes bench pull` does both ahead of the run:
 
@@ -234,8 +235,13 @@ subset fetched by WorkBuddy's `scripts/dataset/fetch-dataset.sh`, Docker,
 with the account key in a dedicated variable and the judge key removed, and
 sets the job's `jobs_dir` to `<jobs-dir>/<run>/workbuddy`, whose Harbor
 trials the job view reads. These are ordinary WorkBuddy runs, not
-launch-gate receipts or quality evidence; the judged Web/Office subsets
-remain with `launch_gate`.
+launch-gate receipts or quality evidence. The Web and Office subsets also
+write a judge model config (`configs/models/metacodes-<run>-judge.yaml`, same
+account key as the agent; WorkBuddy calls its judge as OpenAI passthrough, so
+the config's URL variable holds the account gateway's `/v1` rather than the
+agent's `/v1/messages`) and set the job's `llm_judge_override` to
+`{"enabled": true, "mode": "in_container"}` with it. The judge model is
+`judges.<suite id>.model` in `workbench.json`, default `kimi-k3.1-pro`.
 
 ## Configure execution
 
@@ -268,10 +274,11 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Harbor | `uv tool install --force --python 3.12 harbor==0.26.0` (Harbor 0.26 needs Python 3.12; with an executor's `pypi_index`, prefixed by `env UV_DEFAULT_INDEX=<index>`); the resulting path is saved |
 | Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose and buildx plugins when needed |
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
+| apt 缓存（任务容器） (`ssh` executors) | With `container_mirrors.apt`: builds `metacodes-apt-cache` and runs it on `<metrics_bind>:3142` with `--restart unless-stopped`, then checks that it answers; a running cache with the same mirror is kept (see [Package mirrors and the apt cache](#package-mirrors-and-the-apt-cache-in-task-containers)) |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
-| 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy; a failure names the gateway and the firewall to check |
+| 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy. A tunnel port the executor cannot listen on is retried on another one, up to 5 ports, and then the step says the tunnel port could not be bound; any other failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
 | Metask login | Never automated. The step names the command; the page's 登录 button runs `metacodes login --provider metask --no-browser` and shows its device-flow URL and code |
@@ -358,18 +365,18 @@ remote URL: the host exports the commit and the tags that point at it as a
 release tag and a token in `source_repo` stays on the host.
 
 The unit is published as `<state root>/bench/bundles/metacodes-git-<commit>-x86_64-linux-gnu/`,
-where the 新建 page offers it as a batch version like any other bundle, but
+where the 评测 page offers it as a profile version like any other bundle, but
 only while the configured `source_repo` is the repository that verified it
 under the current trust rule: after switching repositories, a unit appears
-again once `bench build` has re-verified its commit, and a batch cannot be
+again once `bench build` has re-verified its commit, and a profile cannot be
 created from one that is not listed. The same check covers the bundle a run
 actually uses: a single run (`bench run`) refuses a configured default
-bundle that is such an unverified unit before recording anything, and a batch
-validates its datasets against the bundle it selected, so a workbench whose
-only versions are verified git builds can run batches without a default. A
-single run resolves, checks and records the default bundle from one reading
-of `workbench.json`, by its resolved path. A batch keeps the git provenance
-of the bundle it froze (commit, repository digest, trust rule); each dataset
+bundle that is such an unverified unit before recording anything, and a new
+profile validates its datasets against the bundle it selected, so a
+workbench whose only versions are verified git builds can run profiles
+without a default. A single run resolves, checks and freezes the default
+bundle from one reading of `workbench.json`, by its resolved path. A profile
+keeps the git provenance of the bundle it froze (commit, repository digest, trust rule); each dataset
 checks the frozen copy against that record and the current `source_repo`, so
 it still runs after the original unit is removed and stops before recording
 anything once the repository no longer matches. A
@@ -565,8 +572,8 @@ metacodes bench provider remove --id gw
   gives the entry a new revision. A run records the revision its config was
   generated from; if the entry changed before its worker starts, the run
   fails with a message instead of pairing the old upstream with a new key.
-  A batch pins each model's route (source and revision) when it is created;
-  a later item whose model now resolves elsewhere fails with a message. Two
+  A queued dataset pins its model's route (source and revision) when it is
+  queued; if the model resolves elsewhere by its launch, it fails with a message. Two
   concurrent edits of one entry (page and CLI) cannot undo each other: an
   update based on a revision that changed meanwhile is refused.
 - **Ids**: `metask` and the provider ids of the workbench's
@@ -585,8 +592,8 @@ metacodes bench provider remove --id gw
   loopback or unspecified address, IPv4-mapped included, or a name that
   resolves to one, such as an `/etc/hosts` alias) is refused on SSH
   executors: the workbench probed it on its own machine, but the executor's
-  relay would read it as the executor itself. The check runs at batch
-  creation, at launch on the exact route written to the run, and on the
+  relay would read it as the executor itself. The check runs when a
+  dataset is queued, at launch on the exact route written to the run, and on the
   executor against its own resolution before the relay connects. Import an
   address both machines reach for the same gateway instead. WorkBuddy suites refuse them. A suite with an LLM judge (GAIA2)
   refuses them under Metask authentication, where the judge would go
@@ -764,7 +771,7 @@ needs `docker buildx`). Every executable the node staged for WorkBuddy
 when staged; `node info` reports their sha256) must be the run's bundle's:
 otherwise the launch is refused. The node checks again before it starts,
 then builds the split-mount image from the staged context under a tag of
-the run's own (`workbuddy-bench/harness/metacodes:metacodes-<run>`) and
+the run's own (`wbm:<first 12 hex of sha256(run name)>`, short because Docker names an image mount's directory after the hex of image id, reference and target, which must fit in 255 bytes) and
 names it in a transient harness version (the pinned `0.1.0.yaml` plus
 `mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
 `run.sh` would otherwise reuse, and another workbench on the same Docker
@@ -811,6 +818,7 @@ proposes these when its network probe finds those hosts slow or blocked:
 | `pypi_index` | `UV_DEFAULT_INDEX` for setup's Harbor install on the executor only; it does not reach runs or the bundle |
 | `docker_mirrors` | Added to the daemon's `registry-mirrors` by setup (sudo, reload, never restart). They cover Docker Hub images only |
 | `ghcr_mirror` | Before each run, ghcr.io images the selected tasks name (`FROM` lines of their Dockerfiles, `image:` of their compose files, `docker_image` in `task.toml`) that are missing locally are pulled as `<mirror>/<path>` and tagged back to their `ghcr.io/` name; other registries are left alone. A failed pull is logged and Harbor pulls from ghcr.io itself |
+| `container_mirrors` | Package mirrors and the apt cache for the runs' task containers (see [below](#package-mirrors-and-the-apt-cache-in-task-containers)) |
 
 `"egress": "workbench"` builds this path for each run, and only for it:
 
@@ -824,8 +832,13 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
   loopback, on an ephemeral port, before the run session and stops it when
   Harbor has exited. The run's SSH session (only that one) carries
   `-o ExitOnForwardFailure=yes -R 127.0.0.1:<tunnel>:127.0.0.1:<proxy>`,
-  with a random tunnel port in 20000–59999; a port that is already taken
-  fails the session at once and the run says so.
+  with a random tunnel port in 20000–32767, below the ephemeral ranges of
+  Linux (from 32768) and macOS (from 49152). When the executor cannot
+  listen on it (the port is taken, or its sshd does not allow remote
+  forwarding), ssh exits at once with 255 and `remote port forwarding
+  failed`; the worker then uploads the run spec with another port and
+  starts the session again, up to 5 ports, after which the run fails
+  saying the tunnel port could not be bound on the executor.
 - SSRF guard: the proxy connects only to globally routable unicast
   addresses. Loopback, private (RFC 1918, unique-local), link-local, CGNAT
   (100.64/10), multicast, reserved and unspecified addresses are refused
@@ -864,6 +877,60 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
   and every compose service name of the selected tasks.
 - 一键配置's 容器出网（经工作台） step checks the whole path from a
   container on a fresh user-defined network.
+
+### Package mirrors and the apt cache in task containers
+
+`container_mirrors` on an `ssh` executor points every run's task containers
+at package mirrors, and `apt` adds a shared apt cache on the executor, so
+packages that trials and verifiers install (`apt-get install curl`, `pip`,
+`uv`) are fetched from a nearby mirror and, for apt, once per executor:
+
+```json
+"container_mirrors": {
+  "apt": "http://mirrors.aliyun.com",
+  "pypi": "https://mirrors.aliyun.com/pypi/simple/",
+  "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda",
+  "go": "https://goproxy.cn",
+  "rustup": "https://rsproxy.cn",
+  "npm": "https://registry.npmmirror.com"
+}
+```
+
+| Key | In the task container |
+|---|---|
+| `apt` | `/etc/apt/apt.conf.d/99metacodes-apt-cache` sets `Acquire::http::Proxy` to the apt cache, `http://<metrics_bind>:3142`. An `http://` mirror root holding `debian/` and `ubuntu/`; the cache fetches `deb.debian.org` and the Ubuntu archive from there, and other `http` apt sources (`security.ubuntu.com`) from their own hosts. `https` sources are not cached. Only with `egress` = `direct`, since the cache fetches from the executor's own network |
+| `pypi` | `PIP_INDEX_URL` and `UV_DEFAULT_INDEX` |
+| `conda` | `CONDA_CHANNEL_ALIAS=<root>/cloud`, `CONDA_DEFAULT_CHANNELS=<root>/pkgs/main,<root>/pkgs/r` (an Anaconda mirror root) |
+| `go` | `GOPROXY=<url>,direct` |
+| `rustup` | `RUSTUP_DIST_SERVER=<url>`, `RUSTUP_UPDATE_ROOT=<url>/rustup` (crates still come from crates.io) |
+| `npm` | `NPM_CONFIG_REGISTRY` |
+
+Each run uploads `<state_dir>/runs/<name>/mirrors.compose.json` and passes
+it to Harbor as `--extra-docker-compose`: an overlay of Harbor's `main`
+service with those variables and the apt file (an inline compose `config`,
+read-only). The overlay comes after a task's own `docker-compose.yaml` in
+Harbor's compose order, so before staging the run the worker scans the
+suite's compose files, `task.toml` files and Dockerfiles: a variable (or
+`Acquire::http::Proxy`) that any of them names is left out of the overlay
+for that run and the run log says so. Values baked into a prebuilt image
+that the suite's files do not name are still overridden. When `apt` is
+set, the worker also checks over SSH that the apt cache answers; when it
+does not, the run leaves the apt file out (the task containers use their
+own apt sources) and its log names the cache and the setup command that
+restarts it. Builds are not
+affected: `bench pull` builds task images once and Harbor reuses them.
+
+Setup's apt 缓存 step runs the cache: it builds the image
+`metacodes-apt-cache` (apt-cacher-ng on `debian:bookworm-slim`, with the
+mirror as its Debian and Ubuntu backend) and starts the container of the same
+name with `--restart unless-stopped`, published on
+`<metrics_bind>:3142`, with the named volume `metacodes-apt-cache` for the
+packages, then checks that `/acng-report.html` answers. A running container
+already labeled with the same mirror is kept; another mirror replaces it.
+The volume survives that replacement. The cache answers containers on
+Harbor's compose networks the same way the egress forwarder does. Hugging
+Face is not mirrored: `hf-mirror.com` rate-limits (HTTP 429) where the
+executor reaches `huggingface.co` directly.
 
 ### Colima on Apple Silicon
 
@@ -937,71 +1004,104 @@ treated as stale.
 
 ## Using the page
 
-The rail opens on the dashboard (看板), then 新建 (new batch), 对比 (compare)
-and 数据库 (the evaluation database). The dashboard's 数据范围 selector
-scopes every headline metric to one batch (the newest by default), to all
-jobs, or to jobs launched outside a batch.
+The rail opens on the dashboard (看板), then 评测 (start an evaluation), 对比
+(compare) and 数据库 (the evaluation database). The dashboard's 数据范围
+selector scopes every headline metric to one profile (the newest by default)
+or to all jobs.
 
-### Batches
+### Profiles
 
-A batch evaluates one frozen metacodes version on several datasets. The
-新建 page picks the version (the configured Linux bundle by default, or any
-valid bundle under `<state root>/bench/bundles/`, including those
-`metacodes bench build --ref` builds), several suites with their
-tasks, the model, attempts and concurrency (capped per suite). Creating the
-batch validates every dataset first, then copies the bundle, once per content
-digest, to `<state root>/bench/bundles/frozen/<digest>/` with its files made
-read-only. Every dataset of the batch runs that copy, so rebuilding the
-configured bundle in place or switching `workbench.json` to another version
-never changes a batch already created; before each launch the copy is checked
-against its digest, and a modified copy fails the dataset instead of running.
+A profile (评测配置) is what an evaluation tests: one frozen metacodes version
+with a fixed set of advanced features. Every run belongs to a profile, and a
+profile is run on as often as wanted. The 评测 page picks the version (the
+configured Linux bundle by default, or any valid bundle under
+`<state root>/bench/bundles/`, including those `metacodes bench build --ref`
+builds), the advanced features, several suites with their tasks, the model,
+attempts and concurrency (capped per suite). The profile's id is derived from
+the bundle's content digest and the features, so the same version with the
+same features always lands on the same profile, and changing either is
+another profile. The first run on a profile validates every dataset, then
+copies the bundle, once per content digest, to
+`<state root>/bench/bundles/frozen/<digest>/` with its files made read-only.
+Every run of the profile uses that copy, so rebuilding the configured bundle
+in place or switching `workbench.json` to another version never changes a
+profile already created; before each launch the copy is checked against its
+digest, and a modified copy fails the dataset instead of running.
 
-The 高级功能 section of the 新建 page switches on metacodes features that are
-off by default, all off unless ticked. Each one adds a single metacodes flag to
-every trial of the batch: the Lean-modelled run gates
+The 高级功能 section of the 评测 page switches on metacodes features that are
+off in metacodes by default. The Lean-modelled run gates are ticked by
+default (`default_features` in `GET /api/workbench`, also what `bench run`
+uses) and the preview features are not. Each one adds a single metacodes
+flag to every trial of the profile: the run gates
 `verification_final_gate` (`--verification-final-gate`), `requirement_ledger`
 (`--requirement-ledger`), `test_integrity` (`--test-integrity`),
 `delivery_cadence` (`--delivery-cadence`) and `stall_gate` (`--stall-gate`),
 and the preview features `execute_code` (`--preview=execute_code`),
 `comment_guard` (`--preview=comment_guard`) and `harnessmm` (`--harnessmm`).
-`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The batch
-and each of its runs record the chosen names (`features`), and the run passes
-them to the adapter as `--ak features=<names>`. An unknown name is refused, and
-so is any choice for a WorkBuddy suite, whose overlay launches metacodes
-itself. The frozen bundle has to know the flags: a release older than a
-feature fails its trials with a usage error. An SSH executor's node loads the adapter from
-its own checkout, so the node protocol is 2 since features: an older node is
-refused until `metacodes bench setup --executor <name>` updates it, instead of
-running the trials without the chosen flags.
+`ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The
+profile and each of its runs record the chosen names (`features`), and the
+run passes them to the adapter as `--ak features=<names>`. An unknown name is
+refused. A WorkBuddy suite's overlay launches metacodes itself, so its
+datasets run without the profile's features: the queued dataset and its run
+record list none, and the profile page marks them; a direct launch that asks
+for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
+than a feature fails its trials with a usage error. An SSH executor's node
+loads the adapter from its own checkout, so the node protocol is 2 since
+features: an older node is refused until
+`metacodes bench setup --executor <name>` updates it, instead of running the
+trials without the chosen flags.
 
-The datasets run one after another, each as an ordinary workbench run (one
-Harbor job) whose record names the batch and its frozen version. The durable
-state is `<jobs-dir>/.bench-batches/<id>.json`; the service's scheduler only
-advances what that file says, so a restarted service resumes a batch where it
-stopped. While a batch owns the executor, a single launch (`POST /api/runs`)
-is refused. Stopping a batch cancels its running dataset and skips the rest.
-A batch can be renamed at any time (`POST /api/batch/rename` with `id` and
-`name`, 重命名 on its page; an empty name falls back to the batch id), and
-复制为新批次 opens the 新建 page filled with its version, datasets, tasks,
-model, executor, attempts, concurrency and features, to edit and create as a
-new batch. Deleting a batch that has ended (`POST /api/batch/delete`, 删除批次 on its
-page or 删除 in the overview's batch list) removes its record, its runs' records and logs, their job directories
-and their rows in the evaluation database; the frozen bundle copy stays, since
-other batches may share it. A batch still running must be stopped first.
-Only a batch recorded in this service's jobs directory is deleted; one ingested
-from another jobs directory sharing the database is refused. When a file
-cannot be removed or the database delete fails, the request fails and the
-batch stays for a retry: the manifest goes last, after the rows are gone.
+`POST /api/profiles/run` queues datasets: on an existing profile with
+`profile` (its version and features cannot be changed), or with `bundle` and
+`features`, creating the profile on first use (`name` names a new profile).
+The queued datasets run one after another, each as an ordinary workbench run
+(one Harbor job) whose record names the profile. The durable state is
+`<jobs-dir>/.bench-profiles/<id>.json`; the service's scheduler only advances
+what that file says, so a restarted service resumes a queue where it stopped.
+With several profiles queued, the one whose oldest waiting dataset was queued
+first runs until its queue is empty. A single launch (`POST /api/runs`,
+`metacodes bench run`) runs at once on the profile of the configured bundle
+and its `features` (`bench run --features a,b`; the run gates when none are
+given, `--features ""` for none), and is refused while
+a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
+of its queue.
+
+A rerun replaces the earlier result: per suite, model and task the profile
+counts only the attempts of the latest run that has them, and lists the
+replaced runs as the task's history. A run that stopped (cancelled,
+interrupted or failed) with only invalid attempts of a task leaves that
+task's earlier result in place. 再次运行 and 重跑未通过的题 use one model: the
+page's model filter, else the last run's. The profile page's 再次运行 opens the 评测
+page on that profile with its datasets, tasks and last parameters, and
+重跑未通过的题 keeps only the tasks whose latest attempts did not all pass.
+A profile can be renamed at any time (`POST /api/profile/rename` with `id`
+and `name`, 重命名 on its page; an empty name falls back to the id).
+Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除评测配置
+on its page or 删除 in the overview's list) removes its record, its runs'
+records and logs, their job directories and their rows in the evaluation
+database; the frozen bundle copy stays, since other profiles may share it.
+A profile still running must be stopped first. Only a profile recorded in
+this service's jobs directory is deleted; one ingested from another jobs
+directory sharing the database is refused. When a file cannot be removed or
+the database delete fails, the request fails and the profile stays for a
+retry: the manifest goes last, after the rows are gone.
 Imports of a jobs directory (the service's sync, `bench db import`),
 `bench sync --run` and deletions from it take the same lock,
-`<jobs-dir>/.bench-store.lock`, so none of them can write a deleted batch
+`<jobs-dir>/.bench-store.lock`, so none of them can write a deleted profile
 back. A deletion that finds the lock held fails and can be retried; the
 service's sync skips the directory until its next round.
-Batch records are ingested into the `batches` table of the evaluation
-database (schema v3).
+Profile records are ingested into the `profiles` table of the evaluation
+database (schema v4, which replaces the `batches` table of v3).
 
-The batch page lists each dataset's job and every task across them; a task's
-page shows its attempts side by side, then the selected attempt's detail:
+Earlier versions grouped runs into batches. When the service starts, every
+batch record under `<jobs-dir>/.bench-batches/` is merged into the profile of
+its frozen bundle and features (batches with the same version and features
+become one profile, the earliest batch's name kept), its runs stay with it,
+and the batch record is removed.
+
+The profile page lists every task's latest attempts and the run history; a
+task's page shows its attempts side by side, then the selected attempt's
+detail:
 
 - **Token distribution**: one column per model request, its input context
   split by part (or by cached / uncached input when no composition was
@@ -1022,8 +1122,8 @@ The 数据库 page shows the active store and its contents. It tests a SQLite pa
 DSN; `password_env` names the variable), and switches the service to it,
 optionally migrating and verifying the current data first (the same copy as
 `metacodes bench db migrate`). The new `store` is written to `workbench.json`
-and takes effect immediately; switching is refused while a run or batch is
-active.
+and takes effect immediately; switching is refused while a run or a profile's queue
+is active.
 
 ### Metric definitions
 
@@ -1036,6 +1136,14 @@ active.
 | Generation TPS | Sum of reported output tokens / sum of generation seconds, from first semantic output until response completion. Tool execution and first-token waiting are excluded |
 | TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The global mean and P50/P95 pool request samples across jobs |
 | Estimated cost | The metacodes binary's catalog estimate, including cache pricing. It is not the provider's settlement. Missing/zero unknown prices are shown as unknown with coverage counts |
+| Pass rate 95% interval | Wilson score interval of the single-run full-score rate over valid runs. It treats every run as independent, so repeated attempts of a task and pooled jobs make it narrower than a task-level interval |
+| Solved at least once | Tasks with at least one passing run / tasks with at least one valid run |
+| Cost per task | Mean estimated cost of each task's priced valid runs, then the mean over those tasks, as in FrontierHarness Eval v1.1 |
+| Cost per pass | Over the same priced tasks: the sum of per-task mean costs / the sum of per-task pass fractions, so each task weighs the same in both |
+| Non-passing cost share | Estimated cost of valid runs that did not pass / estimated cost of all valid runs; failures and timeouts are also shown separately |
+| Cache hit rate | Cache-read input tokens / all input tokens |
+| Turns per pass | Mean turns (and tool calls) over passing runs |
+| Cost-pass frontier | On the compare page, judged only on the tasks whose first attempt is valid in every compared job: the jobs that no other job beats in both per-task mean cost and mean pass fraction on those tasks. A job without a priced valid run on one of them is left out |
 
 The credential relay runs on the execution host and forwards streaming
 payloads unchanged; with metrics enabled it also times them. It stores numeric timing/usage records and per-request context part sizes only, under
@@ -1068,8 +1176,8 @@ there into the evaluation database):
 ```text
 <jobs-dir>/
   .bench-runs/                     # launch receipts, specs, worker logs
-  .bench-batches/<id>.json         # batches: frozen version, datasets, state
-  .bench-store.lock                # serializes imports, result syncs and batch deletions
+  .bench-profiles/<id>.json        # profiles: frozen version, features, queued runs, state
+  .bench-store.lock                # serializes imports, result syncs and profile deletions
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage

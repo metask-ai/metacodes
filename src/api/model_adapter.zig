@@ -170,6 +170,7 @@ pub const ModelProfile = struct {
     /// doc,2025-12-17 changelog);旧世代 Gemini 走同级 inline_data part 形态。
     /// 保守默认 false。
     supports_multimodal_function_response: bool = false,
+    tool_result_images_as_blocks: bool = false,
 };
 
 /// provider kind(与 capability.zig 对齐,但本模块独立持有以解耦)
@@ -215,6 +216,7 @@ fn anthropicProfile(model: []const u8) ModelProfile {
     // GLM 5.3+ behind an Anthropic-wire endpoint (Z.AI's default channel, the
     // Metask gateway) still takes only its own three levels.
     p.glm53_effort_vocabulary = glmAlwaysThinks(model);
+    p.tool_result_images_as_blocks = !hasSubstr(model, "claude");
     return p;
 }
 

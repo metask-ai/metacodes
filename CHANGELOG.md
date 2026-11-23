@@ -12,6 +12,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **The bench workbench reports FrontierHarness-style statistics.** Every
+  summary adds the pass rate's 95% interval, tasks solved at least once, cost
+  per task (per-task mean, then mean over tasks) and per pass, the share of
+  cost spent on runs that did not pass, cache hit rate and turns per pass. The
+  compare page lists them per job and marks the jobs on the cost-pass
+  frontier.
+- **Bench task containers can use package mirrors and a shared apt cache.**
+  `container_mirrors` on an SSH executor (`apt`, `pypi`, `conda`, `go`,
+  `rustup`, `npm`) reaches every run's task containers through a Harbor
+  compose overlay. With `apt`, `bench setup` runs apt-cacher-ng on the
+  executor's Docker gateway (port 3142) with that mirror as its Debian and
+  Ubuntu backend, so packages that trials and verifiers install are
+  downloaded once per executor.
+
 - **Bench batches can be renamed and copied.** A batch page has 重命名
   (`POST /api/batch/rename`) and 复制为新批次, which fills the 新建 page with
   the batch's version, datasets, tasks and settings. The overview's batch list
@@ -117,6 +131,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Bench profiles replace batches.** A profile (评测配置) is one frozen
+  metacodes version with a fixed set of advanced features, and every run
+  belongs to one; the same version with the same features is always the same
+  profile. Runs are queued on a profile as often as wanted
+  (`POST /api/profiles/run`, 再次运行, 重跑未通过的题), and a rerun of a task
+  replaces its earlier result in the profile's view. The 评测 page ticks the
+  Lean run gates by default and leaves the preview features off; WorkBuddy
+  datasets of a profile run without its features. `bench run` runs on the
+  profile of the configured bundle with the same default features. Existing batches are merged
+  into the profiles of their version and features when the service starts;
+  the evaluation database moves to schema v4 (`profiles` replaces `batches`).
+  `/api/batches` and `/api/batch/*` are gone.
+
 - **The CLI tells the model which command it is.** The environment section of
   the system prompt names the command that started the session (the launcher
   name, `metacodes-dev` for a side-by-side install), says that `metacode` and
@@ -171,6 +198,17 @@ status, compatibility boundaries, and entry points are defined by
   none, and then, if the job ended right then, found nothing running and
   ended the turn. It now checks what is still running before it looks for
   finished jobs.
+
+- **A busy tunnel port on an SSH executor no longer fails `egress =
+  "workbench"`** (#716). Setup's 容器出网 step and each run picked the
+  executor-side port of their `ssh -R` tunnel at random from 20000–59999,
+  mostly inside Linux's ephemeral range, so a port an outgoing connection held
+  made `ssh` exit at once (`ExitOnForwardFailure`): setup then blamed the
+  executor's firewall, and the run failed as a lost SSH connection. The port
+  now comes from 20000–32767, below the ephemeral ranges, and when the
+  executor cannot listen on it, setup and the run try another port, up to 5.
+  When none works, they say the tunnel port could not be bound on the
+  executor, which may also not allow remote forwarding for the account.
 
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to

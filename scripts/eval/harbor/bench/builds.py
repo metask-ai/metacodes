@@ -5,7 +5,7 @@ x86_64 Linux release unit on the executor's node, the machine whose Docker
 also runs the evaluations. Every node builds the same way: it resolves the
 ref in its own mirror of the source repository and builds in its own Docker.
 A remote node's unit is then copied into the workbench's
-`<state>/bench/bundles/`, where a batch can choose and freeze it like any
+`<state>/bench/bundles/`, where a profile can choose and freeze it like any
 other bundle. `commits` lists a branch's history, newest first, for the page
 to pick a commit by its time.
 """
@@ -198,7 +198,7 @@ def frozen_problem(frozen, repo=None):
     git = frozen.get("git")
     if not git and not is_git_unit(frozen.get("source_bundle") or ""):
         return None
-    refusal = "批次冻结的 metacodes 包由 Git 构建，当前 source_repo 没有验证它，本项不再运行"
+    refusal = "评测配置冻结的 metacodes 包由 Git 构建，当前 source_repo 没有验证它，本项不再运行"
     if not isinstance(git, dict) or git.get("trust_policy") != TRUST_POLICY \
             or git.get("source_id") != source_id(repo or DEFAULT_REPO):
         return refusal

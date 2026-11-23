@@ -28,7 +28,7 @@ from scripts.eval.harbor.bench.providers import Providers, echoed, normalize_bas
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
-from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_batches_and_workers, wait_run
+from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_profiles_and_workers, wait_run
 
 KEY = 'imported-secret-key-1234'
 
@@ -482,7 +482,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.addCleanup(stop_batches_and_workers, self.manager)
+        self.addCleanup(stop_profiles_and_workers, self.manager)
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def test_imported_model_runs_with_only_a_placeholder_and_the_relay_sends_the_key(self):
@@ -571,19 +571,19 @@ class ImportedProviderRunTest(unittest.TestCase):
         self.assertEqual(spec['provider_config'], json.loads(self.manager.config_path.read_text())['provider_config'])
         wait_run(self.manager, run['name'])
 
-    def test_a_batch_never_switches_an_items_route_after_creation(self):
+    def test_a_queued_dataset_never_switches_its_route(self):
         base = f'http://127.0.0.1:{self.upstream.server_port}'
         self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
-        created = self.client.request('api/batches', {
+        created = self.client.request('api/profiles/run', {
             'model': 'local/echo', 'attempts': 1, 'concurrency': 1,
             'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']},
                       {'suite': 'terminal-bench-2.0', 'tasks': ['fix-git']}]})
         self.assertNotIn('route', json.dumps(created['items']))  # internal, like the launch request
-        stored = self.manager.batches.get(created['id'])
+        stored = self.manager.profiles.get(created['id'])
         self.assertEqual(stored['items'][0]['route']['source'], 'imported')
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '2'}):
-            self.manager.batches.advance()  # first item starts on the original route
-            first = self.manager.batches.get(created['id'])['items'][0]
+            self.manager.profiles.advance()  # first item starts on the original route
+            first = self.manager.profiles.get(created['id'])['items'][0]
             self.assertEqual(first['status'], 'running')
             # Its worker has taken the key (Harbor is running) before the edit.
             from scripts.eval.tests.test_bench_workbench import wait_status
@@ -592,14 +592,14 @@ class ImportedProviderRunTest(unittest.TestCase):
             self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': 'rotated-key-0000',
                                                   'models': ['echo'], 'replace': True})
             deadline = time.monotonic() + 30
-            while self.manager.batches.get(created['id'])['status'] not in ('finished', 'cancelled') \
+            while self.manager.profiles.get(created['id'])['status'] not in ('finished', 'cancelled') \
                     and time.monotonic() < deadline:
-                self.manager.batches.advance()
+                self.manager.profiles.advance()
                 time.sleep(.1)
-        record = self.manager.batches.get(created['id'])
+        record = self.manager.profiles.get(created['id'])
         self.assertEqual(record['items'][0]['status'], 'finished')
         self.assertEqual(record['items'][1]['status'], 'failed')
-        self.assertIn('批次创建后', record['items'][1]['error'])
+        self.assertIn('排队后', record['items'][1]['error'])
         self.assertEqual(len(self.manager.runs()), 1)
 
     def test_a_loopback_import_is_refused_on_an_ssh_executor(self):
@@ -616,7 +616,7 @@ class ImportedProviderRunTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '回环地址'):
                 self.manager.launch({**request, 'executor': 'gpu'}, dry_run=True)
             with self.assertRaisesRegex(ValueError, '回环地址'):
-                self.client.request('api/batches', {'model': 'local/echo', 'executor': 'gpu', 'attempts': 1,
+                self.client.request('api/profiles/run', {'model': 'local/echo', 'executor': 'gpu', 'attempts': 1,
                                                     'concurrency': 1,
                                                     'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]})
         self.assertEqual(self.manager.runs(), [])
@@ -667,7 +667,7 @@ class ImportedProviderRunTest(unittest.TestCase):
                            'replace': True})
             return real_route(store, model_id)
         with patch.object(Providers, 'run_route', edited_between_checks):
-            with self.assertRaisesRegex(ValueError, '批次创建后'):
+            with self.assertRaisesRegex(ValueError, '排队后'):
                 self.manager.launch(request, pinned=pinned)
         self.assertEqual(self.manager.runs(), [])
         self.assertEqual(list(self.manager.records.glob('*')) if self.manager.records.exists() else [], [])
@@ -684,7 +684,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         # import, it is refused.
         configured = self.manager.launch({'model': 'tokenjoy/test-model', 'tasks': ['fix-git']}, dry_run=True)['route']
         self.assertEqual(configured, {'source': 'provider'})
-        with self.assertRaisesRegex(ValueError, '批次创建后'):
+        with self.assertRaisesRegex(ValueError, '排队后'):
             self.manager.launch({'model': 'tokenjoy/test-model', 'tasks': ['fix-git']}, pinned=pinned)
         self.assertEqual(self.manager.runs(), [])
 

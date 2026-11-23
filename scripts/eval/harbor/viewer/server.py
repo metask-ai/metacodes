@@ -45,8 +45,8 @@ SECURITY_HEADERS = (
 )
 
 
-# A batch request lists task names for every dataset; other bodies are small.
-POST_LIMITS = {"/api/batches": 512 * 1024}
+# A profile run lists task names for every dataset; other bodies are small.
+POST_LIMITS = {"/api/profiles/run": 512 * 1024}
 POST_LIMIT = 16384
 
 
@@ -138,14 +138,14 @@ def make_handler(workbench: Workbench, public_url=None):
                 payload = json.loads(self.rfile.read(length))
                 if path == "/api/runs":
                     self.send_json(workbench.launch(payload), 202)
-                elif path == "/api/batches":
-                    self.send_json(workbench.create_batch(payload), 202)
-                elif path == "/api/batch/cancel" and isinstance(payload, dict):
-                    self.send_json(workbench.cancel_batch(payload.get("id")))
-                elif path == "/api/batch/rename" and isinstance(payload, dict):
-                    self.send_json(workbench.rename_batch(payload.get("id"), payload.get("name")))
-                elif path == "/api/batch/delete" and isinstance(payload, dict):
-                    self.send_json(workbench.delete_batch(payload.get("id")))
+                elif path == "/api/profiles/run":
+                    self.send_json(workbench.queue_profile(payload), 202)
+                elif path == "/api/profile/cancel" and isinstance(payload, dict):
+                    self.send_json(workbench.cancel_profile(payload.get("id")))
+                elif path == "/api/profile/rename" and isinstance(payload, dict):
+                    self.send_json(workbench.rename_profile(payload.get("id"), payload.get("name")))
+                elif path == "/api/profile/delete" and isinstance(payload, dict):
+                    self.send_json(workbench.delete_profile(payload.get("id")))
                 elif path == "/api/store":
                     self.send_json(workbench.store_action(payload))
                 elif path == "/api/setup":
@@ -218,10 +218,10 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.setup_status())
                 else:
                     self.send_json(workbench.login_status())
-            elif path == "/api/batch":
-                value = workbench.batch(query.get("id"))
+            elif path == "/api/profile":
+                value = workbench.profile(query.get("id"))
                 if value is None:
-                    self.send_json({"error": "no such batch"}, 404)
+                    self.send_json({"error": "no such profile"}, 404)
                     return
                 self.send_json({**value, "can_run": self.authorized()})
             elif path == "/api/store":
@@ -229,7 +229,7 @@ def make_handler(workbench: Workbench, public_url=None):
             elif path == "/api/run":
                 self.send_found(workbench.run(query.get("name")), "no such run")
             elif path == "/api/jobs":
-                self.send_json({**workbench.jobs(query.get("batch") or "all"), "can_run": self.authorized()})
+                self.send_json({**workbench.jobs(query.get("profile") or "all"), "can_run": self.authorized()})
             elif path == "/api/job":
                 self.send_found(workbench.job(query.get("name", "")), "no such job")
             elif path == "/api/trial":
@@ -294,7 +294,7 @@ def make_server(workbench: Workbench, bind: str, port: int, public_url=None) -> 
     localhost (see trusted_origin)."""
     server = WorkbenchHTTPServer((bind, port), make_handler(workbench, public_url))
     server.workbench = workbench
-    workbench.start_batches()
+    workbench.start_profiles()
     server.daemon_threads = True
     return server
 
