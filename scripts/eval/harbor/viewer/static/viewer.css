@@ -161,6 +161,7 @@ pre.block{border:1px solid var(--border);border-radius:4px;background:var(--grou
 .scatter-point[data-ours="1"] .scatter-label{color:var(--text);font-weight:600}
 .scatter-point[data-frontier] .scatter-label{color:var(--text)}
 .scatter-plot[data-active] .scatter-point[data-killed]{opacity:.15}
+.scatter-plot[data-group] .scatter-point[data-dim]{opacity:.12}.scatter-plot[data-group] .scatter-point:not([data-dim]) .scatter-label{color:var(--text)}
 .scatter-point[data-current] .mark{box-shadow:0 0 0 3px var(--ground),0 0 0 4px currentColor}.scatter-point[data-current] .scatter-label{color:var(--text)}
 .scatter-tip{position:absolute;z-index:5;display:grid;gap:2px;min-width:200px;background:var(--raised);border:1px solid var(--border);border-radius:5px;padding:8px 10px;font-size:12px;pointer-events:none;box-shadow:0 10px 28px rgba(0,0,0,.4);transform:translate(16px,50%)}
 .scatter-tip[data-side=left]{transform:translate(calc(-100% - 16px),50%)}.scatter-tip span{color:var(--muted)}

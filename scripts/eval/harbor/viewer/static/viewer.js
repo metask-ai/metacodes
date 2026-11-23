@@ -1300,6 +1300,8 @@ function costScatter(rows, focus) {
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
   const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
+  const shared = new Set(points.filter((r, i) => points.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
+  const pointName = (r) => (!r.ours && shared.has(rowName(r)) ? `${r.harness} · ${r.model}` : rowName(r));
   const zone = svg('g', {});
   const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' }, zone,
     svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
@@ -1314,7 +1316,7 @@ function costScatter(rows, focus) {
     'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
-  markOf(r), h('span', { class: 'scatter-label', text: rowName(r) }))]));
+  markOf(r), h('span', { class: 'scatter-label', text: pointName(r) }))]));
   const plot = h('div', { class: 'scatter-plot' }, ...grid, layer, ...dots.values(), tip);
   focus.on((active) => {
     zone.replaceChildren();
@@ -1335,9 +1337,13 @@ function costScatter(rows, focus) {
     tip.style.bottom = py(a) + '%';
     tip.dataset.side = px(a) > 60 ? 'left' : 'right';
   });
+  const group = (name) => {
+    plot.toggleAttribute('data-group', Boolean(name));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(name) && rowName(r) !== name);
+  };
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
   const legend = h('div', { class: 'legend keys scatter-legend' }, [...new Map(points.map((r) => [rowName(r), r])).values()].map((r) =>
-    h('span', { class: 'key', onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null) }, markOf(r), rowName(r))));
+    h('span', { class: 'key', onmouseenter: () => group(rowName(r)), onmouseleave: () => group(null) }, markOf(r), rowName(r))));
   return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
     h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
