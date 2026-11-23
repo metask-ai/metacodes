@@ -765,6 +765,20 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(observed["job"]["orchestrator_override"], {"n_concurrent_trials": 16})
         self.assertFalse((repo / "configs/models" / (slug + "-judge.yaml")).exists())
 
+    def test_a_judged_workbuddy_run_reaches_the_ssh_node_with_its_judge_and_is_refused_without_one(self):
+        from scripts.eval.harbor.bench import executors
+        spec = {"runner": "workbuddy", "name": "bench-x", "suite": "workbuddy-web", "model": "metask/m",
+                "tasks": ["t"], "attempts": 1, "concurrency": 16, "workbuddy_judge": "kimi-k3.1-pro",
+                "executor": {"name": "relay-4090", "kind": "ssh", "host": "h", "user": "u"}}
+        remote = executors.RemoteRun(spec).remote_spec()
+        self.assertEqual(remote["workbuddy_judge"], "kimi-k3.1-pro")
+        repo = workbuddy_checkout(self.root, subset="web")
+        unjudged = {**spec, "workbuddy_judge": None, "jobs_dir": str(self.root / "jobs"),
+                    "workbuddy": {"checkout": str(repo), "subset": "web", "uv": "uv", "bash": "bash"}}
+        with self.assertRaisesRegex(ValueError, "LLM judge"):
+            wb.launch(unjudged, {"METASK_API_KEY": "k"})
+        self.assertFalse(any((repo / "configs/jobs").glob("*.yaml")))
+
     def test_workbuddy_judge_model_defaults_and_rejects_other_settings(self):
         self.assertIsNone(wb.judge_model(suites.get("workbuddy-code"), {}))
         self.assertEqual(wb.judge_model(suites.get("workbuddy-office"), {}), wb.DEFAULT_JUDGE_MODEL)

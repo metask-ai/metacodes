@@ -197,6 +197,8 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     """Write the transient configs and the workbench job; return argv, cwd, env."""
     from scripts.eval.harbor.bench.runner import atomic_json, now
     wb = spec["workbuddy"]
+    if wb["subset"] in JUDGED_SUBSETS and not spec.get("workbuddy_judge"):
+        raise ValueError(f"WorkBuddy {wb['subset']} 需要 LLM judge，但本次运行没有评委模型；请把工作台和执行节点更新到同一版本")
     model, job = job_documents(spec)
     documents = [json.dumps(model, indent=2), json.dumps(job, indent=2)]
     if wb.get("harness_image"):
