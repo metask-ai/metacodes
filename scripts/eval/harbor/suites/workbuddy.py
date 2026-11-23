@@ -42,6 +42,7 @@ ARTIFACT_MANIFEST = Path("configs/harnesses/metacodes/docker/artifacts/share/met
 JUDGED_SUBSETS = ("web", "office")
 DEFAULT_JUDGE_MODEL = "kimi-k3.1-pro"
 BASE_URL_ENV = "METACODES_BENCH_WORKBUDDY_BASE_URL"
+JUDGE_BASE_URL_ENV = "METACODES_BENCH_WORKBUDDY_JUDGE_BASE_URL"
 KEY_ENV = "METACODES_BENCH_WORKBUDDY_API_KEY"
 RESULTS_DIR = "workbuddy"
 
@@ -138,9 +139,9 @@ def judge_slug(spec) -> str:
     return slug(spec["name"]) + "-judge"
 
 
-def model_document(name: str, spec) -> dict:
-    return {"model": {"name": name, "protocols": ["anthropic"],
-                      "backend_url_env": BASE_URL_ENV, "backend_key_env": KEY_ENV,
+def model_document(name: str, spec, protocol: str = "anthropic", url_env: str = BASE_URL_ENV) -> dict:
+    return {"model": {"name": name, "protocols": [protocol],
+                      "backend_url_env": url_env, "backend_key_env": KEY_ENV,
                       "context_window": 200000, "max_concurrent": spec["concurrency"],
                       "params": {"max_output_tokens": 32768}}}
 
@@ -204,7 +205,7 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     if wb.get("harness_image"):
         documents.append(harness_version_document(Path(wb["checkout"]), wb["harness_image"]).rstrip("\n"))
     if spec.get("workbuddy_judge"):
-        documents.append(json.dumps(model_document(spec["workbuddy_judge"], spec), indent=2))
+        documents.append(json.dumps(model_document(spec["workbuddy_judge"], spec, "openai", JUDGE_BASE_URL_ENV), indent=2))
     for path, document in zip(config_paths(spec), documents):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("x", encoding="utf-8") as output:
@@ -224,7 +225,8 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     key = child.pop("METASK_API_KEY", None)
     if not key:
         raise ValueError("缺少账号 Key")
-    child.update({BASE_URL_ENV: spec["account_gateway"].rstrip("/") + "/v1/messages", KEY_ENV: key,
+    child.update({BASE_URL_ENV: spec["account_gateway"].rstrip("/") + "/v1/messages",
+                  JUDGE_BASE_URL_ENV: spec["account_gateway"].rstrip("/") + "/v1", KEY_ENV: key,
                   "SHARDS": "1", "SHARD_CONCURRENCY": str(spec["concurrency"]),
                   "AUTO_BUILD_HARNESS_MOUNT": "1", "DOCKER_DEFAULT_PLATFORM": TARGET_PLATFORM})
     argv = [wb["uv"], "run", "--frozen", wb["bash"], "scripts/run.sh", "--job", slug(spec["name"])]

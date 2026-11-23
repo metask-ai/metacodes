@@ -55,6 +55,7 @@ spec = model['model']
 (jobs_dir.parent / 'observed.json').write_text(json.dumps({{
     'argv': args, 'cwd': str(cwd), 'job': job, 'model': model, 'judge': judge,
     'base_url': os.environ.get(spec['backend_url_env']),
+    'judge_base_url': os.environ.get(judge['model']['backend_url_env']) if judge else None,
     'key_matches': os.environ.get(spec['backend_key_env']) == os.environ.get('FAKE_EXPECT_ACCOUNT_KEY'),
     'judge_key': os.environ.get('{judge}'), 'metask_key': 'METASK_API_KEY' in os.environ,
     'shard_concurrency': os.environ.get('SHARD_CONCURRENCY'), 'platform': os.environ.get('DOCKER_DEFAULT_PLATFORM')}}))
@@ -759,9 +760,9 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(observed["job"]["llm_judge_override"],
                          {"enabled": True, "mode": "in_container", "model": slug + "-judge"})
         judge = observed["judge"]["model"]
-        self.assertEqual((judge["name"], judge["backend_url_env"], judge["backend_key_env"]),
-                         ("judge-model", observed["model"]["model"]["backend_url_env"],
-                          observed["model"]["model"]["backend_key_env"]))
+        self.assertEqual((judge["name"], judge["protocols"], judge["backend_key_env"]),
+                         ("judge-model", ["openai"], observed["model"]["model"]["backend_key_env"]))
+        self.assertEqual(observed["judge_base_url"], f"http://127.0.0.1:{upstream.server_port}/v1")
         self.assertEqual(observed["job"]["orchestrator_override"], {"n_concurrent_trials": 16})
         self.assertFalse((repo / "configs/models" / (slug + "-judge.yaml")).exists())
 
