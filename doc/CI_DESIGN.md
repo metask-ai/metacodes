@@ -400,6 +400,8 @@ earlier nights' entries are no longer read and are evicted first.
 `rule-control.yml` (dispatch only) and `release.yml` (no Zig cache) keep
 their own settings.
 
+The macOS pool job keeps its caches on its host instead (§6).
+
 `scripts/tests/test_ci_scope.py` (`CacheTest`) pins the wiring: nothing but
 the warm run saves; each restore key is its save key without the run ID, and
 both run wherever Zig is set up; `WARM_CACHE` is true only for `main`'s
@@ -459,6 +461,23 @@ every flag of their hosted legs in one job (`Gates (macOS) / all`, `Gates
 `gates-all`), without the legs' repeated checkout, setup and compilation.
 Hosted runners keep the split legs of §4. TTY (Windows), the SDK jobs and
 AgentCore Windows stay on hosted runners.
+
+**The pool host keeps its own caches.** The hosted runners start empty
+and restore `main`'s caches (§5); the macOS pool job runs on a persistent
+host, where those downloads cost the host's network about 650 MB a job (the
+`gates-all` Zig cache, 342 MB, and the Lean cache, 312 MB, measured
+2026-11-23 over 114 jobs) for data its disk already held. So the pool job
+restores and saves neither. Its step `Keep the caches on the pool host`
+links `.zig-cache` and `control-plane/lean/.lake` to
+`~/.cache/metacodes-ci/<runner name>/`, which outlives the checkout (whose
+clean removes the links, not their targets); `~/.elan` is already in the
+host account's home. `main`'s warm run empties the host's Zig cache first,
+so it holds what the current tree builds and does not grow night after
+night. Zig's cache is content-addressed and Lake hash-verifies its products,
+so a stale entry is rebuilt, never trusted. A pool of single-use VMs
+([VM_POOLS.md](VM_POOLS.md)) would start each job cold under this step and
+needs a cache on its host's network instead. The Windows pool job keeps the
+hosted caches until AIPC has a runner.
 
 **The switch.** `.github/runner-pools.json` holds, per platform, `self_hosted`
 (on or off), the pool's `label`, its `slots`, the `pickup_timeout_minutes`,

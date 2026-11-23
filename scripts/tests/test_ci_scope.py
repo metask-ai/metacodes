@@ -53,6 +53,7 @@ DOC_STEPS = {
     "Stand down if the hosted legs took over",
 }
 ECHO_STEPS = {"Release fast path", "Change scope"}
+HOST_CACHE_STEP = "Keep the caches on the pool host"
 # The jobs that do the work, one runner per leg or shard (doc/CI_DESIGN.md §4),
 # and the switch each one's steps read.
 LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("gates-macos-vm", "SUITES"),
@@ -84,7 +85,7 @@ SETUP_STEPS = {
         "Release fast path", "Change scope", CHECKOUT,
         "Restore Lean toolchain and build products", "Install pinned elan", "Build pinned Lean kernel",
         "Install ripgrep", "Install bubblewrap", "Install Python development dependencies",
-        "Stand down if the hosted legs took over",
+        "Stand down if the hosted legs took over", "Keep the caches on the pool host",
     },
     "windows-gates": {
         "Release fast path", "Change scope", CHECKOUT,
@@ -813,10 +814,28 @@ class CacheTest(unittest.TestCase):
                     self.assertEqual(restore["with"]["key"], key[: -len(RUN_SUFFIX)])
                     self.assertEqual(restore["with"]["restore-keys"], restore["with"]["key"])
                     # Both run wherever Zig is set up: the restore first, the save last.
-                    self.assertEqual(restore["if"], "env.WARM_CACHE != 'true' && " + zig["if"])
+                    # A job sharing the pool job's steps reads neither on the pool host.
+                    pool = "env.POOL_JOB != 'true' && " if any(
+                        step.get("name") == HOST_CACHE_STEP for step in steps) else ""
+                    self.assertEqual(restore["if"], "env.WARM_CACHE != 'true' && " + pool + zig["if"])
+                    self.assertTrue(save["if"].startswith("env.WARM_CACHE == 'true' && " + pool), save["if"])
                     self.assertTrue(save["if"].endswith(" && " + zig["if"]), save["if"])
                     self.assertEqual(steps.index(restore), steps.index(zig) + 1)
                     self.assertEqual(steps.index(save), len(steps) - 1)
+
+    def test_the_pool_host_keeps_its_caches_on_disk(self) -> None:
+        jobs = self.workflows["ci.yml"]["jobs"]
+        steps = jobs["gates-macos-vm"]["steps"]
+        host = next(step for step in steps if step.get("name") == HOST_CACHE_STEP)
+        self.assertTrue(host["if"].startswith("env.POOL_JOB == 'true' && "), host["if"])
+        self.assertIn('ln -s "$root/zig-cache" .zig-cache', host["run"])
+        self.assertIn('ln -s "$root/lean-lake" control-plane/lean/.lake', host["run"])
+        self.assertLess(steps.index(host), next(i for i, step in enumerate(steps)
+                                                if step.get("uses", "").startswith("mlugg/setup-zig@")))
+        for step in steps:
+            if step.get("uses", "").startswith(("actions/cache/restore@", "actions/cache/save@")):
+                with self.subTest(step=step_label(step)):
+                    self.assertIn("env.POOL_JOB != 'true' && ", step["if"])
 
     def test_lean_products_are_restored_everywhere_and_saved_by_the_warm_run(self) -> None:
         jobs = self.workflows["ci.yml"]["jobs"]
