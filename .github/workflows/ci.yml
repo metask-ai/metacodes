@@ -388,8 +388,8 @@ jobs:
           RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
-          # A request that gets no answer (a self-hosted runner's network
-          # blip) or a 5xx is tried 3 times; an HTTP 4xx answer fails at once.
+          # A request that gets no answer (a network blip on a self-hosted
+          # runner) or a 5xx is tried 3 times; an HTTP 4xx answer fails at once.
           gh_api() {
             local delay out err
             err=$(mktemp)
@@ -1125,8 +1125,8 @@ jobs:
           RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
-          # A request that gets no answer (a self-hosted runner's network
-          # blip) or a 5xx is tried 3 times; an HTTP 4xx answer fails at once.
+          # A request that gets no answer (a network blip on a self-hosted
+          # runner) or a 5xx is tried 3 times; an HTTP 4xx answer fails at once.
           gh_api() {
             local delay out err
             err=$(mktemp)
