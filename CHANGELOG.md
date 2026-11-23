@@ -214,6 +214,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **On Windows a sign-in opens its whole URL in the browser** (#727). The
+  browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
+  command at the first `&`: the browser got `…/oauth/authorize?response_type=code`
+  without `client_id`, `redirect_uri`, `state` and the rest, and the sign-in
+  page could not go on. The URL now goes to `rundll32.exe
+  url.dll,FileProtocolHandler` from the system directory as one argument, with
+  no shell in between. This covers every place metacodes opens a browser:
+  Metask's sign-in and its device-code page, ChatGPT's and other providers'
+  OAuth, OpenRouter's, an MCP server's, and a provider's page for creating a
+  key.
+
 - **A busy tunnel port on an SSH executor no longer fails `egress =
   "workbench"`** (#716). Setup's 容器出网 step and each run picked the
   executor-side port of their `ssh -R` tunnel at random from 20000–59999,
