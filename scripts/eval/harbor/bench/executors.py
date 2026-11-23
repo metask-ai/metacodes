@@ -513,12 +513,15 @@ def resolve_node(executor: SshExecutor, runner=subprocess.run) -> str:
     try:
         done = runner(shell_argv(executor, script), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                       timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        done = None
-    lines = (done.stdout or "").strip().splitlines() if done else []
-    if not done or done.returncode != 0 or not lines:
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败：{exc}") from None
+    if done.returncode == 127:
         raise ValueError(f"执行机器 {executor.name} 上找不到 metacodes 节点；"
                          f"运行 metacodes bench setup --executor {executor.name}")
+    lines = (done.stdout or "").strip().splitlines()
+    if done.returncode != 0 or not lines:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败（退出码 {done.returncode}）："
+                         f"{(done.stderr or '').strip()[-300:]}")
     return lines[-1]
 
 

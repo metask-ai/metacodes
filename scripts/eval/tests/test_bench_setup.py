@@ -822,6 +822,20 @@ class SshExecutorTest(SetupFixture):
         with self.assertRaisesRegex(ValueError, "找不到 metacodes 节点"):
             executors.resolve_node(relay)
 
+    def test_an_unreachable_executor_is_not_reported_as_a_missing_node(self):
+        self.add_ssh_executor()
+        relay = executors.find(self.cfg(), "relay-4090")
+
+        def runner(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 255, "", "ssh: connect to host 10.126.126.1: Connection refused")
+        with self.assertRaisesRegex(ValueError, "连接执行机器 relay-4090.*退出码 255.*Connection refused"):
+            executors.resolve_node(relay, runner)
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        with self.assertRaisesRegex(ValueError, "连接执行机器 relay-4090"):
+            executors.resolve_node(relay, timeout)
+
     def test_a_node_on_the_path_runs_with_the_configured_python(self):
         """No setup-managed entry: the `metacodes` on the executor's PATH is
         the node, started with the entry's `python`, for probe and commands."""
