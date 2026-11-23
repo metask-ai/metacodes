@@ -150,7 +150,7 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 | footer | 会话 | 保留 | usage/mode 快照 |
 | panel.task_list_visible | 会话 | 保留 | Ctrl+T 偏好,两期共用 |
 | agent_count | 会话 | 保留 | registry 镜像,render 回写 |
-| Interaction.editor | input / generating | 清空 | 输入期借用 readLineRaw 的 LineEditor 缓冲;生成期借用 region 的副本 `gen_editor`(§9.2),草稿本体是这一轮 TuiBackend 的 `draft`——权限/提问对话框会停掉再重启 watcher 线程,草稿归 backend 才能跨过这次重启(以前归 watcher,对话框一关缓冲就被释放,框里读到已释放内存、下一个键丢掉草稿)。阶段结束缓冲即释放 |
+| Interaction.editor | input / generating | 清空 | 输入期借用 readLineRaw 的 LineEditor 缓冲;生成期借用 region 的副本 `gen_editor`(§9.2),草稿本体是这一轮 TuiBackend 的 `draft`——权限/提问对话框会停掉再重启 watcher 线程,草稿归 backend 才能跨过这次重启(以前归 watcher,对话框一关缓冲就被释放,框里读到已释放内存、下一个键丢掉草稿)。回复结束时没发出的草稿连同光标交给 `loop.zig` 的 `unsent_draft`,由下一次读输入或排队消息起的下一个回复接过(#756);空草稿和读输入的缓冲在阶段结束时释放 |
 | Interaction.help_open | input / generating | 关 | `?` 帮助 |
 | Interaction.ctrl_x_armed | input / generating | 清 | Ctrl+X 前缀 |
 | Interaction.agents | input / generating | closed | switcher list/viewing、sel、viewing_id、视口 |

@@ -221,6 +221,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **What you type while the model answers is still in the box when it ends**
+  (#756). Text typed into the input box during a reply and not sent was
+  dropped when the reply ended, and the prompt came back empty. It now stays,
+  with the cursor where it was, also through the reply to a message queued
+  before it.
+
 - **A paste while the model answers stays whole in the input box** (#755).
   During a reply each line break of a pasted text acted as Enter: the first
   line was queued on its own and sent as soon as the reply ended, and the

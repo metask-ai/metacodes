@@ -217,6 +217,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     // 逐条取出作为后续 input 续发,直到队空(对齐 Claude Code commandQueue)。
     var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
     defer msg_queue.deinit();
+    var unsent_draft: ?input.LineEditor = null;
+    defer if (unsent_draft) |*draft| draft.deinit();
 
     const turn_host: TurnHost = .{
         .app = app,
@@ -225,6 +227,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         .stdin_fd = stdin_fd,
         .region = if (tui_region) |*r| r else null,
         .msg_queue = &msg_queue,
+        .unsent_draft = &unsent_draft,
         .history = &history,
         .eval_runtime = &eval_runtime,
         .eval_execution_policy = eval_execution_policy,
@@ -276,7 +279,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             echoUserSubmission(app, q, if (tui_region) |*r| r else null);
             break :blk q; // q owned,与 readLine 返回所有权一致
         } else if (tty)
-            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?) catch |err| switch (err) {
+            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?, &unsent_draft) catch |err| switch (err) {
                 // The double-press exits leave quietly, as Claude Code does;
                 // only `/exit` says goodbye.
                 error.Eof, error.ExitRequested => break,
@@ -878,6 +881,7 @@ const TurnHost = struct {
     stdin_fd: c_int,
     region: ?*render_region_mod.RenderRegion,
     msg_queue: *msg_queue_mod.MsgQueue,
+    unsent_draft: *?input.LineEditor,
     history: *history_mod.History,
     eval_runtime: *?evaluation_backend_mod.RuntimeConfig,
     eval_execution_policy: ?@import("../tools.zig").ToolExecutionPolicy,
@@ -903,7 +907,7 @@ const TurnKind = enum { prompt, skill, macro };
 /// the caller's stack at a fixed address while its watcher runs.
 fn turnBackend(host: *const TurnHost, region: *render_region_mod.RenderRegion) tui_backend_mod.TuiBackend {
     const app = host.app;
-    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .state_root = app.stateRoot(), .input_abort = &app.abort };
+    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .state_root = app.stateRoot(), .unsent_draft = host.unsent_draft, .input_abort = &app.abort };
 }
 
 /// What the spinner says while a request waits on MCP servers.
@@ -1854,7 +1858,7 @@ const TeamworkReader = struct {
     fn read(ctx: *anyopaque) ?[]u8 {
         const self: *TeamworkReader = @ptrCast(@alignCast(ctx));
         const host = self.host;
-        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region) catch null;
+        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region, host.unsent_draft) catch null;
         return readLineBuffered(host.allocator, host.stdin_fd) catch null;
     }
 };
@@ -1871,6 +1875,7 @@ fn readLineRaw(
     history: *history_mod.History,
     app: *app_mod.App,
     region: *render_region_mod.RenderRegion,
+    unsent_draft: *?input.LineEditor,
 ) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
@@ -1878,7 +1883,8 @@ fn readLineRaw(
     };
     defer input.restoreMode(fd, orig);
 
-    var editor = input.LineEditor.init(allocator);
+    var editor = unsent_draft.* orelse input.LineEditor.init(allocator);
+    unsent_draft.* = null;
     defer editor.deinit();
 
     var parser = input.KeyParser{};

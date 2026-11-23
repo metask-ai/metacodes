@@ -186,9 +186,11 @@ pub const TuiBackend = struct {
 
     /// 生成期输入框里的草稿。归 backend(= 这一轮回复)所有,不归 watcher:权限/提问对话框会
     /// stopInput 再 startInput,换一个 watcher 线程,而回复(生成阶段)还在继续——草稿、光标和
-    /// region 上它的投影都得跨过这次重启。首次 startInput 时建,deinit 时释放。
+    /// region 上它的投影都得跨过这次重启。首次 startInput 时建(接过 unsent_draft 里上一阶段没发出的
+    /// 草稿),deinit 时交回 unsent_draft。
     /// 只由存活的 watcher 线程读写;stopInput 与 startInput 之间没有 watcher,主线程也不碰它。
     draft: ?input.LineEditor = null,
+    unsent_draft: ?*?input.LineEditor = null,
 
     pub fn init(region: *RenderRegion) TuiBackend {
         return .{ .region = region };
@@ -487,7 +489,7 @@ pub const TuiBackend = struct {
         // 不是不变量的真正强制者(真正强制靠 input_thread 这个 optional 的存在性 + 调用纪律)。多 session
         // 若要硬保证,得让 start 在 input_thread!=null 时返回 error 或先内部 stop(Linus #3 认知项)。
         std.debug.assert(self.input_thread == null);
-        if (self.draft == null) self.draft = input.LineEditor.init(allocator);
+        if (self.draft == null) self.draft = self.takeUnsentDraft() orelse input.LineEditor.init(allocator);
         self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
         self.cancel_sent = false;
@@ -515,17 +517,32 @@ pub const TuiBackend = struct {
         }
     }
 
-    /// 回复结束:停 watcher(若还在),释放草稿。持有 backend 的一方 defer 调它,任何出口都走得到。
+    /// 回复结束:停 watcher(若还在),草稿交回 unsent_draft(交不回就释放)。持有 backend 的一方
+    /// defer 调它,任何出口都走得到。
     /// 出错返回时 defer 先跑这里、后离开生成阶段,所以释放前先撤掉 region 上的投影(持锁)。
     /// 投影是 region 自己的副本(gen_editor),不会读到释放的缓冲;撤掉它是让这之间画出的帧
     /// 不再显示一份已经没有回复接收的草稿。
     pub fn deinit(self: *TuiBackend) void {
         self.stopInput();
-        if (self.draft) |*d| {
+        if (self.draft) |draft| {
             self.region.setGenInput("", 0);
-            d.deinit();
+            self.handBackDraft(draft);
         }
         self.draft = null;
+    }
+
+    fn takeUnsentDraft(self: *TuiBackend) ?input.LineEditor {
+        const slot = self.unsent_draft orelse return null;
+        const draft = slot.*;
+        slot.* = null;
+        return draft;
+    }
+
+    fn handBackDraft(self: *TuiBackend, draft: input.LineEditor) void {
+        var unsent = draft;
+        const slot = self.unsent_draft orelse return unsent.deinit();
+        if (unsent.view().len == 0 or slot.* != null) return unsent.deinit();
+        slot.* = unsent;
     }
 
     /// 统一的终端接管骨架(三套 UI 请求曾各写一遍,现合一)。
@@ -1015,4 +1032,34 @@ test "a long paste during a reply is held as a placeholder, and the queued messa
     try std.testing.expectEqualStrings(text, event.queue_message);
     const kept = (try history.prev("")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(editor.view(), kept);
+}
+
+test "the end of a reply hands an unsent draft and its cursor on, the next phase takes it, and an empty one is freed (#756)" {
+    const a = std.testing.allocator;
+    var region = RenderRegion.init(a, 2, theme_mod.monochrome, .none);
+    defer region.deinit();
+    _ = @import("ui.zig").dispatch(&region.ui, .{ .phase_change = .{ .generating = .{} } });
+    var unsent: ?input.LineEditor = null;
+    defer if (unsent) |*draft| draft.deinit();
+
+    var reply = TuiBackend.init(&region);
+    reply.unsent_draft = &unsent;
+    reply.draft = input.LineEditor.init(a);
+    try reply.draft.?.setLine("keep me");
+    reply.draft.?.cursor = 4;
+    region.setGenInput(reply.draft.?.view(), reply.draft.?.cursor);
+    reply.deinit();
+    try std.testing.expect(reply.draft == null);
+    try std.testing.expectEqualStrings("", region.ui.phase.generating.interaction.editor.view);
+    try std.testing.expectEqualStrings("keep me", unsent.?.view());
+    try std.testing.expectEqual(@as(usize, 4), unsent.?.cursor);
+
+    var next = TuiBackend.init(&region);
+    next.unsent_draft = &unsent;
+    next.draft = next.takeUnsentDraft();
+    try std.testing.expect(unsent == null);
+    try std.testing.expectEqualStrings("keep me", next.draft.?.view());
+    next.draft.?.clear();
+    next.deinit();
+    try std.testing.expect(unsent == null);
 }

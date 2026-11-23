@@ -6,7 +6,7 @@ key_events 用够长 sleep 落在生成窗口内。
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run
+from tty_driver import run, wait_for
 from asserts import TTYAssert
 from e2e_helpers import run_live_fresh, require_model  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
 
@@ -251,7 +251,10 @@ SHIFT_ENTERS = {
 }
 
 
-def _reply_with_keys(bin_path, keys):
+IDLE_UNDER_A_MULTILINE_DRAFT = wait_for("for newline")
+
+
+def _reply_with_keys(bin_path, keys, after=(), second_turn=None, idle=None):
     """Press `keys` while a slow reply streams, then let the reply end on its
     own. The TTYAssert and the model requests that were made."""
     from tty_driver import IDLE, IS_WINDOWS, READY, wait_for
@@ -262,10 +265,11 @@ def _reply_with_keys(bin_path, keys):
     # The reply has to outlast the keys: through ConPTY they land several times
     # slower than through a pty (a Windows run typed about one key in 0.45 s
     # and the 4 s reply ended halfway through the draft).
-    turns = [slow_text_then_end(n_chunks=50 if IS_WINDOWS else 14, delay=0.3), simple_text("SECOND_REPLY")]
+    turns = [slow_text_then_end(n_chunks=50 if IS_WINDOWS else 14, delay=0.3),
+             second_turn or simple_text("SECOND_REPLY")]
     with SlowMockServer(turns) as srv:
         raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt")]
-                  + keys + [IDLE, "strictsleep:1.0"],
+                  + keys + [idle or IDLE, "strictsleep:1.0"] + list(after),
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
         requests = list(srv.requests)
     return TTYAssert(raw), requests
@@ -307,7 +311,8 @@ def test_shift_enter_during_a_reply_inserts_a_newline(bin_path):
     the next message."""
     for name, shift_enter in SHIFT_ENTERS.items():
         a, requests = _reply_with_keys(
-            bin_path, ["type:DRAFT_A"] + shift_enter + ["type:DRAFT_B", "strictsleep:0.5"])
+            bin_path, ["type:DRAFT_A"] + shift_enter + ["type:DRAFT_B", "strictsleep:0.5"],
+            idle=IDLE_UNDER_A_MULTILINE_DRAFT)
         frames = _reply_frames(a)
         if not any(_box_rows(a, sc) == ["❯ DRAFT_A", "DRAFT_B"] for sc in frames):
             last = frames[-1].render_ascii() if frames else "(no frame drawn during the reply)"
@@ -370,7 +375,8 @@ def _second_request_text(a, requests, what):
 
 
 def test_a_paste_during_a_reply_stays_whole_in_the_draft(bin_path):
-    a, requests = _reply_with_keys(bin_path, [_bracketed_paste("PASTE_ONE\nPASTE_TWO"), "strictsleep:0.5"])
+    a, requests = _reply_with_keys(bin_path, [_bracketed_paste("PASTE_ONE\nPASTE_TWO"), "strictsleep:0.5"],
+                                   idle=IDLE_UNDER_A_MULTILINE_DRAFT)
     _assert_draft_held_and_nothing_sent(a, requests, ["❯ PASTE_ONE", "PASTE_TWO"], "a two-line paste")
 
 
@@ -390,6 +396,36 @@ def test_a_long_paste_during_a_reply_is_held_as_at_the_prompt_and_sent_whole(bin
     sent = _second_request_text(a, requests, "Enter after a long paste")
     if "\n".join(lines) not in sent or "[Pasted text" in sent:
         a._fail(f"the next request did not carry the whole paste: {sent!r}")
+
+
+def test_a_draft_left_when_a_reply_ends_comes_back_to_the_prompt_with_its_cursor(bin_path):
+    a, requests = _reply_with_keys(bin_path, ["type:DRAFT_ABCD", "key:left", "key:left"],
+                                   after=["type:X", "strictsleep:0.5"])
+    a.assert_input_echo("DRAFT_ABXCD")
+    a.assert_cursor_on_content("DRAFT_ABX")
+    if len(requests) != 1:
+        a._fail(f"the draft was sent: {[_user_texts(body)[-1] for body in requests[1:]]}")
+
+
+def test_a_draft_left_when_a_reply_ends_stays_in_the_box_through_the_queued_reply(bin_path):
+    from slow_mock_server import slow_text_then_end
+
+    def echoed_above_the_box(sc):
+        echo, box = sc.find_row("❯ QUEUED_MSG"), sc.find_last_row("❯")
+        return echo is not None and box is not None and echo < box
+
+    a, requests = _reply_with_keys(bin_path, ["type:QUEUED_MSG", "key:enter", "type:LEFT_OVER"],
+                                   second_turn=slow_text_then_end(n_chunks=6, delay=0.3))
+    queued_reply = [sc for sc in _reply_frames(a) if echoed_above_the_box(sc)]
+    if not queued_reply:
+        a._fail("no frame of the reply to the queued message was drawn")
+    if not any(_box_rows(a, sc) == ["❯ LEFT_OVER"] for sc in queued_reply):
+        a._fail(f"the box did not hold the draft during the queued reply; its first frame:\n"
+                f"{queued_reply[0].render_ascii()}")
+    a.assert_input_echo("LEFT_OVER")
+    sent = _second_request_text(a, requests, "a queued message with a draft left")
+    if "QUEUED_MSG" not in sent or "LEFT_OVER" in sent:
+        a._fail(f"the queued request should carry the queued message only: {sent!r}")
 
 
 def test_ctrl_l_while_generating_resets_the_screen_in_one_frame(bin_path):
