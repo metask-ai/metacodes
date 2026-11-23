@@ -460,21 +460,32 @@ async function renderProfile(id) {
   return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), compositionPanel(s, '最新结果均值'), tasks, items);
 }
 
-// The latest results of each model side by side, when the profile has several.
+// The latest results of each model side by side, when the profile has several:
+// over every task each ran, then, when they ran different tasks, over the tasks
+// all of them ran, so a model is not judged on an easier subset.
 function modelsPanel(b) {
   if ((b.by_model || []).length < 2) return null;
-  const rows = b.by_model.map(({ model, summary: m }) => h('tr', { class: 'link', onclick: () => { state.profileModel = model; render(); } },
+  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '总 Token', '估算成本'];
+  const row = (model, tasks, m) => h('tr', { class: 'link', onclick: () => { state.profileModel = model; render(); } },
     h('td', { text: model || '—' }),
+    h('td', { class: 'num', text: String(tasks) }),
     h('td', {}, outcomeBar(m.counts, m.trials || 0)),
     h('td', { class: 'num', text: pct(m.one_shot_pass_rate) }),
     h('td', { class: 'num', text: `${m.counts.pass} / ${m.valid || 0}` }),
     h('td', { class: 'num', text: pct(m.first_pass_rate) }),
     h('td', { class: 'num', text: String(m.counts.invalid) }),
     h('td', { class: 'num', text: compact(m.total_tokens) }),
-    h('td', { class: 'num', text: usd(m.cost_usd) })));
-  return panel('模型对比', `${b.by_model.length} 个模型 · 各自的最新结果 · 点一行只看这个模型的逐任务结果`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['模型', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '总 Token', '估算成本'].map((t, i) => h('th', { class: i >= 2 ? 'num' : null, text: t })))),
-    h('tbody', {}, rows))));
+    h('td', { class: 'num', text: usd(m.cost_usd) }));
+  const table = (rows) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 1 || i >= 3 ? 'num' : null, text: t })))),
+    h('tbody', {}, rows)));
+  const mixed = b.common_tasks !== null && b.common_tasks !== undefined;
+  const body = [table(b.by_model.map((x) => row(x.model, x.tasks, x.summary)))];
+  if (mixed) {
+    body.push(h('div', { class: 'callout' }, h('p', { text: `各模型跑过的题不一样，上表不能直接比。下表只算所有模型都跑过的 ${b.common_tasks} 道题。` })),
+      b.common_tasks ? table(b.by_model.map((x) => row(x.model, b.common_tasks, x.common_summary))) : h('div', { class: 'empty', text: '没有所有模型都跑过的题。' }));
+  }
+  return panel('模型对比', `${b.by_model.length} 个模型 · 各自的最新结果 · 点一行只看这个模型的逐任务结果`, h('div', {}, body));
 }
 
 async function renderProfileTask(profileId, jobName, taskName, trialName) {

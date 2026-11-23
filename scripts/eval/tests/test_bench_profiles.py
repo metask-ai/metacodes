@@ -672,6 +672,24 @@ class ProfileTest(unittest.TestCase):
                 request = {k: v for k, v in self.request(**override).items() if k != 'model' or 'model' in override}
                 self.client.request('api/profiles/run', request)
 
+    def test_models_that_ran_different_tasks_are_also_compared_on_the_common_ones(self):
+        def entry(status):
+            return (None, 'job', [{'task': 't', 'status': status}])
+        def summarize(rows):
+            return {'trials': len(rows), 'counts': {'pass': sum(r['status'] == 'pass' for r in rows)}}
+        summarized = patch.object(workbench_module.data, 'summarize', side_effect=summarize)
+        summarized.start()
+        self.addCleanup(summarized.stop)
+        latest = {('s', 'a', 'x'): entry('pass'), ('s', 'a', 'y'): entry('fail'), ('s', 'b', 'x'): entry('fail')}
+        by_model, common = workbench_module.model_comparison(latest)
+        self.assertEqual(common, 1)
+        self.assertEqual([(m['model'], m['tasks'], m['summary']['trials']) for m in by_model], [('a', 2, 2), ('b', 1, 1)])
+        self.assertEqual([m['common_summary']['counts']['pass'] for m in by_model], [1, 0])
+        same = {('s', 'a', 'x'): entry('pass'), ('s', 'b', 'x'): entry('fail')}
+        by_model, common = workbench_module.model_comparison(same)
+        self.assertIsNone(common)
+        self.assertNotIn('common_summary', by_model[0])
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
