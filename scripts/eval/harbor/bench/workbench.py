@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
+from scripts.eval.harbor.suites import leaderboards
 from scripts.eval.harbor.bench import builds, data, executors
 from scripts.eval.harbor.bench.profiles import PROFILE_ACTIVE, ProfileManager, public as public_profile, runs_of
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
@@ -27,6 +28,8 @@ RUNTIME_ROOT = Path(__file__).resolve().parents[4]
 READ_ONLY = "当前服务为只读模式"
 READ_ONLY_CATALOG = {"service": "metacodes-bench", "schema_version": 1, "ready": False,
                      "reasons": [READ_ONLY], "runs": []}
+LEADERBOARD_SUMMARY = ("pass_rate", "pass_rate_ci95", "cost_per_task", "tasks_attempted", "tasks_solved", "trials", "valid")
+RANKED_COVERAGE = 0.8
 ATTEMPT_FIELDS = ("trial", "status", "cause", "reward", "attempt_number", "first_attempt", "total_tokens",
                   "initial_input_tokens", "input_tokens", "output_tokens", "elapsed_s", "turns", "tool_calls", "tests")
 
@@ -233,6 +236,33 @@ class Workbench:
         """Every stored job, newest first, as Harbor wrote it."""
         self.library.maybe_sync()
         return self.library.overview()
+
+    def leaderboard(self, suite_id=None) -> Optional[Dict[str, Any]]:
+        """Published boards of one suite (default: the first that has any) and
+        this workbench's finished jobs on it. Jobs that scored at least
+        RANKED_COVERAGE of the suite's tasks are ranked; the rest are listed."""
+        published = leaderboards.boards()
+        listed = [s.id for s in suites.ALL if any(s.id in b["suites"] for b in published)]
+        suite_id = suite_id or (listed[0] if listed else None)
+        if suite_id not in listed:
+            return None
+        suite = suites.resolved(suites.BY_ID[suite_id])
+        task_count = len(suite.tasks) if suite.tasks else suite.max_tasks
+        self.library.maybe_sync()
+        runs = self.runs()
+        jobs = []
+        for name in self.library.job_names():
+            view = self.job_view(name, False, runs)
+            if not view or view.get("suite") != suite_id or view["running"] or view["summary"]["pass_rate"] is None:
+                continue
+            summary = {k: view["summary"].get(k) for k in LEADERBOARD_SUMMARY}
+            jobs.append({"name": view["name"], "model": view.get("model"), "profile": view.get("profile"),
+                         "started_at": view.get("started_at"), "summary": summary,
+                         "ranked": (summary["tasks_attempted"] or 0) >= RANKED_COVERAGE * task_count})
+        jobs.sort(key=lambda job: job["summary"]["pass_rate"], reverse=True)
+        return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "task_count": task_count,
+                "ranked_coverage": RANKED_COVERAGE, "boards": [b for b in published if suite_id in b["suites"]],
+                "jobs": jobs}
 
     def job(self, name) -> Optional[Dict[str, Any]]:
         self.library.maybe_sync()

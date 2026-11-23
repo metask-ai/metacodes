@@ -182,6 +182,39 @@ class LibraryTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith("job,model,task,trial,status"))
 
 
+class LeaderboardTest(unittest.TestCase):
+    BOARD = {"suites": ["terminal-bench-2.1"], "title": "Public board",
+             "source": {"name": "board", "url": "https://example.invalid/", "retrieved": "2026-11-22", "metric": "accuracy"},
+             "entries": [{"harness": "Other", "model": "x", "score": 50.0}]}
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        full = _job(self.root, "full", "m", planned=72)
+        for n in range(72):
+            _trial(full, f"task{n}__aaa", reward=1.0 if n % 4 else 0.0)
+        _trial(_job(self.root, "sample", "m", planned=1), "task0__bbb", reward=1.0)
+        _trial(_job(self.root, "live", "m", planned=2, finished=False), "task0__ccc", reward=1.0)
+        patcher = patch("scripts.eval.harbor.suites.leaderboards.boards", return_value=[self.BOARD])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.workbench = Workbench(data.Library([self.root]))
+
+    def test_finished_jobs_covering_most_tasks_are_ranked_and_samples_only_listed(self):
+        board = self.workbench.leaderboard(None)
+        self.assertEqual(board["suite"], "terminal-bench-2.1")
+        self.assertEqual(board["task_count"], 89)
+        self.assertEqual(board["boards"], [self.BOARD])
+        jobs = {job["name"]: job for job in board["jobs"]}
+        self.assertEqual(sorted(jobs), ["full", "sample"])
+        self.assertTrue(jobs["full"]["ranked"])
+        self.assertEqual(jobs["full"]["summary"]["pass_rate"], 0.75)
+        self.assertFalse(jobs["sample"]["ranked"])
+
+    def test_a_suite_without_a_published_board_is_not_found(self):
+        self.assertIsNone(self.workbench.leaderboard("aime"))
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())

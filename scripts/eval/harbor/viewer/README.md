@@ -21,6 +21,7 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 | 作业 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
 | trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |
 | 对比 `#/compare/<job>,<job>` | the same tasks across jobs (models), the pass rate on tasks every job scored |
+| 榜单 `#/leaderboard/<suite>` | published results of other agents and models on the suite, with this workbench's jobs ranked among them |
 
 Outcomes follow [doc/BENCHMARKS.md](../../../../doc/BENCHMARKS.md): `invalid`
 (verifier timeout, provider or environment failure, no reward) stays out of

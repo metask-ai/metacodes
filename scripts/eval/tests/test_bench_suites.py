@@ -266,6 +266,25 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(wb.TARGET_PLATFORM, TARGET_PLATFORM)
         self.assertEqual(wb.HARNESS_IMAGE, DEFAULT_HARNESS_IMAGE)
 
+    def test_published_boards_name_catalog_suites_and_cite_their_source(self):
+        from scripts.eval.harbor.suites import leaderboards
+        boards = leaderboards.boards()
+        self.assertTrue(boards)
+        for board in boards:
+            with self.subTest(board=board["title"]):
+                self.assertTrue(board["suites"])
+                self.assertTrue(set(board["suites"]) <= set(suites.BY_ID))
+                source = board["source"]
+                self.assertTrue(source["url"].startswith("https://"))
+                self.assertRegex(source["retrieved"], r"^\d{4}-\d{2}-\d{2}$")
+                self.assertTrue(source["name"] and source["metric"])
+                self.assertTrue(board["entries"])
+                for entry in board["entries"]:
+                    self.assertTrue(entry["harness"])
+                    self.assertTrue(0 <= entry["score"] <= 100)
+                    cost = entry.get("cost_per_task_usd")
+                    self.assertTrue(cost is None or cost >= 0)
+
     def test_binary_carries_every_module_the_workbench_imports(self):
         assets = set(re.findall(r'\.path = "([^"]+)"', (REPO / "scripts/bench_assets.zig").read_text()))
         probe = ("import sys, json\n"
