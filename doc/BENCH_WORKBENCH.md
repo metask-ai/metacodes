@@ -60,11 +60,11 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
 | 终端工程 | `frontier-harness-eval-1.1` | harbor-registry | `-d frontier-harness-eval/frontier-harness-eval@v1.1.0` | 62 (62) |
 | 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
-| 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (20) |
-| 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | listed, not launched (LLM judge budget) | 70 / 50 |
+| 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
+| 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
 Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
-and the small-task adapters allow up to 16, GAIA2 and WorkBuddy 2). The page starts at 4 runs
+the WorkBuddy subsets and the small-task adapters allow up to 16, GAIA2 2). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
@@ -234,8 +234,11 @@ subset fetched by WorkBuddy's `scripts/dataset/fetch-dataset.sh`, Docker,
 with the account key in a dedicated variable and the judge key removed, and
 sets the job's `jobs_dir` to `<jobs-dir>/<run>/workbuddy`, whose Harbor
 trials the job view reads. These are ordinary WorkBuddy runs, not
-launch-gate receipts or quality evidence; the judged Web/Office subsets
-remain with `launch_gate`.
+launch-gate receipts or quality evidence. The Web and Office subsets also
+write a judge model config (`configs/models/metacodes-<run>-judge.yaml`, same
+account route as the agent) and set the job's `llm_judge_override` to
+`{"enabled": true, "mode": "in_container"}` with it. The judge model is
+`judges.<suite id>.model` in `workbench.json`, default `kimi-k3.1-pro`.
 
 ## Configure execution
 

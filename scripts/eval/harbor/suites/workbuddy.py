@@ -20,8 +20,9 @@ run directories (data.trial_dirs).
 Scope: these are ordinary (unbudgeted) WorkBuddy runs with the execution
 host's Metask account key, not launch-gate receipts; their results are not
 quality evidence for the paired studies in scripts/eval/workbuddy/README.md.
-The Web and Office subsets run an LLM judge whose spend only the launch gate
-budgets, so the workbench lists them but does not launch them.
+The Web and Office subsets run WorkBuddy's in-container LLM judge through
+the same account route as the agent, with the model `judges.<suite id>.model`
+from workbench.json (default `DEFAULT_JUDGE_MODEL`).
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ HARNESS = "metacodes/0.1.0"
 OVERLAY = Path("configs/harnesses/metacodes/OVERLAY.json")
 ARTIFACT_MANIFEST = Path("configs/harnesses/metacodes/docker/artifacts/share/metacodes/artifact-manifest.json")
 JUDGED_SUBSETS = ("web", "office")
+DEFAULT_JUDGE_MODEL = "kimi-k3.1-pro"
 BASE_URL_ENV = "METACODES_BENCH_WORKBUDDY_BASE_URL"
 KEY_ENV = "METACODES_BENCH_WORKBUDDY_API_KEY"
 RESULTS_DIR = "workbuddy"
@@ -88,8 +90,6 @@ def task_ids(suite, ctx) -> List[str]:
 
 def readiness(suite, ctx) -> List[str]:
     reasons = []
-    if suite.subset in JUDGED_SUBSETS:
-        reasons.append(f"{suite.name} 需要 LLM judge，其花费只能由 WorkBuddy launch_gate 预算授权；工作台暂不发起")
     if auth_mode(ctx.cfg) != "metask":
         reasons.append("WorkBuddy 评测目前只支持 Metask 账号模式（--auth metask）")
     repo = checkout(ctx)
@@ -121,13 +121,34 @@ def slug(name: str) -> str:
     return "metacodes-" + name
 
 
+def judge_model(suite, cfg) -> Optional[str]:
+    if suite.subset not in JUDGED_SUBSETS:
+        return None
+    entry = ((cfg or {}).get("judges") or {}).get(suite.id) or {}
+    if not isinstance(entry, dict) or set(entry) - {"model"}:
+        raise ValueError(f"workbench.json 的 judges.{suite.id} 只接受 model")
+    model = entry.get("model", DEFAULT_JUDGE_MODEL)
+    from scripts.eval.harbor.profiling import JUDGE_MODEL
+    if not isinstance(model, str) or not JUDGE_MODEL.fullmatch(model.removeprefix("metask/")):
+        raise ValueError(f"judges.{suite.id}.model 无效：{str(model)[:80]}")
+    return model.removeprefix("metask/")
+
+
+def judge_slug(spec) -> str:
+    return slug(spec["name"]) + "-judge"
+
+
+def model_document(name: str, spec) -> dict:
+    return {"model": {"name": name, "protocols": ["anthropic"],
+                      "backend_url_env": BASE_URL_ENV, "backend_key_env": KEY_ENV,
+                      "context_window": 200000, "max_concurrent": spec["concurrency"],
+                      "params": {"max_output_tokens": 32768}}}
+
+
 def job_documents(spec) -> Tuple[dict, dict]:
     """(model config, job config). JSON is valid YAML; WorkBuddy reads YAML."""
     # Account models are listed as `metask/<id>`; the gateway takes the id.
-    model = {"model": {"name": split_model(spec["model"])[1], "protocols": ["anthropic"],
-                       "backend_url_env": BASE_URL_ENV, "backend_key_env": KEY_ENV,
-                       "context_window": 200000, "max_concurrent": spec["concurrency"],
-                       "params": {"max_output_tokens": 32768}}}
+    model = model_document(split_model(spec["model"])[1], spec)
     params = {}
     if spec.get("reasoning_effort"):
         params["METACODES_REASONING_EFFORT"] = spec["reasoning_effort"]
@@ -144,6 +165,8 @@ def job_documents(spec) -> Tuple[dict, dict]:
            "context_window": 200000, "context_compact_pct": 92}
     if params:
         job["harness_params_override"] = params
+    if spec.get("workbuddy_judge"):
+        job["llm_judge_override"] = {"enabled": True, "mode": "in_container", "model": judge_slug(spec)}
     return model, job
 
 
@@ -153,6 +176,8 @@ def config_paths(spec) -> List[Path]:
     paths = [repo / "configs" / "models" / name, repo / "configs" / "jobs" / name]
     if spec["workbuddy"].get("harness_image"):
         paths.append(repo / HARNESS_VERSIONS / name)
+    if spec.get("workbuddy_judge"):
+        paths.append(repo / "configs" / "models" / (judge_slug(spec) + ".yaml"))
     return paths
 
 
@@ -176,6 +201,8 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     documents = [json.dumps(model, indent=2), json.dumps(job, indent=2)]
     if wb.get("harness_image"):
         documents.append(harness_version_document(Path(wb["checkout"]), wb["harness_image"]).rstrip("\n"))
+    if spec.get("workbuddy_judge"):
+        documents.append(json.dumps(model_document(spec["workbuddy_judge"], spec), indent=2))
     for path, document in zip(config_paths(spec), documents):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("x", encoding="utf-8") as output:
