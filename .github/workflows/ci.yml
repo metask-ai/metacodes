@@ -230,6 +230,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          clean: ${{ env.POOL_JOB != 'true' }}
       # The pool job only (POOL_JOB): its env leaves FAST_PATH unset and this
       # step sets it. If the watch already finished, the hosted legs took over
       # before a VM took this job, so FAST_PATH=true and every later step
@@ -245,12 +246,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$HOME/.cache/metacodes-ci/$RUNNER_NAME"
-          if [ "$WARM_CACHE" = "true" ]; then rm -rf "$root/zig-cache"; fi
-          mkdir -p "$root/zig-cache" "$root/lean-lake"
-          rm -rf .zig-cache control-plane/lean/.lake
-          ln -s "$root/zig-cache" .zig-cache
-          ln -s "$root/lean-lake" control-plane/lean/.lake
+          if [ "$WARM_CACHE" = "true" ]; then rm -rf .zig-cache; fi
+          git clean -ffdx -e /.zig-cache -e /control-plane/lean/.lake
           test -z "$(git status --porcelain --untracked-files=normal)"
       # setup-zig points ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR at
       # .zig-cache. Its own cache stays off, since it saves on every run; the

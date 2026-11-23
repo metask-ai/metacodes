@@ -828,8 +828,9 @@ class CacheTest(unittest.TestCase):
         steps = jobs["gates-macos-vm"]["steps"]
         host = next(step for step in steps if step.get("name") == HOST_CACHE_STEP)
         self.assertTrue(host["if"].startswith("env.POOL_JOB == 'true' && "), host["if"])
-        self.assertIn('ln -s "$root/zig-cache" .zig-cache', host["run"])
-        self.assertIn('ln -s "$root/lean-lake" control-plane/lean/.lake', host["run"])
+        self.assertIn("git clean -ffdx -e /.zig-cache -e /control-plane/lean/.lake", host["run"])
+        checkout = next(step for step in steps if step.get("uses") == CHECKOUT)
+        self.assertEqual(checkout["with"]["clean"], "${{ env.POOL_JOB != 'true' }}")
         self.assertTrue(host["run"].rstrip().endswith('test -z "$(git status --porcelain --untracked-files=normal)"'))
         self.assertLess(steps.index(host), next(i for i, step in enumerate(steps)
                                                 if step.get("uses", "").startswith("mlugg/setup-zig@")))

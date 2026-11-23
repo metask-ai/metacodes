@@ -467,14 +467,16 @@ and restore `main`'s caches (§5); the macOS pool job runs on a persistent
 host, where those downloads cost the host's network about 650 MB a job (the
 `gates-all` Zig cache, 342 MB, and the Lean cache, 312 MB, measured
 2026-11-23 over 114 jobs) for data its disk already held. So the pool job
-restores and saves neither. Its step `Keep the caches on the pool host`
-links `.zig-cache` and `control-plane/lean/.lake` to
-`~/.cache/metacodes-ci/<runner name>/`, which outlives the checkout (whose
-clean removes the links, not their targets); `~/.elan` is already in the
-host account's home. `main`'s warm run empties the host's Zig cache first,
-so it holds what the current tree builds and does not grow night after
-night. Zig's cache is content-addressed and Lake hash-verifies its products,
-so a stale entry is rebuilt, never trusted. A pool of single-use VMs
+restores and saves neither: its checkout skips its own clean, and the step
+`Keep the caches on the pool host` cleans the tree with `git clean -ffdx`
+except `.zig-cache` and `control-plane/lean/.lake`, then fails unless the
+tree is clean. Both stay real directories inside the workspace, at the paths
+the hosted legs use, because tests and the kernel builds expect their
+temporary and output paths under the checkout; `~/.elan` is already in the
+host account's home. `main`'s warm run empties the Zig cache first, so it
+holds what the current tree builds and does not grow night after night.
+Zig's cache is content-addressed and Lake hash-verifies its products, so a
+stale entry is rebuilt, never trusted. A pool of single-use VMs
 ([VM_POOLS.md](VM_POOLS.md)) would start each job cold under this step and
 needs a cache on its host's network instead. The Windows pool job keeps the
 hosted caches until AIPC has a runner.
