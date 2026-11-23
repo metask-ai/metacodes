@@ -1424,7 +1424,8 @@ function scoreBars(rows, focus, lookOf) {
   const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : !r.model ? [r.harness, null]
     : harnesses === 1 ? [r.model, null] : byModel ? [r.model, r.harness] : [r.harness, r.model]);
   const err = (r) => r.stderr || 0;
-  const lo = Math.min(...shown.map((r) => r.score - err(r))); const hi = Math.max(...shown.map((r) => r.score + err(r)));
+  const top = Math.max(...shown.map((r) => r.score + err(r)));
+  const lo = Math.min(...shown.map((r) => r.score - err(r)), Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
   const { step } = niceTicks(Math.max(0, lo - (hi - lo) * 0.15), Math.min(100, hi));
   const x1 = Math.min(100, Math.ceil(hi / step) * step);
   const floor = Math.floor(lo / step) * step;
