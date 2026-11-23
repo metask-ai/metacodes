@@ -26,6 +26,7 @@ const models_pages = @import("api/models_pages.zig");
 const dialect_mod = @import("api/dialect.zig");
 const auth_header_mod = @import("api/auth_header.zig");
 const credential_mod = @import("api/credential_cell.zig");
+const context_pressure = @import("core/context_pressure.zig");
 
 /// P0:AnthropicProvider 复用中立 Provider 接口(非 generic)。Client.provider() 产出它
 /// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
@@ -958,8 +959,7 @@ pub const Client = struct {
         return asClient(ctx).resolveMaxInputTokens();
     }
     fn pMaxTokensFor(ctx: *anyopaque, model: []const u8) u32 {
-        const client = asClient(ctx);
-        return client.catalog.maxTokensFor(model, client.max_tokens_override);
+        return asClient(ctx).resolveMaxTokensFor(model);
     }
     fn pMaxInputTokensFor(ctx: *anyopaque, model: []const u8) u32 {
         return asClient(ctx).resolveMaxInputTokensFor(model);
@@ -1040,7 +1040,13 @@ pub const Client = struct {
 
     /// 按当前 model 解析真实使用的 max_tokens。
     pub fn resolveMaxTokens(client: *const Client) u32 {
-        return client.catalog.maxTokensFor(client.model, client.max_tokens_override);
+        return client.resolveMaxTokensFor(client.model);
+    }
+
+    pub fn resolveMaxTokensFor(client: *const Client, model: []const u8) u32 {
+        const listed = client.catalog.maxTokensFor(model, client.max_tokens_override);
+        if (client.max_tokens_override != null) return listed;
+        return context_pressure.requestOutputTokens(listed, client.resolveMaxInputTokensFor(model));
     }
 
     /// 按当前 model 解析 input context window(用于 auto-compact 阈值,非 output max_tokens)。
@@ -1099,7 +1105,7 @@ pub const Client = struct {
         model_override: ?[]const u8,
     ) !ApiResponse {
         const effective_model = model_override orelse client.modelSnapshot();
-        const max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
+        const max_tokens = client.resolveMaxTokensFor(effective_model); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
         const result = while (true) {
             const sent_cache_control = client.sends_cache_control;
             const req_body = try json_mod.serializeMessagesRequestWithDialect(.{
@@ -1153,7 +1159,7 @@ pub const Client = struct {
 
     /// 完整签名:支持 per-call model_override(subagent 用 def.zig 的 model 字段覆盖父 model)。
     /// model_override = null → 用 client.modelSnapshot();非 null → 用 override。
-    /// **task#13**:max_tokens 用与 .model **同一** effective_model(catalog.maxTokensFor(effective_model,…)),
+    /// **task#13**:max_tokens 用与 .model **同一** effective_model(resolveMaxTokensFor(effective_model)),
     /// 即请求内一致(override 时 max_tokens 也按 override model 查,与实际发送的 model 匹配,更正确);
     /// 且不再在 .model 快照后紧接着单独裸读 client.model(避免跨线程撕裂 {new_ptr,old_len} OOB)。
     pub fn sendMessageStreamFull(
@@ -1184,7 +1190,7 @@ pub const Client = struct {
         // profile 声称支持时仍拒绝发图),随流句柄回传给 agent_loop 的送达水位。
         var report = json_mod.SerializationReport{};
         defer report.deinit(client.allocator);
-        const max_tokens = client.catalog.maxTokensFor(effective_model, client.max_tokens_override); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
+        const max_tokens = client.resolveMaxTokensFor(effective_model); // task#13:用同一 effective_model 快照(不再单读 client.model 撕裂)
         const result = while (true) {
             const sent_cache_control = client.sends_cache_control;
             report.deinit(client.allocator);
@@ -2410,6 +2416,29 @@ test "getModelsList uses sendBodiless (no sendBodyComplete on GET)" {
     try std.testing.expect(std.mem.indexOf(u8, src, "http_connection.sendBodiless(&req)") != null);
     // 确认没人回退到 sendBodyComplete("") 模式
     try std.testing.expect(std.mem.indexOf(u8, src, "sendBodyComplete(@constCast(\"\"))") == null);
+}
+
+test "resolveMaxTokensFor asks for at most half the model's window; an explicit --max-tokens is sent as given" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = Client.initWithBaseUrl(a, io_rt.io(), "k", "kimi-k3.1-pro", "http://x");
+    defer client.deinit();
+    try client.catalog.loadFromModelsListJson(
+        \\{"data":[
+        \\{"id":"kimi-k3.1-pro","max_input_tokens":1048576,"max_tokens":1048576},
+        \\{"id":"DeepSeek-V4.1-Flash-1017","max_input_tokens":1000000,"max_tokens":384000},
+        \\{"id":"no-window-listed","max_tokens":384000}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(u32, 524_288), client.resolveMaxTokensFor("kimi-k3.1-pro"));
+    try std.testing.expectEqual(@as(u32, 524_288), client.resolveMaxTokens());
+    try std.testing.expectEqual(@as(u32, 524_288), client.provider().maxTokensFor("kimi-k3.1-pro"));
+    try std.testing.expectEqual(@as(u32, 384_000), client.resolveMaxTokensFor("DeepSeek-V4.1-Flash-1017"));
+    try std.testing.expectEqual(@as(u32, 100_000), client.resolveMaxTokensFor("no-window-listed"));
+
+    client.setMaxTokensOverride(1_048_576);
+    try std.testing.expectEqual(@as(u32, 1_048_576), client.resolveMaxTokensFor("kimi-k3.1-pro"));
 }
 
 test "task#13: setModel/modelSnapshot round-trip + 并发无撕裂(mutex 串行)" {
