@@ -28,6 +28,7 @@ pub const Model = struct {
     /// when thinking can be switched off. Only words metacodes can send
     /// (`types.ReasoningEffort.parse`); empty when it names none.
     efforts: []const []const u8 = &.{},
+    thinking_off_or_on: bool = false,
 };
 
 pub const Catalog = struct {
@@ -55,6 +56,7 @@ pub fn parseModels(allocator: std.mem.Allocator, body: []const u8) !Catalog {
         if (messagesEndpoint(item) == .unsupported) continue;
         const display = jsonString(item.object.get("display_name")) orelse id;
         const thinking = capability(item, "thinking");
+        const efforts = try reasoningEfforts(arena, item);
         try result.models.append(arena, .{
             .id = id,
             .display_name = display,
@@ -62,7 +64,8 @@ pub fn parseModels(allocator: std.mem.Allocator, body: []const u8) !Catalog {
             .max_tokens = positiveU32(item.object.get("max_tokens")),
             .reasoning = if (thinking != .unknown) thinking else capability(item, "reasoning"),
             .vision = capability(item, "image_input"),
-            .efforts = try reasoningEfforts(arena, item),
+            .efforts = efforts,
+            .thinking_off_or_on = thinkingOffOrOn(item, efforts),
         });
     }
     return result;
@@ -112,6 +115,29 @@ fn reasoningEfforts(arena: std.mem.Allocator, model: std.json.Value) ![]const []
         if (!seen) try out.append(arena, name);
     }
     return out.toOwnedSlice(arena);
+}
+
+fn thinkingOffOrOn(model: std.json.Value, efforts: []const []const u8) bool {
+    for (efforts) |word| {
+        if (!std.mem.eql(u8, word, "none")) return false;
+    }
+    const caps = objectIn(model, "capabilities") orelse return false;
+    const reasoning = objectIn(caps, "reasoning") orelse return false;
+    const thinking = objectIn(caps, "thinking") orelse return false;
+    const kinds = objectIn(thinking, "types") orelse return false;
+    return supportedIn(reasoning, "disable") and supportedIn(kinds, "enabled");
+}
+
+fn objectIn(value: std.json.Value, name: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    const field = value.object.get(name) orelse return null;
+    return if (field == .object) field else null;
+}
+
+fn supportedIn(parent: std.json.Value, name: []const u8) bool {
+    const field = objectIn(parent, name) orelse return false;
+    const yes = field.object.get("supported") orelse return false;
+    return yes == .bool and yes.bool;
 }
 
 fn jsonString(value: ?std.json.Value) ?[]const u8 {
@@ -190,4 +216,32 @@ test "the www gateway's catalog: models it does not serve on /v1/messages are le
     try std.testing.expectEqualStrings("high", models[1].efforts[2]);
     try std.testing.expectEqual(offer.Tri.unknown, models[2].reasoning);
     try std.testing.expectEqual(@as(usize, 0), models[2].efforts.len);
+}
+
+test "the www gateway's catalog: a model that names no level but switches thinking off and on is marked so" {
+    var parsed = try parseModels(std.testing.allocator,
+        \\{"object":"list","data":[
+        \\ {"id":"hy4","capabilities":{"endpoints":{"messages":{"supported":true}},
+        \\   "reasoning":{"disable":{"supported":true},"supported":true,"translated":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\ {"id":"listed-empty","capabilities":{"reasoning":{"disable":{"supported":true},"efforts":[],"supported":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\ {"id":"glm-5.3","capabilities":{"reasoning":{"disable":{"supported":false},"efforts":["low","high"],"supported":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\ {"id":"levels-and-off","capabilities":{"reasoning":{"disable":{"supported":true},"efforts":["low","high"],"supported":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\ {"id":"no-enabled","capabilities":{"reasoning":{"disable":{"supported":true},"supported":true},
+        \\   "thinking":{"types":{"enabled":{"supported":false}}}}},
+        \\ {"id":"always-on","capabilities":{"reasoning":{"disable":{"supported":false},"supported":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true}}}}}
+        \\]}
+    );
+    defer parsed.deinit();
+    const models = parsed.models.items;
+    try std.testing.expectEqual(@as(usize, 6), models.len);
+    try std.testing.expect(models[0].thinking_off_or_on);
+    try std.testing.expectEqual(@as(usize, 0), models[0].efforts.len);
+    try std.testing.expect(models[1].thinking_off_or_on);
+    for (models[2..]) |model| try std.testing.expect(!model.thinking_off_or_on);
+    try std.testing.expectEqual(@as(usize, 3), models[3].efforts.len);
 }

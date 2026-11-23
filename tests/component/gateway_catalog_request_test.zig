@@ -113,3 +113,60 @@ test "L2 a model whose output limit fits in half its window is asked for that li
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, turn.stop_reason);
     try std.testing.expectEqualStrings("384000", srv.requestAt(1).?.jsonField("max_tokens").?);
 }
+
+test "L2 a model the gateway only switches on and off: on sends thinking enabled, off sends it disabled, unset sends neither" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&LISTING_THEN_THREE_TURNS, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "DeepSeek-V4.1-Flash-1017", url);
+    defer client.deinit();
+    try loadGatewayCatalog(srv, &client);
+
+    const levels = [_]?cc.types_mod.ReasoningEffort{ .high, .none, null };
+    const sent_thinking = [_]?[]const u8{ "{\"type\":\"enabled\"}", "{\"type\":\"disabled\"}", null };
+    for (levels, sent_thinking, 1..) |level, thinking, at| {
+        try client.provider().setReasoningEffort(level);
+        const turn = try runOneTurn(a, &client);
+        defer a.free(turn.text);
+        try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, turn.stop_reason);
+        const sent = srv.requestAt(at).?;
+        try std.testing.expectEqualStrings("\"DeepSeek-V4.1-Flash-1017\"", sent.jsonField("model").?);
+        if (thinking) |expected| {
+            try std.testing.expectEqualStrings(expected, sent.jsonField("thinking").?);
+        } else {
+            try std.testing.expect(sent.jsonField("thinking") == null);
+        }
+        try std.testing.expect(sent.jsonField("output_config") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 4), srv.requestCount());
+}
+
+test "L2 a model the gateway lists levels for still sends adaptive thinking with its level" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&LISTING_THEN_ONE_TURN, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "glm-5.3", url);
+    defer client.deinit();
+    try loadGatewayCatalog(srv, &client);
+
+    try client.provider().setReasoningEffort(.medium);
+    const turn = try runOneTurn(a, &client);
+    defer a.free(turn.text);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, turn.stop_reason);
+    const sent = srv.requestAt(1).?;
+    try std.testing.expectEqualStrings("{\"type\":\"adaptive\"}", sent.jsonField("thinking").?);
+    try std.testing.expectEqualStrings("{\"effort\":\"high\"}", sent.jsonField("output_config").?);
+    try std.testing.expectEqualStrings("131072", sent.jsonField("max_tokens").?);
+}

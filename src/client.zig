@@ -986,11 +986,12 @@ pub const Client = struct {
     }
 
     /// 本 client 发往 `model` 时用的方言:注册表/插件解析出的 Dialect,再叠上 Host 或目录对
-    /// image_input 的声明(Host 优先)。**序列化守门与能力查询的唯一出口**——两条 send 路径和
+    /// image_input 的声明(Host 优先)和目录对思考开关的声明。**序列化守门与能力查询的唯一出口**——两条 send 路径和
     /// `supportsForModel` 都从这里拿 profile,声明不可能只影响其中一边。
     pub fn dialectFor(client: *const Client, model: []const u8) dialect_mod.Dialect {
         var dialect = client.dialect_resolver.resolve(.anthropic, client.declared_dialect.vendorFor(client.model, model), model);
         dialect.declareImageInput(client.host_capabilities.imageInputFor(model), client.catalog.imageInputFor(model));
+        dialect.declareThinkingSwitch(client.catalog.thinkingSwitchFor(model));
         return dialect;
     }
 
