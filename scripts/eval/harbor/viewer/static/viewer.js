@@ -1298,12 +1298,16 @@ function svg(tag, attrs, ...children) {
 const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
 const rowGroup = (r) => (r.ours ? 'metacodes' : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
-const PALETTE = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
+const PALETTE = ['#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
 const SHAPES = ['diamond', 'square', 'circle', 'triangle', 'hexagon'];
+function spareHue(i) {
+  const hue = (i * 137.508 + 20) % 360;
+  return hue > 185 && hue < 245 ? (hue + 60) % 360 : hue;
+}
 function harnessLooks(rows) {
   const names = [...new Set(rows.filter((r) => !r.ours).map((r) => r.harness))];
   const looks = new Map(names.map((name, i) => [name, {
-    color: PALETTE[i] || `hsl(${(i * 137.508 + 20) % 360} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
+    color: PALETTE[i] || `hsl(${spareHue(i)} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
   looks.set('metacodes', { color: 'var(--accent)', shape: 'star' });
   return (r) => looks.get(rowGroup(r));
 }

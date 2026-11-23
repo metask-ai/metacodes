@@ -157,7 +157,7 @@ pre.block{border:1px solid var(--border);border-radius:4px;background:var(--grou
 .scatter-point .glyph{position:absolute;left:0;top:0;width:11px;height:11px;translate:-50% -50%}
 .scatter-point .glyph[data-shape=star]{width:18px;height:18px}
 .scatter-point[data-ours]{cursor:pointer;z-index:2}
-.scatter-point:focus{outline:none}.scatter-point:focus-visible .glyph,.scatter-point[data-current] .glyph{outline:2px solid var(--text);outline-offset:3px}
+.scatter-point:focus{outline:none}.scatter-point::before{content:'';position:absolute;left:0;top:0;width:24px;height:24px;translate:-50% -50%;border-radius:50%;box-shadow:0 0 0 2px var(--text);opacity:0;pointer-events:none}.scatter-point:focus-visible::before,.scatter-point[data-current]::before{opacity:1}
 .scatter-label{position:absolute;top:0;display:grid;white-space:nowrap;line-height:1.35;transform:translateY(calc(-50% + var(--dy,0px)));pointer-events:none}
 .scatter-label b{font-size:12.5px;font-weight:500}.scatter-label small{font-size:11px;color:var(--muted)}
 .scatter-label[data-side=right]{left:12px}.scatter-label[data-side=left]{right:12px;text-align:right}
