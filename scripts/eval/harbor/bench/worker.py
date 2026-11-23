@@ -36,6 +36,8 @@ def command(spec):
         argv += ["--ak", "reasoning_effort=" + spec["reasoning_effort"]]
     if spec.get("features"):
         argv += ["--ak", "features=" + ",".join(spec["features"])]
+    if spec.get("agent_timeout_multiplier"):
+        argv += ["--agent-timeout-multiplier", str(spec["agent_timeout_multiplier"])]
     if spec.get("metrics_proxy"):
         argv += ["--ak", "metrics_proxy=" + spec["metrics_proxy"]]
     if spec.get("metrics_ca"):

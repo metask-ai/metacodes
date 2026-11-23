@@ -326,8 +326,11 @@ pub const Host = struct {
     /// The reasoning levels a Metask model takes (`metask_catalog.Model.efforts`,
     /// the gateway's words), as the `reasoning_effort` control `/model` offers
     /// and a commit applies; none when the gateway names none. Copied into
-    /// `arena`, which the registry keeps.
-    fn metaskReasoningControls(arena: std.mem.Allocator, efforts: []const []const u8) ![]const ControlSpec {
+    /// `arena`, which the registry keeps. A model the gateway only switches off
+    /// and on takes `none` and `high` under "Thinking", as MiniMax M3 does.
+    fn metaskReasoningControls(arena: std.mem.Allocator, model: metask_catalog.Model) ![]const ControlSpec {
+        if (model.thinking_off_or_on) return &METASK_THINKING_OFF_OR_ON;
+        const efforts = model.efforts;
         if (efforts.len == 0) return &.{};
         const values = try arena.alloc([]const u8, efforts.len);
         for (efforts, 0..) |effort, i| values[i] = try arena.dupe(u8, effort);
@@ -340,6 +343,14 @@ pub const Host = struct {
         };
         return specs;
     }
+
+    const METASK_THINKING_OFF_OR_ON_VALUES = [_][]const u8{ "none", "high" };
+    const METASK_THINKING_OFF_OR_ON = [_]ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Thinking",
+        .kind = .enumeration,
+        .allowed_values = &METASK_THINKING_OFF_OR_ON_VALUES,
+    }};
 
     pub fn ingestMetask(
         self: *Host,
@@ -380,7 +391,7 @@ pub const Host = struct {
                 },
                 .capabilities = capabilities,
                 .quote = .unknown,
-                .controls = try metaskReasoningControls(scratch, model.efforts),
+                .controls = try metaskReasoningControls(scratch, model),
             };
         }
 
@@ -905,6 +916,37 @@ test "the www gateway's catalog offers only the models it serves on /v1/messages
     }
     // One model, on the Messages and the Chat route.
     try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "a www gateway model that only switches thinking off and on is offered Thinking none or high" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("https://www.metask-ai.com",
+        \\{"object":"list","data":[
+        \\ {"id":"hy4","capabilities":{"endpoints":{"messages":{"supported":true}},
+        \\   "reasoning":{"disable":{"supported":true},"supported":true,"translated":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\ {"id":"says-nothing","capabilities":{"endpoints":{"messages":{"supported":true}}}}
+        \\]}
+    , .messages);
+    var switched: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        if (std.mem.eql(u8, item.request_model_id, "says-nothing")) {
+            try std.testing.expect(controls_mod.findSpec(item.controls, "reasoning_effort") == null);
+            continue;
+        }
+        switched += 1;
+        try std.testing.expectEqualStrings("hy4", item.request_model_id);
+        const spec = controls_mod.findSpec(item.controls, "reasoning_effort") orelse return error.NoReasoningControl;
+        try std.testing.expectEqualStrings("Thinking", spec.label);
+        try std.testing.expectEqual(@as(usize, 2), spec.allowed_values.len);
+        try std.testing.expectEqualStrings("none", spec.allowed_values[0]);
+        try std.testing.expectEqualStrings("high", spec.allowed_values[1]);
+        try std.testing.expect(spec.default_value == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), switched);
 }
 
 test "two refreshes keep the retired catalog alive for one generation" {

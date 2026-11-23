@@ -3270,7 +3270,7 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         if (account != null) " as " else "",
         account orelse "",
         catalog.entries.items[choice.model].model_id,
-        choice.effort.name(),
+        catalog_mod.effortLabel(catalog.entries.items[choice.model].effort_vocabulary, choice.effort),
     });
     printReplacedNote(replaced.revoke(token_json, metask_oauth_mod.siteUrl(), 5000));
     forgetDefaultForSignIn(allocator, state_dir);
@@ -3300,6 +3300,10 @@ fn promptModelAndEffort(allocator: std.mem.Allocator, catalog: *const catalog_mo
     const model = catalog.entries.items[model_idx];
     var effort_buf: catalog_mod.ReasoningOptions = undefined;
     const efforts = catalog_mod.reasoningOptions(model.reasoning_mask, &effort_buf);
+    if (efforts.len == 1) {
+        std.debug.print("\nReasoning effort: {s} (the only choice {s} offers)\n", .{ catalog_mod.effortLabel(model.effort_vocabulary, efforts[0]), model.model_id });
+        return .{ .model = model_idx, .effort = efforts[0] };
+    }
     std.debug.print("\nSelect reasoning effort:\n", .{});
     for (efforts, 0..) |effort, i| {
         std.debug.print("  {d}. {s}\n", .{ i + 1, catalog_mod.effortLabel(model.effort_vocabulary, effort) });

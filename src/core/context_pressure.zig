@@ -17,6 +17,10 @@ pub fn scaledBuffer(base: usize, effective_window: usize) usize {
     return @intCast(@min(scaled, @as(u128, std.math.maxInt(usize))));
 }
 
+pub fn requestOutputTokens(listed_output_tokens: u32, raw_context_window: u32) u32 {
+    return @min(listed_output_tokens, raw_context_window / 2);
+}
+
 pub const ContextPressure = struct {
     pub const Level = enum {
         low,
@@ -168,6 +172,24 @@ test "ContextPressure scales the buffers with the window above 200K" {
     try std.testing.expectEqual(@as(usize, 917_504 - 13_762), p.blocking_limit);
     try std.testing.expect(p.warning_threshold < p.auto_compact_threshold);
     try std.testing.expect(p.auto_compact_threshold < p.blocking_limit);
+}
+
+test "requestOutputTokens: an output limit past half the window is cut to half, so the input keeps the other half" {
+    const kimi_output = requestOutputTokens(1_048_576, 1_048_576);
+    try std.testing.expectEqual(@as(u32, 524_288), kimi_output);
+    const kimi = ContextPressure.fromModel(1_048_576, kimi_output, null, 15_496);
+    try std.testing.expectEqual(@as(usize, 524_288), kimi.effective_context_window);
+    try std.testing.expect(!kimi.isAtBlockingLimit());
+    try std.testing.expectEqual(ContextPressure.Level.low, kimi.level());
+    const uncut = ContextPressure.fromModel(1_048_576, 1_048_576, null, 15_496);
+    try std.testing.expectEqual(@as(usize, 0), uncut.blocking_limit);
+
+    try std.testing.expectEqual(@as(u32, 384_000), requestOutputTokens(384_000, 1_000_000));
+    try std.testing.expectEqual(@as(u32, 131_072), requestOutputTokens(131_072, 1_000_000));
+    try std.testing.expectEqual(@as(u32, 65_536), requestOutputTokens(65_536, 1_048_576));
+    try std.testing.expectEqual(@as(u32, 64_000), requestOutputTokens(64_000, 200_000));
+    try std.testing.expectEqual(@as(u32, 100_000), requestOutputTokens(100_001, 200_000));
+    try std.testing.expectEqual(@as(u32, 100_000), requestOutputTokens(384_000, 200_000));
 }
 
 test "ContextPressure learned cap lowers every threshold and never raises them" {

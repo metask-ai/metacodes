@@ -344,6 +344,7 @@ pub const Dialect = struct {
     /// (issue #273). Recorded on the profile so a refusal can say whether a
     /// declaration or the family table answered.
     image_input_override_source: ImageInputSource = .catalog,
+    thinking_switch_override: model_adapter.ThinkingSwitch = .family,
 
     /// 便利转发:inline 调对应方法(免调用方写 `dialect.serializeThinkingFn(dialect.ctx, ...)`)。
     pub fn serializeThinking(self: Dialect, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
@@ -396,12 +397,16 @@ pub const Dialect = struct {
             self.image_input_override_source = .catalog;
         }
     }
+    pub fn declareThinkingSwitch(self: *Dialect, catalog: model_adapter.ThinkingSwitch) void {
+        self.thinking_switch_override = catalog;
+    }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         var profile = self.profileFn(self.ctx, kind, model);
         if (self.image_input_override) |declared| {
             profile.supports_image_input = declared;
             profile.image_input_source = self.image_input_override_source;
         }
+        if (self.thinking_switch_override != .family) profile.thinking_switch = self.thinking_switch_override;
         return profile;
     }
 

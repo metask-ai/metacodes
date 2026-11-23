@@ -186,6 +186,10 @@ class SshExecutor:
     docker_mirrors: Tuple[str, ...] = ()
     ghcr_mirror: Optional[str] = None
     container_mirrors: Tuple[Tuple[str, str], ...] = ()
+    # Whether teamwork runs may give their task containers the permissions
+    # bubblewrap needs (TEAMWORK_CONTAINER): near privileged, so only for a
+    # disposable executor that holds no credentials.
+    teamwork_privileged: bool = False
 
     kind = "ssh"
 
@@ -194,7 +198,7 @@ class SshExecutor:
         return (self.user + "@" if self.user else "") + self.host
 
     def public(self) -> Dict:
-        return {"name": self.name, "kind": "ssh",
+        return {"name": self.name, "kind": "ssh", "teamwork_privileged": self.teamwork_privileged,
                 "label": f"{self.name}（SSH {self.destination}:{self.port}）"}
 
     def spec(self) -> Dict:
@@ -206,7 +210,8 @@ class SshExecutor:
                 "egress_allow": list(self.egress_allow) if self.egress_allow is not None else None,
                 "pypi_index": self.pypi_index,
                 "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror,
-                "container_mirrors": dict(self.container_mirrors) or None}
+                "container_mirrors": dict(self.container_mirrors) or None,
+                "teamwork_privileged": self.teamwork_privileged}
 
     @property
     def apt_cache_url(self) -> str:
@@ -248,6 +253,21 @@ class SshExecutor:
 Executor = Union[LocalExecutor, SshExecutor]
 
 
+def with_teamwork(overlay: Optional[Dict], features, executor) -> Optional[Dict]:
+    """The run's compose overlay, with the container permissions bubblewrap
+    needs on Harbor's `main` service when the run uses teamwork."""
+    from scripts.eval.harbor.command import TEAMWORK, TEAMWORK_CONTAINER
+    if TEAMWORK not in features:
+        return overlay
+    if not executor.teamwork_privileged:
+        raise ValueError(f"执行机器 {executor.name} 没有开启 teamwork_privileged，不能运行 Teamwork 评测")
+    overlay = json.loads(json.dumps(overlay or {}))
+    main = overlay.setdefault("services", {}).setdefault("main", {})
+    for key, values in TEAMWORK_CONTAINER.items():
+        main[key] = list(main.get(key) or []) + [v for v in values if v not in (main.get(key) or [])]
+    return overlay
+
+
 def parse(entry) -> Executor:
     """One validated executor entry; raises ValueError naming the problem."""
     if not isinstance(entry, dict):
@@ -264,7 +284,7 @@ def parse(entry) -> Executor:
         raise ValueError(f"{name}: kind 必须是 local 或 ssh")
     allowed = {"name", "kind", "host", "user", "port", "identity_file", "state_dir", "harbor", "python",
                "metrics_bind", "metrics_enabled", "egress", "egress_ports", "egress_allow", "pypi_index", "docker_mirrors",
-               "ghcr_mirror", "container_mirrors"}
+               "ghcr_mirror", "container_mirrors", "teamwork_privileged"}
     extra = set(entry) - allowed
     if extra:
         raise ValueError(f"{name}: 不支持的字段 {', '.join(sorted(extra))}")
@@ -294,6 +314,10 @@ def parse(entry) -> Executor:
     enabled = entry.get("metrics_enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{name}: metrics_enabled 必须是布尔值")
+    teamwork = entry.get("teamwork_privileged", False)
+    if not isinstance(teamwork, bool):
+        raise ValueError(f"{name}: teamwork_privileged 必须是布尔值")
+    values["teamwork_privileged"] = teamwork
     values.update(network_fields(name, entry))
     return SshExecutor(name=name, host=host, user=user, port=port, identity_file=identity,
                        metrics_bind=bind, metrics_enabled=enabled, **values)
@@ -1167,7 +1191,7 @@ class RemoteRun:
             local = Path(self.spec["local_dataset"])
         if local is not None:
             self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
-        self.overlay = self.mirror_overlay(local)
+        self.overlay = with_teamwork(self.mirror_overlay(local), self.spec.get("features") or [], self.executor)
 
     def mirror_overlay(self, local: Optional[Path]) -> Optional[Dict]:
         """This run's compose overlay: without the settings the dataset's
