@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Teamwork trials get a cap that lasts.** The dollar cap now follows the
+  difficulty at easy $20, medium $40, hard $80 (otherwise $40), since the
+  ledger charges models without their own price at the Sonnet fallback
+  rates; a run that spends its budget is scored instead of counted invalid,
+  and the run directory (ledger, seat logs, no worktrees) is kept with the
+  trial as `teamwork-run/`.
+
 - **A bench profile can measure teamwork.** The `teamwork` preview feature
   runs each Harbor task through `metacodes teamwork run`: task containers get
   the permissions bubblewrap needs, a directory without a commit gets a
