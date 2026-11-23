@@ -1442,6 +1442,7 @@ pub const MetaskSignInDialog = struct {
     /// `/login metask`: a code confirmed on any device, not the browser
     /// coming back here (`metask_sign_in.Options.device_code`).
     device_code: bool = false,
+    over_ssh: bool = false,
     /// The providers `/login <provider>` signs in to, comma-separated, for
     /// the line that says so (borrowed); empty leaves it out.
     others: []const u8 = "",
@@ -1560,6 +1561,10 @@ pub const MetaskSignInDialog = struct {
                 // device-code sign-in needs only a code typed elsewhere.
                 if (!self.device_code) {
                     try p.paragraph(p.th.dim, "No browser on this machine? /login metask signs in with a short code instead.");
+                    try p.blank();
+                }
+                if (self.over_ssh) {
+                    try p.paragraph(p.th.dim, "This looks like an SSH session, so this signs in with a code instead of the browser. /login --no-browser keeps the browser sign-in.");
                     try p.blank();
                 }
                 if (self.others.len > 0) {
@@ -1992,6 +1997,25 @@ test "metask sign-in: the browser wait names the short-code sign-in for a machin
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "No browser on this machine? /login metask signs in with a short code instead.") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "Another provider instead: /login <provider> (deepseek, zai-coding-plan)") != null);
+}
+
+test "metask sign-in: over SSH the device code says why and how to keep the browser (#722)" {
+    const ssh_line = "This looks like an SSH session, so this signs in with a code instead of the browser. /login --no-browser keeps the browser sign-in.";
+    var over_ssh = MetaskSignInDialog.init(testing.allocator);
+    defer over_ssh.deinit();
+    over_ssh.device_code = true;
+    over_ssh.over_ssh = true;
+    const ssh_plain = try renderPlain(&over_ssh, 200);
+    defer testing.allocator.free(ssh_plain);
+    try testing.expect(std.mem.indexOf(u8, ssh_plain, ssh_line) != null);
+    try testing.expect(std.mem.indexOf(u8, ssh_plain, "No browser on this machine?") == null);
+
+    var asked = MetaskSignInDialog.init(testing.allocator);
+    defer asked.deinit();
+    asked.device_code = true;
+    const asked_plain = try renderPlain(&asked, 200);
+    defer testing.allocator.free(asked_plain);
+    try testing.expect(std.mem.indexOf(u8, asked_plain, ssh_line) == null);
 }
 
 test "login: no provider to sign in to says how keys are configured" {

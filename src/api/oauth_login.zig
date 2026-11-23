@@ -193,10 +193,11 @@ fn acquireByLoopback(
     defer allocator.free(url);
 
     if (options.notify) |notify| {
+        var forward_buf: [160]u8 = undefined;
         const text = try std.fmt.allocPrint(
             allocator,
-            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n",
-            .{ endpoints.redirect_host, server.port, url },
+            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n{s}",
+            .{ endpoints.redirect_host, server.port, url, if (auth.sshSession()) auth.sshForwardLine(&forward_buf, server.port) else "" },
         );
         defer allocator.free(text);
         notify.say(text);

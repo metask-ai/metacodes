@@ -58,6 +58,27 @@ pub const LEGACY_OAUTH_CLIENT_ID = "metacode-cli";
 const OAUTH_REFRESH_SKEW_SECONDS: i64 = 300;
 const DEFAULT_LOGIN_PORT: u16 = 1455;
 const FALLBACK_LOGIN_PORT: u16 = 1457;
+pub const LOGIN_CALLBACK_TIMEOUT_ENV = "METACODES_LOGIN_CALLBACK_TIMEOUT_MS";
+pub const DEFAULT_LOGIN_CALLBACK_TIMEOUT_MS: u64 = 10 * std.time.ms_per_min;
+
+pub fn sshSession() bool {
+    for ([_][*:0]const u8{ "SSH_CONNECTION", "SSH_TTY" }) |name| {
+        const value = std.c.getenv(name) orelse continue;
+        if (std.mem.span(value).len > 0) return true;
+    }
+    return false;
+}
+
+pub fn sshForwardLine(buffer: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buffer, "Over SSH? Forward the port first: ssh -L {d}:127.0.0.1:{d} <you>@<this machine>\n", .{ port, port }) catch
+        "Over SSH? Forward the callback port to this machine with ssh -L first.\n";
+}
+
+pub fn loginCallbackTimeoutMs() ?u64 {
+    const raw = std.c.getenv(LOGIN_CALLBACK_TIMEOUT_ENV) orelse return DEFAULT_LOGIN_CALLBACK_TIMEOUT_MS;
+    const value = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return DEFAULT_LOGIN_CALLBACK_TIMEOUT_MS;
+    return if (value == 0) null else value;
+}
 
 pub const AuthPrecedence = types.AuthPrecedence;
 
@@ -436,6 +457,7 @@ pub const BrowserLoginOptions = struct {
     /// Where the instructions go (the URL to open). Null prints them to
     /// stderr, as `metacodes login` always has; the TUI draws them instead.
     notify: ?Notify = null,
+    timeout_ms: ?u64 = null,
 };
 
 /// A sink for the lines the user must act on, shaped like
@@ -466,6 +488,7 @@ pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLogi
     var server = try CallbackServer.bind(opts.port);
     defer server.close();
     server.path = METASK_CALLBACK_PATH;
+    if (opts.timeout_ms) |ms| server.deadline_ms = time.nowMs() + @as(time.Millis, @intCast(ms));
 
     const redirect_uri = try std.fmt.allocPrint(allocator, "http://localhost:{d}{s}", .{ server.port, METASK_CALLBACK_PATH });
     defer allocator.free(redirect_uri);
@@ -476,6 +499,7 @@ pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLogi
     say(opts.notify, std.fmt.bufPrint(&line_buf, "Starting local login server on http://localhost:{d}.\nOpen this URL to authenticate:\n\n", .{server.port}) catch "Open this URL to authenticate:\n\n");
     say(opts.notify, authorize_url);
     say(opts.notify, "\n\n");
+    if (sshSession()) say(opts.notify, sshForwardLine(&line_buf, server.port));
     if (opts.open_browser) openBrowser(allocator, authorize_url) catch |err| {
         say(opts.notify, std.fmt.bufPrint(&line_buf, "Could not open browser automatically: {s}\n", .{@errorName(err)}) catch "Could not open the browser automatically.\n");
     };
@@ -646,6 +670,7 @@ pub const CallbackServer = struct {
     /// copied here. Null keeps waiting after answering it, as the Metask
     /// sign-in always has. `denied_body`, when set, answers first.
     refusal: ?*Refusal = null,
+    deadline_ms: ?time.Millis = null,
 
     /// Bound on each accepted connection's reads and writes: a client that
     /// connects and then stalls must not pin the wait (and with it Esc in the
@@ -686,6 +711,7 @@ pub const CallbackServer = struct {
     pub fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8, abort_signal: ?*const AbortSignal) ![]u8 {
         while (true) {
             if (abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
+            if (self.deadline_ms) |deadline| if (time.nowMs() >= deadline) return error.CallbackTimedOut;
             if (!net.pollReadable(self.sock, 100)) continue;
             const conn_fd = net.acceptConn(self.sock) orelse return error.AcceptFailed;
             defer net.closeSocket(conn_fd);

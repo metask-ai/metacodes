@@ -17,6 +17,7 @@ const app_mod = @import("../app.zig");
 const provider_login = @import("../api/provider_login.zig");
 const oauth_login_mod = @import("../api/oauth_login.zig");
 const openrouter_login = @import("../api/openrouter_login.zig");
+const auth_mod = @import("../core/auth.zig");
 const api_key_store = @import("../provider/api_key_store.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
@@ -3244,7 +3245,8 @@ fn printLoginUsage() void {
         \\With no provider, sign in to Metask in the browser, as `metacodes login`
         \\does, and choose a model and a reasoning level; the session and new
         \\sessions use it. /login metask does the same with a code confirmed on
-        \\any device. With another provider, sign in to that provider; the login
+        \\any device, and so does /login in an SSH session (--no-browser keeps the
+        \\browser there). With another provider, sign in to that provider; the login
         \\is stored where `metacodes login --provider <id>` stores it. A provider
         \\whose site creates the key (OpenRouter) asks which way: the browser here,
         \\or another device (--device-code), whose page shows a code to paste back.
@@ -3342,10 +3344,12 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             break :blk value.options;
         },
     };
-    // `/login` alone (or with `--no-browser`) is the Metask browser sign-in
-    // `metacodes login` runs (#485); the provider list is `/login <provider>`.
+    // `/login` alone (or with `--no-browser`) is the Metask sign-in
+    // `metacodes login` runs (#485), over SSH with the device code (#722);
+    // the provider list is `/login <provider>`.
     if (named == null and options.method == .loopback and options.client_id == null) {
-        return handleMetaskSignIn(app, options.open_browser, false);
+        const over_ssh = options.open_browser and auth_mod.sshSession();
+        return handleMetaskSignIn(app, options.open_browser and !over_ssh, over_ssh, over_ssh);
     }
     const host = app.providerHost() catch |err| {
         cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
@@ -3357,7 +3361,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     // compiled default, which the gateway does not serve.
     if (named) |name| if (options.client_id == null) {
         for (host.registry.profiles.items) |*profile| {
-            if (profile.id.eqlText("metask") and profile.matchesName(name)) return handleMetaskSignIn(app, options.open_browser, true);
+            if (profile.id.eqlText("metask") and profile.matchesName(name)) return handleMetaskSignIn(app, options.open_browser, true, false);
         }
     };
 
@@ -3367,7 +3371,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .key_options = .{ .state_root = app.stateRoot(), .open_browser = options.open_browser },
         // A key grant (OpenRouter) offers the other device first over SSH,
         // and starts there with `--device-code`.
-        .how_ssh = openrouter_login.sshSession(),
+        .how_ssh = auth_mod.sshSession(),
         .how_start = if (options.method == .device_code) .other_device else .ask,
     };
     defer dialog.deinit();
@@ -3538,11 +3542,12 @@ fn offerLogin(dialog: *dialogs.LoginDialog, start_at: *?usize, named: ?[]const u
 /// Metask becomes the default: a stored `/model` default (which would outrank
 /// the sign-in at the next start) is forgotten. Esc at any step stores and
 /// changes nothing.
-fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) !void {
+fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool, over_ssh: bool) !void {
     const th = app.theme;
     var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
     defer dialog.deinit();
     dialog.term_rows = terminalRows();
+    dialog.over_ssh = over_ssh;
     var others: std.ArrayList(u8) = .empty;
     defer others.deinit(app.allocator);
     if (app.providerHost()) |host| {

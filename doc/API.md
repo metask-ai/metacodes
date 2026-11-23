@@ -113,6 +113,18 @@ AgentCore ABI and SDK layouts are unchanged.
   `gateway_url`, `models_url`, and `client_name` in
   `$HOME/.metacodes/oauth/metask.json` (or `METACODES_OAUTH_DIR`).
 
+In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set), where a loopback
+redirect lands on this machine and the browser that would follow it is on
+another one, `metacodes login` and `/login` take this flow by themselves,
+say so in one line, and open no browser; `--no-browser` keeps the browser
+sign-in (#722). The browser sign-in of `metacodes login` waits for the
+callback at most `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (default 600000;
+`0` waits without a limit), then exits 1 having stored nothing and names
+this flow. In an SSH session every loopback sign-in (Metask's, `login
+--provider <id>`'s OAuth, OpenRouter's browser way) prints the forward its
+callback needs, with the port it bound:
+`ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`.
+
 Every Metask sign-in that replaces a stored session (this one, `metacodes
 login`, `/login`, `/login metask`) revokes the replaced one at
 `$METASK_SITE_URL/api/oauth/revoke`, as `metacodes logout` revokes the current
@@ -167,6 +179,7 @@ normative model; the entry points are:
 | `--offer <offer-id>` | pin one exact reproducible route |
 | `--base-url <url>` | validated against the selected profile and route policy before any request URL is built |
 | `--check-providers` | validate the configuration and print every route it produces, then exit; no credential is resolved and no request URL is built |
+| `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` | how long `metacodes login`'s browser sign-in waits for the browser to come back (default 600000, ten minutes; `0` waits without a limit); then it exits 1, stores nothing, and names the device-code sign-in (#722) |
 | `METACODES_STREAM_IDLE_TIMEOUT_MS` | stream liveness, **head phase**: a request whose connection stays open but delivers no byte before the response head for this long (default 120000; 0 disables liveness monitoring entirely) is shut down by the client's monitor and retried as a transient network error. Nothing in a blocked socket read notices an abort flag; this is what turns a silent gateway or proxy into a bounded failure instead of a frozen session. Progress is measured per SSE line, not per parsed event: a tool call's `input_json_delta` frames and unknown events keep the request alive, but keepalive lines (`event: ping`, `data: {"type":"ping"}`, `:` comments) do not — they prove the gateway connection is up, not that the model is producing (2026-09-23: a gateway pinged every 15 s for 55 minutes over an upstream that produced nothing) |
 | `METACODES_STREAM_BODY_IDLE_TIMEOUT_MS` | stream liveness, **body phase** (response head accepted): unset = automatic, `clamp(max_tokens × 100 ms, 600000, 1800000)` — a gateway may generate an entire tool call before writing a byte of it, so the tolerated silence scales with the response the request allows; an explicit value is a flat limit in ms; 0 disables body-phase monitoring. Past the limit the client shuts the connection down, the turn ends with `StreamStalled` and the TUI reports `正文空闲超时: <idle> ms 内无任何字节(上限 <limit> ms)` when the connection itself went silent, or `<idle> ms 内无模型输出,但网关 keepalive 仍在到达(最近字节 <n> ms 前)…` when a gateway kept the connection alive over a dead upstream — instead of the generic failure text. A user cancel (Ctrl+C/Esc) that wakes the blocked read is reported as an abort, never as an API error, and the streamed prefix is kept as partial text. A body-phase stall after visible output (text, thinking or a tool call) is not retried automatically in the TUI (the streamed prefix cannot be pretended away); a stall, a stream that ended without a stop report, or a dropped connection before any visible output is re-sent once (an in-stream server error, reported as `API 错误帧: …` on every wire, is not). Independently of this limit, once an endpoint has been seen to send keepalives mid-stream (three pings or SSE comments, each ending a silence of at least 2 s), a streamed body with no byte at all, keepalives included, for max(4 × the longest such interval, 2 minutes) is judged a dead connection and reported as `连接已断: <n> ms 内无任何字节,连 keepalive 也没有…`; 0 here disables that rule as well |
 | `metacodes login --provider <id> --oauth-token-json <file>` | import an OAuth token into that provider's own store; refresh, single flight, and rotated-refresh persistence then run themselves |
@@ -220,7 +233,9 @@ holds no credential afterwards. Neither runs in the middle of a turn: a
 command typed then waits in the queue until the turn ends.
 `/login metask` is Metask's device grant in the pane `/login` uses: the code
 is confirmed on any device, then the model and reasoning level are chosen,
-and the sign-in is stored and used as `/login`'s (#527).
+and the sign-in is stored and used as `/login`'s (#527). In an SSH session
+`/login` alone is the same device grant, and the pane says why;
+`/login --no-browser` keeps the browser sign-in there (#722).
 `/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts
 another provider's sign-in directly; it
 runs the kernel OAuth flow on a worker thread (`Esc` cancels it) and stores

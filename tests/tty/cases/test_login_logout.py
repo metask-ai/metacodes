@@ -21,6 +21,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -98,7 +99,8 @@ def _case(mock, extra=None):
     state = os.path.join(home, ".metacodes")
     os.makedirs(state, exist_ok=True)
     env = {name: None for name in KEY_VARIABLES}
-    env.update({"HOME": home, "METACODES_HOME": None, "METACODES_JEV_URL": "off", "HOUSE_RELAY_TOKEN": None})
+    env.update({"HOME": home, "METACODES_HOME": None, "METACODES_JEV_URL": "off", "HOUSE_RELAY_TOKEN": None,
+                "SSH_CONNECTION": None, "SSH_TTY": None, "METACODES_LOGIN_CALLBACK_TIMEOUT_MS": None})
     env.update(mock.env(home))
     env.update(extra or {})
     return home, state, env
@@ -645,3 +647,122 @@ def test_a_named_provider_without_a_key_opens_unbound_and_names_the_variable(bin
         a.assert_prose_contains("not set — /login, or configure .env")
         assert "DEEPSEEK_API_KEY" in screen, screen
         assert mock.messages == [], mock.messages
+
+
+_SSH = {"SSH_CONNECTION": "192.0.2.10 50022 192.0.2.20 22", "SSH_TTY": "/dev/pts/7"}
+_SSH_LINE = "This looks like an SSH session, so this signs in with a code instead of the browser."
+_CLI_SSH_LINE = "This looks like an SSH session: signing in with a code you confirm on any device. (--no-browser keeps the browser sign-in.)"
+
+
+def _plain(raw):
+    return re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r", "",
+                  raw.decode("utf-8", "replace"))
+
+
+def _forward_line(text):
+    found = re.search(r"Starting local login server on http://localhost:(\d+)\.", text)
+    assert found, text[-2000:]
+    port = found.group(1)
+    return f"Over SSH? Forward the port first: ssh -L {port}:127.0.0.1:{port} <you>@<this machine>"
+
+
+def test_login_over_ssh_signs_in_with_the_device_code_and_says_why(bin_path):
+    # Over SSH the browser could not come back to this machine's loopback
+    # callback (#722): `/login` takes the device code, opens no browser, and
+    # signs in as `/login metask` does.
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        work = case_tmpdir("cc-tty-login-work-")
+        raw = run(bin_path, [
+            READY, "type:/login", "key:enter",
+            wait_for("Select a model", 20), "key:enter",
+            wait_for("Select a reasoning level", 10), "key:enter",
+            wait_for("Signed in to Metask", 10),
+        ], env=env, base_url=None, cwd=work, term_size=(30, 160))
+        a = TTYAssert(raw, rows=30, cols=160)
+        if not a.screens_with(_SSH_LINE):
+            a._fail("the pane should say why it signs in with a code")
+        assert f"Signed in to Metask as {ACCOUNT_NAME} · glm-5 · reasoning low" in _screen(a), _screen(a)
+        _expect_device_request(mock)
+        assert not os.path.exists(mock.browser_log), "no browser may be opened over SSH"
+        assert not any(path.startswith("/oauth/authorize") for _, path, _ in mock.requests), mock.requests
+        assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
+
+
+def test_login_no_browser_over_ssh_keeps_the_browser_sign_in_and_names_the_forward(bin_path):
+    # `--no-browser` keeps the browser sign-in over SSH (#722); the pane then
+    # names the forward the callback needs, with the port it bound.
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        work = case_tmpdir("cc-tty-login-work-")
+        raw = run(bin_path, [
+            READY, "type:/login --no-browser", "key:enter",
+            wait_for("Over SSH?", 15), "sleep:0.5",
+            "key:esc", wait_for("Login interrupted", 10),
+        ], env=env, base_url=None, cwd=work, term_size=(30, 200))
+        text = _plain(raw)
+        assert _forward_line(text) in text, text[-2000:]
+        assert _SSH_LINE not in text, text[-2000:]
+        assert mock.device_requests == [], mock.device_requests
+        assert not os.path.exists(mock.browser_log)
+
+
+def test_cli_login_over_ssh_signs_in_with_the_device_code_and_says_why(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "1\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert _CLI_SSH_LINE in text, text
+        assert f"METASK_USER_CODE={USER_CODE}" in text, text
+        assert f"Signed in to Metask with the device code as {ACCOUNT_NAME}. Model glm-5, reasoning low." in text, text
+        assert "Starting local login server" not in text, text
+        _expect_device_request(mock)
+        assert not os.path.exists(mock.browser_log), "no browser may be opened over SSH"
+        with open(os.path.join(state, "auth.json")) as f:
+            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "low"}
+
+
+def test_cli_login_no_browser_over_ssh_names_the_forward_and_stops_waiting_after_the_bound(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, dict(_SSH, METACODES_LOGIN_CALLBACK_TIMEOUT_MS="3000"))
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["login", "--no-browser"], _cli_env(env), [])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert _forward_line(text) in text, text
+        assert _CLI_SSH_LINE not in text, text
+        assert "No answer from the browser in 3 seconds; nothing was stored." in text, text
+        assert elapsed < 15, f"took {elapsed:.1f}s"
+        assert mock.device_requests == [], mock.device_requests
+
+
+def test_cli_login_stops_waiting_for_the_browser_after_the_bound_and_stores_nothing(bin_path):
+    # `metacodes login` waited for the browser without a limit (#722): after
+    # METACODES_LOGIN_CALLBACK_TIMEOUT_MS it exits 1, stores nothing, and
+    # names the device code. The browser is a no-op: it never comes back.
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, {"BROWSER": "true", "METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "2000"})
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert ("No answer from the browser in 2 seconds; nothing was stored. "
+                "Signing in on another computer? Run `metacodes login --provider metask`.") in text, text
+        assert "Over SSH?" not in text, text
+        assert 1.5 < elapsed < 15, f"took {elapsed:.1f}s"
+        assert not os.path.exists(os.path.join(state, "auth.json"))
+        assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests
+

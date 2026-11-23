@@ -3059,7 +3059,17 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                 std.debug.print("Login setup needs an interactive terminal: {s}\n", .{@errorName(err)});
                 return 1;
             };
-            const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser }) catch |err| {
+            if (open_browser and auth.sshSession()) {
+                std.debug.print("This looks like an SSH session: signing in with a code you confirm on any device. (--no-browser keeps the browser sign-in.)\n", .{});
+                return runMetaskDeviceLogin(allocator, init.io, state_dir, false);
+            }
+            const timeout_ms = auth.loginCallbackTimeoutMs();
+            const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser, .timeout_ms = timeout_ms }) catch |err| {
+                if (err == error.CallbackTimedOut) {
+                    var wait_buf: [48]u8 = undefined;
+                    std.debug.print("No answer from the browser in {s}; nothing was stored. Signing in on another computer? Run `metacodes login --provider metask`.\n", .{waitText(&wait_buf, timeout_ms.?)});
+                    return 1;
+                }
                 std.debug.print("OAuth browser login failed: {s}\n", .{@errorName(err)});
                 return 1;
             };
@@ -3116,6 +3126,28 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     }
 }
 
+fn waitText(buffer: []u8, ms: u64) []const u8 {
+    const minute = std.time.ms_per_min;
+    if (ms >= minute and ms % minute == 0) {
+        const minutes = ms / minute;
+        return std.fmt.bufPrint(buffer, "{d} minute{s}", .{ minutes, if (minutes == 1) "" else "s" }) catch "time";
+    }
+    if (ms % std.time.ms_per_s == 0) {
+        const seconds = ms / std.time.ms_per_s;
+        return std.fmt.bufPrint(buffer, "{d} second{s}", .{ seconds, if (seconds == 1) "" else "s" }) catch "time";
+    }
+    return std.fmt.bufPrint(buffer, "{d} ms", .{ms}) catch "time";
+}
+
+test "waitText names the login wait bound in the largest whole unit (#722)" {
+    var buffer: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("10 minutes", waitText(&buffer, 10 * std.time.ms_per_min));
+    try std.testing.expectEqualStrings("1 minute", waitText(&buffer, std.time.ms_per_min));
+    try std.testing.expectEqualStrings("90 seconds", waitText(&buffer, 90 * std.time.ms_per_s));
+    try std.testing.expectEqualStrings("1 second", waitText(&buffer, std.time.ms_per_s));
+    try std.testing.expectEqualStrings("1500 ms", waitText(&buffer, 1500));
+}
+
 fn printLoginHelp() void {
     dumpWrite(
         \\Usage:
@@ -3132,7 +3164,11 @@ fn printLoginHelp() void {
         \\  metacodes logout --provider <id>
         \\
         \\Default login starts a local browser OAuth flow on /auth/metask/callback.
-        \\Use --no-browser to print the URL without launching a browser.
+        \\Use --no-browser to print the URL without launching a browser. In an SSH
+        \\session, where the browser cannot come back to this machine, it signs in
+        \\with the device code instead (--no-browser keeps the browser sign-in, and
+        \\prints the ssh -L forward it needs). It waits for the browser 10 minutes
+        \\(METACODES_LOGIN_CALLBACK_TIMEOUT_MS; 0 waits without a limit).
         \\
         \\`login --provider <id>` signs in to that provider and stores the token
         \\in its own OAuth session, never the Metask credential store. It uses a
@@ -3373,7 +3409,7 @@ fn runProviderKeyGrantLogin(allocator: std.mem.Allocator, io: std.Io, state_dir:
     var other_device = request.other_device;
     // Over SSH a loopback redirect lands on this machine, and the browser
     // that would follow it is on another one.
-    if (!other_device and request.open_browser and openrouter_login.sshSession()) {
+    if (!other_device and request.open_browser and auth.sshSession()) {
         std.debug.print("This looks like an SSH session: sign in on another device instead. (--no-browser keeps the browser sign-in.)\n", .{});
         other_device = true;
     }

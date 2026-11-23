@@ -164,6 +164,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Signing in over SSH no longer waits forever for a browser that cannot come
+  back** (#722). `metacodes login` and `/login` sent the browser back to
+  `http://localhost:1455`, which on a machine reached over SSH is not where
+  the browser is: the sign-in waited with no limit and said nothing.
+  - In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set) they now take
+    Metask's device code by themselves and say why, as OpenRouter's sign-in
+    already did; `--no-browser` keeps the browser sign-in.
+  - Every sign-in that waits for a localhost callback (Metask's, ChatGPT's,
+    another provider's OAuth, OpenRouter's browser way) prints the forward it
+    needs over SSH, with the port it bound:
+    `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`.
+  - `metacodes login` stops waiting for the browser after ten minutes
+    (`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`, `0` for no limit), stores nothing,
+    and names the device-code sign-in.
+
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
   8 s before the write and 6 s after it, so a server that answered

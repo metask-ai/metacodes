@@ -80,6 +80,8 @@ class _Case:
             "Z_AI_API_KEY": None,
             "BROWSER": self.browser,
             "METACODES_KEY_CHECK_URL": f"http://127.0.0.1:{self.server.server_port}/api/coding/paas/v4/models",
+            "SSH_CONNECTION": None,
+            "SSH_TTY": None,
         }
 
     def key_file(self):
@@ -229,12 +231,13 @@ def _cli(bin_path, args, env, answers, timeout=WAIT_S):
             if not chunk:
                 break
             out += chunk
-        done, status = os.waitpid(pid, os.WNOHANG)
+        done, waited = os.waitpid(pid, os.WNOHANG)
         if done:
+            status = waited
             break
     else:
         os.kill(pid, 9)
-    if status is None or not os.WIFEXITED(status):
+    if status is None:
         _, status = os.waitpid(pid, 0)
     # Read to EOF after the exit. macOS holds the exit until the output is
     # read, but on Linux the child can be reaped with its last lines (the

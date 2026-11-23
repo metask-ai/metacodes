@@ -230,7 +230,12 @@ Metask's JSON device authorization flow and stores the same session. It prints
 model and reasoning level, as `metacodes login` does, and stores them the same
 way; without one (a script that confirms the code elsewhere) it stores only
 the session and says so, and a start on it names its model with `--model`.
-`/login metask` is the same in the TUI. A plain start signs in with the stored
+`/login metask` is the same in the TUI. In an SSH session `metacodes login`
+and `/login` take the device code by themselves, since the browser could not
+come back to this machine (`--no-browser` keeps the browser sign-in, and then
+prints the `ssh -L` forward its callback needs). `metacodes login` waits for
+the browser ten minutes (`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`), then stops
+and stores nothing. A plain start signs in with the stored
 session unless a key signs Metask in (`--api-key`, `METASK_API_KEY`, or a key
 in `auth.json` from `metacodes login --api-key` or a sign-in older than this).
 Set `METASK_SITE_URL` for a local control plane (`http://localhost:3000`);
