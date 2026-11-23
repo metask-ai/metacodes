@@ -227,9 +227,11 @@ The `workbuddy` runner drives the pinned integration in
 durable worker. Readiness requires a checkout from `provision_checkout.sh`
 (`metacodes bench --workbuddy-checkout <dir>` or
 `METACODES_WORKBUDDY_CHECKOUT`) at the pinned commit with the overlay and
-`.venv`, production linux/amd64 artifacts staged by `stage_artifacts`, the
+`.venv`, the workbench's Linux bundle (the same one Harbor suites run), the
 subset fetched by WorkBuddy's `scripts/dataset/fetch-dataset.sh`, Docker,
-`uv`, `bash`, and Metask account authentication. A launch writes a transient
+`uv`, `bash`, and Metask account authentication. A launch stages the run's bundle with
+`stage_artifacts` into a build context of its own, builds the split-mount
+image under the run's tag (removed afterwards), writes a transient
 `configs/models|jobs/metacodes-<run>.yaml` (removed afterwards), runs
 `uv run --frozen bash scripts/run.sh --job metacodes-<run>` in the checkout
 with the account key in a dedicated variable and the judge key removed, and
@@ -766,17 +768,15 @@ validates the tasks against the list the node reports and copies the job
 back like a Harbor run. Its readiness there is reaching a compatible node,
 Metask authentication and what the node reports for the suite (an executor
 without the Harbor CLI still runs WorkBuddy, which brings its own, but it
-needs `docker buildx`). Every executable the node staged for WorkBuddy
-(`metacodes`, TinyKG, the formal kernel and ripgrep, and the project kernel
-when staged; `node info` reports their sha256) must be the run's bundle's:
-otherwise the launch is refused. The node checks again before it starts,
-then builds the split-mount image from the staged context under a tag of
+needs `docker buildx`). The workbench ships the run's bundle to the node
+like a Harbor run's; the node stages its `metacodes`, TinyKG, formal kernel
+and ripgrep with `stage_artifacts` into a build context of its own, never
+the checkout's `docker/artifacts`, and builds the split-mount image under a tag of
 the run's own (`wbm:<first 12 hex of sha256(run name)>`, short because Docker names an image mount's directory after the hex of image id, reference and target, which must fit in 255 bytes) and
 names it in a transient harness version (the pinned `0.1.0.yaml` plus
 `mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
 `run.sh` would otherwise reuse, and another workbench on the same Docker
-daemon could move, never reaches the trials; the build checks the staged
-executables in the very manifest it builds from. The run's tag and version
+daemon could move, never reaches the trials. The run's tag and version
 file are removed (within 60 seconds) under heartbeats before the node
 reports the run's end. The build sends heartbeats like a running Harbor,
 and a cancel (or a closed channel) kills it and ends the run. WorkBuddy's host proxy is given a run-scoped placeholder and a
@@ -1079,6 +1079,17 @@ the other features' flags, and only on an SSH executor whose entry sets
   directory without a commit gets one first (`git init` when it is no
   repository, then a snapshot commit of what the image put there); one with
   a commit is used as it is.
+- **Permissions**: a headless trial runs with `bypassPermissions`, but
+  `teamwork run` takes no `--permission`, and its seats and isolated
+  verifier would ask for every risky command with nobody to answer (the
+  first real runs ended `audit_unavailable`: the verifier stopped at its
+  prompts). The trial writes user-level allow rules for the built-in tools
+  (`TEAMWORK_ALLOWED_TOOLS`, WebFetch included) and every MCP server the
+  task declares (`mcp__<server>`) to `~/.claude/settings.json` in the
+  disposable container, unless the image has that file; seat commands still
+  run under bubblewrap. This is narrower than `bypassPermissions`: a
+  protected path (for example metacodes' own configuration) still asks, so a
+  seat that touches one is refused and the verifier can stop there.
 - **Request and approval**: the instruction is the approved request
   (`--approve`); text starting with `[` gets a heading, since a leading
   bracket would be read as an option segment. Every seat uses metacodes and

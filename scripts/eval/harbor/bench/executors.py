@@ -1173,12 +1173,12 @@ class RemoteRun:
         return self.executor.remote("jobs", self.spec["name"])
 
     def stage(self) -> None:
-        """Ship the bundle and the run's dataset. A WorkBuddy run needs
-        neither: the node runs its own WorkBuddy checkout."""
-        if self.spec.get("runner") == "workbuddy":
-            return
+        """Ship the bundle and the run's dataset. A WorkBuddy run needs only
+        the bundle: the node runs its own WorkBuddy checkout."""
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
+        if self.spec.get("runner") == "workbuddy":
+            return
         registry = self.spec.get("registry_download")
         local = None
         if registry:
@@ -1216,12 +1216,9 @@ class RemoteRun:
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
         if self.spec.get("runner") == "workbuddy":
-            # The node refuses a checkout whose staged executables are not
-            # those of the bundle this run's record names.
-            from scripts.eval.harbor.suites import workbuddy
-            bundle = self.spec.get("bundle")
+            # The node stages the run's mount image from this shipped bundle.
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
-                    "executables": workbuddy.bundle_executables(bundle) if bundle else None,
+                    "bundle": self.bundle,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
                                                      "reasoning_effort", "account_gateway", "workbuddy_judge")}}
         run_dir = self.executor.remote("runs", self.spec["name"])

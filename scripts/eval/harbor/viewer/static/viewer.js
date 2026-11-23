@@ -1416,6 +1416,40 @@ function costScatter(rows, focus, lookOf) {
   return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
     h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
+const BARS_TOP = 15;
+function scoreBars(rows, focus, lookOf) {
+  const shown = rows.filter((r, i) => i < BARS_TOP || r.ours);
+  if (shown.length < 2) return null;
+  const pub = rows.filter((r) => !r.ours);
+  const harnesses = new Set(pub.map((r) => r.harness)).size;
+  const byModel = harnesses * 2 <= pub.length;
+  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : !r.model ? [r.harness, null]
+    : harnesses === 1 ? [r.model, null] : byModel ? [r.model, r.harness] : [r.harness, r.model]);
+  const err = (r) => r.stderr || 0;
+  const top = Math.max(...shown.map((r) => r.score + err(r)));
+  const lo = Math.min(...shown.map((r) => r.score - err(r)), Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
+  const { step } = niceTicks(Math.max(0, lo - (hi - lo) * 0.15), Math.min(100, hi));
+  const x1 = Math.min(100, Math.ceil(hi / step) * step);
+  const floor = Math.floor(lo / step) * step;
+  const x0 = floor < x1 * 0.25 ? 0 : Math.max(0, floor - step);
+  const at = (v) => (Math.min(Math.max(v, x0), x1) - x0) / (x1 - x0) * 100;
+  const marks = Array.from({ length: Math.round((x1 - x0) / step) + 1 }, (_, i) => +(x0 + i * step).toPrecision(12));
+  const digits = step < 1 ? 1 : 0;
+  const lines = h('div', { class: 'bars-grid', style: `grid-row:1 / span ${shown.length}` },
+    marks.map((v) => h('i', { style: `left:${at(v)}%` })));
+  const axis = h('div', { class: 'bars-axis', style: `grid-row:${shown.length + 1}` }, marks.map((v) => h('span', { style: `left:${at(v)}%`, text: v.toFixed(digits) + '%' })));
+  const items = new Map(shown.map((r, i) => [r, h('div', { class: 'bar-row', 'data-ours': r.ours ? '1' : null, style: `--row:${i + 1}`,
+    onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
+    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+  h('span', { class: 'bar-name', title: name(r).filter(Boolean).join(' · ') }, glyph(lookOf(r)),
+    h('span', {}, name(r)[0], name(r)[1] ? h('small', { text: ' · ' + name(r)[1] }) : null)),
+  h('span', { class: 'bar-track' }, h('i', { class: 'bar-fill', style: `width:${at(r.score)}%;background:${lookOf(r).color}` }),
+    err(r) ? h('i', { class: 'bar-err', style: `left:${at(r.score - err(r))}%;width:${at(r.score + err(r)) - at(r.score - err(r))}%` }) : null),
+  h('span', { class: 'bar-value num', text: score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '') }))]));
+  focus.on((active) => { for (const [r, el] of items) el.toggleAttribute('data-current', r === active); });
+  const note = rows.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 名${shown.some((r) => r.ours) ? '及我们的作业' : ''} · 共 ${rows.length} 条，完整列表见下表` }) : null;
+  return h('div', { class: 'scatter-box bars-box' }, h('div', { class: 'bars' }, lines, ...items.values(), axis), note);
+}
 function focusHub() {
   const listeners = [];
   return { on: (fn) => listeners.push(fn), set: (row) => listeners.forEach((fn) => fn(row)) };
@@ -1439,6 +1473,7 @@ function boardPanel(board) {
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
   const lookOf = harnessLooks(rows);
+  const priced = rows.some((r) => r.cost_per_task_usd > 0);
   const src = board.source;
   const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
   const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
@@ -1455,14 +1490,14 @@ function boardPanel(board) {
   h('td', { class: 'muted', text: r.model || '—' }),
   h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
     h('span', { class: 'num', text: score(r.score) }))),
-  h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }))]));
+  priced ? h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }) : null)]));
   focus.on((active) => { for (const [r, tr] of rowNodes) tr.classList.toggle('active', r === active); });
   const more = rows.length > shown.length || expanded ? h('button', { type: 'button', class: 'board-more',
     onclick: (e) => { state.boardExpanded[key] = !expanded; redraw(e); } }, expanded ? '收起' : `全部 ${rows.length} 条`) : null;
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
-    h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', '每题成本'].map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', priced ? '每题成本' : null].filter(Boolean).map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus, lookOf), table),
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus, lookOf) || scoreBars(rows, focus, lookOf), table),
     h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {

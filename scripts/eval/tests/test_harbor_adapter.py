@@ -150,6 +150,11 @@ class ModelAndFlagsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             cmd.teamwork_flags(provider=None, model="m", reasoning_effort="turbo")
 
+    def test_teamwork_allows_the_built_in_tools_and_the_tasks_mcp_servers(self):
+        self.assertIn("WebFetch", cmd.teamwork_allow_rules())
+        self.assertEqual(cmd.teamwork_allow_rules(["are"])[-1], "mcp__are")
+        self.assertEqual(cmd.teamwork_allow_rules()[:len(cmd.TEAMWORK_ALLOWED_TOOLS)], list(cmd.TEAMWORK_ALLOWED_TOOLS))
+
     def test_teamwork_runs_alone(self):
         self.assertEqual(cmd.checked_features(["teamwork"]), ["teamwork"])
         self.assertEqual(cmd.checked_features(["execute_code", "stall_gate"]), ["execute_code", "stall_gate"])
@@ -423,6 +428,18 @@ class TeamworkScriptTest(unittest.TestCase):
         self.assertEqual((kept / "budget.jsonl").read_text(encoding="utf-8").strip(), '{"charge":1}')
         self.assertEqual((kept / "seats" / "implementer-1" / "session.log").read_text(encoding="utf-8").strip(), "seat-log")
         self.assertFalse((kept / "worktree").exists())
+
+    def test_seats_get_allow_rules_and_an_images_own_settings_are_kept(self):
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        settings = json.loads((self.tmp / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings, {"permissions": {"allow": list(cmd.TEAMWORK_ALLOWED_TOOLS)}})
+        (self.tmp / ".claude" / "settings.json").write_text('{"permissions": {"deny": ["Bash"]}}', encoding="utf-8")
+        shutil.rmtree(self.tmp / "state")
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('"deny"', (self.tmp / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertIn("keeping the image's own", (self.logs / cmd.STDERR_FILENAME).read_text(encoding="utf-8"))
 
     def test_an_existing_commit_is_kept_and_a_bracket_request_gets_a_heading(self):
         subprocess.run(["git", "init", "-q"], cwd=self.work, check=True)

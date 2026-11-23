@@ -261,6 +261,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 budget_usd=cmd.teamwork_budget(cmd.task_difficulty(self.logs_dir.parent)),
                 flags=flags,
                 config_path=remote_config,
+                mcp_servers=list(servers),
             )
         else:
             script = cmd.run_command(
