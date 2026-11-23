@@ -289,6 +289,10 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(run['features'], self.client.request('api/workbench')['default_features'])
         self.assertEqual(self.manager.profiles.get(run['profile'])['features'], run['features'])
         wait_run(self.manager, run['name'])
+        plain = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'features': []})
+        self.assertNotIn('features', plain)
+        self.assertEqual(self.manager.profiles.get(plain['profile'])['features'], [])
+        wait_run(self.manager, plain['name'])
 
     def test_a_stopped_rerun_keeps_the_earlier_result_of_tasks_it_left_invalid(self):
         def view(name, status):

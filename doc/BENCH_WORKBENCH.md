@@ -21,6 +21,7 @@ metacodes bench run --task fix-git --task cancel-async-tasks --wait
 metacodes bench run --suite aime-2025 --wait          # the suite's default sample
 metacodes bench run --suite terminal-bench-2.0 --task fix-git
 metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH executor
+metacodes bench run --task fix-git --features ""      # without the default run gates
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090   # pre-pull/pre-build task images
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
@@ -999,7 +1000,8 @@ what that file says, so a restarted service resumes a queue where it stopped.
 With several profiles queued, the one whose oldest waiting dataset was queued
 first runs until its queue is empty. A single launch (`POST /api/runs`,
 `metacodes bench run`) runs at once on the profile of the configured bundle
-and its `features` (the run gates when none are given), and is refused while
+and its `features` (`bench run --features a,b`; the run gates when none are
+given, `--features ""` for none), and is refused while
 a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
 of its queue.
 
