@@ -372,8 +372,15 @@ fn serializeContent(
                 //   字节与此前手写形态逐字节相同(prompt cache 前缀契约不变)。
                 // 非 vision(如经 Anthropic 网关的 GLM 文本模型,方言返 false)发短
                 // 占位文本——绝不把 MB 级 base64(文本或 block 形态)塞给无法看图的模型。
+                var image_after: std.ArrayList(u8) = .empty;
+                defer image_after.deinit(allocator);
                 if (dialect_mod.extractImageResult(tr.content)) |img| image: {
                     report.image_results += 1;
+                    if (profile.tool_result_images_as_blocks and try dialect.serializeImagePart(profile, img, &image_after, allocator)) {
+                        try util_json.serializeString(IMAGE_FOLLOWS_NOTE, buf, allocator);
+                        break :image;
+                    }
+                    image_after.clearRetainingCapacity();
                     const mark = buf.items.len;
                     try buf.append(allocator, '[');
                     if (try dialect.serializeImagePart(profile, img, buf, allocator)) {
@@ -393,6 +400,10 @@ fn serializeContent(
                     try buf.appendSlice(allocator, ",\"is_error\":true");
                 }
                 try buf.append(allocator, '}');
+                if (image_after.items.len > 0) {
+                    try buf.append(allocator, ',');
+                    try buf.appendSlice(allocator, image_after.items);
+                }
             },
             .image => |img| {
                 // 一等图像内容(issue #10):wire 形态委托方言(Claude=base64 source block)。
@@ -410,6 +421,8 @@ fn serializeContent(
 /// (openai/gemini client) 与投影层(估算/身份/预算)必须用同一嗅探,两份实现会漂移。
 /// 这里保留别名:`json.zig` 经此再导出给 agent_loop / conversation / session_budget。
 pub const ImageResult = types.ImageBlock;
+
+const IMAGE_FOLLOWS_NOTE = "[image attached in the next content block]";
 pub const extractImageResult = dialect_mod.extractImageResult;
 
 fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -890,6 +903,27 @@ test "serializeMessagesRequest with image tool_result emits content block array"
     try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":{\"type\":\"base64\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"iVBORw==\"") != null);
+}
+
+test "serializeMessagesRequest: a non-Claude vision model gets a tool's image as the next block, not inside the tool_result" {
+    const msg = types.ApiMessage{
+        .role = .user,
+        .content = &.{
+            .{ .tool_result = .{
+                .tool_use_id = "t1",
+                .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}",
+                .is_error = false,
+            } },
+            .{ .text = "next" },
+        },
+    };
+    const req = MessagesRequest{ .model = "gpt-5.2", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    const expected = "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"[image attached in the next content block]\"}," ++
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}}," ++
+        "{\"type\":\"text\",\"text\":\"next\"}]";
+    try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
 }
 
 test "serializeMessagesRequest: 非 vision 模型的图像 tool_result → 占位文本(不发 base64)" {
