@@ -340,6 +340,58 @@ def test_enter_after_shift_enter_during_a_reply_sends_one_message(bin_path):
         a._fail(f"the next request did not carry the draft as one two-line message: {sent!r}")
 
 
+def _bracketed_paste(text):
+    return "raw:\\x1b[200~" + text.replace("\n", "\\x0d") + "\\x1b[201~"
+
+
+def _queued_rows(a):
+    return sorted({sc.line_text(r) for sc in a.frame_screens for r in range(sc.rows)
+                   if "⏳" in sc.line_text(r)})
+
+
+def _assert_draft_held_and_nothing_sent(a, requests, rows, what):
+    frames = _reply_frames(a)
+    if not any(_box_rows(a, sc) == rows for sc in frames):
+        last = frames[-1].render_ascii() if frames else "(no frame drawn during the reply)"
+        a._fail(f"{what}: the box never held {rows} during the reply; last frame:\n{last}")
+    if _queued_rows(a):
+        a._fail(f"{what}: a message was queued: {_queued_rows(a)}")
+    if b"Interrupted" in a.raw:
+        a._fail(f"{what}: the reply was interrupted")
+    if len(requests) != 1:
+        sent = [_user_texts(body)[-1] for body in requests[1:]]
+        a._fail(f"{what}: a message was sent when the reply ended: {sent}")
+
+
+def _second_request_text(a, requests, what):
+    if len(requests) != 2:
+        a._fail(f"{what}: expected the reply and the queued message, got {len(requests)} requests")
+    return _user_texts(requests[1])[-1]
+
+
+def test_a_paste_during_a_reply_stays_whole_in_the_draft(bin_path):
+    a, requests = _reply_with_keys(bin_path, [_bracketed_paste("PASTE_ONE\nPASTE_TWO"), "strictsleep:0.5"])
+    _assert_draft_held_and_nothing_sent(a, requests, ["❯ PASTE_ONE", "PASTE_TWO"], "a two-line paste")
+
+
+def test_enter_after_a_paste_during_a_reply_sends_it_as_one_message(bin_path):
+    a, requests = _reply_with_keys(bin_path, [_bracketed_paste("PASTE_ONE\nPASTE_TWO"), "key:enter"])
+    sent = _second_request_text(a, requests, "Enter after a paste")
+    if "PASTE_ONE\nPASTE_TWO" not in sent:
+        a._fail(f"the next request did not carry the paste as one two-line message: {sent!r}")
+
+
+def test_a_long_paste_during_a_reply_is_held_as_at_the_prompt_and_sent_whole(bin_path):
+    lines = [f"LONG_PASTE_{i}" for i in range(6)]
+    a, requests = _reply_with_keys(
+        bin_path, [_bracketed_paste("\n".join(lines)), "strictsleep:0.5", "key:enter"])
+    if not any(_box_rows(a, sc) == ["❯ [Pasted text #1 +5 lines]"] for sc in _reply_frames(a)):
+        a._fail("the box did not hold the long paste as a placeholder during the reply")
+    sent = _second_request_text(a, requests, "Enter after a long paste")
+    if "\n".join(lines) not in sent or "[Pasted text" in sent:
+        a._fail(f"the next request did not carry the whole paste: {sent!r}")
+
+
 def test_ctrl_l_while_generating_resets_the_screen_in_one_frame(bin_path):
     """Ctrl+L during a reply goes through RenderRegion.resetScreen under the
     render lock: the region is erased, ED 2 clears the screen and the region

@@ -903,7 +903,7 @@ const TurnKind = enum { prompt, skill, macro };
 /// the caller's stack at a fixed address while its watcher runs.
 fn turnBackend(host: *const TurnHost, region: *render_region_mod.RenderRegion) tui_backend_mod.TuiBackend {
     const app = host.app;
-    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .input_abort = &app.abort };
+    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .state_root = app.stateRoot(), .input_abort = &app.abort };
 }
 
 /// What the spinner says while a request waits on MCP servers.
@@ -1584,32 +1584,9 @@ fn pasteTarget(app: *app_mod.App, region: *render_region_mod.RenderRegion, edito
 
 fn routePaste(target: PasteTarget, allocator: std.mem.Allocator, state_root: []const u8, text: []const u8) !void {
     switch (target) {
-        .editor => |editor| try insertPaste(editor, allocator, state_root, text),
+        .editor => |editor| try paste_mod.insert(editor, allocator, state_root, text),
         .picker => |p| picker_host.onPaste(p.app, &p.region.ui, text, .of(p.region)),
     }
-}
-
-/// 插入一段粘贴的文字:小粘贴内联;大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
-fn insertPaste(
-    editor: *input.LineEditor,
-    allocator: std.mem.Allocator,
-    state_root: []const u8,
-    text: []const u8,
-) !void {
-    if (text.len == 0) return;
-
-    if (paste_mod.isLarge(text)) {
-        if (state_root.len > 0) {
-            g_paste_id += 1;
-            if (paste_mod.store(allocator, state_root, g_paste_id, text) catch null) |placeholder| {
-                defer allocator.free(placeholder);
-                try insertAtCursor(editor, allocator, placeholder);
-                return;
-            }
-        }
-        // store 失败 / 无 HOME → 退回内联
-    }
-    try insertAtCursor(editor, allocator, text);
 }
 
 const startup_text_cut = "Some of what was typed during startup did not fit in memory and was dropped.";
@@ -1626,28 +1603,12 @@ fn insertStartupText(
     state_root: []const u8,
     startup: *const input.StartupText,
 ) ?[]const u8 {
-    insertPaste(editor, allocator, state_root, startup.text()) catch {
+    paste_mod.insert(editor, allocator, state_root, startup.text()) catch {
         editor.reset();
         return startup_text_lost;
     };
     return if (startup.dropped) startup_text_cut else null;
 }
-
-/// 在光标处插入一段文本，光标移到插入末尾。
-fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text: []const u8) !void {
-    const line = editor.view();
-    var nl = std.ArrayList(u8).empty;
-    defer nl.deinit(allocator);
-    try nl.appendSlice(allocator, line[0..editor.cursor]);
-    try nl.appendSlice(allocator, text);
-    try nl.appendSlice(allocator, line[editor.cursor..]);
-    const new_cursor = editor.cursor + text.len;
-    try editor.setLine(nl.items);
-    editor.cursor = new_cursor;
-}
-
-/// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
-var g_paste_id: usize = 0;
 
 fn openRouterTick(app: *app_mod.App, region: *render_region_mod.RenderRegion) bool {
     const change = app.takeOpenRouterRefresh(util_time.nowMs());

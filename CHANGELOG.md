@@ -221,6 +221,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A paste while the model answers stays whole in the input box** (#755).
+  During a reply each line break of a pasted text acted as Enter: the first
+  line was queued on its own and sent as soon as the reply ended, and the
+  rest stayed in the box. The paste now goes into the box whole, line breaks
+  included, as at the prompt; a paste of more than three lines or 1,600 bytes
+  is held as `[Pasted text #N +M lines]` there too, and the model gets the
+  whole text when it is sent.
+
 - **On Windows a sign-in opens its whole URL in the browser** (#727). The
   browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
   command at the first `&`: the browser got `…/oauth/authorize?response_type=code`

@@ -49,6 +49,7 @@ const app_mod = @import("../../app.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
 const picker_host = @import("../picker_host.zig");
 const model_picker = @import("../model_picker.zig");
+const paste_mod = @import("../paste.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
@@ -93,6 +94,30 @@ const InputCtx = struct {
     }
 };
 
+const ReplyPaste = union(enum) {
+    picker: model_picker.PastedLine,
+    draft: Draft,
+
+    const Draft = struct {
+        allocator: std.mem.Allocator,
+        text: std.ArrayList(u8) = .empty,
+    };
+
+    fn add(self: *ReplyPaste, byte: u8) void {
+        switch (self.*) {
+            .picker => |*line| line.add(byte),
+            .draft => |*draft| draft.text.append(draft.allocator, byte) catch {},
+        }
+    }
+
+    fn deinit(self: *ReplyPaste) void {
+        switch (self.*) {
+            .picker => {},
+            .draft => |*draft| draft.text.deinit(draft.allocator),
+        }
+    }
+};
+
 pub const TuiBackend = struct {
     region: *RenderRegion,
     /// 工具卡渲染所需(renderStart/renderResult)。null → 卡渲染跳过(等价无 theme)。
@@ -115,6 +140,7 @@ pub const TuiBackend = struct {
     /// `history.append` 对齐)。loop.zig 注入;与 poll 同在 driver 线程,无并发。
     history: ?*history_mod.History = null,
     abort_signal: ?*const abort.AbortSignal = null,
+    state_root: []const u8 = "",
 
     // ── 生成期输入子系统(阶段 C:watcher 归属 backend)──────────────────────
     // 旧 loop.zig 硬编码的 stdinAbortWatcher 线程移到这里。TuiBackend owns 键盘输入:
@@ -419,7 +445,14 @@ pub const TuiBackend = struct {
         // ↑ 也翻得到它——与 Run 之间消费队列时的 echoUserSubmission/history.append 对齐。
         self.echoQueuedSubmission(msg);
         if (self.history) |h| h.append(msg) catch {};
-        return .{ .queue_message = msg };
+        return .{ .queue_message = self.withPastesExpanded(q.allocator, msg) };
+    }
+
+    fn withPastesExpanded(self: *const TuiBackend, allocator: std.mem.Allocator, msg: []u8) []u8 {
+        if (self.state_root.len == 0) return msg;
+        const expanded = paste_mod.expandPlaceholders(allocator, self.state_root, msg) catch return msg;
+        allocator.free(msg);
+        return expanded;
     }
 
     /// 生成期队列里能在 turn 边界交给 agent_loop 的条目:普通 prompt(空白也交出去,让 loop 丢弃)。
@@ -614,7 +647,8 @@ pub const TuiBackend = struct {
         // 重启后先把草稿重新交给 region:对话框期间没人动它,框里应该照旧是这份草稿和光标。
         self.region.setGenInput(editor.view(), editor.cursor);
         var dead_reads: u32 = 0; // 连续"poll 可读却读不到字节"计数(终端 hangup 检测)
-        var picker_paste: ?model_picker.PastedLine = null;
+        var paste: ?ReplyPaste = null;
+        defer if (paste) |*open| open.deinit();
 
         while (!self.input_stop.load(.acquire)) {
             _ = input.reconcileAfterResume(fd);
@@ -626,9 +660,9 @@ pub const TuiBackend = struct {
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
-                    self.routeKey(snap, k, editor, &picker_paste);
+                    self.routeKey(snap, k, editor, &paste);
                     // Alt+] 兑现成 ESC 后,']'(和其后的数字)在 pending 里。
-                    while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &picker_paste);
+                    while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &paste);
                 } else {
                     // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
@@ -664,31 +698,49 @@ pub const TuiBackend = struct {
             dead_reads = 0;
 
             const key = parser.feedRead(fd, b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
-            self.routeKey(snap, key, editor, &picker_paste);
+            self.routeKey(snap, key, editor, &paste);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
-            while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &picker_paste);
+            while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &paste);
         }
     }
 
-    fn routeKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor, paste: *?model_picker.PastedLine) void {
-        if (paste.*) |*line| {
+    fn routeKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor, paste: *?ReplyPaste) void {
+        if (paste.*) |*open| {
             if (key != .paste_end) {
-                if (input.pastedByte(key)) |byte| line.add(byte);
+                if (input.pastedByte(key)) |byte| open.add(byte);
                 return;
             }
-            const pasted = line.*;
+            var pasted = open.*;
             paste.* = null;
-            const app = snap.app orelse return;
-            if (!self.region.pickerOpen()) return;
-            picker_host.onPaste(app, &self.region.ui, pasted.text(), .of(self.region));
-            self.region.redrawGen(app);
+            defer pasted.deinit();
+            switch (pasted) {
+                .picker => |*line| self.pasteIntoPicker(snap, line.text()),
+                .draft => |*draft| self.pasteIntoDraft(draft.allocator, ed, draft.text.items),
+            }
             return;
         }
-        if (key == .paste_begin and self.region.pickerOpen()) {
-            paste.* = .{};
+        if (key == .paste_begin) {
+            if (self.region.pickerOpen()) {
+                paste.* = .{ .picker = .{} };
+            } else if (snap.alloc) |allocator| {
+                paste.* = .{ .draft = .{ .allocator = allocator } };
+            }
             return;
         }
         self.handleKey(snap, key, ed);
+    }
+
+    fn pasteIntoPicker(self: *TuiBackend, snap: InputCtx.Snapshot, text: []const u8) void {
+        const app = snap.app orelse return;
+        if (!self.region.pickerOpen()) return;
+        picker_host.onPaste(app, &self.region.ui, text, .of(self.region));
+        self.region.redrawGen(app);
+    }
+
+    fn pasteIntoDraft(self: *TuiBackend, allocator: std.mem.Allocator, ed: *input.LineEditor, text: []const u8) void {
+        paste_mod.insert(ed, allocator, self.state_root, text) catch return;
+        self.region.setGenInput(ed.view(), ed.cursor);
+        self.region.requestGenRedraw();
     }
 
     /// 中断当前推理(Esc / 原始字节 Ctrl+C 共用):置 abort + 真的 shutdown 在飞连接 + 停 agent job。
@@ -882,21 +934,85 @@ test "a paste during a reply reaches an open picker as one event: no key of it, 
     defer editor.deinit();
     try editor.setLine("queued draft");
     const snap: InputCtx.Snapshot = .{ .fd = 0, .app = null, .alloc = a };
-    var paste: ?model_picker.PastedLine = null;
+    var paste: ?ReplyPaste = null;
+    defer if (paste) |*open| open.deinit();
 
     region.ui.interaction().?.picker_open = true;
     backend.routeKey(snap, .paste_begin, &editor, &paste);
-    try std.testing.expect(paste != null);
+    try std.testing.expect(paste != null and paste.? == .picker);
     for ("zai") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
     backend.routeKey(snap, .enter, &editor, &paste);
     backend.routeKey(snap, .{ .char = 'x' }, &editor, &paste);
-    try std.testing.expectEqualStrings("zai", paste.?.text());
-    try std.testing.expect(paste.?.ended);
+    try std.testing.expectEqualStrings("zai", paste.?.picker.text());
+    try std.testing.expect(paste.?.picker.ended);
     backend.routeKey(snap, .paste_end, &editor, &paste);
     try std.testing.expect(paste == null);
     try std.testing.expectEqualStrings("queued draft", editor.view());
 
     region.ui.interaction().?.picker_open = false;
     backend.routeKey(snap, .paste_begin, &editor, &paste);
+    try std.testing.expect(paste != null and paste.? == .draft);
+}
+
+test "a paste during a reply with no picker open goes into the draft whole, its line breaks kept (#755)" {
+    const a = std.testing.allocator;
+    var region = RenderRegion.init(a, 2, theme_mod.monochrome, .none);
+    defer region.deinit();
+    region.beginInput(.builtin);
+    var backend = TuiBackend.init(&region);
+    var editor = input.LineEditor.init(a);
+    defer editor.deinit();
+    try editor.setLine("draft: ");
+    const snap: InputCtx.Snapshot = .{ .fd = 0, .app = null, .alloc = a };
+    var paste: ?ReplyPaste = null;
+    defer if (paste) |*open| open.deinit();
+
+    backend.routeKey(snap, .paste_begin, &editor, &paste);
+    for ("one") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
+    backend.routeKey(snap, .enter, &editor, &paste);
+    for ("two") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
+    try std.testing.expectEqualStrings("draft: ", editor.view());
+    backend.routeKey(snap, .paste_end, &editor, &paste);
     try std.testing.expect(paste == null);
+    try std.testing.expectEqualStrings("draft: one\ntwo", editor.view());
+    try std.testing.expectEqual(editor.view().len, editor.cursor);
+}
+
+test "a long paste during a reply is held as a placeholder, and the queued message reaches the model whole (#755)" {
+    const a = std.testing.allocator;
+    const test_fs = @import("../../util/fs.zig").testing;
+    var root_buf: [512]u8 = undefined;
+    const state_root = test_fs.perPidDir(&root_buf, "cc-zig-reply-paste-root");
+    _ = pfs.mkdir(state_root.ptr, 0o700);
+    defer test_fs.rmrfBestEffort(state_root);
+    var region = RenderRegion.init(a, 2, theme_mod.monochrome, .none);
+    defer region.deinit();
+    region.beginInput(.builtin);
+    var queue = msg_queue.MsgQueue.init(a);
+    defer queue.deinit();
+    var history = history_mod.History.init(a);
+    defer history.deinit();
+    var backend = TuiBackend.init(&region);
+    backend.state_root = state_root;
+    backend.queue = &queue;
+    backend.history = &history;
+    var editor = input.LineEditor.init(a);
+    defer editor.deinit();
+    const snap: InputCtx.Snapshot = .{ .fd = 0, .app = null, .alloc = a };
+    var paste: ?ReplyPaste = null;
+    defer if (paste) |*open| open.deinit();
+
+    const text = "l1\nl2\nl3\nl4\nl5";
+    backend.routeKey(snap, .paste_begin, &editor, &paste);
+    for (text) |byte| backend.routeKey(snap, if (byte == '\n') .enter else .{ .char = byte }, &editor, &paste);
+    backend.routeKey(snap, .paste_end, &editor, &paste);
+    try std.testing.expect(std.mem.startsWith(u8, editor.view(), "[Pasted text #"));
+    try std.testing.expect(std.mem.endsWith(u8, editor.view(), " +4 lines]"));
+
+    _ = queue.push(editor.view());
+    const event = backend.pollImpl() orelse return error.TestUnexpectedResult;
+    defer a.free(event.queue_message);
+    try std.testing.expectEqualStrings(text, event.queue_message);
+    const kept = (try history.prev("")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(editor.view(), kept);
 }
