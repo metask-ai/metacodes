@@ -3593,7 +3593,7 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
     // up from a browser already signed in).
     if (worker.accountName()) |name| cmd_output.print(" as {s}", .{name});
     cmd_output.print(" · {s}", .{app.activeModel()});
-    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{effort.name()});
+    if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{dialog.models.effortLabelFor(model, effort)});
     cmd_output.print("\n", .{});
     // The session this sign-in replaced, revoked at Metask (#560).
     if (@import("../api/metask_oauth.zig").replacedNote(applied.replaced)) |note| {

@@ -36,6 +36,12 @@ const GATEWAY_MODELS =
     "{\"id\":\"kimi-k3\",\"display_name\":\"Kimi K3\",\"max_input_tokens\":262144,\"max_tokens\":32768}" ++
     "]}";
 const DEV_MODELS = "{\"object\":\"list\",\"data\":[{\"id\":\"dev-model\",\"max_tokens\":8192}]}";
+const ON_OFF_GATEWAY_MODELS =
+    \\{"object":"list","data":[
+    \\{"id":"hy4","display_name":"hy4","max_input_tokens":1048576,"max_tokens":65536,"capabilities":{"endpoints":{"messages":{"supported":true}},"reasoning":{"disable":{"supported":true},"supported":true,"translated":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+    \\{"id":"glm-5.3-flash","display_name":"glm-5.3-flash","max_input_tokens":1048576,"max_tokens":131072,"capabilities":{"endpoints":{"messages":{"supported":true}},"reasoning":{"disable":{"supported":false},"efforts":["low","high","max"],"supported":true,"translated":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}}
+    \\]}
+;
 const END_TURN_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
@@ -260,6 +266,49 @@ test "L2 metask api-key route: the picker offers the gateway's models at the ses
     const elsewhere = cc.repl_picker_host.useSelector(app, "glm-5.3");
     try std.testing.expect(elsewhere == .ambiguous);
     try std.testing.expectEqual(@as(usize, 4), elsewhere.ambiguous.total);
+}
+
+test "L2 metask api-key route: a model the gateway only switches on and off is offered Thinking in /model, and the pick reaches the request" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const bodies = [_][]const u8{ ON_OFF_GATEWAY_MODELS, END_TURN_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    var buffer: [64][]const u8 = undefined;
+    try std.testing.expect(containsModel(try metaskOffers(app, &buffer), "hy4"));
+    const picker = &app.model_picker;
+    for ("hy4") |byte| _ = picker.onKey(.{ .char = byte });
+    const offer = picker.focusedOffer() orelse return error.NoFocusedRoute;
+    try std.testing.expectEqualStrings("hy4", offer.request_model_id);
+    const spec = picker_mod.firstEnumeration(offer.controls) orelse return error.NoThinkingControl;
+    try std.testing.expectEqualStrings("Thinking", spec.label);
+    try std.testing.expectEqual(@as(usize, 2), spec.allowed_values.len);
+    try std.testing.expect(picker.effectiveValue(spec) == null);
+    _ = picker.onKey(.right);
+    try std.testing.expectEqualStrings("none", picker.effectiveValue(spec).?);
+    _ = picker.onKey(.right);
+    try std.testing.expectEqualStrings("high", picker.effectiveValue(spec).?);
+    const outcome = picker.onKey(.enter);
+    try std.testing.expect(outcome == .commit);
+    try std.testing.expect(try app.commitModelSelection(outcome.commit) == .committed);
+    try std.testing.expectEqualStrings("hy4", app.activeModel());
+
+    const captured = try sendOneTurn(app, server);
+    try std.testing.expectEqualStrings("\"hy4\"", captured.jsonField("model").?);
+    try std.testing.expectEqualStrings("{\"type\":\"enabled\"}", captured.jsonField("thinking").?);
+    try std.testing.expect(captured.jsonField("output_config") == null);
 }
 
 test "L2 metask api-key route: every page of a paginated /v1/models becomes the inventory" {

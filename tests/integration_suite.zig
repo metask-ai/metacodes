@@ -18,6 +18,7 @@ test {
     _ = @import("integration/agents_e2e_test.zig");
     _ = @import("component/provider_offer_test.zig");
     _ = @import("component/metask_api_key_picker_test.zig");
+    _ = @import("component/gateway_catalog_request_test.zig");
     _ = @import("component/credential_route_scope_test.zig");
     _ = @import("component/provider_cli_key_scope_test.zig");
     _ = @import("component/vendor_dialect_test.zig");

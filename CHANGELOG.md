@@ -225,6 +225,26 @@ status, compatibility boundaries, and entry points are defined by
   When none works, they say the tunnel port could not be bound on the
   executor, which may also not allow remote forwarding for the account.
 
+- **A model whose output limit is its whole context window can be used.**
+  Metask's gateway lists kimi-k3.1-pro with a 1,048,576-token window and the
+  same output limit. The request asked for all of it and the whole of it was
+  reserved from the window, which left no room for the input: every message
+  stopped before it was sent (`context blocking limit reached ...
+  effective_window=0`). A request now asks for at most half the model's window
+  as output, and the input keeps the other half; models whose output limit is
+  under half their window (every other model the gateway lists today) send
+  what they did before. An explicit `--max-tokens` is sent as given.
+
+- **Reasoning can be switched off and on for Metask models that name no
+  level.** For DeepSeek-V4.1-Flash-1017, hy4 and kimi-k3.1-pro the gateway
+  says thinking can be turned off and on but lists no levels, and the sign-in
+  offered `none` alone, which sent nothing: thinking was whatever the gateway
+  chose. `metacodes login` and `/login` now offer `off` and `on`, and `/model`
+  offers Thinking `none` or `high`; on sends `thinking: {"type":"enabled"}`
+  and off sends `{"type":"disabled"}`. `none` on a gateway model that lists
+  levels and can be turned off now sends `disabled` as well. A model with a
+  single choice is no longer asked for one.
+
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
   8 s before the write and 6 s after it, so a server that answered

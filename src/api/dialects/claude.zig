@@ -21,6 +21,10 @@
 //!
 //! - 选了档位才发:`output_config:{"effort":...}` + `thinking:{"type":"adaptive"}`;
 //!   none / minimal / 未指定都不发,用服务端默认。
+//! - 路由目录(`/v1/models`,经 `Dialect.declareThinkingSwitch`)说能关思考的模型,none /
+//!   minimal 发 `thinking:{"type":"disabled"}`;说只能开关、不列档位的(Metask 网关上的
+//!   DeepSeek-V4.1-Flash-1017、hy4、kimi-k3.1-pro),任一档位都发 `thinking:{"type":"enabled"}`,
+//!   不发 `output_config`。
 //! - 词汇 low / medium / high / max:中立的 `xhigh` 发成 `max`(Anthropic 没有 xhigh);
 //!   GLM-5.3+ 在这条 wire 上换成 low / high / max(`glm53_effort_vocabulary`)。
 //! - 响应:SSE 的 `thinking_delta` 事件由 `client.zig` 的事件解析直接处理,不经本方言。
@@ -81,13 +85,20 @@ pub const wire = Dialect{
 
 fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
     _ = ctx;
-    if (effort) |e| if (e.active()) {
-        try out.appendSlice(a, ",\"output_config\":{\"effort\":");
-        const name = if (p.glm53_effort_vocabulary) model_adapter.glm53EffortName(e) else effortName(e);
-        try util_json.serializeString(name, out, a);
-        try out.append(a, '}');
-        try out.appendSlice(a, ",\"thinking\":{\"type\":\"adaptive\"}");
-    };
+    const e = effort orelse return;
+    if (!e.active()) {
+        if (p.thinking_switch != .family) try out.appendSlice(a, ",\"thinking\":{\"type\":\"disabled\"}");
+        return;
+    }
+    if (p.thinking_switch == .off_or_on) {
+        try out.appendSlice(a, ",\"thinking\":{\"type\":\"enabled\"}");
+        return;
+    }
+    try out.appendSlice(a, ",\"output_config\":{\"effort\":");
+    const name = if (p.glm53_effort_vocabulary) model_adapter.glm53EffortName(e) else effortName(e);
+    try util_json.serializeString(name, out, a);
+    try out.append(a, '}');
+    try out.appendSlice(a, ",\"thinking\":{\"type\":\"adaptive\"}");
 }
 
 /// Anthropic `output_config.effort` 的词汇是 low / medium / high / max。中立的 `xhigh`
@@ -155,6 +166,47 @@ test "Claude: 选了档位才发 adaptive + output_config;xhigh→max,其余原�
     out.clearRetainingCapacity();
     try d.serializeThinking(.{}, null, &out, allocator);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "Claude wire: a catalog-declared switch sends disabled for none, and enabled with no level for a model that takes none" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    var on_or_off = claude();
+    on_or_off.declareThinkingSwitch(.off_or_on);
+    const switched = on_or_off.profileFor(.anthropic, "kimi-k3.1-pro");
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_on, switched.thinking_switch);
+    inline for (.{ ReasoningEffort.low, ReasoningEffort.medium, ReasoningEffort.high, ReasoningEffort.xhigh, ReasoningEffort.max }) |level| {
+        out.clearRetainingCapacity();
+        try on_or_off.serializeThinking(switched, level, &out, a);
+        try std.testing.expectEqualStrings(",\"thinking\":{\"type\":\"enabled\"}", out.items);
+    }
+    inline for (.{ ReasoningEffort.none, ReasoningEffort.minimal }) |off| {
+        out.clearRetainingCapacity();
+        try on_or_off.serializeThinking(switched, off, &out, a);
+        try std.testing.expectEqualStrings(",\"thinking\":{\"type\":\"disabled\"}", out.items);
+    }
+    out.clearRetainingCapacity();
+    try on_or_off.serializeThinking(switched, null, &out, a);
+    try std.testing.expectEqualStrings("", out.items);
+
+    var off_or_levels = claude();
+    off_or_levels.declareThinkingSwitch(.off_or_levels);
+    const leveled = off_or_levels.profileFor(.anthropic, "some-gateway-model");
+    out.clearRetainingCapacity();
+    try off_or_levels.serializeThinking(leveled, .none, &out, a);
+    try std.testing.expectEqualStrings(",\"thinking\":{\"type\":\"disabled\"}", out.items);
+    out.clearRetainingCapacity();
+    try off_or_levels.serializeThinking(leveled, .high, &out, a);
+    try std.testing.expectEqualStrings(",\"output_config\":{\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}", out.items);
+
+    const undeclared = claude();
+    const family = undeclared.profileFor(.anthropic, "kimi-k3.1-pro");
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, family.thinking_switch);
+    out.clearRetainingCapacity();
+    try undeclared.serializeThinking(family, .none, &out, a);
+    try std.testing.expectEqualStrings("", out.items);
 }
 
 test "Claude wire: GLM 5.3+ 的 effort 用 low/high/max" {
