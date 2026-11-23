@@ -1079,6 +1079,14 @@ the other features' flags, and only on an SSH executor whose entry sets
   directory without a commit gets one first (`git init` when it is no
   repository, then a snapshot commit of what the image put there); one with
   a commit is used as it is.
+- **Permissions**: a headless trial runs with `bypassPermissions`, but
+  `teamwork run` takes no `--permission`, and its seats and isolated
+  verifier would ask for every risky command with nobody to answer (the
+  first real runs ended `audit_unavailable`: the verifier stopped at its
+  prompts). The trial writes user-level allow rules for the built-in tools
+  (`TEAMWORK_ALLOWED_TOOLS`) to `~/.claude/settings.json` in the disposable
+  container, unless the image has that file; seat commands still run under
+  bubblewrap.
 - **Request and approval**: the instruction is the approved request
   (`--approve`); text starting with `[` gets a heading, since a leading
   bracket would be read as an option segment. Every seat uses metacodes and

@@ -97,6 +97,11 @@ TEAMWORK_PACKAGE_INSTALL = {
     "apk": "apk add --no-cache git bubblewrap",
 }
 TEAMWORK_TOOLS_CHECK = "command -v git >/dev/null 2>&1 && command -v bwrap >/dev/null 2>&1"
+# `teamwork run` takes no --permission: a headless trial runs with
+# bypassPermissions, and teamwork's seats and verifier would otherwise ask,
+# with nobody to answer. User-level allow rules in the disposable container
+# give them the same; their commands still run under bubblewrap.
+TEAMWORK_ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebSearch", "NotebookEdit")
 # What a task container needs for bubblewrap to create its namespaces, as
 # root (no user namespace: SYS_ADMIN, NET_ADMIN for the loopback) or as
 # another user (unconfined seccomp, AppArmor and /proc).
@@ -461,13 +466,20 @@ def teamwork_run_command(
         "  { git rev-parse --show-toplevel >/dev/null 2>&1 || git init -q; } &&",
         f"  git add -A && git {identity} commit -q --allow-empty -m 'bench snapshot before teamwork' || exit 75",
         "fi",
+        'settings="${HOME:-/root}/.claude/settings.json"',
+        'if [ -e "$settings" ]; then',
+        f'  echo "keeping the image\'s own $settings: teamwork seats may ask for permissions" >>{logs}/{STDERR_FILENAME}',
+        "else",
+        '  mkdir -p "$(dirname "$settings")" &&'
+        f' printf %s {shlex.quote(json.dumps({"permissions": {"allow": list(TEAMWORK_ALLOWED_TOOLS)}}))} > "$settings" || exit 78',
+        "fi",
         'request="$state/request.md"',
         f'{{ if [ "$(head -c 1 {shlex.quote(instruction_path)})" = "[" ]; then printf "Task:\\n\\n"; fi;'
         f' cat {shlex.quote(instruction_path)}; }} > "$request" || exit 76',
         f'{run} --preview=teamwork teamwork run --request-file "$request" --approve'
         f" --budget-usd {budget_usd:g} --id {shlex.quote(run_id)} --events "
         + " ".join(shlex.quote(flag) for flag in flags)
-        + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>{logs}/{STDERR_FILENAME}",
+        + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>>{logs}/{STDERR_FILENAME}",
         f'echo "teamwork run exited $?" >>{logs}/{STDERR_FILENAME}',
         teamwork_keep_run_command(state_dir=state_dir, run_id=run_id, logs_dir=logs_dir),
         f"{run} teamwork status {shlex.quote(run_id)} --json"

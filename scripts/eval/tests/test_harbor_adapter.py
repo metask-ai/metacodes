@@ -424,6 +424,18 @@ class TeamworkScriptTest(unittest.TestCase):
         self.assertEqual((kept / "seats" / "implementer-1" / "session.log").read_text(encoding="utf-8").strip(), "seat-log")
         self.assertFalse((kept / "worktree").exists())
 
+    def test_seats_get_allow_rules_and_an_images_own_settings_are_kept(self):
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        settings = json.loads((self.tmp / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings, {"permissions": {"allow": list(cmd.TEAMWORK_ALLOWED_TOOLS)}})
+        (self.tmp / ".claude" / "settings.json").write_text('{"permissions": {"deny": ["Bash"]}}', encoding="utf-8")
+        shutil.rmtree(self.tmp / "state")
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('"deny"', (self.tmp / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertIn("keeping the image's own", (self.logs / cmd.STDERR_FILENAME).read_text(encoding="utf-8"))
+
     def test_an_existing_commit_is_kept_and_a_bracket_request_gets_a_heading(self):
         subprocess.run(["git", "init", "-q"], cwd=self.work, check=True)
         subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "task"],
