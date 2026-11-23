@@ -2,6 +2,7 @@ import http.client
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ _SSH = {"SSH_CONNECTION": "192.0.2.10 50022 192.0.2.20 22", "SSH_TTY": "/dev/pts
 _PASTE_LINE = "paste that page's address here and press Enter."
 _OTHER_SIGN_IN = "That address is from another sign-in."
 _NO_PTY = "the CLI's prompt is answered over a POSIX pty here"
+_NO_POLL = "a pipe on stdin is polled with poll(2) here"
 
 
 class _AuthMock:
@@ -165,3 +167,86 @@ def test_cli_mcp_login_ends_when_the_authorization_page_refuses_and_stores_nothi
         assert elapsed < 6, f"took {elapsed:.1f}s"
         assert _stored(state) == [], _stored(state)
         assert mock.seen("/as/token") == [], mock.seen("/as/token")
+
+
+def _on_a_pipe(bin_path, env):
+    return subprocess.Popen([os.path.abspath(bin_path), "mcp", "login", "authd", "--no-browser"], env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _read_until(stream, marker, timeout):
+    out = b""
+    deadline = time.monotonic() + timeout
+    while marker.encode() not in out and time.monotonic() < deadline:
+        ready, _, _ = select.select([stream.fileno()], [], [], 0.1)
+        if ready:
+            chunk = os.read(stream.fileno(), 4096)
+            if not chunk:
+                break
+            out += chunk
+    return out
+
+
+def _end(proc):
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        stream.close()
+
+
+def test_cli_mcp_login_with_half_a_line_on_a_pipe_still_stops_at_the_bound(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_POLL)
+    with _AuthMock() as mock:
+        state, env = _case(mock, {"METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "2000"})
+        proc = _on_a_pipe(bin_path, env)
+        try:
+            err = _read_until(proc.stderr, _PASTE_LINE, 10)
+            assert _PASTE_LINE.encode() in err, err.decode("utf-8", "replace")
+            started = time.monotonic()
+            proc.stdin.write(b"http://localhost:1/callback?code=half-a-li")
+            proc.stdin.flush()
+            code = proc.wait(timeout=15)
+            elapsed = time.monotonic() - started
+            err += proc.stderr.read()
+        finally:
+            _end(proc)
+        text = err.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert "error: login to 'authd' failed: no answer from the browser in 2 seconds; nothing was stored" in text, text
+        assert elapsed < 10, f"took {elapsed:.1f}s"
+        assert _stored(state) == [], _stored(state)
+        assert mock.seen("/as/token") == [], mock.seen("/as/token")
+
+
+def test_cli_mcp_login_on_a_pipe_puts_an_address_written_in_two_halves_back_together(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_POLL)
+    with _AuthMock() as mock:
+        state, env = _case(mock, {"METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "8000"})
+        proc = _on_a_pipe(bin_path, env)
+        try:
+            err = _read_until(proc.stderr, _PASTE_LINE, 10)
+            assert _PASTE_LINE.encode() in err, err.decode("utf-8", "replace")
+            address = mock.ended_on(err)
+            half = len(address) // 2
+            proc.stdin.write(address[:half].encode())
+            proc.stdin.flush()
+            time.sleep(0.5)
+            proc.stdin.write(address[half:].encode() + b"\n")
+            proc.stdin.flush()
+            code = proc.wait(timeout=15)
+            out = proc.stdout.read()
+            err += proc.stderr.read()
+        finally:
+            _end(proc)
+        text = (out + err).decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert "Logged in to MCP server 'authd'" in text, text
+        stored = _stored(state)
+        assert len(stored) == 1 and stored[0].startswith("authd-"), stored
+        tokens = mock.seen("/as/token")
+        assert len(tokens) == 1, tokens
+        pasted_code = urllib.parse.parse_qs(urllib.parse.urlsplit(address).query)["code"][0]
+        assert tokens[0]["form"]["code"] == pasted_code, tokens
