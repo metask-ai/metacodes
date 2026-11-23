@@ -42,7 +42,7 @@ from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import (FAKE_HARBOR, REPO, RotatingGateway, gaia2_dataset, node_script,
-                                                     offline_hugging_face, session_fixture, stop_batches_and_workers,
+                                                     offline_hugging_face, session_fixture, stop_profiles_and_workers,
                                                      wait_run)
 
 FAKES = r'''
@@ -133,6 +133,8 @@ elif name == "docker":
         except Exception as exc:
             print("wget: " + str(exc), file=sys.stderr)
             sys.exit(1)
+    if args[:1] == ["inspect"] and env.get("FAKE_DOCKER_INSPECT"):
+        print(env["FAKE_DOCKER_INSPECT"])
     images = state / "images"
     if args[:2] == ["image", "inspect"]:
         sys.exit(0 if (images / args[2].replace("/", "_")).exists() else 1)
@@ -170,7 +172,7 @@ elif name == "ssh":
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
                 "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
-                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS"):
+                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -186,8 +188,12 @@ elif name == "ssh":
         # life of the session (ExitOnForwardFailure: a busy port fails it).
         import socket, threading
         _, rport, _, lport = reverse.split(":")
+        refusals = env.get("FAKE_REFUSED_FORWARDS")
         listener = socket.socket()
         try:
+            if refusals and int(Path(refusals).read_text()) > 0:
+                Path(refusals).write_text(str(int(Path(refusals).read_text()) - 1))
+                raise OSError("the executor refuses this forward")
             listener.bind(("127.0.0.1", int(rport)))
         except OSError:
             print("Error: remote port forwarding failed for listen port " + rport, file=sys.stderr)
@@ -583,6 +589,70 @@ class ExecutorConfigTest(unittest.TestCase):
         self.assertEqual(executors.configured({})[0][0].name, "local")
 
 
+    def test_container_mirrors_are_validated_and_become_the_compose_overlay(self):
+        base = {"name": "relay", "kind": "ssh", "host": "h"}
+        for bad in ({"apt": "https://mirrors.aliyun.com"}, {"hf": "https://hf-mirror.com"},
+                    {"pypi": "file:///simple"}, ["pypi"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                executors.parse({**base, "container_mirrors": bad})
+        with self.assertRaises(ValueError):
+            executors.parse({**base, "egress": "workbench", "container_mirrors": {"apt": "http://mirrors.aliyun.com"}})
+        self.assertIsNone(executors.parse(base).compose_overlay())
+        mirrors = {"pypi": "https://mirrors.aliyun.com/pypi/simple/", "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/",
+                   "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com"}
+        relay = executors.parse({**base, "egress": "workbench", "container_mirrors": mirrors})
+        self.assertEqual(executors.parse(relay.spec()), relay)
+        self.assertEqual(relay.compose_overlay(), {"services": {"main": {"environment": {
+            "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/",
+            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/",
+            "CONDA_CHANNEL_ALIAS": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud",
+            "CONDA_DEFAULT_CHANNELS": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main,"
+                                      "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r",
+            "GOPROXY": "https://goproxy.cn,direct",
+            "RUSTUP_DIST_SERVER": "https://rsproxy.cn", "RUSTUP_UPDATE_ROOT": "https://rsproxy.cn/rustup",
+            "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}}})
+
+    def test_mirror_settings_a_task_sets_itself_are_left_out(self):
+        relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
+            "apt": "http://mirrors.aliyun.com", "pypi": "https://mirrors.aliyun.com/pypi/simple/",
+            "go": "https://goproxy.cn"}})
+        mirrors = dict(relay.container_mirrors)
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp)
+            (dataset / "offline-go/environment").mkdir(parents=True)
+            (dataset / "offline-go/environment/docker-compose.yaml").write_text(
+                "services:\n  main:\n    environment:\n      - GOPROXY=off\n")
+            (dataset / "apt-proxy/environment").mkdir(parents=True)
+            (dataset / "apt-proxy/environment/Dockerfile").write_text(
+                "FROM debian\nRUN echo 'Acquire::http::Proxy \"http://proxy\";' > /etc/apt/apt.conf.d/01p\n")
+            (dataset / "plain/tests").mkdir(parents=True)
+            (dataset / "plain/tests/test.sh").write_text("export PIP_INDEX_URL=https://example.invalid\n")
+            owned = executors.task_owned_settings(dataset, mirrors)
+        self.assertEqual(owned, ["Acquire::http::Proxy", "GOPROXY"])
+        self.assertEqual(relay.compose_overlay(owned), {"services": {"main": {"environment": {
+            "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/",
+            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/"}}}})
+        self.assertIsNone(relay.compose_overlay(["Acquire::http::Proxy", "GOPROXY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX"]))
+
+    def test_apt_is_left_out_of_a_run_whose_apt_cache_does_not_answer(self):
+        relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
+            "apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}})
+        for code, apt in ((0, True), (1, False)):
+            probes, logged = [], []
+
+            def runner(argv, **_kwargs):
+                probes.append(argv)
+                return subprocess.CompletedProcess(argv, code, "", "")
+            run = executors.RemoteRun({"name": "r", "executor": relay.spec()}, runner=runner, log=logged.append)
+            overlay = run.mirror_overlay(None)
+            with self.subTest(code=code):
+                self.assertEqual(len(probes), 1)
+                self.assertIn("http://172.17.0.1:3142/acng-report.html", probes[0][-1])
+                self.assertEqual("configs" in overlay, apt)
+                self.assertEqual(overlay["services"]["main"]["environment"], {"GOPROXY": "https://goproxy.cn,direct"})
+                self.assertEqual(any("没有响应" in line for line in logged), not apt)
+
+
 class ExecutorEntryTest(SetupFixture):
     def test_harbor_path_with_space_and_at_parses_and_a_bad_entry_spares_the_others(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h",
@@ -768,7 +838,7 @@ class SshRunTest(SetupFixture):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
-        self.addCleanup(stop_batches_and_workers, manager)
+        self.addCleanup(stop_profiles_and_workers, manager)
         return manager, cli.Client(f"http://127.0.0.1:{http.server_address[1]}/"), calls
 
     def request(self):
@@ -806,6 +876,23 @@ class SshRunTest(SetupFixture):
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
         self.assertEqual((view["rows"][0]["requests"], view["rows"][0]["total_tokens"]), (1, 70))
         self.assertTrue(list((local / ".bench-metrics").glob("*.jsonl")))
+
+    def test_container_mirrors_reach_harbor_as_a_compose_overlay(self):
+        manager, client, _ = self.prepare_remote()
+        cfg = self.cfg()
+        entry = next(e for e in cfg["executors"] if e["name"] == "relay-4090")
+        entry["container_mirrors"] = {"apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}
+        atomic_json(self.config, cfg)
+        run = client.request("api/runs", self.request())
+        final = wait_run(manager, run["name"])
+        self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
+        argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+        overlay = self.remote_home / ".metacodes-bench/runs" / run["name"] / executors.COMPOSE_OVERLAY
+        self.assertEqual(argv[argv.index("--extra-docker-compose") + 1], str(overlay.resolve()))
+        # Nothing answers as the apt cache here: apt keeps the task's own sources.
+        self.assertEqual(json.loads(overlay.read_text()),
+                         {"services": {"main": {"environment": {"GOPROXY": "https://goproxy.cn,direct"}}}})
+        self.assertIn("apt 缓存 http://127.0.0.1:3142 没有响应", (manager.records / (run["name"] + ".log")).read_text())
 
     def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
         gateway = RotatingGateway(self.root, lifetime=4)
@@ -1828,7 +1915,7 @@ class EgressRunTest(SetupFixture):
         self.assertRegex(forward, r"^127\.0\.0\.1:\d+:127\.0\.0\.1:\d+$")
         self.assertIn("ExitOnForwardFailure=yes", session)
         # Only the run session carries the forward.
-        self.assertEqual(len([c for c in self.calls("ssh") if "-R" in c[1]]), 1)
+        self.assertEqual([c for c in self.calls("ssh") if "-R" in c[1] and " node run " not in c[1][-1]], [])
         local = manager.jobs_dir / run["name"]
         harbor_env = json.loads((local / "harbor-env.json").read_text())
         docker_config = Path(harbor_env["DOCKER_CONFIG"])
@@ -1850,6 +1937,42 @@ class EgressRunTest(SetupFixture):
         self.assertFalse((self.home / ".docker/config.json").exists())
         log = data.tail(manager.records / (run["name"] + ".log"))
         self.assertIn("出网代理已停止", log)
+
+    def run_refusing_forwards(self, refused, **env):
+        manager, client, _ = self.prepare_remote()
+        self.harbor_local_suite()
+        self.egress_executor(egress="workbench")
+        refusals = self.root / "refused-forwards"
+        refusals.write_text(str(refused))
+        os.environ.update(FAKE_REFUSED_FORWARDS=str(refusals), **env)
+        run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
+                                          "tasks": ["humaneval-7"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"], timeout=60)
+        sessions = [c[1] for c in self.calls("ssh") if "-R" in c[1]]
+        self.assertTrue(all(" node run " in session[-1] for session in sessions), sessions)
+        ports = [int(session[session.index("-R") + 1].split(":")[1]) for session in sessions]
+        self.assertEqual(len(set(ports)), len(ports), ports)
+        self.assertTrue(all(20000 <= port < LOWEST_EPHEMERAL_PORT for port in ports), ports)
+        return manager, run["name"], final, ports, int(refusals.read_text())
+
+    def test_a_refused_tunnel_port_is_retried_on_another_one_and_the_run_finishes(self):
+        manager, name, final, ports, left = self.run_refusing_forwards(1, FAKE_EGRESS_FETCH="1")
+        log = data.tail(manager.records / (name + ".log"))
+        self.assertEqual(final["status"], "finished", (final, log))
+        self.assertEqual(left, 0)
+        self.assertGreaterEqual(len(ports), 2)
+        self.assertIn(f"Error: remote port forwarding failed for listen port {ports[0]}", log)
+        relay = executors.find(self.cfg(), "relay-4090")
+        self.assertIn(executors.tunnel_retry_note(relay, ports[0], ports[1], 2), log)
+        self.assertEqual((manager.jobs_dir / name / "egress-probe.txt").read_bytes(), b"metacodes-bench-egress-ok")
+
+    def test_a_tunnel_refused_on_every_port_fails_the_run_with_the_executor_side_cause(self):
+        _, _, final, ports, left = self.run_refusing_forwards(100)
+        self.assertEqual(final["status"], "failed", final)
+        self.assertEqual(len(ports), executors.TUNNEL_ATTEMPTS)
+        self.assertEqual(left, 100 - executors.TUNNEL_ATTEMPTS)
+        relay = executors.find(self.cfg(), "relay-4090")
+        self.assertEqual(final["error"], executors.tunnel_unbound(relay, ports))
 
     def test_ghcr_mirror_pulls_and_tags_only_ghcr_images_of_the_selected_tasks(self):
         manager, client, _ = self.prepare_remote()
@@ -1887,31 +2010,40 @@ class NetworkSetupTest(SetupFixture):
         os.symlink(self.templates / "docker", self.remote_bin / "docker")
         os.environ["FAKE_REMOTE_DOCKER_DAEMON"] = "1"
 
-    def free_tunnel_ports(self):
+    def tunnel_ports(self, busy=0):
         chosen = []
 
-        def randrange(start, stop):
-            candidates = list(range(start, min(stop, LOWEST_EPHEMERAL_PORT)))
+        def pick(tried=()):
+            candidates = [port for port in executors.TUNNEL_PORTS if port not in tried]
             random.shuffle(candidates)
             for port in candidates:
-                with socket.socket() as sock:
-                    try:
-                        sock.bind(("127.0.0.1", port))
-                    except OSError:
-                        continue
+                sock = socket.socket()
+                try:
+                    sock.bind(("127.0.0.1", port))
+                except OSError:
+                    sock.close()
+                    continue
+                if len(chosen) < busy:
+                    sock.listen()
+                    self.addCleanup(sock.close)
+                else:
+                    sock.close()
                 chosen.append(port)
                 return port
-            raise AssertionError(f"no free port in range({start}, {min(stop, LOWEST_EPHEMERAL_PORT)})")
-        patcher = patch.object(setup, "secrets", types.SimpleNamespace(
-            SystemRandom=lambda: types.SimpleNamespace(randrange=randrange)))
+            raise AssertionError(f"no free port in {executors.TUNNEL_PORTS}")
+        patcher = patch.object(executors, "tunnel_port", pick)
         patcher.start()
         self.addCleanup(patcher.stop)
         return chosen
 
+    def forwarded_ports(self):
+        return [int(c[1][c[1].index("-R") + 1].split(":")[1]) for c in self.calls("ssh") if "-R" in c[1]]
+
     def local_external_probe(self):
+        import importlib
         from http.server import BaseHTTPRequestHandler
         from urllib.parse import urlsplit
-        from scripts.eval.harbor.bench import egress
+        egress = importlib.import_module("scripts.eval.harbor.bench.egress")
         probe = types.SimpleNamespace(served=[], proxy_checked=[])
 
         class Origin(BaseHTTPRequestHandler):
@@ -1947,7 +2079,7 @@ class NetworkSetupTest(SetupFixture):
 
     def test_blocked_registries_propose_mirrors_and_one_click_applies_them(self):
         probe = self.local_external_probe()
-        tunnel_ports = self.free_tunnel_ports()
+        tunnel_ports = self.tunnel_ports()
         self.add_ssh_executor(metrics_bind="127.0.0.1", egress_ports=[443, 80, probe.port])
         self.remote_docker()
         os.symlink(self.templates / "uv", self.local_bin / "uv")
@@ -1997,9 +2129,44 @@ class NetworkSetupTest(SetupFixture):
         self.assertEqual(self.step(again, "egress")["status"], "ok")
         self.assertEqual(len(self.calls("systemctl")), 1)
         self.assertFalse(any("restart" in json.dumps(c) for c in self.calls()))
-        forwarded = {int(c[1][c[1].index("-R") + 1].split(":")[1]) for c in self.calls("ssh") if "-R" in c[1]}
-        self.assertLessEqual(forwarded, set(tunnel_ports))
+        self.assertLessEqual(set(self.forwarded_ports()), set(tunnel_ports))
         self.assertEqual((probe.served, probe.proxy_checked), ([probe.path] * 2, ["127.0.0.1"] * 2))
+
+    def test_apt_cache_starts_once_per_mirror_on_the_docker_gateway(self):
+        class Report(SimpleHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/acng-report.html" else 404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+        cache = ThreadingHTTPServer(("127.0.0.1", 0), Report)
+        threading.Thread(target=cache.serve_forever, daemon=True).start()
+        self.addCleanup(cache.server_close)
+        self.addCleanup(cache.shutdown)
+        port = cache.server_port
+        patcher = patch.object(executors, "APT_CACHE_PORT", port)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors={"apt": "http://mirrors.example/"})
+        self.remote_docker()
+        dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(dry, "apt_cache")["status"], "planned", self.step(dry, "apt_cache"))
+        self.assertFalse([c for c in self.calls("docker", "remote") if c[1][:1] in (["build"], ["run"])])
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "apt_cache")
+        self.assertEqual(step["status"], "done", step)
+        docker = [c[1] for c in self.calls("docker", "remote")]
+        self.assertIn(["build", "-q", "-t", setup.APT_CACHE_NAME, "--build-arg", "MIRROR=http://mirrors.example", "-"], docker)
+        started = next(c for c in docker if c[:2] == ["run", "-d"])
+        for flag in (["--restart", "unless-stopped"], ["--label", setup.APT_CACHE_LABEL + "=http://mirrors.example"],
+                     ["-p", f"127.0.0.1:{port}:3142"], ["-v", setup.APT_CACHE_NAME + ":/var/cache/apt-cacher-ng"]):
+            self.assertIn(flag, [started[i:i + 2] for i in range(len(started) - 1)])
+        os.environ["FAKE_DOCKER_INSPECT"] = "http://mirrors.example true"
+        again = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(again, "apt_cache")["status"], "ok", self.step(again, "apt_cache"))
+        self.assertEqual(len([c for c in self.calls("docker", "remote") if c[1][:1] == ["build"]]), 1)
 
     def test_docker_mirrors_without_sudo_report_the_command_and_change_nothing(self):
         self.add_ssh_executor(docker_mirrors=["https://docker.m.daocloud.io"])
@@ -2016,7 +2183,7 @@ class NetworkSetupTest(SetupFixture):
         self.assertEqual(self.step(progress, "network")["status"], "ok")
 
     def test_workbench_egress_probe_failure_is_explained(self):
-        self.free_tunnel_ports()
+        self.tunnel_ports()
         self.add_ssh_executor(metrics_bind="127.0.0.1", egress="workbench")
         self.remote_docker()
         # A container cannot fetch (no route in this fixture's fake docker).
@@ -2029,6 +2196,34 @@ class NetworkSetupTest(SetupFixture):
         self.assertIn("容器无法经执行机器的 Docker 网关", step["detail"])
         self.assertIn("wget: timed out", step["detail"])
         self.assertIn("防火墙", step["detail"])
+
+    def test_a_busy_tunnel_port_on_the_executor_is_retried_on_another_one(self):
+        probe = self.local_external_probe()
+        ports = self.tunnel_ports(busy=1)
+        self.add_ssh_executor(metrics_bind="127.0.0.1", egress="workbench", egress_ports=[443, 80, probe.port])
+        self.remote_docker()
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "egress")
+        self.assertEqual(step["status"], "ok", step)
+        self.assertEqual(len(ports), 2)
+        self.assertEqual(self.forwarded_ports(), ports)
+        relay = executors.find(self.cfg(), "relay-4090")
+        self.assertIn(executors.tunnel_retry_note(relay, ports[0], ports[1], 2), step["log"])
+        self.assertEqual(probe.served, [probe.path])
+
+    def test_a_tunnel_port_refused_on_every_attempt_names_the_executor_side_cause(self):
+        ports = self.tunnel_ports(busy=executors.TUNNEL_ATTEMPTS)
+        self.add_ssh_executor(metrics_bind="127.0.0.1", egress="workbench")
+        self.remote_docker()
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "egress")
+        self.assertEqual(step["status"], "failed", step)
+        self.assertEqual(len(ports), executors.TUNNEL_ATTEMPTS)
+        self.assertEqual(self.forwarded_ports(), ports)
+        relay = executors.find(self.cfg(), "relay-4090")
+        self.assertEqual(step["detail"], executors.tunnel_unbound(relay, ports))
+        self.assertIn("绑不了隧道端口", step["detail"])
+        self.assertNotIn("防火墙", step["detail"])
 
     def test_egress_config_is_validated(self):
         for bad in ({"egress": "tunnel"}, {"egress": {"proxy": "socks5://h:1"}}, {"egress_ports": [0]},
@@ -2043,6 +2238,14 @@ class NetworkSetupTest(SetupFixture):
         argv = executors.ssh_argv(relay, ["true"], reverse=(23456, 34567))
         self.assertEqual(argv[argv.index("-R") + 1], "127.0.0.1:23456:127.0.0.1:34567")
         self.assertNotIn("-R", executors.ssh_argv(relay, ["true"]))
+
+
+class TunnelPortTest(unittest.TestCase):
+    def test_a_tunnel_port_is_below_the_ephemeral_ranges_and_never_one_already_tried(self):
+        ports = {executors.tunnel_port() for _ in range(2000)}
+        self.assertTrue(all(20000 <= port < LOWEST_EPHEMERAL_PORT for port in ports), sorted(ports)[-5:])
+        tried = set(range(20000, LOWEST_EPHEMERAL_PORT)) - {31000}
+        self.assertEqual(executors.tunnel_port(tried), 31000)
 
 
 if __name__ == "__main__":

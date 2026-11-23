@@ -210,14 +210,14 @@ def wait_status(manager, name, status, timeout=6):
         time.sleep(.05)
 
 
-def stop_batches_and_workers(manager, timeout=60):
-    batches = getattr(manager, 'batches', None)
-    if batches is not None:
-        batches.stop()
-        if batches._thread is not None:
-            batches._thread.join(timeout)
-            if batches._thread.is_alive():
-                raise AssertionError('the batch scheduler did not stop')
+def stop_profiles_and_workers(manager, timeout=60):
+    profiles = getattr(manager, 'profiles', None)
+    if profiles is not None:
+        profiles.stop()
+        if profiles._thread is not None:
+            profiles._thread.join(timeout)
+            if profiles._thread.is_alive():
+                raise AssertionError('the profile scheduler did not stop')
 
     def active():
         receipts = {path.stem: data.read_json(path) for path in manager.records.glob('*.json')}
@@ -557,7 +557,7 @@ class WorkbenchTest(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.addCleanup(stop_batches_and_workers, self.manager)
+        self.addCleanup(stop_profiles_and_workers, self.manager)
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self):
@@ -721,9 +721,9 @@ class WorkbenchTest(unittest.TestCase):
         self.assertIsNone(cli.receipt_client({'url': gone}, self.manager.config_path))
 
     def test_an_unexpected_failure_answers_instead_of_dropping_the_connection(self):
-        with patch.object(Workbench, 'create_batch', side_effect=FileNotFoundError('/tmp/gone/bench-provider-x')):
+        with patch.object(Workbench, 'queue_profile', side_effect=FileNotFoundError('/tmp/gone/bench-provider-x')):
             with self.assertRaisesRegex(ValueError, '内部错误'), redirect_stderr(io.StringIO()):
-                self.client.request('api/batches', {})
+                self.client.request('api/profiles/run', {})
 
     def test_a_login_era_service_is_known_by_its_receipt_capability(self):
         legacy = {'url': 'http://127.0.0.1:1/', 'token': 'capability'}

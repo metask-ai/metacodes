@@ -1,0 +1,3484 @@
+{
+ "boards": [
+  {
+   "suites": [
+    "frontier-harness-eval-1.1"
+   ],
+   "title": "FrontierHarness Eval v1.1 排行榜",
+   "model_filter": true,
+   "default_model": "All models",
+   "source": {
+    "name": "FrontierHarness Eval v1.1 leaderboard (frontierharness.org) / frontier-harness-eval/eval release/v1.1",
+    "url": "https://frontierharness.org/leaderboard/v1.1/",
+    "retrieved": "2026-11-22",
+    "metric": "pass rate % = verifier passes / scored attempts (62 tasks x 4 attempts per harness-model cell = 248; 1,240 per harness pooled over 5 models). Infra errors excluded; timeouts graded; reward-hacking/online-solution-lookup passes counted as fails. cost_per_task_usd = mean over tasks of each task's mean inference cost (Baseten list price x reported tokens), i.e. the site's 'average cost per task'; cost_per_pass_usd = cost_per_task / pass_rate.",
+    "notes": "Repo contains no per-trial results files (only README table with pooled pass rate + cost per pass, suite config, dataset manifest). Per-model numbers were recomputed from the site's public trial feed (/api/live, 27,280 trials, complete=true) using the site's own scoring code (js/live.js); pooled pass rates and cost per pass reproduce the README table exactly (e.g. ZCode 61.9% $1.06/pass, Codex CLI 61.1% $0.937/pass). All runs at effort max via Baseten; run window 2026-11-10..2026-11-14 (date field = run end). Models: GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, Muse Spark Open, Kimi-K3. No stderr published. Harness versions included. Dataset frontier-harness-eval/frontier-harness-eval@v1.1.0 (45 TB2.1-derived + 17 'tb4' tasks)."
+   },
+   "entries": [
+    {
+     "harness": "ZCode",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 69.0,
+     "cost_per_task_usd": 0.153,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 68.1,
+     "cost_per_task_usd": 0.194,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 67.3,
+     "cost_per_task_usd": 0.16,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "KimiCode",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 66.5,
+     "cost_per_task_usd": 0.175,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Grok Build",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 66.1,
+     "cost_per_task_usd": 0.188,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 64.9,
+     "cost_per_task_usd": 0.142,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Creator",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 64.9,
+     "cost_per_task_usd": 0.178,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Kimi-K3",
+     "score": 64.9,
+     "cost_per_task_usd": 1.313,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v2",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 64.1,
+     "cost_per_task_usd": 0.173,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Code",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 64.1,
+     "cost_per_task_usd": 0.156,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Alma",
+     "model": "Kimi-K3",
+     "score": 64.1,
+     "cost_per_task_usd": 1.013,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "ZCode",
+     "model": "Kimi-K3",
+     "score": 64.1,
+     "cost_per_task_usd": 1.063,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Minimal",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 63.7,
+     "cost_per_task_usd": 0.163,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "Kimi-K3",
+     "score": 63.7,
+     "cost_per_task_usd": 1.134,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Cline CLI",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 63.3,
+     "cost_per_task_usd": 0.545,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Alma",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 62.5,
+     "cost_per_task_usd": 0.156,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Hermes Agent",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 62.5,
+     "cost_per_task_usd": 0.196,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "MiniMax Code",
+     "model": "Kimi-K3",
+     "score": 62.5,
+     "cost_per_task_usd": 1.061,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Standard",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 62.1,
+     "cost_per_task_usd": 0.181,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Grok Build",
+     "model": "Kimi-K3",
+     "score": 62.1,
+     "cost_per_task_usd": 1.123,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Kimi-K3",
+     "score": 62.1,
+     "cost_per_task_usd": 1.207,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "ZCode",
+     "model": "All models",
+     "score": 61.9,
+     "cost_per_task_usd": 0.659,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Maka",
+     "model": "Kimi-K3",
+     "score": 61.7,
+     "cost_per_task_usd": 1.373,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Pi",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 61.3,
+     "cost_per_task_usd": 0.129,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v1",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 61.3,
+     "cost_per_task_usd": 0.108,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v1",
+     "model": "Kimi-K3",
+     "score": 61.3,
+     "cost_per_task_usd": 1.068,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "All models",
+     "score": 61.1,
+     "cost_per_task_usd": 0.573,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Hermes Agent",
+     "model": "GLM-5.3-Flash",
+     "score": 60.9,
+     "cost_per_task_usd": 0.2,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v2",
+     "model": "Kimi-K3",
+     "score": 60.9,
+     "cost_per_task_usd": 0.982,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Pi",
+     "model": "Kimi-K3",
+     "score": 60.9,
+     "cost_per_task_usd": 0.938,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Cline CLI",
+     "model": "Kimi-K3",
+     "score": 60.9,
+     "cost_per_task_usd": 1.063,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Hermes Agent",
+     "model": "Kimi-K3",
+     "score": 60.9,
+     "cost_per_task_usd": 1.109,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Maka",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 60.5,
+     "cost_per_task_usd": 0.117,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "KimiCode",
+     "model": "All models",
+     "score": 60.2,
+     "cost_per_task_usd": 0.653,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "ZCode",
+     "model": "GLM-5.3-Flash",
+     "score": 60.1,
+     "cost_per_task_usd": 0.159,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "MiniMax Code",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 60.1,
+     "cost_per_task_usd": 0.154,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "KimiCode",
+     "model": "Kimi-K3",
+     "score": 60.1,
+     "cost_per_task_usd": 1.106,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Grok Build",
+     "model": "All models",
+     "score": 60.0,
+     "cost_per_task_usd": 0.723,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Hermes Agent",
+     "model": "All models",
+     "score": 59.9,
+     "cost_per_task_usd": 0.692,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Alma",
+     "model": "All models",
+     "score": 59.7,
+     "cost_per_task_usd": 0.731,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "KimiCode",
+     "model": "GLM-5.3-Flash",
+     "score": 59.7,
+     "cost_per_task_usd": 0.226,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Grok Build",
+     "model": "Muse Spark Open",
+     "score": 59.7,
+     "cost_per_task_usd": 1.059,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "GLM-5.3-Flash",
+     "score": 59.3,
+     "cost_per_task_usd": 0.134,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Minimal",
+     "model": "Kimi-K3",
+     "score": 59.3,
+     "cost_per_task_usd": 1.005,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "All models",
+     "score": 58.9,
+     "cost_per_task_usd": 0.915,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "ZCode",
+     "model": "GLM-5.3",
+     "score": 58.9,
+     "cost_per_task_usd": 0.873,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Alma",
+     "model": "GLM-5.3-Flash",
+     "score": 58.9,
+     "cost_per_task_usd": 0.173,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "GitHub Copilot CLI",
+     "model": "GLM-5.3-Flash",
+     "score": 58.9,
+     "cost_per_task_usd": 0.178,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Antigravity CLI",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 58.9,
+     "cost_per_task_usd": 0.172,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Oh My Pi",
+     "model": "Muse Spark Open",
+     "score": 58.9,
+     "cost_per_task_usd": 0.714,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "All models",
+     "score": 58.6,
+     "cost_per_task_usd": 0.757,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "GitHub Copilot CLI",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 58.5,
+     "cost_per_task_usd": 0.287,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "KimiCode",
+     "model": "GLM-5.3",
+     "score": 58.1,
+     "cost_per_task_usd": 0.899,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Oh My Pi",
+     "model": "GLM-5.3-Flash",
+     "score": 58.1,
+     "cost_per_task_usd": 0.158,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Pi",
+     "model": "GLM-5.3-Flash",
+     "score": 58.1,
+     "cost_per_task_usd": 0.13,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "GitHub Copilot CLI",
+     "model": "Kimi-K3",
+     "score": 58.1,
+     "cost_per_task_usd": 1.043,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Cline CLI",
+     "model": "All models",
+     "score": 57.7,
+     "cost_per_task_usd": 0.689,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Pi",
+     "model": "All models",
+     "score": 57.7,
+     "cost_per_task_usd": 0.563,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Maka",
+     "model": "All models",
+     "score": 57.7,
+     "cost_per_task_usd": 0.654,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Hermes Agent",
+     "model": "GLM-5.3",
+     "score": 57.7,
+     "cost_per_task_usd": 0.956,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "GLM-5.3",
+     "score": 57.7,
+     "cost_per_task_usd": 0.463,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Oh My Pi",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 57.7,
+     "cost_per_task_usd": 0.144,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "ZCode",
+     "model": "Muse Spark Open",
+     "score": 57.7,
+     "cost_per_task_usd": 1.032,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Hermes Agent",
+     "model": "Muse Spark Open",
+     "score": 57.7,
+     "cost_per_task_usd": 0.972,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "Muse Spark Open",
+     "score": 57.7,
+     "cost_per_task_usd": 0.972,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Creator",
+     "model": "Kimi-K3",
+     "score": 57.7,
+     "cost_per_task_usd": 1.297,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Oh My Pi",
+     "model": "Kimi-K3",
+     "score": 57.7,
+     "cost_per_task_usd": 0.839,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v1",
+     "model": "All models",
+     "score": 57.4,
+     "cost_per_task_usd": 0.646,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Minimal",
+     "model": "All models",
+     "score": 57.4,
+     "cost_per_task_usd": 0.661,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v2",
+     "model": "All models",
+     "score": 57.3,
+     "cost_per_task_usd": 0.561,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Oh My Pi",
+     "model": "All models",
+     "score": 57.3,
+     "cost_per_task_usd": 0.564,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "GitHub Copilot CLI",
+     "model": "All models",
+     "score": 56.9,
+     "cost_per_task_usd": 0.787,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "GLM-5.3-Flash",
+     "score": 56.9,
+     "cost_per_task_usd": 0.209,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Antigravity CLI",
+     "model": "Kimi-K3",
+     "score": 56.9,
+     "cost_per_task_usd": 1.55,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "MiniMax Code",
+     "model": "All models",
+     "score": 56.8,
+     "cost_per_task_usd": 0.647,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Grok Build",
+     "model": "GLM-5.3",
+     "score": 56.5,
+     "cost_per_task_usd": 1.021,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Pi",
+     "model": "GLM-5.3",
+     "score": 56.5,
+     "cost_per_task_usd": 0.875,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Maka",
+     "model": "GLM-5.3",
+     "score": 56.5,
+     "cost_per_task_usd": 0.834,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Alma",
+     "model": "GLM-5.3",
+     "score": 56.5,
+     "cost_per_task_usd": 0.914,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Cline CLI",
+     "model": "GLM-5.3-Flash",
+     "score": 56.5,
+     "cost_per_task_usd": 0.148,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v1",
+     "model": "GLM-5.3-Flash",
+     "score": 56.5,
+     "cost_per_task_usd": 0.162,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v2",
+     "model": "Muse Spark Open",
+     "score": 56.5,
+     "cost_per_task_usd": 0.763,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "KimiCode",
+     "model": "Muse Spark Open",
+     "score": 56.5,
+     "cost_per_task_usd": 0.842,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Alma",
+     "model": "Muse Spark Open",
+     "score": 56.5,
+     "cost_per_task_usd": 1.357,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Creator",
+     "model": "All models",
+     "score": 56.1,
+     "cost_per_task_usd": 0.713,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Maka",
+     "model": "GLM-5.3-Flash",
+     "score": 56.0,
+     "cost_per_task_usd": 0.145,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GLM-5.3-Flash",
+     "score": 56.0,
+     "cost_per_task_usd": 0.249,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Code",
+     "model": "Kimi-K3",
+     "score": 56.0,
+     "cost_per_task_usd": 1.182,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Grok Build",
+     "model": "GLM-5.3-Flash",
+     "score": 55.6,
+     "cost_per_task_usd": 0.179,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "MiniMax Code",
+     "model": "Muse Spark Open",
+     "score": 55.6,
+     "cost_per_task_usd": 0.928,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Code",
+     "model": "All models",
+     "score": 55.2,
+     "cost_per_task_usd": 0.732,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Minimal",
+     "model": "GLM-5.3",
+     "score": 55.2,
+     "cost_per_task_usd": 1.039,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Antigravity CLI",
+     "model": "GLM-5.3-Flash",
+     "score": 55.2,
+     "cost_per_task_usd": 0.247,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "MiniMax Code",
+     "model": "GLM-5.3-Flash",
+     "score": 55.2,
+     "cost_per_task_usd": 0.178,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Minimal",
+     "model": "GLM-5.3-Flash",
+     "score": 55.2,
+     "cost_per_task_usd": 0.268,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Exo",
+     "model": "Muse Spark Open",
+     "score": 55.2,
+     "cost_per_task_usd": 0.738,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Antigravity CLI",
+     "model": "All models",
+     "score": 55.0,
+     "cost_per_task_usd": 0.897,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Standard",
+     "model": "All models",
+     "score": 55.0,
+     "cost_per_task_usd": 0.697,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "GitHub Copilot CLI",
+     "model": "GLM-5.3",
+     "score": 54.8,
+     "cost_per_task_usd": 0.964,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Code",
+     "model": "GLM-5.3-Flash",
+     "score": 54.8,
+     "cost_per_task_usd": 0.204,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Standard",
+     "model": "GLM-5.3-Flash",
+     "score": 54.8,
+     "cost_per_task_usd": 0.246,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Cline CLI",
+     "model": "Muse Spark Open",
+     "score": 54.8,
+     "cost_per_task_usd": 0.87,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Oh My Pi",
+     "model": "GLM-5.3",
+     "score": 54.4,
+     "cost_per_task_usd": 0.945,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "GLM-5.3",
+     "score": 54.4,
+     "cost_per_task_usd": 0.963,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "GitHub Copilot CLI",
+     "model": "Muse Spark Open",
+     "score": 54.4,
+     "cost_per_task_usd": 1.609,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Standard",
+     "model": "Kimi-K3",
+     "score": 54.4,
+     "cost_per_task_usd": 1.06,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v1",
+     "model": "GLM-5.3",
+     "score": 54.0,
+     "cost_per_task_usd": 0.875,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GLM-5.3",
+     "score": 54.0,
+     "cost_per_task_usd": 1.098,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Standard",
+     "model": "GLM-5.3",
+     "score": 54.0,
+     "cost_per_task_usd": 1.081,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v2",
+     "model": "GLM-5.3-Flash",
+     "score": 54.0,
+     "cost_per_task_usd": 0.137,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Creator",
+     "model": "GLM-5.3-Flash",
+     "score": 54.0,
+     "cost_per_task_usd": 0.252,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Exo",
+     "model": "DeepSeek-V4.1-Flash-1017",
+     "score": 54.0,
+     "cost_per_task_usd": 0.181,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v1",
+     "model": "Muse Spark Open",
+     "score": 54.0,
+     "cost_per_task_usd": 0.965,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Maka",
+     "model": "Muse Spark Open",
+     "score": 54.0,
+     "cost_per_task_usd": 0.813,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Antigravity CLI",
+     "model": "GLM-5.3",
+     "score": 53.6,
+     "cost_per_task_usd": 1.318,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Minimal",
+     "model": "Muse Spark Open",
+     "score": 53.6,
+     "cost_per_task_usd": 0.825,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Cline CLI",
+     "model": "GLM-5.3",
+     "score": 53.2,
+     "cost_per_task_usd": 0.824,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Muse Spark Open",
+     "score": 53.2,
+     "cost_per_task_usd": 0.943,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Muse Spark Open",
+     "score": 52.8,
+     "cost_per_task_usd": 1.982,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Code",
+     "model": "Muse Spark Open",
+     "score": 52.8,
+     "cost_per_task_usd": 1.1,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Creator",
+     "model": "Muse Spark Open",
+     "score": 52.4,
+     "cost_per_task_usd": 0.702,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Pi",
+     "model": "Muse Spark Open",
+     "score": 52.0,
+     "cost_per_task_usd": 0.764,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Creator",
+     "model": "GLM-5.3",
+     "score": 51.6,
+     "cost_per_task_usd": 1.133,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "OpenCode v2",
+     "model": "GLM-5.3",
+     "score": 51.2,
+     "cost_per_task_usd": 0.782,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Exo",
+     "model": "All models",
+     "score": 50.6,
+     "cost_per_task_usd": 0.691,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "MiniMax Code",
+     "model": "GLM-5.3",
+     "score": 50.4,
+     "cost_per_task_usd": 0.889,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Exo",
+     "model": "GLM-5.3-Flash",
+     "score": 50.4,
+     "cost_per_task_usd": 0.214,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Antigravity CLI",
+     "model": "Muse Spark Open",
+     "score": 50.4,
+     "cost_per_task_usd": 1.174,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Exo",
+     "model": "GLM-5.3",
+     "score": 50.0,
+     "cost_per_task_usd": 1.359,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Standard",
+     "model": "Muse Spark Open",
+     "score": 49.6,
+     "cost_per_task_usd": 0.88,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "DSH Code",
+     "model": "GLM-5.3",
+     "score": 48.4,
+     "cost_per_task_usd": 1.014,
+     "date": "2026-11-14"
+    },
+    {
+     "harness": "Exo",
+     "model": "Kimi-K3",
+     "score": 43.5,
+     "cost_per_task_usd": 0.975,
+     "date": "2026-11-14"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "terminal-bench-2.0"
+   ],
+   "title": "Terminal-Bench 2.0 排行榜",
+   "source": {
+    "name": "Terminal-Bench 2.0 leaderboard (tbench.ai, served via Harbor hub leaderboard-read API, package terminal-bench/terminal-bench-2, leaderboard '2-0')",
+    "url": "https://www.tbench.ai/leaderboard/terminal-bench/2.0",
+    "retrieved": "2026-11-22",
+    "metric": "accuracy % (task resolution rate over 89 tasks, averaged over >=5 trials per task); site shows +/- 95% CI half-width",
+    "notes": "142 rows total; included top 30 by rank, plus the best row for every other distinct agent, plus Terminus 2 rows for open-weight models (GLM/Kimi/DeepSeek/MiniMax/Qwen). stderr here is derived as ci95_half_width/1.96 (only the CI is published); null where no CI published. No cost data on this board. Board is a seeded snapshot (last update 2026-08-28; newest submission 2026-05-14). 'verified' flag from the board metadata. Several top entries use 'Multiple' models."
+   },
+   "entries": [
+    {
+     "harness": "NexAU-AHE",
+     "model": "GPT-5.5",
+     "score": 84.7,
+     "stderr": 1.07,
+     "date": "2026-04-23"
+    },
+    {
+     "harness": "LemonHarness",
+     "model": "Multiple (gemini-3.1-pro-preview, gpt-5.3-codex)",
+     "score": 84.5,
+     "stderr": 1.31,
+     "date": "2026-05-14"
+    },
+    {
+     "harness": "Capy",
+     "model": "GPT-5.5",
+     "score": 83.1,
+     "stderr": 1.08,
+     "date": "2026-04-23"
+    },
+    {
+     "harness": "Codex CLI",
+     "model": "GPT-5.5",
+     "score": 82.2,
+     "stderr": 1.13,
+     "date": "2026-04-23"
+    },
+    {
+     "harness": "Polaris",
+     "model": "Multiple (claude-opus-4-7, gemini-3.1-pro-preview, gpt-5.5)",
+     "score": 82.2,
+     "stderr": 1.42,
+     "date": "2026-05-14"
+    },
+    {
+     "harness": "TongAgents",
+     "model": "Gemini 3.1 Pro",
+     "score": 80.2,
+     "stderr": 1.34,
+     "date": "2026-02-19"
+    },
+    {
+     "harness": "WOZCODE",
+     "model": "Claude Opus 4.7",
+     "score": 80.2,
+     "stderr": 1.08,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "LemonHarness",
+     "model": "Multiple (gemini-3.1-pro-preview, gpt-3.5-codex)",
+     "score": 79.9,
+     "stderr": 1.55,
+     "date": "2026-05-14"
+    },
+    {
+     "harness": "SageAgent",
+     "model": "GPT-5.3-Codex",
+     "score": 78.4,
+     "stderr": 1.12,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Droid",
+     "model": "GPT-5.3-Codex",
+     "score": 77.3,
+     "stderr": 1.1,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Meta-Harness",
+     "model": "Claude Opus 4.6",
+     "score": 76.4,
+     "stderr": 1.24,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "CodeBrain-1.5",
+     "model": "GPT-5.3-Codex",
+     "score": 75.8,
+     "stderr": 1.04,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Codelia",
+     "model": "GPT-5.3-Codex",
+     "score": 75.7,
+     "stderr": 1.1,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Capy",
+     "model": "Claude Opus 4.6",
+     "score": 75.3,
+     "stderr": 1.22,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Simple Codex",
+     "model": "GPT-5.3-Codex",
+     "score": 75.1,
+     "stderr": 1.22,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Terminus-KIRA",
+     "model": "Gemini 3.1 Pro",
+     "score": 74.8,
+     "stderr": 1.31,
+     "date": "2026-02-19"
+    },
+    {
+     "harness": "Terminus-KIRA",
+     "model": "Claude Opus 4.6",
+     "score": 74.7,
+     "stderr": 1.32,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Mux",
+     "model": "GPT-5.3-Codex",
+     "score": 74.6,
+     "stderr": 1.28,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "MAYA-V2",
+     "model": "Claude 4.6 Opus",
+     "score": 72.1,
+     "stderr": 1.13,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "TongAgents",
+     "model": "Claude Opus 4.6",
+     "score": 71.9,
+     "stderr": 1.37,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "spoox-o-m",
+     "model": "GPT-5.3-Codex",
+     "score": 71.5,
+     "stderr": 1.27,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Junie CLI",
+     "model": "Multiple (claude-opus-4-6, gemini-3-flash-preview, gemini-3.1-pro-preview, gpt-5.3-codex)",
+     "score": 71.0,
+     "stderr": 1.46,
+     "date": "2026-03-07"
+    },
+    {
+     "harness": "Droid",
+     "model": "Claude Opus 4.6",
+     "score": 69.9,
+     "stderr": 1.26,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Ante",
+     "model": "Gemini 3 Pro",
+     "score": 69.4,
+     "stderr": 1.07,
+     "date": "2025-11-18"
+    },
+    {
+     "harness": "IndusAGI Coding Agent",
+     "model": "GPT-5.3-Codex",
+     "score": 69.1,
+     "stderr": 1.16,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Crux",
+     "model": "Claude Opus 4.6",
+     "score": 66.9,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Deep Agents",
+     "model": "GPT-5.2-Codex",
+     "score": 66.5,
+     "stderr": 1.56,
+     "date": "2026-01-14"
+    },
+    {
+     "harness": "Mux",
+     "model": "Claude Opus 4.6",
+     "score": 66.5,
+     "stderr": 1.29,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "clnkr",
+     "model": "GPT-5.5",
+     "score": 66.1,
+     "stderr": 1.27,
+     "date": "2026-04-23"
+    },
+    {
+     "harness": "SageAgent",
+     "model": "Gemini 3 Pro",
+     "score": 65.2,
+     "stderr": 1.05,
+     "date": "2025-11-18"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "GPT-5.3-Codex",
+     "score": 64.7,
+     "stderr": 1.39,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "II-Agent",
+     "model": "Gemini 3 Pro",
+     "score": 61.8,
+     "stderr": 1.44,
+     "date": "2025-11-18"
+    },
+    {
+     "harness": "hookele",
+     "model": "GPT-5.1-Codex-Mini",
+     "score": 61.6,
+     "stderr": 0.97,
+     "date": "2025-11-12"
+    },
+    {
+     "harness": "Gemini CLI",
+     "model": "Gemini 3.1 Pro",
+     "score": 61.4,
+     "stderr": 2.1,
+     "date": "2026-02-19"
+    },
+    {
+     "harness": "Warp",
+     "model": "Multiple (claude-haiku-4-5, gpt-5.2)",
+     "score": 61.2,
+     "stderr": 1.54,
+     "date": "2025-12-12"
+    },
+    {
+     "harness": "Letta Code",
+     "model": "Claude Opus 4.5",
+     "score": 59.1,
+     "stderr": 1.23,
+     "date": "2025-11-24"
+    },
+    {
+     "harness": "Abacus AI Desktop",
+     "model": "Multiple (claude-haiku-4-5, gemini-3-pro-preview)",
+     "score": 58.4,
+     "stderr": 1.4,
+     "date": "2025-12-11"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Claude Opus 4.6",
+     "score": 58.0,
+     "stderr": 1.48,
+     "date": "2026-02-05"
+    },
+    {
+     "harness": "Grok CLI",
+     "model": "Grok 4.20 Reasoning",
+     "score": 57.3,
+     "date": "2026-03-10"
+    },
+    {
+     "harness": "Goose",
+     "model": "Claude Opus 4.5",
+     "score": 54.3,
+     "stderr": 1.34,
+     "date": "2025-11-24"
+    },
+    {
+     "harness": "Simplai Agent",
+     "model": "Claude Sonnet 4.6",
+     "score": 53.4,
+     "stderr": 1.44,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "GLM 5",
+     "score": 52.4,
+     "stderr": 1.34,
+     "date": "2026-02-11"
+    },
+    {
+     "harness": "OpenHands",
+     "model": "Claude Opus 4.5",
+     "score": 51.9,
+     "stderr": 1.47,
+     "date": "2025-11-24"
+    },
+    {
+     "harness": "OpenCode",
+     "model": "Claude Opus 4.5",
+     "score": 51.7,
+     "date": "2025-11-24"
+    },
+    {
+     "harness": "CAMEL-AI",
+     "model": "Claude Sonnet 4.5",
+     "score": 46.5,
+     "stderr": 1.2,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Kimi K2.5",
+     "score": 43.2,
+     "stderr": 1.47,
+     "date": "2026-01-27"
+    },
+    {
+     "harness": "Harness Agent",
+     "model": "MiniMax M2.7 Highspeed",
+     "score": 42.9,
+     "stderr": 1.5,
+     "date": "2026-03-18"
+    },
+    {
+     "harness": "cchuter",
+     "model": "minimax-m2.5",
+     "score": 42.7,
+     "stderr": 1.44,
+     "date": "2026-02-12"
+    },
+    {
+     "harness": "Mini-SWE-Agent",
+     "model": "Claude Sonnet 4.5",
+     "score": 42.5,
+     "stderr": 1.43,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Minimax m2.5",
+     "score": 42.2,
+     "stderr": 1.34,
+     "date": "2026-02-12"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "DeepSeek-V3.2",
+     "score": 39.6,
+     "stderr": 1.4,
+     "date": "2025-12-01"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Kimi K2 Thinking",
+     "score": 35.7,
+     "stderr": 1.44,
+     "date": "2025-11-06"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "GLM 4.7",
+     "score": 33.4,
+     "stderr": 1.45,
+     "date": "2025-12-22"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "MiniMax M2",
+     "score": 30.0,
+     "stderr": 1.4,
+     "date": "2025-10-27"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "MiniMax M2.1",
+     "score": 29.2,
+     "stderr": 1.48,
+     "date": "2025-12-23"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Kimi K2 Instruct",
+     "score": 27.8,
+     "stderr": 1.29,
+     "date": "2025-07-11"
+    },
+    {
+     "harness": "Dakou Agent",
+     "model": "Qwen 3 Coder 480B",
+     "score": 27.2,
+     "stderr": 1.31,
+     "date": "2025-07-22"
+    },
+    {
+     "harness": "little-coder",
+     "model": "Qwen3.6-35B-A3B",
+     "score": 24.6,
+     "stderr": 1.64,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "GLM 4.6",
+     "score": 24.5,
+     "stderr": 1.25,
+     "date": "2025-09-30"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Qwen 3 Coder 480B",
+     "score": 23.9,
+     "stderr": 1.43,
+     "date": "2025-07-22"
+    },
+    {
+     "harness": "Bash Agent",
+     "model": "TermiGen-32B",
+     "score": 19.3,
+     "stderr": 1.02,
+     "date": "2026-05-14"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "terminal-bench-2.1"
+   ],
+   "title": "Terminal-Bench 2.1 排行榜",
+   "source": {
+    "name": "Terminal-Bench 2.1 leaderboard (tbench.ai / Harbor hub, package terminal-bench/terminal-bench-2-1, leaderboard 'main')",
+    "url": "https://www.tbench.ai/leaderboard/terminal-bench/2.1",
+    "retrieved": "2026-11-22",
+    "metric": "accuracy % (resolution rate over 89 tasks x 5 trials = 445 trials), with published accuracy_stderr and 95% CI half-width",
+    "notes": "All 22 rows included. cost_per_task_usd = total_cost_usd / n_trials (per trial/attempt). Model label includes reasoning effort. reward_hack_pct = share of trials flagged as reward hacks. Last board update 2026-09-03."
+   },
+   "entries": [
+    {
+     "harness": "Codex",
+     "model": "GPT-6 Astra (high)",
+     "score": 87.42,
+     "stderr": 0.91,
+     "cost_per_task_usd": 1.738,
+     "date": "2026-09-03"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-6 Astra (medium)",
+     "score": 86.97,
+     "stderr": 0.96,
+     "cost_per_task_usd": 1.391,
+     "date": "2026-09-03"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-6 Astra (low)",
+     "score": 86.74,
+     "stderr": 0.93,
+     "cost_per_task_usd": 1.041,
+     "date": "2026-09-03"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-6 Astra (max)",
+     "score": 86.74,
+     "stderr": 0.69,
+     "cost_per_task_usd": 2.404,
+     "date": "2026-09-03"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-6 Astra (xhigh)",
+     "score": 85.84,
+     "stderr": 0.73,
+     "cost_per_task_usd": 1.997,
+     "date": "2026-09-03"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Fable 5 (xhigh)",
+     "score": 83.82,
+     "stderr": 1.16,
+     "cost_per_task_usd": 1.242,
+     "date": "2026-06-09"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-5.5 (xhigh)",
+     "score": 83.15,
+     "stderr": 1.13,
+     "cost_per_task_usd": 4.627,
+     "date": "2026-04-23"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Fable 5 (high)",
+     "score": 80.45,
+     "stderr": 1.16,
+     "cost_per_task_usd": 0.986,
+     "date": "2026-06-09"
+    },
+    {
+     "harness": "Cursor CLI",
+     "model": "Grok 4.5 (high)",
+     "score": 79.33,
+     "stderr": 1.46,
+     "cost_per_task_usd": 0.301,
+     "date": "2026-07-08"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Opus 4.8 (high)",
+     "score": 78.88,
+     "stderr": 1.31,
+     "cost_per_task_usd": 0.645,
+     "date": "2026-05-28"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-5.6 Terra (max)",
+     "score": 78.43,
+     "stderr": 1.25,
+     "cost_per_task_usd": 0.946,
+     "date": "2026-06-26"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "GPT-5.5 (xhigh)",
+     "score": 77.98,
+     "stderr": 1.22,
+     "cost_per_task_usd": 1.11,
+     "date": "2026-04-23"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Muse Spark 1.1 (xhigh)",
+     "score": 76.18,
+     "stderr": 1.23,
+     "cost_per_task_usd": 0.445,
+     "date": "2026-07-09"
+    },
+    {
+     "harness": "Codex",
+     "model": "GPT-5.6 Luna (max)",
+     "score": 75.73,
+     "stderr": 1.32,
+     "cost_per_task_usd": 0.543,
+     "date": "2026-06-26"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Sonnet 5 (high)",
+     "score": 74.61,
+     "stderr": 1.64,
+     "cost_per_task_usd": 0.648,
+     "date": "2026-06-30"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Gemini 3 Pro (high)",
+     "score": 73.93,
+     "stderr": 1.29,
+     "cost_per_task_usd": 0.504,
+     "date": "2025-11-18"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "Opus 4.7 (max)",
+     "score": 68.9,
+     "stderr": 1.41,
+     "cost_per_task_usd": 1.341,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Opus 4.7 (max)",
+     "score": 66.07,
+     "stderr": 1.37,
+     "cost_per_task_usd": 1.308,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Gemini CLI",
+     "model": "Gemini 3 Pro (high)",
+     "score": 65.84,
+     "stderr": 1.38,
+     "cost_per_task_usd": 0.557,
+     "date": "2025-11-18"
+    },
+    {
+     "harness": "Gemini CLI",
+     "model": "Gemini 3.1 Pro (high)",
+     "score": 65.84,
+     "stderr": 1.67,
+     "cost_per_task_usd": 0.531,
+     "date": "2026-02-19"
+    },
+    {
+     "harness": "Terminus 2",
+     "model": "Gemini 3.1 Pro (high)",
+     "score": 65.62,
+     "stderr": 1.65,
+     "cost_per_task_usd": 0.517,
+     "date": "2026-02-19"
+    },
+    {
+     "harness": "Claude Code",
+     "model": "GLM-5.1 (max)",
+     "score": 58.65,
+     "stderr": 1.24,
+     "cost_per_task_usd": 0.623,
+     "date": "2026-03-27"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "humaneval"
+   ],
+   "title": "EvalPlus HumanEval（base 测试）",
+   "source": {
+    "name": "EvalPlus leaderboard",
+    "url": "https://evalplus.github.io/leaderboard.html",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1, greedy decoding, base HumanEval tests (164 problems); data from https://evalplus.github.io/results.json",
+    "notes": "Leaderboard is stale: newest entries are late-2024 models (o1-preview, GPT-4o, DeepSeek-V3, Qwen2.5-Coder). HumanEval+ (stricter tests) also available in results.json but not recorded here."
+   },
+   "entries": [
+    {
+     "harness": "EvalPlus",
+     "model": "O1 Preview (Sept 2024)",
+     "score": 96.3
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "O1 Mini (Sept 2024)",
+     "score": 96.3
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT 4o (Aug 2024)",
+     "score": 92.7
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Qwen2.5-Coder-32B-Instruct",
+     "score": 92.1
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-V3 (Nov 2024)",
+     "score": 91.5
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-V2.5 (Nov 2024)",
+     "score": 90.2
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT-4-Turbo (April 2024)",
+     "score": 90.2
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Gemini 1.5 Pro 002",
+     "score": 89.0
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Grok Beta",
+     "score": 88.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT 4o Mini (July 2024)",
+     "score": 88.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT-4 (May 2023)",
+     "score": 88.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Claude Sonnet 3.5 (June 2024)",
+     "score": 87.2
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-Coder-V2-Instruct",
+     "score": 85.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT-4-Turbo (Nov 2023)",
+     "score": 85.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "CodeQwen1.5-7B-Chat",
+     "score": 83.5
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "claude-3-opus (Mar 2024)",
+     "score": 82.9
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Gemini 1.5 Flash 002",
+     "score": 82.3
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "OpenCoder-8B-Instruct",
+     "score": 81.7
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-Coder-33B-instruct",
+     "score": 81.1
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Codestral-22B-v0.1",
+     "score": 79.9
+    }
+   ]
+  },
+  {
+   "suites": [
+    "humaneval"
+   ],
+   "title": "厂商自报 HumanEval（llm-stats 汇总）",
+   "source": {
+    "name": "llm-stats.com HumanEval (aggregated vendor self-reported)",
+    "url": "https://llm-stats.com/benchmarks/humaneval",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1 as reported by each vendor (0-shot typically; prompt/harness varies per vendor)",
+    "notes": "Page marks 65/66 results as self-reported/unverified; no per-model dates or harness details. Use only as rough reference."
+   },
+   "entries": [
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "MiniCPM-SALA (OpenBMB)",
+     "score": 95.1
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Kimi K2 0905 (Moonshot AI)",
+     "score": 94.5
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Claude 3.5 Sonnet (20241022)",
+     "score": 93.7
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "GPT-5 (OpenAI)",
+     "score": 93.4
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Kimi K2 Instruct (Moonshot AI)",
+     "score": 93.3
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Qwen2.5-Coder 32B Instruct",
+     "score": 92.7
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "o1-mini",
+     "score": 92.4
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Sarvam-30B",
+     "score": 92.1
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Mistral Large 2",
+     "score": 92.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "GPT-4o",
+     "score": 90.2
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Llama 3.1 405B Instruct",
+     "score": 89.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "DeepSeek-V2.5",
+     "score": 89.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Nova Pro (Amazon)",
+     "score": 89.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "LongCat-Flash-Chat (Meituan)",
+     "score": 88.4
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Grok-2",
+     "score": 88.4
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "o1 (2024-12-17)",
+     "score": 88.1
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "GPT-4.5",
+     "score": 88.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Gemma 3 27B",
+     "score": 87.8
+    }
+   ]
+  },
+  {
+   "suites": [
+    "mbpp"
+   ],
+   "title": "技术报告 MBPP 3-shot（基座模型）",
+   "source": {
+    "name": "DeepSeek-V3 Tech Report (Table 3) and Qwen3 Tech Report (Table 3)",
+    "url": "https://arxiv.org/abs/2412.19437",
+    "retrieved": "2026-11-22",
+    "metric": "MBPP 3-shot pass@1, BASE (pretrained) models; the reports do not state full-500 vs sanitized explicitly (3-shot convention is normally the full 500-problem test split)",
+    "notes": "Base-model few-shot numbers; same model can differ across reports (e.g. DeepSeek-V3-Base 75.4 vs 74.2 in Qwen3 report)."
+   },
+   "entries": [
+    {
+     "harness": "tech report (Qwen3)",
+     "model": "Qwen3-235B-A22B-Base",
+     "score": 81.4,
+     "date": "2025-05"
+    },
+    {
+     "harness": "tech report (Qwen3)",
+     "model": "Qwen2.5-72B-Base",
+     "score": 76.0,
+     "date": "2025-05"
+    },
+    {
+     "harness": "tech report (Qwen3)",
+     "model": "Llama-4-Maverick-Base",
+     "score": 75.4,
+     "date": "2025-05"
+    },
+    {
+     "harness": "tech report (DeepSeek-V3)",
+     "model": "DeepSeek-V3 Base",
+     "score": 75.4,
+     "date": "2024-12"
+    },
+    {
+     "harness": "tech report (Qwen3)",
+     "model": "Qwen2.5-Plus-Base",
+     "score": 74.6,
+     "date": "2025-05"
+    },
+    {
+     "harness": "tech report (Qwen3)",
+     "model": "DeepSeek-V3-Base",
+     "score": 74.2,
+     "date": "2025-05"
+    },
+    {
+     "harness": "tech report (DeepSeek-V3)",
+     "model": "Qwen2.5 72B Base",
+     "score": 72.6,
+     "date": "2024-12"
+    },
+    {
+     "harness": "tech report (DeepSeek-V3)",
+     "model": "LLaMA-3.1 405B Base",
+     "score": 68.4,
+     "date": "2024-12"
+    },
+    {
+     "harness": "tech report (DeepSeek-V3)",
+     "model": "DeepSeek-V2 Base",
+     "score": 65.0,
+     "date": "2024-12"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "mbpp"
+   ],
+   "title": "厂商自报 MBPP（llm-stats 汇总）",
+   "source": {
+    "name": "llm-stats.com MBPP (aggregated vendor self-reported)",
+    "url": "https://llm-stats.com/benchmarks/mbpp",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1 as reported by vendors; variant (full/sanitized/EvalPlus, shots) NOT specified per entry",
+    "notes": "All 33 entries self-reported/unverified; mixes MBPP variants. Low comparability."
+   },
+   "entries": [
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Sarvam-30B",
+     "score": 92.7
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Llama-3.3 Nemotron Super 49B v1",
+     "score": 91.3
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Qwen2.5-Coder 32B Instruct",
+     "score": 90.2
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "MiniCPM-SALA",
+     "score": 89.1
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Qwen2.5 72B Instruct",
+     "score": 88.2
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Llama 3.1 Nemotron Nano 8B V1",
+     "score": 84.6
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Qwen2.5 32B Instruct",
+     "score": 84.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Qwen3 235B A22B",
+     "score": 81.4
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Phi-3.5-MoE-instruct",
+     "score": 80.8
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Codestral-22B",
+     "score": 78.2
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Llama 4 Maverick",
+     "score": 77.6
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Gemini Diffusion",
+     "score": 76.0
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Mistral Small 3.1 24B Instruct",
+     "score": 74.7
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Gemma 3 27B",
+     "score": 74.4
+    },
+    {
+     "harness": "model card (self-reported, via llm-stats)",
+     "model": "Llama 4 Scout",
+     "score": 67.8
+    }
+   ]
+  },
+  {
+   "suites": [
+    "mbpp-sanitized"
+   ],
+   "title": "EvalPlus MBPP（base 测试，近似 sanitized）",
+   "source": {
+    "name": "EvalPlus leaderboard (MBPP base column)",
+    "url": "https://evalplus.github.io/leaderboard.html",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1 greedy, base MBPP tests on EvalPlus MBPP v0.2.0 = 378/399-task hand-verified subset of the 427-task MBPP-sanitized set (NOT the 257-problem sanitized test split)",
+    "notes": "Closest public leaderboard to MBPP-sanitized; task set differs, so treat as approximate. Stale (late-2024 models)."
+   },
+   "entries": [
+    {
+     "harness": "EvalPlus",
+     "model": "O1 Preview (Sept 2024)",
+     "score": 95.5
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "O1 Mini (Sept 2024)",
+     "score": 93.1
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Qwen2.5-Coder-32B-Instruct",
+     "score": 90.5
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Gemini 1.5 Pro 002",
+     "score": 89.7
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-Coder-V2-Instruct",
+     "score": 89.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Claude Sonnet 3.5 (June 2024)",
+     "score": 89.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "claude-3-opus (Mar 2024)",
+     "score": 89.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-V3 (Nov 2024)",
+     "score": 87.6
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-V2.5 (Nov 2024)",
+     "score": 87.6
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT 4o (Aug 2024)",
+     "score": 87.6
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Grok Beta",
+     "score": 86.0
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT-4-Turbo (Nov 2023)",
+     "score": 85.7
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT 4o Mini (July 2024)",
+     "score": 85.4
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Gemini 1.5 Flash 002",
+     "score": 84.7
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "claude-3-sonnet (Mar 2024)",
+     "score": 83.6
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "GPT-3.5-Turbo (Nov 2023)",
+     "score": 82.5
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Llama3-70B-instruct",
+     "score": 82.3
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "OpenCoder-8B-Instruct",
+     "score": 82.0
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "Artigenz-Coder-DS-6.7B",
+     "score": 80.7
+    },
+    {
+     "harness": "EvalPlus",
+     "model": "DeepSeek-Coder-33B-instruct",
+     "score": 80.4
+    }
+   ]
+  },
+  {
+   "suites": [
+    "aime"
+   ],
+   "title": "Vals.ai AIME 2024",
+   "source": {
+    "name": "Vals.ai AIME benchmark (2024 task)",
+    "url": "https://www.vals.ai/benchmarks/aime",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1 averaged over 8 runs per question (30 questions, AIME I+II); prompt 'Please reason step by step, and put your final answer within \\boxed{}'; stderr and cost_per_test as published by Vals",
+    "notes": "Data from https://www.vals.ai/_astro/benchmark_view_aime.CmeuYPIC.json. Benchmark archived 2026-04-16 (saturated), so post-April-2026 models absent. Model ids are Vals' provider/model ids. Harness = Vals single-turn prompting, no tools."
+   },
+   "entries": [
+    {
+     "harness": "Vals.ai",
+     "model": "anthropic/claude-opus-4-5-20251101-thinking",
+     "score": 99.58,
+     "stderr": 0.417,
+     "cost_per_task_usd": 1.2125,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "google/gemini-3.1-pro-preview",
+     "score": 99.17,
+     "stderr": 0.546,
+     "cost_per_task_usd": 0.1114,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "google/gemini-3-pro-preview",
+     "score": 99.17,
+     "stderr": 0.546,
+     "cost_per_task_usd": 0.1626,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "grok/grok-4.20-0309-reasoning",
+     "score": 98.75,
+     "stderr": 0.61,
+     "cost_per_task_usd": 0.0519,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "anthropic/claude-opus-4-6-thinking",
+     "score": 97.5,
+     "stderr": 0.833,
+     "cost_per_task_usd": 0.2857,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "kimi/kimi-k2.5-thinking",
+     "score": 97.5,
+     "stderr": 0.546,
+     "cost_per_task_usd": 0.0589,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.2-2025-12-11",
+     "score": 97.08,
+     "stderr": 0.417,
+     "cost_per_task_usd": 0.1201,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.4-2026-03-05",
+     "score": 97.08,
+     "stderr": 0.984,
+     "cost_per_task_usd": 0.1173,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "meta/muse_spark",
+     "score": 96.67,
+     "stderr": 0.63,
+     "cost_per_task_usd": 0.0037,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "anthropic/claude-opus-4-7",
+     "score": 96.67,
+     "stderr": 0.0,
+     "cost_per_task_usd": 0.3398,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "google/gemini-3-flash-preview",
+     "score": 95.83,
+     "stderr": 0.833,
+     "cost_per_task_usd": 0.0442,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.4-mini-2026-03-17",
+     "score": 95.83,
+     "stderr": 0.546,
+     "cost_per_task_usd": 0.1185,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "alibaba/qwen3.6-plus",
+     "score": 95.42,
+     "stderr": 1.08,
+     "cost_per_task_usd": 0.0926,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "zai/glm-4.7",
+     "score": 95.0,
+     "stderr": 0.63,
+     "cost_per_task_usd": 0.0385,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "zai/glm-4.6",
+     "score": 94.58,
+     "stderr": 0.877,
+     "cost_per_task_usd": 0.1023,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "grok/grok-4-fast-reasoning",
+     "score": 94.17,
+     "stderr": 0.833,
+     "cost_per_task_usd": 0.004,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5-2025-08-07",
+     "score": 94.17,
+     "stderr": 0.833,
+     "cost_per_task_usd": 0.0854,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.1-2025-11-13",
+     "score": 93.75,
+     "stderr": 0.984,
+     "cost_per_task_usd": 0.1328,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "grok/grok-4-1-fast-reasoning",
+     "score": 93.33,
+     "stderr": 0.891,
+     "cost_per_task_usd": 0.0037,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "grok/grok-4-0709",
+     "score": 93.33,
+     "stderr": 3.333,
+     "cost_per_task_usd": 0.1418,
+     "date": "2026-04-16"
+    }
+   ],
+   "tasks": [
+    "aime_60",
+    "aime_61",
+    "aime_62",
+    "aime_63",
+    "aime_64",
+    "aime_65",
+    "aime_66",
+    "aime_67",
+    "aime_68",
+    "aime_69",
+    "aime_70",
+    "aime_71",
+    "aime_72",
+    "aime_73",
+    "aime_74",
+    "aime_75",
+    "aime_76",
+    "aime_77",
+    "aime_78",
+    "aime_79",
+    "aime_80",
+    "aime_81",
+    "aime_82",
+    "aime_83",
+    "aime_84",
+    "aime_85",
+    "aime_86",
+    "aime_87",
+    "aime_88",
+    "aime_89"
+   ]
+  },
+  {
+   "suites": [
+    "aime-2025"
+   ],
+   "title": "Vals.ai AIME 2025",
+   "source": {
+    "name": "Vals.ai AIME benchmark (2025 task)",
+    "url": "https://www.vals.ai/benchmarks/aime",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1 averaged over 8 runs per question (30 questions, AIME I+II); prompt 'Please reason step by step, and put your final answer within \\boxed{}'; stderr and cost_per_test as published by Vals",
+    "notes": "Data from https://www.vals.ai/_astro/benchmark_view_aime.CmeuYPIC.json. Benchmark archived 2026-04-16 (saturated), so post-April-2026 models absent. Model ids are Vals' provider/model ids. Harness = Vals single-turn prompting, no tools."
+   },
+   "entries": [
+    {
+     "harness": "Vals.ai",
+     "model": "google/gemini-3.1-pro-preview",
+     "score": 97.08,
+     "stderr": 0.417,
+     "cost_per_task_usd": 0.1426,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "meta/muse_spark",
+     "score": 97.08,
+     "stderr": 0.417,
+     "cost_per_task_usd": 0.0054,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.2-2025-12-11",
+     "score": 96.67,
+     "stderr": 0.0,
+     "cost_per_task_usd": 0.1505,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.4-2026-03-05",
+     "score": 96.25,
+     "stderr": 0.417,
+     "cost_per_task_usd": 0.1591,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "anthropic/claude-opus-4-7",
+     "score": 95.83,
+     "stderr": 1.045,
+     "cost_per_task_usd": 0.5612,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "google/gemini-3-flash-preview",
+     "score": 95.42,
+     "stderr": 0.61,
+     "cost_per_task_usd": 0.0484,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.4-mini-2026-03-17",
+     "score": 95.42,
+     "stderr": 0.61,
+     "cost_per_task_usd": 0.1388,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "google/gemini-3-pro-preview",
+     "score": 94.19,
+     "stderr": 0.54,
+     "cost_per_task_usd": 0.176,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "grok/grok-4.20-0309-reasoning",
+     "score": 94.17,
+     "stderr": 0.833,
+     "cost_per_task_usd": 0.0669,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "anthropic/claude-opus-4-6-thinking",
+     "score": 93.75,
+     "stderr": 0.984,
+     "cost_per_task_usd": 0.4019,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "kimi/kimi-k2.5-thinking",
+     "score": 93.75,
+     "stderr": 0.417,
+     "cost_per_task_usd": 0.0694,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "alibaba/qwen3.6-plus",
+     "score": 93.75,
+     "stderr": 0.417,
+     "cost_per_task_usd": 0.0944,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.1-2025-11-13",
+     "score": 92.92,
+     "stderr": 0.755,
+     "cost_per_task_usd": 0.1679,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5-2025-08-07",
+     "score": 92.58,
+     "stderr": 2.474,
+     "cost_per_task_usd": 0.1,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "openai/gpt-5.4-nano-2026-03-17",
+     "score": 92.08,
+     "stderr": 1.4,
+     "cost_per_task_usd": 0.0039,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "fireworks/gpt-oss-120b",
+     "score": 92.08,
+     "stderr": 1.535,
+     "cost_per_task_usd": 0.011,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "alibaba/qwen3.5-flash",
+     "score": 91.67,
+     "stderr": 1.091,
+     "cost_per_task_usd": 0.0115,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "zai/glm-5.1",
+     "score": 91.67,
+     "stderr": 0.63,
+     "cost_per_task_usd": 0.0781,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "zai/glm-4.7",
+     "score": 91.67,
+     "stderr": 0.63,
+     "cost_per_task_usd": 0.0481,
+     "date": "2026-04-16"
+    },
+    {
+     "harness": "Vals.ai",
+     "model": "anthropic/claude-opus-4-5-20251101-thinking",
+     "score": 91.25,
+     "stderr": 0.61,
+     "cost_per_task_usd": 1.428,
+     "date": "2026-04-16"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "aime-2025"
+   ],
+   "title": "MathArena AIME 2025",
+   "source": {
+    "name": "MathArena AIME 2025",
+    "url": "https://matharena.ai/?comp=aime--aime_2025",
+    "retrieved": "2026-11-22",
+    "metric": "accuracy averaged over 4 runs per problem (30 problems, AIME 2025 I+II); stderr = published 95% CI / 1.96; cost = average USD for one run on one problem",
+    "notes": "Data from https://matharena.ai/competition_tables/aime--aime_2025. MathArena flags models released after the competition date with a warning (possible contamination), marked in the model name. Newest MathArena frontier models (e.g. GPT-6.2, Gemini 4) are evaluated on newer competitions (AIME 2026) but not AIME 2025. MathArena has no AIME 2024 table."
+   },
+   "entries": [
+    {
+     "harness": "MathArena",
+     "model": "GPT-5.2 (high) [contamination warning]",
+     "score": 100.0,
+     "stderr": 0.0,
+     "cost_per_task_usd": 0.11
+    },
+    {
+     "harness": "MathArena",
+     "model": "GPT-5.2 (xhigh) [contamination warning]",
+     "score": 100.0,
+     "stderr": 0.0,
+     "cost_per_task_usd": 0.18
+    },
+    {
+     "harness": "MathArena",
+     "model": "Step 3.5 Flash [contamination warning]",
+     "score": 98.33,
+     "stderr": 1.17,
+     "cost_per_task_usd": 0.011
+    },
+    {
+     "harness": "MathArena",
+     "model": "Gemini 3 Flash (high) [contamination warning]",
+     "score": 97.5,
+     "stderr": 1.42,
+     "cost_per_task_usd": 0.055
+    },
+    {
+     "harness": "MathArena",
+     "model": "GLM 5 [contamination warning]",
+     "score": 96.67,
+     "stderr": 1.64,
+     "cost_per_task_usd": 0.081
+    },
+    {
+     "harness": "MathArena",
+     "model": "DeepSeek-v3.2-Speciale [contamination warning]",
+     "score": 95.83,
+     "stderr": 1.83,
+     "cost_per_task_usd": 0.009
+    },
+    {
+     "harness": "MathArena",
+     "model": "Kimi K2.5 (high) [contamination warning]",
+     "score": 95.83,
+     "stderr": 1.83,
+     "cost_per_task_usd": 0.068
+    },
+    {
+     "harness": "MathArena",
+     "model": "GPT-5 (high) [contamination warning]",
+     "score": 95.0,
+     "stderr": 1.99,
+     "cost_per_task_usd": 0.14
+    },
+    {
+     "harness": "MathArena",
+     "model": "Gemini 3 Pro (preview) [contamination warning]",
+     "score": 95.0,
+     "stderr": 1.99,
+     "cost_per_task_usd": 0.18
+    },
+    {
+     "harness": "MathArena",
+     "model": "DeepSeek-v3.2 (Think) [contamination warning]",
+     "score": 94.17,
+     "stderr": 2.14,
+     "cost_per_task_usd": 0.006
+    },
+    {
+     "harness": "MathArena",
+     "model": "GPT-5.1 (high) [contamination warning]",
+     "score": 94.17,
+     "stderr": 2.14,
+     "cost_per_task_usd": 0.18
+    },
+    {
+     "harness": "MathArena",
+     "model": "GLM 4.5 [contamination warning]",
+     "score": 93.33,
+     "stderr": 2.28,
+     "cost_per_task_usd": 0.048
+    },
+    {
+     "harness": "MathArena",
+     "model": "Kimi K2 Thinking [contamination warning]",
+     "score": 92.5,
+     "stderr": 2.4,
+     "cost_per_task_usd": 0.06
+    },
+    {
+     "harness": "MathArena",
+     "model": "Grok 4 [contamination warning]",
+     "score": 92.5,
+     "stderr": 2.4,
+     "cost_per_task_usd": 0.19
+    },
+    {
+     "harness": "MathArena",
+     "model": "DeepSeek-v3.2-Exp (Think) [contamination warning]",
+     "score": 91.67,
+     "stderr": 2.53,
+     "cost_per_task_usd": 0.006
+    },
+    {
+     "harness": "MathArena",
+     "model": "GLM 4.6 [contamination warning]",
+     "score": 91.67,
+     "stderr": 2.53,
+     "cost_per_task_usd": 0.036
+    },
+    {
+     "harness": "MathArena",
+     "model": "o4-mini (high) [contamination warning]",
+     "score": 91.67,
+     "stderr": 2.53,
+     "cost_per_task_usd": 0.062
+    },
+    {
+     "harness": "MathArena",
+     "model": "Grok 4 Fast R [contamination warning]",
+     "score": 90.83,
+     "stderr": 2.63,
+     "cost_per_task_usd": 0.005
+    },
+    {
+     "harness": "MathArena",
+     "model": "DeepSeek-v3.1 (Think) [contamination warning]",
+     "score": 90.83,
+     "stderr": 2.63,
+     "cost_per_task_usd": 0.033
+    },
+    {
+     "harness": "MathArena",
+     "model": "GPT OSS 120B (high) [contamination warning]",
+     "score": 90.0,
+     "stderr": 2.74,
+     "cost_per_task_usd": 0.013
+    }
+   ]
+  },
+  {
+   "suites": [
+    "livemath"
+   ],
+   "title": "LiveMathBench 202412（GPassK 论文）",
+   "source": {
+    "name": "GPassK / LiveMathBench-202412 main results (paper 'Are Your LLMs Capable of Stable Reasoning?', arXiv 2412.13147)",
+    "url": "https://github.com/open-compass/GPassK",
+    "retrieved": "2026-11-22",
+    "metric": "score = 'Greedy' column (greedy-decoding accuracy; for o1/o3 models avg accuracy over 20 samples). mG-Pass@16 (n=48 samples) recorded in notes per model below",
+    "notes": "Table is COMBINED over English+Chinese (238 = 119 en x 2 languages); no English-only breakdown is published. mG-Pass@16 by model: DeepSeek-R1 77.6; OpenAI-o3-mini 76.8; DeepSeek-Distill-Llama-70B 69.7; DeepSeek-Distill-Qwen-32B 69.7; OpenAI-o1-mini 64.8; DeepSeek-Distill-Qwen-7B 63.1; QwQ-32B-Preview 61.2; DeepSeek-Distill-Llama-8B 52.2; Qwen2.5-Math-72B-Instruct 42.3; Qwen2.5-Max 42.2; Qwen2.5-32B-Instruct 37.8; Qwen2.5-Math-7B-Instruct 36.6; Mistral-Large-Instruct-2411 36.4; Claude-3.5-Sonnet 35.3; InternLM3-8B-Instruct 33.6; Llama-3.3-70B-Instruct 27.5; Qwen2.5-7B-Instruct 25.8; Llama-3.1-8B-Instruct 10.4. Models are all late-2024/early-2025; no recent frontier results published."
+   },
+   "entries": [
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "OpenAI-o3-mini",
+     "score": 84.7,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "DeepSeek-R1",
+     "score": 81.1,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "DeepSeek-Distill-Llama-70B",
+     "score": 74.8,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "OpenAI-o1-mini",
+     "score": 74.1,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "QwQ-32B-Preview",
+     "score": 72.7,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Qwen2.5-Math-7B-Instruct",
+     "score": 68.4,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "DeepSeek-Distill-Qwen-32B",
+     "score": 67.7,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "DeepSeek-Distill-Qwen-7B",
+     "score": 65.6,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "DeepSeek-Distill-Llama-8B",
+     "score": 58.4,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Qwen2.5-Math-72B-Instruct",
+     "score": 57.6,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Qwen2.5-Max",
+     "score": 52.9,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Qwen2.5-32B-Instruct",
+     "score": 50.8,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Claude-3.5-Sonnet",
+     "score": 46.7,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "InternLM3-8B-Instruct",
+     "score": 44.5,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Mistral-Large-Instruct-2411",
+     "score": 41.6,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Llama-3.3-70B-Instruct",
+     "score": 40.3,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Qwen2.5-7B-Instruct",
+     "score": 37.0,
+     "date": "2025-01"
+    },
+    {
+     "harness": "OpenCompass GPassK",
+     "model": "Llama-3.1-8B-Instruct",
+     "score": 24.0,
+     "date": "2025-01"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "workbuddy-code"
+   ],
+   "title": "WorkBuddy-Bench Code 官方榜",
+   "source": {
+    "name": "Tencent WorkBuddy Bench official leaderboard v1.3 (data.js behind workbuddybench.com)",
+    "url": "https://workbuddybench.com/",
+    "retrieved": "2026-11-22",
+    "metric": "Harbor run-level reward (mean task reward x100), 80 tasks, v2.3; percent, 3-run average, think mode",
+    "notes": "Leaderboard generated 2026-11-05. Two harnesses: CodeBuddy Code (cbc, results refreshed 2026-09-10; top 12 of 23 models kept) and Claude Code (cc, 2026-07-15 snapshot, all rows). Scores not comparable across subsets. Claude Opus 4.8 cc Code score uses modified no-ask instruction. Paper: https://arxiv.org/abs/2607.20911; repo https://github.com/Tencent/workbuddy-bench."
+   },
+   "entries": [
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 5.5",
+     "score": 83.26,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 5",
+     "score": 80.54,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-v4.1-flash-1017",
+     "score": 80.18,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4-dev",
+     "score": 79.07,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GPT-5.6 Sol",
+     "score": 78.78,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Claude Opus 4.8",
+     "score": 77.9,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3",
+     "score": 77.14,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GLM-5.2",
+     "score": 77.06,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GLM-5.3",
+     "score": 76.93,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3.1-Pro",
+     "score": 76.91,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-V4-Pro",
+     "score": 76.82,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GPT-5.5",
+     "score": 76.63,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Step-5 Preview",
+     "score": 76.18,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4 preview",
+     "score": 75.8,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "MiMo-V2.6-Pro",
+     "score": 75.29,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GLM5.1-nothink",
+     "score": 67.06,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "MiniMax-M3",
+     "score": 66.42,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3",
+     "score": 66.26,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-V4-Pro",
+     "score": 64.59,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-v4-flash",
+     "score": 61.89,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3-preview",
+     "score": 57.71,
+     "date": "2026-07-15"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "workbuddy-web"
+   ],
+   "title": "WorkBuddy-Bench Web 官方榜",
+   "source": {
+    "name": "Tencent WorkBuddy Bench official leaderboard v1.3 (data.js behind workbuddybench.com)",
+    "url": "https://workbuddybench.com/",
+    "retrieved": "2026-11-22",
+    "metric": "Rubric-item score, 70 tasks (stricter rubric, 2026-07-16 refresh); percent, 3-run average, think mode",
+    "notes": "Leaderboard generated 2026-11-05. Two harnesses: CodeBuddy Code (cbc, results refreshed 2026-09-10; top 12 of 20 models kept) and Claude Code (cc, 2026-07-15 snapshot, all rows). Scores not comparable across subsets. Claude Opus 4.8 cc Code score uses modified no-ask instruction. Paper: https://arxiv.org/abs/2607.20911; repo https://github.com/Tencent/workbuddy-bench."
+   },
+   "entries": [
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 5.5",
+     "score": 76.24,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GLM-5.3",
+     "score": 75.36,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4-dev",
+     "score": 74.1,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4 preview",
+     "score": 72.76,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3.1-Pro",
+     "score": 72.71,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-v4-flash",
+     "score": 72.43,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-V4-Pro",
+     "score": 72.29,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3",
+     "score": 72.0,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-v4.1-flash-1017",
+     "score": 71.98,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GPT-5.6 Sol",
+     "score": 71.94,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 5",
+     "score": 71.86,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Step-5 Preview",
+     "score": 71.52,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Claude Opus 4.8",
+     "score": 69.86,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3",
+     "score": 66.43,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GPT-5.5",
+     "score": 64.86,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GLM-5.2",
+     "score": 60.71,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "MiniMax-M3",
+     "score": 52.57,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-V4-Pro",
+     "score": 51.57,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-v4-flash",
+     "score": 50.29,
+     "date": "2026-07-15"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "workbuddy-office"
+   ],
+   "title": "WorkBuddy-Bench Office 官方榜",
+   "source": {
+    "name": "Tencent WorkBuddy Bench official leaderboard v1.3 (data.js behind workbuddybench.com)",
+    "url": "https://workbuddybench.com/",
+    "retrieved": "2026-11-22",
+    "metric": "Rubric score, 50 tasks; percent, 3-run average, think mode",
+    "notes": "Leaderboard generated 2026-11-05. Two harnesses: CodeBuddy Code (cbc, results refreshed 2026-09-10; top 12 of 22 models kept) and Claude Code (cc, 2026-07-15 snapshot, all rows). Scores not comparable across subsets. Claude Opus 4.8 cc Code score uses modified no-ask instruction. Paper: https://arxiv.org/abs/2607.20911; repo https://github.com/Tencent/workbuddy-bench."
+   },
+   "entries": [
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3.1-Pro",
+     "score": 86.42,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GPT-5.5",
+     "score": 86.05,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 5.5",
+     "score": 85.24,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4-dev",
+     "score": 84.65,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Claude Opus 4.8",
+     "score": 83.23,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-v4.1-flash-1017",
+     "score": 82.7,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "MiniMax-M3.1-Flash",
+     "score": 82.4,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 4.8",
+     "score": 82.37,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "HY-3",
+     "score": 82.08,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GPT-5.5",
+     "score": 81.96,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4 preview",
+     "score": 81.22,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3",
+     "score": 81.04,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K2.7",
+     "score": 80.88,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3",
+     "score": 80.08,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GLM-5.3",
+     "score": 79.78,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GLM-5.2",
+     "score": 79.57,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-V4-Pro",
+     "score": 78.71,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-v4-flash",
+     "score": 77.54,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "MiniMax-M3",
+     "score": 76.3,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3-preview",
+     "score": 76.07,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Kimi K2.6",
+     "score": 67.72,
+     "date": "2026-07-15"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "workbuddy-sec"
+   ],
+   "title": "WorkBuddy-Bench Security 官方榜",
+   "source": {
+    "name": "Tencent WorkBuddy Bench official leaderboard v1.3 (data.js behind workbuddybench.com)",
+    "url": "https://workbuddybench.com/",
+    "retrieved": "2026-11-22",
+    "metric": "Deterministic scoring, 60 tasks; percent, 3-run average, think mode",
+    "notes": "Leaderboard generated 2026-11-05. Two harnesses: CodeBuddy Code (cbc, results refreshed 2026-09-10; top 12 of 17 models kept) and Claude Code (cc, 2026-07-15 snapshot, all rows). Scores not comparable across subsets. Claude Opus 4.8 cc Code score uses modified no-ask instruction. Paper: https://arxiv.org/abs/2607.20911; repo https://github.com/Tencent/workbuddy-bench."
+   },
+   "entries": [
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "GPT-5.5",
+     "score": 77.91,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Gemini-3.5-Flash",
+     "score": 76.99,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Hy4-dev",
+     "score": 73.16,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-v4.1-flash-1017",
+     "score": 72.22,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3.1-Pro",
+     "score": 68.36,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Kimi K3",
+     "score": 67.61,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GLM-5.3",
+     "score": 66.52,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Step-5 Preview",
+     "score": 66.31,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Claude Opus 4.8",
+     "score": 65.87,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "DeepSeek-v4-flash",
+     "score": 65.65,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3",
+     "score": 65.59,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "HY-3",
+     "score": 64.5,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "GPT-5.5",
+     "score": 64.39,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "Claude Opus 4.8",
+     "score": 64.37,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "MiMo-V2.6-Pro",
+     "score": 64.37,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "CodeBuddy Code 2.109.3 (think)",
+     "model": "HY-3-preview",
+     "score": 64.17,
+     "date": "2026-09-10"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-V4-Pro",
+     "score": 58.73,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "HY-3-preview",
+     "score": 58.63,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "DeepSeek-v4-flash",
+     "score": 53.9,
+     "date": "2026-07-15"
+    },
+    {
+     "harness": "Claude Code 2.1.187 (think)",
+     "model": "Kimi K2.6",
+     "score": 43.67,
+     "date": "2026-07-15"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "gaia2-cli"
+   ],
+   "title": "GAIA2 官方榜（原生 ARE，非 CLI 变体）",
+   "source": {
+    "name": "Gaia2 Leaderboard (HF space meta-agents-research-environments/leaderboard), legacy native-ARE table",
+    "url": "https://huggingface.co/spaces/meta-agents-research-environments/leaderboard",
+    "retrieved": "2026-11-22",
+    "metric": "pass@1 macro success rate over capabilities (%), native ARE ReAct scaffold, legacy Gaia2 incl. noise and agent2agent; NOT the CLI variant",
+    "notes": "The live space (read via its Gradio API) only serves the legacy table; the app code has a gaia2-cli table (search/execution/adaptability/ambiguity/time) but no public CLI rows. Per-config (Exec/Search/Ambig/Adapt/Time): GPT-5 high 69.2/79.6/51.9/40.4/0.0; Claude-4-Sonnet Thinking 62.1/60.6/27.3/42.1/8.5; Claude-4-Sonnet 57.9/59.8/24.2/38.1/8.1; GPT-5 low 52.7/64.2/39.6/30.2/2.3; Gemini-2.5-Pro 39.2/57.7/18.1/17.5/7.3; Kimi-K2 34.2/36.0/8.3/24.0/0.8. All submitted by Meta. Reference only."
+   },
+   "entries": [
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "GPT-5 (high)",
+     "score": 42.1,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "Claude-4-Sonnet Thinking",
+     "score": 37.8,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "Claude-4-Sonnet",
+     "score": 34.8,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "GPT-5 (low)",
+     "score": 34.6,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "Gemini-2.5-Pro",
+     "score": 25.8,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "DeepSeek-v3.1 Terminus",
+     "score": 23.1,
+     "date": "2025-09-30"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "DeepSeek-v3.1",
+     "score": 21.9,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "Kimi-K2",
+     "score": 20.1,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "GPT-5 (minimal)",
+     "score": 18.2,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "Grok-4",
+     "score": 15.7,
+     "date": "2025-09-09"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "Qwen3-235B-thinking",
+     "score": 15.7,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "ARE ReAct scaffold (Meta)",
+     "model": "GPT-OSS 120B (high)",
+     "score": 13.7,
+     "date": "2025-09-29"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "gaia2-cli"
+   ],
+   "title": "Harbor gaia2-cli 适配器对齐结果",
+   "source": {
+    "name": "Harbor gaia2 adapter README, gaia2-cli variant (provisional)",
+    "url": "https://github.com/laude-institute/harbor/tree/main/adapters/gaia2",
+    "retrieved": "2026-11-22",
+    "metric": "strict pass rate (%) per config on 100-task subset (20 per config), 1 run; partial credit not counted",
+    "notes": "Partial counts: execution 12/20, time 7/20 partial. Harbor-side verifier approximates ARE GraphPerEventJudge. Native ARE parity (gaia2-parity-agent, gpt-5-mini, 100 tasks): 6.0% +/-1.0 original vs 6.0% +/-0.0 Harbor. No date given."
+   },
+   "entries": [
+    {
+     "harness": "opencode (Harbor gaia2-cli)",
+     "model": "openai/gpt-5-mini (OpenRouter)",
+     "score": 15.0
+    }
+   ]
+  },
+  {
+   "suites": [
+    "alfworld"
+   ],
+   "title": "ALFWorld · GiGPO / verl-agent 论文",
+   "source": {
+    "name": "GiGPO / verl-agent paper (Feng et al.), Table 1",
+    "url": "https://arxiv.org/abs/2505.10978",
+    "retrieved": "2026-11-22",
+    "metric": "overall success rate (%) on ALFWorld eval set, averaged over 3 seeds",
+    "notes": "Paper does not name the split in text (verl-agent eval is understood to be the out-of-distribution/unseen set; unverified). RL rows report seed std (GiGPO 7B +/-1.3, GRPO 7B +/-5.2), not stderr. v3 dated 2025-10-28."
+   },
+   "entries": [
+    {
+     "harness": "GiGPO-trained (verl-agent)",
+     "model": "Qwen2.5-7B-Instruct",
+     "score": 90.8,
+     "date": "2025-10-28"
+    },
+    {
+     "harness": "GiGPO-trained (verl-agent)",
+     "model": "Qwen2.5-1.5B-Instruct",
+     "score": 86.7,
+     "date": "2025-10-28"
+    },
+    {
+     "harness": "GRPO-trained",
+     "model": "Qwen2.5-7B-Instruct",
+     "score": 77.6,
+     "date": "2025-10-28"
+    },
+    {
+     "harness": "Gemini-2.5-Pro prompting",
+     "model": "Gemini-2.5-Pro",
+     "score": 60.3,
+     "date": "2025-10-28"
+    },
+    {
+     "harness": "GPT-4o prompting",
+     "model": "GPT-4o",
+     "score": 48.0,
+     "date": "2025-10-28"
+    },
+    {
+     "harness": "Reflexion",
+     "model": "Qwen2.5-7B-Instruct",
+     "score": 42.7,
+     "date": "2025-10-28"
+    },
+    {
+     "harness": "ReAct",
+     "model": "Qwen2.5-7B-Instruct",
+     "score": 31.2,
+     "date": "2025-10-28"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "alfworld"
+   ],
+   "title": "ALFWorld · World Model Predictive Paths 论文（134 题）",
+   "source": {
+    "name": "Self-Improving Agents with World Model Predictive Paths, Table 1",
+    "url": "https://arxiv.org/abs/2610.28945",
+    "retrieved": "2026-11-22",
+    "metric": "SR@1 success rate (%), 134 ALFWorld tasks, 30-step limit",
+    "notes": "Split not named but 134 tasks matches valid_unseen size. SR@5 also reported (e.g., GPT-5.4-mini ReAct 48.5). Submitted 2026-10-20."
+   },
+   "entries": [
+    {
+     "harness": "MPPI-style test-time framework (paper method)",
+     "model": "Gemma-4-26B-A4B",
+     "score": 65.7,
+     "date": "2026-10-20"
+    },
+    {
+     "harness": "MPPI-style test-time framework (paper method)",
+     "model": "GPT-5.4-mini",
+     "score": 64.9,
+     "date": "2026-10-20"
+    },
+    {
+     "harness": "ITP-I",
+     "model": "GPT-5.4-mini",
+     "score": 50.0,
+     "date": "2026-10-20"
+    },
+    {
+     "harness": "ReAct",
+     "model": "GPT-5.4-mini",
+     "score": 38.8,
+     "date": "2026-10-20"
+    },
+    {
+     "harness": "ReAct",
+     "model": "Gemma-4-26B-A4B",
+     "score": 20.1,
+     "date": "2026-10-20"
+    }
+   ]
+  }
+ ]
+}

@@ -17,7 +17,7 @@ from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_fo
                                            route_problem, upstream_for)
 from scripts.eval.harbor.bench import credentials
 from scripts.eval.harbor.store.ingest import WorkerSync
-from scripts.eval.harbor.bench.executors import RemoteRun, signal_group
+from scripts.eval.harbor.bench.executors import RemoteRun, signal_group, tunnel_unbound
 
 
 def command(spec):
@@ -43,6 +43,8 @@ def command(spec):
     if spec.get("judge") and spec.get("metrics_proxy"):
         # The verifier's LLM judge: relay route, placeholder *name*, model.
         argv += judge_argv(spec["judge"], spec["metrics_proxy"])
+    if spec.get("compose_overlay"):
+        argv += ["--extra-docker-compose", spec["compose_overlay"]]
     filters = spec.get("task_filters") or ["terminal-bench/" + task for task in spec["tasks"]]
     for pattern in filters:
         argv += ["-i", pattern]
@@ -178,7 +180,8 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     cancelled_at = None
     expired = False
     last_write = 0.0
-    while remote.process.poll() is None:
+    while (remote.process.poll() is None
+           or cancelled_at is None and remote.retry_tunnel(secret_env, source.current)):
         now_s = time.monotonic()
         if credential_failed(source) and cancelled_at is None:
             # Fail fast instead of burning the remaining tasks on 401s.
@@ -229,7 +232,9 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     code = remote.exit_code()
     if code is None:
         lost = remote.error_message() or "SSH 连接中断"
-        if remote.tunnel_port is not None and not remote.events and remote.process.returncode == 255:
+        if remote.forward_was_refused():
+            lost = tunnel_unbound(remote.executor, remote.tunnel_ports)
+        elif remote.tunnel_port is not None and not remote.events and remote.process.returncode == 255:
             lost += (f"（会话带有 ssh -R 127.0.0.1:{remote.tunnel_port} 反向转发；"
                      "若该端口在执行机器上已被占用，重新启动评测会换一个端口）")
         record.update(status="cancelled" if cancelled_at and not record.get("error") else "failed",

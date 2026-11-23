@@ -594,7 +594,8 @@ class VersionGateStepTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp) / "bin"
             bindir.mkdir()
-            for name, text in (("gh", self.GH), ("python3", self.ECHO), ("python", self.ECHO)):
+            sleep = '#!/bin/sh\necho "sleep $*" >> "$FAKE_GH_LOG"\n'  # the retry waits, logged, not slept
+            for name, text in (("gh", self.GH), ("python3", self.ECHO), ("python", self.ECHO), ("sleep", sleep)):
                 (bindir / name).write_text(text, encoding="utf-8")
                 (bindir / name).chmod(0o755)
             log = Path(tmp) / "gh.log"
@@ -637,6 +638,29 @@ class VersionGateStepTest(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0, job)
             self.assertNotIn("argv=scripts/check_version_state.py", proc.stdout, job)
             self.assertEqual(len(calls), 1, (job, calls))
+
+    def test_a_request_without_an_answer_is_retried(self):
+        """The self-hosted macOS runner once lost the labels request to a
+        dial timeout (#726) and the whole gate went red."""
+        self.GH = ('#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\n'
+                   'if [ "$(grep -c "^api " "$FAKE_GH_LOG")" -lt 3 ]; then\n'
+                   '  echo "Get \\"https://api.github.com/\\": dial tcp: i/o timeout" >&2; exit 1\nfi\n'
+                   'echo "bug,release"\n')
+        for job in ("gates-linux", "windows-gates"):
+            proc, calls = self.run_step(job, "176")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("labels=[bug,release] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
+            self.assertEqual([c.split(" ")[0] + " " + c.split(" ")[1] for c in calls],
+                             ["api repos/o/r/issues/176/labels", "sleep 10", "api repos/o/r/issues/176/labels",
+                              "sleep 30", "api repos/o/r/issues/176/labels"], job)
+
+    def test_a_request_that_never_gets_an_answer_fails_after_three_tries(self):
+        self.GH = '#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\necho "dial tcp: i/o timeout" >&2\nexit 1\n'
+        for job in ("gates-linux", "windows-gates"):
+            proc, calls = self.run_step(job, "176")
+            self.assertNotEqual(proc.returncode, 0, job)
+            self.assertNotIn("argv=scripts/check_version_state.py", proc.stdout, job)
+            self.assertEqual(len([c for c in calls if c.startswith("api ")]), 3, (job, calls))
 
     def test_a_merge_group_ref_without_a_pr_is_refused(self):
         for job in ("gates-linux", "windows-gates"):

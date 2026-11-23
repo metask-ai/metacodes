@@ -24,7 +24,7 @@ from scripts.eval.harbor.bench.runner import RunManager
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench import builds, executors
-from scripts.eval.harbor.bench.batches import bundle_choices
+from scripts.eval.harbor.bench.profiles import bundle_choices
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
 from scripts.eval.tests.posix_only import POSIX
 
@@ -181,7 +181,7 @@ class GitRefBuildTest(unittest.TestCase):
         return subprocess.run(['bash', '-c', builds.CHECKOUT_SCRIPT + probe], capture_output=True, text=True,
                               env={**os.environ, 'SOURCE': str(source), 'COMMIT': commit, 'TMPDIR': str(self.root)})
 
-    def test_ref_builds_once_per_commit_into_a_batch_choice(self):
+    def test_ref_builds_once_per_commit_into_a_profile_choice(self):
         first = self.git('rev-parse', 'HEAD')
         unit, info = self.build('main')
         self.assertEqual(unit, self.bench / 'bundles' / f'metacodes-git-{first[:12]}-x86_64-linux-gnu')

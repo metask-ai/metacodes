@@ -95,7 +95,7 @@ def run(spec_path):
         if index and argv[index - 1] == "--ak" and value.split("=", 1)[0] in ("bundle", "config"):
             key, path = value.split("=", 1)
             argv[index] = key + "=" + absolute(path)
-        elif index and argv[index - 1] in ("-o", "-p"):
+        elif index and argv[index - 1] in ("-o", "-p", "--extra-docker-compose"):
             argv[index] = absolute(value)
     env = dict(os.environ)
     env.update(secret_env)

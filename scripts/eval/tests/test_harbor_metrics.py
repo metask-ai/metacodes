@@ -402,6 +402,31 @@ class MetricProjectionTest(unittest.TestCase):
         self.assertEqual(summary['tps'], 20)  # 100 tokens / 5 seconds
         self.assertEqual(summary['ttft_ms'], 300)
 
+    def test_cost_and_effort_metrics_average_per_task_and_pool_across_jobs(self):
+        _trial(self.job, 'a__1', reward=1)
+        _trial(self.job, 'a__2', reward=0)
+        _trial(self.job, 'b__1', reward=0)
+        _trial(self.job, 'c__1', exception='VerifierTimeoutError')
+        rows = data.job_view(self.job)['rows']
+        priced = {'a__1': (1.0, 10, 4), 'a__2': (3.0, 30, 12), 'b__1': (4.0, 40, 16), 'c__1': (9.0, 90, 36)}
+        for row in rows:
+            row['cost_usd'], row['turns'], row['tool_calls'] = priced[row['trial']]
+        s = data.summarize(rows)
+        self.assertEqual((s['tasks_solved'], s['tasks_attempted']), (1, 2))
+        self.assertEqual(s['cost_per_task'], 3.0)  # mean of task a (2.0) and task b (4.0); invalid c excluded
+        self.assertAlmostEqual(s['cost_per_pass'], 12.0)  # (2.0 + 4.0) / (1/2 + 0) passes over the same priced tasks
+        self.assertAlmostEqual(s['non_pass_cost_share'], 7 / 8)
+        self.assertEqual((s['turns_per_pass'], s['tool_calls_per_pass']), (10, 4))
+        low, high = s['pass_rate_ci95']
+        self.assertAlmostEqual(low, 0.0615, places=4)
+        self.assertAlmostEqual(high, 0.7923, places=4)
+
+        merged = data.merge_summaries([s, s])
+        self.assertEqual((merged['tasks_solved'], merged['tasks_attempted']), (2, 4))
+        self.assertEqual(merged['cost_per_task'], 3.0)
+        self.assertAlmostEqual(merged['non_pass_cost_share'], 7 / 8)
+        self.assertLess(merged['pass_rate_ci95'][1] - merged['pass_rate_ci95'][0], high - low)
+
     def test_first_attempt_order_compares_timestamp_offsets_as_instants(self):
         _trial(self.job, 'same__a', reward=1)
         b = _trial(self.job, 'same__b', reward=0)

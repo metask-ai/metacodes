@@ -22,7 +22,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import socket
@@ -899,7 +898,7 @@ def step_network(s: Setup):
         proposals.append(("docker_mirrors", list(DEFAULT_DOCKER_MIRRORS), "Docker Hub 镜像加速"))
     if "ghcr" in bad and "ghcr_mirror" not in entry:
         proposals.append(("ghcr_mirror", DEFAULT_GHCR_MIRROR, "ghcr.io 镜像"))
-    if bad & {"github", "pypi"} and "egress" not in entry:
+    if bad & {"github", "pypi"} and "egress" not in entry and "apt" not in (entry.get("container_mirrors") or {}):
         # Task verifiers download uv, Python and packages at test time.
         proposals.append(("egress", "workbench", "任务容器经工作台出网"))
     if not proposals:
@@ -956,6 +955,48 @@ def step_docker_mirrors(s: Setup):
     return "done", "registry-mirrors：" + "、".join(merged) + "（已 reload，未重启 Docker）"
 
 
+APT_CACHE_NAME = "metacodes-apt-cache"
+APT_CACHE_LABEL = "metacodes.apt-mirror"
+APT_CACHE_DOCKERFILE = """FROM debian:bookworm-slim
+ARG MIRROR
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-cacher-ng \\
+ && rm -rf /var/lib/apt/lists/* \\
+ && echo "$MIRROR/debian/" > /etc/apt-cacher-ng/backends_debian \\
+ && echo "$MIRROR/ubuntu/" > /etc/apt-cacher-ng/backends_ubuntu \\
+ && echo "ForeGround: 1" >> /etc/apt-cacher-ng/acng.conf
+CMD ["/usr/sbin/apt-cacher-ng", "-c", "/etc/apt-cacher-ng"]
+"""
+def apt_cache_answers(s: Setup) -> bool:
+    done = s.sh(executors.apt_cache_probe(s.executor, 20))
+    return bool(done) and done.returncode == 0
+
+
+def step_apt_cache(s: Setup):
+    """The executor's shared apt cache (apt-cacher-ng on the Docker bridge's
+    gateway), fetching Debian and Ubuntu packages from container_mirrors.apt.
+    Runs' task containers reach it through the compose overlay."""
+    s.require_shell()
+    mirror = dict(s.executor.container_mirrors).get("apt")
+    if not mirror:
+        raise Skip("container_mirrors 未配置 apt")
+    mirror = mirror.rstrip("/")
+    running = s.out("docker inspect -f " + shlex.quote("{{index .Config.Labels \"" + APT_CACHE_LABEL + "\"}} "
+                                                      "{{.State.Running}}") + " " + APT_CACHE_NAME + " 2>/dev/null")
+    if running == mirror + " true" and apt_cache_answers(s):
+        return "ok", f"apt 缓存在 {s.executor.apt_cache_url}，回源 {mirror}"
+    s.sh(f"docker build -q -t {APT_CACHE_NAME} --build-arg MIRROR={shlex.quote(mirror)} -",
+         mutate=True, input=APT_CACHE_DOCKERFILE, check=True)
+    s.sh(f"docker rm -f {APT_CACHE_NAME} >/dev/null 2>&1; docker run -d --name {APT_CACHE_NAME} "
+         f"--restart unless-stopped --label {APT_CACHE_LABEL}={shlex.quote(mirror)} "
+         f"-p {s.executor.metrics_bind}:{executors.APT_CACHE_PORT}:3142 "
+         f"-v {APT_CACHE_NAME}:/var/cache/apt-cacher-ng {APT_CACHE_NAME}", mutate=True, check=True)
+    if s.dry_run:
+        return "planned", f"将在 {s.executor.apt_cache_url} 启动 apt 缓存，回源 {mirror}"
+    if not apt_cache_answers(s):
+        raise Failed(f"apt 缓存已启动，但 {s.executor.apt_cache_url} 没有响应；查看 docker logs {APT_CACHE_NAME}")
+    return "done", f"apt 缓存在 {s.executor.apt_cache_url}，回源 {mirror}"
+
+
 def step_egress(s: Setup):
     """End to end: a container on a user-defined network reaches the egress
     proxy (workbench mode: forwarder -> ssh -R -> this machine's proxy)."""
@@ -963,26 +1004,36 @@ def step_egress(s: Setup):
     mode = s.effective("egress")
     if mode == "direct":
         raise Skip("egress = direct：任务容器直接使用执行机器的网络")
-    options = ({"mode": "workbench", "tunnel_port": secrets.SystemRandom().randrange(20000, 60000),
+    ports = [executors.tunnel_port()] if mode == "workbench" else []
+    options = ({"mode": "workbench", "tunnel_port": ports[0],
                 "bind": s.executor.metrics_bind, "external": EGRESS_EXTERNAL_PROBE}
                if mode == "workbench" else {"mode": "proxy", "url": mode["proxy"]})
     proxy = None
     try:
         reverse = None
-        if mode == "workbench":
-            if not s.dry_run:
-                from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
-                allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
-                proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
-            reverse = (options["tunnel_port"], proxy.port if proxy else 0)
-        argv = executors.node_argv(s.executor, "egress-probe", json.dumps(options), reverse=reverse)
-        done = s.run(argv, mutate=True, timeout=600)
+        if mode == "workbench" and not s.dry_run:
+            from scripts.eval.harbor.bench.egress import DEFAULT_ALLOW_NETWORKS, EgressProxy, allow_policy
+            allow = s.executor.egress_allow if s.executor.egress_allow is not None else DEFAULT_ALLOW_NETWORKS
+            proxy = EgressProxy(s.executor.egress_ports, log=s.log, allow=allow_policy(allow)).start()
+        while True:
+            if ports:
+                options["tunnel_port"] = ports[-1]
+                reverse = (ports[-1], proxy.port if proxy else 0)
+            argv = executors.node_argv(s.executor, "egress-probe", json.dumps(options), reverse=reverse)
+            done = s.run(argv, mutate=True, timeout=600)
+            if not (done and ports and len(ports) < executors.TUNNEL_ATTEMPTS
+                    and executors.forward_refused(done.returncode, done.stderr)):
+                break
+            ports.append(executors.tunnel_port(ports))
+            s.log(executors.tunnel_retry_note(s.executor, ports[-2], ports[-1], len(ports)))
     finally:
         if proxy is not None:
             proxy.close()
     if s.dry_run:
         return "planned", ("将验证：自定义网络中的容器经 docker0 网关转发、ssh -R 访问工作台代理" if mode == "workbench"
                            else "将验证：自定义网络中的容器能连到站点代理 " + mode["proxy"])
+    if ports and executors.forward_refused(done.returncode, done.stderr):
+        raise Failed(executors.tunnel_unbound(s.executor, ports))
     lines = (done.stdout or "").strip().splitlines()
     try:
         result = json.loads(lines[-1]) if lines else {}
@@ -1064,7 +1115,8 @@ def plan(s: Setup):
     steps += [("uv", "uv", step_uv), ("harbor", "Harbor " + HARBOR_VERSION, step_harbor),
               ("docker", "Docker" + ("" if s.remote else "（macOS: Colima）"), step_docker)]
     if s.remote:
-        steps.append(("docker_mirrors", "Docker 镜像加速", step_docker_mirrors))
+        steps += [("docker_mirrors", "Docker 镜像加速", step_docker_mirrors),
+                  ("apt_cache", "apt 缓存（任务容器）", step_apt_cache)]
     steps += [("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]
     if s.remote:
         steps += [("node", "metacodes 节点", step_node),

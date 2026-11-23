@@ -36,7 +36,7 @@ from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import (fixture, offline_hugging_face, session_fixture,
-                                                     stop_batches_and_workers, wait_run)
+                                                     stop_profiles_and_workers, wait_run)
 from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV, WORKBUDDY_PINNED_COMMIT
 
 REPO = Path(__file__).resolve().parents[3]
@@ -49,10 +49,13 @@ cwd = pathlib.Path.cwd()
 job = json.loads((cwd / 'configs/jobs' / (slug + '.yaml')).read_text())
 model = json.loads((cwd / 'configs/models' / (slug + '.yaml')).read_text())
 jobs_dir = pathlib.Path(job['jobs_dir'])
+judge_path = cwd / 'configs/models' / (slug + '-judge.yaml')
+judge = json.loads(judge_path.read_text()) if judge_path.exists() else None
 spec = model['model']
 (jobs_dir.parent / 'observed.json').write_text(json.dumps({{
-    'argv': args, 'cwd': str(cwd), 'job': job, 'model': model,
+    'argv': args, 'cwd': str(cwd), 'job': job, 'model': model, 'judge': judge,
     'base_url': os.environ.get(spec['backend_url_env']),
+    'judge_base_url': os.environ.get(judge['model']['backend_url_env']) if judge else None,
     'key_matches': os.environ.get(spec['backend_key_env']) == os.environ.get('FAKE_EXPECT_ACCOUNT_KEY'),
     'judge_key': os.environ.get('{judge}'), 'metask_key': 'METASK_API_KEY' in os.environ,
     'shard_concurrency': os.environ.get('SHARD_CONCURRENCY'), 'platform': os.environ.get('DOCKER_DEFAULT_PLATFORM')}}))
@@ -262,6 +265,27 @@ class CatalogTest(unittest.TestCase):
         from scripts.eval.workbuddy.stage_artifacts import TARGET_PLATFORM
         self.assertEqual(wb.TARGET_PLATFORM, TARGET_PLATFORM)
         self.assertEqual(wb.HARNESS_IMAGE, DEFAULT_HARNESS_IMAGE)
+
+    def test_published_boards_name_catalog_suites_and_cite_their_source(self):
+        from scripts.eval.harbor.suites import leaderboards
+        boards = leaderboards.boards()
+        self.assertTrue(boards)
+        for board in boards:
+            with self.subTest(board=board["title"]):
+                self.assertTrue(board["suites"])
+                self.assertTrue(set(board["suites"]) <= set(suites.BY_ID))
+                source = board["source"]
+                self.assertTrue(source["url"].startswith("https://"))
+                self.assertRegex(source["retrieved"], r"^\d{4}-\d{2}-\d{2}$")
+                self.assertTrue(source["name"] and source["metric"])
+                self.assertTrue(board["entries"])
+                for suite_id in board["suites"] if board.get("tasks") else ():
+                    self.assertLessEqual(set(board["tasks"]), set(suites.BY_ID[suite_id].tasks))
+                for entry in board["entries"]:
+                    self.assertTrue(entry["harness"])
+                    self.assertTrue(0 <= entry["score"] <= 100)
+                    cost = entry.get("cost_per_task_usd")
+                    self.assertTrue(cost is None or cost >= 0)
 
     def test_binary_carries_every_module_the_workbench_imports(self):
         assets = set(re.findall(r'\.path = "([^"]+)"', (REPO / "scripts/bench_assets.zig").read_text()))
@@ -525,7 +549,7 @@ def stubbed_harbor():
         yield module
 
 
-def workbuddy_checkout(root, *, head=WORKBUDDY_PINNED_COMMIT):
+def workbuddy_checkout(root, *, head=WORKBUDDY_PINNED_COMMIT, subset="code"):
     repo = root / "workbuddy-bench"
     (repo / ".git").mkdir(parents=True)
     (repo / ".git/HEAD").write_text(head + "\n")
@@ -533,8 +557,8 @@ def workbuddy_checkout(root, *, head=WORKBUDDY_PINNED_COMMIT):
     atomic_json(repo / wb.OVERLAY, {"workbuddy_commit": WORKBUDDY_PINNED_COMMIT})
     atomic_json(repo / wb.ARTIFACT_MANIFEST, {"target_platform": "linux/amd64", "synthetic_fixture": False})
     for task in ("bug_fix-easy-alpha", "data_quality-hard-beta", "data_quality-hard-gamma"):
-        (repo / wb.dataset_rel("code") / task).mkdir(parents=True)
-        (repo / wb.dataset_rel("code") / task / "task.toml").write_text("[task]\n")
+        (repo / wb.dataset_rel(subset) / task).mkdir(parents=True)
+        (repo / wb.dataset_rel(subset) / task / "task.toml").write_text("[task]\n")
     return repo
 
 
@@ -558,7 +582,7 @@ class SuiteLaunchTest(unittest.TestCase):
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
-        self.addCleanup(stop_batches_and_workers, self.manager)
+        self.addCleanup(stop_profiles_and_workers, self.manager)
         self.client = cli.Client(f"http://127.0.0.1:{self.http.server_address[1]}/")
 
     def launch(self, **request):
@@ -694,7 +718,7 @@ class SuiteLaunchTest(unittest.TestCase):
             by_id = {s["id"]: s for s in catalog["suites"]}
             self.assertTrue(by_id["workbuddy-code"]["ready"], by_id["workbuddy-code"]["reasons"])
             self.assertEqual(by_id["workbuddy-code"]["task_count"], 3)
-            self.assertIn("LLM judge", " ".join(by_id["workbuddy-web"]["reasons"]))
+            self.assertNotIn("LLM judge", " ".join(by_id["workbuddy-web"]["reasons"]))
             with self.assertRaises(ValueError):
                 self.client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
                                                  "tasks": ["not-a-workbuddy-task"]})
@@ -715,6 +739,8 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(job["jobs_dir"], str(job_root / "workbuddy"))
         self.assertEqual(job["orchestrator_override"], {"n_concurrent_trials": 2})
         self.assertEqual(job["harness_params_override"], {"METACODES_REASONING_EFFORT": "max"})
+        self.assertNotIn("llm_judge_override", job)
+        self.assertIsNone(observed["judge"])
         self.assertEqual(observed["model"]["model"]["name"], "session-model")
         self.assertEqual(observed["base_url"], f"http://127.0.0.1:{upstream.server_port}/v1/messages")
         self.assertTrue(observed["key_matches"])
@@ -732,6 +758,63 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(trial["row"]["status"], "pass")
         public = json.dumps(catalog) + "".join(p.read_text() for p in self.manager.records.iterdir())
         self.assertNotIn("session-access", public)
+
+    def test_a_judged_workbuddy_subset_runs_its_judge_on_the_account_route(self):
+        state, upstream, _ = session_fixture(self.root)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        repo = workbuddy_checkout(self.root, subset="web")
+        cfg = json.loads(self.manager.config_path.read_text())
+        cfg.update(auth_mode="metask", account_state_dir=str(state), workbuddy_checkout=str(repo),
+                   judges={"workbuddy-web": {"model": "metask/judge-model"}})
+        atomic_json(self.manager.config_path, cfg)
+        with patch.dict(os.environ, {"METASK_SITE_URL": f"http://127.0.0.1:{upstream.server_port}",
+                                     "FAKE_EXPECT_ACCOUNT_KEY": "session-access"}):
+            by_id = {s["id"]: s for s in self.client.request("api/workbench")["suites"]}
+            self.assertTrue(by_id["workbuddy-web"]["ready"], by_id["workbuddy-web"]["reasons"])
+            run = self.client.request("api/runs", {"suite": "workbuddy-web", "model": "metask/session-model",
+                                                   "tasks": ["bug_fix-easy-alpha"], "attempts": 1, "concurrency": 16})
+            final = wait_run(self.manager, run["name"])
+        self.assertEqual(final["status"], "finished", final)
+        observed = json.loads((self.manager.jobs_dir / run["name"] / "observed.json").read_text())
+        slug = "metacodes-" + run["name"]
+        self.assertEqual(observed["job"]["llm_judge_override"],
+                         {"enabled": True, "mode": "in_container", "model": slug + "-judge"})
+        judge = observed["judge"]["model"]
+        self.assertEqual((judge["name"], judge["protocols"], judge["backend_key_env"]),
+                         ("judge-model", ["openai"], observed["model"]["model"]["backend_key_env"]))
+        self.assertEqual(observed["judge_base_url"], f"http://127.0.0.1:{upstream.server_port}/v1")
+        self.assertEqual(observed["job"]["orchestrator_override"], {"n_concurrent_trials": 16})
+        self.assertFalse((repo / "configs/models" / (slug + "-judge.yaml")).exists())
+
+    def test_a_judged_workbuddy_run_reaches_the_ssh_node_with_its_judge_and_is_refused_without_one(self):
+        from scripts.eval.harbor.bench import executors
+        spec = {"runner": "workbuddy", "name": "bench-x", "suite": "workbuddy-web", "model": "metask/m",
+                "tasks": ["t"], "attempts": 1, "concurrency": 16, "workbuddy_judge": "kimi-k3.1-pro",
+                "executor": {"name": "relay-4090", "kind": "ssh", "host": "h", "user": "u"}}
+        remote = executors.RemoteRun(spec).remote_spec()
+        self.assertEqual(remote["workbuddy_judge"], "kimi-k3.1-pro")
+        repo = workbuddy_checkout(self.root, subset="web")
+        unjudged = {**spec, "workbuddy_judge": None, "jobs_dir": str(self.root / "jobs"),
+                    "workbuddy": {"checkout": str(repo), "subset": "web", "uv": "uv", "bash": "bash"}}
+        with self.assertRaisesRegex(ValueError, "LLM judge"):
+            wb.launch(unjudged, {"METASK_API_KEY": "k"})
+        self.assertFalse(any((repo / "configs/jobs").glob("*.yaml")))
+
+    def test_a_run_mount_image_reference_fits_dockers_image_mount_directory_name(self):
+        name = "bench-20261122-201744-334243" + "-x" * 40
+        tag = wb.run_image_tag(name)
+        self.assertNotEqual(tag, wb.run_image_tag(name + "y"))
+        key = "0" * 64 + ",src=" + tag + ",dst=/opt/metacodes"
+        self.assertLessEqual(len(key.encode().hex()), 255)
+
+    def test_workbuddy_judge_model_defaults_and_rejects_other_settings(self):
+        self.assertIsNone(wb.judge_model(suites.get("workbuddy-code"), {}))
+        self.assertEqual(wb.judge_model(suites.get("workbuddy-office"), {}), wb.DEFAULT_JUDGE_MODEL)
+        with self.assertRaises(ValueError):
+            wb.judge_model(suites.get("workbuddy-web"), {"judges": {"workbuddy-web": {"model": "x y"}}})
+        with self.assertRaises(ValueError):
+            wb.judge_model(suites.get("workbuddy-web"), {"judges": {"workbuddy-web": {"key": "k"}}})
 
     def test_the_mount_image_build_checks_the_manifest_it_builds_from(self):
         """Staged artifacts swapped after the node's check: the build reads the
