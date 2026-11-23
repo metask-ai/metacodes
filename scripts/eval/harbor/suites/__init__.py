@@ -176,8 +176,7 @@ class Suite:
     max_concurrency: int = 10
     # harbor-local: adapter module under scripts.eval.harbor.adapters.
     adapter: str = ""
-    # workbuddy: dataset subset (code/web/office/sec) and whether the
-    # workbench can launch it (judged subsets need a judge budget).
+    # workbuddy: dataset subset (code/web/office/sec).
     subset: str = ""
     notes: Tuple[str, ...] = field(default_factory=tuple)
     # harbor-local: container architectures the adapter's tasks support
@@ -232,13 +231,13 @@ ADAPTER_SUITES: Tuple[Suite, ...] = (
 
 WORKBUDDY_SUITES: Tuple[Suite, ...] = (
     Suite("workbuddy-code", "work-agent", "WorkBuddy Code", "WorkBuddy-Bench 代码子集（80 题），verifier 判分",
-          WORKBUDDY, subset="code", max_tasks=20, max_concurrency=2),
+          WORKBUDDY, subset="code", max_tasks=80, max_concurrency=16),
     Suite("workbuddy-sec", "work-agent", "WorkBuddy Security", "WorkBuddy-Bench 安全子集（60 题），verifier 判分",
-          WORKBUDDY, subset="sec", max_tasks=20, max_concurrency=2),
-    Suite("workbuddy-web", "work-agent", "WorkBuddy Web", "WorkBuddy-Bench 网页子集（70 题），需 LLM judge",
-          WORKBUDDY, subset="web", max_tasks=20, max_concurrency=2),
-    Suite("workbuddy-office", "work-agent", "WorkBuddy Office", "WorkBuddy-Bench 办公文档子集（50 题），需 LLM judge",
-          WORKBUDDY, subset="office", max_tasks=20, max_concurrency=2),
+          WORKBUDDY, subset="sec", max_tasks=60, max_concurrency=16),
+    Suite("workbuddy-web", "work-agent", "WorkBuddy Web", "WorkBuddy-Bench 网页子集（70 题），LLM judge 判分",
+          WORKBUDDY, subset="web", max_tasks=70, max_concurrency=16),
+    Suite("workbuddy-office", "work-agent", "WorkBuddy Office", "WorkBuddy-Bench 办公文档子集（50 题），LLM judge 判分",
+          WORKBUDDY, subset="office", max_tasks=50, max_concurrency=16),
 )
 
 ALL: Tuple[Suite, ...] = SUITES + ADAPTER_SUITES + WORKBUDDY_SUITES

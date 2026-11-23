@@ -587,6 +587,7 @@ class RunManager:
                 # On an SSH executor the node resolves its own checkout and tools.
                 spec["workbuddy"] = (workbuddy.spec_fields(suite, ctx) if executor.kind == "local"
                                      else {"subset": suite.subset})
+                spec["workbuddy_judge"] = workbuddy.judge_model(suite, cfg)
             else:
                 spec.update(harbor=facts.get("harbor") if executor.kind == "local" else None,
                             remote_harbor=facts.get("harbor") if executor.kind == "ssh" else None,
