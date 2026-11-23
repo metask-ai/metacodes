@@ -966,22 +966,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
  && echo "ForeGround: 1" >> /etc/apt-cacher-ng/acng.conf
 CMD ["/usr/sbin/apt-cacher-ng", "-c", "/etc/apt-cacher-ng"]
 """
-APT_CACHE_PROBE = r'''
-import sys, time, urllib.request
-for _ in range(20):
-    try:
-        with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
-            sys.exit(0 if response.status == 200 else 1)
-    except OSError:
-        time.sleep(0.5)
-sys.exit(1)
-'''
-
-
 def apt_cache_answers(s: Setup) -> bool:
-    url = s.executor.apt_cache_url + "/acng-report.html"
-    command = " ".join(shlex.quote(part) for part in (s.executor.python, "-c", APT_CACHE_PROBE, url))
-    done = s.sh(command)
+    done = s.sh(executors.apt_cache_probe(s.executor, 20))
     return bool(done) and done.returncode == 0
 
 

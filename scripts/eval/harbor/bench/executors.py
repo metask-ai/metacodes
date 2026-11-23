@@ -82,6 +82,22 @@ APT_CACHE_PORT = 3142
 APT_CACHE_CONF = "/etc/apt/apt.conf.d/99metacodes-apt-cache"
 COMPOSE_OVERLAY = "mirrors.compose.json"
 APT_PROXY_SETTING = "Acquire::http::Proxy"
+APT_CACHE_PROBE = r'''
+import sys, time, urllib.request
+for _ in range(int(sys.argv[2])):
+    try:
+        with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+            sys.exit(0 if response.status == 200 else 1)
+    except OSError:
+        time.sleep(0.5)
+sys.exit(1)
+'''
+
+
+def apt_cache_probe(executor: "SshExecutor", attempts: int) -> str:
+    """Shell command on the executor that exits 0 once its apt cache answers."""
+    return " ".join(shlex.quote(part) for part in (executor.python, "-c", APT_CACHE_PROBE,
+                                                    executor.apt_cache_url + "/acng-report.html", str(attempts)))
 
 
 def container_mirror_env(mirrors: Dict[str, str]) -> Dict[str, str]:
@@ -196,14 +212,14 @@ class SshExecutor:
     def apt_cache_url(self) -> str:
         return f"http://{self.metrics_bind}:{APT_CACHE_PORT}"
 
-    def compose_overlay(self, task_owned: Collection[str] = ()) -> Optional[Dict]:
+    def compose_overlay(self, left_out: Collection[str] = ()) -> Optional[Dict]:
         """The Harbor compose overlay that points a run's task containers at
-        container_mirrors, or None without any. Settings in `task_owned`
-        (the tasks set them themselves) are left out."""
+        container_mirrors, or None without any. Settings in `left_out`
+        (environment variables, APT_PROXY_SETTING) are not set."""
         mirrors = dict(self.container_mirrors)
-        if APT_PROXY_SETTING in task_owned:
+        if APT_PROXY_SETTING in left_out:
             mirrors.pop("apt", None)
-        env = {k: v for k, v in container_mirror_env(mirrors).items() if k not in task_owned}
+        env = {k: v for k, v in container_mirror_env(mirrors).items() if k not in left_out}
         if not env and "apt" not in mirrors:
             return None
         main: Dict = {}
@@ -1151,11 +1167,27 @@ class RemoteRun:
             local = Path(self.spec["local_dataset"])
         if local is not None:
             self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
+        self.overlay = self.mirror_overlay(local)
+
+    def mirror_overlay(self, local: Optional[Path]) -> Optional[Dict]:
+        """This run's compose overlay: without the settings the dataset's
+        tasks make themselves, and without apt when the executor's apt cache
+        does not answer."""
         mirrors = dict(self.executor.container_mirrors)
-        owned = task_owned_settings(local, mirrors) if mirrors and local is not None else []
-        if owned:
-            self.log("任务自己设置了 " + "、".join(owned) + "，本次运行不注入这些镜像设置")
-        self.overlay = self.executor.compose_overlay(owned)
+        left_out = task_owned_settings(local, mirrors) if mirrors and local is not None else []
+        if left_out:
+            self.log("任务自己设置了 " + "、".join(left_out) + "，本次运行不注入这些镜像设置")
+        if "apt" in mirrors and APT_PROXY_SETTING not in left_out:
+            try:
+                answered = self.runner(shell_argv(self.executor, apt_cache_probe(self.executor, 3)),
+                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=60).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                answered = False
+            if not answered:
+                self.log(f"apt 缓存 {self.executor.apt_cache_url} 没有响应：本次运行的任务容器直接使用自己的 apt 源；"
+                         f"运行 metacodes bench setup --executor {self.executor.name} 重新启动缓存")
+                left_out.append(APT_PROXY_SETTING)
+        return self.executor.compose_overlay(left_out)
 
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command

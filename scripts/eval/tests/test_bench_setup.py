@@ -634,6 +634,24 @@ class ExecutorConfigTest(unittest.TestCase):
             "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/"}}}})
         self.assertIsNone(relay.compose_overlay(["Acquire::http::Proxy", "GOPROXY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX"]))
 
+    def test_apt_is_left_out_of_a_run_whose_apt_cache_does_not_answer(self):
+        relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
+            "apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}})
+        for code, apt in ((0, True), (1, False)):
+            probes, logged = [], []
+
+            def runner(argv, **_kwargs):
+                probes.append(argv)
+                return subprocess.CompletedProcess(argv, code, "", "")
+            run = executors.RemoteRun({"name": "r", "executor": relay.spec()}, runner=runner, log=logged.append)
+            overlay = run.mirror_overlay(None)
+            with self.subTest(code=code):
+                self.assertEqual(len(probes), 1)
+                self.assertIn("http://172.17.0.1:3142/acng-report.html", probes[0][-1])
+                self.assertEqual("configs" in overlay, apt)
+                self.assertEqual(overlay["services"]["main"]["environment"], {"GOPROXY": "https://goproxy.cn,direct"})
+                self.assertEqual(any("没有响应" in line for line in logged), not apt)
+
 
 class ExecutorEntryTest(SetupFixture):
     def test_harbor_path_with_space_and_at_parses_and_a_bad_entry_spares_the_others(self):
@@ -871,10 +889,10 @@ class SshRunTest(SetupFixture):
         argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
         overlay = self.remote_home / ".metacodes-bench/runs" / run["name"] / executors.COMPOSE_OVERLAY
         self.assertEqual(argv[argv.index("--extra-docker-compose") + 1], str(overlay.resolve()))
-        self.assertEqual(json.loads(overlay.read_text()), {
-            "services": {"main": {"environment": {"GOPROXY": "https://goproxy.cn,direct"},
-                                  "configs": [{"source": "metacodes_apt_cache", "target": executors.APT_CACHE_CONF}]}},
-            "configs": {"metacodes_apt_cache": {"content": 'Acquire::http::Proxy "http://127.0.0.1:3142";\n'}}})
+        # Nothing answers as the apt cache here: apt keeps the task's own sources.
+        self.assertEqual(json.loads(overlay.read_text()),
+                         {"services": {"main": {"environment": {"GOPROXY": "https://goproxy.cn,direct"}}}})
+        self.assertIn("apt 缓存 http://127.0.0.1:3142 没有响应", (manager.records / (run["name"] + ".log")).read_text())
 
     def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
         gateway = RotatingGateway(self.root, lifetime=4)

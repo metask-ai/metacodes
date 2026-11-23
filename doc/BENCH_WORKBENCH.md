@@ -911,7 +911,11 @@ Harbor's compose order, so before staging the run the worker scans the
 suite's compose files, `task.toml` files and Dockerfiles: a variable (or
 `Acquire::http::Proxy`) that any of them names is left out of the overlay
 for that run and the run log says so. Values baked into a prebuilt image
-that the suite's files do not name are still overridden. Builds are not
+that the suite's files do not name are still overridden. When `apt` is
+set, the worker also checks over SSH that the apt cache answers; when it
+does not, the run leaves the apt file out (the task containers use their
+own apt sources) and its log names the cache and the setup command that
+restarts it. Builds are not
 affected: `bench pull` builds task images once and Harbor reuses them.
 
 Setup's apt 缓存 step runs the cache: it builds the image
