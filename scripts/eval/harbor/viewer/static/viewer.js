@@ -290,7 +290,7 @@ async function renderOverview() {
 
   const profileRows = profiles.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = profileHref(b); } },
     h('td', {}, h('a', { href: profileHref(b), onclick: (e) => e.stopPropagation(), text: profileName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
-    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: '高级功能 ' + featuresText(b) })),
+    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: [b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : null, '高级功能 ' + featuresText(b)].filter(Boolean).join(' · ') })),
     h('td', { text: b.models.join('、') || '—' }),
     h('td', {}, h('span', { text: [...new Map(b.items.map((i) => [i.suite, i.suite_name || i.suite])).values()].join('、') }), h('span', { class: 'sub', text: `${b.items.length} 次运行` })),
     h('td', {}, h('span', { text: PROFILE_STATUS[b.status] || b.status }), h('span', { class: 'sub', text: progressText(b) })),
