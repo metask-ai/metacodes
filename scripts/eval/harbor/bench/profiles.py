@@ -263,9 +263,10 @@ class ProfileManager:
         one of a listed bundle and `features`, created when first used.
         Each dataset is queued once per model (`model`, or several `models`)."""
         allowed = {"profile", "name", "model", "models", "executor", "attempts", "concurrency", "bundle", "items",
-                   "features"}
+                   "features", "max_tokens"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 profile、name、model、models、executor、attempts、concurrency、bundle、items、features")
+            raise ValueError("只接受 profile、name、model、models、executor、attempts、concurrency、bundle、items、features、"
+                             "max_tokens")
         models = checked_models(request)
         items = request.get("items")
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
@@ -287,6 +288,8 @@ class ProfileManager:
                 run_request = {"suite": suite.id, "model": model, "tasks": item.get("tasks"),
                                "attempts": request.get("attempts", 1),
                                "concurrency": min(concurrency, suite.max_concurrency)}
+                if request.get("max_tokens") is not None:
+                    run_request["max_tokens"] = request["max_tokens"]
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
                 planned.append(self.planned(target, run_request, request.get("executor"), label))
         return self.append(target, name, planned)

@@ -588,6 +588,17 @@ class WorkbenchTest(unittest.TestCase):
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
 
+    def test_a_run_can_cap_the_output_tokens_of_each_model_request(self):
+        for bad in (100, 131073, '32000', True):
+            with self.assertRaisesRegex(ValueError, 'max_tokens'):
+                self.manager.launch({**self.request(), 'max_tokens': bad})
+        run = self.client.request('api/runs', {**self.request(), 'max_tokens': 32000})
+        final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual(final['max_tokens'], 32000)
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('max_tokens=32000', argv)
+
     def test_provider_mode_reads_the_config_of_the_workbench_state_root(self):
         native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']
         state_root = self.root / 'state'

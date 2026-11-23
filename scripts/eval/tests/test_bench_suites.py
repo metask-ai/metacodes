@@ -794,6 +794,11 @@ class SuiteLaunchTest(unittest.TestCase):
                 "executor": {"name": "relay-4090", "kind": "ssh", "host": "h", "user": "u"}}
         remote = executors.RemoteRun(spec).remote_spec()
         self.assertEqual(remote["workbuddy_judge"], "kimi-k3.1-pro")
+        self.assertIsNone(remote["max_tokens"])
+        capped = executors.RemoteRun({**spec, "max_tokens": 32000}).remote_spec()
+        self.assertEqual(capped["max_tokens"], 32000)
+        self.assertEqual(wb.model_document("m", capped)["model"]["params"]["max_output_tokens"], 32000)
+        self.assertEqual(wb.model_document("m", remote)["model"]["params"]["max_output_tokens"], 32768)
         repo = workbuddy_checkout(self.root, subset="web")
         unjudged = {**spec, "workbuddy_judge": None, "jobs_dir": str(self.root / "jobs"),
                     "workbuddy": {"checkout": str(repo), "subset": "web", "uv": "uv", "bash": "bash"}}

@@ -143,7 +143,7 @@ def model_document(name: str, spec, protocol: str = "anthropic", url_env: str = 
     return {"model": {"name": name, "protocols": [protocol],
                       "backend_url_env": url_env, "backend_key_env": KEY_ENV,
                       "context_window": 200000, "max_concurrent": spec["concurrency"],
-                      "params": {"max_output_tokens": 32768}}}
+                      "params": {"max_output_tokens": spec.get("max_tokens") or 32768}}}
 
 
 def job_documents(spec) -> Tuple[dict, dict]:

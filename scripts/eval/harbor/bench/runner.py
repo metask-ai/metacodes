@@ -27,6 +27,7 @@ from scripts.eval.harbor.bench.providers import KEY_ENV as PROVIDER_KEY_ENV, Pro
 
 # The launch API's original fixed dataset, still accepted as `dataset`.
 DATASET = suites.BY_ID[suites.DEFAULT_SUITE].dataset
+MAX_OUTPUT_TOKENS = 131072
 SAMPLE_TASKS = list(suites.BY_ID[suites.DEFAULT_SUITE].default_tasks)
 TASK = suites.TASK
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -434,9 +435,9 @@ class RunManager:
         elsewhere — another source, or an imported provider at another
         revision — is refused, so one queued run never records an upstream
         other than the one it was checked against."""
-        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor", "features"}
+        allowed = {"model", "tasks", "attempts", "concurrency", "dataset", "suite", "executor", "features", "max_tokens"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor、features")
+            raise ValueError("只接受 model、suite、tasks、attempts、concurrency、dataset、executor、features、max_tokens")
         # `dataset` is the original API's only choice, kept for older clients.
         if "dataset" in request and request["dataset"] != DATASET:
             raise ValueError("dataset 只接受 " + DATASET + "；其他评测集请用 suite")
@@ -503,13 +504,16 @@ class RunManager:
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
+        max_tokens = request.get("max_tokens")
+        if max_tokens is not None and (type(max_tokens) is not int or not 1024 <= max_tokens <= MAX_OUTPUT_TOKENS):
+            raise ValueError(f"max_tokens 必须是 1024–{MAX_OUTPUT_TOKENS} 的整数")
         if dry_run:
             if suite.runner != suites.WORKBUDDY:
                 problem = self.run_bundle(settings(self.config_path), frozen, bundle)[1]
                 if problem:
                     raise ValueError(problem)
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
-                    "executor": state["name"], "features": features}
+                    "executor": state["name"], "features": features, "max_tokens": max_tokens}
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
@@ -538,6 +542,8 @@ class RunManager:
                       **suites.label(suite.id), "runner": suite.runner, "executor": executor.name,
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
+            if max_tokens is not None:
+                record["max_tokens"] = max_tokens
             shown_judge = suites.judge_label(suite, cfg)
             if shown_judge:
                 record["judge"] = shown_judge  # model id and route only

@@ -233,6 +233,12 @@ const Fixture = struct {
     }
 };
 
+fn expectRestartNudged(first: []const u8, reissue: []const u8) !void {
+    const nudge = agent_loop.RESTART_AFTER_STREAM_CUT;
+    try std.testing.expectEqual(std.mem.count(u8, first, nudge) + 1, std.mem.count(u8, reissue, nudge));
+    try std.testing.expect(reissue.len > first.len);
+}
+
 fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     return harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, buf)]);
 }
@@ -262,9 +268,9 @@ test "issue #461: after a file-writing tool, a response cut after partial text i
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, fx.result.stop_reason);
     // Three model requests: the tool call, the cut answer, its re-issue.
     try std.testing.expectEqual(@as(usize, 3), fx.requests());
-    // The re-issue repeats the second request byte for byte: the tool's result
-    // from the earlier turn is kept, nothing of the cut answer is added.
-    try std.testing.expectEqualStrings(try fx.body(1), try fx.body(2));
+    // The re-issue repeats the second request plus the restart request: the
+    // tool's result from the earlier turn is kept, nothing of the cut answer is added.
+    try expectRestartNudged(try fx.body(1), try fx.body(2));
     try std.testing.expect(std.mem.indexOf(u8, try fx.body(2), "\"tool_use_id\":\"toolu_write\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, try fx.body(2), "PARTIAL_SENTINEL") == null);
     // The tool ran exactly once.
@@ -291,7 +297,7 @@ test "issue #461: a response cut after thinking only is re-issued and its thinki
 
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, fx.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), fx.requests());
-    try std.testing.expectEqualStrings(try fx.body(0), try fx.body(1));
+    try expectRestartNudged(try fx.body(0), try fx.body(1));
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
@@ -337,8 +343,8 @@ test "issue #461: two distinct model requests in one Run each get their own re-i
 
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, fx.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 4), fx.requests());
-    try std.testing.expectEqualStrings(try fx.body(0), try fx.body(1));
-    try std.testing.expectEqualStrings(try fx.body(2), try fx.body(3));
+    try expectRestartNudged(try fx.body(0), try fx.body(1));
+    try expectRestartNudged(try fx.body(2), try fx.body(3));
     try std.testing.expect(!std.mem.eql(u8, try fx.body(1), try fx.body(2)));
     try std.testing.expect(std.mem.indexOf(u8, try fx.body(3), "marker-461.md") != null);
     // The first turn's re-issue did not use up the second's: each is the
@@ -357,7 +363,7 @@ test "issue #461: when both attempts of one request are cut, the Run ends api_er
 
     try std.testing.expectEqual(agent_loop.StopReason.api_error, fx.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), fx.requests());
-    try std.testing.expectEqualStrings(try fx.body(0), try fx.body(1));
+    try expectRestartNudged(try fx.body(0), try fx.body(1));
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "text 16\n" ++

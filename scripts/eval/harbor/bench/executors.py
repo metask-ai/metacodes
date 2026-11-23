@@ -1199,7 +1199,8 @@ class RemoteRun:
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
                     "executables": workbuddy.bundle_executables(bundle) if bundle else None,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
-                                                     "reasoning_effort", "account_gateway", "workbuddy_judge")}}
+                                                     "reasoning_effort", "account_gateway", "workbuddy_judge",
+                                                     "max_tokens")}}
         run_dir = self.executor.remote("runs", self.spec["name"])
         remote = {**self.spec, "harbor": self.spec.get("remote_harbor") or self.executor.harbor or ".local/bin/harbor",
                   "bundle": self.bundle, "jobs_dir": self.executor.remote("jobs")}

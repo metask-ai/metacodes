@@ -157,9 +157,20 @@ const Outcome = struct {
         a.free(self.answer);
     }
 
-    fn expectIdenticalRequests(self: *const Outcome) !void {
-        try std.testing.expect(self.bodies.items.len >= 2);
-        for (self.bodies.items[1..]) |body| try std.testing.expectEqualStrings(self.bodies.items[0], body);
+    fn expectReissuedRequests(self: *const Outcome) !void {
+        const nudge = agent_loop.RESTART_AFTER_STREAM_CUT;
+        const bodies = self.bodies.items;
+        try std.testing.expect(bodies.len >= 2);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bodies[0], nudge));
+        for (bodies[1..], bodies[0 .. bodies.len - 1]) |body, previous| {
+            const nudges = std.mem.count(u8, body, nudge);
+            try std.testing.expect(nudges <= 1);
+            if (nudges == std.mem.count(u8, previous, nudge)) {
+                try std.testing.expectEqualStrings(previous, body);
+            } else {
+                try std.testing.expect(body.len > previous.len);
+            }
+        }
     }
 };
 
@@ -259,7 +270,7 @@ test "issue #452: thinking then a clean end of body is re-issued, and the host i
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), out.requests);
     // The same request went out again, byte for byte.
-    try out.expectIdenticalRequests();
+    try out.expectReissuedRequests();
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
@@ -285,7 +296,7 @@ test "issue #452: thinking and text from a dropped attempt are both withdrawn" {
     defer out.deinit(a);
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), out.requests);
-    try out.expectIdenticalRequests();
+    try out.expectReissuedRequests();
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
@@ -307,7 +318,7 @@ test "issue #452: with no retractable budget the reproduction is re-issued once,
     defer out.deinit(a);
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
     try std.testing.expectEqual(@as(usize, 2), out.requests);
-    try out.expectIdenticalRequests();
+    try out.expectReissuedRequests();
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
@@ -331,7 +342,7 @@ test "issue #452: visible text cut before its stop report is re-issued on every 
             defer out.deinit(a);
             try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
             try std.testing.expectEqual(@as(usize, 2), out.requests);
-            try out.expectIdenticalRequests();
+            try out.expectReissuedRequests();
             try std.testing.expectEqualStrings(
                 "begin 0\n" ++
                     "text 14\n" ++
@@ -351,7 +362,7 @@ test "issue #452: visible text cut before its stop report is re-issued on every 
             defer out.deinit(a);
             try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
             try std.testing.expectEqual(@as(usize, 2), out.requests);
-            try out.expectIdenticalRequests();
+            try out.expectReissuedRequests();
             try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 1/2 after 0\n"));
             try std.testing.expectEqualStrings("complete answer", out.answer);
         }
@@ -403,7 +414,7 @@ test "issue #452: the budget bounds the re-issues; the last failure ends the Run
     try std.testing.expectEqual(agent_loop.StopReason.api_error, out.result.stop_reason);
     // The first attempt, the request's own re-issue, and the budget's two.
     try std.testing.expectEqual(@as(usize, 4), out.requests);
-    try out.expectIdenticalRequests();
+    try out.expectReissuedRequests();
     try std.testing.expectEqual(@as(usize, 3), out.events.count("thinking_discarded "));
     try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 1/4 after 0\n"));
     try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 2/4 after 0\n"));
@@ -430,7 +441,7 @@ test "issue #452: an attempt that showed nothing is still re-issued silently, an
         defer out.deinit(a);
         try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
         try std.testing.expectEqual(@as(usize, 3), out.requests);
-        try out.expectIdenticalRequests();
+        try out.expectReissuedRequests();
         try std.testing.expectEqual(@as(usize, 0), out.events.count("retry "));
         try std.testing.expectEqual(@as(usize, 0), out.events.count("thinking_discarded "));
         try std.testing.expectEqualStrings("complete answer", out.answer);
@@ -456,7 +467,7 @@ test "issue #452: a silent and a visible failure share the request's own re-issu
         defer out.deinit(a);
         try std.testing.expectEqual(agent_loop.StopReason.end_turn, out.result.stop_reason);
         try std.testing.expectEqual(@as(usize, 3), out.requests);
-        try out.expectIdenticalRequests();
+        try out.expectReissuedRequests();
         try std.testing.expectEqual(@as(usize, 1), out.events.count("retry "));
         try std.testing.expectEqual(@as(usize, 1), out.events.count("retry 2/3 after 0\n"));
         try std.testing.expectEqual(@as(usize, 1), out.events.count("thinking_discarded "));
