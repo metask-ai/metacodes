@@ -388,18 +388,38 @@ jobs:
           RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
+          # A request that gets no answer (a self-hosted runner's network
+          # blip) or a 5xx is tried 3 times; an HTTP 4xx answer fails at once.
+          gh_api() {
+            local delay out err
+            err=$(mktemp)
+            for delay in 10 30 ""; do
+              if out=$(gh api "$@" 2>"$err"); then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              cat "$err" >&2
+              if [ -z "$delay" ] || grep -q 'HTTP 4[0-9][0-9]' "$err"; then
+                rm -f "$err"
+                return 1
+              fi
+              echo "gh api $1 failed; retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+          }
           if [ -n "$MERGE_GROUP_HEAD_REF" ]; then
             if [[ ! "$MERGE_GROUP_HEAD_REF" =~ /pr-([0-9]+)-[0-9a-f]+$ ]]; then
               echo "not a merge queue ref: $MERGE_GROUP_HEAD_REF" >&2
               exit 1
             fi
             RELEASE_PR_NUMBER=${BASH_REMATCH[1]}
-            GITHUB_HEAD_REF=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .head.ref)
-            RELEASE_PR_TITLE=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .title)
+            GITHUB_HEAD_REF=$(gh_api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .head.ref)
+            RELEASE_PR_TITLE=$(gh_api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .title)
             export GITHUB_HEAD_REF RELEASE_PR_TITLE
           fi
           if [ -n "$RELEASE_PR_NUMBER" ]; then
-            RELEASE_PR_LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
+            RELEASE_PR_LABELS=$(gh_api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
             export RELEASE_PR_LABELS
           fi
           if [ "$FAST_PATH" = "true" ]; then
@@ -1105,18 +1125,38 @@ jobs:
           RELEASE_PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
+          # A request that gets no answer (a self-hosted runner's network
+          # blip) or a 5xx is tried 3 times; an HTTP 4xx answer fails at once.
+          gh_api() {
+            local delay out err
+            err=$(mktemp)
+            for delay in 10 30 ""; do
+              if out=$(gh api "$@" 2>"$err"); then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              cat "$err" >&2
+              if [ -z "$delay" ] || grep -q 'HTTP 4[0-9][0-9]' "$err"; then
+                rm -f "$err"
+                return 1
+              fi
+              echo "gh api $1 failed; retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+          }
           if [ -n "$MERGE_GROUP_HEAD_REF" ]; then
             if [[ ! "$MERGE_GROUP_HEAD_REF" =~ /pr-([0-9]+)-[0-9a-f]+$ ]]; then
               echo "not a merge queue ref: $MERGE_GROUP_HEAD_REF" >&2
               exit 1
             fi
             RELEASE_PR_NUMBER=${BASH_REMATCH[1]}
-            GITHUB_HEAD_REF=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .head.ref)
-            RELEASE_PR_TITLE=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .title)
+            GITHUB_HEAD_REF=$(gh_api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .head.ref)
+            RELEASE_PR_TITLE=$(gh_api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR_NUMBER" --jq .title)
             export GITHUB_HEAD_REF RELEASE_PR_TITLE
           fi
           if [ -n "$RELEASE_PR_NUMBER" ]; then
-            RELEASE_PR_LABELS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
+            RELEASE_PR_LABELS=$(gh_api "repos/$GITHUB_REPOSITORY/issues/$RELEASE_PR_NUMBER/labels" --jq '[.[].name] | join(",")')
             export RELEASE_PR_LABELS
           fi
           python scripts/check_version_state.py --rehearse
