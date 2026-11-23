@@ -520,7 +520,10 @@ fallback), in `src/mcp/oauth.zig`:
    judged as the callback would be (path, `state`, `code`, `error`), so one
    from another login is refused and the wait goes on. The CLI waits at most
    `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes by default, `0` for no
-   limit), then exits 1 having stored nothing (#740).
+   limit), then exits 1 having stored nothing (#740). A redirect that
+   carries the login's `state` and an `error`, as a denial on the
+   authorization page does, ends the login: the CLI prints what the
+   authorization server said and exits 1 having stored nothing (#749).
 4. **Token.** The code is exchanged with its verifier and the same
    `resource`. Before it is stored, the new token is tried with one
    authenticated request in the server's own transport (an `initialize`, or

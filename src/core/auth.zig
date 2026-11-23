@@ -567,6 +567,8 @@ pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLogi
     server.path = METASK_CALLBACK_PATH;
     if (opts.timeout_ms) |ms| server.deadline_ms = time.nowMs() +| @as(time.Millis, @intCast(@min(ms, std.math.maxInt(time.Millis))));
     server.paste = opts.paste;
+    var refusal: Refusal = .{};
+    server.refusal = &refusal;
 
     const redirect_uri = try std.fmt.allocPrint(allocator, "http://localhost:{d}{s}", .{ server.port, METASK_CALLBACK_PATH });
     defer allocator.free(redirect_uri);
@@ -583,7 +585,10 @@ pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLogi
         say(opts.notify, std.fmt.bufPrint(&line_buf, "Could not open browser automatically: {s}\n", .{@errorName(err)}) catch "Could not open the browser automatically.\n");
     };
 
-    const code = try server.waitForAuthorizationCode(allocator, state, opts.abort_signal);
+    const code = server.waitForAuthorizationCode(allocator, state, opts.abort_signal) catch |err| {
+        if (err == error.OAuthAccessDenied) say(opts.notify, refusal.line(&line_buf));
+        return err;
+    };
     defer secureFree(allocator, code);
     if (opts.abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
     return exchangeAuthorizationCode(allocator, code, redirect_uri, pkce.code_verifier);
@@ -711,6 +716,14 @@ pub const Refusal = struct {
         return self.description_buf[0..self.description_len];
     }
 
+    pub fn line(self: *const Refusal, buffer: []u8) []const u8 {
+        const text = if (self.description_len > 0)
+            std.fmt.bufPrint(buffer, "The sign-in was refused: {s} ({s}).\n", .{ self.code(), self.description() })
+        else
+            std.fmt.bufPrint(buffer, "The sign-in was refused: {s}.\n", .{self.code()});
+        return text catch "The sign-in was refused.\n";
+    }
+
     fn fill(self: *Refusal, allocator: std.mem.Allocator, query: []const u8) void {
         self.code_len = copyParam(allocator, query, "error", &self.code_buf);
         self.description_len = copyParam(allocator, query, "error_description", &self.description_buf);
@@ -746,8 +759,8 @@ pub const CallbackServer = struct {
     denied_body: ?[]const u8 = null,
     /// When set, a callback that carries the expected state and an `error`
     /// ends the wait with `error.OAuthAccessDenied`, what the server said
-    /// copied here. Null keeps waiting after answering it, as the Metask
-    /// sign-in always has. `denied_body`, when set, answers first.
+    /// copied here. Null keeps waiting after answering it. `denied_body`,
+    /// when set, answers first.
     refusal: ?*Refusal = null,
     deadline_ms: ?time.Millis = null,
     paste: ?PasteSource = null,

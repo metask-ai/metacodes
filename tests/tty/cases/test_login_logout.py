@@ -18,6 +18,7 @@ Everything runs against loopback stand-ins (`metask_mock.py`, a relay mock for
 the `.env` provider): no account, no real request.
 """
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -881,5 +882,68 @@ def test_cli_login_stops_waiting_for_the_browser_after_the_bound_and_stores_noth
         assert "Over SSH?" not in text, text
         assert 1.5 < elapsed < 15, f"took {elapsed:.1f}s"
         assert not os.path.exists(os.path.join(state, "auth.json"))
+        assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests
+
+
+def _refuse(authorize_url):
+    import urllib.parse
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(authorize_url).query)
+    callback = urllib.parse.urlsplit(query["redirect_uri"][0])
+    state = urllib.parse.quote(query["state"][0], safe="")
+    conn = http.client.HTTPConnection("127.0.0.1", callback.port, timeout=5)
+    try:
+        conn.request("GET", f"{callback.path}?error=access_denied&error_description=The%20user%20said%20no&state={state}")
+        conn.getresponse().read()
+    finally:
+        conn.close()
+    return ""
+
+
+def test_cli_login_ends_when_the_authorization_page_refuses_and_stores_nothing(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, {"METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "8000"})
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [
+            (_PASTE_LINE, lambda _: _refuse(_recorded(log))),
+        ])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert "The sign-in was refused: access_denied (The user said no)." in text, text
+        assert "No answer from the browser" not in text, text
+        assert elapsed < 6, f"took {elapsed:.1f}s"
+        assert not os.path.exists(os.path.join(state, "auth.json"))
+        assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests
+
+
+def test_login_ends_when_the_authorization_page_refuses_and_stores_nothing(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        work = case_tmpdir("cc-tty-login-work-")
+
+        def events():
+            yield READY
+            yield "type:/login"
+            yield "key:enter"
+            yield wait_for(_PASTE_LINE, 15)
+            _refuse(_recorded(log))
+            yield wait_for("Sign-in failed", 10)
+
+        raw = run(bin_path, events(), env=env, base_url=None, cwd=work, term_size=(30, 200), per_key_drain=0.05)
+        a = TTYAssert(raw, rows=30, cols=200)
+        if not a.screens_with("Sign-in failed: OAuthAccessDenied"):
+            a._fail("a refusal on the authorization page should end the sign-in in the pane")
+        if not a.screens_with("Nothing was stored."):
+            a._fail("the pane should say that nothing was stored")
         assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
         assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests

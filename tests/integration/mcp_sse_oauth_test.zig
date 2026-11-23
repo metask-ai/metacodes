@@ -286,6 +286,45 @@ const PastingBrowser = struct {
     }
 };
 
+const RefusingBrowser = struct {
+    thread: ?std.Thread = null,
+    url: ?[]u8 = null,
+
+    fn open(ctx: *anyopaque, url: []const u8) void {
+        const self: *RefusingBrowser = @ptrCast(@alignCast(ctx));
+        self.url = std.testing.allocator.dupe(u8, url) catch return;
+        self.thread = std.Thread.spawn(.{}, refuse, .{self.url.?}) catch null;
+    }
+
+    fn refuse(url: []const u8) void {
+        var client: std.http.Client = .{ .allocator = std.heap.c_allocator, .io = std.testing.io };
+        defer client.deinit();
+        var location_buffer: [2048]u8 = undefined;
+        const location = finalAddress(&client, url, &location_buffer) orelse return;
+        const query_at = std.mem.indexOfScalar(u8, location, '?') orelse return;
+        const state_at = std.mem.indexOf(u8, location, "state=") orelse return;
+        var refused_buffer: [2200]u8 = undefined;
+        const refused = std.fmt.bufPrint(&refused_buffer, "{s}error=access_denied&error_description=The%20user%20said%20no&{s}", .{ location[0 .. query_at + 1], location[state_at..] }) catch return;
+        var callback_buffer: [2200]u8 = undefined;
+        const size = std.mem.replacementSize(u8, refused, "//localhost:", "//127.0.0.1:");
+        _ = std.mem.replace(u8, refused, "//localhost:", "//127.0.0.1:", callback_buffer[0..size]);
+        var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer body.deinit();
+        _ = client.fetch(.{ .location = .{ .url = callback_buffer[0..size] }, .response_writer = &body.writer }) catch {};
+    }
+
+    fn finish(self: *RefusingBrowser) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        if (self.url) |url| std.testing.allocator.free(url);
+        self.url = null;
+    }
+
+    fn opener(self: *RefusingBrowser) cc.mcp_oauth.OpenUrl {
+        return .{ .ctx = self, .open = open };
+    }
+};
+
 const EnvGuard = struct {
     name: [*:0]const u8,
     previous: ?[:0]u8,
@@ -783,4 +822,51 @@ test "MCP OAuth: over SSH the instructions name the ssh -L forward for the port 
         std.debug.print("instructions:\n{s}\n", .{text});
         return error.NoForwardLine;
     }
+}
+
+test "MCP OAuth: a refusal on the authorization page ends the login, says why and stores nothing (#749)" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = try tmpRoot(&tmp, &root_buffer);
+    var url_buffer: [128]u8 = undefined;
+    const url = try mock.url(&url_buffer, "oauth-mcp");
+
+    var transcript: Transcript = .{};
+    defer transcript.deinit();
+    var browser: RefusingBrowser = .{};
+    const outcome = cc.mcp_oauth.login(a, std.testing.io, state_root, .{
+        .name = "refused",
+        .target = .{ .url = url, .wire = .streamable },
+    }, .{
+        .open_browser = false,
+        .open_url = browser.opener(),
+        .notify = transcript.notify(),
+        .timeout_ms = 10_000,
+    });
+    browser.finish();
+    if (outcome) |stored| {
+        var result = stored;
+        result.deinit(a);
+        return error.LoginSucceededDespiteTheRefusal;
+    } else |err| {
+        if (err != error.OAuthAccessDenied) std.debug.print("instructions:\n{s}\n", .{transcript.text.items});
+        try std.testing.expectEqual(@as(anyerror, error.OAuthAccessDenied), err);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, transcript.text.items, "The sign-in was refused: access_denied (The user said no).\n") != null);
+    try std.testing.expectEqualStrings("authorization was denied in the browser", cc.mcp_oauth.describe(error.OAuthAccessDenied));
+
+    const path = try cc.mcp_oauth.storePath(a, state_root, "refused", url);
+    defer a.free(path);
+    if (try cc.mcp_oauth.loadRecord(a, path, url)) |found| {
+        var record = found;
+        record.deinit(a);
+        return error.LoginStoredDespiteTheRefusal;
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try mock.seen(arena.allocator(), "/as/token")).len);
 }

@@ -1068,6 +1068,8 @@ pub fn login(
     var callback = try bindCallback(server.settings);
     defer callback.close();
     callback.paste = options.paste;
+    var denial: auth.Refusal = .{};
+    callback.refusal = &denial;
     const redirect_uri = try std.fmt.allocPrint(arena, "http://localhost:{d}{s}", .{ callback.port, CALLBACK_PATH });
 
     const client: Client = if (server.settings.client_id) |id|
@@ -1114,7 +1116,13 @@ pub fn login(
     }
 
     if (options.timeout_ms) |ms| callback.deadline_ms = util_time.nowMs() +| @as(util_time.Millis, @intCast(@min(ms, std.math.maxInt(util_time.Millis))));
-    const code = try callback.waitForAuthorizationCode(gpa, state, options.abort);
+    const code = callback.waitForAuthorizationCode(gpa, state, options.abort) catch |err| {
+        if (err == error.OAuthAccessDenied) if (options.notify) |notify| {
+            var line_buf: [400]u8 = undefined;
+            notify.say(denial.line(&line_buf));
+        };
+        return err;
+    };
     defer auth.secureFree(gpa, code);
 
     var form: std.Io.Writer.Allocating = .init(arena);
@@ -1188,7 +1196,7 @@ pub fn describe(err: anyerror) []const u8 {
         Error.McpOAuthPersistFailed => "the token could not be stored",
         Error.McpOAuthCallbackPortBusy => "the loopback callback port is unavailable (oauth.callbackPort in use?)",
         error.StateMismatch => "the redirect's state did not match; try again",
-        error.OAuthDenied => "authorization was denied in the browser",
+        error.OAuthDenied, error.OAuthAccessDenied => "authorization was denied in the browser",
         error.Aborted => "login canceled",
         else => @errorName(err),
     };

@@ -224,7 +224,10 @@ fn acquireByLoopback(
 
     const code = server.waitForAuthorizationCode(allocator, state, options.abort_signal) catch |err| switch (err) {
         error.OAuthAccessDenied => {
-            if (options.notify) |notify| sayRefusal(allocator, notify, &refusal);
+            if (options.notify) |notify| {
+                var line_buf: [400]u8 = undefined;
+                notify.say(refusal.line(&line_buf));
+            }
             return Error.OAuthAccessDenied;
         },
         else => return err,
@@ -257,17 +260,6 @@ fn sayPortsInUse(allocator: std.mem.Allocator, notify: Notify, ports: []const u1
     ) catch return;
     defer allocator.free(text);
     notify.say(text);
-}
-
-/// What the authorization server said when it refused.
-fn sayRefusal(allocator: std.mem.Allocator, notify: Notify, refusal: *const auth.Refusal) void {
-    const text = if (refusal.description().len > 0)
-        std.fmt.allocPrint(allocator, "The sign-in was refused: {s} ({s}).\n", .{ refusal.code(), refusal.description() })
-    else
-        std.fmt.allocPrint(allocator, "The sign-in was refused: {s}.\n", .{refusal.code()});
-    const line = text catch return;
-    defer allocator.free(line);
-    notify.say(line);
 }
 
 /// What the device authorization endpoint told us. Slices borrow the response

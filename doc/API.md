@@ -121,16 +121,20 @@ flow opens no browser on this machine; the browser way, picked in `/login`,
 opens it as it does without SSH. `--no-browser` keeps the browser sign-in
 (#722). A loopback sign-in (Metask's, `login --provider <id>`'s OAuth, and
 `metacodes mcp login`'s, #740) also takes the address the browser ended on,
-pasted at the prompt or into the `/login` pane: its path and query are judged as the callback would be (path,
-`state`, `code`, `error`), so an address from another sign-in is refused and
-the wait goes on. The browser sign-in of `metacodes login` waits for the
+pasted at the prompt or into the `/login` pane: its path and query are
+judged as the callback would be (path, `state`, `code`, `error`), so an
+address from another sign-in is refused and the wait goes on. The browser sign-in of `metacodes login` waits for the
 callback at most `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (default 600000;
 `0` waits without a limit), then exits 1 having stored nothing and names
 this flow; `metacodes mcp login` waits as long, then exits 1 having stored
 nothing. In an SSH session every loopback sign-in (Metask's, `login
 --provider <id>`'s OAuth, `metacodes mcp login`'s, OpenRouter's browser way)
 prints the forward its callback needs, with the port it bound:
-`ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`.
+`ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`. A callback that
+carries the sign-in's `state` and an `error`, as a denial on the
+authorization page does, ends Metask's browser sign-in and `metacodes mcp
+login` as it ends `login --provider <id>`'s OAuth: each says what the
+server said and stores nothing (#749).
 
 Every Metask sign-in that replaces a stored session (this one, `metacodes
 login`, `/login`, `/login metask`) revokes the replaced one at

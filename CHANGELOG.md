@@ -229,6 +229,14 @@ status, compatibility boundaries, and entry points are defined by
     is refused and the wait goes on;
   - it stops waiting after `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes
     by default, `0` for no limit), exits 1 and stores nothing.
+- **Refusing on the authorization page now ends `metacodes mcp login` and
+  Metask's browser sign-in** (#749). Their loopback callback answered a
+  redirect that carried an `error` with an error page and kept waiting:
+  `mcp login` until Ctrl+C, `metacodes login` up to its bound and `/login`
+  until Esc, without saying why. As another provider's OAuth already did, a
+  redirect with the sign-in's `state` and an `error` now ends the wait: the
+  terminal says what the authorization server said (`The sign-in was
+  refused: <error> (<description>).`), and nothing is stored.
 - **A busy tunnel port on an SSH executor no longer fails `egress =
   "workbench"`** (#716). Setup's 容器出网 step and each run picked the
   executor-side port of their `ssh -R` tunnel at random from 20000–59999,

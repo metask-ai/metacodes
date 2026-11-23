@@ -82,6 +82,21 @@ def _stored(state):
     return sorted(os.listdir(directory)) if os.path.isdir(directory) else []
 
 
+def _refuse(out):
+    found = re.search(rb"http://127\.0\.0\.1:\d+/as/authorize\?[^\s]+", out)
+    assert found, out.decode("utf-8", "replace")
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(found.group(0).decode()).query)
+    callback = urllib.parse.urlsplit(query["redirect_uri"][0])
+    state = urllib.parse.quote(query["state"][0], safe="")
+    conn = http.client.HTTPConnection("127.0.0.1", callback.port, timeout=5)
+    try:
+        conn.request("GET", f"{callback.path}?error=access_denied&error_description=The%20user%20said%20no&state={state}")
+        conn.getresponse().read()
+    finally:
+        conn.close()
+    return ""
+
+
 def test_cli_mcp_login_over_ssh_names_the_forward_and_finishes_with_the_pasted_address(bin_path):
     if IS_WINDOWS:
         raise SkipTest(_NO_PTY)
@@ -128,5 +143,25 @@ def test_cli_mcp_login_stops_waiting_after_the_bound_and_stores_nothing(bin_path
         assert _PASTE_LINE in text, text
         assert "Over SSH?" not in text, text
         assert 1.5 < elapsed < 15, f"took {elapsed:.1f}s"
+        assert _stored(state) == [], _stored(state)
+        assert mock.seen("/as/token") == [], mock.seen("/as/token")
+
+
+def test_cli_mcp_login_ends_when_the_authorization_page_refuses_and_stores_nothing(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_PTY)
+    with _AuthMock() as mock:
+        state, env = _case(mock, {"METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "8000"})
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["mcp", "login", "authd", "--no-browser"], env, [
+            (_PASTE_LINE, _refuse),
+        ])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert "The sign-in was refused: access_denied (The user said no)." in text, text
+        assert "error: login to 'authd' failed: authorization was denied in the browser" in text, text
+        assert "no answer from the browser" not in text, text
+        assert elapsed < 6, f"took {elapsed:.1f}s"
         assert _stored(state) == [], _stored(state)
         assert mock.seen("/as/token") == [], mock.seen("/as/token")
