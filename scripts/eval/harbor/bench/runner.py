@@ -383,6 +383,7 @@ class RunManager:
                 "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
                 "features": [{"id": name, "group": entry["group"], "label": entry["label"]}
                              for name, entry in ADVANCED_FEATURES.items()],
+                "default_features": DEFAULT_FEATURES,
                 "bundles": [{k: v for k, v in b.items() if k != "source"} for b in choices]}
 
     def add_provider(self, request):
@@ -636,6 +637,9 @@ class RunManager:
         if record["status"] in ACTIVE:
             (self.records / (name + ".cancel")).touch()
         return {"name": name, "status": record["status"], "cancel_requested": True}
+
+
+DEFAULT_FEATURES = [name for name, entry in ADVANCED_FEATURES.items() if entry["group"] == "formal"]
 
 
 def chosen_features(value):

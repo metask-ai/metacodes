@@ -191,20 +191,27 @@ const profileName = (b) => b.name || b.id;
 const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
 const featuresText = (b) => (b.features || []).join(', ') || '未开启';
 
-// Fills the run form for another run on profile `b`: its suites with the
-// tasks of every task row (on the profile page) or of every queued dataset,
-// or only the tasks whose latest attempts did not all pass.
+// Fills the run form for another run on profile `b` with one model (the
+// page's model filter, else the last run's): that model's suites and tasks
+// from the task rows (on the profile page) or the queued datasets, or only
+// the tasks whose latest attempts did not all pass.
+const unpassed = (t) => !t.attempts.length || t.passed < t.attempts.length;
+function runModel(b) {
+  return b.tasks && state.profileModel && state.profileModel !== 'all' ? state.profileModel : b.items[b.items.length - 1]?.model;
+}
 function runAgain(b, onlyUnpassed) {
   const last = b.items[b.items.length - 1] || {};
+  const model = runModel(b);
+  const lastOfModel = [...b.items].reverse().find((i) => i.model === model) || last;
   state.runDraft = { profile: b.id, from: profileName(b), label: b.metacodes?.label, features: b.features || [],
-    model: last.model, attempts: last.attempts, concurrency: last.concurrency };
-  state.executor = last.executor;
+    model, attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
+  state.executor = lastOfModel.executor;
   const wanted = new Map();
   const add = (suite, task) => { if (!wanted.has(suite)) wanted.set(suite, []); if (!wanted.get(suite).includes(task)) wanted.get(suite).push(task); };
   if (b.tasks) {
-    for (const t of b.tasks) if (!onlyUnpassed || !t.attempts.length || t.passed < t.attempts.length) add(t.suite, t.task);
+    for (const t of b.tasks.filter((x) => x.model === model)) if (!onlyUnpassed || unpassed(t)) add(t.suite, t.task);
   } else {
-    for (const item of b.items) for (const task of item.tasks || []) add(item.suite, task);
+    for (const item of b.items.filter((i) => i.model === model)) for (const task of item.tasks || []) add(item.suite, task);
   }
   state.suitePick = new Map([...wanted.keys()].map((id) => [id, null]));
   state.taskWanted = wanted;
@@ -228,7 +235,7 @@ function profileActions(b, compact) {
   const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
   return [
     h('button', { type: 'button', class: 'button', title: '在这个评测配置上再运行，题目和参数按上次填好', onclick: keep(() => runAgain(b, false)) }, compact ? '运行' : '再次运行'),
-    b.tasks && b.tasks.some((t) => t.attempts.length && t.passed < t.attempts.length)
+    b.tasks && b.tasks.some((t) => t.model === runModel(b) && t.attempts.length && unpassed(t))
       ? h('button', { type: 'button', class: 'button', title: '只选最新结果没有全部通过的题', onclick: keep(() => runAgain(b, true)) }, '重跑未通过的题') : null,
     profileActive(b)
       ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, compact ? '停止' : '停止队列')
@@ -383,7 +390,8 @@ async function renderProfile(id) {
   const itemRows = [...b.items].reverse().map((item) => {
     const j = item.job; const js = j?.summary;
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
-      h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`].filter(Boolean).join(' · ') })),
+      h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
+        (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
       h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * (item.attempts || 1)}` }),
@@ -569,7 +577,7 @@ async function renderNewRun() {
     oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,
-      checked: draft.features ? draft.features.includes(f.id) : f.group === 'formal',
+      checked: (draft.features || c.default_features || []).includes(f.id),
       onchange: () => { draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id); } }), label: f.label }));
   const featureGroup = (group, title) => {
     const boxes = featureBoxes.filter((f) => f.group === group);

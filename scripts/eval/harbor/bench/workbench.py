@@ -53,17 +53,21 @@ def task_group(task, rows, item, job):
 def latest_results(record, views):
     """Per (suite, model, task), the rows of the last run that has them: a
     rerun replaces the earlier result, which stays in `history` (job names,
-    oldest first)."""
+    oldest first). A run that stopped (cancelled, interrupted, failed) with
+    only invalid attempts of a task leaves that task's earlier result."""
     latest, history = {}, {}
     for item in record.get("items") or []:
         view = views.get(item.get("run")) if item.get("run") else None
         if view is None:
             continue
+        stopped = item["status"] in ("cancelled", "interrupted", "failed")
         by_task = {}
         for row in view.get("rows") or []:
             by_task.setdefault(row["task"], []).append(row)
         for task, rows in by_task.items():
             key = (item["suite"], item.get("model"), task)
+            if key in latest and stopped and all(row["status"] == "invalid" for row in rows):
+                continue
             if key in latest:
                 history.setdefault(key, []).append(latest[key][1])
             latest[key] = (item, view["name"], rows)

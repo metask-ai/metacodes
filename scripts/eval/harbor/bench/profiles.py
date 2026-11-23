@@ -34,7 +34,7 @@ from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
-from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, chosen_features, now, settings
+from scripts.eval.harbor.bench.runner import ACTIVE, DEFAULT_FEATURES, atomic_json, chosen_features, now, settings
 
 MAX_ITEMS = 16
 NAME_LIMIT = 80
@@ -186,6 +186,12 @@ def checked_name(value: Any) -> Optional[str]:
     return name.strip() or None
 
 
+def run_features(features: List[str], suite_id: str) -> List[str]:
+    """The profile's features a dataset runs with: none for a WorkBuddy
+    suite, whose overlay launches metacodes itself."""
+    return [] if suites.get(suite_id).runner == suites.WORKBUDDY else list(features)
+
+
 def profile_id(digest: str, features: List[str]) -> str:
     key = digest + "|" + ",".join(features)
     return "profile-" + hashlib.sha256(key.encode()).hexdigest()[:12]
@@ -275,7 +281,7 @@ class ProfileManager:
         if self.runs.setup_running():
             raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
         run_request = {k: v for k, v in request.items() if k not in ("features", "executor")}
-        target = self.target({"features": request.get("features")})
+        target = self.target({"features": request.get("features", DEFAULT_FEATURES)})
         suite_name = suites.resolved(suites.get(run_request.get("suite", suites.DEFAULT_SUITE))).name
         planned = self.planned(target, run_request, request.get("executor"), suite_name)
         with self.lock:
@@ -320,7 +326,8 @@ class ProfileManager:
         queue with the model route it resolved to."""
         if executor is not None:
             run_request["executor"] = executor
-        run_request["features"] = target["features"]
+        features = run_features(target["features"], run_request.get("suite", suites.DEFAULT_SUITE))
+        run_request["features"] = features
         try:
             if target["id"]:
                 checked = self.runs.launch(run_request, dry_run=True, frozen=target["metacodes"])
@@ -333,7 +340,7 @@ class ProfileManager:
         run_request.pop("features")
         return {"suite": checked["suite"], **suites.label(checked["suite"]), "tasks": checked["tasks"],
                 "model": run_request["model"], "attempts": checked["attempts"],
-                "concurrency": checked["concurrency"], "executor": checked["executor"],
+                "concurrency": checked["concurrency"], "executor": checked["executor"], "features": features,
                 "request": run_request, "route": checked["route"], "status": "pending", "run": None,
                 "error": None, "queued_at": None, "started_at": None, "finished_at": None}
 
@@ -446,8 +453,9 @@ class ProfileManager:
             if frozen_digest(Path(record["metacodes"]["bundle"])) != record["metacodes"]["digest"]:
                 raise ValueError("冻结的 metacodes 发行包已被修改，这个评测配置不再运行")
             request = dict(pending["request"])
-            if record.get("features"):
-                request["features"] = record["features"]
+            features = run_features(record.get("features") or [], request.get("suite", suites.DEFAULT_SUITE))
+            if features:
+                request["features"] = features
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
                                         pinned=pending.get("route"))
             pending.update(status="running", run=launched["name"], started_at=now())

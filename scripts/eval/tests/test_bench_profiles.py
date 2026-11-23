@@ -25,6 +25,7 @@ from scripts.eval.harbor.bench import data, executors, profiles
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
+from scripts.eval.harbor.bench import workbench as workbench_module
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.tests.posix_only import POSIX
 from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_profiles_and_workers, wait_run
@@ -276,10 +277,29 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profile/rename', {'id': 'profile-elsewhere', 'name': 'x'})
         self.assertTrue(self.client.request('api/jobs?profile=all')['can_run'])
 
-    def test_features_are_refused_for_a_workbuddy_suite(self):
+    def test_features_are_refused_for_a_workbuddy_suite_and_left_out_by_a_profile(self):
         with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持选择高级功能'):
-            self.client.request('api/runs', {'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],
-                                             'attempts': 1, 'concurrency': 1, 'features': ['execute_code']})
+            self.manager.launch({'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],
+                                 'attempts': 1, 'concurrency': 1, 'features': ['execute_code']})
+        self.assertEqual(profiles.run_features(['execute_code'], 'workbuddy-code'), [])
+        self.assertEqual(profiles.run_features(['execute_code'], 'terminal-bench-2.1'), ['execute_code'])
+
+    def test_a_single_run_takes_the_page_default_features(self):
+        run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})
+        self.assertEqual(run['features'], self.client.request('api/workbench')['default_features'])
+        self.assertEqual(self.manager.profiles.get(run['profile'])['features'], run['features'])
+        wait_run(self.manager, run['name'])
+
+    def test_a_stopped_rerun_keeps_the_earlier_result_of_tasks_it_left_invalid(self):
+        def view(name, status):
+            return {'name': name, 'rows': [{'task': 'fix-git', 'status': status}]}
+        item = {'suite': 'terminal-bench-2.1', 'model': 'm'}
+        record = {'items': [{**item, 'status': 'finished', 'run': 'a'}, {**item, 'status': 'cancelled', 'run': 'b'}]}
+        latest, history = workbench_module.latest_results(record, {'a': view('a', 'pass'), 'b': view('b', 'invalid')})
+        self.assertEqual(latest[('terminal-bench-2.1', 'm', 'fix-git')][1], 'a')
+        self.assertEqual(history, {})
+        latest, _ = workbench_module.latest_results(record, {'a': view('a', 'pass'), 'b': view('b', 'fail')})
+        self.assertEqual(latest[('terminal-bench-2.1', 'm', 'fix-git')][1], 'b')
 
     def test_single_launch_waits_and_cancel_skips_remaining_datasets(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):

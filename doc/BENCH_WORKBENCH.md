@@ -968,7 +968,8 @@ digest, and a modified copy fails the dataset instead of running.
 
 The 高级功能 section of the 评测 page switches on metacodes features that are
 off in metacodes by default. The Lean-modelled run gates are ticked by
-default and the preview features are not. Each one adds a single metacodes
+default (`default_features` in `GET /api/workbench`, also what `bench run`
+uses) and the preview features are not. Each one adds a single metacodes
 flag to every trial of the profile: the run gates
 `verification_final_gate` (`--verification-final-gate`), `requirement_ledger`
 (`--requirement-ledger`), `test_integrity` (`--test-integrity`),
@@ -978,8 +979,10 @@ and the preview features `execute_code` (`--preview=execute_code`),
 `ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The
 profile and each of its runs record the chosen names (`features`), and the
 run passes them to the adapter as `--ak features=<names>`. An unknown name is
-refused, and so is any choice for a WorkBuddy suite, whose overlay launches
-metacodes itself. The frozen bundle has to know the flags: a release older
+refused. A WorkBuddy suite's overlay launches metacodes itself, so its
+datasets run without the profile's features: the queued dataset and its run
+record list none, and the profile page marks them; a direct launch that asks
+for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
 features: an older node is refused until
@@ -996,13 +999,16 @@ what that file says, so a restarted service resumes a queue where it stopped.
 With several profiles queued, the one whose oldest waiting dataset was queued
 first runs until its queue is empty. A single launch (`POST /api/runs`,
 `metacodes bench run`) runs at once on the profile of the configured bundle
-and its `features`, and is refused while a queue or another run owns the
-executor. Stopping a profile cancels its running dataset and skips the rest
+and its `features` (the run gates when none are given), and is refused while
+a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
 of its queue.
 
 A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
-replaced runs as the task's history. The profile page's 再次运行 opens the 评测
+replaced runs as the task's history. A run that stopped (cancelled,
+interrupted or failed) with only invalid attempts of a task leaves that
+task's earlier result in place. 再次运行 and 重跑未通过的题 use one model: the
+page's model filter, else the last run's. The profile page's 再次运行 opens the 评测
 page on that profile with its datasets, tasks and last parameters, and
 重跑未通过的题 keeps only the tasks whose latest attempts did not all pass.
 A profile can be renamed at any time (`POST /api/profile/rename` with `id`

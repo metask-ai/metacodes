@@ -123,8 +123,9 @@ status, compatibility boundaries, and entry points are defined by
   profile. Runs are queued on a profile as often as wanted
   (`POST /api/profiles/run`, 再次运行, 重跑未通过的题), and a rerun of a task
   replaces its earlier result in the profile's view. The 评测 page ticks the
-  Lean run gates by default and leaves the preview features off. `bench run`
-  runs on the profile of the configured bundle. Existing batches are merged
+  Lean run gates by default and leaves the preview features off; WorkBuddy
+  datasets of a profile run without its features. `bench run` runs on the
+  profile of the configured bundle with the same default features. Existing batches are merged
   into the profiles of their version and features when the service starts;
   the evaluation database moves to schema v4 (`profiles` replaces `batches`).
   `/api/batches` and `/api/batch/*` are gone.
