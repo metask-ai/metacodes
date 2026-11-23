@@ -76,7 +76,7 @@ function tps(value) { return value === null || value === undefined ? '未采集'
 function ttft(value) { return value === null || value === undefined ? '未采集' : (value / 1000).toFixed(2) + 's'; }
 function measurementCards(s) {
   return [
-    metric('一次性完成率', pct(s.one_shot_pass_rate), `${s.counts.pass} 通过 / ${s.valid || 0} 有效`, true),
+    metric('一次性完成率', pct(s.one_shot_pass_rate), `${s.counts.pass} 通过 / ${s.valid || 0} 有效 · 95% 区间 ${ciText(s.pass_rate_ci95)}`, true),
     metric('首轮满分率', pct(s.first_pass_rate), `${s.first_passed || 0} 首次满分 / ${s.first_valid || 0} 首次有效 · 无效 ${s.first_invalid || 0}`),
     metric('任务总 Token', compact(s.total_tokens), `输入含缓存 + 输出 · ${s.token_trials || 0}/${s.trials || 0} 次有数据${s.partial_token_trials ? ' · 含部分记录' : ''}`),
     metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), `首个请求完整输入 · ${s.initial_token_trials || 0} 次有数据`, false,
@@ -84,8 +84,16 @@ function measurementCards(s) {
     metric('TPS（生成）', tps(s.tps), `${s.profiled_requests || 0}/${s.requests || 0} 个请求有计时与输出用量 · 不含工具执行`),
     metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_samples_ms?.length || 0} 个请求`),
     metric('估算成本', usd(s.cost_usd), `metacodes 价目表估算 · ${s.cost_trials || 0}/${s.trials || 0} 次有价格数据`),
+    metric('至少通过一次', pct(s.solved_rate), `${s.tasks_solved || 0} / ${s.tasks_attempted || 0} 道题有有效结局`),
+    metric('每题平均成本', usd(s.cost_per_task), `先对每题有价格的有效 trial 取均值，再对 ${s.task_cost_tasks || 0} 道题取均值`),
+    metric('每次通过成本', usd(s.cost_per_pass), '每题平均成本 ÷ 通过率'),
+    metric('未通过的成本占比', pct(s.non_pass_cost_share), `有效 trial 的估算成本里花在未通过上的部分 · 失败 ${usd(s.cost_by_status?.fail)} · 超时 ${usd(s.cost_by_status?.timeout)}`),
+    metric('缓存命中率', pct(s.cache_hit_rate), '缓存 token ÷ 输入 token（含缓存）'),
+    metric('通过 trial 平均轮数', fixed(s.turns_per_pass), `工具调用 ${fixed(s.tool_calls_per_pass)} 次 · ${s.passed_turn_trials || 0} 个通过 trial 有数据`),
   ];
 }
+function fixed(x) { return x === null || x === undefined ? '—' : x.toFixed(1); }
+function ciText(ci) { return ci ? `${pct(ci[0])}–${pct(ci[1])}` : '—'; }
 function panel(title, sub, body, actions) {
   return h('section', { class: 'panel' },
     h('div', { class: 'panel-heading' }, h('h2', {}, title, sub ? h('small', { text: sub }) : null), actions || null),
@@ -1154,7 +1162,32 @@ async function renderCompare(names) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'matrix' },
     h('thead', {}, h('tr', {}, h('th', { text: '任务' }), jobs.map((j) => h('th', { class: 'center' }, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name }))))),
     h('tbody', {}, rows)));
-  return h('div', {}, metrics, panel('逐题对比', '首次执行成绩 · 重跑不回填 · 深色行表示结局不同', table));
+  return h('div', {}, metrics, costPassPanel(jobs), panel('逐题对比', '首次执行成绩 · 重跑不回填 · 深色行表示结局不同', table));
+}
+function dominated(a, b) {
+  return b.cost_per_task <= a.cost_per_task && b.pass_rate >= a.pass_rate && (b.cost_per_task < a.cost_per_task || b.pass_rate > a.pass_rate);
+}
+function costPassPanel(jobs) {
+  const ranked = jobs.map((j) => j.summary).filter((s) => s.cost_per_task !== null && s.pass_rate !== null);
+  const rows = jobs.map((j) => {
+    const s = j.summary;
+    const frontier = ranked.includes(s) && !ranked.some((o) => dominated(s, o));
+    return h('tr', {},
+      h('td', {}, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name })),
+      h('td', { class: 'num', text: pct(s.pass_rate) }, h('span', { class: 'sub', text: ciText(s.pass_rate_ci95) })),
+      h('td', { class: 'num', text: `${s.tasks_solved || 0} / ${s.tasks_attempted || 0}` }),
+      h('td', { class: 'num', text: usd(s.cost_per_task) }),
+      h('td', { class: 'num', text: usd(s.cost_per_pass) }),
+      h('td', { class: 'num', text: pct(s.non_pass_cost_share) }),
+      h('td', { class: 'num', text: pct(s.cache_hit_rate) }),
+      h('td', { class: 'num', text: fixed(s.turns_per_pass) }),
+      h('td', { text: frontier ? '是' : ranked.includes(s) ? '' : '—' }));
+  });
+  const heads = ['作业', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '成本-通过率前沿'];
+  return panel('成本与通过率', '前沿：没有其他作业同时更便宜且通过率更高 · 参考 FrontierHarness Eval v1.1',
+    h('div', { class: 'table-scroll' }, h('table', {},
+      h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 0 || i === heads.length - 1 ? null : 'num', text: t })))),
+      h('tbody', {}, rows))));
 }
 
 // ------------------------------------------------------------ settings (database)

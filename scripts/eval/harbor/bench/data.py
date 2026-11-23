@@ -33,6 +33,7 @@ from scripts.eval.harbor.profiling import CONTEXT_PARTS, usage_values
 
 VALID = ("pass", "partial", "fail", "timeout")
 STATUSES = VALID + ("invalid", "running")
+Z95 = 1.959963984540054
 
 # Harbor exception types (harbor/agents/installed/base.py) that mean the model
 # provider, not the agent, failed the trial.
@@ -595,7 +596,7 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     initials = [r["initial_input_tokens"] for r in rows if r.get("initial_input_tokens") is not None]
     compositions = [r["initial_composition"] for r in rows if r.get("initial_composition")]
 
-    return {
+    summary = {
         "trials": len(rows),
         "counts": counts,
         "invalid_causes": causes,
@@ -629,6 +630,61 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "agent_seconds": sum(
             row["phases"]["agent"] for row in rows if row["phases"].get("agent") is not None
         ),
+        **outcome_totals(rows),
+    }
+    return {**summary, **outcome_fields(summary)}
+
+
+def outcome_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summable per-task and per-outcome totals behind the cost and effort metrics."""
+    by_task: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if row["status"] in VALID:
+            by_task.setdefault(row["task"], []).append(row)
+    task_costs = [[r["cost_usd"] for r in trials if r.get("cost_usd") is not None] for trials in by_task.values()]
+    task_costs = [costs for costs in task_costs if costs]
+    passed = [r for r in rows if r["status"] == "pass"]
+    return {
+        "tasks_attempted": len(by_task),
+        "tasks_solved": sum(any(r["status"] == "pass" for r in trials) for trials in by_task.values()),
+        "task_cost_sum": sum(sum(costs) / len(costs) for costs in task_costs),
+        "task_cost_tasks": len(task_costs),
+        "cost_by_status": {status: sum(r["cost_usd"] for r in rows if r["status"] == status and r.get("cost_usd") is not None)
+                           for status in VALID},
+        "passed_turns": sum(r["turns"] for r in passed if r.get("turns") is not None),
+        "passed_turn_trials": sum(r.get("turns") is not None for r in passed),
+        "passed_tool_calls": sum(r["tool_calls"] for r in passed if r.get("tool_calls") is not None),
+        "passed_tool_call_trials": sum(r.get("tool_calls") is not None for r in passed),
+    }
+
+
+def wilson_interval(successes: int, trials: int) -> Optional[List[float]]:
+    if not trials:
+        return None
+    rate = successes / trials
+    spread = Z95 * Z95 / trials
+    centre = (rate + spread / 2) / (1 + spread)
+    half = Z95 * math.sqrt(rate * (1 - rate) / trials + spread / (4 * trials)) / (1 + spread)
+    return [max(0.0, centre - half), min(1.0, centre + half)]
+
+
+def ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    return numerator / denominator if numerator is not None and denominator else None
+
+
+def outcome_fields(s: Dict[str, Any]) -> Dict[str, Any]:
+    """FrontierHarness-style metrics derived from a summary's summable totals."""
+    cost_per_task = ratio(s["task_cost_sum"], s["task_cost_tasks"])
+    scored_cost = sum(s["cost_by_status"].values())
+    return {
+        "pass_rate_ci95": wilson_interval(s["counts"]["pass"], s["valid"] or 0),
+        "solved_rate": ratio(s["tasks_solved"], s["tasks_attempted"]),
+        "cost_per_task": cost_per_task,
+        "cost_per_pass": ratio(cost_per_task, s["pass_rate"]),
+        "non_pass_cost_share": 1 - s["cost_by_status"]["pass"] / scored_cost if scored_cost else None,
+        "cache_hit_rate": ratio(s["cache_tokens"], s["input_tokens"]),
+        "turns_per_pass": ratio(s["passed_turns"], s["passed_turn_trials"]),
+        "tool_calls_per_pass": ratio(s["passed_tool_calls"], s["passed_tool_call_trials"]),
     }
 
 
@@ -645,7 +701,9 @@ def merge_summaries(summaries):
     fields = ("trials", "valid", "empty_final", "first_tasks", "first_valid", "first_passed", "first_invalid", "first_pending",
               "total_tokens", "token_trials", "partial_token_trials", "initial_input_tokens", "initial_token_trials",
               "input_tokens", "cache_tokens", "output_tokens", "cost_usd", "cost_trials", "agent_seconds",
-              "requests", "profiled_requests", "tps_output_tokens", "tps_generation_ms")
+              "requests", "profiled_requests", "tps_output_tokens", "tps_generation_ms",
+              "tasks_attempted", "tasks_solved", "task_cost_sum", "task_cost_tasks",
+              "passed_turns", "passed_turn_trials", "passed_tool_calls", "passed_tool_call_trials")
     result = {}
     for field in fields:
         values = [s[field] for s in summaries if s.get(field) is not None]
@@ -662,6 +720,8 @@ def merge_summaries(summaries):
     ttfts = [t for s in summaries for t in s.get("ttft_samples_ms", [])]
     result["ttft_samples_ms"] = ttfts
     result.update(performance_fields(ttfts, result["tps_output_tokens"] or 0, result["tps_generation_ms"] or 0))
+    result["cost_by_status"] = {status: sum(s["cost_by_status"][status] for s in summaries) for status in VALID}
+    result.update(outcome_fields(result))
     return result
 
 
