@@ -42,7 +42,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple, Union
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
@@ -340,6 +340,30 @@ def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=F
     if remote:
         argv.append(shlex.join(remote))
     return argv
+
+
+TUNNEL_PORTS = range(20000, 32768)
+TUNNEL_ATTEMPTS = 5
+
+
+def tunnel_port(tried: Collection[int] = ()) -> int:
+    return secrets.choice([port for port in TUNNEL_PORTS if port not in tried])
+
+
+def forward_refused(returncode: Optional[int], stderr: Optional[str]) -> bool:
+    return returncode == 255 and "remote port forwarding failed" in (stderr or "")
+
+
+def tunnel_retry_note(executor: SshExecutor, refused: int, port: int, attempt: int) -> str:
+    return (f"执行机器 {executor.name} 的回环端口 {refused} 上建不起 ssh -R 反向转发，"
+            f"换端口 {port} 重试（第 {attempt}/{TUNNEL_ATTEMPTS} 次）")
+
+
+def tunnel_unbound(executor: SshExecutor, ports: Sequence[int]) -> str:
+    return (f"执行机器 {executor.name} 上绑不了隧道端口：ssh -R 试了 {len(ports)} 个回环端口"
+            f"（{'、'.join(str(port) for port in ports)}）都没建起反向转发。可能这些端口已被占用，"
+            "也可能执行机器不允许这个账号做远程端口转发（sshd_config 的 AllowTcpForwarding、PermitListen、"
+            "DisableForwarding，或 authorized_keys 里的 no-port-forwarding、restrict）")
 
 
 def node_prelude(executor: SshExecutor, binary: Optional[str] = None) -> str:
@@ -1013,8 +1037,15 @@ class RemoteRun:
         # egress "workbench": this run's proxy on the workbench loopback and
         # the executor loopback port its `ssh -R` forward listens on.
         self.proxy = None
-        self.tunnel_port = (secrets.SystemRandom().randrange(20000, 60000)
-                            if self.executor.egress == "workbench" else None)
+        self.tunnel_ports = [tunnel_port()] if self.executor.egress == "workbench" else []
+        self.uploaded = None
+        self.remote_spec_path = None
+        self.stderr_relay = None
+        self.stderr_tail = ""
+
+    @property
+    def tunnel_port(self) -> Optional[int]:
+        return self.tunnel_ports[-1] if self.tunnel_ports else None
 
     @property
     def remote_job_dir(self) -> str:
@@ -1115,6 +1146,8 @@ class RemoteRun:
 
     def close(self) -> None:
         """Stop the run's workbench proxy (idempotent)."""
+        if self.stderr_relay is not None:
+            self.stderr_relay.join(5)
         if self.proxy is not None:
             self.proxy.close()
             self.log("出网代理已停止：" + json.dumps(self.proxy.counts))
@@ -1123,6 +1156,7 @@ class RemoteRun:
     def upload_run(self, remote_spec: Dict) -> str:
         """The run directory holds the remote spec and provider config only."""
         import tempfile
+        self.uploaded = remote_spec
         run_dir = self.executor.remote("runs", self.spec["name"])
         with tempfile.TemporaryDirectory(prefix="bench-remote-run-") as temporary:
             root = Path(temporary)
@@ -1135,6 +1169,47 @@ class RemoteRun:
         return run_dir + "/spec.json"
 
     def start(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str] = None) -> None:
+        self.spawn(secret_env, remote_spec_path, credential)
+        self.sync_state = self.job_sync()
+
+    def retry_tunnel(self, secret_env: Dict[str, str], credential: Callable[[], Optional[str]]) -> bool:
+        if len(self.tunnel_ports) >= TUNNEL_ATTEMPTS or not self.forward_was_refused():
+            return False
+        self.tunnel_ports.append(tunnel_port(self.tunnel_ports))
+        self.log(tunnel_retry_note(self.executor, self.tunnel_ports[-2], self.tunnel_port, len(self.tunnel_ports)))
+        if (self.uploaded or {}).get("egress"):
+            self.upload_run({**self.uploaded, "egress": self.egress_spec()})
+        self.spawn(secret_env, self.remote_spec_path, credential())
+        return True
+
+    def forward_was_refused(self) -> bool:
+        if self.tunnel_port is None or self.events or self.process is None or self.process.poll() != 255:
+            return False
+        if self.stderr_relay is not None:
+            self.stderr_relay.join(10)
+        return forward_refused(self.process.returncode, self.stderr_tail)
+
+    def relay_stderr(self, process) -> None:
+        if process.stderr is None:
+            return
+        tail, sink = b"", True
+        try:
+            for chunk in iter(lambda: process.stderr.read1(65536), b""):
+                tail = (tail + chunk)[-4096:]
+                while sink and chunk:
+                    try:
+                        chunk = chunk[os.write(2, chunk):]
+                    except OSError:
+                        sink = False
+        except (OSError, ValueError):
+            pass
+        finally:
+            process.stderr.close()
+        if process is self.process:
+            self.stderr_tail = tail.decode(errors="replace")
+
+    def spawn(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str]) -> None:
+        self.remote_spec_path = remote_spec_path
         argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress())
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
@@ -1142,7 +1217,9 @@ class RemoteRun:
         # Under the lock, so no pushed token can precede that line; a token
         # pushed before the channel existed replaces the one given here.
         with self.stdin_lock:
-            self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+            self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      start_new_session=True)
+            self.stderr_tail = ""
             self.last_event = time.monotonic()  # staging may have taken minutes
             first = {"env": secret_env}
             credential = self.pending_credential or credential
@@ -1155,7 +1232,8 @@ class RemoteRun:
             self.process.stdin.write((json.dumps(first) + "\n").encode())
             self.process.stdin.flush()
         threading.Thread(target=self.read_events, daemon=True).start()
-        self.sync_state = self.job_sync()
+        self.stderr_relay = threading.Thread(target=self.relay_stderr, args=(self.process,), daemon=True)
+        self.stderr_relay.start()
 
     def read_events(self) -> None:
         for line in self.process.stdout:
