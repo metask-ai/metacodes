@@ -1054,6 +1054,13 @@ trials without the chosen flags.
 `POST /api/profiles/run` queues datasets: on an existing profile with
 `profile` (its version and features cannot be changed), or with `bundle` and
 `features`, creating the profile on first use (`name` names a new profile).
+A profile holds results of any number of models: `models` (up to 8, the
+评测 page's model checkboxes) queues every dataset once per model, `model`
+queues it with one. The profile page compares the models' latest results
+(模型对比, with how many tasks each ran) and filters the task list by model;
+when the models ran different tasks it adds the same comparison over only the
+tasks all of them ran (`common_tasks` and each model's `common_summary` in
+`GET /api/profile`).
 The queued datasets run one after another, each as an ordinary workbench run
 (one Harbor job) whose record names the profile. The durable state is
 `<jobs-dir>/.bench-profiles/<id>.json`; the service's scheduler only advances

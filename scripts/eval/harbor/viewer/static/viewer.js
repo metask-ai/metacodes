@@ -213,7 +213,7 @@ function runAgain(b, onlyUnpassed) {
   const model = runModel(b);
   const lastOfModel = [...b.items].reverse().find((i) => i.model === model) || last;
   state.runDraft = { profile: b.id, from: profileName(b), label: b.metacodes?.label, features: b.features || [],
-    model, attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
+    models: [model], attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
   state.executor = lastOfModel.executor;
   const wanted = new Map();
   const add = (suite, task) => { if (!wanted.has(suite)) wanted.set(suite, []); if (!wanted.get(suite).includes(task)) wanted.get(suite).push(task); };
@@ -457,7 +457,35 @@ async function renderProfile(id) {
   const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), compositionPanel(s, '最新结果均值'), tasks, items);
+  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), compositionPanel(s, '最新结果均值'), tasks, items);
+}
+
+// The latest results of each model side by side, when the profile has several:
+// over every task each ran, then, when they ran different tasks, over the tasks
+// all of them ran, so a model is not judged on an easier subset.
+function modelsPanel(b) {
+  if ((b.by_model || []).length < 2) return null;
+  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '总 Token', '估算成本'];
+  const row = (model, tasks, m) => h('tr', { class: 'link', onclick: () => { state.profileModel = model; render(); } },
+    h('td', { text: model || '—' }),
+    h('td', { class: 'num', text: String(tasks) }),
+    h('td', {}, outcomeBar(m.counts, m.trials || 0)),
+    h('td', { class: 'num', text: pct(m.one_shot_pass_rate) }),
+    h('td', { class: 'num', text: `${m.counts.pass} / ${m.valid || 0}` }),
+    h('td', { class: 'num', text: pct(m.first_pass_rate) }),
+    h('td', { class: 'num', text: String(m.counts.invalid) }),
+    h('td', { class: 'num', text: compact(m.total_tokens) }),
+    h('td', { class: 'num', text: usd(m.cost_usd) }));
+  const table = (rows) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 1 || i >= 3 ? 'num' : null, text: t })))),
+    h('tbody', {}, rows)));
+  const mixed = b.common_tasks !== null && b.common_tasks !== undefined;
+  const body = [table(b.by_model.map((x) => row(x.model, x.tasks, x.summary)))];
+  if (mixed) {
+    body.push(h('div', { class: 'callout' }, h('p', { text: `各模型跑过的题不一样，上表不能直接比。下表只算所有模型都跑过的 ${b.common_tasks} 道题。` })),
+      b.common_tasks ? table(b.by_model.map((x) => row(x.model, b.common_tasks, x.common_summary))) : h('div', { class: 'empty', text: '没有所有模型都跑过的题。' }));
+  }
+  return panel('模型对比', `${b.by_model.length} 个模型 · 各自的最新结果 · 点一行只看这个模型的逐任务结果`, h('div', {}, body));
 }
 
 async function renderProfileTask(profileId, jobName, taskName, trialName) {
@@ -574,10 +602,20 @@ async function renderNewRun() {
   const picker = h('div', { class: 'suite-picker' });
   const boxes = h('div', { class: 'stack' });
   const models = c.models || [];
-  const modelMissing = draft.model && !models.some((m) => m.id === draft.model);
-  const wantedModel = draft.model && !modelMissing ? draft.model : c.default_model;
-  const model = h('select', { name: 'model', required: true, onchange: () => { draft.model = model.value; } },
-    models.map((m) => h('option', { value: m.id, selected: m.id === wantedModel }, m.label)));
+  const known = (id) => models.some((m) => m.id === id);
+  const modelMissing = (draft.models || []).find((id) => !known(id));
+  const chosenModels = new Set((draft.models || []).filter(known));
+  if (!chosenModels.size && known(c.default_model)) chosenModels.add(c.default_model);
+  const modelChecks = models.map((m) => {
+    const check = h('input', { type: 'checkbox', name: 'models', value: m.id, onchange: () => {
+      if (check.checked) chosenModels.add(m.id); else chosenModels.delete(m.id);
+      draft.models = models.filter((x) => chosenModels.has(x.id)).map((x) => x.id);
+      syncSubmit();
+    } });
+    check.checked = chosenModels.has(m.id);
+    return h('label', { class: 'task-option' }, check, h('span', { text: m.label }));
+  });
+  const model = h('div', { class: 'task-options', role: 'group', 'aria-label': '模型' }, modelChecks);
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
@@ -606,8 +644,9 @@ async function renderNewRun() {
     const picked = [...state.suitePick.entries()];
     const total = picked.reduce((acc, [, e]) => acc + (e ? e.selected.size : 0), 0);
     const problems = picked.filter(([id, e]) => !comboReady(byId.get(id)) || !e || !e.selected.size || e.selected.size > byId.get(id).max_tasks);
-    submit.disabled = !picked.length || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
-    submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次）` : '开始评测';
+    submit.disabled = !picked.length || !chosenModels.size || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
+    const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
+    submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '开始评测';
   }
   function drawPicker() {
     picker.replaceChildren(...(c.categories || []).map((cat) => {
@@ -701,7 +740,7 @@ async function renderNewRun() {
   }
   if (draft.from) {
     const notes = [`在评测配置「${draft.from}」上运行`];
-    if (modelMissing) notes.push(`上次的模型 ${draft.model} 当前不可用，请重新选择。`);
+    if (modelMissing) notes.push(`上次的模型 ${modelMissing} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
         state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; render();
@@ -715,7 +754,7 @@ async function renderNewRun() {
       fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name)),
     fixed ? null : commitBox,
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
-    h('label', { class: 'field' }, h('span', { text: '模型' }), model,
+    h('div', { class: 'field' }, h('span', { text: '模型（可多选，每个评测集按每个模型各跑一次）' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
       h('small', {}, c.providers?.models ? `另有 ${c.providers.count} 个导入的 Provider · ${c.providers.models} 个模型 · ` : '',
         link('#/providers', '用 URL + API Key 导入 Provider')),
@@ -730,7 +769,8 @@ async function renderNewRun() {
     submit.disabled = true;
     feedback.textContent = fixed ? '正在排队…' : '正在冻结 metacodes 版本并排队…';
     try {
-      const request = { model: model.value, attempts: Number(attempts.value), concurrency: Number(concurrency.value),
+      const picked = models.filter((m) => chosenModels.has(m.id)).map((m) => m.id);
+      const request = { ...(picked.length > 1 ? { models: picked } : { model: picked[0] }), attempts: Number(attempts.value), concurrency: Number(concurrency.value),
         items: [...state.suitePick.entries()].map(([id, entry]) => ({ suite: id, tasks: entry.tasks.filter((t) => entry.selected.has(t)) })) };
       if (fixed) request.profile = draft.profile;
       else {
