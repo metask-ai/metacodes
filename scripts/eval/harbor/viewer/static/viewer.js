@@ -185,11 +185,10 @@ function stackBar(segments, mini) {
 function compositionSegments(c) { return PARTS.map(([k, l]) => ['c-' + k, c[k] || 0, l]); }
 function compositionPanel(summary, scopeText) {
   const c = summary.initial_composition_mean;
-  const body = c ? h('div', { class: 'panel-body' },
+  if (!c) return null;
+  return panel('初始上下文窗口组成', scopeText || '均值', h('div', { class: 'panel-body' },
     stackBar(compositionSegments(c)),
-    h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }), `${l} ${compact(c[k])} · ${pct((c[k] || 0) / Math.max(1, partsTotal(c)))}`))))
-    : h('div', { class: 'empty', text: '还没有上下文组成数据' });
-  return panel('初始上下文窗口组成', scopeText || '均值', body);
+    h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }), `${l} ${compact(c[k])} · ${pct((c[k] || 0) / Math.max(1, partsTotal(c)))}`)))));
 }
 
 // ------------------------------------------------------------ overview
@@ -291,8 +290,7 @@ async function renderOverview() {
 
   const profileRows = profiles.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = profileHref(b); } },
     h('td', {}, h('a', { href: profileHref(b), onclick: (e) => e.stopPropagation(), text: profileName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
-    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : '' })),
-    h('td', { class: 'mono', text: featuresText(b) }),
+    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: '高级功能 ' + featuresText(b) })),
     h('td', { text: b.models.join('、') || '—' }),
     h('td', {}, h('span', { text: [...new Map(b.items.map((i) => [i.suite, i.suite_name || i.suite])).values()].join('、') }), h('span', { class: 'sub', text: `${b.items.length} 次运行` })),
     h('td', {}, h('span', { text: PROFILE_STATUS[b.status] || b.status }), h('span', { class: 'sub', text: progressText(b) })),
@@ -301,9 +299,9 @@ async function renderOverview() {
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
     h('td', { class: 'num', text: when(b.last_run_at) }),
     body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
-  const profileHeads = ['评测配置', 'metacodes 版本', '高级功能', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
+  const profileHeads = ['评测配置', 'metacodes 版本', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
   const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 7 && i <= 9 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : null, text: t })))),
     h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
   h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
@@ -347,8 +345,9 @@ async function renderOverview() {
       h('b', { text: r.name }), h('span', { class: 'muted', text: [r.suite_name, r.model].filter(Boolean).join(' · ') }),
       h('span', { text: RUN_STATUS[r.status] || r.status })))));
   const jobsTitle = current ? '这个评测配置的作业（每次运行的每个评测集一个）' : '作业';
-  return h('div', {}, scopeBar, metrics, compositionPanel(summary, current ? '本评测配置所有作业均值' : '均值'), profilePanel,
-    panel(jobsTitle, state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn), launches);
+  return h('div', {}, profilePanel, scopeBar, metrics,
+    panel(jobsTitle, state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn),
+    compositionPanel(summary, current ? '本评测配置所有作业均值' : '均值'), launches);
 }
 
 // ------------------------------------------------------------ profile
@@ -457,7 +456,7 @@ async function renderProfile(id) {
   const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), compositionPanel(s, '最新结果均值'), tasks, items);
+  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, tasks, compositionPanel(s, '最新结果均值'));
 }
 
 // The latest results of each model side by side, when the profile has several:
@@ -753,17 +752,17 @@ async function renderNewRun() {
         c.can_run && !fixed ? h('div', {}, commitToggle) : null),
       fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name)),
     fixed ? null : commitBox,
-    h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
+    features,
     h('div', { class: 'field' }, h('span', { text: '模型（可多选，每个评测集按每个模型各跑一次）' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
       h('small', {}, c.providers?.models ? `另有 ${c.providers.count} 个导入的 Provider · ${c.providers.models} 个模型 · ` : '',
         link('#/providers', '用 URL + API Key 导入 Provider')),
       c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
+    h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
-    features,
-    feedback, submit);
+    h('div', { class: 'form-submit' }, submit, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     submit.disabled = true;

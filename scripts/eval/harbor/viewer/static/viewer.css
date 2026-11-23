@@ -9,7 +9,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 fieldset{border:1px solid var(--border);border-radius:5px;padding:14px}
 .task-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px;margin-bottom:12px}
 .task-option{display:flex;align-items:center;gap:8px;min-height:36px;cursor:pointer;overflow-wrap:anywhere}
-.task-option input{accent-color:var(--accent)}.run-form>.button{justify-self:start}
+.task-option input{accent-color:var(--accent)}
 .suite-picker{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px 20px}.suite-group{display:grid;gap:8px;align-content:start}.suite-group.wide{grid-column:1/-1}
 .suite-group-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:13px}.suite-group-head .muted{font-size:12px}
 .suite-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}
@@ -218,3 +218,5 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .commit-list{max-height:420px}
 .row-actions{display:flex;gap:6px}.row-actions .button{height:26px;padding:0 8px}
 .rename{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.rename input{min-width:220px;height:32px;padding:0 10px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;font:inherit}
+.field .task-option input{width:auto;padding:0}
+.form-submit{position:sticky;bottom:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px 0;background:var(--surface);border-top:1px solid var(--border)}
