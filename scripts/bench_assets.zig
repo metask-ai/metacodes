@@ -30,7 +30,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/bench/worker.py", .bytes = @embedFile("eval/harbor/bench/worker.py") },
     .{ .path = "scripts/eval/harbor/bench/workbench.py", .bytes = @embedFile("eval/harbor/bench/workbench.py") },
     .{ .path = "scripts/eval/harbor/bench/client.py", .bytes = @embedFile("eval/harbor/bench/client.py") },
-    .{ .path = "scripts/eval/harbor/bench/batches.py", .bytes = @embedFile("eval/harbor/bench/batches.py") },
+    .{ .path = "scripts/eval/harbor/bench/profiles.py", .bytes = @embedFile("eval/harbor/bench/profiles.py") },
     .{ .path = "scripts/eval/harbor/bench/builds.py", .bytes = @embedFile("eval/harbor/bench/builds.py") },
     .{ .path = "scripts/eval/harbor/bench/credentials.py", .bytes = @embedFile("eval/harbor/bench/credentials.py") },
     .{ .path = "scripts/eval/harbor/bench/executors.py", .bytes = @embedFile("eval/harbor/bench/executors.py") },

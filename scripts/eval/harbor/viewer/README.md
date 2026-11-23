@@ -13,10 +13,10 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 
 | View | Answers |
 |---|---|
-| 看板 `#/` | metrics scoped to one batch (or all / unbatched jobs), initial context composition, batches, jobs |
-| 批次 `#/batch/<id>` | frozen metacodes version, each dataset's job, every task with its attempts; rename it, copy it into a new batch, stop it while running, delete it once ended |
-| 任务 `#/batch/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task |
-| 新建 `#/new` | a batch: metacodes version, several suites and their tasks, model, attempts, concurrency |
+| 看板 `#/` | metrics scoped to one profile (or all jobs), initial context composition, profiles, jobs |
+| 评测配置 `#/profile/<id>` | frozen metacodes version and advanced features, every task's latest attempts (a rerun replaces the earlier result), the run history; rename it, run it again or rerun its unpassed tasks, stop its queue, delete it once ended |
+| 任务 `#/profile/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task and the replaced runs |
+| 评测 `#/new` | a run: metacodes version and advanced features (the profile), several suites and their tasks, model, attempts, concurrency |
 | 数据库 `#/settings` | the active store; test, switch and migrate to another SQLite file or PostgreSQL |
 | 作业 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
 | trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |
@@ -44,8 +44,8 @@ request metrics through the host streaming relay.
 This directory is only the web presentation: `server.py` maps routes onto the
 runtime's `Workbench` and `static/` is the page. The runtime lives in
 [`../bench/`](../bench/): `data.py` is the projection (applied to the stored
-bytes by `../store/ingest.py`), `runner.py` validates selections, `batches.py`
-freezes a bundle and runs a batch's datasets in order, `worker.py` owns one
+bytes by `../store/ingest.py`), `runner.py` validates selections, `profiles.py`
+freezes a bundle and runs the datasets queued on a profile in order, `worker.py` owns one
 durable execution and ingests its job, and `workbench.py` is the facade the
 page and the CLI both read. `executors.py` (this machine or SSH hosts),
 `remote.py` (the driver on an SSH host), `setup.py` (`bench setup`) and
@@ -56,4 +56,4 @@ has no login (internal network); POSTs with a foreign browser `Origin` are
 refused, and a service without `--config` is read-only. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
 `test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py`,
-`test_bench_batches.py` and `test_bench_providers.py`.
+`test_bench_profiles.py` and `test_bench_providers.py`.

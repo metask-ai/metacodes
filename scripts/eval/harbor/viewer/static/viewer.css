@@ -149,7 +149,7 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .setup-step pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mono);margin:8px 0 0}
 .setup-status{font:12px var(--mono);min-width:72px}.s-ok,.s-done{color:var(--positive)}.s-failed{color:var(--negative)}.s-manual,.s-planned{color:var(--warning)}.s-skipped{color:var(--faint)}
 
-/* batches, per-request charts, context composition, settings */
+/* profiles, per-request charts, context composition, settings */
 .c-system{background:#8a8c95}.c-tools{background:var(--partial)}.c-user{background:var(--accent)}.c-assistant{background:var(--positive)}.c-tool_results{background:var(--warning)}
 .t-cached{background:#3f6a99}.t-input{background:var(--accent)}.t-output{background:var(--positive)}.t-model{background:var(--accent)}.t-tool{background:var(--warning)}.t-other{background:#5b5d66}
 .stack-bar{display:flex;height:10px;background:var(--raised);border-radius:2px;overflow:hidden;min-width:120px}

@@ -230,8 +230,8 @@ class EquivalenceTest(StoreCase):
 
         def labelled(view):
             # The service adds suite/category display fields (bench-suites)
-            # and the batch and metacodes version of the launch (none here).
-            return {**view, **suites.label(suites.infer(view.get("dataset"))), "batch": None, "metacodes": None}
+            # and the profile and metacodes version of the launch (none here).
+            return {**view, **suites.label(suites.infer(view.get("dataset"))), "profile": None, "metacodes": None}
 
         jobs = json.loads(get("/api/jobs"))
         self.assertEqual(jobs["jobs"], [labelled(view) for view in expected["overview"]])
@@ -968,7 +968,7 @@ class MigrationDuringRunTest(StoreCase):
 class WorkerEndToEndTest(StoreCase):
     def test_launched_worker_fills_the_configured_store_before_reporting_done(self):
         from scripts.eval.harbor.bench.runner import RunManager
-        from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_batches_and_workers, wait_run
+        from scripts.eval.tests.test_bench_workbench import fixture, offline_hugging_face, stop_profiles_and_workers, wait_run
 
         config, binary_dir = fixture(self.temp)
         offline_hugging_face(self)
@@ -977,7 +977,7 @@ class WorkerEndToEndTest(StoreCase):
         env = {"PATH": str(binary_dir) + os.pathsep + os.environ.get("PATH", ""), "TOKENJOY_API_KEY": "private"}
         with patch.dict(os.environ, env):
             manager = RunManager(self.temp / "jobs", config)
-            self.addCleanup(stop_batches_and_workers, manager)
+            self.addCleanup(stop_profiles_and_workers, manager)
             run = manager.launch({"model": "tokenjoy/test-model", "tasks": ["fix-git"]})
             self.assertEqual(json.loads((manager.records / (run["name"] + ".spec")).read_text())["store"],
                              {"backend": "sqlite", "path": str(target.resolve())})

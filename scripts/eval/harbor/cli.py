@@ -446,6 +446,7 @@ def main(argv=None):
     parser.add_argument("--workbuddy-checkout", type=Path, help="WorkBuddy-Bench checkout（provision_checkout.sh 准备）")
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--features", help="run：高级功能，逗号分隔；空字符串表示不开；省略时开启页面默认勾选的门控")
     parser.add_argument("--wait", action="store_true", help="等待评测结束后返回结果和工作台链接")
     parser.add_argument("--store-sqlite", help="评测数据库使用该 SQLite 文件")
     parser.add_argument("--store-postgres", metavar="DSN", help="评测数据库使用 PostgreSQL（DSN 不含密码）")
@@ -616,6 +617,8 @@ def main(argv=None):
                 payload["suite"] = args.suite
             if args.executor:
                 payload["executor"] = args.executor
+            if args.features is not None:
+                payload["features"] = [name.strip() for name in args.features.split(",") if name.strip()]
             record = client.request("api/runs", payload)
             if args.wait:
                 while record["status"] in ACTIVE:

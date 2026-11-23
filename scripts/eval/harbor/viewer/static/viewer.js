@@ -12,7 +12,7 @@ const REFRESH_S = 10;
 
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
   jobFilter: 'all', jobSearch: '', suite: null, category: 'all', sort: { key: 'task', dir: 1 }, selected: new Set(),
-  scope: null, batchPick: null, batchSuite: 'all', taskFilter: 'all', taskSearch: '' };
+  scope: null, suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '' };
 
 // ------------------------------------------------------------ DOM helpers
 function h(tag, props, ...children) {
@@ -126,8 +126,8 @@ function route() {
   if (parts[0] === 'settings') return { view: 'settings' };
   if (parts[0] === 'providers') return { view: 'providers' };
   if (parts[0] === 'run' && parts[1]) return { view: 'run', name: parts[1] };
-  if (parts[0] === 'batch' && parts[1] && parts[2] === 'task' && parts[3] && parts[4]) return { view: 'task', batch: parts[1], job: parts[3], task: parts[4], trial: parts[5] || null };
-  if (parts[0] === 'batch' && parts[1]) return { view: 'batch', batch: parts[1] };
+  if (parts[0] === 'profile' && parts[1] && parts[2] === 'task' && parts[3] && parts[4]) return { view: 'task', profile: parts[1], job: parts[3], task: parts[4], trial: parts[5] || null };
+  if (parts[0] === 'profile' && parts[1]) return { view: 'profile', profile: parts[1] };
   if (parts[0] === 'job' && parts[1] && parts[2]) return { view: 'trial', job: parts[1], trial: parts[2] };
   if (parts[0] === 'job' && parts[1]) return { view: 'job', job: parts[1] };
   if (parts[0] === 'compare') return { view: 'compare', jobs: (parts[1] || '').split(',').filter(Boolean) };
@@ -149,13 +149,13 @@ async function render() {
   const r = route();
   try {
     let node;
-    if (r.view === 'new') node = await renderNewBatch();
+    if (r.view === 'new') node = await renderNewRun();
     else if (r.view === 'settings') node = await renderSettings();
     else if (r.view === 'providers') node = await renderProviders();
     else if (r.view === 'run') node = await renderRun(r.name);
     else if (r.view === 'overview') node = await renderOverview();
-    else if (r.view === 'batch') node = await renderBatch(r.batch);
-    else if (r.view === 'task') node = await renderBatchTask(r.batch, r.job, r.task, r.trial);
+    else if (r.view === 'profile') node = await renderProfile(r.profile);
+    else if (r.view === 'task') node = await renderProfileTask(r.profile, r.job, r.task, r.trial);
     else if (r.view === 'job') node = await renderJob(r.job);
     else if (r.view === 'trial') node = await renderTrial(r.job, r.trial);
     else node = await renderCompare(r.jobs);
@@ -192,72 +192,94 @@ function compositionPanel(summary, scopeText) {
 }
 
 // ------------------------------------------------------------ overview
-const BATCH_STATUS = { queued: '排队中', running: '运行中', cancelling: '正在停止', finished: '已完成', cancelled: '已停止' };
+const PROFILE_STATUS = { queued: '排队中', running: '运行中', cancelling: '正在停止', finished: '空闲', cancelled: '已停止' };
 const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '跳过' };
-const batchActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
-const batchName = (b) => b.name || b.id;
-const batchHref = (b) => '#/batch/' + encodeURIComponent(b.id);
+const profileActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
+const profileName = (b) => b.name || b.id;
+const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
+const featuresText = (b) => (b.features || []).join(', ') || '未开启';
 
-function copyBatch(b) {
-  state.batchDraft = { from: batchName(b), name: '', model: b.model, attempts: b.attempts, concurrency: b.concurrency,
-    features: b.features || [], source: b.metacodes?.source_bundle || null };
-  state.executor = b.executor;
-  state.pickBundle = null;
-  state.batchPick = new Map(b.items.map((i) => [i.suite, null]));
-  state.batchWanted = new Map(b.items.map((i) => [i.suite, i.tasks]));
+// Fills the run form for another run on profile `b` with one model (the
+// page's model filter, else the last run's): that model's suites and tasks
+// from the task rows (on the profile page) or the queued datasets, or only
+// the tasks whose latest attempts did not all pass.
+const unpassed = (t) => !t.attempts.length || t.passed < t.attempts.length;
+function runModel(b) {
+  return b.tasks && state.profileModel && state.profileModel !== 'all' ? state.profileModel : b.items[b.items.length - 1]?.model;
+}
+function runAgain(b, onlyUnpassed) {
+  const last = b.items[b.items.length - 1] || {};
+  const model = runModel(b);
+  const lastOfModel = [...b.items].reverse().find((i) => i.model === model) || last;
+  state.runDraft = { profile: b.id, from: profileName(b), label: b.metacodes?.label, features: b.features || [],
+    model, attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
+  state.executor = lastOfModel.executor;
+  const wanted = new Map();
+  const add = (suite, task) => { if (!wanted.has(suite)) wanted.set(suite, []); if (!wanted.get(suite).includes(task)) wanted.get(suite).push(task); };
+  if (b.tasks) {
+    for (const t of b.tasks.filter((x) => x.model === model)) if (!onlyUnpassed || unpassed(t)) add(t.suite, t.task);
+  } else {
+    for (const item of b.items.filter((i) => i.model === model)) for (const task of item.tasks || []) add(item.suite, task);
+  }
+  state.suitePick = new Map([...wanted.keys()].map((id) => [id, null]));
+  state.taskWanted = wanted;
   location.hash = '#/new';
 }
-async function deleteBatch(b, button) {
-  if (!confirm(`删除批次 ${batchName(b)}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
+async function deleteProfile(b, button) {
+  if (!confirm(`删除评测配置 ${profileName(b)}？它的所有运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
   button.disabled = true;
-  try { await api('/api/batch/delete', { id: b.id }); }
+  try { await api('/api/profile/delete', { id: b.id }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
   if (state.scope === b.id) state.scope = null;
   return true;
 }
-async function stopBatch(b, button) {
-  if (!confirm(`停止批次 ${batchName(b)}？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
+async function stopProfile(b, button) {
+  if (!confirm(`停止评测配置 ${profileName(b)} 的队列？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
   button.disabled = true;
-  try { await api('/api/batch/cancel', { id: b.id }); state.countdown = 1; }
+  try { await api('/api/profile/cancel', { id: b.id }); state.countdown = 1; }
   catch (error) { button.disabled = false; setConnection(false, error.message); }
 }
-function batchActions(b, compact) {
+function profileActions(b, compact) {
   const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
   return [
-    h('button', { type: 'button', class: 'button', title: '用这个批次的版本、评测集、题目和参数新建批次', onclick: keep(() => copyBatch(b)) }, compact ? '复制' : '复制为新批次'),
-    batchActive(b)
-      ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopBatch(b, button)) }, compact ? '停止' : '停止批次')
+    h('button', { type: 'button', class: 'button', title: '在这个评测配置上再运行，题目和参数按上次填好', onclick: keep(() => runAgain(b, false)) }, compact ? '运行' : '再次运行'),
+    b.tasks && b.tasks.some((t) => t.model === runModel(b) && t.attempts.length && unpassed(t))
+      ? h('button', { type: 'button', class: 'button', title: '只选最新结果没有全部通过的题', onclick: keep(() => runAgain(b, true)) }, '重跑未通过的题') : null,
+    profileActive(b)
+      ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, compact ? '停止' : '停止队列')
       : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
-        if (!await deleteBatch(b, button)) return;
+        if (!await deleteProfile(b, button)) return;
         if (route().view === 'overview') render(); else location.hash = '#/';
-      }) }, compact ? '删除' : '删除批次'),
+      }) }, compact ? '删除' : '删除评测配置'),
   ];
+}
+function progressText(b) {
+  return b.progress ? `${b.progress.done} / ${b.progress.planned} trial` : '—';
 }
 
 async function renderOverview() {
   navCurrent('overview');
   $('#title').textContent = 'Bench 看板';
-  let body = await api('/api/jobs?batch=' + encodeURIComponent(state.scope || 'all'));
+  let body = await api('/api/jobs?profile=' + encodeURIComponent(state.scope || 'all'));
   if (!state.scope) {
-    state.scope = body.batches.length ? body.batches[0].id : 'all';
-    if (state.scope !== 'all') body = await api('/api/jobs?batch=' + encodeURIComponent(state.scope));
+    state.scope = body.profiles.length ? body.profiles[0].id : 'all';
+    if (state.scope !== 'all') body = await api('/api/jobs?profile=' + encodeURIComponent(state.scope));
   }
-  const { jobs, runs = [], summary, batches = [] } = body;
-  if (!['all', 'none'].includes(state.scope) && !batches.some((b) => b.id === state.scope)) {
+  const { jobs, runs = [], summary, profiles = [] } = body;
+  if (state.scope !== 'all' && !profiles.some((b) => b.id === state.scope)) {
     state.scope = 'all';
     return renderOverview();
   }
-  const current = batches.find((b) => b.id === state.scope);
-  crumbs([{ text: current ? '批次 ' + batchName(current) : state.scope === 'none' ? '未分批的作业' : '所有作业' }]);
-  state.live = jobs.some((j) => j.running) || batches.some(batchActive) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
+  const current = profiles.find((b) => b.id === state.scope);
+  crumbs([{ text: current ? '评测配置 ' + profileName(current) : '所有作业' }]);
+  state.live = jobs.some((j) => j.running) || profiles.some(profileActive) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
 
-  const select = h('select', { 'aria-label': '按批次查看', onchange: () => { state.scope = select.value; state.selected.clear(); render(); } },
-    batches.map((b) => h('option', { value: b.id, selected: b.id === state.scope }, `${batchName(b)} · ${b.metacodes?.label || '—'} · ${BATCH_STATUS[b.status] || b.status}`)),
-    h('option', { value: 'all', selected: state.scope === 'all' }, `全部作业（${body.job_total}）`),
-    h('option', { value: 'none', selected: state.scope === 'none' }, '未分批的作业'));
+  const select = h('select', { 'aria-label': '按评测配置查看', onchange: () => { state.scope = select.value; state.selected.clear(); render(); } },
+    profiles.map((b) => h('option', { value: b.id, selected: b.id === state.scope }, `${profileName(b)} · ${b.metacodes?.label || '—'} · ${PROFILE_STATUS[b.status] || b.status}`)),
+    h('option', { value: 'all', selected: state.scope === 'all' }, `全部作业（${body.job_total}）`));
   const scopeBar = h('div', { class: 'scope' }, h('b', { text: '数据范围' }), select,
-    current ? h('span', { class: 'meta', text: `metacodes ${current.metacodes?.label || '—'} · ${current.model || '—'} · ${current.items.length} 个评测集 · ${current.progress.done}/${current.progress.planned} trial · ${BATCH_STATUS[current.status] || current.status}` }) : null,
-    current ? link('#/batch/' + encodeURIComponent(current.id), '查看批次详情 →') : null);
+    current ? h('span', { class: 'meta', text: `metacodes ${current.metacodes?.label || '—'} · 高级功能 ${featuresText(current)} · ${current.suites.length} 个评测集 · ${PROFILE_STATUS[current.status] || current.status}` }) : null,
+    current ? link(profileHref(current), '查看评测配置 →') : null);
 
   const all = { trials: 0, running: 0, invalid: 0 };
   for (const j of jobs) { all.trials += j.summary.trials; all.running += j.summary.counts.running; all.invalid += j.summary.counts.invalid; }
@@ -266,24 +288,23 @@ async function renderOverview() {
     metric('trial', String(all.trials), all.running + ' 个运行中'),
     metric('无效', String(all.invalid), '基础设施原因，不计入通过率'));
 
-  const batchRows = batches.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = batchHref(b); } },
-    h('td', {}, h('a', { href: batchHref(b), onclick: (e) => e.stopPropagation(), text: batchName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
+  const profileRows = profiles.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = profileHref(b); } },
+    h('td', {}, h('a', { href: profileHref(b), onclick: (e) => e.stopPropagation(), text: profileName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
     h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : '' })),
-    h('td', { text: b.model || '—' }),
-    h('td', {}, h('span', { text: b.items.map((i) => i.suite_name || i.suite).join('、') }), h('span', { class: 'sub', text: `${b.items.length} 个评测集` })),
-    h('td', {}, h('span', { text: BATCH_STATUS[b.status] || b.status }), h('span', { class: 'sub', text: b.items.filter((i) => ['finished', 'failed', 'cancelled', 'interrupted', 'skipped'].includes(i.status)).length + ' / ' + b.items.length + ' 数据集结束' })),
-    h('td', {}, h('span', { class: 'num', text: `${b.progress.done} / ${b.progress.planned}` }), h('div', { class: 'track' }, h('span', { width: (b.progress.planned ? 100 * b.progress.done / b.progress.planned : 0) + '%' }))),
+    h('td', { class: 'mono', text: featuresText(b) }),
+    h('td', { text: b.models.join('、') || '—' }),
+    h('td', {}, h('span', { text: [...new Map(b.items.map((i) => [i.suite, i.suite_name || i.suite])).values()].join('、') }), h('span', { class: 'sub', text: `${b.items.length} 次运行` })),
+    h('td', {}, h('span', { text: PROFILE_STATUS[b.status] || b.status }), h('span', { class: 'sub', text: progressText(b) })),
     h('td', {}, outcomeBar(b.summary.counts, b.summary.trials || 0)),
     h('td', { class: 'num', text: pct(b.summary.first_pass_rate) }),
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
-    h('td', { class: 'num', text: dur(b.wall_s) }),
-    h('td', { class: 'num', text: when(b.created_at) }),
-    body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, batchActions(b, true))) : null));
-  const batchHeads = ['批次', 'metacodes 版本', '模型', '评测集', '状态', '进度', '结局分布', '首次满分率', '总 Token', '用时', '创建', ...(body.can_run ? ['操作'] : [])];
-  const batchPanel = panel('批次', `${batches.length} 个 · 每个批次冻结一个 metacodes 版本`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, batchHeads.map((t, i) => h('th', { class: i >= 7 && i <= 10 ? 'num' : null, text: t })))),
-    h('tbody', {}, batchRows.length ? batchRows : h('tr', {}, h('td', { colspan: batchHeads.length, class: 'empty' }, '还没有批次。', link('#/new', '新建一个批次'), '：选择一个 metacodes 版本和多个评测集。'))))),
-  h('a', { class: 'button', href: '#/new', text: '新建批次' }));
+    h('td', { class: 'num', text: when(b.last_run_at) }),
+    body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
+  const profileHeads = ['评测配置', 'metacodes 版本', '高级功能', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
+  const profilePanel = panel('评测配置', `${profiles.length} 个 · 每个评测配置固定一个 metacodes 版本和一组高级功能，可以反复运行`, h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 7 && i <= 9 ? 'num' : null, text: t })))),
+    h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置。', link('#/new', '发起一次评测'), '：选择 metacodes 版本、高级功能和评测集。'))))),
+  h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
   const compareBtn = h('button', { class: 'button primary', type: 'button', disabled: state.selected.size < 2 || null,
     onclick: () => { location.hash = '#/compare/' + [...state.selected].map(encodeURIComponent).join(','); } }, `对比所选 (${state.selected.size})`);
@@ -319,30 +340,30 @@ async function renderOverview() {
   const table = h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始'].map((t, i) => h('th', { class: i >= 5 ? 'num' : null, text: t })))),
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 14, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
-  const loose = runs.filter((r) => !r.batch);
-  const launches = state.scope !== 'all' && state.scope !== 'none' || !loose.length ? null : panel('单独发起的评测', `${loose.length} 次（未归入批次）`,
+  const loose = runs.filter((r) => !r.profile && !r.batch);
+  const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次（不属于任何评测配置）`,
     h('div', { class: 'launches' }, loose.map((r) => h('a', { class: 'launch', href: '#/run/' + r.name },
       h('b', { text: r.name }), h('span', { class: 'muted', text: [r.suite_name, r.model].filter(Boolean).join(' · ') }),
       h('span', { text: RUN_STATUS[r.status] || r.status })))));
-  const jobsTitle = current ? '本批次的作业（每个评测集一个）' : '作业';
-  return h('div', {}, scopeBar, metrics, compositionPanel(summary, current ? '本批次均值' : '均值'), batchPanel,
+  const jobsTitle = current ? '这个评测配置的作业（每次运行的每个评测集一个）' : '作业';
+  return h('div', {}, scopeBar, metrics, compositionPanel(summary, current ? '本评测配置所有作业均值' : '均值'), profilePanel,
     panel(jobsTitle, state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn), launches);
 }
 
-// ------------------------------------------------------------ batch
-async function renderBatch(id) {
+// ------------------------------------------------------------ profile
+async function renderProfile(id) {
   navCurrent('overview');
-  const b = await api('/api/batch?id=' + encodeURIComponent(id));
-  state.live = batchActive(b);
-  $('#title').textContent = batchName(b);
-  crumbs([{ text: '看板', href: '#/' }, { text: '批次 ' + b.id }]);
+  const b = await api('/api/profile?id=' + encodeURIComponent(id));
+  state.live = profileActive(b);
+  $('#title').textContent = profileName(b);
+  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + b.id }]);
   const s = b.summary;
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
-    metric('进度', `${b.progress.done} / ${b.progress.planned}`, `${BATCH_STATUS[b.status] || b.status} · ${dur(b.wall_s)}`),
-    metric('评测集', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
+    metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
+    metric('运行', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
     metric('无效', String(s.counts.invalid), '基础设施原因，不计入通过率'));
 
-  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '批次名称' });
+  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
   const closeRename = () => { state.editing = false; renameForm.hidden = true; nameRow.hidden = false; };
   const renameForm = h('form', { class: 'rename', hidden: true },
@@ -353,11 +374,11 @@ async function renderBatch(id) {
     event.preventDefault();
     renameFeedback.textContent = '正在保存…';
     try {
-      await api('/api/batch/rename', { id: b.id, name: nameInput.value });
+      await api('/api/profile/rename', { id: b.id, name: nameInput.value });
       render();
     } catch (error) { renameFeedback.textContent = error.message; }
   });
-  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（显示批次编号）' }),
+  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（显示评测配置编号）' }),
     b.can_run ? h('button', { type: 'button', class: 'button', onclick: () => {
       state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
     } }, '重命名') : null);
@@ -369,36 +390,41 @@ async function renderBatch(id) {
     h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
     h('dt', { text: '二进制 SHA-256' }), h('dd', { class: 'mono', text: m.binary_sha256 || '—' }),
     h('dt', { text: '冻结副本' }), h('dd', { class: 'mono', text: m.bundle || '—' }),
-    h('dt', { text: '模型' }), h('dd', { text: b.model || '—' }),
-    h('dt', { text: '执行机器' }), h('dd', { text: b.executor || '—' }),
-    h('dt', { text: '每题次数 / 并发' }), h('dd', { text: `${b.attempts} 次 · 并发 ${b.concurrency}（不超过各评测集上限）` }),
-    h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: (b.features || []).join(', ') || '未开启' }),
-    h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 开始 ${when(b.started_at)} · 结束 ${when(b.finished_at)}` })),
-    h('p', { class: 'muted', text: '批次创建时复制并锁定这个 metacodes 发行包；之后重新构建或切换工作台的版本不影响本批次。各评测集依次运行，每个评测集一个作业。' }));
+    h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: featuresText(b) }),
+    h('dt', { text: '模型' }), h('dd', { text: b.models.join('、') || '—' }),
+    h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })),
+    h('p', { class: 'muted', text: '评测配置固定一个冻结的 metacodes 发行包和一组高级功能；之后重新构建或切换工作台的版本不影响它。可以反复运行，同一模型同一道题的新结果覆盖旧结果，旧结果留在运行历史里。' }));
 
-  const itemRows = b.items.map((item) => {
+  const itemRows = [...b.items].reverse().map((item) => {
     const j = item.job; const js = j?.summary;
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
-      h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`].filter(Boolean).join(' · ') })),
+      h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
+        (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
+      h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
-      h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * b.attempts}` }),
+      h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * (item.attempts || 1)}` }),
       h('td', {}, js ? outcomeBar(js.counts, js.trials) : dash()),
       h('td', { class: 'num', text: js ? pct(js.first_pass_rate) : '—' }),
       h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
-      h('td', { class: 'num', text: js ? compact(js.initial_input_tokens_mean) : '—' }),
       h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
+      h('td', { class: 'num', text: when(item.queued_at) }),
       h('td', { class: 'mono', text: item.run || '—' }));
   });
-  const items = panel('评测集', `${b.items.length} 个 · 依次运行`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['评测集', '状态', '完成', '结局分布', '首次满分率', '总 Token', '初始 Token（均值）', '用时', '作业'].map((t, i) => h('th', { class: i >= 2 && i <= 7 && i !== 3 ? 'num' : null, text: t })))),
+  const items = panel('运行历史', `${b.items.length} 次 · 新的在前 · 排队的评测集依次运行`, h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业'].map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, itemRows))));
 
-  // Per task: every dataset's tasks, attempts in order.
+  // Per task: each (suite, model, task)'s latest attempts in order.
   const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
-  if (state.batchSuite && !suitesPresent.some(([id]) => id === state.batchSuite)) state.batchSuite = 'all';
+  if (state.profileSuite && !suitesPresent.some(([id]) => id === state.profileSuite)) state.profileSuite = 'all';
   const chips = suitesPresent.length > 1 ? h('div', { class: 'chips', role: 'group', 'aria-label': '按评测集筛选' },
-    [['all', '全部评测集'], ...suitesPresent].map(([sid, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String((state.batchSuite || 'all') === sid),
-      onclick: () => { state.batchSuite = sid; render(); } }, name))) : null;
+    [['all', '全部评测集'], ...suitesPresent].map(([sid, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String((state.profileSuite || 'all') === sid),
+      onclick: () => { state.profileSuite = sid; render(); } }, name))) : null;
+  const modelsPresent = [...new Set(b.tasks.map((t) => t.model).filter(Boolean))];
+  if (state.profileModel && !modelsPresent.includes(state.profileModel)) state.profileModel = 'all';
+  const modelChips = modelsPresent.length > 1 ? h('div', { class: 'chips', role: 'group', 'aria-label': '按模型筛选' },
+    [['all', '全部模型'], ...modelsPresent.map((x) => [x, x])].map(([mid, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String((state.profileModel || 'all') === mid),
+      onclick: () => { state.profileModel = mid; render(); } }, name))) : null;
   const firstFilter = h('div', { class: 'filters' }, ['all', ...ORDER].map((key) => h('button', {
     type: 'button', class: (state.taskFilter || 'all') === key ? 'on' : null, onclick: () => { state.taskFilter = key; render(); },
   }, key === 'all' ? '全部' : '首次' + STATUS[key])));
@@ -407,47 +433,52 @@ async function renderBatch(id) {
   const tbody = h('tbody', {});
   function drawTasks() {
     const q = (state.taskSearch || '').trim().toLowerCase();
-    const shown = b.tasks.filter((t) => (state.batchSuite || 'all') === 'all' || t.suite === state.batchSuite)
+    const shown = b.tasks.filter((t) => (state.profileSuite || 'all') === 'all' || t.suite === state.profileSuite)
+      .filter((t) => (state.profileModel || 'all') === 'all' || t.model === state.profileModel)
       .filter((t) => (state.taskFilter || 'all') === 'all' || t.first_status === state.taskFilter)
       .filter((t) => !q || t.task.toLowerCase().includes(q));
     tbody.replaceChildren(...(shown.length ? shown.map((t) => {
-      const href = t.job ? `#/batch/${encodeURIComponent(b.id)}/task/${encodeURIComponent(t.job)}/${encodeURIComponent(t.task)}` : null;
+      const href = t.job ? `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(t.job)}/${encodeURIComponent(t.task)}` : null;
       return h('tr', { class: href ? 'link' : null, onclick: href ? () => { location.hash = href; } : null },
         h('td', {}, h('span', { class: 'mono', text: t.task })),
         h('td', { text: t.suite_name || t.suite }),
+        h('td', { text: t.model || '—' }),
         h('td', {}, t.attempts.length ? h('span', { class: 'dots' }, t.attempts.map((a) => h('a', { href: href + '/' + encodeURIComponent(a.trial), onclick: (e) => e.stopPropagation(), title: `第 ${a.attempt_number} 次 · ${STATUS[a.status] || a.status}${a.cause ? ' · ' + a.cause : ''}` }, badge(a.status)))) : h('span', { class: 'muted', text: '等待运行' })),
         h('td', { class: 'num', text: t.attempts.length ? `${t.passed} / ${t.valid}` : '—' }),
+        h('td', { class: 'num', text: t.history.length ? `覆盖了 ${t.history.length} 次` : '—' }),
         h('td', { class: 'num', text: compact(t.mean_total_tokens) }),
         h('td', { class: 'num', text: compact(t.mean_initial_input_tokens) }),
         h('td', { class: 'num', text: t.mean_turns === null || t.mean_turns === undefined ? '—' : t.mean_turns.toFixed(1) }),
         h('td', { class: 'num', text: t.mean_tool_calls === null || t.mean_tool_calls === undefined ? '—' : t.mean_tool_calls.toFixed(1) }),
         h('td', { class: 'num', text: dur(t.mean_elapsed_s) }));
-    }) : [h('tr', {}, h('td', { colspan: 9, class: 'empty', text: '没有符合条件的任务' }))]));
+    }) : [h('tr', {}, h('td', { colspan: 11, class: 'empty', text: '没有符合条件的任务' }))]));
   }
   drawTasks();
-  const tasks = panel('逐任务', `${b.tasks.length} 道 · 点开看每次尝试的轨迹、Token 分布和耗时`, h('div', {}, chips,
+  const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道 · 重跑的题显示最新一次运行 · 点开看每次尝试的轨迹、Token 分布和耗时`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
-    h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '各次结局', '通过 / 有效', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 3 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('批次信息', BATCH_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, batchActions(b, false)) : null), compositionPanel(s, '本批次均值'), items, tasks);
+    h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
+  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), compositionPanel(s, '最新结果均值'), tasks, items);
 }
 
-async function renderBatchTask(batchId, jobName, taskName, trialName) {
+async function renderProfileTask(profileId, jobName, taskName, trialName) {
   navCurrent('overview');
-  const b = await api('/api/batch?id=' + encodeURIComponent(batchId));
+  const b = await api('/api/profile?id=' + encodeURIComponent(profileId));
   const ordered = b.tasks.filter((t) => t.job);
   const index = ordered.findIndex((t) => t.job === jobName && t.task === taskName);
-  const group = ordered[index];
-  if (!group) throw new Error('批次中没有这个任务');
+  const group = ordered[index] || await historyGroup(b, jobName, taskName);
+  if (!group) throw new Error('评测配置中没有这个任务');
   const chosen = group.attempts.find((a) => a.trial === trialName) || group.attempts[0];
   $('#title').textContent = taskName;
-  crumbs([{ text: '看板', href: '#/' }, { text: '批次 ' + batchName(b), href: '#/batch/' + encodeURIComponent(b.id) },
+  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + profileName(b), href: profileHref(b) },
     { text: group.suite_name || group.suite }, { text: taskName }]);
-  const taskHref = (t) => `#/batch/${encodeURIComponent(b.id)}/task/${encodeURIComponent(t.job)}/${encodeURIComponent(t.task)}`;
-  const prev = ordered[index - 1]; const next = ordered[index + 1];
+  const taskHref = (t) => `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(t.job)}/${encodeURIComponent(t.task)}`;
+  const prev = index >= 0 ? ordered[index - 1] : null; const next = index >= 0 ? ordered[index + 1] : null;
   const nav = h('div', { class: 'header-actions' },
-    h('span', { class: 'muted num', text: `${index + 1} / ${ordered.length}` }),
+    h('span', { class: 'muted num', text: index >= 0 ? `${index + 1} / ${ordered.length}` : '历史结果' }),
     prev ? h('a', { class: 'button', href: taskHref(prev), title: prev.task }, '← 上一个任务') : h('button', { class: 'button', type: 'button', disabled: true }, '← 上一个任务'),
     next ? h('a', { class: 'button', href: taskHref(next), title: next.task }, '下一个任务 →') : h('button', { class: 'button', type: 'button', disabled: true }, '下一个任务 →'));
+  const history = (group.history || []).length ? h('div', { class: 'panel-body' }, h('small', { class: 'muted' }, '被覆盖的早先运行：',
+    ...group.history.map((job) => h('a', { class: 'mono', href: taskHref({ job, task: taskName }), text: ' ' + job + ' ' })))) : null;
   const cards = h('div', { class: 'panel-body attempts' }, group.attempts.map((a) => h('a', {
     class: 'attempt', href: taskHref(group) + '/' + encodeURIComponent(a.trial), 'aria-pressed': String(chosen && a.trial === chosen.trial) },
     h('span', {}, `第 ${a.attempt_number} 次 `, badge(a.status, a.cause)),
@@ -460,15 +491,26 @@ async function renderBatchTask(batchId, jobName, taskName, trialName) {
     h('div', {}, h('div', { class: 'stack-bar', title: `总 Token ${int(a.total_tokens)}` }, h('span', { class: 't-input', width: (100 * (a.total_tokens || 0) / maxTokens) + '%' })),
       h('div', { class: 'stack-bar mini', title: `用时 ${dur(a.elapsed_s)}` }, h('span', { class: 't-other', width: (100 * (a.elapsed_s || 0) / maxTime) + '%' }))),
     h('span', { class: 'num muted', text: `${compact(a.total_tokens)} · ${dur(a.elapsed_s)}` })))) : null;
-  const parts = [panel('各次尝试', `${group.attempts.length} 次 · 通过 ${group.passed} / 有效 ${group.valid}`, h('div', {}, cards, compare), nav)];
+  const parts = [panel('各次尝试', `${group.attempts.length} 次 · 通过 ${group.passed} / 有效 ${group.valid}${group.model ? ' · ' + group.model : ''}`, h('div', {}, cards, compare, history), nav)];
   if (chosen) {
     const t = await api(`/api/trial?job=${encodeURIComponent(jobName)}&trial=${encodeURIComponent(chosen.trial)}`);
-    state.live = t.row.status === 'running' || batchActive(b);
+    state.live = t.row.status === 'running' || profileActive(b);
     parts.push(...trialBody(t));
   } else {
-    state.live = batchActive(b);
+    state.live = profileActive(b);
   }
   return h('div', {}, parts);
+}
+
+// A task's attempts in a run a later one replaced, read from that job.
+async function historyGroup(b, jobName, taskName) {
+  const item = b.items.find((i) => i.run === jobName);
+  if (!item) return null;
+  const job = await api('/api/job?name=' + encodeURIComponent(jobName));
+  const attempts = (job.rows || []).filter((r) => r.task === taskName).sort((x, y) => (x.attempt_number || 0) - (y.attempt_number || 0));
+  if (!attempts.length) return null;
+  return { task: taskName, job: jobName, suite: item.suite, suite_name: item.suite_name, model: item.model, attempts,
+    passed: attempts.filter((a) => a.status === 'pass').length, valid: attempts.filter((a) => !['invalid', 'running'].includes(a.status)).length, history: [] };
 }
 
 // ------------------------------------------------------------ run workbench
@@ -483,53 +525,51 @@ const RUNNERS = { 'harbor-registry': 'Harbor 注册表', 'harbor-local': '本地
 // The LLM judge that scores a suite/run: model id and how it is reached.
 const judgeText = (j) => '评委 ' + j.model + (j.via === 'metask' ? '（Metask 网关）' : j.via === 'host_env' ? '（执行机器环境变量）' : '');
 
-async function renderNewBatch() {
+async function renderNewRun() {
   state.live = false;
   navCurrent('new');
-  $('#title').textContent = '新建批次';
-  crumbs([{ text: '看板', href: '#/' }, { text: '冻结一个 metacodes 版本，选择多个评测集' }]);
+  $('#title').textContent = '发起评测';
+  crumbs([{ text: '看板', href: '#/' }, { text: '选择 metacodes 版本和高级功能（即评测配置），再选评测集' }]);
   const c = await api('/api/workbench');
   const suites = c.suites || [];
   const byId = new Map(suites.map((s) => [s.id, s]));
   // Selected suites, in the order picked: id -> {tasks, defaults, selected, error, loaded}.
-  if (!state.batchPick) state.batchPick = new Map();
-  for (const id of [...state.batchPick.keys()]) if (!byId.has(id)) state.batchPick.delete(id);
-  if (!state.batchPick.size && byId.has(c.default_suite)) state.batchPick.set(c.default_suite, null);
+  if (!state.suitePick) state.suitePick = new Map();
+  for (const id of [...state.suitePick.keys()]) if (!byId.has(id)) state.suitePick.delete(id);
+  if (!state.suitePick.size && byId.has(c.default_suite)) state.suitePick.set(c.default_suite, null);
   const executorsList = c.executors || [];
   if (!executorsList.some((e) => e.name === state.executor)) state.executor = c.default_executor;
   const selectedExecutor = () => executorsList.find((e) => e.name === state.executor) || { reasons: [], ready: true };
   const comboReasons = (s) => ((s.executors || {})[state.executor] || s).reasons || [];
   const comboReady = (s) => !comboReasons(s).length;
   const form = h('form', { class: 'run-form' });
-  const draft = state.batchDraft || (state.batchDraft = {});
-  if (!state.batchWanted) state.batchWanted = new Map();
+  const draft = state.runDraft || (state.runDraft = {});
+  if (!state.taskWanted) state.taskWanted = new Map();
 
   const executor = h('select', { name: 'executor', onchange: () => {
     state.executor = executor.value;
-    for (const [id, entry] of state.batchPick) {
-      if (entry) state.batchWanted.set(id, [...entry.selected]);
-      state.batchPick.set(id, null);
+    for (const [id, entry] of state.suitePick) {
+      if (entry) state.taskWanted.set(id, [...entry.selected]);
+      state.suitePick.set(id, null);
       loadTasks(id);
     }
     drawNotes(); drawPicker(); drawBoxes(); syncSubmit();
   } }, executorsList.map((e) => h('option', { value: e.name, selected: e.name === state.executor },
     e.label + (e.ready ? '' : ' · 待配置'))));
   const bundles = c.bundles || [];
-  if (draft.source) {
-    state.pickBundle = bundles.find((b) => b.path === draft.source)?.id || null;
-    draft.bundleMissing = !state.pickBundle;
-    draft.source = null;
-  }
+  const fixed = Boolean(draft.profile);
   const picked = bundles.some((b) => b.id === state.pickBundle) ? state.pickBundle : null;
-  const bundle = h('select', { name: 'bundle', onchange: () => { state.pickBundle = bundle.value; draft.bundleMissing = false; } }, bundles.map((b) => h('option', { value: b.id, selected: picked ? b.id === picked : b.current },
-    `${b.label}${b.current ? '（当前配置）' : ''}`)));
+  const bundle = fixed
+    ? h('select', { name: 'bundle', disabled: true }, h('option', { text: `${draft.label || '—'}（评测配置已冻结）` }))
+    : h('select', { name: 'bundle', onchange: () => { state.pickBundle = bundle.value; } }, bundles.map((b) => h('option', { value: b.id, selected: picked ? b.id === picked : b.current },
+      `${b.label}${b.current ? '（当前配置）' : ''}`)));
   const commitBox = h('div', { class: 'commit-builder', hidden: !state.commitsOpen });
   const commitToggle = h('button', { type: 'button', class: 'button', onclick: () => {
     state.commitsOpen = !state.commitsOpen;
     commitBox.hidden = !state.commitsOpen;
     if (state.commitsOpen && !commitBox.childElementCount) drawCommits();
   } }, '按 commit 编译…');
-  const name = h('input', { name: 'name', type: 'text', maxlength: 80, value: draft.name || '', placeholder: '例如：v0.12 回归 · DeepSeek',
+  const name = h('input', { name: 'name', type: 'text', maxlength: 80, value: draft.name || '', placeholder: '例如：v0.12 · 全部门控',
     oninput: () => { draft.name = name.value; } });
   const picker = h('div', { class: 'suite-picker' });
   const boxes = h('div', { class: 'stack' });
@@ -544,30 +584,31 @@ async function renderNewBatch() {
   const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, max: 16, step: 1, required: true,
     oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
-    input: h('input', { type: 'checkbox', name: 'features', value: f.id, checked: (draft.features || []).includes(f.id),
+    input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,
+      checked: (draft.features || c.default_features || []).includes(f.id),
       onchange: () => { draft.features = featureBoxes.filter((x) => x.input.checked).map((x) => x.id); } }), label: f.label }));
   const featureGroup = (group, title) => {
     const boxes = featureBoxes.filter((f) => f.group === group);
     return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),
       ...boxes.map((f) => h('label', { class: 'check' }, f.input, h('span', { text: f.label }), h('small', { class: 'mono muted', text: f.id })))) : null;
   };
-  const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: '高级功能（可选，默认全部关闭）' }),
+  const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: fixed ? '高级功能（评测配置已固定）' : '高级功能（形式化门控默认开启，Preview 默认关闭）' }),
     featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性'),
-    h('small', { class: 'muted', text: '只对 Harbor 评测集生效；所选发行包须支持这些开关。' })) : '';
+    h('small', { class: 'muted', text: '只对 Harbor 评测集生效；所选发行包须支持这些开关。同一个 metacodes 版本和同一组高级功能总是同一个评测配置。' })) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
-  const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '创建批次');
+  const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
 
   function setupReasons() {
-    const harbor = [...state.batchPick.keys()].some((id) => (byId.get(id) || {}).runner !== 'workbuddy');
+    const harbor = [...state.suitePick.keys()].some((id) => (byId.get(id) || {}).runner !== 'workbuddy');
     return [...(c.global_reasons || []), ...(harbor ? (c.harbor_reasons || []) : []),
       ...(harbor ? (selectedExecutor().reasons || []) : [])];
   }
   function syncSubmit() {
-    const picked = [...state.batchPick.entries()];
+    const picked = [...state.suitePick.entries()];
     const total = picked.reduce((acc, [, e]) => acc + (e ? e.selected.size : 0), 0);
     const problems = picked.filter(([id, e]) => !comboReady(byId.get(id)) || !e || !e.selected.size || e.selected.size > byId.get(id).max_tasks);
-    submit.disabled = !picked.length || problems.length > 0 || !c.can_run || !bundles.length;
-    submit.textContent = picked.length ? `创建批次（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次）` : '创建批次';
+    submit.disabled = !picked.length || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
+    submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次）` : '开始评测';
   }
   function drawPicker() {
     picker.replaceChildren(...(c.categories || []).map((cat) => {
@@ -576,26 +617,26 @@ async function renderNewBatch() {
       return h('div', { class: members.length > 2 ? 'suite-group wide' : 'suite-group' },
         h('div', { class: 'suite-group-head' }, h('b', { text: cat.name }), h('span', { class: 'muted', text: cat.description })),
         h('div', { class: 'suite-cards' }, members.map((s) => h('button', {
-          type: 'button', class: 'suite-card', 'aria-pressed': String(state.batchPick.has(s.id)), 'data-suite': s.id,
+          type: 'button', class: 'suite-card', 'aria-pressed': String(state.suitePick.has(s.id)), 'data-suite': s.id,
           onclick: () => {
-            if (state.batchPick.has(s.id)) state.batchPick.delete(s.id); else { state.batchPick.set(s.id, null); loadTasks(s.id); }
+            if (state.suitePick.has(s.id)) state.suitePick.delete(s.id); else { state.suitePick.set(s.id, null); loadTasks(s.id); }
             drawPicker(); drawNotes(); drawBoxes(); syncSubmit();
           },
         }, h('span', { class: 'suite-name', text: s.name }),
         h('span', { class: 'sub', text: (s.task_count === null ? '任务待准备' : s.task_count + ' 题') + ' · ' + (RUNNERS[s.runner] || s.runner) }),
-        h('span', { class: 'suite-state ' + (comboReady(s) ? 'ok' : s.available ? 'todo' : 'off'), text: (state.batchPick.has(s.id) ? '已加入 · ' : '') + (comboReady(s) ? '可运行' : s.available ? '待配置' : '尚未接入') })))));
+        h('span', { class: 'suite-state ' + (comboReady(s) ? 'ok' : s.available ? 'todo' : 'off'), text: (state.suitePick.has(s.id) ? '已加入 · ' : '') + (comboReady(s) ? '可运行' : s.available ? '待配置' : '尚未接入') })))));
     }).filter(Boolean));
   }
   function suiteBox(s, entry) {
     const shown = new Set(setupReasons());
     const reasons = comboReasons(s).filter((text) => !shown.has(text));
-    const remove = h('button', { type: 'button', class: 'button', onclick: () => { state.batchPick.delete(s.id); drawPicker(); drawBoxes(); syncSubmit(); } }, '移出批次');
+    const remove = h('button', { type: 'button', class: 'button', onclick: () => { state.suitePick.delete(s.id); drawPicker(); drawBoxes(); syncSubmit(); } }, '移出');
     const head = h('div', { class: 'suite-box-head' }, h('span', { class: 'muted', text: s.description }), remove);
     const box = h('fieldset', {}, h('legend', { text: `${s.name} · ${(c.categories || []).find((x) => x.id === s.category)?.name || ''}` }), head,
       reasons.length ? h('div', { class: 'callout' }, reasons.map((text) => h('p', { text }))) : null);
     if (!entry) { box.append(h('div', { class: 'empty', text: '读取任务列表…' })); return box; }
     if (!entry.tasks.length) { box.append(h('div', { class: 'empty', text: entry.error || '该评测集暂无可选任务' })); return box; }
-    if (entry.missing) box.append(h('div', { class: 'callout', text: `${draft.from ? '原批次' : '之前选'}的 ${entry.missing} 道题不在当前执行机器的任务列表里，已略过。` }));
+    if (entry.missing) box.append(h('div', { class: 'callout', text: `${draft.from ? '上次运行' : '之前选'}的 ${entry.missing} 道题不在当前执行机器的任务列表里，已略过。` }));
     const list = h('div', { class: 'task-options' });
     const search = h('input', { type: 'search', placeholder: `搜索 ${entry.tasks.length} 道任务`, 'aria-label': '搜索 ' + s.name + ' 的任务' });
     const count = h('span', { class: 'muted num' });
@@ -629,8 +670,8 @@ async function renderNewBatch() {
     return box;
   }
   function drawBoxes() {
-    boxes.replaceChildren(...(state.batchPick.size ? [...state.batchPick.entries()].map(([id, entry]) => suiteBox(byId.get(id), entry))
-      : [h('div', { class: 'empty', text: '在上面点选一个或多个评测集加入批次。' })]));
+    boxes.replaceChildren(...(state.suitePick.size ? [...state.suitePick.entries()].map(([id, entry]) => suiteBox(byId.get(id), entry))
+      : [h('div', { class: 'empty', text: '在上面点选一个或多个评测集。' })]));
   }
   async function loadTasks(id) {
     const wanted = state.executor;
@@ -642,16 +683,16 @@ async function renderNewBatch() {
     try {
       const body = await api('/api/suite?id=' + encodeURIComponent(id) + '&executor=' + encodeURIComponent(wanted || ''));
       const tasks = body.tasks || [];
-      const kept = state.batchWanted.get(id);
+      const kept = state.taskWanted.get(id);
       const selected = kept ? kept.filter((t) => tasks.includes(t)) : body.default_tasks || [];
       entry = { tasks, defaults: body.default_tasks || [], selected: new Set(selected), error: body.error || null,
         missing: kept ? kept.length - selected.length : 0 };
     } catch (e) { entry.error = e.message; }
     // Only the suite's latest request counts: an older one may be for another
     // executor, or for this one before a switch away and back.
-    if (state.batchPick.has(id) && state.taskTickets.get(id) === ticket) {
-      if (!entry.error) state.batchWanted.delete(id);
-      state.batchPick.set(id, entry); drawBoxes(); syncSubmit();
+    if (state.suitePick.has(id) && state.taskTickets.get(id) === ticket) {
+      if (!entry.error) state.taskWanted.delete(id);
+      state.suitePick.set(id, entry); drawBoxes(); syncSubmit();
     }
   }
   attempts.addEventListener('input', syncSubmit);
@@ -661,21 +702,20 @@ async function renderNewBatch() {
       h('small', { text: '运行 Harbor 和 Docker 的机器。SSH 执行机器的结果会同步回本机作业目录并写入评测数据库。' })));
   }
   if (draft.from) {
-    const notes = [`已按批次「${draft.from}」的版本、评测集、题目和参数填好，可以修改后创建。`];
-    if (draft.bundleMissing) notes.push('原批次的 metacodes 版本已不在可选列表中，请重新选择。');
-    if (modelMissing) notes.push(`原批次的模型 ${draft.model} 当前不可用，请重新选择。`);
+    const notes = [`在评测配置「${draft.from}」上运行：版本和高级功能已固定，评测集、题目和参数按上次填好，可以修改。`];
+    if (modelMissing) notes.push(`上次的模型 ${draft.model} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
-        state.batchDraft = null; state.batchWanted = null; state.batchPick = null; state.pickBundle = null; render();
-      } }, '清空，从头填写')));
+        state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; render();
+      } }, '改为新的评测配置')));
   }
   form.append(
     h('div', { class: 'form-row' },
       h('div', { class: 'field' }, h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), bundle),
-        h('small', { text: bundles.length ? '创建时按内容摘要复制并锁定这个发行包；之后重新构建或切换版本不影响本批次。' : '还没有可用的 Linux 发行包，请先运行一键配置。' }),
-        c.can_run ? h('div', {}, commitToggle) : null),
-      h('label', { class: 'field' }, h('span', { text: '批次名称（可选）' }), name, h('small', { text: '不填则用批次编号。' }))),
-    commitBox,
+        h('small', { text: fixed ? '评测配置创建时已按内容摘要复制并锁定。' : bundles.length ? '第一次使用时按内容摘要复制并锁定这个发行包；之后重新构建或切换版本不影响它。' : '还没有可用的 Linux 发行包，请先运行一键配置。' }),
+        c.can_run && !fixed ? h('div', {}, commitToggle) : null),
+      fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name, h('small', { text: '只在第一次创建这个评测配置时使用；不填则用编号。' }))),
+    fixed ? null : commitBox,
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('label', { class: 'field' }, h('span', { text: '模型' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
@@ -686,25 +726,27 @@ async function renderNewBatch() {
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency, h('small', { text: '每个评测集按自己的上限截断。' }))),
     features,
-    h('p', { class: 'muted', text: '评测会调用所选模型。各评测集依次运行；创建后可在批次页持续查看进度、逐任务轨迹、Token 分布和耗时。' }), feedback, submit);
+    h('p', { class: 'muted', text: '评测会调用所选模型。各评测集依次运行；之后可在评测配置页持续查看进度、逐任务轨迹、Token 分布和耗时，重跑的题覆盖旧结果。' }), feedback, submit);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     submit.disabled = true;
-    feedback.textContent = '正在冻结 metacodes 版本并创建批次…';
+    feedback.textContent = fixed ? '正在排队…' : '正在冻结 metacodes 版本并排队…';
     try {
       const request = { model: model.value, attempts: Number(attempts.value), concurrency: Number(concurrency.value),
-        items: [...state.batchPick.entries()].map(([id, entry]) => ({ suite: id, tasks: entry.tasks.filter((t) => entry.selected.has(t)) })) };
-      if (bundle.value) request.bundle = bundle.value;
-      if (name.value.trim()) request.name = name.value.trim();
+        items: [...state.suitePick.entries()].map(([id, entry]) => ({ suite: id, tasks: entry.tasks.filter((t) => entry.selected.has(t)) })) };
+      if (fixed) request.profile = draft.profile;
+      else {
+        if (bundle.value) request.bundle = bundle.value;
+        if (name.value.trim()) request.name = name.value.trim();
+        request.features = featureBoxes.filter((f) => f.input.checked).map((f) => f.id);
+      }
       if (executorsList.length) request.executor = executor.value;
-      const chosen = featureBoxes.filter((f) => f.input.checked).map((f) => f.id);
-      if (chosen.length) request.features = chosen;
-      const record = await api('/api/batches', request);
-      state.batchPick = null;
-      state.batchDraft = null;
-      state.batchWanted = null;
+      const record = await api('/api/profiles/run', request);
+      state.suitePick = null;
+      state.runDraft = null;
+      state.taskWanted = null;
       state.scope = record.id;
-      location.hash = '#/batch/' + encodeURIComponent(record.id);
+      location.hash = profileHref(record);
     } catch (error) {
       feedback.textContent = error.message;
       syncSubmit();
@@ -715,7 +757,7 @@ async function renderNewBatch() {
   function drawNotes() {
     const reasons = setupReasons();
     const notes = [...reasons, ...(c.warnings || [])];
-    for (const id of state.batchPick.keys()) {
+    for (const id of state.suitePick.keys()) {
       const s = byId.get(id);
       if (s && s.judge) notes.push(s.name + '：' + judgeText(s.judge) + '；分数与使用其他评委（如官方 openai/gpt-4o-mini）的结果不可直接比较');
     }
@@ -838,7 +880,7 @@ async function renderNewBatch() {
   drawPicker();
   drawNotes();
   drawBoxes();
-  for (const [id, entry] of state.batchPick) if (!entry) loadTasks(id);
+  for (const [id, entry] of state.suitePick) if (!entry) loadTasks(id);
   drawSetup();
   syncSubmit();
   const groupRows = (c.account_groups || []).map((g) => h('tr', {},
@@ -850,7 +892,7 @@ async function renderNewBatch() {
       h('p', { class: 'muted', text: '模型下拉框合并了已有 Key 的模型目录。其他可选组需要先在 Metask 账号中配置对应 Key，刷新后自动加入。' }),
       groupTable)) : null;
   return h('div', {}, callout, setupBox,
-    panel('新建批次', '冻结 metacodes 版本 · 多个评测集依次运行 · 独立容器 · 完整轨迹 · 自动判分', form), groups);
+    panel('发起评测', '评测配置 = 冻结的 metacodes 版本 + 高级功能 · 多个评测集依次运行 · 独立容器 · 完整轨迹 · 自动判分', form), groups);
 }
 
 async function renderRun(name) {
@@ -904,7 +946,7 @@ async function renderJob(name) {
   const job = await api('/api/job?name=' + encodeURIComponent(name));
   state.live = job.running;
   $('#title').textContent = job.name;
-  crumbs([{ text: '看板', href: '#/' }, job.batch ? { text: '批次 ' + job.batch, href: '#/batch/' + encodeURIComponent(job.batch) } : null, { text: job.name }].filter(Boolean));
+  crumbs([{ text: '看板', href: '#/' }, job.profile ? { text: '评测配置 ' + job.profile, href: '#/profile/' + encodeURIComponent(job.profile) } : null, { text: job.name }].filter(Boolean));
   const s = job.summary;
   const causes = Object.entries(s.invalid_causes).map(([k, v]) => `${k} ${v}`).join(' · ');
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
@@ -915,7 +957,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
-    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（批次冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
+    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（评测配置冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
   const filters = h('div', { class: 'filters' }, ['all', ...ORDER].map((key) => h('button', {
@@ -1215,13 +1257,13 @@ async function renderSettings() {
     h('dt', { text: '类型' }), h('dd', { text: `${db.format}（schema v${db.schema_version}）` }),
     h('dt', { text: '位置' }), h('dd', { class: 'mono', text: db.location }),
     db.password_env ? h('dt', { text: '密码环境变量' }) : null, db.password_env ? h('dd', { class: 'mono', text: db.password_env }) : null,
-    h('dt', { text: '内容' }), h('dd', { text: `批次 ${counts.batches ?? 0} · 作业 ${counts.jobs ?? 0} · trial ${counts.trials ?? 0} · 请求 ${counts.requests ?? 0} · 文件 ${counts.files ?? 0} · 启动记录 ${counts.runs ?? 0}` }),
+    h('dt', { text: '内容' }), h('dd', { text: `评测配置 ${counts.profiles ?? 0} · 作业 ${counts.jobs ?? 0} · trial ${counts.trials ?? 0} · 请求 ${counts.requests ?? 0} · 文件 ${counts.files ?? 0} · 启动记录 ${counts.runs ?? 0}` }),
     h('dt', { text: '最近导入' }), h('dd', { text: st.last_ingested_at ? when(st.last_ingested_at) : '—' }),
     h('dt', { text: '待重算投影' }), h('dd', { text: String(st.stale_projections) }),
     h('dt', { text: '同步的作业目录' }), h('dd', { class: 'mono', text: (st.jobs_dirs || []).join('\n') || '—' }),
     st.records_dir ? h('dt', { text: '启动记录目录' }) : null, st.records_dir ? h('dd', { class: 'mono', text: st.records_dir }) : null,
     st.config_path ? h('dt', { text: '配置文件' }) : null, st.config_path ? h('dd', { class: 'mono', text: st.config_path }) : null),
-    h('p', { class: 'muted', text: '页面从评测数据库读取：Harbor 作业目录中的成绩、逐次轨迹、判分日志、请求计时（.bench-metrics/）和批次记录都会同步进来。首次满分率只看每道题的首次执行，重跑成绩不回填；基础设施无效项单列。' })));
+    h('p', { class: 'muted', text: '页面从评测数据库读取：Harbor 作业目录中的成绩、逐次轨迹、判分日志、请求计时（.bench-metrics/）和评测配置记录都会同步进来。首次满分率只看每道题的首次执行，重跑成绩不回填；基础设施无效项单列。' })));
 
   const configured = st.configured || { backend: 'sqlite', path: st.default_sqlite || '' };
   let backend = configured.backend === 'postgres' ? 'postgres' : 'sqlite';
@@ -1255,7 +1297,7 @@ async function renderSettings() {
       const body = await api('/api/store', { action, store: target(), ...(action === 'apply' ? { migrate: migrate.checked } : {}) });
       result.className = 'result ok';
       if (action === 'test') {
-        result.textContent = body.exists ? `连接成功：${body.database.format} ${body.database.location}（schema v${body.database.schema_version}）${body.same ? ' · 就是当前数据库' : ''}\n已有：作业 ${body.counts.jobs} · trial ${body.counts.trials} · 批次 ${body.counts.batches ?? 0}` : `可用：${body.message}`;
+        result.textContent = body.exists ? `连接成功：${body.database.format} ${body.database.location}（schema v${body.database.schema_version}）${body.same ? ' · 就是当前数据库' : ''}\n已有：作业 ${body.counts.jobs} · trial ${body.counts.trials} · 评测配置 ${body.counts.profiles ?? 0}` : `可用：${body.message}`;
       } else if (body.unchanged) {
         result.textContent = '目标就是当前数据库，未作改动。';
       } else {
@@ -1276,7 +1318,7 @@ async function renderSettings() {
     sqliteFields, pgFields,
     h('label', { class: 'check' }, migrate, '把当前数据库的数据迁移到新数据库（逐表复制并校验，可重复执行）'),
     h('div', { class: 'header-actions' }, testBtn, applyBtn), result,
-    h('p', { class: 'muted', text: '有评测或批次运行时不能切换。切换后新数据写入新数据库；不勾选迁移时，作业目录仍会同步进新库，但只存在于旧库的数据不会出现。命令行等价操作：metacodes bench db migrate --to <目标> --switch' }))
+    h('p', { class: 'muted', text: '有评测运行时不能切换。切换后新数据写入新数据库；不勾选迁移时，作业目录仍会同步进新库，但只存在于旧库的数据不会出现。命令行等价操作：metacodes bench db migrate --to <目标> --switch' }))
     : h('div', { class: 'empty', text: '当前服务为只读模式（未用 metacodes bench 启动），不能修改数据库。' });
   return h('div', {}, current, panel('配置数据库', '工作台配置中的 store', form));
 }
@@ -1375,7 +1417,7 @@ async function renderProviders() {
   });
   return h('div', {},
     panel('已导入的 Provider', `${(list.providers || []).length} 个`, h('div', { class: 'panel-body' },
-      h('p', { class: 'muted', text: '这些模型出现在新建批次的模型下拉框里，和 Metask 账号模型并列。探测会真实发送一次请求：让模型原样返回一个随机字符串，返回一致才算通过。导入的 Provider 不支持 WorkBuddy；带 LLM 评委的评测集（GAIA2）在 Metask 认证下不可用（评委会被转发到导入的上游），在 --auth provider 下评委读取执行机器的环境变量，可以运行。' }),
+      h('p', { class: 'muted', text: '这些模型出现在发起评测的模型下拉框里，和 Metask 账号模型并列。探测会真实发送一次请求：让模型原样返回一个随机字符串，返回一致才算通过。导入的 Provider 不支持 WorkBuddy；带 LLM 评委的评测集（GAIA2）在 Metask 认证下不可用（评委会被转发到导入的上游），在 --auth provider 下评委读取执行机器的环境变量，可以运行。' }),
       table, result)),
     panel('导入 Provider', 'URL + API Key', form));
 }
