@@ -26,22 +26,23 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = std.heap.page_allocator;
     const args = init.args.toSlice(allocator) catch |err| std.debug.panic("unable to parse command line args: {t}", .{err});
     var listen = false;
+    var dir_path = test_id_record.dirFromEnviron(init.environ);
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--listen=-")) {
             listen = true;
         } else if (std.mem.startsWith(u8, arg, "--seed=")) {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
+        } else if (std.mem.startsWith(u8, arg, test_id_record.dir_arg)) {
+            dir_path = arg[test_id_record.dir_arg.len..];
         } else if (!std.mem.startsWith(u8, arg, "--cache-dir=")) {
             std.debug.panic("unrecognized command line argument: {s}", .{arg});
         }
     }
-
-    var unique: [8]u8 = undefined;
-    runner_io.random(&unique);
-    const suffix = std.fmt.allocPrint(allocator, "--{x}", .{unique}) catch @panic("OOM");
-    const file_name = test_id_record.fileName(allocator, args[0], suffix) catch @panic("OOM");
-    recording = test_id_record.open(&test_ids, &test_ids_buffer, runner_io, init.environ, file_name);
+    if (dir_path) |path| {
+        test_id_record.open(&test_ids, &test_ids_buffer, runner_io, path, args[0], "");
+        recording = true;
+    }
 
     if (listen) {
         mainServer(init) catch |err| std.debug.panic("internal test runner failure: {t}", .{err});

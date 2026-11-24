@@ -2771,15 +2771,28 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
-    const test_id_record_tests = b.addTest(.{
-        .name = "test-id-record",
+    const test_id_fixture = addRecordedTest(b, .{
+        .name = "test-id-fixture",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/test_id_record.zig"),
+            .root_source_file = b.path("scripts/test_id_fixture.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
         }),
     });
-    units_test_step.dependOn(&addTestRunArtifact(b, test_id_record_tests).step);
+    const test_id_fixture_run = addTestRunArtifact(b, test_id_fixture);
+    const test_id_fixture_records = test_id_fixture_run.addPrefixedOutputDirectoryArg("--test-ids-dir=", "test-ids");
+    const test_id_fixture_check = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_ids.py",
+        "collect",
+        "--raw",
+    });
+    test_id_fixture_check.addDirectoryArg(test_id_fixture_records);
+    test_id_fixture_check.expectStdOutEqual(
+        "zig:<unnamed>\ttest_id_fixture\tpass\t1\n" ++
+            "zig:passes\ttest_id_fixture\tpass\t1\n" ++
+            "zig:skips\ttest_id_fixture\tskip\t1\n",
+    );
+    units_test_step.dependOn(&test_id_fixture_check.step);
     const test_ids_check_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "scripts/test_ids.py",
@@ -2794,6 +2807,7 @@ pub fn build(b: *std.Build) void {
     });
     const test_ids_test_step = b.step("test:test-ids", "Test the executed-test ID lists and their base comparison");
     test_ids_test_step.dependOn(&test_ids_test_cmd.step);
+    test_ids_test_step.dependOn(&test_id_fixture_check.step);
     units_test_step.dependOn(&test_ids_test_cmd.step);
     const pr_loop_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",

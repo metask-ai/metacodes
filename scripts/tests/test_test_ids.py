@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from scripts import test_ids
@@ -29,15 +28,14 @@ def missing(base, head, renamed=(), removed=None):
 
 class EntryTest(unittest.TestCase):
     def test_a_zig_entry_is_the_test_name_and_its_file(self):
-        self.assertEqual(test_ids.zig_entry("core.agent_loop.test.stops at max turns"), ("zig:stops at max turns", "agent_loop"))
-        self.assertEqual(test_ids.zig_entry("kernel.loop.agent_loop.test.stops at max turns"), ("zig:stops at max turns", "agent_loop"))
-        self.assertEqual(test_ids.zig_entry("main.S.test.in struct"), ("zig:in struct", "S"))
-        self.assertEqual(test_ids.zig_entry("sub.b.test.name with .test. inside"), ("zig:name with .test. inside", "b"))
+        self.assertEqual(test_ids.zig_entry("core.agent_loop.test.stops at max turns"), ("zig:stops at max turns", "core.agent_loop"))
+        self.assertEqual(test_ids.zig_entry("main.S.test.in struct"), ("zig:in struct", "main.S"))
+        self.assertEqual(test_ids.zig_entry("sub.b.test.name with .test. inside"), ("zig:name with .test. inside", "sub.b"))
         self.assertEqual(test_ids.zig_entry("main.decltest.foo"), ("zig:decltest foo", "main"))
-        self.assertEqual(test_ids.zig_entry("sub.b.test_3"), ("zig:<unnamed>", "b"))
+        self.assertEqual(test_ids.zig_entry("sub.b.test_3"), ("zig:<unnamed>", "sub.b"))
 
     def test_a_python_entry_is_the_class_method_and_its_module(self):
-        self.assertEqual(test_ids.python_entry("scripts.tests.test_ci_scope.ScopeTest.test_docs"), ("py:ScopeTest.test_docs", "test_ci_scope"))
+        self.assertEqual(test_ids.python_entry("scripts.tests.test_ci_scope.ScopeTest.test_docs"), ("py:ScopeTest.test_docs", "scripts.tests.test_ci_scope"))
         self.assertEqual(test_ids.python_entry("test_analysis.AnalysisTest.test_x"), ("py:AnalysisTest.test_x", "test_analysis"))
 
 
@@ -57,10 +55,11 @@ class CollectTest(unittest.TestCase):
         self.write("py-scripts-tests--abc.tsv", "pass\tscripts.tests.test_x.XTest.test_one\n")
         counts, sources = test_ids.collect(self.raw, None)
         self.assertEqual(test_ids.format_ids(counts),
-                         "py:XTest.test_one\ttest_x\tpass\t1\n"
-                         "zig:<unnamed>\ta\tpass\t1\n"
-                         "zig:same name\ta\tpass\t2\n"
-                         "zig:skipped\tb\tskip\t1\n"
+                         "py:XTest.test_one\tscripts.tests.test_x\tpass\t1\n"
+                         "zig:<unnamed>\tcore.a\tpass\t1\n"
+                         "zig:same name\tcore.a\tpass\t1\n"
+                         "zig:same name\ttools.a\tpass\t1\n"
+                         "zig:skipped\tcore.b\tskip\t1\n"
                          "zig:unique\tcapability\tpass\t1\n")
         self.assertEqual(sources, {"zig-metacodes-core-test-Debug": Counter({"pass": 3, "skip": 1}),
                                    "zig-provider-test-Debug": Counter({"pass": 1}),
@@ -137,22 +136,39 @@ class CompareTest(unittest.TestCase):
         self.assertIn("zig:a", test_ids.render(result, self.BASE, head, "", True))
 
     def test_one_of_two_same_named_tests_deleted_is_missing(self):
-        self.assertEqual(missing(raw("a.test.dup", "b.test.dup"), raw("a.test.dup")), ["zig:dup @b"])
+        self.assertEqual(missing(raw("x.a.test.dup", "x.b.test.dup"), raw("x.a.test.dup")), ["zig:dup @x.b"])
 
     def test_a_same_count_swap_of_unnamed_tests_is_missing(self):
-        self.assertEqual(missing(raw("core.a.test_0", "core.b.test_0"), raw("core.b.test_0", "core.c.test_0")), ["zig:<unnamed> @a"])
+        self.assertEqual(missing(raw("core.a.test_0", "core.b.test_0"), raw("core.b.test_0", "core.c.test_0")), ["zig:<unnamed> @core.a"])
+
+    def test_a_swap_between_same_named_files_in_other_directories_is_missing(self):
+        base = raw("provider.openai.root.test_0", "provider.anthropic.root.test_0")
+        head = raw("provider.anthropic.root.test_0", "provider.gemini.root.test_0")
+        self.assertEqual(missing(base, head), ["zig:<unnamed> @provider.openai.root"])
+
+    def test_one_test_compiled_into_two_roots_is_one_test(self):
+        base = raw("platform.process.test_0", "process.test_0", "platform.fs.test_0", "fs.test_0")
+        head = raw("base.platform.process.test_0", "process.test_0", "base.platform.fs.test_0", "fs.test_0")
+        self.assertEqual(missing(base, head), ["zig:<unnamed> @platform.fs", "zig:<unnamed> @platform.process"])
+        self.assertEqual(missing(base, head, [("@platform", "@base.platform")]), [])
+
+    def test_a_directory_move_is_explained_by_one_namespace_entry(self):
+        base = raw("core.tools.a.test_0", "core.tools.b.test_0", "core.c.test_0")
+        head = raw("coding.tools.a.test_0", "coding.tools.b.test_0", "core.c.test_0")
+        result = test_ids.compare(base, head, [("@core.tools", "@coding.tools"), ("@gone", "@elsewhere")], {})
+        self.assertEqual((result.missing, result.unused), ([], ["tests/test_ids/renamed.tsv: @gone → @elsewhere"]))
 
     def test_a_same_count_swap_of_same_named_tests_is_missing(self):
-        self.assertEqual(missing(raw("a.test.dup", "b.test.dup"), raw("b.test.dup", "c.test.dup")), ["zig:dup @a"])
+        self.assertEqual(missing(raw("x.a.test.dup", "x.b.test.dup"), raw("x.b.test.dup", "x.c.test.dup")), ["zig:dup @x.a"])
 
     def test_a_new_test_with_an_existing_name_does_not_hide_or_fake_a_loss(self):
-        self.assertEqual(missing(raw("a.test.dup"), raw("a.test.dup", "b.test.dup")), [])
-        self.assertEqual(missing(raw("a.test.dup"), raw("c.test.dup", "b.test.dup")), ["zig:dup @a"])
+        self.assertEqual(missing(raw("x.a.test.dup"), raw("x.a.test.dup", "x.b.test.dup")), [])
+        self.assertEqual(missing(raw("x.a.test.dup"), raw("x.c.test.dup", "x.b.test.dup")), ["zig:dup @x.a"])
 
     def test_a_moved_same_named_test_is_explained_by_a_rename(self):
-        base, head = raw("a.test.dup", "b.test.dup"), raw("b.test.dup", "a2.test.dup")
-        result = test_ids.compare(base, head, [("zig:dup @a", "zig:dup @a2")], {})
-        self.assertEqual((result.missing, [change.key for change in result.renamed]), ([], ["zig:dup @a"]))
+        base, head = raw("x.a.test.dup", "x.b.test.dup"), raw("x.b.test.dup", "x.a2.test.dup")
+        result = test_ids.compare(base, head, [("zig:dup @x.a", "zig:dup @x.a2")], {})
+        self.assertEqual((result.missing, [change.key for change in result.renamed]), ([], ["zig:dup @x.a"]))
 
     def test_a_test_that_now_skips_no_longer_runs(self):
         head = ids("zig:a\tx\tskip\t1", "zig:b\tx\tpass\t2", "zig:c\ty\tskip\t1", "py:T.test_x\ttest_t\tpass\t1")
@@ -221,6 +237,8 @@ class ExplanationTest(unittest.TestCase):
             ("a\tzig:b\n", "", "does not start"),
             ("zig:a\tzig:a\n", "", "renamed to itself"),
             ("zig:a\tpy:T.a\n", "", "different kinds"),
+            ("@core\tzig:a\n", "", "mixes a namespace move"),
+            ("", "@core\treason\n", "does not start"),
             ("", "zig:a\tx\nzig:a\ty\n", "listed twice"),
         ):
             with self.subTest(renamed=renamed, removed=removed):
@@ -232,14 +250,14 @@ class ExplanationTest(unittest.TestCase):
             def git(*argv):
                 subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *argv], cwd=tmp, check=True, capture_output=True)
             git("init", "-q")
-            self.write(tmp, "zig:old\tzig:new\n", "zig:dup @a\tmerged into b\n")
+            self.write(tmp, "zig:old\tzig:new\n", "zig:dup @x.a\tmerged into b\n")
             git("add", "-A")
             git("commit", "-qm", "base")
-            self.write(tmp, "zig:old\tzig:new\nzig:x\tzig:y\n", "zig:dup @a\tmerged into b\nzig:gone\tobsolete\n")
+            self.write(tmp, "zig:old\tzig:new\nzig:x\tzig:y\n", "zig:dup @x.a\tmerged into b\nzig:gone\tobsolete\n")
             renamed, removed = test_ids.read_explanations(Path(tmp), "HEAD")
         self.assertEqual((renamed, removed), ([("zig:x", "zig:y")], {"zig:gone": "obsolete"}))
-        base, head = raw("a.test.dup", "b.test.dup", "c.test.dup"), raw("b.test.dup")
-        self.assertEqual(missing(base, head, renamed, removed), ["zig:dup @a", "zig:dup @c"])
+        base, head = raw("x.a.test.dup", "x.b.test.dup", "x.c.test.dup"), raw("x.b.test.dup")
+        self.assertEqual(missing(base, head, renamed, removed), ["zig:dup @x.a", "zig:dup @x.c"])
 
     def test_the_repository_files_are_well_formed(self):
         self.assertEqual(test_ids.main(["check"]), 0)
@@ -285,42 +303,66 @@ class BaseTest(unittest.TestCase):
         self.assertIn("nothing to compare", base.note)
 
 
-class RefreshTest(unittest.TestCase):
-    def test_a_label_change_reruns_the_comparison_once_the_run_finishes(self):
-        states = iter([{"id": 5, "status": "in_progress"}, {"id": 5, "status": "completed"}])
-        calls = []
+class LabelVerdictTest(unittest.TestCase):
+    HEAD = ids("zig:a\tx\tpass\t1")
 
-        def query(path):
+    def query(self, jobs, labels=("migration",), runs=None):
+        states = iter([{"id": 5, "status": "in_progress"}, {"id": 5, "status": "completed"}])
+
+        def answer(path):
             if path.endswith("event=pull_request&per_page=20"):
-                return {"workflow_runs": [{"id": 4, "created_at": "1", "status": "completed"},
-                                          {"id": 5, "created_at": "2", "status": "queued"}]}
+                return {"workflow_runs": runs if runs is not None else [
+                    {"id": 4, "created_at": "1", "status": "completed"}, {"id": 5, "created_at": "2", "status": "queued"}]}
             if path.endswith("/runs/5"):
                 return next(states)
-            return {"jobs": [{"name": "Gates (Linux)", "id": 1}, {"name": test_ids.CI_JOB, "id": 2, "conclusion": "success"}]}
+            if "/labels" in path:
+                return [{"name": name} for name in labels]
+            return {"jobs": jobs}
+        return answer
 
-        def run(argv, **kwargs):
-            calls.append(argv)
-            return SimpleNamespace(returncode=0, stderr="")
+    def verdict(self, jobs, labels=("migration",), tree="t", runs=None, judged=("compared", False)):
+        calls = []
 
-        message = test_ids.refresh("o/r", "h" * 40, 600, query, run, sleep=lambda seconds: None, clock=lambda: 0)
-        self.assertEqual(calls, [["gh", "run", "rerun", "5", "--job", "2", "--repo", "o/r"]])
-        self.assertIn("re-running", message)
+        def judge(head, base_sha, repository, enforced):
+            calls.append((head, base_sha, enforced))
+            return judged
 
-    def test_nothing_to_refresh_without_a_comparison(self):
-        def query(path):
-            if "workflows" in path:
-                return {"workflow_runs": [{"id": 5, "created_at": "1", "status": "completed"}]}
-            return {"jobs": [{"name": test_ids.CI_JOB, "id": 2, "conclusion": "skipped"}]}
+        found = (self.HEAD, {"tree": tree})
+        result = test_ids.label_verdict("o/r", 9, "h" * 40, "b" * 40, "t", 600, self.query(jobs, labels, runs),
+                                        lambda repo, run: found, judge, sleep=lambda seconds: None, clock=lambda: 0)
+        return result, calls
 
-        self.assertIn("nothing to refresh", test_ids.refresh("o/r", "h" * 40, 0, query, run=None))
-        self.assertIn("no CI run", test_ids.refresh("o/r", "h" * 40, 0, lambda path: {"workflow_runs": []}, run=None))
+    LEGS = [{"name": "Gates (Linux) / units", "conclusion": "success"}, {"name": "Gates (Linux) / checks", "conclusion": "success"}]
 
-    def test_a_run_that_does_not_finish_in_time_fails(self):
-        def query(path):
-            return {"workflow_runs": [{"id": 5, "created_at": "1", "status": "in_progress"}]}
+    def test_adding_the_label_judges_the_finished_run_with_it(self):
+        jobs = self.LEGS + [{"name": test_ids.CI_JOB, "conclusion": "success"}]
+        (report, failed), calls = self.verdict(jobs, judged=("missing zig:b", True))
+        self.assertEqual((report, failed), ("missing zig:b", True))
+        self.assertEqual(calls, [(self.HEAD, "b" * 40, True)])
+        (report, failed), calls = self.verdict(jobs, labels=(), judged=("report", False))
+        self.assertEqual((failed, calls[0][2]), (False, False))
 
-        with self.assertRaisesRegex(test_ids.TestIdError, "did not finish in time"):
-            test_ids.refresh("o/r", "h" * 40, 0, query, run=None, sleep=lambda seconds: None, clock=lambda: 1)
+    def test_failed_legs_fail_whatever_the_labels(self):
+        jobs = [{"name": "Gates (Linux) / units", "conclusion": "failure"}, {"name": test_ids.CI_JOB, "conclusion": "skipped"}]
+        (report, failed), calls = self.verdict(jobs, labels=())
+        self.assertTrue(failed)
+        self.assertEqual(calls, [])
+
+    def test_a_run_without_a_comparison_passes_with_its_legs(self):
+        (report, failed), calls = self.verdict(self.LEGS + [{"name": test_ids.CI_JOB, "conclusion": "skipped"}])
+        self.assertFalse(failed)
+        self.assertIn("compared no test IDs", report)
+
+    def test_a_migration_pr_tested_on_another_merge_fails(self):
+        jobs = self.LEGS + [{"name": test_ids.CI_JOB, "conclusion": "success"}]
+        (report, failed), calls = self.verdict(jobs, tree="older merge")
+        self.assertTrue(failed)
+        self.assertIn("another merge", report)
+
+    def test_no_ci_run_yet_leaves_the_verdict_to_it(self):
+        (report, failed), calls = self.verdict([], runs=[])
+        self.assertFalse(failed)
+        self.assertIn("No CI run", report)
 
 
 if __name__ == "__main__":

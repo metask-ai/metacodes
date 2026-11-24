@@ -161,18 +161,20 @@ Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成
 
 | 来源 | 记录方 | ID 和位置 |
 |---|---|---|
-| core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig` | `zig:<test 名>`,去掉命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 记为 `zig:<unnamed>`。位置是命名空间的最后一段,一般就是文件名(`agent_loop`) |
-| 其余所有 Zig 测试二进制(`cc-test`、`provider-test`、`mcp-test`、`lsp-test`……) | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
-| `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,位置是模块名的最后一段 |
+| core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig` | `zig:<test 名>`,去掉命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 记为 `zig:<unnamed>`。位置是完整的命名空间(`core.agent_loop`) |
+| 其余所有 Zig 测试二进制(`cc-test`、`provider-test`、`mcp-test`、`lsp-test`……),以及 CI 里直接 `zig test src/platform/platform.zig` 的原生进程测试 | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变;也接受 `--test-ids-dir=<目录>`。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
+| `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,位置是模块路径 |
 | `scripts/eval/tests` | `scripts/eval/tests/run_shard.py` | 同上 |
 | TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,位置是文件名;只报告,不强制 |
 
-两个运行器共用 `scripts/test_id_record.zig` 写记录。`time_test_runner.zig` 是诊断入口,不记录;
-CI 里直接 `zig test src/platform/platform.zig` 的那一步不经 build runner,也不记录。
+两个运行器共用 `scripts/test_id_record.zig` 写记录;`test:units` 用 `scripts/test_id_fixture.zig` 端到端地
+核对记录(一个通过、一个跳过、一个无名测试)。`time_test_runner.zig` 是诊断入口,不记录。
 
-比较时一个测试的**键**:ID 在 base 和 head 里都只出现在一个位置时,键就是 ID,所以搬目录、
-改文件名都不会改变它;同一个 ID 出现在多个位置时(同名测试、无名 `test {}`),键是
-`<ID> @<位置>`,这样两个同名测试换掉一个也能看出来,只换目录不改文件名的搬迁也不受影响。
+比较时一个测试的**键**:同一个文件编进不同的测试根时命名空间不同(`platform.process` 和
+`process`),一个是另一个按段的后缀,算同一处。ID 在 base 和 head 里都只有一处时,键就是 ID,
+搬目录、改文件名都不会改变它;同一个 ID 有多处时(同名测试、无名 `test {}`),键是
+`<ID> @<命名空间>`,所以换掉同名测试里的一个,哪怕文件名相同、只是目录不同,也能看出来。
+这类测试搬了目录,用一条命名空间搬迁说明整个目录(见下)。
 同一个键的测试按次数计;同一个测试在几个二进制里都跑(比如 `cc-test` 和 core 套件),次数照实累加,
 base 和 head 在同样的 CI 布局下比较。
 
@@ -194,7 +196,8 @@ CI:Gates (Linux) 的 `units`、`product`、`checks` 三条腿在跑测试时顺�
 
 - base 跑过的测试,head 里次数变少,或者从 `pass` 变成 `skip`,都算**消失**;新增的测试允许。
 - 消失的键要在**本 PR 新增或改动的**说明里列出:`tests/test_ids/renamed.tsv`(`<旧键>\t<新键>`,
-  新键在 head 里多出来的次数抵掉旧键少掉的)或 `tests/test_ids/removed.tsv`(`<键>\t<删除原因>`)。
+  新键在 head 里多出来的次数抵掉旧键少掉的;或者 `@<旧命名空间前缀>\t@<新命名空间前缀>`,说明整个
+  目录搬了家,比如 `@platform\t@base.platform`)或 `tests/test_ids/removed.tsv`(`<键>\t<删除原因>`)。
   base 里已有的条目不算数,旧理由不能替新的删除放行。两个文件的格式由 `scripts/test_ids.py check`
   检查,它在 `gate:static` 里;自测 `scripts.tests.test_test_ids` 和 `test-id-record` 在 `test:units`。
 - PR 带 `migration` 标签时强制执行:未说明的消失让 `Test IDs (Linux)`、进而让 `Gates (Linux)` 失败,
@@ -203,9 +206,10 @@ CI:Gates (Linux) 的 `units`、`product`、`checks` 三条腿在跑测试时顺�
   的 CI 产物,都要求树和 base 相同。找不到时,普通 PR 退而用 main 最近一次的产物出报告;
   migration PR 直接失败:等 main 的头就是 PR 的 base 时在 main 上手动触发一次 CI
   (`gh workflow run ci.yml --ref main`),再重跑这个 job。
-- CI 跑完后再加上或去掉 `migration` 标签时,`.github/workflows/test-ids-label.yml` 等这个 head 的
-  CI 跑完,重跑 `Test IDs (Linux)` 和等它的 `Gates (Linux)`,判定按新的标签刷新。
-  来自 fork 的 PR 没有重跑权限,这一步会失败,需要有权限的人手动重跑。
+- PR 的标签有任何变化时,`.github/workflows/test-ids-label.yml` 里同名的 `Gates (Linux)` job 等这个
+  head 的 CI 跑完,按当前标签重新判定:Linux 各条腿都通过,并用那次 CI 的 `test-ids` 产物重新比较。
+  这个 job 只读,fork 的 PR 也能跑;它产生的 `Gates (Linux)` 是这个提交上最新的同名检查。
+  强制模式下,那次 CI 测的合并结果和现在的合并树不一致时直接失败,要求合入 main 或重跑 CI。
 
 ## 已知执行覆盖缺口(登记非沉默)
 

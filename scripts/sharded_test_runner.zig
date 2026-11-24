@@ -82,13 +82,12 @@ fn stableEnviron(environ: std.process.Environ) std.process.Environ {
 }
 
 fn openTestIds(record: *test_id_record.Record, buffer: []u8, io: std.Io, environ: std.process.Environ, args: std.process.Args, shard: ShardConfig) bool {
+    const dir_path = test_id_record.dirFromEnviron(environ) orelse return false;
     const allocator = std.heap.page_allocator;
     const argv = args.toSlice(allocator) catch @panic("cannot read the test binary path");
-    var unique: [8]u8 = undefined;
-    io.random(&unique);
-    const suffix = std.fmt.allocPrint(allocator, "-{}of{}--{x}", .{ shard.index, shard.count, unique }) catch @panic("OOM");
-    const file_name = test_id_record.fileName(allocator, argv[0], suffix) catch @panic("OOM");
-    return test_id_record.open(record, buffer, io, environ, file_name);
+    const suffix = std.fmt.allocPrint(allocator, "-{}of{}", .{ shard.index, shard.count }) catch @panic("OOM");
+    test_id_record.open(record, buffer, io, dir_path, argv[0], suffix);
+    return true;
 }
 
 fn elapsedMs(elapsed_ns: u64) f64 {

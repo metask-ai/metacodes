@@ -265,7 +265,8 @@ The rules that keep the split from dropping coverage:
 - **The tests that ran are recorded by ID.** On Linux the `units`,
   `product` and `checks` legs set `METACODES_TEST_IDS_DIR` before their
   suites. Every Zig test binary records the tests it runs: the sharded
-  suites through `scripts/sharded_test_runner.zig`, all the others through
+  suites through `scripts/sharded_test_runner.zig`, all the others, and the
+  native `zig test src/platform/platform.zig` step, through
   `scripts/recording_test_runner.zig`, which speaks the build runner's
   protocol as Zig's default runner does, so `--test-timeout` still applies.
   So do the `scripts/tests` suites and the evaluation shards. The legs upload
@@ -276,8 +277,11 @@ The rules that keep the split from dropping coverage:
   to the job summary. It fails a PR labelled `migration` that drops a test
   without explaining it in `tests/test_ids/` in that PR, or whose base has
   no IDs recorded on its tree, and `Gates (Linux)` needs it, so the
-  required check fails too. Adding or removing the label later re-runs the
-  job (`.github/workflows/test-ids-label.yml`)
+  required check fails too. When a PR's labels change after its CI ran,
+  `.github/workflows/test-ids-label.yml` runs a read-only job also named
+  `Gates (Linux)`: it waits for the head's CI run and judges its Linux legs
+  and its `test-ids` artifact again with the current labels, so the newest
+  `Gates (Linux)` on the commit follows the label, on fork PRs too
   ([tests/README.md](../tests/README.md)).
 
 What it costs:

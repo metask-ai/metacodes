@@ -53,12 +53,12 @@ def zig_entry(name: str) -> Tuple[str, str]:
         if unnamed is None:
             return "zig:" + name, ""
         namespace, test_id = name[:unnamed.start()], "zig:<unnamed>"
-    return test_id, namespace.rsplit(".", 1)[-1]
+    return test_id, namespace
 
 
 def python_entry(test_id: str) -> Tuple[str, str]:
     parts = test_id.split(".")
-    return "py:" + ".".join(parts[-2:]), parts[-3] if len(parts) >= 3 else ""
+    return "py:" + ".".join(parts[-2:]), ".".join(parts[:-2])
 
 
 def raw_source(path: Path) -> str:
@@ -139,7 +139,7 @@ def format_sources(sources: Dict[str, Counter]) -> str:
                    for source, tally in sorted(sources.items()))
 
 
-def parse_pairs(text: str, origin: str, what: str) -> List[Tuple[str, str]]:
+def parse_pairs(text: str, origin: str, what: str, allow_moves: bool = False) -> List[Tuple[str, str]]:
     pairs = []
     seen = set()
     for number, line in enumerate(text.splitlines(), 1):
@@ -148,7 +148,7 @@ def parse_pairs(text: str, origin: str, what: str) -> List[Tuple[str, str]]:
         fields = line.split("\t")
         if len(fields) != 2 or not all(f.strip() == f and f for f in fields):
             raise TestIdError(f"{origin}:{number}: expected <key><TAB><{what}>")
-        if fields[0].split(":", 1)[0] not in KINDS:
+        if fields[0].split(":", 1)[0] not in KINDS and not (allow_moves and fields[0].startswith("@")):
             raise TestIdError(f"{origin}:{number}: {fields[0]!r} does not start with one of {', '.join(k + ':' for k in KINDS)}")
         if fields[0] in seen:
             raise TestIdError(f"{origin}:{number}: {fields[0]} is listed twice")
@@ -167,14 +167,16 @@ def file_at(root: Path, rev: Optional[str], rel: Path) -> str:
 
 def read_explanations(root: Path, since: Optional[str] = None) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
     def pairs(rel: Path, what: str, rev: Optional[str]) -> List[Tuple[str, str]]:
-        return parse_pairs(file_at(root, rev, rel), f"{rel}" + (f"@{rev}" if rev else ""), what)
+        return parse_pairs(file_at(root, rev, rel), f"{rel}" + (f"@{rev}" if rev else ""), what, rel == RENAMED)
 
     renamed = pairs(RENAMED, "new key", None)
     removed = pairs(REMOVED, "reason", None)
     for old, new in renamed:
         if old == new:
             raise TestIdError(f"{RENAMED}: {old} is renamed to itself")
-        if old.split(":", 1)[0] != new.split(":", 1)[0]:
+        if old.startswith("@") != new.startswith("@"):
+            raise TestIdError(f"{RENAMED}: {old} → {new} mixes a namespace move with a test key")
+        if not old.startswith("@") and old.split(":", 1)[0] != new.split(":", 1)[0]:
             raise TestIdError(f"{RENAMED}: {old} and {new} are different kinds of test")
     if since is not None:
         renamed_before, removed_before = set(pairs(RENAMED, "new key", since)), set(pairs(REMOVED, "reason", since))
@@ -222,17 +224,55 @@ def keyed(counts: IdCounts, key: Callable[[str, str], str]) -> Dict[str, List[in
     return table
 
 
+def is_segment_suffix(short: str, long: str) -> bool:
+    return long == short or long.endswith("." + short)
+
+
+def clusters(namespaces: Set[str]) -> Dict[str, str]:
+    representatives: List[str] = []
+    found: Dict[str, str] = {}
+    for namespace in sorted(namespaces, key=lambda ns: (-ns.count("."), -len(ns), ns)):
+        representative = next((rep for rep in representatives if is_segment_suffix(namespace, rep)), None)
+        if representative is None:
+            representatives.append(namespace)
+            representative = namespace
+        found[namespace] = representative
+    return found
+
+
+def apply_moves(location: str, moves: Sequence[Tuple[str, str]], used: Set[Tuple[str, str]]) -> str:
+    for old, new in moves:
+        if is_segment_prefix(new[1:], location):
+            used.add((old, new))
+            return old[1:] + location[len(new) - 1:]
+    return location
+
+
+def is_segment_prefix(prefix: str, namespace: str) -> bool:
+    return namespace == prefix or namespace.startswith(prefix + ".")
+
+
 def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], removed: Dict[str, str]) -> Comparison:
     result = Comparison()
-    base_locations, head_locations = locations(base), locations(head)
+    moves = [pair for pair in renamed if pair[0].startswith("@")]
+    renamed = [pair for pair in renamed if not pair[0].startswith("@")]
+    used_moves: Set[Tuple[str, str]] = set()
+    head = Counter({(test_id, apply_moves(location, moves, used_moves), status): count
+                    for (test_id, location, status), count in head.items()})
+    result.unused.extend(f"{RENAMED}: {old} → {new}" for old, new in moves if (old, new) not in used_moves)
+    base_clusters = {test_id: clusters(found) for test_id, found in locations(base).items()}
+    head_clusters = {test_id: clusters(found) for test_id, found in locations(head).items()}
 
-    def key(test_id: str, location: str) -> str:
-        if len(base_locations.get(test_id, ())) <= 1 and len(head_locations.get(test_id, ())) <= 1:
-            return test_id
-        return f"{test_id} @{location}"
+    def keyer(side: Dict[str, Dict[str, str]]) -> Callable[[str, str], str]:
+        def key(test_id: str, location: str) -> str:
+            if (len(set(base_clusters.get(test_id, {}).values())) <= 1
+                    and len(set(head_clusters.get(test_id, {}).values())) <= 1):
+                return test_id
+            return f"{test_id} @{side[test_id][location]}"
+        return key
 
-    base_table = keyed(base, key)
-    head_table = keyed(head, key)
+    base_table = keyed(base, keyer(base_clusters))
+    head_table = keyed(head, keyer(head_clusters))
     original_head = {test_key: tuple(pair) for test_key, pair in head_table.items()}
     renamed_from: Dict[str, str] = {}
     for old, new in renamed:
@@ -443,27 +483,42 @@ def ci_report(head: IdCounts, base: Base, renamed, removed, enforced: bool) -> T
     return report, enforced
 
 
-def refresh(repository: str, head_sha: str, wait_seconds: float, query: Callable = github_json,
-            run: Callable = subprocess.run, sleep: Callable = time.sleep, clock: Callable = time.monotonic) -> str:
+def judge(head: IdCounts, base_sha: str, repository: str, enforced: bool, root: Path = ROOT,
+          base_finder: Callable = find_base) -> Tuple[str, bool]:
+    renamed, removed = read_explanations(root, base_sha)
+    tree = subprocess.check_output(["git", "rev-parse", base_sha + "^{tree}"], cwd=str(root), text=True).strip()
+    return ci_report(head, base_finder(repository, base_sha, tree), renamed, removed, enforced)
+
+
+def label_verdict(repository: str, pr: int, head_sha: str, base_sha: str, merge_tree: str, wait_seconds: float,
+                  query: Callable = github_json, download: Callable = download_ids, judge_ids: Callable = judge,
+                  sleep: Callable = time.sleep, clock: Callable = time.monotonic) -> Tuple[str, bool]:
     runs = query(f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={head_sha}&event=pull_request&per_page=20")["workflow_runs"]
     if not runs:
-        return f"no CI run for {head_sha[:12]} yet; its {CI_JOB} job will read the labels when it runs"
+        return f"No CI run for `{head_sha[:12]}` yet; its Gates (Linux) reads the labels when it runs.\n", False
     ci_run = max(runs, key=lambda candidate: candidate.get("created_at", ""))
     deadline = clock() + wait_seconds
     while ci_run.get("status") != "completed":
         if clock() >= deadline:
-            raise TestIdError(f"CI run {ci_run['id']} did not finish in time; re-run its {CI_JOB} job by hand")
+            return f"CI run {ci_run['id']} did not finish in time; re-run this job once it has.\n", True
         sleep(POLL_SECONDS)
         ci_run = query(f"repos/{repository}/actions/runs/{ci_run['id']}")
     jobs = query(f"repos/{repository}/actions/runs/{ci_run['id']}/jobs?filter=latest&per_page=100")["jobs"]
-    job = next((candidate for candidate in jobs if candidate.get("name") == CI_JOB), None)
-    if job is None or job.get("conclusion") == "skipped":
-        return f"CI run {ci_run['id']} compared no test IDs; nothing to refresh"
-    proc = run(["gh", "run", "rerun", str(ci_run["id"]), "--job", str(job["id"]), "--repo", repository],
-               capture_output=True, text=True, check=False)
-    if proc.returncode:
-        raise TestIdError(f"cannot re-run {CI_JOB} of run {ci_run['id']}: {proc.stderr.strip()}")
-    return f"re-running {CI_JOB} of run {ci_run['id']} and the checks that wait for it"
+    legs = [job for job in jobs if job.get("name", "").startswith("Gates (Linux) / ")]
+    if not legs or any(job.get("conclusion") != "success" for job in legs):
+        return f"The Linux gate legs of CI run {ci_run['id']} did not all pass.\n", True
+    compared = next((job for job in jobs if job.get("name") == CI_JOB), None)
+    if compared is None or compared.get("conclusion") == "skipped":
+        return f"CI run {ci_run['id']} compared no test IDs (no suite ran).\n", False
+    enforced = MIGRATION_LABEL in pr_labels(repository, pr, query)
+    found = download(repository, ci_run["id"])
+    if found is None:
+        return f"CI run {ci_run['id']} has no `{ARTIFACT}` artifact.\n", enforced
+    head, meta = found
+    if enforced and meta.get("tree") != merge_tree:
+        return (f"CI run {ci_run['id']} tested another merge of this PR than the current one; "
+                "merge main or re-run CI so the test IDs match what would be merged.\n"), True
+    return judge_ids(head, base_sha, repository, enforced)
 
 
 def cmd_collect(args) -> int:
@@ -472,12 +527,12 @@ def cmd_collect(args) -> int:
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         Path(args.output).write_text(text, encoding="utf-8")
+        sys.stderr.write(format_sources(sources))
     else:
         sys.stdout.write(text)
     if args.meta:
         meta = {"commit": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}")}
         Path(args.meta).write_text(json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
-    sys.stderr.write(format_sources(sources))
     return 0
 
 
@@ -490,23 +545,26 @@ def cmd_compare(args) -> int:
     return 1 if args.enforce and comparison.missing else 0
 
 
+def write_report(report: str, summary: Optional[str]) -> None:
+    sys.stdout.write(report)
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(report)
+
+
 def cmd_ci_compare(args) -> int:
     head = parse_ids(Path(args.head).read_text(encoding="utf-8"), args.head)
-    base_sha = git("rev-parse", args.base)
-    renamed, removed = read_explanations(ROOT, base_sha)
     enforced = MIGRATION_LABEL in pr_labels(args.repository, args.pr)
-    base = find_base(args.repository, base_sha, git("rev-parse", base_sha + "^{tree}"))
-    report, failed = ci_report(head, base, renamed, removed, enforced)
-    sys.stdout.write(report)
-    if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as handle:
-            handle.write(report)
+    report, failed = judge(head, git("rev-parse", args.base), args.repository, enforced)
+    write_report(report, args.summary)
     return 1 if failed else 0
 
 
-def cmd_refresh(args) -> int:
-    print(refresh(args.repository, args.head_sha, args.wait_minutes * 60))
-    return 0
+def cmd_label_verdict(args) -> int:
+    report, failed = label_verdict(args.repository, args.pr, args.head_sha, git("rev-parse", args.base),
+                                   git("rev-parse", "HEAD^{tree}"), args.wait_minutes * 60)
+    write_report(report, args.summary)
+    return 1 if failed else 0
 
 
 def cmd_check(args) -> int:
@@ -552,11 +610,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ci.add_argument("--pr", type=int, required=True)
     ci.add_argument("--summary")
     ci.set_defaults(handler=cmd_ci_compare)
-    refresh_parser = commands.add_parser("refresh", help=f"re-run {CI_JOB} of a PR head's CI run after its labels changed")
-    refresh_parser.add_argument("--repository", required=True)
-    refresh_parser.add_argument("--head-sha", required=True)
-    refresh_parser.add_argument("--wait-minutes", type=float, default=100)
-    refresh_parser.set_defaults(handler=cmd_refresh)
+    verdict = commands.add_parser("label-verdict", help="judge the head's Linux gates and test IDs again with the PR's current labels")
+    verdict.add_argument("--repository", required=True)
+    verdict.add_argument("--pr", type=int, required=True)
+    verdict.add_argument("--head-sha", required=True)
+    verdict.add_argument("--base", required=True)
+    verdict.add_argument("--wait-minutes", type=float, default=100)
+    verdict.add_argument("--summary")
+    verdict.set_defaults(handler=cmd_label_verdict)
     check = commands.add_parser("check", help=f"check the format of {RENAMED} and {REMOVED}")
     check.add_argument("--root", default=str(ROOT))
     check.set_defaults(handler=cmd_check)

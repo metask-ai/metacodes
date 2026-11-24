@@ -468,7 +468,7 @@ jobs:
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
-        run: zig test src/platform/platform.zig -lc
+        run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform
       # The installed-adapter WorkBuddy suites (scripts/eval/tests/
       # test_workbuddy_adapter.py) run the overlay inside the real pinned
       # WorkBuddy-Bench, against its locked environment; without a checkout
