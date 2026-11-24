@@ -1519,8 +1519,10 @@ const ToolAdmission = struct {
         // branch classifies canonical_name (resolved above, same
         // normalizer as executeOne) so classification can never look at
         // a different name than what dispatch will actually run.
-        const classified = if (opts.tool_dispatcher) |dispatcher|
-            dispatcher.category(tu.name) orelse .execute
+        const offered_category = if (opts.tool_dispatcher) |dispatcher| dispatcher.category(tu.name) else null;
+        const not_offered = opts.tool_dispatcher != null and offered_category == null;
+        const classified = if (opts.tool_dispatcher != null)
+            offered_category orelse .execute
         else if (opts.dyn_registry) |registry|
             registry.category(canonical_name)
         else
@@ -1538,7 +1540,10 @@ const ToolAdmission = struct {
             .deny => {
                 log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
                 slot.decision = .denied;
-                slot.content = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or permission mode", .{tu.name}, allocator);
+                slot.content = if (not_offered)
+                    try tool_error.errorToJson("UnknownTool", "tool '{s}' is not offered in this session; call only the tools this request lists", .{tu.name}, allocator)
+                else
+                    try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or permission mode", .{tu.name}, allocator);
                 slot.is_error = true;
             },
             .ask => {

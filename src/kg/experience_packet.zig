@@ -21,7 +21,6 @@
 const std = @import("std");
 const client_mod = @import("client.zig");
 const util_json = @import("../util/json.zig");
-const util_time = @import("../util/time.zig");
 
 pub const SCHEMA_VERSION = "metacodes-experience-packet-v1";
 const TINYKG_SCHEMA_VERSION = "tinykg-agent-retrieval-v1";
@@ -119,7 +118,6 @@ const Metrics = struct {
     logical_call_lower_bound: usize = 0,
     recall_invoked: bool = false,
     query_reused_from_tool_result: bool = false,
-    elapsed_ms: u64 = 0,
 };
 
 const TaskGate = union(enum) {
@@ -264,7 +262,6 @@ fn buildPacket(
     task_id: u64,
     query_override: ?[]const u8,
 ) ![]u8 {
-    const started_ms = util_time.nowMs();
     var metrics = Metrics{};
     var experiences: std.ArrayList(Experience) = .empty;
     defer {
@@ -278,7 +275,6 @@ fn buildPacket(
         metrics.logical_call_lower_bound += 1;
         fetched_text = kg.fetchNodeText(task_id) catch |err| {
             if (err == client_mod.KgError.OutOfMemory) return error.OutOfMemory;
-            metrics.elapsed_ms = elapsedSince(started_ms);
             return renderPacket(allocator, task_id, "unavailable", "query_task_unavailable", experiences.items, metrics);
         };
         break :blk fetched_text.?;
@@ -286,7 +282,6 @@ fn buildPacket(
     metrics.query_reused_from_tool_result = query_override != null;
     const query = truncateUtf8(std.mem.trim(u8, current_text, " \t\r\n"), QUERY_BYTES);
     if (query.len == 0) {
-        metrics.elapsed_ms = elapsedSince(started_ms);
         return renderPacket(allocator, task_id, "unavailable", "empty_query_task", experiences.items, metrics);
     }
 
@@ -294,7 +289,6 @@ fn buildPacket(
     metrics.recall_invoked = true;
     const hits = kg.recallTasks(query, SEARCH_LIMIT) catch |err| {
         if (err == client_mod.KgError.OutOfMemory) return error.OutOfMemory;
-        metrics.elapsed_ms = elapsedSince(started_ms);
         return renderPacket(allocator, task_id, "unavailable", "lexical_search_unavailable", experiences.items, metrics);
     };
     defer {
@@ -413,7 +407,6 @@ fn buildPacket(
         };
     }
 
-    metrics.elapsed_ms = elapsedSince(started_ms);
     return renderPacket(allocator, task_id, "available", null, experiences.items, metrics);
 }
 
@@ -670,7 +663,7 @@ fn renderPacket(
     const subprocess_calls_upper_bound = logical_call_upper_bound * MAX_READ_ATTEMPTS_PER_LOGICAL_CALL;
     const metrics_prefix = try std.fmt.allocPrint(
         allocator,
-        ",\"metrics\":{{\"search_hits\":{d},\"task_candidates\":{d},\"accepted_tasks\":{d},\"accepted_evidence_excerpts\":{d},\"accepted_associations\":{d},\"accepted_tentative\":{d},\"accepted_confirmed\":{d},\"rejected_current\":{d},\"rejected_not_completed\":{d},\"rejected_unverified\":{d},\"rejected_truncated\":{d},\"rejected_protocol\":{d},\"rejected_no_associations\":{d},\"association_label_failures\":{d},\"evidence_excerpt_failures\":{d},\"query_reused_from_tool_result\":{s},\"subprocess_calls_lower_bound\":{d},\"subprocess_calls_upper_bound\":{d},\"subprocess_count_exact\":false,\"elapsed_ms\":{d},\"packet_bytes\":\"",
+        ",\"metrics\":{{\"search_hits\":{d},\"task_candidates\":{d},\"accepted_tasks\":{d},\"accepted_evidence_excerpts\":{d},\"accepted_associations\":{d},\"accepted_tentative\":{d},\"accepted_confirmed\":{d},\"rejected_current\":{d},\"rejected_not_completed\":{d},\"rejected_unverified\":{d},\"rejected_truncated\":{d},\"rejected_protocol\":{d},\"rejected_no_associations\":{d},\"association_label_failures\":{d},\"evidence_excerpt_failures\":{d},\"query_reused_from_tool_result\":{s},\"subprocess_calls_lower_bound\":{d},\"subprocess_calls_upper_bound\":{d},\"subprocess_count_exact\":false,\"packet_bytes\":\"",
         .{
             metrics.search_hits,
             metrics.task_candidates,
@@ -690,7 +683,6 @@ fn renderPacket(
             if (metrics.query_reused_from_tool_result) "true" else "false",
             subprocess_calls_lower_bound,
             subprocess_calls_upper_bound,
-            metrics.elapsed_ms,
         },
     );
     defer allocator.free(metrics_prefix);
@@ -738,10 +730,6 @@ fn writeFixedDecimal(destination: []u8, value: usize) void {
     // Packets are bounded far below ten decimal digits. Saturating would hide a
     // broken bound from paper telemetry, so make an impossible overflow loud.
     std.debug.assert(remaining == 0);
-}
-
-fn elapsedSince(started_ms: i64) u64 {
-    return @intCast(@max(util_time.nowMs() - started_ms, 0));
 }
 
 fn truncateUtf8(value: []const u8, limit: usize) []const u8 {
