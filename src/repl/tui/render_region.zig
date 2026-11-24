@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
+const screen_mirror = @import("screen_mirror.zig");
 const app_mod = @import("../../app.zig");
 const types = @import("../../types.zig");
 const ansi = @import("ansi.zig");
@@ -686,6 +687,7 @@ pub const RenderRegion = struct {
             out.writeAll(bytes) catch {};
             return;
         }
+        screen_mirror.feed(self.fd, bytes);
         std.debug.print("{s}", .{bytes});
     }
 

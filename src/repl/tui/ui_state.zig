@@ -252,6 +252,7 @@ pub const InputPhase = struct {
     /// Ctrl+U/K/W 杀行后显 `Ctrl+Y to paste deleted text` 提示(对齐 cc,框上方右对齐)。
     /// 杀行键置 true,下次打字(char)清 false。
     paste_hint: bool = false,
+    copied: bool = false,
     /// Idle-prompt double-press confirmation (Ctrl+C / Ctrl+D exit, Esc clear).
     press: DoublePress = .{},
     /// Suggestion menus closed with Esc for the current draft.

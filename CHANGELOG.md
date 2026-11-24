@@ -12,6 +12,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Dragging over text in the TUI can copy it** (preview `copy_on_select`).
+  With `--preview=copy_on_select` or `{"preview": {"copy_on_select": true}}`
+  the interactive TUI reports the mouse; releasing a left-button drag copies
+  the text under it through OSC 52 (and `pbcopy` in a local macOS session)
+  and the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
+  mode. While it is on, the wheel no longer scrolls the scrollback and the
+  terminal's own selection needs its modifier key. macOS and Linux only.
+
 - **Models can be priced in config.json, and bench runs use OpenRouter
   prices.** `model_prices` in `~/.metacodes/config.json` prices a model in
   USD per million tokens; every cost meter (the session cost, evaluation

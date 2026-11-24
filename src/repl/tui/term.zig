@@ -193,7 +193,7 @@ fn decodeCodepoint(s: []const u8) ?u21 {
 }
 
 /// East Asian Width 主要区段(简化表)。
-fn codepointDisplayWidth(cp: u21) usize {
+pub fn codepointDisplayWidth(cp: u21) usize {
     if (cp < 0x20 or cp == 0x7F) return 0;
     if (cp >= 0x1100 and cp <= 0x115F) return 2; // Hangul Jamo
     if (cp >= 0x2E80 and cp <= 0x303E) return 2;

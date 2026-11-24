@@ -152,6 +152,7 @@ fn skipPaste(in_fd: c_int, parser: *input_mod.KeyParser) ?PermissionChoice {
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
+    @import("../screen_mirror.zig").feed(fd, bytes);
     _ = pfs.writeAll(fd, bytes); // resize 打断(EINTR)重试,不丢半帧
 }
 
