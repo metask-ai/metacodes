@@ -17,6 +17,7 @@ status, compatibility boundaries, and entry points are defined by
   attempts include an invalid one (network or environment failures), not the
   ones the model failed. Turning on 自动重跑无效的题 on a profile queues a
   finished dataset's invalid tasks again, at most two rounds per dataset.
+
 - **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
   Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,
   `[docs](https://…)`) as an underlined OSC 8 hyperlink showing only its
