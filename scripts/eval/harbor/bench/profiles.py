@@ -26,6 +26,7 @@ import json
 import re
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -34,7 +35,8 @@ from scripts.eval.harbor import live_concurrency, suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
-from scripts.eval.harbor.bench.runner import ACTIVE, DEFAULT_FEATURES, atomic_json, chosen_features, now, settings
+from scripts.eval.harbor.bench.runner import (ACTIVE, DEFAULT_FEATURES, ExecutorUnreachable, atomic_json,
+                                              chosen_features, now, settings)
 
 MAX_ITEMS = 16
 MAX_MODELS = 8
@@ -214,6 +216,9 @@ class ProfileManager:
     """Durable profiles over a RunManager; one profile's queue advances at a
     time, the one whose oldest waiting dataset was queued first."""
 
+    # How long a dataset waits for an SSH executor that does not answer.
+    UNREACHABLE_WAIT = 1800
+
     def __init__(self, runs):
         self.runs = runs
         self.dir = runs.jobs_dir / PROFILES_DIR
@@ -311,9 +316,11 @@ class ProfileManager:
                 raise ValueError("评测配置 " + owner + " 的队列正在运行，请等它结束或先停止")
             record = self._append(target, None, [planned])
             self._step(record)
-            if record["items"][-1]["status"] == "failed":
+            item = record["items"][-1]
+            if item["status"] == "pending":  # `bench run` does not wait for an executor
+                item.update(status="failed", error=item.pop("waiting")["reason"], finished_at=now())
+            if item["status"] == "failed":
                 self._step(record)
-        item = record["items"][-1]
         if item["status"] == "failed":
             raise ValueError(item["error"])
         return next(r for r in self.runs.runs() if r["name"] == item["run"])
@@ -498,9 +505,16 @@ class ProfileManager:
                 request["features"] = features
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
                                         pinned=pending.get("route"))
+            pending.pop("waiting", None)
             pending.update(status="running", run=launched["name"], started_at=now())
             record["status"] = "running"
             record["started_at"] = record.get("started_at") or now()
+        except ExecutorUnreachable as exc:
+            waiting = pending.setdefault("waiting", {"since": time.time()})
+            waiting["reason"] = str(exc)
+            if time.time() - waiting["since"] > self.UNREACHABLE_WAIT:
+                pending.update(status="failed", finished_at=now(),
+                               error=f"执行机器 {self.UNREACHABLE_WAIT // 60} 分钟内一直连不上：{exc}")
         except (ValueError, OSError) as exc:
             pending.update(status="failed", error=str(exc), finished_at=now())
         self.save(record)

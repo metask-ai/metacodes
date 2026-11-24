@@ -186,7 +186,9 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     The receipt is rewritten every two seconds whatever the copy-back is
     doing (RunManager shows a receipt older than 30 seconds as interrupted),
     and the run is `finished` only when the final copy was verified
-    complete; otherwise the receipt says where the results still are."""
+    complete; otherwise the receipt says where the results still are. A
+    channel that drops or goes silent is reattached (RemoteRun.reconnect):
+    Harbor keeps running on the executor meanwhile."""
     secret_env = {}
     if spec.get("runner") != "workbuddy":
         # The run's key plus the suite's execution-host variables (a judge
@@ -207,8 +209,14 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     cancelled_at = None
     expired = False
     last_write = 0.0
-    while (remote.process.poll() is None
-           or cancelled_at is None and remote.retry_tunnel(secret_env, source.current)):
+    def channel_open():
+        if remote.process.poll() is None:
+            return True
+        if cancelled_at is None and remote.retry_tunnel(secret_env, source.current):
+            return True
+        return remote.reconnect(source.current, cancelled_at)
+
+    while channel_open():
         now_s = time.monotonic()
         if credential_failed(source) and cancelled_at is None:
             # Fail fast instead of burning the remaining tasks on 401s.
@@ -224,16 +232,17 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
             remote.hang_up()
         if cancelled_at and now_s - cancelled_at > 60:
             remote.process.kill()
-        if now_s - remote.last_event > remote.HEARTBEAT_TIMEOUT and cancelled_at is None:
-            # A silent channel: closing it makes the driver stop Harbor.
-            record["error"] = "远程执行机器心跳超时"
-            cancelled_at = now_s
-            remote.hang_up()
+        if now_s - remote.last_event > remote.HEARTBEAT_TIMEOUT and remote.process.poll() is None:
+            # A silent channel is a lost one: end it and attach anew.
+            remote.log("远程执行机器心跳超时，断开重连")
+            remote.process.kill()
         if spec.get("runner") != "workbuddy" and cancelled_at is None:
             wanted = adjusted_concurrency(spec_path, record)
             if remote.concurrency != wanted:
                 remote.set_concurrency(wanted)
         if now_s - last_write > 2:
+            if remote.reconnects:
+                record["reconnects"] = remote.reconnects
             stamp_credential(record, source)
             atomic_json(record_path, record)
             last_write = time.monotonic()
@@ -262,7 +271,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         complete = False
     code = remote.exit_code()
     if code is None:
-        lost = remote.error_message() or "SSH 连接中断"
+        lost = remote.error_message() or remote.lost_message() or "SSH 连接中断"
         if remote.forward_was_refused():
             lost = tunnel_unbound(remote.executor, remote.tunnel_ports)
         elif remote.tunnel_port is not None and not remote.events and remote.process.returncode == 255:

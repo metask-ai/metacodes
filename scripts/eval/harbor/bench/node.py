@@ -7,6 +7,7 @@ own `metacodes` over SSH and talks to it on the channel's stdin/stdout.
     metacodes bench node info [--json] [--peer NAME]
     metacodes bench node peers [--json]
     metacodes bench node run <spec.json>
+    metacodes bench node attach <spec.json>
     metacodes bench node build                   # {"ref", "repo"} on stdin
     metacodes bench node manifest <job-dir>
     metacodes bench node pack <job-dir>          # JSON items on stdin
@@ -22,6 +23,7 @@ built (remote.py); a WorkBuddy run uses this node's own WorkBuddy checkout,
 so it runs here exactly as it would on the workbench's own machine. The
 channel protocol is remote.py's: the first stdin line carries the secrets,
 later lines a refreshed token or `cancel`; stdout carries JSON events.
+`attach` reconnects a new session to a run whose session was lost.
 `build` builds one git revision's Linux unit in this node's own Docker,
 exactly as `metacodes bench build` does on its own machine (builds.py), and
 prints the unit as the last stdout line; closing stdin cancels it.
@@ -47,7 +49,7 @@ from scripts.eval.harbor.bench.runner import atomic_json, now, settings
 
 # Raised whenever the workbench and a node stop understanding each other's
 # `info` or `run`; the workbench refuses a node with another protocol.
-PROTOCOL = 6
+PROTOCOL = 7
 PEERS = "peers.json"
 # How long removing a run's image tag may take before the run ends anyway.
 CLEANUP_TIMEOUT = 60
@@ -116,7 +118,7 @@ class Node:
     def run(self, spec_path: str) -> int:
         spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
         if spec.get("runner") == suites.WORKBUDDY:
-            return self.run_workbuddy(spec)
+            return self.run_workbuddy(spec, Path(spec_path).resolve().parent)
         return remote.run(spec_path)
 
     def build(self) -> int:
@@ -142,7 +144,7 @@ class Node:
         print(json.dumps({"bundle": unit.name, "path": str(unit), **info}, ensure_ascii=False), flush=True)
         return 0
 
-    def run_workbuddy(self, spec) -> int:
+    def run_workbuddy(self, spec, run_dir: Path) -> int:
         """WorkBuddy on this node's checkout. Its host proxy talks to a
         loopback relay holding only a placeholder; the relay forwards with the
         access token from the stdin line and swaps in each refreshed one."""
@@ -199,7 +201,7 @@ class Node:
 
         try:
             return remote.supervise(spec, None, None, credential, threading.Event(), threading.Event(),
-                                    prepare=prepare, finish=finish)
+                                    prepare=prepare, finish=finish, run_dir=run_dir)
         finally:
             if relay is not None:
                 relay.__exit__(None, None, None)
@@ -228,6 +230,10 @@ def main(argv, state_root, version) -> int:
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(code)
+    if action == "attach" and len(args) == 1:
+        code = remote.attach(args[0])
+        sys.stdout.flush()
+        os._exit(code)
     if action == "build" and not args:
         code = node.build()
         sys.stdout.flush()
@@ -235,8 +241,8 @@ def main(argv, state_root, version) -> int:
         os._exit(code)
     if action in ("manifest", "pack", "egress-probe") and len(args) == 1:
         return remote.main([action, args[0]])
-    print("usage: metacodes bench node info [--json] | peers [--json] | run <spec> | build | manifest <dir> | "
-          "pack <dir> | egress-probe <json>", file=sys.stderr)
+    print("usage: metacodes bench node info [--json] | peers [--json] | run <spec> | attach <spec> | build | "
+          "manifest <dir> | pack <dir> | egress-probe <json>", file=sys.stderr)
     return 2
 
 

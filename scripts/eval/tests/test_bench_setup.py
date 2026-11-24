@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
-from scripts.eval.harbor.bench import data, executors, setup
+from scripts.eval.harbor.bench import data, executors, remote, setup
 from scripts.eval.harbor.bench import node as node_protocol
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
@@ -185,6 +185,28 @@ elif name == "ssh":
             sys.exit(1)
         time.sleep(float(env.get("FAKE_SSH_PACK_DELAY") or 0))
     os.chdir(home)
+    drops = env.get("FAKE_SSH_DROPS")
+    if drops and " node run " in command and int(Path(drops).read_text()) > 0:
+        # The network fails under a run's session: the driver's stdin ends
+        # and its stdout breaks while it keeps running.
+        Path(drops).write_text(str(int(Path(drops).read_text()) - 1))
+        import threading
+        child = subprocess.Popen(["/bin/sh", "-c", command], env=remote, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, start_new_session=True)
+        def down():
+            for line in sys.stdin.buffer:
+                child.stdin.write(line)
+                child.stdin.flush()
+        def up():
+            for line in child.stdout:
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+        threading.Thread(target=down, daemon=True).start()
+        threading.Thread(target=up, daemon=True).start()
+        time.sleep(float(env.get("FAKE_SSH_DROP_AFTER") or 2))
+        child.stdin.close()
+        print("client_loop: send disconnect: Broken pipe", file=sys.stderr)
+        os._exit(255)
     if reverse:
         # `-R 127.0.0.1:R:127.0.0.1:L`: the "executor" is this machine, so
         # the remote end listens on loopback port R and relays to L, for the
@@ -313,6 +335,17 @@ class NodeProtocolTest(unittest.TestCase):
         relay = executors.SshExecutor(name="relay", host="relay.invalid")
         self.assertIn("不兼容", executors.node_problem(relay, {"node": {"protocol": 4}}))
         self.assertIn("不兼容", executors.reach_reasons(relay, {"node": {"protocol": 4}})[0])
+
+
+    def test_only_network_failures_count_as_unreachable(self):
+        for detail in ("ssh: connect to host 58.211.6.133 port 107: No route to host",
+                       "ssh: connect to host 58.211.6.133 port 107: Operation timed out",
+                       "ssh: Could not resolve hostname relay: Name or service not known",
+                       "kex_exchange_identification: read: Connection reset by peer"):
+            self.assertTrue(executors.unreachable({"error": "ssh", "detail": detail}), detail)
+        self.assertTrue(executors.unreachable({"error": "timeout"}))
+        self.assertFalse(executors.unreachable({"error": "ssh", "detail": "bench@relay: Permission denied (publickey)."}))
+        self.assertFalse(executors.unreachable({"error": "noshell"}))
 
 
 @unittest.skipUnless(POSIX, "fake executables are POSIX shell scripts")
@@ -1070,6 +1103,20 @@ class SshRunTest(SetupFixture):
         self.assertEqual((local / "t__1/agent.log").read_bytes(), log.read_bytes())
         self.assertTrue(sync.complete())
 
+    def test_a_dropped_session_is_reattached_and_the_run_finishes(self):
+        manager, client, _ = self.prepare_remote()
+        drops = self.root / "drops"
+        drops.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="2", FAKE_BENCH_DELAY="6")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual(final["status"], "finished", (final, log))
+        self.assertEqual((final["exit_code"], final["reconnects"]), (0, 1), final)
+        self.assertEqual(drops.read_text(), "0")
+        self.assertIn("已重新连上执行机器 relay-4090", log)
+        self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
     def test_cancel_reaches_the_remote_harbor_process(self):
         manager, client, _ = self.prepare_remote()
         os.environ["FAKE_BENCH_DELAY"] = "30"
@@ -1086,25 +1133,53 @@ class SshRunTest(SetupFixture):
         self.assertNotEqual(final["exit_code"], 0)
         self.assertTrue((manager.jobs_dir / run["name"] / "argv.json").exists())
 
-    def test_closed_channel_stops_remote_harbor(self):
-        manager, _, _ = self.prepare_remote()
+    def start_driver(self, grace):
+        """A remote driver whose Harbor runs 30 s, and its first session."""
+        self.prepare_remote()
         relay = executors.find(self.cfg(), "relay-4090")
         jobs = self.remote_home / "jobs"
         spec = {"argv": [str(self.remote_home / ".local/bin/harbor"), "run", "-m", "metask/x", "-k", "1",
-                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None}
-        (self.remote_home / "spec.json").write_text(json.dumps(spec))
-        argv = executors.node_argv(relay, "run", "spec.json")
+                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None,
+                "detach_grace": grace}
+        (self.remote_home / "runs/eof").mkdir(parents=True)
+        (self.remote_home / "runs/eof/spec.json").write_text(json.dumps(spec))
         env = {**os.environ, "FAKE_BENCH_DELAY": "30"}
-        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+        process = subprocess.Popen(executors.node_argv(relay, "run", "runs/eof/spec.json"), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, env=env)
+        self.addCleanup(process.kill)
         process.stdin.write(b'{"env": {"METASK_API_KEY": "k"}}\n')
         process.stdin.flush()
         self.assertEqual(json.loads(process.stdout.readline())["event"], "started")
+        return relay, process
+
+    def test_closed_channel_stops_remote_harbor_after_the_grace_period(self):
+        _, process = self.start_driver(grace=1)
         process.stdin.close()
-        events = [json.loads(line) for line in process.stdout]
         process.stdout.close()
         process.wait(30)
+        end = json.loads((self.remote_home / "runs/eof" / remote.END_EVENT).read_text())
+        self.assertEqual((end["event"], end["cancelled"]), ("exit", True))
+
+    def test_a_new_session_attaches_to_a_run_whose_channel_closed(self):
+        """A dropped SSH session leaves Harbor running; `node attach` takes
+        over its events and control lines, and gets the terminal event even
+        once the run has ended."""
+        relay, process = self.start_driver(grace=60)
+        process.stdin.close()
+        process.stdout.close()
+        attach = executors.node_argv(relay, "attach", "runs/eof/spec.json")
+        session = subprocess.Popen(attach, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(session.kill)
+        self.assertEqual(json.loads(session.stdout.readline())["event"], "heartbeat")
+        self.assertIsNone(process.poll())
+        session.stdin.write(b"cancel\n")
+        session.stdin.flush()
+        events = [json.loads(line) for line in session.stdout]
         self.assertEqual(events[-1]["event"], "exit")
         self.assertTrue(events[-1]["cancelled"])
+        process.wait(30)
+        late = subprocess.run(attach, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(json.loads(late.stdout), events[-1])
 
 
 class SuiteOnExecutorTest(SetupFixture):
