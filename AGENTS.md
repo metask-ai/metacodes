@@ -93,7 +93,15 @@ These rules apply to the entire repository.
   `kernel_budget` (lines and the packages it reaches) only goes down. CI
   checks the PR against its base (`zig build layer:check -Dlayer-base=<ref>`)
   and fails when the baseline or the budget grows or `allowed_dependencies`
-  widen.
+  widen. A change to the layering itself goes in its own PR. The base
+  comparison accepts an entry a package split exposes only when the base
+  tree already had that import between two files of one package; an upward
+  entry must already be upward in the base, while a deep one may come from
+  either list. A package may start depending on a package the base lacks
+  only when that package's dependencies and its files, each already in the
+  base tree at the same path, were already within the dependent's reach. `src/lib.zig`, the
+  `metacodes-core` facade that re-exports the lower packages, is its own
+  `facade` package between `teamwork` and `agentcore`.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
   journals, timestamps, and equivalent configuration churn must not enter prompts.
 - TinyKG is a separately built external binary dependency. The repository owns one

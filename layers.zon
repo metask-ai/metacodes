@@ -78,7 +78,6 @@
             .paths = .{
                 "src/core/agent_session.zig",
                 "src/core/session_host.zig",
-                "src/lib.zig",
             },
             .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding" },
         },
@@ -88,9 +87,14 @@
             .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session" },
         },
         .{
+            .name = "facade",
+            .paths = .{"src/lib.zig"},
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" },
+        },
+        .{
             .name = "agentcore",
             .paths = .{"src/agentcore/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade" },
         },
         .{
             .name = "cli",
@@ -106,7 +110,7 @@
                 "src/install_root.zig",
                 "src/picker_test_root.zig",
             },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "agentcore" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore" },
         },
         .{
             .name = "testing",
@@ -114,12 +118,12 @@
                 "tests/_harness/",
                 "tests/helpers/",
             },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "agentcore", "cli" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli" },
         },
         .{
             .name = "tests",
             .paths = .{"tests/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "agentcore", "cli", "testing" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli", "testing" },
         },
     },
     .kernel_budget = .{
