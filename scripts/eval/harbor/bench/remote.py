@@ -25,9 +25,10 @@ Later stdin lines are control messages:
 - `cancel`: interrupt Harbor (SIGINT, then SIGKILL after 20 s).
 
 The channel closing does not stop the run: Harbor and the relay keep going
-and `attach <spec.json>` connects a new session to the driver (the run
-directory's ATTACH_SOCKET), whose stdin/stdout then carry the same control
-lines and events. Only when no session is back within the spec's
+and `attach <spec.json>` connects a new session to the driver (on the
+socket attach_socket() names for the run directory), whose stdin/stdout
+then carry the same control lines and events. Until that socket listens,
+the run directory's DRIVER_PID tells `attach` the driver is still starting. Only when no session is back within the spec's
 `detach_grace` seconds is Harbor interrupted. The run's terminal event is
 also kept in the run directory, so a session attaching after the end still
 receives it; with the original session gone, the driver's and Harbor's
@@ -69,13 +70,45 @@ from scripts.eval.harbor import live_concurrency
 
 DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
 DETACH_GRACE = 1800
-ATTACH_SOCKET = "attach.sock"
+SOCKET_ROOT = "/tmp"  # short: AF_UNIX paths are limited to about 100 bytes
+DRIVER_PID = "driver.pid"
 END_EVENT = "end.json"
 DRIVER_LOG = "driver.log"
 
 
 EMIT_LOCK = threading.Lock()
 OUT = None  # the attached session's writer; None while the first one lasts
+
+
+def attach_socket(run_dir):
+    """The attach socket of the driver of `run_dir`: a bounded name in a
+    directory only this user can enter."""
+    root = Path(SOCKET_ROOT) / f"metacodes-bench-{os.getuid()}"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(root)
+    if not os.path.isdir(root) or os.path.islink(root) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise OSError(f"{root} 不是当前用户私有的目录")
+    digest = hashlib.sha256(str(Path(run_dir).resolve()).encode()).hexdigest()[:24]
+    return str(root / (digest + ".sock"))
+
+
+def claim(run_dir):
+    """Mark `run_dir` as having a live driver, for `attach` to wait on."""
+    try:
+        (Path(run_dir) / DRIVER_PID).write_text(str(os.getpid()), encoding="ascii")
+    except OSError:
+        pass
+
+
+def driver_alive(run_dir):
+    try:
+        os.kill(int((Path(run_dir) / DRIVER_PID).read_text(encoding="ascii")), 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def emit(event, **fields):
@@ -102,6 +135,7 @@ class Control:
         self.lost_at = None
         self.quiet = False
         self.listener = None
+        self.path = None
 
     def follow(self, reader, generation):
         try:
@@ -127,9 +161,9 @@ class Control:
 
     def listen(self):
         """Accept attaching sessions; False when the socket cannot be bound."""
-        path = os.path.relpath(self.run_dir / ATTACH_SOCKET)  # AF_UNIX paths are short
         previous = os.umask(0o077)
         try:
+            path = self.path = attach_socket(self.run_dir)
             if os.path.lexists(path):
                 os.unlink(path)
             self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -168,7 +202,7 @@ class Control:
         if self.listener is not None:
             self.listener.close()
             try:
-                os.unlink(os.path.relpath(self.run_dir / ATTACH_SOCKET))
+                os.unlink(self.path)
             except OSError:
                 pass
 
@@ -189,6 +223,7 @@ def absolute(value):
 
 def run(spec_path):
     os.chdir(os.path.expanduser("~"))
+    claim(Path(spec_path).resolve().parent)
     first = sys.stdin.buffer.readline()
     try:
         message = json.loads(first)
@@ -362,8 +397,12 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
             emit("credential", pushes=credential.pushes)  # a count, never the token
 
     control = Control(run_dir, on_line, float(spec.get("detach_grace") or DETACH_GRACE))
-    if run_dir is None or not control.listen():
+    if run_dir is None:
         control.grace = 0  # nothing can attach: a closed channel stops the run
+    elif not control.listen():
+        terminal(run_dir, "error", message="执行机器上建不了重连用的 Unix socket（/tmp/metacodes-bench-<uid>/），"
+                                           "评测没有启动；请检查 /tmp 是否可写、该目录是否属于当前用户且权限为 700")
+        return 2
 
     def watch():
         while not control.expired():
@@ -436,6 +475,7 @@ def run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run
             last = time.monotonic()
         time.sleep(0.25)
     output.join(5)
+    process.stdout.close()
     finishing()
     terminal(run_dir, "exit", code=process.returncode, cancelled=interrupted_at is not None)
     return process.returncode
@@ -448,13 +488,15 @@ def attach(spec_path):
     run_dir = Path(spec_path).resolve().parent
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        conn.connect(os.path.relpath(run_dir / ATTACH_SOCKET))
+        conn.connect(attach_socket(run_dir))
     except OSError:
         end = run_dir / END_EVENT
         if end.is_file():
             sys.stdout.write(end.read_text(encoding="utf-8"))
             sys.stdout.flush()
             return 0
+        if driver_alive(run_dir):
+            return 75  # still starting: no event, the workbench tries again
         emit("error", message="执行机器上这次运行的驱动进程已经不在了（机器重启，或进程被结束），结果只有已经写入作业目录的部分")
         return 3
 

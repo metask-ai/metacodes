@@ -804,7 +804,11 @@ A lost connection does not end the run. When the channel closes, or no
 heartbeat arrives for 90 seconds, the worker ends that session and starts
 `metacodes bench node attach <run spec>` over SSH every 10 seconds. The
 driver keeps Harbor and the relay running and accepts the new session on a
-Unix socket in `<state_dir>/runs/<name>/` (owner-only). The new session then
+Unix socket in `/tmp/metacodes-bench-<uid>/` (a directory only that user can
+enter; the socket is named after a hash of the run directory). A session
+lost before its first event is attached the same way, and while the driver
+is still starting (its pid is in `runs/<name>/driver.pid`) `attach` exits
+without an event and the worker tries again. The new session then
 carries the events and control lines, the current access token, and the
 egress tunnel on a fresh `ssh -R` port, which the driver's forwarder follows.
 While no session is attached, the driver's and Harbor's output goes to

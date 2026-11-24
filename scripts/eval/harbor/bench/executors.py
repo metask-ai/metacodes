@@ -1427,9 +1427,15 @@ class RemoteRun:
         """The channel closed without the run's terminal event: attach a new
         session to the remote driver, which keeps Harbor running meanwhile.
         True while the run goes on (attached, or the next attempt is due
-        later); False once the driver is gone, the run never started, a
-        cancel has waited a minute, or reconnect_window has passed."""
-        if not self.events or self.exit_code() is not None or self.error_message():
+        later); False once the driver is gone, the remote command itself
+        failed (an exit status other than ssh's 255, or a refused forward),
+        a cancel has waited a minute, or reconnect_window has passed. A
+        session lost before its first event is attached too: its start
+        request may have reached the node."""
+        if self.exit_code() is not None or self.error_message():
+            return False
+        if self.lost_at is None and not self.events and (self.process.returncode != 255
+                                                         or self.forward_was_refused()):
             return False
         now_s = time.monotonic()
         if cancelled_at is not None and now_s - cancelled_at > 60:

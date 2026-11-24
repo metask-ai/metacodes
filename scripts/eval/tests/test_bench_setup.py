@@ -188,21 +188,26 @@ elif name == "ssh":
     drops = env.get("FAKE_SSH_DROPS")
     if drops and " node run " in command and int(Path(drops).read_text()) > 0:
         # The network fails under a run's session: the driver's stdin ends
-        # and its stdout breaks while it keeps running.
+        # and its stdout breaks while it keeps running. FAKE_SSH_DROP_SILENT:
+        # none of its events got through before that.
         Path(drops).write_text(str(int(Path(drops).read_text()) - 1))
         import threading
         child = subprocess.Popen(["/bin/sh", "-c", command], env=remote, stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, start_new_session=True)
+        sent = threading.Event()
         def down():
             for line in sys.stdin.buffer:
                 child.stdin.write(line)
                 child.stdin.flush()
+                sent.set()
         def up():
             for line in child.stdout:
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
+                if not env.get("FAKE_SSH_DROP_SILENT"):
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
         threading.Thread(target=down, daemon=True).start()
         threading.Thread(target=up, daemon=True).start()
+        sent.wait(30)
         time.sleep(float(env.get("FAKE_SSH_DROP_AFTER") or 2))
         child.stdin.close()
         print("client_loop: send disconnect: Broken pipe", file=sys.stderr)
@@ -1116,6 +1121,35 @@ class SshRunTest(SetupFixture):
         self.assertEqual(drops.read_text(), "0")
         self.assertIn("已重新连上执行机器 relay-4090", log)
         self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
+    def test_a_session_lost_before_its_first_event_is_attached_too(self):
+        """The start request reached the node but no event came back: the
+        worker attaches (waiting while the driver starts) and gets the
+        remote run's own end."""
+        manager, client, _ = self.prepare_remote()
+        drops = self.root / "drops"
+        drops.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="0", FAKE_SSH_DROP_SILENT="1",
+                          FAKE_BENCH_DELAY="4")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"]), ("finished", 0), (final, log))
+        self.assertEqual(final["reconnects"], 1, final)
+        end = self.remote_home / ".metacodes-bench/runs" / run["name"] / remote.END_EVENT
+        self.assertEqual(json.loads(end.read_text())["code"], 0)
+        self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
+    def test_the_attach_socket_is_short_and_private_for_a_deep_state_dir(self):
+        self.prepare_remote()
+        run_dir = self.remote_home / ("state/" * 12) / "runs" / "bench-20261124-055700-0a1b2c"
+        run_dir.mkdir(parents=True)
+        control = remote.Control(run_dir, lambda _line: None, 60)
+        self.addCleanup(control.close)
+        self.assertTrue(control.listen())
+        self.assertLess(len(control.path), 100)
+        self.assertEqual(control.path, remote.attach_socket(run_dir))
+        self.assertEqual(os.stat(os.path.dirname(control.path)).st_mode & 0o777, 0o700)
 
     def test_cancel_reaches_the_remote_harbor_process(self):
         manager, client, _ = self.prepare_remote()

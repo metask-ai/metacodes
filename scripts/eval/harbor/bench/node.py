@@ -151,6 +151,7 @@ class Node:
         from scripts.eval.harbor.profiling import PushedCredential, TimingRelay, placeholder
         from scripts.eval.harbor.suites import workbuddy
         os.chdir(os.path.expanduser("~"))
+        remote.claim(run_dir)
         try:
             message = json.loads(sys.stdin.buffer.readline())
             credential = PushedCredential(message["credential"])
