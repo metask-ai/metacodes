@@ -169,7 +169,7 @@ Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成
 ID 不含路径和模块前缀,所以只搬文件不会改变 ID。同名的测试按次数计:两个都叫 `zig:basic` 的
 测试删掉一个,也算少了一个。同一个测试在几个步骤里都跑(比如 Debug 和 ReleaseSafe 的 core
 套件),次数照实累加,base 和 head 在同样的 CI 布局下比较。`time_test_runner.zig` 是诊断入口,不记录;
-`test:provider`、`test:lsp` 等用 Zig 默认运行器的隔离根暂时不在 ID 集合里。
+用 Zig 默认运行器的测试二进制暂时不在 ID 集合里:`test:units` 里 Debug 的 `cc-test`(`src/` 全图,含 CLI 层),以及 `test:provider`、`test:mcp`、`test:picker`、`test:lsp`、`test:platform` 等隔离根。`src/` 里经 `src/lib.zig` 可达的测试由 CI checks 腿上 ReleaseSafe 的 core 套件记录。
 
 本地看一次完整离线测试的 ID 集合(各来源的条数打印到 stderr,和各套件的汇总行对得上):
 
