@@ -512,10 +512,22 @@ def write_report(report: str, summary: Optional[str]) -> None:
             handle.write(report)
 
 
+def narrowed_report(enforced: bool) -> Tuple[str, bool]:
+    report = ("## Executed test IDs\n\nThis run's change scope ran only part of `zig build test` "
+              "(scripts/ci_scope.py), so its IDs are not compared and not kept as a base; "
+              "main's nightly full run records the complete set.\n")
+    if enforced:
+        report += "\nA migration PR is compared on a complete run, so this fails: its change must take the full scope.\n"
+    return report, enforced
+
+
 def cmd_ci_compare(args) -> int:
-    head = parse_ids(Path(args.head).read_text(encoding="utf-8"), args.head)
     enforced = MIGRATION_LABEL in pr_labels(args.repository, args.pr)
-    report, failed = judge(head, git("rev-parse", args.base), args.repository, enforced)
+    if args.scope_complete == "false":
+        report, failed = narrowed_report(enforced)
+    else:
+        head = parse_ids(Path(args.head).read_text(encoding="utf-8"), args.head)
+        report, failed = judge(head, git("rev-parse", args.base), args.repository, enforced)
     write_report(report, args.summary)
     return 1 if failed else 0
 
@@ -562,6 +574,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ci.add_argument("--repository", required=True)
     ci.add_argument("--pr", type=int, required=True)
     ci.add_argument("--summary")
+    ci.add_argument("--scope-complete", default="true",
+                    help="'false' when the change scope ran part of the suite: nothing to compare")
     ci.set_defaults(handler=cmd_ci_compare)
     check = commands.add_parser("check", help=f"check the format of {RENAMED.as_posix()} and {REMOVED.as_posix()}")
     check.add_argument("--root", default=str(ROOT))

@@ -193,7 +193,7 @@ Before submitting:
 zig build gate:static
 python3 scripts/lint.py
 zig build test:lib -Doptimize=ReleaseSafe
-zig build test
+zig build test:affected
 scripts/test_coverage_audit.sh
 python3 scripts/check_doc_links.py
 python3 scripts/check_doc_facts.py
@@ -208,9 +208,14 @@ runner has no fail-fast: inside the full gate a failed guard is reported
 only when everything else has finished (#587). Every CI gate leg runs it
 first too.
 
-`zig build gate:pr` runs this list: the core suite always in ReleaseSafe, the
-full suite at `-Doptimize` (Debug by default). CI runs the same commands (the
-full suite in Debug, the core suite in ReleaseSafe;
+`zig build test:affected` runs the part of `zig build test` that CI selects
+for the change against `origin/main`, working tree included
+(`scripts/ci_scope.py`, `doc/CI_DESIGN.md` §2): all of it for most changes,
+less when only tests or packages `layers.zon` trusts changed. The full suite
+is left to CI's full runs and main's nightly run. `zig build gate:pr` runs
+this list with the full suite in place of `test:affected`: the core suite
+always in ReleaseSafe, the full suite at `-Doptimize` (Debug by default). CI
+runs the same commands (the full suite in Debug, the core suite in ReleaseSafe;
 `scripts/tests/test_gate_manifest.py` asserts every command above has a CI
 step), so this block is the single source. CI runs the full suite as its
 three parts, `zig build test:units`, `test:integration` and `test:product`, on
@@ -220,8 +225,9 @@ goes into one of them, and a new CI step names its leg (`doc/CI_DESIGN.md`
 reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
 whose complete CI coverage passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
-or to documentation and the evaluation harness, skips the CI suites it cannot
-affect (`scripts/ci_scope.py`). CI runs once per PR revision, and again when its labels change, on Linux x86_64,
+to documentation and the evaluation harness, to tests, or to packages whose
+`layer_baseline.zon` entries are gone, skips the CI suites it cannot affect
+(`scripts/ci_scope.py`). CI runs once per PR revision, and again when its labels change, on Linux x86_64,
 macOS ARM64 and Windows x86_64; main pushes do not repeat it. Linux ARM64,
 Intel macOS and Windows ARM64 cross-build checks run in the release workflow
 (`doc/CI_DESIGN.md` §3); keep lightweight target-contract fixtures in PR CI.

@@ -327,6 +327,20 @@ class BaseTest(unittest.TestCase):
         self.assertIsNone(base.counts)
         self.assertIn("nothing to compare", base.note)
 
+    def test_a_narrowed_run_compares_nothing_and_fails_only_a_migration_pr(self):
+        # scripts/ci_scope.py ran part of the suite: its IDs would read as
+        # missing tests, so no head list is read and no base is looked up.
+        for labels, status in (([], 0), ([test_ids.MIGRATION_LABEL], 1)):
+            with self.subTest(labels=labels), tempfile.TemporaryDirectory() as tmp:
+                summary = Path(tmp) / "summary.md"
+                with mock.patch.object(test_ids, "pr_labels", return_value=labels), \
+                        mock.patch.object(test_ids, "judge", side_effect=AssertionError("compared")):
+                    code = test_ids.main(["ci-compare", "--head", str(Path(tmp) / "absent.tsv"), "--base", "HEAD^1",
+                                          "--repository", "o/r", "--pr", "1", "--summary", str(summary),
+                                          "--scope-complete", "false"])
+                self.assertEqual(code, status)
+                self.assertIn("not compared", summary.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -104,8 +104,9 @@ class GateManifestTest(unittest.TestCase):
         parts = test_part_commands(ci)
         for expected in checklist_commands():
             words = normalized_words(expected)
-            if words[:3] == ["zig", "build", "test"]:
-                # Every part runs somewhere, with the checklist command's options.
+            if words[:2] == ["zig", "build"] and words[2:3] in (["test"], ["test:affected"]):
+                # `test:affected` runs the parts CI selects for the change; CI
+                # runs every part on a full run, with the checklist command's options.
                 for part in TEST_PARTS:
                     self.assertTrue(
                         any(part in steps and options[: len(words) - 3] == words[3:] for steps, options in parts),
@@ -181,6 +182,20 @@ class GateManifestTest(unittest.TestCase):
         self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
         self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
         self.assertIn("needs: [gates-linux, test-ids]", workflow)
+
+    def test_the_checklist_runs_what_ci_selects(self):
+        """The checklist's suite is `test:affected`: scripts/ci_scope.py's
+        decision for the working tree against origin/main, run locally."""
+        self.assertIn("zig build test:affected", checklist_commands())
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn('b.step("test:affected",', build)
+        command = re.search(r"const affected_cmd = b\.addSystemCommand\(&\.\{(.*?)\}\);", build, re.S).group(1)
+        words = re.findall(r'"([^"]*)"', command)
+        self.assertEqual(words[words.index("scripts/ci_scope.py"):],
+                         ["scripts/ci_scope.py", "--event", "local", "--base", "affected-base",
+                          "test:affected: the revision whose merge base with HEAD the change is measured from",
+                          "origin/main", "--candidate", "", "--github-summary", "", "--run", "--zig"])
+        self.assertIn("gate_pr_step.dependOn(test_step);", build)
 
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")

@@ -2905,6 +2905,24 @@ pub fn build(b: *std.Build) void {
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
+    const affected_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/ci_scope.py",
+        "--event",
+        "local",
+        "--base",
+        b.option([]const u8, "affected-base", "test:affected: the revision whose merge base with HEAD the change is measured from") orelse "origin/main",
+        "--candidate",
+        "",
+        "--github-summary",
+        "",
+        "--run",
+        "--zig",
+        b.graph.zig_exe,
+    });
+    affected_cmd.setCwd(b.path("."));
+    affected_cmd.has_side_effects = true;
+    b.step("test:affected", "Run the tests CI selects for the change against origin/main, working tree included (scripts/ci_scope.py)").dependOn(&affected_cmd.step);
 
     const update_contract = b.option(bool, "update-contract", "test:contract: rewrite the snapshots under tests/contract instead of comparing") orelse false;
     const contract_step = b.step("test:contract", "Compare the external contracts with their snapshots under tests/contract: ABI, Zig API, provider requests, events, on-disk formats, CLI");
