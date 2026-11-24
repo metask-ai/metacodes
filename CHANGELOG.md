@@ -12,6 +12,43 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Teamwork trials no longer stop at permission prompts.** `teamwork run`
+  has no `--permission`, so its verifier asked for each command and, with
+  nobody to answer, the audit ended unavailable and nothing merged. A
+  teamwork trial now writes user-level allow rules for the built-in tools in
+  its disposable container, as a headless trial runs with
+  `bypassPermissions`.
+
+- **Teamwork trials get a cap that lasts.** The dollar cap now follows the
+  difficulty at easy $20, medium $40, hard $80 (otherwise $40), since the
+  ledger charges models without their own price at the Sonnet fallback
+  rates; a run that spends its budget is scored instead of counted invalid,
+  and the run directory (ledger, seat logs, no worktrees) is kept with the
+  trial as `teamwork-run/`.
+
+- **A bench profile can measure teamwork.** The `teamwork` preview feature
+  runs each Harbor task through `metacodes teamwork run`: task containers get
+  the permissions bubblewrap needs, a directory without a commit gets a
+  snapshot commit, the dollar cap follows the task's difficulty and the
+  agent timeout triples. A run in which no implementer seat finished counts
+  as invalid. It runs alone and only on an SSH executor whose entry sets
+  `teamwork_privileged: true`: the container permissions are close to a
+  privileged container, so only for a disposable node without credentials.
+  The bench node protocol is now 4 (rerun `metacodes bench setup --executor
+  <name>`).
+
+- **A bench profile runs several models at once.** The 评测 page selects
+  several models (`models` in `POST /api/profiles/run`), queuing every
+  dataset once per model, and the profile page compares the models' latest
+  results side by side.
+
+- **The bench workbench shows public leaderboards next to our runs.** A
+  榜单 page lists, per suite, results other harnesses and models published
+  (FrontierHarness Eval v1.1 per model, Terminal-Bench 2.0/2.1, EvalPlus,
+  Vals.ai and MathArena AIME, LiveMathBench, WorkBuddy-Bench, GAIA2,
+  ALFWorld) with their sources, and ranks this workbench's finished jobs among
+  them. Boards with costs add a pass-rate/cost scatter with the cost-pass
+  frontier; hovering a point or row shows what it beats.
 - **The bench workbench reports FrontierHarness-style statistics.** Every
   summary adds the pass rate's 95% interval, tasks solved at least once, cost
   per task (per-task mean, then mean over tasks) and per pass, the share of
@@ -191,21 +228,58 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- **A background job that finishes while the model is answering wakes the
-  agent** (#719). When a job the model had started finished during the
-  model's last answer, the turn ended without waiting, because the job was no
-  longer running, and the exit only came with the next message: the agent
-  stopped although its job was done. The end of a turn now also counts a
-  finished job whose exit has not been announced, so the exit is delivered
-  and the agent goes on, as when the job finishes during the wait.
+- **Signing in over SSH no longer waits forever for a browser that cannot come
+  back** (#722). `metacodes login` and `/login` sent the browser back to
+  `http://localhost:1455`, which on a machine reached over SSH is not where
+  the browser is: the sign-in waited with no limit and said nothing.
+  - In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set) `metacodes login`
+    takes Metask's device code by itself and says why, and `/login` asks which
+    way with the code selected, as OpenRouter's sign-in already did;
+    `--no-browser` keeps the browser sign-in.
+  - A browser sign-in finished on another computer ends on a page that does
+    not load: paste that page's address at the prompt, or into the `/login`
+    pane, and the sign-in finishes here (Metask's, and another provider's
+    OAuth such as ChatGPT's). An address from another sign-in is refused and
+    the wait goes on.
+  - Every sign-in that waits for a localhost callback (Metask's, ChatGPT's,
+    another provider's OAuth, OpenRouter's browser way) prints the forward it
+    needs over SSH, with the port it bound:
+    `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`.
+  - `metacodes login` stops waiting for the browser after ten minutes
+    (`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`, `0` for no limit), stores nothing,
+    and names the device-code sign-in.
 
-- **The agent carries on when a background job it waits for finishes**
-  (#714). After the model said it would wait for a background job, the job
-  could finish and the agent stay idle until the next message, which then
-  brought the job's exit along. The wait looked for finished jobs, found
-  none, and then, if the job ended right then, found nothing running and
-  ended the turn. It now checks what is still running before it looks for
-  finished jobs.
+- **`metacodes mcp login` over SSH no longer waits forever for a browser that
+  cannot come back** (#740). It sent the browser to
+  `http://localhost:<port>/callback` on the machine it runs on and waited with
+  no limit. As `metacodes login` does since #722:
+  - in an SSH session it prints the forward its callback needs, with the port
+    it bound: `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`;
+  - the address a browser on another computer ended on can be pasted at the
+    prompt, and is judged as the callback would be, so one from another login
+    is refused and the wait goes on;
+  - it stops waiting after `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes
+    by default, `0` for no limit), exits 1 and stores nothing.
+
+- **Refusing on the authorization page now ends `metacodes mcp login` and
+  Metask's browser sign-in** (#749). Their loopback callback answered a
+  redirect that carried an `error` with an error page and kept waiting:
+  `mcp login` until Ctrl+C, `metacodes login` up to its bound and `/login`
+  until Esc, without saying why. As another provider's OAuth already did, a
+  redirect with the sign-in's `state` and an `error` now ends the wait: the
+  terminal says what the authorization server said (`The sign-in was
+  refused: <error> (<description>).`), and nothing is stored.
+
+- **On Windows a sign-in opens its whole URL in the browser** (#727). The
+  browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
+  command at the first `&`: the browser got `…/oauth/authorize?response_type=code`
+  without `client_id`, `redirect_uri`, `state` and the rest, and the sign-in
+  page could not go on. The URL now goes to `rundll32.exe
+  url.dll,FileProtocolHandler` from the system directory as one argument, with
+  no shell in between. This covers every place metacodes opens a browser:
+  Metask's sign-in and its device-code page, ChatGPT's and other providers'
+  OAuth, OpenRouter's, an MCP server's, and a provider's page for creating a
+  key.
 
 - **A busy tunnel port on an SSH executor no longer fails `egress =
   "workbench"`** (#716). Setup's 容器出网 step and each run picked the
@@ -217,6 +291,26 @@ status, compatibility boundaries, and entry points are defined by
   executor cannot listen on it, setup and the run try another port, up to 5.
   When none works, they say the tunnel port could not be bound on the
   executor, which may also not allow remote forwarding for the account.
+
+- **A model whose output limit is its whole context window can be used.**
+  Metask's gateway lists kimi-k3.1-pro with a 1,048,576-token window and the
+  same output limit. The request asked for all of it and the whole of it was
+  reserved from the window, which left no room for the input: every message
+  stopped before it was sent (`context blocking limit reached ...
+  effective_window=0`). A request now asks for at most half the model's window
+  as output, and the input keeps the other half; models whose output limit is
+  under half their window (every other model the gateway lists today) send
+  what they did before. An explicit `--max-tokens` is sent as given.
+
+- **Reasoning can be switched off and on for Metask models that name no
+  level.** For DeepSeek-V4.1-Flash-1017, hy4 and kimi-k3.1-pro the gateway
+  says thinking can be turned off and on but lists no levels, and the sign-in
+  offered `none` alone, which sent nothing: thinking was whatever the gateway
+  chose. `metacodes login` and `/login` now offer `off` and `on`, and `/model`
+  offers Thinking `none` or `high`; on sends `thinking: {"type":"enabled"}`
+  and off sends `{"type":"disabled"}`. `none` on a gateway model that lists
+  levels and can be turned off now sends `disabled` as well. A model with a
+  single choice is no longer asked for one.
 
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
@@ -253,6 +347,22 @@ status, compatibility boundaries, and entry points are defined by
   reply. Now it does nothing while the draft has text; on an empty prompt it
   still counts toward the double-press exit, so the picker never traps the
   session.
+
+- **A background job that finishes while the model is answering wakes the
+  agent** (#719). When a job the model had started finished during the
+  model's last answer, the turn ended without waiting, because the job was no
+  longer running, and the exit only came with the next message: the agent
+  stopped although its job was done. The end of a turn now also counts a
+  finished job whose exit has not been announced, so the exit is delivered
+  and the agent goes on, as when the job finishes during the wait.
+
+- **The agent carries on when a background job it waits for finishes**
+  (#714). After the model said it would wait for a background job, the job
+  could finish and the agent stay idle until the next message, which then
+  brought the job's exit along. The wait looked for finished jobs, found
+  none, and then, if the job ended right then, found nothing running and
+  ended the turn. It now checks what is still running before it looks for
+  finished jobs.
 
 - **A foreground Bash command is collected as soon as it exits** (#670). The
   wait slept 100 ms before it first looked at the job, so every foreground

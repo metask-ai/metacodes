@@ -17,6 +17,7 @@ const rng = @import("platform").rng;
 const process = @import("platform").process;
 const pfs = @import("platform").fs;
 const net = @import("platform").net;
+const sync = @import("platform").sync;
 const builtin = @import("builtin");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
@@ -58,6 +59,102 @@ pub const LEGACY_OAUTH_CLIENT_ID = "metacode-cli";
 const OAUTH_REFRESH_SKEW_SECONDS: i64 = 300;
 const DEFAULT_LOGIN_PORT: u16 = 1455;
 const FALLBACK_LOGIN_PORT: u16 = 1457;
+pub const LOGIN_CALLBACK_TIMEOUT_ENV = "METACODES_LOGIN_CALLBACK_TIMEOUT_MS";
+pub const DEFAULT_LOGIN_CALLBACK_TIMEOUT_MS: u64 = 10 * std.time.ms_per_min;
+
+pub fn sshSession() bool {
+    for ([_][*:0]const u8{ "SSH_CONNECTION", "SSH_TTY" }) |name| {
+        const value = std.c.getenv(name) orelse continue;
+        if (std.mem.span(value).len > 0) return true;
+    }
+    return false;
+}
+
+pub fn sshForwardLine(buffer: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buffer, "Over SSH? Forward the port first: ssh -L {d}:127.0.0.1:{d} <you>@<this machine>\n", .{ port, port }) catch
+        "Over SSH? Forward the callback port to this machine with ssh -L first.\n";
+}
+
+pub const PasteRefusal = enum { not_an_address, other_page, other_sign_in, no_code, refused };
+
+pub const PasteSource = struct {
+    ctx: *anyopaque,
+    take: *const fn (ctx: *anyopaque, out: []u8) ?[]const u8,
+    refused: *const fn (ctx: *anyopaque, why: PasteRefusal) void,
+    prompt: ?[]const u8 = null,
+};
+
+pub const PASTE_PROMPT = "Browser on another computer? Once you sign in there, it ends on a page that does not load: paste that page's address here and press Enter.\n";
+
+pub fn pasteRefusalText(why: PasteRefusal) []const u8 {
+    return switch (why) {
+        .not_an_address => "That is not an address. Paste the whole address the browser ended on (it starts with http://localhost).",
+        .other_page => "That is not this sign-in's page. Paste the address the browser ended on after you signed in.",
+        .other_sign_in => "That address is from another sign-in. Paste the address from this sign-in's page.",
+        .no_code => "That address carries no code. Paste the address the browser ended on after you signed in.",
+        .refused => "The sign-in was refused on that page. Sign in again in the browser, then paste the new address.",
+    };
+}
+
+pub fn pastedRequest(buffer: []u8, pasted: []const u8) ?[]const u8 {
+    const text = std.mem.trim(u8, pasted, " \t\r\n\"'<>");
+    if (text.len == 0) return null;
+    const after_scheme = if (std.mem.indexOf(u8, text, "://")) |at| text[at + 3 ..] else text;
+    const slash = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return null;
+    const with_fragment = after_scheme[slash..];
+    const target = with_fragment[0 .. std.mem.indexOfScalar(u8, with_fragment, '#') orelse with_fragment.len];
+    if (std.mem.indexOfAny(u8, target, " \t\r\n") != null) return null;
+    return std.fmt.bufPrint(buffer, "GET {s} HTTP/1.1\r\n\r\n", .{target}) catch null;
+}
+
+pub const PasteBox = struct {
+    mutex: sync.Mutex = .{},
+    text: [4096]u8 = undefined,
+    len: usize = 0,
+    pending: bool = false,
+    last_refusal: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    pub fn submit(self: *PasteBox, text: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const n = @min(text.len, self.text.len);
+        @memcpy(self.text[0..n], text[0..n]);
+        self.len = n;
+        self.pending = true;
+        self.last_refusal.store(0, .release);
+    }
+
+    pub fn refusal(self: *const PasteBox) ?PasteRefusal {
+        const raw = self.last_refusal.load(.acquire);
+        return if (raw == 0) null else @enumFromInt(raw - 1);
+    }
+
+    pub fn source(self: *PasteBox) PasteSource {
+        return .{ .ctx = self, .take = take, .refused = refused };
+    }
+
+    fn take(ctx: *anyopaque, out: []u8) ?[]const u8 {
+        const self: *PasteBox = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.pending) return null;
+        self.pending = false;
+        const n = @min(self.len, out.len);
+        @memcpy(out[0..n], self.text[0..n]);
+        return out[0..n];
+    }
+
+    fn refused(ctx: *anyopaque, why: PasteRefusal) void {
+        const self: *PasteBox = @ptrCast(@alignCast(ctx));
+        self.last_refusal.store(@as(u8, @intFromEnum(why)) + 1, .release);
+    }
+};
+
+pub fn loginCallbackTimeoutMs() ?u64 {
+    const raw = std.c.getenv(LOGIN_CALLBACK_TIMEOUT_ENV) orelse return DEFAULT_LOGIN_CALLBACK_TIMEOUT_MS;
+    const value = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return DEFAULT_LOGIN_CALLBACK_TIMEOUT_MS;
+    return if (value == 0) null else value;
+}
 
 pub const AuthPrecedence = types.AuthPrecedence;
 
@@ -436,6 +533,8 @@ pub const BrowserLoginOptions = struct {
     /// Where the instructions go (the URL to open). Null prints them to
     /// stderr, as `metacodes login` always has; the TUI draws them instead.
     notify: ?Notify = null,
+    timeout_ms: ?u64 = null,
+    paste: ?PasteSource = null,
 };
 
 /// A sink for the lines the user must act on, shaped like
@@ -466,6 +565,10 @@ pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLogi
     var server = try CallbackServer.bind(opts.port);
     defer server.close();
     server.path = METASK_CALLBACK_PATH;
+    if (opts.timeout_ms) |ms| server.deadline_ms = time.nowMs() +| @as(time.Millis, @intCast(@min(ms, std.math.maxInt(time.Millis))));
+    server.paste = opts.paste;
+    var refusal: Refusal = .{};
+    server.refusal = &refusal;
 
     const redirect_uri = try std.fmt.allocPrint(allocator, "http://localhost:{d}{s}", .{ server.port, METASK_CALLBACK_PATH });
     defer allocator.free(redirect_uri);
@@ -476,11 +579,16 @@ pub fn loginWithBrowserTokenJson(allocator: std.mem.Allocator, opts: BrowserLogi
     say(opts.notify, std.fmt.bufPrint(&line_buf, "Starting local login server on http://localhost:{d}.\nOpen this URL to authenticate:\n\n", .{server.port}) catch "Open this URL to authenticate:\n\n");
     say(opts.notify, authorize_url);
     say(opts.notify, "\n\n");
+    if (sshSession()) say(opts.notify, sshForwardLine(&line_buf, server.port));
+    if (opts.paste) |source| if (source.prompt) |prompt| say(opts.notify, prompt);
     if (opts.open_browser) openBrowser(allocator, authorize_url) catch |err| {
         say(opts.notify, std.fmt.bufPrint(&line_buf, "Could not open browser automatically: {s}\n", .{@errorName(err)}) catch "Could not open the browser automatically.\n");
     };
 
-    const code = try server.waitForAuthorizationCode(allocator, state, opts.abort_signal);
+    const code = server.waitForAuthorizationCode(allocator, state, opts.abort_signal) catch |err| {
+        if (err == error.OAuthAccessDenied) say(opts.notify, refusal.line(&line_buf));
+        return err;
+    };
     defer secureFree(allocator, code);
     if (opts.abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
     return exchangeAuthorizationCode(allocator, code, redirect_uri, pkce.code_verifier);
@@ -608,6 +716,14 @@ pub const Refusal = struct {
         return self.description_buf[0..self.description_len];
     }
 
+    pub fn line(self: *const Refusal, buffer: []u8) []const u8 {
+        const text = if (self.description_len > 0)
+            std.fmt.bufPrint(buffer, "The sign-in was refused: {s} ({s}).\n", .{ self.code(), self.description() })
+        else
+            std.fmt.bufPrint(buffer, "The sign-in was refused: {s}.\n", .{self.code()});
+        return text catch "The sign-in was refused.\n";
+    }
+
     fn fill(self: *Refusal, allocator: std.mem.Allocator, query: []const u8) void {
         self.code_len = copyParam(allocator, query, "error", &self.code_buf);
         self.description_len = copyParam(allocator, query, "error_description", &self.description_buf);
@@ -643,9 +759,11 @@ pub const CallbackServer = struct {
     denied_body: ?[]const u8 = null,
     /// When set, a callback that carries the expected state and an `error`
     /// ends the wait with `error.OAuthAccessDenied`, what the server said
-    /// copied here. Null keeps waiting after answering it, as the Metask
-    /// sign-in always has. `denied_body`, when set, answers first.
+    /// copied here. Null keeps waiting after answering it. `denied_body`,
+    /// when set, answers first.
     refusal: ?*Refusal = null,
+    deadline_ms: ?time.Millis = null,
+    paste: ?PasteSource = null,
 
     /// Bound on each accepted connection's reads and writes: a client that
     /// connects and then stalls must not pin the wait (and with it Esc in the
@@ -684,8 +802,31 @@ pub const CallbackServer = struct {
     }
 
     pub fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8, abort_signal: ?*const AbortSignal) ![]u8 {
+        var pasted_buf: [4096]u8 = undefined;
+        var request_buf: [4200]u8 = undefined;
         while (true) {
             if (abort_signal) |signal| if (signal.isAborted()) return error.Aborted;
+            if (self.deadline_ms) |deadline| if (time.nowMs() >= deadline) return error.CallbackTimedOut;
+            if (self.paste) |source| if (source.take(source.ctx, &pasted_buf)) |pasted| {
+                const req = pastedRequest(&request_buf, pasted) orelse {
+                    source.refused(source.ctx, .not_an_address);
+                    continue;
+                };
+                switch (self.judge(allocator, req, expected_state)) {
+                    .code => |code| return code,
+                    .denied_page, .refused => return error.OAuthAccessDenied,
+                    .rejected => |err| {
+                        source.refused(source.ctx, switch (err) {
+                            error.NotCallback => .other_page,
+                            error.StateMismatch => .other_sign_in,
+                            error.MissingCode => .no_code,
+                            error.OAuthDenied => .refused,
+                            else => .not_an_address,
+                        });
+                        continue;
+                    },
+                }
+            };
             if (!net.pollReadable(self.sock, 100)) continue;
             const conn_fd = net.acceptConn(self.sock) orelse return error.AcceptFailed;
             defer net.closeSocket(conn_fd);
@@ -698,31 +839,48 @@ pub const CallbackServer = struct {
                 continue;
             };
             defer allocator.free(req);
-            if (self.denied_body) |page| if (callbackCarriesError(req, self.path)) {
-                sendHttpResponse(conn_fd, 400, "Bad Request", page);
-                return error.OAuthAccessDenied;
-            };
-            const parsed = parseCallbackRequestAt(allocator, req, self.path, expected_state) catch |err| {
-                if (err == error.OAuthDenied) if (self.refusal) |refusal| {
-                    refusal.fill(allocator, callbackQuery(req));
+            switch (self.judge(allocator, req, expected_state)) {
+                .code => |code| {
+                    sendHttpResponse(conn_fd, 200, "OK", self.success_body);
+                    return code;
+                },
+                .denied_page => {
+                    sendHttpResponse(conn_fd, 400, "Bad Request", self.denied_body.?);
+                    return error.OAuthAccessDenied;
+                },
+                .refused => {
                     sendHttpResponse(conn_fd, 400, "Bad Request", "The sign-in was refused. You can close this tab.");
                     return error.OAuthAccessDenied;
-                };
-                const body = switch (err) {
-                    error.NotCallback => "Not Found",
-                    error.StateMismatch => "State mismatch",
-                    error.OAuthDenied => "OAuth authorization was denied",
-                    error.MissingCode => "Missing authorization code",
-                    else => "Bad Request",
-                };
-                const status: u16 = if (err == error.NotCallback) 404 else 400;
-                const reason = if (status == 404) "Not Found" else "Bad Request";
-                sendHttpResponse(conn_fd, status, reason, body);
-                continue;
-            };
-            sendHttpResponse(conn_fd, 200, "OK", self.success_body);
-            return parsed;
+                },
+                .rejected => |err| {
+                    const body = switch (err) {
+                        error.NotCallback => "Not Found",
+                        error.StateMismatch => "State mismatch",
+                        error.OAuthDenied => "OAuth authorization was denied",
+                        error.MissingCode => "Missing authorization code",
+                        else => "Bad Request",
+                    };
+                    const status: u16 = if (err == error.NotCallback) 404 else 400;
+                    const reason = if (status == 404) "Not Found" else "Bad Request";
+                    sendHttpResponse(conn_fd, status, reason, body);
+                    continue;
+                },
+            }
         }
+    }
+
+    const Verdict = union(enum) { code: []u8, denied_page, refused, rejected: anyerror };
+
+    fn judge(self: *CallbackServer, allocator: std.mem.Allocator, req: []const u8, expected_state: []const u8) Verdict {
+        if (self.denied_body != null and callbackCarriesError(req, self.path)) return .denied_page;
+        const parsed = parseCallbackRequestAt(allocator, req, self.path, expected_state) catch |err| {
+            if (err == error.OAuthDenied) if (self.refusal) |refusal| {
+                refusal.fill(allocator, callbackQuery(req));
+                return .refused;
+            };
+            return .{ .rejected = err };
+        };
+        return .{ .code = parsed };
     }
 };
 
@@ -927,14 +1085,26 @@ pub fn openBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
     const url_z = try allocator.dupeZ(u8, url);
     defer allocator.free(url_z);
     // detached fire-and-forget（关 stdio、不 wait），走可移植 platform/process。
-    // POSIX：/usr/bin/env <opener> <url>；Windows：cmd /c start "" <url>（ShellExecute 语义）。
+    // POSIX：/usr/bin/env <opener> <url>；Windows：系统目录的 rundll32.exe url.dll,FileProtocolHandler <url>，不经 cmd.exe。
     if (builtin.os.tag == .windows) {
-        var argv = [_]?[*:0]const u8{ "cmd.exe", "/c", "start", "", url_z.ptr, null };
+        const launcher = try windowsUrlLauncher(allocator, if (std.c.getenv("SystemRoot")) |root| std.mem.span(root) else null);
+        defer allocator.free(launcher);
+        var argv = windowsOpenUrlArgv(launcher.ptr, url_z.ptr);
         process.spawnDetached(&argv, true) catch return error.ForkFailed;
     } else {
         var argv = [_]?[*:0]const u8{ env_z.ptr, opener_z.ptr, url_z.ptr, null };
         process.spawnDetached(&argv, true) catch return error.ForkFailed;
     }
+}
+
+fn windowsUrlLauncher(allocator: std.mem.Allocator, system_root: ?[]const u8) ![:0]u8 {
+    const root = std.mem.trimEnd(u8, system_root orelse "", "\\");
+    if (root.len == 0) return allocator.dupeZ(u8, "rundll32.exe");
+    return std.fmt.allocPrintSentinel(allocator, "{s}\\System32\\rundll32.exe", .{root}, 0);
+}
+
+fn windowsOpenUrlArgv(launcher: [*:0]const u8, url: [*:0]const u8) [4]?[*:0]const u8 {
+    return .{ launcher, "url.dll,FileProtocolHandler", url, null };
 }
 
 const RefreshTokenPolicy = enum { required, optional_replacement };
@@ -1369,6 +1539,76 @@ test "the loopback wait returns the code a valid callback carries" {
     t.join();
 }
 
+test "a pasted address becomes the callback request, whatever the browser shows around it (#722)" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("GET /auth/metask/callback?code=c&state=s HTTP/1.1\r\n\r\n", pastedRequest(&buffer, "http://localhost:1455/auth/metask/callback?code=c&state=s").?);
+    try std.testing.expectEqualStrings("GET /auth/callback?code=c&state=s HTTP/1.1\r\n\r\n", pastedRequest(&buffer, "  localhost:1457/auth/callback?code=c&state=s#done\r\n").?);
+    try std.testing.expectEqualStrings("GET /auth/callback?code=c&state=s HTTP/1.1\r\n\r\n", pastedRequest(&buffer, "\"/auth/callback?code=c&state=s\"").?);
+    try std.testing.expect(pastedRequest(&buffer, "") == null);
+    try std.testing.expect(pastedRequest(&buffer, "MOCK-4711") == null);
+    try std.testing.expect(pastedRequest(&buffer, "http://localhost:1455/auth/callback?code=c d") == null);
+}
+
+test "the loopback wait takes a pasted address as the browser's callback, and says why it refuses another (#722)" {
+    const a = std.testing.allocator;
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    const Pastes = struct {
+        lines: []const []const u8,
+        next: usize = 0,
+        refusals: [4]PasteRefusal = undefined,
+        refused_count: usize = 0,
+        fn take(ctx: *anyopaque, out: []u8) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.next == self.lines.len) return null;
+            const line = self.lines[self.next];
+            self.next += 1;
+            @memcpy(out[0..line.len], line);
+            return out[0..line.len];
+        }
+        fn refused(ctx: *anyopaque, why: PasteRefusal) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.refusals[self.refused_count] = why;
+            self.refused_count += 1;
+        }
+    };
+    var pastes = Pastes{ .lines = &.{
+        "MOCK-4711",
+        "http://localhost:1455/elsewhere?code=x&state=s",
+        "http://localhost:1455/auth/callback?code=x&state=another",
+        "http://localhost:1455/auth/callback?state=s",
+        "http://localhost:1455/auth/callback?code=abc123&state=s",
+    } };
+    server.paste = .{ .ctx = &pastes, .take = Pastes.take, .refused = Pastes.refused };
+    server.deadline_ms = time.nowMs() + 5_000;
+    const code = try server.waitForAuthorizationCode(a, "s", null);
+    defer secureFree(a, code);
+    try std.testing.expectEqualStrings("abc123", code);
+    try std.testing.expectEqualSlices(PasteRefusal, &.{ .not_an_address, .other_page, .other_sign_in, .no_code }, pastes.refusals[0..pastes.refused_count]);
+}
+
+test "a pasted refusal ends a wait that ends on refusals, as the browser's would (#722)" {
+    const a = std.testing.allocator;
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    var refusal: Refusal = .{};
+    server.refusal = &refusal;
+    var box: PasteBox = .{};
+    box.submit("http://localhost:1456/auth/callback?error=access_denied&error_description=no&state=s");
+    server.paste = box.source();
+    server.deadline_ms = time.nowMs() + 5_000;
+    try std.testing.expectError(error.OAuthAccessDenied, server.waitForAuthorizationCode(a, "s", null));
+    try std.testing.expectEqualStrings("access_denied", refusal.code());
+}
+
+test "a callback wait with a bound ends when it passes (#722)" {
+    const a = std.testing.allocator;
+    var server = try CallbackServer.bind(0);
+    defer server.close();
+    server.deadline_ms = time.nowMs() + 150;
+    try std.testing.expectError(error.CallbackTimedOut, server.waitForAuthorizationCode(a, "s", null));
+}
+
 test "the loopback wait stops when the signal aborts" {
     var server = try CallbackServer.bind(0);
     defer server.close();
@@ -1382,6 +1622,33 @@ test "the loopback wait stops when the signal aborts" {
     const t = try std.Thread.spawn(.{}, Worker.run, .{&signal});
     try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
     t.join();
+}
+
+test "on Windows the whole URL reaches rundll32 as one argument, with no cmd.exe to end it at the first & (#727)" {
+    const a = std.testing.allocator;
+    const launcher = try windowsUrlLauncher(a, "C:\\Windows\\");
+    defer a.free(launcher);
+    const url = "https://www.metask-ai.com/oauth/authorize?response_type=code&client_id=metacodes&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fmetask%2Fcallback&scope=read%20model%3Ainvoke&state=a^b|c<d>e%PATH%";
+    var argv = windowsOpenUrlArgv(launcher.ptr, url);
+    const cmdline = try process.buildWindowsCmdline(a, &argv);
+    defer a.free(cmdline);
+    const expected = try std.unicode.utf8ToUtf16LeAllocZ(a, "C:\\Windows\\System32\\rundll32.exe url.dll,FileProtocolHandler " ++ url);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u16, expected, cmdline);
+
+    const bare = try windowsUrlLauncher(a, null);
+    defer a.free(bare);
+    try std.testing.expectEqualStrings("rundll32.exe", bare);
+}
+
+test "the rundll32 a Windows sign-in hands its URL to is where this machine keeps it (#727)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const root = std.c.getenv("SystemRoot") orelse return error.SkipZigTest;
+    const launcher = try windowsUrlLauncher(a, std.mem.span(root));
+    defer a.free(launcher);
+    try std.testing.expect(std.fs.path.isAbsolute(launcher));
+    try std.testing.expect(pfs.exists(launcher.ptr));
 }
 
 test "the loopback wait keeps serving a wrong-state callback and still aborts" {

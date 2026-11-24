@@ -226,6 +226,8 @@ def make_handler(workbench: Workbench, public_url=None):
                 self.send_json({**value, "can_run": self.authorized()})
             elif path == "/api/store":
                 self.send_json(workbench.store_status(self.authorized()))
+            elif path == "/api/leaderboard":
+                self.send_found(workbench.leaderboard(query.get("suite")), "no published board for this suite")
             elif path == "/api/run":
                 self.send_found(workbench.run(query.get("name")), "no such run")
             elif path == "/api/jobs":

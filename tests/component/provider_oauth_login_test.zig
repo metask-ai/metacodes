@@ -111,6 +111,7 @@ const LoopbackRun = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     result: ?anyerror![]u8 = null,
+    done: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *LoopbackRun) void {
         self.result = oauth_login.acquireFirstToken(
@@ -119,6 +120,7 @@ const LoopbackRun = struct {
             self.endpoints,
             self.options,
         );
+        self.done.store(true, .release);
     }
 };
 
@@ -221,6 +223,80 @@ test "L2 provider login: a loopback PKCE grant becomes a durable per-provider lo
     // Recorded with the tokens: a refresh that presented a different client
     // would be rejected as `invalid_client`, hours after the login looked fine.
     try std.testing.expectEqualStrings("test-client", reloaded.client_id.?);
+}
+
+test "L2 provider login: the address a browser on another computer ended on, pasted back, finishes a loopback grant (#722)" {
+    const a = std.testing.allocator;
+
+    var token_server = try harness.MockServer.start(
+        \\{"access_token":"provider-access","refresh_token":"provider-refresh","token_type":"Bearer","expires_in":3600}
+    , 0);
+    defer token_server.stop();
+    const token_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/oauth/token", .{token_server.port});
+    defer a.free(token_url);
+
+    var instructions = Instructions{ .allocator = a };
+    defer instructions.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    var box: cc.core_auth.PasteBox = .{};
+    var source = box.source();
+    source.prompt = cc.core_auth.PASTE_PROMPT;
+    var abort = cc.util_abort.AbortSignal.init();
+    var run = LoopbackRun{
+        .allocator = a,
+        .io = io_runtime.io(),
+        .endpoints = .{
+            .token_url = token_url,
+            .authorize_url = "http://127.0.0.1:1/authorize",
+            .client_id = "test-client",
+        },
+        .options = .{
+            .method = .loopback,
+            .open_browser = false,
+            .port = 0,
+            .notify = instructions.notify(),
+            .paste = source,
+            .abort_signal = &abort,
+        },
+    };
+    var thread = try std.Thread.spawn(.{}, LoopbackRun.run, .{&run});
+    var joined = false;
+    defer if (!joined) {
+        abort.abort(.user_interrupt);
+        thread.join();
+    };
+
+    if (!instructions.wait()) return error.FlowNeverPublishedInstructions;
+    const port = try instructions.callbackPort();
+    const state = try instructions.stateValue();
+    try std.testing.expect(std.mem.indexOf(u8, instructions.buffer.items, "paste that page's address here and press Enter.") != null);
+
+    const stale = try std.fmt.allocPrint(a, "http://localhost:{d}/auth/callback?code=stale-code&state=not-the-state", .{port});
+    defer a.free(stale);
+    box.submit(stale);
+    var spins: usize = 0;
+    while (box.refusal() == null and spins < 300) : (spins += 1) cc.util_time.sleepMs(10);
+    try std.testing.expectEqual(@as(?cc.core_auth.PasteRefusal, .other_sign_in), box.refusal());
+    try std.testing.expect(token_server.requestCount() == 0);
+
+    const address = try std.fmt.allocPrint(a, "http://localhost:{d}/auth/callback?code=pasted-code-7&state={s}", .{ port, state });
+    defer a.free(address);
+    box.submit(address);
+    spins = 0;
+    while (!run.done.load(.acquire) and spins < 500) : (spins += 1) cc.util_time.sleepMs(10);
+    if (!run.done.load(.acquire)) return error.FlowDidNotEnd;
+    thread.join();
+    joined = true;
+
+    const token_json = try (run.result orelse return error.FlowDidNotRun);
+    defer a.free(token_json);
+    try std.testing.expect(std.mem.indexOf(u8, token_json, "provider-access") != null);
+    try std.testing.expectEqual(@as(usize, 1), token_server.requestCount());
+    const body = (token_server.lastRequest() orelse return error.NoTokenRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "code=pasted-code-7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "code_verifier=") != null);
 }
 
 test "L2 provider login: a device grant polls through authorization_pending" {
