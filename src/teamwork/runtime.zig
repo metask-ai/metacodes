@@ -19,6 +19,7 @@
 //!                   ─► 2nd fail / unverified, or unavailable ─► failed
 //!   any live state ── cancel() ─► cancelled
 //!                  ── budget reached ─► budget_exhausted
+//!   budget_exhausted ── reopenWithCap(higher cap) ─► the phase it paused in
 //!                  ── per-role dispatch cap ─► failed(rounds_exhausted)
 //! ```
 //!
@@ -199,7 +200,7 @@ pub const State = union(Phase) {
     merging: TreeId,
     done: Done,
     failed: Failure,
-    budget_exhausted,
+    budget_exhausted: ?Resume,
     cancelled,
 
     pub fn phase(self: State) Phase {
@@ -208,6 +209,32 @@ pub const State = union(Phase) {
 
     pub fn isTerminal(self: State) bool {
         return self.phase().isTerminal();
+    }
+};
+
+pub const Resume = union(enum) {
+    approved,
+    implementing,
+    reviewing,
+    review_approved: TreeId,
+
+    fn of(current: State) ?Resume {
+        return switch (current) {
+            .approved, .candidates => .approved,
+            .implementing => .implementing,
+            .reviewing => .reviewing,
+            .review_approved, .auditing => |tree| .{ .review_approved = tree },
+            else => null,
+        };
+    }
+
+    fn resumed(self: Resume) State {
+        return switch (self) {
+            .approved => .approved,
+            .implementing => .implementing,
+            .reviewing => .reviewing,
+            .review_approved => |tree| .{ .review_approved = tree },
+        };
     }
 };
 
@@ -306,6 +333,7 @@ pub const CandidateStatus = enum {
 pub const CandidateSnapshot = struct {
     status: CandidateStatus = .queued,
     tree: ?TreeId = null,
+    reviewer: ?SeatId = null,
 };
 
 pub const SeatSnapshot = struct {
@@ -418,7 +446,7 @@ pub const Error = run_dir.Error || error{
 
 pub const StartError = Error || merge_back.Error || ledger_mod.LoadError || issues.LoadError || error{EmptyRequest};
 
-pub const ReopenError = StartError || error{ StateCorrupt, ConfigurationChanged };
+pub const ReopenError = StartError || error{ StateCorrupt, ConfigurationChanged, NotResumable, CapNotRaised };
 
 // ── the run ─────────────────────────────────────────────────────────────────
 
@@ -506,6 +534,14 @@ pub const Run = struct {
     /// counted; an interrupted merge-back fails the run for the user to
     /// inspect. A terminal run reopens as it ended.
     pub fn reopen(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId) ReopenError!*Run {
+        return reopenAt(gpa, deps, cfg, state_root, run_id, null);
+    }
+
+    pub fn reopenWithCap(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId, cap_usd: f64) ReopenError!*Run {
+        return reopenAt(gpa, deps, cfg, state_root, run_id, cap_usd);
+    }
+
+    fn reopenAt(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId, raised_cap_usd: ?f64) ReopenError!*Run {
         if (!deps.preview.teamwork) return error.PreviewDisabled;
         if (!platform_supported) return error.UnsupportedPlatform;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -534,16 +570,27 @@ pub const Run = struct {
             errdefer gpa.free(repo);
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
             errdefer gpa.free(worktree);
-            const state: State = switch (saved.state) {
+            var effective = cfg;
+            const state: State = if (raised_cap_usd) |cap_usd| raised: {
+                const paused = switch (saved.state) {
+                    .budget_exhausted => |point| point orelse return error.NotResumable,
+                    else => return error.NotResumable,
+                };
+                if (!(cap_usd > cfg.budget_usd) or !std.math.isFinite(cap_usd)) return error.CapNotRaised;
+                effective.budget_usd = cap_usd;
+                break :raised paused.resumed();
+            } else switch (saved.state) {
                 .auditing => |tree| .{ .review_approved = tree },
                 .merging => .{ .failed = .merge_interrupted },
                 .candidates => .{ .failed = .candidates_interrupted },
                 else => saved.state,
             };
-            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, saved.base, state, saved.request_source);
+            break :blk try open(gpa, deps, effective, dir, lease, repo, worktree, saved.base, state, saved.request_source);
         };
         errdefer self.destroy();
+        if (raised_cap_usd != null and self.ledger.isExhausted()) return error.CapNotRaised;
         self.candidates = saved.candidates;
+        if (raised_cap_usd != null and !self.raisedCapCoversNextStep()) return error.CapNotRaised;
         for (self.candidates[0..cfg.candidates.len], 1..) |candidate, number| {
             if (candidate.status != .selected) continue;
             const selected = try self.candidateWorktree(number);
@@ -718,7 +765,7 @@ pub const Run = struct {
             else => unreachable,
         };
         try self.closeSeat(id, result);
-        if (try self.stopAfterSeat(result)) return id;
+        if (try self.stopAfterSeat(result, spec)) return id;
         switch (result) {
             .finished => try self.transition(.reviewing),
             .review => |review| switch (review) {
@@ -738,12 +785,17 @@ pub const Run = struct {
         try self.checkLive();
         const count = self.cfg.candidates.len;
         if (count == 0 or self.state != .approved) return error.NoCandidates;
-        if (candidateEstimate(self.cfg) > self.ledger.remainingUsd()) return error.CandidateBudgetExceeded;
+        if (self.pendingCandidateEstimate() > self.ledger.remainingUsd()) return error.CandidateBudgetExceeded;
         try self.transition(.candidates);
 
         var trials: [config.max_candidates]Trial = @splat(.{});
         for (self.cfg.candidates.slice(), 1..) |*spec, number| {
-            if (try self.runCandidate(spec, number, &trials[number - 1])) return self.endedResult();
+            const candidate = self.candidates[number - 1];
+            switch (candidate.status) {
+                .approved, .rejected => trials[number - 1] = .{ .decided_earlier = true, .reviewer = candidate.reviewer },
+                .queued, .implementing, .reviewing => if (try self.runCandidate(spec, number, &trials[number - 1])) return self.endedResult(),
+                .selected, .eliminated => unreachable,
+            }
         }
 
         var facts: [config.max_candidates][160]u8 = undefined;
@@ -786,9 +838,11 @@ pub const Run = struct {
         implementer: ?SeatResult = null,
         review: ?SeatResult = null,
         reviewer: ?SeatId = null,
+        decided_earlier: bool = false,
 
         fn fact(self: Trial, buf: []u8, eligible: bool) []const u8 {
             if (eligible) return "passed its verified review";
+            if (self.decided_earlier) return "was not approved before the run paused at its budget";
             if (self.review) |result| return switch (result) {
                 .review => |review| switch (review) {
                     .approved => unreachable,
@@ -809,39 +863,43 @@ pub const Run = struct {
 
     fn runCandidate(self: *Run, spec: *const types.SeatSpec, number: usize, trial: *Trial) Error!bool {
         const candidate = &self.candidates[number - 1];
-        candidate.status = .implementing;
         const workspace = try self.candidateWorktree(number);
         defer self.gpa.free(workspace);
-        var dir_buf: run_dir.PathBuf = undefined;
-        const parent = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.dir.root, run_dir.candidates_dir }) catch return error.PathTooLong;
-        util_fs.mkdirParents(parent) catch return error.MkdirFailed;
-        merge_back.addWorktree(self.gpa, self.repo, workspace, self.base.commit, &self.abort) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Aborted => {
-                try self.transition(.cancelled);
-                return true;
-            },
-            else => {
-                log.warn("teamwork", "run {s}: candidate {d} worktree: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+        const kept = try candidateWorktreeExists(workspace);
+        const built_earlier = kept and candidate.status == .reviewing;
+        if (!kept) {
+            candidate.status = .implementing;
+            switch (try self.addCandidateWorktree(workspace, number)) {
+                .added => {},
+                .rejected => {
+                    candidate.status = .rejected;
+                    return false;
+                },
+                .cancelled => return true,
+            }
+        }
+        if (!built_earlier) {
+            candidate.status = .implementing;
+            const implementer_packet = try self.renderPacket(.implementer, "");
+            defer self.gpa.free(implementer_packet);
+            if (try self.candidateRoundsExhausted(.implementer)) return true;
+            const implementer = try self.openSeat(.implementer, spec, implementer_packet);
+            try self.setSeatStatus(implementer, .working);
+            const built = try self.runImplementer(implementer, spec, workspace);
+            trial.implementer = built;
+            try self.closeSeat(implementer, built);
+            if (try self.stopAfterSeat(built, spec)) return true;
+            if (built != .finished) {
                 candidate.status = .rejected;
                 return false;
-            },
-        };
-
-        const implementer_packet = try self.renderPacket(.implementer, "");
-        defer self.gpa.free(implementer_packet);
-        const implementer = try self.openSeat(.implementer, spec, implementer_packet);
-        try self.setSeatStatus(implementer, .working);
-        const built = try self.runImplementer(implementer, spec, workspace);
-        trial.implementer = built;
-        if (built != .finished) candidate.status = .rejected else candidate.status = .reviewing;
-        try self.closeSeat(implementer, built);
-        if (try self.stopAfterSeat(built)) return true;
-        if (built != .finished) return false;
+            }
+            candidate.status = .reviewing;
+        }
 
         const reviewer_spec = self.cfg.seats.getPtrConst(.reviewer);
         const reviewer_packet = try self.renderPacket(.reviewer, "");
         defer self.gpa.free(reviewer_packet);
+        if (try self.candidateRoundsExhausted(.reviewer)) return true;
         const review_seat = try self.openSeat(.reviewer, reviewer_spec, reviewer_packet);
         trial.reviewer = review_seat;
         try self.setSeatStatus(review_seat, .working);
@@ -849,15 +907,67 @@ pub const Run = struct {
         defer candidate_issues.deinit();
         const reviewed = try self.runReviewer(review_seat, reviewer_spec, workspace, .{ .candidate = &candidate_issues });
         trial.review = reviewed;
+        try self.closeSeat(review_seat, reviewed);
+        if (try self.stopAfterSeat(reviewed, reviewer_spec)) return true;
         switch (reviewed) {
             .review => |review| switch (review) {
-                .approved => |tree| candidate.* = .{ .status = .approved, .tree = tree },
+                .approved => |tree| candidate.* = .{ .status = .approved, .tree = tree, .reviewer = review_seat },
                 else => candidate.status = .rejected,
             },
             else => candidate.status = .rejected,
         }
-        try self.closeSeat(review_seat, reviewed);
-        return self.stopAfterSeat(reviewed);
+        return false;
+    }
+
+    fn candidateRoundsExhausted(self: *Run, role: Role) Error!bool {
+        if (self.dispatched.get(role) < self.dispatchCap(role)) return false;
+        try self.transition(.{ .failed = .rounds_exhausted });
+        return true;
+    }
+
+    fn candidateWorktreeExists(workspace: []const u8) Error!bool {
+        var buf: run_dir.PathBuf = undefined;
+        const z = std.fmt.bufPrintZ(&buf, "{s}", .{workspace}) catch return error.PathTooLong;
+        return pfs.exists(z.ptr);
+    }
+
+    const WorktreeAdded = enum { added, rejected, cancelled };
+
+    fn addCandidateWorktree(self: *Run, workspace: []const u8, number: usize) Error!WorktreeAdded {
+        var dir_buf: run_dir.PathBuf = undefined;
+        const parent = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.dir.root, run_dir.candidates_dir }) catch return error.PathTooLong;
+        util_fs.mkdirParents(parent) catch return error.MkdirFailed;
+        merge_back.addWorktree(self.gpa, self.repo, workspace, self.base.commit, &self.abort) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Aborted => {
+                try self.transition(.cancelled);
+                return .cancelled;
+            },
+            else => {
+                log.warn("teamwork", "run {s}: candidate {d} worktree: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+                return .rejected;
+            },
+        };
+        return .added;
+    }
+
+    fn raisedCapCoversNextStep(self: *const Run) bool {
+        const remaining = self.ledger.remainingUsd();
+        const allowance = self.cfg.manager_budget_usd orelse 0;
+        if (self.cfg.manager_budget_usd != null and allowance >= remaining) return false;
+        if (self.state != .approved) return true;
+        return self.pendingCandidateEstimate() <= remaining - allowance;
+    }
+
+    fn pendingCandidateEstimate(self: *const Run) f64 {
+        var pending: f64 = 0;
+        for (self.candidates[0..self.cfg.candidates.len]) |candidate| {
+            switch (candidate.status) {
+                .queued, .implementing, .reviewing => pending += 1,
+                .approved, .rejected, .selected, .eliminated => {},
+            }
+        }
+        return pending * (self.cfg.candidate_estimate_usd orelse 0);
     }
 
     fn runJudge(self: *Run, arena: std.mem.Allocator, entries: []const judge.Entry, trials: []const Trial) Error!?judge.Judgment {
@@ -885,7 +995,7 @@ pub const Run = struct {
                 .aborted => .aborted,
             };
             try self.closeSeat(id, result);
-            if (try self.stopAfterSeat(result)) return null;
+            if (try self.stopAfterSeat(result, spec)) return null;
             if (result == .judgment and result.judgment == .selected) return judgment;
         }
         try self.transition(.{ .failed = .rounds_exhausted });
@@ -924,7 +1034,7 @@ pub const Run = struct {
             defer self.gpa.free(diff);
             const diff_path = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ workspace, judge.diffFile(&name_buf, number) }) catch return error.PathTooLong;
             try run_dir.writeAtomic(diff_path, diff);
-            const review_path = try self.dir.seatPath(&file_buf, trial.reviewer.?, .review);
+            const review_path = try self.dir.seatPath(&file_buf, trial.reviewer orelse continue, .review);
             const review = try run_dir.readSeatOutput(self.gpa, review_path, reviewer.max_review_bytes + 1) orelse continue;
             defer self.gpa.free(review);
             const copy_path = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ workspace, judge.reviewFile(&name_buf, number) }) catch return error.PathTooLong;
@@ -1007,9 +1117,16 @@ pub const Run = struct {
         });
     }
 
-    fn stopAfterSeat(self: *Run, result: SeatResult) Error!bool {
-        if (self.ledger.isExhausted() or result == .budget_exhausted) {
+    fn stopAfterSeat(self: *Run, result: SeatResult, spec: *const types.SeatSpec) Error!bool {
+        if (self.ledger.isExhausted()) {
             try self.endForBudget();
+            return true;
+        }
+        if (result == .budget_exhausted) {
+            if (spec.harness == .claude_code and spec.harness.claude_code.budget == .wallclock_only) {
+                self.abort.abort(.host_failure);
+                try self.transition(.{ .budget_exhausted = null });
+            } else try self.endForBudget();
             return true;
         }
         if (result == .aborted or self.abort.isAborted()) {
@@ -1061,13 +1178,13 @@ pub const Run = struct {
         });
         defer verdict.deinit(self.gpa);
         try self.writeAuditReport(attempt, &verdict);
-        self.audits = attempt;
-        self.last_audit = std.meta.activeTag(verdict);
-
         if (self.ledger.isExhausted()) {
             try self.endForBudget();
             return .budget_exhausted;
         }
+        self.audits = attempt;
+        self.last_audit = std.meta.activeTag(verdict);
+
         if (self.abort.isAborted()) return self.settleAbort();
         switch (verdict) {
             .pass => |tree| if (!tree.eql(approved)) return self.failWith(.audit_changed_worktree),
@@ -1146,6 +1263,7 @@ pub const Run = struct {
     pub fn finishManager(self: *Run, id: SeatId, wallclock_ms: u64, cost: ledger_mod.Cost, result: SeatResult) Error!void {
         _ = common.charge(.{ .ledger = &self.ledger, .seat = id }, self.cfg.seats.get(.manager).harnessKind(), wallclock_ms, cost);
         try self.closeSeat(id, result);
+        if (self.state.isTerminal() and self.ledger.hold_seat == null) self.releaseLease();
     }
 
     pub fn seatDir(self: *const Run, buf: *run_dir.PathBuf, id: SeatId) Error![]const u8 {
@@ -1476,7 +1594,7 @@ pub const Run = struct {
 
     fn endForBudget(self: *Run) Error!void {
         self.abort.abort(.host_failure);
-        try self.transition(.budget_exhausted);
+        try self.transition(.{ .budget_exhausted = Resume.of(self.state) });
     }
 
     fn settleAbort(self: *Run) Error!CompletionResult {
@@ -1503,7 +1621,7 @@ pub const Run = struct {
         const previous = self.state.phase();
         self.state = next;
         try self.persist();
-        if (next.isTerminal()) self.releaseLease();
+        if (next.isTerminal() and self.ledger.hold_seat == null) self.releaseLease();
         if (previous != next.phase()) self.emit(.{ .phase = .{ .from = .of(previous), .to = .of(next.phase()) } });
     }
 
@@ -1555,7 +1673,17 @@ pub const Run = struct {
                 try s.write(done.worktree_removed);
                 try s.endObject();
             },
-            .approved, .candidates, .implementing, .reviewing, .budget_exhausted, .cancelled => try s.write(null),
+            .budget_exhausted => |point| if (point) |paused| {
+                try s.beginObject();
+                try s.objectField("resume");
+                try s.write(@tagName(paused));
+                if (paused == .review_approved) {
+                    try s.objectField("tree");
+                    try s.write(paused.review_approved.slice());
+                }
+                try s.endObject();
+            } else try s.write(null),
+            .approved, .candidates, .implementing, .reviewing, .cancelled => try s.write(null),
         }
         try s.objectField("repo");
         try s.write(self.repo);
@@ -1584,6 +1712,10 @@ pub const Run = struct {
             try s.write(@tagName(candidate.status));
             try s.objectField("tree");
             if (candidate.tree) |tree| try s.write(tree.slice()) else try s.write(null);
+            if (candidate.reviewer) |seat| {
+                try s.objectField("reviewer");
+                try s.write(seat.slice());
+            }
             try s.endObject();
         }
         try s.endArray();
@@ -1643,7 +1775,7 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
         .candidates => .candidates,
         .implementing => .implementing,
         .reviewing => .reviewing,
-        .budget_exhausted => .budget_exhausted,
+        .budget_exhausted => .{ .budget_exhausted = try resumeOf(detail) },
         .cancelled => .cancelled,
         .review_approved => .{ .review_approved = try treeOf(detail) },
         .auditing => .{ .auditing = try treeOf(detail) },
@@ -1678,6 +1810,10 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
                     .null => null,
                     else => |tree| try treeOf(tree),
                 },
+                .reviewer = if (item.object.get("reviewer")) |seat|
+                    SeatId.parse(if (seat == .string) seat.string else return error.StateCorrupt) catch return error.StateCorrupt
+                else
+                    null,
             };
         }
     }
@@ -1792,6 +1928,18 @@ fn intField(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
     const value = obj.get(key) orelse return error.StateCorrupt;
     if (value != .integer) return error.StateCorrupt;
     return std.math.cast(T, value.integer) orelse error.StateCorrupt;
+}
+
+fn resumeOf(detail: std.json.Value) !?Resume {
+    if (detail == .null) return null;
+    if (detail != .object) return error.StateCorrupt;
+    const tag = std.meta.stringToEnum(std.meta.Tag(Resume), try stringField(detail.object, "resume")) orelse return error.StateCorrupt;
+    return switch (tag) {
+        .approved => .approved,
+        .implementing => .implementing,
+        .reviewing => .reviewing,
+        .review_approved => .{ .review_approved = try treeOf(detail.object.get("tree") orelse return error.StateCorrupt) },
+    };
 }
 
 fn treeOf(value: std.json.Value) !TreeId {

@@ -23,7 +23,7 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.bench import data, executors, profiles
 from scripts.eval.harbor.viewer import server
-from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.runner import ExecutorUnreachable, RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
 from scripts.eval.harbor.bench import workbench as workbench_module
 from scripts.eval.harbor.bench.workbench import Workbench
@@ -326,6 +326,42 @@ class ProfileTest(unittest.TestCase):
         latest, _ = workbench_module.latest_results(record, {'a': view('a', 'pass'), 'b': view('b', 'fail')})
         self.assertEqual(latest[('terminal-bench-2.1', 'm', 'fix-git')][1], 'b')
 
+    def unreachable_launches(self, down):
+        """RunManager.launch refusing real launches while `down` is set, as
+        an SSH executor that does not answer would."""
+        launch = self.manager.launch
+
+        def flaky(request, **kwargs):
+            if not kwargs.get('dry_run') and down.is_set():
+                raise ExecutorUnreachable('无法通过 SSH 登录 relay-4090：ssh: connect to host 10.0.0.1 port 22: '
+                                          'No route to host')
+            return launch(request, **kwargs)
+        return patch.object(self.manager, 'launch', flaky)
+
+    def test_a_dataset_waits_while_its_executor_does_not_answer(self):
+        down = threading.Event()
+        down.set()
+        with self.unreachable_launches(down):
+            created = self.client.request('api/profiles/run', self.request())
+            for _ in range(3):
+                self.manager.profiles.advance()
+            waiting = self.manager.profiles.get(created['id'])['items'][0]
+            self.assertEqual((waiting['status'], waiting['run']), ('pending', None))
+            self.assertIn('No route to host', waiting['waiting']['reason'])
+            down.clear()
+            record = self.wait_profile(created['id'])
+        self.assertEqual([i['status'] for i in record['items']], ['finished', 'finished'])
+        self.assertNotIn('waiting', record['items'][0])
+
+    def test_a_dataset_fails_once_its_executor_stayed_unreachable(self):
+        down = threading.Event()
+        down.set()
+        with self.unreachable_launches(down), patch.object(profiles.ProfileManager, 'UNREACHABLE_WAIT', -1):
+            created = self.client.request('api/profiles/run', self.request())
+            record = self.wait_profile(created['id'])
+        self.assertEqual([i['status'] for i in record['items']], ['failed', 'failed'])
+        self.assertIn('分钟内一直连不上：无法通过 SSH 登录 relay-4090', record['items'][0]['error'])
+
     def test_single_launch_waits_and_cancel_skips_remaining_datasets(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
             created = self.client.request('api/profiles/run', self.request())
@@ -351,8 +387,11 @@ class ProfileTest(unittest.TestCase):
                 self.manager.profiles.advance()
                 time.sleep(.05)
             run = self.manager.profiles.get(created['id'])['items'][0]['run']
-            with self.assertRaisesRegex(ValueError, '1–16'):
-                self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 17})
+            with self.assertRaisesRegex(ValueError, '正整数'):
+                self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 0})
+            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 64})
+            record = self.manager.profiles.get(created['id'])
+            self.assertEqual([i['concurrency'] for i in record['items']], [64, 64])
 
             changed = self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 2})
 
@@ -850,6 +889,17 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profiles/run', self.request(features=['teamwork']))
         self.assertEqual(self.manager.profiles.records(), [])
 
+    def test_a_run_records_its_models_openrouter_price_and_passes_it_to_harbor(self):
+        from scripts.eval.harbor.bench import prices
+        atomic_json(self.config, {**json.loads(self.config.read_text()), 'model_prices': 'openrouter'})
+        catalog = {'vendor/test-model': {'prompt': '0.00000015', 'completion': '0.0000006'}}
+        with patch.object(prices, 'fetch', return_value=catalog):
+            run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})
+        self.assertEqual(run['model_price'], {'openrouter_id': 'vendor/test-model', 'input': 0.15, 'output': 0.6})
+        wait_run(self.manager, run['name'])
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('model_price={"input":0.15,"output":0.6}', argv)
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
@@ -965,6 +1015,64 @@ class TeamworkRunTest(unittest.TestCase):
         alone = executors.with_teamwork(None, ["teamwork"], opted)
         self.assertEqual(alone["services"]["main"]["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
 
+
+
+class ModelPriceTest(unittest.TestCase):
+    MODELS = {"deepseek/deepseek-v4.1-flash-1017": {"prompt": "0.00000015", "completion": "0.0000006",
+                                                     "input_cache_read": "0.000000003"},
+              "deepseek/deepseek-v4.1-flash-1017:batch": {"prompt": "0.000000035", "completion": "0.000000149"},
+              "a/twin": {"prompt": "1", "completion": "1"}, "b/twin": {"prompt": "2", "completion": "2"},
+              "x/unpriced": {"prompt": None, "completion": "1"}}
+
+    def test_a_run_model_matches_one_openrouter_model_by_its_request_id(self):
+        from scripts.eval.harbor.bench import prices
+        price = prices.price_for("metask/DeepSeek-V4.1-Flash-1017", self.MODELS)
+        self.assertEqual(price, {"openrouter_id": "deepseek/deepseek-v4.1-flash-1017", "input": 0.15, "output": 0.6,
+                                 "cached_input": 0.003})
+        self.assertIsNone(prices.price_for("metask/twin", self.MODELS))
+        self.assertIsNone(prices.price_for("x/unpriced", self.MODELS))
+        self.assertIsNone(prices.price_for("nobody/else", self.MODELS))
+        self.assertIsNone(prices.price_for("gateway/acme/model", {"other/model": {"prompt": "1", "completion": "1"}}))
+        self.assertEqual(prices.price_for("gateway/acme/model", {"acme/model": {"prompt": "0.000001", "completion": "0.000002"},
+                                                                 "other/model": {"prompt": "1", "completion": "1"}}),
+                         {"openrouter_id": "acme/model", "input": 1.0, "output": 2.0})
+
+    def test_the_catalog_is_cached_for_a_day_and_a_failed_fetch_keeps_the_cached_copy(self):
+        from scripts.eval.harbor.bench import prices
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return {"v/m": {"prompt": "1", "completion": "2"}}
+
+        def failing():
+            raise OSError("offline")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0), {"v/m": {"prompt": "1", "completion": "2"}})
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0 + 3600)
+            self.assertEqual(len(calls), 1)
+            later = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), failing, now=lambda: later), {"v/m": {"prompt": "1", "completion": "2"}})
+        def truncated():
+            import http.client
+            raise http.client.IncompleteRead(b"{\"data\": [", 1000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0)
+            stale = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), truncated, now=lambda: stale), {"v/m": {"prompt": "1", "completion": "2"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(prices.catalog(Path(tmp), failing), {})
+
+    def test_the_harbor_command_carries_the_price_numbers_only(self):
+        from scripts.eval.harbor.bench.worker import command
+        spec = {"harbor": "harbor", "dataset": "d", "model": "m", "bundle": "/b", "key_env": "K", "attempts": 1,
+                "concurrency": 1, "jobs_dir": "/j", "name": "run", "tasks": ["t"],
+                "model_price": {"openrouter_id": "v/m", "input": 0.15, "output": 0.6}}
+        self.assertEqual([a for a in command(spec) if a.startswith("model_price=")],
+                         ['model_price={"input":0.15,"output":0.6}'])
+        self.assertFalse([a for a in command({**spec, "model_price": None}) if a.startswith("model_price=")])
 
 if __name__ == '__main__':
     unittest.main()

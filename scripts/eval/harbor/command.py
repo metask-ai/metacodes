@@ -290,6 +290,24 @@ def teamwork_flags(*, provider: Optional[str], model: str, reasoning_effort: Opt
     return flags
 
 
+def model_prices_config(model: str, price: Any) -> Optional[Dict[str, Any]]:
+    """The config.json `model_prices` entry for the trial's model, from the
+    workbench's `model_price` (USD per million tokens), or None without one."""
+
+    if price is None:
+        return None
+    if isinstance(price, str):
+        price = json.loads(price)
+    if not isinstance(price, Mapping) or set(price) - {"input", "output", "cached_input", "cache_write"}:
+        raise ValueError("model_price must be an object of input/output/cached_input/cache_write")
+    if "input" not in price or "output" not in price:
+        raise ValueError("model_price needs input and output")
+    for value in price.values():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
+            raise ValueError("model_price values must be non-negative numbers")
+    return {model: dict(price)}
+
+
 def checked_features(features: Iterable[str]) -> List[str]:
     """The features of one trial; teamwork runs alone, since `teamwork run`
     takes none of the other features' flags."""

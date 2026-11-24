@@ -103,7 +103,7 @@ pub const EvaluationBudget = struct {
         model: []const u8,
     ) void {
         self.request_reserve_tokens = max_input_tokens +| max_output_tokens;
-        self.rates = pricing.rateFor(model);
+        self.rates = pricing.effectiveRates(model);
         self.request_reserve_cost_usd = reserveCost(
             self.rates,
             max_input_tokens,
@@ -712,7 +712,7 @@ pub const EvaluationBackend = struct {
             },
             .usage => |u| {
                 const estimated_cost_usd = pricing.computeCost(
-                    pricing.rateFor(self.metadata.runtime_model_id),
+                    pricing.effectiveRates(self.metadata.runtime_model_id),
                     u.input_tokens,
                     u.output_tokens,
                     u.cache_read_input_tokens,
@@ -725,7 +725,7 @@ pub const EvaluationBackend = struct {
                     .cache_read_tokens = u.cache_read_input_tokens,
                     .cache_write_tokens = u.cache_creation_input_tokens,
                     .estimated_cost_usd = estimated_cost_usd,
-                    .pricing_provenance = pricing.provenanceFor(self.metadata.runtime_model_id),
+                    .pricing_provenance = pricing.effectiveProvenance(self.metadata.runtime_model_id),
                 } });
                 // Persist complete usage before the next request boundary can
                 // consult the gate and terminate the scored rollout.

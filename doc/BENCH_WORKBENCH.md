@@ -64,8 +64,8 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
-Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
-the WorkBuddy subsets and the small-task adapters allow up to 16, GAIA2 2). The page starts at 4 runs
+Each task runs 1–5 times; concurrency has no upper limit (GAIA2 caps it at
+2 and ALFWorld at 10). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
@@ -198,7 +198,7 @@ in `ADAPTER_SUITES` (its id and category are authoritative) and listed in
 ```python
 SUITE_ID = "humaneval"                                 # the catalog id
 SUITE = {"name": "HumanEval", "description": "…", "default_tasks": [...],
-         "max_tasks": 164, "max_concurrency": 16, "arch": "amd64, arm64"}  # all optional
+         "max_tasks": 164, "max_concurrency": 4, "arch": "amd64, arm64"}  # all optional
 HOST_ENV = ("OPENAI_API_KEY",)        # optional: verifier env, forwarded to SSH executors
 JUDGE = {"default_model": "glm-5.3-flash",            # optional: an OpenAI-compatible LLM
          "env": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL",   # judge, routed
@@ -798,9 +798,28 @@ are those of the default executor (the top level for the default suite).
 
 Cancel sends `cancel` on the channel: the driver interrupts Harbor (SIGINT,
 then SIGKILL after 20 seconds). A login that can no longer be refreshed
-cancels the same way and fails the run with the reason above. If the channel closes, or no heartbeat
-arrives for 90 seconds, the driver stops Harbor as well, so a lost connection
-never leaves trials running unsupervised.
+cancels the same way and fails the run with the reason above.
+
+A lost connection does not end the run. When the channel closes, or no
+heartbeat arrives for 90 seconds, the worker ends that session and starts
+`metacodes bench node attach <run spec>` over SSH every 10 seconds. The
+driver keeps Harbor and the relay running and accepts the new session on a
+Unix socket in `/tmp/metacodes-bench-<uid>/` (a directory only that user can
+enter; the socket is named after a hash of the run directory). A session
+lost before its first event is attached the same way, and while the driver
+is still starting (its pid is in `runs/<name>/driver.pid`) `attach` exits
+without an event and the worker tries again. The new session then
+carries the events and control lines, the current access token, and the
+egress tunnel on a fresh `ssh -R` port, which the driver's forwarder follows.
+While no session is attached, the driver's and Harbor's output goes to
+`<state_dir>/runs/<name>/driver.log`. The run's terminal event is also kept
+there, so a session that attaches after Harbor exited still receives it. The
+record counts the reattached sessions in `reconnects`. Both sides give up
+after 30 minutes (`METACODES_BENCH_RECONNECT_WINDOW` seconds on the
+workbench, which passes the value to the driver as the spec's
+`detach_grace`): the driver interrupts Harbor, so a lost connection never
+leaves trials running unsupervised, and the run fails with what is still on
+the executor.
 
 ### Network-restricted executors
 
@@ -1030,7 +1049,7 @@ profile is run on as often as wanted. The 评测 page picks the version (the
 configured Linux bundle by default, or any valid bundle under
 `<state root>/bench/bundles/`, including those `metacodes bench build --ref`
 builds), the advanced features, several suites with their tasks, the model,
-attempts and concurrency (capped per suite). The profile's id is derived from
+attempts and concurrency (no upper limit unless a suite sets `max_concurrency`). The profile's id is derived from
 the bundle's content digest and the features, so the same version with the
 same features always lands on the same profile, and changing either is
 another profile. The first run on a profile validates every dataset, then
@@ -1060,7 +1079,7 @@ record list none, and the profile page marks them; a direct launch that asks
 for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork): an older node is refused until
+features (4 since teamwork, 7 since model prices): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 
@@ -1111,12 +1130,30 @@ the other features' flags, and only on an SSH executor whose entry sets
 - **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
   `task.toml` (easy $20, medium $40, hard $80, otherwise $40), and the trial
   gets `--agent-timeout-multiplier 3`, recorded on the run as
-  `agent_timeout_multiplier`. The cap is in metacodes' price-table
-  estimate, not a provider bill: a model without its own price (most
-  imported and Metask models) is charged at the Sonnet fallback rates
-  (`src/util/pricing.zig`), so the cap stops far earlier than real spend
-  would. A first real-model run at easy $5 ran out before the reviewer
-  finished.
+  `agent_timeout_multiplier`. The cap is in metacodes' price estimate,
+  not a provider bill; without the run's OpenRouter price (below) a model
+  missing from metacodes' table is charged at the Sonnet fallback rates
+  (`src/util/pricing.zig`), and the cap, and the isolated verifier's own
+  $0.20, stop far earlier than real spend would. The first real-model runs
+  without it ran out of budget or ended with no audit verdict.
+
+#### Model prices
+
+A Harbor run's model is priced from OpenRouter: at launch the workbench
+matches the model to the one OpenRouter model whose id without its `vendor/`
+prefix is the run's request model id (case-insensitive, so
+`metask/DeepSeek-V4.1-Flash-1017` is `deepseek/deepseek-v4.1-flash-1017`;
+a request id with its own namespace, such as `acme/model` behind
+`gateway/`, matches only the OpenRouter id `acme/model`),
+records it on the run as `model_price` (USD per million tokens and the
+`openrouter_id`), and the adapter writes it to the trial's `config.json` as
+`model_prices`, which every metacodes cost meter charges first (`doc/API.md`,
+"Model prices"). The catalog (`https://openrouter.ai/api/v1/models`) is
+cached beside `workbench.json` as `openrouter-prices.json` for a day; when
+OpenRouter cannot be reached the cached copy is used. A model with no single
+match, or without a cached catalog, keeps metacodes' own estimate and
+records no `model_price`. `"model_prices": "off"` in `workbench.json` skips
+the lookup.
 - **Validity**: `teamwork status --json` lands in the trial's agent logs,
   and the run directory without its worktrees (`teamwork-run/`: ledger,
   seat records and logs) beside it. A run that wrote no status, or in which
@@ -1151,12 +1188,15 @@ first runs until its queue is empty. A single launch (`POST /api/runs`,
 and its `features` (`bench run --features a,b`; the run gates when none are
 given, `--features ""` for none), and is refused while
 a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
-of its queue.
+of its queue. A dataset whose SSH executor does not answer when it is due
+(the SSH connection fails or times out; a refused login does not count)
+stays pending, with the reason in its `waiting` field, and is retried until the executor
+answers. After 30 minutes it fails, and the queue moves on.
 
 While a profile runs, its concurrency can be changed (`POST /api/profile/concurrency`
-with `id` and `concurrency`, 1–16; 并发数 on its page). The value is capped per
-suite and applies to the running dataset at once and to the datasets still
-waiting in the queue. Lowering it lets the trials already running finish;
+with `id` and `concurrency`, any positive integer; 并发数 on its page). A suite's
+`max_concurrency`, when set, caps it. The value applies to the running dataset
+at once and to the datasets still waiting in the queue. Lowering it lets the trials already running finish;
 raising it starts more within about a second. The workbench writes the value
 to `<jobs>/.bench-runs/<run>.concurrency`; on an SSH executor the worker sends
 it over the run's control channel and the node writes it beside the run's

@@ -80,11 +80,11 @@ class LiveLimitTest(unittest.TestCase):
 
     def test_unreadable_or_out_of_range_values_keep_the_fallback(self):
         self.assertEqual(live_concurrency.read(self.path, 3), 3)
-        for text in ("x", "0", "17"):
+        for text in ("x", "0", "-1"):
             self.path.write_text(text)
             self.assertEqual(live_concurrency.read(self.path, 3), 3)
-        live_concurrency.write(self.path, 16)
-        self.assertEqual(live_concurrency.read(self.path, 3), 16)
+        live_concurrency.write(self.path, 64)
+        self.assertEqual(live_concurrency.read(self.path, 3), 64)
 
 
 class Credential:

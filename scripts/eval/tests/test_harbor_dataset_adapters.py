@@ -198,7 +198,8 @@ class AdapterContractTest(unittest.TestCase):
             )
             self.assertRegex(suite["description"], HAN)
             self.assertTrue(type(suite["max_tasks"]) is int and 1 <= suite["max_tasks"] <= 200)
-            self.assertTrue(type(suite["max_concurrency"]) is int and 1 <= suite["max_concurrency"] <= 16)
+            if "max_concurrency" in suite:
+                self.assertTrue(type(suite["max_concurrency"]) is int and suite["max_concurrency"] >= 1)
             self.assertTrue(callable(module.prepare) and callable(module.tasks))
             self.assertTrue(suite["default_tasks"], suite_id)
             for tid in suite["default_tasks"]:

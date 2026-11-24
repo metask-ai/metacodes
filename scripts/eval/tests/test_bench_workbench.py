@@ -178,7 +178,8 @@ def fixture(root):
     config = root / 'workbench.json'
     atomic_json(config, {'bundle': str(bundle), 'provider_config': str(native),
                          'harbor': str(harbor), 'model': 'tokenjoy/test-model',
-                         'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False, 'metrics_bind': '127.0.0.1'})
+                         'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False, 'metrics_bind': '127.0.0.1',
+                         'model_prices': 'off'})
     return config, binary_dir
 
 

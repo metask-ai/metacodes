@@ -306,10 +306,10 @@ async function renderOverview() {
     h('td', { class: 'num', text: pct(b.summary.first_pass_rate) }),
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
     h('td', { class: 'num', text: when(b.last_run_at) }),
-    body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
+    body.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
   const profileHeads = ['评测配置', 'metacodes 版本', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
   const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
     h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
   h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
@@ -330,25 +330,20 @@ async function renderOverview() {
     box.checked = state.selected.has(j.name);
     return h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', {}, box),
-      h('td', {}, h('span', { text: j.name }), h('span', { class: 'sub', text: [j.category_name, j.suite_name || j.dataset, j.metacodes?.label ? 'metacodes ' + j.metacodes.label : null].filter(Boolean).join(' · ') + (j.running ? ' · 运行中' : '') })),
-      h('td', { text: j.model || '—' }),
+      h('td', { class: 'wrap' }, h('span', { class: 'name', text: j.name }), h('span', { class: 'model', text: j.model || '—' }), h('span', { class: 'sub', text: [j.category_name, j.suite_name || j.dataset, j.metacodes?.label ? 'metacodes ' + j.metacodes.label : null].filter(Boolean).join(' · ') + (j.running ? ' · 运行中' : '') })),
       h('td', {}, h('span', { class: 'num', text: `${done} / ${j.planned}` }), h('div', { class: 'track' }, h('span', { width: (j.planned ? 100 * done / j.planned : 0) + '%' }))),
       h('td', {}, outcomeBar(s.counts, s.trials)),
-      h('td', { class: 'num', text: pct(s.first_pass_rate) }, h('span', { class: 'sub', text: `${s.first_passed}/${s.first_valid} 首次有效` })),
-      h('td', { class: 'num', text: String(s.counts.invalid) }),
-      h('td', { class: 'num', text: compact(s.total_tokens) }, h('span', { class: 'sub', text: '缓存 ' + pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null) })),
-      h('td', { class: 'num', text: compact(s.initial_input_tokens_mean) }),
-      h('td', { class: 'num', text: tps(s.tps) }),
-      h('td', { class: 'num', text: ttft(s.ttft_ms) }),
+      h('td', { class: 'num', text: pct(s.first_pass_rate) }, h('span', { class: 'sub', text: `${s.first_passed}/${s.first_valid} 首次有效 · 无效 ${s.counts.invalid}` })),
+      h('td', { class: 'num', text: compact(s.total_tokens) }, h('span', { class: 'sub', text: `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)} · 初始 ${compact(s.initial_input_tokens_mean)}` })),
+      h('td', { class: 'num', text: tps(s.tps) }, h('span', { class: 'sub', text: 'TTFT ' + ttft(s.ttft_ms) })),
       h('td', { class: 'num', text: usd(s.cost_usd) }),
-      h('td', { class: 'num', text: dur(j.wall_s) }),
-      h('td', { class: 'num', text: when(j.started_at) }),
-      body.can_run ? h('td', {}, j.running ? null : h('button', { type: 'button', class: 'button',
+      h('td', { class: 'num', text: when(j.started_at) }, h('span', { class: 'sub', text: '用时 ' + dur(j.wall_s) })),
+      body.can_run ? h('td', { class: 'pinned' }, j.running ? null : h('button', { type: 'button', class: 'button',
         onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除')) : null);
   });
-  const jobHeads = ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始', ...(body.can_run ? ['操作'] : [])];
+  const jobHeads = ['', '作业 / 模型', '进度', '结局分布', '首次满分率', '任务总 Token', 'TPS', '估算成本', '开始', ...(body.can_run ? ['操作'] : [])];
   const table = h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 5 && i <= 13 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 4 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: jobHeads.length, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
   const loose = runs.filter((r) => !r.profile && !r.batch);
   const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次`,
@@ -476,7 +471,7 @@ async function renderProfile(id) {
 
 function concurrencyControl(b, item) {
   if (!b.can_run || !profileActive(b)) return h('span', { class: 'mono', text: String(item.concurrency ?? '—') });
-  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, max: 16, step: 1, required: true, value: item.concurrency ?? '',
+  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: item.concurrency ?? '',
     'aria-label': '并发数', onfocus: () => { state.editing = true; },
     onblur: () => { if (input.value === String(item.concurrency ?? '')) state.editing = false; } });
   const feedback = h('span', { class: 'muted', role: 'status', text: '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中的评测集也按新值运行' });
@@ -654,7 +649,7 @@ async function renderNewRun() {
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
-  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, max: 16, step: 1, required: true,
+  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, step: 1, required: true,
     oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,

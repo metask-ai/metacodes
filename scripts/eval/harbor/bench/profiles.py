@@ -26,15 +26,17 @@ import json
 import re
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from scripts.eval.harbor import live_concurrency, suites
+from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
-from scripts.eval.harbor.bench.runner import ACTIVE, DEFAULT_FEATURES, atomic_json, chosen_features, now, settings
+from scripts.eval.harbor.bench.runner import (ACTIVE, DEFAULT_FEATURES, ExecutorUnreachable, atomic_json,
+                                              chosen_features, now, settings)
 
 MAX_ITEMS = 16
 MAX_MODELS = 8
@@ -231,6 +233,9 @@ class ProfileManager:
     """Durable profiles over a RunManager; one profile's queue advances at a
     time, the one whose oldest waiting dataset was queued first."""
 
+    # How long a dataset waits for an SSH executor that does not answer.
+    UNREACHABLE_WAIT = 1800
+
     def __init__(self, runs):
         self.runs = runs
         self.dir = runs.jobs_dir / PROFILES_DIR
@@ -289,8 +294,8 @@ class ProfileManager:
             raise ValueError(f"每次需要 1–{MAX_ITEMS} 个评测集")
         name = checked_name(request.get("name"))
         concurrency = request.get("concurrency", 1)
-        if type(concurrency) is not int or not 1 <= concurrency <= 16:
-            raise ValueError("concurrency 必须是 1–16 的整数")
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("concurrency 必须是正整数")
         target = self.target(request)
         seen, planned = set(), []
         for item in items:
@@ -303,7 +308,7 @@ class ProfileManager:
             for model in models:
                 run_request = {"suite": suite.id, "model": model, "tasks": item.get("tasks"),
                                "attempts": request.get("attempts", 1),
-                               "concurrency": min(concurrency, suite.max_concurrency)}
+                               "concurrency": suites.capped_concurrency(suite, concurrency)}
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
                 planned.append(self.planned(target, run_request, request.get("executor"), label))
         return self.append(target, name, planned)
@@ -328,9 +333,11 @@ class ProfileManager:
                 raise ValueError("评测配置 " + owner + " 的队列正在运行，请等它结束或先停止")
             record = self._append(target, None, [planned])
             self._step(record)
-            if record["items"][-1]["status"] == "failed":
+            item = record["items"][-1]
+            if item["status"] == "pending":  # `bench run` does not wait for an executor
+                item.update(status="failed", error=item.pop("waiting")["reason"], finished_at=now())
+            if item["status"] == "failed":
                 self._step(record)
-        item = record["items"][-1]
         if item["status"] == "failed":
             raise ValueError(item["error"])
         return next(r for r in self.runs.runs() if r["name"] == item["run"])
@@ -422,8 +429,8 @@ class ProfileManager:
         return {"id": record["id"], "name": name}
 
     def set_concurrency(self, profile: Any, concurrency: Any) -> Dict[str, Any]:
-        if type(concurrency) is not int or not 1 <= concurrency <= live_concurrency.MAX_CONCURRENCY:
-            raise ValueError(f"concurrency 必须是 1–{live_concurrency.MAX_CONCURRENCY} 的整数")
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("concurrency 必须是正整数")
         with self.lock:
             record = self.get(profile)
             if record is None:
@@ -434,7 +441,7 @@ class ProfileManager:
             for item in record["items"]:
                 if item["status"] not in ("pending", "running"):
                     continue
-                applied = min(concurrency, suites.resolved(suites.get(item["suite"])).max_concurrency)
+                applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
                 if item["status"] == "running" and item.get("run") in active:
                     self.runs.set_concurrency(item["run"], applied)
                 item["concurrency"] = applied
@@ -515,9 +522,16 @@ class ProfileManager:
                 request["features"] = features
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
                                         pinned=pending.get("route"))
+            pending.pop("waiting", None)
             pending.update(status="running", run=launched["name"], started_at=now())
             record["status"] = "running"
             record["started_at"] = record.get("started_at") or now()
+        except ExecutorUnreachable as exc:
+            waiting = pending.setdefault("waiting", {"since": time.time()})
+            waiting["reason"] = str(exc)
+            if time.time() - waiting["since"] > self.UNREACHABLE_WAIT:
+                pending.update(status="failed", finished_at=now(),
+                               error=f"执行机器 {self.UNREACHABLE_WAIT // 60} 分钟内一直连不上：{exc}")
         except (ValueError, OSError) as exc:
             pending.update(status="failed", error=str(exc), finished_at=now())
         self.save(record)

@@ -472,6 +472,19 @@ execution are observations of individually atomic files, not one transaction.
 The approved budget, check, seat models, effective permissions and sandbox
 restrictions must match the run's saved fingerprints. Older CLI runs without
 a host-policy fingerprint still support status, and need a new approval to run.
+A run that reached its cap pauses in `budget_exhausted` with its worktree and
+ledger kept; `detail` names the phase it continues from. Parallel candidates
+that already have a verdict keep it, and unfinished ones continue in their
+worktrees, within the approved rounds per role; a cap that does not cover
+their estimate plus a launched Manager's allowance is refused and the run stays paused. A `wallclock_only` seat that ran out of time also ends in
+`budget_exhausted`, with `detail: null`: a higher dollar cap would not help,
+so it cannot continue. While a launched Manager still holds its allowance,
+the run stays locked until that allowance is settled. `teamwork resume <id>
+--approve --budget-usd <dollars>` approves a higher cap for such a run and
+continues it there. The new cap must exceed the approved cap and the spend so
+far, which stays charged against it (`CapNotRaised` otherwise);
+`NotResumable` refuses any other run. Without `--budget-usd`, the cap never
+changes. Review, audit and merge-back rules are unchanged.
 Inherited native seat models are pinned before the first dispatch. Provider
 credentials/endpoint can be supplied again. Resume also accepts the originally
 saved repository when invoked elsewhere. An OS lifetime lock permits one
@@ -780,6 +793,30 @@ status line label that top level with the route's own word: a catalog whose
 (or nothing) shows `xhigh`; `--reasoning-effort max` is accepted as an alias.
 Explicit `effort:` in an agent definition wins over the tier's effort. The
 built-in `Explore` agent pins the `low` tier.
+
+### Model prices
+
+Cost estimates (the session's cost line, `/cost`, evaluation budgets, the
+isolated verifier and the Teamwork ledger) use metacodes' built-in price
+table, which charges a model it does not know at the Sonnet fallback rates.
+`~/.metacodes/config.json` can price models itself, in USD per million
+tokens:
+
+```json
+"model_prices": {
+  "DeepSeek-V4.1-Flash-1017": {"input": 0.15, "output": 0.6, "cached_input": 0.003}
+}
+```
+
+A key matches the session's model case-insensitively: the full model id
+first, then the id without its first `provider/` segment
+(`gateway/acme/model` matches `acme/model`, never `model`; with keys for
+both `model` and `acme/model`, the session model `acme/model` takes the
+latter). `input` and `output` are required; `cached_input` and
+`cache_write` default to `input`. A malformed table (an unknown field, a
+negative or non-numeric price) is ignored with a warning, and costs keep the
+built-in table. A configured price is a declaration, not a bill: its
+evaluation provenance is `user_config_model_prices`.
 
 ### Multimodal image input
 

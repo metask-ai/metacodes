@@ -20,8 +20,19 @@ Later stdin lines are control messages:
   atomically, and keeps the previous one if none arrives;
 - `{"concurrency": N}`: the most trials Harbor runs at once from now on,
   written to the file its trial queue reads (live_concurrency.py);
-- `cancel`, or the channel closing: interrupt Harbor (SIGINT, then SIGKILL
-  after 20 s).
+- `{"tunnel_port": N}`: the executor loopback port of the `ssh -R` forward
+  the session that attached carries; the egress forwarder relays there;
+- `cancel`: interrupt Harbor (SIGINT, then SIGKILL after 20 s).
+
+The channel closing does not stop the run: Harbor and the relay keep going
+and `attach <spec.json>` connects a new session to the driver (on the
+socket attach_socket() names for the run directory), whose stdin/stdout
+then carry the same control lines and events. Until that socket listens,
+the run directory's DRIVER_PID tells `attach` the driver is still starting. Only when no session is back within the spec's
+`detach_grace` seconds is Harbor interrupted. The run's terminal event is
+also kept in the run directory, so a session attaching after the end still
+receives it; with the original session gone, the driver's and Harbor's
+output goes to DRIVER_LOG there.
 
 With `"egress"` in the spec, the driver starts the run's egress
 (viewer/egress.py) before Harbor and removes it after: in workbench mode a
@@ -46,6 +57,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -57,15 +69,152 @@ from urllib.parse import urlsplit
 from scripts.eval.harbor import live_concurrency
 
 DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
+DETACH_GRACE = 1800
+SOCKET_ROOT = "/tmp"  # short: AF_UNIX paths are limited to about 100 bytes
+DRIVER_PID = "driver.pid"
+END_EVENT = "end.json"
+DRIVER_LOG = "driver.log"
 
 
 EMIT_LOCK = threading.Lock()
+OUT = None  # the attached session's writer; None while the first one lasts
+
+
+def attach_socket(run_dir):
+    """The attach socket of the driver of `run_dir`: a bounded name in a
+    directory only this user can enter."""
+    root = Path(SOCKET_ROOT) / f"metacodes-bench-{os.getuid()}"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(root)
+    if not os.path.isdir(root) or os.path.islink(root) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise OSError(f"{root} 不是当前用户私有的目录")
+    digest = hashlib.sha256(str(Path(run_dir).resolve()).encode()).hexdigest()[:24]
+    return str(root / (digest + ".sock"))
+
+
+def claim(run_dir):
+    """Mark `run_dir` as having a live driver, for `attach` to wait on."""
+    try:
+        (Path(run_dir) / DRIVER_PID).write_text(str(os.getpid()), encoding="ascii")
+    except OSError:
+        pass
+
+
+def driver_alive(run_dir):
+    try:
+        os.kill(int((Path(run_dir) / DRIVER_PID).read_text(encoding="ascii")), 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def emit(event, **fields):
+    """Send one event to the current session. A lost session is not an
+    error here: the run goes on and the next session gets later events."""
+    line = json.dumps({"event": event, **fields}) + "\n"
     with EMIT_LOCK:
-        sys.stdout.write(json.dumps({"event": event, **fields}) + "\n")
-        sys.stdout.flush()
+        try:
+            out = OUT or sys.stdout
+            out.write(line)
+            out.flush()
+        except (OSError, ValueError):
+            pass
+
+
+class Control:
+    """The run's control channel: the session that started it, then each
+    session that attaches. `lost_at` is when the current one closed."""
+
+    def __init__(self, run_dir, on_line, grace):
+        self.run_dir, self.on_line, self.grace = run_dir, on_line, grace
+        self.lock = threading.Lock()
+        self.current = 0
+        self.lost_at = None
+        self.quiet = False
+        self.listener = None
+        self.path = None
+
+    def follow(self, reader, generation):
+        try:
+            for line in reader:
+                self.on_line(line.strip())
+        except (OSError, ValueError):
+            pass
+        with self.lock:
+            if generation == self.current:
+                self.lost_at = time.monotonic()
+                self.silence()
+
+    def silence(self):
+        """Point stdout and stderr at DRIVER_LOG once the first session is
+        gone, so neither the driver nor Harbor writes into a dead channel."""
+        if self.quiet or self.run_dir is None:
+            return
+        self.quiet = True
+        fd = os.open(str(self.run_dir / DRIVER_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        os.close(fd)
+
+    def listen(self):
+        """Accept attaching sessions; False when the socket cannot be bound."""
+        previous = os.umask(0o077)
+        try:
+            path = self.path = attach_socket(self.run_dir)
+            if os.path.lexists(path):
+                os.unlink(path)
+            self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener.bind(path)
+            self.listener.listen(4)
+        except OSError:
+            self.listener = None
+            return False
+        finally:
+            os.umask(previous)
+
+        def accept():
+            global OUT
+            while True:
+                try:
+                    conn, _ = self.listener.accept()
+                except OSError:
+                    return
+                with self.lock:
+                    self.current += 1
+                    generation = self.current
+                    self.lost_at = None
+                    self.silence()
+                    with EMIT_LOCK:
+                        OUT = conn.makefile("w", encoding="utf-8")
+                threading.Thread(target=self.follow, args=(conn.makefile("rb"), generation), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        return True
+
+    def expired(self):
+        with self.lock:
+            return self.lost_at is not None and time.monotonic() - self.lost_at > self.grace
+
+    def close(self):
+        if self.listener is not None:
+            self.listener.close()
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def terminal(run_dir, event, **fields):
+    """The run's one terminal event, kept for a session attaching later."""
+    if run_dir is not None:
+        try:
+            (run_dir / END_EVENT).write_text(json.dumps({"event": event, **fields}) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    emit(event, **fields)
 
 
 def absolute(value):
@@ -74,6 +223,7 @@ def absolute(value):
 
 def run(spec_path):
     os.chdir(os.path.expanduser("~"))
+    claim(Path(spec_path).resolve().parent)
     first = sys.stdin.buffer.readline()
     try:
         message = json.loads(first)
@@ -160,8 +310,12 @@ def run(spec_path):
                                      env=env)
             env["DOCKER_CONFIG"] = str(session.directory)
             emit("egress", mode=spec["egress"]["mode"], proxy=session.proxy_url, no_proxy=session.no_proxy)
+        forwarder = session.forwarder if session is not None else None
         return supervise(spec, argv, env, credential, stop, hung_up,
-                         egress if spec.get("ghcr_mirror") else None, limit_path=limit_path)
+                         egress if spec.get("ghcr_mirror") else None, limit_path=limit_path,
+                         run_dir=Path(spec_path).resolve().parent,
+                         retarget=(lambda port: setattr(forwarder, "target", ("127.0.0.1", port)))
+                         if forwarder is not None else None)
     finally:
         if session is not None:
             session.close()
@@ -177,16 +331,12 @@ def dataset_selection(argv):
 
 def beating(phase, stop, work):
     """work() with a heartbeat every 2 s: preparation can outlast the
-    worker's 90 s heartbeat window. A closed channel sets `stop`."""
+    worker's 90 s heartbeat window."""
     done = threading.Event()
 
     def beat():
         while not done.wait(2):
-            try:
-                emit("heartbeat", phase=phase)
-            except (BrokenPipeError, OSError):
-                stop.set()
-                return
+            emit("heartbeat", phase=phase)
     threading.Thread(target=beat, daemon=True).start()
     try:
         return work()
@@ -194,53 +344,81 @@ def beating(phase, stop, work):
         done.set()
 
 
-def cancelled_exit():
-    try:
-        emit("exit", code=130, cancelled=True)
-    except (BrokenPipeError, OSError):
-        pass
+def cancelled_exit(run_dir):
+    terminal(run_dir, "exit", code=130, cancelled=True)
     return 130
 
 
+def pump(source):
+    """Copy Harbor's output to stderr, wherever that points now."""
+    for chunk in iter(lambda: source.read1(65536), b""):
+        try:
+            os.write(2, chunk)
+        except OSError:
+            pass
+
+
 def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None, finish=None,
-              limit_path=None):
+              limit_path=None, run_dir=None, retarget=None):
     """Run Harbor: control channel, heartbeats, cancel; the exit code.
 
     `prepare(stop)`, when given, runs first under heartbeats and with cancel
     already handled; it returns (argv, env, cwd), or None once `stop` is set,
     and raises ValueError with a user-facing reason. `finish()`, when given,
     runs under heartbeats before the run's one terminal event, however the
-    run ends."""
+    run ends. With `run_dir`, sessions can attach (Control) and the run
+    stops only when none is back within the spec's `detach_grace`;
+    `retarget(port)` points the egress forwarder at a new session's tunnel."""
 
-    def control():
-        for line in sys.stdin.buffer:
-            line = line.strip()
-            if line == b"cancel":
-                stop.set()
-            elif line.startswith(b"{"):
+    def on_line(line):
+        if line == b"cancel":
+            stop.set()
+            return
+        if not line.startswith(b"{"):
+            return
+        try:
+            message = json.loads(line)
+            update = message.get("credential")
+            concurrency = message.get("concurrency")
+            port = message.get("tunnel_port")
+        except (ValueError, AttributeError):
+            return
+        if type(port) is int and retarget is not None:
+            retarget(port)
+        if concurrency is not None:
+            if type(concurrency) is int and limit_path is not None:
                 try:
-                    message = json.loads(line)
-                    update = message.get("credential")
-                    concurrency = message.get("concurrency")
-                except (ValueError, AttributeError):
-                    continue
-                if concurrency is not None:
-                    if type(concurrency) is int and limit_path is not None:
-                        try:
-                            live_concurrency.write(limit_path, concurrency)
-                        except OSError:
-                            pass
-                    continue
-                if credential is not None:
-                    credential.set(update)
-                    try:
-                        emit("credential", pushes=credential.pushes)  # a count, never the token
-                    except (BrokenPipeError, OSError):
-                        pass
+                    live_concurrency.write(limit_path, concurrency)
+                except OSError:
+                    pass
+            return
+        if update is not None and credential is not None:
+            credential.set(update)
+            emit("credential", pushes=credential.pushes)  # a count, never the token
+
+    control = Control(run_dir, on_line, float(spec.get("detach_grace") or DETACH_GRACE))
+    if run_dir is None:
+        control.grace = 0  # nothing can attach: a closed channel stops the run
+    elif not control.listen():
+        terminal(run_dir, "error", message="执行机器上建不了重连用的 Unix socket（/tmp/metacodes-bench-<uid>/），"
+                                           "评测没有启动；请检查 /tmp 是否可写、该目录是否属于当前用户且权限为 700")
+        return 2
+
+    def watch():
+        while not control.expired():
+            time.sleep(0.5)
         hung_up.set()
         stop.set()
 
-    threading.Thread(target=control, daemon=True).start()
+    threading.Thread(target=control.follow, args=(sys.stdin.buffer, 0), daemon=True).start()
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        return run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run_dir)
+    finally:
+        control.close()
+
+
+def run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run_dir):
 
     def finishing():
         if finish is not None:
@@ -254,11 +432,11 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
             prepared = beating("prepare", stop, lambda: prepare(stop))
         except ValueError as exc:
             finishing()
-            emit("error", message=str(exc))
+            terminal(run_dir, "error", message=str(exc))
             return 2
         if prepared is None or stop.is_set():
             finishing()
-            return cancelled_exit()
+            return cancelled_exit(run_dir)
         argv, env, cwd = prepared
     dataset, patterns = dataset_selection(argv)
     if egress is not None and dataset:
@@ -267,22 +445,21 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
             tagged = beating("ghcr", stop, lambda: egress.ensure_ghcr(
                 images, spec["ghcr_mirror"], env=env, stop=stop,
                 log=lambda text: print(text, file=sys.stderr, flush=True)))
-            try:
-                emit("ghcr", images=len(images), tagged=len(tagged))
-            except (BrokenPipeError, OSError):
-                stop.set()
-            if stop.is_set():  # cancelled (or the channel closed) while pulling
+            emit("ghcr", images=len(images), tagged=len(tagged))
+            if stop.is_set():  # cancelled (or no session came back) while pulling
                 finishing()
-                return cancelled_exit()
+                return cancelled_exit(run_dir)
     # Harbor's own output goes to stderr, which SSH carries to the local
     # worker's log; stdout carries only events.
     try:
-        process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno(),
-                                   start_new_session=True)
+        process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
     except OSError as exc:
         finishing()
-        emit("error", message=f"启动失败：{exc}")
+        terminal(run_dir, "error", message=f"启动失败：{exc}")
         return 2
+    output = threading.Thread(target=pump, args=(process.stdout,), daemon=True)
+    output.start()
     emit("started", pid=process.pid)
     interrupted_at = None
     last = 0.0
@@ -294,18 +471,51 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
         if interrupted_at and time.monotonic() - interrupted_at > 20:
             os.killpg(process.pid, signal.SIGKILL)
         if time.monotonic() - last > 2:
-            try:
-                emit("heartbeat")
-            except (BrokenPipeError, OSError):
-                stop.set()
+            emit("heartbeat")
             last = time.monotonic()
         time.sleep(0.25)
+    output.join(5)
+    process.stdout.close()
     finishing()
-    try:
-        emit("exit", code=process.returncode, cancelled=interrupted_at is not None)
-    except (BrokenPipeError, OSError):
-        pass
+    terminal(run_dir, "exit", code=process.returncode, cancelled=interrupted_at is not None)
     return process.returncode
+
+
+def attach(spec_path):
+    """Connect this session to the driver of the run `spec_path` names; once
+    that run has ended, print its terminal event instead."""
+    os.chdir(os.path.expanduser("~"))
+    run_dir = Path(spec_path).resolve().parent
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.connect(attach_socket(run_dir))
+    except OSError:
+        end = run_dir / END_EVENT
+        if end.is_file():
+            sys.stdout.write(end.read_text(encoding="utf-8"))
+            sys.stdout.flush()
+            return 0
+        if driver_alive(run_dir):
+            return 75  # still starting: no event, the workbench tries again
+        emit("error", message="执行机器上这次运行的驱动进程已经不在了（机器重启，或进程被结束），结果只有已经写入作业目录的部分")
+        return 3
+
+    def forward():
+        try:
+            for chunk in iter(lambda: sys.stdin.buffer.read1(65536), b""):
+                conn.sendall(chunk)
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    threading.Thread(target=forward, daemon=True).start()
+    try:
+        for chunk in iter(lambda: conn.recv(65536), b""):
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+    except OSError:
+        pass
+    return 0
 
 
 def files(root):
@@ -453,12 +663,15 @@ def main(argv=None):
         result = egress_probe(json.loads(args[1]))
         print(json.dumps(result))
         return 0 if result["ok"] else 1
-    if len(args) != 2 or args[0] not in ("run", "manifest", "pack"):
-        print("usage: remote.py run <spec> | manifest <dir> | pack <dir> | egress-probe <json>", file=sys.stderr)
+    if len(args) != 2 or args[0] not in ("run", "attach", "manifest", "pack"):
+        print("usage: remote.py run <spec> | attach <spec> | manifest <dir> | pack <dir> | egress-probe <json>",
+              file=sys.stderr)
         return 2
     action, target = args
     if action == "run":
         return run(target)
+    if action == "attach":
+        return attach(target)
     if action == "manifest":
         print(json.dumps(files(target)))
         return 0

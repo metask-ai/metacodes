@@ -567,7 +567,7 @@ fn runSpawn(
     defer if (cache_key) |key| gpa.free(key);
     if (cache_key) |key| overrides.prompt_cache_key = key;
 
-    var meter = Meter{ .rates = pricing.rateFor(resolved.model orelse actor_model) };
+    var meter = Meter{ .rates = pricing.effectiveRates(resolved.model orelse actor_model) };
     const backend = meter.backend();
     var watchdog = Watchdog{ .parent = deps.abort, .deadline_ms = started_ms + @as(i64, @intCast(request.budget.wall_ms)) };
     const watcher = @import("platform").thread.spawn(.waiter, Watchdog.run, .{&watchdog}) catch null;
