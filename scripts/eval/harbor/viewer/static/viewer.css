@@ -84,6 +84,7 @@ th:first-child,td:first-child{padding-left:20px}th:last-child,td:last-child{padd
 td.num,th.num{text-align:right}
 td.wrap{white-space:normal;min-width:240px}td.wrap .name,td.wrap .model{display:block;white-space:nowrap}td.wrap .model{font-size:11px;margin-top:2px}
 tr.link{cursor:pointer}tr.link:hover td{background:var(--raised)}
+th.pinned,td.pinned{position:sticky;right:0;background:var(--surface);box-shadow:-10px 0 10px -10px #000}tr.link:hover td.pinned{background:var(--raised)}
 td .sub,th .sub{display:block;font-size:11px;color:var(--muted);font-family:var(--font)}
 th.center{text-align:center;height:auto;padding-top:8px;padding-bottom:8px}
 .na{color:var(--faint)}

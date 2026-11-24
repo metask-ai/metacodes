@@ -306,10 +306,10 @@ async function renderOverview() {
     h('td', { class: 'num', text: pct(b.summary.first_pass_rate) }),
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
     h('td', { class: 'num', text: when(b.last_run_at) }),
-    body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
+    body.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
   const profileHeads = ['评测配置', 'metacodes 版本', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
   const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
     h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
   h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
@@ -338,12 +338,12 @@ async function renderOverview() {
       h('td', { class: 'num', text: tps(s.tps) }, h('span', { class: 'sub', text: 'TTFT ' + ttft(s.ttft_ms) })),
       h('td', { class: 'num', text: usd(s.cost_usd) }),
       h('td', { class: 'num', text: when(j.started_at) }, h('span', { class: 'sub', text: '用时 ' + dur(j.wall_s) })),
-      body.can_run ? h('td', {}, j.running ? null : h('button', { type: 'button', class: 'button',
+      body.can_run ? h('td', { class: 'pinned' }, j.running ? null : h('button', { type: 'button', class: 'button',
         onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除')) : null);
   });
   const jobHeads = ['', '作业 / 模型', '进度', '结局分布', '首次满分率', '任务总 Token', 'TPS', '估算成本', '开始', ...(body.can_run ? ['操作'] : [])];
   const table = h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 4 && i <= 8 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 4 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: jobHeads.length, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
   const loose = runs.filter((r) => !r.profile && !r.batch);
   const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次`,
