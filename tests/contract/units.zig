@@ -44,6 +44,9 @@ test "string values under identifier keys become <ID>, null stays" {
 test "the request id in a log prefix becomes <ID>" {
     try expectApplied("[ERROR client req=600af9880001] HTTP 400", .{}, "[ERROR client req=<ID>] HTTP 400");
     try expectApplied("prefix_req=abc and req= alone", .{}, "prefix_req=abc and req= alone");
+    try expectApplied("echo req=on", .{}, "echo req=on");
+    try expectApplied("echo req=off]", .{}, "echo req=off]");
+    try expectApplied("echo req=beef and more", .{}, "echo req=beef and more");
 }
 
 test "hex identifiers of 16 or more characters and UUIDs become placeholders" {

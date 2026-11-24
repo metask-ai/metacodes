@@ -100,7 +100,7 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 | 契约面 | 快照 | 怎么得到 |
 |---|---|---|
 | AgentCore C ABI | `abi/agentcore_h.txt`、`abi/exports.txt` | translate-c 后的 `agentcore.h`:每个 struct 的大小、对齐、字段偏移和大小,函数和函数指针签名,常量(含 `METASK_AGENTCORE_ABI_REVISION`),头文件 sha256;共享库实际导出的符号 |
-| AgentCore C 消费者 | `abi/c_consumer.txt` | 只用发布的 `sdk/metask/agentcore.h` 编译 `tests/agentcore_artifact_consumer/consumer.c`(`-DMETASK_AGENTCORE_CONSUMER_DYNAMIC=1`,不链任何源码),运行时 dlopen 同一个共享库;记退出码、stdout、stderr |
+| AgentCore C 消费者 | `abi/c_consumer.txt` | 只用安装进 bundle 的 `include/metask/agentcore.h` 编译 `tests/agentcore_artifact_consumer/consumer.c`(`-DMETASK_AGENTCORE_CONSUMER_DYNAMIC=1`,不链任何源码),运行时 dlopen 同一个共享库;记退出码、stdout、stderr |
 | AgentCore 运行与 checkpoint | `scenarios/abi_session/expected/*` | 用 `std.DynLib` 加载发布的共享库,经 `sdk/zig` 跑一次带工具的 Run,记 CoreEvent 和请求;再把检入的 `scenarios/abi_session/checkpoint.bin` 恢复成新 Session 并跑一次,记恢复报告、CoreEvent 和请求 |
 | Zig 源码 API | `zig_api/metacodes-core.txt` | 第一行 `zig: <版本>` 记生成快照的 Zig;从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;别名记录目标函数的原型或目标常量的值;超过 600 字节的值记长度和摘要 |
 | 发给模型的请求 | `scenarios/<场景>/expected/request-NNN.txt` | 已安装的 CLI 跑场景,回放 mock provider 收到的请求头和完整请求体 |
@@ -131,7 +131,7 @@ SIGINT 只能发在流式读正文期间:等响应头时,或正文发到一半�
 日期加时间 → `<TIMESTAMP>`;本机的 `Platform: <值>`、`OS Version: <uname>` 只换这个值本身,
 后面的字节保留;键名以 `_ms`、`_ns`、`_at`、`_unix`、`Nano` 结尾的数字和 `content_bytes`
 → `<N>`;`trace_id` 的字符串值 → `<ID>`;UUID → `<UUID>`;16 位以上含数字的十六进制串 →
-`<HEXn>`(`offer-` 后面的 offer id 是固定的,保留);日志前缀里的 `req=<请求号>` → `req=<ID>`。
+`<HEXn>`(`offer-` 后面的 offer id 是固定的,保留);日志前缀 `[... req=<十六进制请求号>]` 里的请求号 → `<ID>`,正文里的 `req=` 不动。
 请求体在每个 `{`、`[`、`,` 之后和字符串里每个 `\n` 转义之后断行,去掉所有换行就是原始字节。
 
 改动确实要改变契约时,显式更新快照,并把快照的 diff 和代码放进同一个 PR:

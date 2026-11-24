@@ -12,7 +12,7 @@ pub const Rules = struct {
 const volatile_number_suffixes = [_][]const u8{ "_ms", "_ns", "_at", "_unix", "Nano" };
 const volatile_number_keys = [_][]const u8{"content_bytes"};
 const volatile_string_keys = [_][]const u8{"trace_id"};
-const volatile_token_prefixes = [_][]const u8{" req="};
+const log_request_id_prefix = " req=";
 
 pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
     var current = try gpa.dupe(u8, input);
@@ -30,7 +30,7 @@ pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
         replaceTimestamps,
         replaceVolatileNumbers,
         replaceVolatileStrings,
-        replaceVolatileTokens,
+        replaceLogRequestIds,
         replaceUuids,
         replaceHexRuns,
     };
@@ -173,25 +173,21 @@ fn replaceVolatileStrings(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
     return current;
 }
 
-fn replaceVolatileTokens(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
-    var current = try gpa.dupe(u8, s);
-    for (volatile_token_prefixes) |prefix| {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        var rest: []const u8 = current;
-        while (std.mem.indexOf(u8, rest, prefix)) |at| {
-            const start = at + prefix.len;
-            var end = start;
-            while (end < rest.len and std.ascii.isAlphanumeric(rest[end])) end += 1;
-            try out.appendSlice(gpa, rest[0..start]);
-            if (end > start) try out.appendSlice(gpa, "<ID>");
-            rest = rest[end..];
-        }
-        try out.appendSlice(gpa, rest);
-        gpa.free(current);
-        current = try out.toOwnedSlice(gpa);
+fn replaceLogRequestIds(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var rest: []const u8 = s;
+    while (std.mem.indexOf(u8, rest, log_request_id_prefix)) |at| {
+        const start = at + log_request_id_prefix.len;
+        var end = start;
+        while (end < rest.len and isHex(rest[end])) end += 1;
+        const is_log_prefix = end > start and end < rest.len and rest[end] == ']';
+        try out.appendSlice(gpa, rest[0..start]);
+        if (is_log_prefix) try out.appendSlice(gpa, "<ID>") else try out.appendSlice(gpa, rest[start..end]);
+        rest = rest[end..];
     }
-    return current;
+    try out.appendSlice(gpa, rest);
+    return out.toOwnedSlice(gpa);
 }
 
 fn uuidLen(s: []const u8, at: usize) usize {
