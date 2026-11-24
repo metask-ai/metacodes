@@ -7,6 +7,7 @@ METACODES_PY_SDK_REQUIRE_LIB=1, which CI sets so a missing library fails.
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tempfile
@@ -33,6 +34,18 @@ def _library_available() -> bool:
 REQUIRE = os.environ.get("METACODES_PY_SDK_REQUIRE_LIB") == "1"
 if not _library_available() and not REQUIRE:
     raise unittest.SkipTest("AgentCore shared library not found; set METACODES_AGENTCORE_LIB")
+
+
+RESTART_AFTER_STREAM_CUT = (
+    "Your previous response was cut off mid-stream and none of it was kept. Answer ag"
+    "ain from the start and get to the point: reason briefly, then give the response or make a tool call."
+)
+
+
+def with_restart_request(request):
+    expected = copy.deepcopy(request)
+    expected["messages"][-1]["content"].append({"type": "text", "text": RESTART_AFTER_STREAM_CUT})
+    return expected
 
 
 class PythonSdkTest(unittest.TestCase):
@@ -114,7 +127,7 @@ class PythonSdkTest(unittest.TestCase):
         self.assertIsNone(result.model_error)
         # The same request went out twice.
         self.assertEqual(len(provider.requests), 2)
-        self.assertEqual(provider.requests[0], provider.requests[1])
+        self.assertEqual(with_restart_request(provider.requests[0]), provider.requests[1])
         payloads = {}
         for event in events:
             tag, payload = next(iter(event.items()))
@@ -148,7 +161,7 @@ class PythonSdkTest(unittest.TestCase):
                     session.run("think", stream_retry_budget=_native.MAX_STREAM_RETRY_BUDGET + 1)
         self.assertEqual(result.stop_reason, "api_error")
         self.assertEqual(len(provider.requests), 2)
-        self.assertEqual(provider.requests[0], provider.requests[1])
+        self.assertEqual(with_restart_request(provider.requests[0]), provider.requests[1])
         payloads = {}
         for event in events:
             tag, payload = next(iter(event.items()))

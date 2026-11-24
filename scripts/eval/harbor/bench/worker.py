@@ -35,6 +35,8 @@ def command(spec):
         argv += ["--ak", "account_gateway=" + spec["account_gateway"]]
     if spec.get("reasoning_effort"):
         argv += ["--ak", "reasoning_effort=" + spec["reasoning_effort"]]
+    if spec.get("max_tokens"):
+        argv += ["--ak", "max_tokens=" + str(spec["max_tokens"])]
     if spec.get("features"):
         argv += ["--ak", "features=" + ",".join(spec["features"])]
     if spec.get("model_price"):

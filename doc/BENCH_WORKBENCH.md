@@ -1525,7 +1525,10 @@ Jobs refresh every ten seconds while active; per-trial trajectories become
 available when Harbor copies the agent logs back from the container.
 
 The run endpoint (`POST /api/runs`) accepts `suite`, `tasks`, `model`,
-`attempts`, `concurrency` and `features` (names from the 高级功能 list); the original `dataset:
+`attempts`, `concurrency`, `features` (names from the 高级功能 list) and an optional
+`max_tokens` (1024–131072), the output-token cap of each model request; `POST
+/api/profiles/run` takes the same `max_tokens` for every suite it queues. Without it
+metacodes uses the model's own cap (WorkBuddy runs keep 32768). The original `dataset:
 "terminal-bench/terminal-bench-2-1"` field is still accepted and means
 `suite: "terminal-bench-2.1"`. It takes task/model selections, not shell
 commands, paths, keys, or arbitrary Harbor flags. Full task names are passed as separate argv
