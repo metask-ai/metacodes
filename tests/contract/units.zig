@@ -30,9 +30,9 @@ test "runtime environment values are replaced only where they occur, keeping wha
     );
 }
 
-test "numbers under timing keys become <N>, also inside escaped JSON" {
+test "numbers under timing keys become <N>, but not inside escaped JSON that a model reads" {
     try expectApplied("{\"elapsed_ms\":17,\"turns\":2}", .{}, "{\"elapsed_ms\":<N>,\"turns\":2}");
-    try expectApplied("\"{\\\"elapsed_ms\\\":3}\"", .{}, "\"{\\\"elapsed_ms\\\":<N>}\"");
+    try expectApplied("\"{\\\"elapsed_ms\\\":3}\"", .{}, "\"{\\\"elapsed_ms\\\":3}\"");
     try expectApplied("{\"startTimeUnixNano\":\"1795\",\"last_modified_ns\":9}", .{}, "{\"startTimeUnixNano\":\"<N>\",\"last_modified_ns\":<N>}");
     try expectApplied("{\"bytes\":12,\"content_bytes\":145}", .{}, "{\"bytes\":12,\"content_bytes\":<N>}");
 }

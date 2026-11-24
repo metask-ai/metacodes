@@ -42,7 +42,7 @@ Today's date is <DATE>. Time zone: UTC (UTC+00:00).\n
 {
 "type":"tool_result",
 "tool_use_id":"toolu_01",
-"content":"{\"error\":{\"code\":\"permission_denied\",\"category\":\"safety\",\"detail\":\"tool 'Read' denied by permission rule or permission mode\",\"recoverable\":false}}",
+"content":"{\"error\":{\"code\":\"unknown_tool\",\"category\":\"user_error\",\"detail\":\"tool 'Read' is not offered in this session; call only the tools this request lists\",\"recoverable\":true}}",
 "is_error":true}]}],
 "system":"You are MetaCode, a local CLI agent for software engineering.\n
 \n
