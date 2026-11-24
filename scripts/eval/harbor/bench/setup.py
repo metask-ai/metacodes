@@ -824,6 +824,42 @@ def step_node(s: Setup):
     return "done", f"metacodes {info['version']} 节点（{where}，{info['host']}），发行包 {remote_bundle}"
 
 
+UPGRADE_LABELS = {"unsupported": "由启动它的旧版驱动跑完", "refused": "这次没有换驱动",
+                  "failed": "换驱动失败，原驱动继续运行"}
+
+
+def step_runs(s: Setup):
+    """Hand the runs going on at the executor to the node just installed
+    (`bench node upgrade`): Harbor and model requests go on, and the
+    workbench attaches to the new driver. A run whose driver predates hot
+    upgrade, or one the handoff fails for, goes on with its own driver."""
+    s.require_shell()
+    runs = s.executor.remote("runs")
+    if s.dry_run:
+        s.note_action(f"metacodes bench node upgrade {runs}：正在运行的评测换用新版本的驱动，不中断")
+        return "planned", "正在运行的评测将换用新版本的驱动"
+    done = s.run(executors.node_argv(s.executor, "upgrade", runs), mutate=True, timeout=600)
+    outcomes = []
+    for line in (done.stdout or "").splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("run"), str):
+            outcomes.append(value)
+    if done.returncode not in (0, 1) and not outcomes:
+        raise Failed(f"节点没能处理正在运行的评测（退出码 {done.returncode}）")
+    if not outcomes:
+        return "ok", "没有正在运行的评测"
+    upgraded = sum(1 for o in outcomes if o.get("result") == "upgraded")
+    parts = [f"{upgraded} 个运行已换用新版本驱动"] if upgraded else []
+    for outcome in outcomes:
+        if outcome.get("result") != "upgraded":
+            note = UPGRADE_LABELS.get(outcome.get("result"), str(outcome.get("result")))
+            parts.append(f"{outcome['run']}：{note}" + (f"（{outcome['message']}）" if outcome.get("message") else ""))
+    return ("done" if upgraded else "ok"), "；".join(parts)
+
+
 # ----------------------------------------------------------------- network (ssh executors)
 
 # What the network step probes from the executor, and the mirror it proposes
@@ -1120,6 +1156,7 @@ def plan(s: Setup):
     steps += [("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]
     if s.remote:
         steps += [("node", "metacodes 节点", step_node),
+                  ("runs", "正在运行的评测（换用新驱动）", step_runs),
                   ("egress", "容器出网（经工作台）", step_egress),
                   ("workbench_harbor", "工作台 Harbor（注册表评测集）", step_workbench_harbor)]
     steps += [("psycopg", "psycopg（PostgreSQL 存储）", step_psycopg), ("login", "Metask 登录", step_login)]

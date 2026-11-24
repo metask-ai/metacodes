@@ -89,6 +89,10 @@ pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
 /// manual /retry finished the same request in 18.7 s.
 pub const STREAM_RETRIES_PER_REQUEST: u8 = 1;
 
+pub const CONTINUE_AFTER_TRUNCATION = "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.";
+pub const RESPOND_AFTER_SILENT_TRUNCATION = "Your previous response reached the output token limit before producing any visible output. Stop deliberating: give a brief response or make a tool call right away.";
+pub const RESTART_AFTER_STREAM_CUT = "Your previous response was cut off mid-stream and none of it was kept. Answer again from the start and get to the point: reason briefly, then give the response or make a tool call.";
+
 /// How long a re-issue of an attempt that showed output waits after its
 /// `retry_notice` (#461). Short: the connection already died once, and the
 /// wait is there so a gateway that is restarting is not hit at once. The wait
@@ -3025,6 +3029,7 @@ fn runCounted(
         // retry produces a *different* Provider response, so it opens a new
         // candidate rather than continuing the abandoned one.
         var candidate_attempt: u32 = 0;
+        var stream_cut_nudged = false;
         // The candidate currently open, and whether it is still unsettled.
         // Declared at turn scope because the commit-or-discard decision lives
         // after `break :request_recovery`, and it is the decision the boundary
@@ -3903,6 +3908,10 @@ fn runCounted(
                         failed_streams,
                         @tagName(allowance),
                     });
+                    if (showed_output and !stream_cut_nudged) {
+                        stream_cut_nudged = true;
+                        try conversation.appendHostText(RESTART_AFTER_STREAM_CUT);
+                    }
                     if (showed_output) {
                         // Every attempt this request may make: the first, its
                         // own re-issue (when this failure qualifies for it or
@@ -4140,7 +4149,7 @@ fn runCounted(
                 log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d} (run total {d})", .{ continuation_streak, MAX_CONTINUATIONS, continuations.* });
                 // L4 诊断:续写。
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuation_streak, .max = MAX_CONTINUATIONS } });
-                try conversation.appendHostText("Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
+                try conversation.appendHostText(if (assistant_text.items.len == 0) RESPOND_AFTER_SILENT_TRUNCATION else CONTINUE_AFTER_TRUNCATION);
                 continuation_pending = true;
                 continue;
             }
@@ -9433,6 +9442,11 @@ test "max_tokens_exhausted is an explicit terminal stop with or without visible 
         // Each response with text is committed as an assistant message
         // between the host's continuation prompts.
         try std.testing.expectEqual(@as(usize, if (text.len == 0) 4 else 8), conversation.len());
+        const nudge = conversation.messages.items[if (text.len == 0) 1 else 2].blocks;
+        try std.testing.expectEqualStrings(
+            if (text.len == 0) RESPOND_AFTER_SILENT_TRUNCATION else CONTINUE_AFTER_TRUNCATION,
+            nudge[nudge.len - 1].text,
+        );
         try std.testing.expectEqualSlices(
             output_semantics.Disposition,
             &.{ .continued, .continued, .continued, .partial },

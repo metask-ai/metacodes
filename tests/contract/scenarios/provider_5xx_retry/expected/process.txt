@@ -1,0 +1,5 @@
+exit: 0
+requests: 3
+--- stderr
+[31m[ERROR client req=<ID>][0m HTTP 500 internal_server_error: body={"type":"error","error":{"type":"api_error","message":"Internal server error"}}
+[31m[ERROR client req=<ID>][0m HTTP 503 service_unavailable: body={"type":"error","error":{"type":"api_error","message":"Service unavailable"}}
