@@ -121,7 +121,7 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 出现后发 SIGINT)、`interrupt_awaiting_head`(provider 收到请求后一个字节都不回,请求到达后发
 SIGINT)、`interrupt_stalled_stream`(provider 发完第一段文字后不再发字节,也不关连接,stdout 出现
 `text` 事件后发 SIGINT)。provider 的状态行、断流、沉默和事件间隔写在 `contract_test.zig` 的
-`scenarios` 里。发 SIGINT 的场景要求 CLI 在 3 秒内退出,否则失败;快照里不记耗时。
+`scenarios` 里。发 SIGINT 的场景要求 CLI 在 1 秒内退出:超时就杀掉并回收 CLI,测试失败;快照里不记耗时。
 每个场景目录里放输入:`sse-NNN.txt` 是 provider 依次回的响应正文(状态行不是 200 时是 JSON 错误体),`work/` 复制到工作目录,
 `state/` 复制到 state 目录(其中 `<MOCK_MCP>` 换成 mock MCP 的路径)。CLI 在 `/tmp` 下的
 工作目录里用 `env -i` 跑,`TZ=UTC`;测试进程本身也设 `TZ=UTC`、`SHELL=/bin/sh`。

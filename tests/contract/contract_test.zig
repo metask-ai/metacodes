@@ -176,7 +176,7 @@ fn runCli(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []co
 }
 
 const interrupt_deadline_ms = 60_000;
-const interrupted_exit_limit_ms = 3_000;
+const interrupted_exit_limit_ms = 1_000;
 
 fn runCliInterrupted(scratch: *Scratch, env: Env, server: *harness.MockServer, extra_env: []const []const u8, args: []const []const u8, interrupt: Interrupt) !Run {
     const a = scratch.arena();
@@ -198,23 +198,32 @@ fn runCliInterrupted(scratch: *Scratch, env: Env, server: *harness.MockServer, e
         try waitForInterruptPoint(scratch, server, stdout_path, interrupt);
         const interrupted_at = cc.util_time.nowMs();
         try std.posix.kill(child.id.?, .INT);
-        const term = try child.wait(io);
-        const exit_ms = cc.util_time.nowMs() - interrupted_at;
-        if (exit_ms > interrupted_exit_limit_ms) {
-            std.debug.print("the CLI took {d}ms to exit after SIGINT (limit {d}ms)\n", .{ exit_ms, interrupted_exit_limit_ms });
-            return error.InterruptTooSlow;
-        }
-        break :exit switch (term) {
-            .exited => |code| @as(i32, code),
-            .signal => |signal| 128 + @as(i32, @intCast(@intFromEnum(signal))),
-            else => return error.ChildStoppedUnexpectedly,
-        };
+        break :exit try waitExitWithin(child.id.?, interrupted_at + interrupted_exit_limit_ms);
     };
     return .{
         .exit_code = exit_code,
         .stdout = try std.Io.Dir.cwd().readFileAlloc(io, stdout_path, a, .limited(64 << 20)),
         .stderr = try std.Io.Dir.cwd().readFileAlloc(io, stderr_path, a, .limited(64 << 20)),
     };
+}
+
+fn waitExitWithin(pid: std.posix.pid_t, deadline_ms: i64) !i32 {
+    while (true) : (cc.util_time.sleepMs(5)) {
+        var status: c_int = 0;
+        const reaped = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        if (reaped < 0) return error.WaitFailed;
+        if (reaped == pid) {
+            const raw: u32 = @bitCast(status);
+            if (std.c.W.IFEXITED(raw)) return std.c.W.EXITSTATUS(raw);
+            if (std.c.W.IFSIGNALED(raw)) return 128 + @as(i32, @intCast(@intFromEnum(std.c.W.TERMSIG(raw))));
+            return error.ChildStoppedUnexpectedly;
+        }
+        if (cc.util_time.nowMs() >= deadline_ms) {
+            std.posix.kill(pid, .KILL) catch {};
+            std.debug.print("the CLI did not exit within {d}ms of SIGINT\n", .{interrupted_exit_limit_ms});
+            return error.InterruptTooSlow;
+        }
+    }
 }
 
 fn waitForInterruptPoint(scratch: *Scratch, server: *harness.MockServer, stdout_path: []const u8, interrupt: Interrupt) !void {
