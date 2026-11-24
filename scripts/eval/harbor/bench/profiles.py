@@ -42,6 +42,7 @@ NAME_LIMIT = 80
 PROFILE_ACTIVE = ("queued", "running", "cancelling")
 LEGACY_BATCHES_DIR = ".bench-batches"
 ITEM_DONE = ("finished", "failed", "cancelled", "interrupted", "skipped")
+FINAL_RELEASE = re.compile(r"^v?\d+\.\d+\.\d+$")
 DEV_NAME = re.compile(r"^metacodes-dev-([0-9a-f]{7,40}|worktree)-")
 
 
@@ -214,11 +215,13 @@ def default_name(record: Dict[str, Any]) -> str:
     """How the page names a profile nobody named: `profile-<version>-<bits>`,
     one bit per advanced feature in the order the page lists them."""
     metacodes = record.get("metacodes") or {}
-    release, commit = metacodes.get("release"), metacodes.get("commit")
-    if commit and metacodes.get("label") != release:
+    release, label = str(metacodes.get("release") or ""), str(metacodes.get("label") or "")
+    commit = metacodes.get("commit") or (release.split("+", 1)[1] if "+" in release else None)
+    development = not FINAL_RELEASE.match(release) or label.startswith(("dev ", "git "))
+    if development and commit:
         version = str(commit)[:8]
     else:
-        version = str(release or metacodes.get("label") or str(metacodes.get("digest") or "")[:8])
+        version = release or label or str(metacodes.get("digest") or "")[:8]
     features = record.get("features") or []
     bits = "".join("1" if name in features else "0" for name in ADVANCED_FEATURES)
     return f"profile-{version}-{bits}"

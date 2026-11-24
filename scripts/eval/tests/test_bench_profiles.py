@@ -266,6 +266,18 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(name(label='v0.12.0', release='v0.12.0', commit='0123456789ab'), 'profile-v0.12.0-100000000')
         self.assertEqual(name(label='dev 0123456789ab（基于 v0.12.0）', release='v0.12.0', commit='0123456789ab'),
                          'profile-01234567-100000000')
+        self.assertEqual(name(label='0.0.0-dev+0123456789ab', release='0.0.0-dev+0123456789ab', commit='0123456789ab'),
+                         'profile-01234567-100000000')
+        self.assertEqual(name(label='0.0.0-dev+0123456789ab', release='0.0.0-dev+0123456789ab'),
+                         'profile-01234567-100000000')
+
+    def test_a_dev_bundle_in_a_plain_directory_is_named_by_its_commit(self):
+        atomic_json(self.root / 'bundle' / 'manifest.json',
+                    {'target': {'os': 'linux'}, 'release': {'version': '0.0.0-dev+0123456789ab', 'channel': 'pre'},
+                     'source': {'commit': '0123456789ab'}})
+        created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        self.assertEqual(created['default_name'], 'profile-01234567-000000000')
+        self.wait_profile(created['id'])
 
     def test_a_profile_can_be_renamed_while_running_and_after_it_ends(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
