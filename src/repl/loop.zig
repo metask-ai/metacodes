@@ -30,6 +30,7 @@ const test_integrity_mod = @import("../core/test_integrity.zig");
 const stall_gate_mod = @import("../core/stall_gate.zig");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
 const input = @import("input.zig");
+const copy_select = @import("tui/copy_select.zig");
 const complete = @import("complete.zig");
 const paste_mod = @import("paste.zig");
 const history_mod = @import("history.zig");
@@ -2039,6 +2040,16 @@ fn readLineRaw(
 
             break :blk parser.feedRead(fd, b[0]) orelse continue;
         };
+
+        switch (copy_select.handle(allocator, region, key)) {
+            .not_mine => region.ui.phase.input.copied = false,
+            .consumed => continue,
+            .copied => {
+                region.ui.phase.input.copied = true;
+                redraw(region, &editor, app);
+                continue;
+            },
+        }
 
         if (vim_keys) {
             region.setInput(editor.view(), editor.cursor);

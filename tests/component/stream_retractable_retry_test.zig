@@ -42,7 +42,7 @@ const ANTHROPIC_THINKING_TEXT_THEN_EOF = ANTHROPIC_THINKING_THEN_EOF ++
 const ANTHROPIC_TEXT_THEN_ERROR = ANTHROPIC_START ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"looks finished\"}}\n\n" ++
-    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}\n\n";
 
 const ANTHROPIC_COMPLETE = ANTHROPIC_START ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++

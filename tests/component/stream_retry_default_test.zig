@@ -36,7 +36,7 @@ const THINKING_THEN_EOF = START ++
 const TEXT_THEN_ERROR = START ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL_SENTINEL\"}}\n\n" ++
-    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}\n\n";
 
 /// A tool call whose arguments were still streaming when the body ended.
 const TOOL_ARGS_THEN_EOF = START ++

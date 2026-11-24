@@ -423,6 +423,10 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None, s
         elif ev.startswith("raw:"):
             write(ev[4:].encode("latin-1", "ignore").decode("unicode_escape").encode("latin-1"))
             cap.drain_settle(per_key_drain, QUIET_KEY)
+        elif ev.startswith("select:"):
+            text, _, t = ev[7:].rpartition(":")
+            _drag_over(cap, write, text, float(t))
+            cap.drain_settle(per_key_drain, QUIET_KEY)
         elif ev in ("signal:stopcont", "signal:stopcont:cooked"):
             if signal_child is None:
                 raise RuntimeError("signal:stopcont is only supported by the POSIX PTY driver")
@@ -433,6 +437,28 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None, s
                 raise RuntimeError(f"{ev} is only supported by the POSIX PTY driver")
             send_signal(ev[7:])
             cap.drain_settle(per_key_drain, QUIET_KEY)
+
+
+def _drag_over(cap, write, text, timeout):
+    end = time.time() + timeout
+    while not cap.screen_has(text):
+        if time.time() >= end or cap.eof:
+            raise AssertionError(f"select: {text!r} not on the screen within {timeout}s")
+        cap._pump(0.1)
+    sc = cap._screen
+    row = sc.find_row(text)
+    first = sc.line_text(row).index(text) + 1
+    last = first + len(text) - 1
+    asked = cap.out.count(b"\x1b[6n")
+    write(f"\x1b[<0;{first};{row + 1}M".encode())
+    while cap.out.count(b"\x1b[6n") == asked:
+        if time.time() >= end or cap.eof:
+            raise AssertionError("select: the program sent no cursor query after the press")
+        cap._pump(0.05)
+    cap.screen_has("")
+    write(f"\x1b[{sc.row + 1};{sc.col + 1}R".encode())
+    write(f"\x1b[<32;{last};{row + 1}M".encode())
+    write(f"\x1b[<0;{last};{row + 1}m".encode())
 
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
@@ -462,6 +488,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
                          (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)
       "raw:..."          原样字节(用 \\xNN 转义)
+      "select:TEXT:N"    左键拖过屏幕上第一处 TEXT(ASCII,SGR 鼠标报告),并按虚拟屏幕的光标应答
+                         程序的 DSR 6n;N 秒内 TEXT 没上屏或程序没发查询则抛 AssertionError
       "resize-now:RxC"   改窗口后只收 20ms(resize: 收 0.2s):把 resize 塞进一个按键序列的字节之间
       "signal:stopcont"  POSIX-only: stop and continue the child process
       "signal:stopcont:cooked"  同上,停住期间把 pty 改回 canonical(像 shell 那样)

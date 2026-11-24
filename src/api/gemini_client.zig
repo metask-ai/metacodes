@@ -659,8 +659,7 @@ const GeminiStream = struct {
         // 旧实现当空 chunk 跳过,随后没收尾就结束 → StreamIncomplete,答复被当成断流。
         if (util_json.topLevelObjectField(data, "error")) |err_obj| {
             self.done = true;
-            client_mod.reportServerError("gemini", self.id, err_obj, self.credential);
-            return error.ApiError;
+            return client_mod.reportServerError("gemini", self.id, err_obj, self.credential);
         }
         const report = stopReport(data);
         if (report.finish_reason) |fr| {

@@ -5123,15 +5123,17 @@ test "L2 invalid model is a recoverable provider outcome through the public faca
 }
 
 test "L2 unnamed Provider HTTP 529 crosses AgentCore ABI without killing the Host" {
+    var attempts = try EnvOverride.set("CLAUDE_CODE_MAX_RETRIES", "2");
+    defer attempts.restore();
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
-    var server = try harness.MockServer.startWithStatus(
+    var server = try harness.MockServer.startRepeatingStatus(
         "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}",
-        0,
         "HTTP/1.1 529 Site Overloaded",
+        "",
     );
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -5174,7 +5176,7 @@ test "L2 unnamed Provider HTTP 529 crosses AgentCore ABI without killing the Hos
     );
     fixture.session = null;
     fixture.releaseDiagnostic();
-    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
 // --- issue #408: why a Run stopped with STOP_API_ERROR -----------------------
@@ -5341,12 +5343,14 @@ test "L2 #408 rate limit: retry-after and the attempts spent reach the Host" {
 }
 
 test "L2 #408 service overload: an unnamed status keeps its meaning" {
-    var server = try harness.MockServer.startWithStatus(
+    var server = try harness.MockServer.startRepeatingStatus(
         "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}",
-        0,
         "HTTP/1.1 529 Site Overloaded",
+        "",
     );
     defer server.stop();
+    var attempts = try EnvOverride.set("CLAUDE_CODE_MAX_RETRIES", "2");
+    defer attempts.restore();
     try expectModelFailure(server, .{ .expected = .{
         .category = .overloaded,
         .code = "overloaded_error",
@@ -5354,7 +5358,9 @@ test "L2 #408 service overload: an unnamed status keeps its meaning" {
         .message = "provider overloaded",
         .http_status = 529,
         .retry = .retryable,
+        .attempts = 2,
     } });
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
 }
 
 /// Set for one test and restored; the Session reads these when it is created.
@@ -15605,7 +15611,7 @@ const THINKING_THEN_ERROR_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"THINKING_SENTINEL\"}}\n\n" ++
-    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}\n\n";
 
 /// What a Host sees, decoded through the public SDK: every tag in order, and
 /// one line per event a Host acts on to take back or rebuild output.

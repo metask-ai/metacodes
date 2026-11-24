@@ -115,7 +115,7 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 `permission_denied`(无人确认时 Write 被拒、规则禁止 Bash)、`subagent`(Task 派 Explore)、`mcp_tool`
 (stdio mock MCP 的 echo)、`skill_activation`(项目 skill)、`compaction`(强制自动压缩)。
 错误和取消场景:`provider_4xx`(400,不重试)、`provider_5xx_retry`(500、503 后 200,重试成功)、
-`provider_529`(529 现在按普通 HTTP 错误处理,不重试,快照记的是这个现状)、`sse_cut`(第一次响应
+`provider_529`(529 按过载重试,`CLAUDE_CODE_MAX_RETRIES=2` 下两次都是 529,用完重试次数后失败)、`provider_529_retry`(529 后 200,重试成功)、`provider_overloaded_event`(200 的流里先来 `overloaded_error` 错误帧,同一轮重发后完成)、`sse_cut`(第一次响应
 只发一半 SSE 就断开,重试后完成)、`user_interrupt`(provider 每秒发一个 SSE 事件,stdout 出现第一个
 `usage` 事件后给 CLI 发 SIGINT)、`tool_abort`(Bash 跑 `touch started && sleep 30`,`started`
 出现后发 SIGINT)、`interrupt_awaiting_head`(provider 收到请求后一个字节都不回,请求到达后发

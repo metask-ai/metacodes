@@ -164,6 +164,17 @@ first would have to come with a change to this record.
   (input phase) or frozen (exclusive overlay), with the same climb + ED 0
   erase.
 
+### Copy on select
+
+With the `copy_on_select` preview feature, `screen_mirror` keeps a copy of
+the main screen: the Renderer's `flush`, the command output and the region
+dialogs feed it the bytes they write, and it applies the subset of VT the
+REPL sends. It writes nothing. A drag asks for the cursor position
+(`ESC[6n`) and sends the copied text as OSC 52, both through
+`emitTerminal`; neither moves the cursor or touches the grid. The mirror
+records its own cursor row when it sees the query, and the answer gives the
+row's place on the screen.
+
 ### Review checklist
 
 A change under `src/repl/` that writes to the terminal:

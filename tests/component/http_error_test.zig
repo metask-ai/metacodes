@@ -103,7 +103,7 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     try std.testing.expect(std.mem.indexOf(u8, log_content, "BADKEY42") != null);
 }
 
-test "L2 Provider unnamed HTTP 529 returns HttpError without killing the process" {
+test "L2 Provider unnamed HTTP 529 is ServiceUnavailable without killing the process" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startWithStatus(
         "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}",
@@ -129,7 +129,7 @@ test "L2 Provider unnamed HTTP 529 returns HttpError without killing the process
 
     const empty_messages: []const cc.types_mod.ApiMessage = &.{};
     try std.testing.expectError(
-        error.HttpError,
+        error.ServiceUnavailable,
         client.sendMessageStream(empty_messages, null, null),
     );
 
@@ -144,7 +144,7 @@ test "L2 Stage6: SSE error 帧 → error.ApiError(非 RequestFailed)" {
 
     const ERROR_SSE =
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
-        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"server overloaded\"}}\n\n";
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}\n\n";
 
     var srv = try harness.MockServer.start(ERROR_SSE, 0);
     defer srv.stop();
@@ -168,6 +168,31 @@ test "L2 Stage6: SSE error 帧 → error.ApiError(非 RequestFailed)" {
     // drain 应在 error 帧处抛 error.ApiError(不是 RequestFailed)。
     const drain_result = drainStream(&resp);
     try std.testing.expectError(error.ApiError, drain_result);
+}
+
+test "L2 SSE overloaded_error frame is ServiceUnavailable, the same error as HTTP 529" {
+    const a = std.testing.allocator;
+
+    const ERROR_SSE =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+    var srv = try harness.MockServer.start(ERROR_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-3-5-haiku-20241022", url);
+    defer client.deinit();
+
+    const empty_messages: []const cc.types_mod.ApiMessage = &.{};
+    var resp = try client.sendMessageStream(empty_messages, null, null);
+    defer resp.deinit();
+    try std.testing.expectError(error.ServiceUnavailable, drainStream(&resp));
 }
 
 test "L2 AutoCompact: HTTP context-window-exceeded body → error.ContextWindowExceeded" {
