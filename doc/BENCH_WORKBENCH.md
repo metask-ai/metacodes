@@ -835,15 +835,20 @@ without interrupting it:
   its exit status from the run directory.
 - The relay's TLS key and CA are in `runs/<name>/relay-tls/` (owner only),
   so the CA path Harbor gave the containers stays valid. The old driver
-  passes the relay's and the egress forwarder's listening sockets to the new
-  one over a Unix socket next to the attach socket (SCM_RIGHTS): the
-  address does not change and no connection is refused. The new driver
-  takes over the current access token, the placeholders and the request
-  counter.
-- The old driver stops accepting and finishes the requests it had already
-  accepted (a streaming model response completes), then exits. Its session
-  gets a `handoff` event, and the worker attaches to the new driver, with a
-  fresh token and egress tunnel port, while the old session ends by itself.
+  passes every listening socket of the run to the new one over a Unix
+  socket next to the attach socket (SCM_RIGHTS): the relay, the egress
+  forwarder, the attach socket and that handoff socket itself. Nothing is
+  bound again, no address changes and no connection is refused, and the new
+  driver serves them all before it reports the takeover. It also takes over
+  the current access token, the placeholders and the request counter.
+- The old driver stops accepting and finishes what it had accepted, however
+  long it takes: TLS handshakes and requests in progress (a streaming model
+  response completes), and forwarded connections until they have moved no
+  data for 60 seconds. A keep-alive connection idle between requests does
+  not hold it. Its session gets a `handoff` event, and the worker attaches
+  to the new driver with a fresh token and egress tunnel port. The old
+  driver, and with it the old session and its tunnel, ends only once the new
+  driver has its own tunnel, so container egress has a path throughout.
 - A handoff that fails before the old driver let go (another handoff
   version, the new driver dying, a run already ending or being cancelled)
   leaves the run with the old driver. Runs started by a driver from before

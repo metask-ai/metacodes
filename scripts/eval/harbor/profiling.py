@@ -353,8 +353,10 @@ class TimingRelay:
         self.sequence = sequence
         self.cert_dir = None
         self.ca_path = None
+        # Connections in a TLS handshake, before their first request or in
+        # one: all but those idle between keep-alive requests.
         self.connections = threading.Condition()
-        self.open = 0
+        self.busy = set()
         self.draining = False
         self.serving = None
         owner = self
@@ -369,20 +371,24 @@ class TimingRelay:
                     self.request.do_handshake()
                     self.request.settimeout(1800)
                 super().setup()
-                with owner.connections:
-                    owner.open += 1
 
             def finish(self):
                 try:
                     if self.upstream:
                         self.upstream.close()
                 finally:
-                    try:
-                        super().finish()
-                    finally:
-                        with owner.connections:
-                            owner.open -= 1
-                            owner.connections.notify_all()
+                    super().finish()
+
+            def handle(self):
+                self.close_connection = True
+                self.handle_one_request()
+                while not self.close_connection:
+                    owner.mark(self.request, False)  # idle until the next request line
+                    self.handle_one_request()
+
+            def parse_request(self):
+                owner.mark(self.request, True)
+                return super().parse_request()
 
             def do_GET(self):
                 self.forward(False)
@@ -519,7 +525,14 @@ class TimingRelay:
                     except Exception:
                         connection.close()
                         raise
+                owner.mark(connection, True)
                 return connection, address
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    owner.mark(request, False)
 
             def handle_error(self, request, client_address):
                 if not isinstance(sys.exc_info()[1], (ssl.SSLError, TimeoutError)):
@@ -612,17 +625,26 @@ class TimingRelay:
             self.server.shutdown()
             self.serving = None
 
-    def release(self, timeout):
-        """Once a newer driver serves the listening socket: finish what this
-        relay accepted, each connection closing after its response, then
-        close this process's copy of the socket. The TLS files stay for the
-        new relay."""
+    def mark(self, connection, busy):
+        with self.connections:
+            if busy:
+                self.busy.add(connection)
+            else:
+                self.busy.discard(connection)
+                self.connections.notify_all()
+
+    def release(self):
+        """Once a newer driver serves the listening socket: finish every
+        handshake and request this relay accepted, however long a response
+        streams, each connection closing after its response, then close
+        this process's copy of the socket. A keep-alive connection idle
+        between requests does not hold it. The TLS files stay for the new
+        relay."""
         self.pause()
         self.draining = True
-        deadline = time.monotonic() + timeout
         with self.connections:
-            while self.open and time.monotonic() < deadline:
-                self.connections.wait(max(0.0, min(1.0, deadline - time.monotonic())))
+            while self.busy:
+                self.connections.wait(1.0)
         self.server.server_close()
 
 

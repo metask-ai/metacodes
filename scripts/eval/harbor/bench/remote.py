@@ -40,11 +40,10 @@ original session gone, the driver's output goes to DRIVER_LOG there.
 
 `upgrade` (run by a newer node after an update) replaces the driver of a
 running Harbor run without stopping it (Handoff): Harbor stays with its
-keeper, the new driver serves the relay's and the egress forwarder's
-listening sockets the old one passes over, with the relay's TLS files from
-the run directory, and the old one finishes the requests it had accepted.
-Its session gets a `handoff` event and attaches again, now to the new
-driver. Runs started by a driver from before this, and WorkBuddy runs, keep
+keeper, the new driver serves the listening sockets the old one passes over
+(relay, egress forwarder, attach, handoff), with the relay's TLS files from
+the run directory, and the old one finishes what it had accepted. Its
+session gets a `handoff` event and attaches again, now to the new driver. Runs started by a driver from before this, and WorkBuddy runs, keep
 their driver to the end.
 
 With `"egress"` in the spec, the driver starts the run's egress
@@ -97,8 +96,8 @@ LIMIT_FILE = "concurrency"
 # The handoff exchange between two drivers; a driver refuses any other.
 HANDOFF = 1
 HANDOFF_TIMEOUT = 30
-# How long a replaced driver waits for the requests it accepted to finish.
-DRAIN_LIMIT = 1800
+# A replaced driver ends once its forwarded connections moved no data for this long.
+DRAIN_IDLE = 60
 
 
 EMIT_LOCK = threading.Lock()
@@ -179,6 +178,40 @@ def emit(event, **fields):
             pass
 
 
+class Acceptor:
+    """Accepts on a listening socket that another driver may come to serve
+    (Handoff): polled, so pause() needs neither close() nor shutdown()."""
+
+    def __init__(self, listener, handle):
+        listener.settimeout(0.5)
+        self.listener, self.handle = listener, handle
+        self.running = threading.Event()
+        self.thread = None
+
+    def start(self):
+        self.running.set()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def loop(self):
+        while self.running.is_set() and self.thread is threading.current_thread():
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not self.running.is_set():  # accepted just as the socket was handed over
+                conn.close()
+                return
+            self.handle(conn)
+
+    def pause(self):
+        self.running.clear()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join()
+
+
 class Control:
     """The run's control channel: the session that started it, then each
     session that attaches. `lost_at` is when the current one closed."""
@@ -189,7 +222,7 @@ class Control:
         self.current = 0
         self.lost_at = None
         self.quiet = False
-        self.listener = None
+        self.acceptor = None
         self.path = None
 
     def follow(self, reader, generation):
@@ -217,39 +250,53 @@ class Control:
     def listen(self):
         """Accept attaching sessions; False when the socket cannot be bound."""
         try:
-            self.path = attach_socket(self.run_dir)
-            self.listener = listener = unix_listener(self.path)
+            listener = unix_listener(attach_socket(self.run_dir))
         except OSError:
-            self.listener = None
             return False
-
-        def accept():
-            global OUT
-            while True:
-                try:
-                    conn, _ = listener.accept()
-                except OSError:
-                    return
-                with self.lock:
-                    self.current += 1
-                    generation = self.current
-                    self.lost_at = None
-                    self.silence()
-                    with EMIT_LOCK:
-                        OUT = conn.makefile("w", encoding="utf-8")
-                threading.Thread(target=self.follow, args=(conn.makefile("rb"), generation), daemon=True).start()
-
-        threading.Thread(target=accept, daemon=True).start()
+        self.adopt(listener)
+        self.resume()
         return True
+
+    def adopt(self, listener):
+        """Serve `listener` (the attach socket) from resume() on."""
+        self.path = attach_socket(self.run_dir)
+        self.acceptor = Acceptor(listener, self.attached)
+
+    def attached(self, conn):
+        global OUT
+        with self.lock:
+            self.current += 1
+            generation = self.current
+            self.lost_at = None
+            self.silence()
+            with EMIT_LOCK:
+                OUT = conn.makefile("w", encoding="utf-8")
+        threading.Thread(target=self.follow, args=(conn.makefile("rb"), generation), daemon=True).start()
+
+    def resume(self):
+        self.acceptor.start()
+
+    def pause(self):
+        if self.acceptor is not None:
+            self.acceptor.pause()
 
     def expired(self):
         with self.lock:
             return self.lost_at is not None and time.monotonic() - self.lost_at > self.grace
 
+    def release(self):
+        """Close this process's copy of the attach socket, which a newer
+        driver now serves: its path stays."""
+        if self.acceptor is not None:
+            self.acceptor.pause()
+            self.acceptor.listener.close()
+            self.acceptor = None
+
     def close(self):
-        if self.listener is not None:
-            close_listener(self.listener, self.path)
-            self.listener = None
+        if self.acceptor is not None:
+            self.acceptor.pause()
+            close_listener(self.acceptor.listener, self.path)
+            self.acceptor = None
 
 
 def terminal(run_dir, event, **fields):
@@ -378,56 +425,42 @@ class Handoff:
     """Hands a running run to a newer driver (`upgrade`, run by a newer
     node) on the run's handoff socket, without stopping Harbor or a model
     request. The new driver asks with {"handoff": HANDOFF}; this one answers
-    with the run's state and passes the relay's and the egress forwarder's
-    listening sockets (SCM_RIGHTS); the new one answers {"ready": true}
-    once it can serve them; this one stops accepting, gives up its attach
-    and handoff sockets, says {"released": true} and tells its session
-    (`handoff` event) to attach again. It then finishes only the requests it
-    had accepted. Until the release, any failure leaves this driver running
-    the run as before."""
+    with the run's state and passes the listening sockets it serves (relay,
+    egress forwarder, attach, handoff; SCM_RIGHTS), so nothing is bound
+    again; the new one answers {"ready": true} once it can serve them all;
+    this one stops accepting, says {"released": true} and tells its session
+    (`handoff` event) to attach again. Until then any failure leaves this
+    driver running the run as before. Afterwards it finishes the requests it
+    had accepted, and keeps its session's egress tunnel until the new driver
+    reports its own ({"tunnel": true} on the same connection)."""
 
     def __init__(self, run_dir, relay=None, forwarder=None, docker_config=None, credential=None,
-                 judge_credential=None):
+                 judge_credential=None, listener=None):
         self.run_dir = run_dir
         self.relay, self.forwarder, self.docker_config = relay, forwarder, docker_config
         self.credential, self.judge_credential = credential, judge_credential
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.closed = False
-        self.listener = None
-        self.path = None
+        self.acceptor = Acceptor(listener, self.serve) if listener is not None else None
+        self.successor = None
         self.harbor = self.control = None
 
     def offer(self, harbor, control):
         self.harbor, self.control = harbor, control
-        self.listen()
-
-    def listen(self):
-        try:
-            self.path = handoff_socket(self.run_dir)
-            self.listener = listener = unix_listener(self.path)
-        except OSError:
-            print("执行机器上建不了驱动热更新用的 Unix socket，这次运行不能热更新", file=sys.stderr, flush=True)
-            return
-
-        def accept():
-            while True:
-                try:
-                    conn, _ = listener.accept()
-                except OSError:
-                    return
-                with conn:
-                    try:
-                        self.serve(conn)
-                    except (OSError, ValueError):
-                        pass
-
-        threading.Thread(target=accept, daemon=True).start()
+        if self.acceptor is None:
+            try:
+                self.acceptor = Acceptor(unix_listener(handoff_socket(self.run_dir)), self.serve)
+            except OSError:
+                print("执行机器上建不了驱动热更新用的 Unix socket，这次运行不能热更新", file=sys.stderr, flush=True)
+                return
+        self.acceptor.start()
 
     def close(self):
-        if self.listener is not None:
-            close_listener(self.listener, self.path)
-            self.listener = None
+        if self.acceptor is not None:
+            self.acceptor.pause()
+            close_listener(self.acceptor.listener, handoff_socket(self.run_dir))
+            self.acceptor = None
 
     def keep(self, running):
         """The supervising loop's check: False once the run was handed
@@ -440,9 +473,16 @@ class Handoff:
                 self.closed = True
             return True
 
-    def state(self):
+    def sockets(self):
+        named = [("relay", self.relay and self.relay.server.socket),
+                 ("forwarder", self.forwarder and self.forwarder.sock),
+                 ("attach", self.control.acceptor and self.control.acceptor.listener),
+                 ("handoff", self.acceptor.listener)]
+        return [(name, sock) for name, sock in named if sock is not None]
+
+    def state(self, names):
         lost = self.control.lost_at
-        return {"handoff": HANDOFF, "keeper": self.harbor.keeper, "harbor": self.harbor.pid,
+        return {"handoff": HANDOFF, "sockets": names, "keeper": self.harbor.keeper, "harbor": self.harbor.pid,
                 "log_offset": self.harbor.offset, "lost_for": None if lost is None else time.monotonic() - lost,
                 "credential": self.credential.current() if self.credential is not None else None,
                 "judge_credential": self.judge_credential, "docker_config": self.docker_config,
@@ -452,6 +492,16 @@ class Handoff:
                 "forwarder": None if self.forwarder is None else {"target": list(self.forwarder.target)}}
 
     def serve(self, conn):
+        try:
+            kept = self.exchange(conn)
+        except (OSError, ValueError):
+            kept = False
+        if not kept:
+            conn.close()
+
+    def exchange(self, conn):
+        """True once the run is handed over; `conn` then stays open for the
+        new driver's tunnel report."""
         conn.settimeout(HANDOFF_TIMEOUT)
         reader = conn.makefile("rb")
         request = json.loads(reader.readline() or b"null")
@@ -464,52 +514,98 @@ class Handoff:
                 refusal = None
         if refusal:
             conn.sendall(json.dumps({"refused": refusal}, ensure_ascii=False).encode() + b"\n")
-            return
-        sockets = [s for s in (self.relay and self.relay.server.socket, self.forwarder and self.forwarder.sock) if s]
-        socket.send_fds(conn, [json.dumps(self.state()).encode() + b"\n"], [s.fileno() for s in sockets])
+            return False
+        sockets = self.sockets()
+        socket.send_fds(conn, [json.dumps(self.state([name for name, _ in sockets])).encode() + b"\n"],
+                        [sock.fileno() for _, sock in sockets])
         if json.loads(reader.readline() or b"null") != {"ready": True}:
-            return
+            return False
         with self.lock:
             if self.closed:
                 conn.sendall(json.dumps({"refused": "这次运行正在结束"}, ensure_ascii=False).encode() + b"\n")
-                return
+                return False
             self.pause()
             try:
                 conn.sendall(b'{"released": true}\n')
             except OSError:
                 self.restore()
-                return
+                return False
+            # Before `done`: the supervising loop then ends, and must find no
+            # socket of its own left to close (and unlink).
+            self.successor = conn
+            self.control.release()
+            self.acceptor.listener.close()
+            self.acceptor = None
             self.done.set()
         emit("handoff")
+        return True
 
     def pause(self):
         if self.relay is not None:
             self.relay.pause()
         if self.forwarder is not None:
             self.forwarder.pause()
+        self.control.pause()
+        self.acceptor.pause()
         self.harbor.detached = True
-        self.control.close()
-        self.close()
 
     def restore(self):
         if self.relay is not None:
             self.relay.resume()
         if self.forwarder is not None:
             self.forwarder.start()
+        self.control.resume()
+        self.acceptor.start()
         self.harbor.detached = False
-        self.control.listen()
-        self.listen()
+
+    def wait_successor(self, timeout):
+        """Until the new driver has its own egress tunnel, or `timeout`."""
+        if self.successor is None:
+            return
+        try:
+            self.successor.settimeout(timeout)
+            self.successor.makefile("rb").readline()
+        except OSError:
+            pass
+        self.successor.close()
+
+
+class Predecessor:
+    """The new driver's side of the connection Handoff keeps open: reports
+    its own egress tunnel (the first `tunnel_port` a session brings), after
+    which the old driver may end and with it the old session's tunnel."""
+
+    def __init__(self, conn, forwarder):
+        self.conn, self.forwarder = conn, forwarder
+        self.lock = threading.Lock()
+
+    def retarget(self, port):
+        self.forwarder.target = ("127.0.0.1", port)
+        self.report()
+
+    def report(self):
+        with self.lock:
+            if self.conn is None:
+                return
+            try:
+                self.conn.sendall(b'{"tunnel": true}\n')
+            except OSError:
+                pass
+            self.conn.close()
+            self.conn = None
 
 
 def wind_down(handoff, relay, forwarder, docker_config):
     """The driver's end. Handed over: finish only what this process
-    accepted, and leave the run's relay, forwarder and DOCKER_CONFIG to the
-    newer driver. Otherwise remove them."""
+    accepted, keeping the egress tunnel until the newer driver has one, and
+    leave the run's relay, forwarder and DOCKER_CONFIG to it. Otherwise
+    remove them."""
     if handoff is not None and handoff.done.is_set():
         if relay is not None:
-            relay.release(DRAIN_LIMIT)
+            relay.release()
         if forwarder is not None:
-            forwarder.release(DRAIN_LIMIT)
+            handoff.wait_successor(handoff.control.grace)
+            forwarder.release(DRAIN_IDLE)
         return
     if handoff is not None:
         handoff.close()
@@ -826,67 +922,75 @@ def follow(harbor, stop, hung_up, run_dir, control, handoff, finishing):
 def take_over(spec_path, report):
     """The newer driver's side of Handoff: take the run of `spec_path` over
     from its driver, then supervise it to the end. `report(outcome)` is
-    called once, as soon as the outcome of the takeover is known."""
+    called once, as soon as the outcome of the takeover is known: only once
+    this driver serves every socket of the run."""
     run_dir = Path(spec_path).resolve().parent
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    grace = float(spec.get("detach_grace") or DETACH_GRACE)
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(HANDOFF_TIMEOUT)
-    relay = forwarder = None
+    sockets = {}
     try:
         conn.connect(handoff_socket(run_dir))
         conn.sendall(json.dumps({"handoff": HANDOFF}).encode() + b"\n")
-        data, fds, _flags, _address = socket.recv_fds(conn, 65536, 2)
-        sockets = [socket.socket(fileno=fd) for fd in fds]
+        data, fds, _flags, _address = socket.recv_fds(conn, 65536, 4)
+        received = [socket.socket(fileno=fd) for fd in fds]
         reader = conn.makefile("rb")
         if not data.endswith(b"\n"):
             data += reader.readline()
         state = json.loads(data)
         if "refused" in state:
-            for sock in sockets:
+            for sock in received:
                 sock.close()
+            conn.close()
             report({"result": "refused", "message": state["refused"]})
             return 1
+        sockets = dict(zip(state["sockets"], received))
+        relay = forwarder = None
         if state.get("relay"):
             given = state["relay"]
             relay = start_relay(spec["relay"], run_dir, state["credential"], given["token"], given.get("judge_token"),
-                                state.get("judge_credential"), listener=sockets.pop(0), sequence=given["sequence"])
+                                state.get("judge_credential"), listener=sockets["relay"], sequence=given["sequence"])
         if state.get("forwarder"):
             from scripts.eval.harbor.bench.egress import Forwarder
-            forwarder = Forwarder("", tuple(state["forwarder"]["target"]), sock=sockets.pop(0))
+            forwarder = Forwarder("", tuple(state["forwarder"]["target"]), sock=sockets["forwarder"])
+        credential = relay.credential if relay is not None else None
+        stop, hung_up = threading.Event(), threading.Event()
+        predecessor = Predecessor(None, None)
+        retarget = predecessor.retarget if forwarder is not None else None
+        control = Control(run_dir, control_lines(stop, credential, run_dir / LIMIT_FILE, retarget), grace)
+        control.adopt(sockets["attach"])
+        handoff = Handoff(run_dir, relay, forwarder, state.get("docker_config"), credential,
+                          state.get("judge_credential"), listener=sockets["handoff"])
         conn.sendall(b'{"ready": true}\n')
         if json.loads(reader.readline() or b"null") != {"released": True}:
             raise ValueError("原驱动没有交出这次运行")
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        if relay is not None:
-            relay.server.server_close()  # this copy only; the files stay
-        if forwarder is not None:
-            forwarder.sock.close()
+        for sock in sockets.values():
+            sock.close()  # this process's copies only; the old driver keeps serving
+        conn.close()
         report({"result": "failed", "message": f"{type(exc).__name__}: {exc}"})
         return 1
-    finally:
-        conn.close()
+    predecessor.conn, predecessor.forwarder = conn, forwarder
+    if forwarder is None:
+        predecessor.report()
     if relay is not None:
         relay.resume()
     if forwarder is not None:
         forwarder.start()
+    control.quiet = True  # this process writes to DRIVER_LOG until a session attaches
+    control.lost_at = time.monotonic() - (state.get("lost_for") or 0)
+    control.resume()
     claim(run_dir)
     report({"result": "upgraded", "pid": os.getpid()})
     print(f"驱动 {os.getpid()} 接管了这次运行", file=sys.stderr, flush=True)
-    credential = relay.credential if relay is not None else None
-    handoff = Handoff(run_dir, relay, forwarder, state.get("docker_config"), credential, state.get("judge_credential"))
     harbor = Harbor(run_dir, state["keeper"], state["harbor"], state["log_offset"])
-    stop, hung_up = threading.Event(), threading.Event()
-    control = Control(run_dir, control_lines(stop, credential, run_dir / LIMIT_FILE, retargeting(forwarder)),
-                      float(spec.get("detach_grace") or DETACH_GRACE))
-    control.quiet = True  # this process writes to DRIVER_LOG until a session attaches
-    control.lost_at = time.monotonic() - (state.get("lost_for") or 0)
     try:
-        if not control.listen():
-            print("执行机器上建不了重连用的 Unix socket，工作台连不回这次运行", file=sys.stderr, flush=True)
         watch_sessions(control, stop, hung_up)
         code = follow(harbor, stop, hung_up, run_dir, control, handoff, lambda: None)
         return 0 if code is None else code
     finally:
+        predecessor.report()
         control.close()
         wind_down(handoff, relay, forwarder, state.get("docker_config"))
 

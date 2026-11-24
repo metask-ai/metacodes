@@ -61,8 +61,9 @@ BASE_NO_PROXY = ("localhost", "127.0.0.1", "::1")
 
 # ------------------------------------------------------------------ plumbing
 
-def pipe(left: socket.socket, right: socket.socket) -> None:
-    """Copy bytes both ways until both directions ended; closes both."""
+def pipe(left: socket.socket, right: socket.socket, moved: Optional[Callable[[], None]] = None) -> None:
+    """Copy bytes both ways until both directions ended; closes both.
+    `moved()` is called after each chunk."""
     def one_way(source, target):
         try:
             while True:
@@ -70,6 +71,8 @@ def pipe(left: socket.socket, right: socket.socket) -> None:
                 if not chunk:
                     break
                 target.sendall(chunk)
+                if moved is not None:
+                    moved()
         except OSError:
             pass
         try:
@@ -118,7 +121,7 @@ class _Listener:
         self.closed = threading.Event()
         self.thread = None
         self.connections = threading.Condition()
-        self.open = 0
+        self.open: Dict[socket.socket, float] = {}  # accepted connection -> when it last moved data
 
     def start(self):
         self.closed.clear()
@@ -134,8 +137,7 @@ class _Listener:
                 continue
             except OSError:
                 return
-            with self.connections:
-                self.open += 1
+            self.moved(conn)
             threading.Thread(target=self._guarded, args=(conn,), daemon=True).start()
 
     def _guarded(self, conn):
@@ -148,8 +150,12 @@ class _Listener:
                 pass
         finally:
             with self.connections:
-                self.open -= 1
+                self.open.pop(conn, None)
                 self.connections.notify_all()
+
+    def moved(self, conn):
+        with self.connections:
+            self.open[conn] = time.monotonic()
 
     def pause(self):
         """Stop accepting; the listening socket stays open."""
@@ -157,14 +163,15 @@ class _Listener:
         if self.thread is not None:
             self.thread.join()
 
-    def release(self, timeout):
-        """Once another process serves the listening socket: let the
-        connections accepted here finish, then close this copy of it."""
+    def release(self, idle):
+        """Once another process serves the listening socket: wait until no
+        connection accepted here has moved data for `idle` seconds (each
+        ended, or kept open unused), however long transfers take, then
+        close this copy of the socket."""
         self.pause()
-        deadline = time.monotonic() + timeout
         with self.connections:
-            while self.open and time.monotonic() < deadline:
-                self.connections.wait(max(0.0, min(1.0, deadline - time.monotonic())))
+            while any(time.monotonic() - last < idle for last in self.open.values()):
+                self.connections.wait(1.0)
         self.sock.close()
 
     def handle(self, conn):  # pragma: no cover - overridden
@@ -444,7 +451,7 @@ class Forwarder(_Listener):
         except OSError:
             conn.close()
             return
-        pipe(conn, upstream)
+        pipe(conn, upstream, lambda: self.moved(conn))
 
 
 def interface_ipv4(name: str) -> Optional[str]:

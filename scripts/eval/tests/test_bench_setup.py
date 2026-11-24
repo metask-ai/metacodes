@@ -1182,14 +1182,14 @@ class SshRunTest(SetupFixture):
         self.assertNotEqual(final["exit_code"], 0)
         self.assertTrue((manager.jobs_dir / run["name"] / "argv.json").exists())
 
-    def start_driver(self, grace, delay=30, name="eof", relay=None, env=None, credential=None):
+    def start_driver(self, grace, delay=30, name="eof", relay=None, env=None, credential=None, egress=None):
         """A remote driver whose Harbor runs `delay` s, and its first session."""
         self.prepare_remote()
         executor = executors.find(self.cfg(), "relay-4090")
         jobs = self.remote_home / "jobs"
         spec = {"argv": [str(self.remote_home / ".local/bin/harbor"), "run", "-m", "metask/x", "-k", "1",
                          "-o", str(jobs), "--job-name", name], "key_env": "METASK_API_KEY", "relay": relay,
-                "detach_grace": grace}
+                "detach_grace": grace, "egress": egress}
         (self.remote_home / "runs" / name).mkdir(parents=True)
         (self.remote_home / "runs" / name / "spec.json").write_text(json.dumps(spec))
         process = subprocess.Popen(executors.node_argv(executor, "run", f"runs/{name}/spec.json"),
@@ -1199,12 +1199,15 @@ class SshRunTest(SetupFixture):
         first = {"env": {"METASK_API_KEY": "k"}, **({"credential": credential} if credential else {})}
         process.stdin.write(json.dumps(first).encode() + b"\n")
         process.stdin.flush()
-        self.assertEqual(json.loads(process.stdout.readline())["event"], "started")
+        self.driver_events = []
+        while not self.driver_events or self.driver_events[-1]["event"] != "started":
+            self.driver_events.append(json.loads(process.stdout.readline()))
         return executor, process
 
-    def streaming_upstream(self, events=10, pause=0.6):
-        """A model endpoint whose first answer streams for `events` x `pause`
-        seconds (`streaming` is set once it has begun), the others at once."""
+    def streaming_upstream(self, events=10, pause=0.6, slow=1):
+        """A model endpoint whose `slow`-th answer streams for `events` x
+        `pause` seconds (`streaming` is set once it has begun), the others at
+        once."""
         streaming, seen = threading.Event(), []
 
         class Endpoint(BaseHTTPRequestHandler):
@@ -1213,7 +1216,7 @@ class SshRunTest(SetupFixture):
             def do_POST(self):
                 self.rfile.read(int(self.headers["Content-Length"]))
                 seen.append(self.headers.get("Authorization"))
-                slow = len(seen) == 1
+                slowly = len(seen) == slow
                 parts = ([{"type": "message_start", "message": {"usage": {"input_tokens": 5}}}] +
                          [{"type": "content_block_delta", "delta": {"text": "x"}}] * events +
                          [{"type": "message_delta", "usage": {"output_tokens": events}}, {"type": "message_stop"}])
@@ -1225,7 +1228,7 @@ class SshRunTest(SetupFixture):
                 for index, chunk in enumerate(chunks):
                     self.wfile.write(chunk)
                     self.wfile.flush()
-                    if slow and index < events:
+                    if slowly and index < events:
                         streaming.set()
                         time.sleep(pause)
 
@@ -1287,6 +1290,57 @@ class SshRunTest(SetupFixture):
         self.assertTrue((self.remote_home / "jobs/up/fix-git__fake/result.json").exists())
         self.assertFalse((run_dir / remote.RELAY_TLS).exists())
 
+    def test_the_old_tunnel_carries_egress_until_the_new_driver_has_its_own(self):
+        """Handed over, the forwarder keeps the old session's tunnel port
+        until a session brings the new driver its own; the old driver (and
+        with it that session and tunnel) ends only then."""
+        tunnels = {}
+        for label in ("old", "new"):
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            self.addCleanup(listener.close)
+
+            def answer(listener=listener, label=label):
+                while True:
+                    try:
+                        conn, _ = listener.accept()
+                    except OSError:
+                        return
+                    with conn:
+                        conn.sendall(label.encode())
+            threading.Thread(target=answer, daemon=True).start()
+            tunnels[label] = listener.getsockname()[1]
+        relay, process = self.start_driver(grace=60, delay=60, name="tun", egress={
+            "mode": "workbench", "tunnel_port": tunnels["old"], "bind": "127.0.0.1", "no_proxy": []})
+        proxy = next(e for e in self.driver_events if e["event"] == "egress")["proxy"]
+        address = tuple(proxy.removeprefix("http://").rsplit(":", 1))
+
+        def through_forwarder():
+            with socket.create_connection((address[0], int(address[1])), timeout=10) as conn:
+                return conn.recv(16).decode()
+
+        self.assertEqual(through_forwarder(), "old")
+        done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/tun/spec.json"), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(done.stdout)["result"], "upgraded", done.stderr)
+        for line in process.stdout:
+            if json.loads(line)["event"] == "handoff":
+                break
+        time.sleep(2)
+        self.assertIsNone(process.poll())  # nothing in flight, but no new tunnel yet
+        self.assertEqual(through_forwarder(), "old")
+        session = subprocess.Popen(executors.node_argv(relay, "attach", "runs/tun/spec.json"),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(session.kill)
+        session.stdin.write(json.dumps({"tunnel_port": tunnels["new"]}).encode() + b"\n")
+        session.stdin.flush()
+        self.assertEqual(process.wait(30), 0)
+        self.assertEqual(through_forwarder(), "new")
+        session.stdin.write(b"cancel\n")
+        session.stdin.flush()
+        self.assertEqual([json.loads(line) for line in session.stdout][-1]["event"], "exit")
+
     def test_a_failed_driver_upgrade_leaves_the_run_to_its_driver(self):
         relay, process = self.start_driver(grace=60, delay=4)
         path = remote.handoff_socket(self.remote_home / "runs/eof")
@@ -1347,6 +1401,96 @@ class SshRunTest(SetupFixture):
         process.wait(30)
         late = subprocess.run(attach, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         self.assertEqual(json.loads(late.stdout), events[-1])
+
+
+class DrainTest(unittest.TestCase):
+    """What a driver that handed its run over waits for before it ends."""
+
+    streaming_upstream = SshRunTest.streaming_upstream
+
+    def test_the_relay_waits_for_handshakes_and_streams_but_not_for_idle_connections(self):
+        import http.client
+        import ssl
+        from scripts.eval.harbor.profiling import TimingRelay
+        upstream, streaming, _ = self.streaming_upstream(events=6, pause=0.5, slow=2)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        relay = TimingRelay(f"http://127.0.0.1:{upstream.server_port}", "real", tmp / "metrics", bind="127.0.0.1",
+                            tls=True, token="mcb-token", cert_dir=tmp / "tls").__enter__()
+        port = relay.server.server_port
+        context = ssl.create_default_context(cafile=str(relay.ca_path))
+        headers = {"Authorization": "Bearer mcb-token", "Content-Type": "application/json"}
+
+        def post(conn):
+            conn.request("POST", "/t/v1/messages", body=b"{}", headers=headers)
+            response = conn.getresponse()
+            return response.status, response.read()
+
+        idle = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=30)
+        self.addCleanup(idle.close)
+        self.assertEqual(post(idle)[0], 200)  # kept alive, idle from now on
+        streamed = {}
+        stream = threading.Thread(target=lambda: streamed.update(
+            result=post(http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=30))))
+        stream.start()
+        self.assertTrue(streaming.wait(10))
+        handshaking = socket.create_connection(("127.0.0.1", port))  # no ClientHello yet
+        self.addCleanup(handshaking.close)
+        time.sleep(0.3)
+        released = threading.Thread(target=relay.release)
+        released.start()
+        stream.join(30)
+        self.assertEqual(streamed["result"][0], 200)
+        self.assertIn(b'"message_stop"', streamed["result"][1])
+        time.sleep(0.5)
+        self.assertTrue(released.is_alive())  # the handshake is not over
+        handshaking.close()
+        released.join(20)
+        self.assertFalse(released.is_alive())
+        relay.remove_files()
+
+    def test_the_forwarder_waits_while_data_moves_and_ends_once_idle(self):
+        from scripts.eval.harbor.bench import egress
+        target = socket.socket()
+        target.bind(("127.0.0.1", 0))
+        target.listen(8)
+        self.addCleanup(target.close)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = target.accept()
+                except OSError:
+                    return
+                threading.Thread(target=trickle, args=(conn,), daemon=True).start()
+
+        def trickle(conn):
+            with conn:
+                if conn.recv(1) == b"t":  # a transfer: a byte every 0.3 s for 3 s
+                    for _ in range(10):
+                        conn.sendall(b".")
+                        time.sleep(0.3)
+                else:
+                    conn.recv(1)  # idle: open until the client closes
+
+        threading.Thread(target=serve, daemon=True).start()
+        forwarder = egress.Forwarder("127.0.0.1", target.getsockname()).start()
+        idle = socket.create_connection(forwarder.address)
+        self.addCleanup(idle.close)
+        idle.sendall(b"i")
+        transfer = socket.create_connection(forwarder.address)
+        self.addCleanup(transfer.close)
+        transfer.sendall(b"t")
+        started = time.monotonic()
+        released = threading.Thread(target=forwarder.release, args=(1,))
+        released.start()
+        received = b""
+        while len(received) < 10:
+            received += transfer.recv(16)
+        self.assertTrue(released.is_alive())
+        released.join(10)
+        self.assertFalse(released.is_alive())
+        self.assertGreater(time.monotonic() - started, 3)
 
 
 class SuiteOnExecutorTest(SetupFixture):
