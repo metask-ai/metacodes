@@ -1308,12 +1308,11 @@ function spareHue(i) {
   const hue = (i * 137.508 + 20) % 360;
   return hue > 185 && hue < 245 ? (hue + 60) % 360 : hue;
 }
-function soleHarness(rows) {
-  const names = new Set(rows.filter((r) => !r.ours).map((r) => r.harness));
+function soleHarness(board) {
+  const names = new Set(board.entries.map((e) => e.harness));
   return names.size === 1 ? [...names][0] : null;
 }
-function rowLooks(rows) {
-  const byModel = Boolean(soleHarness(rows));
+function rowLooks(rows, byModel) {
   const groupOf = (r) => (r.ours ? 'metacodes' : byModel ? r.model || r.harness : r.harness);
   const names = [...new Set(rows.filter((r) => !r.ours).map(groupOf))];
   const looks = new Map(names.map((name, i) => [name, { name,
@@ -1478,8 +1477,8 @@ function boardPanel(board) {
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
-  const lookOf = rowLooks(rows);
-  const harness = soleHarness(rows);
+  const harness = soleHarness(board);
+  const lookOf = rowLooks(rows, Boolean(harness));
   const harnessNote = harness ? h('div', { class: 'board-harness muted', text: `Harness：${harness}（本榜公开条目都用它，图中标识按模型区分）` }) : null;
   const priced = rows.some((r) => r.cost_per_task_usd > 0);
   const src = board.source;
