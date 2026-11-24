@@ -35,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
-INSTALL_ZIG = ROOT / "src" / "app" / "install.zig"
+INSTALL_ZIG = ROOT / "apps" / "cli" / "src" / "app" / "install.zig"
 
 
 def order_cases():
