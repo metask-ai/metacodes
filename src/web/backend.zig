@@ -40,16 +40,16 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
-const ui_backend = @import("../core/protocol/ui_backend.zig");
-const ui_event = @import("../core/protocol/ui_event.zig");
-const ui_request = @import("../core/protocol/ui_request.zig");
-const abort_mod = @import("../util/abort.zig");
-const usage_mod = @import("../core/usage.zig");
-const journal_mod = @import("../core/event_journal.zig");
-const log = @import("../util/log.zig");
-const util_time = @import("../util/time.zig");
-const wire = @import("../core/protocol/wire.zig");
-const frontend_capabilities = @import("../core/protocol/frontend_capabilities.zig");
+const ui_backend = @import("metacodes-internal").core.protocol.ui_backend;
+const ui_event = @import("metacodes-internal").core.protocol.ui_event;
+const ui_request = @import("metacodes-internal").core.protocol.ui_request;
+const abort_mod = @import("metacodes-internal").util.abort;
+const usage_mod = @import("metacodes-internal").core.usage;
+const journal_mod = @import("metacodes-internal").core.event_journal;
+const log = @import("metacodes-internal").util.log;
+const util_time = @import("metacodes-internal").util.time;
+const wire = @import("metacodes-internal").core.protocol.wire;
+const frontend_capabilities = @import("metacodes-internal").core.protocol.frontend_capabilities;
 
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
@@ -59,7 +59,7 @@ const UiRequest = ui_request.UiRequest;
 const UiResponse = ui_request.UiResponse;
 const RequestOutcome = ui_request.RequestOutcome;
 const UiRequester = ui_request.UiRequester;
-const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
+const PermissionChoice = @import("metacodes-internal").core.protocol.permission_choice.PermissionChoice;
 const EventJournal = journal_mod.EventJournal;
 
 /// The last UI request id this process handed out, on any WebBackend.
@@ -177,7 +177,7 @@ pub const WebBackend = struct {
     pub const RunEnd = struct {
         stop_reason: ?[]const u8 = null,
         error_name: ?[]const u8 = null,
-        model_error: ?@import("../api/model_error.zig").Detail.View = null,
+        model_error: ?@import("metacodes-internal").api.model_error.Detail.View = null,
     };
 
     /// Driver thread: starts the next Run (1, 2, … per session, as

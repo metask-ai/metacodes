@@ -21,8 +21,8 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
-const types = @import("../types.zig");
-const permission_mode = @import("../permission/mode.zig");
+const types = @import("metacodes-internal").types;
+const permission_mode = @import("metacodes-internal").permission.mode;
 
 /// One queued message. Slices are owned by the queue's allocator once popped.
 pub const Submission = struct {

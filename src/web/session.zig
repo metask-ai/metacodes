@@ -21,26 +21,26 @@
 //! repl/loop.zig 里与 TTY 耦合,是"会话编排层未分离"的存量债,不在本次 scope。
 
 const std = @import("std");
-const time = @import("../util/time.zig");
+const time = @import("metacodes-internal").util.time;
 const app_mod = @import("../app.zig");
-const agent_loop = @import("../core/agent_loop.zig");
-const project_activation = @import("../core/project_rule_activation.zig");
-const run_journal = @import("../core/tool_observation_journal.zig");
-const journal_mod = @import("../core/event_journal.zig");
+const agent_loop = @import("metacodes-internal").core.agent_loop;
+const project_activation = @import("metacodes-internal").core.project_rule_activation;
+const run_journal = @import("metacodes-internal").core.tool_observation_journal;
+const journal_mod = @import("metacodes-internal").core.event_journal;
 const backend_mod = @import("backend.zig");
 const server_mod = @import("server.zig");
 const submission_mod = @import("submission.zig");
-const log = @import("../util/log.zig");
-const util_json = @import("../util/json.zig");
-const wire = @import("../core/protocol/wire.zig");
-const model_error = @import("../api/model_error.zig");
+const log = @import("metacodes-internal").util.log;
+const util_json = @import("metacodes-internal").util.json;
+const wire = @import("metacodes-internal").core.protocol.wire;
+const model_error = @import("metacodes-internal").api.model_error;
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
 const WebServer = server_mod.WebServer;
 const Submission = submission_mod.Submission;
 const SubmissionQueue = submission_mod.SubmissionQueue;
-const ui_event = @import("../core/protocol/ui_event.zig");
+const ui_event = @import("metacodes-internal").core.protocol.ui_event;
 
 fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     const raw = try std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -95,10 +95,10 @@ pub const StateSource = struct {
     /// borrowed (the driver replaces it on `/clear`).
     pub fn spans(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
-        const store = @import("../telemetry/store.zig");
+        const store = @import("metacodes-internal").telemetry.store;
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir = self.app.session_dir_cell.copy(&dir_buf) orelse "";
-        return store.readAsRequest(allocator, dir, @import("../version.zig").semver);
+        return store.readAsRequest(allocator, dir, @import("metacodes-internal").version.semver);
     }
 
     pub fn snapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -125,7 +125,7 @@ pub const StateSource = struct {
             tool_calls: u32,
             foreground: bool,
         };
-        const RegT = @import("../core/agent_job_registry.zig").AgentJobRegistry;
+        const RegT = @import("metacodes-internal").core.agent_job_registry.AgentJobRegistry;
         var job_snaps: []RegT.JobSnapshot = &.{};
         var agent_views: []AgentView = &.{};
         if (self.app.agentJobsPtr()) |reg| {
@@ -151,7 +151,7 @@ pub const StateSource = struct {
         // 锁内 dup 值语义)。attach 客户端由此见 attach 前 mid-session 已有 task,不再只靠 tasks_changed 增量。
         const TaskView = struct { id: []const u8, subject: []const u8, state: []const u8 };
         const raw_tasks = self.app.tasks.snapshotTasks(allocator) catch &.{};
-        defer @import("../core/task_store.zig").TaskStore.freeTaskViews(allocator, raw_tasks);
+        defer @import("metacodes-internal").core.task_store.TaskStore.freeTaskViews(allocator, raw_tasks);
         var task_views: []TaskView = &.{};
         if (raw_tasks.len > 0) task_views = allocator.alloc(TaskView, raw_tasks.len) catch &.{};
         defer if (task_views.len > 0) allocator.free(task_views);
@@ -423,7 +423,7 @@ fn shellCommandResult(svc: *session_service_mod.SessionService, wb: *WebBackend,
     };
     defer web_alloc.free(result);
 
-    const json_util = @import("../util/json.zig");
+    const json_util = @import("metacodes-internal").util.json;
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(web_alloc);
     msg_buf.appendSlice(web_alloc, "$ ") catch return;
@@ -460,7 +460,7 @@ pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]con
     options.progress_updates_observe = app.config.progress_updates_observe;
     // Stall gate: a person resumes the web session with one message, so a run
     // that keeps getting nothing new back is stopped like in the REPL.
-    options.stall_gate = @import("../core/stall_gate.zig").modeFor(app.config.stall_gate, .interactive);
+    options.stall_gate = @import("metacodes-internal").core.stall_gate.modeFor(app.config.stall_gate, .interactive);
     return options;
 }
 
@@ -612,7 +612,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         };
 
         // scoped 自动召回(对齐 headless.zig:按请求装配相关记忆,cache-safe 尾注入)
-        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
+        const scoped_recall = if (app.kg) |*k| (@import("metacodes-internal").kg.scoped_recall.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
 
         var options = buildWebOptions(app, &wb, scoped_recall);
@@ -774,8 +774,8 @@ test "#444 /command lines: command_result first, then the planned Run's user_mes
 
 test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     const a = std.testing.allocator;
-    const RegT = @import("../core/agent_job_registry.zig").AgentJobRegistry;
-    const session_id = @import("../core/session_id.zig");
+    const RegT = @import("metacodes-internal").core.agent_job_registry.AgentJobRegistry;
+    const session_id = @import("metacodes-internal").core.session_id;
 
     var journal = EventJournal.init(a);
     defer journal.deinit();
@@ -785,16 +785,16 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     // 最小 App(undefined trick):只初始化 snapshot() 触及的字段。
     var app: app_mod.App = undefined;
     app.allocator = a;
-    app.config = @import("../types.zig").Config{}; // provider_kind=.anthropic(activeModel 读它)
+    app.config = @import("metacodes-internal").types.Config{}; // provider_kind=.anthropic(activeModel 读它)
     app.snapshot_cache = null; // → snapshotSlices 走 activeModel/additionalDirs 直读
     app.additional_dirs_abs = null;
     app.plugin_snapshot = null;
     app.usage = .{};
     app.session_id = session_id.SessionId.single;
-    app.permission_ctx = @import("../permission.zig").createContext(.default, a);
+    app.permission_ctx = @import("metacodes-internal").permission_root.createContext(.default, a);
     var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
-    app.api_client = @import("../client.zig").Client.initWithBaseUrl(a, io_rt.io(), "k", "m", null);
+    app.api_client = @import("metacodes-internal").client.Client.initWithBaseUrl(a, io_rt.io(), "k", "m", null);
     defer app.api_client.deinit();
     // agent_jobs:直接赋值(勿经 copied local——registry 含 mutex/ArrayList,值拷会双释)。
     app.agent_jobs = try RegT.init(a, "k", null, "m", .anthropic);
@@ -802,7 +802,7 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     try app.agent_jobs.?.pushTestEntryFull(app.session_id, "Explore", "scan files", 3, 100, "Grep", "{}", .running);
     // tasks 必须真 init:snapshot() 走 snapshotTasks 要拿 mutex。undefined 的 mutex 在
     // POSIX 侥幸不崩(pthread 返回错误码被吞),Windows SRW 顺垃圾指针走 → 段错误。
-    app.tasks = @import("../core/task_store.zig").TaskStore.init(a);
+    app.tasks = @import("metacodes-internal").core.task_store.TaskStore.init(a);
     defer app.tasks.deinit();
 
     var inbox = SubmissionQueue.init(a);
