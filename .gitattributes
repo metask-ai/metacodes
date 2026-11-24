@@ -28,3 +28,4 @@ vendor/quickjs/*.h linguist-generated
 sdk/rust/src/raw.rs text eol=lf
 
 CHANGELOG.md merge=union
+tests/contract/** -whitespace

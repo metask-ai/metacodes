@@ -1,0 +1,4 @@
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"delegate the search"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"tool_use","id":"toolu_01","name":"Task","input":"{\"subagent_type\":\"Explore\",\"description\":\"find notes\",\"prompt\":\"Which file holds the notes?\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"{\"subagent_type\":\"Explore\",\"final_text\":\"notes.txt holds the notes.\",\"stop_reason\":\"end_turn\",\"turns\":1,\"tool_calls\":0,\"tokens\":2,\"elapsed_ms\":<N>}","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"The notes are in notes.txt."}]}

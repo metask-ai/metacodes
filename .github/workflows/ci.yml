@@ -515,6 +515,9 @@ jobs:
       - name: ReleaseSafe core gate
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build test:lib -Doptimize=ReleaseSafe
+      - name: Contract snapshots
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: zig build test:contract --summary all
       - name: Repository coverage audit
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: scripts/test_coverage_audit.sh

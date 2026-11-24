@@ -1,0 +1,12 @@
+$ metacodes --state-dir <ROOT>/state sealed --help
+exit: 0
+--- stdout
+usage: metacodes sealed install <gateway-url> <skill_id> [--token-env NAME] [--yes]
+       metacodes sealed list
+       metacodes sealed bind <name> <ref> [--from-env VAR]   (secret from stdin unless --from-env)
+       metacodes sealed unbind <name> <ref>
+       metacodes sealed ledger
+       metacodes sealed serve --skills <dir> [--listen PORT] [--token T]
+                              [--workers N] [--queue-depth N] [--max-model-calls N]
+                              [--keepalive-ms MS] [--provider-cache-ms MS]
+--- stderr

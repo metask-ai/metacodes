@@ -1,0 +1,6 @@
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"copy the note"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"text","text":"Reading the note first."},{"type":"tool_use","id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"     1\talpha\n","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"tool_use","id":"toolu_02","name":"Write","input":"{\"file_path\":\"copy.txt\",\"content\":\"alpha\\n\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_02","content":"{\"success\":true,\"path\":\"copy.txt\",\"structuredPatch\":[{\"oldStart\":0,\"oldLines\":0,\"newStart\":1,\"newLines\":1,\"lines\":[\"+alpha\"]}],\"gitDiff\":\"--- a/copy.txt\\n+++ b/copy.txt\\n@@ -0,0 +1,1 @@\\n+alpha\\n\"}","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"Copied notes.txt to copy.txt."}]}

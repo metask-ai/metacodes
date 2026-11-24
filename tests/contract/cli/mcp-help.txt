@@ -1,0 +1,34 @@
+$ metacodes --state-dir <ROOT>/state mcp --help
+exit: 0
+--- stdout
+usage: metacodes mcp add <name> <url> [--type http|sse] [--header <name>=<value>]... [--force] [--no-check]
+       metacodes mcp add <name> [--env <name>=<value>]... [--force] [--no-check] -- <command> [<arg>...]
+       metacodes mcp add-json <name> '<json>' [--force] [--no-check]
+       metacodes mcp remove <name>
+       metacodes mcp login <server> [--no-browser]
+       metacodes mcp logout <server>
+       metacodes mcp list [--no-check]
+
+  add       Write a server into "mcpServers" of <state root>/config.json, the
+            configuration every session reads first. A URL (or --url) makes an
+            HTTP server (Streamable HTTP; --type sse for the older HTTP+SSE
+            transport); a command makes a stdio server. Claude Code's and Codex's
+            options work too (-t, -e, -H "Name: value", -s user,
+            --bearer-token-env-var, --client-id, --callback-port). A name that is
+            already configured is refused unless --force. Values may name
+            environment variables as ${VAR} or ${VAR:-default}, expanded when a
+            session starts, so a token need not be written into the file. The
+            server is then connected once to say whether it works (--no-check
+            skips that). New sessions connect it; in a running session, run
+            /mcp reconnect <name>.
+  add-json  The same, with the whole entry given as one JSON object.
+  remove    Take a server out of config.json (and forget its stored login).
+  login     OAuth login for an HTTP or SSE server; sessions send and refresh
+            the stored token. Over SSH it prints the ssh -L forward its
+            callback needs; a browser on another computer: paste the address
+            it ended on. Waits 10 minutes (METACODES_LOGIN_CALLBACK_TIMEOUT_MS;
+            0 waits without a limit).
+  logout    Forget a stored login.
+  list      Every configured server (from every source), its transport, how it
+            authenticates and, unless --no-check, whether it connects.
+--- stderr

@@ -1,0 +1,16 @@
+$ metacodes --state-dir <ROOT>/state terminal-setup --help
+exit: 0
+--- stdout
+usage: metacodes terminal-setup [--dry-run | --restore]
+           [--terminal apple-terminal|vscode|vscode-insiders|cursor|windsurf|vscodium]
+           [--keybindings <keybindings.json>]
+
+Makes Shift+Enter insert a newline in a terminal that cannot report it on its own,
+by binding it in the terminal's own settings, after a backup:
+  Apple Terminal    Shift+Return in the default profile's key map
+  VS Code and forks a keybindings.json entry for the integrated terminal
+Without --terminal it sets up the terminal it runs in.
+  --dry-run       say what would change, change nothing
+  --restore       undo what terminal-setup changed (all of it, or the --terminal / --keybindings named)
+  --keybindings   the keybindings.json to edit (a custom --user-data-dir, a profile)
+--- stderr

@@ -1,0 +1,5 @@
+$ metacodes --state-dir <ROOT>/state doctor --help
+exit: 0
+--- stdout
+usage: metacodes doctor [--json | --plain] [--strict]
+--- stderr

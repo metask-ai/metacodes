@@ -1,0 +1,18 @@
+$ metacodes --state-dir <ROOT>/state update --help
+exit: 0
+--- stdout
+usage: metacodes [--state-dir <dir>] update [--check] [--version X.Y.Z] [--release-base <url>]
+                 [--pull] [--allow-downgrade] [--no-sdk] [--ignore-running] [--json]
+
+Brings this install up to date from where it came from. A release install
+moves to the latest published release (or --version), downloaded from the
+base its install record names; --release-base names a mirror, and the
+record keeps it. A mirror serves both the archives and their sums: using
+one trusts it. A development install is rebuilt from the checkout that
+built it (--pull fast-forwards that checkout first). Never moves an
+install backwards unless --allow-downgrade.
+Refuses while sessions run from the install (--ignore-running overrides
+that, except on Windows) and stops this install's TinyKG service.
+--check reports and changes nothing: exit 0 when there is nothing to do,
+3 when there is. --json prints the result as one JSON document.
+--- stderr

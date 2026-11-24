@@ -1,0 +1,103 @@
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+
+retry: 1000
+
+id: <HEX16>-0
+data: {"v":1,"type":"session_lifecycle","data":{"created":"<HEX24>"}}
+
+id: <HEX16>-1
+data: {"v":1,"type":"user_message","data":{"run_id":1,"trace_id":null,"text":"read the notes","replaces":null}}
+
+id: <HEX16>-2
+data: {"v":1,"type":"progress","run_id":1,"data":{"turn":1,"tool_name":"","tool_input":"","tool_calls":0}}
+
+id: <HEX16>-3
+data: {"v":1,"type":"diag_turn_begin","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":1}}
+
+id: <HEX16>-4
+data: {"v":1,"type":"stream_begin","run_id":1,"data":null}
+
+id: <HEX16>-5
+data: {"v":1,"type":"output_segment_begin","run_id":1,"data":{"index":0,"turn":1,"group":0}}
+
+id: <HEX16>-6
+data: {"v":1,"type":"usage","run_id":1,"data":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+
+id: <HEX16>-7
+data: {"v":1,"type":"text_chunk","run_id":1,"data":"Reading the notes."}
+
+id: <HEX16>-8
+data: {"v":1,"type":"usage","run_id":1,"data":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+
+id: <HEX16>-9
+data: {"v":1,"type":"diag_model_request","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":1,"attempt":0,"elapsed_ms":<N>,"outcome":"success"}}
+
+id: <HEX16>-10
+data: {"v":1,"type":"stream_done","run_id":1,"data":null}
+
+id: <HEX16>-11
+data: {"v":1,"type":"output_segment_end","run_id":1,"data":{"index":0,"turn":1,"group":0,"disposition":"commentary","bytes":18}}
+
+id: <HEX16>-12
+data: {"v":1,"type":"policy_decision","run_id":1,"data":{"trace_id":"<ID>","depth":0,"id":"toolu_01","tool":"Read","decision":"allow","source":"permission_chain","allowed":true}}
+
+id: <HEX16>-13
+data: {"v":1,"type":"tool_start","run_id":1,"data":{"id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}"}}
+
+id: <HEX16>-14
+data: {"v":1,"type":"progress","run_id":1,"data":{"turn":1,"tool_name":"Read","tool_input":"{\"file_path\":\"notes.txt\"}","tool_calls":1}}
+
+id: <HEX16>-15
+data: {"v":1,"type":"diag_tool_stage","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":1,"tool_calls":1,"elapsed_ms":<N>}}
+
+id: <HEX16>-16
+data: {"v":1,"type":"clear_current_tool","run_id":1,"data":null}
+
+id: <HEX16>-17
+data: {"v":1,"type":"tool_result","run_id":1,"data":{"id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}","content":"     1\talpha\n","is_error":false,"elapsed_ms":<N>,"file_refs":[{"locator":{"absolute_path":"notes.txt"},"title":"notes.txt","kind":"read","range":null}]}}
+
+id: <HEX16>-18
+data: {"v":1,"type":"diag_turn_end","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":1,"tool_calls":1}}
+
+id: <HEX16>-19
+data: {"v":1,"type":"progress","run_id":1,"data":{"turn":2,"tool_name":"","tool_input":"","tool_calls":1}}
+
+id: <HEX16>-20
+data: {"v":1,"type":"diag_turn_begin","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":2}}
+
+id: <HEX16>-21
+data: {"v":1,"type":"stream_begin","run_id":1,"data":null}
+
+id: <HEX16>-22
+data: {"v":1,"type":"output_segment_begin","run_id":1,"data":{"index":1,"turn":2,"group":1}}
+
+id: <HEX16>-23
+data: {"v":1,"type":"usage","run_id":1,"data":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+
+id: <HEX16>-24
+data: {"v":1,"type":"text_chunk","run_id":1,"data":"The notes say alpha."}
+
+id: <HEX16>-25
+data: {"v":1,"type":"usage","run_id":1,"data":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+
+id: <HEX16>-26
+data: {"v":1,"type":"diag_model_request","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":2,"attempt":0,"elapsed_ms":<N>,"outcome":"success"}}
+
+id: <HEX16>-27
+data: {"v":1,"type":"stream_done","run_id":1,"data":null}
+
+id: <HEX16>-28
+data: {"v":1,"type":"diag_turn_end","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":2,"tool_calls":1}}
+
+id: <HEX16>-29
+data: {"v":1,"type":"output_segment_end","run_id":1,"data":{"index":1,"turn":2,"group":1,"disposition":"final","bytes":20}}
+
+id: <HEX16>-30
+data: {"v":1,"type":"diag_run_end","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turns":2,"tool_calls":1,"stop_reason_name":"end_turn"}}
+
+id: <HEX16>-31
+data: {"v":1,"type":"run_done","data":{"run_id":1,"trace_id":null,"stop_reason":"end_turn","error_name":null,"model_error":null}}
+
