@@ -372,14 +372,17 @@ class Workbench:
         return self.profiles.cancel(profile)
 
     def profile_item(self, profile, index, action) -> Dict[str, Any]:
-        """Act on one queued dataset: `cancel` a waiting or running one, `resume`
-        a stopped one with the tasks it has not finished, `run` one again."""
+        """Act on one queued dataset: `cancel` a waiting one, `stop` the running
+        one, `resume` a stopped one with the tasks it has not finished, `run`
+        an ended one again with all its tasks."""
         if not self.manager:
             raise ValueError(READ_ONLY)
         if action == "cancel":
             return self.profiles.cancel_item(profile, index)
+        if action == "stop":
+            return self.profiles.stop_item(profile, index)
         if action not in ("resume", "run"):
-            raise ValueError("action 只能是 cancel、resume 或 run")
+            raise ValueError("action 只能是 cancel、stop、resume 或 run")
         _, item = self.profiles.record_item(profile, index)
         tasks = item.get("tasks") or []
         if action == "resume":

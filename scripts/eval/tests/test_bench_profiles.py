@@ -388,14 +388,21 @@ class ProfileTest(unittest.TestCase):
                 time.sleep(.05)
             with self.assertRaisesRegex(ValueError, '还在等待或运行'):
                 self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
+            with self.assertRaisesRegex(ValueError, '不在等待'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'cancel'})
+            self.assertEqual(self.manager.profiles.get(created['id'])['items'][0]['status'], 'running')
+            with self.assertRaisesRegex(ValueError, '没有在运行'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'stop'})
             self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
-            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'cancel'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'stop'})
             record = self.wait_profile(created['id'])
         self.assertEqual(record['status'], 'finished')
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
-        with self.assertRaisesRegex(ValueError, '没有在等待或运行'):
+        with self.assertRaisesRegex(ValueError, '不在等待'):
             self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
-        self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
+        # Stopped before Harbor wrote any result: every task is still to run.
+        with patch.object(self.workbench, 'job_view', return_value=None):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
         self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'run'})
         record = self.wait_profile(created['id'])
         self.assertEqual([(i['suite'], i['status']) for i in record['items'][2:]],

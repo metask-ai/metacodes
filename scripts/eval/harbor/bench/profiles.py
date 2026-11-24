@@ -476,18 +476,24 @@ class ProfileManager:
         return record, record["items"][index]
 
     def cancel_item(self, profile: Any, index: Any) -> Dict[str, Any]:
-        """Drop one waiting dataset from the queue, or stop the running one;
-        the rest of the queue goes on."""
+        """Drop one waiting dataset from the queue; the rest of it goes on."""
         with self.lock:
             record, item = self.record_item(profile, index)
-            if item["status"] == "pending":
-                item.pop("waiting", None)
-                item.update(status="skipped", finished_at=now())
-                self.save(record)
-            elif item["status"] == "running" and item.get("run"):
-                self.runs.cancel(item["run"])
-            else:
-                raise ValueError("这个评测集没有在等待或运行")
+            if item["status"] != "pending":
+                raise ValueError("这个评测集已经不在等待了")
+            item.pop("waiting", None)
+            item.update(status="skipped", finished_at=now())
+            self.save(record)
+        self.wake()
+        return {"id": record["id"], "index": index, "status": item["status"]}
+
+    def stop_item(self, profile: Any, index: Any) -> Dict[str, Any]:
+        """Stop the running dataset; the queue goes on with the next one."""
+        with self.lock:
+            record, item = self.record_item(profile, index)
+            if item["status"] != "running" or not item.get("run"):
+                raise ValueError("这个评测集没有在运行")
+            self.runs.cancel(item["run"])
         self.wake()
         return {"id": record["id"], "index": index, "status": item["status"]}
 

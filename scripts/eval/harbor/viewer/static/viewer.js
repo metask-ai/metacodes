@@ -264,7 +264,7 @@ function itemActions(b, index) {
       const button = event.currentTarget;
       if (ITEM_ACTIONS[name].ask && !confirm(ITEM_ACTIONS[name].ask)) return;
       button.disabled = true;
-      try { await api('/api/profile/item', { id: b.id, index, action: name === 'stop' ? 'cancel' : name }); state.countdown = 1; }
+      try { await api('/api/profile/item', { id: b.id, index, action: name }); state.countdown = 1; }
       catch (error) { button.disabled = false; setConnection(false, error.message); }
     } }, ITEM_ACTIONS[name].label));
 }
