@@ -371,6 +371,11 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.profiles.cancel(profile)
 
+    def set_profile_concurrency(self, profile, concurrency) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.profiles.set_concurrency(profile, concurrency)
+
     def rename_profile(self, profile, name) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)

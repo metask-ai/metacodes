@@ -1182,6 +1182,7 @@ class RemoteRun:
         self.remote_spec_path = None
         self.stderr_relay = None
         self.stderr_tail = ""
+        self.concurrency = None
 
     @property
     def tunnel_port(self) -> Optional[int]:
@@ -1375,6 +1376,7 @@ class RemoteRun:
 
     def spawn(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str]) -> None:
         self.remote_spec_path = remote_spec_path
+        self.concurrency = None
         argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress(), binary=self.node)
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
@@ -1415,6 +1417,15 @@ class RemoteRun:
             with self.stdin_lock:
                 self.process.stdin.write(b"cancel\n")
                 self.process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def set_concurrency(self, value: int) -> None:
+        try:
+            with self.stdin_lock:
+                self.process.stdin.write((json.dumps({"concurrency": value}) + "\n").encode())
+                self.process.stdin.flush()
+            self.concurrency = value
         except (BrokenPipeError, OSError, ValueError):
             pass
 
