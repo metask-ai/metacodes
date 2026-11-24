@@ -128,17 +128,13 @@ fn replaceVolatileNumbers(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
         if (quote == 0) continue;
         quote -= 1;
         if (s[quote] != '"') continue;
-        var key_end = quote;
-        if (key_end > 0 and s[key_end - 1] == '\\') key_end -= 1;
+        if (quote > 0 and s[quote - 1] == '\\') continue;
+        const key_end = quote;
         var key_start = key_end;
         while (key_start > 0 and isKeyChar(s[key_start - 1])) key_start -= 1;
         if (!isVolatileKey(s[key_start..key_end])) continue;
         var value_start = i;
-        if (value_start < s.len and s[value_start] == '"') {
-            value_start += 1;
-        } else if (value_start + 1 < s.len and s[value_start] == '\\' and s[value_start + 1] == '"') {
-            value_start += 2;
-        }
+        if (value_start < s.len and s[value_start] == '"') value_start += 1;
         var value_end = value_start;
         while (value_end < s.len and isDigit(s[value_end])) value_end += 1;
         if (value_end == value_start) continue;
