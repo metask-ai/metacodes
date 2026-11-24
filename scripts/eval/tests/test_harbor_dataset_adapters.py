@@ -184,7 +184,7 @@ MODULES = {
     "searchqa": searchqa,
     "livemath": livemath,
 }
-CATALOG_TASK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,160}$")  # suites.TASK
+CATALOG_TASK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$")  # suites.TASK
 HAN = re.compile("[一-鿿]")
 
 
