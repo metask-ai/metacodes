@@ -1321,9 +1321,11 @@ class SshRunTest(SetupFixture):
                 return conn.recv(16).decode()
 
         self.assertEqual(through_forwarder(), "old")
-        done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/tun/spec.json"), stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=60)
-        self.assertEqual(json.loads(done.stdout)["result"], "upgraded", done.stderr)
+        for _ in range(2):  # twice before any session attaches
+            done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/tun/spec.json"),
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            self.assertEqual(json.loads(done.stdout)["result"], "upgraded", done.stderr)
+            time.sleep(1)
         for line in process.stdout:
             if json.loads(line)["event"] == "handoff":
                 break
@@ -1412,7 +1414,7 @@ class DrainTest(unittest.TestCase):
         import http.client
         import ssl
         from scripts.eval.harbor.profiling import TimingRelay
-        upstream, streaming, _ = self.streaming_upstream(events=6, pause=0.5, slow=2)
+        upstream, streaming, seen = self.streaming_upstream(events=6, pause=0.5, slow=2)
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
         relay = TimingRelay(f"http://127.0.0.1:{upstream.server_port}", "real", tmp / "metrics", bind="127.0.0.1",
@@ -1447,14 +1449,20 @@ class DrainTest(unittest.TestCase):
         handshaking.close()
         released.join(20)
         self.assertFalse(released.is_alive())
+        # The idle keep-alive connection was closed: a request sent on it now
+        # never reaches the upstream, so the client may send it again.
+        with self.assertRaises((OSError, http.client.HTTPException)):
+            post(idle)
+        self.assertEqual(len(seen), 2)
         relay.remove_files()
 
-    def test_the_forwarder_waits_while_data_moves_and_ends_once_idle(self):
+    def test_the_forwarder_waits_for_its_connections_or_the_end_of_the_run(self):
         from scripts.eval.harbor.bench import egress
         target = socket.socket()
         target.bind(("127.0.0.1", 0))
         target.listen(8)
         self.addCleanup(target.close)
+        answer = threading.Event()
 
         def serve():
             while True:
@@ -1462,35 +1470,46 @@ class DrainTest(unittest.TestCase):
                     conn, _ = target.accept()
                 except OSError:
                     return
-                threading.Thread(target=trickle, args=(conn,), daemon=True).start()
+                threading.Thread(target=respond, args=(conn,), daemon=True).start()
 
-        def trickle(conn):
+        def respond(conn):
             with conn:
-                if conn.recv(1) == b"t":  # a transfer: a byte every 0.3 s for 3 s
-                    for _ in range(10):
-                        conn.sendall(b".")
-                        time.sleep(0.3)
+                request = conn.recv(1)
+                if request == b"w":  # an upstream still computing its answer
+                    answer.wait(30)
+                    conn.sendall(b"answer")
                 else:
-                    conn.recv(1)  # idle: open until the client closes
+                    conn.recv(1)  # idle until the client closes
 
         threading.Thread(target=serve, daemon=True).start()
+        forwarder = egress.Forwarder("127.0.0.1", target.getsockname()).start()
+        waiting = socket.create_connection(forwarder.address)
+        self.addCleanup(waiting.close)
+        waiting.sendall(b"w")
+        time.sleep(0.3)
+        released = threading.Thread(target=forwarder.release, args=(lambda: False,))
+        released.start()
+        time.sleep(2)  # silent all along, yet waiting for its answer
+        self.assertTrue(released.is_alive())
+        answer.set()
+        self.assertEqual(waiting.recv(16), b"answer")
+        waiting.close()
+        released.join(10)
+        self.assertFalse(released.is_alive())
+
         forwarder = egress.Forwarder("127.0.0.1", target.getsockname()).start()
         idle = socket.create_connection(forwarder.address)
         self.addCleanup(idle.close)
         idle.sendall(b"i")
-        transfer = socket.create_connection(forwarder.address)
-        self.addCleanup(transfer.close)
-        transfer.sendall(b"t")
-        started = time.monotonic()
-        released = threading.Thread(target=forwarder.release, args=(1,))
+        time.sleep(0.3)
+        over = threading.Event()
+        released = threading.Thread(target=forwarder.release, args=(over.is_set,))
         released.start()
-        received = b""
-        while len(received) < 10:
-            received += transfer.recv(16)
+        time.sleep(1.5)
         self.assertTrue(released.is_alive())
+        over.set()  # the run ended
         released.join(10)
         self.assertFalse(released.is_alive())
-        self.assertGreater(time.monotonic() - started, 3)
 
 
 class SuiteOnExecutorTest(SetupFixture):

@@ -22,6 +22,7 @@ import math
 import re
 import secrets
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -353,10 +354,12 @@ class TimingRelay:
         self.sequence = sequence
         self.cert_dir = None
         self.ca_path = None
-        # Connections in a TLS handshake, before their first request or in
-        # one: all but those idle between keep-alive requests.
+        # `busy`: connections in a TLS handshake, before their first request
+        # or in one; `idle`: those between keep-alive requests. One lock, so
+        # draining never misses a connection turning busy.
         self.connections = threading.Condition()
         self.busy = set()
+        self.idle = set()
         self.draining = False
         self.serving = None
         owner = self
@@ -382,12 +385,15 @@ class TimingRelay:
             def handle(self):
                 self.close_connection = True
                 self.handle_one_request()
-                while not self.close_connection:
-                    owner.mark(self.request, False)  # idle until the next request line
+                while not self.close_connection and owner.rest(self.request):
                     self.handle_one_request()
 
             def parse_request(self):
-                owner.mark(self.request, True)
+                if not owner.wake(self.request):
+                    # Arrived on an idle connection once draining began: not
+                    # forwarded, so the client may send it again elsewhere.
+                    self.close_connection = True
+                    return False
                 return super().parse_request()
 
             def do_GET(self):
@@ -525,14 +531,18 @@ class TimingRelay:
                     except Exception:
                         connection.close()
                         raise
-                owner.mark(connection, True)
+                with owner.connections:
+                    owner.busy.add(connection)
                 return connection, address
 
             def process_request_thread(self, request, client_address):
                 try:
                     super().process_request_thread(request, client_address)
                 finally:
-                    owner.mark(request, False)
+                    with owner.connections:
+                        owner.busy.discard(request)
+                        owner.idle.discard(request)
+                        owner.connections.notify_all()
 
             def handle_error(self, request, client_address):
                 if not isinstance(sys.exc_info()[1], (ssl.SSLError, TimeoutError)):
@@ -625,24 +635,42 @@ class TimingRelay:
             self.server.shutdown()
             self.serving = None
 
-    def mark(self, connection, busy):
+    def rest(self, connection):
+        """A response is done: wait for the connection's next request, or
+        False (close it) once draining."""
         with self.connections:
-            if busy:
+            if self.draining:
+                return False
+            self.busy.discard(connection)
+            self.idle.add(connection)
+            self.connections.notify_all()
+            return True
+
+    def wake(self, connection):
+        """A request line arrived: False when it came on an idle connection
+        after draining began."""
+        with self.connections:
+            if connection in self.idle:
+                if self.draining:
+                    return False
+                self.idle.discard(connection)
                 self.busy.add(connection)
-            else:
-                self.busy.discard(connection)
-                self.connections.notify_all()
+            return True
 
     def release(self):
         """Once a newer driver serves the listening socket: finish every
         handshake and request this relay accepted, however long a response
-        streams, each connection closing after its response, then close
-        this process's copy of the socket. A keep-alive connection idle
-        between requests does not hold it. The TLS files stay for the new
-        relay."""
+        streams, each connection closing after its response; close the
+        connections idle between requests; then close this process's copy
+        of the socket. The TLS files stay for the new relay."""
         self.pause()
-        self.draining = True
         with self.connections:
+            self.draining = True
+            for connection in self.idle:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             while self.busy:
                 self.connections.wait(1.0)
         self.server.server_close()

@@ -96,8 +96,6 @@ LIMIT_FILE = "concurrency"
 # The handoff exchange between two drivers; a driver refuses any other.
 HANDOFF = 1
 HANDOFF_TIMEOUT = 30
-# A replaced driver ends once its forwarded connections moved no data for this long.
-DRAIN_IDLE = 60
 
 
 EMIT_LOCK = threading.Lock()
@@ -597,15 +595,16 @@ class Predecessor:
 
 def wind_down(handoff, relay, forwarder, docker_config):
     """The driver's end. Handed over: finish only what this process
-    accepted, keeping the egress tunnel until the newer driver has one, and
-    leave the run's relay, forwarder and DOCKER_CONFIG to it. Otherwise
-    remove them."""
+    accepted, keeping the egress tunnel until the newer driver has one (its
+    report arrives once a session brought one, through every later
+    handoff), and leave the run's relay, forwarder and DOCKER_CONFIG to it.
+    Otherwise remove them."""
     if handoff is not None and handoff.done.is_set():
         if relay is not None:
             relay.release()
         if forwarder is not None:
             handoff.wait_successor(handoff.control.grace)
-            forwarder.release(DRAIN_IDLE)
+            forwarder.release(lambda: (handoff.run_dir / END_EVENT).exists())
         return
     if handoff is not None:
         handoff.close()
@@ -990,9 +989,9 @@ def take_over(spec_path, report):
         code = follow(harbor, stop, hung_up, run_dir, control, handoff, lambda: None)
         return 0 if code is None else code
     finally:
-        predecessor.report()
         control.close()
         wind_down(handoff, relay, forwarder, state.get("docker_config"))
+        predecessor.report()  # handed over: only once the successor had its tunnel
 
 
 def upgrade(target):

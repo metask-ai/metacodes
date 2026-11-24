@@ -843,12 +843,14 @@ without interrupting it:
   the current access token, the placeholders and the request counter.
 - The old driver stops accepting and finishes what it had accepted, however
   long it takes: TLS handshakes and requests in progress (a streaming model
-  response completes), and forwarded connections until they have moved no
-  data for 60 seconds. A keep-alive connection idle between requests does
-  not hold it. Its session gets a `handoff` event, and the worker attaches
-  to the new driver with a fresh token and egress tunnel port. The old
-  driver, and with it the old session and its tunnel, ends only once the new
-  driver has its own tunnel, so container egress has a path throughout.
+  response completes), and forwarded connections until they close or the
+  run ends. A keep-alive connection idle between requests is closed; a
+  request that still arrives on it is not forwarded, so the client can send
+  it again. Its session gets a `handoff` event, and the worker attaches to
+  the new driver with a fresh token and egress tunnel port. The old driver,
+  and with it the old session and its tunnel, ends only once the newest
+  driver has its own tunnel (passed back along several handoffs in a row),
+  so container egress has a path throughout.
 - A handoff that fails before the old driver let go (another handoff
   version, the new driver dying, a run already ending or being cancelled)
   leaves the run with the old driver. Runs started by a driver from before

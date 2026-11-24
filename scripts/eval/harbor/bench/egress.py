@@ -42,7 +42,6 @@ import struct
 import subprocess
 import tempfile
 import threading
-import time
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -61,9 +60,8 @@ BASE_NO_PROXY = ("localhost", "127.0.0.1", "::1")
 
 # ------------------------------------------------------------------ plumbing
 
-def pipe(left: socket.socket, right: socket.socket, moved: Optional[Callable[[], None]] = None) -> None:
-    """Copy bytes both ways until both directions ended; closes both.
-    `moved()` is called after each chunk."""
+def pipe(left: socket.socket, right: socket.socket) -> None:
+    """Copy bytes both ways until both directions ended; closes both."""
     def one_way(source, target):
         try:
             while True:
@@ -71,8 +69,6 @@ def pipe(left: socket.socket, right: socket.socket, moved: Optional[Callable[[],
                 if not chunk:
                     break
                 target.sendall(chunk)
-                if moved is not None:
-                    moved()
         except OSError:
             pass
         try:
@@ -121,7 +117,7 @@ class _Listener:
         self.closed = threading.Event()
         self.thread = None
         self.connections = threading.Condition()
-        self.open: Dict[socket.socket, float] = {}  # accepted connection -> when it last moved data
+        self.open = set()
 
     def start(self):
         self.closed.clear()
@@ -137,7 +133,8 @@ class _Listener:
                 continue
             except OSError:
                 return
-            self.moved(conn)
+            with self.connections:
+                self.open.add(conn)
             threading.Thread(target=self._guarded, args=(conn,), daemon=True).start()
 
     def _guarded(self, conn):
@@ -150,12 +147,8 @@ class _Listener:
                 pass
         finally:
             with self.connections:
-                self.open.pop(conn, None)
+                self.open.discard(conn)
                 self.connections.notify_all()
-
-    def moved(self, conn):
-        with self.connections:
-            self.open[conn] = time.monotonic()
 
     def pause(self):
         """Stop accepting; the listening socket stays open."""
@@ -163,14 +156,14 @@ class _Listener:
         if self.thread is not None:
             self.thread.join()
 
-    def release(self, idle):
-        """Once another process serves the listening socket: wait until no
-        connection accepted here has moved data for `idle` seconds (each
-        ended, or kept open unused), however long transfers take, then
-        close this copy of the socket."""
+    def release(self, over: Callable[[], bool]):
+        """Once another process serves the listening socket: wait until
+        every connection accepted here ended, or until `over()`, then close
+        this copy of the socket. A silent connection may be waiting for a
+        response, so silence does not end it."""
         self.pause()
         with self.connections:
-            while any(time.monotonic() - last < idle for last in self.open.values()):
+            while self.open and not over():
                 self.connections.wait(1.0)
         self.sock.close()
 
@@ -451,7 +444,7 @@ class Forwarder(_Listener):
         except OSError:
             conn.close()
             return
-        pipe(conn, upstream, lambda: self.moved(conn))
+        pipe(conn, upstream)
 
 
 def interface_ipv4(name: str) -> Optional[str]:
