@@ -3001,6 +3001,8 @@ fn runCounted(
         // re-issue cannot use it up.
         var request_stream_retries: u8 = 0;
         var request_overload_retries: u32 = 0;
+        var request_attempts_spent: u32 = 0;
+        var stream_attempts: u32 = 0;
         // The Run's count when this request started: the Run allowance this
         // request may still draw on, and how many of its re-issues it made.
         const run_stream_retries_at_request = stream_turn_retries;
@@ -3210,7 +3212,7 @@ fn runCounted(
                 );
             }
 
-            const max_provider_attempts = providerAttemptLimit(opts.request_gate != null);
+            const max_provider_attempts = providerAttemptLimit(opts.request_gate != null) -| request_attempts_spent;
             const request_sha256 = if (opts.execution_boundary != null)
                 canonicalAgentRequestSha256(
                     allocator,
@@ -3284,6 +3286,7 @@ fn runCounted(
                     error.Aborted => .aborted,
                     else => .api_error,
                 };
+                if (request_attempts_spent > 0) last_error.noteAttempts(request_attempts_spent + retry_ui.active_attempt);
                 if (retry_ui.hasActiveAttempt() and
                     !retry_ui.finishAttempt(attempt_outcome, .unknown))
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -3396,6 +3399,7 @@ fn runCounted(
             rid_for_turn = stream.requestId();
             const rid = rid_for_turn;
             log.infoId("agent", rid, "stream opened, reading events", .{});
+            stream_attempts = retry_ui.active_attempt;
 
             // This is a semantic model-attempt boundary, not only an ANSI
             // color hint. Consumers that observe lifecycle state must see it
@@ -3810,8 +3814,9 @@ fn runCounted(
                 const tool_call_started = tool_uses.items.len != 0 or stream.toolCallStarted();
                 // See STREAM_RETRIES_PER_REQUEST.
                 const request_retry_eligible = connection_failure and !tool_call_started;
-                const overloaded = !tool_call_started and if (stream_failure) |failure| failure == error.ServiceUnavailable else false;
+                const overloaded = if (stream_failure) |failure| failure == error.ServiceUnavailable else false;
                 const overload_attempts = providerAttemptLimit(opts.request_gate != null);
+                const attempts_used = request_attempts_spent + stream_attempts;
                 const thinking_bytes: u64 = thinking_text.items.len;
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();
@@ -3874,10 +3879,10 @@ fn runCounted(
                 const run_retry_cap = @max(opts.max_stream_turn_retries, retractable_cap);
                 const reissue: ?enum { request, overload, run } = if (abort_pending)
                     null
+                else if (overloaded)
+                    (if (!tool_call_started and attempts_used < overload_attempts) .overload else null)
                 else if (request_retry_eligible and request_stream_retries < STREAM_RETRIES_PER_REQUEST)
                     .request
-                else if (overloaded and request_overload_retries + 1 < overload_attempts)
-                    .overload
                 else if (stream_turn_retries < run_retry_cap)
                     .run
                 else
@@ -3889,13 +3894,14 @@ fn runCounted(
                         .run => stream_turn_retries += 1,
                     }
                     if (allowance == .overload) {
-                        const delay_ms = client_mod.retryDelayMs(request_overload_retries, client_mod.RETRY_BASE_MS);
-                        log.warnId("agent", rid_for_turn, "stream overloaded → same-turn retry {d}/{d}; sleeping {d}ms", .{ request_overload_retries, overload_attempts, delay_ms });
+                        request_attempts_spent = attempts_used;
+                        const delay_ms = model_error.responseRetryAfterMs() orelse client_mod.retryDelayMs(attempts_used, client_mod.RETRY_BASE_MS);
+                        log.warnId("agent", rid_for_turn, "stream overloaded → same-turn retry {d}/{d}; sleeping {d}ms", .{ attempts_used, overload_attempts, delay_ms });
                         if (showed_output and !stream_cut_nudged) {
                             stream_cut_nudged = true;
                             try conversation.appendHostText(RESTART_AFTER_STREAM_CUT);
                         }
-                        announceRetractedAttempt(backend, sess, discarded_segment, thinking_bytes, request_overload_retries, overload_attempts, @intCast(delay_ms));
+                        announceRetractedAttempt(backend, sess, discarded_segment, thinking_bytes, attempts_used, overload_attempts, @intCast(delay_ms));
                         if (!client_mod.interruptibleSleepMs(delay_ms, opts.abort)) {
                             log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
                             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -3937,8 +3943,8 @@ fn runCounted(
                     continue :request_recovery;
                 }
                 if (overloaded and !abort_pending) {
-                    log.errId("agent", rid_for_turn, "stream failed after {d} attempt(s): {s}", .{ request_overload_retries + 1, @errorName(error.ServiceUnavailable) });
-                    last_error.noteAttempts(request_overload_retries + 1);
+                    log.errId("agent", rid_for_turn, "stream failed after {d} attempt(s): {s}", .{ attempts_used, @errorName(error.ServiceUnavailable) });
+                    last_error.noteAttempts(attempts_used);
                 }
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
             }

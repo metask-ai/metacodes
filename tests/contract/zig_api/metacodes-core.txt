@@ -7943,6 +7943,7 @@ metacodes-core.api_model_error.maskFailure: fn maskFailure(out: *MaskedFailure, 
 metacodes-core.api_model_error.withoutCutCredential: fn withoutCutCredential(text: []const u8, credential: ?SecretPrint) []const u8
 metacodes-core.api_model_error.noteStreamError: fn noteStreamError(payload: []const u8) void
 metacodes-core.api_model_error.isOverloaded: fn isOverloaded(payload: []const u8) bool
+metacodes-core.api_model_error.responseRetryAfterMs: fn responseRetryAfterMs() ?u64
 metacodes-core.api_model_error.noteTransportFailure: fn noteTransportFailure(category: Category, retry: Retry, message: []const u8) void
 metacodes-core.api_model_error.noteStreamFailure: fn noteStreamFailure(category: Category, retry: Retry, message: []const u8) void
 metacodes-core.api_model_error.noteContextWindowUnrecovered: fn noteContextWindowUnrecovered(message: []const u8) void

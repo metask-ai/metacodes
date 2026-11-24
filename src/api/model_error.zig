@@ -348,8 +348,6 @@ pub fn noteStreamError(payload: []const u8) void {
     if (detail.message.len == 0) detail.message.set("The provider reported an error inside the response stream.", null);
 }
 
-/// Whether a failure declared inside an accepted stream says the provider is
-/// overloaded, the same condition an HTTP 503 or 529 head reports.
 pub fn isOverloaded(payload: []const u8) bool {
     var scratch: [PARSE_SCRATCH_BYTES]u8 = undefined;
     const parsed = parseErrorPayload(&scratch, payload);
@@ -359,6 +357,11 @@ pub fn isOverloaded(payload: []const u8) bool {
     const code = parsed.code orelse return false;
     const status = std.fmt.parseInt(u16, code, 10) catch return false;
     return categoryForStatus(status) == .overloaded;
+}
+
+pub fn responseRetryAfterMs() ?u64 {
+    const capture = active orelse return null;
+    return capture.head.retry_after_ms;
 }
 
 /// A failure before any response head: connecting, sending or waiting for one.

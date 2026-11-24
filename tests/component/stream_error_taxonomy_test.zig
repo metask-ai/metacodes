@@ -463,3 +463,138 @@ test "L2 stream errors ⑤: an overloaded frame is ServiceUnavailable on every w
         return err;
     };
 }
+
+fn runOneTurnWith(a: std.mem.Allocator, provider: cc.api_provider.Provider, be: *const cc.ui_backend.UiBackend, max_stream_turn_retries: u8, abort: ?*cc.util_abort.AbortSignal) !cc.agent_loop.RunResult {
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs: []const cc.json_mod.ToolDefinition = &.{};
+    return cc.agent_loop.run(&conv, provider, defs, &perm, .{
+        .max_turns = 1,
+        .auto_compact_threshold = std.math.maxInt(usize),
+        .max_stream_turn_retries = max_stream_turn_retries,
+        .abort = abort,
+    }, be, a);
+}
+
+const HEADLESS_STREAM_RETRIES = 2;
+
+const RetryNotices = struct {
+    delays: [8]u64 = undefined,
+    len: usize = 0,
+    abort_on_notice: ?*cc.util_abort.AbortSignal = null,
+
+    fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_event.CoreEvent) void {
+        const self: *RetryNotices = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .retry_notice => |r| {
+                if (self.len < self.delays.len) {
+                    self.delays[self.len] = r.delay_ms;
+                    self.len += 1;
+                }
+                if (self.abort_on_notice) |signal| signal.abort(.user_interrupt);
+            },
+            else => {},
+        }
+    }
+
+    fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+        return null;
+    }
+
+    fn backend(self: *RetryNotices) cc.ui_backend.UiBackend {
+        return .{ .ctx = @ptrCast(self), .emit = emit, .poll = poll };
+    }
+};
+
+fn anthropicRun(url: []const u8, notices: *RetryNotices, max_stream_turn_retries: u8, abort: ?*cc.util_abort.AbortSignal) !cc.agent_loop.RunResult {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
+    defer client.deinit();
+    const be = notices.backend();
+    return runOneTurnWith(a, client.provider(), &be, max_stream_turn_retries, abort);
+}
+
+test "L2 stream errors ⑤: exhausted overload retries do not fall through to the headless Run allowance" {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("2");
+    defer retries.restore();
+    const overloaded = overloadedBeforeText(.anthropic);
+    const bodies = [_][]const u8{ overloaded, overloaded, overloaded, overloaded, complete(.anthropic) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, HEADLESS_STREAM_RETRIES, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+}
+
+test "L2 stream errors ⑤: an overload after a tool call started is not re-sent, even under the headless Run allowance" {
+    const a = std.testing.allocator;
+    const tool_then_overload = ANTHROPIC_START ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Glob\",\"input\":{}}}\n\n" ++
+        ANTHROPIC_OVERLOADED;
+    const bodies = [_][]const u8{ tool_then_overload, complete(.anthropic) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, HEADLESS_STREAM_RETRIES, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    clearLastError();
+}
+
+test "L2 stream errors ⑤: an HTTP 529 and an in-stream overload share one attempt limit" {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("2");
+    defer retries.restore();
+    const bodies = [_][]const u8{
+        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        overloadedBeforeText(.anthropic),
+        complete(.anthropic),
+    };
+    var srv = try harness.MockServer.startHttpCassette(&bodies, &.{ "HTTP/1.1 529 Overloaded", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK" });
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, 0, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+}
+
+test "L2 stream errors ⑤: an in-stream overload waits the Retry-After of its response head" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ overloadedBeforeText(.anthropic), complete(.anthropic) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    srv.extra_response_headers = "retry-after: 30\r\n";
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var signal = cc.util_abort.AbortSignal.init();
+    var notices = RetryNotices{ .abort_on_notice = &signal };
+    const result = try anthropicRun(url, &notices, 0, &signal);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqual(@as(u64, 30_000), notices.delays[0]);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    clearLastError();
+}
