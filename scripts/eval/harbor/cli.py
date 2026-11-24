@@ -27,7 +27,7 @@ from pathlib import Path
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.bench.client import Client
 from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json, configured_provider_ids, runtime_env, settings
-from scripts.eval.harbor.bench.workbench import open_local
+from scripts.eval.harbor.bench.workbench import RUNTIME_ROOT, open_local
 from scripts.eval.harbor.store import config as store_config
 
 
@@ -152,11 +152,13 @@ def ensure_service(args, root, config, jobs_dir, store):
     temporary = root / "tmp"
     client = receipt_client(saved, config) if saved.get("jobs_dir") == str(jobs_dir) else None
     reusable = same_service(saved, jobs_dir, store) and saved.get("tmpdir") == str(temporary)
-    if client and reusable and not client.legacy_token:
+    same_build = args.action != "open" or saved.get("runtime") == str(RUNTIME_ROOT)
+    if client and reusable and same_build and not client.legacy_token:
         return client
-    # A running service whose store changed (or that predates it), or that
-    # still requires its login link, is replaced on the same entry. Its
-    # workers keep running; the new service picks them up.
+    # A running service whose store changed (or that predates it), that
+    # still requires its login link, or that `metacodes bench` of another
+    # build finds, is replaced on the same entry. Its workers keep running;
+    # the new service picks them up.
     bind, port, public_url = service_entry(args, saved if client else {})
     if client:
         if client.legacy_token:
@@ -183,7 +185,7 @@ def ensure_service(args, root, config, jobs_dir, store):
             client = Client(value["url"], value.get("listen_url"))
             try:
                 client.request("api/workbench")
-                atomic_json(ready, {**value, "tmpdir": str(temporary)})
+                atomic_json(ready, {**value, "tmpdir": str(temporary), "runtime": str(RUNTIME_ROOT)})
                 ready.chmod(0o600)
                 handshake.unlink(missing_ok=True)
                 threading.Thread(target=process.wait, daemon=True).start()

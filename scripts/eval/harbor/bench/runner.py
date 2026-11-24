@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
+from scripts.eval.harbor.command import ADVANCED_FEATURES, TEAMWORK, TEAMWORK_TIMEOUT_MULTIPLIER, check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.bench import builds, data, executors
@@ -226,22 +226,6 @@ class RunManager:
             raise suites.Unavailable(f"{executor.name}：" + "；".join(reasons))
         return list(entry["tasks"])
 
-    def staged_metacodes_problem(self, suite, executor_name, bundle):
-        """Why an SSH WorkBuddy run would not run the metacodes its record
-        names (the run's bundle): an executable the node staged differs."""
-        if suite.runner != suites.WORKBUDDY or not bundle:
-            return None
-        executor = executors.find(settings(self.config_path), executor_name)
-        if executor.kind != "ssh":
-            return None
-        from scripts.eval.harbor.suites import workbuddy
-        staged = (self.executor_facts(executor).get("node") or {}).get("workbuddy_executables")
-        different = workbuddy.executable_mismatch(staged, workbuddy.bundle_executables(bundle))
-        if not different:
-            return None
-        return (f"{executor.name} 上 WorkBuddy 暂存的制品不是本次选择的 metacodes 版本（{'、'.join(different)} 不同）："
-                "请在该机器上用这个发行包重新运行 scripts.eval.workbuddy.stage_artifacts，或选择与暂存制品一致的版本")
-
     def suite_tasks(self, suite_id, executor=None):
         suite = suites.resolved(suites.get(suite_id))
         try:
@@ -268,11 +252,11 @@ class RunManager:
         for state in states:
             here = own
             if suite.runner == suites.WORKBUDDY:
-                combo = []
+                combo = list(harbor_reasons)
                 if state["kind"] == "ssh":
                     # Prepared on the node itself: its own checkout, Docker
                     # and task list; this machine adds only its sign-in mode.
-                    combo = state["node_reach"] + (state["node_workbuddy"].get(suite.id) or {}).get("reasons", [])
+                    combo += state["node_reach"] + (state["node_workbuddy"].get(suite.id) or {}).get("reasons", [])
                     here = [] if ctx.auth_mode() == "metask" else ["WorkBuddy 评测目前只支持 Metask 账号模式（--auth metask）"]
             else:
                 combo = harbor_reasons + state["reasons"]
@@ -349,8 +333,8 @@ class RunManager:
         states, default_executor, problems = self.executor_states(cfg)
         reasons += problems
         global_reasons = list(reasons)
-        # Harbor suites need the Linux bundle; WorkBuddy brings its own
-        # Harbor and staged artifacts and checks its own prerequisites.
+        # Every suite runs the Linux bundle; WorkBuddy brings its own Harbor
+        # and checks its own prerequisites.
         choices = bundle_choices(cfg, self.config_path)
         default_problem = None if choices or bundle_supplied else self.run_bundle(cfg, None, None)[1]
         harbor_reasons = [default_problem] if default_problem else []
@@ -458,6 +442,9 @@ class RunManager:
         problems = entry["executors"][state["name"]]["reasons"]
         if problems:
             raise ValueError("；".join(problems))
+        if TEAMWORK in features and not (state["kind"] == "ssh" and state.get("teamwork_privileged")):
+            raise ValueError("Teamwork 评测只能在开启了 teamwork_privileged 的 SSH 执行机器上运行：任务容器要放开 bubblewrap "
+                             "需要的权限，接近 privileged 容器，只适合用完即弃、没有凭证的专用节点")
         model = request.get("model")
         chosen = next((m for m in catalog["models"] if m["id"] == model), None)
         if chosen is None:
@@ -495,19 +482,14 @@ class RunManager:
                 raise ValueError(problem)
         ctx = self.suite_context()
         tasks = suites.validate_tasks(suite, ctx, request.get("tasks"), known=self.node_tasks(suite, state["name"]))
-        problem = self.staged_metacodes_problem(suite, state["name"],
-                                                self.run_bundle(settings(self.config_path), frozen, bundle)[0])
-        if problem:
-            raise ValueError(problem)
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
             if type(value) is not int or not 1 <= value <= limit:
                 raise ValueError(f"{name} 必须是 1–{limit} 的整数")
         if dry_run:
-            if suite.runner != suites.WORKBUDDY:
-                problem = self.run_bundle(settings(self.config_path), frozen, bundle)[1]
-                if problem:
-                    raise ValueError(problem)
+            problem = self.run_bundle(settings(self.config_path), frozen, bundle)[1]
+            if problem:
+                raise ValueError(problem)
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
                     "executor": state["name"], "features": features}
         with self.lock:
@@ -519,11 +501,9 @@ class RunManager:
             if self.setup_running():
                 raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
             cfg = settings(self.config_path)
-            used_bundle = frozen["bundle"] if frozen else cfg.get("bundle")
-            if suite.runner != suites.WORKBUDDY:
-                used_bundle, problem = self.run_bundle(cfg, frozen, None)
-                if problem:
-                    raise ValueError(problem)
+            used_bundle, problem = self.run_bundle(cfg, frozen, None)
+            if problem:
+                raise ValueError(problem)
             executor = executors.find(cfg, state["name"])
             facts = self.executor_facts(executor)
             mode = "provider" if imported else catalog["authentication"]["kind"]
@@ -550,6 +530,8 @@ class RunManager:
                 record["profile"] = profile
             if features:
                 record["features"] = features
+            if TEAMWORK in features:
+                record["agent_timeout_multiplier"] = TEAMWORK_TIMEOUT_MULTIPLIER
             route = None
             if imported:
                 # The run's own config (endpoint, model names, key variable)
@@ -651,6 +633,8 @@ def chosen_features(value):
     unknown = [name for name in value if name not in ADVANCED_FEATURES]
     if unknown:
         raise ValueError("未知的高级功能：" + "、".join(unknown))
+    if TEAMWORK in value and len(set(value)) > 1:
+        raise ValueError("Teamwork 只能单独开启：teamwork run 不接受其他高级功能的开关")
     return [name for name in ADVANCED_FEATURES if name in value]
 
 

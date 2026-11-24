@@ -365,6 +365,44 @@ test "L2 OpenRouter: the browser sign-in takes only its own state back, trades c
     try testing.expect(std.mem.indexOf(u8, shown, verifier) == null);
 }
 
+test "L2 OpenRouter: over SSH the browser sign-in names the ssh -L forward for the port it bound (#722)" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var server = try harness.MockServer.startCassette(&.{}, 0);
+    defer server.stop();
+    const origin = try case.openRouterAt(server);
+    try case.setEnv("SSH_CONNECTION", "192.0.2.10 50022 192.0.2.20 22");
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    var instructions = Instructions{ .allocator = testing.allocator };
+    defer instructions.deinit();
+    var abort = cc.util_abort.AbortSignal.init();
+    var run = FlowRun{ .prepared = try prepared(&case), .io = io_runtime.io(), .notify = instructions.notify() };
+    run.prepared.options.abort_signal = &abort;
+    var thread = try std.Thread.spawn(.{}, FlowRun.run, .{&run});
+    defer {
+        abort.abort(.user_interrupt);
+        thread.join();
+    }
+
+    if (!instructions.wait()) return error.FlowNeverPublishedInstructions;
+    const said = try a.dupe(u8, instructions.snapshot());
+    const page = pageIn(said, origin) orelse {
+        std.debug.print("instructions:\n{s}\n", .{said});
+        return error.PageNotOnTheMock;
+    };
+    const port = try callbackPortIn(page);
+    const forward = try std.fmt.allocPrint(a, "Over SSH? Forward the port first: ssh -L {d}:127.0.0.1:{d} <you>@<this machine>", .{ port, port });
+    if (std.mem.indexOf(u8, said, forward) == null) {
+        std.debug.print("instructions:\n{s}\n", .{said});
+        return error.NoForwardLine;
+    }
+    try testing.expectEqual(@as(usize, 0), server.requestCount());
+}
+
 test "L2 OpenRouter: a refusal ends the sign-in at once, with or without a state, and stores nothing" {
     var case: Case = undefined;
     try case.init();

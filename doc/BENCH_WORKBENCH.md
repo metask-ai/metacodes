@@ -227,9 +227,11 @@ The `workbuddy` runner drives the pinned integration in
 durable worker. Readiness requires a checkout from `provision_checkout.sh`
 (`metacodes bench --workbuddy-checkout <dir>` or
 `METACODES_WORKBUDDY_CHECKOUT`) at the pinned commit with the overlay and
-`.venv`, production linux/amd64 artifacts staged by `stage_artifacts`, the
+`.venv`, the workbench's Linux bundle (the same one Harbor suites run), the
 subset fetched by WorkBuddy's `scripts/dataset/fetch-dataset.sh`, Docker,
-`uv`, `bash`, and Metask account authentication. A launch writes a transient
+`uv`, `bash`, and Metask account authentication. A launch stages the run's bundle with
+`stage_artifacts` into a build context of its own, builds the split-mount
+image under the run's tag (removed afterwards), writes a transient
 `configs/models|jobs/metacodes-<run>.yaml` (removed afterwards), runs
 `uv run --frozen bash scripts/run.sh --job metacodes-<run>` in the checkout
 with the account key in a dedicated variable and the judge key removed, and
@@ -696,9 +698,14 @@ The local worker stays the durable owner of the run: it resolves the
 account (or provider) credential exactly as for a local run, and keeps
 refreshing a session login, then
 
-1. ships the Linux bundle the run evaluates as a tar stream over SSH into
-   `<state_dir>/bundles/<digest>`, once per content digest (complete
-   directories are marked and reused);
+1. resolves the node `<state_dir>/bin/metacodes` points at (the physical
+   path inside `<state_dir>/bundles/<digest>`) and runs every node command
+   of the run (`run`, `manifest`, `pack`) with that binary, so a
+   `metacodes bench setup --executor` that switches the node mid-run does
+   not change the driver under a running job; a run without a node stops
+   here. It then ships the Linux bundle the run evaluates as a tar stream
+   over SSH into `<state_dir>/bundles/<digest>`, once per content digest
+   (complete directories are marked and reused);
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
 3. starts `<state_dir>/bin/metacodes bench node run …` over SSH and
@@ -766,17 +773,15 @@ validates the tasks against the list the node reports and copies the job
 back like a Harbor run. Its readiness there is reaching a compatible node,
 Metask authentication and what the node reports for the suite (an executor
 without the Harbor CLI still runs WorkBuddy, which brings its own, but it
-needs `docker buildx`). Every executable the node staged for WorkBuddy
-(`metacodes`, TinyKG, the formal kernel and ripgrep, and the project kernel
-when staged; `node info` reports their sha256) must be the run's bundle's:
-otherwise the launch is refused. The node checks again before it starts,
-then builds the split-mount image from the staged context under a tag of
+needs `docker buildx`). The workbench ships the run's bundle to the node
+like a Harbor run's; the node stages its `metacodes`, TinyKG, formal kernel
+and ripgrep with `stage_artifacts` into a build context of its own, never
+the checkout's `docker/artifacts`, and builds the split-mount image under a tag of
 the run's own (`wbm:<first 12 hex of sha256(run name)>`, short because Docker names an image mount's directory after the hex of image id, reference and target, which must fit in 255 bytes) and
 names it in a transient harness version (the pinned `0.1.0.yaml` plus
 `mount.images.local`), which the run's job uses. The shared tag WorkBuddy's
 `run.sh` would otherwise reuse, and another workbench on the same Docker
-daemon could move, never reaches the trials; the build checks the staged
-executables in the very manifest it builds from. The run's tag and version
+daemon could move, never reaches the trials. The run's tag and version
 file are removed (within 60 seconds) under heartbeats before the node
 reports the run's end. The build sends heartbeats like a running Harbor,
 and a cancel (or a closed channel) kills it and ends the run. WorkBuddy's host proxy is given a run-scoped placeholder and a
@@ -983,18 +988,26 @@ CLI) only need a trusted entry. Open it by IP, `localhost` or the
 viewer) is read-only. The service receipt is
 `<state root>/bench/service.json` (mode 0600 on POSIX).
 
-After upgrading the binary, a running workbench keeps serving the previous
-version. On the service host, use the existing state directory for both
-commands. Run `metacodes bench stop` and wait for the old listener to stop
-responding, then rerun `metacodes bench` with the same jobs directory and any
-bind, port, and public URL options. Active benchmark workers continue through the
-restart. A service from before the login was dropped still requires its
+The workbench updates while benchmarks run. The version a run evaluates is
+its frozen bundle, and each run's worker is a process of its own that runs
+the workbench files it started with (extracted per content digest under
+`<state root>/bench/runtime/`, never removed), so neither depends on the
+service. After upgrading the binary, `metacodes bench` (with the same jobs
+directory and state directory) finds the service of the previous build,
+stops it and starts this build's on the same bind, port and public URL; the
+receipt records the build as `runtime`. Other commands (`run`, `info`, …)
+keep using the running service. Active workers continue through the restart,
+the new service shows their progress and advances profile queues from where
+they stood, and later queue items launch with the new workbench code on the
+same frozen bundle. On an SSH executor, `metacodes bench setup --executor`
+may install the new node while runs are active: each run keeps the node it
+started with (see [How an SSH run works](#how-an-ssh-run-works)). A service from before the login was dropped still requires its
 link: `metacodes bench stop` and `metacodes bench` stop it with the
 capability from this machine's receipt (the only use of it left), and
 `metacodes bench` then starts the login-free service.
 
-When `metacodes bench` replaces a running service (a store change or the
-login-free upgrade), the new service keeps the old bind, port and public
+When `metacodes bench` replaces a running service (another build, a store
+change or the login-free upgrade), the new service keeps the old bind, port and public
 URL unless the command gives them. A receipt from before this release does
 not record the bind, so when the old service listens on 127.0.0.1 (or
 0.0.0.0) the command leaves it running and asks for `--bind`. The CLI acts
@@ -1047,9 +1060,76 @@ record list none, and the profile page marks them; a direct launch that asks
 for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features: an older node is refused until
+features (4 since teamwork): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
+
+#### Teamwork
+
+`teamwork` is a preview feature of its own kind: not a flag of the headless
+run but its entry. A profile with it runs every Harbor task through
+`metacodes --preview=teamwork teamwork run`, the same pipeline as the REPL's
+`/teamwork` (implementer, reviewer, isolated verifier, merge-back), and the
+task's own verifier then scores the merged result. Comparing a profile with
+teamwork against one without on the same version, model and tasks measures
+what turning it on changes. It runs alone, since `teamwork run` takes none of
+the other features' flags, and only on an SSH executor whose entry sets
+`"teamwork_privileged": true`:
+
+- **Container**: teamwork seats run their commands under bubblewrap, which
+  Docker's defaults refuse. A teamwork run's compose overlay gives Harbor's
+  `main` service `cap_add: [SYS_ADMIN, NET_ADMIN]` and unconfined seccomp,
+  AppArmor and `systempaths` (`TEAMWORK_CONTAINER`), and the agent installs
+  git and bubblewrap when the image lacks them. **This is close to a
+  privileged container.** The seats' commands stay inside bubblewrap, but
+  the task's verifier runs as root in the same container, outside it, and
+  executes code the model wrote (a solution module, a `conftest.py`); with
+  these permissions such code can reach the executor host (for example its
+  `core_pattern`, or a cgroup v1 `release_agent`). Set
+  `teamwork_privileged` only on a disposable executor that holds no
+  credentials or other secrets; without it a teamwork launch is refused.
+- **Repository**: teamwork works in a git worktree and merges back. A task
+  directory without a commit gets one first (`git init` when it is no
+  repository, then a snapshot commit of what the image put there); one with
+  a commit is used as it is.
+- **Permissions**: a headless trial runs with `bypassPermissions`, but
+  `teamwork run` takes no `--permission`, and its seats and isolated
+  verifier would ask for every risky command with nobody to answer (the
+  first real runs ended `audit_unavailable`: the verifier stopped at its
+  prompts). The trial writes user-level allow rules for the built-in tools
+  (`TEAMWORK_ALLOWED_TOOLS`, WebFetch included) and every MCP server the
+  task declares (`mcp__<server>`) to `~/.claude/settings.json` in the
+  disposable container, unless the image has that file; seat commands still
+  run under bubblewrap. This is narrower than `bypassPermissions`: a
+  protected path (for example metacodes' own configuration) still asks, so a
+  seat that touches one is refused and the verifier can stop there.
+- **Request and approval**: the instruction is the approved request
+  (`--approve`); text starting with `[` gets a heading, since a leading
+  bracket would be read as an option segment. Every seat uses metacodes and
+  the trial's model; the run's reasoning effort reaches the implementer and
+  reviewer seats (`--config-json`), while the verifier keeps its own.
+- **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
+  `task.toml` (easy $20, medium $40, hard $80, otherwise $40), and the trial
+  gets `--agent-timeout-multiplier 3`, recorded on the run as
+  `agent_timeout_multiplier`. The cap is in metacodes' price-table
+  estimate, not a provider bill: a model without its own price (most
+  imported and Metask models) is charged at the Sonnet fallback rates
+  (`src/util/pricing.zig`), so the cap stops far earlier than real spend
+  would. A first real-model run at easy $5 ran out before the reviewer
+  finished.
+- **Validity**: `teamwork status --json` lands in the trial's agent logs,
+  and the run directory without its worktrees (`teamwork-run/`: ledger,
+  seat records and logs) beside it. A run that wrote no status, or in which
+  no implementer seat finished (all failed, as on a provider error), fails
+  the trial with `TeamworkNotEngaged`, so it counts as invalid. A run that
+  spent its budget (`budget_exhausted`), worked but did not merge, or merged
+  a wrong change is scored by the verifier like any other. Its stop reason
+  is `teamwork_<state>`, and summaries count `budget_exhausted` trials
+  apart (预算用完 on the profile page and in 模型对比), since for a model
+  without its own price that is often the fallback estimate rather than the
+  task. The run directory is copied again when the trial is killed on its
+  timeout. The trial's cost is the run's ledger spend; per-request timing
+  and tokens come from the relay's request metrics as for a headless run.
 
 `POST /api/profiles/run` queues datasets: on an existing profile with
 `profile` (its version and features cannot be changed), or with `bundle` and

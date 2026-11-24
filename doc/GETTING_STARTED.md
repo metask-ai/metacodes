@@ -209,7 +209,9 @@ naming the variable, when one is set.
 at Metask's OAuth server `https://www.metask-ai.com`, as the public client
 `metacodes` asking for `read model:invoke`: the browser returns to
 `http://localhost:<port>/auth/metask/callback`, and you choose a model and a
-reasoning level from the `/v1/models` of the gateway the sign-in names. There
+reasoning level from the `/v1/models` of the gateway the sign-in names. A model
+the gateway can turn thinking off and on for but lists no levels for is offered
+`off` and `on`; a model with a single choice is not asked for one. There
 is no API key to choose: the session calls that gateway with its own access
 token, billed to the account. The access and rotating refresh tokens, with the
 gateway and model URLs, are stored as the Metask session in
@@ -230,7 +232,16 @@ Metask's JSON device authorization flow and stores the same session. It prints
 model and reasoning level, as `metacodes login` does, and stores them the same
 way; without one (a script that confirms the code elsewhere) it stores only
 the session and says so, and a start on it names its model with `--model`.
-`/login metask` is the same in the TUI. A plain start signs in with the stored
+`/login metask` is the same in the TUI. In an SSH session the browser could
+not come back to this machine: `metacodes login` takes the device code by
+itself, and `/login` asks which way with the code first (`--no-browser` keeps
+the browser sign-in, and then prints the `ssh -L` forward its callback needs).
+A browser sign-in finished on another computer ends on a page that does not
+load; paste that page's address at the prompt (or into the `/login` pane) and
+the sign-in finishes here, for Metask and for `login --provider <id>` sign-ins
+alike. `metacodes login` waits for the browser ten minutes
+(`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`), then stops and stores nothing. A
+plain start signs in with the stored
 session unless a key signs Metask in (`--api-key`, `METASK_API_KEY`, or a key
 in `auth.json` from `metacodes login --api-key` or a sign-in older than this).
 Set `METASK_SITE_URL` for a local control plane (`http://localhost:3000`);

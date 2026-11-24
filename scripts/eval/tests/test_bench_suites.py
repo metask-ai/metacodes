@@ -502,7 +502,7 @@ class McpForwardingTest(unittest.TestCase):
             agent.__dict__.update(
                 logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[types.SimpleNamespace(
                     name="are", transport="streamable-http", url="http://are-sidecar:8000/mcp", headers={})],
-                config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None,
+                config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=False,
                 _account_gateway=None)
             environment = CapturingEnvironment()
             asyncio.run(agent.run("solve it", environment, None))
@@ -511,12 +511,35 @@ class McpForwardingTest(unittest.TestCase):
         self.assertTrue(any('/config.json"' in c for c in environment.agent_commands))
 
 
+    def test_a_teamwork_trial_killed_on_timeout_still_keeps_its_run_records(self):
+        with stubbed_harbor() as agent_module, tempfile.TemporaryDirectory() as tmp:
+            agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
+            agent.__dict__.update(
+                logs_dir=Path(tmp) / "trial-x" / "agent", mcp_servers=[], config_source=None,
+                _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=True, _account_gateway=None)
+
+            async def killed(environment, command):
+                raise asyncio.TimeoutError("agent timeout")
+
+            agent.exec_as_agent = killed
+            environment = CapturingEnvironment()
+            with self.assertRaises(asyncio.TimeoutError):
+                asyncio.run(agent.run("solve it", environment, None))
+        kept = [c for c in environment.root_commands if "teamwork-run" in c]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("--exclude=worktree", kept[0])
+
+
 class CapturingEnvironment:
     def __init__(self):
-        self.uploads, self.agent_commands = [], []
+        self.uploads, self.agent_commands, self.root_commands = [], [], []
 
     async def upload_file(self, source, target):
         self.uploads.append((str(target), Path(source).read_bytes()))
+
+    async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
+        self.root_commands.append(command)
+        return types.SimpleNamespace(return_code=0, stdout="", stderr="")
 
 
 @contextlib.contextmanager
@@ -549,13 +572,35 @@ def stubbed_harbor():
         yield module
 
 
+def workbuddy_bundle(bundle, machine=62):
+    """A Linux bundle stage_artifacts accepts: ELF64 headers of `machine`,
+    the source commits and the licenses it stages."""
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    header[18:20] = machine.to_bytes(2, "little")
+    from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
+    for file in BUNDLE_EXECUTABLES:
+        (bundle / file).parent.mkdir(parents=True, exist_ok=True)
+        (bundle / file).write_bytes(bytes(header) + file.encode())
+        (bundle / file).chmod(0o755)
+    atomic_json(bundle / "manifest.json", {"target": {"os": "linux"}, "source": {"commit": "a" * 40}})
+    atomic_json(bundle / "vendor/tinykg/tinykg.provenance.json", {"source_commit": "b" * 40})
+    (bundle / "share/licenses").mkdir(parents=True, exist_ok=True)
+    for _, _, name in wb.BUNDLE_LICENSES:
+        (bundle / "share/licenses" / name).write_text(name + "\n")
+    return bundle
+
+
 def workbuddy_checkout(root, *, head=WORKBUDDY_PINNED_COMMIT, subset="code"):
     repo = root / "workbuddy-bench"
     (repo / ".git").mkdir(parents=True)
     (repo / ".git/HEAD").write_text(head + "\n")
     (repo / ".venv").mkdir()
     atomic_json(repo / wb.OVERLAY, {"workbuddy_commit": WORKBUDDY_PINNED_COMMIT})
-    atomic_json(repo / wb.ARTIFACT_MANIFEST, {"target_platform": "linux/amd64", "synthetic_fixture": False})
+    (repo / wb.HARNESS_CONTEXT).mkdir(parents=True)
+    (repo / wb.HARNESS_CONTEXT / "Dockerfile").write_text("FROM scratch\nCOPY artifacts/bin/ /bin/\n")
+    (repo / wb.HARNESS_VERSIONS).mkdir(parents=True)
+    shutil.copy(REPO / "scripts/eval/workbuddy/overlay" / wb.HARNESS_VERSIONS / "0.1.0.yaml", repo / wb.HARNESS_VERSIONS)
     for task in ("bug_fix-easy-alpha", "data_quality-hard-beta", "data_quality-hard-gamma"):
         (repo / wb.dataset_rel(subset) / task).mkdir(parents=True)
         (repo / wb.dataset_rel(subset) / task / "task.toml").write_text("[task]\n")
@@ -709,7 +754,8 @@ class SuiteLaunchTest(unittest.TestCase):
         self.addCleanup(upstream.shutdown)
         repo = workbuddy_checkout(self.root)
         cfg = json.loads(self.manager.config_path.read_text())
-        cfg.update(auth_mode="metask", account_state_dir=str(state), workbuddy_checkout=str(repo))
+        cfg.update(auth_mode="metask", account_state_dir=str(state), workbuddy_checkout=str(repo),
+                   bundle=str(workbuddy_bundle(self.root / "wb-bundle")))
         atomic_json(self.manager.config_path, cfg)
         with patch.dict(os.environ, {"METASK_SITE_URL": f"http://127.0.0.1:{upstream.server_port}",
                                      "FAKE_EXPECT_ACCOUNT_KEY": "session-access",
@@ -733,8 +779,9 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(observed["argv"][:2] + observed["argv"][3:], ["run", "--frozen", "scripts/run.sh", "--job", slug])
         self.assertEqual(Path(observed["cwd"]).resolve(), repo.resolve())
         job = observed["job"]
+        # The trials mount the image staged from the run's bundle.
         self.assertEqual((job["harness"], job["dataset"], job["model"]),
-                         ("metacodes/0.1.0", "datasets/wb-bench-code-v1.0/tasks", slug))
+                         ("metacodes/" + slug, "datasets/wb-bench-code-v1.0/tasks", slug))
         self.assertEqual(job["task_selection"], {"mode": "name", "names": ["bug_fix-easy-alpha", "data_quality-hard-beta"]})
         self.assertEqual(job["jobs_dir"], str(job_root / "workbuddy"))
         self.assertEqual(job["orchestrator_override"], {"n_concurrent_trials": 2})
@@ -766,7 +813,8 @@ class SuiteLaunchTest(unittest.TestCase):
         repo = workbuddy_checkout(self.root, subset="web")
         cfg = json.loads(self.manager.config_path.read_text())
         cfg.update(auth_mode="metask", account_state_dir=str(state), workbuddy_checkout=str(repo),
-                   judges={"workbuddy-web": {"model": "metask/judge-model"}})
+                   judges={"workbuddy-web": {"model": "metask/judge-model"}},
+                   bundle=str(workbuddy_bundle(self.root / "wb-bundle")))
         atomic_json(self.manager.config_path, cfg)
         with patch.dict(os.environ, {"METASK_SITE_URL": f"http://127.0.0.1:{upstream.server_port}",
                                      "FAKE_EXPECT_ACCOUNT_KEY": "session-access"}):
@@ -816,18 +864,23 @@ class SuiteLaunchTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             wb.judge_model(suites.get("workbuddy-web"), {"judges": {"workbuddy-web": {"key": "k"}}})
 
-    def test_the_mount_image_build_checks_the_manifest_it_builds_from(self):
-        """Staged artifacts swapped after the node's check: the build reads the
-        manifest once and refuses before Docker runs."""
+    def test_the_mount_image_is_staged_from_the_runs_bundle(self):
+        """The build context holds the bundle's own executables; a bundle
+        stage_artifacts refuses never reaches Docker."""
         import threading
         repo = workbuddy_checkout(self.root)
-        staged = {"metacodes": "b" * 64, "tinykg": "b" * 64, "metacodes-formal-kernel": "b" * 64, "ripgrep": "b" * 64}
-        manifest = json.loads((repo / wb.ARTIFACT_MANIFEST).read_text())
-        manifest["executables"] = {label: {"sha256": digest} for label, digest in staged.items()}
-        atomic_json(repo / wb.ARTIFACT_MANIFEST, manifest)
-        expected = {**staged, "metacodes": "a" * 64}
-        with self.assertRaisesRegex(ValueError, "metacodes"):
-            wb.build_harness_image(repo, "t:x", threading.Event(), expected=expected, docker=str(self.root / "no-docker"))
+        bundle = workbuddy_bundle(self.root / "bundle")
+        seen = self.root / "seen"
+        docker = self.root / "docker"
+        docker.write_text(f"#!/bin/sh\ncp -R \"$8\" {seen}\n")
+        docker.chmod(0o755)
+        self.assertTrue(wb.build_harness_image(repo, bundle, "t:x", threading.Event(), docker=str(docker)))
+        self.assertEqual((seen / "artifacts/bin/metacodes").read_bytes(), (bundle / "bin/metacodes").read_bytes())
+        self.assertEqual((seen / "artifacts/bin/tinykg").read_bytes(), (bundle / "vendor/tinykg/tinykg").read_bytes())
+        self.assertEqual((seen / "Dockerfile").read_bytes(), (repo / wb.HARNESS_CONTEXT / "Dockerfile").read_bytes())
+        arm = workbuddy_bundle(self.root / "arm", machine=183)
+        with self.assertRaisesRegex(ValueError, "arm.*不能用于 WorkBuddy"):
+            wb.build_harness_image(repo, arm, "t:x", threading.Event(), docker=str(self.root / "no-docker"))
 
     def test_workbuddy_readiness_reports_an_unpinned_checkout(self):
         repo = workbuddy_checkout(self.root, head="0" * 40)

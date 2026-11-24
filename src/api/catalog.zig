@@ -25,20 +25,21 @@ const model_fallback = @import("../util/model.zig");
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const model_name = @import("model_name.zig");
+const model_adapter = @import("model_adapter.zig");
 
-/// 顶档(内部 `.xhigh`)在某条路由上的叫法。neutral = 目录没说、或用 OpenAI 词汇 xhigh。
-pub const EffortVocabulary = enum { neutral, max };
+/// 顶档(内部 `.xhigh`)在某条路由上的叫法,或只能开关的路由叫 on / off。neutral = 目录没说、或用 OpenAI 词汇 xhigh。
+pub const EffortVocabulary = enum { neutral, max, on_off };
 
-/// 给人看的档位标签:顶档按路由词汇,其余档位各家叫法一致。
+/// 给人看的档位标签:顶档按路由词汇,其余档位各家叫法一致;只能开关的路由叫 on / off。
 pub fn effortLabel(vocabulary: EffortVocabulary, effort: types.ReasoningEffort) []const u8 {
-    return switch (effort) {
-        .xhigh => switch (vocabulary) {
-            .max => "max",
-            .neutral => effort.name(),
-        },
-        .none, .minimal, .low, .medium, .high, .max => effort.name(),
+    return switch (vocabulary) {
+        .on_off => if (effort.active()) "on" else "off",
+        .max => if (effort == .xhigh) "max" else effort.name(),
+        .neutral => effort.name(),
     };
 }
+
+pub const switched_on_level: types.ReasoningEffort = .high;
 
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
@@ -71,6 +72,7 @@ pub const Catalog = struct {
         /// image and video models beside the text ones and says so per
         /// endpoint. null = the catalog did not say.
         messages: ?bool = null,
+        thinking_switch: model_adapter.ThinkingSwitch = .family,
 
         pub fn supportsReasoning(self: Entry, effort: types.ReasoningEffort) bool {
             return (self.reasoning_mask & reasoningBit(effort)) != 0;
@@ -87,7 +89,7 @@ pub const Catalog = struct {
         for (self.entries.items) |entry| {
             const id = try allocator.dupe(u8, entry.model_id);
             errdefer allocator.free(id);
-            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary, .messages = entry.messages });
+            try copy.entries.append(allocator, .{ .model_id = id, .max_tokens = entry.max_tokens, .max_input_tokens = entry.max_input_tokens, .reasoning_mask = entry.reasoning_mask, .image_input = entry.image_input, .effort_vocabulary = entry.effort_vocabulary, .messages = entry.messages, .thinking_switch = entry.thinking_switch });
         }
         return copy;
     }
@@ -144,6 +146,7 @@ pub const Catalog = struct {
             const effort_vocabulary = extractEffortVocabulary(obj);
             const image_input = extractImageInput(obj);
             const messages = extractMessagesEndpoint(obj);
+            const thinking_switch = extractThinkingSwitch(obj);
 
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
@@ -155,6 +158,7 @@ pub const Catalog = struct {
                 .image_input = image_input,
                 .effort_vocabulary = effort_vocabulary,
                 .messages = messages,
+                .thinking_switch = thinking_switch,
             });
             log.debug("catalog", "model {s}: max_tokens={?d} max_input_tokens={?d} image_input={?}", .{ id, mt, mit, image_input });
         }
@@ -199,6 +203,13 @@ pub const Catalog = struct {
             }
         }
         return 200_000;
+    }
+
+    pub fn thinkingSwitchFor(self: *const Catalog, model: []const u8) model_adapter.ThinkingSwitch {
+        for (self.entries.items) |e| {
+            if (model_name.eqlIgnoreCase(e.model_id, model)) return e.thinking_switch;
+        }
+        return .family;
     }
 
     pub fn reasoningMaskFor(self: *const Catalog, model: []const u8) u8 {
@@ -316,6 +327,10 @@ fn extractReasoningMask(obj: []const u8) u8 {
     // The gateway's own list outranks the Anthropic-shaped `effort` block it
     // sends beside it, all false, for every chat model (#527).
     if (gatewayReasoning(caps)) |gateway| return gateway.mask;
+    return effortBlockMask(caps);
+}
+
+fn effortBlockMask(caps: []const u8) u8 {
     const effort = findObjectField(caps, "effort") orelse return 0;
     var mask: u8 = 0;
     if (capSupported(effort, "low")) mask |= reasoningBit(.low);
@@ -334,12 +349,18 @@ fn extractReasoningMask(obj: []const u8) u8 {
 /// (#527): `capabilities.reasoning.efforts`, e.g. `["low","high","max"]`, read
 /// the way `capabilities.effort` is (a list with `max` and no `xhigh` calls its
 /// top level that), and `reasoning.disable.supported`, whether `none` turns the
-/// reasoning off. Null when the catalog names no levels that way.
-const GatewayReasoning = struct { mask: u8, vocabulary: EffortVocabulary };
+/// reasoning off. A model that names no level but can be switched off, and on
+/// (`thinking.types.enabled`), is offered off and on. Null when the catalog
+/// says neither.
+const GatewayReasoning = struct { mask: u8, vocabulary: EffortVocabulary, thinking_switch: model_adapter.ThinkingSwitch };
+
+const switched_on_or_off = GatewayReasoning{ .mask = reasoningBit(switched_on_level), .vocabulary = .on_off, .thinking_switch = .off_or_on };
 
 fn gatewayReasoning(caps: []const u8) ?GatewayReasoning {
     const reasoning = findObjectField(caps, "reasoning") orelse return null;
-    const efforts = findObjectField(reasoning, "efforts") orelse return null;
+    const can_disable = if (findObjectField(reasoning, "disable")) |disable| supportedTrue(disable) else false;
+    const can_switch = can_disable and thinkingTypeSupported(caps, "enabled") and effortBlockMask(caps) == 0;
+    const efforts = findObjectField(reasoning, "efforts") orelse return if (can_switch) switched_on_or_off else null;
     var mask: u8 = 0;
     if (listNames(efforts, "low")) mask |= reasoningBit(.low);
     if (listNames(efforts, "medium")) mask |= reasoningBit(.medium);
@@ -348,12 +369,29 @@ fn gatewayReasoning(caps: []const u8) ?GatewayReasoning {
     if (has_xhigh) mask |= reasoningBit(.xhigh);
     const has_max = listNames(efforts, "max");
     if (has_max) mask |= reasoningBit(if (has_xhigh) .max else .xhigh);
+    if (mask == 0 and can_switch) return switched_on_or_off;
     // A model whose reasoning cannot be turned off gets no `none`, which
     // would not turn it off. Kept when the model names no level, as it is
     // then all there is to choose.
-    const can_disable = if (findObjectField(reasoning, "disable")) |disable| supportedTrue(disable) else false;
     if (mask != 0 and !can_disable) mask |= none_withheld;
-    return .{ .mask = mask, .vocabulary = if (!has_xhigh and has_max) .max else .neutral };
+    return .{
+        .mask = mask,
+        .vocabulary = if (!has_xhigh and has_max) .max else .neutral,
+        .thinking_switch = if (mask != 0 and can_disable) .off_or_levels else .family,
+    };
+}
+
+fn thinkingTypeSupported(caps: []const u8, type_name: []const u8) bool {
+    const thinking = findObjectField(caps, "thinking") orelse return false;
+    const kinds = findObjectField(thinking, "types") orelse return false;
+    const kind = findObjectField(kinds, type_name) orelse return false;
+    return supportedTrue(kind);
+}
+
+fn extractThinkingSwitch(obj: []const u8) model_adapter.ThinkingSwitch {
+    const caps = findObjectField(obj, "capabilities") orelse return .family;
+    const gateway = gatewayReasoning(caps) orelse return .family;
+    return gateway.thinking_switch;
 }
 
 /// `"supported": true` in an object of the gateway's capabilities.
@@ -762,16 +800,16 @@ test "Catalog: empty/invalid json no crash" {
 
 test "Metask's gateway catalog as it answers: the levels it names outrank the all-false effort block beside them, and none only where reasoning turns off (#527)" {
     // Three entries of www.metask-ai.com's `/v1/models` as it answered on
-    // 2026-11-17, trimmed to these fields. Every chat model carries an
+    // 2026-11-23, trimmed to these fields. Every chat model carries an
     // Anthropic-shaped `effort` block, all false; the levels are in
     // `reasoning.efforts`. Read the other way round, GLM offered `none` alone.
     var catalog = Catalog.init(std.testing.allocator);
     defer catalog.deinit();
     try catalog.loadFromModelsListJson(
         \\{"object":"list","data":[
-        \\{"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":false},"efforts":["low","medium","high","max"],"supported":true,"translated":true}}},
-        \\{"id":"glm-5.3-flash","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":false},"efforts":["low","high","max"],"supported":true,"translated":true}}},
-        \\{"id":"kimi-k3.1-pro","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":true},"supported":true,"translated":true}}}
+        \\{"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":false},"efforts":["low","medium","high","max"],"supported":true,"translated":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\{"id":"glm-5.3-flash","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":false},"efforts":["low","high","max"],"supported":true,"translated":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\{"id":"kimi-k3.1-pro","capabilities":{"endpoints":{"messages":{"supported":true}},"effort":{"low":{"supported":false},"max":{"supported":false},"high":{"supported":false},"medium":{"supported":false},"supported":false},"reasoning":{"disable":{"supported":true},"supported":true,"translated":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}}
         \\]}
     );
     try std.testing.expectEqual(@as(usize, 3), catalog.entries.items.len);
@@ -786,11 +824,16 @@ test "Metask's gateway catalog as it answers: the levels it names outrank the al
     try std.testing.expectEqual(@as(?types.ReasoningEffort, .medium), defaultReasoningForMask(glm.reasoning_mask));
     const flash = catalog.entries.items[1];
     try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .low, .high, .xhigh }, reasoningOptions(flash.reasoning_mask, &buf));
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, glm.thinking_switch);
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, flash.thinking_switch);
 
-    // A model that names no level: `none` is all there is, as before.
     const kimi = catalog.entries.items[2];
-    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{.none}, reasoningOptions(kimi.reasoning_mask, &buf));
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), defaultReasoningForMask(kimi.reasoning_mask));
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .none, .high }, reasoningOptions(kimi.reasoning_mask, &buf));
+    try std.testing.expectEqual(EffortVocabulary.on_off, kimi.effort_vocabulary);
+    try std.testing.expectEqualStrings("off", effortLabel(kimi.effort_vocabulary, .none));
+    try std.testing.expectEqualStrings("on", effortLabel(kimi.effort_vocabulary, .high));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), defaultReasoningForMask(kimi.reasoning_mask));
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_on, kimi.thinking_switch);
 }
 
 test "a gateway model whose reasoning turns off is offered none before its levels (#527)" {
@@ -801,6 +844,7 @@ test "a gateway model whose reasoning turns off is offered none before its level
     );
     var buf: ReasoningOptions = undefined;
     try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .none, .low, .high }, reasoningOptions(catalog.entries.items[0].reasoning_mask, &buf));
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_levels, catalog.entries.items[0].thinking_switch);
 }
 
 test "Metask's gateway catalog: reasoning levels from capabilities.reasoning.efforts and the messages endpoint (#527)" {
@@ -825,4 +869,42 @@ test "Metask's gateway catalog: reasoning levels from capabilities.reasoning.eff
     try std.testing.expectEqual(@as(?bool, false), catalog.entries.items[1].messages);
     try std.testing.expectEqual(@as(u8, 0), catalog.entries.items[1].reasoning_mask);
     try std.testing.expectEqual(@as(?bool, null), catalog.entries.items[2].messages);
+}
+
+test "a gateway model that names no level is offered off and on only where the catalog says both can be sent" {
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    try catalog.loadFromModelsListJson(
+        \\{"data":[
+        \\{"id":"switches","capabilities":{"context_management":{"clear_thinking_20251015":{"supported":false}},"reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\{"id":"empty-list","capabilities":{"reasoning":{"disable":{"supported":true},"efforts":[],"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\{"id":"no-enabled","capabilities":{"reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}}}},
+        \\{"id":"always-on","capabilities":{"reasoning":{"disable":{"supported":false},"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}},
+        \\{"id":"clear-thinking-only","capabilities":{"context_management":{"clear_thinking_20251015":{"supported":true}},"reasoning":{"disable":{"supported":true},"supported":true}}},
+        \\{"id":"levels-in-effort-block","capabilities":{"effort":{"high":{"supported":true},"max":{"supported":true},"supported":true},"reasoning":{"disable":{"supported":true},"supported":true},"thinking":{"types":{"enabled":{"supported":true}}}}}
+        \\]}
+    );
+    var buf: ReasoningOptions = undefined;
+    for (catalog.entries.items[0..2]) |switched| {
+        try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .none, switched_on_level }, reasoningOptions(switched.reasoning_mask, &buf));
+        try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_on, switched.thinking_switch);
+        try std.testing.expectEqual(EffortVocabulary.on_off, switched.effort_vocabulary);
+    }
+    const effort_block = catalog.entries.items[5];
+    try std.testing.expectEqualSlices(types.ReasoningEffort, &.{ .none, .high, .xhigh }, reasoningOptions(effort_block.reasoning_mask, &buf));
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, effort_block.thinking_switch);
+    for (catalog.entries.items[2..5]) |unswitched| {
+        try std.testing.expectEqualSlices(types.ReasoningEffort, &.{.none}, reasoningOptions(unswitched.reasoning_mask, &buf));
+        try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, unswitched.thinking_switch);
+        try std.testing.expectEqualStrings("none", effortLabel(unswitched.effort_vocabulary, .none));
+    }
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_on, catalog.thinkingSwitchFor("SWITCHES"));
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.family, catalog.thinkingSwitchFor("not-listed"));
+    try std.testing.expectEqualStrings("on", catalog.effortLabelFor("switches", .medium));
+    try std.testing.expectEqualStrings("off", catalog.effortLabelFor("switches", .minimal));
+
+    var copy = try catalog.clone(std.testing.allocator);
+    defer copy.deinit();
+    try std.testing.expectEqual(model_adapter.ThinkingSwitch.off_or_on, copy.thinkingSwitchFor("switches"));
+    try std.testing.expectEqualStrings("on", copy.effortLabelFor("switches", .high));
 }

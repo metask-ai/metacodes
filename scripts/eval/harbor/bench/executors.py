@@ -186,6 +186,10 @@ class SshExecutor:
     docker_mirrors: Tuple[str, ...] = ()
     ghcr_mirror: Optional[str] = None
     container_mirrors: Tuple[Tuple[str, str], ...] = ()
+    # Whether teamwork runs may give their task containers the permissions
+    # bubblewrap needs (TEAMWORK_CONTAINER): near privileged, so only for a
+    # disposable executor that holds no credentials.
+    teamwork_privileged: bool = False
 
     kind = "ssh"
 
@@ -194,7 +198,7 @@ class SshExecutor:
         return (self.user + "@" if self.user else "") + self.host
 
     def public(self) -> Dict:
-        return {"name": self.name, "kind": "ssh",
+        return {"name": self.name, "kind": "ssh", "teamwork_privileged": self.teamwork_privileged,
                 "label": f"{self.name}（SSH {self.destination}:{self.port}）"}
 
     def spec(self) -> Dict:
@@ -206,7 +210,8 @@ class SshExecutor:
                 "egress_allow": list(self.egress_allow) if self.egress_allow is not None else None,
                 "pypi_index": self.pypi_index,
                 "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror,
-                "container_mirrors": dict(self.container_mirrors) or None}
+                "container_mirrors": dict(self.container_mirrors) or None,
+                "teamwork_privileged": self.teamwork_privileged}
 
     @property
     def apt_cache_url(self) -> str:
@@ -248,6 +253,21 @@ class SshExecutor:
 Executor = Union[LocalExecutor, SshExecutor]
 
 
+def with_teamwork(overlay: Optional[Dict], features, executor) -> Optional[Dict]:
+    """The run's compose overlay, with the container permissions bubblewrap
+    needs on Harbor's `main` service when the run uses teamwork."""
+    from scripts.eval.harbor.command import TEAMWORK, TEAMWORK_CONTAINER
+    if TEAMWORK not in features:
+        return overlay
+    if not executor.teamwork_privileged:
+        raise ValueError(f"执行机器 {executor.name} 没有开启 teamwork_privileged，不能运行 Teamwork 评测")
+    overlay = json.loads(json.dumps(overlay or {}))
+    main = overlay.setdefault("services", {}).setdefault("main", {})
+    for key, values in TEAMWORK_CONTAINER.items():
+        main[key] = list(main.get(key) or []) + [v for v in values if v not in (main.get(key) or [])]
+    return overlay
+
+
 def parse(entry) -> Executor:
     """One validated executor entry; raises ValueError naming the problem."""
     if not isinstance(entry, dict):
@@ -264,7 +284,7 @@ def parse(entry) -> Executor:
         raise ValueError(f"{name}: kind 必须是 local 或 ssh")
     allowed = {"name", "kind", "host", "user", "port", "identity_file", "state_dir", "harbor", "python",
                "metrics_bind", "metrics_enabled", "egress", "egress_ports", "egress_allow", "pypi_index", "docker_mirrors",
-               "ghcr_mirror", "container_mirrors"}
+               "ghcr_mirror", "container_mirrors", "teamwork_privileged"}
     extra = set(entry) - allowed
     if extra:
         raise ValueError(f"{name}: 不支持的字段 {', '.join(sorted(extra))}")
@@ -294,6 +314,10 @@ def parse(entry) -> Executor:
     enabled = entry.get("metrics_enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{name}: metrics_enabled 必须是布尔值")
+    teamwork = entry.get("teamwork_privileged", False)
+    if not isinstance(teamwork, bool):
+        raise ValueError(f"{name}: teamwork_privileged 必须是布尔值")
+    values["teamwork_privileged"] = teamwork
     values.update(network_fields(name, entry))
     return SshExecutor(name=name, host=host, user=user, port=port, identity_file=identity,
                        metrics_bind=bind, metrics_enabled=enabled, **values)
@@ -481,6 +505,24 @@ def node_argv(executor: SshExecutor, *args: str, reverse: Optional[Tuple[int, in
               '[ -n "$n" ] || { echo "metacodes node not found" >&2; exit 127; }; '
               'exec "$n" bench node ' + shlex.join(args))
     return ssh_argv(executor, ["sh", "-c", script], reverse=reverse)
+
+
+def resolve_node(executor: SshExecutor, runner=subprocess.run) -> str:
+    script = (node_prelude(executor) + '[ -n "$n" ] || exit 127; '
+              'readlink -f "$n" 2>/dev/null || printf "%s\\n" "$n"')
+    try:
+        done = runner(shell_argv(executor, script), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                      timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败：{exc}") from None
+    if done.returncode == 127:
+        raise ValueError(f"执行机器 {executor.name} 上找不到 metacodes 节点；"
+                         f"运行 metacodes bench setup --executor {executor.name}")
+    lines = (done.stdout or "").strip().splitlines()
+    if done.returncode != 0 or not lines:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败（退出码 {done.returncode}）："
+                         f"{(done.stderr or '').strip()[-300:]}")
+    return lines[-1]
 
 
 def shell_argv(executor: Executor, script: str) -> List[str]:
@@ -943,8 +985,8 @@ class JobSync:
     PASS_FILES = 2000
 
     def __init__(self, executor: SshExecutor, remote_dir: str, local_dir: Path,
-                 runner=subprocess.run, log=print, popen=subprocess.Popen):
-        self.executor, self.remote_dir = executor, remote_dir
+                 runner=subprocess.run, log=print, popen=subprocess.Popen, binary: Optional[str] = None):
+        self.executor, self.remote_dir, self.binary = executor, remote_dir, binary
         self.local_dir = Path(local_dir)
         self.runner, self.log, self.popen = runner, log, popen
         self.seen: Dict[str, List[int]] = {}
@@ -953,8 +995,8 @@ class JobSync:
         self.pending = 0
 
     def manifest(self) -> Dict[str, List[int]]:
-        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir), stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=self.MANIFEST_TIMEOUT)
+        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir, binary=self.binary),
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=self.MANIFEST_TIMEOUT)
         if listing.returncode != 0:
             raise ValueError("读取远程作业目录失败")
         current = json.loads(listing.stdout or b"{}")
@@ -1012,7 +1054,7 @@ class JobSync:
         import tempfile
         requested = {item if isinstance(item, str) else item[0] for item in items}
         with tempfile.TemporaryFile() as errors:
-            process = self.popen(node_argv(self.executor, "pack", self.remote_dir), stdin=subprocess.PIPE,
+            process = self.popen(node_argv(self.executor, "pack", self.remote_dir, binary=self.binary), stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=errors)
             stream = _Watched(process.stdout)
             done = threading.Event()
@@ -1115,6 +1157,7 @@ class RemoteRun:
         self.spec = spec
         self.runner, self.popen = runner, popen
         self.log = log or (lambda text: print(text, flush=True))
+        self.node = None
         self.bundle = None
         self.dataset = None
         self.overlay = None
@@ -1149,12 +1192,13 @@ class RemoteRun:
         return self.executor.remote("jobs", self.spec["name"])
 
     def stage(self) -> None:
-        """Ship the bundle and the run's dataset. A WorkBuddy run needs
-        neither: the node runs its own WorkBuddy checkout."""
-        if self.spec.get("runner") == "workbuddy":
-            return
+        """Ship the bundle and the run's dataset. A WorkBuddy run needs only
+        the bundle: the node runs its own WorkBuddy checkout."""
+        self.node = resolve_node(self.executor, self.runner)
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
+        if self.spec.get("runner") == "workbuddy":
+            return
         registry = self.spec.get("registry_download")
         local = None
         if registry:
@@ -1167,7 +1211,7 @@ class RemoteRun:
             local = Path(self.spec["local_dataset"])
         if local is not None:
             self.dataset = ship_dataset(self.executor, local, log=self.log, runner=self.runner, popen=self.popen)
-        self.overlay = self.mirror_overlay(local)
+        self.overlay = with_teamwork(self.mirror_overlay(local), self.spec.get("features") or [], self.executor)
 
     def mirror_overlay(self, local: Optional[Path]) -> Optional[Dict]:
         """This run's compose overlay: without the settings the dataset's
@@ -1192,12 +1236,9 @@ class RemoteRun:
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
         if self.spec.get("runner") == "workbuddy":
-            # The node refuses a checkout whose staged executables are not
-            # those of the bundle this run's record names.
-            from scripts.eval.harbor.suites import workbuddy
-            bundle = self.spec.get("bundle")
+            # The node stages the run's mount image from this shipped bundle.
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
-                    "executables": workbuddy.bundle_executables(bundle) if bundle else None,
+                    "bundle": self.bundle,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
                                                      "reasoning_effort", "account_gateway", "workbuddy_judge")}}
         run_dir = self.executor.remote("runs", self.spec["name"])
@@ -1334,7 +1375,7 @@ class RemoteRun:
 
     def spawn(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str]) -> None:
         self.remote_spec_path = remote_spec_path
-        argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress())
+        argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress(), binary=self.node)
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
         # to Harbor (the placeholder, a judge key), `credential` to the relay.
@@ -1418,7 +1459,7 @@ class RemoteRun:
 
     def job_sync(self) -> JobSync:
         return JobSync(self.executor, self.remote_job_dir, self.local_job_dir,
-                       runner=self.runner, log=self.log, popen=self.popen)
+                       runner=self.runner, log=self.log, popen=self.popen, binary=self.node)
 
     def sync(self) -> bool:
         """One pass; False when it failed (logged, retried by the caller)."""

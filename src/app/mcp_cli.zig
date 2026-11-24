@@ -18,6 +18,8 @@ const mcp_oauth = @import("../mcp/oauth.zig");
 const mcp_startup = @import("mcp_startup.zig");
 const mcp_config_edit = @import("mcp_config_edit.zig");
 const util_time = @import("../util/time.zig");
+const core_auth = @import("../core/auth.zig");
+const terminal_prompt = @import("terminal_prompt.zig");
 
 const USAGE =
     \\usage: metacodes mcp add <name> <url> [--type http|sse] [--header <name>=<value>]... [--force] [--no-check]
@@ -47,7 +49,10 @@ const HELP = USAGE ++
     \\  add-json  The same, with the whole entry given as one JSON object.
     \\  remove    Take a server out of config.json (and forget its stored login).
     \\  login     OAuth login for an HTTP or SSE server; sessions send and refresh
-    \\            the stored token.
+    \\            the stored token. Over SSH it prints the ssh -L forward its
+    \\            callback needs; a browser on another computer: paste the address
+    \\            it ended on. Waits 10 minutes (METACODES_LOGIN_CALLBACK_TIMEOUT_MS;
+    \\            0 waits without a limit).
     \\  logout    Forget a stored login.
     \\  list      Every configured server (from every source), its transport, how it
     \\            authenticates and, unless --no-check, whether it connects.
@@ -200,6 +205,8 @@ fn login(
     }
     var std_headers: std.ArrayList(std.http.Header) = .empty;
     for (headers) |header| std_headers.append(arena, .{ .name = header.name, .value = header.value }) catch return 1;
+    const timeout_ms = core_auth.loginCallbackTimeoutMs();
+    var stdin_paste: terminal_prompt.StdinPaste = .{};
     var result = mcp_oauth.login(gpa, io, state_root, .{
         .name = name,
         .target = .{ .url = http.url, .wire = http.wire, .headers = std_headers.items },
@@ -207,7 +214,14 @@ fn login(
     }, .{
         .open_browser = open_browser,
         .notify = .{ .ctx = &notify_ctx, .write = stderrSay },
+        .timeout_ms = timeout_ms,
+        .paste = stdin_paste.source(),
     }) catch |err| {
+        if (err == error.CallbackTimedOut) {
+            var wait_buf: [48]u8 = undefined;
+            std.debug.print("error: login to '{s}' failed: no answer from the browser in {s}; nothing was stored\n", .{ name, terminal_prompt.waitText(&wait_buf, timeout_ms.?) });
+            return 1;
+        }
         std.debug.print("error: login to '{s}' failed: {s}\n", .{ name, mcp_oauth.describe(err) });
         return 1;
     };
