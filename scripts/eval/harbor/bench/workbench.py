@@ -403,6 +403,19 @@ class Workbench:
                                         lambda: self._remove_run_files(runs))
         return {"id": profile, "deleted": True, "runs": runs}
 
+    def delete_job(self, name) -> Dict[str, Any]:
+        manager = self.manager
+        if not manager:
+            raise ValueError(READ_ONLY)
+        if not isinstance(name, str) or not data.NAME.fullmatch(name):
+            raise ValueError("作业不存在")
+        self.profiles.advance()
+        with self.profiles.lock, manager.lock:
+            if any(r["name"] == name and r.get("status") in ACTIVE for r in manager.runs()):
+                raise ValueError("作业还在运行，请先停止，结束后再删除")
+            self.library.delete_job(name, manager.jobs_dir, lambda: self._remove_run_files([name]))
+        return {"name": name, "deleted": True}
+
     def _remove_run_files(self, runs) -> None:
         manager = self.manager
         try:
@@ -419,7 +432,7 @@ class Workbench:
             for path in sorted(receipts, key=lambda path: path.suffix == ".json"):
                 path.unlink(missing_ok=True)
         except OSError as exc:
-            raise ValueError(f"删除文件失败（{exc}），批次已保留，处理后可以重试") from None
+            raise ValueError(f"删除文件失败（{exc}），记录已保留，处理后可以重试") from None
 
     def start_setup(self, request) -> Dict[str, Any]:
         if not self.manager:

@@ -148,6 +148,8 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.rename_profile(payload.get("id"), payload.get("name")))
                 elif path == "/api/profile/delete" and isinstance(payload, dict):
                     self.send_json(workbench.delete_profile(payload.get("id")))
+                elif path == "/api/job/delete" and isinstance(payload, dict):
+                    self.send_json(workbench.delete_job(payload.get("name")))
                 elif path == "/api/store":
                     self.send_json(workbench.store_action(payload))
                 elif path == "/api/setup":

@@ -168,35 +168,41 @@ class StoreLibrary:
         rows, then its manifest, so a failure at any step leaves a profile
         that a retry finds and finishes."""
         jobs_dir = Path(jobs_dir).resolve()
-        owners = [("profiles", "id", profile, jobs_dir / ingest.PROFILES_DIR)]
-        for job in jobs:
-            owners += [("runs", "name", job, jobs_dir / ".bench-runs"), ("jobs", "name", job, jobs_dir / job)]
+        owners = [("profiles", "id", profile, jobs_dir / ingest.PROFILES_DIR)] + _job_owners(jobs, jobs_dir)
         with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
-            with self.store.read() as tx:
-                sources = {(table, value): tx.one(f"SELECT source_dir FROM {table} WHERE {key} = ?", (value,))
-                           for table, key, value, _ in owners}
-            for table, _, value, source in owners:
-                row = sources[(table, value)]
-                if row and row[0] != str(source):
-                    raise ValueError(f"评测配置 {profile} 的数据来自 {Path(row[0]).parent}，请在那个 jobs 目录的工作台删除")
+            sources = self._owned_sources(owners, f"评测配置 {profile}")
             if sources[("profiles", profile)] is None and not manifest.exists():
                 raise ValueError("评测配置不存在")
             remove_files()
             with self.store.transaction() as tx:
-                digests: List[str] = []
-                for job in jobs:
-                    digests += [d for row in tx.query("SELECT sha256, tail_sha256 FROM files WHERE job = ?", (job,))
-                                for d in row]
-                    digests += [d for row in tx.query("SELECT spec_sha256, log_sha256 FROM runs WHERE name = ?", (job,))
-                                for d in row]
-                    tx.execute("DELETE FROM runs WHERE name = ?", (job,))
-                    tx.execute("DELETE FROM jobs WHERE name = ?", (job,))
+                _delete_job_rows(tx, jobs)
                 tx.execute("DELETE FROM profiles WHERE id = ?", (profile,))
-                ingest.collect_garbage(tx, digests)
             try:
                 manifest.unlink(missing_ok=True)
             except OSError as exc:
                 raise ValueError(f"删除评测配置清单失败（{exc}），可以重试") from None
+
+    def delete_job(self, job: str, jobs_dir: Path, remove_files: Callable[[], None]) -> None:
+        """Delete one job this jobs directory owns: its files, then its rows,
+        so a failure leaves a job that a retry finds and finishes."""
+        jobs_dir = Path(jobs_dir).resolve()
+        with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
+            sources = self._owned_sources(_job_owners([job], jobs_dir), f"作业 {job}")
+            if sources[("jobs", job)] is None:
+                raise ValueError("作业不存在")
+            remove_files()
+            with self.store.transaction() as tx:
+                _delete_job_rows(tx, [job])
+
+    def _owned_sources(self, owners, label: str):
+        with self.store.read() as tx:
+            sources = {(table, value): tx.one(f"SELECT source_dir FROM {table} WHERE {key} = ?", (value,))
+                       for table, key, value, _ in owners}
+        for table, _, value, source in owners:
+            row = sources[(table, value)]
+            if row and row[0] != str(source):
+                raise ValueError(f"{label} 的数据来自 {Path(row[0]).parent}，请在那个 jobs 目录的工作台删除")
+        return sources
 
     def replace_store(self, store: Store) -> Store:
         """Serve from `store` from now on; returns the previous store, which
@@ -208,3 +214,20 @@ class StoreLibrary:
 
     def storage(self) -> Dict[str, Any]:
         return {"jobs_dirs": [str(root) for root in self.roots], "database": self.store.describe()}
+
+
+def _job_owners(jobs: List[str], jobs_dir: Path):
+    owners = []
+    for job in jobs:
+        owners += [("runs", "name", job, jobs_dir / ".bench-runs"), ("jobs", "name", job, jobs_dir / job)]
+    return owners
+
+
+def _delete_job_rows(tx, jobs: List[str]) -> None:
+    digests: List[str] = []
+    for job in jobs:
+        digests += [d for row in tx.query("SELECT sha256, tail_sha256 FROM files WHERE job = ?", (job,)) for d in row]
+        digests += [d for row in tx.query("SELECT spec_sha256, log_sha256 FROM runs WHERE name = ?", (job,)) for d in row]
+        tx.execute("DELETE FROM runs WHERE name = ?", (job,))
+        tx.execute("DELETE FROM jobs WHERE name = ?", (job,))
+    ingest.collect_garbage(tx, digests)

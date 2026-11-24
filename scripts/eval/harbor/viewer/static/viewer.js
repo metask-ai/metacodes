@@ -233,6 +233,14 @@ async function deleteProfile(b, button) {
   if (state.scope === b.id) state.scope = null;
   return true;
 }
+async function deleteJob(j, button) {
+  if (!confirm(`删除作业 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+  button.disabled = true;
+  try { await api('/api/job/delete', { name: j.name }); }
+  catch (error) { button.disabled = false; setConnection(false, error.message); return; }
+  state.selected.delete(j.name);
+  render();
+}
 async function stopProfile(b, button) {
   if (!confirm(`停止评测配置 ${profileName(b)} 的队列？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
   button.disabled = true;
@@ -334,11 +342,14 @@ async function renderOverview() {
       h('td', { class: 'num', text: ttft(s.ttft_ms) }),
       h('td', { class: 'num', text: usd(s.cost_usd) }),
       h('td', { class: 'num', text: dur(j.wall_s) }),
-      h('td', { class: 'num', text: when(j.started_at) }));
+      h('td', { class: 'num', text: when(j.started_at) }),
+      body.can_run ? h('td', {}, j.running ? null : h('button', { type: 'button', class: 'button',
+        onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除')) : null);
   });
+  const jobHeads = ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始', ...(body.can_run ? ['操作'] : [])];
   const table = h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始'].map((t, i) => h('th', { class: i >= 5 ? 'num' : null, text: t })))),
-    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 14, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
+    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 5 && i <= 13 ? 'num' : null, text: t })))),
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: jobHeads.length, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
   const loose = runs.filter((r) => !r.profile && !r.batch);
   const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次`,
     h('div', { class: 'launches' }, loose.map((r) => h('a', { class: 'launch', href: '#/run/' + r.name },
