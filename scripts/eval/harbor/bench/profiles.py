@@ -40,6 +40,7 @@ from scripts.eval.harbor.bench.runner import (ACTIVE, DEFAULT_FEATURES, Executor
 
 MAX_ITEMS = 16
 MAX_MODELS = 8
+MAX_AUTO_RERUNS = 2
 NAME_LIMIT = 80
 PROFILE_ACTIVE = ("queued", "running", "cancelling")
 LEGACY_BATCHES_DIR = ".bench-batches"
@@ -456,6 +457,17 @@ class ProfileManager:
             self.save(record)
         return {"id": record["id"], "concurrency": concurrency}
 
+    def set_auto_rerun(self, profile: Any, enabled: Any) -> Dict[str, Any]:
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是 true 或 false")
+        with self.lock:
+            record = self.get(profile)
+            if record is None:
+                raise ValueError("评测配置不存在")
+            record["auto_rerun_invalid"] = enabled
+            self.save(record)
+        return {"id": record["id"], "auto_rerun_invalid": enabled}
+
     def cancel(self, profile: Any) -> Dict[str, Any]:
         with self.lock:
             record = self.get(profile)
@@ -513,12 +525,28 @@ class ProfileManager:
                 raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
             if not tasks:
                 raise ValueError("这个评测集没有要运行的题")
-            again = {key: value for key, value in item.items() if key != "waiting"}
-            again.update(tasks=list(tasks), request={**item["request"], "tasks": list(tasks)}, status="pending",
-                         run=None, error=None, started_at=None, finished_at=None)
-            record = self._append({"id": record["id"]}, None, [again])
+            record = self._append({"id": record["id"]}, None, [rerun(item, tasks, 0)])
         self.wake()
         return public(record)
+
+    def invalid_tasks(self, run: str) -> List[str]:
+        job_dir = self.runs.jobs_dir / run
+        if not job_dir.is_dir():
+            return []
+        rows = data.job_view(job_dir)["rows"]
+        return sorted({row["task"] for row in rows if row["status"] == "invalid"})
+
+    def queue_invalid_rerun(self, record: Dict[str, Any], item: Dict[str, Any]) -> None:
+        """With the profile's auto rerun on, queue the tasks of a finished
+        dataset that had invalid trials, at most MAX_AUTO_RERUNS rounds."""
+        next_round = item.get("auto_rerun", 0) + 1
+        if not record.get("auto_rerun_invalid") or item["status"] != "finished" or next_round > MAX_AUTO_RERUNS:
+            return
+        if not item.get("run") or not isinstance(item.get("request"), dict):
+            return
+        tasks = self.invalid_tasks(item["run"])
+        if tasks:
+            record["items"].append({**rerun(item, tasks, next_round), "queued_at": now()})
 
     # -------------------------------------------------------------- scheduler
 
@@ -550,6 +578,8 @@ class ProfileManager:
             current.update(status=run["status"] if run else "interrupted",
                            error=(run or {}).get("error") or (None if run else "运行记录丢失"),
                            finished_at=(run or {}).get("finished_at") or now())
+            if not record.get("cancel_requested"):
+                self.queue_invalid_rerun(record, current)
         if record.get("cancel_requested"):
             for item in items:
                 if item["status"] == "pending":
@@ -650,6 +680,17 @@ class ProfileManager:
             legacy.rmdir()
         except OSError:
             pass
+
+
+def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
+    """An ended dataset queued again with `tasks`; `auto_round` counts the
+    automatic reruns of invalid tasks it descends from (0: asked for)."""
+    again = {key: value for key, value in item.items() if key not in ("waiting", "auto_rerun")}
+    again.update(tasks=list(tasks), request={**item["request"], "tasks": list(tasks)}, status="pending",
+                 run=None, error=None, started_at=None, finished_at=None)
+    if auto_round:
+        again["auto_rerun"] = auto_round
+    return again
 
 
 def queued_since(record: Dict[str, Any]) -> str:

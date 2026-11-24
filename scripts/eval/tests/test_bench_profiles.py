@@ -411,6 +411,36 @@ class ProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '没有要运行的题'):
             self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'resume'})
 
+    def test_auto_rerun_queues_invalid_tasks_of_a_finished_dataset_at_most_twice(self):
+        created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        with self.assertRaisesRegex(ValueError, 'true 或 false'):
+            self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': 1})
+        changed = self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': True})
+        self.assertEqual(changed, {'id': created['id'], 'auto_rerun_invalid': True})
+        with patch.object(self.manager.profiles, 'invalid_tasks', return_value=['fix-git']) as invalid:
+            record = self.wait_profile(created['id'])
+        self.assertEqual([(i['status'], i.get('auto_rerun'), i['tasks']) for i in record['items']],
+                         [('finished', None, ['fix-git']), ('finished', 1, ['fix-git']), ('finished', 2, ['fix-git'])])
+        self.assertEqual(invalid.call_count, 2)
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'run'})
+        self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': False})
+        with patch.object(self.manager.profiles, 'invalid_tasks', return_value=['fix-git']) as invalid:
+            record = self.wait_profile(created['id'])
+        self.assertEqual(len(record['items']), 4)
+        self.assertNotIn('auto_rerun', record['items'][3])
+        invalid.assert_not_called()
+
+    def test_invalid_tasks_are_read_from_the_job_directory(self):
+        job = self.manager.jobs_dir / 'job-a'
+        for task, rewards in (('fix-git', None), ('hello', {'reward': 1.0})):
+            _write(job / (task + '__x') / 'config.json', {})
+            _write(job / (task + '__x') / 'result.json', {
+                'task_name': 'terminal-bench/' + task, 'started_at': '2026-11-16T00:00:00Z',
+                'finished_at': '2026-11-16T00:01:00Z', **({'verifier_result': {'rewards': rewards}} if rewards else {})})
+        _write(job / 'result.json', {'started_at': '2026-11-16T00:00:00Z', 'finished_at': '2026-11-16T00:01:00Z'})
+        self.assertEqual(self.manager.profiles.invalid_tasks('job-a'), ['fix-git'])
+        self.assertEqual(self.manager.profiles.invalid_tasks('missing'), [])
+
     def test_concurrency_changes_while_the_profile_runs(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
             created = self.client.request('api/profiles/run', self.request())

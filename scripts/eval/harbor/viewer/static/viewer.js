@@ -203,12 +203,12 @@ const skippedFeatures = (b, item) => item.features ? (b.features || []).filter((
 // Fills the run form for another run on profile `b` with one model (the
 // page's model filter, else the last run's): that model's suites and tasks
 // from the task rows (on the profile page) or the queued datasets, or only
-// the tasks whose latest attempts did not all pass.
-const unpassed = (t) => !t.attempts.length || t.passed < t.attempts.length;
+// the tasks whose latest attempts include an invalid one.
+const hasInvalid = (t) => t.attempts.some((a) => a.status === 'invalid');
 function runModel(b) {
   return b.tasks && state.profileModel && state.profileModel !== 'all' ? state.profileModel : b.items[b.items.length - 1]?.model;
 }
-function runAgain(b, onlyUnpassed) {
+function runAgain(b, onlyInvalid) {
   const last = b.items[b.items.length - 1] || {};
   const model = runModel(b);
   const lastOfModel = [...b.items].reverse().find((i) => i.model === model) || last;
@@ -218,7 +218,7 @@ function runAgain(b, onlyUnpassed) {
   const wanted = new Map();
   const add = (suite, task) => { if (!wanted.has(suite)) wanted.set(suite, []); if (!wanted.get(suite).includes(task)) wanted.get(suite).push(task); };
   if (b.tasks) {
-    for (const t of b.tasks.filter((x) => x.model === model)) if (!onlyUnpassed || unpassed(t)) add(t.suite, t.task);
+    for (const t of b.tasks.filter((x) => x.model === model)) if (!onlyInvalid || hasInvalid(t)) add(t.suite, t.task);
   } else {
     for (const item of b.items.filter((i) => i.model === model)) for (const task of item.tasks || []) add(item.suite, task);
   }
@@ -273,8 +273,8 @@ function profileActions(b, compact) {
   const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
   return [
     h('button', { type: 'button', class: 'button', title: '在这个评测配置上再运行，题目和参数按上次填好', onclick: keep(() => runAgain(b, false)) }, compact ? '运行' : '再次运行'),
-    b.tasks && b.tasks.some((t) => t.model === runModel(b) && t.attempts.length && unpassed(t))
-      ? h('button', { type: 'button', class: 'button', title: '只选最新结果没有全部通过的题', onclick: keep(() => runAgain(b, true)) }, '重跑未通过的题') : null,
+    b.tasks && b.tasks.some((t) => t.model === runModel(b) && hasInvalid(t))
+      ? h('button', { type: 'button', class: 'button', title: '只选最新结果里有无效尝试的题（网络波动、环境故障等导致）', onclick: keep(() => runAgain(b, true)) }, '重跑无效的题') : null,
     profileActive(b)
       ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, compact ? '停止' : '停止队列')
       : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
@@ -416,6 +416,7 @@ async function renderProfile(id) {
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
     h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
     liveItem ? h('dt', { text: '并发数' }) : null, liveItem ? h('dd', {}, concurrencyControl(b, liveItem)) : null,
+    h('dt', { text: '自动重跑' }), h('dd', {}, autoRerunControl(b)),
     h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
     h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
     h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
@@ -430,6 +431,7 @@ async function renderProfile(id) {
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
       h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
         item.concurrency ? `并发 ${item.concurrency}` : null,
+        item.auto_rerun ? `自动重跑无效的题 第 ${item.auto_rerun} 轮` : null,
         skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
@@ -519,6 +521,21 @@ function concurrencyControl(b, item) {
     } catch (error) { feedback.textContent = error.message; }
   });
   return form;
+}
+
+function autoRerunControl(b) {
+  const text = '评测集跑完后，自动把有无效尝试的题再排队运行，每个评测集最多重跑 2 轮';
+  const input = h('input', { type: 'checkbox', checked: !!b.auto_rerun_invalid, disabled: !b.can_run, 'aria-label': '自动重跑无效的题' });
+  const feedback = h('span', { class: 'muted', role: 'status', text });
+  input.addEventListener('change', async () => {
+    input.disabled = true;
+    feedback.textContent = '正在保存…';
+    try {
+      await api('/api/profile/auto-rerun', { id: b.id, enabled: input.checked });
+      render();
+    } catch (error) { input.checked = !input.checked; input.disabled = false; feedback.textContent = error.message; }
+  });
+  return h('label', { class: 'check' }, input, h('span', { text: '自动重跑无效的题' }), feedback);
 }
 
 // The latest results of each model side by side, when the profile has several:

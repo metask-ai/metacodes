@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench reruns invalid tasks, and can do it automatically.** The profile
+  page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest
+  attempts include an invalid one (network or environment failures), not the
+  ones the model failed. Turning on 自动重跑无效的题 on a profile queues a
+  finished dataset's invalid tasks again, at most two rounds per dataset.
+
 - **WorkBuddy suites run with the profile's run gates.** A bench profile's
   Lean-modelled run gates now reach the WorkBuddy suites too: the workbench
   passes them as harness parameters and the overlay turns each into its
