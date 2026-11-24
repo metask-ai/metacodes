@@ -1445,17 +1445,9 @@ function costScatter(rows, focus, lookOf) {
     h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
 const BARS_TOP = 15;
-function scoreBars(rows, focus, lookOf) {
-  const shown = rows.filter((r, i) => i < BARS_TOP || r.ours);
-  if (shown.length < 2) return null;
-  const pub = rows.filter((r) => !r.ours);
-  const harnesses = new Set(pub.map((r) => r.harness)).size;
-  const byModel = harnesses * 2 <= pub.length;
-  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : !r.model ? [r.harness, null]
-    : harnesses === 1 ? [r.model, null] : byModel ? [r.model, r.harness] : [r.harness, r.model]);
-  const err = (r) => r.stderr || 0;
-  const top = Math.max(...shown.map((r) => r.score + err(r)));
-  const lo = Math.min(...shown.map((r) => r.score - err(r)), Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
+function scoreScale(lows, highs, rowCount) {
+  const top = Math.max(...highs);
+  const lo = Math.min(...lows, Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
   const { step } = niceTicks(Math.max(0, lo - (hi - lo) * 0.15), Math.min(100, hi));
   const x1 = Math.min(100, Math.ceil(hi / step) * step);
   const floor = Math.floor(lo / step) * step;
@@ -1463,9 +1455,17 @@ function scoreBars(rows, focus, lookOf) {
   const at = (v) => (Math.min(Math.max(v, x0), x1) - x0) / (x1 - x0) * 100;
   const marks = Array.from({ length: Math.round((x1 - x0) / step) + 1 }, (_, i) => +(x0 + i * step).toPrecision(12));
   const digits = step < 1 ? 1 : 0;
-  const lines = h('div', { class: 'bars-grid', style: `grid-row:1 / span ${shown.length}` },
+  const lines = h('div', { class: 'bars-grid', style: `grid-row:1 / span ${rowCount}` },
     marks.map((v) => h('i', { style: `left:${at(v)}%` })));
-  const axis = h('div', { class: 'bars-axis', style: `grid-row:${shown.length + 1}` }, marks.map((v) => h('span', { style: `left:${at(v)}%`, text: v.toFixed(digits) + '%' })));
+  const axis = h('div', { class: 'bars-axis', style: `grid-row:${rowCount + 1}` }, marks.map((v) => h('span', { style: `left:${at(v)}%`, text: v.toFixed(digits) + '%' })));
+  return { at, lines, axis };
+}
+function scoreBars(rows, focus, lookOf) {
+  const shown = rows.filter((r, i) => i < BARS_TOP || r.ours);
+  if (shown.length < 2) return null;
+  const err = (r) => r.stderr || 0;
+  const { at, lines, axis } = scoreScale(shown.map((r) => r.score - err(r)), shown.map((r) => r.score + err(r)), shown.length);
+  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : [r.model || r.harness, null]);
   const items = new Map(shown.map((r, i) => [r, h('div', { class: 'bar-row', 'data-ours': r.ours ? '1' : null, style: `--row:${i + 1}`,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
@@ -1477,6 +1477,52 @@ function scoreBars(rows, focus, lookOf) {
   focus.on((active) => { for (const [r, el] of items) el.toggleAttribute('data-current', r === active); });
   const note = rows.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 名${shown.some((r) => r.ours) ? '及我们的作业' : ''} · 共 ${rows.length} 条，完整列表见下表` }) : null;
   return h('div', { class: 'scatter-box bars-box' }, h('div', { class: 'bars' }, lines, ...items.values(), axis), note);
+}
+function modelDots(rows, focus, lookOf) {
+  const groups = new Map();
+  for (const r of rows) {
+    const key = modelKey(r.model) || r.id;
+    if (!groups.has(key)) groups.set(key, { model: r.model || r.harness, rows: [] });
+    groups.get(key).rows.push(r);
+  }
+  const all = [...groups.values()];
+  const shown = all.filter((g, i) => i < BARS_TOP || g.rows.some((r) => r.ours));
+  if (shown.length < 2) return null;
+  const entries = shown.flatMap((g) => g.rows);
+  const err = (r) => r.stderr || 0;
+  const { at, lines, axis } = scoreScale(entries.map((r) => r.score - err(r)), entries.map((r) => r.score + err(r)), shown.length);
+  const harnessOf = (r) => (r.ours ? 'metacodes' : r.harness);
+  const scoreText = (r) => score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '');
+  const ends = (r) => [scoreText(r), h('small', { text: ' ' + harnessOf(r) })];
+  const dots = new Map();
+  const rowNodes = shown.map((g, i) => {
+    const best = g.rows[0]; const worst = g.rows[g.rows.length - 1];
+    const whiskers = g.rows.filter(err).map((r) => h('i', { class: 'bar-err', style: `left:${at(r.score - err(r))}%;width:${at(r.score + err(r)) - at(r.score - err(r))}%` }));
+    const marks = g.rows.map((r) => {
+      const dot = h('button', { type: 'button', class: 'pair-dot', 'data-ours': r.ours ? '1' : null, style: `left:${at(r.score)}%`,
+        title: `${harnessOf(r)} · ${scoreText(r)}`, 'aria-label': `${g.model} · ${harnessOf(r)} · ${scoreText(r)}`,
+        onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
+        onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null }, glyph(lookOf(r)));
+      dots.set(r, dot);
+      return dot;
+    });
+    return h('div', { class: 'bar-row', style: `--row:${i + 1}` },
+      h('span', { class: 'bar-name', title: g.model }, h('span', { text: g.model })),
+      h('span', { class: 'bar-track pair-track' },
+        g.rows.length > 1 ? h('i', { class: 'pair-span', style: `left:${at(worst.score)}%;width:${at(best.score) - at(worst.score)}%` }) : null, ...whiskers, ...marks),
+      h('span', { class: 'bar-value num', title: g.rows.map((r) => `${harnessOf(r)} ${scoreText(r)}`).join('\n') },
+        ...(g.rows.length > 1 ? [...ends(worst), ' – ', ...ends(best)] : ends(best))));
+  });
+  const box = h('div', { class: 'bars pair-bars' }, lines, ...rowNodes, axis);
+  focus.on((active) => { for (const [r, dot] of dots) dot.toggleAttribute('data-current', r === active); });
+  const group = (look) => {
+    box.toggleAttribute('data-group', Boolean(look));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(look) && lookOf(r) !== look);
+  };
+  const legend = h('div', { class: 'scatter-legend pair-legend' }, [...new Set([...dots.keys()].map(lookOf))].map((look) =>
+    h('span', { class: 'key', onmouseenter: () => group(look), onmouseleave: () => group(null) }, glyph(look), look.name)));
+  const note = all.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 个模型${shown.some((g) => g.rows.some((r) => r.ours)) ? '及我们的作业' : ''} · 共 ${all.length} 个模型、${rows.length} 条，完整列表见下表` }) : null;
+  return h('div', { class: 'scatter-box bars-box' }, legend, box, note);
 }
 function focusHub() {
   const listeners = [];
@@ -1527,7 +1573,7 @@ function boardPanel(board) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
     h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', priced ? '每题成本' : null].filter(Boolean).map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, costScatter(rows, focus, lookOf) || scoreBars(rows, focus, lookOf), table),
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, costScatter(rows, focus, lookOf) || (harness ? scoreBars : modelDots)(rows, focus, lookOf), table),
     h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {
