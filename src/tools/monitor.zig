@@ -4,13 +4,14 @@
 //! Bash 后台是"一次性后台",而 Monitor 是"持续监视" — 默认无超时(or 长超时)。
 //!
 //! 调用方式:模型用 Monitor 启动,得到 job_id;BashOutput 读累积行;KillShell 停。
+//! preview `monitor_events` 开启时 stdout 行改为推送事件(core/monitor_stream.zig),不再轮询。
 //!
-//! 设计:复用 JobRegistry 的 spawnBackground(脚本相同),但默认 timeout 不杀。
+//! 设计:复用 JobRegistry 的 spawnBackground(脚本相同),默认不杀;monitor_events 下默认 300000 ms 过期。
 //!
 //! Schema:
 //!   command:        必填,要 watch 的命令
 //!   description:    必填,告诉用户在 watch 什么
-//!   timeout_ms:     可选,默认 3600000 (1h)
+//!   timeout_ms:     仅 monitor_events,可选,默认 300000,范围 1000..3600000
 //!   persistent:     可选,bool,true → 不设超时(直到 session 结束或被 KillShell)
 //!
 //! 返回 JSON: {"job_id":"...","status":"running","description":"..."}
@@ -19,6 +20,19 @@ const std = @import("std");
 const common = @import("common.zig");
 const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const json = @import("../json.zig");
+const monitor_stream = @import("../core/monitor_stream.zig");
+
+pub const EVENTS_DESCRIPTION = "Start a background monitor that streams events from a long-running script. Each stdout line is an event: lines that arrive together are batched into one <task-notification> that reaches you on its own, so keep working and do not poll or sleep waiting for it. Events arrive on their own schedule and are not replies from the user. Only stdout is the event stream, stderr is not. In pipes use `grep --line-buffered` or awk with `fflush()` so lines are not held back in a buffer. Make the filter match failure states too (errors, tracebacks, FAILED, the process exiting), not only success: silence is not success. Output faster than the event rate limit is dropped and reported as a suppressed count, and a monitor that stays over the limit for 30 s is stopped. The monitor is killed after timeout_ms (default 300000, maximum 3600000) with one notice to re-arm it if still needed; persistent: true removes the timeout. Its exit produces a final notice. Stop it early with KillShell(job_id). For a single \"tell me when X is ready\", use Bash with run_in_background and an until-loop instead. Args: command (required), description (required, shown in every notification).";
+
+pub const EVENTS_PROP_SPECS: []const json.PropSpec = &.{
+    .{ .name = "command", .type = "string", .description = "Shell command to run; each stdout line becomes an event" },
+    .{ .name = "description", .type = "string", .description = "Short description of what is being monitored, shown in every event notification" },
+    .{ .name = "timeout_ms", .type = "integer", .description = "Kill the monitor after this many milliseconds (default 300000, minimum 1000, maximum 3600000)" },
+    .{ .name = "persistent", .type = "boolean", .description = "If true, run with no timeout for the session lifetime" },
+};
+
+const EVENTS_HINT = "Each stdout line reaches you as a <task-notification> event; keep working and do not poll, sleep or call BashOutput for it. A final notice arrives when the monitor exits or times out. KillShell(job_id) to stop.";
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Monitor is detached by definition.  Until background workers own an
@@ -76,6 +90,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 启动后台 job(已 sandbox 包裹)
     const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
+    if (ctx.preview.monitor_events) return startEventMonitor(ctx, jobs, eff_command, cwd_opt, description, args);
     const entry = jobs.spawnBackgroundOwned(eff_command, cwd_opt, ctx.session) catch |err| {
         var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer aw.deinit();
@@ -93,6 +108,38 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try util_json.writeJsonString(&aw.writer, description);
     try aw.writer.writeAll(",\"hint\":");
     try util_json.writeJsonString(&aw.writer, "Its exit is announced to you automatically. Use BashOutput(job_id, until=\"output\") to read streamed lines as they arrive (by default BashOutput waits up to wait_ms for the job to exit), or until=\"pattern\" to wait for a specific line; polls that keep getting only a few lines are batched by poll_guard. KillShell(job_id) to stop.");
+    try aw.writer.writeAll("}");
+    return try aw.toOwnedSlice();
+}
+
+fn startEventMonitor(
+    ctx: *const ToolContext,
+    jobs: *@import("../core/job_registry.zig").JobRegistry,
+    command: []const u8,
+    cwd: ?[]const u8,
+    description: []const u8,
+    args: []const u8,
+) anyerror![]u8 {
+    const persistent = if (common.extractJsonArg(args, "persistent")) |raw| std.mem.eql(u8, raw, "true") else false;
+    const requested: ?u64 = if (common.extractJsonArg(args, "timeout_ms")) |raw| std.fmt.parseInt(u64, raw, 10) catch null else null;
+    const timeout_ms: ?u64 = if (persistent) null else monitor_stream.clampTimeout(requested);
+    const entry = jobs.spawnMonitorOwned(command, cwd, ctx.session, description, timeout_ms) catch |err| {
+        var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("{\"error\":\"spawn_failed\",\"message\":");
+        try util_json.writeJsonString(&aw.writer, @errorName(err));
+        try aw.writer.writeAll("}");
+        return try aw.toOwnedSlice();
+    };
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"job_id\":");
+    try util_json.writeJsonString(&aw.writer, entry.id[0..]);
+    try aw.writer.writeAll(",\"status\":\"running\",\"description\":");
+    try util_json.writeJsonString(&aw.writer, description);
+    if (timeout_ms) |limit| try aw.writer.print(",\"timeout_ms\":{d}", .{limit}) else try aw.writer.writeAll(",\"persistent\":true");
+    try aw.writer.writeAll(",\"hint\":");
+    try util_json.writeJsonString(&aw.writer, EVENTS_HINT);
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
@@ -234,4 +281,103 @@ test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,t
     // sandbox 开 → touch cwd 外被 sandbox-exec 拦 → 文件不存在。
     // **toggle-verify**:去掉 monitor 的 wrap(直投 raw command)→ touch 不受限 → 文件被创建 → 测试红。
     try testing.expect(!pfs.exists(escape));
+}
+
+fn waitForExit(jobs: *@import("../core/job_registry.zig").JobRegistry, job_id: []const u8) !void {
+    var waited: usize = 0;
+    while (waited < 5_000) : (waited += 20) {
+        jobs.reapExited();
+        if ((jobs.get(job_id) orelse return error.JobNotFound).status != .running) return;
+        @import("../util/time.zig").sleepMs(20);
+    }
+    return error.JobDidNotExit;
+}
+
+test "Monitor with monitor_events: start result describes push events and stdout arrives as events" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+    var jobs = try JobRegistry.init(a);
+    defer jobs.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.jobs = &jobs;
+    ctx.preview = .{ .monitor_events = true };
+
+    const out = try execute(&ctx, "{\"command\":\"echo ready; echo oops >&2; exit 3\",\"description\":\"build\",\"timeout_ms\":5}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"timeout_ms\":1000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "BashOutput(") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "<task-notification>") != null);
+    const job_id = common.extractJsonArg(out, "job_id") orelse return error.MissingJobId;
+    try waitForExit(&jobs, job_id);
+
+    const owner = ctx.session;
+    const exits = try jobs.takeUnannouncedExits(owner, a);
+    defer @import("../core/job_registry.zig").freeJobExitEvents(a, exits);
+    try testing.expectEqual(@as(usize, 0), exits.len);
+
+    const notices = try jobs.takeMonitorEvents(owner, a, @import("../util/time.zig").nowMs());
+    defer monitor_stream.freeNotices(a, notices);
+    try testing.expectEqual(@as(usize, 1), notices.len);
+    try testing.expectEqualStrings("ready", notices[0].event);
+    try testing.expectEqualStrings("build", notices[0].description);
+    try testing.expectEqual(@as(?monitor_stream.End, .{ .script_failed = 3 }), notices[0].end);
+
+    const again = try jobs.takeMonitorEvents(owner, a, @import("../util/time.zig").nowMs());
+    defer monitor_stream.freeNotices(a, again);
+    try testing.expectEqual(@as(usize, 0), again.len);
+    try testing.expectEqual(@as(u32, 0), jobs.pendingNotifySummary(owner).count);
+}
+
+test "Monitor with monitor_events: an expired monitor is killed with one re-arm notice" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+    var jobs = try JobRegistry.init(a);
+    defer jobs.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.jobs = &jobs;
+    ctx.preview = .{ .monitor_events = true };
+
+    const out = try execute(&ctx, "{\"command\":\"echo one; sleep 30\",\"description\":\"tail\"}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"timeout_ms\":300000") != null);
+    const job_id = common.extractJsonArg(out, "job_id") orelse return error.MissingJobId;
+    const started = (jobs.get(job_id) orelse return error.JobNotFound).started_ms;
+
+    var first: []monitor_stream.Notice = &.{};
+    var waited: usize = 0;
+    while (first.len == 0 and waited < 5_000) : (waited += 20) {
+        first = try jobs.takeMonitorEvents(ctx.session, a, started);
+        if (first.len == 0) {
+            a.free(first);
+            @import("../util/time.zig").sleepMs(20);
+        }
+    }
+    defer monitor_stream.freeNotices(a, first);
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqualStrings("one", first[0].event);
+    try testing.expectEqual(@as(?monitor_stream.End, null), first[0].end);
+
+    const expired = try jobs.takeMonitorEvents(ctx.session, a, started + @as(i64, monitor_stream.DEFAULT_TIMEOUT_MS));
+    defer monitor_stream.freeNotices(a, expired);
+    try testing.expectEqual(@as(usize, 1), expired.len);
+    try testing.expectEqual(@as(?monitor_stream.End, .{ .expired = .{ .after_ms = monitor_stream.DEFAULT_TIMEOUT_MS, .events_delivered = 1 } }), expired[0].end);
+    try testing.expect((jobs.get(job_id) orelse return error.JobNotFound).status != .running);
+}
+
+test "Monitor with monitor_events: persistent monitors report no timeout" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+    var jobs = try JobRegistry.init(a);
+    defer jobs.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.jobs = &jobs;
+    ctx.preview = .{ .monitor_events = true };
+    const out = try execute(&ctx, "{\"command\":\"true\",\"description\":\"p\",\"persistent\":true}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"persistent\":true") != null);
+    const job_id = common.extractJsonArg(out, "job_id") orelse return error.MissingJobId;
+    try testing.expectEqual(@as(?u64, null), (jobs.get(job_id) orelse return error.JobNotFound).kind.monitor.timeout_ms);
 }

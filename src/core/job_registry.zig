@@ -31,6 +31,7 @@ const utf8 = @import("../util/utf8.zig");
 const ppaths = @import("platform").paths;
 const shell_mod = @import("shell.zig");
 const SessionId = @import("session_id.zig").SessionId;
+const monitor_stream = @import("monitor_stream.zig");
 
 pub const JobStatus = enum { running, exited, killed, failed };
 
@@ -54,6 +55,11 @@ pub const Retention = enum {
 pub const PollStreak = struct {
     low_yield: u8 = 0,
     last_ms: util_time.Millis = 0,
+};
+
+pub const JobKind = union(enum) {
+    plain,
+    monitor: monitor_stream.State,
 };
 
 pub const JobEntry = struct {
@@ -86,6 +92,7 @@ pub const JobEntry = struct {
     /// valid (they are freed at teardown) so an outstanding value snapshot
     /// never dangles; only the directory entries are gone.
     spool_released: bool = false,
+    kind: JobKind = .plain,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -176,6 +183,10 @@ pub const JobRegistry = struct {
             self.allocator.free(j.stdout_path);
             self.allocator.free(j.stderr_path);
             self.allocator.free(j.command_preview);
+            switch (j.kind) {
+                .plain => {},
+                .monitor => |monitor| self.allocator.free(monitor.description),
+            }
         }
         self.index.deinit();
         self.jobs.deinit(self.allocator);
@@ -226,7 +237,13 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
-        return self.spawn(command, cwd, .background, owner, true);
+        return self.spawn(command, cwd, .background, owner, true, .plain);
+    }
+
+    pub fn spawnMonitorOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, description: []const u8, timeout_ms: ?u64) !JobEntry {
+        const owned_description = try self.allocator.dupe(u8, description);
+        errdefer self.allocator.free(owned_description);
+        return self.spawn(command, cwd, .background, owner, true, .{ .monitor = monitor_stream.State.init(owned_description, timeout_ms, util_time.nowMs()) });
     }
 
     /// Same spawn, for output that only one synchronous call will ever read.
@@ -237,7 +254,7 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
-        return self.spawn(command, cwd, .synchronous, owner, false);
+        return self.spawn(command, cwd, .synchronous, owner, false, .plain);
     }
 
     fn spawn(
@@ -247,6 +264,7 @@ pub const JobRegistry = struct {
         retention: Retention,
         owner: SessionId,
         notify_on_exit: bool,
+        kind: JobKind,
     ) !JobEntry {
         const id = try genId();
 
@@ -307,6 +325,7 @@ pub const JobRegistry = struct {
             .notify_on_exit = notify_on_exit,
             .status = .running,
             .retention = retention,
+            .kind = kind,
         };
         try self.registerEntry(entry);
         log.info("job", "bg spawn id={s} cmd={s}", .{ id[0..], preview });
@@ -555,6 +574,7 @@ pub const JobRegistry = struct {
             events.deinit(allocator);
         }
         for (self.jobs.items) |*entry| {
+            if (entry.kind == .monitor) continue;
             if (!entry.notify_on_exit or entry.status == .running or entry.exit_announced or entry.exit_observed) continue;
             if (!std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
             const command_preview = try allocator.dupe(u8, entry.command_preview);
@@ -577,11 +597,85 @@ pub const JobRegistry = struct {
         // exists. An OOM must leave every exit retryable rather than losing the
         // earlier entries collected before the failing append.
         for (self.jobs.items) |*entry| {
-            if (entry.notify_on_exit and entry.status != .running and !entry.exit_announced and !entry.exit_observed and
+            if (entry.kind == .plain and entry.notify_on_exit and entry.status != .running and !entry.exit_announced and !entry.exit_observed and
                 std.mem.eql(u8, &entry.owner.bytes, &owner.bytes))
                 entry.exit_announced = true;
         }
         return owned;
+    }
+
+    pub fn takeMonitorEvents(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now: util_time.Millis) ![]monitor_stream.Notice {
+        self.stopOverdueMonitors(owner, now);
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+        const Commit = struct { index: usize, state: monitor_stream.State, announce: bool };
+        var notices = std.ArrayList(monitor_stream.Notice).empty;
+        errdefer {
+            for (notices.items) |*notice| notice.deinit(allocator);
+            notices.deinit(allocator);
+        }
+        var commits = std.ArrayList(Commit).empty;
+        defer commits.deinit(allocator);
+        for (self.jobs.items, 0..) |*entry, index| {
+            const current = switch (entry.kind) {
+                .plain => continue,
+                .monitor => |state| state,
+            };
+            if (entry.exit_announced or !std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+            const ended = entry.status != .running;
+            if (ended and entry.exit_observed) {
+                try commits.append(allocator, .{ .index = index, .state = current, .announce = true });
+                continue;
+            }
+            var next = current;
+            const chunk = try readSpoolFrom(allocator, entry.stdout_path, next.stdout_cursor, monitor_stream.READ_MAX_BYTES);
+            defer allocator.free(chunk);
+            const mode: monitor_stream.Mode = if (ended and chunk.len < monitor_stream.READ_MAX_BYTES) .final else .streaming;
+            const batch = try monitor_stream.take(allocator, &next, chunk, mode, now);
+            var event_owned = true;
+            defer if (event_owned) allocator.free(batch.event);
+            next.stdout_cursor += batch.consumed;
+            const end: ?monitor_stream.End = if (mode == .final) monitorEnd(entry, next) else null;
+            if (batch.event.len > 0 or end != null) {
+                const description = try allocator.dupe(u8, next.description);
+                errdefer allocator.free(description);
+                try notices.append(allocator, .{ .id = entry.id, .description = description, .event = batch.event, .end = end });
+                event_owned = false;
+            }
+            try commits.append(allocator, .{ .index = index, .state = next, .announce = end != null });
+        }
+        const owned = try notices.toOwnedSlice(allocator);
+        for (commits.items) |commit| {
+            const entry = &self.jobs.items[commit.index];
+            entry.kind = .{ .monitor = commit.state };
+            if (commit.announce) entry.exit_announced = true;
+        }
+        return owned;
+    }
+
+    fn stopOverdueMonitors(self: *JobRegistry, owner: SessionId, now: util_time.Millis) void {
+        while (true) {
+            var id: ?[12]u8 = null;
+            self.lock();
+            self.reapExitedLocked();
+            for (self.jobs.items) |*entry| {
+                if (entry.status != .running or !std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+                switch (entry.kind) {
+                    .plain => {},
+                    .monitor => |*state| if (state.stop == null) {
+                        if (state.overdue(entry.started_ms, now)) |stop| {
+                            state.stop = stop;
+                            id = entry.id;
+                            break;
+                        }
+                    },
+                }
+            }
+            self.unlock();
+            const selected = id orelse return;
+            self.kill(selected[0..]) catch return;
+        }
     }
 
     /// 持锁内部版:返回内部指针供 kill 就地改 status/exit_code。**调用方必须持锁**且不得
@@ -663,6 +757,38 @@ fn createFile(path: []const u8) ?pfs.Fd {
     const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return null;
     return fd;
+}
+
+fn monitorEnd(entry: *const JobEntry, state: monitor_stream.State) monitor_stream.End {
+    if (state.stop) |stop| return switch (stop) {
+        .expired => .{ .expired = .{ .after_ms = state.timeout_ms orelse 0, .events_delivered = state.events_delivered } },
+        .too_much_output => .too_much_output,
+    };
+    if (entry.status == .exited) {
+        const code = entry.exit_code orelse 0;
+        return if (code == 0) .stream_ended else .{ .script_failed = code };
+    }
+    return .killed;
+}
+
+fn readSpoolFrom(allocator: std.mem.Allocator, path: []const u8, offset: u64, max: usize) ![]u8 {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return error.PathTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return allocator.alloc(u8, 0);
+    defer _ = pfs.close(fd);
+    if (pfs.lseek(fd, @intCast(offset), .set) < 0) return error.SeekFailed;
+    const out = try allocator.alloc(u8, max);
+    errdefer allocator.free(out);
+    var filled: usize = 0;
+    while (filled < max) {
+        const n = pfs.read(fd, out[filled..]);
+        if (n <= 0) break;
+        filled += @intCast(n);
+    }
+    return allocator.realloc(out, filled);
 }
 
 fn spoolFileSize(path: []const u8) !u64 {
