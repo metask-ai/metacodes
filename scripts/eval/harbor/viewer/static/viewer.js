@@ -361,7 +361,8 @@ async function renderProfile(id) {
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
     metric('运行', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
-    metric('无效', String(s.counts.invalid)));
+    metric('无效', String(s.counts.invalid)),
+    s.budget_exhausted ? metric('预算用完', String(s.budget_exhausted), 'teamwork 用完上限后停下的尝试，按判分结果计入') : null);
 
   const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
@@ -464,7 +465,7 @@ async function renderProfile(id) {
 // all of them ran, so a model is not judged on an easier subset.
 function modelsPanel(b) {
   if ((b.by_model || []).length < 2) return null;
-  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '总 Token', '估算成本'];
+  const heads = ['模型', '题数', '结局分布', '一次性完成率', '通过 / 有效', '首轮满分率', '无效', '预算用完', '总 Token', '估算成本'];
   const row = (model, tasks, m) => h('tr', { class: 'link', onclick: () => { state.profileModel = model; render(); } },
     h('td', { text: model || '—' }),
     h('td', { class: 'num', text: String(tasks) }),
@@ -473,6 +474,7 @@ function modelsPanel(b) {
     h('td', { class: 'num', text: `${m.counts.pass} / ${m.valid || 0}` }),
     h('td', { class: 'num', text: pct(m.first_pass_rate) }),
     h('td', { class: 'num', text: String(m.counts.invalid) }),
+    h('td', { class: 'num', text: String(m.budget_exhausted || 0) }),
     h('td', { class: 'num', text: compact(m.total_tokens) }),
     h('td', { class: 'num', text: usd(m.cost_usd) }));
   const table = (rows) => h('div', { class: 'table-scroll' }, h('table', {},
@@ -1299,7 +1301,6 @@ function svg(tag, attrs, ...children) {
   return el;
 }
 const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
-const rowGroup = (r) => (r.ours ? 'metacodes' : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
 const PALETTE = ['#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
 const SHAPES = ['diamond', 'square', 'circle', 'triangle', 'hexagon'];
@@ -1307,12 +1308,17 @@ function spareHue(i) {
   const hue = (i * 137.508 + 20) % 360;
   return hue > 185 && hue < 245 ? (hue + 60) % 360 : hue;
 }
-function harnessLooks(rows) {
-  const names = [...new Set(rows.filter((r) => !r.ours).map((r) => r.harness))];
-  const looks = new Map(names.map((name, i) => [name, {
+function soleHarness(board) {
+  const names = new Set(board.entries.map((e) => e.harness));
+  return names.size === 1 ? [...names][0] : null;
+}
+function rowLooks(rows, byModel) {
+  const groupOf = (r) => (r.ours ? 'metacodes' : byModel ? r.model || r.harness : r.harness);
+  const names = [...new Set(rows.filter((r) => !r.ours).map(groupOf))];
+  const looks = new Map(names.map((name, i) => [name, { name,
     color: PALETTE[i] || `hsl(${spareHue(i)} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
-  looks.set('metacodes', { color: 'var(--accent)', shape: 'star' });
-  return (r) => looks.get(rowGroup(r));
+  looks.set('metacodes', { name: 'metacodes', color: 'var(--accent)', shape: 'star' });
+  return (r) => looks.get(groupOf(r));
 }
 const glyph = (look) => h('i', { class: 'glyph', 'data-shape': look.shape, style: 'background:' + look.color });
 function niceTicks(lo, hi) {
@@ -1366,8 +1372,9 @@ function costScatter(rows, focus, lookOf) {
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
   const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
-  const repeated = new Set(points.filter((r, i) => points.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
-  const name = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const label = (r) => (r.ours ? rowName(r) : lookOf(r).name);
+  const repeated = new Set(points.filter((r, i) => points.findIndex((o) => label(o) === label(r)) !== i).map(label));
+  const name = (r) => (!r.ours && repeated.has(label(r)) ? `${r.harness} · ${r.model}` : label(r));
   const order = [...points].sort((p, q) => Boolean(q.ours) - Boolean(p.ours) || frontier.includes(q) - frontier.includes(p) || q.score - p.score);
   const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' },
     svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
@@ -1404,15 +1411,49 @@ function costScatter(rows, focus, lookOf) {
     tip.style.bottom = py(a) + '%';
     tip.dataset.side = px(a) > 60 ? 'left' : 'right';
   });
-  const group = (g) => {
-    plot.toggleAttribute('data-group', Boolean(g));
-    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(g) && rowGroup(r) !== g);
+  const group = (look) => {
+    plot.toggleAttribute('data-group', Boolean(look));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(look) && lookOf(r) !== look);
   };
-  const legend = h('div', { class: 'scatter-legend' }, [...new Map(points.map((r) => [rowGroup(r), r])).values()].map((r) =>
-    h('span', { class: 'key', onmouseenter: () => group(rowGroup(r)), onmouseleave: () => group(null) }, glyph(lookOf(r)), rowGroup(r))));
+  const legend = h('div', { class: 'scatter-legend' }, [...new Set(points.map(lookOf))].map((look) =>
+    h('span', { class: 'key', onmouseenter: () => group(look), onmouseleave: () => group(null) }, glyph(look), look.name)));
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
   return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
     h('div', { class: 'axis-x', text: '每题平均成本' })));
+}
+const BARS_TOP = 15;
+function scoreBars(rows, focus, lookOf) {
+  const shown = rows.filter((r, i) => i < BARS_TOP || r.ours);
+  if (shown.length < 2) return null;
+  const pub = rows.filter((r) => !r.ours);
+  const harnesses = new Set(pub.map((r) => r.harness)).size;
+  const byModel = harnesses * 2 <= pub.length;
+  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : !r.model ? [r.harness, null]
+    : harnesses === 1 ? [r.model, null] : byModel ? [r.model, r.harness] : [r.harness, r.model]);
+  const err = (r) => r.stderr || 0;
+  const top = Math.max(...shown.map((r) => r.score + err(r)));
+  const lo = Math.min(...shown.map((r) => r.score - err(r)), Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
+  const { step } = niceTicks(Math.max(0, lo - (hi - lo) * 0.15), Math.min(100, hi));
+  const x1 = Math.min(100, Math.ceil(hi / step) * step);
+  const floor = Math.floor(lo / step) * step;
+  const x0 = floor < x1 * 0.25 ? 0 : Math.max(0, floor - step);
+  const at = (v) => (Math.min(Math.max(v, x0), x1) - x0) / (x1 - x0) * 100;
+  const marks = Array.from({ length: Math.round((x1 - x0) / step) + 1 }, (_, i) => +(x0 + i * step).toPrecision(12));
+  const digits = step < 1 ? 1 : 0;
+  const lines = h('div', { class: 'bars-grid', style: `grid-row:1 / span ${shown.length}` },
+    marks.map((v) => h('i', { style: `left:${at(v)}%` })));
+  const axis = h('div', { class: 'bars-axis', style: `grid-row:${shown.length + 1}` }, marks.map((v) => h('span', { style: `left:${at(v)}%`, text: v.toFixed(digits) + '%' })));
+  const items = new Map(shown.map((r, i) => [r, h('div', { class: 'bar-row', 'data-ours': r.ours ? '1' : null, style: `--row:${i + 1}`,
+    onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
+    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+  h('span', { class: 'bar-name', title: name(r).filter(Boolean).join(' · ') }, glyph(lookOf(r)),
+    h('span', {}, name(r)[0], name(r)[1] ? h('small', { text: ' · ' + name(r)[1] }) : null)),
+  h('span', { class: 'bar-track' }, h('i', { class: 'bar-fill', style: `width:${at(r.score)}%;background:${lookOf(r).color}` }),
+    err(r) ? h('i', { class: 'bar-err', style: `left:${at(r.score - err(r))}%;width:${at(r.score + err(r)) - at(r.score - err(r))}%` }) : null),
+  h('span', { class: 'bar-value num', text: score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '') }))]));
+  focus.on((active) => { for (const [r, el] of items) el.toggleAttribute('data-current', r === active); });
+  const note = rows.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 名${shown.some((r) => r.ours) ? '及我们的作业' : ''} · 共 ${rows.length} 条，完整列表见下表` }) : null;
+  return h('div', { class: 'scatter-box bars-box' }, h('div', { class: 'bars' }, lines, ...items.values(), axis), note);
 }
 function focusHub() {
   const listeners = [];
@@ -1436,7 +1477,10 @@ function boardPanel(board) {
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
-  const lookOf = harnessLooks(rows);
+  const harness = soleHarness(board);
+  const lookOf = rowLooks(rows, Boolean(harness));
+  const harnessNote = harness ? h('div', { class: 'board-harness muted', text: `Harness：${harness}（本榜公开条目都用它，图中标识按模型区分）` }) : null;
+  const priced = rows.some((r) => r.cost_per_task_usd > 0);
   const src = board.source;
   const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
   const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
@@ -1449,18 +1493,18 @@ function boardPanel(board) {
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
   h('td', { class: 'num rank', text: String(r.rank) }),
-  h('td', {}, h('span', { class: 'harness' }, glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
-  h('td', { class: 'muted', text: r.model || '—' }),
+  h('td', {}, h('span', { class: 'harness' }, harness && !r.ours ? null : glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
+  h('td', { class: 'muted' }, h('span', { class: 'harness' }, harness && !r.ours ? glyph(lookOf(r)) : null, r.model || '—')),
   h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
     h('span', { class: 'num', text: score(r.score) }))),
-  h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }))]));
+  priced ? h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }) : null)]));
   focus.on((active) => { for (const [r, tr] of rowNodes) tr.classList.toggle('active', r === active); });
   const more = rows.length > shown.length || expanded ? h('button', { type: 'button', class: 'board-more',
     onclick: (e) => { state.boardExpanded[key] = !expanded; redraw(e); } }, expanded ? '收起' : `全部 ${rows.length} 条`) : null;
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
-    h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', '每题成本'].map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', priced ? '每题成本' : null].filter(Boolean).map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus, lookOf), table),
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, costScatter(rows, focus, lookOf) || scoreBars(rows, focus, lookOf), table),
     h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {

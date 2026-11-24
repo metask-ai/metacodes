@@ -21,7 +21,8 @@ from e2e_helpers import SkipTest
 
 def test_login_opens_the_metask_sign_in_and_esc_interrupts(bin_path):
     raw = run(bin_path, [READY, "type:/login", "key:enter", wait_for("Sign in to Metask", 10),
-                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 120))
+                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 120),
+              env={"SSH_CONNECTION": None, "SSH_TTY": None})
     # The authorize URL is longer than a row: the terminal wraps it.
     a = TTYAssert(raw, rows=30, cols=120, autowrap=True)
     if not a.screens_with("Open this URL to authenticate"):
@@ -76,12 +77,13 @@ def _hold(port):
     return sock
 
 
-def _codex_sign_in(bin_path):
+def _codex_sign_in(bin_path, env=None):
     """`/login chatgpt-codex` up to its authorize URL, then Esc. `--no-browser`:
     nothing opens on any platform; the URL is in the pane."""
     raw = run(bin_path, [READY, "type:/login chatgpt-codex --no-browser", "key:enter",
                          wait_for("Waiting for the login callback", 15), "sleep:0.5",
-                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 200))
+                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 200),
+              env=env or {"SSH_CONNECTION": None, "SSH_TTY": None})
     text = _ANSI.sub(b"", raw).decode("utf-8", "replace")
     urls = re.findall(r"https://auth\.openai\.com/oauth/authorize\?\S+", text)
     assert urls, text[-2000:]
@@ -135,3 +137,38 @@ def test_login_chatgpt_codex_takes_1457_when_1455_is_held_and_sends_it_nothing(b
     assert "redirect_uri=http%3A%2F%2Flocalhost%3A1457%2Fauth%2Fcallback&" in url, url
     for param in _CODEX_PARAMS:
         assert param in url, f"{param} not in {url}"
+
+
+@runs_alone(_CALLBACK_PORTS)
+def test_login_chatgpt_codex_over_ssh_names_the_forward_for_the_port_it_took(bin_path):
+    holder = _hold(1455)
+    if holder is None:
+        raise SkipTest("port 1455 is in use on this machine")
+    try:
+        free = _hold(1457)
+        if free is None:
+            raise SkipTest("port 1457 is in use on this machine")
+        free.close()
+        text, url = _codex_sign_in(bin_path, {"SSH_CONNECTION": "192.0.2.10 50022 192.0.2.20 22", "SSH_TTY": None})
+    finally:
+        holder.close()
+    assert "Waiting for the login callback on http://localhost:1457." in text, text[-2000:]
+    assert "Over SSH? Forward the port first: ssh -L 1457:127.0.0.1:1457 <you>@<this machine>" in text, text[-2000:]
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A1457%2Fauth%2Fcallback&" in url, url
+
+
+@runs_alone(_CALLBACK_PORTS)
+def test_login_chatgpt_codex_pane_takes_a_pasted_address_and_refuses_another_sign_ins(bin_path):
+    free = _hold(1455)
+    if free is None:
+        raise SkipTest("port 1455 is in use on this machine")
+    free.close()
+    raw = run(bin_path, [READY, "type:/login chatgpt-codex --no-browser", "key:enter",
+                         wait_for("paste that page's address here", 15),
+                         "raw:\x1b[200~http://localhost:1455/auth/callback?code=x&state=another-sign-in\x1b[201~",
+                         "key:enter", wait_for("That address is from another sign-in.", 10), "sleep:0.5",
+                         "key:esc", wait_for("Login interrupted", 10)], term_size=(30, 200),
+              env={"SSH_CONNECTION": None, "SSH_TTY": None}, per_key_drain=0.05)
+    text = _ANSI.sub(b"", raw).decode("utf-8", "replace")
+    assert "That address is from another sign-in. Paste the address from this sign-in's page." in text, text[-2000:]
+    assert "Login interrupted" in text, text[-2000:]

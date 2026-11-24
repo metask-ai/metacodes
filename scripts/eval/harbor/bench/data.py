@@ -319,13 +319,21 @@ def classify(result: Optional[Dict[str, Any]], stop_reason: Optional[str]) -> Tu
 # ------------------------------------------------------------------ trials
 
 
+def teamwork_stop_reason(trial_dir: Path) -> Optional[str]:
+    """`teamwork_<state>` of a teamwork trial's saved run status, or None."""
+
+    status = read_json(trial_dir / "agent" / "teamwork-status.json")
+    return "teamwork_" + str(status["state"]) if isinstance(status, dict) and status.get("state") else None
+
+
 def trial_row(trial_dir: Path) -> Dict[str, Any]:
     """One trial's summary row (no trajectory)."""
 
     result = read_json(trial_dir / "result.json")
     measured = execution_metrics(trial_dir)
     agent = measured["result"]
-    status, cause = classify(result, agent.get("stop_reason"))
+    stop_reason = agent.get("stop_reason") or teamwork_stop_reason(trial_dir)
+    status, cause = classify(result, stop_reason)
     result = result if isinstance(result, dict) else {}
     agent_result = result.get("agent_result") or {}
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
@@ -363,7 +371,7 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
         "cause": cause,
         "reward": number(rewards.get("reward")) if isinstance(rewards, dict) else None,
         "exception": exception.get("exception_type") if isinstance(exception, dict) else None,
-        "stop_reason": agent.get("stop_reason"),
+        "stop_reason": stop_reason,
         # metacodes ended on a reply with no text and no tool call: it took
         # an empty answer as final, a harness signal worth seeing per task.
         "empty_final": agent.get("stop_reason") == "end_turn" and not (agent.get("text") or "").strip(),
@@ -573,6 +581,7 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     counts = {status: 0 for status in STATUSES}
     causes: Dict[str, int] = {}
     empty_final = sum(1 for row in rows if row.get("empty_final"))
+    budget_exhausted = sum(1 for row in rows if row.get("stop_reason") == "teamwork_budget_exhausted")
     for row in rows:
         counts[row["status"]] += 1
         if row["status"] == "invalid":
@@ -601,6 +610,7 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "counts": counts,
         "invalid_causes": causes,
         "empty_final": empty_final,
+        "budget_exhausted": budget_exhausted,
         "valid": valid,
         "pass_rate": counts["pass"] / valid if valid else None,
         "one_shot_pass_rate": counts["pass"] / valid if valid else None,
@@ -699,7 +709,7 @@ def composition_fields(total: Optional[Dict[str, float]], trials: int) -> Dict[s
 def merge_summaries(summaries):
     """Pool jobs as separate evaluations; never deduplicate tasks across models."""
     summaries = list(summaries)
-    fields = ("trials", "valid", "empty_final", "first_tasks", "first_valid", "first_passed", "first_invalid", "first_pending",
+    fields = ("trials", "valid", "empty_final", "budget_exhausted", "first_tasks", "first_valid", "first_passed", "first_invalid", "first_pending",
               "total_tokens", "token_trials", "partial_token_trials", "initial_input_tokens", "initial_token_trials",
               "input_tokens", "cache_tokens", "output_tokens", "cost_usd", "cost_trials", "agent_seconds",
               "requests", "profiled_requests", "tps_output_tokens", "tps_generation_ms",

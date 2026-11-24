@@ -507,6 +507,24 @@ def node_argv(executor: SshExecutor, *args: str, reverse: Optional[Tuple[int, in
     return ssh_argv(executor, ["sh", "-c", script], reverse=reverse)
 
 
+def resolve_node(executor: SshExecutor, runner=subprocess.run) -> str:
+    script = (node_prelude(executor) + '[ -n "$n" ] || exit 127; '
+              'readlink -f "$n" 2>/dev/null || printf "%s\\n" "$n"')
+    try:
+        done = runner(shell_argv(executor, script), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                      timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败：{exc}") from None
+    if done.returncode == 127:
+        raise ValueError(f"执行机器 {executor.name} 上找不到 metacodes 节点；"
+                         f"运行 metacodes bench setup --executor {executor.name}")
+    lines = (done.stdout or "").strip().splitlines()
+    if done.returncode != 0 or not lines:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败（退出码 {done.returncode}）："
+                         f"{(done.stderr or '').strip()[-300:]}")
+    return lines[-1]
+
+
 def shell_argv(executor: Executor, script: str) -> List[str]:
     """argv that runs a POSIX shell script on the executor."""
     if isinstance(executor, SshExecutor):
@@ -967,8 +985,8 @@ class JobSync:
     PASS_FILES = 2000
 
     def __init__(self, executor: SshExecutor, remote_dir: str, local_dir: Path,
-                 runner=subprocess.run, log=print, popen=subprocess.Popen):
-        self.executor, self.remote_dir = executor, remote_dir
+                 runner=subprocess.run, log=print, popen=subprocess.Popen, binary: Optional[str] = None):
+        self.executor, self.remote_dir, self.binary = executor, remote_dir, binary
         self.local_dir = Path(local_dir)
         self.runner, self.log, self.popen = runner, log, popen
         self.seen: Dict[str, List[int]] = {}
@@ -977,8 +995,8 @@ class JobSync:
         self.pending = 0
 
     def manifest(self) -> Dict[str, List[int]]:
-        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir), stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=self.MANIFEST_TIMEOUT)
+        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir, binary=self.binary),
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=self.MANIFEST_TIMEOUT)
         if listing.returncode != 0:
             raise ValueError("读取远程作业目录失败")
         current = json.loads(listing.stdout or b"{}")
@@ -1036,7 +1054,7 @@ class JobSync:
         import tempfile
         requested = {item if isinstance(item, str) else item[0] for item in items}
         with tempfile.TemporaryFile() as errors:
-            process = self.popen(node_argv(self.executor, "pack", self.remote_dir), stdin=subprocess.PIPE,
+            process = self.popen(node_argv(self.executor, "pack", self.remote_dir, binary=self.binary), stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=errors)
             stream = _Watched(process.stdout)
             done = threading.Event()
@@ -1139,6 +1157,7 @@ class RemoteRun:
         self.spec = spec
         self.runner, self.popen = runner, popen
         self.log = log or (lambda text: print(text, flush=True))
+        self.node = None
         self.bundle = None
         self.dataset = None
         self.overlay = None
@@ -1173,12 +1192,13 @@ class RemoteRun:
         return self.executor.remote("jobs", self.spec["name"])
 
     def stage(self) -> None:
-        """Ship the bundle and the run's dataset. A WorkBuddy run needs
-        neither: the node runs its own WorkBuddy checkout."""
-        if self.spec.get("runner") == "workbuddy":
-            return
+        """Ship the bundle and the run's dataset. A WorkBuddy run needs only
+        the bundle: the node runs its own WorkBuddy checkout."""
+        self.node = resolve_node(self.executor, self.runner)
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
+        if self.spec.get("runner") == "workbuddy":
+            return
         registry = self.spec.get("registry_download")
         local = None
         if registry:
@@ -1216,12 +1236,9 @@ class RemoteRun:
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
         if self.spec.get("runner") == "workbuddy":
-            # The node refuses a checkout whose staged executables are not
-            # those of the bundle this run's record names.
-            from scripts.eval.harbor.suites import workbuddy
-            bundle = self.spec.get("bundle")
+            # The node stages the run's mount image from this shipped bundle.
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
-                    "executables": workbuddy.bundle_executables(bundle) if bundle else None,
+                    "bundle": self.bundle,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
                                                      "reasoning_effort", "account_gateway", "workbuddy_judge")}}
         run_dir = self.executor.remote("runs", self.spec["name"])
@@ -1358,7 +1375,7 @@ class RemoteRun:
 
     def spawn(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str]) -> None:
         self.remote_spec_path = remote_spec_path
-        argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress())
+        argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress(), binary=self.node)
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
         # to Harbor (the placeholder, a judge key), `credential` to the relay.
@@ -1442,7 +1459,7 @@ class RemoteRun:
 
     def job_sync(self) -> JobSync:
         return JobSync(self.executor, self.remote_job_dir, self.local_job_dir,
-                       runner=self.runner, log=self.log, popen=self.popen)
+                       runner=self.runner, log=self.log, popen=self.popen, binary=self.node)
 
     def sync(self) -> bool:
         """One pass; False when it failed (logged, retried by the caller)."""

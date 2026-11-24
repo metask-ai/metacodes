@@ -150,6 +150,11 @@ class ModelAndFlagsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reasoning_effort"):
             cmd.teamwork_flags(provider=None, model="m", reasoning_effort="turbo")
 
+    def test_teamwork_allows_the_built_in_tools_and_the_tasks_mcp_servers(self):
+        self.assertIn("WebFetch", cmd.teamwork_allow_rules())
+        self.assertEqual(cmd.teamwork_allow_rules(["are"])[-1], "mcp__are")
+        self.assertEqual(cmd.teamwork_allow_rules()[:len(cmd.TEAMWORK_ALLOWED_TOOLS)], list(cmd.TEAMWORK_ALLOWED_TOOLS))
+
     def test_teamwork_runs_alone(self):
         self.assertEqual(cmd.checked_features(["teamwork"]), ["teamwork"])
         self.assertEqual(cmd.checked_features(["execute_code", "stall_gate"]), ["execute_code", "stall_gate"])
@@ -361,6 +366,9 @@ FAKE_TEAMWORK = textwrap.dedent(
     case " $* " in
       *" teamwork status "*) printf '%s\\n' "$@" > "$RECORD/argv-status"; printf '%s' "${FAKE_TEAMWORK_STATUS:-}"; exit 0 ;;
       *" teamwork run "*) printf '%s\\n' "$@" > "$RECORD/argv-run"; git log --format=%s > "$RECORD/log"
+        run_dir="${args[1]}/teamwork/trial1"; mkdir -p "$run_dir/worktree" "$run_dir/seats/implementer-1"
+        echo '{"charge":1}' > "$run_dir/budget.jsonl"; echo seat-log > "$run_dir/seats/implementer-1/session.log"
+        echo task-copy > "$run_dir/worktree/main.py"
         exit "${FAKE_STATUS:-0}" ;;
     esac
     exit 9
@@ -416,6 +424,22 @@ class TeamworkScriptTest(unittest.TestCase):
         self.assertEqual((self.record / "request").read_text(encoding="utf-8"), "Fix the bug in main.py.\n")
         self.assertEqual(cmd.teamwork_status(self.logs)["dispatched"]["implementer"], 2)
         self.assertIsNone(cmd.teamwork_problem(cmd.teamwork_status(self.logs)))
+        kept = self.logs / cmd.TEAMWORK_RUN_DIRNAME
+        self.assertEqual((kept / "budget.jsonl").read_text(encoding="utf-8").strip(), '{"charge":1}')
+        self.assertEqual((kept / "seats" / "implementer-1" / "session.log").read_text(encoding="utf-8").strip(), "seat-log")
+        self.assertFalse((kept / "worktree").exists())
+
+    def test_seats_get_allow_rules_and_an_images_own_settings_are_kept(self):
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        settings = json.loads((self.tmp / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings, {"permissions": {"allow": list(cmd.TEAMWORK_ALLOWED_TOOLS)}})
+        (self.tmp / ".claude" / "settings.json").write_text('{"permissions": {"deny": ["Bash"]}}', encoding="utf-8")
+        shutil.rmtree(self.tmp / "state")
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('"deny"', (self.tmp / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertIn("keeping the image's own", (self.logs / cmd.STDERR_FILENAME).read_text(encoding="utf-8"))
 
     def test_an_existing_commit_is_kept_and_a_bracket_request_gets_a_heading(self):
         subprocess.run(["git", "init", "-q"], cwd=self.work, check=True)
@@ -434,6 +458,8 @@ class TeamworkScriptTest(unittest.TestCase):
                              "seats": [{"role": "implementer", "status": "failed"}] * 3})
         self.assertIn("no teamwork implementer seat finished", cmd.teamwork_problem(cmd.parse_teamwork_status(failed)))
         self.assertIn("did not start", cmd.teamwork_problem(cmd.parse_teamwork_status("")))
+        spent = json.dumps({"state": "budget_exhausted", "seats": [{"role": "implementer", "status": "failed"}]})
+        self.assertIsNone(cmd.teamwork_problem(cmd.parse_teamwork_status(spent)))
         self.assertIn("did not start", cmd.teamwork_problem(None))
 
     def test_the_root_directory_is_refused(self):

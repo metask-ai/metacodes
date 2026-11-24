@@ -65,6 +65,21 @@ class LaunchRefused(ValueError):
     """A launch refused for a reason the run record states."""
 
 
+def with_run_image(spec):
+    """A local WorkBuddy spec whose trials mount an image of the run's own
+    tag, staged from the run's bundle."""
+    from scripts.eval.harbor.suites import workbuddy
+    tag = workbuddy.run_image_tag(spec["name"])
+    try:
+        workbuddy.build_harness_image(Path(spec["workbuddy"]["checkout"]), Path(spec["bundle"]), tag,
+                                      threading.Event())
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LaunchRefused(f"WorkBuddy 启动失败：{exc}") from None
+    except ValueError as exc:
+        raise LaunchRefused(str(exc)) from None
+    return {**spec, "workbuddy": {**spec["workbuddy"], "harness_image": tag}}
+
+
 def prepare(spec, env):
     """Resolve the run's credential and start its relay.
 
@@ -82,6 +97,10 @@ def prepare(spec, env):
                 raise LaunchRefused(str(exc)) from None
             spec = {**spec, "account_gateway": gateway}
             remote = RemoteRun(spec)
+            try:
+                remote.stage()
+            except ValueError as exc:  # staging messages are user-facing, secret-free
+                raise LaunchRefused(str(exc)) from None
             return {**spec, "remote_spec_path": remote.upload_run(remote.remote_spec())}, remote, source
         # WorkBuddy's own host proxy holds the key; its task containers get
         # only that proxy's route token.
@@ -89,7 +108,7 @@ def prepare(spec, env):
             account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
             env["METASK_API_KEY"] = account.credential(spec["model"], key_id=spec.get("account_key_id"))
             spec = {**spec, "account_gateway": account.gateway}
-        return spec, None, None
+        return with_run_image(spec), None, None
     problem = route_problem(spec)
     if problem:
         raise LaunchRefused(problem)
@@ -358,6 +377,13 @@ def main(argv=None):
                 workbuddy.finish(spec)
             except OSError:
                 record["error"] = record.get("error") or "WorkBuddy 临时配置清理失败"
+            tag = spec["workbuddy"].get("harness_image")
+            if tag:
+                try:
+                    subprocess.run(["docker", "image", "rm", tag], stdin=subprocess.DEVNULL, capture_output=True,
+                                   timeout=60)
+                except (OSError, subprocess.SubprocessError):
+                    pass
         # The final ingest, run row included, precedes the terminal receipt
         # (and follows the WorkBuddy job's finished_at stamp), so a finished
         # run's results are already in the store and nothing writes them once
