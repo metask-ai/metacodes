@@ -2338,10 +2338,13 @@ pub const RenderRegion = struct {
             var vis_w: usize = 0;
             var i: usize = 0;
             const s = rendered.items;
+            var carried: md_render.CarriedStyle = .{};
+            defer carried.deinit(self.allocator);
             while (i < s.len) {
                 if (s[i] == 0x1b) {
                     const esc_end = ansi.escapeEnd(s, i);
                     buf.appendSlice(self.allocator, s[i..esc_end]) catch {};
+                    carried.observe(s[i..esc_end], self.allocator) catch {};
                     i = esc_end;
                     continue;
                 }
@@ -2350,8 +2353,10 @@ pub const RenderRegion = struct {
                 const cw = term.displayWidth(s[i..end]);
                 if (vis_w + cw > avail and vis_w > 0) {
                     // 软折:换行 + 2 空格悬挂缩进,重置可见宽。
+                    carried.appendSuspend(&buf, self.allocator) catch {};
                     buf.append(self.allocator, '\n') catch {};
                     buf.appendSlice(self.allocator, "  ") catch {};
+                    carried.appendResume(&buf, self.allocator) catch {};
                     vis_w = 0;
                 }
                 buf.appendSlice(self.allocator, s[i..end]) catch {};
@@ -3908,4 +3913,15 @@ test "soft-wrapping an assistant line keeps a file hyperlink escape whole" {
     const open = ansi.hyperlink.open_prefix ++ "file:///tmp/a/very/long/directory/name/notes.txt" ++ ansi.hyperlink.open_suffix;
     try std.testing.expect(std.mem.indexOf(u8, r.pending_scroll.items, open) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.pending_scroll.items, "\n") == r.pending_scroll.items.len - 1);
+}
+
+test "soft-wrapping a long link label closes the link before the indent and reopens it after" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.cols = 20;
+    r.hold_paint = true;
+    r.writeGenAssistantText("[a label far too long for one row](/tmp/n.txt)\n");
+    const open = ansi.hyperlink.open_prefix ++ "file:///tmp/n.txt" ++ ansi.hyperlink.open_suffix;
+    const wrap = ansi.sgr.reset ++ ansi.hyperlink.close ++ "\n  " ++ open;
+    try std.testing.expect(std.mem.indexOf(u8, r.pending_scroll.items, wrap) != null);
 }

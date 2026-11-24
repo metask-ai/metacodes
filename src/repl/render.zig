@@ -275,7 +275,7 @@ const LinkTarget = union(enum) {
 fn parseMarkdownLink(text: []const u8, open: usize) ?MarkdownLink {
     const label_end = std.mem.indexOfScalarPos(u8, text, open + 1, ']') orelse return null;
     if (label_end + 1 >= text.len or text[label_end + 1] != '(') return null;
-    const target_end = std.mem.indexOfScalarPos(u8, text, label_end + 2, ')') orelse return null;
+    const target_end = closingParen(text, label_end + 2) orelse return null;
     const label = text[open + 1 .. label_end];
     if (label.len == 0) return null;
     return .{
@@ -283,6 +283,63 @@ fn parseMarkdownLink(text: []const u8, open: usize) ?MarkdownLink {
         .target = text[label_end + 2 .. target_end],
         .end = target_end + 1,
     };
+}
+
+fn closingParen(text: []const u8, start: usize) ?usize {
+    var depth: usize = 0;
+    for (text[start..], start..) |c, i| {
+        if (c == '(') {
+            depth += 1;
+        } else if (c == ')') {
+            if (depth == 0) return i;
+            depth -= 1;
+        }
+    }
+    return null;
+}
+
+pub const CarriedStyle = struct {
+    sgr: std.ArrayList(u8) = .empty,
+    link: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(self: *CarriedStyle, allocator: std.mem.Allocator) void {
+        self.sgr.deinit(allocator);
+        self.link.deinit(allocator);
+    }
+
+    pub fn observe(self: *CarriedStyle, esc: []const u8, allocator: std.mem.Allocator) !void {
+        if (std.mem.startsWith(u8, esc, "\x1b]8;")) {
+            self.link.clearRetainingCapacity();
+            if (!isHyperlinkClose(esc)) try self.link.appendSlice(allocator, esc);
+        } else if (esc.len >= 3 and esc[1] == '[' and esc[esc.len - 1] == 'm') {
+            if (std.mem.eql(u8, esc, RESET) or std.mem.eql(u8, esc, "\x1b[m")) {
+                self.sgr.clearRetainingCapacity();
+            } else {
+                try self.sgr.appendSlice(allocator, esc);
+            }
+        }
+    }
+
+    pub fn appendSuspend(self: *const CarriedStyle, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        if (self.sgr.items.len > 0) try out.appendSlice(allocator, RESET);
+        if (self.link.items.len > 0) try out.appendSlice(allocator, ansi.hyperlink.close);
+    }
+
+    pub fn appendResume(self: *const CarriedStyle, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        try out.appendSlice(allocator, self.link.items);
+        try out.appendSlice(allocator, self.sgr.items);
+    }
+};
+
+fn isHyperlinkClose(esc: []const u8) bool {
+    const body = if (std.mem.endsWith(u8, esc, "\x1b\\"))
+        esc[4 .. esc.len - 2]
+    else if (std.mem.endsWith(u8, esc, "\x07"))
+        esc[4 .. esc.len - 1]
+    else
+        esc[4..];
+    const params_end = std.mem.indexOfScalar(u8, body, ';') orelse return true;
+    return params_end + 1 == body.len;
 }
 
 fn unwrapCodeSpan(s: []const u8) []const u8 {
@@ -724,43 +781,6 @@ fn parseAlign(sep_cell: []const u8) Align {
     return .left;
 }
 
-/// 单元格内容的可见显示宽(按 renderInline 消费 `**`/`*`/`` ` `` 的方式只数可见字符)。
-/// 载荷关键:cell 含 emphasis marker 时,边框须按可见宽对齐而非含 marker 的原始宽。
-fn inlineDisplayWidth(text: []const u8) usize {
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == '`') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |close| {
-                w += term.displayWidth(text[i + 1 .. close]);
-                i = close + 1;
-                continue;
-            }
-        }
-        if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
-            if (std.mem.indexOfPos(u8, text, i + 2, "**")) |close| {
-                w += term.displayWidth(text[i + 2 .. close]);
-                i = close + 2;
-                continue;
-            }
-        }
-        if (text[i] == '*' and (i + 1 >= text.len or text[i + 1] != '*')) {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, '*')) |close| {
-                if (close + 1 >= text.len or text[close + 1] != '*') {
-                    w += term.displayWidth(text[i + 1 .. close]);
-                    i = close + 1;
-                    continue;
-                }
-            }
-        }
-        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const end = @min(i + cp_len, text.len);
-        w += term.displayWidth(text[i..end]);
-        i = end;
-    }
-    return w;
-}
-
 /// 把已渲成 ANSI 的 cell 折成多物理子行,每行可见宽 ≤ width。
 /// ASCII 空格处贪心折;单 token 超列宽按 codepoint 硬折(CJK 无空格必须硬折,不切多字节);
 /// ESC 序列零宽原子透传。返回 owned 子行列表(每条 owned),调用方释放。
@@ -860,7 +880,28 @@ fn wrapCell(rendered: []const u8, width: usize, allocator: std.mem.Allocator) !s
     if (cur.items.len > 0 or lines.items.len == 0) {
         try flushLine(&lines, &cur, allocator);
     }
+    if (lines.items.len > 1) try carryStylesAcrossLines(lines.items, allocator);
     return lines;
+}
+
+fn carryStylesAcrossLines(lines: [][]u8, allocator: std.mem.Allocator) !void {
+    var carried: CarriedStyle = .{};
+    defer carried.deinit(allocator);
+    for (lines) |*line| {
+        var fixed: std.ArrayList(u8) = .empty;
+        errdefer fixed.deinit(allocator);
+        try carried.appendResume(&fixed, allocator);
+        var i: usize = 0;
+        while (i < line.len) {
+            const next = if (line.*[i] == 0x1b) ansi.escapeEnd(line.*, i) else i + 1;
+            if (line.*[i] == 0x1b) try carried.observe(line.*[i..next], allocator);
+            try fixed.appendSlice(allocator, line.*[i..next]);
+            i = next;
+        }
+        try carried.appendSuspend(&fixed, allocator);
+        allocator.free(line.*);
+        line.* = try fixed.toOwnedSlice(allocator);
+    }
 }
 
 /// 把单元格 markdown 渲成 ANSI(借用 renderInline),返回 owned。
@@ -945,13 +986,15 @@ pub fn renderTable(rows: []const []const u8, avail_width: usize, allocator: std.
         try content_rows.append(allocator, r);
     }
 
-    // 列自然宽 = 各行该列 inlineDisplayWidth 最大值。
+    // 列自然宽 = 各行该列渲染后可见宽的最大值。
     const nat = try allocator.alloc(usize, n);
     defer allocator.free(nat);
     for (nat) |*w| w.* = 0;
     for (content_rows.items) |row| {
         for (row, 0..) |cell, c| {
-            const cw = inlineDisplayWidth(cell);
+            const rendered_cell = try renderCellInline(cell, allocator);
+            defer allocator.free(rendered_cell);
+            const cw = visibleWidth(rendered_cell);
             if (cw > nat[c]) nat[c] = cw;
         }
     }
@@ -1430,6 +1473,56 @@ test "markdown links without a usable target stay literal" {
     const out = try renderToOwned("[mail](mailto:a@b.c)", testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("[mail](mailto:a@b.c)", out);
+}
+
+test "markdown link target keeps balanced parentheses in the path" {
+    try expectRendersLink("[笔记](/tmp/draft(1).md)", "file:///tmp/draft%281%29.md", "笔记");
+    try expectRendersLink("([笔记](/tmp/draft(1).md))", "file:///tmp/draft%281%29.md", "(笔记)");
+}
+
+fn styledAtBorder(line: []const u8) bool {
+    var carried: CarriedStyle = .{};
+    defer carried.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b) {
+            const end = ansi.escapeEnd(line, i);
+            carried.observe(line[i..end], testing.allocator) catch unreachable;
+            i = end;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line[i..], BOX.v) and (carried.link.items.len > 0 or carried.sgr.items.len > 0)) return true;
+        i += 1;
+    }
+    return false;
+}
+
+test "a link label wrapped inside a table cell stays inside its cell" {
+    const rows = [_][]const u8{
+        "| file | note |",
+        "|---|---|",
+        "| [a long link label here](/tmp/notes.txt) | plain text |",
+    };
+    const out = try renderTable(&rows, 30, testing.allocator);
+    defer testing.allocator.free(out);
+    var opens: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        try testing.expect(!styledAtBorder(line));
+        if (std.mem.indexOf(u8, line, ansi.hyperlink.open_prefix ++ "file:///tmp/notes.txt") != null) opens += 1;
+    }
+    try testing.expect(opens >= 2);
+}
+
+test "table column width counts a link by its label, not its path" {
+    const rows = [_][]const u8{
+        "| a | b |",
+        "|---|---|",
+        "| [x](/a/very/long/path/to/some/file.txt) | bbbbbbbbbbbb |",
+    };
+    const out = try renderTable(&rows, 30, testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "bbbbbbbbbbbb") != null);
 }
 
 test "a rendered hyperlink is zero width when measured or wrapped" {
