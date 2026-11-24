@@ -6,6 +6,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/model.py", .bytes = @embedFile("eval/model.py") },
     .{ .path = "scripts/eval/workbuddy/__init__.py", .bytes = @embedFile("eval/workbuddy/__init__.py") },
     .{ .path = "scripts/eval/workbuddy/trace.py", .bytes = @embedFile("eval/workbuddy/trace.py") },
+    .{ .path = "scripts/eval/workbuddy/stage_artifacts.py", .bytes = @embedFile("eval/workbuddy/stage_artifacts.py") },
     .{ .path = "scripts/eval/harbor/__init__.py", .bytes = @embedFile("eval/harbor/__init__.py") },
     .{ .path = "scripts/eval/harbor/cli.py", .bytes = @embedFile("eval/harbor/cli.py") },
     .{ .path = "scripts/eval/harbor/command.py", .bytes = @embedFile("eval/harbor/command.py") },

@@ -292,6 +292,7 @@ class CatalogTest(unittest.TestCase):
         probe = ("import sys, json\n"
                  "import scripts.eval.harbor.cli, scripts.eval.harbor.viewer.server, scripts.eval.harbor.bench.worker\n"
                  "import scripts.eval.harbor.suites.workbuddy, scripts.eval.harbor.adapters.gaia2_cli\n"
+                 "import scripts.eval.workbuddy.stage_artifacts\n"
                  "print(json.dumps(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('scripts') and getattr(m, '__file__', None))))")
         loaded = json.loads(subprocess.run([sys.executable, "-c", probe], cwd=REPO, check=True,
                                            capture_output=True, text=True).stdout)
