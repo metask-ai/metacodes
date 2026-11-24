@@ -471,6 +471,9 @@ class ProfileTest(unittest.TestCase):
                 self.manager.profiles.advance()
                 time.sleep(.05)
             run = self.manager.profiles.get(created['id'])['items'][0]['run']
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (self.manager.jobs_dir / run / 'result.json').exists():
+                time.sleep(.05)
             with self.assertRaisesRegex(ValueError, '先停止'):
                 self.client.request('api/job/delete', {'name': run})
             self.client.request('api/profile/cancel', {'id': created['id']})
