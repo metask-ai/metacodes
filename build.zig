@@ -74,6 +74,17 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 /// Every Zig test executable that can run on Windows shares the same legacy
 /// `/tmp` compatibility prerequisite. Keep that policy at test-run creation so
 /// new isolated suites cannot silently forget it.
+fn addInternal(b: *std.Build, mod: *std.Build.Module) void {
+    const internal = b.createModule(.{
+        .root_source_file = b.path("src/internal.zig"),
+        .target = mod.resolved_target,
+        .optimize = mod.optimize,
+        .link_libc = mod.link_libc,
+    });
+    for (mod.import_table.keys(), mod.import_table.values()) |name, imported| internal.addImport(name, imported);
+    mod.addImport("metacodes-internal", internal);
+}
+
 fn addTestRunArtifact(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
@@ -936,6 +947,7 @@ pub fn build(b: *std.Build) void {
     });
     addHl(b, release_mod);
     release_mod.addOptions("build_info", build_info);
+    addInternal(b, release_mod);
     const exe = b.addExecutable(.{
         .name = "metacodes",
         .root_module = release_mod,
@@ -991,6 +1003,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHlWithProjectHarnessActuation(b, project_harness_shadow_mod, true);
+    addInternal(b, project_harness_shadow_mod);
     const project_harness_shadow_exe = b.addExecutable(.{
         .name = "metacodes-project-harness-shadow",
         .root_module = project_harness_shadow_mod,
@@ -1243,6 +1256,7 @@ pub fn build(b: *std.Build) void {
     });
     addHl(b, debug_mod);
     debug_mod.addOptions("build_info", debug_build_info);
+    addInternal(b, debug_mod);
     const debug_exe = b.addExecutable(.{
         .name = "metacodes-debug",
         .root_module = debug_mod,
@@ -1270,6 +1284,7 @@ pub fn build(b: *std.Build) void {
         });
         addHl(b, m2);
         m2.addOptions("build_info", buildInfoOptions(b, target.result, optimize, release_layout, tinykg_input, build_identity));
+        addInternal(b, m2);
         break :blk m2;
     };
     const test_harness_mod = b.createModule(.{
@@ -1328,6 +1343,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, install_probe_root_mod);
+    addInternal(b, install_probe_root_mod);
     const update_unit_probe_mod = b.createModule(.{
         .root_source_file = b.path("tests/_harness/update_unit_probe.zig"),
         .target = target,
@@ -2437,6 +2453,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, picker_test_mod);
+    addInternal(b, picker_test_mod);
     const picker_test = addRecordedTest(b, .{ .name = "picker-test", .root_module = picker_test_mod });
     const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
     picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
@@ -3030,6 +3047,16 @@ pub fn build(b: *std.Build) void {
     wireTinyKgdTestInput(test_run, staged_tinykgd);
     wireLeanKernelTestInputs(test_run, staged_lean_kernels);
     units_test_step.dependOn(&test_run.step);
+    const internal_test = addRecordedTest(b, .{
+        .name = "internal-test",
+        .root_module = test_cc_mod.import_table.get("metacodes-internal").?,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const internal_test_run = addTestRunArtifact(b, internal_test);
+    wireTinyKgTestInput(internal_test_run, staged_tinykg);
+    wireTinyKgdTestInput(internal_test_run, staged_tinykgd);
+    wireLeanKernelTestInputs(internal_test_run, staged_lean_kernels);
+    units_test_step.dependOn(&internal_test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
     // This is the runtime actuator for the daemon transport control plane.

@@ -67,7 +67,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `coding` | `core/` 其余文件 · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `code/` | 以上各包 |
 | `session` | `core/agent_session` · `core/session_host` | 以上各包 |
 | `teamwork` | `teamwork/` | 以上各包 |
-| `facade` | `lib.zig`(`metacodes-core` 的对外门面,汇总导出以上各包) | 以上各包 |
+| `facade` | `lib.zig`(`metacodes-core` 的对外门面,汇总导出以上各包) · `internal.zig`(cli 访问下层的唯一入口,不对外) | 以上各包 |
 | `agentcore` | `agentcore/` | 以上各包 |
 | `cli`(前端,不在 core 里) | `repl/` · `web/` · `daemon/` · `app/` · `main` · `app` · `session_service` · `session_intent` | 以上各包 |
 | `testing` / `tests` | `tests/_harness/`、`tests/helpers/` / 其余 `tests/` | 产品包;`tests` 还可以用 `testing` |
@@ -101,6 +101,13 @@ deep 条目可以来自基线的 upward 或 deep,也可以是基线代码里两�
 (`lib.zig` 仍导出为 `config`、`doctor`);`version_info` 直接读 `release_contract.CONFIG_SCHEMA_VERSION`;
 `swarm/teammate_process` 和 `teamwork/command` 改用 cli 注入的窄接口(`teammate_process.Host`、`command.AppHost`)。
 越层 import 153,深层 import 2163,包间环缩成 base、ai、kernel、guard、coding。
+
+迁移 1.3a:cli 只经 named module `metacodes-internal` 访问下层。它的根文件 `src/internal.zig` 归 `facade`,
+按目录层级重新导出 cli 用到的 371 个下层文件(`@import("metacodes-internal").core.agent_loop`),不进
+`metacodes-core`,Zig API 快照不变。cli 里再写相对路径 import 下层文件,同一个文件会落进两个 module,编译不过,
+`layer:check` 也会报新的深层 import。cli 的 844 条深层 import 清零,换成 `internal.zig` 的 371 条:越层 import 153,
+深层 import 1690,根目录过宽的 module 7 个(新增的 `internal.zig` 和 `lib.zig` 同包、同目录)。下层文件的测试改在
+`internal-test` 里跑(根是这个 module),`cc-test` 只跑 cli 自己的测试。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。
