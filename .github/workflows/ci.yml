@@ -105,8 +105,12 @@ jobs:
   # own names; the legs' and shards' steps read SUITES / TTY / UNITS /
   # PRODUCT / PACKAGE_TESTS, as they read FAST_PATH. A failed decision leaves
   # them empty: everything runs.
+  # It waits for the release fast path only to record it next to the scope:
+  # a fast-path run reuses the base's suite results (`merged-scopes`).
   scope:
     name: Change scope
+    needs: release-fast-path
+    if: ${{ !cancelled() }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -135,6 +139,7 @@ jobs:
         env:
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
         run: |
           case "$GITHUB_EVENT_NAME" in
             pull_request) base=HEAD^1 ;;
@@ -144,7 +149,7 @@ jobs:
               ;;
             *) base="" ;;
           esac
-          python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT" --labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json"
+          python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT" --labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json" --fast-path "$FAST_PATH"
       # What main's nightly run reports for this PR once it is merged
       # (`merged-scopes`).
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

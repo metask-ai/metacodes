@@ -115,20 +115,22 @@ are not complete, so no test is recorded twice.
 untracked files included, against its merge base with `origin/main`
 (`-Daffected-base=<rev>`), and runs the selected suites offline
 (`TTY_SKIP_MODEL=1`; `zig build test` for `full` and `eval`, `windows:tty`
-for TTY on Windows); the AGENTS.md checklist uses it in place of
-`zig build test`.
+for TTY on Windows), plus every changed script suite, as CI's checks leg
+does; the AGENTS.md checklist uses it in place of `zig build test`.
 
 ### The nightly backstop
 
 main's nightly run (`schedule`, or `gh workflow run ci.yml --ref main`) is
-`full` on Linux, macOS and Windows. Every scope job records its decision as
-the `change-scope` artifact (90 days). The nightly **Scopes of the day's
-merges** job (`scripts/ci_scope.py merged`) finds the pull request of every
-first-parent commit of the last 24 hours, reads the record of its newest CI
-run and writes commit, PR, scope, packages and reason to the job summary;
-a pull request without a record is `unknown`. When the nightly run fails,
-the `packages`, `tests` and `unknown` rows are the pull requests that may
-not have run the failing suite. Recomputing the decision measures the rules
+`full` on Linux, macOS and Windows. Every scope job records its decision,
+with the release fast path's, as the `change-scope` artifact (90 days). The
+nightly **Scopes of the day's merges** job (`scripts/ci_scope.py merged`)
+finds the pull request of every first-parent commit of the last 24 hours,
+reads the record of its newest CI run only (an older run may have had other
+labels) and writes commit, PR, scope, packages and reason to the job
+summary. Without a record the row is `unknown`; a fast-path run, which
+reused the base's suite results, is `fast-path`. When the nightly run
+fails, the `packages`, `tests`, `fast-path` and `unknown` rows are the pull
+requests that may not have run the failing suite. Recomputing the decision measures the rules
 instead: `python3 scripts/ci_scope.py replay --max-count 300 --rules HEAD`,
 with `--assume-cleared` for the end state of the migration.
 

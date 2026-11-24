@@ -476,14 +476,24 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
         handle.write("\n".join(lines) + "\n")
 
 
-def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: bool = False) -> List[List[str]]:
+def script_suites(changes: Sequence[Change]) -> Tuple[str, ...]:
+    """The changed scripts/tests modules that still exist."""
+    return tuple(sorted({"scripts.tests." + PurePosixPath(path).stem for status, path in changes
+                         if status != "D" and path_kind(path, None) == "script-test"}))
+
+
+def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: bool = False,
+                   scripts: Sequence[str] = ()) -> List[List[str]]:
     """What `zig build test:affected` runs for a decision: the test part of
-    CI's selection, offline (run_local sets TTY_SKIP_MODEL, as CI does). The
-    rest of the AGENTS.md checklist runs on its own."""
+    CI's selection, offline (run_local sets TTY_SKIP_MODEL, as CI does), and
+    every changed script suite, which CI runs on a checks-leg step of its own
+    when build.zig does not. The rest of the AGENTS.md checklist runs on its
+    own."""
     if not selection.suites:
         return []
+    unittest = [[sys.executable, "-m", "unittest", *scripts]] if scripts else []
     if scope in ("full", "eval"):
-        return [[zig, "build", "test"]]
+        return [[zig, "build", "test"], *unittest]
     steps = []
     if selection.units:
         steps.extend(list(selection.package_tests) or ["test:units"])
@@ -491,9 +501,7 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: 
     if selection.product:
         steps.append("test:product")
     steps.append("test:contract")
-    commands = [[zig, "build", *steps]]
-    if selection.script_tests:
-        commands.append([sys.executable, "-m", "unittest", *selection.script_tests])
+    commands = [[zig, "build", *steps], *unittest]
     if selection.tty and windows:
         commands.append([zig, "build", "windows:tty", "-Dtarget=x86_64-windows-gnu"])
     elif selection.tty:
@@ -502,9 +510,9 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: 
     return commands
 
 
-def run_local(root: Path, scope: str, selection: Selection, zig: str) -> int:
+def run_local(root: Path, scope: str, selection: Selection, zig: str, scripts: Sequence[str] = ()) -> int:
     env = dict(os.environ, TTY_SKIP_MODEL="1")
-    for command in local_commands(scope, selection, zig, windows=os.name == "nt"):
+    for command in local_commands(scope, selection, zig, windows=os.name == "nt", scripts=scripts):
         print("+ " + " ".join(command), flush=True)
         status = subprocess.run(command, cwd=str(root), env=env, check=False).returncode
         if status:
@@ -559,7 +567,8 @@ def replay_report(rows: Sequence[Tuple[str, str, str, Tuple[str, ...], str]], ti
     if not rows:
         return "\n".join(lines + ["No commits in the window.", ""])
     lines.extend(["| Scope | Commits | Share |", "|---|---|---|"])
-    for scope in ("docs", "eval", "tests", "packages", "full") + (("unknown",) if counts["unknown"] else ()):
+    for scope in ("docs", "eval", "tests", "packages", "full") + tuple(
+            extra for extra in ("fast-path", "unknown") if counts[extra]):
         lines.append(f"| {scope} | {counts[scope]} | {100 * counts[scope] / len(rows):.0f}% |")
     lines.extend(["", "| Commit | PR | Scope | Packages | Reason |", "|---|---|---|---|---|"])
     for commit, subject, scope, packages, reason in rows:
@@ -593,16 +602,15 @@ def download_scope(repository: str, run_id: int) -> Optional[dict]:
 def recorded_scope(repository: str, sha: str, query: Callable = gh_json,
                    download: Callable = download_scope) -> Optional[dict]:
     """The scope the newest CI run of the pull request merged as `sha`
-    recorded (the scope job's change-scope artifact), or None."""
+    recorded (the scope job's change-scope artifact), or None. Only the
+    newest: an older run of the same head may have had other labels."""
     for pr in query(f"repos/{repository}/commits/{sha}/pulls?per_page=100"):
         if not (pr.get("merged_at") and pr.get("merge_commit_sha") == sha):
             continue
         runs = query(f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs"
                      f"?head_sha={pr['head']['sha']}&event=pull_request&per_page=20")["workflow_runs"]
-        for run in sorted(runs, key=lambda run: run.get("created_at", ""), reverse=True):
-            found = download(repository, run["id"])
-            if found is not None:
-                return found
+        newest = max(runs, key=lambda run: run.get("created_at", ""), default=None)
+        return None if newest is None else download(repository, newest["id"])
     return None
 
 
@@ -619,6 +627,9 @@ def merged(root: Path, commits: Sequence[str], repository: str, query: Callable 
             missing = "its pull request's CI runs recorded no change scope"
         if found is None:
             rows.append((commit, subject, "unknown", (), missing))
+        elif found.get("fast_path"):
+            rows.append((commit, subject, "fast-path", (),
+                         "release fast path: the suites' results were reused from the base's CI run, not run again"))
         else:
             rows.append((commit, subject, str(found.get("scope", "unknown")),
                          tuple(found.get("packages", ())), " ".join(str(found.get("reason", "")).split())))
@@ -697,6 +708,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--labels", default="", help="the pull request's labels, comma-separated")
     parser.add_argument("--record", help=f"write the decision as JSON here (the {SCOPE_ARTIFACT} artifact)")
+    parser.add_argument("--fast-path", default="", help="the release fast path's decision, recorded with the scope")
     args = parser.parse_args(argv)
     root = Path(args.repo_root)
     candidate = args.candidate or None
@@ -757,14 +769,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
     if args.record:
         with open(args.record, "w", encoding="utf-8") as handle:
-            json.dump({"scope": scope, "packages": list(selection.packages), "reason": reason}, handle, sort_keys=True)
+            json.dump({"scope": scope, "packages": list(selection.packages), "reason": reason,
+                       "fast_path": args.fast_path == "true"}, handle, sort_keys=True)
             handle.write("\n")
     if args.github_summary:
         write_summary(args.github_summary, args.event, base, args.candidate or "(working tree)", scope, reason, observed,
                       selection=selection, doc_references=doc_references, release_docs=release_docs,
                       release_sources=inputs.release_sources, layout=layouts[-1] if layouts else None)
     if args.run:
-        return run_local(root, scope, selection, args.zig)
+        return run_local(root, scope, selection, args.zig, script_suites(observed))
     return 0
 
 

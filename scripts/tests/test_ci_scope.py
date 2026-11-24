@@ -528,9 +528,20 @@ class LayoutTest(unittest.TestCase):
     def test_local_commands_follow_the_selection(self) -> None:
         layout = fixture_layout()
         narrowed = ci_scope.select("packages", [("M", "src/mid/a.zig"), ("M", "scripts/tests/test_x.py")], layout)
-        commands = ci_scope.local_commands("packages", narrowed, "zig")
+        commands = ci_scope.local_commands("packages", narrowed, "zig", scripts=("scripts.tests.test_x",))
         self.assertEqual(commands[0], ["zig", "build", "test:mid", "test:top", "test:integration", "test:product", "test:contract"])
         self.assertEqual(commands[1][1:], ["-m", "unittest", "scripts.tests.test_x"])
+        # CI runs a changed suite build.zig does not name on a checks-leg step,
+        # even on a complete run that leaves script_tests empty; so does the
+        # local run.
+        mixed = [("M", "tests/component/vterm_test.zig"), ("M", "scripts/tests/test_lint.py"), ("D", "scripts/tests/test_old.py")]
+        complete = ci_scope.select("tests", mixed, layout)
+        self.assertEqual((complete.complete, complete.script_tests), (True, ()))
+        self.assertEqual(ci_scope.script_suites(mixed), ("scripts.tests.test_lint",))
+        local = ci_scope.local_commands("tests", complete, "zig", scripts=ci_scope.script_suites(mixed))
+        self.assertIn([sys.executable, "-m", "unittest", "scripts.tests.test_lint"], local)
+        self.assertEqual(ci_scope.local_commands("full", ci_scope.select("full"), "zig", scripts=("scripts.tests.test_x",))[1][1:],
+                         ["-m", "unittest", "scripts.tests.test_x"])
         self.assertIn(["zig", "build", "dev", "test:harness"], commands)
         self.assertEqual(ci_scope.local_commands("full", ci_scope.select("full"), "zig"), [["zig", "build", "test"]])
         self.assertEqual(ci_scope.local_commands("docs", ci_scope.select("docs"), "zig"), [])
@@ -642,14 +653,18 @@ class PackageScopeMainTest(unittest.TestCase):
         self.assertEqual(json.loads(record.read_text(encoding="utf-8"))["scope"], "full")
         narrowed = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", "", "--record", str(record))
         self.assertEqual(json.loads(record.read_text(encoding="utf-8")),
-                         {"scope": "packages", "packages": ["mid", "top"], "reason": narrowed["reason"]})
+                         {"scope": "packages", "packages": ["mid", "top"], "reason": narrowed["reason"], "fast_path": False})
+        self.run_main("--event", "pull_request", "--base", "HEAD^1", "--fast-path", "true", "--record", str(record))
+        self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["fast_path"])
 
     def test_the_nightly_report_reads_what_each_pull_request_recorded(self) -> None:
         self.edit("src/mid/a.zig")
         self.commit("mid (#7)")
         self.edit("src/side/a.zig")
         self.commit("side (#8)")
-        mid, side = (self.git("rev-parse", rev).strip() for rev in ("HEAD^1", "HEAD"))
+        (self.repo / "build.zig.zon").write_text('.{ .version = "1.2.4" }\n', encoding="utf-8")
+        self.commit("release (#9)")
+        mid, side, release = (self.git("rev-parse", rev).strip() for rev in ("HEAD~2", "HEAD^1", "HEAD"))
 
         def query(path):
             if "/commits/" in path:
@@ -657,7 +672,11 @@ class PackageScopeMainTest(unittest.TestCase):
                 return [{"merged_at": "x", "merge_commit_sha": sha, "head": {"sha": "h" + sha[:8]}}]
             return {"workflow_runs": [{"id": 1, "created_at": "a"}, {"id": 2, "created_at": "b"}]}
 
-        records = {("h" + mid[:8], 2): {"scope": "packages", "packages": ["mid", "top"], "reason": "r"}}
+        # side's newest run recorded nothing: an older run's record (with
+        # other labels, say) is not its scope.
+        records = {("h" + mid[:8], 2): {"scope": "packages", "packages": ["mid", "top"], "reason": "r"},
+                   ("h" + side[:8], 1): {"scope": "docs", "packages": [], "reason": "old"},
+                   ("h" + release[:8], 2): {"scope": "full", "packages": [], "reason": "r", "fast_path": True}}
         asked = []
 
         def download(repository, run_id):
@@ -671,13 +690,15 @@ class PackageScopeMainTest(unittest.TestCase):
                 asked_head[0] = path.split("head_sha=")[1].split("&")[0]
             return query(path)
 
-        rows = ci_scope.merged(self.repo, [side, mid], "o/r", tracking_query, download)
+        rows = ci_scope.merged(self.repo, [release, side, mid], "o/r", tracking_query, download)
         self.assertEqual([(scope, packages) for _, _, scope, packages, _ in rows],
-                         [("unknown", ()), ("packages", ("mid", "top"))])
-        self.assertEqual(asked[:2], [2, 1])
+                         [("fast-path", ()), ("unknown", ()), ("packages", ("mid", "top"))])
+        self.assertEqual(asked, [2, 2, 2])
         report = ci_scope.replay_report(rows, "Merged")
-        self.assertIn("| unknown | 1 | 50% |", report)
+        self.assertIn("| unknown | 1 | 33% |", report)
+        self.assertIn("| fast-path | 1 | 33% |", report)
         self.assertIn("| #8 | unknown | - |", report)
+        self.assertIn("reused from the base", report)
 
     def test_replay_keeps_a_documentation_only_protocol_edit_in_docs(self) -> None:
         (self.repo / "doc").mkdir()
@@ -1067,7 +1088,9 @@ class WorkflowTest(unittest.TestCase):
                       job["steps"][1]["run"])
         decide = next(step for step in self.jobs["scope"]["steps"] if step.get("id") == "decide")
         self.assertEqual(decide["env"]["PR_LABELS"], "${{ join(github.event.pull_request.labels.*.name, ',') }}")
-        self.assertIn('--labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json"', decide["run"])
+        self.assertIn('--labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json" --fast-path "$FAST_PATH"', decide["run"])
+        self.assertEqual(decide["env"]["FAST_PATH"], "${{ needs.release-fast-path.outputs.fast }}")
+        self.assertEqual((self.jobs["scope"]["needs"], self.jobs["scope"]["if"]), ("release-fast-path", "${{ !cancelled() }}"))
         upload = self.jobs["scope"]["steps"][-1]
         self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
         self.assertEqual((upload["with"]["name"], upload["with"]["path"]),
