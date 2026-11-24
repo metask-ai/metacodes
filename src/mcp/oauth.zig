@@ -876,6 +876,8 @@ pub const LoginOptions = struct {
     notify: ?Notify = null,
     open_url: ?OpenUrl = null,
     abort: ?*const AbortSignal = null,
+    timeout_ms: ?u64 = null,
+    paste: ?auth.PasteSource = null,
 };
 
 pub const Server = struct {
@@ -1065,6 +1067,9 @@ pub fn login(
 
     var callback = try bindCallback(server.settings);
     defer callback.close();
+    callback.paste = options.paste;
+    var denial: auth.Refusal = .{};
+    callback.refusal = &denial;
     const redirect_uri = try std.fmt.allocPrint(arena, "http://localhost:{d}{s}", .{ callback.port, CALLBACK_PATH });
 
     const client: Client = if (server.settings.client_id) |id|
@@ -1093,7 +1098,15 @@ pub fn login(
     const authorize_url = authorize.written();
 
     if (options.notify) |notify| {
-        const text = try std.fmt.allocPrint(arena, "Authorize metacodes for MCP server '{s}' ({s}).\nOpen this URL if no browser window appears:\n\n{s}\n\nWaiting for the redirect on {s} …\n", .{ server.name, plan.issuer, authorize_url, redirect_uri });
+        var forward_buf: [160]u8 = undefined;
+        const text = try std.fmt.allocPrint(arena, "Authorize metacodes for MCP server '{s}' ({s}).\nOpen this URL if no browser window appears:\n\n{s}\n\nWaiting for the redirect on {s} …\n{s}{s}", .{
+            server.name,
+            plan.issuer,
+            authorize_url,
+            redirect_uri,
+            if (auth.sshSession()) auth.sshForwardLine(&forward_buf, callback.port) else "",
+            if (options.paste) |source| source.prompt orelse "" else "",
+        });
         notify.say(text);
     }
     if (options.open_url) |opener| {
@@ -1102,7 +1115,14 @@ pub fn login(
         auth.openBrowser(gpa, authorize_url) catch {};
     }
 
-    const code = try callback.waitForAuthorizationCode(gpa, state, options.abort);
+    if (options.timeout_ms) |ms| callback.deadline_ms = util_time.nowMs() +| @as(util_time.Millis, @intCast(@min(ms, std.math.maxInt(util_time.Millis))));
+    const code = callback.waitForAuthorizationCode(gpa, state, options.abort) catch |err| {
+        if (err == error.OAuthAccessDenied) if (options.notify) |notify| {
+            var line_buf: [400]u8 = undefined;
+            notify.say(denial.line(&line_buf));
+        };
+        return err;
+    };
     defer auth.secureFree(gpa, code);
 
     var form: std.Io.Writer.Allocating = .init(arena);
@@ -1176,7 +1196,7 @@ pub fn describe(err: anyerror) []const u8 {
         Error.McpOAuthPersistFailed => "the token could not be stored",
         Error.McpOAuthCallbackPortBusy => "the loopback callback port is unavailable (oauth.callbackPort in use?)",
         error.StateMismatch => "the redirect's state did not match; try again",
-        error.OAuthDenied => "authorization was denied in the browser",
+        error.OAuthDenied, error.OAuthAccessDenied => "authorization was denied in the browser",
         error.Aborted => "login canceled",
         else => @errorName(err),
     };

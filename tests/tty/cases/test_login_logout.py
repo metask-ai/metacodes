@@ -18,9 +18,11 @@ Everything runs against loopback stand-ins (`metask_mock.py`, a relay mock for
 the `.env` provider): no account, no real request.
 """
 import hashlib
+import http.client
 import http.server
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -98,7 +100,8 @@ def _case(mock, extra=None):
     state = os.path.join(home, ".metacodes")
     os.makedirs(state, exist_ok=True)
     env = {name: None for name in KEY_VARIABLES}
-    env.update({"HOME": home, "METACODES_HOME": None, "METACODES_JEV_URL": "off", "HOUSE_RELAY_TOKEN": None})
+    env.update({"HOME": home, "METACODES_HOME": None, "METACODES_JEV_URL": "off", "HOUSE_RELAY_TOKEN": None,
+                "SSH_CONNECTION": None, "SSH_TTY": None, "METACODES_LOGIN_CALLBACK_TIMEOUT_MS": None})
     env.update(mock.env(home))
     env.update(extra or {})
     return home, state, env
@@ -705,3 +708,302 @@ def test_a_named_provider_without_a_key_opens_unbound_and_names_the_variable(bin
         a.assert_prose_contains("not set — /login, or configure .env")
         assert "DEEPSEEK_API_KEY" in screen, screen
         assert mock.messages == [], mock.messages
+
+
+_SSH = {"SSH_CONNECTION": "192.0.2.10 50022 192.0.2.20 22", "SSH_TTY": "/dev/pts/7"}
+_SSH_LINE = "This looks like an SSH session: sign in on another device instead."
+_CODE_WAY = "❯ 2. Sign in with a code on another device (SSH, no browser here)"
+_PASTE_LINE = "paste that page's address here and press Enter."
+_CLI_SSH_LINE = "This looks like an SSH session: signing in with a code you confirm on any device. (--no-browser keeps the browser sign-in.)"
+
+
+def _plain(raw):
+    return re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r", "",
+                  raw.decode("utf-8", "replace"))
+
+
+def _forward_line(text):
+    found = re.search(r"Starting local login server on http://localhost:(\d+)\.", text)
+    assert found, text[-2000:]
+    port = found.group(1)
+    return f"Over SSH? Forward the port first: ssh -L {port}:127.0.0.1:{port} <you>@<this machine>"
+
+
+def _recorder(home):
+    log = os.path.join(home, "browser-recorded.txt")
+    stub = os.path.join(home, "browser-recorder")
+    with open(stub, "w") as f:
+        f.write(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{log}'\n")
+    os.chmod(stub, 0o755)
+    return stub, log
+
+
+def _final_address(authorize_url, state=None):
+    import urllib.parse
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(authorize_url).query)
+    back = {"code": "tty-code-0001", "state": state or query["state"][0]}
+    return query["redirect_uri"][0] + "?" + urllib.parse.urlencode(back)
+
+
+def _recorded(log, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(log):
+            with open(log) as f:
+                lines = [line.strip() for line in f if line.strip()]
+            if lines:
+                return lines[-1]
+        time.sleep(0.05)
+    raise AssertionError("the browser was never handed the sign-in address")
+
+
+def test_login_over_ssh_asks_which_way_and_signs_in_with_the_code_by_default(bin_path):
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        work = case_tmpdir("cc-tty-login-work-")
+        raw = run(bin_path, [
+            READY, "type:/login", "key:enter",
+            wait_for("Sign in with a code on another device", 15), "key:enter",
+            wait_for("Select a model", 20), "key:enter",
+            wait_for("Select a reasoning level", 10), "key:enter",
+            wait_for("Signed in to Metask", 10),
+        ], env=env, base_url=None, cwd=work, term_size=(30, 160))
+        a = TTYAssert(raw, rows=30, cols=160)
+        if not a.screens_with(_CODE_WAY):
+            a._fail("over SSH the pane should offer the code first")
+        if not a.screens_with(_SSH_LINE):
+            a._fail("the pane should say why it offers the code first")
+        assert f"Signed in to Metask as {ACCOUNT_NAME} · glm-5 · reasoning low" in _screen(a), _screen(a)
+        _expect_device_request(mock)
+        assert not os.path.exists(mock.browser_log), "no browser may be opened over SSH"
+        assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
+
+
+def test_login_no_browser_over_ssh_keeps_the_browser_sign_in_and_names_the_forward(bin_path):
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        work = case_tmpdir("cc-tty-login-work-")
+        raw = run(bin_path, [
+            READY, "type:/login --no-browser", "key:enter",
+            wait_for("Over SSH?", 15), "sleep:0.5",
+            "key:esc", wait_for("Login interrupted", 10),
+        ], env=env, base_url=None, cwd=work, term_size=(30, 200))
+        text = _plain(raw)
+        assert _forward_line(text) in text, text[-2000:]
+        assert _PASTE_LINE in text, text[-2000:]
+        assert "Sign in with a code on another device" not in text, text[-2000:]
+        assert mock.device_requests == [], mock.device_requests
+        assert not os.path.exists(mock.browser_log)
+
+
+def test_login_takes_the_address_a_browser_on_another_computer_ended_on(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        work = case_tmpdir("cc-tty-login-work-")
+
+        def events():
+            yield READY
+            yield "type:/login"
+            yield "key:enter"
+            yield wait_for(_PASTE_LINE, 15)
+            authorize = _recorded(log)
+            yield "raw:\x1b[200~" + _final_address(authorize, state="from-another-sign-in") + "\x1b[201~"
+            yield "key:enter"
+            yield wait_for("That address is from another sign-in.", 10)
+            yield "raw:\x1b[200~" + _final_address(authorize) + "\x1b[201~"
+            yield "key:enter"
+            yield wait_for("Select a model", 20)
+            yield "key:enter"
+            yield wait_for("Select a reasoning level", 10)
+            yield "key:enter"
+            yield wait_for("Signed in to Metask", 10)
+
+        raw = run(bin_path, events(), env=env, base_url=None, cwd=work, term_size=(30, 200), per_key_drain=0.05)
+        a = TTYAssert(raw, rows=30, cols=200)
+        if not a.screens_with("That address is from another sign-in."):
+            a._fail("an address from another sign-in should be refused in the pane")
+        assert f"Signed in to Metask as {ACCOUNT_NAME} · glm-5 · reasoning low" in _screen(a), _screen(a)
+        tokens = [path for _, path, _ in mock.requests if path.startswith("/api/oauth/token")]
+        assert len(tokens) == 1, mock.requests
+        assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert b"tty-code-0001" not in raw, "the pane should not show the pasted code"
+
+
+def test_login_over_ssh_the_browser_way_opens_the_browser_here_and_names_the_forward(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        work = case_tmpdir("cc-tty-login-work-")
+
+        def events():
+            yield READY
+            yield "type:/login"
+            yield "key:enter"
+            yield wait_for("Sign in with a code on another device", 15)
+            yield "key:up"
+            yield "key:enter"
+            yield wait_for(_PASTE_LINE, 15)
+            yield "raw:\x1b[200~" + _final_address(_recorded(log)) + "\x1b[201~"
+            yield "key:enter"
+            yield wait_for("Select a model", 20)
+            yield "key:enter"
+            yield wait_for("Select a reasoning level", 10)
+            yield "key:enter"
+            yield wait_for("Signed in to Metask", 10)
+
+        raw = run(bin_path, events(), env=env, base_url=None, cwd=work, term_size=(30, 200), per_key_drain=0.05)
+        text = _plain(raw)
+        assert _forward_line(text) in text, text[-2000:]
+        a = TTYAssert(raw, rows=30, cols=200)
+        assert f"Signed in to Metask as {ACCOUNT_NAME} · glm-5 · reasoning low" in _screen(a), _screen(a)
+        assert mock.device_requests == [], mock.device_requests
+        assert os.path.exists(os.path.join(state, "oauth", "metask.json"))
+
+
+def test_cli_login_takes_the_address_a_browser_on_another_computer_ended_on(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [
+            (_PASTE_LINE, lambda _: _final_address(_recorded(log), state="from-another-sign-in") + "\r"),
+            ("That address is from another sign-in.", lambda _: _final_address(_recorded(log)) + "\r"),
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "1\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert f"Signed in to Metask in the browser as {ACCOUNT_NAME}. Model glm-5, reasoning low." in text, text
+        tokens = [path for _, path, _ in mock.requests if path.startswith("/api/oauth/token")]
+        assert len(tokens) == 1, mock.requests
+        with open(os.path.join(state, "auth.json")) as f:
+            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "low"}
+
+
+def test_cli_login_over_ssh_signs_in_with_the_device_code_and_says_why(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, _SSH)
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [
+            ("Select model:", "1\r"),
+            ("Select reasoning effort:", "1\r"),
+        ])
+        text = out.decode("utf-8", "replace")
+        assert code == 0, f"exit {code}:\n{text}"
+        assert _CLI_SSH_LINE in text, text
+        assert f"METASK_USER_CODE={USER_CODE}" in text, text
+        assert f"Signed in to Metask with the device code as {ACCOUNT_NAME}. Model glm-5, reasoning low." in text, text
+        assert "Starting local login server" not in text, text
+        _expect_device_request(mock)
+        assert not os.path.exists(mock.browser_log), "no browser may be opened over SSH"
+        with open(os.path.join(state, "auth.json")) as f:
+            assert json.load(f) == {"selected_model": MODEL, "reasoning_effort": "low"}
+
+
+def test_cli_login_no_browser_over_ssh_names_the_forward_and_stops_waiting_after_the_bound(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, dict(_SSH, METACODES_LOGIN_CALLBACK_TIMEOUT_MS="3000"))
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["login", "--no-browser"], _cli_env(env), [])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert _forward_line(text) in text, text
+        assert _CLI_SSH_LINE not in text, text
+        assert "No answer from the browser in 3 seconds; nothing was stored." in text, text
+        assert elapsed < 15, f"took {elapsed:.1f}s"
+        assert mock.device_requests == [], mock.device_requests
+
+
+def test_cli_login_stops_waiting_for_the_browser_after_the_bound_and_stores_nothing(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, {"BROWSER": "true", "METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "2000"})
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert ("No answer from the browser in 2 seconds; nothing was stored. "
+                "Signing in on another computer? Run `metacodes login --provider metask`.") in text, text
+        assert "Over SSH?" not in text, text
+        assert 1.5 < elapsed < 15, f"took {elapsed:.1f}s"
+        assert not os.path.exists(os.path.join(state, "auth.json"))
+        assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests
+
+
+def _refuse(authorize_url):
+    import urllib.parse
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(authorize_url).query)
+    callback = urllib.parse.urlsplit(query["redirect_uri"][0])
+    state = urllib.parse.quote(query["state"][0], safe="")
+    conn = http.client.HTTPConnection("127.0.0.1", callback.port, timeout=5)
+    try:
+        conn.request("GET", f"{callback.path}?error=access_denied&error_description=The%20user%20said%20no&state={state}")
+        conn.getresponse().read()
+    finally:
+        conn.close()
+    return ""
+
+
+def test_cli_login_ends_when_the_authorization_page_refuses_and_stores_nothing(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the CLI's choices are answered over a POSIX pty here")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock, {"METACODES_LOGIN_CALLBACK_TIMEOUT_MS": "8000"})
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        started = time.monotonic()
+        code, out = _cli(os.path.abspath(bin_path), ["login"], _cli_env(env), [
+            (_PASTE_LINE, lambda _: _refuse(_recorded(log))),
+        ])
+        elapsed = time.monotonic() - started
+        text = out.decode("utf-8", "replace")
+        assert code == 1, f"exit {code}:\n{text}"
+        assert "The sign-in was refused: access_denied (The user said no)." in text, text
+        assert "No answer from the browser" not in text, text
+        assert elapsed < 6, f"took {elapsed:.1f}s"
+        assert not os.path.exists(os.path.join(state, "auth.json"))
+        assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests
+
+
+def test_login_ends_when_the_authorization_page_refuses_and_stores_nothing(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest(_NO_BROWSER_STUB)
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        stub, log = _recorder(home)
+        env["BROWSER"] = stub
+        work = case_tmpdir("cc-tty-login-work-")
+
+        def events():
+            yield READY
+            yield "type:/login"
+            yield "key:enter"
+            yield wait_for(_PASTE_LINE, 15)
+            _refuse(_recorded(log))
+            yield wait_for("Sign-in failed", 10)
+
+        raw = run(bin_path, events(), env=env, base_url=None, cwd=work, term_size=(30, 200), per_key_drain=0.05)
+        a = TTYAssert(raw, rows=30, cols=200)
+        if not a.screens_with("Sign-in failed: OAuthAccessDenied"):
+            a._fail("a refusal on the authorization page should end the sign-in in the pane")
+        if not a.screens_with("Nothing was stored."):
+            a._fail("the pane should say that nothing was stored")
+        assert not os.path.exists(os.path.join(state, "oauth", "metask.json"))
+        assert not any(path.startswith("/api/oauth/token") for _, path, _ in mock.requests), mock.requests

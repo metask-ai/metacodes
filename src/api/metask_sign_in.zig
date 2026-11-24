@@ -99,6 +99,7 @@ pub const Worker = struct {
     transcript_mutex: sync.Mutex = .{},
     transcript: [TRANSCRIPT_CAPACITY]u8 = undefined,
     transcript_len: usize = 0,
+    paste_box: auth.PasteBox = .{},
 
     /// A new worker on the heap, owned by the caller until `release`.
     pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) error{OutOfMemory}!*Worker {
@@ -156,6 +157,14 @@ pub const Worker = struct {
         };
     }
 
+    pub fn pasteAddress(self: *Worker, text: []const u8) void {
+        self.paste_box.submit(text);
+    }
+
+    pub fn pasteRefusal(self: *const Worker) ?auth.PasteRefusal {
+        return self.paste_box.refusal();
+    }
+
     /// Step 1, from `idle`.
     pub fn startSignIn(self: *Worker) error{ AlreadyStarted, ThreadSpawnFailed }!void {
         try self.begin(.idle, .signing_in);
@@ -190,6 +199,7 @@ pub const Worker = struct {
             .port = self.port,
             .abort_signal = &self.abort_signal,
             .notify = .{ .ctx = self, .write = appendTranscript },
+            .paste = self.paste_box.source(),
         });
     }
 
