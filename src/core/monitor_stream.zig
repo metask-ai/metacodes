@@ -95,6 +95,7 @@ pub const Mode = enum { streaming, final };
 
 pub fn take(allocator: std.mem.Allocator, state: *State, chunk: []const u8, mode: Mode, now: util_time.Millis) !Batch {
     state.refill(now);
+    if (state.tokens == BUCKET_CAPACITY) state.over_budget_since_ms = null;
     var skipped: usize = 0;
     if (state.skipping_line) {
         if (std.mem.indexOfScalar(u8, chunk, '\n')) |newline| {
@@ -297,4 +298,16 @@ test "monitor stream emits a line longer than one read once and skips the rest o
     try testing.expect(!state.skipping_line);
     try testing.expectEqual(@as(u32, 2), state.events_delivered);
     try testing.expectEqual(BUCKET_CAPACITY - 2, state.tokens);
+}
+
+test "monitor stream forgives the over-budget period once the bucket has refilled but still reports the dropped count" {
+    var state = testState();
+    state.tokens = 0;
+    const dropped = try take(testing.allocator, &state, "a\n", .streaming, 0);
+    try testing.expectEqual(@as(usize, 0), dropped.event.len);
+    try testing.expectEqual(@as(?util_time.Millis, 0), state.over_budget_since_ms);
+    const resumed = try take(testing.allocator, &state, "b\n", .streaming, OVER_BUDGET_STOP_MS + 1_000);
+    defer testing.allocator.free(resumed.event);
+    try testing.expectEqualStrings("[1 events suppressed — output rate too high]\nb", resumed.event);
+    try testing.expect(!state.overBudgetTooLong(OVER_BUDGET_STOP_MS + 1_000));
 }

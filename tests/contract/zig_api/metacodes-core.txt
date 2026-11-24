@@ -3873,6 +3873,7 @@ metacodes-core.job_registry.JobEntry.stderr_read_offset: u64 = 0
 metacodes-core.job_registry.JobEntry.poll_streak: PollStreak = .{}
 metacodes-core.job_registry.JobEntry.spool_released: bool = false
 metacodes-core.job_registry.JobEntry.kind: JobKind = .plain
+metacodes-core.job_registry.JobEntry.stop_in_progress: bool = false
 metacodes-core.job_registry.JobEntry.idSlice: fn idSlice(self: *const JobEntry) []const u8
 metacodes-core.job_registry.JobExitEvent: struct
 metacodes-core.job_registry.JobExitEvent.id: [12]u8

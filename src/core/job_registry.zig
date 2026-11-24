@@ -93,6 +93,7 @@ pub const JobEntry = struct {
     /// never dangles; only the directory entries are gone.
     spool_released: bool = false,
     kind: JobKind = .plain,
+    stop_in_progress: bool = false,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -408,7 +409,7 @@ pub const JobRegistry = struct {
     /// 持锁内部版(kill 复用,避免自锁死锁)。
     fn reapExitedLocked(self: *JobRegistry) void {
         for (self.jobs.items) |*j| {
-            if (j.status != .running) continue;
+            if (j.status != .running or j.stop_in_progress) continue;
             switch (process.reapNonblock(j.proc)) { // 可移植:waitpid(WNOHANG) / WaitForSingleObject(0)
                 .running => {},
                 .exited => |code| {
@@ -640,10 +641,49 @@ pub const JobRegistry = struct {
         defer flooding.deinit(allocator);
         try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
         if (flooding.items.len > 0) {
-            for (flooding.items) |id| self.kill(id[0..]) catch {};
+            var claims = std.ArrayList(StopClaim).empty;
+            defer claims.deinit(allocator);
+            try claims.ensureTotalCapacity(allocator, flooding.items.len);
+            self.lock();
+            for (flooding.items) |id| {
+                const entry = self.getPtrLocked(id[0..]) orelse continue;
+                if (claimStopLocked(entry)) |claim| claims.appendAssumeCapacity(claim);
+            }
+            self.unlock();
+            self.stopClaimed(claims.items);
             try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
         }
         return try notices.toOwnedSlice(allocator);
+    }
+
+    const StopClaim = struct { id: [12]u8, proc: process.ProcHandle };
+    const STOP_BATCH = 16;
+
+    fn claimStopLocked(entry: *JobEntry) ?StopClaim {
+        if (entry.status != .running or entry.stop_in_progress) return null;
+        entry.stop_in_progress = true;
+        return .{ .id = entry.id, .proc = entry.proc };
+    }
+
+    fn stopClaimed(self: *JobRegistry, claims: []const StopClaim) void {
+        if (claims.len == 0) return;
+        for (claims) |claim| process.terminateJob(claim.proc);
+        process.waitKillGrace();
+        for (claims) |claim| {
+            process.forceKillJob(claim.proc);
+            process.reapBlocking(claim.proc);
+        }
+        self.lock();
+        defer self.unlock();
+        for (claims) |claim| {
+            const entry = self.getPtrLocked(claim.id[0..]) orelse continue;
+            entry.stop_in_progress = false;
+            if (entry.status == .running) {
+                entry.status = .killed;
+                entry.exit_code = -9;
+                entry.ended_ms = util_time.nowMs();
+            }
+        }
     }
 
     fn collectMonitorNotices(
@@ -708,24 +748,26 @@ pub const JobRegistry = struct {
 
     fn stopExpiredMonitors(self: *JobRegistry, owner: ?SessionId, now: util_time.Millis) void {
         while (true) {
-            var id: ?[12]u8 = null;
+            var claims: [STOP_BATCH]StopClaim = undefined;
+            var count: usize = 0;
             self.lock();
             self.reapExitedLocked();
             for (self.jobs.items) |*entry| {
-                if (entry.status != .running) continue;
+                if (count == claims.len) break;
+                if (entry.status != .running or entry.stop_in_progress) continue;
                 if (owner) |wanted| if (!std.mem.eql(u8, &entry.owner.bytes, &wanted.bytes)) continue;
                 switch (entry.kind) {
                     .plain => {},
                     .monitor => |*state| if (state.stop == null and state.expired(entry.started_ms, now)) {
                         state.stop = .expired;
-                        id = entry.id;
-                        break;
+                        claims[count] = claimStopLocked(entry).?;
+                        count += 1;
                     },
                 }
             }
             self.unlock();
-            const selected = id orelse return;
-            self.kill(selected[0..]) catch return;
+            if (count == 0) return;
+            self.stopClaimed(claims[0..count]);
         }
     }
 
@@ -741,34 +783,25 @@ pub const JobRegistry = struct {
 
     /// killGroup：向 pgid 发 SIGTERM → 0.5s → SIGKILL。
     pub fn kill(self: *JobRegistry, id: []const u8) !void {
-        // 读 proc 句柄快照(锁内),kill+reap 在锁外(不让 blocking 收尸钉住锁)。可移植:
-        // process.killJob(TERM→200ms→WNOHANG→KILL)+ reapBlocking(收尸)。**不让数据结构生命周期
-        // 绑架 syscall 正确性**:proc 快照保证即便 entry 状态变化仍能正确 kill/reap。
-        var proc: process.ProcHandle = undefined;
-        {
+        while (true) {
             self.lock();
             const jp = self.getPtrLocked(id) orelse {
                 self.unlock();
                 return error.JobNotFound;
             };
-            if (jp.status != .running) {
+            if (jp.stop_in_progress) {
                 self.unlock();
-                return; // 已结束，幂等返回
+                util_time.sleepMs(10);
+                continue;
             }
-            proc = jp.proc;
+            const claim = claimStopLocked(jp) orelse {
+                self.unlock();
+                return;
+            };
             self.unlock();
+            self.stopClaimed(&.{claim});
+            return;
         }
-        process.killJob(proc); // TERM→等→KILL（锁外）
-        process.reapBlocking(proc); // 收尸（锁外，防僵尸）
-        self.lock();
-        if (self.getPtrLocked(id)) |jp| {
-            if (jp.status == .running) {
-                jp.status = .killed;
-                jp.exit_code = -9; // SIGKILL 语义
-                jp.ended_ms = util_time.nowMs();
-            }
-        }
-        self.unlock();
     }
 
     pub fn activeCount(self: *JobRegistry) usize {
@@ -815,8 +848,6 @@ fn monitorEnd(entry: *const JobEntry, state: monitor_stream.State) monitor_strea
         .expired => .{ .expired = .{ .after_ms = state.timeout_ms orelse 0, .events_delivered = state.events_delivered } },
         .too_much_output => .too_much_output,
     };
-    if (state.timeout_ms != null and entry.ended_ms != null and state.expired(entry.started_ms, entry.ended_ms.?))
-        return .{ .expired = .{ .after_ms = state.timeout_ms.?, .events_delivered = state.events_delivered } };
     if (entry.status == .exited) {
         const code = entry.exit_code orelse 0;
         return if (code == 0) .stream_ended else .{ .script_failed = code };
@@ -1238,6 +1269,116 @@ test "a monitor that went quiet after one dropped batch is not stopped for too m
     try std.testing.expectEqual(@as(usize, 0), later.len);
     try std.testing.expectEqual(JobStatus.running, r.get(j.idSlice()).?.status);
     try std.testing.expectEqual(@as(?monitor_stream.Stop, null), r.get(j.idSlice()).?.kind.monitor.stop);
+}
+
+test "a monitor that resumes with one line after a dropped batch and silence is delivered, not stopped" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnMonitorOwned("echo burst; while [ ! -e go ]; do sleep 0.02; done; echo resumed; sleep 60", root, owner, "quiet", null);
+    try waitForStdout(&r, j.idSlice());
+    const t0: util_time.Millis = 1_000_000;
+    {
+        r.lock();
+        defer r.unlock();
+        r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor.tokens = 0;
+        r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor.refilled_ms = t0;
+    }
+    const dropped = try r.takeMonitorEvents(owner, a, t0);
+    defer monitor_stream.freeNotices(a, dropped);
+    try std.testing.expectEqual(@as(usize, 0), dropped.len);
+    const cursor = r.get(j.idSlice()).?.kind.monitor.stdout_cursor;
+
+    const gate = try tmp.dir.createFile(std.testing.io, "go", .{});
+    gate.close(std.testing.io);
+    var attempts: usize = 0;
+    while (attempts < 500 and (spoolFileSize(r.get(j.idSlice()).?.stdout_path) catch 0) <= cursor) : (attempts += 1) util_time.sleepMs(10);
+
+    const resumed = try r.takeMonitorEvents(owner, a, t0 + monitor_stream.OVER_BUDGET_STOP_MS + 1_000);
+    defer monitor_stream.freeNotices(a, resumed);
+    try std.testing.expectEqual(@as(usize, 1), resumed.len);
+    try std.testing.expectEqualStrings("[1 events suppressed — output rate too high]\nresumed", resumed[0].event);
+    try std.testing.expectEqual(@as(?monitor_stream.End, null), resumed[0].end);
+    try std.testing.expectEqual(JobStatus.running, r.get(j.idSlice()).?.status);
+    try std.testing.expectEqual(@as(?monitor_stream.Stop, null), r.get(j.idSlice()).?.kind.monitor.stop);
+}
+
+test "monitors that expire together are all signalled before any grace period ends" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const first_marker = try std.fmt.allocPrintSentinel(a, "{s}/first", .{root}, 0);
+    defer a.free(first_marker);
+    const second_marker = try std.fmt.allocPrintSentinel(a, "{s}/second", .{root}, 0);
+    defer a.free(second_marker);
+
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const first = try r.spawnMonitorOwned("sleep 1.15; touch first", root, owner, "one", 1_000);
+    const second = try r.spawnMonitorOwned("sleep 1.15; touch second", root, owner, "two", 1_000);
+    {
+        r.lock();
+        defer r.unlock();
+        r.jobs.items[monitorIndex(&r, second.idSlice())].started_ms = r.jobs.items[monitorIndex(&r, first.idSlice())].started_ms;
+    }
+    util_time.sleepMs(1_700);
+    try std.testing.expect(!pfs.exists(first_marker));
+    try std.testing.expect(!pfs.exists(second_marker));
+
+    const notices = try r.takeMonitorEvents(owner, a, util_time.nowMs());
+    defer monitor_stream.freeNotices(a, notices);
+    try std.testing.expectEqual(@as(usize, 2), notices.len);
+    for (notices) |notice| try std.testing.expectEqual(@as(?monitor_stream.End, .{ .expired = .{ .after_ms = 1_000, .events_delivered = 0 } }), notice.end);
+}
+
+test "a monitor that fails before its deadline keeps its exit code even when reaped after it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnMonitorOwned("exit 3", null, owner, "fails", 1_000);
+    try waitUntilExited(&r, j.idSlice());
+    const started = r.get(j.idSlice()).?.started_ms;
+    {
+        r.lock();
+        defer r.unlock();
+        r.jobs.items[monitorIndex(&r, j.idSlice())].ended_ms = started + 5_000;
+    }
+    const notices = try r.takeMonitorEvents(owner, a, started + 5_000);
+    defer monitor_stream.freeNotices(a, notices);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqual(@as(?monitor_stream.End, .{ .script_failed = 3 }), notices[0].end);
+}
+
+test "two concurrent stops of one job claim it once and both return" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const j = try r.spawnBackground("sleep 30", null);
+    const Stopper = struct {
+        fn run(registry: *JobRegistry, id: [12]u8) void {
+            registry.kill(id[0..]) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Stopper.run, .{ &r, j.id });
+    try r.kill(j.idSlice());
+    thread.join();
+    const after = r.get(j.idSlice()).?;
+    try std.testing.expectEqual(JobStatus.killed, after.status);
+    try std.testing.expect(!after.stop_in_progress);
+    try std.testing.expectEqual(@as(usize, 0), r.killAll());
 }
 
 test "a monitor that keeps flooding past the budget for 30 s is stopped with a notice" {
