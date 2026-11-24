@@ -195,7 +195,7 @@ function compositionPanel(summary, scopeText) {
 const PROFILE_STATUS = { queued: '排队中', running: '运行中', cancelling: '正在停止', finished: '空闲', cancelled: '已停止' };
 const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '跳过' };
 const profileActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
-const profileName = (b) => b.name || b.id;
+const profileName = (b) => b.name || b.default_name || b.id;
 const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
 const featuresText = (b) => (b.features || []).join(', ') || '未开启';
 
@@ -367,7 +367,7 @@ async function renderProfile(id) {
   const b = await api('/api/profile?id=' + encodeURIComponent(id));
   state.live = profileActive(b);
   $('#title').textContent = profileName(b);
-  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + b.id }]);
+  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + profileName(b) }]);
   const s = b.summary;
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
@@ -375,7 +375,7 @@ async function renderProfile(id) {
     metric('无效', String(s.counts.invalid)),
     s.budget_exhausted ? metric('预算用完', String(s.budget_exhausted), 'teamwork 用完上限后停下的尝试，按判分结果计入') : null);
 
-  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
+  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.default_name || b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
   const closeRename = () => { state.editing = false; renameForm.hidden = true; nameRow.hidden = false; };
   const renameForm = h('form', { class: 'rename', hidden: true },
@@ -390,7 +390,7 @@ async function renderProfile(id) {
       render();
     } catch (error) { renameFeedback.textContent = error.message; }
   });
-  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（显示评测配置编号）' }),
+  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（按版本和高级功能命名）' }),
     b.can_run ? h('button', { type: 'button', class: 'button', onclick: () => {
       state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
     } }, '重命名') : null);
