@@ -454,10 +454,11 @@ test "L2 zero-retry default re-sends a response cut after its text once, and the
     );
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 3), server.requestCount());
-    try std.testing.expectEqualStrings(
-        (server.requestAt(1) orelse return error.MissingRequest).body(),
-        (server.requestAt(2) orelse return error.MissingRequest).body(),
-    );
+    const cut = (server.requestAt(1) orelse return error.MissingRequest).body();
+    const reissue = (server.requestAt(2) orelse return error.MissingRequest).body();
+    const nudge = cc.agent_loop.RESTART_AFTER_STREAM_CUT;
+    try std.testing.expectEqual(std.mem.count(u8, cut, nudge) + 1, std.mem.count(u8, reissue, nudge));
+    try std.testing.expect(reissue.len > cut.len);
 }
 
 test "L2 zero-retry default still re-sends a connection dropped before any visible output, once" {

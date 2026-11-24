@@ -100,8 +100,9 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 | 契约面 | 快照 | 怎么得到 |
 |---|---|---|
 | AgentCore C ABI | `abi/agentcore_h.txt`、`abi/exports.txt` | translate-c 后的 `agentcore.h`:每个 struct 的大小、对齐、字段偏移和大小,函数和函数指针签名,常量(含 `METASK_AGENTCORE_ABI_REVISION`),头文件 sha256;共享库实际导出的符号 |
+| AgentCore C 消费者 | `abi/c_consumer.txt` | 只用安装进 bundle 的 `include/metask/agentcore.h` 编译 `tests/agentcore_artifact_consumer/consumer.c`(`-DMETASK_AGENTCORE_CONSUMER_DYNAMIC=1`,不链任何源码),运行时 dlopen 同一个共享库;记退出码、stdout、stderr |
 | AgentCore 运行与 checkpoint | `scenarios/abi_session/expected/*` | 用 `std.DynLib` 加载发布的共享库,经 `sdk/zig` 跑一次带工具的 Run,记 CoreEvent 和请求;再把检入的 `scenarios/abi_session/checkpoint.bin` 恢复成新 Session 并跑一次,记恢复报告、CoreEvent 和请求 |
-| Zig 源码 API | `zig_api/metacodes-core.txt` | 从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;别名记录目标函数的原型或目标常量的值;超过 600 字节的值记长度和摘要 |
+| Zig 源码 API | `zig_api/metacodes-core.txt` | 第一行 `zig: <版本>` 记生成快照的 Zig;从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;别名记录目标函数的原型或目标常量的值;超过 600 字节的值记长度和摘要 |
 | 发给模型的请求 | `scenarios/<场景>/expected/request-NNN.txt` | 已安装的 CLI 跑场景,回放 mock provider 收到的请求头和完整请求体 |
 | 事件流 | `scenarios/<场景>/expected/stream.jsonl`、`process.txt` | 同一次运行的 `--json --stream-json` 输出、退出码、stderr;所有场景(含 KG)的 `tool_result` 都先核对 `content_bytes` 和原始内容的长度,再归一化 |
 | `serve` 和 `--web` | `scenarios/daemon_session/expected/{serve,web}/*` | 启动 `serve --uds` 和 `--web`,经 UDS attach 逐行、经 `GET /events` 按 SSE 帧读一次 Run 的 journal(读到 `run_done` 那一帧的终止空行;缺终止空行、一帧多行都失败),`web/events.sse` 记响应头和每一帧;以及这次 Run 的请求 |
@@ -113,7 +114,14 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 `-p` 场景:`single_turn`、`tool_multi_turn`(Read 后 Write)、`parallel_tools`(一轮两个 Read)、
 `permission_denied`(无人确认时 Write 被拒、规则禁止 Bash)、`subagent`(Task 派 Explore)、`mcp_tool`
 (stdio mock MCP 的 echo)、`skill_activation`(项目 skill)、`compaction`(强制自动压缩)。
-每个场景目录里放输入:`sse-NNN.txt` 是 provider 依次回的 SSE,`work/` 复制到工作目录,
+错误和取消场景:`provider_4xx`(400,不重试)、`provider_5xx_retry`(500、503 后 200,重试成功)、
+`provider_529`(529 现在按普通 HTTP 错误处理,不重试,快照记的是这个现状)、`sse_cut`(第一次响应
+只发一半 SSE 就断开,重试后完成)、`user_interrupt`(provider 每秒发一个 SSE 事件,stdout 出现第一个
+`usage` 事件后给 CLI 发 SIGINT)、`tool_abort`(Bash 跑 `touch started && sleep 30`,`started`
+出现后发 SIGINT)。provider 的状态行、断流和事件间隔写在 `contract_test.zig` 的 `scenarios` 里。
+SIGINT 只能发在流式读正文期间:等响应头时,或正文发到一半后不再来字节时,CLI 要到空闲超时才会
+看到中断,做不出快速稳定的快照。
+每个场景目录里放输入:`sse-NNN.txt` 是 provider 依次回的响应正文(状态行不是 200 时是 JSON 错误体),`work/` 复制到工作目录,
 `state/` 复制到 state 目录(其中 `<MOCK_MCP>` 换成 mock MCP 的路径)。CLI 在 `/tmp` 下的
 工作目录里用 `env -i` 跑,`TZ=UTC`;测试进程本身也设 `TZ=UTC`、`SHELL=/bin/sh`。
 
@@ -123,7 +131,7 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 日期加时间 → `<TIMESTAMP>`;本机的 `Platform: <值>`、`OS Version: <uname>` 只换这个值本身,
 后面的字节保留;键名以 `_ms`、`_ns`、`_at`、`_unix`、`Nano` 结尾的数字和 `content_bytes`
 → `<N>`;`trace_id` 的字符串值 → `<ID>`;UUID → `<UUID>`;16 位以上含数字的十六进制串 →
-`<HEXn>`(`offer-` 后面的 offer id 是固定的,保留)。
+`<HEXn>`(`offer-` 后面的 offer id 是固定的,保留);日志前缀 `[... req=<十六进制请求号>]` 里的请求号 → `<ID>`,正文里的 `req=` 不动。
 请求体在每个 `{`、`[`、`,` 之后和字符串里每个 `\n` 转义之后断行,去掉所有换行就是原始字节。
 
 改动确实要改变契约时,显式更新快照,并把快照的 diff 和代码放进同一个 PR:
@@ -135,6 +143,12 @@ zig build test:contract -Dupdate-contract
 `-Dupdate-contract` 不会重写 `checkpoint.bin` 和 `state_fixture/` 这类旧数据 fixture:它们
 代表旧版本写下的数据,新代码要能读。`src/lib.zig` 的 API 快照只读源码,也在 `gate:static`
 和 `test:units` 里跑。
+
+工具链兼容和 Zig API 兼容分开定义。Zig API 快照绑定生成它的 Zig 版本:当前工具链和快照第一行
+记的版本、或和 `build.zig.zon` 的 `minimum_zig_version` 不一致时,`test:contract`、`gate:static`、
+`test:units` 都失败,并提示升级工具链要单独提 PR。升级工具链的 PR 只改 `build.zig.zon`、CI 的
+Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成快照;它不能和拆包、删除或改名
+公开导出放在同一个 PR 里,这样快照的 diff 只能来自一个原因。
 
 ## 已知执行覆盖缺口(登记非沉默)
 

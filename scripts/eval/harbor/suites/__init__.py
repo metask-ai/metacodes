@@ -4,9 +4,12 @@ Every suite has an id, a category, a Chinese name and description, and one
 runner kind:
 
 - ``harbor-registry``: a Harbor 0.26 registry dataset (``harbor run -d REF``).
-  Task ids are fixed in this module and were taken from the registry itself;
-  ``filter_prefix`` turns an id into the ``-i`` pattern Harbor matches
-  (Hub datasets name tasks ``org/name``, legacy-registry ones the bare name).
+  Task ids are fixed in this module or in ``registry_tasks.json`` and were
+  taken from the registry itself; ``filter_prefix`` turns an id into the
+  ``-i`` pattern Harbor matches (Hub datasets name tasks ``org/name``,
+  legacy-registry ones the bare name). ``host_env`` names execution-host
+  variables the dataset's task.toml reads (τ³-bench's user simulator key),
+  forwarded like an adapter's HOST_ENV; ``required_env`` must be set.
 - ``harbor-local``: a Harbor dataset directory generated on the execution
   machine by an adapter's ``prepare()`` (``harbor run -p DIR``). Its task ids
   are the task directory names found there, read at runtime.
@@ -61,6 +64,7 @@ available, with that reason.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import re
 from dataclasses import dataclass, field, replace
@@ -72,12 +76,14 @@ HARBOR_LOCAL = "harbor-local"
 WORKBUDDY = "workbuddy"
 RUNNERS = (HARBOR_REGISTRY, HARBOR_LOCAL, WORKBUDDY)
 
-TASK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,160}$")
-MAX_TASKS = 200
+TASK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$")
+ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+MAX_TASKS = 500
 DEFAULT_SUITE = "terminal-bench-2.1"
 
 # Ordered as the picker shows them.
 CATEGORIES = (
+    ("software-engineering", "软件工程", "修复真实开源仓库的 issue，用仓库测试验收"),
     ("code-generation", "代码生成", "根据描述写出函数，通过单元测试"),
     ("basic-programming", "基础编程", "Python 基础编程任务"),
     ("interactive-planning", "交互规划", "多步骤家庭任务的规划与执行"),
@@ -86,6 +92,7 @@ CATEGORIES = (
     ("competition-math", "竞赛数学", "AIME 竞赛题，答案为整数"),
     ("terminal", "终端工程", "在容器终端里完成真实工程任务"),
     ("general-agent", "通用 Agent", "动态环境中的工具使用与任务执行"),
+    ("customer-service", "客服对话", "按业务政策与模拟用户多轮对话并调用工具办理业务"),
     ("work-agent", "办公 Agent", "WorkBuddy 工作场景任务：代码、网页、办公文档、安全"),
 )
 CATEGORY_IDS = tuple(c[0] for c in CATEGORIES)
@@ -152,6 +159,37 @@ FRONTIER_HARNESS_EVAL_SAMPLE = (
     "html-js-filter",
 )
 
+# Hub datasets with hundreds of tasks, listed in registry_tasks.json by the
+# pinned reference (task names without the org prefix).
+REGISTRY_TASKS = json.loads(Path(__file__).with_name("registry_tasks.json").read_text(encoding="utf-8"))
+
+# SWE-bench Verified (Hub `swe-bench/swe-bench-verified`, revision 2): the 500
+# human-validated SWE-bench instances, named `<owner>__<repo>-<number>`.
+SWE_BENCH_VERIFIED_REF = "swe-bench/swe-bench-verified@2"
+SWE_BENCH_VERIFIED = tuple(REGISTRY_TASKS[SWE_BENCH_VERIFIED_REF]["tasks"])
+SWE_BENCH_VERIFIED_SAMPLE = (
+    "astropy__astropy-12907", "django__django-11099", "django__django-11133", "matplotlib__matplotlib-23314",
+    "psf__requests-2317", "pytest-dev__pytest-10051", "scikit-learn__scikit-learn-13142",
+    "sphinx-doc__sphinx-8721", "sympy__sympy-20590", "pydata__xarray-4094",
+)
+
+# τ³-bench (Hub `sierra-research/tau3-bench`, revision 1): 375 customer-service
+# tasks in four domains, named `tau3-bench__tau3-<domain>-...`. taubench.com
+# scores each domain separately, so each domain is its own suite.
+TAU3_BENCH_REF = "sierra-research/tau3-bench@1"
+TAU3_DOMAINS = ("airline", "retail", "telecom", "banking_knowledge")
+
+
+def tau3_tasks(domain: str) -> Tuple[str, ...]:
+    return tuple(t for t in REGISTRY_TASKS[TAU3_BENCH_REF]["tasks"]
+                 if t.startswith(f"tau3-bench__tau3-{domain}-"))
+
+
+# The task.toml reads these on the execution host: the user simulator (and the
+# banking verifier's NL assertions) call an OpenAI-compatible model.
+TAU3_REQUIRED_ENV = ("OPENAI_API_KEY",)
+TAU3_HOST_ENV = ("OPENAI_BASE_URL", "TAU2_USER_MODEL", "TAU2_USER_REASONING_EFFORT", "TAU2_NL_ASSERTIONS_MODEL")
+
 # Legacy registry `aime@1.0` (harbor-datasets @ 414014c2). Harbor's AIME adapter
 # reads GAIR-NLP/AIME-Preview: test2024 ids 60-89, test2025-I I-1..I-15 and
 # test2025-II II-1..II-15, named aime_<id lowercased>.
@@ -181,31 +219,61 @@ class Suite:
     # harbor-local: container architectures the adapter's tasks support
     # (SUITE["arch"]), shown on the page; ALFWorld's sidecar is amd64 only.
     arch: str = ""
+    # harbor-registry: execution-host variables the tasks read.
+    required_env: Tuple[str, ...] = ()
+    host_env: Tuple[str, ...] = ()
+
+
+def tau3_suite(domain: str, name: str, description: str) -> Suite:
+    tasks = tau3_tasks(domain)
+    return Suite("tau3-" + domain.replace("_", "-"), "customer-service", name, description,
+                 HARBOR_REGISTRY, dataset=TAU3_BENCH_REF, filter_prefix="sierra-research/",
+                 tasks=tasks, default_tasks=tasks[:5], max_tasks=len(tasks),
+                 required_env=TAU3_REQUIRED_ENV, host_env=TAU3_HOST_ENV)
 
 
 SUITES: Tuple[Suite, ...] = (
+    Suite("swe-bench-verified", "software-engineering", "SWE-bench Verified",
+          "500 个真实 GitHub issue（Django、SymPy 等 12 个 Python 仓库，人工确认可解）：在仓库里改代码修复问题，"
+          "原本失败的测试转为通过、其余测试不回归才算解决",
+          HARBOR_REGISTRY, dataset=SWE_BENCH_VERIFIED_REF, filter_prefix="swe-bench/",
+          tasks=SWE_BENCH_VERIFIED, default_tasks=SWE_BENCH_VERIFIED_SAMPLE, max_tasks=500),
     Suite("terminal-bench-2.1", "terminal", "Terminal-Bench 2.1",
-          "89 道终端工程任务（2.1 版更新了题目内容），每题独立容器运行并自动判分",
+          "89 道终端工程任务（编译、调试、运维、数据、ML、安全等），每题独立容器运行，任务自带测试脚本判定是否完成；"
+          "2.1 版修订了部分题目内容",
           HARBOR_REGISTRY, dataset="terminal-bench/terminal-bench-2-1",
           filter_prefix="terminal-bench/", tasks=TERMINAL_BENCH_2,
           default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89),
     Suite("terminal-bench-2.0", "terminal", "Terminal-Bench 2.0",
-          "89 道终端工程任务的 2.0 原版，用于与公开榜单对齐",
+          "Terminal-Bench 2.0 原版 89 题（题名与 2.1 相同、内容未修订），测试脚本判分；用于和 tbench.ai 2.0 公开榜单对齐",
           HARBOR_REGISTRY, dataset="terminal-bench@2.0", tasks=TERMINAL_BENCH_2,
           default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89),
     Suite("frontier-harness-eval-1.1", "terminal", "FrontierHarness Eval v1.1",
-          "FrontierHarness 榜单的 62 道固定版本命令行任务（工程、科学、数据、系统、ML、安全），每题独立容器运行并自动判分",
+          "FrontierHarness 榜单的 62 道固定版本命令行任务（45 道 TB2.1 衍生 + 17 道新题，覆盖工程、科学、数据、系统、ML、安全），"
+          "每题独立容器运行，测试脚本判分；用于比较不同 harness",
           HARBOR_REGISTRY, dataset="frontier-harness-eval/frontier-harness-eval@v1.1.0",
           filter_prefix="terminal-bench/", tasks=FRONTIER_HARNESS_EVAL_1_1,
           default_tasks=FRONTIER_HARNESS_EVAL_SAMPLE, max_tasks=62),
     Suite("aime", "competition-math", "AIME 2024–2025",
-          "60 道 AIME 竞赛题：2024 年 30 道，2025 年 I/II 卷各 15 道",
+          "60 道 AIME 数学竞赛题（2024 年 30 道，2025 年 I/II 卷各 15 道），答案是 0–999 的整数，与标准答案精确比对判分",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2024 + AIME_2025,
           default_tasks=AIME_2024 + AIME_2025, max_tasks=60),
     Suite("aime-2025", "competition-math", "AIME 2025",
-          "单独实验：只跑 2025 年 I/II 卷 30 道题（与 aime 数据集相同来源）",
+          "只跑 AIME 2025 年 I/II 卷 30 题（与 aime 同一数据集），整数答案精确比对；对应 Vals.ai、MathArena 的 2025 榜单",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2025,
           default_tasks=AIME_2025, max_tasks=30),
+    tau3_suite("airline", "τ³-bench Airline",
+               "τ³-bench 航空客服 50 题：按航司政策与 LLM 模拟的旅客对话，用工具改签、退票、加行李；"
+               "结束时数据库状态与标准答案一致才得分。用户模拟器需要 OPENAI_API_KEY"),
+    tau3_suite("retail", "τ³-bench Retail",
+               "τ³-bench 零售客服 114 题：按电商政策处理退货、换货、改地址等请求，与 LLM 模拟用户多轮对话；"
+               "数据库终态与要求的回复信息都对才得分。用户模拟器需要 OPENAI_API_KEY"),
+    tau3_suite("telecom", "τ³-bench Telecom",
+               "τ³-bench 电信技术支持 114 题：指导模拟用户在自己手机上排查无服务、流量、彩信等故障（用户也要操作工具），"
+               "设备与账户终态正确才得分。用户模拟器需要 OPENAI_API_KEY"),
+    tau3_suite("banking_knowledge", "τ³-bench Banking Knowledge",
+               "τ³-bench 银行客服 97 题：先在知识库里检索政策和产品文档，再与模拟用户对话办理业务；"
+               "数据库终态与 LLM 判定的回复要点都满足才得分。用户模拟器和判分需要 OPENAI_API_KEY"),
 )
 
 # harbor-local suites. The id/category here are authoritative; the adapter
@@ -214,28 +282,32 @@ ADAPTER_SUITES: Tuple[Suite, ...] = (
     Suite("humaneval", "code-generation", "HumanEval", "根据函数描述写出实现，通过单元测试",
           HARBOR_LOCAL, adapter="humaneval", max_tasks=164),
     Suite("mbpp", "basic-programming", "MBPP", "MBPP full 测试集 500 道 Python 编程任务",
-          HARBOR_LOCAL, adapter="mbpp", max_tasks=MAX_TASKS),
+          HARBOR_LOCAL, adapter="mbpp", max_tasks=200),
     Suite("mbpp-sanitized", "basic-programming", "MBPP sanitized", "MBPP sanitized 测试集 257 道人工校对的 Python 编程任务",
-          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=MAX_TASKS),
+          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=200),
     Suite("alfworld", "interactive-planning", "ALFWorld", "多步骤家庭任务的规划与执行",
           HARBOR_LOCAL, adapter="alfworld", max_tasks=134),
     Suite("searchqa", "question-answering", "SearchQA", "根据检索到的段落回答问题",
-          HARBOR_LOCAL, adapter="searchqa", max_tasks=MAX_TASKS),
+          HARBOR_LOCAL, adapter="searchqa", max_tasks=200),
     Suite("livemath", "math-reasoning", "LiveMath", "数学问题求解",
-          HARBOR_LOCAL, adapter="livemath", max_tasks=MAX_TASKS),
+          HARBOR_LOCAL, adapter="livemath", max_tasks=200),
     Suite("gaia2-cli", "general-agent", "GAIA2（CLI 模式）",
           "Meta GAIA2 的 Harbor CLI 变体：agent 通过 MCP 侧车调用 ARE 环境的 101 个工具完成动态场景任务",
           HARBOR_LOCAL, adapter="gaia2_cli", max_tasks=100),
 )
 
 WORKBUDDY_SUITES: Tuple[Suite, ...] = (
-    Suite("workbuddy-code", "work-agent", "WorkBuddy Code", "WorkBuddy-Bench 代码子集（80 题），verifier 判分",
+    Suite("workbuddy-code", "work-agent", "WorkBuddy Code",
+          "腾讯 WorkBuddy-Bench 代码子集 80 题：日常开发工作（写功能、修 bug、改脚本），由任务自带的 verifier 程序判分",
           WORKBUDDY, subset="code", max_tasks=80),
-    Suite("workbuddy-sec", "work-agent", "WorkBuddy Security", "WorkBuddy-Bench 安全子集（60 题），verifier 判分",
+    Suite("workbuddy-sec", "work-agent", "WorkBuddy Security",
+          "腾讯 WorkBuddy-Bench 安全子集 60 题：漏洞分析、加固、日志排查等安全工作，由 verifier 程序判分",
           WORKBUDDY, subset="sec", max_tasks=60),
-    Suite("workbuddy-web", "work-agent", "WorkBuddy Web", "WorkBuddy-Bench 网页子集（70 题），LLM judge 判分",
+    Suite("workbuddy-web", "work-agent", "WorkBuddy Web",
+          "腾讯 WorkBuddy-Bench 网页子集 70 题：按需求做网页和前端页面，由 LLM judge 对照评分标准打分",
           WORKBUDDY, subset="web", max_tasks=70),
-    Suite("workbuddy-office", "work-agent", "WorkBuddy Office", "WorkBuddy-Bench 办公文档子集（50 题），LLM judge 判分",
+    Suite("workbuddy-office", "work-agent", "WorkBuddy Office",
+          "腾讯 WorkBuddy-Bench 办公文档子集 50 题：生成或修改 Word、Excel、PPT 等文档，由 LLM judge 对照评分标准打分",
           WORKBUDDY, subset="office", max_tasks=50),
 )
 
@@ -255,6 +327,8 @@ def _validate():
         assert (suite.runner == HARBOR_REGISTRY) == bool(suite.dataset), suite.id
         assert (suite.runner == HARBOR_LOCAL) == bool(suite.adapter), suite.id
         assert (suite.runner == WORKBUDDY) == bool(suite.subset), suite.id
+        assert suite.runner == HARBOR_REGISTRY or not (suite.required_env or suite.host_env), suite.id
+        assert all(ENV_NAME.fullmatch(n) for n in suite.required_env + suite.host_env), suite.id
 
 
 _validate()
@@ -369,6 +443,10 @@ def readiness(suite: Suite, ctx: Context) -> List[str]:
     elif suite.runner == WORKBUDDY:
         from scripts.eval.harbor.suites import workbuddy
         reasons += workbuddy.readiness(suite, ctx)
+    missing = [n for n in suite.required_env if not ctx.env.get(n)]
+    if missing:
+        reasons.append(f"{suite.name} 需要在工作台的环境变量里设置 {'、'.join(missing)}"
+                       f"（可选 {'、'.join(suite.host_env)}），用于任务里的 LLM 用户模拟器")
     try:
         task_ids(suite, ctx)
     except Unavailable as exc:
@@ -401,12 +479,12 @@ def harbor_dataset_args(suite: Suite, ctx: Context) -> List[str]:
     raise ValueError(suite.id + " 不是 Harbor 评测集")
 
 
-ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
-
-
 def host_env(suite: Suite) -> Tuple[str, ...]:
-    """Environment names a harbor-local suite's adapter needs on the
-    execution host (HOST_ENV); forwarded by name to SSH executors."""
+    """Environment names a suite needs on the execution host (a registry
+    suite's own, a harbor-local adapter's HOST_ENV); forwarded by name to
+    SSH executors."""
+    if suite.runner == HARBOR_REGISTRY:
+        return suite.required_env + suite.host_env
     if suite.runner != HARBOR_LOCAL:
         return ()
     names = getattr(adapter_module(suite), "HOST_ENV", ()) or ()

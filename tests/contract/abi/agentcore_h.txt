@@ -1,4 +1,4 @@
-agentcore.h sha256 900f8f4c9f384ba1b8bde2abadc8434836b16594086807d698461e7e95a0712e
+agentcore.h sha256 814a8b99ab617a9f5401b578ee9172241b003c28eb682b60ee1660999240cb6c
 
 opaque metask_agentcore_runtime
 

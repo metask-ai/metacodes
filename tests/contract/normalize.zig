@@ -12,6 +12,7 @@ pub const Rules = struct {
 const volatile_number_suffixes = [_][]const u8{ "_ms", "_ns", "_at", "_unix", "Nano" };
 const volatile_number_keys = [_][]const u8{"content_bytes"};
 const volatile_string_keys = [_][]const u8{"trace_id"};
+const log_request_id_prefix = " req=";
 
 pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
     var current = try gpa.dupe(u8, input);
@@ -29,6 +30,7 @@ pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
         replaceTimestamps,
         replaceVolatileNumbers,
         replaceVolatileStrings,
+        replaceLogRequestIds,
         replaceUuids,
         replaceHexRuns,
     };
@@ -128,17 +130,13 @@ fn replaceVolatileNumbers(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
         if (quote == 0) continue;
         quote -= 1;
         if (s[quote] != '"') continue;
-        var key_end = quote;
-        if (key_end > 0 and s[key_end - 1] == '\\') key_end -= 1;
+        if (quote > 0 and s[quote - 1] == '\\') continue;
+        const key_end = quote;
         var key_start = key_end;
         while (key_start > 0 and isKeyChar(s[key_start - 1])) key_start -= 1;
         if (!isVolatileKey(s[key_start..key_end])) continue;
         var value_start = i;
-        if (value_start < s.len and s[value_start] == '"') {
-            value_start += 1;
-        } else if (value_start + 1 < s.len and s[value_start] == '\\' and s[value_start + 1] == '"') {
-            value_start += 2;
-        }
+        if (value_start < s.len and s[value_start] == '"') value_start += 1;
         var value_end = value_start;
         while (value_end < s.len and isDigit(s[value_end])) value_end += 1;
         if (value_end == value_start) continue;
@@ -169,6 +167,23 @@ fn replaceVolatileStrings(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
         current = try out.toOwnedSlice(gpa);
     }
     return current;
+}
+
+fn replaceLogRequestIds(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var rest: []const u8 = s;
+    while (std.mem.indexOf(u8, rest, log_request_id_prefix)) |at| {
+        const start = at + log_request_id_prefix.len;
+        var end = start;
+        while (end < rest.len and isHex(rest[end])) end += 1;
+        const is_log_prefix = end > start and end < rest.len and rest[end] == ']';
+        try out.appendSlice(gpa, rest[0..start]);
+        if (is_log_prefix) try out.appendSlice(gpa, "<ID>") else try out.appendSlice(gpa, rest[start..end]);
+        rest = rest[end..];
+    }
+    try out.appendSlice(gpa, rest);
+    return out.toOwnedSlice(gpa);
 }
 
 fn uuidLen(s: []const u8, at: usize) usize {

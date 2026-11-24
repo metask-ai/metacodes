@@ -15710,11 +15710,16 @@ fn runTextWithOptions(fixture: *PublicSessionFixture, run_id: u64, prompt: []con
     return result;
 }
 
-fn expectIdenticalRequestBodies(server: *harness.MockServer) !void {
+fn expectReissuedRequestBodies(server: *harness.MockServer) !void {
+    const nudge = core.agent_loop.RESTART_AFTER_STREAM_CUT;
     const first = (server.requestAt(0) orelse return error.MissingRequest).body();
-    for (1..server.requestCount()) |index| {
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first, nudge));
+    const restarted = (server.requestAt(1) orelse return error.MissingRequest).body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, restarted, nudge));
+    try std.testing.expect(restarted.len > first.len);
+    for (2..server.requestCount()) |index| {
         const again = (server.requestAt(index) orelse return error.MissingRequest).body();
-        try std.testing.expectEqualStrings(first, again);
+        try std.testing.expectEqualStrings(restarted, again);
     }
 }
 
@@ -15736,9 +15741,9 @@ test "L2 Revision 28 stream_retry_budget re-issues the issue #452 reproduction a
     const result = try runTextWithOptions(&fixture, 1, "think it through", &options);
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expect(!probe.overflow);
-    // The same request was sent again, byte for byte.
+    // The same request was sent again, with the restart request appended.
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
-    try expectIdenticalRequestBodies(server);
+    try expectReissuedRequestBodies(server);
     // The withdrawn attempt: its (empty) text segment closes discarded, its
     // thinking is withdrawn under the same segment identity, and the re-issue
     // is announced like a connection retry: one failed stream of at most
@@ -15788,7 +15793,7 @@ test "L2 issue #461 with zeroed RunOptions the reproduction is re-issued once an
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expect(!probe.overflow);
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
-    try expectIdenticalRequestBodies(server);
+    try expectReissuedRequestBodies(server);
     // Every request has one re-issue of its own: one failed stream of at
     // most two, announced before the backoff.
     try std.testing.expectEqualStrings(
@@ -15832,7 +15837,7 @@ test "L2 issue #461 with zeroed RunOptions a request cut twice ends api_error af
     try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
     try std.testing.expect(!probe.overflow);
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
-    try expectIdenticalRequestBodies(server);
+    try expectReissuedRequestBodies(server);
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
@@ -15896,7 +15901,7 @@ test "L2 Revision 28 an exhausted budget ends the Run, and model_error counts ev
     try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
     // The first attempt, the request's own re-issue (#461), the budget's two.
     try std.testing.expectEqual(@as(usize, 4), server.requestCount());
-    try expectIdenticalRequestBodies(server);
+    try expectReissuedRequestBodies(server);
     try std.testing.expectEqualStrings(
         "begin 0\n" ++
             "thinking 17\n" ++
@@ -16045,7 +16050,7 @@ fn runSkillWithRetryBudget(context_line: []const u8, budget: u32) !void {
     // budget only raises the most the notice announces.
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
-    try expectIdenticalRequestBodies(server);
+    try expectReissuedRequestBodies(server);
     const log = probe.logText();
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(&expected_buf, "end 0 turn 1 group 0 discarded 0\nthinking_discarded 0 turn 1 group 0 17\nretry 1/{d} after 500\n", .{2 + budget});

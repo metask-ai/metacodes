@@ -30,15 +30,23 @@ test "runtime environment values are replaced only where they occur, keeping wha
     );
 }
 
-test "numbers under timing keys become <N>, also inside escaped JSON" {
+test "numbers under timing keys become <N>, but not inside escaped JSON that a model reads" {
     try expectApplied("{\"elapsed_ms\":17,\"turns\":2}", .{}, "{\"elapsed_ms\":<N>,\"turns\":2}");
-    try expectApplied("\"{\\\"elapsed_ms\\\":3}\"", .{}, "\"{\\\"elapsed_ms\\\":<N>}\"");
+    try expectApplied("\"{\\\"elapsed_ms\\\":3}\"", .{}, "\"{\\\"elapsed_ms\\\":3}\"");
     try expectApplied("{\"startTimeUnixNano\":\"1795\",\"last_modified_ns\":9}", .{}, "{\"startTimeUnixNano\":\"<N>\",\"last_modified_ns\":<N>}");
     try expectApplied("{\"bytes\":12,\"content_bytes\":145}", .{}, "{\"bytes\":12,\"content_bytes\":<N>}");
 }
 
 test "string values under identifier keys become <ID>, null stays" {
     try expectApplied("{\"trace_id\":\"db9832d00000\",\"x\":1},{\"trace_id\":null}", .{}, "{\"trace_id\":\"<ID>\",\"x\":1},{\"trace_id\":null}");
+}
+
+test "the request id in a log prefix becomes <ID>" {
+    try expectApplied("[ERROR client req=600af9880001] HTTP 400", .{}, "[ERROR client req=<ID>] HTTP 400");
+    try expectApplied("prefix_req=abc and req= alone", .{}, "prefix_req=abc and req= alone");
+    try expectApplied("echo req=on", .{}, "echo req=on");
+    try expectApplied("echo req=off]", .{}, "echo req=off]");
+    try expectApplied("echo req=beef and more", .{}, "echo req=beef and more");
 }
 
 test "hex identifiers of 16 or more characters and UUIDs become placeholders" {

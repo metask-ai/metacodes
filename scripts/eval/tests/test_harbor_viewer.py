@@ -106,6 +106,16 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(raw=raw, stop=stop):
                 self.assertEqual(data.classify(raw, stop), expected)
 
+    def test_a_running_trial_takes_its_task_from_the_trial_config(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        configs = {"django__django-11099__Ab3dE5f": {"name": "swe-bench/django__django-11099"},
+                   "tau3-bench__tau3-telecom-mms-is__Zx9Yw8v": {"path": "/data/tau3-bench__tau3-telecom-mms-issue-x"}}
+        for trial, task in configs.items():
+            _write(root / trial / "config.json", {"task": task})
+        self.assertEqual([data.trial_row(root / t)["task"] for t in configs],
+                         ["django__django-11099", "tau3-bench__tau3-telecom-mms-issue-x"])
+
 
 class LibraryTest(unittest.TestCase):
     def setUp(self):

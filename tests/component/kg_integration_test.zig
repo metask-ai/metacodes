@@ -3129,10 +3129,11 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
             try std.testing.expect(subprocess_lower >= 1);
             try std.testing.expect(subprocess_upper >= subprocess_lower);
             try std.testing.expect(!metrics.get("subprocess_count_exact").?.bool);
+            try std.testing.expect(metrics.get("elapsed_ms") == null);
             try std.testing.expectEqual(@as(usize, 10), metrics.get("packet_bytes").?.string.len);
             if (std.c.getenv("METACODES_PRINT_EXPERIENCE_METRICS") != null) {
                 std.debug.print(
-                    "experience_feedback_metrics schema=v1 search_hits={d} task_candidates={d} accepted_tasks={d} accepted_associations={d} accepted_tentative={d} accepted_confirmed={d} rejected_not_completed={d} subprocess_lower={d} subprocess_upper={d} elapsed_ms={d} packet_bytes={s}\n",
+                    "experience_feedback_metrics schema=v1 search_hits={d} task_candidates={d} accepted_tasks={d} accepted_associations={d} accepted_tentative={d} accepted_confirmed={d} rejected_not_completed={d} subprocess_lower={d} subprocess_upper={d} packet_bytes={s}\n",
                     .{
                         metrics.get("search_hits").?.integer,
                         metrics.get("task_candidates").?.integer,
@@ -3143,7 +3144,6 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
                         metrics.get("rejected_not_completed").?.integer,
                         subprocess_lower,
                         subprocess_upper,
-                        metrics.get("elapsed_ms").?.integer,
                         metrics.get("packet_bytes").?.string,
                     },
                 );
