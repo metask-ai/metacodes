@@ -473,8 +473,12 @@ The approved budget, check, seat models, effective permissions and sandbox
 restrictions must match the run's saved fingerprints. Older CLI runs without
 a host-policy fingerprint still support status, and need a new approval to run.
 A run that reached its cap pauses in `budget_exhausted` with its worktree and
-ledger kept; `detail` names the phase it continues from (`null` when it
-stopped among parallel candidates and cannot continue). `teamwork resume <id>
+ledger kept; `detail` names the phase it continues from. Parallel candidates
+that already have a verdict keep it, and unfinished ones continue in their
+worktrees. A `wallclock_only` seat that ran out of time also ends in
+`budget_exhausted`, with `detail: null`: a higher dollar cap would not help,
+so it cannot continue. While a launched Manager still holds its allowance,
+the run stays locked until that allowance is settled. `teamwork resume <id>
 --approve --budget-usd <dollars>` approves a higher cap for such a run and
 continues it there. The new cap must exceed the approved cap and the spend so
 far, which stays charged against it (`CapNotRaised` otherwise);

@@ -181,6 +181,7 @@ const Plan = struct {
     require: ?[]const u8 = null,
     seat_files: []const File = &.{},
     handoff: []const u8 = handoff_text,
+    exhaust_budget: bool = false,
 };
 
 const ScriptedSeats = struct {
@@ -228,6 +229,7 @@ const ScriptedSeats = struct {
         if (plan.charge_usd > 0) _ = common.charge(self.binding, .metacodes, 1, .{ .provider_estimate = plan.charge_usd });
         // A live seat notices the shared signal, as the real drivers do.
         if (abort.isAborted()) return .aborted;
+        if (plan.exhaust_budget) return .budget_exhausted;
         if (plan.fail) |err| return .{ .failed = err };
         if (plan.require) |rel| if (!exists(paths.workspace, rel)) return .{ .failed = .{ .exited = 99 } };
         for (plan.files) |f| writeFile(paths.workspace, f.path, f.bytes) catch return .{ .failed = .spawn_failed };
@@ -750,6 +752,26 @@ test "teamwork runtime L2: a run its budget stopped keeps its worktree and conti
     try expectFile(fx.repo(), "feature.txt", "feature\n");
     try expectFile(fx.repo(), "partial.txt", "partial\n");
     try testing.expectError(error.NotResumable, runtime.Run.reopenWithCap(testing.allocator, deps, raised, fx.state(), id, 5));
+}
+
+test "teamwork runtime L2: a seat that ran out of wallclock time does not offer a dollar cap raise" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-wallclock");
+    defer fx.deinit();
+    const plans = [_]Plan{.{ .seat = "implementer-1", .exhaust_budget = true }};
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const cfg = try fx.cfg(",\"seats\":{\"implementer\":{\"harness\":\"claude_code\",\"command\":\"/opt/claude/bin/claude\",\"budget_enforcement\":\"wallclock_only\",\"wallclock_seconds\":60}}");
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+        defer run.destroy();
+        try testing.expectEqual(runtime.State{ .budget_exhausted = null }, try swe_loop.drive(run));
+        try testing.expectEqual(@as(f64, 0), run.status().budget.spent_usd);
+    }
+    try testing.expectError(error.NotResumable, runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), fx.options().run_id, 10));
 }
 
 test "teamwork runtime L2: no dispatch without budget left; cancel stops the run without touching the workspace" {
@@ -1844,6 +1866,49 @@ test "teamwork candidates L2: of three candidates only the one passing the hidde
     try testing.expectEqualStrings("1\n", worktrees);
 }
 
+test "teamwork candidates L2: a budget pause among candidates keeps the decided ones and continues the rest under a higher cap" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates-pause");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .require = "hidden-test.sh", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_hidden },
+        .{ .seat = "implementer-2", .charge_usd = 2, .files = &.{feature} },
+        .{ .seat = "implementer-3", .require = "partial.txt", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+        .{ .seat = "reviewer-2", .review = approve_hidden },
+        .{ .seat = "judge-1", .require = "candidate-1.review.json", .seat_files = &.{.{ .path = "judgment.json", .bytes = "{\"selected\":\"candidate-1\",\"eliminated\":[{\"candidate\":\"candidate-2\",\"reason\":\"It fails the hidden test.\"}]}" }} },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const cfg = try candidatesCfg(&fx, ",\"candidates\":2,\"candidate_estimate_usd\":0.5");
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const id = fx.options().run_id;
+    var paused_cfg = cfg;
+    paused_cfg.budget_usd = 2;
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, paused_cfg, fx.options());
+        defer run.destroy();
+        try testing.expectEqual(runtime.State{ .budget_exhausted = .approved }, try swe_loop.drive(run));
+        try testing.expectEqual(runtime.CandidateStatus.approved, run.status().candidates[0].status);
+        try testing.expectEqual(runtime.CandidateStatus.implementing, run.status().candidates[1].status);
+    }
+    var root_buf: PathBuf = undefined;
+    try writeFile(fx.runFile(&root_buf, ""), "candidates/candidate-2/partial.txt", "partial\n");
+    const run = try runtime.Run.reopenWithCap(testing.allocator, deps, paused_cfg, fx.state(), id, 5);
+    defer run.destroy();
+    try testing.expectEqual(runtime.CandidateStatus.approved, run.status().candidates[0].status);
+    try testing.expect(try swe_loop.drive(run) == .done);
+    var ids_buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("implementer-1:done,implementer-2:failed,reviewer-1:done,implementer-3:done,reviewer-2:done,judge-1:done", seatIds(run.status(), &ids_buf));
+    try testing.expect(std.mem.indexOf(u8, seats.packetOf("judge-1"), "- `candidate-1` passed its verified review. Eligible.") != null);
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+}
+
 test "teamwork candidates L2: an invalid judgment runs the judge again; no approved candidate fails without a judge" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;
@@ -2245,6 +2310,35 @@ test "teamwork manager L2: a crash while the manager runs consumes its hold once
     try testing.expectEqualStrings("manager-2", next.slice());
     try run.holdManager(next);
     try testing.expectEqual(@as(f64, 2), run.status().budget.remaining_usd);
+}
+
+test "teamwork manager L2: a budget pause keeps the run locked until the manager settles, which is charged once" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-pause");
+    defer fx.deinit();
+    var fake: FakeManager = .{};
+    fake.command_len = (try std.fmt.bufPrint(&fake.command_buf, "{s}/bin/claude-manager", .{fx.root.slice()})).len;
+    const plans = [_]Plan{.{ .seat = "implementer-1", .charge_usd = 3.5 }};
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const cfg = try managerCfg(&fx, &fake, "");
+    const id = fx.options().run_id;
+    const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+    defer run.destroy();
+    const manager_seat = try run.openManager();
+    try run.holdManager(manager_seat);
+    _ = try run.dispatch(.implementer, "");
+    try testing.expectEqual(runtime.State{ .budget_exhausted = .implementing }, run.state);
+    try testing.expectError(error.RunBusy, runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 10));
+    try run.finishManager(manager_seat, 1, .{ .harness_reported = 0.5 }, .finished);
+    const resumed = try runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 10);
+    defer resumed.destroy();
+    try testing.expectEqual(@as(f64, 4), resumed.status().budget.spent_usd);
+    try testing.expectEqual(@as(f64, 0), resumed.status().budget.held_usd);
+    try testing.expectEqual(runtime.State.implementing, resumed.state);
 }
 
 test "teamwork manager L2: the controller's death kills the manager's whole process group" {

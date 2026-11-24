@@ -91,7 +91,10 @@ fn ended(app: *app_mod.App, what: []const u8, id: types.RunId) void {
 
 fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session, explicit: []const u8) void {
     if (explicit.len == 0 and session.job != null) {
-        if (showProgress(app, allocator, &session.board)) return;
+        if (showProgress(app, allocator, &session.board)) {
+            showResumeHint(session.job.?);
+            return;
+        }
     }
     const id = if (explicit.len != 0)
         types.RunId.parse(explicit) catch {
@@ -110,15 +113,22 @@ fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
     };
 }
 
+fn showResumeHint(job: *command.Background) void {
+    if (!job.finished()) return;
+    const run = job.run orelse return;
+    switch (run.state) {
+        .budget_exhausted => |paused| if (paused != null)
+            cmd_output.print("The run paused at its ${d} cap; the worktree is kept. Approve a higher cap and continue with: metacodes --preview teamwork resume {s} --approve --budget-usd <dollars>\n", .{ run.ledger.cap_usd, job.id.slice() }),
+        else => {},
+    }
+}
+
 fn showProgress(app: *app_mod.App, allocator: std.mem.Allocator, board: *progress.Board) bool {
     var copy = (board.read(allocator) catch return false) orelse return false;
     defer copy.deinit();
-    const snapshot = copy.snapshot();
-    const text = agent_tree.renderTeamwork(allocator, app.theme, snapshot, null) catch return false;
+    const text = agent_tree.renderTeamwork(allocator, app.theme, copy.snapshot(), null) catch return false;
     defer allocator.free(text);
     cmd_output.print("{s}", .{text});
-    if (snapshot.phase == .budget_exhausted)
-        cmd_output.print("The run stopped at its ${d} cap; the worktree is kept. Approve a higher cap and continue with: metacodes --preview teamwork resume {s} --approve --budget-usd <dollars>\n", .{ snapshot.budget.cap_usd, snapshot.run_id.slice() });
     return true;
 }
 

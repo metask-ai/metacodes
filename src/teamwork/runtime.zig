@@ -220,7 +220,7 @@ pub const Resume = union(enum) {
 
     fn of(current: State) ?Resume {
         return switch (current) {
-            .approved => .approved,
+            .approved, .candidates => .approved,
             .implementing => .implementing,
             .reviewing => .reviewing,
             .review_approved, .auditing => |tree| .{ .review_approved = tree },
@@ -333,6 +333,7 @@ pub const CandidateStatus = enum {
 pub const CandidateSnapshot = struct {
     status: CandidateStatus = .queued,
     tree: ?TreeId = null,
+    reviewer: ?SeatId = null,
 };
 
 pub const SeatSnapshot = struct {
@@ -763,7 +764,7 @@ pub const Run = struct {
             else => unreachable,
         };
         try self.closeSeat(id, result);
-        if (try self.stopAfterSeat(result)) return id;
+        if (try self.stopAfterSeat(result, spec)) return id;
         switch (result) {
             .finished => try self.transition(.reviewing),
             .review => |review| switch (review) {
@@ -783,12 +784,17 @@ pub const Run = struct {
         try self.checkLive();
         const count = self.cfg.candidates.len;
         if (count == 0 or self.state != .approved) return error.NoCandidates;
-        if (candidateEstimate(self.cfg) > self.ledger.remainingUsd()) return error.CandidateBudgetExceeded;
+        if (self.pendingCandidateEstimate() > self.ledger.remainingUsd()) return error.CandidateBudgetExceeded;
         try self.transition(.candidates);
 
         var trials: [config.max_candidates]Trial = @splat(.{});
         for (self.cfg.candidates.slice(), 1..) |*spec, number| {
-            if (try self.runCandidate(spec, number, &trials[number - 1])) return self.endedResult();
+            const candidate = self.candidates[number - 1];
+            switch (candidate.status) {
+                .approved, .rejected => trials[number - 1] = .{ .decided_earlier = true, .reviewer = candidate.reviewer },
+                .queued, .implementing, .reviewing => if (try self.runCandidate(spec, number, &trials[number - 1])) return self.endedResult(),
+                .selected, .eliminated => unreachable,
+            }
         }
 
         var facts: [config.max_candidates][160]u8 = undefined;
@@ -831,9 +837,11 @@ pub const Run = struct {
         implementer: ?SeatResult = null,
         review: ?SeatResult = null,
         reviewer: ?SeatId = null,
+        decided_earlier: bool = false,
 
         fn fact(self: Trial, buf: []u8, eligible: bool) []const u8 {
             if (eligible) return "passed its verified review";
+            if (self.decided_earlier) return "was not approved before the run paused at its budget";
             if (self.review) |result| return switch (result) {
                 .review => |review| switch (review) {
                     .approved => unreachable,
@@ -854,35 +862,37 @@ pub const Run = struct {
 
     fn runCandidate(self: *Run, spec: *const types.SeatSpec, number: usize, trial: *Trial) Error!bool {
         const candidate = &self.candidates[number - 1];
-        candidate.status = .implementing;
         const workspace = try self.candidateWorktree(number);
         defer self.gpa.free(workspace);
-        var dir_buf: run_dir.PathBuf = undefined;
-        const parent = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.dir.root, run_dir.candidates_dir }) catch return error.PathTooLong;
-        util_fs.mkdirParents(parent) catch return error.MkdirFailed;
-        merge_back.addWorktree(self.gpa, self.repo, workspace, self.base.commit, &self.abort) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Aborted => {
-                try self.transition(.cancelled);
-                return true;
-            },
-            else => {
-                log.warn("teamwork", "run {s}: candidate {d} worktree: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+        const kept = try candidateWorktreeExists(workspace);
+        const built_earlier = kept and candidate.status == .reviewing;
+        if (!kept) {
+            candidate.status = .implementing;
+            switch (try self.addCandidateWorktree(workspace, number)) {
+                .added => {},
+                .rejected => {
+                    candidate.status = .rejected;
+                    return false;
+                },
+                .cancelled => return true,
+            }
+        }
+        if (!built_earlier) {
+            candidate.status = .implementing;
+            const implementer_packet = try self.renderPacket(.implementer, "");
+            defer self.gpa.free(implementer_packet);
+            const implementer = try self.openSeat(.implementer, spec, implementer_packet);
+            try self.setSeatStatus(implementer, .working);
+            const built = try self.runImplementer(implementer, spec, workspace);
+            trial.implementer = built;
+            try self.closeSeat(implementer, built);
+            if (try self.stopAfterSeat(built, spec)) return true;
+            if (built != .finished) {
                 candidate.status = .rejected;
                 return false;
-            },
-        };
-
-        const implementer_packet = try self.renderPacket(.implementer, "");
-        defer self.gpa.free(implementer_packet);
-        const implementer = try self.openSeat(.implementer, spec, implementer_packet);
-        try self.setSeatStatus(implementer, .working);
-        const built = try self.runImplementer(implementer, spec, workspace);
-        trial.implementer = built;
-        if (built != .finished) candidate.status = .rejected else candidate.status = .reviewing;
-        try self.closeSeat(implementer, built);
-        if (try self.stopAfterSeat(built)) return true;
-        if (built != .finished) return false;
+            }
+            candidate.status = .reviewing;
+        }
 
         const reviewer_spec = self.cfg.seats.getPtrConst(.reviewer);
         const reviewer_packet = try self.renderPacket(.reviewer, "");
@@ -894,15 +904,53 @@ pub const Run = struct {
         defer candidate_issues.deinit();
         const reviewed = try self.runReviewer(review_seat, reviewer_spec, workspace, .{ .candidate = &candidate_issues });
         trial.review = reviewed;
+        try self.closeSeat(review_seat, reviewed);
+        if (try self.stopAfterSeat(reviewed, reviewer_spec)) return true;
         switch (reviewed) {
             .review => |review| switch (review) {
-                .approved => |tree| candidate.* = .{ .status = .approved, .tree = tree },
+                .approved => |tree| candidate.* = .{ .status = .approved, .tree = tree, .reviewer = review_seat },
                 else => candidate.status = .rejected,
             },
             else => candidate.status = .rejected,
         }
-        try self.closeSeat(review_seat, reviewed);
-        return self.stopAfterSeat(reviewed);
+        return false;
+    }
+
+    fn candidateWorktreeExists(workspace: []const u8) Error!bool {
+        var buf: run_dir.PathBuf = undefined;
+        const z = std.fmt.bufPrintZ(&buf, "{s}", .{workspace}) catch return error.PathTooLong;
+        return pfs.exists(z.ptr);
+    }
+
+    const WorktreeAdded = enum { added, rejected, cancelled };
+
+    fn addCandidateWorktree(self: *Run, workspace: []const u8, number: usize) Error!WorktreeAdded {
+        var dir_buf: run_dir.PathBuf = undefined;
+        const parent = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.dir.root, run_dir.candidates_dir }) catch return error.PathTooLong;
+        util_fs.mkdirParents(parent) catch return error.MkdirFailed;
+        merge_back.addWorktree(self.gpa, self.repo, workspace, self.base.commit, &self.abort) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Aborted => {
+                try self.transition(.cancelled);
+                return .cancelled;
+            },
+            else => {
+                log.warn("teamwork", "run {s}: candidate {d} worktree: {s}", .{ self.dir.run_id.slice(), number, @errorName(err) });
+                return .rejected;
+            },
+        };
+        return .added;
+    }
+
+    fn pendingCandidateEstimate(self: *const Run) f64 {
+        var pending: f64 = 0;
+        for (self.candidates[0..self.cfg.candidates.len]) |candidate| {
+            switch (candidate.status) {
+                .queued, .implementing, .reviewing => pending += 1,
+                .approved, .rejected, .selected, .eliminated => {},
+            }
+        }
+        return pending * (self.cfg.candidate_estimate_usd orelse 0);
     }
 
     fn runJudge(self: *Run, arena: std.mem.Allocator, entries: []const judge.Entry, trials: []const Trial) Error!?judge.Judgment {
@@ -930,7 +978,7 @@ pub const Run = struct {
                 .aborted => .aborted,
             };
             try self.closeSeat(id, result);
-            if (try self.stopAfterSeat(result)) return null;
+            if (try self.stopAfterSeat(result, spec)) return null;
             if (result == .judgment and result.judgment == .selected) return judgment;
         }
         try self.transition(.{ .failed = .rounds_exhausted });
@@ -969,7 +1017,7 @@ pub const Run = struct {
             defer self.gpa.free(diff);
             const diff_path = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ workspace, judge.diffFile(&name_buf, number) }) catch return error.PathTooLong;
             try run_dir.writeAtomic(diff_path, diff);
-            const review_path = try self.dir.seatPath(&file_buf, trial.reviewer.?, .review);
+            const review_path = try self.dir.seatPath(&file_buf, trial.reviewer orelse continue, .review);
             const review = try run_dir.readSeatOutput(self.gpa, review_path, reviewer.max_review_bytes + 1) orelse continue;
             defer self.gpa.free(review);
             const copy_path = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ workspace, judge.reviewFile(&name_buf, number) }) catch return error.PathTooLong;
@@ -1052,9 +1100,16 @@ pub const Run = struct {
         });
     }
 
-    fn stopAfterSeat(self: *Run, result: SeatResult) Error!bool {
-        if (self.ledger.isExhausted() or result == .budget_exhausted) {
+    fn stopAfterSeat(self: *Run, result: SeatResult, spec: *const types.SeatSpec) Error!bool {
+        if (self.ledger.isExhausted()) {
             try self.endForBudget();
+            return true;
+        }
+        if (result == .budget_exhausted) {
+            if (spec.harness == .claude_code and spec.harness.claude_code.budget == .wallclock_only) {
+                self.abort.abort(.host_failure);
+                try self.transition(.{ .budget_exhausted = null });
+            } else try self.endForBudget();
             return true;
         }
         if (result == .aborted or self.abort.isAborted()) {
@@ -1191,6 +1246,7 @@ pub const Run = struct {
     pub fn finishManager(self: *Run, id: SeatId, wallclock_ms: u64, cost: ledger_mod.Cost, result: SeatResult) Error!void {
         _ = common.charge(.{ .ledger = &self.ledger, .seat = id }, self.cfg.seats.get(.manager).harnessKind(), wallclock_ms, cost);
         try self.closeSeat(id, result);
+        if (self.state.isTerminal() and self.ledger.hold_seat == null) self.releaseLease();
     }
 
     pub fn seatDir(self: *const Run, buf: *run_dir.PathBuf, id: SeatId) Error![]const u8 {
@@ -1548,7 +1604,7 @@ pub const Run = struct {
         const previous = self.state.phase();
         self.state = next;
         try self.persist();
-        if (next.isTerminal()) self.releaseLease();
+        if (next.isTerminal() and self.ledger.hold_seat == null) self.releaseLease();
         if (previous != next.phase()) self.emit(.{ .phase = .{ .from = .of(previous), .to = .of(next.phase()) } });
     }
 
@@ -1639,6 +1695,10 @@ pub const Run = struct {
             try s.write(@tagName(candidate.status));
             try s.objectField("tree");
             if (candidate.tree) |tree| try s.write(tree.slice()) else try s.write(null);
+            if (candidate.reviewer) |seat| {
+                try s.objectField("reviewer");
+                try s.write(seat.slice());
+            }
             try s.endObject();
         }
         try s.endArray();
@@ -1733,6 +1793,10 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
                     .null => null,
                     else => |tree| try treeOf(tree),
                 },
+                .reviewer = if (item.object.get("reviewer")) |seat|
+                    SeatId.parse(if (seat == .string) seat.string else return error.StateCorrupt) catch return error.StateCorrupt
+                else
+                    null,
             };
         }
     }
