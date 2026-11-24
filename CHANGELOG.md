@@ -19,6 +19,15 @@ status, compatibility boundaries, and entry points are defined by
   and the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
   mode. While it is on, the wheel no longer scrolls the scrollback and the
   terminal's own selection needs its modifier key. macOS and Linux only.
+- **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
+  Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,
+  `[docs](https://…)`) as an underlined OSC 8 hyperlink showing only its
+  label, and an inline code span that reads as a file reference
+  (`src/repl/render.zig:42`, `/etc/hosts`) keeps its look but becomes
+  clickable. Relative paths resolve against the working directory and the
+  `:line[:col]` suffix is dropped from the `file://` URL. Terminals without
+  OSC 8 show the same text.
+
 - **WorkBuddy suites run with the profile's run gates.** A bench profile's
   Lean-modelled run gates now reach the WorkBuddy suites too: the workbench
   passes them as harness parameters and the overlay turns each into its
@@ -269,6 +278,16 @@ status, compatibility boundaries, and entry points are defined by
   `max_queued`.
 
 ### Fixed
+
+- **Ctrl-C stops a request that is waiting for its answer or whose stream
+  went quiet.** The interrupt only set a flag that was read when the next
+  byte arrived, so `-p` (and any caller that did not also cancel the
+  request) waited for the 120 s idle limit while the provider had not
+  answered yet, and indefinitely while a started stream sent nothing more.
+  The liveness monitor now closes the connection of every request whose
+  abort signal is set, within a quarter of a second, for every provider
+  protocol and entry point. An interrupt while the answer is awaited no
+  longer prints an error line.
 
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to

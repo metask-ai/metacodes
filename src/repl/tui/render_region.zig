@@ -2340,10 +2340,13 @@ pub const RenderRegion = struct {
             var vis_w: usize = 0;
             var i: usize = 0;
             const s = rendered.items;
+            var carried: md_render.CarriedStyle = .{};
+            defer carried.deinit(self.allocator);
             while (i < s.len) {
                 if (s[i] == 0x1b) {
-                    const esc_end = scanEscape(s, i);
+                    const esc_end = ansi.escapeEnd(s, i);
                     buf.appendSlice(self.allocator, s[i..esc_end]) catch {};
+                    carried.observe(s[i..esc_end], self.allocator) catch {};
                     i = esc_end;
                     continue;
                 }
@@ -2352,8 +2355,10 @@ pub const RenderRegion = struct {
                 const cw = term.displayWidth(s[i..end]);
                 if (vis_w + cw > avail and vis_w > 0) {
                     // 软折:换行 + 2 空格悬挂缩进,重置可见宽。
+                    carried.appendSuspend(&buf, self.allocator) catch {};
                     buf.append(self.allocator, '\n') catch {};
                     buf.appendSlice(self.allocator, "  ") catch {};
+                    carried.appendResume(&buf, self.allocator) catch {};
                     vis_w = 0;
                 }
                 buf.appendSlice(self.allocator, s[i..end]) catch {};
@@ -2375,19 +2380,6 @@ pub const RenderRegion = struct {
         } else {
             buf.appendSlice(self.allocator, "  ") catch {};
         }
-    }
-
-    /// 从 s[i]=ESC 起扫完整转义序列,返回其后第一个字节索引(原子透传用)。
-    /// CSI(`\x1b[...字母`)到字母结尾;OSC/其它两字节 ESC 序列吃 2 字节兜底。
-    fn scanEscape(s: []const u8, i: usize) usize {
-        var j = i + 1;
-        if (j < s.len and s[j] == '[') {
-            j += 1;
-            while (j < s.len and !std.ascii.isAlphabetic(s[j])) : (j += 1) {}
-            if (j < s.len) j += 1; // 含结尾字母
-            return j;
-        }
-        return @min(i + 2, s.len); // 两字节转义兜底
     }
 
     /// 一段文本进 scrollback(#328):攒进 pending_scroll,经普通通道成帧——下一帧按到达顺序写出,
@@ -3912,4 +3904,26 @@ test "the generating input box is the region's own copy, not the watcher's buffe
     @memset(&watcher_buf, 'X');
     try std.testing.expectEqualStrings("draft", r.ui.phase.generating.interaction.editor.view);
     try std.testing.expectEqual(@as(usize, 5), r.ui.phase.generating.interaction.editor.cursor);
+}
+
+test "soft-wrapping an assistant line keeps a file hyperlink escape whole" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.cols = 20;
+    r.hold_paint = true;
+    r.writeGenAssistantText("see [notes.txt](/tmp/a/very/long/directory/name/notes.txt) now\n");
+    const open = ansi.hyperlink.open_prefix ++ "file:///tmp/a/very/long/directory/name/notes.txt" ++ ansi.hyperlink.open_suffix;
+    try std.testing.expect(std.mem.indexOf(u8, r.pending_scroll.items, open) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.pending_scroll.items, "\n") == r.pending_scroll.items.len - 1);
+}
+
+test "soft-wrapping a long link label closes the link before the indent and reopens it after" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.cols = 20;
+    r.hold_paint = true;
+    r.writeGenAssistantText("[a label far too long for one row](/tmp/n.txt)\n");
+    const open = ansi.hyperlink.open_prefix ++ "file:///tmp/n.txt" ++ ansi.hyperlink.open_suffix;
+    const wrap = ansi.sgr.reset ++ ansi.hyperlink.close ++ "\n  " ++ open;
+    try std.testing.expect(std.mem.indexOf(u8, r.pending_scroll.items, wrap) != null);
 }

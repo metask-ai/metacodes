@@ -1,0 +1,9 @@
+models.toml
+projects/
+projects/<HEX16>/
+projects/<HEX16>/<HEX24>/
+projects/<HEX16>/<HEX24>/meta.json
+projects/<HEX16>/<HEX24>/spans.jsonl
+projects/<HEX16>/<HEX24>/tool-observations.jsonl
+projects/<HEX16>/<HEX24>/transcript.jsonl
+projects/<HEX16>/memory/

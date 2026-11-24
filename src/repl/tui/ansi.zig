@@ -191,6 +191,33 @@ pub const syntax_palette = struct {
     };
 };
 
+pub const hyperlink = struct {
+    pub const open_prefix = "\x1b]8;;";
+    pub const open_suffix = "\x1b\\";
+    pub const close = "\x1b]8;;\x1b\\";
+};
+
+pub fn escapeEnd(s: []const u8, i: usize) usize {
+    var j = i + 1;
+    if (j >= s.len) return s.len;
+    switch (s[j]) {
+        '[' => {
+            j += 1;
+            while (j < s.len and !std.ascii.isAlphabetic(s[j])) : (j += 1) {}
+            return @min(j + 1, s.len);
+        },
+        ']' => {
+            j += 1;
+            while (j < s.len) : (j += 1) {
+                if (s[j] == 0x07) return j + 1;
+                if (s[j] == 0x1b and j + 1 < s.len and s[j + 1] == '\\') return j + 2;
+            }
+            return s.len;
+        },
+        else => return j + 1,
+    }
+}
+
 // ============================================================================
 // 光标控制
 // ============================================================================
@@ -335,4 +362,13 @@ test "screen alt screen + bracketed paste" {
     try testing.expectEqualStrings("\x1b[?1049h", screen.alt_enter);
     try testing.expectEqualStrings("\x1b[?1049l", screen.alt_exit);
     try testing.expectEqualStrings("\x1b[?2004h", screen.bracketed_paste_on);
+}
+
+test "escapeEnd spans CSI, OSC 8 with either terminator, and two-byte escapes" {
+    try testing.expectEqual(@as(usize, 4), escapeEnd("\x1b[0mx", 0));
+    const st = hyperlink.open_prefix ++ "file:///a" ++ hyperlink.open_suffix ++ "x";
+    try testing.expectEqual(st.len - 1, escapeEnd(st, 0));
+    try testing.expectEqual(@as(usize, 11), escapeEnd("\x1b]8;;https\x07x", 0));
+    try testing.expectEqual(@as(usize, 2), escapeEnd("\x1b7x", 0));
+    try testing.expectEqual(@as(usize, 5), escapeEnd("\x1b]8;;", 0));
 }

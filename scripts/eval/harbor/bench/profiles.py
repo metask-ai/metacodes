@@ -473,6 +473,53 @@ class ProfileManager:
         self.wake()
         return {"id": record["id"], "status": record["status"], "cancel_requested": True}
 
+    def record_item(self, profile: Any, index: Any):
+        record = self.get(profile)
+        if record is None:
+            raise ValueError("评测配置不存在")
+        if type(index) is not int or not 0 <= index < len(record["items"]):
+            raise ValueError("评测集不存在")
+        return record, record["items"][index]
+
+    def cancel_item(self, profile: Any, index: Any) -> Dict[str, Any]:
+        """Drop one waiting dataset from the queue; the rest of it goes on."""
+        with self.lock:
+            record, item = self.record_item(profile, index)
+            if item["status"] != "pending":
+                raise ValueError("这个评测集已经不在等待了")
+            item.pop("waiting", None)
+            item.update(status="skipped", finished_at=now())
+            self.save(record)
+        self.wake()
+        return {"id": record["id"], "index": index, "status": item["status"]}
+
+    def stop_item(self, profile: Any, index: Any) -> Dict[str, Any]:
+        """Stop the running dataset; the queue goes on with the next one."""
+        with self.lock:
+            record, item = self.record_item(profile, index)
+            if item["status"] != "running" or not item.get("run"):
+                raise ValueError("这个评测集没有在运行")
+            self.runs.cancel(item["run"])
+        self.wake()
+        return {"id": record["id"], "index": index, "status": item["status"]}
+
+    def requeue_item(self, profile: Any, index: Any, tasks: List[str]) -> Dict[str, Any]:
+        """Queue an ended dataset again on its profile with `tasks`."""
+        with self.lock:
+            record, item = self.record_item(profile, index)
+            if item["status"] not in ITEM_DONE:
+                raise ValueError("这个评测集还在等待或运行")
+            if not isinstance(item.get("request"), dict):
+                raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
+            if not tasks:
+                raise ValueError("这个评测集没有要运行的题")
+            again = {key: value for key, value in item.items() if key != "waiting"}
+            again.update(tasks=list(tasks), request={**item["request"], "tasks": list(tasks)}, status="pending",
+                         run=None, error=None, started_at=None, finished_at=None)
+            record = self._append({"id": record["id"]}, None, [again])
+        self.wake()
+        return public(record)
+
     # -------------------------------------------------------------- scheduler
 
     def advance(self) -> None:
