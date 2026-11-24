@@ -232,7 +232,7 @@ class InputDigestTest(Tree):
 
     def test_the_real_tree_has_a_digest(self) -> None:
         paths = release.input_paths(ROOT)
-        for expected in ("src/agentcore/abi_v1.zig", "sdk/metask/agentcore.h", "sdk/zig/types.zig", "scripts/agentcore_manifest.zig", "build.zig"):
+        for expected in ("packages/agentcore/abi_v1.zig", "sdk/metask/agentcore.h", "sdk/zig/types.zig", "scripts/agentcore_manifest.zig", "build.zig"):
             self.assertIn(expected, paths)
         for version_record in (contract.SDK_VERSION, contract.LEDGER, contract.SDK_CHANGELOG, common.VERSION_ZIG):
             self.assertNotIn(version_record, paths)

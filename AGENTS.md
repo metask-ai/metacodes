@@ -155,7 +155,7 @@ all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
 - Prove independence with an L2 test: `--preview=<name>` enables it,
   `--preview=<another feature>` and `--no-preview=<name>` leave it off, and a
   saved `{"preview": {"<name>": true}}` enables it
-  (`tests/component/state_env_test.zig` shows the pattern for the CLI).
+  (`apps/cli/tests/component/state_env_test.zig` shows the pattern for the CLI).
 - Document it in the same change: the feature table in
   [doc/API.md](doc/API.md#preview-features), the feature list in
   [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#preview-features), the `--preview`

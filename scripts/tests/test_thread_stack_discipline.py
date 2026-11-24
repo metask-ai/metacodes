@@ -24,18 +24,20 @@ ALLOWED = {Path("src/platform/thread.zig")}
 DIRECT_SPAWN = re.compile(r"\bThread\s*\.\s*spawn\s*\(")
 TEST_OPEN = re.compile(r"^(\s*)test\b.*\{\s*$")
 
-SOURCE_ROOTS = ("src", "apps")
+SOURCE_ROOTS = ("src", "apps", "packages")
 
 
 def zig_sources(root: Path) -> list[Path]:
-    """Root-relative paths of the Zig files under ``src/`` and ``apps/``, sorted."""
+    """Root-relative paths of the Zig files under ``src/``, ``apps/`` and ``packages/``, a package's ``tests/`` aside, sorted."""
     src = root / "src"
     if not src.is_dir():
         raise NotADirectoryError(str(src))
     found = []
     for name in SOURCE_ROOTS:
-        for current, _dirnames, filenames in os.walk(root / name):
+        for current, dirnames, filenames in os.walk(root / name):
             here = Path(current).relative_to(root)
+            if name != "src" and len(here.parts) == 2:
+                dirnames[:] = [d for d in dirnames if d != "tests"]
             found.extend(here / filename for filename in filenames if filename.endswith(".zig"))
     return sorted(path for path in found if path not in ALLOWED)
 

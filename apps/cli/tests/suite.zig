@@ -1,0 +1,87 @@
+//! Single compilation root for the CLI's component tests (`zig build test:cli`).
+//!
+//! Keep the inventory here as the source of truth. `build.zig` compiles this
+//! graph once and the deterministic runner partitions individual test names
+//! across processes, as it does for tests/integration_suite.zig.
+
+test {
+    _ = @import("component/provider_offer_test.zig");
+    _ = @import("component/metask_api_key_picker_test.zig");
+    _ = @import("component/credential_route_scope_test.zig");
+    _ = @import("component/provider_cli_key_scope_test.zig");
+    _ = @import("component/vendor_dialect_test.zig");
+    _ = @import("component/bedrock_converse_test.zig");
+    _ = @import("component/picker_reasoning_test.zig");
+    _ = @import("component/provider_oauth_login_test.zig");
+    _ = @import("component/chatgpt_codex_test.zig");
+    _ = @import("component/provider_key_login_test.zig");
+    _ = @import("component/custom_providers_cli_test.zig");
+    _ = @import("component/openrouter_login_test.zig");
+    _ = @import("component/kimi_code_provider_test.zig");
+    _ = @import("component/plugin_runtime_test.zig");
+    _ = @import("component/plugin_process_test.zig");
+    _ = @import("component/agent_session_permission_scope_test.zig");
+    _ = @import("component/frontend_capabilities_test.zig");
+    _ = @import("component/prompt_tool_coupling_test.zig");
+    _ = @import("component/base_url_flag_test.zig");
+    _ = @import("component/unknown_flag_test.zig");
+    _ = @import("component/cli_help_test.zig");
+    _ = @import("component/launcher_hint_test.zig");
+    _ = @import("component/state_env_test.zig");
+    _ = @import("component/preset_test.zig");
+    _ = @import("component/unbound_session_test.zig");
+    _ = @import("component/login_logout_test.zig");
+    _ = @import("component/next_step_test.zig");
+    _ = @import("component/verification_checkpoint_test.zig");
+    _ = @import("component/delivery_cadence_test.zig");
+    _ = @import("component/isolated_verifier_test.zig");
+    _ = @import("component/learning_end_of_run_test.zig");
+    _ = @import("component/headless_json_test.zig");
+    _ = @import("component/output_semantics_test.zig");
+    _ = @import("component/message_origin_test.zig");
+    _ = @import("component/startup_catalogs_test.zig");
+    _ = @import("component/mcp_background_startup_test.zig");
+    _ = @import("component/bounded_exit_test.zig");
+    _ = @import("component/mcp_permission_test.zig");
+    _ = @import("component/mcp_unavailable_notice_test.zig");
+    _ = @import("component/mcp_reconnect_test.zig");
+    _ = @import("component/mcp_hotplug_test.zig");
+    _ = @import("component/mcp_add_remove_test.zig");
+    _ = @import("component/cli_command_prompt_test.zig");
+    _ = @import("component/prompt_model_identity_test.zig");
+    _ = @import("component/max_tokens_exhaustion_test.zig");
+    _ = @import("component/symbol_capability_test.zig");
+    _ = @import("component/kg_integration_test.zig");
+    _ = @import("component/formal_kernel_test.zig");
+    _ = @import("component/goal_state_test.zig");
+    _ = @import("component/usage_report_test.zig");
+    _ = @import("component/auth_test.zig");
+    _ = @import("component/render_region_test.zig");
+    _ = @import("component/vterm_test.zig");
+    _ = @import("component/render_region_contract_test.zig");
+    _ = @import("component/redraw_window_contract_test.zig");
+    _ = @import("component/picker_frame_race_test.zig");
+    _ = @import("component/md_stream_convergence_test.zig");
+    _ = @import("component/ui_state_test.zig");
+    _ = @import("component/tui_clear_conversation_test.zig");
+    _ = @import("component/skill_overrides_test.zig");
+    _ = @import("component/skill_hotplug_test.zig");
+    _ = @import("component/comment_preview_entry_test.zig");
+    _ = @import("component/ui_render_test.zig");
+    _ = @import("component/ui_backend_test.zig");
+    _ = @import("component/openai_responses_test.zig");
+    _ = @import("component/diff_highlight_test.zig");
+    _ = @import("component/web_ui_test.zig");
+    _ = @import("component/web_message_config_test.zig");
+    _ = @import("component/web_auth_test.zig");
+    _ = @import("component/serve_sessions_test.zig");
+    _ = @import("component/swarm_process_test.zig");
+    _ = @import("component/session_api_parity_test.zig");
+    _ = @import("component/config_diagnostics_test.zig");
+    _ = @import("component/workspace_root_refresh_test.zig");
+    _ = @import("component/worktree_root_test.zig");
+    _ = @import("component/kg_state_test.zig");
+    _ = @import("component/jev_default_test.zig");
+    _ = @import("component/update_test.zig");
+    _ = @import("component/kgd_e2e_test.zig");
+}

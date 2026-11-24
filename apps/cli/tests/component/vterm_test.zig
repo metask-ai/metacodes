@@ -1,4 +1,4 @@
-//! L2: the component-test virtual terminal (tests/component/vterm.zig, #319)
+//! L2: the component-test virtual terminal (apps/cli/tests/component/vterm.zig, #319)
 //! behaves like tests/tty/screen.py, and its additions work.
 //!
 //! Parity: tests/fixtures/vterm/screen_parity.jsonl is screen.py's complete
@@ -14,7 +14,7 @@ const cc = @import("cc");
 const vterm = @import("vterm.zig");
 
 const testing = std.testing;
-const FIXTURE = @embedFile("../fixtures/vterm/screen_parity.jsonl");
+const FIXTURE = @embedFile("vterm_screen_parity");
 
 const Resize = struct { rows: usize, cols: usize, reflow: bool };
 const Op = struct { feed: ?[]const u8 = null, resize: ?Resize = null };

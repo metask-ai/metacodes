@@ -319,7 +319,7 @@ The cost is a cross-version contract. Every future release must accept
 `install --prefix --upgrade --sdk --allow-downgrade --release-base
 --checkout` with today's meaning, and every future `install.sh` must accept
 `--dev --source --prefix --no-link --no-sdk --allow-downgrade`.
-`tests/component/update_test.zig` asserts the first list against
+`apps/cli/tests/component/update_test.zig` asserts the first list against
 `install --help`, and `scripts/tests/test_install_scripts.py` asserts the
 second. The installer documentation names the contract, so removing a flag
 is a visible break.
@@ -471,7 +471,7 @@ Two repairs now cover it, and they write the same value:
    when a session reports `stale_pin`. A session that holds the old pin
    re-reads the file on its next probe. The full rule is
    doc/TINYKG_INTEGRATION.md, "A stale pin"; the L2 tests are the three
-   "stale pin" tests in `tests/component/kgd_e2e_test.zig`.
+   "stale pin" tests in `apps/cli/tests/component/kgd_e2e_test.zig`.
 
 ## 7. Windows
 
@@ -556,7 +556,7 @@ under the lock.
 | `scripts/install.sh`, `scripts/install.ps1` | pass `--release-base`, `--checkout` and `-ReleaseBase` to units that know them |
 | `apps/cli/src/app/archive_fixture.zig` | test-only `.tar.gz` and `.zip` writers (and raw tar headers for hard links and devices) |
 | `tests/_harness/update_unit_probe.zig`, `apps/cli/src/install_root.zig` | the fixture unit executable of §11 and the module root that gives it the installer |
-| `tests/component/update_test.zig`, `tests/component/kgd_e2e_test.zig` | the L2 evidence of §11 |
+| `apps/cli/tests/component/update_test.zig`, `apps/cli/tests/component/kgd_e2e_test.zig` | the L2 evidence of §11 |
 | `doc/INSTALL_DESIGN.md`, `doc/API.md` (CLI surface), `doc/GETTING_STARTED.md`, `README.md`, `CHANGELOG.md` | document `update` and `update_source`; correct the §4 sentence (§6.1) |
 
 ## 11. Evidence
@@ -575,7 +575,7 @@ Declaration = wiring = L2 (AGENTS.md).
 - `update_source` parsing and keeping;
 - process classification over a synthetic process table.
 
-**L2 (`tests/component/update_test.zig`):** a loopback HTTP server serves a
+**L2 (`apps/cli/tests/component/update_test.zig`):** a loopback HTTP server serves a
 fixture release (`/latest` 302, SUMS, an archive built in the test). The
 fixture unit's `bin/metacodes` is `zig-out/bin/update_unit_probe`, built on
 every platform. Its `install` runs the real installer
@@ -610,7 +610,7 @@ Each wiring point was mutation-checked: dropping `--release-base`, skipping
 the digest comparison, ignoring sessions or the service, skipping the repin,
 or downloading for an up-to-date install each turns a named test red.
 
-**L2, the §6.3 premise** (`tests/component/kgd_e2e_test.zig`): a real service
+**L2, the §6.3 premise** (`apps/cli/tests/component/kgd_e2e_test.zig`): a real service
 refuses a client holding a pin for other binaries, autostart would not start
 one for that state, and `kg install` repins it with the key kept.
 

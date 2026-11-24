@@ -14,7 +14,7 @@ const std = @import("std");
 const cc = @import("cc");
 const platform = @import("platform");
 const pfs = platform.fs;
-const tinykg_binary = @import("tinykg_binary.zig");
+const tinykg_binary = @import("tinykg_binary");
 
 const Supervisor = cc.kgd_server.Supervisor;
 const WebTransport = cc.kg_transport.WebTransport;

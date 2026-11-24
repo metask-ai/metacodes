@@ -62,7 +62,7 @@ INPUT_FILES = {
     "scripts/stage_quickjs_sources.py",
     "scripts/stage_ripgrep_binary.py",
 }
-INPUT_PREFIXES = ("src/", "lib/", "sdk/", "vendor/ripgrep/", "vendor/quickjs/", "deps/")
+INPUT_PREFIXES = ("src/", "packages/", "lib/", "sdk/", "vendor/ripgrep/", "vendor/quickjs/", "deps/")
 # What moves on every release without changing what AgentCore is: its own version
 # records, documents that ship nowhere, the package tests, and the main project's
 # version mirror, which the library compiles but no ABI call reports.

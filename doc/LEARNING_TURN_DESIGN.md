@@ -10,7 +10,7 @@ in `apps/cli/src/main.zig` (`resolveLearningTurn`), `apps/cli/src/repl/loop.zig`
 `control-plane/lean/MetaCodesControl/LearningTurn.lean`; the protocol in
 [learning-turn-v1.md](../evals/experiments/learning-turn-v1.md), not yet run.
 Tests: `tests/component/learning_turn_test.zig` and
-`tests/component/learning_end_of_run_test.zig`; record validation in
+`apps/cli/tests/component/learning_end_of_run_test.zig`; record validation in
 `scripts/eval/workbuddy/trace.py`. §12 lists where the implementation
 departs from the design text below; where they disagree, §12 and the code
 are current. The design is the first of three borrowings from RSIAgent

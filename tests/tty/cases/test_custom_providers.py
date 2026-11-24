@@ -8,7 +8,7 @@ open, check it at the endpoint's model listing, and store it in the
 provider's own key file. A server that needs no key gets the placeholder
 `none` in its place, so it starts. A local mock stands in for the relay;
 nothing goes anywhere else. The non-terminal paths are covered by
-tests/component/custom_providers_cli_test.zig.
+apps/cli/tests/component/custom_providers_cli_test.zig.
 
 `_cli`, which runs the CLI on a pty here, is checked on its own against
 small Python children: the exit code it reports is the child's, also when

@@ -6,7 +6,7 @@
 | 层 | 内容 | 主要命令 | 依赖 |
 |---|---|---|---|
 | L1 单元 | `src/**/*.zig` 内联 `test` 块 + `tests/unit/` spike | `zig build test:lib` | std + testing.allocator |
-| L2 组件 | `tests/component/*.zig`(mock HTTP / pty / 子进程) | `zig build test:spike` | 进程内 mock SSE server |
+| L2 组件 | `tests/component/*.zig`(mock HTTP / pty / 子进程);只测 cli 的在 `apps/cli/tests/component/` | `zig build test:spike`;cli 的用 `zig build test:cli` | 进程内 mock SSE server |
 | L3 集成 | `tests/integration/*.zig`(真 fs、真子进程、真本地 TinyKG) | 同上,或 `zig build test:integration-monolithic` 单进程对照 | tmp 目录 + bundled TinyKG |
 | L4 合约/门禁 | AgentCore ABI、TinyKG 边界、eval 框架、平台层 | `zig build agentcore:test` / `test:tinykg-binary` / `test:eval` / `test:platform` | 见下 |
 | 契约快照 | `tests/contract/`:对外承诺的字节(见下方"契约快照") | `zig build test:contract` | 已安装的 CLI + 回放 mock provider,全部离线 |
@@ -27,6 +27,7 @@ zig build test:lib-monolithic    # 单进程诊断/与分片基线对照
 zig build test:lib-times         # 逐测试耗时、slow buckets 与 top-N
 zig build test:lib-shard-harness # 分片归属与汇总器负例
 zig build test:spike             # 聚合 component/integration 套件(8 分片)
+zig build test:cli               # cli 包的测试:apps/cli/src 内联测试、picker 根、apps/cli/tests 组件套件(8 分片)、termios spike;属于 test:units
 zig build test:integration-times # 聚合 L2/L3 逐测试耗时
 zig build test:integration-monolithic # 聚合 L2/L3 单进程对照
 zig build test:eval              # harness 评估框架(Python 合同测试 + 原生零付费 smoke)
@@ -69,8 +70,8 @@ tests/
 │   ├── mock_sse_server.zig  进程内 TCP SSE server
 │   ├── fixture_loader.zig
 │   └── diff.zig             彩色 diff 输出
-├── unit/                    独立 spike 单元(termios、stream reader)
-├── component/               组件测试(mock HTTP / pty)
+├── unit/                    独立 spike 单元(stream reader)
+├── component/               组件测试(mock HTTP / pty);用到的最高一层是 cli 的在 apps/cli/tests/
 ├── integration/             集成测试(子进程、真 fs)
 ├── integration_suite.zig    聚合 L2/L3 的 inventory source of truth
 ├── contract/                对外契约快照(test:contract):ABI、Zig API、请求字节、事件流、落盘格式、CLI
@@ -80,13 +81,19 @@ tests/
 ├── fixtures/ helpers/       数据与辅助
 ```
 
-新增 component/integration 测试文件必须登记进 `tests/integration_suite.zig`
+新增 component/integration 测试文件必须登记进 `tests/integration_suite.zig`;
+`apps/cli/tests/component/` 下的登记进 `apps/cli/tests/suite.zig`
 (build graph 会在构建期强制检查,漏登记直接失败)。
 
-TUI 渲染的组件测试断言"终端最后显示什么",不断言字节序:`component/vterm.zig` 是
+组件测试按「用到的最高一层」放:用到 cli 的(`cc` 里来自 `apps/cli/src` 的声明、`main.zig`
+里的 `parseArgsForTest` 等函数,或经 `METACODES_TEST_CLI_BIN` 只测 CLI 自身的 help、preset)放
+`apps/cli/tests/component/`,其余留在 `tests/component/`。`apps/cli/tests/` 在 `layers.zon` 里属于
+`tests` 包(可以用 harness),但只改它的 PR 由 `scripts/ci_scope.py` 算作 cli 包的改动,跑 `test:cli`。
+
+TUI 渲染的组件测试断言"终端最后显示什么",不断言字节序:`apps/cli/tests/component/vterm.zig` 是
 `tty/screen.py` 的 Zig 移植(行列网格、光标、SGR、ED/EL、autowrap pending-wrap、DEC 2026 帧、
 alt-screen、宽字符、底部滚入 scrollback,外加有界的 scrollback 内容缓冲),
-`component/region_harness.zig` 把真实 `RenderRegion` 的输出(`RenderRegion.sink`)经 tty 的
+`apps/cli/tests/component/region_harness.zig` 把真实 `RenderRegion` 的输出(`RenderRegion.sink`)经 tty 的
 ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollback,不读内部字段。
 用例:`render_region_contract_test.zig`(emit/erase 成对、半行续接、阶段交接、窄终端 footer)、
 `md_stream_convergence_test.zig`(助手 markdown 流在任意切分下收敛到整段渲染)。

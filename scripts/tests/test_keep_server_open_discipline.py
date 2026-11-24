@@ -14,7 +14,7 @@ ASKS_TO_KEEP_OPEN = re.compile(r"\bhttp_connection\s*\.\s*keepServerOpen\s*\(")
 SENDS = re.compile(r"\bhttp_connection\s*\.\s*(sendBodiless|sendBodyComplete)\s*\(")
 MIN_REQUESTS = 11
 
-SOURCE_ROOTS = ("src", "apps")
+SOURCE_ROOTS = ("src", "apps", "packages")
 
 
 def zig_sources(root: Path) -> list[Path]:
@@ -23,8 +23,10 @@ def zig_sources(root: Path) -> list[Path]:
         raise NotADirectoryError(str(src))
     found = []
     for name in SOURCE_ROOTS:
-        for current, _dirnames, filenames in os.walk(root / name):
+        for current, dirnames, filenames in os.walk(root / name):
             here = Path(current).relative_to(root)
+            if name != "src" and len(here.parts) == 2:
+                dirnames[:] = [d for d in dirnames if d != "tests"]
             found.extend(here / filename for filename in filenames if filename.endswith(".zig"))
     return sorted(path for path in found if path != HELPER)
 

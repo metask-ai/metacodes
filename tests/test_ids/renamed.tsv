@@ -6,3 +6,6 @@
 @src.session_service	@apps.cli.src.session_service
 @src.session_intent	@apps.cli.src.session_intent
 @src.picker_test_root	@apps.cli.src.picker_test_root
+@src.agentcore	@packages.agentcore
+@tests.component	@apps.cli.tests.component
+@tests.unit	@apps.cli.tests.unit

@@ -36,7 +36,9 @@ Scopes, narrowest first:
   entry left in layer_baseline.zon and a `test:<package>` build step. Only
   then is the declared dependency graph the real one, so the unit step runs
   `package_tests` (those steps) instead of `test:units`; integration,
-  product, TTY and the contract snapshots still run.
+  product, TTY and the contract snapshots still run. A test kept inside a
+  product package's directory (`apps/cli/tests/`, in the `tests` package of
+  layers.zon) is that package's change: its `test:<package>` runs it.
 - `full`: anything else, every manual run, an empty diff, a `migration`
   pull request (its test IDs are compared on a complete run), a package with
   a baseline entry or without its test step anywhere in the affected set,
@@ -164,13 +166,24 @@ class Layout:
     test_steps: frozenset
     build_suites: frozenset = frozenset()
 
-    def owner(self, path: str) -> Optional[str]:
+    def owner(self, path: str, among: Optional[Sequence[str]] = None) -> Optional[str]:
         best, best_len = None, -1
         for entry, package in self.paths:
+            if among is not None and package not in among:
+                continue
             matches = path.startswith(entry) if entry.endswith("/") else path == entry
             if matches and len(entry) >= best_len:
                 best, best_len = package, len(entry)
         return best
+
+    def package(self, path: str) -> Optional[str]:
+        """The product package whose tests a change to `path` selects: its
+        owner, or for a test kept inside a product package's directory
+        (apps/cli/tests/ in cli's apps/cli/), that package."""
+        owner = self.owner(path)
+        if owner in TEST_PACKAGES:
+            return self.owner(path, among=self.products)
+        return owner if owner in self.products else None
 
     @property
     def products(self) -> Tuple[str, ...]:
@@ -237,11 +250,10 @@ def path_kind(path: str, layout: Optional[Layout], release_sources: Sequence[str
         return "script-test" if "/" not in name and name.startswith("test_") and name.endswith(".py") else "full"
     if layout is None:
         return "full"
-    owner = layout.owner(path)
-    if owner == TESTS_PACKAGE:
-        return "tty-test" if path.startswith(TTY_TESTS) else "suite-test"
-    if owner in layout.products:
+    if layout.package(path) is not None:
         return "package"
+    if layout.owner(path) == TESTS_PACKAGE:
+        return "tty-test" if path.startswith(TTY_TESTS) else "suite-test"
     return "full"
 
 
@@ -262,7 +274,7 @@ def classify(paths: Sequence[str], deleted: Sequence[str] = (), *,
     unknown = [path for path in outside if kinds[path] == "full"]
     if unknown:
         return "full", f"full scope: {_shown(unknown)} can affect every suite"
-    changed = {layout.owner(path) for path in outside if kinds[path] == "package"}
+    changed = {layout.package(path) for path in outside if kinds[path] == "package"}
     if not changed:
         return "tests", f"tests scope: only tests changed ({_shown(outside)}); only the suites they belong to run"
     affected = layout.affected(sorted(changed))
@@ -315,7 +327,7 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
         tty = any(kind in ("tty-test", "suite-test") for kind in kinds.values())
         chosen = Selection(suites=True, tty=tty, units=units, product=suites)
     else:
-        affected = layout.affected(sorted({layout.owner(path) for path, kind in kinds.items() if kind == "package"}))
+        affected = layout.affected(sorted({layout.package(path) for path, kind in kinds.items() if kind == "package"}))
         package_tests = () if units else tuple(f"test:{package}" for package in affected)
         chosen = Selection(suites=True, tty=True, units=True, product=True, packages=affected, package_tests=package_tests)
     if chosen.complete:

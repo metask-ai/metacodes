@@ -177,7 +177,7 @@ CoreEvent/UiEvent/UiBackend 纯数据 + 函数指针,不碰 fd。因此:
 - **mock backend**(收 CoreEvent 进 ArrayList)→ 跑一轮真 agent_loop(MockServer cassette)→
   断言事件序列。**agent_loop 现在能不起终端、用 mock backend 纯测**。
 - **字节锁单测**:喂每个 CoreEvent 给 backend,断言输出 == legacy 串常量(重构时锁死字节精确)。
-- 见 `tests/component/ui_backend_test.zig`(字节锁)、`tests/component/ui_multifrontend_test.zig`
+- 见 `apps/cli/tests/component/ui_backend_test.zig`(字节锁)、`tests/component/ui_multifrontend_test.zig`
   (mock backend 跑 agent_loop + HeadlessBackend JSON 全链)。
 
 ## 7. 工程方法论沉淀(本次落地总结)

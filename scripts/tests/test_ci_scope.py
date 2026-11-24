@@ -418,6 +418,15 @@ class LayoutTest(unittest.TestCase):
         self.assertNotIn("tests", layout.products)
         self.assertNotIn("testing", layout.products)
         self.assertEqual(layout.affected(["base"]), layout.products)
+        # A change confined to the cli package, sources or tests, runs test:cli.
+        for path in ("apps/cli/src/repl/tui/widget/status_bar.zig", "apps/cli/tests/component/ui_render_test.zig"):
+            with self.subTest(path=path):
+                changes = [("M", path)]
+                scope, reason = ci_scope.classify([path], layout=layout)
+                self.assertEqual(scope, "packages", reason)
+                chosen = ci_scope.select(scope, changes, layout)
+                self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
+                self.assertTrue(chosen.product and chosen.tty)
         self.assertEqual(layout.owner("src/core/agent_loop.zig"), "kernel")
         self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
         self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
@@ -515,6 +524,17 @@ class LayoutTest(unittest.TestCase):
                                                      for entry, owner in moved.paths))
         self.assertEqual(moved.affected(["mid"]), ("mid", "top"))
         self.assertEqual(ci_scope.classify(["apps/top/main.zig"], layout=moved)[0], "packages")
+        # A test kept inside a package directory selects that package.
+        layout = ci_scope.replace(moved, paths=moved.paths + (("apps/top/tests/", "tests"),))
+        self.assertEqual(layout.owner("apps/top/tests/component/a_test.zig"), "tests")
+        self.assertEqual(layout.package("apps/top/tests/component/a_test.zig"), "top")
+        self.assertIsNone(layout.package("tests/component/a_test.zig"))
+        self.assertIsNone(layout.package("tests/helpers/fake.zig"))
+        changes = [("M", "apps/top/tests/component/a_test.zig")]
+        scope, _ = ci_scope.classify([path for _, path in changes], layout=layout)
+        self.assertEqual(scope, "packages")
+        self.assertEqual(ci_scope.select(scope, changes, layout).package_tests, ("test:top",))
+        self.assertEqual(ci_scope.classify(["tests/component/a_test.zig"], layout=layout)[0], "tests")
 
     def test_a_migration_pull_request_is_the_full_scope(self) -> None:
         def diff(base, candidate):
@@ -1204,7 +1224,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, ["git fetch -q --depth=1 origin " + "m" * 40, "git diff --name-only %s HEAD" % ("m" * 40)])
         self.assertIn("relevant=false", output)
-        proc, _, output = self.run_step("merge_group", "src/agentcore/abi_v1.zig")
+        proc, _, output = self.run_step("merge_group", "packages/agentcore/abi_v1.zig")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("relevant=true", output)
 
