@@ -516,7 +516,6 @@ function renderTask(body, name, content) {
     if (j.final_text !== undefined || j.tool_calls !== undefined) {
       let s = "Done (" + (j.tool_calls || 0) + " tool use" + (j.tool_calls === 1 ? "" : "s");
       if (j.tokens) s += " · " + fmtTokens(j.tokens) + " tokens";
-      if (j.elapsed_ms) s += " · " + Math.round(j.elapsed_ms / 1000) + "s";
       s += ")"; body.appendChild(sumline(s, false, "dim"));
       if (j.final_text) body.appendChild(detailBlock("subagent output", unesc(j.final_text), false));
       return;
