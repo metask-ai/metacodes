@@ -626,7 +626,7 @@ fn growth(
         for (package.allowed_dependencies) |dependency| {
             const allowed_before = base.manifest.packages[before].allowed_dependencies;
             if (indexOfPath(allowed_before, dependency) < allowed_before.len) continue;
-            if (base_layers.index(dependency) == null and reachesNoFurther(layers, base_layers, files, dependency, before)) continue;
+            if (base_layers.index(dependency) == null and try reachesNoFurther(arena, io, base, layers, base_layers, files, dependency, before)) continue;
             problems += 1;
             std.debug.print("layers.zon: `{s}` newly allows `{s}`; allowed_dependencies do not widen\n", .{ package.name, dependency });
         }
@@ -645,7 +645,16 @@ fn exposedBySplit(arena: std.mem.Allocator, io: std.Io, base: Base, base_layers:
     return false;
 }
 
-fn reachesNoFurther(layers: Layers, base_layers: Layers, files: []const SourceFile, new_package: []const u8, before: usize) bool {
+fn reachesNoFurther(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base: Base,
+    layers: Layers,
+    base_layers: Layers,
+    files: []const SourceFile,
+    new_package: []const u8,
+    before: usize,
+) !bool {
     const added = layers.index(new_package).?;
     for (layers.manifest.packages[added].allowed_dependencies) |dependency| {
         const target = base_layers.index(dependency) orelse return false;
@@ -655,6 +664,7 @@ fn reachesNoFurther(layers: Layers, base_layers: Layers, files: []const SourceFi
         if (layers.owner(file.path) != added) continue;
         const owner_before = base_layers.owner(file.path) orelse return false;
         if (!base_layers.mayDepend(before, owner_before)) return false;
+        if (try base.source(arena, io, file.path) == null) return false;
     }
     return true;
 }
@@ -1166,4 +1176,21 @@ test "a new package may not take files from paths the base did not own" {
     };
     const base = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &withFile("src/repl/leaf.zig", "") };
     try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, leaf_layers, test_baseline, "module\tsrc/util/platform.zig\n", base));
+}
+
+test "a new package may not take files the base tree did not have, even under a path it assigned" {
+    const tree = withFile("src/core/leaf/view.zig", "");
+    const leaf_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"leaf\", .paths = .{\"src/core/leaf/\"}, .allowed_dependencies = .{} },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"leaf\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const wiring = "module\tsrc/util/platform.zig\n";
+    const moved = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &withFile("src/repl/leaf.zig", "") };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, leaf_layers, test_baseline, wiring, moved));
+    const kept = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &tree };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, leaf_layers, test_baseline, wiring, kept));
 }
