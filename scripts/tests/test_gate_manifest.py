@@ -175,6 +175,8 @@ class GateManifestTest(unittest.TestCase):
         self.assertIn('@import("test_id_record.zig")', (ROOT / "scripts" / "sharded_test_runner.zig").read_text(encoding="utf-8"))
         self.assertIn('@import("test_id_record.zig")', (ROOT / "scripts" / "recording_test_runner.zig").read_text(encoding="utf-8"))
         self.assertEqual(build.count("b.addTest("), 6, "a new test binary goes through addRecordedTest")
+        self.assertIn('recorded.test_runner = .{ .path = b.path("scripts/recording_test_runner.zig"), .mode = .server };', build,
+                      "server mode keeps --test-timeout")
         self.assertIn("units_test_step.dependOn(&test_id_fixture_check.step);", build)
         self.assertIn("run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
         self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
