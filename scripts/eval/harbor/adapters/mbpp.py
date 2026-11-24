@@ -44,7 +44,6 @@ SUITE = {
     "description": "Google MBPP（full 配置）测试集 500 题：按题目描述与示例断言编写 Python 函数，三条断言全部通过得 1 分。",
     "default_tasks": ["mbpp-11", "mbpp-100", "mbpp-250", "mbpp-400", "mbpp-510"],
     "max_tasks": 200,
-    "max_concurrency": 16,
     "arch": "amd64, arm64 (python:3.12-slim-bookworm multi-arch)",
 }
 

@@ -489,8 +489,8 @@ class RunManager:
         tasks = suites.validate_tasks(suite, ctx, request.get("tasks"), known=self.node_tasks(suite, state["name"]))
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
-            if type(value) is not int or not 1 <= value <= limit:
-                raise ValueError(f"{name} 必须是 1–{limit} 的整数")
+            if type(value) is not int or value < 1 or (limit is not None and value > limit):
+                raise ValueError(f"{name} 必须是 1–{limit} 的整数" if limit is not None else f"{name} 必须是正整数")
         if dry_run:
             problem = self.run_bundle(settings(self.config_path), frozen, bundle)[1]
             if problem:

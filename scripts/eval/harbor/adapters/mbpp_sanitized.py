@@ -35,7 +35,6 @@ SUITE = {
     "description": "Google MBPP 人工校订版（sanitized 配置）测试集 257 题：题面与断言更规范，三条断言全部通过得 1 分。",
     "default_tasks": ["mbpp-sanitized-11", "mbpp-sanitized-101", "mbpp-sanitized-245", "mbpp-sanitized-410", "mbpp-sanitized-479"],
     "max_tasks": 200,
-    "max_concurrency": 16,
     "arch": "amd64, arm64 (python:3.12-slim-bookworm multi-arch)",
 }
 

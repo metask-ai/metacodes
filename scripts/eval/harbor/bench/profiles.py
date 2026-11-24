@@ -31,7 +31,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from scripts.eval.harbor import live_concurrency, suites
+from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
@@ -294,8 +294,8 @@ class ProfileManager:
             raise ValueError(f"每次需要 1–{MAX_ITEMS} 个评测集")
         name = checked_name(request.get("name"))
         concurrency = request.get("concurrency", 1)
-        if type(concurrency) is not int or not 1 <= concurrency <= 16:
-            raise ValueError("concurrency 必须是 1–16 的整数")
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("concurrency 必须是正整数")
         target = self.target(request)
         seen, planned = set(), []
         for item in items:
@@ -308,7 +308,7 @@ class ProfileManager:
             for model in models:
                 run_request = {"suite": suite.id, "model": model, "tasks": item.get("tasks"),
                                "attempts": request.get("attempts", 1),
-                               "concurrency": min(concurrency, suite.max_concurrency)}
+                               "concurrency": suites.capped_concurrency(suite, concurrency)}
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
                 planned.append(self.planned(target, run_request, request.get("executor"), label))
         return self.append(target, name, planned)
@@ -429,8 +429,8 @@ class ProfileManager:
         return {"id": record["id"], "name": name}
 
     def set_concurrency(self, profile: Any, concurrency: Any) -> Dict[str, Any]:
-        if type(concurrency) is not int or not 1 <= concurrency <= live_concurrency.MAX_CONCURRENCY:
-            raise ValueError(f"concurrency 必须是 1–{live_concurrency.MAX_CONCURRENCY} 的整数")
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("concurrency 必须是正整数")
         with self.lock:
             record = self.get(profile)
             if record is None:
@@ -441,7 +441,7 @@ class ProfileManager:
             for item in record["items"]:
                 if item["status"] not in ("pending", "running"):
                     continue
-                applied = min(concurrency, suites.resolved(suites.get(item["suite"])).max_concurrency)
+                applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
                 if item["status"] == "running" and item.get("run") in active:
                     self.runs.set_concurrency(item["run"], applied)
                 item["concurrency"] = applied

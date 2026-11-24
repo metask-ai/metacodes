@@ -64,8 +64,8 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
-Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
-the WorkBuddy subsets and the small-task adapters allow up to 16, GAIA2 2). The page starts at 4 runs
+Each task runs 1–5 times; concurrency has no upper limit (GAIA2 caps it at
+2 and ALFWorld at 10). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
@@ -198,7 +198,7 @@ in `ADAPTER_SUITES` (its id and category are authoritative) and listed in
 ```python
 SUITE_ID = "humaneval"                                 # the catalog id
 SUITE = {"name": "HumanEval", "description": "…", "default_tasks": [...],
-         "max_tasks": 164, "max_concurrency": 16, "arch": "amd64, arm64"}  # all optional
+         "max_tasks": 164, "max_concurrency": 4, "arch": "amd64, arm64"}  # all optional
 HOST_ENV = ("OPENAI_API_KEY",)        # optional: verifier env, forwarded to SSH executors
 JUDGE = {"default_model": "glm-5.3-flash",            # optional: an OpenAI-compatible LLM
          "env": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL",   # judge, routed
@@ -1078,7 +1078,7 @@ profile is run on as often as wanted. The 评测 page picks the version (the
 configured Linux bundle by default, or any valid bundle under
 `<state root>/bench/bundles/`, including those `metacodes bench build --ref`
 builds), the advanced features, several suites with their tasks, the model,
-attempts and concurrency (capped per suite). The profile's id is derived from
+attempts and concurrency (no upper limit unless a suite sets `max_concurrency`). The profile's id is derived from
 the bundle's content digest and the features, so the same version with the
 same features always lands on the same profile, and changing either is
 another profile. The first run on a profile validates every dataset, then
@@ -1223,9 +1223,9 @@ stays pending, with the reason in its `waiting` field, and is retried until the 
 answers. After 30 minutes it fails, and the queue moves on.
 
 While a profile runs, its concurrency can be changed (`POST /api/profile/concurrency`
-with `id` and `concurrency`, 1–16; 并发数 on its page). The value is capped per
-suite and applies to the running dataset at once and to the datasets still
-waiting in the queue. Lowering it lets the trials already running finish;
+with `id` and `concurrency`, any positive integer; 并发数 on its page). A suite's
+`max_concurrency`, when set, caps it. The value applies to the running dataset
+at once and to the datasets still waiting in the queue. Lowering it lets the trials already running finish;
 raising it starts more within about a second. The workbench writes the value
 to `<jobs>/.bench-runs/<run>.concurrency`; on an SSH executor the worker sends
 it over the run's control channel and the node writes it beside the run's

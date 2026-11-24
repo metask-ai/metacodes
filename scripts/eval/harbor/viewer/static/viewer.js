@@ -471,7 +471,7 @@ async function renderProfile(id) {
 
 function concurrencyControl(b, item) {
   if (!b.can_run || !profileActive(b)) return h('span', { class: 'mono', text: String(item.concurrency ?? '—') });
-  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, max: 16, step: 1, required: true, value: item.concurrency ?? '',
+  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: item.concurrency ?? '',
     'aria-label': '并发数', onfocus: () => { state.editing = true; },
     onblur: () => { if (input.value === String(item.concurrency ?? '')) state.editing = false; } });
   const feedback = h('span', { class: 'muted', role: 'status', text: '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中的评测集也按新值运行' });
@@ -649,7 +649,7 @@ async function renderNewRun() {
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
-  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, max: 16, step: 1, required: true,
+  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, step: 1, required: true,
     oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,

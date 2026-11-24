@@ -91,7 +91,10 @@ fn ended(app: *app_mod.App, what: []const u8, id: types.RunId) void {
 
 fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session, explicit: []const u8) void {
     if (explicit.len == 0 and session.job != null) {
-        if (showProgress(app, allocator, &session.board)) return;
+        if (showProgress(app, allocator, &session.board)) {
+            showResumeHint(session.job.?);
+            return;
+        }
     }
     const id = if (explicit.len != 0)
         types.RunId.parse(explicit) catch {
@@ -108,6 +111,16 @@ fn showStatus(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
     command.status(arena_state.allocator(), app.stateRoot(), id) catch |err| {
         cmd_output.print("{s}/teamwork status {s}: {s}{s}\n", .{ app.theme.danger, id.slice(), @errorName(err), app.theme.reset });
     };
+}
+
+fn showResumeHint(job: *command.Background) void {
+    if (!job.finished()) return;
+    const run = job.run orelse return;
+    switch (run.state) {
+        .budget_exhausted => |paused| if (paused != null)
+            cmd_output.print("The run paused at its ${d} cap; the worktree is kept. Approve a higher cap and continue with: metacodes --preview teamwork resume {s} --approve --budget-usd <dollars>\n", .{ run.ledger.cap_usd, job.id.slice() }),
+        else => {},
+    }
 }
 
 fn showProgress(app: *app_mod.App, allocator: std.mem.Allocator, board: *progress.Board) bool {
