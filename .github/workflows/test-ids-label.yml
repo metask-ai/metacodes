@@ -1,0 +1,27 @@
+name: Test IDs label
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: test-ids-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    name: Refresh the test ID comparison
+    if: github.event.label.name == 'migration'
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Re-run Test IDs (Linux) once the head's CI run finishes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/test_ids.py refresh --repository "$GITHUB_REPOSITORY" --head-sha "$HEAD_SHA" --wait-minutes 100

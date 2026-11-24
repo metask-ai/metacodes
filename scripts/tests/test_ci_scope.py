@@ -62,7 +62,7 @@ LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("gates-macos-
 # job whose legs or shards each one reports. Gates (macOS) and Gates (Windows)
 # report where the gates ran, a pool or the hosted legs: test_ci_pool_plan.py.
 RESULT_JOBS = {
-    "Gates (Linux)": "gates-linux",
+    "Gates (Linux)": ["gates-linux", "test-ids"],
     "Gates (macOS)": ["runner-plan", "gates-macos-watch", "gates-macos"],
     "Gates (Windows)": ["runner-plan", "windows-gates-watch", "windows-gates"],
     "TTY (Linux)": "tty-linux",
@@ -486,12 +486,30 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(spec["needs"], legs)
                 # Never skipped: a skipped job passes a required check.
                 self.assertEqual(spec["if"], "${{ always() }}")
-                if name not in ("Gates (macOS)", "Gates (Windows)"):
-                    self.assertEqual(spec["steps"], self.jobs["gates-linux-result"]["steps"])
+                if name not in ("Gates (Linux)", "Gates (macOS)", "Gates (Windows)"):
+                    self.assertEqual(spec["steps"], self.jobs["tty-linux-result"]["steps"])
+
+    @unittest.skipIf(os.name == "nt", "bash and jq")
+    def test_gates_linux_passes_only_when_its_legs_and_the_test_id_comparison_did(self) -> None:
+        step = self.jobs["gates-linux-result"]["steps"][0]
+        self.assertEqual(step["env"]["NEEDS"], "${{ toJSON(needs) }}")
+        for legs, test_ids, passes in (
+            ("success", "success", True),
+            ("success", "skipped", True),
+            ("success", "failure", False),
+            ("success", "cancelled", False),
+            ("failure", "skipped", False),
+            ("skipped", "skipped", False),
+        ):
+            needs = {"gates-linux": {"result": legs}, "test-ids": {"result": test_ids}}
+            with self.subTest(needs=needs):
+                proc = subprocess.run([*BASH, step["run"]], env=dict(os.environ, NEEDS=json.dumps(needs)),
+                                      capture_output=True, text=True)
+                self.assertEqual(proc.returncode == 0, passes, proc.stdout + proc.stderr)
 
     @unittest.skipIf(os.name == "nt", "bash and jq")
     def test_a_result_job_passes_only_when_every_leg_succeeded(self) -> None:
-        step = self.jobs["gates-linux-result"]["steps"][0]
+        step = self.jobs["tty-linux-result"]["steps"][0]
         self.assertEqual(step["env"]["NEEDS"], "${{ toJSON(needs) }}")
         cases = (
             ({"gates-linux": {"result": "success", "outputs": {}}}, True),

@@ -157,44 +157,55 @@ Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成
 被换成了另一个,或者悄悄不再执行。
 
 设置了 `METACODES_TEST_IDS_DIR` 时,测试运行器把每个跑过的测试记一行(`pass`、`skip`、`fail`
-分开记):
+分开记),每个进程一个文件:
 
-| 来源 | 记录方 | ID |
+| 来源 | 记录方 | ID 和位置 |
 |---|---|---|
-| Zig core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig`,每个分片一个 `zig-<套件>-<优化模式>-<i>of<n>.tsv` | `zig:<test 名>`:去掉文件和命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 都记为 `zig:<unnamed>` |
-| `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,去掉模块路径 |
+| core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig` | `zig:<test 名>`,去掉命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 记为 `zig:<unnamed>`。位置是命名空间的最后一段,一般就是文件名(`agent_loop`) |
+| 其余所有 Zig 测试二进制(`cc-test`、`provider-test`、`mcp-test`、`lsp-test`……) | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
+| `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,位置是模块名的最后一段 |
 | `scripts/eval/tests` | `scripts/eval/tests/run_shard.py` | 同上 |
-| TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,只报告,不强制 |
+| TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,位置是文件名;只报告,不强制 |
 
-ID 不含路径和模块前缀,所以只搬文件不会改变 ID。同名的测试按次数计:两个都叫 `zig:basic` 的
-测试删掉一个,也算少了一个。同一个测试在几个步骤里都跑(比如 Debug 和 ReleaseSafe 的 core
-套件),次数照实累加,base 和 head 在同样的 CI 布局下比较。`time_test_runner.zig` 是诊断入口,不记录;
-用 Zig 默认运行器的测试二进制暂时不在 ID 集合里:`test:units` 里 Debug 的 `cc-test`(`src/` 全图,含 CLI 层),以及 `test:provider`、`test:mcp`、`test:picker`、`test:lsp`、`test:platform` 等隔离根。`src/` 里经 `src/lib.zig` 可达的测试由 CI checks 腿上 ReleaseSafe 的 core 套件记录。
+两个运行器共用 `scripts/test_id_record.zig` 写记录。`time_test_runner.zig` 是诊断入口,不记录;
+CI 里直接 `zig test src/platform/platform.zig` 的那一步不经 build runner,也不记录。
+
+比较时一个测试的**键**:ID 在 base 和 head 里都只出现在一个位置时,键就是 ID,所以搬目录、
+改文件名都不会改变它;同一个 ID 出现在多个位置时(同名测试、无名 `test {}`),键是
+`<ID> @<位置>`,这样两个同名测试换掉一个也能看出来,只换目录不改文件名的搬迁也不受影响。
+同一个键的测试按次数计;同一个测试在几个二进制里都跑(比如 `cc-test` 和 core 套件),次数照实累加,
+base 和 head 在同样的 CI 布局下比较。
 
 本地看一次完整离线测试的 ID 集合(各来源的条数打印到 stderr,和各套件的汇总行对得上):
 
 ```bash
 python3 scripts/test_ids.py run --output test-ids.tsv                 # 跑 zig build test
 python3 scripts/test_ids.py run --output lib.tsv -- zig build test:lib  # 只跑某一部分
-python3 scripts/test_ids.py compare --base before.tsv --head after.tsv [--enforce]
+python3 scripts/test_ids.py compare --base before.tsv --head after.tsv [--since <base 提交>] [--enforce]
 ```
 
-输出每行 `<ID>\t<pass|skip|listed>\t<次数>`,按 ID 排序。
+输出每行 `<ID>\t<位置>\t<pass|skip|listed>\t<次数>`,排好序。
 
 CI:Gates (Linux) 的 `units`、`product`、`checks` 三条腿在跑测试时顺手记录并上传,不多跑测试;
 `Test IDs (Linux)` 汇总成 `test-ids` artifact(保留 90 天),再和 base 比较,结果写进 job summary。
-base 的 ID 集合取合并出 base 提交的那个 PR 的 CI 产物(要求树相同),没有就取 main 最近一次
-nightly 或手动触发的 CI 产物,并在 summary 里注明是哪一次。
+必需检查 `Gates (Linux)` 等这个 job,它失败,`Gates (Linux)` 也失败。
 
 比较的规则:
 
 - base 跑过的测试,head 里次数变少,或者从 `pass` 变成 `skip`,都算**消失**;新增的测试允许。
-- 消失的 ID 要在 `tests/test_ids/renamed.tsv`(`<旧 ID>\t<新 ID>`,新 ID 在 head 里多出来的次数
-  抵掉旧 ID 少掉的)或 `tests/test_ids/removed.tsv`(`<ID>\t<删除原因>`)里说明。两个文件的格式由
-  `scripts/test_ids.py check` 检查,它在 `gate:static` 里;自测 `scripts.tests.test_test_ids` 在 `test:units`。
-- PR 带 `migration` 标签时,未说明的消失让 `Test IDs (Linux)` 失败,并列出 ID;其他 PR 只出报告。
-  base 没有记录时,migration PR 也失败:在 main 上手动触发一次 CI 再重跑这个 job。
-- 说明条目合并后留在文件里不影响后续 PR,summary 会把用不上的条目列成 Unused,下一个迁移 PR 可以清掉。
+- 消失的键要在**本 PR 新增或改动的**说明里列出:`tests/test_ids/renamed.tsv`(`<旧键>\t<新键>`,
+  新键在 head 里多出来的次数抵掉旧键少掉的)或 `tests/test_ids/removed.tsv`(`<键>\t<删除原因>`)。
+  base 里已有的条目不算数,旧理由不能替新的删除放行。两个文件的格式由 `scripts/test_ids.py check`
+  检查,它在 `gate:static` 里;自测 `scripts.tests.test_test_ids` 和 `test-id-record` 在 `test:units`。
+- PR 带 `migration` 标签时强制执行:未说明的消失让 `Test IDs (Linux)`、进而让 `Gates (Linux)` 失败,
+  并列出键。其他 PR 只出报告。
+- base 的 ID 集合取合并出 base 提交的那个 PR 的 CI 产物,或者 main 上该提交的 nightly、手动触发
+  的 CI 产物,都要求树和 base 相同。找不到时,普通 PR 退而用 main 最近一次的产物出报告;
+  migration PR 直接失败:等 main 的头就是 PR 的 base 时在 main 上手动触发一次 CI
+  (`gh workflow run ci.yml --ref main`),再重跑这个 job。
+- CI 跑完后再加上或去掉 `migration` 标签时,`.github/workflows/test-ids-label.yml` 等这个 head 的
+  CI 跑完,重跑 `Test IDs (Linux)` 和等它的 `Gates (Linux)`,判定按新的标签刷新。
+  来自 fork 的 PR 没有重跑权限,这一步会失败,需要有权限的人手动重跑。
 
 ## 已知执行覆盖缺口(登记非沉默)
 

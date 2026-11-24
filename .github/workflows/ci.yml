@@ -1349,17 +1349,17 @@ jobs:
   # the same way so that it can become required.
   gates-linux-result:
     name: Gates (Linux)
-    needs: gates-linux
+    needs: [gates-linux, test-ids]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: &result-steps
-      - name: Every leg passed
+    steps:
+      - name: Every leg passed, and the test ID comparison where it ran
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -c 'map_values(.result)'
-          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
+          echo "$NEEDS" | jq -e '.["gates-linux"].result == "success" and (.["test-ids"].result == "success" or .["test-ids"].result == "skipped")' > /dev/null
 
   # Gates (macOS) and Gates (Windows) pass when the gates passed where they
   # ran: the pool job (through the watch), or the hosted legs
@@ -1396,7 +1396,13 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: *result-steps
+    steps: &result-steps
+      - name: Every leg passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -c 'map_values(.result)'
+          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
 
   tty-windows-result:
     name: TTY (Windows)
@@ -1428,6 +1434,7 @@ jobs:
           path: ${{ runner.temp }}/test-ids
           if-no-files-found: error
           retention-days: 90
+          overwrite: true
       - name: Compare with the base's test IDs
         if: github.event_name == 'pull_request'
         env:

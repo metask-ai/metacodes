@@ -172,7 +172,10 @@ class GateManifestTest(unittest.TestCase):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn("gate_static_step.dependOn(&test_ids_check_cmd.step);", build)
         self.assertIn("units_test_step.dependOn(&test_ids_test_cmd.step);", build)
-        self.assertIn("METACODES_TEST_IDS_DIR", (ROOT / "scripts" / "sharded_test_runner.zig").read_text(encoding="utf-8"))
+        self.assertIn('@import("test_id_record.zig")', (ROOT / "scripts" / "sharded_test_runner.zig").read_text(encoding="utf-8"))
+        self.assertIn('@import("test_id_record.zig")', (ROOT / "scripts" / "recording_test_runner.zig").read_text(encoding="utf-8"))
+        self.assertEqual(build.count("b.addTest("), 7, "a new test binary goes through addRecordedTest")
+        self.assertIn("needs: [gates-linux, test-ids]", workflow)
 
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")

@@ -9,11 +9,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 IDS_DIR_ENV = "METACODES_TEST_IDS_DIR"
@@ -25,40 +26,47 @@ RENAMED = Path("tests/test_ids/renamed.tsv")
 REMOVED = Path("tests/test_ids/removed.tsv")
 TTY_CASES = Path("tests/tty/cases")
 CI_WORKFLOW = "ci.yml"
+CI_JOB = "Test IDs (Linux)"
 ARTIFACT = "test-ids"
 MIGRATION_LABEL = "migration"
 UNNAMED_ZIG_TEST = re.compile(r"\.test_\d+$")
 SUMMARY_LIST_LIMIT = 50
+POLL_SECONDS = 60
 
-IdCounts = Dict[Tuple[str, str], int]
+Entry = Tuple[str, str, str]
+IdCounts = Dict[Entry, int]
 
 
 class TestIdError(Exception):
     pass
 
 
-def zig_id(name: str) -> str:
+def zig_entry(name: str) -> Tuple[str, str]:
     markers = [(name.find(marker), label) for marker, label in ((".test.", ""), (".decltest.", "decltest "))]
     found = [(index, label) for index, label in markers if index >= 0]
     if found:
         index, label = min(found)
-        rest = name[index + 1:].split(".", 1)[1]
-        return "zig:" + label + rest
-    if UNNAMED_ZIG_TEST.search(name):
-        return "zig:<unnamed>"
-    return "zig:" + name
+        namespace, rest = name[:index], name[index + 1:].split(".", 1)[1]
+        test_id = "zig:" + label + rest
+    else:
+        unnamed = UNNAMED_ZIG_TEST.search(name)
+        if unnamed is None:
+            return "zig:" + name, ""
+        namespace, test_id = name[:unnamed.start()], "zig:<unnamed>"
+    return test_id, namespace.rsplit(".", 1)[-1]
 
 
-def python_id(test_id: str) -> str:
-    return "py:" + ".".join(test_id.split(".")[-2:])
+def python_entry(test_id: str) -> Tuple[str, str]:
+    parts = test_id.split(".")
+    return "py:" + ".".join(parts[-2:]), parts[-3] if len(parts) >= 3 else ""
 
 
 def raw_source(path: Path) -> str:
-    stem = path.stem
+    stem = path.stem.split("--", 1)[0]
     if stem.startswith("zig-"):
         return re.sub(r"-\d+of\d+$", "", stem)
     if stem.startswith("py-"):
-        return stem.split("--", 1)[0]
+        return stem
     raise TestIdError(f"{path.name}: not a test ID record")
 
 
@@ -78,35 +86,36 @@ def read_raw(raw_dir: Path) -> Tuple[IdCounts, Dict[str, Counter]]:
             if not sep or status not in RAW_STATUSES or not name:
                 raise TestIdError(f"{path.name}:{number}: malformed record {line!r}")
             tally[status] += 1
-            test_id = zig_id(name) if source.startswith("zig-") else python_id(name)
-            counts[(test_id, status)] += 1
+            test_id, location = zig_entry(name) if source.startswith("zig-") else python_entry(name)
+            counts[(test_id, location, status)] += 1
     failed = sum(tally["fail"] for tally in sources.values())
     if failed:
         raise TestIdError(f"{failed} tests failed: a failed run is not a test ID set")
     return counts, sources
 
 
-def tty_cases(cases_dir: Path) -> List[str]:
-    names = []
+def tty_cases(cases_dir: Path) -> List[Tuple[str, str]]:
+    cases = []
     for path in sorted(cases_dir.glob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        names.extend(node.name for node in tree.body
+        cases.extend((node.name, path.stem) for node in tree.body
                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"))
-    return names
+    return cases
 
 
 def collect(raw_dir: Path, cases_dir: Optional[Path]) -> Tuple[IdCounts, Dict[str, Counter]]:
     counts, sources = read_raw(raw_dir)
     if cases_dir is not None:
-        names = tty_cases(cases_dir)
-        for name in names:
-            counts[("tty:" + name, "listed")] += 1
-        sources["tty-cases"] = Counter(listed=len(names))
+        cases = tty_cases(cases_dir)
+        for name, location in cases:
+            counts[("tty:" + name, location, "listed")] += 1
+        sources["tty-cases"] = Counter(listed=len(cases))
     return counts, sources
 
 
 def format_ids(counts: IdCounts) -> str:
-    return "".join(f"{test_id}\t{status}\t{count}\n" for (test_id, status), count in sorted(counts.items()) if count)
+    return "".join(f"{test_id}\t{location}\t{status}\t{count}\n"
+                   for (test_id, location, status), count in sorted(counts.items()) if count)
 
 
 def parse_ids(text: str, origin: str = "test IDs") -> IdCounts:
@@ -115,12 +124,13 @@ def parse_ids(text: str, origin: str = "test IDs") -> IdCounts:
         if not line:
             continue
         fields = line.split("\t")
-        if (len(fields) != 3 or fields[0].split(":", 1)[0] not in KINDS or fields[1] not in SET_STATUSES
-                or not fields[2].isdigit() or int(fields[2]) == 0):
+        if (len(fields) != 4 or fields[0].split(":", 1)[0] not in KINDS or fields[2] not in SET_STATUSES
+                or not fields[3].isdigit() or int(fields[3]) == 0):
             raise TestIdError(f"{origin}:{number}: malformed line {line!r}")
-        if (fields[0], fields[1]) in counts:
-            raise TestIdError(f"{origin}:{number}: duplicate {fields[0]} {fields[1]}")
-        counts[(fields[0], fields[1])] = int(fields[2])
+        entry = (fields[0], fields[1], fields[2])
+        if entry in counts:
+            raise TestIdError(f"{origin}:{number}: duplicate {fields[0]} in {fields[1]!r} {fields[2]}")
+        counts[entry] = int(fields[3])
     return counts
 
 
@@ -129,45 +139,59 @@ def format_sources(sources: Dict[str, Counter]) -> str:
                    for source, tally in sorted(sources.items()))
 
 
-def read_pairs(path: Path, what: str) -> List[Tuple[str, str]]:
-    if not path.exists():
-        return []
+def parse_pairs(text: str, origin: str, what: str) -> List[Tuple[str, str]]:
     pairs = []
     seen = set()
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for number, line in enumerate(text.splitlines(), 1):
         if not line:
             continue
         fields = line.split("\t")
         if len(fields) != 2 or not all(f.strip() == f and f for f in fields):
-            raise TestIdError(f"{path}:{number}: expected <id><TAB><{what}>")
+            raise TestIdError(f"{origin}:{number}: expected <key><TAB><{what}>")
         if fields[0].split(":", 1)[0] not in KINDS:
-            raise TestIdError(f"{path}:{number}: {fields[0]!r} does not start with one of {', '.join(k + ':' for k in KINDS)}")
+            raise TestIdError(f"{origin}:{number}: {fields[0]!r} does not start with one of {', '.join(k + ':' for k in KINDS)}")
         if fields[0] in seen:
-            raise TestIdError(f"{path}:{number}: {fields[0]} is listed twice")
+            raise TestIdError(f"{origin}:{number}: {fields[0]} is listed twice")
         seen.add(fields[0])
         pairs.append((fields[0], fields[1]))
     return pairs
 
 
-def read_explanations(root: Path) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
-    renamed = read_pairs(root / RENAMED, "new id")
+def file_at(root: Path, rev: Optional[str], rel: Path) -> str:
+    if rev is None:
+        path = root / rel
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    proc = subprocess.run(["git", "show", f"{rev}:{rel.as_posix()}"], cwd=str(root), capture_output=True, check=False)
+    return proc.stdout.decode("utf-8") if proc.returncode == 0 else ""
+
+
+def read_explanations(root: Path, since: Optional[str] = None) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
+    def pairs(rel: Path, what: str, rev: Optional[str]) -> List[Tuple[str, str]]:
+        return parse_pairs(file_at(root, rev, rel), f"{rel}" + (f"@{rev}" if rev else ""), what)
+
+    renamed = pairs(RENAMED, "new key", None)
+    removed = pairs(REMOVED, "reason", None)
     for old, new in renamed:
         if old == new:
             raise TestIdError(f"{RENAMED}: {old} is renamed to itself")
         if old.split(":", 1)[0] != new.split(":", 1)[0]:
             raise TestIdError(f"{RENAMED}: {old} and {new} are different kinds of test")
-    return renamed, dict(read_pairs(root / REMOVED, "reason"))
+    if since is not None:
+        renamed_before, removed_before = set(pairs(RENAMED, "new key", since)), set(pairs(REMOVED, "reason", since))
+        renamed = [pair for pair in renamed if pair not in renamed_before]
+        removed = [pair for pair in removed if pair not in removed_before]
+    return renamed, dict(removed)
 
 
 @dataclass
 class Change:
-    test_id: str
+    key: str
     base: Tuple[int, int]
     head: Tuple[int, int]
     note: str = ""
 
     def describe(self) -> str:
-        text = f"`{self.test_id}`: {self.base[0]} pass / {self.base[1]} skip → {self.head[0]} pass / {self.head[1]} skip"
+        text = f"`{self.key}`: {self.base[0]} pass / {self.base[1]} skip → {self.head[0]} pass / {self.head[1]} skip"
         return text + (f" ({self.note})" if self.note else "")
 
 
@@ -182,19 +206,34 @@ class Comparison:
     unused: List[str] = field(default_factory=list)
 
 
-def by_id(counts: IdCounts) -> Dict[str, List[int]]:
+def locations(counts: IdCounts) -> Dict[str, Set[str]]:
+    found: Dict[str, Set[str]] = {}
+    for (test_id, location, _), count in counts.items():
+        if count:
+            found.setdefault(test_id, set()).add(location)
+    return found
+
+
+def keyed(counts: IdCounts, key: Callable[[str, str], str]) -> Dict[str, List[int]]:
     table: Dict[str, List[int]] = {}
-    for (test_id, status), count in counts.items():
+    for (test_id, location, status), count in counts.items():
         if test_id.split(":", 1)[0] in ENFORCED_KINDS:
-            table.setdefault(test_id, [0, 0])[0 if status == "pass" else 1] += count
+            table.setdefault(key(test_id, location), [0, 0])[0 if status == "pass" else 1] += count
     return table
 
 
 def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], removed: Dict[str, str]) -> Comparison:
     result = Comparison()
-    base_table = by_id(base)
-    head_table = {test_id: list(pair) for test_id, pair in by_id(head).items()}
-    original_head = {test_id: tuple(pair) for test_id, pair in head_table.items()}
+    base_locations, head_locations = locations(base), locations(head)
+
+    def key(test_id: str, location: str) -> str:
+        if len(base_locations.get(test_id, ())) <= 1 and len(head_locations.get(test_id, ())) <= 1:
+            return test_id
+        return f"{test_id} @{location}"
+
+    base_table = keyed(base, key)
+    head_table = keyed(head, key)
+    original_head = {test_key: tuple(pair) for test_key, pair in head_table.items()}
     renamed_from: Dict[str, str] = {}
     for old, new in renamed:
         old_base = base_table.get(old, [0, 0])
@@ -211,27 +250,27 @@ def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], 
         head_table[new] = new_head
         renamed_from[old] = new
     used_removed = set()
-    for test_id in sorted(set(base_table) | set(head_table)):
-        base_pair = tuple(base_table.get(test_id, (0, 0)))
-        head_pair = tuple(head_table.get(test_id, (0, 0)))
-        shown_head = original_head.get(test_id, (0, 0))
+    for test_key in sorted(set(base_table) | set(head_table)):
+        base_pair = tuple(base_table.get(test_key, (0, 0)))
+        head_pair = tuple(head_table.get(test_key, (0, 0)))
+        shown_head = original_head.get(test_key, (0, 0))
         lost_runs = base_pair[0] > head_pair[0]
         lost_tests = sum(base_pair) > sum(head_pair)
         if lost_runs or lost_tests:
             note = "no longer runs" if lost_runs and not lost_tests else ""
-            if test_id in removed:
-                used_removed.add(test_id)
-                result.removed.append(Change(test_id, base_pair, shown_head, removed[test_id]))
+            if test_key in removed:
+                used_removed.add(test_key)
+                result.removed.append(Change(test_key, base_pair, shown_head, removed[test_key]))
             else:
-                result.missing.append(Change(test_id, base_pair, shown_head, note))
-        elif test_id in renamed_from:
-            new = renamed_from[test_id]
-            result.renamed.append(Change(test_id, base_pair, original_head.get(new, (0, 0)), f"now `{new}`"))
+                result.missing.append(Change(test_key, base_pair, shown_head, note))
+        elif test_key in renamed_from:
+            new = renamed_from[test_key]
+            result.renamed.append(Change(test_key, base_pair, original_head.get(new, (0, 0)), f"now `{new}`"))
         elif sum(head_pair) > sum(base_pair) or head_pair[0] > base_pair[0]:
-            result.added.append(Change(test_id, base_pair, shown_head))
-    result.unused.extend(f"{REMOVED}: {test_id}" for test_id in sorted(set(removed) - used_removed))
-    base_tty = {test_id for (test_id, _), count in base.items() if test_id.startswith("tty:") and count}
-    head_tty = {test_id for (test_id, _), count in head.items() if test_id.startswith("tty:") and count}
+            result.added.append(Change(test_key, base_pair, shown_head))
+    result.unused.extend(f"{REMOVED}: {test_key}" for test_key in sorted(set(removed) - used_removed))
+    base_tty = {test_id for (test_id, _, _), count in base.items() if test_id.startswith("tty:") and count}
+    head_tty = {test_id for (test_id, _, _), count in head.items() if test_id.startswith("tty:") and count}
     result.tty_missing = sorted(base_tty - head_tty)
     result.tty_added = sorted(head_tty - base_tty)
     return result
@@ -239,7 +278,7 @@ def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], 
 
 def kind_totals(counts: IdCounts) -> Dict[Tuple[str, str], int]:
     totals: Dict[Tuple[str, str], int] = Counter()
-    for (test_id, status), count in counts.items():
+    for (test_id, _, status), count in counts.items():
         totals[(test_id.split(":", 1)[0], status)] += count
     return totals
 
@@ -265,16 +304,16 @@ def render(comparison: Comparison, base: IdCounts, head: IdCounts, base_note: st
     lines.append("")
     if comparison.missing:
         verdict = "fails: this is a migration PR" if enforced else "report only: the PR has no `migration` label"
-        lines += [f"Tests that no longer run, unexplained — {verdict}. Explain each in `{RENAMED}` or `{REMOVED}`.", ""]
+        lines += [f"Tests that no longer run, unexplained — {verdict}. Add each key below to `{RENAMED}` or `{REMOVED}` in this PR.", ""]
     else:
-        lines += ["Every test the base ran still runs, or is explained.", ""]
+        lines += ["Every test the base ran still runs, or this PR explains why not.", ""]
     lines += bullet_list("Missing", [change.describe() for change in comparison.missing])
-    lines += bullet_list("Removed (explained)", [change.describe() for change in comparison.removed])
+    lines += bullet_list("Removed (explained in this PR)", [change.describe() for change in comparison.removed])
     lines += bullet_list("Renamed", [change.describe() for change in comparison.renamed])
     lines += bullet_list("Added", [change.describe() for change in comparison.added])
     lines += bullet_list("TTY cases gone (not enforced)", comparison.tty_missing)
     lines += bullet_list("TTY cases added", comparison.tty_added)
-    lines += bullet_list("Unused explanations", comparison.unused)
+    lines += bullet_list("Explanations this PR adds that explain nothing", comparison.unused)
     return "\n".join(lines) + "\n"
 
 
@@ -363,19 +402,25 @@ def latest_main_runs(repository: str, query: Callable = github_json) -> List[dic
     return sorted(runs, key=lambda run: run.get("created_at", ""), reverse=True)
 
 
+@dataclass
+class Base:
+    counts: Optional[IdCounts]
+    note: str
+    exact: bool
+
+
 def find_base(repository: str, sha: str, tree: str, query: Callable = github_json,
-              download: Callable = download_ids) -> Tuple[Optional[IdCounts], str]:
+              download: Callable = download_ids) -> Base:
     for run in candidate_runs(repository, sha, query):
         found = download(repository, run["id"])
         if found is not None and found[1].get("tree") == tree:
-            return found[0], f"Base: `{sha[:12]}`, IDs from run {run['id']} on the same tree."
+            return Base(found[0], f"Base: `{sha[:12]}`, IDs from run {run['id']} on the same tree.", True)
     for run in latest_main_runs(repository, query):
         found = download(repository, run["id"])
         if found is not None:
-            return found[0], (f"Base: `{sha[:12]}` has no recorded IDs; using main's run {run['id']} on "
-                              f"`{str(found[1].get('commit', ''))[:12]}` instead. Tests removed on main since then show "
-                              "as missing; a dispatched CI run on main records the current base.")
-    return None, f"Base: `{sha[:12]}` has no recorded IDs and main has no run with them; nothing to compare."
+            return Base(found[0], (f"Base: `{sha[:12]}` has no recorded IDs; comparing with main's run {run['id']} on "
+                                   f"`{str(found[1].get('commit', ''))[:12]}` instead, which is only good for a report."), False)
+    return Base(None, f"Base: `{sha[:12]}` has no recorded IDs and main has no run with them; nothing to compare.", False)
 
 
 def git(*argv: str) -> str:
@@ -384,6 +429,41 @@ def git(*argv: str) -> str:
 
 def pr_labels(repository: str, pr: int, query: Callable = github_json) -> List[str]:
     return [label["name"] for label in query(f"repos/{repository}/issues/{pr}/labels?per_page=100")]
+
+
+def ci_report(head: IdCounts, base: Base, renamed, removed, enforced: bool) -> Tuple[str, bool]:
+    if base.counts is not None and (base.exact or not enforced):
+        comparison = compare(base.counts, head, renamed, removed)
+        return render(comparison, base.counts, head, base.note, enforced), enforced and bool(comparison.missing)
+    report = f"## Executed test IDs\n\n{base.note}\n"
+    if enforced:
+        report += ("\nA migration PR is compared only with IDs recorded on its base's own tree, so this fails. "
+                   "Run CI on main (`gh workflow run ci.yml --ref main`) once main's head is the PR's base, "
+                   "or merge main into the PR after a main run recorded its IDs, then re-run this job.\n")
+    return report, enforced
+
+
+def refresh(repository: str, head_sha: str, wait_seconds: float, query: Callable = github_json,
+            run: Callable = subprocess.run, sleep: Callable = time.sleep, clock: Callable = time.monotonic) -> str:
+    runs = query(f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={head_sha}&event=pull_request&per_page=20")["workflow_runs"]
+    if not runs:
+        return f"no CI run for {head_sha[:12]} yet; its {CI_JOB} job will read the labels when it runs"
+    ci_run = max(runs, key=lambda candidate: candidate.get("created_at", ""))
+    deadline = clock() + wait_seconds
+    while ci_run.get("status") != "completed":
+        if clock() >= deadline:
+            raise TestIdError(f"CI run {ci_run['id']} did not finish in time; re-run its {CI_JOB} job by hand")
+        sleep(POLL_SECONDS)
+        ci_run = query(f"repos/{repository}/actions/runs/{ci_run['id']}")
+    jobs = query(f"repos/{repository}/actions/runs/{ci_run['id']}/jobs?filter=latest&per_page=100")["jobs"]
+    job = next((candidate for candidate in jobs if candidate.get("name") == CI_JOB), None)
+    if job is None or job.get("conclusion") == "skipped":
+        return f"CI run {ci_run['id']} compared no test IDs; nothing to refresh"
+    proc = run(["gh", "run", "rerun", str(ci_run["id"]), "--job", str(job["id"]), "--repo", repository],
+               capture_output=True, text=True, check=False)
+    if proc.returncode:
+        raise TestIdError(f"cannot re-run {CI_JOB} of run {ci_run['id']}: {proc.stderr.strip()}")
+    return f"re-running {CI_JOB} of run {ci_run['id']} and the checks that wait for it"
 
 
 def cmd_collect(args) -> int:
@@ -404,7 +484,7 @@ def cmd_collect(args) -> int:
 def cmd_compare(args) -> int:
     base = parse_ids(Path(args.base).read_text(encoding="utf-8"), args.base)
     head = parse_ids(Path(args.head).read_text(encoding="utf-8"), args.head)
-    renamed, removed = read_explanations(Path(args.root))
+    renamed, removed = read_explanations(Path(args.root), args.since)
     comparison = compare(base, head, renamed, removed)
     sys.stdout.write(render(comparison, base, head, f"Base: `{args.base}`.", args.enforce))
     return 1 if args.enforce and comparison.missing else 0
@@ -412,24 +492,21 @@ def cmd_compare(args) -> int:
 
 def cmd_ci_compare(args) -> int:
     head = parse_ids(Path(args.head).read_text(encoding="utf-8"), args.head)
-    renamed, removed = read_explanations(ROOT)
-    enforced = MIGRATION_LABEL in pr_labels(args.repository, args.pr)
     base_sha = git("rev-parse", args.base)
-    base, note = find_base(args.repository, base_sha, git("rev-parse", base_sha + "^{tree}"))
-    if base is None:
-        report = f"## Executed test IDs\n\n{note}\n"
-        failed = enforced
-        if enforced:
-            report += "\nThis is a migration PR, so a missing base fails: run CI on main (workflow_dispatch) and re-run this job.\n"
-    else:
-        comparison = compare(base, head, renamed, removed)
-        report = render(comparison, base, head, note, enforced)
-        failed = enforced and bool(comparison.missing)
+    renamed, removed = read_explanations(ROOT, base_sha)
+    enforced = MIGRATION_LABEL in pr_labels(args.repository, args.pr)
+    base = find_base(args.repository, base_sha, git("rev-parse", base_sha + "^{tree}"))
+    report, failed = ci_report(head, base, renamed, removed, enforced)
     sys.stdout.write(report)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as handle:
             handle.write(report)
     return 1 if failed else 0
+
+
+def cmd_refresh(args) -> int:
+    print(refresh(args.repository, args.head_sha, args.wait_minutes * 60))
+    return 0
 
 
 def cmd_check(args) -> int:
@@ -465,6 +542,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     compare_parser.add_argument("--base", required=True)
     compare_parser.add_argument("--head", required=True)
     compare_parser.add_argument("--root", default=str(ROOT))
+    compare_parser.add_argument("--since", help="count only the explanations added after this revision")
     compare_parser.add_argument("--enforce", action="store_true")
     compare_parser.set_defaults(handler=cmd_compare)
     ci = commands.add_parser("ci-compare", help="compare with the base's recorded IDs; enforced on migration PRs")
@@ -474,6 +552,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ci.add_argument("--pr", type=int, required=True)
     ci.add_argument("--summary")
     ci.set_defaults(handler=cmd_ci_compare)
+    refresh_parser = commands.add_parser("refresh", help=f"re-run {CI_JOB} of a PR head's CI run after its labels changed")
+    refresh_parser.add_argument("--repository", required=True)
+    refresh_parser.add_argument("--head-sha", required=True)
+    refresh_parser.add_argument("--wait-minutes", type=float, default=100)
+    refresh_parser.set_defaults(handler=cmd_refresh)
     check = commands.add_parser("check", help=f"check the format of {RENAMED} and {REMOVED}")
     check.add_argument("--root", default=str(ROOT))
     check.set_defaults(handler=cmd_check)
