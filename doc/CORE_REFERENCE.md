@@ -71,16 +71,18 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `cli`(前端,不在 core 里) | `repl/` · `web/` · `daemon/` · `app/` · `main` · `app` · `session_service` · `session_intent` | 以上各包 |
 | `testing` / `tests` | `tests/_harness/`、`tests/helpers/` / 其余 `tests/` | 产品包;`tests` 还可以用 `testing` |
 
-`zig build layer:check`(在 `gate:static` 里)检查:每个文件都有归属;每条 `@import`(包括 test 块里的)
-和 `build.zig` 里每个 module 的 import 都在 `allowed_dependencies` 里;包之间无环;不深层 import 别的包的文件;
-module 根目录不覆盖它不能依赖的包。现状记在 `layer_baseline.zon`,**只减不增**:新违规会失败,
-已经消失的条目也必须删掉。`kernel_budget` 限定 kernel 的行数和它依赖的包,只往下调。
-检查会打印「包 → 包」的违规数,作为迁移进度表。建立时(2026-11)的现状:
+`zig build layer:check`(在 `gate:static` 里)检查:每个文件都有归属;每条 `@import`(包括 test 块里的,
+named module 按写下它的源文件算)和 `build.zig` 里每个 module 的 import 都在 `allowed_dependencies` 里;
+包之间无环;不深层 import 别的包的文件;module 根目录不覆盖它不能依赖的包。现状逐条文件边记在
+`layer_baseline.zon`,**只减不增**:新违规会失败,已经消失的条目也必须删掉;CI 还会和 PR 的合并基线比较
+(`-Dlayer-base=<ref>`),白名单变多、kernel 预算放宽或 `allowed_dependencies` 变宽都会失败。
+`kernel_budget` 限定 kernel 的行数和它依赖的包。检查会打印「包 → 包」的违规数,作为迁移进度表。
+建立时(2026-11)的现状:
 
 | 违规 | 数量 |
 |------|------|
-| 越层 import(文件到文件) | 181:kernel → coding 88、guard → coding 34、session → teamwork 24、ai → coding 14、kernel → guard 7、base → ai 6,其余 8 |
-| 深层 import(包到别的包的文件) | 752 |
+| 越层 import(文件到文件) | 183:kernel → coding 90、guard → coding 34、session → teamwork 24、ai → coding 14、kernel → guard 7、base → ai 6,其余 8 |
+| 深层 import(文件到别的包的文件) | 2133 |
 | 包间环 | 1 个:base、ai、kernel、guard、coding、session、teamwork、cli |
 | module 接线 | 0 |
 | 根目录过宽的 module | 6:`lib.zig` 和 `provider`/`mcp`/`lsp` 的测试隔离根、`sandbox_helper_root`、`release_contract` |

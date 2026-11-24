@@ -82,14 +82,18 @@ These rules apply to the entire repository.
   A package's `allowed_dependencies` lists the packages it may import, never
   the ones that import it, and names only packages declared before it. A new
   file belongs to a package before it lands. `zig build layer:check` holds
-  every `@import`, test blocks included, and every `build.zig` module import
-  to those lists, and finds package cycles, deep imports into another
-  package's files and module roots wide enough to reach packages they may not
-  depend on. `layer_baseline.zon` records today's violations and only
-  shrinks: a new violation fails, and so does an entry whose violation is
-  gone, so delete it in the change that removes it (`zig build
+  every `@import` to those lists from the file that writes it, test blocks
+  and named modules included, and every `build.zig` module import too, and
+  finds package cycles, deep imports into another package's files and module
+  roots wide enough to reach packages they may not depend on.
+  `layer_baseline.zon` records today's violations file edge by file edge and
+  only shrinks: a new violation fails, and so does an entry whose violation
+  is gone, so delete it in the change that removes it (`zig build
   layer:baseline` prints the baseline that matches the tree). The kernel's
-  `kernel_budget` (lines and the packages it reaches) only goes down.
+  `kernel_budget` (lines and the packages it reaches) only goes down. CI
+  checks the PR against its base (`zig build layer:check -Dlayer-base=<ref>`)
+  and fails when the baseline or the budget grows or `allowed_dependencies`
+  widen.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
   journals, timestamps, and equivalent configuration churn must not enter prompts.
 - TinyKG is a separately built external binary dependency. The repository owns one

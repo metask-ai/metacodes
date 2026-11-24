@@ -208,6 +208,58 @@ fn record(arena: std.mem.Allocator, violations: *Violations, key: []const u8, lo
     return true;
 }
 
+const FileImport = struct {
+    literal: []const u8,
+    line: usize,
+};
+
+fn importsOf(arena: std.mem.Allocator, source: [:0]const u8) ![]const FileImport {
+    var imports: std.ArrayList(FileImport) = .empty;
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var line: usize = 1;
+    var scanned: usize = 0;
+    var previous: [2]std.zig.Token.Tag = .{ .invalid, .invalid };
+    var builtin_start: usize = 0;
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        defer {
+            previous = .{ previous[1], token.tag };
+            if (token.tag == .builtin) builtin_start = token.loc.start;
+        }
+        if (token.tag != .string_literal or previous[1] != .l_paren or previous[0] != .builtin) continue;
+        if (!std.mem.startsWith(u8, source[builtin_start..], "@import(")) continue;
+        line += std.mem.count(u8, source[scanned..token.loc.start], "\n");
+        scanned = token.loc.start;
+        try imports.append(arena, .{ .literal = source[token.loc.start + 1 .. token.loc.end - 1], .line = line });
+    }
+    return imports.items;
+}
+
+const EdgeKind = enum { relative, named };
+
+fn addEdge(
+    arena: std.mem.Allocator,
+    layers: Layers,
+    findings: *Findings,
+    path: []const u8,
+    line: usize,
+    target: []const u8,
+    kind: EdgeKind,
+) !void {
+    const from = layers.owner(path) orelse return;
+    const to = layers.owner(target) orelse return;
+    if (to == from) return;
+    findings.depends[from][to] = true;
+    const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ path, target });
+    const location = try std.fmt.allocPrint(arena, "{s}:{d}", .{ path, line });
+    if (!layers.mayDepend(from, to)) {
+        if (try record(arena, &findings.upward, key, location)) findings.upward_counts[from][to] += 1;
+    } else if (kind == .relative) {
+        if (try record(arena, &findings.deep, key, location)) findings.deep_counts[from][to] += 1;
+    }
+}
+
 fn analyze(arena: std.mem.Allocator, layers: Layers, files: []const SourceFile, wiring: Wiring) !Findings {
     const total = layers.count();
     var findings: Findings = .{
@@ -215,40 +267,38 @@ fn analyze(arena: std.mem.Allocator, layers: Layers, files: []const SourceFile, 
         .deep_counts = try matrix(usize, arena, total, 0),
         .depends = try matrix(bool, arena, total, false),
     };
+    var imports_by_file: std.StringHashMapUnmanaged([]const FileImport) = .empty;
     for (files) |file| {
+        const imports = try importsOf(arena, file.source);
+        try imports_by_file.put(arena, file.path, imports);
         const from = layers.owner(file.path) orelse {
             _ = try record(arena, &findings.unowned, file.path, file.path);
             continue;
         };
         if (from == layers.kernel) findings.kernel_lines += std.mem.count(u8, file.source, "\n");
-        var tokenizer = std.zig.Tokenizer.init(file.source);
-        var line: usize = 1;
-        var scanned: usize = 0;
-        var previous: [2]std.zig.Token.Tag = .{ .invalid, .invalid };
-        var import_start: usize = 0;
-        while (true) {
-            const token = tokenizer.next();
-            if (token.tag == .eof) break;
-            defer {
-                previous = .{ previous[1], token.tag };
-                if (token.tag == .builtin) import_start = token.loc.start;
-            }
-            if (token.tag != .string_literal or previous[1] != .l_paren or previous[0] != .builtin) continue;
-            if (!std.mem.eql(u8, file.source[import_start..][0.."@import".len], "@import")) continue;
-            line += std.mem.count(u8, file.source[scanned..token.loc.start], "\n");
-            scanned = token.loc.start;
-            const literal = file.source[token.loc.start + 1 .. token.loc.end - 1];
-            const target = try resolve(arena, file.path, literal) orelse continue;
-            const to = layers.owner(target) orelse continue;
-            if (to == from) continue;
-            findings.depends[from][to] = true;
-            const location = try std.fmt.allocPrint(arena, "{s}:{d}", .{ file.path, line });
-            if (!layers.mayDepend(from, to)) {
-                const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ file.path, target });
-                if (try record(arena, &findings.upward, key, location)) findings.upward_counts[from][to] += 1;
-            } else {
-                const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ layers.name(from), target });
-                if (try record(arena, &findings.deep, key, location)) findings.deep_counts[from][to] += 1;
+        for (imports) |import| {
+            const target = try resolve(arena, file.path, import.literal) orelse continue;
+            try addEdge(arena, layers, &findings, file.path, import.line, target, .relative);
+        }
+    }
+    var seen_roots: std.StringHashMapUnmanaged(void) = .empty;
+    for (wiring.roots) |root| {
+        if ((try seen_roots.getOrPut(arena, root)).found_existing) continue;
+        var reached: std.StringHashMapUnmanaged(void) = .empty;
+        var pending: std.ArrayList([]const u8) = .empty;
+        try reached.put(arena, root, {});
+        try pending.append(arena, root);
+        while (pending.pop()) |path| {
+            const imports = imports_by_file.get(path) orelse continue;
+            for (imports) |import| {
+                if (try resolve(arena, path, import.literal)) |target| {
+                    if (!(try reached.getOrPut(arena, target)).found_existing) try pending.append(arena, target);
+                    continue;
+                }
+                for (wiring.imports) |wired| {
+                    if (!std.mem.eql(u8, wired.root, root) or !std.mem.eql(u8, wired.name, import.literal)) continue;
+                    try addEdge(arena, layers, &findings, path, import.line, wired.target, .named);
+                }
             }
         }
     }
@@ -503,18 +553,117 @@ fn readZ(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8
     return dir.readFileAllocOptions(io, path, arena, .limited(16 * 1024 * 1024), .of(u8), 0);
 }
 
+const Base = struct {
+    manifest: Manifest,
+    baseline: Baseline,
+};
+
+fn growth(arena: std.mem.Allocator, base: Base, manifest: Manifest, baseline: Baseline) !usize {
+    var problems: usize = 0;
+    inline for (.{ Category.upward, Category.deep, Category.wiring, Category.wide_roots }) |category| {
+        var before: std.StringHashMapUnmanaged(void) = .empty;
+        for (try baselineKeys(arena, category, base.baseline)) |key| try before.put(arena, key, {});
+        for (try baselineKeys(arena, category, baseline)) |key| {
+            if (before.contains(key)) continue;
+            problems += 1;
+            std.debug.print("layer_baseline.zon: {s} entry `{s}` is not in the base's baseline, which only shrinks\n", .{ @tagName(category), key });
+        }
+    }
+    for (baseline.cycles) |members| {
+        if (withinSomeCycle(members, base.baseline.cycles)) continue;
+        problems += 1;
+        std.debug.print("layer_baseline.zon: cycle `{s}` is not within a cycle of the base's baseline\n", .{try std.mem.join(arena, ", ", members)});
+    }
+    const budget = manifest.kernel_budget;
+    const base_budget = base.manifest.kernel_budget;
+    if (budget.max_lines > base_budget.max_lines) {
+        problems += 1;
+        std.debug.print("layers.zon: kernel_budget.max_lines rises from {d} to {d}; it only goes down\n", .{ base_budget.max_lines, budget.max_lines });
+    }
+    for (budget.max_dependencies) |dependency| {
+        if (indexOfPath(base_budget.max_dependencies, dependency) < base_budget.max_dependencies.len) continue;
+        problems += 1;
+        std.debug.print("layers.zon: kernel_budget gains `{s}`; it only shrinks\n", .{dependency});
+    }
+    for (manifest.packages) |package| {
+        const before = basePackage(base.manifest, package.name) orelse continue;
+        for (package.allowed_dependencies) |dependency| {
+            if (indexOfPath(before.allowed_dependencies, dependency) < before.allowed_dependencies.len) continue;
+            problems += 1;
+            std.debug.print("layers.zon: `{s}` newly allows `{s}`; allowed_dependencies do not widen\n", .{ package.name, dependency });
+        }
+    }
+    return problems;
+}
+
+fn withinSomeCycle(members: []const []const u8, cycles: []const []const []const u8) bool {
+    for (cycles) |cycle| {
+        for (members) |member| {
+            if (indexOfPath(cycle, member) == cycle.len) break;
+        } else return true;
+    }
+    return false;
+}
+
+fn basePackage(manifest: Manifest, package_name: []const u8) ?Package {
+    for (manifest.packages) |package| {
+        if (std.mem.eql(u8, package.name, package_name)) return package;
+    }
+    return null;
+}
+
+fn parseBase(arena: std.mem.Allocator, layers_text: [:0]const u8, baseline_text: [:0]const u8) !Base {
+    return .{
+        .manifest = try parseZon(Manifest, arena, "base layers.zon", layers_text),
+        .baseline = try parseZon(Baseline, arena, "base layer_baseline.zon", baseline_text),
+    };
+}
+
+fn git(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !?[]const u8 {
+    const result = try std.process.run(arena, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(64 * 1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    return switch (result.term) {
+        .exited => |code| if (code == 0) result.stdout else null,
+        else => null,
+    };
+}
+
+fn readBase(arena: std.mem.Allocator, io: std.Io, ref: []const u8) !?Base {
+    const commit = try std.fmt.allocPrint(arena, "{s}^{{commit}}", .{ref});
+    if (try git(arena, io, &.{ "git", "rev-parse", "--verify", "--quiet", commit }) == null) {
+        std.debug.print("layer:check: base `{s}` is not a commit\n", .{ref});
+        return error.InvalidBase;
+    }
+    var texts: [2][:0]const u8 = undefined;
+    for ([_][]const u8{ "layers.zon", "layer_baseline.zon" }, &texts) |path, *text| {
+        const object = try std.fmt.allocPrint(arena, "{s}:{s}", .{ ref, path });
+        if (try git(arena, io, &.{ "git", "cat-file", "-e", object }) == null) {
+            std.debug.print("layer:check: base `{s}` has no {s}, so there is nothing to compare against\n", .{ ref, path });
+            return null;
+        }
+        const contents = try git(arena, io, &.{ "git", "show", object }) orelse return error.InvalidBase;
+        text.* = try arena.dupeZ(u8, contents);
+    }
+    return try parseBase(arena, texts[0], texts[1]);
+}
+
 const Outcome = struct {
     layers: Layers,
     findings: Findings,
     problems: usize,
 };
 
-fn run(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, wiring_text: []const u8) !Outcome {
+fn run(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, wiring_text: []const u8, base: ?Base) !Outcome {
     const manifest = try parseZon(Manifest, arena, "layers.zon", try readZ(arena, io, root, "layers.zon"));
     const baseline = try parseZon(Baseline, arena, "layer_baseline.zon", try readZ(arena, io, root, "layer_baseline.zon"));
     const layers = try resolveLayers(arena, manifest);
     const findings = try analyze(arena, layers, try readTree(arena, io, root), try parseWiring(arena, wiring_text));
-    return .{ .layers = layers, .findings = findings, .problems = try check(arena, layers, findings, baseline) };
+    var problems = try check(arena, layers, findings, baseline);
+    if (base) |before| problems += try growth(arena, before, manifest, baseline);
+    return .{ .layers = layers, .findings = findings, .problems = problems };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -525,12 +674,21 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     const root_path = args.next() orelse return error.InvalidArguments;
     const wiring_path = args.next() orelse return error.InvalidArguments;
-    const print_baseline = if (args.next()) |flag| std.mem.eql(u8, flag, "--print-baseline") else false;
+    var print_baseline = false;
+    var base_ref: ?[]const u8 = null;
+    while (args.next()) |flag| {
+        if (std.mem.eql(u8, flag, "--print-baseline")) {
+            print_baseline = true;
+        } else if (std.mem.eql(u8, flag, "--base")) {
+            base_ref = args.next() orelse return error.InvalidArguments;
+        } else return error.InvalidArguments;
+    }
 
     var root = try std.Io.Dir.cwd().openDir(init.io, root_path, .{});
     defer root.close(init.io);
     const wiring_text = try std.Io.Dir.cwd().readFileAlloc(init.io, wiring_path, arena, .limited(16 * 1024 * 1024));
-    const outcome = try run(arena, init.io, root, wiring_text);
+    const base = if (base_ref) |ref| try readBase(arena, init.io, ref) else null;
+    const outcome = try run(arena, init.io, root, wiring_text, base);
 
     var buffer: [4096]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
@@ -564,11 +722,12 @@ const test_baseline =
     \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
     \\    },
     \\    .deep = .{
-    \\        .{ "cli", "src/core/agent_loop.zig" },
-    \\        .{ "cli", "src/tools/bash.zig" },
-    \\        .{ "coding", "src/core/agent_loop.zig" },
-    \\        .{ "coding", "src/util/fs.zig" },
-    \\        .{ "kernel", "src/util/fs.zig" },
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/bash.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
     \\    },
     \\    .cycles = .{
     \\        .{ "kernel", "coding" },
@@ -592,6 +751,16 @@ const clean_tree = [_][2][]const u8{
 };
 
 fn checkTree(files: []const [2][]const u8, layers_text: []const u8, baseline_text: []const u8, wiring: []const u8) !usize {
+    return checkTreeAgainst(files, layers_text, baseline_text, wiring, null);
+}
+
+fn checkTreeAgainst(
+    files: []const [2][]const u8,
+    layers_text: []const u8,
+    baseline_text: []const u8,
+    wiring: []const u8,
+    base_texts: ?[2][:0]const u8,
+) !usize {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "layers.zon", .data = layers_text });
@@ -602,7 +771,8 @@ fn checkTree(files: []const [2][]const u8, layers_text: []const u8, baseline_tex
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const outcome = try run(arena.allocator(), std.testing.io, tmp.dir, wiring);
+    const base = if (base_texts) |texts| try parseBase(arena.allocator(), texts[0], texts[1]) else null;
+    const outcome = try run(arena.allocator(), std.testing.io, tmp.dir, wiring, base);
     return outcome.problems;
 }
 
@@ -694,4 +864,88 @@ test "paths resolve the way the compiler reads them" {
     try std.testing.expectEqualStrings("src/util/model.zig", (try resolve(arena.allocator(), "src/provider/profiles/metask.zig", "../../util/model.zig")).?);
     try std.testing.expectEqualStrings("src/core/agent_loop.zig", (try resolve(arena.allocator(), "src/core/compact.zig", "./agent_loop.zig")).?);
     try std.testing.expect((try resolve(arena.allocator(), "src/provider/ids.zig", "platform")) == null);
+}
+
+test "a named import counts from the file that writes it, not the module root" {
+    var tree = withFile("src/util/log.zig", "const code = @import(\"code\");\n");
+    tree[5][1] = "const loop = @import(\"core/agent_loop.zig\");\nconst bash = @import(\"tools/bash.zig\");\nconst log = @import(\"util/log.zig\");\n";
+    const wiring = test_wiring ++ "import\tsrc/main.zig\tcode\tsrc/tools/bash.zig\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&clean_tree, test_layers, test_baseline, wiring));
+    try std.testing.expectEqual(@as(usize, 4), try checkTree(&tree, test_layers, test_baseline, wiring));
+}
+
+test "a deep import is one file edge, so a second file reaching the same target is new" {
+    const tree = withFile("src/tools/grep.zig", "const fs = @import(\"../util/fs.zig\");\n");
+    try std.testing.expectEqual(@as(usize, 1), try checkTree(&tree, test_layers, test_baseline, test_wiring));
+}
+
+const grown_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\        .{ "src/util/log.zig", "src/repl/view.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/bash.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "base", "kernel", "coding", "cli" },
+    \\    },
+    \\}
+    \\
+;
+
+test "the baseline may not grow against the base, even when it matches the tree" {
+    const base = [2][:0]const u8{ test_layers, test_baseline };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, test_layers, test_baseline, test_wiring, base));
+    const tree = withFile("src/util/log.zig", "const view = @import(\"../repl/view.zig\");\n");
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, test_layers, grown_baseline, test_wiring));
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&tree, test_layers, grown_baseline, test_wiring, base));
+}
+
+test "the kernel budget and allowed_dependencies may not widen against the base" {
+    const base = [2][:0]const u8{ test_layers, test_baseline };
+    const raised = comptime blk: {
+        const needle = ".max_lines = 3";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++ ".max_lines = 9" ++ test_layers[at + needle.len ..];
+    };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&clean_tree, raised, test_baseline, test_wiring, base));
+    const narrower = comptime blk: {
+        const needle = "\"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++ "\"src/tools/\" }, .allowed_dependencies = .{\"base\"} }," ++ test_layers[at + needle.len ..];
+    };
+    const narrower_base = [2][:0]const u8{ narrower, test_baseline };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&clean_tree, test_layers, test_baseline, test_wiring, narrower_base));
+}
+
+test "a shrinking baseline and budget pass against the base" {
+    const base = [2][:0]const u8{ test_layers, test_baseline };
+    var tree = clean_tree;
+    tree[2][1] = "const fs = @import(\"../util/fs.zig\");\n";
+    const shrunk_layers = comptime blk: {
+        const needle = ".max_lines = 3, .max_dependencies = .{ \"base\", \"coding\" }";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++ ".max_lines = 1, .max_dependencies = .{\"base\"}" ++ test_layers[at + needle.len ..];
+    };
+    const shrunk_baseline =
+        \\.{
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, shrunk_layers, shrunk_baseline, test_wiring, base));
 }

@@ -3716,6 +3716,9 @@ fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_st
     layer_run.setCwd(b.path("."));
     layer_run.addArg(".");
     layer_run.addFileArg(wiring);
+    if (b.option([]const u8, "layer-base", "Git ref whose layer_baseline.zon and kernel_budget layer:check may not exceed")) |base| {
+        layer_run.addArgs(&.{ "--base", base });
+    }
     layer_run.addFileInput(b.path("layers.zon"));
     layer_run.addFileInput(b.path("layer_baseline.zon"));
     layer_run.has_side_effects = true;
@@ -3741,6 +3744,7 @@ fn layerWiring(b: *std.Build) []const u8 {
     var seen_modules: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
     var pending: std.ArrayList(*std.Build.Step) = .empty;
     for (b.top_level_steps.values()) |top| pending.append(b.allocator, &top.step) catch @panic("OOM");
+    for (b.modules.values()) |module| addModuleWiring(b, module, &seen_modules, &lines);
     while (pending.pop()) |step| {
         if ((seen_steps.getOrPut(b.allocator, step) catch @panic("OOM")).found_existing) continue;
         pending.appendSlice(b.allocator, step.dependencies.items) catch @panic("OOM");
