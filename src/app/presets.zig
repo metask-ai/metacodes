@@ -63,6 +63,7 @@ pub const Facts = struct {
     defined: []const []const u8 = &.{},
     /// The selections of the presets the three levels found.
     chosen: []const Chosen = &.{},
+    global_default: bool = true,
 
     pub const Chosen = struct {
         name: []const u8,
@@ -111,6 +112,7 @@ pub const Inputs = struct {
     /// The provider registry a session builds, to name a found preset's
     /// route (`login status`); null leaves the routes unnamed.
     registry: ?*const registry_mod.ProviderRegistry = null,
+    unreadable_global_default: ?bool = null,
 };
 
 /// The facts of the three preset levels. Everything returned lives in
@@ -130,6 +132,11 @@ pub fn gather(arena: std.mem.Allocator, inputs: Inputs) error{OutOfMemory}!Facts
         for (doc.presets.items, names) |*entry, *name| name.* = try arena.dupe(u8, entry.name.slice());
         facts.defined = names;
     }
+    facts.global_default = switch (inputs.document) {
+        .absent => true,
+        .read => |doc| doc.global_default orelse true,
+        .unreadable => inputs.unreadable_global_default orelse true,
+    };
     var chosen: std.ArrayList(Facts.Chosen) = .empty;
 
     const named = shellOrFlag(inputs.flag);
@@ -650,4 +657,22 @@ test "the preset .env falls back to resolves as level 6 of a start does (#489)" 
 
     try testing.expect((try resolveLocal(arena, registry, .{ .preset = .{ .name = "gone", .selection = try config_doc.RuntimeSelection.auto("no-such-model-489", .{}, .session) } })) == null);
     try testing.expect((try resolveLocal(arena, registry, .{ .provider = .{ .name = "no-such-provider-489" } })) == null);
+}
+
+test "gather reads global_default from config.json, and from the lenient read when the document is unreadable (#489)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var document = config_doc.Document.init(testing.allocator);
+    defer document.deinit();
+
+    try testing.expect((try gather(arena, .{ .document = .{ .read = &document } })).global_default);
+    document.global_default = false;
+    try testing.expect(!(try gather(arena, .{ .document = .{ .read = &document }, .unreadable_global_default = true })).global_default);
+    document.global_default = true;
+    try testing.expect((try gather(arena, .{ .document = .{ .read = &document } })).global_default);
+
+    try testing.expect((try gather(arena, .{})).global_default);
+    try testing.expect((try gather(arena, .{ .document = .{ .unreadable = "InvalidPreset" } })).global_default);
+    try testing.expect(!(try gather(arena, .{ .document = .{ .unreadable = "InvalidPreset" }, .unreadable_global_default = false })).global_default);
 }

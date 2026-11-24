@@ -1215,6 +1215,16 @@ fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
     return if (abort) |signal| stopReasonForReason(signal.reason()) else .aborted;
 }
 
+pub const JobWaitPoll = struct {
+    events: []@import("job_registry.zig").JobExitEvent,
+    any_running: bool,
+};
+
+pub fn pollJobWait(registry: anytype, owner: @import("session_id.zig").SessionId, allocator: std.mem.Allocator) !JobWaitPoll {
+    const any_running = registry.hasPendingNotifyJobs(owner);
+    return .{ .events = try registry.takeUnannouncedExits(owner, allocator), .any_running = any_running };
+}
+
 /// UI → core input (#115). Drains `UiBackend.poll` at a turn boundary — the
 /// previous turn's tool_results are already appended and the next provider
 /// request has not been built yet — so a message the user queued during the
@@ -4295,10 +4305,11 @@ fn runCounted(
                             break;
                         }
                     }
-                    const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
+                    const poll = pollJobWait(registry, owner, allocator) catch |err| {
                         log.warn("agent", "job wait notification skipped: {s}", .{@errorName(err)});
                         break;
                     };
+                    const events = poll.events;
                     if (events.len > 0) {
                         defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
                         const text = job_notification_mod.render(allocator, events) catch |err| {
@@ -4320,7 +4331,7 @@ fn runCounted(
                     }
                     @import("job_registry.zig").freeJobExitEvents(allocator, events);
                     // Jobs ended but were already observed via BashOutput/KillShell: nothing to say.
-                    if (!registry.hasPendingNotifyJobs(owner)) break;
+                    if (!poll.any_running) break;
                     if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
                 }
             }

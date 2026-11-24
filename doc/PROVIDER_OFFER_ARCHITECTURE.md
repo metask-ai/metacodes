@@ -461,7 +461,10 @@ one, chosen by `src/app/startup_order.zig` (`--preset`/`METACODES_PRESET`, then
 the working directory's), by lowering it into the fields the flags naming the
 same route would set (`src/app/presets.zig`); nothing is persisted by using
 one. A preset written by hand is written back as it was by every other commit
-(`config_doc.Preset.raw`).
+(`config_doc.Preset.raw`). `"global_default": false` keeps the global selection,
+a Metask sign-in and `.env`'s choice from deciding for any directory: a start
+that names no route, in a directory that remembers no preset, opens unbound
+(`startup_order.Decision.directory_unchosen`).
 
 Session scope is narrower, so on resume it wins: a resumed session continues on
 the route it was using, not on whatever became global in the meantime. A stored
@@ -830,8 +833,8 @@ store, and health plane land — see the deferred list.
 ## Persistence
 
 `~/.metacodes/config.json` gains `schema_version`, `config_revision`,
-`providers`, `aliases`, `global_selection`, `presets`, `directory_presets`, and
-`last_operation_id`. The
+`providers`, `aliases`, `global_selection`, `presets`, `directory_presets`,
+`global_default`, and `last_operation_id`. The
 document is a provider *map*: several providers, accounts, regions, and relays
 coexist, and disabling one preserves its configuration and credential reference.
 

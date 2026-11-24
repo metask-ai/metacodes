@@ -12,6 +12,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A directory can be left without a default** (part of #489). With
+  `"global_default": false` at the top level of `config.json`, the `/model`
+  default, a Metask sign-in and `.env`'s choice (levels 4 to 6 of the startup
+  order) decide for no directory: a start uses what it names (`--provider`,
+  `--offer`, `--preset`, `--api-key`, `METACODES_PROVIDER` or
+  `METACODES_PRESET` in the shell) or the preset its directory remembers. In a
+  directory that remembers none, the TUI opens without a model, and a message
+  gets a red note naming `/model`, the presets and the `directory_presets`
+  entry to add; `-p`, `serve` and `--web` stop with exit code 2 before any
+  request. So an unfamiliar repository uses no account until one is chosen for
+  it. Keys and sign-ins still serve the route that is chosen; `/logout` leaves
+  the session without a model instead of switching to `.env`'s choice, and
+  `metacodes login status` marks the levels left out. A value that is not a
+  boolean fails to load with `InvalidGlobalDefault`; a malformed preset does
+  not hide the setting ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
+
 - **Teamwork trials no longer stop at permission prompts.** `teamwork run`
   has no `--permission`, so its verifier asked for each command and, with
   nobody to answer, the audit ended unavailable and nothing merged. A
@@ -374,6 +390,22 @@ status, compatibility boundaries, and entry points are defined by
   still counts toward the double-press exit, so the picker never traps the
   session.
 
+- **A background job that finishes while the model is answering wakes the
+  agent** (#719). When a job the model had started finished during the
+  model's last answer, the turn ended without waiting, because the job was no
+  longer running, and the exit only came with the next message: the agent
+  stopped although its job was done. The end of a turn now also counts a
+  finished job whose exit has not been announced, so the exit is delivered
+  and the agent goes on, as when the job finishes during the wait.
+
+- **The agent carries on when a background job it waits for finishes**
+  (#714). After the model said it would wait for a background job, the job
+  could finish and the agent stay idle until the next message, which then
+  brought the job's exit along. The wait looked for finished jobs, found
+  none, and then, if the job ended right then, found nothing running and
+  ended the turn. It now checks what is still running before it looks for
+  finished jobs.
+
 - **A foreground Bash command is collected as soon as it exits** (#670). The
   wait slept 100 ms before it first looked at the job, so every foreground
   call, even `true`, cost at least 100 ms. It now checks at once and then
@@ -405,6 +437,18 @@ status, compatibility boundaries, and entry points are defined by
   TUI ignored both. The key parser now reads both forms through one table, so
   modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
   their CSI u forms do (#643).
+
+- **FindSymbol and CodeMap no longer give up early on a language server
+  that is busy publishing diagnostics, and the LSP waits around Edit and Write
+  end on time** (#741). The LSP client counted its waits in 150 ms steps
+  instead of keeping a deadline, and every response or diagnostics push from
+  the server used up a step. A `documentSymbol` request to a server
+  publishing diagnostics for other files could fail long before its 10 s
+  limit, which FindSymbol and CodeMap reported as a language server that
+  could not be started. A wait that nothing woke ran one step past its limit,
+  plus the scheduling delay of every step: the 8 s diagnostics wait before an
+  Edit or Write took about 8.3 s on an idle machine. Both waits now end at
+  their deadline, and still check for an interrupt every 150 ms.
 
 - **The TTY relogin revocation cases replay the screen with line wrap**
   (#673). The `/login` dialog shows a sign-in URL wider than the terminal and
@@ -448,6 +492,19 @@ status, compatibility boundaries, and entry points are defined by
   mode: typing filters, Esc clears the filter and then closes it, Enter
   applies the model under the cursor, and the input box is left alone. Vim's
   keymap takes over again once the picker closes.
+
+- **A Metask key in `.env` no longer outranks the preset the same file
+  names** (#748, part of #489). A `<state root>/.env` with
+  `METACODES_PRESET=fast` (a DeepSeek preset, say) and `METASK_API_KEY`
+  started on Metask, without a word: the file's key counted as a Metask
+  sign-in (level 5 of the startup order) unless its `METACODES_PROVIDER`
+  named another provider, so the file's own preset (level 6) was never
+  reached. The file's preset now counts as its choice too: the key signs
+  Metask in only when that preset's route is Metask, and otherwise waits
+  until Metask is chosen, as beside `METACODES_PROVIDER`. A preset
+  `config.json` does not define holds the key back as well, so the start
+  reports the name instead of quietly using Metask. `metacodes login
+  status` says why the key waits.
 
 - **A stalled HTTP MCP server no longer holds `/exit` or the first message**
   (#671). The session DELETE a Streamable HTTP client sends at close now has

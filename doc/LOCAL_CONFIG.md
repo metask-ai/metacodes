@@ -115,7 +115,7 @@ first one is the one to use; the others are accepted too):
 | MiniMax (`minimax`) | `MINIMAX_API_KEY` |
 | Amazon Bedrock (`bedrock`) | `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) |
 | OpenRouter (`openrouter`) | `OPENROUTER_API_KEY` (`/login openrouter` signs in on OpenRouter instead and stores the key it creates) |
-| Metask (`metask`) | `METASK_API_KEY` (see [the order below](#which-provider-and-model-are-used): it counts as a Metask sign-in unless the file names another provider) |
+| Metask (`metask`) | `METASK_API_KEY` (see [the order below](#which-provider-and-model-are-used): it counts as a Metask sign-in unless the file chooses something else, another provider or a preset that is not on Metask) |
 
 A provider you define in `config.json` (`custom_providers`: written by
 `metacodes providers add`, see [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own),
@@ -200,9 +200,11 @@ At start, metacodes takes the first of these that applies:
 5. **A Metask sign-in**: `--api-key`, `METASK_API_KEY` in the shell, a key in
    `auth.json`, or the Metask session `metacodes login` (or `/login`) stored
    in `oauth/metask.json`; a key comes before the session. `METASK_API_KEY` in this
-   file counts too, unless the file's `METACODES_PROVIDER` names another
-   provider: the provider the file names is its choice, and a Metask key
-   beside it does not overrule that.
+   file counts too, unless the file chooses something else: its
+   `METACODES_PRESET` (a preset whose route is not Metask, or one
+   `config.json` does not define), or a `METACODES_PROVIDER` naming another
+   provider. What the file chooses is its choice, and a Metask key beside it
+   does not overrule that: it is kept for when Metask is chosen.
 6. **What this file chooses**: its `METACODES_PRESET`, else its
    `METACODES_PROVIDER`, or, when it names neither, the one provider whose
    key the file holds.
@@ -211,6 +213,9 @@ At start, metacodes takes the first of these that applies:
    a red note says how to sign in or set up this file, and ↑ brings the
    message back once a model is set up. `-p`, `serve` and `--web` stop
    instead, with the same advice.
+
+`"global_default": false` in `config.json` turns steps 4 to 6 off for every
+directory: see [Presets](#presets).
 
 So `METACODES_PRESET`, `METACODES_PROVIDER` and `METACODES_MODEL` in the file
 apply only when nothing above them decides: once you sign in to Metask (`/login`, or
@@ -333,6 +338,44 @@ the directory itself, as `pwd -P` prints it; an entry written with a trailing
 `/` or through a symlink matches too. Nothing is ever written into the
 directory. For now you write these entries by hand; `metacodes login status`,
 run in the directory, shows which one applies.
+
+**No global default.** With `"global_default": false` at the top level of
+`config.json`, nothing outside a directory chooses for it: steps 4 to 6 above
+(the `/model` default, a Metask sign-in, what this file chooses) apply in no
+directory. A start uses what it names (`--provider`, `--offer`, `--preset`,
+`--api-key`, or `METACODES_PROVIDER` or `METACODES_PRESET` set in the shell)
+or the preset its directory remembers. In a directory that remembers none, the
+terminal UI opens without a model, and a message you send gets a red note
+instead of a request:
+
+```text
+No model is chosen for this directory: it remembers no preset, and global_default is off.
+  Choose one for this session:  /model
+  Or start with a preset:       metacodes --preset <name> (presets: kimi, client-a)
+  Or remember one here:         "/Users/you/src/scratch": "<name>" under directory_presets in /Users/you/.local/opt/metacodes/state/config.json
+  How to: https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md#presets
+```
+
+`-p`, `serve` and `--web` stop there with exit code 2 and send nothing. So an
+unfamiliar repository uses no account until you choose one for it. Keys and
+sign-ins stay where they are and still serve the route you choose: a preset
+whose provider's key is in this file reads it there, and a Metask preset uses
+your Metask sign-in. Without the setting, or with `true`, nothing changes.
+While it is `false`:
+
+- `/model`'s "from now on" (and the picker `/login` opens) stores the default
+  of step 4, which no directory uses then: the choice serves the session you
+  make it in. Remember a preset for the directory instead.
+- `/logout` leaves the session without a model, rather than switching to what
+  this file chooses.
+- `METACODES_PROVIDER` or `METACODES_PRESET` exported in your shell profile
+  still name a route at every start (steps 1 and 2).
+- `metacodes login status` says so and marks steps 4 to 6 as not consulted.
+- The setting is read even when another entry of `config.json` is malformed:
+  every directory then opens without a model, and the note says why. When the
+  setting itself is neither `true` nor `false` (`InvalidGlobalDefault`, which
+  makes `config.json` unreadable), or `config.json` is not JSON at all, it is
+  not read, and the start goes on as if it were absent.
 
 **A name that is not there.** A preset named at start, remembered by the
 directory, or named in this file that `config.json` does not define makes
