@@ -17,10 +17,10 @@
 //!   - runWithTheme:alt-screen 交互循环(从 loop.zig / tui_backend 调,需要 tty)
 
 const std = @import("std");
-const host_injection_meter = @import("../core/host_injection_meter.zig");
+const host_injection_meter = @import("metacodes-internal").core.host_injection_meter;
 const pfs = @import("platform").fs;
 const input = @import("input.zig");
-const Conversation = @import("../core/conversation.zig").Conversation;
+const Conversation = @import("metacodes-internal").core.conversation.Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;
 
 /// 把整个对话渲染成可显示的行(owned;caller free 每行 + 数组)。
@@ -397,7 +397,7 @@ test "renderToLines: assistant markdown 渲染(粗体→SGR,非源码)" {
 
 test "renderToLines: Edit tool_result 经 renderResult 出 diff 着色" {
     const a = testing.allocator;
-    const msg = @import("../core/message.zig");
+    const msg = @import("metacodes-internal").core.message;
     var conv = Conversation.init(a);
     defer conv.deinit();
 

@@ -25,7 +25,7 @@ const input_mod = @import("../../input.zig");
 const Theme = theme_mod.Theme;
 
 /// PermissionChoice 已移到中立协议位置(core/protocol/);此处 re-export 保 UI 端引用兼容。
-pub const PermissionChoice = @import("../../../core/protocol/permission_choice.zig").PermissionChoice;
+pub const PermissionChoice = @import("metacodes-internal").core.protocol.permission_choice.PermissionChoice;
 
 pub const Option = struct {
     key: u8, // 'y' / 'a' / 'n' / 'd'

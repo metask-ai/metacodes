@@ -4,12 +4,12 @@
 //! REPL layer is responsible for rendering and mutating App state.
 
 const std = @import("std");
-const model_name = @import("../api/model_name.zig");
-const types = @import("../types.zig");
-const catalog_mod = @import("../api/catalog.zig");
-const capability_mod = @import("../api/capability.zig");
-const provider_mod = @import("../api/provider.zig");
-const model_availability = @import("../api/model_availability.zig");
+const model_name = @import("metacodes-internal").api.model_name;
+const types = @import("metacodes-internal").types;
+const catalog_mod = @import("metacodes-internal").api.catalog;
+const capability_mod = @import("metacodes-internal").api.capability;
+const provider_mod = @import("metacodes-internal").api.provider;
+const model_availability = @import("metacodes-internal").api.model_availability;
 
 pub const Capability = provider_mod.Capability;
 

@@ -22,8 +22,8 @@
 //!   时间线,不是 UI。
 
 const std = @import("std");
-const ui_backend = @import("../core/protocol/ui_backend.zig");
-const util_json = @import("../util/json.zig");
+const ui_backend = @import("metacodes-internal").core.protocol.ui_backend;
+const util_json = @import("metacodes-internal").util.json;
 
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;
@@ -121,7 +121,7 @@ pub const StreamJsonBackend = struct {
     fn emitEvent(self: *StreamJsonBackend, ev: CoreEvent) void {
         // 行构造失败(OOM)丢事件不致命,但不静默(与 DiagnosticsBackend 同则)。
         self.tryEmit(ev) catch {
-            @import("../util/log.zig").warn("stream", "dropped stream-json event (OOM)", .{});
+            @import("metacodes-internal").util.log.warn("stream", "dropped stream-json event (OOM)", .{});
         };
     }
 
@@ -383,7 +383,7 @@ test "StreamJsonBackend: 事件→NDJSON 行,每行合法 JSON,忽略渲染事�
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     be.emitEvent(sid, .{ .tool_start = .{ .id = "t1", .name = "Bash", .input = "{\"command\":\"ls\"}" } });
     be.emitEvent(sid, .{ .text_chunk = "hello \"world\"\n" });
@@ -416,7 +416,7 @@ test "StreamJsonBackend: 输出段定性进时间线,消费者不必自建 final
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     // 工具前的过程说明 → commentary;续写两段 → continued + final(同 group)。
     be.emitEvent(sid, .{ .output_segment_begin = .{ .index = 0, .turn = 1, .group = 0 } });
@@ -470,7 +470,7 @@ test "StreamJsonBackend: 超限 input 截断到码点边界且显式标注" {
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     // 中文填充:MAX_FIELD_PREVIEW 处大概率切进 3 字节码点中间。
     var big = std.ArrayList(u8).empty;
@@ -491,9 +491,9 @@ test "StreamJsonBackend: 超限 input 截断到码点边界且显式标注" {
 
 test "StreamJsonBackend: run() 同款 tee 组合——usage 记账腿与流式腿同时生效" {
     const a = std.testing.allocator;
-    const writer_backend = @import("../core/writer_backend.zig");
-    const tee_backend_mod = @import("../core/tee_backend.zig");
-    const UsageTotals = @import("../core/usage.zig").UsageTotals;
+    const writer_backend = @import("metacodes-internal").core.writer_backend;
+    const tee_backend_mod = @import("metacodes-internal").core.tee_backend;
+    const UsageTotals = @import("metacodes-internal").core.usage.UsageTotals;
 
     var usage = UsageTotals{};
     var wb = writer_backend.WriterBackend.initNullWithUsage(&usage);
@@ -504,7 +504,7 @@ test "StreamJsonBackend: run() 同款 tee 组合——usage 记账腿与流式�
     var sjb_be = sjb.backend();
     var stream_tee = tee_backend_mod.TeeBackend{ .primary = &wb_be, .secondary = &sjb_be };
     const be = stream_tee.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     be.emitEvent(sid, .{ .tool_start = .{ .id = "t1", .name = "Bash", .input = "{}" } });
     be.emitEvent(sid, .{ .usage = .{ .input_tokens = 7, .output_tokens = 3 } });
@@ -525,7 +525,7 @@ test "StreamJsonBackend: tool_result 带二进制字节(PDF 头 %93 8C 8B 9E)→
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     // 2026-09-05 patron 现场原样:Read 一个 ReportLab PDF,第二行的二进制标记直送了 stdout。
     // id/name/input 同样是不可信字节,一并带脏。
@@ -564,7 +564,7 @@ test "StreamJsonBackend: 文本增量在多字节字符中间断开 → 跨行�
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     // "判定" = E5 88 A4 E5 AE 9A:第一刀切在"判"的第 2/3 字节之间;
     // "🎉" = F0 9F 8E 89:切成 1+1+2 字节,中间那片连一个字符都凑不齐,只能继续悬挂。
@@ -589,7 +589,7 @@ test "StreamJsonBackend: 块结束仍拼不上的尾巴 → 先以 U+FFFD 独立
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     be.emitEvent(sid, .{ .text_chunk = "abc\xe5\x88" }); // "abc" 出行,E5 88 悬挂
     be.emitEvent(sid, .{ .thinking_chunk = "hmm" }); // 种类切换 = text 块结束 → 先 text U+FFFD 行
@@ -632,7 +632,7 @@ test "StreamJsonBackend: 悬挂尾巴接不上下一增量 → 尾巴记 U+FFFD,
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     be.emitEvent(sid, .{ .text_chunk = "\xe7\xbb" }); // 整片悬挂
     be.emitEvent(sid, .{ .text_chunk = "abc" }); // 拼不上 → U+FFFD + "abc"
@@ -653,7 +653,7 @@ test "StreamJsonBackend: 增量中段的非法字节逐字节 U+FFFD,相邻合�
     defer cap.buf.deinit(a);
     var sjb = StreamJsonBackend.init(a, cap.sink());
     const be = sjb.backend();
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
 
     be.emitEvent(sid, .{ .text_chunk = "a\x93b判\xff\xfe定\x93\x8c\x8b\x9e" }); // 尾部的孤立 continuation 不是前缀,不悬挂
     be.emitEvent(sid, .{ .thinking_chunk = "x\xed\xa0\x80y" }); // CESU-8 代理编码:非法
@@ -670,7 +670,7 @@ test "StreamJsonBackend: 增量中段的非法字节逐字节 U+FFFD,相邻合�
 
 test "StreamJsonBackend: 合法 UTF-8 文本任意切分后经时间线重组逐字节相等(随机切分)" {
     const a = std.testing.allocator;
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
     var prng = std.Random.DefaultPrng.init(0x5eed_2026);
     const rnd = prng.random();
     // 1/2/3/4 字节字符 + 需要转义的 ASCII 混排。
@@ -703,7 +703,7 @@ test "StreamJsonBackend: 合法 UTF-8 文本任意切分后经时间线重组逐
 
 test "StreamJsonBackend: 随机字节流(含非法 UTF-8)任意切分后每一行仍合法 UTF-8 + 严格可解码" {
     const a = std.testing.allocator;
-    const sid = @import("../core/session_id.zig").SessionId.single;
+    const sid = @import("metacodes-internal").core.session_id.SessionId.single;
     var prng = std.Random.DefaultPrng.init(0xbadb17e5);
     const rnd = prng.random();
     var round: usize = 0;

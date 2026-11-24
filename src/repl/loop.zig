@@ -14,21 +14,21 @@ const platform_sync = @import("platform").sync;
 const platform_term = @import("platform").terminal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
-const provider_login = @import("../api/provider_login.zig");
-const oauth_login_mod = @import("../api/oauth_login.zig");
-const openrouter_login = @import("../api/openrouter_login.zig");
-const auth_mod = @import("../core/auth.zig");
-const api_key_store = @import("../provider/api_key_store.zig");
-const Conversation = @import("../core/conversation.zig").Conversation;
-const tools = @import("../tools.zig");
-const agent_loop = @import("../core/agent_loop.zig");
-const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
-const check_gate_mod = @import("../core/check_gate.zig");
-const isolated_verifier_mod = @import("../core/isolated_verifier.zig");
-const learning_turn_mod = @import("../core/learning_turn.zig");
-const test_integrity_mod = @import("../core/test_integrity.zig");
-const stall_gate_mod = @import("../core/stall_gate.zig");
-const host_injection_meter = @import("../core/host_injection_meter.zig");
+const provider_login = @import("metacodes-internal").api.provider_login;
+const oauth_login_mod = @import("metacodes-internal").api.oauth_login;
+const openrouter_login = @import("metacodes-internal").api.openrouter_login;
+const auth_mod = @import("metacodes-internal").core.auth;
+const api_key_store = @import("metacodes-internal").provider.api_key_store;
+const Conversation = @import("metacodes-internal").core.conversation.Conversation;
+const tools = @import("metacodes-internal").tools_root;
+const agent_loop = @import("metacodes-internal").core.agent_loop;
+const delivery_cadence_mod = @import("metacodes-internal").core.delivery_cadence;
+const check_gate_mod = @import("metacodes-internal").core.check_gate;
+const isolated_verifier_mod = @import("metacodes-internal").core.isolated_verifier;
+const learning_turn_mod = @import("metacodes-internal").core.learning_turn;
+const test_integrity_mod = @import("metacodes-internal").core.test_integrity;
+const stall_gate_mod = @import("metacodes-internal").core.stall_gate;
+const host_injection_meter = @import("metacodes-internal").core.host_injection_meter;
 const input = @import("input.zig");
 const copy_select = @import("tui/copy_select.zig");
 const complete = @import("complete.zig");
@@ -39,36 +39,36 @@ const cmd_output = @import("cmd_output.zig");
 const dialogs = @import("dialogs.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
-const transcript_mod = @import("../core/transcript.zig");
+const transcript_mod = @import("metacodes-internal").core.transcript;
 const transcript_viewer = @import("transcript_viewer.zig");
 const picker_host = @import("picker_host.zig");
 const progress = @import("progress.zig");
 const render_region_mod = @import("tui/render_region.zig");
-const agent_job_registry_mod = @import("../core/agent_job_registry.zig");
+const agent_job_registry_mod = @import("metacodes-internal").core.agent_job_registry;
 const msg_queue_mod = @import("msg_queue.zig");
 const tui_term_root = @import("tui/term.zig");
 const tui_theme = @import("tui/theme.zig");
 const splash_player = @import("tui/splash_player.zig");
-const util_fs = @import("../util/fs.zig");
-const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
-const writer_backend_mod = @import("../core/writer_backend.zig");
-const tee_backend_mod = @import("../core/tee_backend.zig");
-const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
-const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
-const project_activation = @import("../core/project_rule_activation.zig");
-const run_journal = @import("../core/tool_observation_journal.zig");
+const util_fs = @import("metacodes-internal").util.fs;
+const ui_backend_mod = @import("metacodes-internal").core.protocol.ui_backend;
+const writer_backend_mod = @import("metacodes-internal").core.writer_backend;
+const tee_backend_mod = @import("metacodes-internal").core.tee_backend;
+const diagnostics_backend_mod = @import("metacodes-internal").core.diagnostics_backend;
+const evaluation_backend_mod = @import("metacodes-internal").core.evaluation_backend;
+const project_activation = @import("metacodes-internal").core.project_rule_activation;
+const run_journal = @import("metacodes-internal").core.tool_observation_journal;
 const tui_backend_mod = @import("tui/tui_backend.zig");
 const terminal_title = @import("tui/terminal_title.zig");
-const goal_mod = @import("../core/goal.zig");
-const usage_mod = @import("../core/usage.zig");
-const types_mod = @import("../types.zig");
-const dialect_mod = @import("../api/dialect.zig");
-const request_overrides = @import("../api/request_overrides.zig");
-const util_time = @import("../util/time.zig");
+const goal_mod = @import("metacodes-internal").core.goal;
+const usage_mod = @import("metacodes-internal").core.usage;
+const types_mod = @import("metacodes-internal").types;
+const dialect_mod = @import("metacodes-internal").api.dialect;
+const request_overrides = @import("metacodes-internal").api.request_overrides;
+const util_time = @import("metacodes-internal").util.time;
 const model_command = @import("model_command.zig");
 const session_service = @import("../session_service.zig");
 const replay = @import("replay.zig");
-const skill_cli_adapter = @import("../skills/cli_adapter.zig");
+const skill_cli_adapter = @import("metacodes-internal").skills.cli_adapter;
 const teamwork = @import("teamwork.zig");
 
 fn hasPendingRunInput(ctx: *anyopaque) bool {
@@ -83,7 +83,7 @@ fn debugSink(_: *anyopaque, bytes: []const u8) void {
 }
 
 /// 建一个走 std.debug.print 的 WriterBackend(colorize=true 复刻旧 DebugWriter 继承的默认)。
-fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("../core/usage.zig").UsageTotals) writer_backend_mod.WriterBackend {
+fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("metacodes-internal").core.usage.UsageTotals) writer_backend_mod.WriterBackend {
     return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = true, .verbose = verbose, .show_retry = show_retry, .usage_acc = usage_acc };
 }
 
@@ -117,7 +117,7 @@ pub const Splash = union(enum) {
 pub fn startSplash(allocator: std.mem.Allocator, variant: tui_theme.Variant, state_root: []const u8) Splash {
     const plan = splashPlan(allocator, state_root) orelse return .off;
     const bg = splash_player.Background.start(allocator, plan, splashStyle(variant), splashSeed()) catch |err| {
-        @import("../util/log.zig").debug("splash", "background start failed: {s}; playing after init", .{@errorName(err)});
+        @import("metacodes-internal").util.log.debug("splash", "background start failed: {s}; playing after init", .{@errorName(err)});
         return .not_started;
     };
     return .{ .playing = bg };
@@ -142,7 +142,7 @@ fn endSplash(bg: *splash_player.Background, how: enum { wait, stop }) void {
 }
 
 fn logSplash(outcome: splash_player.Outcome, plan: splash_player.Plan, mode: @import("tui/splash.zig").ColorMode) void {
-    @import("../util/log.zig").debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(mode) });
+    @import("metacodes-internal").util.log.debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(mode) });
 }
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !void {
@@ -259,7 +259,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         // 入队当作下一轮 user input(idle→立即;有 draft→排在队尾)。**SW5 债**:idle 阻塞在
         // readLineRaw 时的实时注入需接进输入 poll 循环(见 readLineRaw poll,当前需按回车触发)。
         if (app.swarm.hasTeam()) {
-            if (@import("../swarm/tools.zig").pollLeadInbox(allocator, &app.swarm) catch null) |pulled| {
+            if (@import("metacodes-internal").swarm.tools.pollLeadInbox(allocator, &app.swarm) catch null) |pulled| {
                 _ = msg_queue.push(pulled);
                 allocator.free(pulled);
             }
@@ -886,7 +886,7 @@ const TurnHost = struct {
     unsent_draft: *?input.LineEditor,
     history: *history_mod.History,
     eval_runtime: *?evaluation_backend_mod.RuntimeConfig,
-    eval_execution_policy: ?@import("../tools.zig").ToolExecutionPolicy,
+    eval_execution_policy: ?@import("metacodes-internal").tools_root.ToolExecutionPolicy,
     spawn_tick: ?*const fn (u64, []const u8) void,
 };
 
@@ -1275,7 +1275,7 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     };
 
     // Why the model failed, for the next step the `.api_error` notice below gives.
-    var model_failure: ?@import("../api/model_error.zig").Detail = null;
+    var model_failure: ?@import("metacodes-internal").api.model_error.Detail = null;
     run_opts.model_error_out = &model_failure;
     const result = agent_loop.run(
         &app.conversation,
@@ -1324,7 +1324,7 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     if (result.suspend_info) |si| {
         defer si.deinit();
         if (app.sessionDir()) |dir| {
-            const suspend_state = @import("../core/suspend_state.zig");
+            const suspend_state = @import("metacodes-internal").core.suspend_state;
             suspend_state.writeFromSuspendInfo(dir, si, allocator) catch {};
             cmd_output.print("\x1b[36m⏸ Suspended (kind={s}) — resume from: {s}\x1b[0m\n", .{ si.kind, dir });
         }
@@ -1370,7 +1370,7 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     // The last line is the next step. A rejected sign-in or key, or a balance
     // that ran out, says what helps instead of /retry (next_step.zig).
     if (result.stop_reason == .api_error) {
-        const last_error = @import("../api/last_error.zig");
+        const last_error = @import("metacodes-internal").api.last_error;
         const next_step = @import("next_step.zig");
         const next_owned: ?[]u8 = if (model_failure) |*failure|
             next_step.forFailure(allocator, app, failure, .interactive) catch null
@@ -1754,7 +1754,7 @@ fn appendProviderRows(arena: std.mem.Allocator, entries: *std.ArrayList(complete
 
 /// What `/login <provider>` does for `profile`, or null when it cannot sign
 /// in to it (the same test the `/login` list applies).
-fn loginRowText(arena: std.mem.Allocator, host: *const @import("../provider/host.zig").Host, profile: *const @import("../provider/profile.zig").ProviderProfile, state_root: []const u8) ?[]const u8 {
+fn loginRowText(arena: std.mem.Allocator, host: *const @import("metacodes-internal").provider.host.Host, profile: *const @import("metacodes-internal").provider.profile.ProviderProfile, state_root: []const u8) ?[]const u8 {
     if (profile.key_grant != null) {
         return std.fmt.allocPrint(arena, "Sign in to {s}: in the browser, on another device, or with a key", .{profile.display_name}) catch null;
     }
@@ -2266,8 +2266,8 @@ fn readLineRaw(
                         redraw(region, &editor, app);
                         continue;
                     }
-                    var efforts_buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
-                    const efforts = @import("../api/catalog.zig").reasoningOptions(entries[model_idx].reasoning_mask, &efforts_buf);
+                    var efforts_buf: @import("metacodes-internal").api.catalog.ReasoningOptions = undefined;
+                    const efforts = @import("metacodes-internal").api.catalog.reasoningOptions(entries[model_idx].reasoning_mask, &efforts_buf);
                     const effort_idx = @min(region.ui.phase.input.slash_sel, efforts.len - 1);
                     try app.setReasoningEffort(efforts[effort_idx]);
                     const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[model_idx].model_id});
@@ -2650,7 +2650,7 @@ const testing = std.testing;
 test "/login: the model choice replaces an older key in auth.json, and a copy that runs out of memory leaves it whole (#485, #527)" {
     const Run = struct {
         fn run(allocator: std.mem.Allocator) !void {
-            var stored: @import("../core/auth.zig").StoredCredentials = .{};
+            var stored: @import("metacodes-internal").core.auth.StoredCredentials = .{};
             defer stored.deinit(allocator);
             stored.api_key = try allocator.dupe(u8, "sk-previous-key");
             stored.selected_model = try allocator.dupe(u8, "previous-model");
@@ -2967,7 +2967,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
                 cmd_output.print("usage: /model use <model-id>\n", .{});
                 return;
             }
-            const resolved = @import("../tools/agent.zig").resolveModelSelection(
+            const resolved = @import("metacodes-internal").tools.agent.resolveModelSelection(
                 app.activeModelTiers(),
                 target_raw,
                 null,
@@ -3027,9 +3027,9 @@ fn printAliasHelp() void {
 }
 
 fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    const config_store = @import("../provider/config_store.zig");
-    const config_doc = @import("../provider/config_doc.zig");
-    const alias_mod = @import("../provider/alias.zig");
+    const config_store = @import("metacodes-internal").provider.config_store;
+    const config_doc = @import("metacodes-internal").provider.config_doc;
+    const alias_mod = @import("metacodes-internal").provider.alias;
 
     if (std.mem.eql(u8, rest, "help") or std.mem.eql(u8, rest, "--help")) {
         printAliasHelp();
@@ -3133,7 +3133,7 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             cmd_output.print("\x1b[31malias name too long\x1b[0m\n", .{});
             return;
         };
-        const parsed_selector = @import("../provider/selection.zig").Selector.parse(selector) catch {
+        const parsed_selector = @import("metacodes-internal").provider.selection.Selector.parse(selector) catch {
             cmd_output.print("\x1b[31mselector too long\x1b[0m\n", .{});
             return;
         };
@@ -3192,8 +3192,8 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 /// A second traversal, on the error path only: a floating alias that matches
 /// several routes cannot pick one, and telling the user *which* ones lets them
 /// pin instead.
-fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/config_store.zig").Store, name: []const u8) void {
-    const alias_mod = @import("../provider/alias.zig");
+fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("metacodes-internal").provider.config_store.Store, name: []const u8) void {
+    const alias_mod = @import("metacodes-internal").provider.alias;
     var document = store.load() catch return;
     defer document.deinit();
     const entry = document.alias(name) orelse return;
@@ -3431,7 +3431,7 @@ const PreviousKeys = struct {
     entries: [4]Entry = undefined,
     len: usize = 0,
 
-    const Entry = struct { provider_id: @import("../provider/ids.zig").Slug, manage_url: []u8 };
+    const Entry = struct { provider_id: @import("metacodes-internal").provider.ids.Slug, manage_url: []u8 };
 
     fn note(self: *PreviousKeys, allocator: std.mem.Allocator, state_root: []const u8, prepared: provider_login.KeyGrantPrepared) void {
         if (self.len == self.entries.len) return;
@@ -3440,7 +3440,7 @@ const PreviousKeys = struct {
         self.len += 1;
     }
 
-    fn forProvider(self: *const PreviousKeys, id: @import("../provider/ids.zig").Slug) ?[]const u8 {
+    fn forProvider(self: *const PreviousKeys, id: @import("metacodes-internal").provider.ids.Slug) ?[]const u8 {
         for (self.entries[0..self.len]) |entry| if (entry.provider_id.eql(id)) return entry.manage_url;
         return null;
     }
@@ -3456,7 +3456,7 @@ const ListingFetch = enum { background, now };
 /// After a key grant (OpenRouter) stored a key: what the provider said about
 /// it, an account without credits, the key a previous sign-in left behind,
 /// and a variable that is read before the stored key.
-fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile, previous: ?[]const u8, fetch: ListingFetch) void {
+fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("metacodes-internal").provider.profile.ProviderProfile, previous: ?[]const u8, fetch: ListingFetch) void {
     const th = app.theme;
     const grant = profile.key_grant orelse return;
     const grant_origin = openrouter_login.origin(grant);
@@ -3482,7 +3482,7 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     // The account's own models, so /model lists them.
     switch (fetch) {
         .background => app.startOpenRouterRefresh(true) catch |err| {
-            @import("../util/log.zig").debug("catalog", "OpenRouter listing not fetched in the background ({s}); fetching now", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("catalog", "OpenRouter listing not fetched in the background ({s}); fetching now", .{@errorName(err)});
             fetchListingNow(app, profile);
         },
         .now => fetchListingNow(app, profile),
@@ -3495,7 +3495,7 @@ fn printKeyGrantSignedIn(app: *app_mod.App, profile: *const @import("../provider
     app.pending_picker_preset = app_mod.PickerPreset.withFilter(.global, if (meta.free_tier orelse false) ":free" else "");
 }
 
-fn fetchListingNow(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile) void {
+fn fetchListingNow(app: *app_mod.App, profile: *const @import("metacodes-internal").provider.profile.ProviderProfile) void {
     const th = app.theme;
     cmd_output.print("{s}Downloading the models your {s} account can use…{s}\n", .{ th.dim, profile.display_name, th.reset });
     _ = app.refreshOpenRouterListing() catch |err| {
@@ -3585,7 +3585,7 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool, 
     if (dialog.effort) |effort| cmd_output.print(" · reasoning {s}", .{dialog.models.effortLabelFor(model, effort)});
     cmd_output.print("\n", .{});
     // The session this sign-in replaced, revoked at Metask (#560).
-    if (@import("../api/metask_oauth.zig").replacedNote(applied.replaced)) |note| {
+    if (@import("metacodes-internal").api.metask_oauth.replacedNote(applied.replaced)) |note| {
         cmd_output.print("{s}{s}{s}\n", .{ if (note.warn) th.warn else th.dim, note.text, th.reset });
     }
     if (applied.default_error) |err| {
@@ -3604,7 +3604,7 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool, 
 /// reasoning level (`StoredCredentials.recordSessionChoice`).
 fn recordSignInChoice(
     allocator: std.mem.Allocator,
-    stored: *@import("../core/auth.zig").StoredCredentials,
+    stored: *@import("metacodes-internal").core.auth.StoredCredentials,
     model: []const u8,
     effort: ?types_mod.ReasoningEffort,
 ) error{OutOfMemory}!void {
@@ -3671,7 +3671,7 @@ fn handleLogout(app: *app_mod.App, rest: []const u8) void {
 /// `/logout <provider>`: the key `/login <provider>` stored. A session that
 /// was using it holds no credential afterwards. A key in `.env` or the shell
 /// is not removed here; the line says where it is.
-fn logoutProvider(app: *app_mod.App, profile: *const @import("../provider/profile.zig").ProviderProfile) void {
+fn logoutProvider(app: *app_mod.App, profile: *const @import("metacodes-internal").provider.profile.ProviderProfile) void {
     const th = app.theme;
     const result = app.forgetProviderKey(profile.id) catch |err| {
         cmd_output.print("{s}Logout failed: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
@@ -3810,7 +3810,7 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
             cmd_output.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
             return;
         };
-        const id = @import("../provider/ids.zig").Slug.parse(target) catch {
+        const id = @import("metacodes-internal").provider.ids.Slug.parse(target) catch {
             cmd_output.print("\x1b[31minvalid provider id '{s}'\x1b[0m\n", .{target});
             return;
         };
@@ -3869,7 +3869,7 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         cmd_output.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
-    var page: std.ArrayList(@import("../provider/control_plane.zig").OfferSummary) = .empty;
+    var page: std.ArrayList(@import("metacodes-internal").provider.control_plane.OfferSummary) = .empty;
     defer page.deinit(allocator);
     const listed = host.kernel.modelList(.{}, .{}, allocator, &page) catch |err| {
         cmd_output.print("\x1b[31mmodel.list failed: {s}\x1b[0m\n", .{@errorName(err)});
@@ -3968,8 +3968,8 @@ fn printModelCandidate(c: model_command.Candidate, current: bool) void {
 fn reasoningOptionCount(app: *const app_mod.App) usize {
     const idx = app.models_picker_model_index orelse return 0;
     if (idx >= app.api_client.catalog.entries.items.len) return 0;
-    var buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
-    return @import("../api/catalog.zig").reasoningOptions(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
+    var buf: @import("metacodes-internal").api.catalog.ReasoningOptions = undefined;
+    return @import("metacodes-internal").api.catalog.reasoningOptions(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
 }
 
 fn printCapabilities(provider: types_mod.ProviderKind, model: []const u8) void {
@@ -4143,7 +4143,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         app.joinKgStartup();
     }
     const kg = if (app.kg) |*k| k else {
-        cmd_output.print("KG unavailable: not configured\nFix: {s}\n", .{@import("../kg/client.zig").KgClient.hintFor(.unconfigured)});
+        cmd_output.print("KG unavailable: not configured\nFix: {s}\n", .{@import("metacodes-internal").kg.client.KgClient.hintFor(.unconfigured)});
         return;
     };
     // An explicit status request probes now; the backoff only paces the tools.
@@ -4194,7 +4194,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         if (app.kg_projects_dir.len > 0) {
             // 12b 单入口:有 task 锚指针 → 一次深遍历看全(多计划+inbox,与模型侧
             // appendKgFrontier 同源);存量店退回双指针(kg_root+kg_inbox)。
-            const inject_mod = @import("../kg/inject.zig");
+            const inject_mod = @import("metacodes-internal").kg.inject;
             const has_anchor = inject_mod.readIdPointer(allocator, app.kg_projects_dir, "kg_task_anchor") != null;
             const shown_plan = if (has_anchor)
                 printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_task_anchor", "Tasks")
@@ -4239,7 +4239,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
     if (std.mem.eql(u8, arg, "plan")) {
         // TinyKG task graph is the sole progress source. `kg_plan_doc` is a
         // legacy approved-plan artifact, never an authority for lifecycle.
-        const inject = @import("../kg/inject.zig");
+        const inject = @import("metacodes-internal").kg.inject;
         const root = if (app.kg_projects_dir.len > 0)
             inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root")
         else
@@ -4248,7 +4248,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             cmd_output.print("This project has no kg_root, so there is no plan to show.\n", .{});
             return;
         };
-        const md = @import("../kg/plan_view.zig").render(allocator, kg, root_id) catch |err| {
+        const md = @import("metacodes-internal").kg.plan_view.render(allocator, kg, root_id) catch |err| {
             const detail = kg.detail();
             if (detail.len > 0) {
                 cmd_output.print("Could not render the plan: {s}: {s}\n", .{ @errorName(err), detail });
@@ -4280,7 +4280,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
 
     if (std.mem.eql(u8, arg, "sync")) {
         // PM P1:手工编辑(vim)不经 Write 钩子 → 图里旧版;sync 遍历 memdir 重跑幂等 upsert。
-        const autosync = @import("../kg/autosync.zig");
+        const autosync = @import("metacodes-internal").kg.autosync;
         const stats = autosync.syncAll(allocator, kg, app.memdir_abs);
         cmd_output.print("Memory sync done: {d} imported, {d} failed, {d} skipped (index or invalid path).\n", .{ stats.synced, stats.failed, stats.skipped });
         return;
@@ -4484,7 +4484,7 @@ fn extractGcCount(summary: []const u8, key: []const u8) usize {
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
     if (end <= 100) return text[0..end];
-    return text[0..@import("../util/utf8.zig").prefixEnd(text, 100)]; // 不切半个 CJK 字
+    return text[0..@import("metacodes-internal").util.utf8.prefixEnd(text, 100)]; // 不切半个 CJK 字
 }
 
 /// max_turns backstop 可配(METACODES_MAX_TURNS 覆盖;默认 400)。非法值退默认。
@@ -4541,11 +4541,11 @@ fn toolCallBreakdown(app: *app_mod.App, allocator: std.mem.Allocator) ?[]u8 {
     return out.toOwnedSlice(allocator) catch null;
 }
 
-const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+const scoped_recall_mod = @import("metacodes-internal").kg.scoped_recall;
 
 /// 打印某个 root(kg_root/kg_inbox)的 frontier。返回是否显示了内容(供"全空"提示)。
 fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: []const u8, pointer: []const u8, label: []const u8) bool {
-    const inject = @import("../kg/inject.zig");
+    const inject = @import("metacodes-internal").kg.inject;
     const root = inject.readIdPointer(allocator, projects_dir, pointer) orelse return false;
     const rows = kg.frontier(root, 30) catch return false;
     defer {
@@ -4842,7 +4842,7 @@ fn flattenConversation(app: *app_mod.App, allocator: std.mem.Allocator) ![]u8 {
 
 /// 用临时 subagent 跑一个不进主历史的查询(/btw /recap 共用)。
 fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    const subagent = @import("../core/subagent.zig");
+    const subagent = @import("metacodes-internal").core.subagent;
     const result = try subagent.spawnAgent(
         allocator,
         app.provider(),
@@ -4910,7 +4910,7 @@ fn printReport(app: *const app_mod.App, comptime write: fn (*std.Io.Writer, *con
 /// The official name of a permission mode (`acceptEdits`, …), with the
 /// historic aliases folded in.
 fn modeName(m: types_mod.PermissionMode) []const u8 {
-    return switch (@import("../permission/mode.zig").canonical(m)) {
+    return switch (@import("metacodes-internal").permission.mode.canonical(m)) {
         .default, .prompt => "default",
         .accept_edits => "acceptEdits",
         .auto => "auto",
@@ -4989,7 +4989,7 @@ fn writeCommandList(w: *std.Io.Writer, catalog: complete.SlashCatalog, kind: com
 /// (以目录名代替)。失败、跳过与缺描述都必须可见——
 /// 静默丢 skill 或静默降级正是兼容问题最难排查的形态。
 pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
-    const catalog = @import("../skills/runtime/catalog.zig");
+    const catalog = @import("metacodes-internal").skills.runtime.catalog;
     const snapshot = app.skill_runtime.currentSnapshot() orelse {
         try w.writeAll("Skills unavailable (catalog not loaded; run with METACODES_LOG=warn for the reason)\n");
         return;
@@ -5086,7 +5086,7 @@ pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writ
 /// /hooks:生效的 hook(按事件)与最近一次加载发现的每一处坏配置。格式错的 hook 不会报错,
 /// 只会永不触发——这里是用户看见"为什么没触发"的地方。
 pub fn writeHooksReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
-    const hooks_mod = @import("../permission/hooks.zig");
+    const hooks_mod = @import("metacodes-internal").permission.hooks;
     const problems: []const hooks_mod.Problem = if (app.hook_diagnostics) |*diag| diag.items() else &.{};
     const sources = "<project>/.claude/settings.json and ~/.claude/settings.json";
     if (app.hooks == null and problems.len == 0) {
@@ -5354,7 +5354,7 @@ fn printMcpConnecting(app: *const app_mod.App, startup: *const @import("../app/m
 /// /agents:列出已加载的 subagent 定义(builtin / personal / project / plugin),缺 `description`
 /// 的 agent(Task 工具按描述列出,模型据此决定委托),以及没加载成的 agent 文件。
 pub fn writeAgentsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
-    const agent_set = @import("../agents/set.zig");
+    const agent_set = @import("metacodes-internal").agents.set;
     const failures = app.agents.load_failures.items;
     if (app.agents.len() == 0 and failures.len == 0) {
         try w.writeAll("(no subagents loaded)\n");
@@ -5362,7 +5362,7 @@ pub fn writeAgentsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writ
     }
 
     // 按来源分组打印
-    const Origin = @import("../agents/def.zig").Origin;
+    const Origin = @import("metacodes-internal").agents.def.Origin;
     const origins = [_]struct { tag: Origin, label: []const u8, color: []const u8 }{
         .{ .tag = .builtin, .label = "Built-in", .color = "\x1b[33m" },
         .{ .tag = .personal, .label = "Personal", .color = "\x1b[36m" },
@@ -5405,7 +5405,7 @@ pub fn writeAgentsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writ
                 try w.print("    model: {s}\n", .{a.model});
             }
             if (a.permission_mode) |m| {
-                const agent_tool = @import("../tools/agent.zig");
+                const agent_tool = @import("metacodes-internal").tools.agent;
                 const refused = !app.permission_ctx.modeAllowed(agent_tool.mapPermissionMode(m));
                 try w.print("    permissionMode: {s}{s}\n", .{
                     @tagName(m),
@@ -5624,7 +5624,7 @@ fn editMemorySlot(app: *app_mod.App, allocator: std.mem.Allocator, home: []const
     };
 
     // mkdir 父目录(~/.claude 等可能不存在);创建空文件(保留已存在,wx 语义)。
-    if (std.fs.path.dirname(path)) |d| @import("../util/fs.zig").mkdirParents(d) catch {};
+    if (std.fs.path.dirname(path)) |d| @import("metacodes-internal").util.fs.mkdirParents(d) catch {};
     {
         var zb: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len + 1 <= zb.len) {
@@ -5713,7 +5713,7 @@ fn printBanner(app: *const app_mod.App) void {
     // 去掉旧的 64 封顶——宽窗口下旧版框 64 列、分隔线满宽,两条线不等长(用户实测割裂)。
     const inner: usize = if (cols > 3) cols - 3 else 60;
 
-    const title = " metacodes v" ++ @import("../version.zig").semver ++ " ";
+    const title = " metacodes v" ++ @import("metacodes-internal").version.semver ++ " ";
     // 顶边框:╭─ metacodes ───…──╮
     cmd_output.print("{s}{s}{s}{s}", .{ th.accent, th.box_tl, th.box_h, title });
     var filled: usize = 1 + displayWidthAscii(title); // box_h(1) + title
@@ -5753,7 +5753,7 @@ fn splashPlan(allocator: std.mem.Allocator, state_root: []const u8) ?splash_play
     const config = if (state_root.len > 0) @import("tui/config.zig").loadStartupAnimation(allocator, state_root) else null;
     return switch (splash_player.decide(splash_player.gateFromEnv(config))) {
         .skip => |why| {
-            @import("../util/log.zig").debug("splash", "skipped: {s}", .{@tagName(why)});
+            @import("metacodes-internal").util.log.debug("splash", "skipped: {s}", .{@tagName(why)});
             return null;
         },
         .play => |plan| plan,
@@ -5844,7 +5844,7 @@ const StartupSuggestionGit = struct {
     mutex: platform_sync.Mutex = .{},
     cond: platform_sync.Condition = .{},
     /// Raised by `finish`; the capture checks it while it waits on git.
-    stop: @import("../util/abort.zig").AbortSignal = .init(),
+    stop: @import("metacodes-internal").util.abort.AbortSignal = .init(),
     thread: ?std.Thread = null,
     started_ms: i64 = 0,
     done: bool = false,
@@ -5858,7 +5858,7 @@ const StartupSuggestionGit = struct {
 
     fn fetch(self: *StartupSuggestionGit) void {
         const argv = [_]?[*:0]const u8{ "/usr/bin/env", "git", "log", "-1", "--name-only", "--pretty=format:", null };
-        const out = @import("../tools/common.zig").spawnCaptureStdoutAbortableTimed(argv[0..], std.heap.c_allocator, &self.stop, STARTUP_SUGGESTION_GIT_LIMIT_MS) catch null;
+        const out = @import("metacodes-internal").tools.common.spawnCaptureStdoutAbortableTimed(argv[0..], std.heap.c_allocator, &self.stop, STARTUP_SUGGESTION_GIT_LIMIT_MS) catch null;
         self.mutex.lock();
         defer self.mutex.unlock();
         self.out = out;
@@ -5957,7 +5957,7 @@ fn printTaskList(app: *app_mod.App) void {
     // 后台 subagent jobs(独立于 todo 任务):running/done/failed/killed。
     if (app.agent_jobs) |*reg| {
         const snaps = reg.snapshotJobsInScope(app.allocator, app.agentJobScope()) catch return;
-        defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeSnapshots(app.allocator, snaps);
+        defer @import("metacodes-internal").core.agent_job_registry.AgentJobRegistry.freeSnapshots(app.allocator, snaps);
         if (snaps.len == 0) return;
         cmd_output.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});
         for (snaps) |s| {
@@ -6086,7 +6086,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // state. A hand-created/legacy directory with a malformed id must never
     // leave the writer pointed at one session while routing/permissions still
     // use another.
-    const target_sid = @import("../core/session_id.zig").SessionId.fromSlice(target_id orelse "") orelse {
+    const target_sid = @import("metacodes-internal").core.session_id.SessionId.fromSlice(target_id orelse "") orelse {
         cmd_output.print("load failed: invalid session id (session state unchanged)\n", .{});
         return null;
     };

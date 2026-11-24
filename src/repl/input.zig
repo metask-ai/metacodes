@@ -15,7 +15,7 @@ const platform_term = @import("platform").terminal;
 const win32_input = @import("platform").win32_input;
 const platform_signal = @import("platform").signal;
 const process = @import("platform").process;
-const shutdown = @import("../core/shutdown.zig");
+const shutdown = @import("metacodes-internal").core.shutdown;
 const bg_probe = @import("tui/bg_probe.zig");
 
 // ============================================================================
@@ -950,7 +950,7 @@ fn collectStartupInput(fd: c_int, settle_ms: i32) void {
         text.feed(chunk[0..@intCast(n)]);
     }
     text.finish();
-    @import("../util/log.zig").debug("input", "startup input before the first prompt: {d} bytes of text", .{text.text().len});
+    @import("metacodes-internal").util.log.debug("input", "startup input before the first prompt: {d} bytes of text", .{text.text().len});
     if (text.text().len == 0 and !text.dropped) return text.deinit();
     g_startup_text = text;
 }
@@ -2801,7 +2801,7 @@ test "collectStartupInput: it waits two round trips of the terminal for the rest
         try testing.expect(pfs.writeAll(fds[1], "line1\rline2\r"));
         const Later = struct {
             fn send(fd: c_int, gap_ms: u64) void {
-                @import("../util/time.zig").sleepMs(gap_ms);
+                @import("metacodes-internal").util.time.sleepMs(gap_ms);
                 _ = pfs.writeAll(fd, "line3\rline4");
             }
         };

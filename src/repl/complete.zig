@@ -8,7 +8,7 @@
 //! 调用方（loop.zig）负责：唯一候选直接补全；多候选打印列表 + 补到公共前缀。
 
 const std = @import("std");
-const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
+const tt = @import("metacodes-internal").tools.test_tmp; // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 
@@ -275,7 +275,7 @@ pub fn slashNthMatch(catalog: SlashCatalog, line: []const u8, idx: usize) ?Slash
 /// 返回的 entries 与名字由 `arena` 持有。
 pub fn buildSlashCatalog(
     arena: std.mem.Allocator,
-    skills: []const @import("../skills/runtime/definition.zig").Skill,
+    skills: []const @import("metacodes-internal").skills.runtime.definition.Skill,
 ) !SlashCatalog {
     var list: std.ArrayList(SlashCmd) = .empty;
     try list.appendSlice(arena, &SLASH_COMMAND_TABLE);
@@ -536,7 +536,7 @@ test "@-mention completion finds file" {
 test "slash catalog: skills join the built-ins, collisions and model-only skills stay out" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const definition = @import("../skills/runtime/definition.zig");
+    const definition = @import("metacodes-internal").skills.runtime.definition;
     const base = definition.Skill{
         .name = "deploy",
         .description = "Deploy\n  the service",

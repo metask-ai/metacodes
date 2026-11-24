@@ -256,7 +256,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 pub fn shellOutputText(allocator: std.mem.Allocator, dim: []const u8, reset: []const u8, result: []const u8) error{OutOfMemory}![]u8 {
     // Decoded once, parity-correct (the web's shellCommandResult reads it the
     // same way); the old closing-quote scan misread a trailing backslash.
-    const json_util = @import("../util/json.zig");
+    const json_util = @import("metacodes-internal").util.json;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (json_util.extractAndUnescapeStringField(result, "stdout", allocator) catch null) |u| {

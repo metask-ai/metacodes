@@ -13,8 +13,8 @@ const ansi = @import("tui/ansi.zig");
 const theme_mod = @import("tui/theme.zig");
 const term = @import("tui/term.zig");
 const picker_mod = @import("model_picker.zig");
-const offer_mod = @import("../provider/offer.zig");
-const selection_mod = @import("../provider/selection.zig");
+const offer_mod = @import("metacodes-internal").provider.offer;
+const selection_mod = @import("metacodes-internal").provider.selection;
 
 pub const Theme = theme_mod.Theme;
 pub const Picker = picker_mod.Picker;
@@ -722,9 +722,9 @@ pub fn scopePhrase(scope: selection_mod.Scope) []const u8 {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const ids = @import("../provider/ids.zig");
-const control_plane = @import("../provider/control_plane.zig");
-const controls_mod = @import("../provider/controls.zig");
+const ids = @import("metacodes-internal").provider.ids;
+const control_plane = @import("metacodes-internal").provider.control_plane;
+const controls_mod = @import("metacodes-internal").provider.controls;
 
 fn offerOf(provider: []const u8, channel: []const u8, model: []const u8, protocol: []const u8) control_plane.OfferSummary {
     const provider_id = ids.Slug.parse(provider) catch unreachable;

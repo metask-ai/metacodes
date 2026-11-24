@@ -15,16 +15,16 @@ const ui = @import("tui/ui.zig");
 const term = @import("tui/term.zig");
 const ansi = @import("tui/ansi.zig");
 const Theme = @import("tui/theme.zig").Theme;
-const catalog_mod = @import("../skills/runtime/catalog.zig");
-const overrides_mod = @import("../skills/overrides.zig");
-const provider_login = @import("../api/provider_login.zig");
-const login_worker_mod = @import("../api/login_worker.zig");
-const openrouter_login = @import("../api/openrouter_login.zig");
-const metask_sign_in = @import("../api/metask_sign_in.zig");
-const auth = @import("../core/auth.zig");
-const model_catalog = @import("../api/catalog.zig");
-const types = @import("../types.zig");
-const provider_profile = @import("../provider/profile.zig");
+const catalog_mod = @import("metacodes-internal").skills.runtime.catalog;
+const overrides_mod = @import("metacodes-internal").skills.overrides;
+const provider_login = @import("metacodes-internal").api.provider_login;
+const login_worker_mod = @import("metacodes-internal").api.login_worker;
+const openrouter_login = @import("metacodes-internal").api.openrouter_login;
+const metask_sign_in = @import("metacodes-internal").api.metask_sign_in;
+const auth = @import("metacodes-internal").core.auth;
+const model_catalog = @import("metacodes-internal").api.catalog;
+const types = @import("metacodes-internal").types;
+const provider_profile = @import("metacodes-internal").provider.profile;
 
 const Pane = pane_mod.Pane;
 const Step = pane_mod.Step;
@@ -1285,7 +1285,7 @@ pub const LoginDialog = struct {
                     if (self.keyPages().len == 0) return .none;
                     if (self.key_options.open_browser) if (self.keyPages()[self.key_page].url) |url| {
                         // Best effort: the page is also printed whole to copy.
-                        @import("../core/auth.zig").openBrowser(self.allocator, url) catch {};
+                        @import("metacodes-internal").core.auth.openBrowser(self.allocator, url) catch {};
                     };
                     self.stage = .key_entry;
                     return .redraw;
@@ -2176,8 +2176,8 @@ test "login: no provider to sign in to says how keys are configured" {
 test "login: the list wraps, numbers are shown, Esc interrupts" {
     const kinds = [_]provider_profile.CredentialKind{.openai_oauth};
     const profile = provider_profile.ProviderProfile{
-        .id = @import("../provider/ids.zig").Slug.lit("dialog-test"),
-        .implementation_id = @import("../provider/ids.zig").Slug.lit("dialog-test"),
+        .id = @import("metacodes-internal").provider.ids.Slug.lit("dialog-test"),
+        .implementation_id = @import("metacodes-internal").provider.ids.Slug.lit("dialog-test"),
         .display_name = "Dialog Test",
         .channels = &.{},
         .accepted_credential_kinds = &kinds,
@@ -2208,8 +2208,8 @@ fn manyKeyProviders(comptime count: usize) [count]provider_profile.ProviderProfi
         @setEvalBranchQuota(20_000 * count);
         var list: [count]provider_profile.ProviderProfile = undefined;
         for (&list, 0..) |*entry, i| {
-            entry.* = @import("../provider/profiles/zai_coding_plan.zig").PROFILE;
-            entry.id = @import("../provider/ids.zig").Slug.lit(std.fmt.comptimePrint("p{d}", .{i + 1}));
+            entry.* = @import("metacodes-internal").provider.profiles.zai_coding_plan.PROFILE;
+            entry.id = @import("metacodes-internal").provider.ids.Slug.lit(std.fmt.comptimePrint("p{d}", .{i + 1}));
         }
         return list;
     }
@@ -2266,7 +2266,7 @@ test "login: past what a dialog holds, the providers are counted and the named o
 }
 
 test "login: a key provider goes plan page → paste, and the key is never drawn" {
-    const zai = &@import("../provider/profiles/zai_coding_plan.zig").PROFILE;
+    const zai = &@import("metacodes-internal").provider.profiles.zai_coding_plan.PROFILE;
     var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
     defer dialog.deinit();
     dialog.add(.{ .profile = zai, .method = .api_key });
@@ -2320,15 +2320,15 @@ test "login: a key provider goes plan page → paste, and the key is never drawn
 test "login: a provider the user configured goes straight to the paste, with no page to open" {
     const kinds = [_]provider_profile.CredentialKind{.api_key};
     const pages = [_]provider_profile.KeyPage{.{
-        .id = @import("../provider/ids.zig").Slug.lit("key"),
+        .id = @import("metacodes-internal").provider.ids.Slug.lit("key"),
         .label = "House relay",
         .url = null,
         .check_url = "https://relay.example.com/v1/models",
         .check_wire = .openai_chat,
     }};
     const profile = provider_profile.ProviderProfile{
-        .id = @import("../provider/ids.zig").Slug.lit("house-relay"),
-        .implementation_id = @import("../provider/ids.zig").Slug.lit("house-relay"),
+        .id = @import("metacodes-internal").provider.ids.Slug.lit("house-relay"),
+        .implementation_id = @import("metacodes-internal").provider.ids.Slug.lit("house-relay"),
         .display_name = "House relay",
         .channels = &.{},
         .accepted_credential_kinds = &kinds,
@@ -2354,7 +2354,7 @@ test "login: a provider the user configured goes straight to the paste, with no 
 
 /// OpenRouter's sign-in, prepared the way `/login` prepares it.
 fn openrouterChoice(options: provider_login.Options) LoginDialog.Choice {
-    const openrouter = &@import("../provider/profiles/openrouter.zig").PROFILE;
+    const openrouter = &@import("metacodes-internal").provider.profiles.openrouter.PROFILE;
     const flow = provider_login.prepareFlow(openrouter, options, null) catch unreachable;
     return .{ .profile = openrouter, .method = .{ .flow = flow } };
 }
@@ -2476,7 +2476,7 @@ test "login: over SSH a key grant offers the other device first, and --device-co
 }
 
 test "login: a key that was not stored says why and what to do, by provider" {
-    const zai = &@import("../provider/profiles/zai_coding_plan.zig").PROFILE;
+    const zai = &@import("metacodes-internal").provider.profiles.zai_coding_plan.PROFILE;
     var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
     defer dialog.deinit();
     dialog.add(.{ .profile = zai, .method = .api_key });

@@ -34,13 +34,13 @@
 //! `.env` path.
 
 const std = @import("std");
-const model_error = @import("../api/model_error.zig");
-const auth = @import("../core/auth.zig");
+const model_error = @import("metacodes-internal").api.model_error;
+const auth = @import("metacodes-internal").core.auth;
 const app_mod = @import("../app.zig");
-const profile_mod = @import("../provider/profile.zig");
-const provider_host_mod = @import("../provider/host.zig");
+const profile_mod = @import("metacodes-internal").provider.profile;
+const provider_host_mod = @import("metacodes-internal").provider.host;
 const state_env = @import("../app/state_env.zig");
-const codex_usage = @import("../api/codex_usage.zig");
+const codex_usage = @import("metacodes-internal").api.codex_usage;
 
 /// Where the line is shown.
 pub const Surface = union(enum) {
@@ -514,7 +514,7 @@ test "-p names the command that was run and --provider instead of the slash comm
 }
 
 test "every built-in provider names its key's variable or its sign-in; Metask is the Metask route" {
-    const registry = @import("../provider/registry.zig");
+    const registry = @import("metacodes-internal").provider.registry;
     for (&registry.BUILTIN_PROFILES) |*profile| {
         switch (routeFor(profile)) {
             .metask => try testing.expect(profile.id.eqlText("metask")),
@@ -539,7 +539,7 @@ test "every built-in provider names its key's variable or its sign-in; Metask is
 }
 
 test "OpenRouter, whose site creates the key: a refused key signs in again; its 403 keeps the provider's own words" {
-    const registry = @import("../provider/registry.zig");
+    const registry = @import("metacodes-internal").provider.registry;
     const openrouter = routeFor(&registry.openrouter.PROFILE);
     try testing.expectEqualStrings("openrouter", openrouter.provider.sign_in.?);
     try testing.expect(openrouter.provider.key_grant);

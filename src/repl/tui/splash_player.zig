@@ -20,7 +20,7 @@ const pfs = platform.fs;
 const splash = @import("splash.zig");
 const term = @import("term.zig");
 const theme = @import("theme.zig");
-const util_time = @import("../../util/time.zig");
+const util_time = @import("metacodes-internal").util.time;
 const bg_probe = @import("bg_probe.zig");
 
 /// Set to any value to keep the splash off for this process.

@@ -4,7 +4,7 @@
 //! 各事件源(键盘/工具/tick/resize/usage)产生 Event;ui.dispatch(state, event) → Effect。
 
 const std = @import("std");
-const types = @import("../../types.zig");
+const types = @import("metacodes-internal").types;
 const input = @import("../input.zig");
 const ui_state = @import("ui_state.zig");
 

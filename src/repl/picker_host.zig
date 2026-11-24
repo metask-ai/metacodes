@@ -25,9 +25,9 @@ const app_mod = @import("../app.zig");
 const ui_state = @import("tui/ui_state.zig");
 const picker_mod = @import("model_picker.zig");
 const view_mod = @import("model_picker_view.zig");
-const provider_host_mod = @import("../provider/host.zig");
+const provider_host_mod = @import("metacodes-internal").provider.host;
 const state_env = @import("../app/state_env.zig");
-const util_time = @import("../util/time.zig");
+const util_time = @import("metacodes-internal").util.time;
 const RenderRegion = @import("tui/render_region.zig").RenderRegion;
 
 pub const Key = picker_mod.Key;
@@ -297,17 +297,17 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, gu
 
 /// " · reasoning high" for a level a route was committed with or the
 /// session runs at, "" for none.
-fn levelNote(level: ?@import("../types.zig").ReasoningEffort, buf: []u8) []const u8 {
+fn levelNote(level: ?@import("metacodes-internal").types.ReasoningEffort, buf: []u8) []const u8 {
     const effort = level orelse return "";
     if (!effort.active()) return "";
     return std.fmt.bufPrint(buf, " · reasoning {s}", .{effort.name()}) catch "";
 }
 
 /// The reasoning level a commit carries, if any.
-fn committedLevel(commit: picker_mod.Commit) ?@import("../types.zig").ReasoningEffort {
+fn committedLevel(commit: picker_mod.Commit) ?@import("metacodes-internal").types.ReasoningEffort {
     const value = commit.controls.get("reasoning_effort") orelse return null;
     if (value != .text) return null;
-    return @import("../types.zig").ReasoningEffort.parse(value.text.slice());
+    return @import("metacodes-internal").types.ReasoningEffort.parse(value.text.slice());
 }
 
 /// The provider of the route the session is on, as the kernel knows it;
@@ -339,7 +339,7 @@ fn localConfigPath(app: *const app_mod.App, buf: []u8) []const u8 {
     return std.fs.path.join(fixed.allocator(), &.{ app.stateRoot(), state_env.file_name }) catch state_env.file_name;
 }
 
-fn rejectionText(outcome: @import("../provider/control_plane.zig").ValidationOutcome) []const u8 {
+fn rejectionText(outcome: @import("metacodes-internal").provider.control_plane.ValidationOutcome) []const u8 {
     return switch (outcome) {
         .ok => "accepted",
         .unavailable => |err| switch (err) {
@@ -353,8 +353,8 @@ fn rejectionText(outcome: @import("../provider/control_plane.zig").ValidationOut
 
 // ── `/model use <id>` compatibility ──────────────────────────────────────────
 
-const registry_mod = @import("../provider/registry.zig");
-const ids_mod = @import("../provider/ids.zig");
+const registry_mod = @import("metacodes-internal").provider.registry;
+const ids_mod = @import("metacodes-internal").provider.ids;
 
 pub const MAX_CANDIDATES: usize = 6;
 

@@ -17,8 +17,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
 const pfs = @import("platform").fs;
-const util_time = @import("../../util/time.zig");
-const log = @import("../../util/log.zig");
+const util_time = @import("metacodes-internal").util.time;
+const log = @import("metacodes-internal").util.log;
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 

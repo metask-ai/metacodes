@@ -15,10 +15,10 @@
 //! (`/init`), a recorded `!cmd` as its echo and output.
 
 const std = @import("std");
-const msg = @import("../core/message.zig");
-const Conversation = @import("../core/conversation.zig").Conversation;
-const host_injection_meter = @import("../core/host_injection_meter.zig");
-const SessionId = @import("../core/session_id.zig").SessionId;
+const msg = @import("metacodes-internal").core.message;
+const Conversation = @import("metacodes-internal").core.conversation.Conversation;
+const host_injection_meter = @import("metacodes-internal").core.host_injection_meter;
+const SessionId = @import("metacodes-internal").core.session_id.SessionId;
 const session_service = @import("../session_service.zig");
 const user_echo = @import("user_echo.zig");
 const cmd_output = @import("cmd_output.zig");

@@ -168,7 +168,7 @@ fn defaultJson(alloc: std.mem.Allocator, theme_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{{\"theme\":\"{s}\"}}\n", .{theme_name});
 }
 
-const util_json = @import("../../util/json.zig");
+const util_json = @import("metacodes-internal").util.json;
 
 fn writeEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     try util_json.serializeStringContents(s, out, alloc);
@@ -246,7 +246,7 @@ test "writeWithTheme: 字段不存在时追加" {
 
 test "loadTheme + saveTheme 往返(临时 state_root)" {
     var dir_buf: [512]u8 = undefined;
-    const dir = @import("../../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-thtest");
+    const dir = @import("metacodes-internal").util.fs.testing.perPidDir(&dir_buf, "cc-zig-thtest");
     _ = pfs.mkdir(dir.ptr, 0o755);
     defer {
         // 清理 <state_root>/config.json + <state_root> + tmp 目录
@@ -275,7 +275,7 @@ test "loadTheme + saveTheme 往返(临时 state_root)" {
 
 test "loadStartupAnimation: 缺省 null、读 bool、非 bool 视为未设、/theme 写回不丢字段" {
     var dir_buf: [512]u8 = undefined;
-    const dir = @import("../../util/fs.zig").testing.perPidDir(&dir_buf, "cc-zig-anim");
+    const dir = @import("metacodes-internal").util.fs.testing.perPidDir(&dir_buf, "cc-zig-anim");
     _ = pfs.mkdir(dir.ptr, 0o755);
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/config.json", .{dir}) catch unreachable;

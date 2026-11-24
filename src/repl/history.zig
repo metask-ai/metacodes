@@ -10,9 +10,9 @@
 //! 不在 append 时立即写盘——一次 session 的批量追加更省 IO；崩溃时最多丢当前 session。
 
 const std = @import("std");
-const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
+const tt = @import("metacodes-internal").tools.test_tmp; // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
-const util_json = @import("../util/json.zig");
+const util_json = @import("metacodes-internal").util.json;
 
 pub const MAX_ENTRIES: usize = 1000;
 

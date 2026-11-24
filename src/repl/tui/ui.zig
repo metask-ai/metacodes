@@ -12,7 +12,7 @@ const Theme = @import("theme.zig").Theme;
 const ui_state = @import("ui_state.zig");
 const event = @import("event.zig");
 const complete = @import("../complete.zig");
-const agent_job_registry = @import("../../core/agent_job_registry.zig");
+const agent_job_registry = @import("metacodes-internal").core.agent_job_registry;
 
 const UiState = ui_state.UiState;
 const Event = event.Event;
