@@ -557,16 +557,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 标记前台 entry 完成(终值),removeForeground 由上面的 defer 兜底。
     var fg_tokens: u64 = 0;
-    var fg_elapsed_ms: u64 = 0;
     if (fg_entry) |e| {
         if (ctx.agent_jobs) |reg| reg.finishForeground(e, result.turns, result.tool_calls, result.stop_reason);
-        // 读 tokens + 算耗时(entry 仍有效,removeForeground 在函数返回时才跑)。
         e.lockPublic();
         fg_tokens = e.tokens;
-        const start = e.started_ms;
         e.unlockPublic();
-        const now = @import("../util/time.zig").nowMs();
-        fg_elapsed_ms = @intCast(@max(now - start, 0));
     }
 
     // U6 A2:前台 agent 结束 → done(同步路径,本站点即终态,threading 与 spawned 同)。
@@ -588,11 +583,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try util_json.serializeString(result.final_text, &out, ctx.allocator);
     try out.appendSlice(ctx.allocator, ",\"stop_reason\":\"");
     try out.appendSlice(ctx.allocator, @tagName(result.stop_reason));
-    // tokens + elapsed_ms:完成态塌缩卡 `Done (N tool uses · X tokens · Ns)` 渲染用。
     const numeric_tail = try std.fmt.allocPrint(
         ctx.allocator,
-        "\",\"turns\":{d},\"tool_calls\":{d},\"tokens\":{d},\"elapsed_ms\":{d}",
-        .{ result.turns, result.tool_calls, fg_tokens, fg_elapsed_ms },
+        "\",\"turns\":{d},\"tool_calls\":{d},\"tokens\":{d}",
+        .{ result.turns, result.tool_calls, fg_tokens },
     );
     defer ctx.allocator.free(numeric_tail);
     try out.appendSlice(ctx.allocator, numeric_tail);
