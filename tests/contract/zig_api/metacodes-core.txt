@@ -3854,6 +3854,10 @@ metacodes-core.job_registry.PollStreak: struct
 metacodes-core.job_registry.PollStreak.low_yield: u8 = 0
 metacodes-core.job_registry.PollStreak.last_ms: util_time.Millis = 0
 metacodes-core.job_registry.INPUT_STALL_QUIET_MS: const u64 = 45_000
+metacodes-core.job_registry.Supervision: enum
+metacodes-core.job_registry.Supervision.unwatched
+metacodes-core.job_registry.Supervision.watchdog
+metacodes-core.job_registry.test_refuse_sweeper_thread: var bool = false
 metacodes-core.job_registry.Watchdog: struct
 metacodes-core.job_registry.Watchdog.limit_ms: u64
 metacodes-core.job_registry.Watchdog.output_bytes: u64 = 0
@@ -3886,7 +3890,7 @@ metacodes-core.job_registry.JobEntry.poll_streak: PollStreak = .{}
 metacodes-core.job_registry.JobEntry.spool_released: bool = false
 metacodes-core.job_registry.JobEntry.watchdog: ?Watchdog = null
 metacodes-core.job_registry.JobEntry.stop_in_progress: bool = false
-metacodes-core.job_registry.JobEntry.tree_stop: process.TreeStop = .best_effort
+metacodes-core.job_registry.JobEntry.supervision: Supervision = .unwatched
 metacodes-core.job_registry.JobEntry.idSlice: fn idSlice(self: *const JobEntry) []const u8
 metacodes-core.job_registry.JobExitEvent: struct
 metacodes-core.job_registry.JobExitEvent.id: [12]u8
@@ -3916,10 +3920,10 @@ metacodes-core.job_registry.JobRegistry.promoteToBackground: fn promoteToBackgro
 metacodes-core.job_registry.JobRegistry.armWatchdog: fn armWatchdog(self: *JobRegistry, id: []const u8, limit_ms: u64) void
 metacodes-core.job_registry.JobRegistry.spawnBackground: fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackgroundOwned: fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
-metacodes-core.job_registry.JobRegistry.spawnBackgroundStopping: fn spawnBackgroundStopping(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, tree_stop: process.TreeStop) !JobEntry
+metacodes-core.job_registry.JobRegistry.spawnBackgroundSupervised: fn spawnBackgroundSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnSynchronous: fn spawnSynchronous(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnSynchronousOwned: fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
-metacodes-core.job_registry.JobRegistry.spawnSynchronousStopping: fn spawnSynchronousStopping(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, tree_stop: process.TreeStop) !JobEntry
+metacodes-core.job_registry.JobRegistry.spawnSynchronousSupervised: fn spawnSynchronousSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry
 metacodes-core.job_registry.JobRegistry.runningCount: fn runningCount(self: *JobRegistry) usize
 metacodes-core.job_registry.JobRegistry.runningCountForOwner: fn runningCountForOwner(self: *JobRegistry, owner: SessionId) usize
 metacodes-core.job_registry.JobRegistry.reapExited: fn reapExited(self: *JobRegistry) void

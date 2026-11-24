@@ -61,6 +61,20 @@ pub const INPUT_STALL_QUIET_MS: u64 = 45_000;
 const SWEEP_MAX_WAIT_MS: u64 = 250;
 const STOP_WAIT_SLICE_MS: u64 = 10;
 
+pub const Supervision = enum {
+    unwatched,
+    watchdog,
+
+    fn treeStop(self: Supervision) process.TreeStop {
+        return switch (self) {
+            .unwatched => .best_effort,
+            .watchdog => .required,
+        };
+    }
+};
+
+pub var test_refuse_sweeper_thread: bool = false;
+
 pub const Watchdog = struct {
     limit_ms: u64,
     output_bytes: u64 = 0,
@@ -108,7 +122,7 @@ pub const JobEntry = struct {
     spool_released: bool = false,
     watchdog: ?Watchdog = null,
     stop_in_progress: bool = false,
-    tree_stop: process.TreeStop = .best_effort,
+    supervision: Supervision = .unwatched,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -246,10 +260,20 @@ pub const JobRegistry = struct {
             self.sweeper_wake.signal();
             return;
         }
-        self.sweeper = platform_thread.spawn(.waiter, sweepDeadlines, .{self}) catch |err| blk: {
+        self.startSweeperLocked() catch |err| {
             log.warn("job", "deadline sweeper not started ({s}); limits are enforced when exits are collected", .{@errorName(err)});
-            break :blk null;
         };
+    }
+
+    fn ensureSweeper(self: *JobRegistry) !void {
+        self.lock();
+        defer self.unlock();
+        if (self.sweeper == null) try self.startSweeperLocked();
+    }
+
+    fn startSweeperLocked(self: *JobRegistry) !void {
+        if (@import("builtin").is_test and test_refuse_sweeper_thread) return error.SweeperUnavailable;
+        self.sweeper = try platform_thread.spawn(.waiter, sweepDeadlines, .{self});
     }
 
     fn sweepDeadlines(self: *JobRegistry) void {
@@ -309,11 +333,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
-        return self.spawn(command, cwd, .background, owner, true, .best_effort);
+        return self.spawn(command, cwd, .background, owner, true, .unwatched);
     }
 
-    pub fn spawnBackgroundStopping(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, tree_stop: process.TreeStop) !JobEntry {
-        return self.spawn(command, cwd, .background, owner, true, tree_stop);
+    pub fn spawnBackgroundSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry {
+        return self.spawn(command, cwd, .background, owner, true, supervision);
     }
 
     /// Same spawn, for output that only one synchronous call will ever read.
@@ -324,11 +348,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
-        return self.spawn(command, cwd, .synchronous, owner, false, .best_effort);
+        return self.spawn(command, cwd, .synchronous, owner, false, .unwatched);
     }
 
-    pub fn spawnSynchronousStopping(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, tree_stop: process.TreeStop) !JobEntry {
-        return self.spawn(command, cwd, .synchronous, owner, false, tree_stop);
+    pub fn spawnSynchronousSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry {
+        return self.spawn(command, cwd, .synchronous, owner, false, supervision);
     }
 
     fn spawn(
@@ -338,8 +362,9 @@ pub const JobRegistry = struct {
         retention: Retention,
         owner: SessionId,
         notify_on_exit: bool,
-        tree_stop: process.TreeStop,
+        supervision: Supervision,
     ) !JobEntry {
+        if (supervision == .watchdog) try self.ensureSweeper();
         const id = try genId();
 
         const stdout_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.out", .{ self.base_dir, id[0..] });
@@ -366,7 +391,7 @@ pub const JobRegistry = struct {
         defer self.allocator.free(cmd_z);
         var argv: [6]?[*:0]const u8 = undefined;
         shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-        const proc = process.spawnToFilesStopping(argv[0..], out_fd, err_fd, cwd, true, tree_stop) catch |e| return switch (e) {
+        const proc = process.spawnToFilesStopping(argv[0..], out_fd, err_fd, cwd, true, supervision.treeStop()) catch |e| return switch (e) {
             // 子进程自己交代的失败原样上抛:Bash 据此告诉模型是 cwd 没了还是 shell 起不来,
             // 而不是登记一个 exit 127、双空流的 job 让模型去猜。
             error.ChildChdirFailed, error.ChildExecFailed => e,
@@ -399,7 +424,7 @@ pub const JobRegistry = struct {
             .notify_on_exit = notify_on_exit,
             .status = .running,
             .retention = retention,
-            .tree_stop = tree_stop,
+            .supervision = supervision,
         };
         try self.registerEntry(entry);
         log.info("job", "bg spawn id={s} cmd={s}", .{ id[0..], preview });
