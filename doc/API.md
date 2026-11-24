@@ -472,6 +472,14 @@ execution are observations of individually atomic files, not one transaction.
 The approved budget, check, seat models, effective permissions and sandbox
 restrictions must match the run's saved fingerprints. Older CLI runs without
 a host-policy fingerprint still support status, and need a new approval to run.
+A run that reached its cap pauses in `budget_exhausted` with its worktree and
+ledger kept; `detail` names the phase it continues from (`null` when it
+stopped among parallel candidates and cannot continue). `teamwork resume <id>
+--approve --budget-usd <dollars>` approves a higher cap for such a run and
+continues it there. The new cap must exceed the approved cap and the spend so
+far, which stays charged against it (`CapNotRaised` otherwise);
+`NotResumable` refuses any other run. Without `--budget-usd`, the cap never
+changes. Review, audit and merge-back rules are unchanged.
 Inherited native seat models are pinned before the first dispatch. Provider
 credentials/endpoint can be supplied again. Resume also accepts the originally
 saved repository when invoked elsewhere. An OS lifetime lock permits one

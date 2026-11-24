@@ -688,7 +688,7 @@ test "teamwork runtime L2: reaching the budget aborts the live seat through the 
     defer run.destroy();
     const final = try swe_loop.drive(run);
 
-    try testing.expectEqual(runtime.State.budget_exhausted, final);
+    try testing.expectEqual(runtime.State{ .budget_exhausted = .implementing }, final);
     // The charge that reached the cap tripped the seat's own abort signal
     // before the seat could write anything.
     try testing.expect(run.abort.isAborted());
@@ -703,6 +703,53 @@ test "teamwork runtime L2: reaching the budget aborts the live seat through the 
     var ledger_buf: PathBuf = undefined;
     try expectFile(fx.runFile(&ledger_buf, ""), "budget.jsonl", "{\"seat_id\":\"implementer-1\",\"harness\":\"metacodes\",\"usd\":1.5,\"wallclock_ms\":1,\"source\":\"provider_estimate\"}\n");
     try testing.expectError(error.RunEnded, run.dispatch(.implementer, ""));
+}
+
+test "teamwork runtime L2: a run its budget stopped keeps its worktree and continues only under a higher approved cap" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-rt-raise");
+    defer fx.deinit();
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .charge_usd = 1.5 },
+        .{ .seat = "implementer-2", .require = "partial.txt", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_review },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    const script = [_]audit.StubAuditor.Scripted{.pass};
+    var auditor: audit.StubAuditor = .{ .script = &script, .gpa = testing.allocator };
+    defer auditor.deinit();
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const cfg = try fx.cfg(",\"budget_usd\":1");
+    const id = fx.options().run_id;
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+        defer run.destroy();
+        try testing.expectEqual(runtime.State{ .budget_exhausted = .implementing }, try swe_loop.drive(run));
+    }
+    var wt_buf: PathBuf = undefined;
+    try writeFile(fx.worktree(&wt_buf), "partial.txt", "partial\n");
+    {
+        const kept = try runtime.Run.reopen(testing.allocator, deps, cfg, fx.state(), id);
+        defer kept.destroy();
+        try testing.expectEqual(runtime.State{ .budget_exhausted = .implementing }, try swe_loop.drive(kept));
+    }
+    try testing.expectError(error.CapNotRaised, runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 1));
+    try testing.expectError(error.CapNotRaised, runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 1.5));
+    var raised = cfg;
+    raised.budget_usd = 3;
+    try testing.expectError(error.ConfigurationChanged, runtime.Run.reopenWithCap(testing.allocator, deps, raised, fx.state(), id, 4));
+    {
+        const run = try runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 3);
+        defer run.destroy();
+        try testing.expectEqual(@as(f64, 3), run.status().budget.cap_usd);
+        try testing.expectEqual(@as(f64, 1.5), run.status().budget.spent_usd);
+        try testing.expect(try swe_loop.drive(run) == .done);
+    }
+    try expectFile(fx.repo(), "feature.txt", "feature\n");
+    try expectFile(fx.repo(), "partial.txt", "partial\n");
+    try testing.expectError(error.NotResumable, runtime.Run.reopenWithCap(testing.allocator, deps, raised, fx.state(), id, 5));
 }
 
 test "teamwork runtime L2: no dispatch without budget left; cancel stops the run without touching the workspace" {
@@ -724,7 +771,7 @@ test "teamwork runtime L2: no dispatch without budget left; cancel stops the run
         // Spend recorded elsewhere in the run (an interviewer, say) used it up.
         try testing.expectError(error.BudgetExhausted, run.ledger.charge(.{ .seat_id = try types.SeatId.parse("interviewer-1"), .harness = .metacodes, .wallclock_ms = 0, .cost = .{ .provider_estimate = 5 } }));
         try testing.expectError(error.BudgetExhausted, run.dispatch(.implementer, ""));
-        try testing.expectEqual(runtime.State.budget_exhausted, run.state);
+        try testing.expectEqual(runtime.State{ .budget_exhausted = .approved }, run.state);
         try testing.expectEqual(@as(usize, 0), seats.ran.items.len);
         var recovery = try run.dir.recover(testing.allocator);
         defer recovery.deinit(testing.allocator);

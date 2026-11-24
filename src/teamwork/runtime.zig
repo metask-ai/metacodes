@@ -19,6 +19,7 @@
 //!                   ─► 2nd fail / unverified, or unavailable ─► failed
 //!   any live state ── cancel() ─► cancelled
 //!                  ── budget reached ─► budget_exhausted
+//!   budget_exhausted ── reopenWithCap(higher cap) ─► the phase it paused in
 //!                  ── per-role dispatch cap ─► failed(rounds_exhausted)
 //! ```
 //!
@@ -199,7 +200,7 @@ pub const State = union(Phase) {
     merging: TreeId,
     done: Done,
     failed: Failure,
-    budget_exhausted,
+    budget_exhausted: ?Resume,
     cancelled,
 
     pub fn phase(self: State) Phase {
@@ -208,6 +209,32 @@ pub const State = union(Phase) {
 
     pub fn isTerminal(self: State) bool {
         return self.phase().isTerminal();
+    }
+};
+
+pub const Resume = union(enum) {
+    approved,
+    implementing,
+    reviewing,
+    review_approved: TreeId,
+
+    fn of(current: State) ?Resume {
+        return switch (current) {
+            .approved => .approved,
+            .implementing => .implementing,
+            .reviewing => .reviewing,
+            .review_approved, .auditing => |tree| .{ .review_approved = tree },
+            else => null,
+        };
+    }
+
+    fn resumed(self: Resume) State {
+        return switch (self) {
+            .approved => .approved,
+            .implementing => .implementing,
+            .reviewing => .reviewing,
+            .review_approved => |tree| .{ .review_approved = tree },
+        };
     }
 };
 
@@ -418,7 +445,7 @@ pub const Error = run_dir.Error || error{
 
 pub const StartError = Error || merge_back.Error || ledger_mod.LoadError || issues.LoadError || error{EmptyRequest};
 
-pub const ReopenError = StartError || error{ StateCorrupt, ConfigurationChanged };
+pub const ReopenError = StartError || error{ StateCorrupt, ConfigurationChanged, NotResumable, CapNotRaised };
 
 // ── the run ─────────────────────────────────────────────────────────────────
 
@@ -506,6 +533,14 @@ pub const Run = struct {
     /// counted; an interrupted merge-back fails the run for the user to
     /// inspect. A terminal run reopens as it ended.
     pub fn reopen(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId) ReopenError!*Run {
+        return reopenAt(gpa, deps, cfg, state_root, run_id, null);
+    }
+
+    pub fn reopenWithCap(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId, cap_usd: f64) ReopenError!*Run {
+        return reopenAt(gpa, deps, cfg, state_root, run_id, cap_usd);
+    }
+
+    fn reopenAt(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId, raised_cap_usd: ?f64) ReopenError!*Run {
         if (!deps.preview.teamwork) return error.PreviewDisabled;
         if (!platform_supported) return error.UnsupportedPlatform;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -534,15 +569,25 @@ pub const Run = struct {
             errdefer gpa.free(repo);
             const worktree = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir.root, run_dir.worktree_dir });
             errdefer gpa.free(worktree);
-            const state: State = switch (saved.state) {
+            var effective = cfg;
+            const state: State = if (raised_cap_usd) |cap_usd| raised: {
+                const paused = switch (saved.state) {
+                    .budget_exhausted => |point| point orelse return error.NotResumable,
+                    else => return error.NotResumable,
+                };
+                if (!(cap_usd > cfg.budget_usd) or !std.math.isFinite(cap_usd)) return error.CapNotRaised;
+                effective.budget_usd = cap_usd;
+                break :raised paused.resumed();
+            } else switch (saved.state) {
                 .auditing => |tree| .{ .review_approved = tree },
                 .merging => .{ .failed = .merge_interrupted },
                 .candidates => .{ .failed = .candidates_interrupted },
                 else => saved.state,
             };
-            break :blk try open(gpa, deps, cfg, dir, lease, repo, worktree, saved.base, state, saved.request_source);
+            break :blk try open(gpa, deps, effective, dir, lease, repo, worktree, saved.base, state, saved.request_source);
         };
         errdefer self.destroy();
+        if (raised_cap_usd != null and self.ledger.isExhausted()) return error.CapNotRaised;
         self.candidates = saved.candidates;
         for (self.candidates[0..cfg.candidates.len], 1..) |candidate, number| {
             if (candidate.status != .selected) continue;
@@ -1061,13 +1106,13 @@ pub const Run = struct {
         });
         defer verdict.deinit(self.gpa);
         try self.writeAuditReport(attempt, &verdict);
-        self.audits = attempt;
-        self.last_audit = std.meta.activeTag(verdict);
-
         if (self.ledger.isExhausted()) {
             try self.endForBudget();
             return .budget_exhausted;
         }
+        self.audits = attempt;
+        self.last_audit = std.meta.activeTag(verdict);
+
         if (self.abort.isAborted()) return self.settleAbort();
         switch (verdict) {
             .pass => |tree| if (!tree.eql(approved)) return self.failWith(.audit_changed_worktree),
@@ -1476,7 +1521,7 @@ pub const Run = struct {
 
     fn endForBudget(self: *Run) Error!void {
         self.abort.abort(.host_failure);
-        try self.transition(.budget_exhausted);
+        try self.transition(.{ .budget_exhausted = Resume.of(self.state) });
     }
 
     fn settleAbort(self: *Run) Error!CompletionResult {
@@ -1555,7 +1600,17 @@ pub const Run = struct {
                 try s.write(done.worktree_removed);
                 try s.endObject();
             },
-            .approved, .candidates, .implementing, .reviewing, .budget_exhausted, .cancelled => try s.write(null),
+            .budget_exhausted => |point| if (point) |paused| {
+                try s.beginObject();
+                try s.objectField("resume");
+                try s.write(@tagName(paused));
+                if (paused == .review_approved) {
+                    try s.objectField("tree");
+                    try s.write(paused.review_approved.slice());
+                }
+                try s.endObject();
+            } else try s.write(null),
+            .approved, .candidates, .implementing, .reviewing, .cancelled => try s.write(null),
         }
         try s.objectField("repo");
         try s.write(self.repo);
@@ -1643,7 +1698,7 @@ fn parseSaved(arena: std.mem.Allocator, text: []const u8) !Saved {
         .candidates => .candidates,
         .implementing => .implementing,
         .reviewing => .reviewing,
-        .budget_exhausted => .budget_exhausted,
+        .budget_exhausted => .{ .budget_exhausted = try resumeOf(detail) },
         .cancelled => .cancelled,
         .review_approved => .{ .review_approved = try treeOf(detail) },
         .auditing => .{ .auditing = try treeOf(detail) },
@@ -1792,6 +1847,18 @@ fn intField(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
     const value = obj.get(key) orelse return error.StateCorrupt;
     if (value != .integer) return error.StateCorrupt;
     return std.math.cast(T, value.integer) orelse error.StateCorrupt;
+}
+
+fn resumeOf(detail: std.json.Value) !?Resume {
+    if (detail == .null) return null;
+    if (detail != .object) return error.StateCorrupt;
+    const tag = std.meta.stringToEnum(std.meta.Tag(Resume), try stringField(detail.object, "resume")) orelse return error.StateCorrupt;
+    return switch (tag) {
+        .approved => .approved,
+        .implementing => .implementing,
+        .reviewing => .reviewing,
+        .review_approved => .{ .review_approved = try treeOf(detail.object.get("tree") orelse return error.StateCorrupt) },
+    };
 }
 
 fn treeOf(value: std.json.Value) !TreeId {

@@ -554,6 +554,13 @@ FAIL 第一次进入修复轮;UNVERIFIED 第一次进入 leads 轮:报告里 ver
 `runtime.lock` 的内核锁保证同一个运行只有一个控制进程,第二次恢复返回 `RunBusy`。
 `run.json` 原子记录批准配置、状态、树 id、轮数、审计次数与配置 SHA-256。首次 checkout 中断时可以用同一运行 ID 恢复。
 恢复时必须提供相同的预算、seat/harness/model、固定检查和有效权限配置,否则 `ConfigurationChanged`。
+预算用完是暂停:运行停在 `budget_exhausted`,`run.json` 的 `detail` 记下停在哪个阶段
+(`{"resume":"implementing"}`;评审已批准或审计中则为 `review_approved` 加树 id;候选阶段停下为 null,
+不能续跑)。worktree 和账本都保留,停下的审计不计入审计次数。只有用户显式批准更高上限
+(`teamwork resume <id> --approve --budget-usd <新上限>`,即 `Run.reopenWithCap`)才能回到那个阶段继续:
+新上限必须大于原上限且大于已花加保留,否则 `CapNotRaised`;运行不是可续跑的预算暂停时
+`NotResumable`。之前的花费照旧算在新上限里,`run.json` 改存新上限及其指纹;不带 `--budget-usd`
+的恢复和项目配置都不会改上限。续跑仍要经过评审、审计,才会合回。
 控制器的 seat 状态文件记录宪章 SHA-256 并在恢复后保留。崩溃时未完成的 seat
 记为 interrupted;如果丢失了付费结果,先按预算预留规则停止。中断的审计可以在预算允许时重跑,
 中断的合回停下交由用户检查。
