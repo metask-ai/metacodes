@@ -1465,14 +1465,19 @@ function modelDots(rows, focus, lookOf) {
   const all = [...groups.values()];
   const shown = all.filter((g, i) => i < BARS_TOP || g.rows.some((r) => r.ours));
   if (shown.length < 2) return null;
-  const scores = shown.flatMap((g) => g.rows.map((r) => r.score));
-  const { at, lines, axis } = scoreScale(scores, scores, shown.length);
+  const entries = shown.flatMap((g) => g.rows);
+  const err = (r) => r.stderr || 0;
+  const { at, lines, axis } = scoreScale(entries.map((r) => r.score - err(r)), entries.map((r) => r.score + err(r)), shown.length);
+  const harnessOf = (r) => (r.ours ? 'metacodes' : r.harness);
+  const scoreText = (r) => score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '');
+  const ends = (r) => [scoreText(r), h('small', { text: ' ' + harnessOf(r) })];
   const dots = new Map();
   const rowNodes = shown.map((g, i) => {
-    const best = g.rows[0].score; const worst = g.rows[g.rows.length - 1].score;
+    const best = g.rows[0]; const worst = g.rows[g.rows.length - 1];
+    const whiskers = g.rows.filter(err).map((r) => h('i', { class: 'bar-err', style: `left:${at(r.score - err(r))}%;width:${at(r.score + err(r)) - at(r.score - err(r))}%` }));
     const marks = g.rows.map((r) => {
       const dot = h('button', { type: 'button', class: 'pair-dot', 'data-ours': r.ours ? '1' : null, style: `left:${at(r.score)}%`,
-        title: `${r.ours ? 'metacodes' : r.harness} · ${score(r.score)}`, 'aria-label': `${g.model} · ${r.ours ? 'metacodes' : r.harness} · ${score(r.score)}`,
+        title: `${harnessOf(r)} · ${scoreText(r)}`, 'aria-label': `${g.model} · ${harnessOf(r)} · ${scoreText(r)}`,
         onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
         onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null }, glyph(lookOf(r)));
       dots.set(r, dot);
@@ -1481,10 +1486,11 @@ function modelDots(rows, focus, lookOf) {
     return h('div', { class: 'bar-row', style: `--row:${i + 1}` },
       h('span', { class: 'bar-name', title: g.model }, h('span', { text: g.model })),
       h('span', { class: 'bar-track pair-track' },
-        g.rows.length > 1 ? h('i', { class: 'pair-span', style: `left:${at(worst)}%;width:${at(best) - at(worst)}%` }) : null, ...marks),
-      h('span', { class: 'bar-value num', text: g.rows.length > 1 ? `${score(worst)} – ${score(best)}` : score(best) }));
+        g.rows.length > 1 ? h('i', { class: 'pair-span', style: `left:${at(worst.score)}%;width:${at(best.score) - at(worst.score)}%` }) : null, ...whiskers, ...marks),
+      h('span', { class: 'bar-value num', title: g.rows.map((r) => `${harnessOf(r)} ${scoreText(r)}`).join('\n') },
+        ...(g.rows.length > 1 ? [...ends(worst), ' – ', ...ends(best)] : ends(best))));
   });
-  const box = h('div', { class: 'bars' }, lines, ...rowNodes, axis);
+  const box = h('div', { class: 'bars pair-bars' }, lines, ...rowNodes, axis);
   focus.on((active) => { for (const [r, dot] of dots) dot.toggleAttribute('data-current', r === active); });
   const group = (look) => {
     box.toggleAttribute('data-group', Boolean(look));
