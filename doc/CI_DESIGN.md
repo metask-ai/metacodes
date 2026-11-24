@@ -216,10 +216,10 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `checks` | The linters (`scripts/lint.py`, Linux), the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the contract snapshots (`zig build test:contract`, Linux; `tests/README.md`), the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 Before any of these, every leg on every platform runs `zig build
-gate:static`: `zig fmt --check`, the scans of `http-status:gate` and
-`subsystem:boundary`, the `scripts/tests/test_*_discipline.py` scans and
-`git diff --check`, the guards that only read the source. It compiles only
-the two small scanners: the boundary gates' self-tests are test binaries,
+gate:static`: `zig fmt --check`, the scans of `http-status:gate`,
+`subsystem:boundary` and `layer:check`, the `scripts/tests/test_*_discipline.py`
+scans and `git diff --check`, the guards that only read the source. It
+compiles only the three small scanners: the boundary gates' self-tests are test binaries,
 which install the fs-helper, so they stay in `test:units`. They take seconds, and the build runner
 has no fail-fast: inside a suite step a failed guard is reported only when
 the whole step has finished, minutes later (#587). The boundary gates and

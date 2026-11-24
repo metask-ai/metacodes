@@ -3700,4 +3700,84 @@ pub fn build(b: *std.Build) void {
         .paths = &.{"src/"},
         .exclude_paths = &.{},
     });
+
+    addLayerCheck(b, gate_static_step, units_test_step);
+}
+
+fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_step: *std.Build.Step) void {
+    const wiring = b.addWriteFiles().add("layer_wiring.tsv", layerWiring(b));
+    const layer_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/layer_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const layer_exe = b.addExecutable(.{ .name = "layer-gate", .root_module = layer_mod });
+    const layer_run = b.addRunArtifact(layer_exe);
+    layer_run.setCwd(b.path("."));
+    layer_run.addArg(".");
+    layer_run.addFileArg(wiring);
+    layer_run.addFileInput(b.path("layers.zon"));
+    layer_run.addFileInput(b.path("layer_baseline.zon"));
+    layer_run.has_side_effects = true;
+    const layer_unit = b.addTest(.{ .name = "layer-gate-unit", .root_module = layer_mod });
+    const layer_step = b.step("layer:check", "Enforce layers.zon: owned files, downward imports, no package cycles, module wiring, a shrinking baseline");
+    layer_step.dependOn(&layer_run.step);
+    layer_step.dependOn(&addTestRunArtifact(b, layer_unit).step);
+    gate_static_step.dependOn(&layer_run.step);
+    units_test_step.dependOn(layer_step);
+
+    const baseline_run = b.addRunArtifact(layer_exe);
+    baseline_run.setCwd(b.path("."));
+    baseline_run.addArg(".");
+    baseline_run.addFileArg(wiring);
+    baseline_run.addArg("--print-baseline");
+    baseline_run.has_side_effects = true;
+    b.step("layer:baseline", "Print the layer_baseline.zon that matches the tree").dependOn(&baseline_run.step);
+}
+
+fn layerWiring(b: *std.Build) []const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var seen_steps: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
+    var seen_modules: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    var pending: std.ArrayList(*std.Build.Step) = .empty;
+    for (b.top_level_steps.values()) |top| pending.append(b.allocator, &top.step) catch @panic("OOM");
+    while (pending.pop()) |step| {
+        if ((seen_steps.getOrPut(b.allocator, step) catch @panic("OOM")).found_existing) continue;
+        pending.appendSlice(b.allocator, step.dependencies.items) catch @panic("OOM");
+        const compile = step.cast(std.Build.Step.Compile) orelse continue;
+        addModuleWiring(b, compile.root_module, &seen_modules, &lines);
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    return std.mem.join(b.allocator, "", lines.items) catch @panic("OOM");
+}
+
+fn addModuleWiring(
+    b: *std.Build,
+    module: *std.Build.Module,
+    seen: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
+    lines: *std.ArrayList([]const u8),
+) void {
+    if ((seen.getOrPut(b.allocator, module) catch @panic("OOM")).found_existing) return;
+    const root = sourcePath(b, module);
+    if (root) |path| lines.append(b.allocator, b.fmt("module\t{s}\n", .{path})) catch @panic("OOM");
+    for (module.import_table.keys(), module.import_table.values()) |name, imported| {
+        if (root) |path| {
+            if (sourcePath(b, imported)) |target| {
+                lines.append(b.allocator, b.fmt("import\t{s}\t{s}\t{s}\n", .{ path, name, target })) catch @panic("OOM");
+            }
+        }
+        addModuleWiring(b, imported, seen, lines);
+    }
+}
+
+fn sourcePath(b: *std.Build, module: *std.Build.Module) ?[]const u8 {
+    const file = module.root_source_file orelse return null;
+    return switch (file) {
+        .src_path => |source| if (source.owner == b) source.sub_path else null,
+        else => null,
+    };
 }

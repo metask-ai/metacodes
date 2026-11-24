@@ -76,6 +76,20 @@ These rules apply to the entire repository.
   code they describe changes; then correct or delete them.
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
+- Packages depend downward only. `layers.zon` declares the packages from the
+  lowest (`base`) to the highest (`cli`, then `testing` and `tests`) and
+  assigns every `.zig` file under `src/` and `tests/` to one of them by path.
+  A package's `allowed_dependencies` lists the packages it may import, never
+  the ones that import it, and names only packages declared before it. A new
+  file belongs to a package before it lands. `zig build layer:check` holds
+  every `@import`, test blocks included, and every `build.zig` module import
+  to those lists, and finds package cycles, deep imports into another
+  package's files and module roots wide enough to reach packages they may not
+  depend on. `layer_baseline.zon` records today's violations and only
+  shrinks: a new violation fails, and so does an entry whose violation is
+  gone, so delete it in the change that removes it (`zig build
+  layer:baseline` prints the baseline that matches the tree). The kernel's
+  `kernel_budget` (lines and the packages it reaches) only goes down.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
   journals, timestamps, and equivalent configuration churn must not enter prompts.
 - TinyKG is a separately built external binary dependency. The repository owns one
@@ -183,8 +197,8 @@ git diff --check
 ```
 
 `zig build gate:static` runs only the guards that read the source:
-`zig fmt --check build.zig src tests`, the scans of `http-status:gate` and
-`subsystem:boundary` (their self-tests run in `test:units`), the
+`zig fmt --check build.zig src tests`, the scans of `http-status:gate`,
+`subsystem:boundary` and `layer:check` (their self-tests run in `test:units`), the
 `scripts/tests/test_*_discipline.py` scans and `git diff --check`. It takes seconds, and it comes first because the build
 runner has no fail-fast: inside the full gate a failed guard is reported
 only when everything else has finished (#587). Every CI gate leg runs it
