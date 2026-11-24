@@ -412,6 +412,103 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(orphans, [])
         self.assertEqual(json.loads(ingest.decode(*spec))['name'], kept['items'][0]['run'])
 
+    def test_deleting_a_job_removes_its_run_files_and_rows_and_keeps_its_profile(self):
+        record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
+        doomed, kept = [item['run'] for item in record['items']]
+        self.client.request('api/profile?id=' + record['id'])
+
+        deleted = self.client.request('api/job/delete', {'name': doomed})
+
+        self.assertEqual(deleted, {'name': doomed, 'deleted': True})
+        self.assertFalse((self.manager.jobs_dir / doomed).exists())
+        self.assertEqual(list(self.manager.records.glob(doomed + '.*')), [])
+        self.assertTrue((self.manager.jobs_dir / kept).is_dir())
+        listing = self.client.request('api/jobs?profile=all')
+        self.assertEqual([j['name'] for j in listing['jobs']], [kept])
+        self.assertEqual([b['id'] for b in listing['profiles']], [record['id']])
+        self.assertEqual({t['job'] for t in self.client.request('api/profile?id=' + record['id'])['tasks']}, {kept})
+        counts = self.client.request('api/store')['counts']
+        self.assertEqual((counts['profiles'], counts['jobs'], counts['runs']), (1, 1, 1))
+        with self.workbench.library.store.read() as tx:
+            orphans = tx.query("SELECT sha256 FROM blobs WHERE sha256 NOT IN (SELECT sha256 FROM files WHERE sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT tail_sha256 FROM files WHERE tail_sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT spec_sha256 FROM runs WHERE spec_sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT log_sha256 FROM runs WHERE log_sha256 IS NOT NULL)")
+        self.assertEqual(orphans, [])
+        for name in (doomed, '../' + kept, '.bench-runs'):
+            with self.assertRaisesRegex(ValueError, '不存在'):
+                self.client.request('api/job/delete', {'name': name})
+        self.assertEqual([i['run'] for i in self.manager.profiles.get(record['id'])['items']], [None, kept])
+        with self.workbench.library.store.read() as tx:
+            stored = json.loads(tx.one("SELECT record_json FROM profiles WHERE id = ?", (record['id'],))[0])
+        self.assertEqual([i['run'] for i in stored['items']], [None, kept])
+
+        _write(self.manager.jobs_dir / doomed / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(self.manager.jobs_dir / doomed / 'result.json', {'started_at': '2026-11-16T08:00:00Z',
+                                                                'finished_at': '2026-11-16T08:30:00Z', 'n_total_trials': 0})
+        self.workbench.library.sync()
+        self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
+        self.client.request('api/profile/delete', {'id': record['id']})
+        self.assertEqual(self.client.request('api/store')['counts']['profiles'], 0)
+        self.assertTrue((self.manager.jobs_dir / doomed).is_dir())
+        self.workbench.library.sync()
+        self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
+
+    def test_a_profile_left_only_in_the_database_drops_a_deleted_job(self):
+        record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
+        doomed, kept = [item['run'] for item in record['items']]
+        self.client.request('api/profile?id=' + record['id'])
+        self.manager.profiles.path(record['id']).unlink()
+
+        self.client.request('api/job/delete', {'name': doomed})
+
+        with self.workbench.library.store.read() as tx:
+            stored = json.loads(tx.one("SELECT record_json FROM profiles WHERE id = ?", (record['id'],))[0])
+        self.assertEqual([i['run'] for i in stored['items']], [None, kept])
+        _write(self.manager.jobs_dir / doomed / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(self.manager.jobs_dir / doomed / 'result.json', {'started_at': '2026-11-16T08:00:00Z',
+                                                                'finished_at': '2026-11-16T08:30:00Z', 'n_total_trials': 0})
+        self.workbench.library.sync()
+        self.client.request('api/profile/delete', {'id': record['id']})
+        self.assertTrue((self.manager.jobs_dir / doomed).is_dir())
+        self.assertFalse((self.manager.jobs_dir / kept).exists())
+
+    def test_a_harbor_job_still_running_without_a_receipt_is_not_deleted(self):
+        job = self.manager.jobs_dir / 'harbor-by-hand'
+        _write(job / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(job / 'result.json', {'started_at': '2026-11-16T08:00:00Z', 'finished_at': None, 'n_total_trials': 1})
+        listed = {j['name']: j for j in self.client.request('api/jobs?profile=all')['jobs']}
+        self.assertTrue(listed['harbor-by-hand']['running'])
+        with self.assertRaisesRegex(ValueError, '先停止'):
+            self.client.request('api/job/delete', {'name': 'harbor-by-hand'})
+        self.assertTrue(job.is_dir())
+        self.assertEqual(self.client.request('api/store')['counts']['jobs'], 1)
+
+    def test_a_running_job_or_one_from_another_jobs_directory_is_not_deleted(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            run = self.manager.profiles.get(created['id'])['items'][0]['run']
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (self.manager.jobs_dir / run / 'result.json').exists():
+                time.sleep(.05)
+            with self.assertRaisesRegex(ValueError, '先停止'):
+                self.client.request('api/job/delete', {'name': run})
+            self.client.request('api/profile/cancel', {'id': created['id']})
+            self.wait_profile(created['id'])
+        self.client.request('api/profile?id=' + created['id'])
+        other = RunManager(self.root / 'jobs-b', self.config)
+        shutil.copytree(self.manager.jobs_dir / run, other.jobs_dir / run)
+        bench = Workbench(data.Library([other.jobs_dir]), other)
+        self.addCleanup(bench.close)
+        with self.assertRaisesRegex(ValueError, '请在那个 jobs 目录'):
+            bench.delete_job(run)
+        self.assertTrue((other.jobs_dir / run).is_dir())
+        self.assertTrue((self.manager.jobs_dir / run).is_dir())
+
     def test_a_profile_whose_files_cannot_be_removed_stays_for_a_retry(self):
         if os.geteuid() == 0:
             self.skipTest('root ignores directory permissions')

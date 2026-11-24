@@ -1184,6 +1184,13 @@ this service's jobs directory is deleted; one ingested from another jobs
 directory sharing the database is refused. When a file cannot be removed or
 the database delete fails, the request fails and the profile stays for a
 retry: the manifest goes last, after the rows are gone.
+A single job can be deleted the same way (`POST /api/job/delete` with `name`,
+删除 in the overview's job list): its run record and log, its job directory and
+its rows go; a profile that ran it drops the link to it (so a later job of the
+same name is not the profile's), keeps its other runs and shows the task's
+earlier result, if any. A running job, whether the workbench launched it or
+Harbor is still writing it, must be stopped first, and a job from another jobs
+directory is refused.
 Imports of a jobs directory (the service's sync, `bench db import`),
 `bench sync --run` and deletions from it take the same lock,
 `<jobs-dir>/.bench-store.lock`, so none of them can write a deleted profile
