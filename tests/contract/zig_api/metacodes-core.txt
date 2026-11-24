@@ -5650,10 +5650,15 @@ metacodes-core.teamwork_runtime.State.auditing: TreeId
 metacodes-core.teamwork_runtime.State.merging: TreeId
 metacodes-core.teamwork_runtime.State.done: Done
 metacodes-core.teamwork_runtime.State.failed: Failure
-metacodes-core.teamwork_runtime.State.budget_exhausted
+metacodes-core.teamwork_runtime.State.budget_exhausted: ?Resume
 metacodes-core.teamwork_runtime.State.cancelled
 metacodes-core.teamwork_runtime.State.phase: fn phase(self: State) Phase
 metacodes-core.teamwork_runtime.State.isTerminal: fn isTerminal(self: State) bool
+metacodes-core.teamwork_runtime.Resume: union(enum)
+metacodes-core.teamwork_runtime.Resume.approved
+metacodes-core.teamwork_runtime.Resume.implementing
+metacodes-core.teamwork_runtime.Resume.reviewing
+metacodes-core.teamwork_runtime.Resume.review_approved: TreeId
 metacodes-core.teamwork_runtime.Phase: enum
 metacodes-core.teamwork_runtime.Phase.approved
 metacodes-core.teamwork_runtime.Phase.candidates
@@ -5697,6 +5702,7 @@ metacodes-core.teamwork_runtime.CandidateStatus.parse: fn parse(text: []const u8
 metacodes-core.teamwork_runtime.CandidateSnapshot: struct
 metacodes-core.teamwork_runtime.CandidateSnapshot.status: CandidateStatus = .queued
 metacodes-core.teamwork_runtime.CandidateSnapshot.tree: ?TreeId = null
+metacodes-core.teamwork_runtime.CandidateSnapshot.reviewer: ?SeatId = null
 metacodes-core.teamwork_runtime.SeatSnapshot: struct
 metacodes-core.teamwork_runtime.SeatSnapshot.id: SeatId
 metacodes-core.teamwork_runtime.SeatSnapshot.role: Role
@@ -5746,7 +5752,7 @@ metacodes-core.teamwork_runtime.CompletionResult.budget_exhausted
 metacodes-core.teamwork_runtime.CompletionResult.cancelled
 metacodes-core.teamwork_runtime.Error: const = run_dir.Error || error{ PreviewDisabled, RunBusy, LeaseFailed, UnsupportedPlatform, RunEnded, RoleNotDispatchable, NothingToReview, CandidatesPending, NoCandidates, CandidateBudgetExceeded, NotApproved, InstructionsNameRunState, RoundsExhausted, BudgetExhausted, Aborted, IllegalTransition, }
 metacodes-core.teamwork_runtime.StartError: const = Error || merge_back.Error || ledger_mod.LoadError || issues.LoadError || error{EmptyRequest}
-metacodes-core.teamwork_runtime.ReopenError: const = StartError || error{ StateCorrupt, ConfigurationChanged }
+metacodes-core.teamwork_runtime.ReopenError: const = StartError || error{ StateCorrupt, ConfigurationChanged, NotResumable, CapNotRaised }
 metacodes-core.teamwork_runtime.Run: struct
 metacodes-core.teamwork_runtime.Run.gpa: std.mem.Allocator
 metacodes-core.teamwork_runtime.Run.deps: Deps
@@ -5771,6 +5777,7 @@ metacodes-core.teamwork_runtime.Run.seats: std.ArrayList(SeatSnapshot) = .empty
 metacodes-core.teamwork_runtime.Run.goal: []u8
 metacodes-core.teamwork_runtime.Run.start: fn start(gpa: std.mem.Allocator, deps: Deps, request: ApprovedRequest, cfg: config.Config.Enabled, options: StartOptions) StartError!*Run
 metacodes-core.teamwork_runtime.Run.reopen: fn reopen(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId) ReopenError!*Run
+metacodes-core.teamwork_runtime.Run.reopenWithCap: fn reopenWithCap(gpa: std.mem.Allocator, deps: Deps, cfg: config.Config.Enabled, state_root: []const u8, run_id: types.RunId, cap_usd: f64) ReopenError!*Run
 metacodes-core.teamwork_runtime.Run.destroy: fn destroy(self: *Run) void
 metacodes-core.teamwork_runtime.Run.status: fn status(self: *const Run) RunSnapshot
 metacodes-core.teamwork_runtime.Run.dispatch: fn dispatch(self: *Run, role: Role, instructions: []const u8) Error!SeatId
