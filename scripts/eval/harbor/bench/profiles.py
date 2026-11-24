@@ -546,7 +546,7 @@ class ProfileManager:
             return
         try:
             tasks = self.invalid_tasks(item["run"])
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
             item["auto_rerun_error"] = f"读取结果失败，没有自动重跑无效的题：{exc}"
             return
         if tasks:

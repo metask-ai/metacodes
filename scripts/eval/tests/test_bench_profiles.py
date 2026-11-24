@@ -435,13 +435,14 @@ class ProfileTest(unittest.TestCase):
         self.client.request('api/profile/auto-rerun', {'id': first['id'], 'enabled': True})
         second = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}],
                                                                        features=['execute_code']))
+        self.client.request('api/profile/auto-rerun', {'id': second['id'], 'enabled': True})
         self.assertNotEqual(first['id'], second['id'])
-        with patch.object(self.manager.profiles, 'invalid_tasks', side_effect=PermissionError('denied')):
-            record = self.wait_profile(first['id'])
-            self.assertEqual(len(record['items']), 1)
-            self.assertEqual(record['items'][0]['status'], 'finished')
-            self.assertIn('denied', record['items'][0]['auto_rerun_error'])
-            self.assertEqual(self.wait_profile(second['id'])['items'][0]['status'], 'finished')
+        with patch.object(self.manager.profiles, 'invalid_tasks',
+                          side_effect=[PermissionError('denied'), AttributeError('malformed result')]):
+            for created, reason in ((first, 'denied'), (second, 'malformed result')):
+                record = self.wait_profile(created['id'])
+                self.assertEqual([i['status'] for i in record['items']], ['finished'])
+                self.assertIn(reason, record['items'][0]['auto_rerun_error'])
 
     def test_invalid_tasks_are_read_from_the_job_directory(self):
         job = self.manager.jobs_dir / 'job-a'
