@@ -38,11 +38,11 @@
 
 const std = @import("std");
 const net = @import("platform").net;
-const log = @import("../util/log.zig");
-const time = @import("../util/time.zig");
+const log = @import("metacodes-internal").util.log;
+const time = @import("metacodes-internal").util.time;
 const server_mod = @import("../web/server.zig");
 const submission_mod = @import("../web/submission.zig");
-const wire = @import("../core/protocol/wire.zig");
+const wire = @import("metacodes-internal").core.protocol.wire;
 const SessionView = server_mod.SessionView;
 const Lease = server_mod.Lease;
 

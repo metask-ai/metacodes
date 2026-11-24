@@ -28,10 +28,10 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
-const time = @import("../util/time.zig");
-const abort = @import("../util/abort.zig");
-const SessionId = @import("../core/session_id.zig").SessionId;
-const EventJournal = @import("../core/event_journal.zig").EventJournal;
+const time = @import("metacodes-internal").util.time;
+const abort = @import("metacodes-internal").util.abort;
+const SessionId = @import("metacodes-internal").core.session_id.SessionId;
+const EventJournal = @import("metacodes-internal").core.event_journal.EventJournal;
 const SubmissionQueue = @import("../web/submission.zig").SubmissionQueue;
 
 /// 一个 session 的运行时宿主单元。堆分配,registry 持 *SessionHost。

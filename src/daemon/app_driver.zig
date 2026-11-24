@@ -20,16 +20,16 @@
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
-const agent_loop = @import("../core/agent_loop.zig");
-const project_activation = @import("../core/project_rule_activation.zig");
-const run_journal = @import("../core/tool_observation_journal.zig");
+const agent_loop = @import("metacodes-internal").core.agent_loop;
+const project_activation = @import("metacodes-internal").core.project_rule_activation;
+const run_journal = @import("metacodes-internal").core.tool_observation_journal;
 const web_session = @import("../web/session.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
 const registry = @import("registry.zig");
 const SessionHost = registry.SessionHost;
-const abort = @import("../util/abort.zig");
-const time = @import("../util/time.zig");
-const log = @import("../util/log.zig");
+const abort = @import("metacodes-internal").util.abort;
+const time = @import("metacodes-internal").util.time;
+const log = @import("metacodes-internal").util.log;
 
 /// driver 注入上下文:该 session 的 App + 共享 wb(serve 建)。
 pub const DriverCtx = struct {
@@ -57,10 +57,10 @@ pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
 /// **task#18:driver 线程 reap 后台 job 的 done 事件**。job 线程只置 e.status(不能安全用父栈
 /// trampoline reporter,后台续跑时早失效)。driver(session 线程)周期排出新终态 job,发
 /// agent_lifecycle.done 到 session journal → attach/SSE 客户端实时见后台 agent 完成(不必再轮询 roster)。
-fn reapAgentDone(app: *app_mod.App, be: *const @import("../core/protocol/ui_backend.zig").UiBackend, session: @import("../core/session_id.zig").SessionId, infra: std.mem.Allocator) void {
+fn reapAgentDone(app: *app_mod.App, be: *const @import("metacodes-internal").core.protocol.ui_backend.UiBackend, session: @import("metacodes-internal").core.session_id.SessionId, infra: std.mem.Allocator) void {
     const aj = if (app.agent_jobs) |*a| a else return;
     const infos = aj.drainNewlyDoneForSession(infra, session) catch return;
-    defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeDoneInfos(infra, infos);
+    defer @import("metacodes-internal").core.agent_job_registry.AgentJobRegistry.freeDoneInfos(infra, infos);
     for (infos) |d| {
         be.emitEvent(session, .{ .agent_lifecycle = .{ .done = .{
             .id = d.id,
@@ -157,7 +157,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             continue;
         };
 
-        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(app_alloc, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
+        const scoped_recall = if (app.kg) |*k| (@import("metacodes-internal").kg.scoped_recall.build(app_alloc, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| app_alloc.free(s);
 
         // 生成期门(S1):transport 的 /interrupt 只在此窗口打 abort。true→run→false(defer 保证异常也复位)。
@@ -168,7 +168,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         options.tool_observer = if (run_control) |control| control.observer() else null;
         options.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
         options.project_rule_gate = if (run_control) |control| control.formalGate() else null;
-        var model_failure: ?@import("../api/model_error.zig").Detail = null;
+        var model_failure: ?@import("metacodes-internal").api.model_error.Detail = null;
         options.model_error_out = &model_failure;
         const result = agent_loop.run(
             &app.conversation,
