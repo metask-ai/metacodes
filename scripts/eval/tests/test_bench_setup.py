@@ -343,8 +343,8 @@ class NodeProtocolTest(unittest.TestCase):
 
 
     def test_only_network_failures_count_as_unreachable(self):
-        for detail in ("ssh: connect to host 58.211.6.133 port 107: No route to host",
-                       "ssh: connect to host 58.211.6.133 port 107: Operation timed out",
+        for detail in ("ssh: connect to host 203.0.113.7 port 107: No route to host",
+                       "ssh: connect to host 203.0.113.7 port 107: Operation timed out",
                        "ssh: Could not resolve hostname relay: Name or service not known",
                        "kex_exchange_identification: read: Connection reset by peer"):
             self.assertTrue(executors.unreachable({"error": "ssh", "detail": detail}), detail)
