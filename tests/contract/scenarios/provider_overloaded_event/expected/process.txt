@@ -1,0 +1,4 @@
+exit: 0
+requests: 2
+--- stderr
+[31m[ERROR agent req=<ID>][0m stream returned error ServiceUnavailable at turn 1

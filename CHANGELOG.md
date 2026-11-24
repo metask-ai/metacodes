@@ -272,6 +272,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A provider overload is retried like a 503.** HTTP 529 was an unnamed
+  status that ended the turn after one attempt; it is now
+  `ServiceUnavailable` and goes through the connect retry (attempt limit,
+  backoff, `Retry-After`). An overload declared inside an accepted stream
+  (Anthropic's `overloaded_error` frame, an OpenAI-compatible or Gemini
+  `error` object, a Responses `response.failed`, a Bedrock
+  `serviceUnavailableException`) ends the stream as `ServiceUnavailable` too,
+  and the agent loop re-sends the request unless a tool call had started.
+  The HTTP and in-stream attempts of one request share one attempt limit,
+  the wait is the response head's `Retry-After` or the usual backoff, and a
+  Run's extra stream retries are not spent on an overload. When the attempts
+  run out the failure reads `API 错误帧(重试 N 次后放弃): …`, as the HTTP
+  path does. This holds for `-p`, the TUI, `serve`/`--web` and AgentCore
+  sessions.
 - **Ctrl-C stops a request that is waiting for its answer or whose stream
   went quiet.** The interrupt only set a flag that was read when the next
   byte arrived, so `-p` (and any caller that did not also cancel the

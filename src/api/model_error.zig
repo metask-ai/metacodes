@@ -348,6 +348,22 @@ pub fn noteStreamError(payload: []const u8) void {
     if (detail.message.len == 0) detail.message.set("The provider reported an error inside the response stream.", null);
 }
 
+pub fn isOverloaded(payload: []const u8) bool {
+    var scratch: [PARSE_SCRATCH_BYTES]u8 = undefined;
+    const parsed = parseErrorPayload(&scratch, payload);
+    for ([_]?[]const u8{ parsed.type_name, parsed.code, parsed.status }) |name| {
+        if (technicalCategory(name) == .overloaded) return true;
+    }
+    const code = parsed.code orelse return false;
+    const status = std.fmt.parseInt(u16, code, 10) catch return false;
+    return categoryForStatus(status) == .overloaded;
+}
+
+pub fn responseRetryAfterMs() ?u64 {
+    const capture = active orelse return null;
+    return capture.head.retry_after_ms;
+}
+
 /// A failure before any response head: connecting, sending or waiting for one.
 pub fn noteTransportFailure(category: Category, retry: Retry, message: []const u8) void {
     const capture = active orelse return;
@@ -490,6 +506,7 @@ fn technicalCategory(name: ?[]const u8) ?Category {
         .{ "overloaded", .overloaded },
         .{ "service_unavailable", .overloaded },
         .{ "UNAVAILABLE", .overloaded },
+        .{ "server_is_overloaded", .overloaded },
         .{ "rate_limit_error", .rate_limited },
         .{ "rate_limit_exceeded", .rate_limited },
         .{ "authentication_error", .authentication },
@@ -547,6 +564,7 @@ const Parsed = struct {
     type_name: ?[]const u8 = null,
     message: ?[]const u8 = null,
     request_id: ?[]const u8 = null,
+    status: ?[]const u8 = null,
     payload: enum { none, json, partial_json } = .none,
 };
 
@@ -585,6 +603,7 @@ fn parseErrorPayload(scratch: []u8, body: []const u8) Parsed {
     if (out.request_id == null) out.request_id = stringField(fields, "request_id") orelse stringField(fields, "requestId");
 
     out.type_name = stringField(fields, "type");
+    out.status = stringField(fields, "status");
     // The event discriminator of a flat frame, not an error type.
     if (out.type_name) |name| if (std.mem.eql(u8, name, "error")) {
         out.type_name = null;
@@ -986,6 +1005,19 @@ test "control bytes are flattened and fields are bounded without splitting UTF-8
     try testing.expect(std.unicode.utf8ValidateSlice(view.message));
     try testing.expect(std.mem.indexOfScalar(u8, view.message, 0x1b) == null);
     try testing.expect(view.truncated);
+}
+
+test "isOverloaded recognizes every dialect's overload frame and nothing else" {
+    try testing.expect(isOverloaded("{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"));
+    try testing.expect(isOverloaded("{\"type\":\"overloaded_error\",\"message\":\"busy\"}"));
+    try testing.expect(isOverloaded("{\"code\":503,\"message\":\"The model is overloaded.\",\"status\":\"UNAVAILABLE\"}"));
+    try testing.expect(isOverloaded("{\"code\":529,\"message\":\"Overloaded\"}"));
+    try testing.expect(isOverloaded("{\"code\":\"server_is_overloaded\",\"message\":\"busy\"}"));
+    try testing.expect(isOverloaded("{\"type\":\"serviceUnavailableException\",\"message\":\"busy\"}"));
+    try testing.expect(!isOverloaded("{\"type\":\"invalid_request_error\",\"message\":\"bad\"}"));
+    try testing.expect(!isOverloaded("{\"code\":500,\"message\":\"internal\",\"status\":\"INTERNAL\"}"));
+    try testing.expect(!isOverloaded("{\"type\":\"throttlingException\",\"message\":\"slow down\"}"));
+    try testing.expect(!isOverloaded("not json"));
 }
 
 test "a stream frame is classified by its technical type; an unknown one stays opaque" {

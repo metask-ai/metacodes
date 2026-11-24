@@ -7591,7 +7591,7 @@ metacodes-core.client.reportBodyStall: fn reportBodyStall(comptime module: []con
 metacodes-core.client.requestSetupFailure: fn requestSetupFailure(comptime module: []const u8, rid: log.RequestId, raw_err: anyerror) anyerror
 metacodes-core.client.requestTransportFailure: fn requestTransportFailure(comptime module: []const u8, rid: log.RequestId, comptime stage: []const u8, err: anyerror) anyerror
 metacodes-core.client.noteConnectFailure: fn noteConnectFailure(err: anyerror) void
-metacodes-core.client.reportServerError: fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8, credential: ?model_error.SecretPrint) void
+metacodes-core.client.reportServerError: fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8, credential: ?model_error.SecretPrint) error{ ApiError, ServiceUnavailable }
 metacodes-core.client.ReadFailure: struct
 metacodes-core.client.ReadFailure.body: ?anyerror = null
 metacodes-core.client.ReadFailure.tls: ?anyerror = null
@@ -7611,6 +7611,7 @@ metacodes-core.client.RetryReporter: struct
 metacodes-core.client.RetryReporter.state: *anyopaque
 metacodes-core.client.RetryReporter.failedFn: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool
 metacodes-core.client.RetryReporter.beforeAttemptFn: *const fn (state: *anyopaque, attempt: u32, max: u32) bool
+metacodes-core.client.RetryReporter.attempts_before: u32 = 0
 metacodes-core.client.RetryReporter.failed: fn failed(self: RetryReporter, attempt: u32, max: u32, delay_ms: u64) bool
 metacodes-core.client.RetryReporter.beforeAttempt: fn beforeAttempt(self: RetryReporter, attempt: u32, max: u32) bool
 metacodes-core.client.cancelled: fn cancelled(abort: ?*const AbortSignal) bool
@@ -7942,6 +7943,8 @@ metacodes-core.api_model_error.MaskedFailure: const = Text(8 * 1024)
 metacodes-core.api_model_error.maskFailure: fn maskFailure(out: *MaskedFailure, raw: []const u8, credential: ?SecretPrint) []const u8
 metacodes-core.api_model_error.withoutCutCredential: fn withoutCutCredential(text: []const u8, credential: ?SecretPrint) []const u8
 metacodes-core.api_model_error.noteStreamError: fn noteStreamError(payload: []const u8) void
+metacodes-core.api_model_error.isOverloaded: fn isOverloaded(payload: []const u8) bool
+metacodes-core.api_model_error.responseRetryAfterMs: fn responseRetryAfterMs() ?u64
 metacodes-core.api_model_error.noteTransportFailure: fn noteTransportFailure(category: Category, retry: Retry, message: []const u8) void
 metacodes-core.api_model_error.noteStreamFailure: fn noteStreamFailure(category: Category, retry: Retry, message: []const u8) void
 metacodes-core.api_model_error.noteContextWindowUnrecovered: fn noteContextWindowUnrecovered(message: []const u8) void
