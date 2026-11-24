@@ -203,9 +203,12 @@ def checked_models(request: Dict[str, Any]) -> List[Any]:
 
 
 def run_features(features: List[str], suite_id: str) -> List[str]:
-    """The profile's features a dataset runs with: none for a WorkBuddy
-    suite, whose overlay launches metacodes itself."""
-    return [] if suites.get(suite_id).runner == suites.WORKBUDDY else list(features)
+    """The profile's features a dataset runs with: for a WorkBuddy suite,
+    whose overlay launches metacodes itself, only those its overlay takes."""
+    if suites.get(suite_id).runner == suites.WORKBUDDY:
+        from scripts.eval.harbor.suites import workbuddy
+        return [name for name in features if name in workbuddy.FEATURE_PARAMS]
+    return list(features)
 
 
 def profile_id(digest: str, features: List[str]) -> str:
@@ -520,7 +523,9 @@ class ProfileManager:
             if frozen_digest(Path(record["metacodes"]["bundle"])) != record["metacodes"]["digest"]:
                 raise ValueError("冻结的 metacodes 发行包已被修改，这个评测配置不再运行")
             request = dict(pending["request"])
-            features = run_features(record.get("features") or [], request.get("suite", suites.DEFAULT_SUITE))
+            features = pending.get("features")
+            if features is None:
+                features = run_features(record.get("features") or [], request.get("suite", suites.DEFAULT_SUITE))
             if features:
                 request["features"] = features
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
