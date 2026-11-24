@@ -11,7 +11,7 @@
 {"run_state":{"run_id":1,"transition_seq":3,"phase":"executing_tools","turn":1,"tool_calls":0,"in_flight_tools":[{"tool_call_id":"toolu_01","name":"Read"}]}}
 {"tool_start":{"id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}"}}
 {"run_state":{"run_id":1,"transition_seq":4,"phase":"generating","turn":1,"tool_calls":0,"in_flight_tools":[]}}
-{"tool_result":{"id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}","content":"{\"error\":{\"code\":\"permission_denied\",\"category\":\"safety\",\"detail\":\"tool 'Read' denied by permission rule or permission mode\",\"recoverable\":false}}","is_error":true,"elapsed_ms":<N>,"file_refs":null}}
+{"tool_result":{"id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}","content":"{\"error\":{\"code\":\"unknown_tool\",\"category\":\"user_error\",\"detail\":\"tool 'Read' is not offered in this session; call only the tools this request lists\",\"recoverable\":true}}","is_error":true,"elapsed_ms":<N>,"file_refs":null}}
 {"run_state":{"run_id":1,"transition_seq":5,"phase":"generating","turn":2,"tool_calls":1,"in_flight_tools":[]}}
 {"progress":{"turn":2,"tool_name":"","tool_input":"","tool_calls":1}}
 {"output_segment_begin":{"index":1,"turn":2,"group":1}}

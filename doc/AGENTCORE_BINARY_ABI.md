@@ -2612,7 +2612,10 @@ ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`,
 `AskUserQuestion`. The kernel-owned `ReadArtifact` recovery tool is also
 present in every Runtime generation and is automatically selected for every
 AgentCore Session; it is not a fallback that admits any other unselected
-built-in. `WebSearch` uses the Session's configured internal web
+built-in. A Session offers only the tools its Host names in `allowed_tools`
+(plus `ReadArtifact`); no permission mode, `full_access` included, adds one.
+A model call to a tool the Session does not offer never runs: its tool result
+is an `unknown_tool` error, "tool 'Read' is not offered in this session". `WebSearch` uses the Session's configured internal web
 service/provider; it is an ordinary function tool rather than a
 provider-specific server-tool descriptor. The Host may select `WebSearch` in
 `builtin_tools`, but does not provide or register an executor callback for it.

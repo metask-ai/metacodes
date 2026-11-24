@@ -670,6 +670,9 @@ typedef struct {
     metask_agentcore_bytes_view_v1 base_url;
     metask_agentcore_bytes_view_v1 workspace_root;
     metask_agentcore_bytes_view_v1 workspace_home;
+    /* The built-in tools the Session offers, besides ReadArtifact. No
+     * permission mode adds one: under PERMISSION_FULL_ACCESS an empty list
+     * still leaves Read unavailable. */
     const metask_agentcore_bytes_view_v1 *allowed_tools;
     uint64_t allowed_tool_count;
     metask_agentcore_skill_catalog *skill_catalog;
