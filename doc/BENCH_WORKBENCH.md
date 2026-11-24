@@ -798,9 +798,28 @@ are those of the default executor (the top level for the default suite).
 
 Cancel sends `cancel` on the channel: the driver interrupts Harbor (SIGINT,
 then SIGKILL after 20 seconds). A login that can no longer be refreshed
-cancels the same way and fails the run with the reason above. If the channel closes, or no heartbeat
-arrives for 90 seconds, the driver stops Harbor as well, so a lost connection
-never leaves trials running unsupervised.
+cancels the same way and fails the run with the reason above.
+
+A lost connection does not end the run. When the channel closes, or no
+heartbeat arrives for 90 seconds, the worker ends that session and starts
+`metacodes bench node attach <run spec>` over SSH every 10 seconds. The
+driver keeps Harbor and the relay running and accepts the new session on a
+Unix socket in `/tmp/metacodes-bench-<uid>/` (a directory only that user can
+enter; the socket is named after a hash of the run directory). A session
+lost before its first event is attached the same way, and while the driver
+is still starting (its pid is in `runs/<name>/driver.pid`) `attach` exits
+without an event and the worker tries again. The new session then
+carries the events and control lines, the current access token, and the
+egress tunnel on a fresh `ssh -R` port, which the driver's forwarder follows.
+While no session is attached, the driver's and Harbor's output goes to
+`<state_dir>/runs/<name>/driver.log`. The run's terminal event is also kept
+there, so a session that attaches after Harbor exited still receives it. The
+record counts the reattached sessions in `reconnects`. Both sides give up
+after 30 minutes (`METACODES_BENCH_RECONNECT_WINDOW` seconds on the
+workbench, which passes the value to the driver as the spec's
+`detach_grace`): the driver interrupts Harbor, so a lost connection never
+leaves trials running unsupervised, and the run fails with what is still on
+the executor.
 
 ### Network-restricted executors
 
@@ -1151,7 +1170,10 @@ first runs until its queue is empty. A single launch (`POST /api/runs`,
 and its `features` (`bench run --features a,b`; the run gates when none are
 given, `--features ""` for none), and is refused while
 a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
-of its queue.
+of its queue. A dataset whose SSH executor does not answer when it is due
+(the SSH connection fails or times out; a refused login does not count)
+stays pending, with the reason in its `waiting` field, and is retried until the executor
+answers. After 30 minutes it fails, and the queue moves on.
 
 While a profile runs, its concurrency can be changed (`POST /api/profile/concurrency`
 with `id` and `concurrency`, 1–16; 并发数 on its page). The value is capped per

@@ -127,6 +127,10 @@ def key_env_problems(key_env, model):
     return []
 
 
+class ExecutorUnreachable(ValueError):
+    """A launch refused only because the SSH executor did not answer."""
+
+
 class RunManager:
     # A worker rewrites its receipt every two seconds; one older than this
     # belongs to a worker that stopped.
@@ -180,6 +184,7 @@ class RunManager:
             if node:
                 public["label"] += f" · metacodes {node.get('version')}"
             states.append({**public, "ready": not problems, "reasons": problems,
+                           "unreachable": executors.unreachable(facts),
                            "default": executor.name == default, "harbor": facts.get("harbor") or None,
                            "node": {k: node.get(k) for k in ("version", "host")} if node else None,
                            "node_reach": executors.reach_reasons(executor, facts)
@@ -441,7 +446,7 @@ class RunManager:
         entry = next(s for s in catalog["suites"] if s["id"] == suite.id)
         problems = entry["executors"][state["name"]]["reasons"]
         if problems:
-            raise ValueError("；".join(problems))
+            raise (ExecutorUnreachable if state.get("unreachable") else ValueError)("；".join(problems))
         if TEAMWORK in features and not (state["kind"] == "ssh" and state.get("teamwork_privileged")):
             raise ValueError("Teamwork 评测只能在开启了 teamwork_privileged 的 SSH 执行机器上运行：任务容器要放开 bubblewrap "
                              "需要的权限，接近 privileged 容器，只适合用完即弃、没有凭证的专用节点")
