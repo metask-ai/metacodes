@@ -417,8 +417,32 @@ class ProfileTest(unittest.TestCase):
         for name in (doomed, '../' + kept, '.bench-runs'):
             with self.assertRaisesRegex(ValueError, '不存在'):
                 self.client.request('api/job/delete', {'name': name})
+        self.assertEqual([i['run'] for i in self.manager.profiles.get(record['id'])['items']], [None, kept])
+        with self.workbench.library.store.read() as tx:
+            stored = json.loads(tx.one("SELECT record_json FROM profiles WHERE id = ?", (record['id'],))[0])
+        self.assertEqual([i['run'] for i in stored['items']], [None, kept])
+
+        _write(self.manager.jobs_dir / doomed / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(self.manager.jobs_dir / doomed / 'result.json', {'started_at': '2026-11-16T08:00:00Z',
+                                                                'finished_at': '2026-11-16T08:30:00Z', 'n_total_trials': 0})
+        self.workbench.library.sync()
+        self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
         self.client.request('api/profile/delete', {'id': record['id']})
         self.assertEqual(self.client.request('api/store')['counts']['profiles'], 0)
+        self.assertTrue((self.manager.jobs_dir / doomed).is_dir())
+        self.workbench.library.sync()
+        self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
+
+    def test_a_harbor_job_still_running_without_a_receipt_is_not_deleted(self):
+        job = self.manager.jobs_dir / 'harbor-by-hand'
+        _write(job / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(job / 'result.json', {'started_at': '2026-11-16T08:00:00Z', 'finished_at': None, 'n_total_trials': 1})
+        listed = {j['name']: j for j in self.client.request('api/jobs?profile=all')['jobs']}
+        self.assertTrue(listed['harbor-by-hand']['running'])
+        with self.assertRaisesRegex(ValueError, '先停止'):
+            self.client.request('api/job/delete', {'name': 'harbor-by-hand'})
+        self.assertTrue(job.is_dir())
+        self.assertEqual(self.client.request('api/store')['counts']['jobs'], 1)
 
     def test_a_running_job_or_one_from_another_jobs_directory_is_not_deleted(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):

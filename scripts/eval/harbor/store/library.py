@@ -183,8 +183,10 @@ class StoreLibrary:
                 raise ValueError(f"删除评测配置清单失败（{exc}），可以重试") from None
 
     def delete_job(self, job: str, jobs_dir: Path, remove_files: Callable[[], None]) -> None:
-        """Delete one job this jobs directory owns: its files, then its rows,
-        so a failure leaves a job that a retry finds and finishes."""
+        """Delete one job this jobs directory owns: its files (`remove_files`
+        also unlinks it from the profile manifests), then its rows and the
+        profiles' rows, so a failure leaves a job that a retry finds and
+        finishes."""
         jobs_dir = Path(jobs_dir).resolve()
         with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
             sources = self._owned_sources(_job_owners([job], jobs_dir), f"作业 {job}")
@@ -193,6 +195,7 @@ class StoreLibrary:
             remove_files()
             with self.store.transaction() as tx:
                 _delete_job_rows(tx, [job])
+            ingest.ingest_profiles(self.store, jobs_dir / ingest.PROFILES_DIR)
 
     def _owned_sources(self, owners, label: str):
         with self.store.read() as tx:

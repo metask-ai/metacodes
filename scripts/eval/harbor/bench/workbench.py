@@ -411,10 +411,21 @@ class Workbench:
             raise ValueError("作业不存在")
         self.profiles.advance()
         with self.profiles.lock, manager.lock:
-            if any(r["name"] == name and r.get("status") in ACTIVE for r in manager.runs()):
+            receipts = manager.runs()
+            view = self.job_view(name, True, receipts)
+            if (view and view["running"]) or any(r["name"] == name and r.get("status") in ACTIVE for r in receipts):
                 raise ValueError("作业还在运行，请先停止，结束后再删除")
-            self.library.delete_job(name, manager.jobs_dir, lambda: self._remove_run_files([name]))
+            self.library.delete_job(name, manager.jobs_dir, lambda: self._forget_run(name))
         return {"name": name, "deleted": True}
+
+    def _forget_run(self, name) -> None:
+        for record in self.profiles.records():
+            items = [item for item in record["items"] if item.get("run") == name]
+            for item in items:
+                item["run"] = None
+            if items:
+                self.profiles.save(record)
+        self._remove_run_files([name])
 
     def _remove_run_files(self, runs) -> None:
         manager = self.manager
