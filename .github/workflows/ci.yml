@@ -652,6 +652,17 @@ jobs:
             *) echo "no base to compare on a $GITHUB_EVENT_NAME run"; exit 0 ;;
           esac
           python3 scripts/check_changelog_sections.py --base "$base"
+      - name: Layer baseline only shrinks
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
+            *) echo "no base to compare on a $GITHUB_EVENT_NAME run"; exit 0 ;;
+          esac
+          zig build layer:check -Dlayer-base="$base"
       - name: Changelog section check unit tests
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_changelog_sections -v

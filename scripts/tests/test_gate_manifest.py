@@ -131,10 +131,10 @@ class GateManifestTest(unittest.TestCase):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn('const gate_static_step = b.step("gate:static",', build)
         deps = set(re.findall(r"\bgate_static_step\.dependOn\(&?([\w.]+?)(?:\.step)?\)", build))
-        self.assertTrue({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "gate_diff_check"} <= deps, deps)
+        self.assertTrue({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "layer_run", "gate_diff_check"} <= deps, deps)
         # Source-only: the boundary gates' full steps carry their self-tests,
         # test binaries that build and install the fs-helper.
-        self.assertFalse(deps & {"http_status_gate_step", "subsystem_boundary_step"}, deps)
+        self.assertFalse(deps & {"http_status_gate_step", "subsystem_boundary_step", "layer_step"}, deps)
         scans = re.findall(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*?"scripts\.tests\.test_\w+_discipline"', build, re.S)
         self.assertTrue(scans)
         for scan in scans:
