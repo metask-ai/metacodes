@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
+const platform_thread = @import("platform").thread;
 const process = @import("platform").process;
 const pfs = @import("platform").fs;
 const rng = @import("platform").rng;
@@ -57,6 +58,8 @@ pub const PollStreak = struct {
 };
 
 pub const INPUT_STALL_QUIET_MS: u64 = 45_000;
+const SWEEP_MAX_WAIT_MS: u64 = 250;
+const STOP_WAIT_SLICE_MS: u64 = 10;
 
 const StopCause = enum { request, time_limit };
 
@@ -105,6 +108,7 @@ pub const JobEntry = struct {
     /// never dangles; only the directory entries are gone.
     spool_released: bool = false,
     watchdog: ?Watchdog = null,
+    stop_in_progress: bool = false,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -147,6 +151,9 @@ pub const JobRegistry = struct {
     /// BashOutput)会并发 spawnBackground(append+put)/get/reapExited/kill → 无锁则 ArrayList/HashMap
     /// 数据竞争 + 堆损坏(Linus HIGH-1)。全仓惯例 std.c.pthread_*(裁剪 std 无 Thread.Mutex)。
     mu: sync.Mutex = .{},
+    sweeper: ?std.Thread = null,
+    sweeper_quit: bool = false,
+    sweeper_wake: sync.Condition = .{},
 
     fn lock(self: *JobRegistry) void {
         _ = self.mu.lock();
@@ -179,6 +186,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn deinit(self: *JobRegistry) void {
+        self.lock();
+        self.sweeper_quit = true;
+        self.sweeper_wake.signal();
+        self.unlock();
+        if (self.sweeper) |sweeper| sweeper.join();
         // 杀所有 running job 并 reap（防孤儿进程）。可移植:killJob(TERM→等→KILL)+reapBlocking(收尸)。
         for (self.jobs.items) |*j| {
             if (j.status == .running) {
@@ -230,6 +242,58 @@ pub const JobRegistry = struct {
         const entry = self.getPtrLocked(id) orelse return;
         if (entry.status != .running) return;
         entry.watchdog = .{ .limit_ms = limit_ms, .output_changed_ms = util_time.nowMs() };
+        if (self.sweeper != null) {
+            self.sweeper_wake.signal();
+            return;
+        }
+        self.sweeper = platform_thread.spawn(.waiter, sweepDeadlines, .{self}) catch |err| blk: {
+            log.warn("job", "deadline sweeper not started ({s}); limits are enforced when exits are collected", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    fn sweepDeadlines(self: *JobRegistry) void {
+        self.lock();
+        while (!self.sweeper_quit) {
+            self.reapExitedLocked();
+            const now = util_time.nowMs();
+            const scan = self.scanDeadlinesLocked(null, now);
+            if (scan.expired) |id| {
+                self.unlock();
+                log.info("job", "bg time limit reached id={s}", .{id[0..]});
+                self.stop(id[0..], .time_limit) catch {};
+                self.lock();
+                continue;
+            }
+            const next_deadline = scan.next_deadline orelse {
+                self.sweeper_wake.wait(&self.mu);
+                continue;
+            };
+            const wait_ms: u64 = @min(@as(u64, @intCast(next_deadline - now)), SWEEP_MAX_WAIT_MS);
+            _ = self.sweeper_wake.timedWait(&self.mu, wait_ms * std.time.ns_per_ms);
+        }
+        self.unlock();
+    }
+
+    const DeadlineScan = struct {
+        expired: ?[12]u8 = null,
+        next_deadline: ?util_time.Millis = null,
+    };
+
+    fn scanDeadlinesLocked(self: *JobRegistry, owner: ?SessionId, now_ms: util_time.Millis) DeadlineScan {
+        var scan: DeadlineScan = .{};
+        for (self.jobs.items) |entry| {
+            const watchdog = entry.watchdog orelse continue;
+            if (entry.status != .running or entry.stop_in_progress) continue;
+            if (owner) |o| if (!std.mem.eql(u8, &entry.owner.bytes, &o.bytes)) continue;
+            const deadline = entry.started_ms + @as(util_time.Millis, @intCast(watchdog.limit_ms));
+            if (deadline <= now_ms) {
+                scan.expired = entry.id;
+                return scan;
+            }
+            scan.next_deadline = if (scan.next_deadline) |next| @min(next, deadline) else deadline;
+        }
+        return scan;
     }
 
     /// 生成新 job id：12 hex = 6 byte，走可移植熵源 `platform/rng.zig`
@@ -392,7 +456,7 @@ pub const JobRegistry = struct {
     /// 持锁内部版(kill 复用,避免自锁死锁)。
     fn reapExitedLocked(self: *JobRegistry) void {
         for (self.jobs.items) |*j| {
-            if (j.status != .running) continue;
+            if (j.status != .running or j.stop_in_progress) continue;
             switch (process.reapNonblock(j.proc)) { // 可移植:waitpid(WNOHANG) / WaitForSingleObject(0)
                 .running => {},
                 .exited => |code| {
@@ -662,17 +726,9 @@ pub const JobRegistry = struct {
 
     fn stopExpired(self: *JobRegistry, owner: SessionId, now_ms: util_time.Millis) void {
         while (true) {
-            var expired: ?[12]u8 = null;
             self.lock();
             self.reapExitedLocked();
-            for (self.jobs.items) |entry| {
-                const watchdog = entry.watchdog orelse continue;
-                if (entry.status != .running or !std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
-                if (now_ms - entry.started_ms >= @as(util_time.Millis, @intCast(watchdog.limit_ms))) {
-                    expired = entry.id;
-                    break;
-                }
-            }
+            const expired = self.scanDeadlinesLocked(owner, now_ms).expired;
             self.unlock();
             const id = expired orelse return;
             log.info("job", "bg time limit reached id={s}", .{id[0..]});
@@ -682,10 +738,10 @@ pub const JobRegistry = struct {
 
     fn stop(self: *JobRegistry, id: []const u8, cause: StopCause) !void {
         // 读 proc 句柄快照(锁内),kill+reap 在锁外(不让 blocking 收尸钉住锁)。可移植:
-        // process.killJob(TERM→200ms→WNOHANG→KILL)+ reapBlocking(收尸)。**不让数据结构生命周期
+        // process.killJob(TERM→200ms→KILL)+ reapBlocking(收尸)。**不让数据结构生命周期
         // 绑架 syscall 正确性**:proc 快照保证即便 entry 状态变化仍能正确 kill/reap。
         var proc: process.ProcHandle = undefined;
-        {
+        while (true) {
             self.lock();
             const jp = self.getPtrLocked(id) orelse {
                 self.unlock();
@@ -695,13 +751,20 @@ pub const JobRegistry = struct {
                 self.unlock();
                 return; // 已结束，幂等返回
             }
-            proc = jp.proc;
+            if (!jp.stop_in_progress) {
+                jp.stop_in_progress = true;
+                proc = jp.proc;
+                self.unlock();
+                break;
+            }
             self.unlock();
+            util_time.sleepMs(STOP_WAIT_SLICE_MS);
         }
         process.killJob(proc); // TERM→等→KILL（锁外）
         process.reapBlocking(proc); // 收尸（锁外，防僵尸）
         self.lock();
         if (self.getPtrLocked(id)) |jp| {
+            jp.stop_in_progress = false;
             if (jp.status == .running) {
                 jp.status = .killed;
                 jp.exit_code = -9; // SIGKILL 语义
@@ -1269,4 +1332,51 @@ test "looksLikeInteractivePrompt matches the listed prompts and nothing else" {
         "Ratio: 3/4\n",
     };
     for (plain) |text| try std.testing.expect(!looksLikeInteractivePrompt(text));
+}
+
+test "watchdog stops a job at its deadline without anyone collecting exits" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    var marker_buf: [512]u8 = undefined;
+    const marker = @import("../tools/test_tmp.zig").path(&marker_buf, "watchdog-sweeper-marker");
+    unlinkPath(marker);
+    defer unlinkPath(marker);
+    var command_buf: [640]u8 = undefined;
+    const command = try std.fmt.bufPrint(&command_buf, "sleep 1; touch '{s}'", .{marker});
+    const j = try r.spawnBackgroundOwned(command, null, owner);
+    r.armWatchdog(j.idSlice(), 300);
+    util_time.sleepMs(1500);
+    try std.testing.expect(!spoolExists(marker));
+    try std.testing.expectEqual(JobStatus.killed, r.get(j.idSlice()).?.status);
+    const events = try r.takeUnannouncedExits(owner, a);
+    defer freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(JobEventKind{ .time_limit = 300 }, events[0].kind);
+}
+
+test "stopping a job kills a worker that ignores TERM after its shell has exited" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    var ready_buf: [512]u8 = undefined;
+    const ready = @import("../tools/test_tmp.zig").path(&ready_buf, "term-ignoring-worker-ready");
+    var marker_buf: [512]u8 = undefined;
+    const marker = @import("../tools/test_tmp.zig").path(&marker_buf, "term-ignoring-worker-marker");
+    unlinkPath(ready);
+    unlinkPath(marker);
+    defer unlinkPath(ready);
+    defer unlinkPath(marker);
+    var command_buf: [1280]u8 = undefined;
+    const command = try std.fmt.bufPrint(&command_buf, "sh -c 'trap \"\" TERM; touch \"{s}\"; sleep 1; touch \"{s}\"' & wait", .{ ready, marker });
+    const j = try r.spawnBackground(command, null);
+    var attempts: usize = 0;
+    while (!spoolExists(ready) and attempts < 500) : (attempts += 1) util_time.sleepMs(10);
+    if (!spoolExists(ready)) return error.WorkerDidNotStart;
+    try r.kill(j.idSlice());
+    util_time.sleepMs(1500);
+    try std.testing.expect(!spoolExists(marker));
 }

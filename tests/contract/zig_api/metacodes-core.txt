@@ -3880,6 +3880,7 @@ metacodes-core.job_registry.JobEntry.stderr_read_offset: u64 = 0
 metacodes-core.job_registry.JobEntry.poll_streak: PollStreak = .{}
 metacodes-core.job_registry.JobEntry.spool_released: bool = false
 metacodes-core.job_registry.JobEntry.watchdog: ?Watchdog = null
+metacodes-core.job_registry.JobEntry.stop_in_progress: bool = false
 metacodes-core.job_registry.JobEntry.idSlice: fn idSlice(self: *const JobEntry) []const u8
 metacodes-core.job_registry.JobExitEvent: struct
 metacodes-core.job_registry.JobExitEvent.id: [12]u8
@@ -3899,6 +3900,9 @@ metacodes-core.job_registry.JobRegistry.jobs: std.ArrayList(JobEntry)
 metacodes-core.job_registry.JobRegistry.index: std.AutoHashMap([12]u8, usize)
 metacodes-core.job_registry.JobRegistry.base_dir: []const u8
 metacodes-core.job_registry.JobRegistry.mu: sync.Mutex = .{}
+metacodes-core.job_registry.JobRegistry.sweeper: ?std.Thread = null
+metacodes-core.job_registry.JobRegistry.sweeper_quit: bool = false
+metacodes-core.job_registry.JobRegistry.sweeper_wake: sync.Condition = .{}
 metacodes-core.job_registry.JobRegistry.init: fn init(allocator: std.mem.Allocator) !JobRegistry
 metacodes-core.job_registry.JobRegistry.deinit: fn deinit(self: *JobRegistry) void
 metacodes-core.job_registry.JobRegistry.releaseSpool: fn releaseSpool(self: *JobRegistry, id: []const u8) void
