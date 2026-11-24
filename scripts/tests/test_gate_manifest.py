@@ -141,6 +141,22 @@ class GateManifestTest(unittest.TestCase):
             self.assertIn(scan, deps, "a discipline scan is missing from gate:static")
         self.assertIn("gate_pr_step.dependOn(gate_static_step);", build)
 
+    def test_the_contract_snapshots_run_on_the_linux_checks_leg(self):
+        """tests/contract pins the bytes other services depend on. Its one entry
+        is `test:contract`; the Linux checks leg runs it, and the Zig API scan,
+        which only reads the source, is also in `gate:static` and `test:units`."""
+        lines = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
+        runs = [i for i, line in enumerate(lines) if line.strip() == "run: zig build test:contract --summary all"]
+        self.assertEqual(len(runs), 1, "ci.yml runs zig build test:contract exactly once")
+        condition = lines[runs[0] - 1].strip()
+        self.assertTrue(condition.startswith("if: matrix.checks && runner.os == 'Linux'"), condition)
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn('b.step("test:contract",', build)
+        self.assertIn('b.option(bool, "update-contract",', build)
+        for step in ("gate_static_step", "units_test_step", "contract_step"):
+            self.assertIn("%s.dependOn(&zig_api_snapshot.step);" % step, build)
+        self.assertIn("contract_step.dependOn(&contract_run.step);", build)
+
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn('const units_test_step = b.step("test:units",', build)

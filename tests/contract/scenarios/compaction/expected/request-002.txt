@@ -1,0 +1,35 @@
+POST /v1/messages HTTP/1.1
+user-agent: metacodes/<VERSION>
+connection: keep-alive
+anthropic-version: 2023-06-01
+content-type: application/json
+authorization: Bearer sk-contract
+
+{
+"model":"claude-sonnet-4-20250514",
+"max_tokens":32000,
+"messages":[
+{
+"role":"user",
+"content":[
+{
+"type":"text",
+"text":"Summarize this conversation for compaction:\n
+\n
+User: read the notes\n
+Assistant: [tool Read]\n
+"}]}],
+"system":"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n
+\n
+Include, in this order:\n
+1. **Original request & intent** — the user's original task and every explicit requirement/constraint, stated as literally as possible. PRESERVE THIS VERBATIM: on a long task this summary may itself be compacted again and again, so never paraphrase the goal away or let it drift — the resuming LLM must know EXACTLY what the user originally asked for.\n
+2. Current progress and key decisions made\n
+3. Important context, constraints, or user preferences\n
+4. What remains to be done (clear next steps)\n
+5. Any critical data, examples, or references needed to continue\n
+\n
+Be concise and structured. The #1 priority is that a long, repeatedly-compacted task does not lose its original goal through summary-of-summary drift.\n
+",
+"stream":true,
+"cache_control":{
+"type":"ephemeral"}}

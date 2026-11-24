@@ -1,0 +1,23 @@
+session 000001a20c5c66a788a9a330
+title: read the notes
+model: claude-sonnet-4-20250514
+messages: 4
+compact_boundary: 2
+compact_summary: Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:
+<summary>The user asked to read notes.txt; it says alpha.</summary>
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"read the notes"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"tool_use","id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"     1\talpha\n","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"The notes say alpha."}]}
+session 000001a20c5c683ea0e6b348
+title: copy the note
+model: claude-sonnet-4-20250514
+messages: 6
+compact_boundary: 0
+compact_summary: null
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"copy the note"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"text","text":"Reading the note first."},{"type":"tool_use","id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"     1\talpha\n","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"tool_use","id":"toolu_02","name":"Write","input":"{\"file_path\":\"copy.txt\",\"content\":\"alpha\\n\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_02","content":"{\"success\":true,\"path\":\"copy.txt\",\"structuredPatch\":[{\"oldStart\":0,\"oldLines\":0,\"newStart\":1,\"newLines\":1,\"lines\":[\"+alpha\"]}],\"gitDiff\":\"--- a/copy.txt\\n+++ b/copy.txt\\n@@ -0,0 +1,1 @@\\n+alpha\\n\"}","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"Copied notes.txt to copy.txt."}]}

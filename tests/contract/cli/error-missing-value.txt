@@ -1,0 +1,18 @@
+$ metacodes --state-dir <ROOT>/state --model
+exit: 1
+--- stdout
+--- stderr
+[31m[ERROR auth][0m credential resolution failed: MissingCredentials
+Authentication required.
+Use one of:
+  metacodes login
+  metacodes login --oauth-token-json <token-response.json>
+  metacodes login --provider <id>
+  metacodes login --provider <id> --oauth-token-json <token-response.json>
+  metacodes login --api-key <key>
+  export METASK_API_KEY=...
+Or use your own provider key: put it in <ROOT>/state/.env, then start again.
+  How to: https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md
+
+No token value was printed.
+error: MissingCredentials

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mock": {
+      "type": "stdio",
+      "command": "<MOCK_MCP>"
+    }
+  }
+}
