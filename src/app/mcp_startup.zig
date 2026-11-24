@@ -11,7 +11,7 @@
 //! list a provider sees is fixed by the outcomes, never by when they arrived.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const mcp_config = @import("metacodes-internal").mcp.config;
 const mcp_launch = @import("metacodes-internal").mcp.launch;
 const mcp_transport = @import("metacodes-internal").mcp.transport;
@@ -357,7 +357,7 @@ pub const Startup = struct {
                     continue;
                 },
             }
-            thread.* = @import("platform").thread.spawn(.full, Job.run, .{job}) catch blk: {
+            thread.* = @import("metacodes-internal").platform.thread.spawn(.full, Job.run, .{job}) catch blk: {
                 job.run();
                 break :blk null;
             };
@@ -466,7 +466,7 @@ fn openLog(arena: std.mem.Allocator, state_root: []const u8, server: []const u8,
     // the flag each server, and anything else spawned meanwhile, would
     // also hold every other server's log open. The fork lock keeps a
     // concurrent spawn out of the gap between open and fcntl.
-    const process = @import("platform").process;
+    const process = @import("metacodes-internal").platform.process;
     process.forkSerialLock();
     defer process.forkSerialUnlock();
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));

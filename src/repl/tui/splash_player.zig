@@ -14,7 +14,7 @@
 //! included, so no frame is drawn at a size the terminal no longer has.
 
 const std = @import("std");
-const platform = @import("platform");
+const platform = @import("metacodes-internal").platform;
 const platform_term = platform.terminal;
 const pfs = platform.fs;
 const splash = @import("splash.zig");
@@ -175,7 +175,7 @@ pub const Background = struct {
         const self = try gpa.create(Background);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .plan = plan, .style = style, .seed = seed };
-        self.thread = try @import("platform").thread.spawn(.full, run, .{self});
+        self.thread = try @import("metacodes-internal").platform.thread.spawn(.full, run, .{self});
         return self;
     }
 

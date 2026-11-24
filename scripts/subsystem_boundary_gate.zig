@@ -385,8 +385,9 @@ fn isListed(list: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The lower-package files `src/internal.zig` re-exports to the application
-/// side, by the namespace path a use spells after the module name.
+/// The lower-package files and named modules `src/internal.zig` re-exports to
+/// the application side, by the namespace path a use spells after the module
+/// name.
 const Internal = struct {
     entries: []const Entry = &.{},
 
@@ -395,7 +396,9 @@ const Internal = struct {
 
     const Entry = struct {
         chain: []const u8,
-        file: []const u8,
+        /// A repository-relative file, or the name of a named module.
+        target: []const u8,
+        module: bool,
     };
 
     fn load(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Internal {
@@ -438,14 +441,18 @@ const Internal = struct {
                     if (index + 6 >= all.len or all[index + 6].tag != .string_literal) continue;
                     const literal = source[all[index + 6].loc.start + 1 .. all[index + 6].loc.end - 1];
                     var buffer: [512]u8 = undefined;
-                    const file = resolve(&buffer, root, literal) orelse continue;
+                    const file = resolve(&buffer, root, literal);
                     var chain: std.ArrayList(u8) = .empty;
                     for (namespaces.items) |namespace| {
                         try chain.appendSlice(allocator, namespace.name);
                         try chain.append(allocator, '.');
                     }
                     try chain.appendSlice(allocator, decl);
-                    try entries.append(allocator, .{ .chain = chain.items, .file = try allocator.dupe(u8, file) });
+                    try entries.append(allocator, .{
+                        .chain = chain.items,
+                        .target = try allocator.dupe(u8, file orelse literal),
+                        .module = file == null,
+                    });
                 },
                 else => {},
             }
@@ -453,14 +460,14 @@ const Internal = struct {
         return .{ .entries = entries.items };
     }
 
-    /// The file a use of the entry names: `rest` is the source after the
-    /// closing quote of `@import("metacodes-internal"`.
-    fn fileOf(internal: Internal, rest: []const u8) ?[]const u8 {
+    /// The entry a use names: `rest` is the source after the closing quote
+    /// of `@import("metacodes-internal"`.
+    fn use(internal: Internal, rest: []const u8) ?Entry {
         var cursor = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
         cursor += 1;
         var chain_end: usize = 0;
         var chain_start: ?usize = null;
-        var found: ?[]const u8 = null;
+        var found: ?Entry = null;
         while (true) {
             while (cursor < rest.len and std.ascii.isWhitespace(rest[cursor])) cursor += 1;
             if (cursor >= rest.len or rest[cursor] != '.') break;
@@ -473,10 +480,15 @@ const Internal = struct {
             chain_end = cursor;
             const spelled = rest[chain_start.?..chain_end];
             for (internal.entries) |entry| {
-                if (sameChain(entry.chain, spelled)) found = entry.file;
+                if (sameChain(entry.chain, spelled)) found = entry;
             }
         }
         return found;
+    }
+
+    fn fileOf(internal: Internal, rest: []const u8) ?[]const u8 {
+        const entry = internal.use(rest) orelse return null;
+        return if (entry.module) null else entry.target;
     }
 };
 
@@ -498,6 +510,14 @@ fn importedFile(buffer: []u8, internal: Internal, path: []const u8, target: []co
     if (resolve(buffer, path, target)) |resolved| return resolved;
     if (!std.mem.eql(u8, target, Internal.name)) return null;
     return internal.fileOf(rest);
+}
+
+/// The named module `target`, imported at `rest`, stands for: the module a
+/// use of the internal entry names, or `target` itself.
+fn namedModule(internal: Internal, target: []const u8, rest: []const u8) []const u8 {
+    if (!std.mem.eql(u8, target, Internal.name)) return target;
+    const entry = internal.use(rest) orelse return target;
+    return if (entry.module) entry.target else target;
 }
 
 /// The files one subsystem reaches, each with the file it was reached from
@@ -741,7 +761,7 @@ fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, inte
         var buffer: [512]u8 = undefined;
         const target = source[start..end];
         const resolved = importedFile(&buffer, internal, path, target, source[end + 1 ..]) orelse {
-            if (!std.mem.eql(u8, target, Internal.name)) continue;
+            if (!std.mem.eql(u8, target, Internal.name) or internal.use(source[end + 1 ..]) != null) continue;
             violations.* += 1;
             std.debug.print(
                 "{s}:{d}: uses {s} without naming a file of {s}, so the {s} rule cannot see what it reaches\n",
@@ -825,7 +845,7 @@ fn check(
                 if (!ownedElsewhere(subsystems, index, resolved)) try walk.visit(resolved, path);
                 continue;
             }
-        } else if (isListed(subsystem.modules, target)) continue;
+        } else if (isListed(subsystem.modules, namedModule(walk.internal, target, source[end + 1 ..]))) continue;
 
         violations.* += 1;
         std.debug.print(
@@ -1182,6 +1202,7 @@ test "the host ratchet's baseline is under its directories and has no duplicate"
 const test_internal =
     \\const std = @import("std");
     \\
+    \\pub const platform = @import("platform");
     \\pub const tools_root = @import("tools.zig");
     \\pub const core = struct {
     \\    pub const agent_loop = @import("core/agent_loop.zig");
@@ -1206,7 +1227,7 @@ test "a use of the internal entry names the file its namespace path re-exports" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const internal = try Internal.parse(arena.allocator(), test_internal);
-    try std.testing.expectEqual(@as(usize, 5), internal.entries.len);
+    try std.testing.expectEqual(@as(usize, 6), internal.entries.len);
     try std.testing.expectEqualStrings("src/tools.zig", internal.fileOf(").tools_root.ToolContext").?);
     try std.testing.expectEqualStrings("src/core/agent_loop.zig", internal.fileOf(").core.agent_loop.AgentLoop").?);
     try std.testing.expectEqualStrings("src/kg/kgd/server.zig", internal.fileOf(")\n    . kg .kgd. server;").?);
@@ -1214,6 +1235,10 @@ test "a use of the internal entry names the file its namespace path re-exports" 
     try std.testing.expect(internal.fileOf(");") == null);
     try std.testing.expect(internal.fileOf(").kg;") == null);
     try std.testing.expect(internal.fileOf(").kg.missing") == null);
+    try std.testing.expect(internal.fileOf(").platform.fs") == null);
+    try std.testing.expectEqualStrings("platform", namedModule(internal, "metacodes-internal", ").platform.fs"));
+    try std.testing.expectEqualStrings("metacodes-internal", namedModule(internal, "metacodes-internal", ").core.agent_loop"));
+    try std.testing.expectEqualStrings("hl", namedModule(internal, "hl", ")"));
 }
 
 test "the picker's reach through the internal entry is held to its lists" {
@@ -1229,6 +1254,13 @@ test "the picker's reach through the internal entry is held to its lists" {
     }};
     var walk: Walk = .{ .allocator = arena.allocator(), .internal = try Internal.parse(arena.allocator(), test_internal) };
     var violations: usize = 0;
+    var with_platform = subsystems;
+    with_platform[0].modules = &.{ "std", "platform" };
+    try check(&walk, "const fs = @import(\"metacodes-internal\").platform.fs;", "src/repl/model_picker.zig", &with_platform, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 0), violations);
+    try check(&walk, "const fs = @import(\"metacodes-internal\").platform.fs;", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations);
+    violations = 0;
     try check(&walk, "const ids = @import(\"metacodes-internal\").provider.ids;", "src/repl/model_picker.zig", &subsystems, 0, &violations);
     try std.testing.expectEqual(@as(usize, 0), violations);
     try std.testing.expect(walk.reached_from.contains("src/provider/ids.zig"));
@@ -1244,7 +1276,7 @@ test "a host file may not reach the AgentLoop through the internal entry either"
     const clean = [_][2][]const u8{
         entry,
         driver,
-        .{ "src/web/server.zig", "const ids = @import(\"metacodes-internal\").provider.ids;\n" },
+        .{ "src/web/server.zig", "const ids = @import(\"metacodes-internal\").provider.ids;\nconst fs = @import(\"metacodes-internal\").platform.fs;\n" },
     };
     try std.testing.expectEqual(@as(usize, 0), try checkRatchetTree(TEST_RATCHET, &clean));
     var named = clean;

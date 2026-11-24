@@ -59,7 +59,7 @@ pub const Startup = struct {
         const id = try gpa.dupe(u8, identity);
         errdefer gpa.free(id);
         self.* = .{ .gpa = gpa, .client = client, .projects_dir = dir, .identity = id };
-        self.thread = try @import("platform").thread.spawn(.full, run, .{self});
+        self.thread = try @import("metacodes-internal").platform.thread.spawn(.full, run, .{self});
         return self;
     }
 

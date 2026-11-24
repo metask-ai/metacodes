@@ -20,7 +20,7 @@
 //! TUI has no per-message configuration.
 
 const std = @import("std");
-const sync = @import("platform").sync;
+const sync = @import("metacodes-internal").platform.sync;
 const types = @import("metacodes-internal").types;
 const permission_mode = @import("metacodes-internal").permission.mode;
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const process = @import("platform").process;
+const process = @import("metacodes-internal").platform.process;
 const input = @import("../input.zig");
 const mirror = @import("screen_mirror.zig");
 const RenderRegion = @import("render_region.zig").RenderRegion;

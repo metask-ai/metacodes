@@ -11,8 +11,8 @@
 //! from the current directory), so `login` names what `/mcp` lists.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const paths = @import("platform").paths;
+const pfs = @import("metacodes-internal").platform.fs;
+const paths = @import("metacodes-internal").platform.paths;
 const mcp_config = @import("metacodes-internal").mcp.config;
 const mcp_oauth = @import("metacodes-internal").mcp.oauth;
 const mcp_startup = @import("mcp_startup.zig");

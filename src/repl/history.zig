@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const tt = @import("metacodes-internal").tools.test_tmp; // 测试 fixture 唯一路径(并发隔离)
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const util_json = @import("metacodes-internal").util.json;
 
 pub const MAX_ENTRIES: usize = 1000;

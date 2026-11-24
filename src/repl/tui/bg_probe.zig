@@ -15,8 +15,8 @@
 //! ④ 管道/NO_PROBE/非 tty 由调用方跳过(本模块也自带非 tty 守卫)。
 const std = @import("std");
 const builtin = @import("builtin");
-const platform_term = @import("platform").terminal;
-const pfs = @import("platform").fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
+const pfs = @import("metacodes-internal").platform.fs;
 const util_time = @import("metacodes-internal").util.time;
 const log = @import("metacodes-internal").util.log;
 

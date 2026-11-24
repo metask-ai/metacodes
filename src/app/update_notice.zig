@@ -1,7 +1,7 @@
 //! The update notice of an interactive session (doc/UPDATE_DESIGN.md §13).
 
 const std = @import("std");
-const platform = @import("platform");
+const platform = @import("metacodes-internal").platform;
 const install = @import("install.zig");
 const release_fetch = @import("release_fetch.zig");
 const update = @import("update.zig");

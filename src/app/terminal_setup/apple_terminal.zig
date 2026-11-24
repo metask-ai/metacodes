@@ -21,8 +21,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const process = @import("platform").process;
-const process_scan = @import("platform").process_scan;
+const process = @import("metacodes-internal").platform.process;
+const process_scan = @import("metacodes-internal").platform.process_scan;
 const log = @import("metacodes-internal").util.log;
 const files = @import("files.zig");
 const setup = @import("setup.zig");

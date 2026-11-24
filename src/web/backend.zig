@@ -39,7 +39,7 @@
 //! poll 恒 null(生产路径无人消费 poll,与 TuiBackend 现状一致)。
 
 const std = @import("std");
-const sync = @import("platform").sync;
+const sync = @import("metacodes-internal").platform.sync;
 const ui_backend = @import("metacodes-internal").core.protocol.ui_backend;
 const ui_event = @import("metacodes-internal").core.protocol.ui_event;
 const ui_request = @import("metacodes-internal").core.protocol.ui_request;

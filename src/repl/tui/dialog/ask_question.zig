@@ -11,7 +11,7 @@
 //! ESC / Ctrl+C → error.InputAborted(取消整个 AskUserQuestion,对齐 cc)。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const ansi = @import("../ansi.zig");
 const input_mod = @import("../../input.zig");
 const theme_mod = @import("../theme.zig");
@@ -1244,7 +1244,7 @@ test "run reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at
     defer _ = pfs.close(sink);
     const Later = struct {
         fn send(fd: c_int, bytes: []const u8) void {
-            @import("platform").sync.sleepMs(300);
+            @import("metacodes-internal").platform.sync.sleepMs(300);
             _ = pfs.writeAll(fd, bytes);
             _ = std.c.close(fd);
         }

@@ -3,6 +3,7 @@ const std = @import("std");
 pub const client = @import("client.zig");
 pub const json = @import("json.zig");
 pub const permission_root = @import("permission.zig");
+pub const platform = @import("platform");
 pub const tools_root = @import("tools.zig");
 pub const types = @import("types.zig");
 pub const version = @import("version.zig");

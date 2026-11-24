@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const host_injection_meter = @import("metacodes-internal").core.host_injection_meter;
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const input = @import("input.zig");
 const Conversation = @import("metacodes-internal").core.conversation.Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;

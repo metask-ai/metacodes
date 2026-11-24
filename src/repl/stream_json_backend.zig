@@ -29,7 +29,7 @@ const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;
 const UiBackend = ui_backend.UiBackend;
 const SessionId = ui_backend.SessionId;
-const Mutex = @import("platform").sync.Mutex;
+const Mutex = @import("metacodes-internal").platform.sync.Mutex;
 
 /// 单条 input/content 预览的截断上限(字节;码点边界回退后可能更短)。
 pub const MAX_FIELD_PREVIEW: usize = 2048;

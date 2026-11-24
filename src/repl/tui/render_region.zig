@@ -13,7 +13,7 @@
 //! mutex 只管"擦/画"这组动作的逻辑原子性,不用裸 writeAll(2) 绕过。
 
 const std = @import("std");
-const sync = @import("platform").sync;
+const sync = @import("metacodes-internal").platform.sync;
 const screen_mirror = @import("screen_mirror.zig");
 const app_mod = @import("../../app.zig");
 const types = @import("metacodes-internal").types;
@@ -490,7 +490,7 @@ pub const RenderRegion = struct {
         const m = &(self.merge orelse return);
         if (!m.timer) return;
         if (m.thread == null) {
-            m.thread = @import("platform").thread.spawn(.full, timerMain, .{self}) catch {
+            m.thread = @import("metacodes-internal").platform.thread.spawn(.full, timerMain, .{self}) catch {
                 self.merge = null;
                 self.paintLocked(.as_needed, "");
                 return;
@@ -3647,15 +3647,15 @@ const MergeFixture = struct {
     /// `merge` false keeps the default paint-through region.
     fn init(f: *MergeFixture, merge: bool) !void {
         const a = std.testing.allocator;
-        const ppaths = @import("platform").paths;
+        const ppaths = @import("metacodes-internal").platform.paths;
         const util_fs = @import("metacodes-internal").util.fs;
         f.home = util_fs.testing.perPidDir(&f.home_buf, "cc-zig-merge-window");
-        _ = @import("platform").fs.mkdir(f.home.ptr, 0o755);
+        _ = @import("metacodes-internal").platform.fs.mkdir(f.home.ptr, 0o755);
         f.old_home = std.c.getenv("HOME");
         ppaths.setEnv("HOME", f.home.ptr);
         ppaths.setEnv("METACODES_NO_PROBE", "1");
         f.app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        f.io_rt = @import("platform").signal.threadedIo(a, .{});
+        f.io_rt = @import("metacodes-internal").platform.signal.threadedIo(a, .{});
         f.app = try app_mod.App.init(f.app_arena.allocator(), f.io_rt.io(), .{ .model = "claude-sonnet-4-20250514" }, "test-key");
         f.out = .init(a);
         f.r = RenderRegion.init(a, -1, theme_mod.select(.monochrome, .none), .none);
@@ -3671,7 +3671,7 @@ const MergeFixture = struct {
         f.app.deinit();
         f.io_rt.deinit();
         f.app_arena.deinit();
-        const ppaths = @import("platform").paths;
+        const ppaths = @import("metacodes-internal").platform.paths;
         if (f.old_home) |h| ppaths.setEnv("HOME", h) else ppaths.unsetEnv("HOME");
         @import("metacodes-internal").util.fs.testing.rmrfBestEffort(f.home);
     }

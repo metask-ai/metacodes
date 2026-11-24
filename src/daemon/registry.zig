@@ -27,7 +27,7 @@
 //!   journal.close;否则 destroy 的 join 会挂到当前一整轮 agent_loop.run 自然结束。
 
 const std = @import("std");
-const sync = @import("platform").sync;
+const sync = @import("metacodes-internal").platform.sync;
 const time = @import("metacodes-internal").util.time;
 const abort = @import("metacodes-internal").util.abort;
 const SessionId = @import("metacodes-internal").core.session_id.SessionId;
@@ -77,7 +77,7 @@ pub const SessionHost = struct {
     }
 
     pub fn start(self: *SessionHost) !void {
-        self.thread = try @import("platform").thread.spawn(.full, driverTrampoline, .{self});
+        self.thread = try @import("metacodes-internal").platform.thread.spawn(.full, driverTrampoline, .{self});
     }
 
     fn driverTrampoline(self: *SessionHost) void {

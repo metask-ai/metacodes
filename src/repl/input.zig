@@ -9,12 +9,12 @@
 //! 测试策略：LineEditor 全部用 fake keystream 驱动。termios 只做 "不崩" 测试（真 tty 行为难在 CI 里验证）。
 
 const std = @import("std");
-const ppaths = @import("platform").paths;
-const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
-const win32_input = @import("platform").win32_input;
-const platform_signal = @import("platform").signal;
-const process = @import("platform").process;
+const ppaths = @import("metacodes-internal").platform.paths;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
+const win32_input = @import("metacodes-internal").platform.win32_input;
+const platform_signal = @import("metacodes-internal").platform.signal;
+const process = @import("metacodes-internal").platform.process;
 const shutdown = @import("metacodes-internal").core.shutdown;
 const bg_probe = @import("tui/bg_probe.zig");
 
@@ -2143,7 +2143,7 @@ test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走�
     // 编译期跳过:否则别的平台也要分析下面对 Windows API 的调用(macOS 不认 winapi 调用约定,
     // Linux 链接不到 kernel32 的符号)。
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var console = try @import("platform").test_support.PrivateConsole.begin();
+    var console = try @import("metacodes-internal").platform.test_support.PrivateConsole.begin();
     defer console.end();
     var p = KeyParser{};
     var b: [1]u8 = undefined;
@@ -2183,7 +2183,7 @@ test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走�
 test "readInput(Windows 控制台送按键记录):读出的是键,抬键记录不叫醒等待,半截的不是记录照原样" {
     // win32-input-mode 开着时控制台把一条记录逐字符排进队列(sendChars),与真机同形。
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var console = try @import("platform").test_support.PrivateConsole.begin();
+    var console = try @import("metacodes-internal").platform.test_support.PrivateConsole.begin();
     defer console.end();
     defer platform_term.resetConsoleInputForTesting();
     platform_term.decodeKeyRecords();
@@ -2219,7 +2219,7 @@ test "readInput(Windows 控制台送按键记录):读出的是键,抬键记录�
 
 test "readInput(Windows 控制台送按键记录):一条记录被 ReadConsoleW 的 256 字符一批切开,读出的仍是那个键" {
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var console = try @import("platform").test_support.PrivateConsole.begin();
+    var console = try @import("metacodes-internal").platform.test_support.PrivateConsole.begin();
     defer console.end();
     defer platform_term.resetConsoleInputForTesting();
     platform_term.decodeKeyRecords();
@@ -2241,7 +2241,7 @@ test "readInput(Windows 控制台送按键记录):一条记录被 ReadConsoleW �
 
 test "lendTerminal(Windows 控制台):编辑器拿到的控制台没有 win32-input-mode 和括号粘贴,还回来再打开" {
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var console = try @import("platform").test_support.PrivateConsole.begin();
+    var console = try @import("metacodes-internal").platform.test_support.PrivateConsole.begin();
     defer console.end();
     defer platform_term.resetConsoleInputForTesting();
     // 控制台模式序列写进一个文件(这里 stdout 不是控制台),按写入顺序核对。
@@ -2294,7 +2294,7 @@ fn expectFile(path: [:0]const u8, want: []const u8) !void {
 
 test "readKey(Windows 控制台送按键记录):Esc 记录后面排着 Enter 也是两个键;终端写来的 ESC CR 是 Shift+Enter" {
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var console = try @import("platform").test_support.PrivateConsole.begin();
+    var console = try @import("metacodes-internal").platform.test_support.PrivateConsole.begin();
     defer console.end();
     defer platform_term.resetConsoleInputForTesting();
     platform_term.decodeKeyRecords();
@@ -2408,7 +2408,7 @@ test "a resize between ESC and [ interrupts readKey and leaves the sequence in t
     // before it blocks.
     var rounds: usize = 0;
     while (rounds < 100 and !reader.finished.load(.acquire)) : (rounds += 1) {
-        @import("platform").sync.sleepMs(2);
+        @import("metacodes-internal").platform.sync.sleepMs(2);
         _ = std.c.pthread_kill(thread.getHandle(), std.posix.SIG.WINCH);
     }
     thread.join();

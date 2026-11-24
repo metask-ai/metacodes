@@ -12,7 +12,7 @@
 //! 调用方自己组织,本模块只负责"进入/退出 alt screen + 隐藏/恢复光标"。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const ansi = @import("ansi.zig");
 
 pub const Overlay = struct {
@@ -57,7 +57,7 @@ const testing = std.testing;
 
 test "Overlay: 双 enter 幂等" {
     // 用 /dev/null fd 避免污染终端
-    const dev_null = pfs.open(@import("platform").paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    const dev_null = pfs.open(@import("metacodes-internal").platform.paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
     defer {
         if (dev_null >= 0) _ = pfs.close(dev_null);
     }
@@ -76,7 +76,7 @@ test "Overlay: 双 enter 幂等" {
 }
 
 test "Overlay: hide_cursor=false 不写 hide/show" {
-    const dev_null = pfs.open(@import("platform").paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    const dev_null = pfs.open(@import("metacodes-internal").platform.paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
     defer {
         if (dev_null >= 0) _ = pfs.close(dev_null);
     }

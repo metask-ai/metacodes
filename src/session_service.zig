@@ -779,7 +779,7 @@ test "U11: execLine 管线 —— prompt/宏 append + RunPlan;失败前零 mutat
     app.active_skill = null;
     app.permission_ctx = @import("metacodes-internal").permission_root.createContext(.default, a);
     app.session_id = @import("metacodes-internal").core.session_id.SessionId.single;
-    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    var io_rt = @import("metacodes-internal").platform.signal.threadedIo(a, .{});
     defer io_rt.deinit();
     app.skill_runtime = @import("metacodes-internal").skills.cli_adapter.Runtime.init(a, io_rt.io());
     defer app.skill_runtime.deinit();

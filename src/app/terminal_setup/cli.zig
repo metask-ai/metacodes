@@ -3,7 +3,7 @@
 //! another terminal, and for undoing it.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const util_fs = @import("metacodes-internal").util.fs;
 const util_time = @import("metacodes-internal").util.time;
 const setup = @import("setup.zig");

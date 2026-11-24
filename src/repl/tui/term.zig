@@ -93,7 +93,7 @@ pub fn detectFromEnv(fd: c_int) ColorCapability {
 // TTY 检测 + 终端尺寸
 // ============================================================================
 
-const platform_term = @import("platform").terminal;
+const platform_term = @import("metacodes-internal").platform.terminal;
 
 pub fn isatty(fd: c_int) bool {
     return platform_term.isatty(fd);

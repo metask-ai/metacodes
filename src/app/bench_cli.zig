@@ -2,7 +2,7 @@
 //! files it invokes, so installs do not discover a sibling checkout.
 const std = @import("std");
 const builtin = @import("builtin");
-const platform = @import("platform");
+const platform = @import("metacodes-internal").platform;
 const assets = @import("bench_assets");
 const version = @import("metacodes-internal").version;
 

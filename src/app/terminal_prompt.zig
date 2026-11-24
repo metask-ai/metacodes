@@ -4,8 +4,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const auth = @import("metacodes-internal").core.auth;
 
 /// Both ends a prompt needs are terminals: stdin to answer on, stderr to ask

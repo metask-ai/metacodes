@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const install = @import("install.zig");
 
 const is_windows = builtin.os.tag == .windows;

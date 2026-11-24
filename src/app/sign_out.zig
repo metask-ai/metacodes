@@ -17,7 +17,7 @@
 //! never touched here.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const auth = @import("metacodes-internal").core.auth;
 const provider_oauth = @import("metacodes-internal").provider.oauth;
 const provider_ids = @import("metacodes-internal").provider.ids;

@@ -29,9 +29,9 @@
 //! 卡渲染用 alloc(堆),渲染完即 free,TuiBackend 不持有跨调用。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const sync = @import("platform").sync;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const sync = @import("metacodes-internal").platform.sync;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const render_region = @import("render_region.zig");
 const ui_backend = @import("metacodes-internal").core.protocol.ui_backend;
 const ui_event = @import("metacodes-internal").core.protocol.ui_event;
@@ -494,7 +494,7 @@ pub const TuiBackend = struct {
         self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
         self.cancel_sent = false;
-        self.input_thread = try @import("platform").thread.spawn(.full, watcherMain, .{self});
+        self.input_thread = try @import("metacodes-internal").platform.thread.spawn(.full, watcherMain, .{self});
     }
 
     /// SIGINT 桥:abort 标志已置但连接还没被 shutdown → 代 handler 调 provider.cancel(一次)。

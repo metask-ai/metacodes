@@ -48,8 +48,8 @@
 //! 之前(freeSlot 的顺序)。
 
 const std = @import("std");
-const sync = @import("platform").sync;
-const pfs = @import("platform").fs;
+const sync = @import("metacodes-internal").platform.sync;
+const pfs = @import("metacodes-internal").platform.fs;
 const app_mod = @import("../app.zig");
 const types = @import("metacodes-internal").types;
 const time = @import("metacodes-internal").util.time;
@@ -621,7 +621,7 @@ pub const MultiDaemon = struct {
         errdefer md.gpa.destroy(slot);
         const io_rt = try md.gpa.create(std.Io.Threaded);
         errdefer md.gpa.destroy(io_rt);
-        io_rt.* = @import("platform").signal.threadedIo(md.gpa, .{});
+        io_rt.* = @import("metacodes-internal").platform.signal.threadedIo(md.gpa, .{});
         errdefer io_rt.deinit();
         slot.* = .{ .id = id, .id_text = id.bytes, .io_rt = io_rt, .app = undefined };
         var config = md.config;

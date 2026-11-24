@@ -1,11 +1,11 @@
 const std = @import("std");
 const model_name = @import("metacodes-internal").api.model_name;
 const builtin = @import("builtin");
-const platform_term = @import("platform").terminal;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const terminal_prompt = @import("app/terminal_prompt.zig");
-const pfs = @import("platform").fs;
-const platform_signal = @import("platform").signal;
-const platform_net = @import("platform").net;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_signal = @import("metacodes-internal").platform.signal;
+const platform_net = @import("metacodes-internal").platform.net;
 const types = @import("metacodes-internal").types;
 const client = @import("metacodes-internal").client;
 const app_mod = @import("app.zig");
@@ -200,8 +200,8 @@ pub const swarm_context = @import("metacodes-internal").swarm.context;
 pub const swarm_tools = @import("metacodes-internal").swarm.tools;
 pub const swarm_teammate_process = @import("metacodes-internal").swarm.teammate_process;
 pub const tools_common = @import("metacodes-internal").tools.common;
-pub const platform_fs = @import("platform").fs;
-pub const platform_test_support = @import("platform").test_support; // 组件测试的链接/枚举夹具
+pub const platform_fs = @import("metacodes-internal").platform.fs;
+pub const platform_test_support = @import("metacodes-internal").platform.test_support; // 组件测试的链接/枚举夹具
 pub const kg_inject = @import("metacodes-internal").kg.inject;
 pub const kg_scoped_recall = @import("metacodes-internal").kg.scoped_recall;
 pub const abort = @import("metacodes-internal").util.abort;
@@ -423,7 +423,7 @@ pub fn parseArgsForTest(argv: []const [*:0]const u8, allocator: std.mem.Allocato
         const opt_argv = allocator.alloc(?[*:0]const u8, argv.len) catch @panic("OOM");
         defer allocator.free(opt_argv);
         for (argv, opt_argv) |src, *dst| dst.* = src;
-        const cmdline_w = @import("platform").process.buildWindowsCmdline(allocator, opt_argv) catch @panic("OOM");
+        const cmdline_w = @import("metacodes-internal").platform.process.buildWindowsCmdline(allocator, opt_argv) catch @panic("OOM");
         defer allocator.free(cmdline_w);
         var args = std.process.Args.iterateAllocator(.{ .vector = cmdline_w }, allocator) catch
             @panic("args iterate failed");
@@ -1212,9 +1212,9 @@ fn firstArgument(init: std.process.Init, allocator: std.mem.Allocator) ?[]const 
 fn invokedCommand(scratch: std.mem.Allocator) []const u8 {
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     return invocation.commandName(scratch, .{
-        .launcher = @import("platform").paths.launcherEnv(),
+        .launcher = @import("metacodes-internal").platform.paths.launcherEnv(),
         .argv0 = started_as,
-        .self_exe = @import("platform").paths.selfExeRealPath(&exe_buf),
+        .self_exe = @import("metacodes-internal").platform.paths.selfExeRealPath(&exe_buf),
     });
 }
 
@@ -2483,12 +2483,12 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
     var version_buf: [version_info.MAX_VERSION_LEN]u8 = undefined;
     report.version = version_info.fullVersion(&version_buf, VERSION, version_info.BuildInfo.fromOptions(build_options));
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (@import("platform").paths.selfExeRealPath(&exe_buf)) |exe| report.install_prefix = @import("metacodes-internal").util.state_root.prefixOf(exe);
+    if (@import("metacodes-internal").platform.paths.selfExeRealPath(&exe_buf)) |exe| report.install_prefix = @import("metacodes-internal").util.state_root.prefixOf(exe);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     // A person at a terminal gets the readable report; a pipe, a script and
     // `--plain` keep one line per check, which callers parse.
-    const human = !json and !plain and @import("platform").terminal.isatty(1);
+    const human = !json and !plain and @import("metacodes-internal").platform.terminal.isatty(1);
     const rendered = if (json)
         doctor.writeJson(&out.writer, &report)
     else if (human)
@@ -2699,7 +2699,7 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
         return 2;
     }
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = @import("platform").paths.selfExeRealPath(&exe_buf) orelse {
+    const exe = @import("metacodes-internal").platform.paths.selfExeRealPath(&exe_buf) orelse {
         std.debug.print("error: cannot locate this executable\n", .{});
         return 1;
     };
@@ -2811,7 +2811,7 @@ fn runUpdate(args: *std.process.Args.Iterator, init: std.process.Init, allocator
     }
     if (leadingStateDir(init, allocator).value) |dir| options.state_dir = absolutePath(allocator, dir) orelse return 2;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = @import("platform").paths.selfExeRealPath(&exe_buf) orelse {
+    const exe = @import("metacodes-internal").platform.paths.selfExeRealPath(&exe_buf) orelse {
         std.debug.print("error: cannot locate this executable\n", .{});
         return 1;
     };
@@ -2972,7 +2972,7 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
         std.process.exit(2);
     }
     const workspace_z = try arena.dupeZ(u8, prepared.workspace);
-    if (@import("platform").fs.chdir(workspace_z) != 0) return error.WorkingDirectoryUnavailable;
+    if (@import("metacodes-internal").platform.fs.chdir(workspace_z) != 0) return error.WorkingDirectoryUnavailable;
     host_config.* = options.host_config;
     return prepared;
 }
@@ -4939,7 +4939,7 @@ pub fn providerSignInToken(
     };
     defer session.deinit();
     if (!(try session.load())) return null;
-    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    var io_runtime = @import("metacodes-internal").platform.signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     // The refresh grant presents the client the sign-in recorded.
     var exchange = oauth_exchange_mod.HttpExchange{

@@ -10,7 +10,7 @@
 //! 占位符 → 真实内容的还原由调用方在提交时做（expandPlaceholders）。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const LineEditor = @import("input.zig").LineEditor;
 
 /// 触发外部存储的阈值：行数 > 此值 或 字节数 > 此值。

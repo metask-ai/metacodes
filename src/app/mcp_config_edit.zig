@@ -1,5 +1,5 @@
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const mcp_config = @import("metacodes-internal").mcp.config;
 const json_merge = @import("metacodes-internal").util.json_merge;
 const file_lock = @import("metacodes-internal").util.file_lock;

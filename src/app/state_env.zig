@@ -60,7 +60,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const credential = @import("metacodes-internal").provider.credential;
 const profile_mod = @import("metacodes-internal").provider.profile;
 const registry_mod = @import("metacodes-internal").provider.registry;

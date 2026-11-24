@@ -12,8 +12,8 @@
 //! 并按码点数上限截断。逻辑与消毒范围逐条对齐 codex。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const app_mod = @import("../../app.zig");
 
 /// REPL 三态:空闲等输入 / 生成中 / 需要用户操作(权限·问题·计划审批)。

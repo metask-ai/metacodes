@@ -12,7 +12,7 @@
 //! 不带 `--json` 时，失败原因写 stderr（`stopNotice`），stdout 只放模型文本。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("metacodes-internal").core.agent_loop;
 const delivery_cadence_mod = @import("metacodes-internal").core.delivery_cadence;
@@ -427,7 +427,7 @@ pub fn run(
                     .mode = v.mode,
                     .model = v.model,
                     .task_statement = prompt,
-                    .repo = @import("platform").fs.getCwd(&cwd_buf) orelse "",
+                    .repo = @import("metacodes-internal").platform.fs.getCwd(&cwd_buf) orelse "",
                     .deps = .{
                         .provider = app.provider(),
                         .tool_defs = app.tool_defs,

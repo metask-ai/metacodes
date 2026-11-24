@@ -24,7 +24,7 @@ const ansi = @import("tui/ansi.zig");
 // CJK-aware 显示宽度(表格列宽/cell 折行用);term 不引 render,无循环依赖。
 const term = @import("tui/term.zig");
 const theme_mod = @import("tui/theme.zig");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const SyntaxTheme = theme_mod.SyntaxTheme;
 const RESET = ansi.sgr.reset;
 const BOLD = ansi.sgr.bold;

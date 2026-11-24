@@ -22,7 +22,7 @@
 //! else.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const ids = @import("metacodes-internal").provider.ids;
 const profile_mod = @import("metacodes-internal").provider.profile;
 const custom_provider = @import("metacodes-internal").provider.custom_provider;

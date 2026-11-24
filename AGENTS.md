@@ -111,13 +111,16 @@ These rules apply to the entire repository.
   files name the file they use, `@import("metacodes-internal").core.agent_loop`,
   never a relative path into a lower package: such an import puts one file in
   two modules, which does not compile, and is a new deep import for
-  `layer:check`. `src/internal.zig` mirrors the directory tree (`tools.zig` and
-  `permission.zig` are `tools_root` and `permission_root`); exporting a file it
-  does not have yet is a new deep import like any other. The base comparison
-  accepts a deep entry from an entry module when a file that now imports that
-  module by name had an entry to the same target in the base, and a new wide
+  `layer:check`. The lower named modules (`platform`, `hl`, `code_runtime`) are
+  wired to `metacodes-internal` only, so `cli` uses `platform` as
+  `@import("metacodes-internal").platform`. `src/internal.zig` mirrors the
+  directory tree (`tools.zig` and `permission.zig` are `tools_root` and
+  `permission_root`); exporting a file it does not have yet is a new deep
+  import like any other. The base comparison accepts a deep entry from an
+  entry module when a file that now imports that module by name had an entry
+  to the same target in the base and no longer imports it directly, and a new wide
   module root beside a base wide root of the same package and directory.
-  `subsystem:boundary` reads each use as an import of the file it names, and
+  `subsystem:boundary` reads each use as an import of the file or module it names, and
   counts a use that names no file (an alias) as a violation. The lower files'
   tests run in `internal-test` (`test:units`), whose root is that module.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,

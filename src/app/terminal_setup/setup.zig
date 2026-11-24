@@ -19,8 +19,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const paths = @import("platform").paths;
-const process = @import("platform").process;
+const paths = @import("metacodes-internal").platform.paths;
+const process = @import("metacodes-internal").platform.process;
 const util_fs = @import("metacodes-internal").util.fs;
 const util_time = @import("metacodes-internal").util.time;
 const files = @import("files.zig");
@@ -1060,7 +1060,7 @@ test "run vscode: a keybindings.json that is a link: the file it links to change
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "dotfiles/keybindings.json", .data = original });
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
     const target = try h.join(&.{ "dotfiles", "keybindings.json" });
-    try @import("platform").test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
+    try @import("metacodes-internal").platform.test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
     const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const ctx = try h.ctx(env);
     const link_path = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
@@ -1070,18 +1070,18 @@ test "run vscode: a keybindings.json that is a link: the file it links to change
     var buf: [std.fs.max_path_bytes:0]u8 = undefined;
     @memcpy(buf[0..link_path.len], link_path);
     buf[link_path.len] = 0;
-    try testing.expect(@import("platform").fs.isSymlink(buf[0..link_path.len :0]));
+    try testing.expect(@import("metacodes-internal").platform.fs.isSymlink(buf[0..link_path.len :0]));
     try testing.expectEqual(Status.installed, try vscode.classify(arena, try files.read(arena, target)));
 
     h.reset();
     try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
-    try testing.expect(@import("platform").fs.isSymlink(buf[0..link_path.len :0]));
+    try testing.expect(@import("metacodes-internal").platform.fs.isSymlink(buf[0..link_path.len :0]));
     try testing.expectEqualStrings(original, try files.read(arena, target));
 
     // A link to nothing is refused, and nothing is created behind it.
     h.reset();
     try h.tmp.dir.createDirPath(testing.io, "cfg2/Code/User");
-    try @import("platform").test_support.symlinkOrSkip(h.tmp.dir, testing.io, try h.join(&.{ "dotfiles", "gone.json" }), "cfg2/Code/User/keybindings.json", .{});
+    try @import("metacodes-internal").platform.test_support.symlinkOrSkip(h.tmp.dir, testing.io, try h.join(&.{ "dotfiles", "gone.json" }), "cfg2/Code/User/keybindings.json", .{});
     const dangling: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg2"}) };
     try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(dangling), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "does not exist") != null);
@@ -1133,7 +1133,7 @@ test "run vscode: a link to a file that cannot be written says to add the bindin
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "store/keybindings.json", .data = "[\n]\n" });
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
     const target = try h.join(&.{ "store", "keybindings.json" });
-    try @import("platform").test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
+    try @import("metacodes-internal").platform.test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
     try occupy(h, "store/keybindings.json.metacodes-tmp");
     const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const link_path = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
@@ -1146,7 +1146,7 @@ test "run vscode: a link to a file that cannot be written says to add the bindin
     var buf: [std.fs.max_path_bytes:0]u8 = undefined;
     @memcpy(buf[0..link_path.len], link_path);
     buf[link_path.len] = 0;
-    try testing.expect(@import("platform").fs.isSymlink(buf[0..link_path.len :0]));
+    try testing.expect(@import("metacodes-internal").platform.fs.isSymlink(buf[0..link_path.len :0]));
     // There was no record before, and there is none now.
     try testing.expect(!files.exists(try h.join(&.{ "state", "terminal-setup", "installed.json" })));
 }

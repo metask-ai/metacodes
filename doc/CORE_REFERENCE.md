@@ -105,7 +105,8 @@ deep 条目可以来自基线的 upward 或 deep,也可以是基线代码里两�
 迁移 1.3a:cli 只经 named module `metacodes-internal` 访问下层。它的根文件 `src/internal.zig` 归 `facade`,
 按目录层级重新导出 cli 用到的 371 个下层文件(`@import("metacodes-internal").core.agent_loop`),不进
 `metacodes-core`,Zig API 快照不变。cli 里再写相对路径 import 下层文件,同一个文件会落进两个 module,编译不过,
-`layer:check` 也会报新的深层 import。cli 的 844 条深层 import 清零,换成 `internal.zig` 的 371 条:越层 import 153,
+`layer:check` 也会报新的深层 import。下层的 named module(`platform`、`hl`、`code_runtime`)只接在这个 module 上,
+cli 用 `platform` 也写成 `@import("metacodes-internal").platform`。cli 的 844 条深层 import 清零,换成 `internal.zig` 的 371 条:越层 import 153,
 深层 import 1690,根目录过宽的 module 7 个(新增的 `internal.zig` 和 `lib.zig` 同包、同目录)。下层文件的测试改在
 `internal-test` 里跑(根是这个 module),`cc-test` 只跑 cli 自己的测试。
 

@@ -665,6 +665,8 @@ fn reroutedThroughEntry(
 ) !bool {
     for (findings.named.items) |named| {
         if (!std.mem.eql(u8, named[1], entry[0])) continue;
+        const direct = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ named[0], entry[1] });
+        if (findings.deep.contains(direct) or findings.upward.contains(direct)) continue;
         const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ pathInBase(base, named[0]), pathInBase(base, entry[1]) });
         if (before.contains(key)) return true;
     }
@@ -1419,6 +1421,28 @@ const entry_baseline =
     \\
 ;
 
+const entry_kept_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\        .{ "src/tools/entry.zig", "src/core/agent_loop.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{},
+    \\}
+    \\
+;
+
 const entry_wider_baseline =
     \\.{
     \\    .upward = .{
@@ -1441,7 +1465,7 @@ const entry_wider_baseline =
     \\
 ;
 
-test "a deep import moved behind an entry module keeps the base's entry, and only for its importers' targets" {
+test "a deep import moved behind an entry module keeps the base's entry, only for its importers' targets and only once the direct import is gone" {
     const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
     var tree = withFile("src/tools/entry.zig", "pub const loop = @import(\"../core/agent_loop.zig\");\npub const bash = @import(\"bash.zig\");\n");
     tree[5][1] = "const internal = @import(\"internal\");\n";
@@ -1453,6 +1477,11 @@ test "a deep import moved behind an entry module keeps the base's entry, and onl
     wider[wider.len - 1][1] = "pub const loop = @import(\"../core/agent_loop.zig\");\npub const fs = @import(\"../util/fs.zig\");\n";
     try std.testing.expectEqual(@as(usize, 0), try checkTree(&wider, test_layers, entry_wider_baseline, wiring));
     try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&wider, test_layers, entry_wider_baseline, wiring, base));
+
+    var kept = tree;
+    kept[5][1] = "const internal = @import(\"internal\");\nconst loop = @import(\"core/agent_loop.zig\");\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&kept, test_layers, entry_kept_baseline, wiring));
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&kept, test_layers, entry_kept_baseline, wiring, base));
 
     var unimported = tree;
     unimported[5][1] = "";

@@ -13,9 +13,9 @@
 //!   own and calls the model over each client's route (§8.1).
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const paths = @import("platform").paths;
-const platform_signal = @import("platform").signal;
+const pfs = @import("metacodes-internal").platform.fs;
+const paths = @import("metacodes-internal").platform.paths;
+const platform_signal = @import("metacodes-internal").platform.signal;
 const util_time = @import("metacodes-internal").util.time;
 const shutdown = @import("metacodes-internal").core.shutdown;
 const protocol = @import("metacodes-internal").skills.sealed.protocol;
@@ -315,7 +315,7 @@ fn bind(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, state_ro
             return 1;
         }
     else blk: {
-        if (@import("platform").terminal.isatty(0)) std.debug.print("Secret for {s} ({s}), then Enter: ", .{ ref, manifest.name });
+        if (@import("metacodes-internal").platform.terminal.isatty(0)) std.debug.print("Secret for {s} ({s}), then Enter: ", .{ ref, manifest.name });
         const n = pfs.read(0, &secret_buf);
         if (n <= 0) {
             std.debug.print("error: no secret on stdin\n", .{});

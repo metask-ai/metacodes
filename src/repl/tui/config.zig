@@ -9,7 +9,7 @@
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const theme_mod = @import("theme.zig");
 
 /// 读取 state_root 目录下 <state_root>/config.json 的 theme 字段。

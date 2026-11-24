@@ -14,8 +14,8 @@
 //! - promptLoop():render + 读键循环(调用方负责 raw mode 与终端接管,见 TuiBackend)
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
@@ -223,7 +223,7 @@ test "promptLoop 读 Windows 控制台送来的按键记录:y、n、Ctrl+C 各�
     // win32-input-mode 开着时每个键都是一条记录(控制台逐字符排进队列,sendChars)。对话框读的是
     // 还原后的键;读原始字节时一个也认不出,工具调用一直等着(#388 审查)。
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var console = try @import("platform").test_support.PrivateConsole.begin();
+    var console = try @import("metacodes-internal").platform.test_support.PrivateConsole.begin();
     defer console.end();
     defer platform_term.resetConsoleInputForTesting();
     platform_term.decodeKeyRecords();
@@ -248,7 +248,7 @@ test "promptLoop reads whole keys: Ctrl+C sent as CSI u refuses, keys written to
     defer _ = pfs.close(sink);
     const Later = struct {
         fn send(fd: c_int, bytes: []const u8) void {
-            @import("platform").sync.sleepMs(300);
+            @import("metacodes-internal").platform.sync.sleepMs(300);
             _ = pfs.writeAll(fd, bytes);
             _ = std.c.close(fd);
         }

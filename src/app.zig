@@ -6,10 +6,10 @@
 //! M1.5 起加入 AbortSignal + SIGINT 绑定。signal handler 只做 atomic store，async-signal-safe。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const platform_signal = @import("platform").signal;
-const platform_paths = @import("platform").paths;
-const sync = @import("platform").sync;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_signal = @import("metacodes-internal").platform.signal;
+const platform_paths = @import("metacodes-internal").platform.paths;
+const sync = @import("metacodes-internal").platform.sync;
 const login_worker = @import("metacodes-internal").api.login_worker;
 
 /// **U5 B1:slice-safe snapshot 发布缓存(A')**。UAF-critical、运行时会 free+reassign 的 slice
@@ -961,7 +961,7 @@ pub const App = struct {
         app.plugin_snapshot = try buildCliPluginSnapshot(
             allocator,
             cwd_for_skills orelse "",
-            @import("platform").paths.homeDir() orelse "",
+            @import("metacodes-internal").platform.paths.homeDir() orelse "",
             config.plugin_dirs,
             config.process_plugin_dirs,
         );
@@ -1000,7 +1000,7 @@ pub const App = struct {
             const skill_add_dirs = cliAddDirs(add_dir_scratch.allocator(), config.add_dirs, cwd) catch &.{};
             app.skill_runtime.loadDefaultWithExtraSources(
                 cwd,
-                @import("platform").paths.homeDir() orelse "",
+                @import("metacodes-internal").platform.paths.homeDir() orelse "",
                 app.stateRoot(),
                 skill_add_dirs,
                 if (app.plugin_snapshot != null) "plugin-generation-1" else "",
@@ -1060,7 +1060,7 @@ pub const App = struct {
         // layer lives where `/skills` writes it: the project root, or the
         // working directory outside a repository (Claude Code).
         app.skill_overrides.load(
-            @import("platform").paths.homeDir() orelse "",
+            @import("metacodes-internal").platform.paths.homeDir() orelse "",
             app.project_dir orelse app.cwd_abs,
         ) catch |err| {
             @import("metacodes-internal").util.log.warn("skill", "skillOverrides not loaded: {s}", .{@errorName(err)});
@@ -5355,7 +5355,7 @@ pub const App = struct {
     /// 挂到 permission_ctx.settings,并填 match_ctx(cwd/project_root/home)。
     fn loadSettings(app: *App) !void {
         const loader = @import("metacodes-internal").permission.loader;
-        const home: ?[]const u8 = @import("platform").paths.homeDir();
+        const home: ?[]const u8 = @import("metacodes-internal").platform.paths.homeDir();
 
         const ms = try loader.load(app.allocator, .{
             .managed = null,
@@ -5733,7 +5733,7 @@ pub const App = struct {
             .home = app.homeDir(),
             .cwd = app.cwdAbs(),
             .workspace_root = app.project_dir_or_empty(),
-            .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
+            .codex_home = @import("metacodes-internal").platform.paths.codexHomeEnv() orelse "",
         }) catch |err| {
             log.debug("mcp", "no servers connected: {s}", .{@errorName(err)});
             return;
@@ -5876,7 +5876,7 @@ pub const App = struct {
             .home = app.homeDir(),
             .cwd = app.cwdAbs(),
             .workspace_root = app.project_dir_or_empty(),
-            .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
+            .codex_home = @import("metacodes-internal").platform.paths.codexHomeEnv() orelse "",
         };
     }
 
@@ -5992,7 +5992,7 @@ pub const App = struct {
         const add_dirs = cliAddDirs(scratch.allocator(), app.config.add_dirs, cwd) catch &.{};
         try app.skill_runtime.reloadDefaultWithExtraSources(
             cwd,
-            @import("platform").paths.homeDir() orelse "",
+            @import("metacodes-internal").platform.paths.homeDir() orelse "",
             app.stateRoot(),
             add_dirs,
             if (app.plugin_snapshot != null) "plugin-generation-1" else "",
@@ -6592,7 +6592,7 @@ pub const App = struct {
             .home = app.homeDir(),
             .cwd = cwd,
             .workspace_root = if (workspace_root.len != 0) workspace_root else cwd,
-            .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
+            .codex_home = @import("metacodes-internal").platform.paths.codexHomeEnv() orelse "",
             .env = mcp_config.Environment.fromProcess(arena) catch return &.{},
         }) catch return &.{};
         var late: std.ArrayList(McpLate) = .empty;
@@ -6817,7 +6817,7 @@ const McpRelist = struct {
         errdefer allocator.destroy(relist);
         relist.* = .{ .allocator = allocator, .name = try allocator.dupe(u8, name), .client = client };
         errdefer allocator.free(relist.name);
-        relist.thread = try @import("platform").thread.spawn(.full, run, .{relist});
+        relist.thread = try @import("metacodes-internal").platform.thread.spawn(.full, run, .{relist});
         return relist;
     }
 
@@ -7022,7 +7022,7 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     app.additional_dirs_abs = null; // setConfigEventSink seed 读 additionalDirs()
     app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
     // api_client 被 setReasoningEffort 写 reasoning_effort 字段——需真 Client。
-    var io_rt = @import("platform").signal.threadedIo(std.testing.allocator, .{});
+    var io_rt = @import("metacodes-internal").platform.signal.threadedIo(std.testing.allocator, .{});
     defer io_rt.deinit();
     app.api_client = client_mod.Client.initWithBaseUrl(std.testing.allocator, io_rt.io(), "k", "m", null);
     defer app.api_client.deinit();
@@ -7286,7 +7286,7 @@ test "U2 S2: permission_mode 单一源 — permMode 读 ctx,cyclePermMode 只写
 
 test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 抓的第7点)" {
     const a = std.testing.allocator;
-    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    var io_rt = @import("metacodes-internal").platform.signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const io = io_rt.io();
 

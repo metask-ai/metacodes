@@ -34,7 +34,7 @@ const registry_mod = @import("metacodes-internal").provider.registry;
 const provider_startup = @import("metacodes-internal").provider.startup;
 const startup_order = @import("startup_order.zig");
 const state_env = @import("state_env.zig");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 
 /// `METACODES_PRESET`.
 pub const variable = state_env.preset_variable;

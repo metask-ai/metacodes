@@ -25,8 +25,8 @@
 //! 6. 退出:恢复
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const term = @import("../term.zig");

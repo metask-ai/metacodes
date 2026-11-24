@@ -1,5 +1,5 @@
 const std = @import("std");
-const sync = @import("platform").sync;
+const sync = @import("metacodes-internal").platform.sync;
 const term = @import("term.zig");
 const zero_width = @import("zero_width.zig");
 

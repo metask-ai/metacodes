@@ -8,10 +8,10 @@
 //! - Ctrl+C：输入阶段 → 清 buffer（ISIG=false 让字节 0x03 落到 LineEditor）；生成阶段 → SIGINT → app.abort
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const platform_signal = @import("platform").signal;
-const platform_sync = @import("platform").sync;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_signal = @import("metacodes-internal").platform.signal;
+const platform_sync = @import("metacodes-internal").platform.sync;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
 const provider_login = @import("metacodes-internal").api.provider_login;
@@ -4042,7 +4042,7 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     } else {
         cmd_output.print("Config problems:  none\n", .{});
     }
-    cmd_output.print("Home:             {s}\n", .{@import("platform").paths.homeDir() orelse "unset"});
+    cmd_output.print("Home:             {s}\n", .{@import("metacodes-internal").platform.paths.homeDir() orelse "unset"});
     if (util_fs.getCwd(allocator)) |cwd| {
         defer allocator.free(cwd);
         cmd_output.print("Working dir:      {s}\n", .{cwd});
@@ -5853,7 +5853,7 @@ const StartupSuggestionGit = struct {
 
     fn start(self: *StartupSuggestionGit) void {
         self.started_ms = util_time.nowMs();
-        self.thread = @import("platform").thread.spawn(.full, fetch, .{self}) catch null;
+        self.thread = @import("metacodes-internal").platform.thread.spawn(.full, fetch, .{self}) catch null;
     }
 
     fn fetch(self: *StartupSuggestionGit) void {
@@ -6406,7 +6406,7 @@ test "vim INSERT mode dispatches every key but its Esc; NORMAL mode runs vim's k
 
 test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随会话)" {
     const a = std.testing.allocator;
-    const ppaths = @import("platform").paths;
+    const ppaths = @import("metacodes-internal").platform.paths;
     var home_buf: [512]u8 = undefined;
     const home = util_fs.testing.perPidDir(&home_buf, "cc-zig-resume-l2-16");
     _ = pfs.mkdir(home.ptr, 0o755);
@@ -6420,7 +6420,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     // App 用独立 arena(App 是 arena 生命周期设计,避免 testing.allocator 噪声);测试自身用 a。
     var app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer app_arena.deinit();
-    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    var io_rt = @import("metacodes-internal").platform.signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const cfg = types_mod.Config{ .model = "claude-sonnet-4-20250514" };
     const app = try app_mod.App.init(app_arena.allocator(), io_rt.io(), cfg, "test-key");
