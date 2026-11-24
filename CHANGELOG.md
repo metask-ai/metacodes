@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **WorkBuddy suites run with the profile's run gates.** A bench profile's
+  Lean-modelled run gates now reach the WorkBuddy suites too: the workbench
+  passes them as harness parameters and the overlay turns each into its
+  metacodes flag. Preview features still run on Harbor suites only, and the
+  profile page names what a WorkBuddy dataset left out. Reinstall the overlay
+  (`python3 -m scripts.eval.workbuddy.install_overlay <checkout>`) on every
+  WorkBuddy checkout; the bench node protocol is now 9, so rerun
+  `metacodes bench setup --executor <name>`.
+
 - **Models can be priced in config.json, and bench runs use OpenRouter
   prices.** `model_prices` in `~/.metacodes/config.json` prices a model in
   USD per million tokens; every cost meter (the session cost, evaluation

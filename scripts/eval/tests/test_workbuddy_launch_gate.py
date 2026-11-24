@@ -3146,6 +3146,16 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
                 with self.assertRaisesRegex(LaunchError, "--judge-budget-usd"):
                     self._build(root, job)
 
+    def test_create_refuses_a_job_with_workbench_only_gates(self):
+        for key in ("METACODES_TEST_INTEGRITY", "METACODES_DELIVERY_CADENCE", "METACODES_STALL_GATE"):
+            job = self._job("code")
+            job["harness_params_override"][key] = True
+            with self.subTest(key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._checkout(root)
+                with self.assertRaisesRegex(LaunchError, "workbench-only gates"):
+                    self._build(root, job)
+
     def test_create_adds_the_judge_cap_to_the_transaction_maximum(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

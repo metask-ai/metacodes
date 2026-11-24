@@ -2748,6 +2748,9 @@ def _bare_agent(adapter, logs_dir, **overrides):
         "_verification_final_observe": False,
         "_requirement_ledger": False,
         "_requirement_ledger_observe": False,
+        "_test_integrity": False,
+        "_delivery_cadence": False,
+        "_stall_gate": False,
         "_project_kernel_relative": None,
         "_project_rules_relative": None,
         "_project_control_mode": "absent",
@@ -5617,6 +5620,29 @@ class WorkBuddyLeaderboardProtocolTest(unittest.TestCase):
         )
         self.assertEqual(contract["reasoning_effort"], "high")
         self.assertEqual(contract["declared_context_window"], 200000)
+
+    def test_bench_run_gates_reach_flags_and_runtime_contract(self):
+        environment, _ = self._run_adapter(model_name=self.ROUTE)
+        command = environment.agent_commands[-1]
+        for flag in ("--test-integrity", "--delivery-cadence", "--stall-gate"):
+            self.assertNotIn(flag, command)
+        environment, _ = self._run_adapter(
+            model_name=self.ROUTE,
+            _test_integrity=True,
+            _delivery_cadence=True,
+            _stall_gate=True,
+        )
+        command = environment.agent_commands[-1]
+        self.assertIn("--test-integrity --delivery-cadence --stall-gate", command)
+        contract = json.loads(
+            re.search(r"printf '%s\\n' ('[^']*') > /logs/agent/metacodes-runtime-contract.json", command)
+            .group(1)
+            .strip("'")
+        )
+        self.assertEqual(
+            [contract[name] for name in ("test_integrity", "delivery_cadence", "stall_gate")],
+            [True, True, True],
+        )
 
     def test_out_of_vocabulary_effort_window_and_route_fail_closed(self):
         with _stubbed_adapter() as adapter, tempfile.TemporaryDirectory() as directory:
