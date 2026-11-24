@@ -103,8 +103,8 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 | AgentCore 运行与 checkpoint | `scenarios/abi_session/expected/*` | 用 `std.DynLib` 加载发布的共享库,经 `sdk/zig` 跑一次带工具的 Run,记 CoreEvent 和请求;再把检入的 `scenarios/abi_session/checkpoint.bin` 恢复成新 Session 并跑一次,记恢复报告、CoreEvent 和请求 |
 | Zig 源码 API | `zig_api/metacodes-core.txt` | 从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;别名记录目标函数的原型或目标常量的值;超过 600 字节的值记长度和摘要 |
 | 发给模型的请求 | `scenarios/<场景>/expected/request-NNN.txt` | 已安装的 CLI 跑场景,回放 mock provider 收到的请求头和完整请求体 |
-| 事件流 | `scenarios/<场景>/expected/stream.jsonl`、`process.txt` | 同一次运行的 `--json --stream-json` 输出、退出码、stderr;`tool_result` 的 `content_bytes` 先和原始内容的长度核对 |
-| `serve` 和 `--web` | `scenarios/daemon_session/expected/{serve,web}/*` | 启动 `serve --uds` 和 `--web`,经 UDS attach 和 `GET /events` 读一次 Run 的 journal 行,以及这次 Run 的请求 |
+| 事件流 | `scenarios/<场景>/expected/stream.jsonl`、`process.txt` | 同一次运行的 `--json --stream-json` 输出、退出码、stderr;所有场景(含 KG)的 `tool_result` 都先核对 `content_bytes` 和原始内容的长度,再归一化 |
+| `serve` 和 `--web` | `scenarios/daemon_session/expected/{serve,web}/*` | 启动 `serve --uds` 和 `--web`,经 UDS attach 逐行、经 `GET /events` 按 SSE 帧读一次 Run 的 journal(读到 `run_done` 那一帧的终止空行;缺终止空行、一帧多行都失败),`web/events.sse` 记响应头和每一帧;以及这次 Run 的请求 |
 | KG 注入 | `scenarios/kg_injection/expected/*` | 用 staged TinyKG,第一次运行经 KgRemember 记一条记忆,第二次运行的请求里带上注入的 Knowledge Graph 段;测试结束停掉自己的 tinykgd |
 | 落盘格式(写) | `scenarios/<场景>/expected/session-N/*`、`state-files.txt` | 运行后的 transcript.jsonl、meta.json 和 state 目录文件清单 |
 | 落盘格式(读) | `state_fixture/read-back.txt` | 检入的旧 session(`state_fixture/projects/PROJECT/`)用当前代码读回,再序列化 |

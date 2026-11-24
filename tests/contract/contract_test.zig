@@ -4,6 +4,7 @@ const cc = @import("cc");
 const golden = @import("golden.zig");
 const normalize = @import("normalize.zig");
 const abi = @import("abi.zig");
+const sse = @import("sse.zig");
 
 const testing = std.testing;
 const io = testing.io;
@@ -293,11 +294,7 @@ fn runScenario(env: Env, checker: *Checker, scenario: Scenario) !void {
     var process: std.ArrayList(u8) = .empty;
     try process.print(a, "exit: {d}\nrequests: {d}\n--- stderr\n{s}", .{ run.exit_code, server.requestCount(), run.stderr });
     try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "process.txt" }), try normalize.apply(a, process.items, rules));
-    if (!try toolResultSizesMatch(a, run.stdout)) {
-        std.debug.print("scenario {s}: a tool_result's content_bytes differs from its content\n", .{scenario.name});
-        checker.failures += 1;
-    }
-    try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "stream.jsonl" }), try normalize.apply(a, run.stdout, rules));
+    try checkStream(checker, a, expected_dir, run.stdout, rules);
 
     for (0..server.requestCount()) |index| {
         const request = server.requestAt(index).?;
@@ -319,6 +316,14 @@ fn runScenario(env: Env, checker: *Checker, scenario: Scenario) !void {
         }
     }
     try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "state-files.txt" }), try normalize.apply(a, try listTree(a, scratch.state), rules));
+}
+
+fn checkStream(checker: *Checker, a: std.mem.Allocator, expected_dir: []const u8, stream: []const u8, rules: normalize.Rules) !void {
+    if (!try toolResultSizesMatch(a, stream)) {
+        std.debug.print("{s}: a tool_result's content_bytes differs from its content\n", .{expected_dir});
+        checker.failures += 1;
+    }
+    try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "stream.jsonl" }), try normalize.apply(a, stream, rules));
 }
 
 fn toolResultSizesMatch(a: std.mem.Allocator, stream: []const u8) !bool {
@@ -539,20 +544,27 @@ fn sendAll(conn: pnet.Socket, bytes: []const u8) !void {
 }
 
 fn readUntil(a: std.mem.Allocator, conn: pnet.Socket, needle: []const u8) ![]const u8 {
+    return readThrough(a, conn, needle, "\n");
+}
+
+fn readThrough(a: std.mem.Allocator, conn: pnet.Socket, needle: []const u8, terminator: []const u8) ![]const u8 {
     pnet.setRecvTimeoutMs(conn, 200);
     const deadline = cc.util_time.nowMs() + stream_deadline_ms;
     var out: std.ArrayList(u8) = .empty;
     var chunk: [4096]u8 = undefined;
     while (true) {
         if (std.mem.indexOf(u8, out.items, needle)) |at| {
-            if (std.mem.indexOfScalarPos(u8, out.items, at, '\n')) |end| return out.items[0 .. end + 1];
+            if (std.mem.indexOfPos(u8, out.items, at, terminator)) |end| return out.items[0 .. end + terminator.len];
         }
         if (cc.util_time.nowMs() >= deadline) {
             std.debug.print("stream never showed {s}; got:\n{s}\n", .{ needle, out.items });
             return error.StreamTimeout;
         }
         const n = pnet.recv(conn, &chunk);
-        if (n == 0) return error.StreamClosed;
+        if (n == 0) {
+            std.debug.print("stream closed before {s} and its terminator; got:\n{s}\n", .{ needle, out.items });
+            return error.StreamClosed;
+        }
         if (n < 0) {
             if (pnet.recvRetriable()) continue;
             return error.StreamFailed;
@@ -578,11 +590,9 @@ fn httpPost(a: std.mem.Allocator, port: u16, path: []const u8, body: []const u8)
 fn journalLines(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, raw, '\n');
-    while (lines.next()) |line_crlf| {
-        const line = std.mem.trimEnd(u8, line_crlf, "\r");
-        const json = if (std.mem.startsWith(u8, line, "data: ")) line["data: ".len..] else line;
-        if (!std.mem.startsWith(u8, json, "{\"v\":")) continue;
-        try out.print(a, "{s}\n", .{json});
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"v\":")) continue;
+        try out.print(a, "{s}\n", .{line});
     }
     return out.items;
 }
@@ -590,13 +600,14 @@ fn journalLines(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
 const daemon_scenario = "daemon_session";
 const daemon_prompt = "read the notes";
 
-fn checkDaemonRun(env: Env, checker: *Checker, scratch: *Scratch, server: *harness.MockServer, host: []const u8, journal: []const u8) !void {
+fn checkDaemonRun(env: Env, checker: *Checker, scratch: *Scratch, server: *harness.MockServer, host: []const u8, journal: []const u8, sse_text: ?[]const u8) !void {
     const a = scratch.arena();
     const provider = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
     const rules: normalize.Rules = .{ .literals = try literals(scratch, env, &.{.{ .needle = provider, .placeholder = "<PROVIDER>" }}) };
     const expected_dir = try std.fmt.allocPrint(a, "scenarios/{s}/expected/{s}", .{ daemon_scenario, host });
     if (env.mode == .update) try std.Io.Dir.cwd().deleteTree(io, try std.fs.path.join(a, &.{ env.contract_root, expected_dir }));
-    try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "journal.jsonl" }), try normalize.apply(a, try journalLines(a, journal), rules));
+    try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "journal.jsonl" }), try normalize.apply(a, journal, rules));
+    if (sse_text) |text| try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "events.sse" }), try normalize.apply(a, text, rules));
     for (0..server.requestCount()) |index| {
         const text = try renderRequest(a, server.requestAt(index).?.raw);
         const name = try std.fmt.allocPrint(a, "request-{d:0>3}.txt", .{index + 1});
@@ -633,7 +644,7 @@ test "serve: the journal a UDS attach reads for one Run, and its provider reques
     const accepted = try udsRequest(a, socket, try std.fmt.allocPrint(a, "{{\"op\":\"message\",\"session\":\"{s}\",\"text\":\"{s}\"}}\n", .{ session, daemon_prompt }));
     try testing.expect(std.mem.indexOf(u8, accepted, "\"ok\":true") != null);
     const journal = try readUntil(a, attach, "\"type\":\"run_done\"");
-    try checkDaemonRun(env, &checker, &scratch, server, "serve", journal);
+    try checkDaemonRun(env, &checker, &scratch, server, "serve", try journalLines(a, journal), null);
     try checker.finish();
 }
 
@@ -657,8 +668,16 @@ test "--web: the journal GET /events streams for one Run, and its provider reque
     try sendAll(events, "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
     const accepted = try httpPost(a, port, "/message", "{\"text\":\"" ++ daemon_prompt ++ "\"}");
     try testing.expect(std.mem.startsWith(u8, accepted, "HTTP/1.1 200"));
-    const journal = try readUntil(a, events, "\"type\":\"run_done\"");
-    try checkDaemonRun(env, &checker, &scratch, server, "web", journal);
+    const raw = try readThrough(a, events, "\"type\":\"run_done\"", "\n\n");
+    const response = sse.parse(a, raw) catch |err| {
+        std.debug.print("GET /events is not a stream of SSE frames ({s}):\n{s}\n", .{ @errorName(err), raw });
+        return err;
+    };
+    const journal = sse.journal(a, response) catch |err| {
+        std.debug.print("GET /events frame carries more than one journal line ({s}):\n{s}\n", .{ @errorName(err), raw });
+        return err;
+    };
+    try checkDaemonRun(env, &checker, &scratch, server, "web", journal, try sse.render(a, response));
     try checker.finish();
 }
 
@@ -905,7 +924,7 @@ fn runKgStep(env: Env, checker: *Checker, scratch: *Scratch, step: []const u8, a
     var process: std.ArrayList(u8) = .empty;
     try process.print(a, "exit: {d}\nrequests: {d}\n--- stderr\n{s}", .{ run.exit_code, server.requestCount(), run.stderr });
     try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "process.txt" }), try normalize.apply(a, process.items, rules));
-    try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "stream.jsonl" }), try normalize.apply(a, run.stdout, rules));
+    try checkStream(checker, a, expected_dir, run.stdout, rules);
     for (0..server.requestCount()) |index| {
         const text = try renderRequest(a, server.requestAt(index).?.raw);
         const name = try std.fmt.allocPrint(a, "request-{d:0>3}.txt", .{index + 1});

@@ -1,6 +1,7 @@
 const std = @import("std");
 const normalize = @import("normalize.zig");
 const golden = @import("golden.zig");
+const sse = @import("sse.zig");
 
 test {
     _ = @import("zig_api.zig");
@@ -127,4 +128,37 @@ test "a store in check mode fails on drift and on a missing snapshot; update mod
     try update.expect(a, "s/one.txt", "x\n");
     try check.expect(a, "s/one.txt", "x\n");
     try std.testing.expectError(error.ContractDrift, check.expect(a, "s/one.txt", "y\n"));
+}
+
+const sse_response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" ++
+    "retry: 1000\n\n" ++
+    ": keepalive\n\n" ++
+    "id: e-0\ndata: {\"v\":1,\"type\":\"a\"}\n\n" ++
+    "id: e-1\ndata: {\"v\":1,\"type\":\"b\"}\n\n";
+
+test "SSE frames end at a blank line; comments are dropped and data lines give the journal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const response = try sse.parse(a, sse_response);
+    try std.testing.expectEqual(@as(usize, 3), response.frames.len);
+    try std.testing.expectEqualStrings("{\"v\":1,\"type\":\"a\"}\n{\"v\":1,\"type\":\"b\"}\n", try sse.journal(a, response));
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\nContent-Type: text/event-stream\n\nretry: 1000\n\nid: e-0\ndata: {\"v\":1,\"type\":\"a\"}\n\nid: e-1\ndata: {\"v\":1,\"type\":\"b\"}\n\n",
+        try sse.render(a, response),
+    );
+}
+
+test "a missing frame terminator is an error or changes both the journal and the rendered frames" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const good = try sse.parse(a, sse_response);
+    try std.testing.expectError(error.UnterminatedFrame, sse.parse(a, sse_response[0 .. sse_response.len - 1]));
+    const merged_text = try std.mem.replaceOwned(u8, a, sse_response, "\"a\"}\n\nid", "\"a\"}\nid");
+    const merged = try sse.parse(a, merged_text);
+    try std.testing.expectError(error.FrameCarriesSeveralLines, sse.journal(a, merged));
+    try std.testing.expect(!std.mem.eql(u8, try sse.render(a, good), try sse.render(a, merged)));
+    const bare_text = try std.mem.replaceOwned(u8, a, sse_response, "\n\n", "\n");
+    try std.testing.expectError(error.UnterminatedFrame, sse.parse(a, bare_text[0 .. bare_text.len - 1]));
 }
