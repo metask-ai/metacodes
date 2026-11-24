@@ -184,7 +184,7 @@ test "teamwork command: approval and budget gates precede App, seats and worktre
     try testing.expectEqual(@as(i32, 2), unsupported.exit_code);
     try testing.expect(std.mem.indexOf(u8, unsupported.stderr, "VerifierEffortUnsupported") != null);
     try testing.expect(!try c.exists("state/teamwork"));
-    const resume_override = try c.cliEnabled(&.{ "resume", "r1", "--approve", "--budget-usd", "5" });
+    const resume_override = try c.cliEnabled(&.{ "resume", "r1", "--approve", "--max-rounds", "5" });
     try testing.expectEqual(@as(i32, 2), resume_override.exit_code);
     try testing.expect(std.mem.indexOf(u8, resume_override.stderr, "ResumeOverridesForbidden") != null);
     const resume_model = try c.cliEnabled(&.{ "resume", "r1", "--approve", "--model", "changed" });
@@ -291,6 +291,24 @@ test "teamwork command: inherited native models are pinned on wire and retained 
     const resumed = try c.cliEnabled(&.{ "resume", "native1", "--approve", "--api-key", "fixture-key", "--base-url", url });
     try testing.expectEqual(@as(i32, 1), resumed.exit_code); // terminal failure stays terminal
     try testing.expectEqual(@as(usize, 1), server.requestCount());
+
+    var raise_args = std.mem.splitScalar(u8, "resume native1 --approve --budget-usd 5", ' ');
+    const raise = try cc.teamwork_command.parse(a, &raise_args);
+    try testing.expectEqual(@as(?f64, 5), raise.raised_cap_usd);
+    try testing.expect(!raise.has_overrides);
+    var options = raise;
+    options.host_config.preview = .enabled;
+    try testing.expectError(error.NotResumable, cc.teamwork_command.prepare(a, options, c.state, c.repo));
+    var paused = try std.json.parseFromSliceLeaky(std.json.Value, a, try c.read("state/teamwork/native1/run.json"), .{});
+    try paused.object.put(a, "state", .{ .string = "budget_exhausted" });
+    try paused.object.put(a, "detail", try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"resume\":\"implementing\"}", .{}));
+    try c.write("state/teamwork/native1/run.json", try std.json.Stringify.valueAlloc(a, paused, .{}));
+    options.raised_cap_usd = 2;
+    try testing.expectError(error.CapNotRaised, cc.teamwork_command.prepare(a, options, c.state, c.repo));
+    options.raised_cap_usd = 5;
+    const raised = try cc.teamwork_command.prepare(a, options, c.state, c.repo);
+    try testing.expectEqual(@as(?f64, 5), raised.raised_cap_usd);
+    try testing.expectEqual(@as(f64, 2), raised.cfg.budget_usd);
 }
 
 test "teamwork command: approved external seats config reaches argv, verifier wire, merge and disk-only status" {

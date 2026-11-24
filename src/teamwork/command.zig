@@ -27,7 +27,7 @@ pub const RunId = types.RunId;
 pub const help =
     \\usage: metacodes [--state-dir <dir>] teamwork run --request-file <file> --approve [options]
     \\       metacodes [--state-dir <dir>] teamwork status <id> [--json]
-    \\       metacodes [--state-dir <dir>] teamwork resume <id> --approve [provider options]
+    \\       metacodes [--state-dir <dir>] teamwork resume <id> --approve [--budget-usd <dollars>] [provider options]
     \\       metacodes [--state-dir <dir>] teamwork mcp --request-file <file> --approve [options]
     \\
     \\Run options: --id <id> --budget-usd <dollars> --max-rounds <n>
@@ -46,6 +46,8 @@ pub const help =
     \\--preview does not approve a task.
     \\Status and cancellation of an existing handle remain available with preview off.
     \\Runs are synchronous. Resume uses the saved approved policy, never new overrides.
+    \\A run its budget stopped keeps its worktree; resume it with --approve --budget-usd
+    \\<higher cap> to approve that cap and continue. Spend so far counts against it.
     \\Status always emits JSON and starts no provider. Exit: 0 done/status/help,
     \\1 terminal failure, 2 invalid input/refusal. Required sandbox; no fallback.
     \\
@@ -60,6 +62,7 @@ pub const Options = struct {
     events: bool = false,
     overrides: config.Layer = .{},
     has_overrides: bool = false,
+    raised_cap_usd: ?f64 = null,
     host_config: app_types.Config = .{ .prompt = "", .mcp_connect = .disabled },
 };
 
@@ -98,6 +101,8 @@ pub fn parse(arena: std.mem.Allocator, args: anytype) !Options {
                 out.host_config.base_url = value;
             } else if (eq(arg, "--api-key")) {
                 out.host_config.api_key = value;
+            } else if (out.action == .@"resume" and eq(arg, "--budget-usd")) {
+                out.raised_cap_usd = try std.fmt.parseFloat(f64, value);
             } else {
                 if (out.action != .run and out.action != .mcp) return error.ResumeOverridesForbidden;
                 if (eq(arg, "--request-file")) {
@@ -132,6 +137,7 @@ pub const Prepared = struct {
     source: runtime.RequestSource,
     workspace: []const u8,
     events: bool = false,
+    raised_cap_usd: ?f64 = null,
 };
 
 /// Approval is checked before file reads, git, App startup or run creation.
@@ -157,6 +163,7 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
         const policy = saved.object.get("approved_config_json") orelse return error.ConfigurationChanged;
         if (policy != .string) return error.StateCorrupt;
         layer = try config.parse(arena, policy.string, null);
+        if (options.raised_cap_usd) |cap_usd| try checkRaise(saved, layer, cap_usd);
         const saved_repo = saved.object.get("repo") orelse return error.StateCorrupt;
         if (saved_repo != .string) return error.StateCorrupt;
         repo = try @import("merge_back.zig").toplevel(arena, saved_repo.string, null);
@@ -175,7 +182,15 @@ pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u
     // Git's toplevel is read-only. Do not let run state become an untracked
     // input of the workspace snapshot or a writable part of the worker tree.
     try requireExternalState(arena, state_root, repo);
-    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .source = source, .workspace = repo, .events = options.events };
+    return .{ .action = options.action, .id = id, .cfg = cfg, .request = request, .source = source, .workspace = repo, .events = options.events, .raised_cap_usd = options.raised_cap_usd };
+}
+
+fn checkRaise(saved: std.json.Value, approved: config.Layer, cap_usd: f64) !void {
+    const state = saved.object.get("state") orelse return error.StateCorrupt;
+    const detail = saved.object.get("detail") orelse return error.StateCorrupt;
+    if (state != .string or !eq(state.string, "budget_exhausted") or detail != .object) return error.NotResumable;
+    const approved_cap = approved.budget_usd orelse return error.StateCorrupt;
+    if (!std.math.isFinite(cap_usd) or !(cap_usd > approved_cap)) return error.CapNotRaised;
 }
 
 fn configuredLayer(arena: std.mem.Allocator, state_root: []const u8, repo: []const u8) !config.Layer {
@@ -432,7 +447,9 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     const host = try Host.create(arena, app, cfg);
     try checkClaudeState(arena, app, cfg, prepared.workspace);
     var deps = host.deps();
-    deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
+    var approved = cfg;
+    if (prepared.raised_cap_usd) |cap_usd| approved.budget_usd = cap_usd;
+    deps.cli_approval = .{ .config_json = try policyJson(arena, approved), .host_sha256 = try host.policyFingerprint(arena) };
     var lines: LineObserver = .{};
     if (prepared.events) deps.observer = lines.observer();
     if (prepared.action == .mcp) {
@@ -442,6 +459,8 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
         try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request, .source = prepared.source }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
+    else if (prepared.raised_cap_usd) |cap_usd|
+        try runtime.Run.reopenWithCap(app.allocator, deps, cfg, app.stateRoot(), prepared.id, cap_usd)
     else
         try runtime.Run.reopen(app.allocator, deps, cfg, app.stateRoot(), prepared.id);
     defer run.destroy();
@@ -459,6 +478,8 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     }
     const state = try manager.drive(run, host.claudeCodeOptions());
     try status(arena, app.stateRoot(), prepared.id);
+    if (state == .budget_exhausted and state.budget_exhausted != null)
+        std.debug.print("teamwork run {s} paused at its ${d} cap; the worktree is kept. Continue with: metacodes --preview teamwork resume {s} --approve --budget-usd <higher cap>\n", .{ prepared.id.slice(), run.ledger.cap_usd, prepared.id.slice() });
     return if (state == .done) 0 else 1;
 }
 
