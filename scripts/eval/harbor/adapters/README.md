@@ -23,8 +23,8 @@ suite's id and category; the suite id differs from the module name only for
 `mbpp-sanitized` (`mbpp_sanitized.py`). Each module exposes:
 
 - `SUITE_ID` (the catalog id) and `SUITE`: `name`, `description` (Chinese),
-  `default_tasks`, `max_tasks` (<= 200), `max_concurrency` (<= 8), plus an
-  informational `arch` the catalog passes through (`arch` in
+  `default_tasks`, `max_tasks` (<= 200), `max_concurrency` (optional cap,
+  none by default), plus an informational `arch` the catalog passes through (`arch` in
   `GET /api/workbench` suites, shown on the 新建评测 task list).
 - `prepare(dest) -> Path`: `dest` is the dataset directory
   (`<state>/bench/datasets/<suite id>`); downloads the pinned sources into

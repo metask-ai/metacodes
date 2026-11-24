@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 
 FILE_ENV = "METACODES_BENCH_CONCURRENCY_FILE"
-MAX_CONCURRENCY = 16
 POLL_SECONDS = 1.0
 
 
@@ -15,7 +14,7 @@ def read(path, fallback):
         value = int(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return fallback
-    return value if 1 <= value <= MAX_CONCURRENCY else fallback
+    return value if value >= 1 else fallback
 
 
 def write(path, value):
