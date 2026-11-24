@@ -649,6 +649,16 @@ class WorkbenchTest(unittest.TestCase):
         shipped = next(a.removeprefix('config=') for a in argv if a.startswith('config='))
         self.assertEqual(list(json.loads(Path(shipped).read_text())), ['custom_providers'])
 
+    def test_a_task_host_variable_named_like_the_agent_key_is_refused(self):
+        cfg = json.loads(self.manager.config_path.read_text())
+        request = {'model': 'tokenjoy/test-model', 'suite': 'tau3-airline', 'tasks': ['tau3-bench__tau3-airline-0']}
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'user-simulator-key'}):
+            self.assertEqual(self.manager.launch(request, dry_run=True)['suite'], 'tau3-airline')
+            atomic_json(self.manager.config_path, {**cfg, 'key_env': 'OPENAI_API_KEY'})
+            with self.assertRaisesRegex(ValueError, 'OPENAI_API_KEY.*relay 占位令牌'):
+                self.client.request('api/runs', request)
+        self.assertEqual(self.manager.runs(), [])
+
     def test_no_credential_is_needed_but_cross_origin_is_refused(self):
         import urllib.request
         # An internal-network workbench: the page needs no link capability.

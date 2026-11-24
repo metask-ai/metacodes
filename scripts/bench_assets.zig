@@ -25,6 +25,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/suites/workbuddy.py", .bytes = @embedFile("eval/harbor/suites/workbuddy.py") },
     .{ .path = "scripts/eval/harbor/suites/leaderboards.py", .bytes = @embedFile("eval/harbor/suites/leaderboards.py") },
     .{ .path = "scripts/eval/harbor/suites/leaderboards.json", .bytes = @embedFile("eval/harbor/suites/leaderboards.json") },
+    .{ .path = "scripts/eval/harbor/suites/registry_tasks.json", .bytes = @embedFile("eval/harbor/suites/registry_tasks.json") },
     .{ .path = "scripts/eval/harbor/adapters/__init__.py", .bytes = @embedFile("eval/harbor/adapters/__init__.py") },
     .{ .path = "scripts/eval/harbor/adapters/gaia2_cli.py", .bytes = @embedFile("eval/harbor/adapters/gaia2_cli.py") },
     .{ .path = "scripts/eval/harbor/bench/__init__.py", .bytes = @embedFile("eval/harbor/bench/__init__.py") },
