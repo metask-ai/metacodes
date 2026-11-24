@@ -176,8 +176,9 @@ fn runCli(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []co
 }
 
 const interrupt_deadline_ms = 60_000;
+const interrupted_exit_limit_ms = 3_000;
 
-fn runCliInterrupted(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []const []const u8, interrupt: Interrupt) !Run {
+fn runCliInterrupted(scratch: *Scratch, env: Env, server: *harness.MockServer, extra_env: []const []const u8, args: []const []const u8, interrupt: Interrupt) !Run {
     const a = scratch.arena();
     const stdout_path = try std.fs.path.join(a, &.{ scratch.root, "stdout" });
     const stderr_path = try std.fs.path.join(a, &.{ scratch.root, "stderr" });
@@ -194,9 +195,16 @@ fn runCliInterrupted(scratch: *Scratch, env: Env, extra_env: []const []const u8,
             .stderr = .{ .file = stderr_file },
         });
         errdefer child.kill(io);
-        try waitForInterruptPoint(scratch, stdout_path, interrupt);
+        try waitForInterruptPoint(scratch, server, stdout_path, interrupt);
+        const interrupted_at = cc.util_time.nowMs();
         try std.posix.kill(child.id.?, .INT);
-        break :exit switch (try child.wait(io)) {
+        const term = try child.wait(io);
+        const exit_ms = cc.util_time.nowMs() - interrupted_at;
+        if (exit_ms > interrupted_exit_limit_ms) {
+            std.debug.print("the CLI took {d}ms to exit after SIGINT (limit {d}ms)\n", .{ exit_ms, interrupted_exit_limit_ms });
+            return error.InterruptTooSlow;
+        }
+        break :exit switch (term) {
             .exited => |code| @as(i32, code),
             .signal => |signal| 128 + @as(i32, @intCast(@intFromEnum(signal))),
             else => return error.ChildStoppedUnexpectedly,
@@ -209,12 +217,13 @@ fn runCliInterrupted(scratch: *Scratch, env: Env, extra_env: []const []const u8,
     };
 }
 
-fn waitForInterruptPoint(scratch: *Scratch, stdout_path: []const u8, interrupt: Interrupt) !void {
+fn waitForInterruptPoint(scratch: *Scratch, server: *harness.MockServer, stdout_path: []const u8, interrupt: Interrupt) !void {
     const a = scratch.arena();
     const deadline = cc.util_time.nowMs() + interrupt_deadline_ms;
     while (cc.util_time.nowMs() < deadline) : (cc.util_time.sleepMs(20)) {
         switch (interrupt) {
             .none => return,
+            .after_request => if (server.requestCount() > 0) return,
             .after_output => |needle| {
                 const stdout = try std.Io.Dir.cwd().readFileAlloc(io, stdout_path, a, .limited(64 << 20));
                 if (std.mem.indexOf(u8, stdout, needle) != null) return;
@@ -322,10 +331,13 @@ const Provider = union(enum) {
     status_lines: []const []const u8,
     cut_response: usize,
     event_interval_ms: u32,
+    silent_head,
+    silent_after: []const u8,
 };
 
 const Interrupt = union(enum) {
     none,
+    after_request,
     after_output: []const u8,
     after_file: []const u8,
 };
@@ -353,6 +365,8 @@ const scenarios = [_]Scenario{
     .{ .name = "sse_cut", .args = &.{ "-p", "say hi" }, .provider = .{ .cut_response = 0 } },
     .{ .name = "user_interrupt", .args = &.{ "-p", "say hi" }, .provider = .{ .event_interval_ms = 1000 }, .interrupt = .{ .after_output = "\"type\":\"usage\"" } },
     .{ .name = "tool_abort", .args = &.{ "--allowedTools", "Bash", "-p", "run the slow check" }, .interrupt = .{ .after_file = "started" } },
+    .{ .name = "interrupt_awaiting_head", .args = &.{ "-p", "say hi" }, .provider = .silent_head, .interrupt = .after_request },
+    .{ .name = "interrupt_stalled_stream", .args = &.{ "-p", "say hi" }, .provider = .{ .silent_after = "\"text\":\"Hello\"}}\n\n" }, .interrupt = .{ .after_output = "\"type\":\"text\"" } },
 };
 
 test "provider request bytes, stream-json events and session files of fixed scenarios" {
@@ -382,6 +396,8 @@ fn runScenario(env: Env, checker: *Checker, scenario: Scenario) !void {
         .status_lines => |lines| try harness.MockServer.startHttpCassette(bodies, lines),
         .cut_response => |index| try harness.MockServer.startCassetteMidStreamCut(bodies, index),
         .event_interval_ms => |interval| try harness.MockServer.startCassette(bodies, interval),
+        .silent_head => try harness.MockServer.startCassetteSilent(bodies, 0, 0),
+        .silent_after => |marker| try harness.MockServer.startCassetteSilent(bodies, 0, try prefixThrough(bodies[0], marker)),
     };
     defer server.stop();
     const base_url = try server.urlOwned(a);
@@ -390,7 +406,7 @@ fn runScenario(env: Env, checker: *Checker, scenario: Scenario) !void {
     try args.appendSlice(a, scenario.args);
     const run = switch (scenario.interrupt) {
         .none => try runCli(&scratch, env, scenario.env, args.items),
-        else => try runCliInterrupted(&scratch, env, scenario.env, args.items, scenario.interrupt),
+        else => try runCliInterrupted(&scratch, env, server, scenario.env, args.items, scenario.interrupt),
     };
 
     const provider = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
@@ -423,6 +439,11 @@ fn runScenario(env: Env, checker: *Checker, scenario: Scenario) !void {
         }
     }
     try checker.expect(a, try std.fs.path.join(a, &.{ expected_dir, "state-files.txt" }), try normalize.apply(a, try listTree(a, scratch.state), rules));
+}
+
+fn prefixThrough(body: []const u8, marker: []const u8) !usize {
+    const start = std.mem.indexOf(u8, body, marker) orelse return error.SilenceMarkerMissing;
+    return start + marker.len;
 }
 
 fn checkStream(checker: *Checker, a: std.mem.Allocator, expected_dir: []const u8, stream: []const u8, rules: normalize.Rules) !void {

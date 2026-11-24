@@ -254,6 +254,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Ctrl-C stops a request that is waiting for its answer or whose stream
+  went quiet.** The interrupt only set a flag that was read when the next
+  byte arrived, so `-p` (and any caller that did not also cancel the
+  request) waited for the 120 s idle limit while the provider had not
+  answered yet, and indefinitely while a started stream sent nothing more.
+  The liveness monitor now closes the connection of every request whose
+  abort signal is set, within a quarter of a second, for every provider
+  protocol and entry point. An interrupt while the answer is awaited no
+  longer prints an error line.
+
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to
   `http://localhost:1455`, which on a machine reached over SSH is not where
