@@ -84,10 +84,9 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
-    if (artifact.root_module.root_source_file) |root| switch (root) {
-        .src_path => |source| run.setEnvironmentVariable("METACODES_TEST_ROOT", std.fs.path.dirnamePosix(source.sub_path) orelse ""),
-        else => {},
-    };
+    if (sourcePath(b, artifact.root_module)) |root| {
+        run.setEnvironmentVariable("METACODES_TEST_ROOT", std.fs.path.dirnamePosix(root) orelse "");
+    }
     if (g_sandbox_helper_install) |install| {
         run.step.dependOn(install);
         run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
@@ -2321,7 +2320,7 @@ pub fn build(b: *std.Build) void {
     });
     const core_shard_harness_step = b.step("test:lib-shard-harness", "Test core shard partition and aggregate fail-closed checks");
     core_shard_harness_step.dependOn(&b.addRunArtifact(shard_runner_tests).step);
-    core_shard_harness_step.dependOn(&b.addRunArtifact(shard_reporter_tests).step);
+    core_shard_harness_step.dependOn(&addTestRunArtifact(b, shard_reporter_tests).step);
 
     // Diagnostic companion to test:lib. It runs the identical test graph and
     // semantics, but emits per-test timings plus slow-test buckets/top-N so
