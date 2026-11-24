@@ -483,6 +483,8 @@ const HEADLESS_STREAM_RETRIES = 2;
 
 const RetryNotices = struct {
     delays: [8]u64 = undefined,
+    attempts: [8]u32 = undefined,
+    maxes: [8]u32 = undefined,
     len: usize = 0,
     abort_on_notice: ?*cc.util_abort.AbortSignal = null,
 
@@ -492,6 +494,8 @@ const RetryNotices = struct {
             .retry_notice => |r| {
                 if (self.len < self.delays.len) {
                     self.delays[self.len] = r.delay_ms;
+                    self.attempts[self.len] = r.attempt;
+                    self.maxes[self.len] = r.max;
                     self.len += 1;
                 }
                 if (self.abort_on_notice) |signal| signal.abort(.user_interrupt);
@@ -596,5 +600,33 @@ test "L2 stream errors ⑤: an in-stream overload waits the Retry-After of its r
     try std.testing.expectEqual(@as(usize, 1), notices.len);
     try std.testing.expectEqual(@as(u64, 30_000), notices.delays[0]);
     try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    clearLastError();
+}
+
+test "L2 stream errors ⑤: an HTTP 529 after an in-stream overload continues the attempt count and the backoff" {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("3");
+    defer retries.restore();
+    const bodies = [_][]const u8{
+        overloadedBeforeText(.anthropic),
+        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        complete(.anthropic),
+    };
+    var srv = try harness.MockServer.startHttpCassette(&bodies, &.{ "HTTP/1.1 200 OK", "HTTP/1.1 529 Overloaded", "HTTP/1.1 200 OK" });
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, 0, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), notices.len);
+    try std.testing.expectEqual(@as(u32, 1), notices.attempts[0]);
+    try std.testing.expectEqual(@as(u32, 3), notices.maxes[0]);
+    try std.testing.expect(notices.delays[0] >= 500 and notices.delays[0] <= 625);
+    try std.testing.expectEqual(@as(u32, 2), notices.attempts[1]);
+    try std.testing.expectEqual(@as(u32, 3), notices.maxes[1]);
+    try std.testing.expect(notices.delays[1] >= 1000 and notices.delays[1] <= 1250);
     clearLastError();
 }

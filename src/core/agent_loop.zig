@@ -2901,13 +2901,14 @@ fn runCounted(
                 logical_turn: u32,
                 context_generation: u32,
                 max_attempts: u32,
+                first_attempt: u32,
             ) bool {
                 if (self.active_attempt != 0 or max_attempts == 0) return false;
                 self.request_sha256 = request_sha256;
                 self.logical_turn = logical_turn;
                 self.context_generation = context_generation;
                 self.max_attempts = max_attempts;
-                return self.startAttempt(1);
+                return self.startAttempt(first_attempt);
             }
 
             fn failed(state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool {
@@ -2985,7 +2986,7 @@ fn runCounted(
             .boundary = opts.execution_boundary,
             .actor_id = opts.agent_ident orelse sess,
         };
-        const reporter = provider_mod.RetryReporter{
+        var reporter = provider_mod.RetryReporter{
             .state = @ptrCast(&retry_ui),
             .failedFn = RetryUi.failed,
             .beforeAttemptFn = RetryUi.beforeAttempt,
@@ -3212,7 +3213,8 @@ fn runCounted(
                 );
             }
 
-            const max_provider_attempts = providerAttemptLimit(opts.request_gate != null) -| request_attempts_spent;
+            const max_provider_attempts = providerAttemptLimit(opts.request_gate != null);
+            reporter.attempts_before = request_attempts_spent;
             const request_sha256 = if (opts.execution_boundary != null)
                 canonicalAgentRequestSha256(
                     allocator,
@@ -3247,6 +3249,7 @@ fn runCounted(
                 turns + 1,
                 @intCast(@min(attempt_generation, std.math.maxInt(u32))),
                 max_provider_attempts,
+                request_attempts_spent + 1,
             )) return finishRun(backend, sess, trace_id, depth, .{
                 .stop_reason = .api_error,
                 .turns = turns,
@@ -3286,7 +3289,6 @@ fn runCounted(
                     error.Aborted => .aborted,
                     else => .api_error,
                 };
-                if (request_attempts_spent > 0) last_error.noteAttempts(request_attempts_spent + retry_ui.active_attempt);
                 if (retry_ui.hasActiveAttempt() and
                     !retry_ui.finishAttempt(attempt_outcome, .unknown))
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -3816,7 +3818,7 @@ fn runCounted(
                 const request_retry_eligible = connection_failure and !tool_call_started;
                 const overloaded = if (stream_failure) |failure| failure == error.ServiceUnavailable else false;
                 const overload_attempts = providerAttemptLimit(opts.request_gate != null);
-                const attempts_used = request_attempts_spent + stream_attempts;
+                const attempts_used = stream_attempts;
                 const thinking_bytes: u64 = thinking_text.items.len;
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();

@@ -210,6 +210,7 @@ pub fn ConnectRetryFor(comptime module: []const u8) type {
                 .base_ms = if (retry_base_ms > 0) retry_base_ms else RETRY_BASE_MS,
                 .reporter = reporter,
                 .abort = abort,
+                .failed = if (reporter) |rep| rep.attempts_before else 0,
             };
         }
 

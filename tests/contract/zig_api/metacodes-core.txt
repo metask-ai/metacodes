@@ -7611,6 +7611,7 @@ metacodes-core.client.RetryReporter: struct
 metacodes-core.client.RetryReporter.state: *anyopaque
 metacodes-core.client.RetryReporter.failedFn: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool
 metacodes-core.client.RetryReporter.beforeAttemptFn: *const fn (state: *anyopaque, attempt: u32, max: u32) bool
+metacodes-core.client.RetryReporter.attempts_before: u32 = 0
 metacodes-core.client.RetryReporter.failed: fn failed(self: RetryReporter, attempt: u32, max: u32, delay_ms: u64) bool
 metacodes-core.client.RetryReporter.beforeAttempt: fn beforeAttempt(self: RetryReporter, attempt: u32, max: u32) bool
 metacodes-core.client.cancelled: fn cancelled(abort: ?*const AbortSignal) bool
