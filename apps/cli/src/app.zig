@@ -7319,11 +7319,3 @@ fn stringField(value: ?std.json.Value) ?[]const u8 {
         else => null,
     };
 }
-
-test "model routing source guard rejects direct case-sensitive model matching in the CLI" {
-    const sources = [_][]const u8{ @embedFile("repl/model_command.zig"), @embedFile("main.zig") };
-    const forbidden = [_][]const u8{
-        "std.mem.indexOf(u8, model", "std.mem.eql(u8, model", "std.mem.startsWith(u8, model", "std.mem.eql(u8, e.model_id",
-    };
-    for (sources) |source| for (forbidden) |needle| try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
-}

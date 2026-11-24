@@ -245,4 +245,7 @@ test "capability and provider checks are derived from the central matrix" {
     try std.testing.expect(!supports(.openai, "gpt-4o", .web_search));
     try std.testing.expect(providerForModel("gpt-4o").? == .openai);
     try std.testing.expect(providerForModel("gemini-2.5-pro").? == .gemini);
+    for ([_][]const u8{ @embedFile("model_command.zig"), @embedFile("../main.zig") }) |source| {
+        for (model_name.case_sensitive_model_matches) |needle| try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
+    }
 }

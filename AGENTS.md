@@ -230,7 +230,7 @@ git diff --check
 ```
 
 `zig build gate:static` runs only the guards that read the source:
-`zig fmt --check build.zig src tests`, the scans of `http-status:gate`,
+`zig fmt --check build.zig src apps tests`, the scans of `http-status:gate`,
 `subsystem:boundary` and `layer:check` (their self-tests run in `test:units`), the
 `scripts/tests/test_*_discipline.py` scans and `git diff --check`. It takes seconds, and it comes first because the build
 runner has no fail-fast: inside the full gate a failed guard is reported

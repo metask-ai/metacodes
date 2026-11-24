@@ -41,6 +41,10 @@ test "model name matching is ASCII case insensitive and bounded" {
     try std.testing.expect(!startsWithIgnoreCase("claude-3-5-haiku", "claude-haiku-4"));
 }
 
+pub const case_sensitive_model_matches = [_][]const u8{
+    "std.mem.indexOf(u8, model", "std.mem.eql(u8, model", "std.mem.startsWith(u8, model", "std.mem.eql(u8, e.model_id",
+};
+
 // The behavioural half of this guard, that every consumer answers the same
 // for either case, is `model_name_consumers_test.zig`. It cannot live here: the
 // provider kernel reaches this file through `util/pricing.zig`, so every test
@@ -56,8 +60,5 @@ test "model routing source guard rejects direct case-sensitive model matching" {
         @embedFile("dialects/openai_compat.zig"), @embedFile("model_context.zig"),         @embedFile("../util/pricing.zig"),
         @embedFile("../util/model.zig"),          @embedFile("../core/system_prompt.zig"), @embedFile("../plugin/runtime.zig"),
     };
-    const forbidden = [_][]const u8{
-        "std.mem.indexOf(u8, model", "std.mem.eql(u8, model", "std.mem.startsWith(u8, model", "std.mem.eql(u8, e.model_id",
-    };
-    for (sources) |source| for (forbidden) |needle| try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
+    for (sources) |source| for (case_sensitive_model_matches) |needle| try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
 }
