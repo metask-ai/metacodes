@@ -99,7 +99,10 @@ These rules apply to the entire repository.
   entry must already be upward in the base, while a deep one may come from
   either list. A package may start depending on a package the base lacks
   only when that package's dependencies and its files, each already in the
-  base tree at the same path, were already within the dependent's reach. `src/lib.zig`, the
+  base tree at the same path, were already within the dependent's reach. A
+  file moved since the base (a rename git detects) is compared under its base
+  path: an upward entry must have been upward there, while a deep one may also
+  be an import the base tree had inside one package. `src/lib.zig`, the
   `metacodes-core` facade that re-exports the lower packages, is its own
   `facade` package between `teamwork` and `agentcore`.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,

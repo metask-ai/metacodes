@@ -29,6 +29,57 @@ pub const Session = struct {
     }
 };
 
+pub fn appHost(app: *app_mod.App) command.AppHost {
+    return .{ .ctx = app, .vtable = &app_host_vtable };
+}
+
+const app_host_vtable: command.AppHost.VTable = .{
+    .view = view,
+    .publishMcpServers = publishMcpServers,
+    .makeBackgroundProvider = makeBackgroundProvider,
+    .rememberObservation = rememberObservation,
+};
+
+fn appOf(ctx: *anyopaque) *app_mod.App {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn view(ctx: *anyopaque) command.AppHost.View {
+    const app = appOf(ctx);
+    return .{
+        .allocator = app.allocator,
+        .active_model = app.activeModel(),
+        .abort = &app.abort,
+        .seat = .{
+            .preview = app.config.preview.features(),
+            .provider = app.provider(),
+            .anthropic_client = app.anthropicClientOrNull(),
+            .tool_defs = app.tool_defs,
+            .permission_ctx = &app.permission_ctx,
+            .host_sandbox = app.sandboxPtr(),
+            .home_dir = app.homeDir(),
+            .state_root = app.stateRoot(),
+            .artifact_root = app.sessionDir() orelse "",
+            .session = app.session_id,
+        },
+    };
+}
+
+fn publishMcpServers(ctx: *anyopaque) anyerror!void {
+    return appOf(ctx).publishMcpServers();
+}
+
+fn makeBackgroundProvider(ctx: *anyopaque) anyerror!command.AppHost.OwnedProvider {
+    const jobs = if (appOf(ctx).agent_jobs) |*registry| registry else return error.TeamworkBackgroundUnavailable;
+    return jobs.makeProvider();
+}
+
+fn rememberObservation(ctx: *anyopaque, text: []const u8, schema_type: []const u8) bool {
+    const kg = if (appOf(ctx).kg) |*client| client else return false;
+    _ = kg.remember(.observation, text, schema_type, false) catch return false;
+    return true;
+}
+
 pub const usage =
     \\Usage: /teamwork [skip-interview] [seats=<role>:<harness>[:<model>],...] <request>
     \\       /teamwork status [<run id>]
@@ -61,7 +112,7 @@ pub fn handle(app: *app_mod.App, allocator: std.mem.Allocator, session: *Session
     var prompter_state: Prompter = .{ .app = app, .allocator = allocator, .reader = reader };
     defer prompter_state.deinit();
     cmd_output.print("Preparing the teamwork run; unless the request says [skip-interview], the interviewer drafts the task first…\n", .{});
-    const result = command.startInteractive(app, app.cwdAbs(), args, prompter_state.prompter(), &session.board);
+    const result = command.startInteractive(appHost(app), app.cwdAbs(), args, prompter_state.prompter(), &session.board);
     app.abort.reset();
     settleBoard(&session.board, result);
     const outcome = result catch |err| {

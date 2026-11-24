@@ -846,7 +846,7 @@ pub const App = struct {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
         var active_config = config;
-        active_config.preview = try @import("app/config.zig").resolvePreview(allocator, config.state_root, config.preview);
+        active_config.preview = try @import("core/file_config.zig").resolvePreview(allocator, config.state_root, config.preview);
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,

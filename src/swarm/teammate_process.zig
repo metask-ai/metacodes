@@ -33,7 +33,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const mailbox = @import("mailbox.zig");
 const team_mod = @import("team.zig");
@@ -55,8 +54,33 @@ pub const Identity = struct {
 /// 轮询间隔(同 in-process)。
 const POLL_MS: u64 = 500;
 
-/// 进程外 teammate 主循环。返回进程退出码。app 已由 main 建好(provider/tools/system_prompt)。
-pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
+pub const Host = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        adoptSessionIdentity: *const fn (ctx: *anyopaque, session: SessionId) anyerror!void,
+        enterWorktree: *const fn (ctx: *anyopaque, cwd_abs: ?[]u8, project_dir: ?[]u8) void,
+        stateRoot: *const fn (ctx: *anyopaque) []const u8,
+        isAborted: *const fn (ctx: *anyopaque) bool,
+        appendUserText: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
+        runTurn: *const fn (ctx: *anyopaque, turn: Turn) anyerror!agent_loop.StopReason,
+    };
+
+    pub const Turn = struct {
+        swarm: *swarm_ctx.SwarmContext,
+        session: SessionId,
+        agent_ident: SessionId,
+        agent_id: []const u8,
+    };
+
+    pub fn isAborted(self: Host) bool {
+        return self.vtable.isAborted(self.ctx);
+    }
+};
+
+/// 进程外 teammate 主循环。返回进程退出码。host 由 main 在建好的 App 上实现(provider/tools/system_prompt)。
+pub fn run(host: Host, allocator: std.mem.Allocator, id: Identity) !u8 {
     var name_buf: [64]u8 = undefined;
     const name_s = team_mod.sanitizeAgentName(id.name[0..@min(id.name.len, 64)], &name_buf);
     if (name_s.len == 0 or id.name.len > 64 or !std.mem.eql(u8, name_s, id.name)) {
@@ -99,7 +123,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         log.err("swarm", "teammate process: invalid --teammate-lease-id", .{});
         return 2;
     };
-    app.adoptSessionIdentity(parent_session) catch |err| {
+    host.vtable.adoptSessionIdentity(host.ctx, parent_session) catch |err| {
         log.err("swarm", "teammate process: cannot bind parent session writer: {s}", .{@errorName(err)});
         return 2;
     };
@@ -124,21 +148,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                     log.err("swarm", "teammate process: cannot resolve cwd {s}", .{id.cwd});
                     return 2;
                 };
-                if (allocator.dupe(u8, resolved)) |new_cwd| {
-                    if (app.cwd_abs) |old| allocator.free(old);
-                    app.cwd_abs = new_cwd;
-                } else |_| {}
+                const new_cwd = allocator.dupe(u8, resolved) catch null;
                 const new_root = @import("../skills/skill.zig").findRepoRoot(allocator, resolved) catch null;
-                if (new_root) |nr| {
-                    if (app.project_dir) |old| allocator.free(old);
-                    app.project_dir = nr;
-                }
+                host.vtable.enterWorktree(host.ctx, new_cwd, new_root);
                 log.info("swarm", "teammate {s} chdir + cwd_abs → {s} (worktree isolation)", .{ name_s, resolved });
             }
         }
     }
 
-    const state_dir = app.stateRoot();
+    const state_dir = host.vtable.stateRoot(host.ctx);
     if (state_dir.len == 0) {
         log.err("swarm", "teammate process: no state root", .{});
         return 2;
@@ -178,44 +196,34 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
         team_owned = &.{};
     }
 
-    // teammate 权限:绝不读 fd 0(headless 进程 fd 0 可能是 pipe/tty,行为不定)。fail-closed。
-    app.permission_ctx.no_interactive_prompt = true;
-
     // 对外身份(KG 租约):进程外 teammate 用 name@team 做 claim 身份(kanban 显名)。
     var agent_id_buf: [96]u8 = undefined;
     const agent_id = team_mod.formatAgentId(name_s, team_s, &agent_id_buf) orelse name_s;
 
     log.info("swarm", "teammate process {s} online (parent session {s})", .{ agent_id, id.parent_session });
 
-    // 无 TUI:WriterBackend null-sink 吞流式输出(同 headless.zig),usage 仍累计。
-    var wb = @import("../core/writer_backend.zig").WriterBackend.initNullWithUsage(&app.usage);
-    const backend = wb.backend();
-
     // 初次:标记 active,发一个 "online" idle 通知让 lead 知道就绪。
     _ = setMemberActive(allocator, config_path, name_s, parent_session, lease_id, true);
 
     var exit_code: u8 = 0;
     while (true) {
-        if (app.abort.isAborted()) break;
+        if (host.isAborted()) break;
         if (!ownsPersistedMember(allocator, config_path, name_s, parent_session, lease_id, id.cwd)) break;
 
         // 等下一条工作(mailbox 轮询;shutdown 优先且仅认 team-lead)。
-        const prompt = waitForWork(allocator, &app.abort, inbox, name_s, config_path, parent_session, lease_id, id.cwd) orelse break;
+        const prompt = waitForWork(allocator, host, inbox, name_s, config_path, parent_session, lease_id, id.cwd) orelse break;
         defer allocator.free(prompt);
         if (!ownsPersistedMember(allocator, config_path, name_s, parent_session, lease_id, id.cwd)) break;
 
         if (!setMemberActive(allocator, config_path, name_s, parent_session, lease_id, true)) break;
-        try app.conversation.appendText(.user, prompt);
+        try host.vtable.appendUserText(host.ctx, prompt);
 
-        const result = agent_loop.run(
-            &app.conversation,
-            app.provider(),
-            app.tool_defs,
-            &app.permission_ctx,
-            loopOptions(app, &sw, parent_session, agent_ident, agent_id),
-            &backend,
-            allocator,
-        ) catch |err| {
+        const stop_reason = host.vtable.runTurn(host.ctx, .{
+            .swarm = &sw,
+            .session = parent_session,
+            .agent_ident = agent_ident,
+            .agent_id = agent_id,
+        }) catch |err| {
             log.warn("swarm", "teammate {s} run failed: {s}", .{ agent_id, @errorName(err) });
             _ = setMemberActive(allocator, config_path, name_s, parent_session, lease_id, false);
             sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "failed", @errorName(err));
@@ -225,12 +233,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
 
         _ = setMemberActive(allocator, config_path, name_s, parent_session, lease_id, false);
         // 软截断不洗白(同 in-process)。
-        if (result.stop_reason == .end_turn) {
+        if (stop_reason == .end_turn) {
             sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "available", null);
-        } else if (result.stop_reason == .aborted) {
+        } else if (stop_reason == .aborted) {
             break;
         } else {
-            sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "needs_continuation", @tagName(result.stop_reason));
+            sendNotice(allocator, lead_inbox, name_s, parent_session, lease_id, "needs_continuation", @tagName(stop_reason));
         }
     }
 
@@ -541,41 +549,6 @@ pub fn removeWorktreeStrict(a: std.mem.Allocator, wt_path: []const u8, repo: []c
     const path_z = try a.dupeZ(u8, wt_path);
     defer a.free(path_z);
     if (pfs.exists(path_z.ptr)) return error.WorktreeStillExists;
-}
-
-pub fn loopOptions(app: *app_mod.App, sw: *swarm_ctx.SwarmContext, parent_session: SessionId, agent_ident: SessionId, agent_id: []const u8) agent_loop.Options {
-    return .{
-        .session = parent_session,
-        .abort = &app.abort,
-        .api_client = app.anthropicClientOrNull(),
-        .tool_defs = app.tool_defs,
-        .system_prompt = app.system_prompt,
-        .preview = app.config.preview.features(),
-        .swarm = sw,
-        .tasks = &app.tasks,
-        .kg = if (app.kg) |*k| k else null,
-        .kg_projects_dir = app.kg_projects_dir,
-        .dyn_registry = &app.dyn_registry,
-        .agents = &app.agents,
-        .parent_model = app.activeModel(),
-        .project_dir = app.project_dir_or_empty(),
-        // task#12(Linus review 第五处):进程外 teammate 的 Bash 也须套 sandbox。此前只传
-        // cwd_abs/home_dir/additional_dirs,漏 .sandbox → ctx.sandbox=null → wrapCommand 被跳过,
-        // Bash 脱管("共享 App 就以为共享沙箱"的假设缺口)。App 已从 settings 载 sandbox,直接接上。
-        .sandbox = app.sandboxPtr(),
-        .cwd_abs = app.cwdAbs(),
-        .additional_dirs = app.additionalDirs(),
-        .home_dir = app.homeDir(),
-        .state_root = app.stateRoot(),
-        .artifact_root = app.sessionDir() orelse "",
-        .tool_result_metrics = &app.tool_result_metrics,
-        // agent_ident 仍是进程自己的 24-hex session id，用于通用
-        // agent-loop 身份。TinyKG 租约单独使用 name@team，保证宿主自领与
-        // 模型后续 TaskUpdate/TaskStop 共用完全相同的 holder 字符串。
-        .agent_ident = agent_ident,
-        .kg_agent_ident = agent_id,
-        .colorize = false,
-    };
 }
 
 /// spawn 函数签名(DI):生产 = forkExecTeammate;测试注入 mock(不真 fork)验证接线。

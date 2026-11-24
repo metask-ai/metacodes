@@ -80,6 +80,8 @@ named module 按写下它的源文件算)和 `build.zig` 里每个 module 的 im
 调整分层(拆包、改归属)的 PR 单独提。拆包后暴露出来的边,只有基线代码里本来就有、而且按基线清单两端在同一个包里,才不算新增;
 upward 条目必须在基线的 upward 里,deep 条目可以来自基线的 upward 或 deep。一个包可以新依赖基线里没有的包,
 前提是新包依赖的包它原来都能访问,新包的每个文件在基线代码里都已存在于同一路径、在基线清单里有归属,而且它原来就能访问那个包。
+从基线以来挪动过的文件(git 识别出的改名)按它在基线里的路径比较:upward 条目必须是基线里的 upward,
+deep 条目可以来自基线的 upward 或 deep,也可以是基线代码里两端同包的 import。
 `kernel_budget` 限定 kernel 的行数和它依赖的包。检查会打印「包 → 包」的违规数,作为迁移进度表。
 建立时(2026-11)的现状:
 
@@ -94,6 +96,11 @@ upward 条目必须在基线的 upward 里,deep 条目可以来自基线的 upwa
 
 迁移 1.1 把 `lib.zig` 从 `session` 拆成 `facade` 后:越层 import 159(`session → teamwork` 24 条和
 `session → cli` 2 条消失,剩 `facade → cli` 2 条),深层 import 2159(`lib.zig` 对 teamwork 和 session 的 26 条导出)。
+
+迁移 1.2 清掉下层指向 `cli` 的 6 条边:`app/config.zig`、`app/doctor.zig` 移到 `core/file_config.zig`、`core/doctor.zig`
+(`lib.zig` 仍导出为 `config`、`doctor`);`version_info` 直接读 `release_contract.CONFIG_SCHEMA_VERSION`;
+`swarm/teammate_process` 和 `teamwork/command` 改用 cli 注入的窄接口(`teammate_process.Host`、`command.AppHost`)。
+越层 import 153,深层 import 2163,包间环缩成 base、ai、kernel、guard、coding。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。
