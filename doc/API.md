@@ -43,6 +43,7 @@ Preview features default to disabled, and each has its own switch:
 | `execute_code` | The `ExecuteCode` JavaScript orchestration tool |
 | `teamwork` | `metacodes teamwork` run, resume and Manager MCP execution |
 | `comment_guard` | The no-comment instruction and the editors' comment check |
+| `copy_on_select` | Copying text dragged over with the mouse in the interactive TUI |
 
 `--preview` enables every feature and `--no-preview` disables every feature.
 `--preview=<list>` and `--no-preview=<list>` take comma-separated feature names
@@ -75,6 +76,19 @@ text with a known baseline and up to 512 KiB on each side. It uses the bundled
 highlighter's string and comment rules, so language-specific constructs can be
 misclassified. It skips Bash sources containing `<<`, and YAML and CSS files entirely. Writes by shell commands,
 external tools and edits to unsupported formats rely on the prompt guidance.
+
+`copy_on_select` makes the interactive TUI on macOS and Linux report the
+mouse (`ESC[?1002h`, `ESC[?1006h`) while it reads keys. Dragging with the
+left button copies the text under the drag when the button is released: the
+TUI sends it as OSC 52 and, in a local session on macOS, also to `pbcopy`.
+The prompt then shows `Copied to clipboard`. The TUI keeps a copy of the
+text it printed and asks the terminal for the cursor position (`ESC[6n`) to
+place it on the screen. Text that other programs printed, or that the
+terminal rewrapped after a resize, may not match what the drag covered.
+While the mouse is reported, the wheel no longer scrolls the terminal's
+scrollback and the terminal's own selection needs its modifier key (Shift in
+most terminals, Option in iTerm2). Linux needs a terminal that accepts OSC 52.
+Windows ignores the feature.
 
 ## JavaScript tool orchestration
 

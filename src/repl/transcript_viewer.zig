@@ -269,6 +269,10 @@ pub fn runWithThemeAnchor(fd: c_int, allocator: std.mem.Allocator, conv: *const 
             .down => top = @min(top + 1, max_top),
             .page_up => top = if (top > view_rows) top - view_rows else 0,
             .page_down => top = @min(top + view_rows, max_top),
+            .mouse => |m| if (m.wheel()) |direction| switch (direction) {
+                .up => top -|= 3,
+                .down => top = @min(top + 3, max_top),
+            },
             .char => |c| switch (c) {
                 'q' => break,
                 'j', ' ' => top = @min(top + 1, max_top),

@@ -9,6 +9,7 @@ pub const PreviewFeature = enum {
     execute_code,
     teamwork,
     comment_guard,
+    copy_on_select,
 
     pub fn parse(name: []const u8) ?PreviewFeature {
         return std.meta.stringToEnum(PreviewFeature, name);
@@ -19,7 +20,8 @@ pub const PreviewFeatures = packed struct(u8) {
     execute_code: bool = false,
     teamwork: bool = false,
     comment_guard: bool = false,
-    _unused: u5 = 0,
+    copy_on_select: bool = false,
+    _unused: u4 = 0,
 
     comptime {
         for (@typeInfo(PreviewFeatures).@"struct".fields) |field| {

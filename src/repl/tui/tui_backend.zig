@@ -45,6 +45,7 @@ const api_stream = @import("../../api/stream.zig");
 const tool_card = @import("widget/tool_card.zig");
 const theme_mod = @import("theme.zig");
 const input = @import("../input.zig");
+const copy_select = @import("copy_select.zig");
 const app_mod = @import("../../app.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
 const picker_host = @import("../picker_host.zig");
@@ -735,6 +736,9 @@ pub const TuiBackend = struct {
                 .draft => |*draft| self.pasteIntoDraft(draft.allocator, ed, draft.text.items),
             }
             return;
+        }
+        if (snap.alloc) |allocator| {
+            if (copy_select.handle(allocator, self.region, key) != .not_mine) return;
         }
         if (key == .paste_begin) {
             if (self.region.pickerOpen()) {
