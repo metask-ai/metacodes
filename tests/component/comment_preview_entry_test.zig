@@ -169,7 +169,7 @@ test "L2 comment preview: a process teammate's Write refuses a new comment" {
     try fx.app.conversation.appendText(.user, "write new.py");
     var sink = cc.writer_backend.WriterBackend.initNull();
     const backend = sink.backend();
-    const options = cc.swarm_teammate_process.loopOptions(fx.app, &sw, session, cc.session_id.gen(), "worker@proj");
+    const options = cc.TeammateHost.loopOptions(fx.app, &sw, session, cc.session_id.gen(), "worker@proj");
     const result = try cc.agent_loop.run(&fx.app.conversation, fx.app.provider(), fx.app.tool_defs, &fx.app.permission_ctx, options, &backend, fx.app.allocator);
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try fx.expectWriteRefused();

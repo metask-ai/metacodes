@@ -231,17 +231,7 @@ const LIBRARY = Library{
         "src/session_intent.zig",
     },
     .unbaselined = &.{"src/core/"},
-    .baseline = &.{
-        // Re-exported as `config` and `doctor`: consumers reach them by those
-        // names, so moving the files out of `app/` is its own change.
-        .{ .from = "src/lib.zig", .to = "src/app/config.zig" },
-        .{ .from = "src/lib.zig", .to = "src/app/doctor.zig" },
-        .{ .from = "src/version_info.zig", .to = "src/app/config.zig" },
-        // The out-of-process teammate main loop drives a whole `App`. The
-        // library reaches it from `swarm/context.zig` inside function bodies
-        // only, so lazy analysis never compiles it into the library.
-        .{ .from = "src/swarm/teammate_process.zig", .to = "src/app.zig" },
-    },
+    .baseline = &.{},
 };
 
 comptime {

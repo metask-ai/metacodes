@@ -23,7 +23,7 @@ const provider_oauth_mod = @import("provider/oauth.zig");
 const provider_ids_mod = @import("provider/ids.zig");
 const version_info = @import("version_info.zig");
 const invocation = @import("app/invocation.zig");
-pub const doctor = @import("app/doctor.zig"); // pub: component tests build the report by hand
+pub const doctor = @import("core/doctor.zig"); // pub: component tests build the report by hand
 pub const app_state_env = @import("app/state_env.zig"); // pub: component tests read the template and the parser
 const state_env_mod = app_state_env;
 pub const app_route_state = @import("app/route_state.zig"); // pub: component tests read the banner and the reminder
@@ -1909,7 +1909,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (teamwork_request) |request| {
-        const code = teamwork_command.executeWithMcp(allocator, app, request, teamwork_mcp_host) catch |err| {
+        const code = teamwork_command.executeWithMcp(allocator, @import("repl/teamwork.zig").appHost(app), request, teamwork_mcp_host) catch |err| {
             std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
             return err;
         };
@@ -1933,7 +1933,8 @@ pub fn main(init: std.process.Init) !void {
     // SW6 进程外 teammate 模式:`--teammate --agent-name X --team-name Y` → 跑 mailbox 消息循环,
     // 不进 TUI REPL。身份经 CLI args 注入,可 chdir 进 worktree(cwd 隔离)。
     if (config.teammate_name.len > 0) {
-        const code = @import("swarm/teammate_process.zig").run(app, gpa, .{
+        var teammate_host: TeammateHost = .init(app, gpa);
+        const code = swarm_teammate_process.run(teammate_host.host(), gpa, .{
             .name = config.teammate_name,
             .team = config.teammate_team,
             .parent_session = config.teammate_parent_session,
@@ -2026,6 +2027,115 @@ pub fn main(init: std.process.Init) !void {
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
     try repl.run(app, gpa, .{ .resumed = resumed, .splash = splash });
 }
+
+pub const TeammateHost = struct {
+    app: *app_mod.App,
+    gpa: std.mem.Allocator,
+    sink: writer_backend.WriterBackend,
+
+    pub fn init(app: *app_mod.App, gpa: std.mem.Allocator) TeammateHost {
+        // teammate 权限:绝不读 fd 0(headless 进程 fd 0 可能是 pipe/tty,行为不定)。fail-closed。
+        app.permission_ctx.no_interactive_prompt = true;
+        // 无 TUI:WriterBackend null-sink 吞流式输出(同 headless.zig),usage 仍累计。
+        return .{ .app = app, .gpa = gpa, .sink = .initNullWithUsage(&app.usage) };
+    }
+
+    pub fn host(self: *TeammateHost) swarm_teammate_process.Host {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: swarm_teammate_process.Host.VTable = .{
+        .adoptSessionIdentity = adoptSessionIdentity,
+        .enterWorktree = enterWorktree,
+        .stateRoot = stateRoot,
+        .isAborted = isAborted,
+        .appendUserText = appendUserText,
+        .runTurn = runTurn,
+    };
+
+    fn of(ctx: *anyopaque) *TeammateHost {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn adoptSessionIdentity(ctx: *anyopaque, session: session_id.SessionId) anyerror!void {
+        return of(ctx).app.adoptSessionIdentity(session);
+    }
+
+    fn enterWorktree(ctx: *anyopaque, cwd_abs: ?[]u8, project_dir: ?[]u8) void {
+        const self = of(ctx);
+        if (cwd_abs) |new_cwd| {
+            if (self.app.cwd_abs) |old| self.gpa.free(old);
+            self.app.cwd_abs = new_cwd;
+        }
+        if (project_dir) |new_root| {
+            if (self.app.project_dir) |old| self.gpa.free(old);
+            self.app.project_dir = new_root;
+        }
+    }
+
+    fn stateRoot(ctx: *anyopaque) []const u8 {
+        return of(ctx).app.stateRoot();
+    }
+
+    fn isAborted(ctx: *anyopaque) bool {
+        return of(ctx).app.abort.isAborted();
+    }
+
+    fn appendUserText(ctx: *anyopaque, text: []const u8) anyerror!void {
+        return of(ctx).app.conversation.appendText(.user, text);
+    }
+
+    fn runTurn(ctx: *anyopaque, turn: swarm_teammate_process.Host.Turn) anyerror!agent_loop.StopReason {
+        const self = of(ctx);
+        const app = self.app;
+        const backend = self.sink.backend();
+        const result = try agent_loop.run(
+            &app.conversation,
+            app.provider(),
+            app.tool_defs,
+            &app.permission_ctx,
+            loopOptions(app, turn.swarm, turn.session, turn.agent_ident, turn.agent_id),
+            &backend,
+            self.gpa,
+        );
+        return result.stop_reason;
+    }
+
+    pub fn loopOptions(app: *app_mod.App, sw: *swarm_context.SwarmContext, parent_session: session_id.SessionId, agent_ident: session_id.SessionId, agent_id: []const u8) agent_loop.Options {
+        return .{
+            .session = parent_session,
+            .abort = &app.abort,
+            .api_client = app.anthropicClientOrNull(),
+            .tool_defs = app.tool_defs,
+            .system_prompt = app.system_prompt,
+            .preview = app.config.preview.features(),
+            .swarm = sw,
+            .tasks = &app.tasks,
+            .kg = if (app.kg) |*k| k else null,
+            .kg_projects_dir = app.kg_projects_dir,
+            .dyn_registry = &app.dyn_registry,
+            .agents = &app.agents,
+            .parent_model = app.activeModel(),
+            .project_dir = app.project_dir_or_empty(),
+            // task#12(Linus review 第五处):进程外 teammate 的 Bash 也须套 sandbox。此前只传
+            // cwd_abs/home_dir/additional_dirs,漏 .sandbox → ctx.sandbox=null → wrapCommand 被跳过,
+            // Bash 脱管("共享 App 就以为共享沙箱"的假设缺口)。App 已从 settings 载 sandbox,直接接上。
+            .sandbox = app.sandboxPtr(),
+            .cwd_abs = app.cwdAbs(),
+            .additional_dirs = app.additionalDirs(),
+            .home_dir = app.homeDir(),
+            .state_root = app.stateRoot(),
+            .artifact_root = app.sessionDir() orelse "",
+            .tool_result_metrics = &app.tool_result_metrics,
+            // agent_ident 仍是进程自己的 24-hex session id，用于通用
+            // agent-loop 身份。TinyKG 租约单独使用 name@team，保证宿主自领与
+            // 模型后续 TaskUpdate/TaskStop 共用完全相同的 holder 字符串。
+            .agent_ident = agent_ident,
+            .kg_agent_ident = agent_id,
+            .colorize = false,
+        };
+    }
+};
 
 /// `-p`: after the raw error the run printed, one line saying what to do when
 /// a retry cannot help — a rejected sign-in or key, or no balance left — with
@@ -2852,7 +2962,7 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
     }
     const cwd = try @import("util/fs.zig").getCwd(arena);
     options.host_config.preview = leading_preview.overlay(options.host_config.preview);
-    if (options.approve) options.host_config.preview = try @import("app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
+    if (options.approve) options.host_config.preview = try @import("core/file_config.zig").resolvePreview(arena, state_root, options.host_config.preview);
     const prepared = teamwork_command.prepare(arena, options, state_root, cwd) catch |err| {
         std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
         std.process.exit(2);
@@ -6209,7 +6319,7 @@ test {
     _ = &@import("tools/descriptions.zig");
     _ = &@import("core/cron_registry.zig");
     _ = &@import("skills/tool.zig");
-    _ = &@import("app/config.zig");
+    _ = &@import("core/file_config.zig");
     _ = &@import("core/subagent.zig");
     _ = &@import("core/patch.zig");
     _ = &@import("core/event_journal.zig");

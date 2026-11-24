@@ -392,7 +392,7 @@ the same root `"preview"` in `<state root>/config.json` and the same
 `--preview`, `--no-preview`, `--preview=teamwork` and `--no-preview=teamwork`
 flags as the other preview features. Flags may precede `teamwork` or follow
 the action; the last flag naming the feature wins and overrides the saved value. CLI dispatch
-before App initialization and App initialization share `app/config.zig`'s
+before App initialization and App initialization share `core/file_config.zig`'s
 `resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
 selects the feature; it does not approve a task or authorize spend.
 
