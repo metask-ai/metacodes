@@ -590,6 +590,8 @@ pub const Run = struct {
         errdefer self.destroy();
         if (raised_cap_usd != null and self.ledger.isExhausted()) return error.CapNotRaised;
         self.candidates = saved.candidates;
+        if (raised_cap_usd != null and self.state == .approved and self.pendingCandidateEstimate() > self.ledger.remainingUsd())
+            return error.CapNotRaised;
         for (self.candidates[0..cfg.candidates.len], 1..) |candidate, number| {
             if (candidate.status != .selected) continue;
             const selected = try self.candidateWorktree(number);
@@ -881,6 +883,7 @@ pub const Run = struct {
             candidate.status = .implementing;
             const implementer_packet = try self.renderPacket(.implementer, "");
             defer self.gpa.free(implementer_packet);
+            if (try self.candidateRoundsExhausted(.implementer)) return true;
             const implementer = try self.openSeat(.implementer, spec, implementer_packet);
             try self.setSeatStatus(implementer, .working);
             const built = try self.runImplementer(implementer, spec, workspace);
@@ -897,6 +900,7 @@ pub const Run = struct {
         const reviewer_spec = self.cfg.seats.getPtrConst(.reviewer);
         const reviewer_packet = try self.renderPacket(.reviewer, "");
         defer self.gpa.free(reviewer_packet);
+        if (try self.candidateRoundsExhausted(.reviewer)) return true;
         const review_seat = try self.openSeat(.reviewer, reviewer_spec, reviewer_packet);
         trial.reviewer = review_seat;
         try self.setSeatStatus(review_seat, .working);
@@ -914,6 +918,12 @@ pub const Run = struct {
             else => candidate.status = .rejected,
         }
         return false;
+    }
+
+    fn candidateRoundsExhausted(self: *Run, role: Role) Error!bool {
+        if (self.dispatched.get(role) < self.dispatchCap(role)) return false;
+        try self.transition(.{ .failed = .rounds_exhausted });
+        return true;
     }
 
     fn candidateWorktreeExists(workspace: []const u8) Error!bool {

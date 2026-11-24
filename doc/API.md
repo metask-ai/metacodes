@@ -475,7 +475,8 @@ a host-policy fingerprint still support status, and need a new approval to run.
 A run that reached its cap pauses in `budget_exhausted` with its worktree and
 ledger kept; `detail` names the phase it continues from. Parallel candidates
 that already have a verdict keep it, and unfinished ones continue in their
-worktrees. A `wallclock_only` seat that ran out of time also ends in
+worktrees, within the approved rounds per role; a cap that does not cover
+their estimate is refused and the run stays paused. A `wallclock_only` seat that ran out of time also ends in
 `budget_exhausted`, with `detail: null`: a higher dollar cap would not help,
 so it cannot continue. While a launched Manager still holds its allowance,
 the run stays locked until that allowance is settled. `teamwork resume <id>

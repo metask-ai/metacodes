@@ -1899,6 +1899,7 @@ test "teamwork candidates L2: a budget pause among candidates keeps the decided 
     }
     var root_buf: PathBuf = undefined;
     try writeFile(fx.runFile(&root_buf, ""), "candidates/candidate-2/partial.txt", "partial\n");
+    try testing.expectError(error.CapNotRaised, runtime.Run.reopenWithCap(testing.allocator, deps, paused_cfg, fx.state(), id, 2.25));
     const run = try runtime.Run.reopenWithCap(testing.allocator, deps, paused_cfg, fx.state(), id, 5);
     defer run.destroy();
     try testing.expectEqual(runtime.CandidateStatus.approved, run.status().candidates[0].status);
@@ -1907,6 +1908,36 @@ test "teamwork candidates L2: a budget pause among candidates keeps the decided 
     try testing.expectEqualStrings("implementer-1:done,implementer-2:failed,reviewer-1:done,implementer-3:done,reviewer-2:done,judge-1:done", seatIds(run.status(), &ids_buf));
     try testing.expect(std.mem.indexOf(u8, seats.packetOf("judge-1"), "- `candidate-1` passed its verified review. Eligible.") != null);
     try expectFile(fx.repo(), "feature.txt", "feature\n");
+}
+
+test "teamwork candidates L2: resuming candidates under a higher cap never dispatches past the approved rounds" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-candidates-pause-rounds");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .require = "hidden-test.sh", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_hidden },
+        .{ .seat = "implementer-2", .charge_usd = 2 },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const cfg = try candidatesCfg(&fx, ",\"max_rounds\":1,\"candidates\":2,\"candidate_estimate_usd\":0.5");
+    var paused_cfg = cfg;
+    paused_cfg.budget_usd = 2;
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, paused_cfg, fx.options());
+        defer run.destroy();
+        try testing.expectEqual(runtime.State{ .budget_exhausted = .approved }, try swe_loop.drive(run));
+    }
+    const run = try runtime.Run.reopenWithCap(testing.allocator, deps, paused_cfg, fx.state(), fx.options().run_id, 5);
+    defer run.destroy();
+    try testing.expectEqual(runtime.State{ .failed = .rounds_exhausted }, try swe_loop.drive(run));
+    var ids_buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("implementer-1:done,implementer-2:failed,reviewer-1:done", seatIds(run.status(), &ids_buf));
 }
 
 test "teamwork candidates L2: an invalid judgment runs the judge again; no approved candidate fails without a judge" {
