@@ -136,6 +136,7 @@ pre.block{border:1px solid var(--border);border-radius:4px;background:var(--grou
 .board-bar{display:flex;justify-content:flex-end;margin-bottom:16px}.board-bar select,.board-model{background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;padding:6px 10px;font:inherit}
 .board-actions{display:flex;gap:14px;align-items:center}.board-link{font-size:12px;color:var(--muted);text-decoration:none}.board-link:hover{color:var(--text)}
 .metrics.leaders{margin:4px 0 20px}
+.board-harness{margin:-8px 0 14px;font-size:12px}
 .scatter-box{margin:0 0 22px;border:1px solid var(--border);border-radius:8px;background:var(--ground);padding:16px 20px 14px}
 .glyph{display:inline-block;flex:none;width:9px;height:9px;border-radius:50%}
 .glyph[data-shape=square]{border-radius:1px}.glyph[data-shape=diamond]{border-radius:1px;transform:rotate(45deg) scale(.85)}
