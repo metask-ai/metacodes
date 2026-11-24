@@ -9,6 +9,7 @@
 | L2 组件 | `tests/component/*.zig`(mock HTTP / pty / 子进程) | `zig build test:spike` | 进程内 mock SSE server |
 | L3 集成 | `tests/integration/*.zig`(真 fs、真子进程、真本地 TinyKG) | 同上,或 `zig build test:integration-monolithic` 单进程对照 | tmp 目录 + bundled TinyKG |
 | L4 合约/门禁 | AgentCore ABI、TinyKG 边界、eval 框架、平台层 | `zig build agentcore:test` / `test:tinykg-binary` / `test:eval` / `test:platform` | 见下 |
+| 契约快照 | `tests/contract/`:对外承诺的字节(见下方"契约快照") | `zig build test:contract` | 已安装的 CLI + 回放 mock provider,全部离线 |
 | L5 E2E(可选) | `tests/e2e/`、`tests/tty/` 真模型/真终端 | `tests/e2e/run_e2e.sh`、`zig build test:e2e-tty` | 真实 API key,不进默认 CI |
 
 各命令的分片方式与参数见下方"常用命令"。
@@ -72,6 +73,7 @@ tests/
 ├── component/               组件测试(mock HTTP / pty)
 ├── integration/             集成测试(子进程、真 fs)
 ├── integration_suite.zig    聚合 L2/L3 的 inventory source of truth
+├── contract/                对外契约快照(test:contract):ABI、Zig API、请求字节、事件流、落盘格式、CLI
 ├── agentcore_artifact_consumer/  source-free AgentCore 消费端 fixture
 ├── e2e/                     真模型 e2e(不进默认 CI)
 ├── tty/                     虚拟屏幕网格 TTY 回放框架
@@ -88,6 +90,51 @@ alt-screen、宽字符、底部滚入 scrollback,外加有界的 scrollback 内�
 ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollback,不读内部字段。
 用例:`render_region_contract_test.zig`(emit/erase 成对、半行续接、阶段交接、窄终端 footer)、
 `md_stream_convergence_test.zig`(助手 markdown 流在任意切分下收敛到整段渲染)。
+
+## 契约快照(tests/contract)
+
+下游服务依赖的行为固定成快照,迁移 PR 只改依赖方向,不改这些字节。入口只有一个:
+`zig build test:contract`,CI 在 Gates (Linux) 的 `checks` 腿上跑。快照有差异时,测试打印
+文件名、第一处不同的行列和 diff,并失败。
+
+| 契约面 | 快照 | 怎么得到 |
+|---|---|---|
+| AgentCore C ABI | `abi/agentcore_h.txt`、`abi/exports.txt` | translate-c 后的 `agentcore.h`:每个 struct 的大小、对齐、字段偏移和大小,函数和函数指针签名,常量(含 `METASK_AGENTCORE_ABI_REVISION`),头文件 sha256;共享库实际导出的符号 |
+| AgentCore 运行与 checkpoint | `scenarios/abi_session/expected/*` | 用 `std.DynLib` 加载发布的共享库,经 `sdk/zig` 跑一次带工具的 Run,记 CoreEvent 和请求;再把检入的 `scenarios/abi_session/checkpoint.bin` 恢复成新 Session 并跑一次,记恢复报告、CoreEvent 和请求 |
+| Zig 源码 API | `zig_api/metacodes-core.txt` | 从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;别名记录目标函数的原型或目标常量的值;超过 600 字节的值记长度和摘要 |
+| 发给模型的请求 | `scenarios/<场景>/expected/request-NNN.txt` | 已安装的 CLI 跑场景,回放 mock provider 收到的请求头和完整请求体 |
+| 事件流 | `scenarios/<场景>/expected/stream.jsonl`、`process.txt` | 同一次运行的 `--json --stream-json` 输出、退出码、stderr;所有场景(含 KG)的 `tool_result` 都先核对 `content_bytes` 和原始内容的长度,再归一化 |
+| `serve` 和 `--web` | `scenarios/daemon_session/expected/{serve,web}/*` | 启动 `serve --uds` 和 `--web`,经 UDS attach 逐行、经 `GET /events` 按 SSE 帧读一次 Run 的 journal(读到 `run_done` 那一帧的终止空行;缺终止空行、一帧多行都失败),`web/events.sse` 记响应头和每一帧;以及这次 Run 的请求 |
+| KG 注入 | `scenarios/kg_injection/expected/*` | 用 staged TinyKG,第一次运行经 KgRemember 记一条记忆,第二次运行的请求里带上注入的 Knowledge Graph 段;测试结束停掉自己的 tinykgd |
+| 落盘格式(写) | `scenarios/<场景>/expected/session-N/*`、`state-files.txt` | 运行后的 transcript.jsonl、meta.json 和 state 目录文件清单 |
+| 落盘格式(读) | `state_fixture/read-back.txt` | 检入的旧 session(`state_fixture/projects/PROJECT/`)用当前代码读回,再序列化 |
+| CLI 外观 | `cli/*.txt` | `--help`、子命令 help、主要错误路径的退出码和输出 |
+
+`-p` 场景:`single_turn`、`tool_multi_turn`(Read 后 Write)、`parallel_tools`(一轮两个 Read)、
+`permission_denied`(无人确认时 Write 被拒、规则禁止 Bash)、`subagent`(Task 派 Explore)、`mcp_tool`
+(stdio mock MCP 的 echo)、`skill_activation`(项目 skill)、`compaction`(强制自动压缩)。
+每个场景目录里放输入:`sse-NNN.txt` 是 provider 依次回的 SSE,`work/` 复制到工作目录,
+`state/` 复制到 state 目录(其中 `<MOCK_MCP>` 换成 mock MCP 的路径)。CLI 在 `/tmp` 下的
+工作目录里用 `env -i` 跑,`TZ=UTC`;测试进程本身也设 `TZ=UTC`、`SHELL=/bin/sh`。
+
+不稳定的值按 `tests/contract/normalize.zig` 的规则换成占位符,规则的自测在 `test:units`:
+临时根目录 → `<ROOT>`,CLI、mock MCP、TinyKG 路径 → `<CLI>`、`<MOCK_MCP>`、`<TINYKG>`、
+`<TINYKGD>`,mock provider 的地址 → `<PROVIDER>`,版本号 → `<VERSION>`;今天的日期 → `<DATE>`,
+日期加时间 → `<TIMESTAMP>`;本机的 `Platform: <值>`、`OS Version: <uname>` 只换这个值本身,
+后面的字节保留;键名以 `_ms`、`_ns`、`_at`、`_unix`、`Nano` 结尾的数字和 `content_bytes`
+→ `<N>`;`trace_id` 的字符串值 → `<ID>`;UUID → `<UUID>`;16 位以上含数字的十六进制串 →
+`<HEXn>`(`offer-` 后面的 offer id 是固定的,保留)。
+请求体在每个 `{`、`[`、`,` 之后和字符串里每个 `\n` 转义之后断行,去掉所有换行就是原始字节。
+
+改动确实要改变契约时,显式更新快照,并把快照的 diff 和代码放进同一个 PR:
+
+```bash
+zig build test:contract -Dupdate-contract
+```
+
+`-Dupdate-contract` 不会重写 `checkpoint.bin` 和 `state_fixture/` 这类旧数据 fixture:它们
+代表旧版本写下的数据,新代码要能读。`src/lib.zig` 的 API 快照只读源码,也在 `gate:static`
+和 `test:units` 里跑。
 
 ## 已知执行覆盖缺口(登记非沉默)
 

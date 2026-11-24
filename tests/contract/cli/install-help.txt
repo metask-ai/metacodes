@@ -1,0 +1,19 @@
+$ metacodes --state-dir <ROOT>/state install --help
+exit: 0
+--- stdout
+usage: metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <agentcore-bundle-dir>]
+                         [--link <bin-dir> [--link-name <name>]] [--upgrade]
+                         [--allow-downgrade] [--force]
+                         [--release-base <url> | --checkout <dir>]
+
+Installs the release unit this executable belongs to at <dir> as one isolated
+install: its own state root (default <dir>/state), kernels, TinyKG and, with
+--sdk, the AgentCore SDK under <dir>/sdk/agentcore. --link writes a launcher
+into a directory on PATH. Ends with the installed `doctor --strict`.
+--upgrade replaces another version of this product's install (state kept),
+but never a newer one with an older one unless --allow-downgrade;
+--force also replaces foreign files and an existing launcher.
+--release-base records the releases mirror this unit came from, and
+--checkout the checkout that built it, for `metacodes update`; without
+either the install keeps the source its record already names.
+--- stderr

@@ -213,7 +213,7 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `integration` | Windows only: `zig build test:integration`, whose integration suite waits five minutes for the ReleaseSmall app there |
 | `product` | `zig build test:product` (the smokes, and the evaluation suite as three shards), with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
 | `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on POSIX also the footprint red lines (`scripts/perf_baseline.sh`, report-only: written to the job summary, never fails the leg); on macOS also its native ARM64 executable built for the release target and held to it (`scripts/check_binary_baseline.py`); on Windows also the version state gate and the Windows script suites |
-| `checks` | The linters (`scripts/lint.py`, Linux), the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
+| `checks` | The linters (`scripts/lint.py`, Linux), the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the contract snapshots (`zig build test:contract`, Linux; `tests/README.md`), the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 Before any of these, every leg on every platform runs `zig build
 gate:static`: `zig fmt --check`, the scans of `http-status:gate` and

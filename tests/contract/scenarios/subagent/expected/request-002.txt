@@ -1,0 +1,136 @@
+POST /v1/messages HTTP/1.1
+user-agent: metacodes/<VERSION>
+connection: keep-alive
+anthropic-version: 2023-06-01
+content-type: application/json
+authorization: Bearer sk-contract
+
+{
+"model":"claude-sonnet-4-20250514",
+"max_tokens":32000,
+"messages":[
+{
+"role":"user",
+"content":[
+{
+"type":"text",
+"text":"Which file holds the notes?"}]}],
+"system":"You are an Explore subagent. Your job is to help the parent agent locate code and answer \"where is X?\" / \"which files reference Y?\" / \"what does Z look like?\" questions.\n
+\n
+You are read-only. Use Glob, Grep, and Read to find and analyze code. You CANNOT use Write or Edit.\n
+\n
+Return a concise summary that includes:\n
+- File paths (with line numbers where relevant)\n
+- Short excerpts of the most important code\n
+- A brief conclusion\n
+\n
+Be thorough proportional to the thoroughness level the parent requests.\n
+\n
+\n
+# Environment\n
+- You are running as a subagent (agent type: Explore).\n
+- Working directory: <ROOT>/work\n
+- Model: low\n
+- Allowed tools: Read, Glob, Grep\n
+- Disallowed tools: Write, Edit, Bash\n
+",
+"stream":true,
+"tools":[
+{
+"name":"Read",
+"description":"Reads a file from the local filesystem. You can access any file directly by using this tool.\n
+Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n
+\n
+Usage:\n
+- The file_path parameter must be an absolute path, not a relative path\n
+- By default, it reads up to 2000 lines starting from the beginning of the file\n
+- Files larger than 256KB are rejected for a full read — pass offset+limit to read a range, or use Grep to find specific content\n
+- Very long single lines are truncated; the marker \"[line truncated]\" indicates this\n
+- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n
+- When you already know which part of the file you need, only read that part. This can be important for larger files.\n
+- Results are returned using cat -n format, with line numbers starting at 1\n
+- This tool reads images (PNG, JPG, GIF, WEBP). When the active model supports image input the image is presented visually. When it does not, the call fails with error code capability_unsupported and the detail names which models on this route can view images; do not retry the same Read, pick another approach (switch model, or extract text/metadata with a script).\n
+- This tool cannot read PDF files. It has no PDF extraction or page-rendering path and no pages parameter; reading a .pdf here yields its raw bytes, not its contents.\n
+- Jupyter notebooks (.ipynb files) are read as their raw JSON, not as rendered cells; use NotebookEdit to modify a cell.\n
+- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n
+- You will regularly be asked to read screenshots. If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path. This tool will work with all temporary file paths.\n
+- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.",
+"input_schema":{
+"type":"object",
+"properties":{
+"file_path":{
+"type":"string",
+"description":"The absolute path to the file to read"},
+"offset":{
+"type":"integer",
+"description":"The line number to start reading from (1-based)"},
+"limit":{
+"type":"integer",
+"description":"The number of lines to read"},
+"outline":{
+"type":"boolean",
+"description":"Return a symbol outline (functions/types with line numbers) instead of file contents. Requires an installed language server for the file's language; falls back to normal reading otherwise, naming the reason when the language server is unavailable."}},
+"required":[
+"file_path"]}},
+{
+"name":"Glob",
+"description":"- Fast file pattern matching tool that works with any codebase size\n
+- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n
+- Returns matching file paths sorted by modification time\n
+- Use this tool when you need to find files by name patterns",
+"input_schema":{
+"type":"object",
+"properties":{
+"pattern":{
+"type":"string",
+"description":"The glob pattern to match files against (e.g. **/*.zig)"},
+"path":{
+"type":"string",
+"description":"The directory to search in (defaults to cwd)"}},
+"required":[
+"pattern"]}},
+{
+"name":"Grep",
+"description":"A powerful search tool built on ripgrep\n
+\n
+Usage:\n
+- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n
+- Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n
+- Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\") or type parameter (e.g., \"js\", \"py\", \"rust\")\n
+- Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts\n
+- Results are capped at 250 lines by default (head_limit); pass head_limit:0 for unlimited, or use offset to page. Prefer narrowing the pattern over fetching everything.\n
+- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\\{\\}` to find `interface{}` in Go code)\n
+- Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \\{[\\s\\S]*?field`, use `multiline: true`\n
+- Searching a truncated tool result: pass its artifact_id instead of path. One search answers \"where in this output is X\" directly; paging the same result with ReadArtifact costs one round-trip per 32KB and re-sends the whole context each time. output_mode must be \"content\" or \"count\" (there is only one file to name), and path must be omitted.",
+"input_schema":{
+"type":"object",
+"properties":{
+"pattern":{
+"type":"string",
+"description":"The regular expression pattern to search for in file contents"},
+"path":{
+"type":"string",
+"description":"File or directory to search in (defaults to cwd)"},
+"artifact_id":{
+"type":"string",
+"description":"Search a recovered tool-result artifact instead of a path. Use the sha256 artifact_id from a truncated result to find the part you need in one call, rather than paging it with ReadArtifact. Mutually exclusive with path; output_mode must be content or count"},
+"glob":{
+"type":"string",
+"description":"Glob pattern to filter files (e.g. *.zig)"},
+"output_mode":{
+"type":"string",
+"description":"Output mode",
+"enum":[
+"content",
+"files_with_matches",
+"count"]},
+"-i":{
+"type":"boolean",
+"description":"Case insensitive search"},
+"-n":{
+"type":"boolean",
+"description":"Show line numbers (content mode)"}},
+"required":[
+"pattern"]}}],
+"cache_control":{
+"type":"ephemeral"}}

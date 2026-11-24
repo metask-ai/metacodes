@@ -1,0 +1,62 @@
+$ metacodes --state-dir <ROOT>/state login --help
+exit: 0
+--- stdout
+Usage:
+  metacodes login
+  metacodes login --no-browser
+  metacodes login status
+  metacodes login --oauth-token-json <token-response.json>
+  metacodes login --provider <id> [--client-id <client>] [--device-code] [--no-browser]
+  metacodes login --provider <id> --oauth-token-json <token-response.json>
+  metacodes login --api-key <key>
+  metacodes login --provider <id> [--key-page <page>] [--no-browser]
+  metacodes login --provider <id> (--api-key <key> | --api-key-stdin) [--key-page <page>] [--no-check]
+  metacodes logout
+  metacodes logout --provider <id>
+
+Default login starts a local browser OAuth flow on /auth/metask/callback.
+Use --no-browser to print the URL without launching a browser. In an SSH
+session, where the browser cannot come back to this machine, it signs in
+with the device code instead (--no-browser keeps the browser sign-in, and
+prints the ssh -L forward it needs). It waits for the browser 10 minutes
+(METACODES_LOGIN_CALLBACK_TIMEOUT_MS; 0 waits without a limit). A browser
+on another computer ends on a page that does not load: paste that page's
+address at the prompt to finish the sign-in here (also for --provider
+sign-ins that wait for a localhost callback).
+
+`login --provider <id>` signs in to that provider and stores the token
+in its own OAuth session, never the Metask credential store. It uses a
+loopback-redirect PKCE flow by default; --device-code is the flow for a
+headless or SSH session that cannot open a browser. --client-id supplies
+the registered OAuth client when the profile declares none.
+`login --provider metask` signs in to Metask with a code confirmed on any
+device; at a terminal it then asks for the model and reasoning level, as
+the browser sign-in does.
+
+A provider that signs in with an API key (the GLM Coding Plan) opens the
+page the key is created on, reads the pasted key without showing it,
+checks it with a request the provider does not bill, and stores it in
+<state root>/keys/<provider>.json (0600). --key-page picks the page
+(cn-personal, cn-team, global-personal, global-team), --no-check stores
+the key unchecked, and `logout --provider <id>` removes it.
+
+A provider whose site creates the key (OpenRouter) signs in there: the
+browser on this machine, or with --device-code on another device, whose
+page shows a code to paste back here (the way over SSH, which is taken
+unasked there unless --no-browser keeps the browser). The key is your
+own account's and is stored like a pasted one; `logout --provider <id>`
+removes it from this machine and names the page where you delete it.
+--api-key-stdin stores a key you created yourself instead.
+
+`login status` says which credential a plain start here uses and why:
+the step of the startup order that decides, and what each step holds
+(names, paths and expiry; never a key or a token).
+
+OAuth token JSON must match the token endpoint response:
+access_token, refresh_token, token_type=Bearer, expires_in, and for
+Metask gateway_url and models_url. It remains the path for recovery.
+The Metask sign-in is stored as the Metask session in
+<state root>/oauth/metask.json; its model and reasoning level, and a key
+from `login --api-key`, in <state root>/auth.json. Both are 0600
+(see `metacodes doctor`).
+--- stderr

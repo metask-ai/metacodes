@@ -1,0 +1,52 @@
+$ metacodes --state-dir <ROOT>/state providers --help
+exit: 0
+--- stdout
+usage: metacodes providers add <id> --base-url <url> --protocol <wire> [--protocol <wire>[=<url>]]...
+                           [--model <model>]... [--probe] [--display-name <name>]
+                           [--key-env <VAR>] [--auth bearer|header:<name>[:<prefix>]]
+                           [--dialect <vendor>] [--subscription-plan] [--replace]
+       metacodes providers add                 (at a terminal: asks for each part)
+       metacodes providers probe <id>
+       metacodes providers probe --base-url <url> --protocol <wire> [--auth ...] [--key-env <VAR> | --api-key-stdin]
+       metacodes providers list
+       metacodes providers remove <id>
+
+A provider of your own: a relay, a company gateway, a server on this machine
+(Ollama, vLLM). `add` writes it to <state root>/config.json under
+custom_providers.<id>, after checking the whole file the way
+`metacodes --check-providers` does; it applies from the next start.
+
+  <id>            Lowercase letters, digits, '-', '_', '.'. Permanent: to rename
+                  one, add a new one and remove the old.
+  --base-url      Where the API is: https, or plain http to this machine only
+                  (127.0.0.1, localhost, ::1). No user name or password in it.
+  --protocol      openai_chat, openai_responses, anthropic_messages,
+                  gemini_generate_content or bedrock_converse. Repeat it for a
+                  relay that serves several: one provider, one channel each.
+                  wire=<url> gives that one its own address. Anthropic and Gemini
+                  addresses work with or without their /v1 or /v1beta.
+  --model         A model to offer; repeat it.
+  --probe         Ask the endpoint which models it serves. At a terminal you pick
+                  from the list (and paste the key; Enter, for a server on this
+                  machine that needs none, stores the placeholder `none`);
+                  elsewhere give --model and the probe checks the ids.
+  --display-name  What /model calls it (the id otherwise).
+  --key-env       The variable its key is read from, in your shell or in
+                  <state root>/.env. Or store the key with
+                  `metacodes login --provider <id>` (<state root>/keys/<id>.json).
+  --auth          How the key is sent: bearer (the default; gemini_generate_content
+                  alone defaults to x-goog-api-key), header:<name> such as
+                  header:x-api-key, or header:<name>:<prefix>.
+  --dialect       Whose models these are when their names do not say: openai,
+                  claude, gemini, glm, kimi, deepseek, qwen, minimax, mistral,
+                  openrouter.
+  --subscription-plan
+                  A coding plan licensed for interactive use (Bailian's, Ark's):
+                  a -p, serve or CI start on it prints a warning.
+  --replace       Change one that exists: only what you give changes, and what was
+                  written by hand (prices, limits, controls) stays.
+
+`probe` lists what the endpoint serves and stores nothing. `list` shows each
+definition and where its key comes from. `remove` removes the definition, its
+settings, its stored key and login, and a default model that was one of its.
+--- stderr

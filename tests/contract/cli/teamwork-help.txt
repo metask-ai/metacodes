@@ -1,0 +1,29 @@
+$ metacodes --state-dir <ROOT>/state teamwork --help
+exit: 0
+--- stdout
+usage: metacodes [--state-dir <dir>] teamwork run --request-file <file> --approve [options]
+       metacodes [--state-dir <dir>] teamwork status <id> [--json]
+       metacodes [--state-dir <dir>] teamwork resume <id> --approve [--budget-usd <dollars>] [provider options]
+       metacodes [--state-dir <dir>] teamwork mcp --request-file <file> --approve [options]
+
+Run options: --id <id> --budget-usd <dollars> --max-rounds <n>
+             --events (run/resume: teamwork.snapshot and teamwork.event lines on stdout)
+             --preview | --no-preview | --preview=teamwork,... | --no-preview=...
+             (last flag wins per feature; overrides saved preview)
+             --check-command <command> --config-json <teamwork-object>
+Provider options: --provider <profile> --model <model> --base-url <url>
+                  --api-key <key> --verbose
+Configuration: state/config.json teamwork < project/.metacodes/teamwork.json < CLI.
+The request may start with [skip-interview] and [seats=<role>:<harness>[:<model>],...]
+segments; seats apply to this run only. The rest of the request is approved as is.
+A positive dollar cap and explicit --approve are required. Approval covers
+the request, configured harnesses/check, spend up to the cap and merge-back.
+Teamwork requires the teamwork preview feature (off by default).
+--preview does not approve a task.
+Status and cancellation of an existing handle remain available with preview off.
+Runs are synchronous. Resume uses the saved approved policy, never new overrides.
+A run its budget stopped keeps its worktree; resume it with --approve --budget-usd
+<higher cap> to approve that cap and continue. Spend so far counts against it.
+Status always emits JSON and starts no provider. Exit: 0 done/status/help,
+1 terminal failure, 2 invalid input/refusal. Required sandbox; no fallback.
+--- stderr

@@ -1,0 +1,4 @@
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"greet me"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"tool_use","id":"toolu_01","name":"Skill","input":"{\"name\":\"greet\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"# Skill: greet\n\nBase directory for this skill: <ROOT>/work/.claude/skills/greet\n\n\nAlways greet with \"Ahoy\".\n","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"Ahoy!"}]}

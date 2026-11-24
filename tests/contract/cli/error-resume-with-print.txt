@@ -1,0 +1,5 @@
+$ metacodes --state-dir <ROOT>/state --resume abc -p x
+exit: 2
+--- stdout
+--- stderr
+error: --resume opens the interactive REPL and cannot be combined with -p/--print or - (use --help to list supported flags)
