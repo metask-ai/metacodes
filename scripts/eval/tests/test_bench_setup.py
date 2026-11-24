@@ -2451,7 +2451,7 @@ class EgressRunTest(SetupFixture):
         manager, client, _ = self.prepare_remote(profile=True)
         self.harbor_local_suite()
         self.egress_executor(egress="workbench")
-        release = self.root / "release"
+        release = self.root / "harbor-release"
         os.environ.update(FAKE_EGRESS_FETCH="1", FAKE_LATE_TRAFFIC="1", FAKE_BENCH_RELEASE_FILE=str(release))
         run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
                                           "tasks": ["humaneval-7"], "executor": "relay-4090"})
