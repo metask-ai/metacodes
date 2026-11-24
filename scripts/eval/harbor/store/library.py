@@ -184,9 +184,9 @@ class StoreLibrary:
 
     def delete_job(self, job: str, jobs_dir: Path, remove_files: Callable[[], None]) -> None:
         """Delete one job this jobs directory owns: its files (`remove_files`
-        also unlinks it from the profile manifests), then its rows and the
-        profiles' rows, so a failure leaves a job that a retry finds and
-        finishes."""
+        also unlinks it from the profile manifests), then in one transaction
+        its rows and its links from this directory's profile rows, so a
+        failure leaves a job that a retry finds and finishes."""
         jobs_dir = Path(jobs_dir).resolve()
         with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
             sources = self._owned_sources(_job_owners([job], jobs_dir), f"作业 {job}")
@@ -195,7 +195,15 @@ class StoreLibrary:
             remove_files()
             with self.store.transaction() as tx:
                 _delete_job_rows(tx, [job])
-            ingest.ingest_profiles(self.store, jobs_dir / ingest.PROFILES_DIR)
+                profiles = tx.query("SELECT id, record_json FROM profiles WHERE source_dir = ?",
+                                    (str(jobs_dir / ingest.PROFILES_DIR),))
+                for profile, record_json in profiles:
+                    record = json.loads(record_json)
+                    items = [item for item in record.get("items") or [] if item.get("run") == job]
+                    for item in items:
+                        item["run"] = None
+                    if items:
+                        tx.execute("UPDATE profiles SET record_json = ? WHERE id = ?", (ingest._json(record), profile))
 
     def _owned_sources(self, owners, label: str):
         with self.store.read() as tx:

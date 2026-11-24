@@ -433,6 +433,25 @@ class ProfileTest(unittest.TestCase):
         self.workbench.library.sync()
         self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
 
+    def test_a_profile_left_only_in_the_database_drops_a_deleted_job(self):
+        record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
+        doomed, kept = [item['run'] for item in record['items']]
+        self.client.request('api/profile?id=' + record['id'])
+        self.manager.profiles.path(record['id']).unlink()
+
+        self.client.request('api/job/delete', {'name': doomed})
+
+        with self.workbench.library.store.read() as tx:
+            stored = json.loads(tx.one("SELECT record_json FROM profiles WHERE id = ?", (record['id'],))[0])
+        self.assertEqual([i['run'] for i in stored['items']], [None, kept])
+        _write(self.manager.jobs_dir / doomed / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(self.manager.jobs_dir / doomed / 'result.json', {'started_at': '2026-11-16T08:00:00Z',
+                                                                'finished_at': '2026-11-16T08:30:00Z', 'n_total_trials': 0})
+        self.workbench.library.sync()
+        self.client.request('api/profile/delete', {'id': record['id']})
+        self.assertTrue((self.manager.jobs_dir / doomed).is_dir())
+        self.assertFalse((self.manager.jobs_dir / kept).exists())
+
     def test_a_harbor_job_still_running_without_a_receipt_is_not_deleted(self):
         job = self.manager.jobs_dir / 'harbor-by-hand'
         _write(job / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
