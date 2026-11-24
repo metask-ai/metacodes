@@ -374,6 +374,22 @@ status, compatibility boundaries, and entry points are defined by
   still counts toward the double-press exit, so the picker never traps the
   session.
 
+- **A background job that finishes while the model is answering wakes the
+  agent** (#719). When a job the model had started finished during the
+  model's last answer, the turn ended without waiting, because the job was no
+  longer running, and the exit only came with the next message: the agent
+  stopped although its job was done. The end of a turn now also counts a
+  finished job whose exit has not been announced, so the exit is delivered
+  and the agent goes on, as when the job finishes during the wait.
+
+- **The agent carries on when a background job it waits for finishes**
+  (#714). After the model said it would wait for a background job, the job
+  could finish and the agent stay idle until the next message, which then
+  brought the job's exit along. The wait looked for finished jobs, found
+  none, and then, if the job ended right then, found nothing running and
+  ended the turn. It now checks what is still running before it looks for
+  finished jobs.
+
 - **A foreground Bash command is collected as soon as it exits** (#670). The
   wait slept 100 ms before it first looked at the job, so every foreground
   call, even `true`, cost at least 100 ms. It now checks at once and then

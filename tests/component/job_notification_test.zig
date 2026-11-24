@@ -61,6 +61,7 @@ const FakeProvider = struct {
     /// Index of the first send whose request carried a notification; null = never.
     notification_send_index: ?u8 = null,
     notification_job_id: [12]u8 = "000000000000".*,
+    exit_during_answer: ?ExitDuringAnswer = null,
 
     fn model(_: *anyopaque) []const u8 {
         return "fake";
@@ -70,6 +71,7 @@ const FakeProvider = struct {
         if (self.sends >= self.script.len or self.sends >= self.streams.len) return error.UnexpectedTestCall;
         const index = self.sends;
         self.sends += 1;
+        if (self.exit_during_answer) |exit| if (exit.send_index == index) try exit.run();
         // The job id lives in the Bash tool_result already in the conversation.
         var job_id: ?[]const u8 = null;
         for (messages) |message| {
@@ -132,6 +134,10 @@ const SpinnerBackend = struct {
     allocator: std.mem.Allocator,
     labels: std.ArrayList([]u8) = .empty,
     clears: u32 = 0,
+    wait_began: std.atomic.Value(bool) = .init(false),
+    gate_opened_by_wait: ?*const Gate = null,
+    gate_error: ?anyerror = null,
+    await_job_exits_after_turn: ?JobExitAwait = null,
 
     fn deinit(self: *SpinnerBackend) void {
         for (self.labels.items) |l| self.allocator.free(l);
@@ -146,26 +152,88 @@ const SpinnerBackend = struct {
             .set_current_tool => |s| {
                 const copy = self.allocator.dupe(u8, s.name) catch return;
                 self.labels.append(self.allocator, copy) catch self.allocator.free(copy);
+                if (isWaitingLabel(s.name)) self.beginWait();
             },
             .clear_current_tool => self.clears += 1,
+            .diag_turn_end => |end| if (self.await_job_exits_after_turn) |awaited| if (end.turn == awaited.turn) awaited.run(),
             else => {},
         }
+    }
+    fn beginWait(self: *SpinnerBackend) void {
+        self.wait_began.store(true, .release);
+        if (self.gate_opened_by_wait) |gate| gate.open() catch |err| {
+            self.gate_error = err;
+        };
     }
     fn pollThunk(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
         return null;
     }
+    fn isWaitingLabel(label: []const u8) bool {
+        return std.mem.startsWith(u8, label, "waiting for ");
+    }
     fn waitingLabelCount(self: *const SpinnerBackend) usize {
         var n: usize = 0;
-        for (self.labels.items) |l| if (std.mem.startsWith(u8, l, "waiting for ")) {
+        for (self.labels.items) |l| if (isWaitingLabel(l)) {
             n += 1;
         };
         return n;
     }
 };
 
+const JobExitAwait = struct {
+    jobs: *cc.job_registry.JobRegistry,
+    turn: u32,
+
+    fn run(self: JobExitAwait) void {
+        var polls: usize = 0;
+        while (polls < 1000 and self.jobs.hasPendingNotifyJobs(cc.session_id.SessionId.single)) : (polls += 1) {
+            cc.util_time.sleepMs(10);
+        }
+    }
+};
+
+const ExitDuringAnswer = struct {
+    send_index: u8,
+    gate: *const Gate,
+    jobs: *cc.job_registry.JobRegistry,
+
+    fn run(self: ExitDuringAnswer) !void {
+        try self.gate.open();
+        (JobExitAwait{ .jobs = self.jobs, .turn = 0 }).run();
+    }
+};
+
+const GATE_FILE = "go";
+
+const Gate = struct {
+    tmp: std.testing.TmpDir,
+    root_buf: [std.fs.max_path_bytes]u8 = undefined,
+    root_len: usize = 0,
+
+    fn init(self: *Gate) !void {
+        self.* = .{ .tmp = std.testing.tmpDir(.{}) };
+        errdefer self.tmp.cleanup();
+        self.root_len = try self.tmp.dir.realPath(std.testing.io, &self.root_buf);
+    }
+    fn deinit(self: *Gate) void {
+        self.tmp.cleanup();
+    }
+    fn root(self: *const Gate) []const u8 {
+        return self.root_buf[0..self.root_len];
+    }
+    fn open(self: *const Gate) !void {
+        const file = try self.tmp.dir.createFile(std.testing.io, GATE_FILE, .{});
+        file.close(std.testing.io);
+    }
+};
+
+const AWAIT_GATE = "i=0; while [ ! -e " ++ GATE_FILE ++ " ] && [ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; ";
+
 const BG_JOB: Step = .{ .tool_use = .{ .id = "bash-bg", .input = "{\"command\":\"sleep 0.3; echo done\",\"run_in_background\":true}" } };
 const BG_LONG_JOB: Step = .{ .tool_use = .{ .id = "bash-bg", .input = "{\"command\":\"sleep 5\",\"run_in_background\":true}" } };
-const FG_SLEEP: Step = .{ .tool_use = .{ .id = "bash-fg", .input = "{\"command\":\"sleep 0.6\"}" } };
+const GATED_JOB: Step = .{ .tool_use = .{ .id = "bash-bg", .input = "{\"command\":\"" ++ AWAIT_GATE ++ "echo done\",\"run_in_background\":true}" } };
+const GATED_SLOW_JOB: Step = .{ .tool_use = .{ .id = "bash-bg", .input = "{\"command\":\"" ++ AWAIT_GATE ++ "sleep 0.3; echo done\",\"run_in_background\":true}" } };
+const FG_OPEN_GATE: Step = .{ .tool_use = .{ .id = "bash-fg", .input = "{\"command\":\"touch " ++ GATE_FILE ++ "\"}" } };
 const SAY_WAITING: Step = .{ .text = "I will wait for the job." };
 const SAY_DONE: Step = .{ .text = "Got it, the job finished." };
 
@@ -210,19 +278,24 @@ const Fixture = struct {
 test "JobNotify agent loop delivers one persisted notification at the next turn" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    var fake = FakeProvider{ .allocator = a, .script = &.{ .{ .tool_use = .{ .id = "bash-bg", .input = "{\"command\":\"sleep 0.2; echo done\",\"run_in_background\":true}" } }, FG_SLEEP, SAY_DONE } };
-    var writer = cc.writer_backend.WriterBackend.initNull();
-    const backend = writer.backend();
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, FG_OPEN_GATE, SAY_DONE } };
+    var spinner = SpinnerBackend{ .allocator = a, .await_job_exits_after_turn = .{ .jobs = &f.jobs, .turn = 2 } };
+    defer spinner.deinit();
+    const backend = spinner.backend();
     const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
         .max_turns = 5,
         .jobs = &f.jobs,
         .job_notifications = &f.jobs,
+        .cwd_abs = gate.root(),
     }, &backend, a);
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(u8, 3), fake.sends);
-    // Delivered on the wire in the request after the foreground sleep (index 2), naming the real job.
+    // Delivered on the wire in the request after the foreground command (index 2), naming the real job.
     try std.testing.expectEqual(@as(?u8, 2), fake.notification_send_index);
     try std.testing.expect(!std.mem.eql(u8, fake.notification_job_id[0..], "000000000000"));
     try std.testing.expectEqual(@as(usize, 1), countPersistedNotifications(&f.conversation));
@@ -251,18 +324,24 @@ test "JobNotify null option injects nothing" {
 test "JobWait T1 end_turn with a running job waits in core and continues after the exit" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    var fake = FakeProvider{ .allocator = a, .script = &.{ BG_JOB, SAY_WAITING, SAY_DONE } };
-    var writer = cc.writer_backend.WriterBackend.initNull();
-    const backend = writer.backend();
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_SLOW_JOB, SAY_WAITING, SAY_DONE } };
+    var spinner = SpinnerBackend{ .allocator = a, .gate_opened_by_wait = &gate };
+    defer spinner.deinit();
+    const backend = spinner.backend();
     const started = cc.util_time.nowMs();
     const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
         .max_turns = 5,
         .jobs = &f.jobs,
         .job_notifications = &f.jobs,
+        .cwd_abs = gate.root(),
     }, &backend, a);
     const elapsed = cc.util_time.nowMs() - started;
+    if (spinner.gate_error) |err| return err;
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(u8, 3), fake.sends);
     try std.testing.expectEqual(@as(u32, 3), result.turns);
@@ -315,11 +394,15 @@ const AlwaysPending = struct {
 test "JobWait T3 pending user input ends the wait and leaves the exit for the next run" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    var fake = FakeProvider{ .allocator = a, .script = &.{ BG_JOB, SAY_WAITING, SAY_DONE } };
-    var writer = cc.writer_backend.WriterBackend.initNull();
-    const backend = writer.backend();
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, SAY_WAITING, SAY_DONE } };
+    var spinner = SpinnerBackend{ .allocator = a };
+    defer spinner.deinit();
+    const backend = spinner.backend();
     var dummy: u8 = 0;
     const started = cc.util_time.nowMs();
     const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
@@ -327,11 +410,14 @@ test "JobWait T3 pending user input ends the wait and leaves the exit for the ne
         .jobs = &f.jobs,
         .job_notifications = &f.jobs,
         .pending_input = .{ .ctx = @ptrCast(&dummy), .hasPendingFn = &AlwaysPending.hasPending },
+        .cwd_abs = gate.root(),
     }, &backend, a);
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(u8, 2), fake.sends);
     try std.testing.expect(cc.util_time.nowMs() - started < 2000);
+    try std.testing.expectEqual(@as(usize, 1), spinner.waitingLabelCount());
     // The exit was not consumed: once the job ends it is still announceable.
+    try gate.open();
     var attempts: usize = 0;
     while (attempts < 200) : (attempts += 1) {
         if (!f.jobs.hasPendingNotifyJobs(cc.session_id.SessionId.single)) break;
@@ -348,17 +434,25 @@ test "JobWait T4 abort during the wait returns aborted without consuming the exi
     var f = try Fixture.init(a);
     defer f.deinit(a);
     var fake = FakeProvider{ .allocator = a, .script = &.{ BG_LONG_JOB, SAY_WAITING, SAY_DONE } };
-    var writer = cc.writer_backend.WriterBackend.initNull();
-    const backend = writer.backend();
+    var spinner = SpinnerBackend{ .allocator = a };
+    defer spinner.deinit();
+    const backend = spinner.backend();
     var signal = cc.util_abort.AbortSignal.init();
+    var run_returned = std.atomic.Value(bool).init(false);
     const Aborter = struct {
-        fn run(target: *cc.util_abort.AbortSignal) void {
-            cc.util_time.sleepMs(150);
-            target.abort(.user_interrupt);
+        fn run(wait_began: *const std.atomic.Value(bool), returned: *const std.atomic.Value(bool), target: *cc.util_abort.AbortSignal) void {
+            while (!returned.load(.acquire)) {
+                if (wait_began.load(.acquire)) {
+                    target.abort(.user_interrupt);
+                    return;
+                }
+                cc.util_time.sleepMs(1);
+            }
         }
     };
-    const thread = try std.Thread.spawn(.{}, Aborter.run, .{&signal});
+    const thread = try std.Thread.spawn(.{}, Aborter.run, .{ &spinner.wait_began, &run_returned, &signal });
     defer thread.join();
+    defer run_returned.store(true, .release);
     const started = cc.util_time.nowMs();
     const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
         .max_turns = 5,
@@ -418,17 +512,22 @@ test "JobWait T7 the wait is visible through set_current_tool and cleared afterw
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     {
+        var gate: Gate = undefined;
+        try gate.init();
+        defer gate.deinit();
         var f = try Fixture.init(a);
         defer f.deinit(a);
-        var fake = FakeProvider{ .allocator = a, .script = &.{ BG_JOB, SAY_WAITING, SAY_DONE } };
-        var spinner = SpinnerBackend{ .allocator = a };
+        var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, SAY_WAITING, SAY_DONE } };
+        var spinner = SpinnerBackend{ .allocator = a, .gate_opened_by_wait = &gate };
         defer spinner.deinit();
         const backend = spinner.backend();
         _ = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
             .max_turns = 5,
             .jobs = &f.jobs,
             .job_notifications = &f.jobs,
+            .cwd_abs = gate.root(),
         }, &backend, a);
+        if (spinner.gate_error) |err| return err;
         try std.testing.expectEqual(@as(usize, 1), spinner.waitingLabelCount());
         var named_job = false;
         for (spinner.labels.items) |l| if (std.mem.startsWith(u8, l, "waiting for background job ") and std.mem.indexOf(u8, l, fake.notification_job_id[0..]) != null) {
@@ -482,4 +581,98 @@ test "JobWait T8 an exit left over from a previous run is delivered with the nex
     const events = try f.jobs.takeUnannouncedExits(cc.session_id.SessionId.single, a);
     defer cc.job_registry.freeJobExitEvents(a, events);
     try std.testing.expectEqual(@as(usize, 0), events.len);
+}
+
+test "JobWait T9 a job that exits between the wait's two registry checks is still delivered" {
+    const a = std.testing.allocator;
+    const ExitsAfterFirstCheck = struct {
+        checks: u32 = 0,
+        taken: bool = false,
+
+        pub fn hasPendingNotifyJobs(self: *@This(), _: cc.session_id.SessionId) bool {
+            defer self.checks += 1;
+            return self.checks == 0;
+        }
+        pub fn takeUnannouncedExits(self: *@This(), _: cc.session_id.SessionId, allocator: std.mem.Allocator) ![]cc.job_registry.JobExitEvent {
+            defer self.checks += 1;
+            if (self.checks == 0 or self.taken) return allocator.alloc(cc.job_registry.JobExitEvent, 0);
+            const events = try allocator.alloc(cc.job_registry.JobExitEvent, 1);
+            errdefer allocator.free(events);
+            events[0] = .{
+                .id = "000000000001".*,
+                .status = .exited,
+                .exit_code = 0,
+                .started_ms = 0,
+                .ended_ms = 0,
+                .command_preview = try allocator.dupe(u8, "echo done"),
+                .stdout_unread = 0,
+                .stderr_unread = 0,
+            };
+            self.taken = true;
+            return events;
+        }
+    };
+    var registry: ExitsAfterFirstCheck = .{};
+    var delivered = false;
+    var polls: usize = 0;
+    while (polls < 3) : (polls += 1) {
+        const poll = try cc.agent_loop.pollJobWait(&registry, cc.session_id.SessionId.single, a);
+        defer cc.job_registry.freeJobExitEvents(a, poll.events);
+        if (poll.events.len > 0) {
+            delivered = true;
+            break;
+        }
+        if (!poll.any_running) break;
+    }
+    try std.testing.expect(delivered);
+}
+
+test "JobWait T10 a job that exits while the model answers is delivered before the run ends" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, SAY_WAITING, SAY_DONE }, .exit_during_answer = .{ .send_index = 1, .gate = &gate, .jobs = &f.jobs } };
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
+        .max_turns = 5,
+        .jobs = &f.jobs,
+        .job_notifications = &f.jobs,
+        .cwd_abs = gate.root(),
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u8, 3), fake.sends);
+    try std.testing.expectEqual(@as(?u8, 2), fake.notification_send_index);
+    try std.testing.expect(!std.mem.eql(u8, fake.notification_job_id[0..], "000000000000"));
+    try std.testing.expectEqual(@as(usize, 1), countPersistedNotifications(&f.conversation));
+}
+
+test "JobWait T11 the wakeup cap holds back an exit that came while the model answered" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var gate: Gate = undefined;
+    try gate.init();
+    defer gate.deinit();
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    var fake = FakeProvider{ .allocator = a, .script = &.{ GATED_JOB, SAY_WAITING, SAY_DONE }, .exit_during_answer = .{ .send_index = 1, .gate = &gate, .jobs = &f.jobs } };
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(&f.conversation, fake.provider(), f.defs, &f.permission, .{
+        .max_turns = 5,
+        .jobs = &f.jobs,
+        .job_notifications = &f.jobs,
+        .job_wait = .{ .max_wakeups = 0 },
+        .cwd_abs = gate.root(),
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u8, 2), fake.sends);
+    try std.testing.expectEqual(@as(?u8, null), fake.notification_send_index);
+    const events = try f.jobs.takeUnannouncedExits(cc.session_id.SessionId.single, a);
+    defer cc.job_registry.freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
 }
