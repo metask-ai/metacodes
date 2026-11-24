@@ -91,9 +91,12 @@ pub fn effectiveProvenance(model: []const u8) []const u8 {
 }
 
 fn configuredRates(model: []const u8) ?Rates {
-    const bare = if (std.mem.indexOfScalar(u8, model, '/')) |slash| model[slash + 1 ..] else model;
     for (configured) |price| {
-        if (model_name.eqlIgnoreCase(price.model, model) or model_name.eqlIgnoreCase(price.model, bare)) return price.rates;
+        if (model_name.eqlIgnoreCase(price.model, model)) return price.rates;
+    }
+    const slash = std.mem.indexOfScalar(u8, model, '/') orelse return null;
+    for (configured) |price| {
+        if (model_name.eqlIgnoreCase(price.model, model[slash + 1 ..])) return price.rates;
     }
     return null;
 }
@@ -255,6 +258,20 @@ test "a namespaced configured price matches the model behind its provider prefix
     try std.testing.expectEqual(@as(f64, 1), effectiveRates("gateway/acme/model").input_per_mtok);
     try std.testing.expectEqual(@as(f64, 1), effectiveRates("acme/model").input_per_mtok);
     try std.testing.expectEqual(DEFAULT_RATES, effectiveRates("other/model"));
+}
+
+test "the full model id wins over a bare key listed before it" {
+    const gpa = std.testing.allocator;
+    const prices = (try parseConfigured(gpa,
+        \\{"model_prices": {"model": {"input": 9, "output": 9}, "acme/model": {"input": 1, "output": 2}}}
+    )).?;
+    defer gpa.free(prices);
+    defer freeConfigured(gpa, prices);
+    installConfigured(prices);
+    defer installConfigured(&.{});
+    try std.testing.expectEqual(@as(f64, 1), effectiveRates("acme/model").input_per_mtok);
+    try std.testing.expectEqual(@as(f64, 9), effectiveRates("gateway/model").input_per_mtok);
+    try std.testing.expectEqual(@as(f64, 9), effectiveRates("model").input_per_mtok);
 }
 
 test "a malformed model_prices table is refused and an absent one is null" {

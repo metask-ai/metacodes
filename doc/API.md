@@ -795,9 +795,11 @@ tokens:
 }
 ```
 
-A key matches the session's model case-insensitively, with or without its
-first `provider/` segment (`gateway/acme/model` matches `acme/model`, never
-`model`). `input` and `output` are required; `cached_input` and
+A key matches the session's model case-insensitively: the full model id
+first, then the id without its first `provider/` segment
+(`gateway/acme/model` matches `acme/model`, never `model`; with keys for
+both `model` and `acme/model`, the session model `acme/model` takes the
+latter). `input` and `output` are required; `cached_input` and
 `cache_write` default to `input`. A malformed table (an unknown field, a
 negative or non-numeric price) is ignored with a warning, and costs keep the
 built-in table. A configured price is a declaration, not a bill: its
