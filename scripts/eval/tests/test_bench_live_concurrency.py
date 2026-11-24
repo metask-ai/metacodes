@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import live_concurrency
 from scripts.eval.harbor.bench import remote
+from scripts.eval.tests.posix_only import POSIX
 
 
 class FakeQueue:
@@ -96,6 +97,7 @@ class Credential:
         self.pushes += 1
 
 
+@unittest.skipUnless(POSIX, "the remote driver signals Harbor's process group")
 class RemoteControlTest(unittest.TestCase):
     def test_concurrency_line_writes_the_limit_and_leaves_the_credential(self):
         with tempfile.TemporaryDirectory() as tmp:
