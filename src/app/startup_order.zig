@@ -106,6 +106,8 @@ pub const Facts = struct {
     local_preset: Preset = .none,
     /// Level 6.
     local: state_env.Choice,
+    global_default: bool = true,
+    metask_key_handed: bool = false,
 
     /// Whether a level above the stored default decides: the start judges
     /// that default only otherwise.
@@ -127,6 +129,7 @@ pub const Decision = enum {
     /// chosen, and the start lists them.
     local_unchosen,
     nothing,
+    directory_unchosen,
 
     /// The level that decided, 1 to `levels`. A file that names no provider
     /// among several decided nothing: the last level.
@@ -138,7 +141,7 @@ pub const Decision = enum {
             .stored_default => 4,
             .metask_key, .metask_session => 5,
             .local_preset, .local_provider => 6,
-            .local_unchosen, .nothing => 7,
+            .local_unchosen, .nothing, .directory_unchosen => 7,
         };
     }
 
@@ -153,6 +156,7 @@ pub fn decide(read: Facts) Decision {
     if (read.named) return .named;
     if (read.preset == .found) return .preset;
     if (read.directory_preset == .found) return .directory_preset;
+    if (!read.global_default) return if (read.metask_key_handed) .metask_key else .directory_unchosen;
     if (read.stored_default == .usable) return .stored_default;
     if (read.metask_key) return .metask_key;
     if (read.metask_session and !read.metask_key_requested) return .metask_session;
@@ -182,7 +186,7 @@ pub fn unknownPresets(read: Facts, decision: Decision) Unknown {
     var out: Unknown = .{};
     if (read.preset == .unknown) out.named = read.preset.unknown;
     if (read.directory_preset == .unknown and decision.level() > 3) out.directory = read.directory_preset.unknown;
-    if (read.local_preset == .unknown and decision.level() >= 6) out.local = read.local_preset.unknown;
+    if (read.local_preset == .unknown and read.global_default and decision.level() >= 6) out.local = read.local_preset.unknown;
     return out;
 }
 
@@ -354,4 +358,56 @@ test "an unknown preset decides nothing, and the start reports it once its level
     decision = decide(read);
     try testing.expectEqual(Decision.local_provider, decision);
     try testing.expectEqualStrings("x", unknownPresets(read, decision).local.?);
+}
+
+test "with global_default false, only what the start names or the directory remembers decides (#489)" {
+    const everything_global = factsWith(.{
+        .stored_default = usableDefault(),
+        .metask_key = true,
+        .metask_session = true,
+        .local_preset = found("c"),
+        .local = deepseek_file,
+        .global_default = false,
+    });
+    try testing.expectEqual(Decision.directory_unchosen, decide(everything_global));
+    try testing.expectEqual(levels, Decision.directory_unchosen.level());
+    try testing.expect(!Decision.directory_unchosen.byPreset());
+
+    var with_global = everything_global;
+    with_global.global_default = true;
+    try testing.expectEqual(Decision.stored_default, decide(with_global));
+
+    var named = everything_global;
+    named.named = true;
+    try testing.expectEqual(Decision.named, decide(named));
+    var preset = everything_global;
+    preset.preset = found("a");
+    try testing.expectEqual(Decision.preset, decide(preset));
+    var directory = everything_global;
+    directory.directory_preset = found("b");
+    try testing.expectEqual(Decision.directory_preset, decide(directory));
+
+    var handed = everything_global;
+    handed.metask_key_handed = true;
+    try testing.expectEqual(Decision.metask_key, decide(handed));
+    try testing.expectEqual(Decision.directory_unchosen, decide(factsWith(.{ .global_default = false })));
+}
+
+test "with global_default false, .env's unknown preset is not reported, the directory's still is (#489)" {
+    var read = factsWith(.{ .local_preset = Preset{ .unknown = "x" }, .local = deepseek_file, .global_default = false });
+    var decision = decide(read);
+    try testing.expectEqual(Decision.directory_unchosen, decision);
+    try testing.expect(!unknownPresets(read, decision).any());
+
+    read.directory_preset = Preset{ .unknown = "gone" };
+    decision = decide(read);
+    try testing.expectEqual(Decision.directory_unchosen, decision);
+    const unknown = unknownPresets(read, decision);
+    try testing.expectEqualStrings("gone", unknown.directory.?);
+    try testing.expect(unknown.local == null);
+
+    read.metask_key_handed = true;
+    decision = decide(read);
+    try testing.expectEqual(Decision.metask_key, decision);
+    try testing.expectEqualStrings("gone", unknownPresets(read, decision).directory.?);
 }

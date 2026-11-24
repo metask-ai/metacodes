@@ -1467,9 +1467,10 @@ pub const App = struct {
             .missing = missing,
             .env_path = env_path,
             .template = template,
-            .guide_url = state_env.guide_url,
+            .guide_url = if (reason == .directory_unchosen) presets_mod.guide_url else state_env.guide_url,
             .environment_keys = keys,
             .unchosen_local = if (host) |found| try displayNames(arena, found, app.unchosen_local_providers) else app.unchosen_local_providers,
+            .command = app.commandName(),
         });
     }
 

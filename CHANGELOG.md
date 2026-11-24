@@ -12,6 +12,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **A directory can be left without a default** (part of #489). With
+  `"global_default": false` at the top level of `config.json`, the `/model`
+  default, a Metask sign-in and `.env`'s choice (levels 4 to 6 of the startup
+  order) decide for no directory: a start uses what it names (`--provider`,
+  `--offer`, `--preset`, `--api-key`, `METACODES_PROVIDER` or
+  `METACODES_PRESET` in the shell) or the preset its directory remembers. In a
+  directory that remembers none, the TUI opens without a model, and a message
+  gets a red note naming `/model`, the presets and the `directory_presets`
+  entry to add; `-p`, `serve` and `--web` stop with exit code 2 before any
+  request. So an unfamiliar repository uses no account until one is chosen for
+  it. Keys and sign-ins still serve the route that is chosen; `/logout` leaves
+  the session without a model instead of switching to `.env`'s choice, and
+  `metacodes login status` marks the levels left out. A value that is not a
+  boolean fails to load with `InvalidGlobalDefault`; a malformed preset does
+  not hide the setting ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
+
 - **Teamwork trials no longer stop at permission prompts.** `teamwork run`
   has no `--permission`, so its verifier asked for each command and, with
   nobody to answer, the audit ended unavailable and nothing merged. A
@@ -476,6 +492,19 @@ status, compatibility boundaries, and entry points are defined by
   mode: typing filters, Esc clears the filter and then closes it, Enter
   applies the model under the cursor, and the input box is left alone. Vim's
   keymap takes over again once the picker closes.
+
+- **A Metask key in `.env` no longer outranks the preset the same file
+  names** (#748, part of #489). A `<state root>/.env` with
+  `METACODES_PRESET=fast` (a DeepSeek preset, say) and `METASK_API_KEY`
+  started on Metask, without a word: the file's key counted as a Metask
+  sign-in (level 5 of the startup order) unless its `METACODES_PROVIDER`
+  named another provider, so the file's own preset (level 6) was never
+  reached. The file's preset now counts as its choice too: the key signs
+  Metask in only when that preset's route is Metask, and otherwise waits
+  until Metask is chosen, as beside `METACODES_PROVIDER`. A preset
+  `config.json` does not define holds the key back as well, so the start
+  reports the name instead of quietly using Metask. `metacodes login
+  status` says why the key waits.
 
 - **A stalled HTTP MCP server no longer holds `/exit` or the first message**
   (#671). The session DELETE a Streamable HTTP client sends at close now has
