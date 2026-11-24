@@ -351,8 +351,11 @@ class ProfileTest(unittest.TestCase):
                 self.manager.profiles.advance()
                 time.sleep(.05)
             run = self.manager.profiles.get(created['id'])['items'][0]['run']
-            with self.assertRaisesRegex(ValueError, '1–16'):
-                self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 17})
+            with self.assertRaisesRegex(ValueError, '正整数'):
+                self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 0})
+            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 64})
+            record = self.manager.profiles.get(created['id'])
+            self.assertEqual([i['concurrency'] for i in record['items']], [64, 64])
 
             changed = self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 2})
 
