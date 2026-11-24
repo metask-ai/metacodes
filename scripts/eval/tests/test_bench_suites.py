@@ -238,6 +238,25 @@ class CatalogTest(unittest.TestCase):
                           "python", str(source / "adapters/gaia2/run_adapter.py"), "--cli", "--output-dir",
                           str(self.root / "out"), "--overwrite", "--revision", gaia2_cli.HF_REVISION])
 
+    def test_tau3_domains_split_the_pinned_dataset_and_need_a_user_simulator_key(self):
+        domains = [suites.get("tau3-" + d.replace("_", "-")) for d in suites.TAU3_DOMAINS]
+        pinned = suites.REGISTRY_TASKS[suites.TAU3_BENCH_REF]["tasks"]
+        self.assertEqual(sorted(t for s in domains for t in s.tasks), sorted(pinned))
+        self.assertEqual([len(s.tasks) for s in domains], [50, 114, 114, 97])
+        suite = domains[0]
+        self.assertEqual(suites.harbor_dataset_args(suite, suites.Context({}, self.root)),
+                         ["-d", "sierra-research/tau3-bench@1"])
+        self.assertEqual(suites.task_filters(suite, ["tau3-bench__tau3-airline-0"]),
+                         ["sierra-research/tau3-bench__tau3-airline-0"])
+        self.assertEqual(suites.host_env(suite), ("OPENAI_API_KEY", "OPENAI_BASE_URL", "TAU2_USER_MODEL",
+                                                  "TAU2_USER_REASONING_EFFORT", "TAU2_NL_ASSERTIONS_MODEL"))
+        for cfg in ({}, {"auth_mode": "provider"}):
+            ctx = suites.Context(cfg, self.root, env={})
+            self.assertIn("OPENAI_API_KEY", " ".join(suites.readiness(suite, ctx)))
+            ctx.env = {"OPENAI_API_KEY": "user-sim"}
+            self.assertEqual(suites.readiness(suite, ctx), [])
+        self.assertEqual(suites.host_env(suites.get("swe-bench-verified")), ())
+
     def test_gaia2_judge_follows_authentication_and_configuration(self):
         suite = suites.resolved(suites.get("gaia2-cli"))
         env = {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL", "model": "JUDGE_MODEL",

@@ -302,7 +302,8 @@ class Workbench:
                     ranked_anywhere.add(job["name"])
             boards.append({**board, "jobs": sorted(jobs, key=lambda job: job["score"], reverse=True)})
         unranked = [job for job in (board_job(view, None) for view in views) if job and job["name"] not in ranked_anywhere]
-        return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "task_count": task_count,
+        return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "description": suite.description,
+                "task_count": task_count,
                 "ranked_coverage": RANKED_COVERAGE, "boards": boards, "unranked": unranked}
 
     def job(self, name) -> Optional[Dict[str, Any]]:
