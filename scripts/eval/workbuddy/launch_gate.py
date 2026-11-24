@@ -992,6 +992,7 @@ def build_launch_manifest(
             "WorkBuddy job must declare every treatment key explicitly; "
             f"missing: {_missing_treatment_keys}"
         )
+    _reject_workbench_only_keys(project_overrides, label="paid WorkBuddy job")
     verification_checkpoint = project_overrides.get(
         "METACODES_VERIFICATION_CHECKPOINT", False
     )
@@ -2326,6 +2327,22 @@ def _expected_project_control(manifest: Mapping[str, Any]) -> Dict[str, object]:
     }
 
 
+_WORKBENCH_ONLY_KEYS = (
+    "METACODES_TEST_INTEGRITY",
+    "METACODES_DELIVERY_CADENCE",
+    "METACODES_STALL_GATE",
+)
+
+
+def _reject_workbench_only_keys(values: object, *, label: str) -> None:
+    present = [key for key in _WORKBENCH_ONLY_KEYS if key in (values or {})]
+    if present:
+        raise LaunchError(
+            f"{label} must not carry workbench-only gates the receipt's "
+            f"evaluation_treatment does not record: {present}"
+        )
+
+
 def _validate_project_control_kwargs(
     kwargs: object, expected: Mapping[str, object], *, label: str
 ) -> None:
@@ -2487,6 +2504,7 @@ def _validate_trial_project_control(
     _validate_outcome_feedback_kwargs(
         agent.get("kwargs"), manifest, label="official WorkBuddy trial"
     )
+    _reject_workbench_only_keys(agent.get("kwargs"), label="official WorkBuddy trial")
     runtime = _json(agent_dir / "metacodes-runtime-contract.json")
     backend_model_name = str(manifest.get("model", {}).get("backend_model_name") or "")
     if (

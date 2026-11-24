@@ -42,13 +42,17 @@ do not start a service or call a model.
 
 ## Benchmarks
 
-The 新建评测 page groups the suites by category. `metacodes bench info` and
+The 新建评测 page groups the suites by category; each suite card and each
+selected suite's box show the suite's one-line description (what it tests,
+how it is scored, how many tasks), and so does the 榜单 page for the chosen
+suite. `metacodes bench info` and
 `GET /api/workbench` (`suites`, `categories`) list each suite with its task
 count and readiness; `GET /api/suite?id=<suite>` returns its task ids and
 default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 
 | Category | Suite id | Runner | Harbor 0.26 source | Tasks (cap per launch) |
 |---|---|---|---|---|
+| 软件工程 | `swe-bench-verified` | harbor-registry | `-d swe-bench/swe-bench-verified@2` | 500 (500) |
 | 代码生成 | `humaneval` | harbor-local | adapter `humaneval` (openai/human-eval, pinned) | 164 (164) |
 | 基础编程 | `mbpp` | harbor-local | adapter `mbpp` (full test split, pinned) | 500 (200) |
 | 基础编程 | `mbpp-sanitized` | harbor-local | adapter `mbpp_sanitized` (sanitized test split, pinned) | 257 (200) |
@@ -61,6 +65,7 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
 | 终端工程 | `frontier-harness-eval-1.1` | harbor-registry | `-d frontier-harness-eval/frontier-harness-eval@v1.1.0` | 62 (62) |
 | 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
+| 客服对话 | `tau3-airline`, `tau3-retail`, `tau3-telecom`, `tau3-banking-knowledge` | harbor-registry | `-d sierra-research/tau3-bench@1`, one domain each | 50 / 114 / 114 / 97 (all) |
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
@@ -80,6 +85,27 @@ is in neither registry, so `gaia2-cli` runs a locally generated dataset with
 `-p`. Its tasks reach the agent's tools through an MCP sidecar
 (`[[environment.mcp_servers]]`), which the metacodes Harbor agent writes into
 the trial's `mcpServers`.
+
+`swe-bench-verified` and the `tau3-*` suites pin a Hub revision (`@2`,
+`@1`). Their task ids, read from that revision, are in
+`scripts/eval/harbor/suites/registry_tasks.json` (500 SWE-bench Verified
+instances named `<owner>__<repo>-<number>`; 375 τ³-bench tasks named
+`tau3-bench__tau3-<domain>-...`, up to 238 characters, which is why task ids
+may be up to 255 characters). taubench.com scores each τ³ domain on its own,
+so each domain is one suite over the same dataset.
+
+τ³-bench tasks talk to an LLM-simulated customer through an MCP sidecar
+(`tau3-runtime`), and the banking verifier grades natural-language
+assertions with an LLM. Both read the execution host's `OPENAI_API_KEY`
+(required; readiness names it when missing) and optionally
+`OPENAI_BASE_URL`, `TAU2_USER_MODEL` (default `gpt-5.2`, as on
+taubench.com), `TAU2_USER_REASONING_EFFORT` and `TAU2_NL_ASSERTIONS_MODEL`,
+in every authentication mode; a suite's `required_env` and `host_env` in the
+catalog name them and SSH executors receive them like an adapter's
+`HOST_ENV`. Scores with another user model are not comparable with the
+public board. A launch is refused when the agent's key variable is one of
+these names (the worker replaces it with the run's relay placeholder, which
+the simulator would then receive); give the provider another `key_env`.
 
 `frontier-harness-eval-1.1` is the pinned task set of the
 [FrontierHarness Eval](https://frontierharness.org/) leaderboard (a Hub
@@ -1109,13 +1135,21 @@ and the preview features `execute_code` (`--preview=execute_code`),
 `ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The
 profile and each of its runs record the chosen names (`features`), and the
 run passes them to the adapter as `--ak features=<names>`. An unknown name is
-refused. A WorkBuddy suite's overlay launches metacodes itself, so its
-datasets run without the profile's features: the queued dataset and its run
-record list none, and the profile page marks them; a direct launch that asks
-for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
+refused. A WorkBuddy suite's overlay launches metacodes itself and takes
+only the run gates: the workbench writes each one as a harness parameter of
+the WorkBuddy job (`FEATURE_PARAMS` in `scripts/eval/harbor/suites/workbuddy.py`,
+for example `METACODES_STALL_GATE: true`), and the overlay turns it into the
+same flag. Its datasets run without the profile's preview features: the
+queued dataset and its run record list only the gates, and the profile page
+names the features left out; a direct launch that asks for a preview feature
+on a WorkBuddy suite is refused. A WorkBuddy checkout whose installed overlay
+differs from this checkout's refuses a run with features until
+`install_overlay` reinstalls it. The paid launch gate (`scripts/eval/workbuddy/launch_gate.py`)
+refuses a job carrying `METACODES_TEST_INTEGRITY`, `METACODES_DELIVERY_CADENCE`
+or `METACODES_STALL_GATE`, which its receipt's `evaluation_treatment` does not record. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork, 7 since model prices): an older node is refused until
+features (4 since teamwork, 7 since model prices, 9 since WorkBuddy gates): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 
@@ -1317,7 +1351,9 @@ tasks it scored, its source (name, URL, the date it was read, what its score
 means) and its entries (agent or harness, model, score in percent, and the
 standard error, cost per task and date when the source gives them). A board
 may list `tasks`, the part of the suite it scored (the AIME 2024 board on
-`aime`). On each board a finished job of the suite scores the mean reward of
+`aime`). SWE-bench Verified has two boards from swebench.com (mini-SWE-agent
+bash-only runs with cost, and other agents' submissions); each τ³ domain has
+the taubench.com text board for that domain (pass^1). On each board a finished job of the suite scores the mean reward of
 its finished trials on the board's tasks, an invalid trial counting 0, with
 cost per task as the mean over tasks of each task's mean priced cost; it is
 ranked when it covers at least 80% of those tasks, and a job ranked on no

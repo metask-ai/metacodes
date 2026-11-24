@@ -3479,6 +3479,727 @@
      "date": "2026-10-20"
     }
    ]
+  },
+  {
+   "suites": [
+    "swe-bench-verified"
+   ],
+   "title": "SWE-bench Verified · mini-SWE-agent（bash-only，同一 harness 比模型）",
+   "source": {
+    "name": "SWE-bench leaderboard (swebench.com), Verified tab, mini-SWE-agent bash-only entries",
+    "url": "https://www.swebench.com/",
+    "retrieved": "2026-11-24",
+    "metric": "% resolved = instances whose FAIL_TO_PASS tests pass and PASS_TO_PASS tests still pass, over all 500 instances, single attempt. cost_per_task_usd = the board's instance_cost (total API cost / 500).",
+    "notes": "Read from SWE-bench/swe-bench.github.io data/leaderboards.json (master, last data commit 2026-09-01; newest Verified entry 2026-02-26). Top 20 of 47 mini-SWE-agent runs by resolved; model = the board's entry name (model + reasoning effort/date)."
+   },
+   "entries": [
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4.5 Opus (high)",
+     "score": 76.8,
+     "cost_per_task_usd": 0.754,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Gemini 3 Flash (high)",
+     "score": 75.8,
+     "cost_per_task_usd": 0.356,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "MiniMax M2.5 (high)",
+     "score": 75.8,
+     "cost_per_task_usd": 0.073,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4.6 Opus",
+     "score": 75.6,
+     "cost_per_task_usd": 0.552,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4.5 Opus (20251101) (medium)",
+     "score": 74.4,
+     "cost_per_task_usd": 0.721,
+     "date": "2025-11-24"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Gemini 3 Pro Preview (2025-11-18)",
+     "score": 74.2,
+     "cost_per_task_usd": 0.46,
+     "date": "2025-11-18"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GLM 5 (high)",
+     "score": 72.8,
+     "cost_per_task_usd": 0.534,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GPT 5.2 (high)",
+     "score": 72.8,
+     "cost_per_task_usd": 0.474,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GPT 5.2 Codex",
+     "score": 72.8,
+     "cost_per_task_usd": 0.449,
+     "date": "2026-02-19"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GPT 5.2 (2025-12-11) (high)",
+     "score": 71.8,
+     "cost_per_task_usd": 0.52,
+     "date": "2025-12-11"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4.5 Sonnet (high)",
+     "score": 71.4,
+     "cost_per_task_usd": 0.658,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Kimi K2.5 (high)",
+     "score": 70.8,
+     "cost_per_task_usd": 0.147,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4.5 Sonnet (20250929)",
+     "score": 70.6,
+     "cost_per_task_usd": 0.558,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "DeepSeek V3.2 (high)",
+     "score": 70.0,
+     "cost_per_task_usd": 0.448,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Gemini 3 Pro",
+     "score": 69.6,
+     "cost_per_task_usd": 0.96,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GPT 5.2 (2025-12-11)",
+     "score": 69.0,
+     "cost_per_task_usd": 0.27,
+     "date": "2025-12-11"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4 Opus (20250514)",
+     "score": 67.6,
+     "cost_per_task_usd": 1.131,
+     "date": "2025-08-02"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "Claude 4.5 Haiku (high)",
+     "score": 66.6,
+     "cost_per_task_usd": 0.331,
+     "date": "2026-02-17"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GPT 5.1 (2025-11-13) (medium)",
+     "score": 66.0,
+     "cost_per_task_usd": 0.306,
+     "date": "2025-11-20"
+    },
+    {
+     "harness": "mini-SWE-agent",
+     "model": "GPT 5.1 Codex (medium)",
+     "score": 66.0,
+     "cost_per_task_usd": 0.589,
+     "date": "2025-11-24"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "swe-bench-verified"
+   ],
+   "title": "SWE-bench Verified · 各家 agent 提交",
+   "source": {
+    "name": "SWE-bench leaderboard (swebench.com), Verified tab, all non-mini-SWE-agent submissions",
+    "url": "https://www.swebench.com/",
+    "retrieved": "2026-11-24",
+    "metric": "% resolved over the 500 Verified instances, as submitted (attempt count and model mix vary; most are pass@1).",
+    "notes": "Read from SWE-bench/swe-bench.github.io data/leaderboards.json (master, last data commit 2026-09-01). Top 25 of 133 submissions by resolved; 'Multiple' means the agent combines several models. Most entries are self-reported (checked=false)."
+   },
+   "entries": [
+    {
+     "harness": "Sonar Foundation Agent",
+     "model": "Claude 4.5 Opus",
+     "score": 79.2,
+     "date": "2025-12-05"
+    },
+    {
+     "harness": "live-SWE-agent",
+     "model": "Claude 4.5 Opus",
+     "score": 79.2,
+     "date": "2025-12-15"
+    },
+    {
+     "harness": "TRAE",
+     "model": "Doubao-Seed-Code",
+     "score": 78.8,
+     "date": "2025-09-28"
+    },
+    {
+     "harness": "live-SWE-agent",
+     "model": "Gemini 3 Pro Preview",
+     "score": 77.4,
+     "date": "2025-11-20"
+    },
+    {
+     "harness": "EPAM AI/Run Developer Agent",
+     "model": "Claude 4 Sonnet",
+     "score": 76.8,
+     "date": "2025-08-04"
+    },
+    {
+     "harness": "Atlassian Rovo Dev",
+     "model": "Multiple",
+     "score": 76.8,
+     "date": "2025-09-02"
+    },
+    {
+     "harness": "ACoder",
+     "model": "Multiple",
+     "score": 76.4,
+     "date": "2025-08-19"
+    },
+    {
+     "harness": "Warp",
+     "model": "Multiple",
+     "score": 75.6,
+     "date": "2025-09-01"
+    },
+    {
+     "harness": "TRAE",
+     "model": "Multiple",
+     "score": 75.2,
+     "date": "2025-06-12"
+    },
+    {
+     "harness": "Harness AI",
+     "model": "Claude Sonnet 4",
+     "score": 74.8,
+     "date": "2025-07-31"
+    },
+    {
+     "harness": "Sonar Foundation Agent",
+     "model": "Claude 4.5 Sonnet",
+     "score": 74.8,
+     "date": "2025-11-03"
+    },
+    {
+     "harness": "Lingxi-v1.5",
+     "model": "Claude 4 Sonnet",
+     "score": 74.6,
+     "date": "2025-07-20"
+    },
+    {
+     "harness": "JoyCode",
+     "model": "Multiple",
+     "score": 74.6,
+     "date": "2025-09-15"
+    },
+    {
+     "harness": "Refact.ai Agent",
+     "model": "Multiple",
+     "score": 74.4,
+     "date": "2025-06-03"
+    },
+    {
+     "harness": "Prometheus-v1.2.1",
+     "model": "GPT-5",
+     "score": 74.4,
+     "date": "2025-10-15"
+    },
+    {
+     "harness": "Salesforce AI Research SAGE",
+     "model": "Multiple",
+     "score": 73.8,
+     "date": "2025-11-03"
+    },
+    {
+     "harness": "Tools",
+     "model": "Claude 4 Opus",
+     "score": 73.2,
+     "date": "2025-05-22"
+    },
+    {
+     "harness": "Salesforce AI Research SAGE",
+     "model": "Multiple",
+     "score": 73.0,
+     "date": "2025-10-21"
+    },
+    {
+     "harness": "Tools",
+     "model": "Claude 4 Sonnet",
+     "score": 72.4,
+     "date": "2025-05-22"
+    },
+    {
+     "harness": "OpenHands",
+     "model": "GPT-5",
+     "score": 71.8,
+     "date": "2025-08-07"
+    },
+    {
+     "harness": "Bloop",
+     "model": "Claude 4 Sonnet",
+     "score": 71.2,
+     "date": "2025-07-10"
+    },
+    {
+     "harness": "Qodo Command",
+     "model": "Multiple",
+     "score": 71.2,
+     "date": "2025-07-15"
+    },
+    {
+     "harness": "Prometheus-v1.2",
+     "model": "GPT-5",
+     "score": 71.2,
+     "date": "2025-09-29"
+    },
+    {
+     "harness": "Lingxi v1.5",
+     "model": "Kimi K2",
+     "score": 71.2,
+     "date": "2025-10-14"
+    },
+    {
+     "harness": "Warp",
+     "model": "Multiple",
+     "score": 71.0,
+     "date": "2025-06-23"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "tau3-airline"
+   ],
+   "title": "τ³-bench Airline 官方榜（taubench.com，文本）",
+   "source": {
+    "name": "τ-bench leaderboard (taubench.com), text tab, airline domain",
+    "url": "https://taubench.com/",
+    "retrieved": "2026-11-24",
+    "metric": "pass^1 % = mean success over tasks and trials (most entries 4 trials, seed 300); a task succeeds when the final database state and required outputs match the gold. cost_per_task_usd = the submission's mean agent cost per task where reported.",
+    "notes": "Read from sierra-research/tau2-bench web/leaderboard/public/submissions (manifest 'submissions' = text tab, main @ 2026-11-21). User simulator gpt-5.2 (low reasoning) for all standard entries; τ²-bench v1.0.1 grading. Model label adds the submission's reasoning_effort. Our runs use the TAU2_USER_MODEL set on the execution host, so scores are comparable only with the same user simulator."
+   },
+   "entries": [
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.5 (high)",
+     "score": 84.0,
+     "cost_per_task_usd": 0.399,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (high)",
+     "score": 83.0,
+     "cost_per_task_usd": 0.114,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GLM-5 (thinking)",
+     "score": 82.5,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Flash (high)",
+     "score": 82.5,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Qwen3.5-397B-A17B (thinking)",
+     "score": 81.5,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Pro (high)",
+     "score": 80.5,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Sonnet 4.5 (thinking)",
+     "score": 72.0,
+     "cost_per_task_usd": 0.296,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (none)",
+     "score": 52.5,
+     "cost_per_task_usd": 0.054,
+     "date": "2026-02-26"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "tau3-retail"
+   ],
+   "title": "τ³-bench Retail 官方榜（taubench.com，文本）",
+   "source": {
+    "name": "τ-bench leaderboard (taubench.com), text tab, retail domain",
+    "url": "https://taubench.com/",
+    "retrieved": "2026-11-24",
+    "metric": "pass^1 % = mean success over tasks and trials (most entries 4 trials, seed 300); a task succeeds when the final database state and required outputs match the gold. cost_per_task_usd = the submission's mean agent cost per task where reported.",
+    "notes": "Read from sierra-research/tau2-bench web/leaderboard/public/submissions (manifest 'submissions' = text tab, main @ 2026-11-21). User simulator gpt-5.2 (low reasoning) for all standard entries; τ²-bench v1.0.1 grading. Model label adds the submission's reasoning_effort. Our runs use the TAU2_USER_MODEL set on the execution host, so scores are comparable only with the same user simulator."
+   },
+   "entries": [
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Qwen3.5-397B-A17B (thinking)",
+     "score": 84.4,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "Northeastern University HAI Lab 自定义 agent",
+     "model": "RAFT-30B-A3B",
+     "score": 82.5,
+     "cost_per_task_usd": 0.0,
+     "date": "2026-04-30"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (high)",
+     "score": 81.6,
+     "cost_per_task_usd": 0.072,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.5 (high)",
+     "score": 79.6,
+     "cost_per_task_usd": 0.387,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Flash (high)",
+     "score": 76.8,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Pro (high)",
+     "score": 75.9,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (none)",
+     "score": 75.0,
+     "cost_per_task_usd": 0.048,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GLM-5 (thinking)",
+     "score": 73.7,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Sonnet 4.5 (thinking)",
+     "score": 72.4,
+     "cost_per_task_usd": 0.255,
+     "date": "2026-02-26"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "tau3-telecom"
+   ],
+   "title": "τ³-bench Telecom 官方榜（taubench.com，文本）",
+   "source": {
+    "name": "τ-bench leaderboard (taubench.com), text tab, telecom domain",
+    "url": "https://taubench.com/",
+    "retrieved": "2026-11-24",
+    "metric": "pass^1 % = mean success over tasks and trials (most entries 4 trials, seed 300); a task succeeds when the final database state and required outputs match the gold. cost_per_task_usd = the submission's mean agent cost per task where reported.",
+    "notes": "Read from sierra-research/tau2-bench web/leaderboard/public/submissions (manifest 'submissions' = text tab, main @ 2026-11-21). User simulator gpt-5.2 (low reasoning) for all standard entries; τ²-bench v1.0.1 grading. Model label adds the submission's reasoning_effort. Our runs use the TAU2_USER_MODEL set on the execution host, so scores are comparable only with the same user simulator."
+   },
+   "entries": [
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Qwen3.5-397B-A17B (thinking)",
+     "score": 97.8,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.5 (high)",
+     "score": 92.3,
+     "cost_per_task_usd": 0.72,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Flash (high)",
+     "score": 91.2,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Pro (high)",
+     "score": 91.0,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (high)",
+     "score": 89.7,
+     "cost_per_task_usd": 0.093,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GLM-5 (thinking)",
+     "score": 86.8,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Sonnet 4.5 (thinking)",
+     "score": 84.9,
+     "cost_per_task_usd": 0.488,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (none)",
+     "score": 57.2,
+     "cost_per_task_usd": 0.049,
+     "date": "2026-02-26"
+    }
+   ]
+  },
+  {
+   "suites": [
+    "tau3-banking-knowledge"
+   ],
+   "title": "τ³-bench Banking Knowledge 官方榜（taubench.com，文本）",
+   "source": {
+    "name": "τ-bench leaderboard (taubench.com), text tab, banking_knowledge domain",
+    "url": "https://taubench.com/",
+    "retrieved": "2026-11-24",
+    "metric": "pass^1 % = mean success over tasks and trials (most entries 4 trials, seed 300); a task succeeds when the final database state and required outputs match the gold. cost_per_task_usd = the submission's mean agent cost per task where reported.",
+    "notes": "Read from sierra-research/tau2-bench web/leaderboard/public/submissions (manifest 'submissions' = text tab, main @ 2026-11-21). User simulator gpt-5.2 (low reasoning) for all standard entries; τ²-bench v1.0.1 grading. Model label adds the submission's reasoning_effort. Our runs use the TAU2_USER_MODEL set on the execution host, so scores are comparable only with the same user simulator. banking_knowledge entries mostly use AllTools retrieval (BM25 + embeddings + shell); scores before the 2026-07-15 regrade are not comparable."
+   },
+   "entries": [
+    {
+     "harness": "Principled Machines 自定义 agent",
+     "model": "PrincipledMachines Cortex 0.1 (medium)",
+     "score": 73.2,
+     "cost_per_task_usd": 0.596,
+     "date": "2026-10-20"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Qwen 3.8 Max (xhigh)",
+     "score": 55.2,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 5 (max)",
+     "score": 48.7,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Grok 4.5 (high)",
+     "score": 47.9,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.6-sol (xhigh)",
+     "score": 46.9,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.5 (xhigh)",
+     "score": 44.6,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Muse Spark 1.1 (xhigh)",
+     "score": 40.5,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.7 (max)",
+     "score": 40.2,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.8 (max)",
+     "score": 39.7,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Fable 5 (max)",
+     "score": 39.7,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.4 (xhigh)",
+     "score": 39.4,
+     "cost_per_task_usd": 1.842,
+     "date": "2026-03-25"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Kimi K3 (max)",
+     "score": 37.1,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GLM-5.2 (xhigh)",
+     "score": 37.1,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (high)",
+     "score": 32.2,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "Distyl AI 自定义 agent",
+     "model": "Distyl ButtonAgent (high)",
+     "score": 31.2,
+     "date": "2026-03-25"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Flash (high)",
+     "score": 27.3,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.6 (max)",
+     "score": 27.3,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3.1 Pro Preview (high)",
+     "score": 26.0,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Sonnet 4.5 (thinking)",
+     "score": 25.3,
+     "cost_per_task_usd": 4.048,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Inkling (max)",
+     "score": 25.0,
+     "date": "2026-08-04"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Claude Opus 4.5 (high)",
+     "score": 24.7,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 3 Pro (high)",
+     "score": 18.0,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Grok 4.2 (high)",
+     "score": 18.0,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Grok 4 fast (high)",
+     "score": 15.7,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Gemini 2.5 Pro (high)",
+     "score": 13.7,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Grok 4.1 fast (high)",
+     "score": 13.1,
+     "date": "2026-05-05"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GPT-5.2 (none)",
+     "score": 12.6,
+     "cost_per_task_usd": 0.243,
+     "date": "2026-02-26"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "GLM-5 (thinking)",
+     "score": 9.8,
+     "date": "2026-03-02"
+    },
+    {
+     "harness": "τ²-bench 参考 agent",
+     "model": "Qwen3.5-397B-A17B (thinking)",
+     "score": 9.8,
+     "date": "2026-03-02"
+    }
+   ]
   }
  ]
 }

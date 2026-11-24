@@ -298,11 +298,11 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profile/rename', {'id': 'profile-elsewhere', 'name': 'x'})
         self.assertTrue(self.client.request('api/jobs?profile=all')['can_run'])
 
-    def test_features_are_refused_for_a_workbuddy_suite_and_left_out_by_a_profile(self):
-        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持选择高级功能'):
+    def test_a_workbuddy_suite_takes_only_the_run_gates(self):
+        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持这些高级功能：execute_code'):
             self.manager.launch({'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],
-                                 'attempts': 1, 'concurrency': 1, 'features': ['execute_code']})
-        self.assertEqual(profiles.run_features(['execute_code'], 'workbuddy-code'), [])
+                                 'attempts': 1, 'concurrency': 1, 'features': ['stall_gate', 'execute_code']})
+        self.assertEqual(profiles.run_features(['stall_gate', 'execute_code'], 'workbuddy-code'), ['stall_gate'])
         self.assertEqual(profiles.run_features(['execute_code'], 'terminal-bench-2.1'), ['execute_code'])
 
     def test_a_single_run_takes_the_page_default_features(self):
@@ -378,6 +378,38 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(record['status'], 'cancelled')
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
+
+    def test_one_dataset_is_cancelled_stopped_resumed_or_run_again_while_the_queue_goes_on(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request())
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            with self.assertRaisesRegex(ValueError, '还在等待或运行'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
+            with self.assertRaisesRegex(ValueError, '不在等待'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'cancel'})
+            self.assertEqual(self.manager.profiles.get(created['id'])['items'][0]['status'], 'running')
+            with self.assertRaisesRegex(ValueError, '没有在运行'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'stop'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'stop'})
+            record = self.wait_profile(created['id'])
+        self.assertEqual(record['status'], 'finished')
+        self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
+        with self.assertRaisesRegex(ValueError, '不在等待'):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
+        # Stopped before Harbor wrote any result: every task is still to run.
+        with patch.object(self.workbench, 'job_view', return_value=None):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'run'})
+        record = self.wait_profile(created['id'])
+        self.assertEqual([(i['suite'], i['status']) for i in record['items'][2:]],
+                         [('terminal-bench-2.1', 'finished'), ('terminal-bench-2.0', 'finished')])
+        self.assertEqual(record['items'][2]['tasks'], ['fix-git'])
+        with self.assertRaisesRegex(ValueError, '没有要运行的题'):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'resume'})
 
     def test_concurrency_changes_while_the_profile_runs(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):

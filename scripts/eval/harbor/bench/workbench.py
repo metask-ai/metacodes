@@ -302,7 +302,8 @@ class Workbench:
                     ranked_anywhere.add(job["name"])
             boards.append({**board, "jobs": sorted(jobs, key=lambda job: job["score"], reverse=True)})
         unranked = [job for job in (board_job(view, None) for view in views) if job and job["name"] not in ranked_anywhere]
-        return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "task_count": task_count,
+        return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "description": suite.description,
+                "task_count": task_count,
                 "ranked_coverage": RANKED_COVERAGE, "boards": boards, "unranked": unranked}
 
     def job(self, name) -> Optional[Dict[str, Any]]:
@@ -370,6 +371,29 @@ class Workbench:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.profiles.cancel(profile)
+
+    def profile_item(self, profile, index, action) -> Dict[str, Any]:
+        """Act on one queued dataset: `cancel` a waiting one, `stop` the running
+        one, `resume` a stopped one with the tasks it has not finished, `run`
+        an ended one again with all its tasks."""
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        if action == "cancel":
+            return self.profiles.cancel_item(profile, index)
+        if action == "stop":
+            return self.profiles.stop_item(profile, index)
+        if action not in ("resume", "run"):
+            raise ValueError("action 只能是 cancel、stop、resume 或 run")
+        _, item = self.profiles.record_item(profile, index)
+        tasks = item.get("tasks") or []
+        if action == "resume":
+            view = self.job_view(item["run"]) if item.get("run") else None
+            finished = {}
+            for row in view["rows"] if view else []:
+                if row["status"] not in ("running", "invalid"):
+                    finished[row["task"]] = finished.get(row["task"], 0) + 1
+            tasks = [t for t in tasks if finished.get(t, 0) < (item.get("attempts") or 1)]
+        return self.profiles.requeue_item(profile, index, tasks)
 
     def set_profile_concurrency(self, profile, concurrency) -> Dict[str, Any]:
         if not self.manager:

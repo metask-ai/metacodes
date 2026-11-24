@@ -326,6 +326,20 @@ def teamwork_stop_reason(trial_dir: Path) -> Optional[str]:
     return "teamwork_" + str(status["state"]) if isinstance(status, dict) and status.get("state") else None
 
 
+def configured_task(trial_dir: Path) -> Optional[str]:
+    """The task of a trial without result.json, from Harbor's config.json:
+    a registry task's `org/name`, else the task directory's name. Harbor
+    truncates the trial directory's name, which may itself contain `__`."""
+
+    config = read_json(trial_dir / "config.json")
+    task = config.get("task") if isinstance(config, dict) else None
+    if not isinstance(task, dict):
+        return None
+    if task.get("name"):
+        return str(task["name"])
+    return Path(str(task["path"])).name if task.get("path") else None
+
+
 def trial_row(trial_dir: Path) -> Dict[str, Any]:
     """One trial's summary row (no trajectory)."""
 
@@ -337,7 +351,7 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
     result = result if isinstance(result, dict) else {}
     agent_result = result.get("agent_result") or {}
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
-    task = str(result.get("task_name") or trial_dir.name.split("__")[0])
+    task = str(result.get("task_name") or configured_task(trial_dir) or trial_dir.name.split("__")[0])
     started = parse_time(result.get("started_at"))
     if started is None:
         try:

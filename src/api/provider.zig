@@ -131,6 +131,16 @@ pub const RequestAbortRegistry = struct {
         stalled_cause: Stall.Cause = .no_progress,
         stalled_limit_ms: u64 = 0,
         stalled_keepalive_gap_ms: u64 = 0,
+        abort_shut_down: bool = false,
+
+        fn shutDownIfAborted(active: *Slot) bool {
+            if (active.abort_shut_down) return false;
+            const signal = active.signal orelse return false;
+            if (!signal.isAborted()) return false;
+            active.abort_shut_down = true;
+            active.shutdown_fn(active.ctx);
+            return true;
+        }
     };
 
     /// Monitor wake-up interval; also bounds how late a stall is detected.
@@ -241,14 +251,14 @@ pub const RequestAbortRegistry = struct {
         });
         // Close the race where abort was accepted just before the transport
         // published its request in this registry.
-        if (signal) |s| if (s.isAborted()) shutdown_fn(ctx);
-        self.ensureMonitorLocked(idle_limit_ms);
+        _ = self.slots.items[self.slots.items.len - 1].shutDownIfAborted();
+        self.ensureMonitorLocked();
     }
 
-    /// Spawn the monitor thread on a monitored registration when none is
-    /// running. Caller holds the mutex. A limit of 0 never needs a monitor.
-    fn ensureMonitorLocked(self: *RequestAbortRegistry, idle_limit_ms: u64) void {
-        if (idle_limit_ms == 0) return;
+    /// Spawn the monitor thread when a slot needs watching and none is
+    /// running. Caller holds the mutex.
+    fn ensureMonitorLocked(self: *RequestAbortRegistry) void {
+        if (!self.watchingLocked()) return;
         if (self.monitor) |thread| {
             if (!self.monitor_exited) return;
             // The monitor set the flag under this mutex and does nothing after
@@ -262,7 +272,7 @@ pub const RequestAbortRegistry = struct {
         self.monitor = platform_thread.spawn(.waiter, monitorMain, .{self}) catch |err| blk: {
             // No monitor = no liveness guarantee for this process; say so
             // once rather than pretending the limit is enforced.
-            log.warn("client", "stream liveness monitor unavailable ({s}); idle limit {d}ms will not be enforced", .{ @errorName(err), idle_limit_ms });
+            log.warn("client", "stream liveness monitor unavailable ({s}); idle limits and aborts of blocked reads will not be enforced", .{@errorName(err)});
             break :blk null;
         };
     }
@@ -286,7 +296,7 @@ pub const RequestAbortRegistry = struct {
             active.last_activity_ms = now;
             active.last_transport_ms = now;
             active.unsampled_read = false;
-            self.ensureMonitorLocked(limit_ms);
+            self.ensureMonitorLocked();
             return;
         }
     }
@@ -305,9 +315,21 @@ pub const RequestAbortRegistry = struct {
     pub fn cancel(self: *RequestAbortRegistry, signal: *const AbortSignal) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.slots.items) |active| {
-            if (active.signal == signal) active.shutdown_fn(active.ctx);
+        for (self.slots.items) |*active| {
+            if (active.signal != signal) continue;
+            active.abort_shut_down = true;
+            active.shutdown_fn(active.ctx);
         }
+    }
+
+    fn reapAborted(self: *RequestAbortRegistry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var reaped: usize = 0;
+        for (self.slots.items) |*active| {
+            if (active.shutDownIfAborted()) reaped += 1;
+        }
+        return reaped;
     }
 
     /// Progress arrived for `ctx` (model-output bytes: a non-keepalive SSE line,
@@ -375,7 +397,7 @@ pub const RequestAbortRegistry = struct {
         defer self.mutex.unlock();
         var reaped: usize = 0;
         for (self.slots.items) |*active| {
-            if (active.idle_limit_ms == 0 or active.stalled_after_ms != null) continue;
+            if (active.idle_limit_ms == 0 or active.stalled_after_ms != null or active.abort_shut_down) continue;
             const idle = now_ms -| active.last_activity_ms;
             const transport_idle = now_ms -| active.last_transport_ms;
             const dead_limit: u64 = if (active.phase == .sse_body)
@@ -443,6 +465,7 @@ pub const RequestAbortRegistry = struct {
             _ = self.monitor_cond.timedWait(&self.mutex, MONITOR_TICK_MS * std.time.ns_per_ms);
             if (self.monitor_stop) break;
             self.mutex.unlock();
+            _ = self.reapAborted();
             _ = self.reapStalled(monotonicMs());
             self.mutex.lock();
             if (!self.watchingLocked()) {
@@ -452,10 +475,12 @@ pub const RequestAbortRegistry = struct {
         }
     }
 
-    /// Whether a slot can still stall: monitored and not shut down yet.
+    /// Whether a slot can still stall or be aborted: not shut down yet, and
+    /// monitored or cancellable through a signal.
     fn watchingLocked(self: *const RequestAbortRegistry) bool {
         for (self.slots.items) |active| {
-            if (active.idle_limit_ms != 0 and active.stalled_after_ms == null) return true;
+            if (active.stalled_after_ms != null or active.abort_shut_down) continue;
+            if (active.idle_limit_ms != 0 or active.signal != null) return true;
         }
         return false;
     }
@@ -954,6 +979,30 @@ test "RequestAbortRegistry closes pre-registration abort race" {
     );
     defer registry.unregister(&interrupted);
     try std.testing.expect(interrupted);
+}
+
+test "RequestAbortRegistry: the monitor shuts a request down once its signal is aborted, with no cancel and no idle limit" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var signal = AbortSignal.init();
+    var probe = LivenessProbe{};
+    try registry.registerMonitored(a, &signal, @ptrCast(&probe), LivenessProbe.shutdown, 0);
+    defer registry.unregister(@ptrCast(&probe));
+    try std.testing.expect(registry.monitor != null);
+    @import("../util/time.zig").sleepMs(2 * RequestAbortRegistry.MONITOR_TICK_MS);
+    try std.testing.expectEqual(@as(u32, 0), probe.shutdowns.load(.acquire));
+    signal.abort(.user_ctrl_c);
+    var waited_ms: u64 = 0;
+    while (probe.shutdowns.load(.acquire) == 0 and waited_ms < 5_000) : (waited_ms += 10) {
+        @import("../util/time.zig").sleepMs(10);
+    }
+    try std.testing.expectEqual(@as(u32, 1), probe.shutdowns.load(.acquire));
+    try std.testing.expect(registry.stalled(@ptrCast(&probe)) == null);
+    try std.testing.expect(waitMonitorExited(&registry));
+    try std.testing.expectEqual(@as(usize, 0), registry.reapAborted());
+    registry.cancel(&signal);
+    try std.testing.expectEqual(@as(u32, 2), probe.shutdowns.load(.acquire));
 }
 
 test "runtime capability bridge covers the full runtime enum" {

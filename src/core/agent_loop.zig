@@ -3370,14 +3370,14 @@ fn runCounted(
                         }
                         continue :request_recovery;
                     },
+                    error.Aborted => {
+                        log.warn("agent", "sendMessageStream aborted turn={d}", .{turns + 1});
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                    },
                     else => |e| {
                         log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
-                        if (e != error.Aborted) model_error.noteRequestError(e);
-                        const stop_reason = if (e == error.Aborted)
-                            stopReasonForAbort(opts.abort)
-                        else
-                            .api_error;
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
+                        model_error.noteRequestError(e);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                     },
                 }
             };
