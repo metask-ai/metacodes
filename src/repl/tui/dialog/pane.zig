@@ -366,6 +366,7 @@ fn erase(out_fd: c_int, rows: u16) void {
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
+    @import("../screen_mirror.zig").feed(fd, bytes);
     _ = pfs.writeAll(fd, bytes); // a resize (EINTR) is retried, not half a frame
 }
 

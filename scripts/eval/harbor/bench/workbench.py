@@ -400,6 +400,11 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.profiles.set_concurrency(profile, concurrency)
 
+    def set_profile_auto_rerun(self, profile, enabled) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.profiles.set_auto_rerun(profile, enabled)
+
     def rename_profile(self, profile, name) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)

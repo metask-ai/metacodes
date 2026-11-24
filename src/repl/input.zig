@@ -60,7 +60,34 @@ pub const Key = union(enum) {
     ctrl_underscore, // Ctrl+_ / Ctrl+Shift+- (0x1f): undo
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
+    mouse: Mouse,
+    cursor_position: CursorPosition,
     unknown,
+};
+
+pub const Mouse = struct {
+    code: u16,
+    col: u16,
+    row: u16,
+    released: bool,
+
+    pub fn wheel(self: Mouse) ?enum { up, down } {
+        if (self.code & 64 == 0) return null;
+        return if (self.code & 1 == 0) .up else .down;
+    }
+
+    pub fn leftButton(self: Mouse) bool {
+        return self.code & (3 | 64) == 0;
+    }
+
+    pub fn motion(self: Mouse) bool {
+        return self.code & 32 != 0;
+    }
+};
+
+pub const CursorPosition = struct {
+    row: u16,
+    col: u16,
 };
 
 pub fn pastedByte(key: Key) ?u8 {
@@ -84,6 +111,8 @@ pub fn pastedByte(key: Key) ?u8 {
 ///     - 9;2 = Shift+Tab
 ///     - 13;2 = Shift+Enter
 ///     - 13;5 = Ctrl+Enter
+///   ESC [ < b;x;y M/m  SGR 鼠标报告(按下/拖动 M,松开 m)→ .mouse
+///   ESC [ row;col R   光标位置应答(DSR 6n)→ .cursor_position
 ///   ESC CR            Meta+Return = Shift+Enter(/terminal-setup 装进终端的绑定),仅当两字节
 ///                     同批到达(feedRead / feedQueued);一字节一字节的 feed 仍是 Esc + Enter
 /// 其它 CSI(私有前缀、更多参数段、认不出的组合)整条吃掉、报一个 .unknown;OSC 应答(`ESC ] 11 ; … BEL`)
@@ -93,6 +122,7 @@ pub const KeyParser = struct {
     num1: u32 = 0,
     num2: u32 = 0,
     num3: u32 = 0,
+    mouse_field: u8 = 0,
     // 一字节 feed 偶尔需吐多个键(ESC 后紧跟普通字符 = 孤立 ESC + 该字符;`ESC ]` 后不是
     // OSC 应答 = ESC + ']' + 数字 + 下一个键):feed 返回第一个,其余按序暂存这里,
     // 调用方 feed / flushEsc 后须 while(drain())|k| 排空。
@@ -109,7 +139,7 @@ pub const KeyParser = struct {
     // ']' + 3 位数字 + 截断它的那个键。
     const queue_capacity = 5;
 
-    // csi_skip:一个认不出的 CSI(私有前缀 `?`/`<`/`>`/`=`、四段以上参数、`:` 子参数),
+    // csi_skip:一个认不出的 CSI(私有前缀 `?`/`>`/`=`、不成形的 `<` 鼠标报告、四段以上参数、`:` 子参数),
     // 吃到它的终结字节(0x40-0x7E)为止,整条报一个 .unknown。终端应答(DA1 `ESC[?62c`、
     // Kitty flags `ESC[?1u`)晚于启动探测才到也走这里——
     // 否则后半截会被当成敲进来的字符("62c" 进了输入框)。
@@ -117,7 +147,7 @@ pub const KeyParser = struct {
     // 背景色 `ESC]11;rgb:…`)。只认数字编号 + `;` 开头的形状:Alt+] 之后敲别的(包括什么都不敲、
     // 等到 ESC 超时)仍是原来那几个键。迟到的背景色应答以前会变成 Esc、字符、Esc——两次 Esc
     // 连按清空了输入框。
-    const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, osc_seen, osc_ps, osc_body, osc_st };
+    const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, sgr_mouse, osc_seen, osc_ps, osc_body, osc_st };
 
     /// CSI 的参数/中间字节(0x20-0x3F):数字、`;`、`:`、私有前缀 `<=>?`、空格../。
     fn csiParam(b: u8) bool {
@@ -171,7 +201,7 @@ pub const KeyParser = struct {
                 self.queueOscPrefix();
                 break :blk .esc;
             },
-            .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_semi2, .csi_num3, .csi_skip, .osc_body => null,
+            .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_semi2, .csi_num3, .csi_skip, .sgr_mouse, .osc_body => null,
         };
         self.state = .normal;
         return key;
@@ -252,6 +282,11 @@ pub const KeyParser = struct {
                     self.state = .csi_num1;
                     return null;
                 }
+                if (b == '<') {
+                    self.state = .sgr_mouse;
+                    self.mouse_field = 0;
+                    return null;
+                }
                 if (csiParam(b)) {
                     self.state = .csi_skip;
                     return null;
@@ -329,6 +364,7 @@ pub const KeyParser = struct {
                     return null;
                 }
                 self.state = .normal;
+                if (b == 'R') return .{ .cursor_position = .{ .row = saturate16(self.num1), .col = saturate16(self.num2) } };
                 const modifier = KeyModifier.fromParam(self.num2);
                 if (b == 'u') return decodeModifiedKey(self.num1, modifier);
                 if (modifier != .none) return .unknown;
@@ -368,6 +404,27 @@ pub const KeyParser = struct {
                 self.state = .normal;
                 if (b == '~' and self.num1 == 27) return decodeModifiedKey(self.num3, KeyModifier.fromParam(self.num2));
                 return .unknown;
+            },
+            .sgr_mouse => {
+                if (b >= '0' and b <= '9') {
+                    const field = switch (self.mouse_field) {
+                        0 => &self.num1,
+                        1 => &self.num2,
+                        else => &self.num3,
+                    };
+                    field.* = field.* *| 10 +| (b - '0');
+                    return null;
+                }
+                if (b == ';' and self.mouse_field < 2) {
+                    self.mouse_field += 1;
+                    return null;
+                }
+                if ((b == 'M' or b == 'm') and self.mouse_field == 2) {
+                    self.state = .normal;
+                    return .{ .mouse = .{ .code = saturate16(self.num1), .col = saturate16(self.num2), .row = saturate16(self.num3), .released = b == 'm' } };
+                }
+                self.state = .csi_skip;
+                return self.feed(b);
             },
             .csi_skip => {
                 if (csiParam(b)) return null;
@@ -425,6 +482,10 @@ pub const KeyParser = struct {
         }
     }
 };
+
+fn saturate16(value: u32) u16 {
+    return @intCast(@min(value, std.math.maxInt(u16)));
+}
 
 const KeyModifier = enum {
     none,
@@ -681,6 +742,20 @@ fn emitEnableSequences(fd: c_int) void {
     }
     const enable_paste = "\x1b[?2004h";
     _ = pfs.writeAll(fd, enable_paste);
+    if (mouseSelectionOn()) _ = pfs.writeAll(fd, mouse_selection_enable);
+}
+
+pub const mouse_selection_enable = "\x1b[?1002h\x1b[?1006h";
+pub const mouse_selection_disable = "\x1b[?1006l\x1b[?1002l";
+
+var g_mouse_selection = std.atomic.Value(bool).init(false);
+
+pub fn recordMouseSelection(on: bool) void {
+    g_mouse_selection.store(on, .release);
+}
+
+pub fn mouseSelectionOn() bool {
+    return g_mouse_selection.load(.acquire);
 }
 
 /// 切 raw 模式，返回旧 termios；非 tty 或失败返 null。
@@ -965,6 +1040,7 @@ pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
 fn emitDisableSequences(fd: c_int) void {
     const disable_paste = "\x1b[?2004l";
     _ = pfs.writeAll(fd, disable_paste);
+    if (mouseSelectionOn()) _ = pfs.writeAll(fd, mouse_selection_disable);
     if (shouldEnableKittyKeyboard()) {
         _ = pfs.writeAll(fd, kbd_disable_seq);
     }
@@ -1271,7 +1347,7 @@ pub const LineEditor = struct {
             // editor 正常收不到;此处兜底返 .none(防御:vim/边界路径若漏到这不崩)。
             .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_b, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
             .page_up, .page_down => return .none, // viewing 视口翻页键,editor 不处理(dispatch 拦截)
-            .unknown => return .none,
+            .mouse, .cursor_position, .unknown => return .none,
         }
     }
 
@@ -1360,6 +1436,20 @@ fn nextCharBoundary(bytes: []const u8, pos: usize) usize {
 // ============================================================================
 
 const testing = std.testing;
+
+test "KeyParser: SGR mouse reports and cursor position answers become keys" {
+    var p = KeyParser{};
+    var got: ?Key = null;
+    for ("\x1b[<32;12;5M") |b| got = p.feed(b);
+    try std.testing.expectEqualDeep(Key{ .mouse = .{ .code = 32, .col = 12, .row = 5, .released = false } }, got.?);
+    for ("\x1b[<0;3;4m") |b| got = p.feed(b);
+    try std.testing.expectEqualDeep(Key{ .mouse = .{ .code = 0, .col = 3, .row = 4, .released = true } }, got.?);
+    for ("\x1b[17;1R") |b| got = p.feed(b);
+    try std.testing.expectEqualDeep(Key{ .cursor_position = .{ .row = 17, .col = 1 } }, got.?);
+    for ("\x1b[<1;2Ma") |b| got = p.feed(b);
+    try std.testing.expectEqualDeep(Key{ .char = 'a' }, got.?);
+    try std.testing.expect(!p.pendingEsc());
+}
 
 test "KeyParser: ASCII char" {
     var p = KeyParser{};
