@@ -3771,7 +3771,7 @@ fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_st
     layer_run.addFileInput(b.path("layers.zon"));
     layer_run.addFileInput(b.path("layer_baseline.zon"));
     layer_run.has_side_effects = true;
-    const layer_unit = b.addTest(.{ .name = "layer-gate-unit", .root_module = layer_mod });
+    const layer_unit = addRecordedTest(b, .{ .name = "layer-gate-unit", .root_module = layer_mod });
     const layer_step = b.step("layer:check", "Enforce layers.zon: owned files, downward imports, no package cycles, module wiring, a shrinking baseline");
     layer_step.dependOn(&layer_run.step);
     layer_step.dependOn(&addTestRunArtifact(b, layer_unit).step);
