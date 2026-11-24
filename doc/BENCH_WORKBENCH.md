@@ -1082,7 +1082,9 @@ queued dataset and its run record list only the gates, and the profile page
 names the features left out; a direct launch that asks for a preview feature
 on a WorkBuddy suite is refused. A WorkBuddy checkout whose installed overlay
 differs from this checkout's refuses a run with features until
-`install_overlay` reinstalls it. The frozen bundle has to know the flags: a release older
+`install_overlay` reinstalls it. The paid launch gate (`scripts/eval/workbuddy/launch_gate.py`)
+refuses a job carrying `METACODES_TEST_INTEGRITY`, `METACODES_DELIVERY_CADENCE`
+or `METACODES_STALL_GATE`, which its receipt's `evaluation_treatment` does not record. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
 features (4 since teamwork, 7 since model prices, 8 since WorkBuddy gates): an older node is refused until

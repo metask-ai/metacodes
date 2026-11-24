@@ -1348,6 +1348,10 @@ class SuiteOnExecutorTest(SetupFixture):
         local = manager.jobs_dir / run["name"]
         observed = json.loads((local / "observed.json").read_text())
         self.assertEqual(Path(observed["cwd"]).resolve(), repo.resolve())
+        self.assertEqual(final["features"], run["features"])
+        self.assertEqual({key: value for key, value in observed["job"]["harness_params_override"].items()
+                          if key != "METACODES_REASONING_EFFORT"},
+                         {wb_suite.FEATURE_PARAMS[name]: True for name in run["features"]})
         # WorkBuddy holds a placeholder and talks to the node's loopback relay.
         self.assertTrue(observed["key"].startswith("mcb-"), observed["key"])
         self.assertTrue(observed["base_url"].startswith("http://127.0.0.1:"), observed["base_url"])
@@ -1499,6 +1503,23 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertEqual(final["status"], "failed", final)
         self.assertIn("启动失败", final["error"])
         self.assertNotIn("SSH 连接中断", final["error"])
+        self.assertEqual(list((repo / "configs").rglob("metacodes-" + run["name"] + "*")), [])
+
+    def test_a_stale_node_overlay_refuses_a_workbuddy_run_with_gates(self):
+        from scripts.eval.harbor.suites import workbuddy as wb_suite
+        from scripts.eval.tests.test_bench_suites import workbuddy_checkout
+        manager, client, _ = self.prepare_remote()
+        uv = self.remote_home / ".local/bin/uv"
+        uv.write_text("#!/bin/sh\nexit 0\n")
+        uv.chmod(0o755)
+        repo = self.node_checkout(workbuddy_checkout)
+        (repo / wb_suite.AGENT).write_text("# an older overlay\n")
+        run = client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                          "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090",
+                                          "features": ["stall_gate"]})
+        final = wait_run(manager, run["name"], timeout=60)
+        self.assertEqual(final["status"], "failed", final)
+        self.assertIn("install_overlay", final["error"])
         self.assertEqual(list((repo / "configs").rglob("metacodes-" + run["name"] + "*")), [])
 
     def test_registry_suite_runs_on_ssh_executor_into_the_store(self):
