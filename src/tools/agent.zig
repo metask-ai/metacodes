@@ -186,6 +186,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         effective_tool_names = names;
         for (filtered, 0..) |fd, i| names[i] = fd.name;
         const sub_prompt_ctx = tools_mod.PromptContext{
+            .preview = ctx.preview,
             .permission_mode = mode_override.mode orelse .default,
             .enabled_tool_names = names,
             .agent_type = d.name,

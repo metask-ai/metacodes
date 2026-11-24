@@ -56,6 +56,24 @@ pub const PollStreak = struct {
     last_ms: util_time.Millis = 0,
 };
 
+pub const INPUT_STALL_QUIET_MS: u64 = 45_000;
+
+const StopCause = enum { request, time_limit };
+
+pub const Watchdog = struct {
+    limit_ms: u64,
+    output_bytes: u64 = 0,
+    output_changed_ms: util_time.Millis,
+    expired: bool = false,
+    input_notice_sent: bool = false,
+};
+
+pub const JobEventKind = union(enum) {
+    ended,
+    time_limit: u64,
+    awaiting_input,
+};
+
 pub const JobEntry = struct {
     id: [12]u8,
     /// 进程句柄（POSIX=pid，Windows=HANDLE）。走可移植 platform/process。
@@ -86,6 +104,7 @@ pub const JobEntry = struct {
     /// valid (they are freed at teardown) so an outstanding value snapshot
     /// never dangles; only the directory entries are gone.
     spool_released: bool = false,
+    watchdog: ?Watchdog = null,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -103,6 +122,7 @@ pub const JobExitEvent = struct {
     command_preview: []u8,
     stdout_unread: u64,
     stderr_unread: u64,
+    kind: JobEventKind = .ended,
 
     pub fn deinit(self: *JobExitEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.command_preview);
@@ -202,6 +222,14 @@ pub const JobRegistry = struct {
         const entry = self.getPtrLocked(id) orelse return;
         entry.retention = .background;
         entry.notify_on_exit = true;
+    }
+
+    pub fn armWatchdog(self: *JobRegistry, id: []const u8, limit_ms: u64) void {
+        self.lock();
+        defer self.unlock();
+        const entry = self.getPtrLocked(id) orelse return;
+        if (entry.status != .running) return;
+        entry.watchdog = .{ .limit_ms = limit_ms, .output_changed_ms = util_time.nowMs() };
     }
 
     /// 生成新 job id：12 hex = 6 byte，走可移植熵源 `platform/rng.zig`
@@ -546,6 +574,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn takeUnannouncedExits(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator) ![]JobExitEvent {
+        return self.takeUnannouncedExitsAt(owner, allocator, util_time.nowMs());
+    }
+
+    pub fn takeUnannouncedExitsAt(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now_ms: util_time.Millis) ![]JobExitEvent {
+        self.stopExpired(owner, now_ms);
         self.lock();
         defer self.unlock();
         self.reapExitedLocked();
@@ -570,9 +603,37 @@ pub const JobRegistry = struct {
                 .command_preview = command_preview,
                 .stdout_unread = stdout_size -| entry.stdout_read_offset,
                 .stderr_unread = stderr_size -| entry.stderr_read_offset,
+                .kind = endedKind(entry),
+            });
+        }
+        for (self.jobs.items) |*entry| {
+            if (!entry.notify_on_exit or entry.status != .running) continue;
+            if (!std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+            const watchdog = if (entry.watchdog) |*w| w else continue;
+            if (watchdog.input_notice_sent) continue;
+            const stdout_size = spoolFileSize(entry.stdout_path) catch 0;
+            const stderr_size = spoolFileSize(entry.stderr_path) catch 0;
+            if (!awaitsInput(watchdog, entry.stdout_path, entry.stderr_path, stdout_size + stderr_size, now_ms)) continue;
+            const command_preview = try allocator.dupe(u8, entry.command_preview);
+            errdefer allocator.free(command_preview);
+            try events.append(allocator, .{
+                .id = entry.id,
+                .status = .running,
+                .exit_code = null,
+                .started_ms = entry.started_ms,
+                .ended_ms = null,
+                .command_preview = command_preview,
+                .stdout_unread = stdout_size -| entry.stdout_read_offset,
+                .stderr_unread = stderr_size -| entry.stderr_read_offset,
+                .kind = .awaiting_input,
             });
         }
         const owned = try events.toOwnedSlice(allocator);
+        for (owned) |event| {
+            if (event.kind != .awaiting_input) continue;
+            const entry = self.getPtrLocked(event.id[0..]) orelse continue;
+            if (entry.watchdog) |*w| w.input_notice_sent = true;
+        }
         // Commit the at-most-once markers only after the complete owned slice
         // exists. An OOM must leave every exit retryable rather than losing the
         // earlier entries collected before the failing append.
@@ -596,6 +657,30 @@ pub const JobRegistry = struct {
 
     /// killGroup：向 pgid 发 SIGTERM → 0.5s → SIGKILL。
     pub fn kill(self: *JobRegistry, id: []const u8) !void {
+        return self.stop(id, .request);
+    }
+
+    fn stopExpired(self: *JobRegistry, owner: SessionId, now_ms: util_time.Millis) void {
+        while (true) {
+            var expired: ?[12]u8 = null;
+            self.lock();
+            self.reapExitedLocked();
+            for (self.jobs.items) |entry| {
+                const watchdog = entry.watchdog orelse continue;
+                if (entry.status != .running or !std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+                if (now_ms - entry.started_ms >= @as(util_time.Millis, @intCast(watchdog.limit_ms))) {
+                    expired = entry.id;
+                    break;
+                }
+            }
+            self.unlock();
+            const id = expired orelse return;
+            log.info("job", "bg time limit reached id={s}", .{id[0..]});
+            self.stop(id[0..], .time_limit) catch return;
+        }
+    }
+
+    fn stop(self: *JobRegistry, id: []const u8, cause: StopCause) !void {
         // 读 proc 句柄快照(锁内),kill+reap 在锁外(不让 blocking 收尸钉住锁)。可移植:
         // process.killJob(TERM→200ms→WNOHANG→KILL)+ reapBlocking(收尸)。**不让数据结构生命周期
         // 绑架 syscall 正确性**:proc 快照保证即便 entry 状态变化仍能正确 kill/reap。
@@ -621,6 +706,9 @@ pub const JobRegistry = struct {
                 jp.status = .killed;
                 jp.exit_code = -9; // SIGKILL 语义
                 jp.ended_ms = util_time.nowMs();
+                if (cause == .time_limit) if (jp.watchdog) |*w| {
+                    w.expired = true;
+                };
             }
         }
         self.unlock();
@@ -645,6 +733,72 @@ fn unlinkSpool(entry: *JobEntry) void {
     entry.spool_released = true;
     unlinkPath(entry.stdout_path);
     unlinkPath(entry.stderr_path);
+}
+
+fn endedKind(entry: *const JobEntry) JobEventKind {
+    const watchdog = entry.watchdog orelse return .ended;
+    return if (watchdog.expired) .{ .time_limit = watchdog.limit_ms } else .ended;
+}
+
+fn awaitsInput(watchdog: *Watchdog, stdout_path: []const u8, stderr_path: []const u8, output_bytes: u64, now_ms: util_time.Millis) bool {
+    if (output_bytes != watchdog.output_bytes) {
+        watchdog.output_bytes = output_bytes;
+        watchdog.output_changed_ms = now_ms;
+        return false;
+    }
+    if (now_ms - watchdog.output_changed_ms < @as(util_time.Millis, @intCast(INPUT_STALL_QUIET_MS))) return false;
+    return spoolEndsWithPrompt(stdout_path) or spoolEndsWithPrompt(stderr_path);
+}
+
+const PROMPT_TAIL_BYTES = 512;
+
+fn spoolEndsWithPrompt(path: []const u8) bool {
+    var buf: [PROMPT_TAIL_BYTES]u8 = undefined;
+    const tail = readSpoolTail(path, &buf) catch return false;
+    return looksLikeInteractivePrompt(tail);
+}
+
+fn readSpoolTail(path: []const u8, buf: *[PROMPT_TAIL_BYTES]u8) ![]const u8 {
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= path_buf.len) return error.PathTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&path_buf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+    const total = pfs.lseek(fd, 0, .end);
+    if (total < 0) return error.SeekFailed;
+    const start = @max(total - PROMPT_TAIL_BYTES, 0);
+    if (pfs.lseek(fd, start, .set) < 0) return error.SeekFailed;
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = pfs.read(fd, buf[filled..]);
+        if (n <= 0) break;
+        filled += @intCast(n);
+    }
+    return buf[0..filled];
+}
+
+const PROMPT_MARKERS = [_][]const u8{
+    "(y/n)",
+    "[y/n]",
+    "(yes/no)",
+    "[yes/no]",
+    "press enter",
+    "press any key",
+    "password:",
+    "continue?",
+};
+
+pub fn looksLikeInteractivePrompt(tail: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, tail, "\r\n");
+    const line_start = if (std.mem.findLastAny(u8, trimmed, "\r\n")) |index| index + 1 else 0;
+    const line = trimmed[line_start..];
+    if (std.mem.trim(u8, line, " \t").len == 0) return false;
+    for (PROMPT_MARKERS) |marker| {
+        if (std.ascii.findIgnoreCase(line, marker) != null) return true;
+    }
+    return std.mem.endsWith(u8, line, "? ") or std.mem.endsWith(u8, line, ": ");
 }
 
 fn unlinkPath(path: []const u8) void {
@@ -994,4 +1148,125 @@ test "spawn: cwd 已消失 → 子进程的报告原样上抛,不登记一个 ex
     try std.testing.expectEqual(@as(c_int, 0), std.c.rmdir(dir.ptr));
     try std.testing.expectError(error.ChildChdirFailed, r.spawnSynchronous("echo hello", dir));
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "watchdog stops a job at its background time limit and says so in the exit event" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnBackgroundOwned("sleep 30", null, owner);
+    r.armWatchdog(j.idSlice(), 60_000);
+    const early = try r.takeUnannouncedExitsAt(owner, a, j.started_ms + 59_999);
+    defer freeJobExitEvents(a, early);
+    try std.testing.expectEqual(@as(usize, 0), early.len);
+    try std.testing.expectEqual(JobStatus.running, r.get(j.idSlice()).?.status);
+    const events = try r.takeUnannouncedExitsAt(owner, a, j.started_ms + 60_000);
+    defer freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(JobStatus.killed, events[0].status);
+    try std.testing.expectEqual(JobEventKind{ .time_limit = 60_000 }, events[0].kind);
+    try std.testing.expectEqual(JobStatus.killed, r.get(j.idSlice()).?.status);
+}
+
+test "watchdog leaves a job without a limit and a KillShell kill as ordinary exits" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const unarmed = try r.spawnBackgroundOwned("sleep 30", null, owner);
+    const armed = try r.spawnBackgroundOwned("sleep 30", null, owner);
+    r.armWatchdog(armed.idSlice(), 60_000);
+    try r.kill(armed.idSlice());
+    const events = try r.takeUnannouncedExitsAt(owner, a, unarmed.started_ms + 100 * 3_600_000);
+    defer freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(JobEventKind.ended, events[0].kind);
+    try std.testing.expectEqual(JobStatus.running, r.get(unarmed.idSlice()).?.status);
+    try r.kill(unarmed.idSlice());
+}
+
+fn waitForOutput(r: *JobRegistry, id: []const u8, bytes: u64) !void {
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const entry = r.get(id) orelse return error.JobNotFound;
+        if ((spoolFileSize(entry.stdout_path) catch 0) >= bytes) return;
+        util_time.sleepMs(10);
+    }
+    return error.NoOutput;
+}
+
+test "watchdog notices a prompt-like tail once, after the quiet window" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const prompt = "Overwrite existing files? [y/N] ";
+    const j = try r.spawnBackgroundOwned("printf '" ++ prompt ++ "'; sleep 30", null, owner);
+    r.armWatchdog(j.idSlice(), 3_600_000);
+    try waitForOutput(&r, j.idSlice(), prompt.len);
+    const now = util_time.nowMs();
+    const quiet: util_time.Millis = @intCast(INPUT_STALL_QUIET_MS);
+    const first = try r.takeUnannouncedExitsAt(owner, a, now);
+    defer freeJobExitEvents(a, first);
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+    const before_window = try r.takeUnannouncedExitsAt(owner, a, now + quiet - 1);
+    defer freeJobExitEvents(a, before_window);
+    try std.testing.expectEqual(@as(usize, 0), before_window.len);
+    const notice = try r.takeUnannouncedExitsAt(owner, a, now + quiet);
+    defer freeJobExitEvents(a, notice);
+    try std.testing.expectEqual(@as(usize, 1), notice.len);
+    try std.testing.expectEqual(JobEventKind.awaiting_input, notice[0].kind);
+    try std.testing.expectEqual(JobStatus.running, notice[0].status);
+    const again = try r.takeUnannouncedExitsAt(owner, a, now + 4 * quiet);
+    defer freeJobExitEvents(a, again);
+    try std.testing.expectEqual(@as(usize, 0), again.len);
+    try r.kill(j.idSlice());
+}
+
+test "watchdog stays quiet about a stalled job whose output is not a prompt" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnBackgroundOwned("printf 'compiling module 3 of 9\\n'; sleep 30", null, owner);
+    r.armWatchdog(j.idSlice(), 3_600_000);
+    try waitForOutput(&r, j.idSlice(), "compiling module 3 of 9\n".len);
+    const now = util_time.nowMs();
+    const quiet: util_time.Millis = @intCast(INPUT_STALL_QUIET_MS);
+    const first = try r.takeUnannouncedExitsAt(owner, a, now);
+    defer freeJobExitEvents(a, first);
+    const later = try r.takeUnannouncedExitsAt(owner, a, now + 10 * quiet);
+    defer freeJobExitEvents(a, later);
+    try std.testing.expectEqual(@as(usize, 0), first.len + later.len);
+    try r.kill(j.idSlice());
+}
+
+test "looksLikeInteractivePrompt matches the listed prompts and nothing else" {
+    const prompts = [_][]const u8{
+        "Proceed (y/n)",
+        "Install 3 packages? [Y/n] ",
+        "Remove? [y/N]",
+        "Are you sure (yes/no)?",
+        "Press ENTER to continue",
+        "press any key\n",
+        "line one\nPassword:",
+        "Continue?",
+        "Name of the project? ",
+        "Enter a value: ",
+    };
+    for (prompts) |prompt| try std.testing.expect(looksLikeInteractivePrompt(prompt));
+    const plain = [_][]const u8{
+        "",
+        "\n\n",
+        "Building...\n",
+        "Error: missing file\n",
+        "Continue? [y/N]\nDone.\n",
+        "Ratio: 3/4\n",
+    };
+    for (plain) |text| try std.testing.expect(!looksLikeInteractivePrompt(text));
 }

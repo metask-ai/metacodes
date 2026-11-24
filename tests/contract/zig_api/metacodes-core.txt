@@ -3849,6 +3849,17 @@ metacodes-core.job_registry.Retention.synchronous
 metacodes-core.job_registry.PollStreak: struct
 metacodes-core.job_registry.PollStreak.low_yield: u8 = 0
 metacodes-core.job_registry.PollStreak.last_ms: util_time.Millis = 0
+metacodes-core.job_registry.INPUT_STALL_QUIET_MS: const u64 = 45_000
+metacodes-core.job_registry.Watchdog: struct
+metacodes-core.job_registry.Watchdog.limit_ms: u64
+metacodes-core.job_registry.Watchdog.output_bytes: u64 = 0
+metacodes-core.job_registry.Watchdog.output_changed_ms: util_time.Millis
+metacodes-core.job_registry.Watchdog.expired: bool = false
+metacodes-core.job_registry.Watchdog.input_notice_sent: bool = false
+metacodes-core.job_registry.JobEventKind: union(enum)
+metacodes-core.job_registry.JobEventKind.ended
+metacodes-core.job_registry.JobEventKind.time_limit: u64
+metacodes-core.job_registry.JobEventKind.awaiting_input
 metacodes-core.job_registry.JobEntry: struct
 metacodes-core.job_registry.JobEntry.id: [12]u8
 metacodes-core.job_registry.JobEntry.proc: process.ProcHandle
@@ -3868,6 +3879,7 @@ metacodes-core.job_registry.JobEntry.stdout_read_offset: u64 = 0
 metacodes-core.job_registry.JobEntry.stderr_read_offset: u64 = 0
 metacodes-core.job_registry.JobEntry.poll_streak: PollStreak = .{}
 metacodes-core.job_registry.JobEntry.spool_released: bool = false
+metacodes-core.job_registry.JobEntry.watchdog: ?Watchdog = null
 metacodes-core.job_registry.JobEntry.idSlice: fn idSlice(self: *const JobEntry) []const u8
 metacodes-core.job_registry.JobExitEvent: struct
 metacodes-core.job_registry.JobExitEvent.id: [12]u8
@@ -3878,6 +3890,7 @@ metacodes-core.job_registry.JobExitEvent.ended_ms: ?util_time.Millis
 metacodes-core.job_registry.JobExitEvent.command_preview: []u8
 metacodes-core.job_registry.JobExitEvent.stdout_unread: u64
 metacodes-core.job_registry.JobExitEvent.stderr_unread: u64
+metacodes-core.job_registry.JobExitEvent.kind: JobEventKind = .ended
 metacodes-core.job_registry.JobExitEvent.deinit: fn deinit(self: *JobExitEvent, allocator: std.mem.Allocator) void
 metacodes-core.job_registry.freeJobExitEvents: fn freeJobExitEvents(allocator: std.mem.Allocator, events: []JobExitEvent) void
 metacodes-core.job_registry.JobRegistry: struct
@@ -3890,6 +3903,7 @@ metacodes-core.job_registry.JobRegistry.init: fn init(allocator: std.mem.Allocat
 metacodes-core.job_registry.JobRegistry.deinit: fn deinit(self: *JobRegistry) void
 metacodes-core.job_registry.JobRegistry.releaseSpool: fn releaseSpool(self: *JobRegistry, id: []const u8) void
 metacodes-core.job_registry.JobRegistry.promoteToBackground: fn promoteToBackground(self: *JobRegistry, id: []const u8) void
+metacodes-core.job_registry.JobRegistry.armWatchdog: fn armWatchdog(self: *JobRegistry, id: []const u8, limit_ms: u64) void
 metacodes-core.job_registry.JobRegistry.spawnBackground: fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackgroundOwned: fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnSynchronous: fn spawnSynchronous(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
@@ -3915,8 +3929,10 @@ metacodes-core.job_registry.JobRegistry.PendingNotifySummary.first_preview_len: 
 metacodes-core.job_registry.JobRegistry.PendingNotifySummary.preview: fn preview(self: *const PendingNotifySummary) []const u8
 metacodes-core.job_registry.JobRegistry.pendingNotifySummary: fn pendingNotifySummary(self: *JobRegistry, owner: SessionId) PendingNotifySummary
 metacodes-core.job_registry.JobRegistry.takeUnannouncedExits: fn takeUnannouncedExits(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator) ![]JobExitEvent
+metacodes-core.job_registry.JobRegistry.takeUnannouncedExitsAt: fn takeUnannouncedExitsAt(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now_ms: util_time.Millis) ![]JobExitEvent
 metacodes-core.job_registry.JobRegistry.kill: fn kill(self: *JobRegistry, id: []const u8) !void
 metacodes-core.job_registry.JobRegistry.activeCount: fn activeCount(self: *JobRegistry) usize
+metacodes-core.job_registry.looksLikeInteractivePrompt: fn looksLikeInteractivePrompt(tail: []const u8) bool
 metacodes-core.job_notification: file
 metacodes-core.job_notification.TASK_NOTIFICATION_TAG: const = "task-notification"
 metacodes-core.job_notification.render: fn render(allocator: std.mem.Allocator, events: []const JobExitEvent) ![]u8
@@ -8891,12 +8907,14 @@ metacodes-core.types.PreviewFeature: enum
 metacodes-core.types.PreviewFeature.execute_code
 metacodes-core.types.PreviewFeature.teamwork
 metacodes-core.types.PreviewFeature.comment_guard
+metacodes-core.types.PreviewFeature.background_watchdog
 metacodes-core.types.PreviewFeature.parse: fn parse(name: []const u8) ?PreviewFeature
 metacodes-core.types.PreviewFeatures: struct(u8)
 metacodes-core.types.PreviewFeatures.execute_code: bool = false
 metacodes-core.types.PreviewFeatures.teamwork: bool = false
 metacodes-core.types.PreviewFeatures.comment_guard: bool = false
-metacodes-core.types.PreviewFeatures._unused: u5 = 0
+metacodes-core.types.PreviewFeatures.background_watchdog: bool = false
+metacodes-core.types.PreviewFeatures._unused: u4 = 0
 metacodes-core.types.PreviewFeatures.none: const PreviewFeatures = .{}
 metacodes-core.types.PreviewFeatures.all: const PreviewFeatures = blk: { var features: PreviewFeatures = .{}; for (std.enums.values(PreviewFeature)) |feature| @field(features, @tagName(feature)) = true; break :blk features; }
 metacodes-core.types.PreviewFeatures.has: fn has(self: PreviewFeatures, feature: PreviewFeature) bool

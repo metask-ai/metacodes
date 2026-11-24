@@ -184,7 +184,13 @@ const BASH_READONLY_NOTE =
     \\NOTE: You are a read-only agent. Use Bash ONLY for read-only operations (ls, git status, git log, git diff, find, cat, head, tail). NEVER run state-changing commands (mkdir, touch, rm, cp, mv, git add, git commit, npm/pip install) or use redirection (>, >>) / heredocs to write files.
 ;
 
+const BASH_BACKGROUND_LIMIT_NOTE =
+    \\
+    \\- A background job is stopped when it reaches its background time limit. With `run_in_background`, `timeout` sets that limit (default 1800000 ms = 30 minutes, maximum 7200000 ms = 2 hours); a command moved to the background after 15s gets the default. If a background job seems to be waiting for interactive input, you are told once: kill it with KillShell and re-run it non-interactively.
+;
+
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    const background_limit_note = if (ctx.preview.background_watchdog) BASH_BACKGROUND_LIMIT_NOTE else "";
     const git_section = if (ctx.include_git and !ctx.isReadonlyAgent()) BASH_GIT_SECTION else "";
     const readonly_note = if (ctx.isReadonlyAgent()) BASH_READONLY_NOTE else "";
     // 复刻 codex 第③层:平台化工具描述。Windows 上用系统自带 PowerShell 跑(零 git-bash),
@@ -197,14 +203,14 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
             \\- The command argument is required. Write **PowerShell** syntax (this runs via `powershell -NoProfile -Command`, not bash).
             \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
             \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-            \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms); do not append '&'.
+            \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms); do not append '&'.{s}
             \\- VERY IMPORTANT: avoid search/read via the shell — use Grep, Glob, Read, LS tools instead of `Select-String`/`Get-Content`/`Get-ChildItem` for finding and reading files. If you still must grep, prefer ripgrep at `rg`.
             \\- Chain multiple commands with ';'. DO NOT use newlines.
             \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
             \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
             \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
             \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
-        , .{ git_section, readonly_note });
+        , .{ background_limit_note, git_section, readonly_note });
     }
     return std.fmt.allocPrint(allocator,
         \\Executes a given bash command in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
@@ -213,13 +219,13 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- The command argument is required.
         \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
         \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-        \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.
+        \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.{s}
         \\- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Agent to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.
         \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
         \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
         \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
         \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
-    , .{ git_section, readonly_note });
+    , .{ background_limit_note, git_section, readonly_note });
 }
 
 // ============================================================================

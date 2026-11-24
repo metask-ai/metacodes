@@ -28,6 +28,16 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
 /// 同步模式超过此时长自动转后台：与 TS 对齐（ASSISTANT_BLOCKING_BUDGET_MS）
 pub const AUTO_BACKGROUND_MS: u64 = 15_000;
+pub const BACKGROUND_LIMIT_DEFAULT_MS: u64 = 1_800_000;
+pub const BACKGROUND_LIMIT_MAX_MS: u64 = 7_200_000;
+
+fn backgroundLimitMs(ctx: *const ToolContext, args: []const u8) ?u64 {
+    if (!ctx.preview.background_watchdog) return null;
+    const requested = common.extractJsonArg(args, "timeout") orelse return BACKGROUND_LIMIT_DEFAULT_MS;
+    const parsed = std.fmt.parseInt(u64, requested, 10) catch return BACKGROUND_LIMIT_DEFAULT_MS;
+    if (parsed == 0) return BACKGROUND_LIMIT_DEFAULT_MS;
+    return @min(parsed, BACKGROUND_LIMIT_MAX_MS);
+}
 
 /// 自动转后台时那份**部分快照**里单股输出的上限(`formatAutoBackgrounded`)。
 /// 已完成的结果不走这里:它按 `ToolContext.result_budget` 派生的额度做头尾预览,
@@ -741,6 +751,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
                 const j = registry.spawnBackgroundOwned(command, cwd_opt, ctx.session) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
+                if (backgroundLimitMs(ctx, args)) |limit_ms| registry.armWatchdog(j.idSlice(), limit_ms);
                 // Nothing watches what a detached command writes. Say so on
                 // the file-change contract instead of reporting no changes.
                 if (observesFileChanges(ctx, args)) ctx.file_change_sink.?.noteIncomplete();
@@ -816,7 +827,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.abort,
             cwd_opt,
             ctx.artifact_root,
-            ctx.project_rule_gate == null,
+            if (ctx.project_rule_gate == null) .{ .after = .{ .limit_ms = if (ctx.preview.background_watchdog) BACKGROUND_LIMIT_DEFAULT_MS else null } } else .never,
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
@@ -841,7 +852,7 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
             ctx.abort,
             cwd_opt,
             ctx.artifact_root,
-            false,
+            .never,
             ctx.result_budget,
             ctx.tool_result_metrics,
             attachments,
@@ -890,7 +901,7 @@ fn runAutoBackgroundable(
     abort: ?*const @import("../util/abort.zig").AbortSignal,
     cwd: ?[]const u8,
     artifact_root: []const u8,
-    allow_auto_background: bool,
+    auto_background: AutoBackground,
     budget: result_budget.Budget,
     metrics: ?*ResultMetrics,
     attachments: *tool_result.SealedHandles,
@@ -904,6 +915,7 @@ fn runAutoBackgroundable(
     const j_entry = try registry.spawnSynchronousOwned(command, cwd, owner);
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
+    const allow_auto_background = auto_background != .never;
     const effective_budget = if (allow_auto_background) @min(timeout_ms, AUTO_BACKGROUND_MS) else timeout_ms;
     const start = nowMs();
     var polls: u32 = 0;
@@ -935,12 +947,18 @@ fn runAutoBackgroundable(
             // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
             // → 转为 background 保留期。
             registry.promoteToBackground(job_id[0..]);
+            if (auto_background.after.limit_ms) |limit_ms| registry.armWatchdog(job_id[0..], limit_ms);
             outlived.* = true;
             return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }
         util_time.sleepMs(@min(foregroundPollDelayMs(polls), effective_budget - elapsed));
     }
 }
+
+const AutoBackground = union(enum) {
+    never,
+    after: struct { limit_ms: ?u64 },
+};
 
 const FOREGROUND_POLL_MAX_MS: u64 = 100;
 
@@ -1152,6 +1170,55 @@ test "BashTool auto-backgrounds after 15s" {
     for (registry.jobs.items) |*j| {
         if (j.status == .running) registry.kill(j.idSlice()) catch {};
     }
+}
+
+test "BashTool run_in_background arms the watchdog only with background_watchdog on" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    defer _ = registry.killAll();
+
+    const off = ToolContext{ .allocator = a, .jobs = &registry };
+    const off_result = try execute(&off, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\",\"timeout\":60000}");
+    defer a.free(off_result);
+    try std.testing.expectEqual(@as(?@import("../core/job_registry.zig").Watchdog, null), registry.jobs.items[0].watchdog);
+
+    const on = ToolContext{ .allocator = a, .jobs = &registry, .preview = .{ .background_watchdog = true } };
+    const default_result = try execute(&on, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\"}");
+    defer a.free(default_result);
+    try std.testing.expectEqual(BACKGROUND_LIMIT_DEFAULT_MS, registry.jobs.items[1].watchdog.?.limit_ms);
+    const capped_result = try execute(&on, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\",\"timeout\":99999999}");
+    defer a.free(capped_result);
+    try std.testing.expectEqual(BACKGROUND_LIMIT_MAX_MS, registry.jobs.items[2].watchdog.?.limit_ms);
+    const short_result = try execute(&on, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\",\"timeout\":60000}");
+    defer a.free(short_result);
+    try std.testing.expectEqual(@as(u64, 60_000), registry.jobs.items[3].watchdog.?.limit_ms);
+}
+
+test "Bash description with background_watchdog off is byte-identical to the base description" {
+    const a = std.testing.allocator;
+    const descriptions = @import("descriptions.zig");
+    const base = try descriptions.describeBash(a, &.{});
+    defer a.free(base);
+    const other = try descriptions.describeBash(a, &.{ .preview = .{ .execute_code = true, .teamwork = true, .comment_guard = true } });
+    defer a.free(other);
+    try std.testing.expectEqualStrings(base, other);
+    try std.testing.expect(std.mem.indexOf(u8, base, "background time limit") == null);
+    const on = try descriptions.describeBash(a, &.{ .preview = .{ .background_watchdog = true } });
+    defer a.free(on);
+    try std.testing.expect(std.mem.indexOf(u8, on, "background time limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, on, "7200000") != null);
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tools = @import("../tools.zig");
+    const base_defs = try tools.toToolDefinitionsFull(arena, null, &.{});
+    const off_defs = try tools.toToolDefinitionsFull(arena, null, &.{ .preview = .{ .comment_guard = true } });
+    const base_bash = for (base_defs) |d| (if (std.mem.eql(u8, d.name, "Bash")) break d) else return error.BashMissing;
+    const off_bash = for (off_defs) |d| (if (std.mem.eql(u8, d.name, "Bash")) break d) else return error.BashMissing;
+    try std.testing.expectEqualStrings(base_bash.description, off_bash.description);
+    try std.testing.expectEqual(base_bash.input_schema.prop_specs.?.ptr, off_bash.input_schema.prop_specs.?.ptr);
 }
 
 test "formatAutoBackgrounded 交出稳定的 job_id,而不是 staging 路径" {

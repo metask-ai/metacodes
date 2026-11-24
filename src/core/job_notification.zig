@@ -14,25 +14,71 @@ pub fn render(allocator: std.mem.Allocator, events: []const JobExitEvent) ![]u8 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     for (events, 0..) |event, index| {
-        var duration_buf: [32]u8 = undefined;
         if (index != 0) try out.writer.writeAll("\n\n");
         try out.writer.writeAll("<task-notification>\n<task-id>");
         try out.writer.writeAll(event.id[0..]);
         try out.writer.writeAll("</task-id>\n<status>");
-        try out.writer.writeAll(if (event.status == .killed) "killed" else "exited");
+        try out.writer.writeAll(switch (event.status) {
+            .running => "running",
+            .killed => "killed",
+            .exited, .failed => "exited",
+        });
         try out.writer.writeAll("</status>\n");
         if (event.exit_code) |code| try out.writer.print("<exit-code>{d}</exit-code>\n", .{code});
         try out.writer.writeAll("<summary>Background job `");
         try writeXmlEscaped(&out.writer, event.command_preview);
-        try out.writer.print("` {s} after {s}. Unread output: stdout {d} bytes, stderr {d} bytes. Read it with BashOutput(job_id=\"{s}\"); do not re-run the command.</summary>\n</task-notification>", .{
-            if (event.status == .killed) "was killed" else "exited",
-            humanDuration(&duration_buf, event.started_ms, event.ended_ms),
-            event.stdout_unread,
-            event.stderr_unread,
-            event.id[0..],
-        });
+        try out.writer.writeAll("` ");
+        switch (event.kind) {
+            .ended => try writeEnded(&out.writer, event),
+            .time_limit => |limit_ms| try writeTimeLimit(&out.writer, event, limit_ms),
+            .awaiting_input => try writeAwaitingInput(&out.writer, event),
+        }
+        try out.writer.writeAll("</summary>\n</task-notification>");
     }
     return try out.toOwnedSlice();
+}
+
+fn writeEnded(writer: *std.Io.Writer, event: JobExitEvent) !void {
+    var duration_buf: [32]u8 = undefined;
+    try writer.print("{s} after {s}. Unread output: stdout {d} bytes, stderr {d} bytes. Read it with BashOutput(job_id=\"{s}\"); do not re-run the command.", .{
+        if (event.status == .killed) "was killed" else "exited",
+        humanDuration(&duration_buf, event.started_ms, event.ended_ms),
+        event.stdout_unread,
+        event.stderr_unread,
+        event.id[0..],
+    });
+}
+
+fn writeTimeLimit(writer: *std.Io.Writer, event: JobExitEvent, limit_ms: u64) !void {
+    var limit_buf: [32]u8 = undefined;
+    try writer.print("was stopped after reaching its background time limit of {s}. Unread output: stdout {d} bytes, stderr {d} bytes. Read it with BashOutput(job_id=\"{s}\"). If it needs longer, re-run it with a larger timeout.", .{
+        humanLimit(&limit_buf, limit_ms),
+        event.stdout_unread,
+        event.stderr_unread,
+        event.id[0..],
+    });
+}
+
+fn writeAwaitingInput(writer: *std.Io.Writer, event: JobExitEvent) !void {
+    try writer.print("is still running, but its output has not changed for {d}s and appears to be waiting for interactive input. Stop it with KillShell(job_id=\"{s}\") and re-run it with the input piped in or with non-interactive flags (for example --yes). Unread output: stdout {d} bytes, stderr {d} bytes; read it with BashOutput(job_id=\"{s}\").", .{
+        registry_mod.INPUT_STALL_QUIET_MS / 1000,
+        event.id[0..],
+        event.stdout_unread,
+        event.stderr_unread,
+        event.id[0..],
+    });
+}
+
+fn humanLimit(buffer: *[32]u8, limit_ms: u64) []const u8 {
+    if (limit_ms % 1000 != 0) return std.fmt.bufPrint(buffer, "{d}ms", .{limit_ms}) catch "0s";
+    const seconds = limit_ms / 1000;
+    const hours = seconds / 3600;
+    const minutes = (seconds % 3600) / 60;
+    const secs = seconds % 60;
+    if (secs != 0) return std.fmt.bufPrint(buffer, "{d}s", .{seconds}) catch "0s";
+    if (hours > 0 and minutes > 0) return std.fmt.bufPrint(buffer, "{d}h{d:0>2}m", .{ hours, minutes }) catch "0s";
+    if (hours > 0) return std.fmt.bufPrint(buffer, "{d}h", .{hours}) catch "0s";
+    return std.fmt.bufPrint(buffer, "{d}m", .{minutes}) catch "0s";
 }
 
 fn writeXmlEscaped(writer: *std.Io.Writer, text: []const u8) !void {
@@ -193,4 +239,85 @@ test "JobNotify replaces an incomplete UTF-8 preview instead of emitting bad tex
     defer a.free(text);
     try std.testing.expect(std.unicode.utf8ValidateSlice(text));
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{FFFD}") != null);
+}
+
+test "JobNotify explains a stop at the background time limit" {
+    const a = std.testing.allocator;
+    var event = JobExitEvent{
+        .id = "000000000005".*,
+        .status = .killed,
+        .exit_code = null,
+        .started_ms = 0,
+        .ended_ms = 1_800_000,
+        .command_preview = try a.dupe(u8, "npm run dev"),
+        .stdout_unread = 10,
+        .stderr_unread = 0,
+        .kind = .{ .time_limit = 1_800_000 },
+    };
+    defer event.deinit(a);
+    const text = try render(a, &.{event});
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<status>killed</status>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "stopped after reaching its background time limit of 30m.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<exit-code>") == null);
+}
+
+test "JobNotify formats background time limits" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("30m", humanLimit(&buf, 1_800_000));
+    try std.testing.expectEqualStrings("2h", humanLimit(&buf, 7_200_000));
+    try std.testing.expectEqualStrings("1h30m", humanLimit(&buf, 5_400_000));
+    try std.testing.expectEqualStrings("90s", humanLimit(&buf, 90_000));
+    try std.testing.expectEqualStrings("300ms", humanLimit(&buf, 300));
+}
+
+test "JobNotify awaiting-input notice is metadata only and asks for a non-interactive re-run" {
+    const a = std.testing.allocator;
+    var event = JobExitEvent{
+        .id = "000000000006".*,
+        .status = .running,
+        .exit_code = null,
+        .started_ms = 0,
+        .ended_ms = null,
+        .command_preview = try a.dupe(u8, "apt-get install foo"),
+        .stdout_unread = 33,
+        .stderr_unread = 0,
+        .kind = .awaiting_input,
+    };
+    defer event.deinit(a);
+    const text = try render(a, &.{event});
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<status>running</status>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "waiting for interactive input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "KillShell(job_id=\"000000000006\")") != null);
+}
+
+test "JobNotify real awaiting-input notice never carries the prompt text" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var jobs = try registry_mod.JobRegistry.init(a);
+    defer jobs.deinit();
+    const owner = @import("session_id.zig").gen();
+    const entry = try jobs.spawnBackgroundOwned("printf '\\124\\117\\120\\123\\105\\103\\122\\105\\124\\040\\120\\141\\163\\163\\167\\157\\162\\144\\072\\040'; sleep 30", null, owner);
+    defer jobs.kill(entry.idSlice()) catch {};
+    jobs.armWatchdog(entry.idSlice(), 3_600_000);
+    const quiet: util_time.Millis = @intCast(registry_mod.INPUT_STALL_QUIET_MS);
+    var now = util_time.nowMs();
+    var events: []JobExitEvent = &.{};
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        now += quiet;
+        events = try jobs.takeUnannouncedExitsAt(owner, a, now);
+        if (events.len > 0) break;
+        a.free(events);
+        events = &.{};
+        util_time.sleepMs(10);
+    }
+    defer registry_mod.freeJobExitEvents(a, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(registry_mod.JobEventKind.awaiting_input, events[0].kind);
+    const text = try render(a, events);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "TOPSECRET") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Password") == null);
 }
