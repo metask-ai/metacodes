@@ -909,17 +909,22 @@ pub fn reapNonblock(h: ProcHandle) ReapStatus {
     return .{ .exited = posixExitCode(status) };
 }
 
-/// 杀子进程。POSIX killpg（-pid=杀整组，因 spawnToFiles 已 setpgid(pid,pid) 使 pgid==pid）；
-/// Windows TerminateProcess（单进程）。之后须 reapBlocking 收尸。
-pub fn killJob(h: ProcHandle) void {
-    terminateJob(h);
-    waitKillGrace();
-    forceKillJob(h);
-}
-
 pub const KILL_GRACE_MS: u64 = 200;
 
-pub fn terminateJob(h: ProcHandle) void {
+/// 杀子进程树 = terminate → KILL_GRACE_MS → forceKill。POSIX killpg（-pid=杀整组，因
+/// spawnToFiles 已 setpgid(pid,pid) 使 pgid==pid）；不在这里收尸，未收尸的 leader 让 pgid 不被复用。
+/// Windows TerminateProcess（单进程）。之后须 reapBlocking 收尸。
+pub fn killJob(h: ProcHandle) void {
+    terminate(h);
+    if (!is_windows) {
+        const req = std.c.timespec{ .sec = 0, .nsec = @intCast(KILL_GRACE_MS * std.time.ns_per_ms) };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&req, &rem);
+    }
+    forceKill(h);
+}
+
+pub fn terminate(h: ProcHandle) void {
     if (is_windows) {
         _ = TerminateProcess(h, 1);
     } else {
@@ -927,20 +932,8 @@ pub fn terminateJob(h: ProcHandle) void {
     }
 }
 
-pub fn waitKillGrace() void {
-    if (is_windows) return;
-    const req = std.c.timespec{ .sec = 0, .nsec = KILL_GRACE_MS * std.time.ns_per_ms };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
-}
-
-pub fn forceKillJob(h: ProcHandle) void {
-    if (is_windows) return;
-    var status: c_int = 0;
-    const WNOHANG: c_int = 1;
-    if (std.c.waitpid(h, &status, WNOHANG) == 0) {
-        _ = std.c.kill(-h, std.c.SIG.KILL);
-    }
+pub fn forceKill(h: ProcHandle) void {
+    if (!is_windows) _ = std.c.kill(-h, std.c.SIG.KILL);
 }
 
 /// 阻塞 reap（收尸，防僵尸）。POSIX waitpid(0)；Windows CloseHandle（已 Terminate/退出）。

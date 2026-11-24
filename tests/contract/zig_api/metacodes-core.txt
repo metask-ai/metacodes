@@ -3897,7 +3897,8 @@ metacodes-core.job_registry.JobRegistry.index: std.AutoHashMap([12]u8, usize)
 metacodes-core.job_registry.JobRegistry.base_dir: []const u8
 metacodes-core.job_registry.JobRegistry.mu: sync.Mutex = .{}
 metacodes-core.job_registry.JobRegistry.sweeper: ?std.Thread = null
-metacodes-core.job_registry.JobRegistry.sweeper_stop: std.atomic.Value(bool) = .init(false)
+metacodes-core.job_registry.JobRegistry.sweeper_quit: bool = false
+metacodes-core.job_registry.JobRegistry.sweeper_wake: sync.Condition = .{}
 metacodes-core.job_registry.JobRegistry.init: fn init(allocator: std.mem.Allocator) !JobRegistry
 metacodes-core.job_registry.JobRegistry.deinit: fn deinit(self: *JobRegistry) void
 metacodes-core.job_registry.JobRegistry.releaseSpool: fn releaseSpool(self: *JobRegistry, id: []const u8) void
@@ -3959,6 +3960,7 @@ metacodes-core.monitor_stream.State.suppressed: u32 = 0
 metacodes-core.monitor_stream.State.over_budget_since_ms: ?util_time.Millis = null
 metacodes-core.monitor_stream.State.events_delivered: u32 = 0
 metacodes-core.monitor_stream.State.stop: ?Stop = null
+metacodes-core.monitor_stream.State.kill_at_ms: ?util_time.Millis = null
 metacodes-core.monitor_stream.State.skipping_line: bool = false
 metacodes-core.monitor_stream.State.init: fn init(description: []const u8, timeout_ms: ?u64, now: util_time.Millis) State
 metacodes-core.monitor_stream.State.expired: fn expired(self: *const State, started_ms: util_time.Millis, now: util_time.Millis) bool

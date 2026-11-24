@@ -24,6 +24,7 @@ pub const State = struct {
     over_budget_since_ms: ?util_time.Millis = null,
     events_delivered: u32 = 0,
     stop: ?Stop = null,
+    kill_at_ms: ?util_time.Millis = null,
     skipping_line: bool = false,
 
     pub fn init(description: []const u8, timeout_ms: ?u64, now: util_time.Millis) State {
