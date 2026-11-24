@@ -1,3 +1,4 @@
+zig: 0.16.0
 metacodes-core: file
 metacodes-core.VERSION: const = "<VERSION>"
 metacodes-core.util_fs: file

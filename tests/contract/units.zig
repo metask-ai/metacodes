@@ -41,6 +41,14 @@ test "string values under identifier keys become <ID>, null stays" {
     try expectApplied("{\"trace_id\":\"db9832d00000\",\"x\":1},{\"trace_id\":null}", .{}, "{\"trace_id\":\"<ID>\",\"x\":1},{\"trace_id\":null}");
 }
 
+test "the request id in a log prefix becomes <ID>" {
+    try expectApplied("[ERROR client req=600af9880001] HTTP 400", .{}, "[ERROR client req=<ID>] HTTP 400");
+    try expectApplied("prefix_req=abc and req= alone", .{}, "prefix_req=abc and req= alone");
+    try expectApplied("echo req=on", .{}, "echo req=on");
+    try expectApplied("echo req=off]", .{}, "echo req=off]");
+    try expectApplied("echo req=beef and more", .{}, "echo req=beef and more");
+}
+
 test "hex identifiers of 16 or more characters and UUIDs become placeholders" {
     try expectApplied("projects/54104febbb7b708c/000001a20c4ced0066a5c7b0", .{}, "projects/<HEX16>/<HEX24>");
     try expectApplied("id 123e4567-e89b-12d3-a456-426614174000.", .{}, "id <UUID>.");
