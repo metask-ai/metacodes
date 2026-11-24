@@ -2871,7 +2871,7 @@ pub fn build(b: *std.Build) void {
     const zig_api_snapshot = b.addRunArtifact(zig_api_snapshot_tool);
     zig_api_snapshot.has_side_effects = true;
     zig_api_snapshot.setCwd(b.path("."));
-    zig_api_snapshot.addArgs(&.{ "src/lib.zig", "metacodes-core", "tests/contract", "zig_api/metacodes-core.txt", manifest.version });
+    zig_api_snapshot.addArgs(&.{ "src/lib.zig", "metacodes-core", "tests/contract", "zig_api/metacodes-core.txt", manifest.version, manifest.minimum_zig_version });
     if (update_contract) zig_api_snapshot.addArg("--update");
     gate_static_step.dependOn(&zig_api_snapshot.step);
     units_test_step.dependOn(&zig_api_snapshot.step);
@@ -2919,6 +2919,24 @@ pub fn build(b: *std.Build) void {
     });
     contract_run.setEnvironmentVariable("METACODES_CONTRACT_AGENTCORE_SHARED", b.getInstallPath(.{ .custom = "contract" }, agentcore_shared_lib.out_filename));
     contract_run.step.dependOn(&contract_agentcore_shared.step);
+    const contract_c_consumer_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    contract_c_consumer_mod.addCSourceFile(.{
+        .file = b.path("tests/agentcore_artifact_consumer/consumer.c"),
+        .flags = &.{ "-std=c11", "-DMETASK_AGENTCORE_CONSUMER_DYNAMIC=1" },
+    });
+    contract_c_consumer_mod.addIncludePath(b.path("sdk"));
+    if (target.result.os.tag == .windows) contract_c_consumer_mod.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
+    if (target.result.os.tag == .linux) contract_c_consumer_mod.linkSystemLibrary("dl", .{ .use_pkg_config = .no });
+    const contract_c_consumer = b.addExecutable(.{ .name = "agentcore-contract-c-consumer", .root_module = contract_c_consumer_mod });
+    const install_contract_c_consumer = b.addInstallArtifact(contract_c_consumer, .{
+        .dest_dir = .{ .override = .{ .custom = "contract" } },
+    });
+    contract_run.setEnvironmentVariable("METACODES_CONTRACT_C_CONSUMER", b.getInstallPath(.{ .custom = "contract" }, contract_c_consumer.out_filename));
+    contract_run.step.dependOn(&install_contract_c_consumer.step);
     wireTinyKgTestInput(contract_run, staged_tinykg);
     wireTinyKgdTestInput(contract_run, staged_tinykgd);
     contract_run.step.dependOn(install_cli);

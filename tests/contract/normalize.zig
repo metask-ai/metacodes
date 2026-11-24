@@ -12,6 +12,7 @@ pub const Rules = struct {
 const volatile_number_suffixes = [_][]const u8{ "_ms", "_ns", "_at", "_unix", "Nano" };
 const volatile_number_keys = [_][]const u8{"content_bytes"};
 const volatile_string_keys = [_][]const u8{"trace_id"};
+const volatile_token_prefixes = [_][]const u8{" req="};
 
 pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
     var current = try gpa.dupe(u8, input);
@@ -29,6 +30,7 @@ pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
         replaceTimestamps,
         replaceVolatileNumbers,
         replaceVolatileStrings,
+        replaceVolatileTokens,
         replaceUuids,
         replaceHexRuns,
     };
@@ -162,6 +164,27 @@ fn replaceVolatileStrings(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
             const end = std.mem.indexOfScalarPos(u8, rest, start, '"') orelse break;
             try out.appendSlice(gpa, rest[0..start]);
             try out.appendSlice(gpa, "<ID>");
+            rest = rest[end..];
+        }
+        try out.appendSlice(gpa, rest);
+        gpa.free(current);
+        current = try out.toOwnedSlice(gpa);
+    }
+    return current;
+}
+
+fn replaceVolatileTokens(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
+    var current = try gpa.dupe(u8, s);
+    for (volatile_token_prefixes) |prefix| {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        var rest: []const u8 = current;
+        while (std.mem.indexOf(u8, rest, prefix)) |at| {
+            const start = at + prefix.len;
+            var end = start;
+            while (end < rest.len and std.ascii.isAlphanumeric(rest[end])) end += 1;
+            try out.appendSlice(gpa, rest[0..start]);
+            if (end > start) try out.appendSlice(gpa, "<ID>");
             rest = rest[end..];
         }
         try out.appendSlice(gpa, rest);

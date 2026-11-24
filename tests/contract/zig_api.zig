@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Ast = std.zig.Ast;
 const golden = @import("golden.zig");
 
@@ -294,15 +295,23 @@ pub fn main(init: std.process.Init) !void {
     const contract_root = args.next() orelse return usage();
     const snapshot_path = args.next() orelse return usage();
     const version = args.next() orelse return usage();
+    const declared_zig = args.next() orelse return usage();
     var mode: golden.Mode = .check;
     if (args.next()) |flag| {
         if (!std.mem.eql(u8, flag, "--update")) return usage();
         mode = .update;
     }
+    const full_path = try std.fs.path.join(arena, &.{ contract_root, snapshot_path });
+    const recorded = if (mode == .check) recordedZig(std.Io.Dir.cwd().readFileAlloc(init.io, full_path, arena, .limited(64 << 20)) catch null) else null;
+    if (try toolchainProblem(arena, snapshot_path, builtin.zig_version_string, declared_zig, recorded)) |problem| {
+        std.debug.print("{s}", .{problem});
+        std.process.exit(1);
+    }
     var disk: DiskSource = .{ .io = init.io };
     const raw = try snapshot(arena, .{ .ctx = &disk, .readFn = DiskSource.read }, root_path, root_name);
     const quoted_version = try std.fmt.allocPrint(arena, "\"{s}\"", .{version});
-    const text = try std.mem.replaceOwned(u8, arena, raw, quoted_version, "\"<VERSION>\"");
+    const api = try std.mem.replaceOwned(u8, arena, raw, quoted_version, "\"<VERSION>\"");
+    const text = try std.fmt.allocPrint(arena, "{s}{s}\n{s}", .{ zig_header, builtin.zig_version_string, api });
     const store: golden.Store = .{ .io = init.io, .root = contract_root, .mode = mode };
     store.expect(arena, snapshot_path, text) catch |err| switch (err) {
         error.ContractDrift, error.ContractSnapshotMissing => std.process.exit(1),
@@ -311,8 +320,28 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: zig-api-snapshot <root.zig> <root name> <contract dir> <snapshot path> <version> [--update]\n", .{});
+    std.debug.print("usage: zig-api-snapshot <root.zig> <root name> <contract dir> <snapshot path> <version> <declared zig version> [--update]\n", .{});
     return error.InvalidArguments;
+}
+
+const zig_header = "zig: ";
+
+const toolchain_upgrade_hint = "a Zig toolchain upgrade goes in its own PR, with build.zig.zon's minimum_zig_version raised and the snapshot regenerated with: " ++ golden.update_hint ++ "\n";
+
+pub fn recordedZig(snapshot_text: ?[]const u8) ?[]const u8 {
+    const text = snapshot_text orelse return null;
+    const line = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    if (!std.mem.startsWith(u8, line, zig_header)) return "";
+    return line[zig_header.len..];
+}
+
+pub fn toolchainProblem(gpa: std.mem.Allocator, snapshot_path: []const u8, toolchain: []const u8, declared: []const u8, recorded: ?[]const u8) !?[]u8 {
+    if (!std.mem.eql(u8, toolchain, declared)) {
+        return try std.fmt.allocPrint(gpa, "zig api snapshot: this build runs Zig {s}, but build.zig.zon declares {s}\n" ++ toolchain_upgrade_hint, .{ toolchain, declared });
+    }
+    const snapshot_zig = recorded orelse return null;
+    if (std.mem.eql(u8, toolchain, snapshot_zig)) return null;
+    return try std.fmt.allocPrint(gpa, "zig api snapshot: tests/contract/{s} was recorded with Zig {s}, this build runs Zig {s}\n" ++ toolchain_upgrade_hint, .{ snapshot_path, if (snapshot_zig.len == 0) "<unrecorded>" else snapshot_zig, toolchain });
 }
 
 const MemorySource = struct {
@@ -439,4 +468,28 @@ test "an alias of a function or a typed constant in another file records the tar
         \\lib.tool.LIMIT: const usize = 8
         \\
     );
+}
+
+test "the snapshot's first line records the Zig version; another toolchain or another declared version fails with the upgrade rule" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqualStrings("0.16.0", recordedZig("zig: 0.16.0\nlib: file\n").?);
+    try std.testing.expectEqualStrings("", recordedZig("lib: file\n").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), recordedZig(null));
+
+    try std.testing.expectEqual(@as(?[]u8, null), try toolchainProblem(a, "zig_api/x.txt", "0.16.0", "0.16.0", "0.16.0"));
+    try std.testing.expectEqual(@as(?[]u8, null), try toolchainProblem(a, "zig_api/x.txt", "0.16.0", "0.16.0", null));
+
+    const recorded_other = (try toolchainProblem(a, "zig_api/x.txt", "0.16.0", "0.16.0", "0.15.2")).?;
+    defer a.free(recorded_other);
+    try std.testing.expect(std.mem.indexOf(u8, recorded_other, "tests/contract/zig_api/x.txt was recorded with Zig 0.15.2, this build runs Zig 0.16.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorded_other, "its own PR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorded_other, "-Dupdate-contract") != null);
+
+    const unrecorded = (try toolchainProblem(a, "zig_api/x.txt", "0.16.0", "0.16.0", "")).?;
+    defer a.free(unrecorded);
+    try std.testing.expect(std.mem.indexOf(u8, unrecorded, "recorded with Zig <unrecorded>") != null);
+
+    const undeclared = (try toolchainProblem(a, "zig_api/x.txt", "0.17.0", "0.16.0", "0.17.0")).?;
+    defer a.free(undeclared);
+    try std.testing.expect(std.mem.indexOf(u8, undeclared, "runs Zig 0.17.0, but build.zig.zon declares 0.16.0") != null);
 }
