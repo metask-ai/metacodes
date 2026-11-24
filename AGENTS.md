@@ -93,11 +93,13 @@ These rules apply to the entire repository.
   `kernel_budget` (lines and the packages it reaches) only goes down. CI
   checks the PR against its base (`zig build layer:check -Dlayer-base=<ref>`)
   and fails when the baseline or the budget grows or `allowed_dependencies`
-  widen. A change to the layering itself goes in its own PR: edges that a
-  package split exposes count as new only when the base's manifest already
-  put their two files in different packages, and a package may start
-  depending on a package the base lacks only when that package depends on
-  nothing the dependent could not already import. `src/lib.zig`, the
+  widen. A change to the layering itself goes in its own PR. The base
+  comparison accepts an entry a package split exposes only when the base
+  tree already had that import between two files of one package; an upward
+  entry must already be upward in the base, while a deep one may come from
+  either list. A package may start depending on a package the base lacks
+  only when that package's dependencies and the files it takes over were
+  already within the dependent's reach. `src/lib.zig`, the
   `metacodes-core` facade that re-exports the lower packages, is its own
   `facade` package between `teamwork` and `agentcore`.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
