@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
+  Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,
+  `[docs](https://…)`) as an underlined OSC 8 hyperlink showing only its
+  label, and an inline code span that reads as a file reference
+  (`src/repl/render.zig:42`, `/etc/hosts`) keeps its look but becomes
+  clickable. Relative paths resolve against the working directory and the
+  `:line[:col]` suffix is dropped from the `file://` URL. Terminals without
+  OSC 8 show the same text.
+
 - **Models can be priced in config.json, and bench runs use OpenRouter
   prices.** `model_prices` in `~/.metacodes/config.json` prices a model in
   USD per million tokens; every cost meter (the session cost, evaluation

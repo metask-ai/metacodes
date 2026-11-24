@@ -7,6 +7,7 @@
 //! - `### heading` → bold cyan（支持 #/##/###/####）
 //! - ```` ```lang\n...\n``` ```` → 代码块（dim，前后换行）
 //! - `- item` / `* item` → `  • item`
+//! - `[label](path|url)` 与形如文件引用的 `` `path:line` `` → OSC 8 超链接(Cmd/Ctrl+点击打开)
 //!
 //! 设计选择（有意保持简单）：
 //! - 单遍扫描，不建 AST
@@ -23,6 +24,7 @@ const ansi = @import("tui/ansi.zig");
 // CJK-aware 显示宽度(表格列宽/cell 折行用);term 不引 render,无循环依赖。
 const term = @import("tui/term.zig");
 const theme_mod = @import("tui/theme.zig");
+const pfs = @import("platform").fs;
 const SyntaxTheme = theme_mod.SyntaxTheme;
 const RESET = ansi.sgr.reset;
 const BOLD = ansi.sgr.bold;
@@ -34,6 +36,7 @@ const GREEN = ansi.sgr.fg_green;
 const YELLOW = ansi.sgr.fg_yellow;
 const MAGENTA = ansi.sgr.fg_magenta;
 const BLUE = ansi.sgr.fg_blue;
+const UNDERLINE = ansi.sgr.underline;
 
 pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;
@@ -198,12 +201,31 @@ fn renderHeading(line: []const u8, hash_count: usize, out: *std.ArrayList(u8), a
 fn renderInline(text: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     var i: usize = 0;
     while (i < text.len) {
+        if (text[i] == '[') {
+            if (parseMarkdownLink(text, i)) |link| {
+                if (markdownLinkTarget(link.target)) |target| {
+                    if (try appendHyperlinkOpen(target, out, allocator)) {
+                        try out.appendSlice(allocator, UNDERLINE);
+                        try out.appendSlice(allocator, BLUE);
+                        try out.appendSlice(allocator, link.label);
+                        try out.appendSlice(allocator, RESET);
+                        try out.appendSlice(allocator, ansi.hyperlink.close);
+                        i = link.end;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // 代码 `...`
         if (text[i] == '`') {
             if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |close| {
+                const code = text[i + 1 .. close];
+                const linked = if (codeSpanLinkTarget(code)) |target| try appendHyperlinkOpen(target, out, allocator) else false;
                 try out.appendSlice(allocator, DIM);
-                try out.appendSlice(allocator, text[i + 1 .. close]);
+                try out.appendSlice(allocator, code);
                 try out.appendSlice(allocator, RESET);
+                if (linked) try out.appendSlice(allocator, ansi.hyperlink.close);
                 i = close + 1;
                 continue;
             }
@@ -236,6 +258,133 @@ fn renderInline(text: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Al
 
         try out.append(allocator, text[i]);
         i += 1;
+    }
+}
+
+const MarkdownLink = struct {
+    label: []const u8,
+    target: []const u8,
+    end: usize,
+};
+
+const LinkTarget = union(enum) {
+    web: []const u8,
+    path: []const u8,
+};
+
+fn parseMarkdownLink(text: []const u8, open: usize) ?MarkdownLink {
+    const label_end = std.mem.indexOfScalarPos(u8, text, open + 1, ']') orelse return null;
+    if (label_end + 1 >= text.len or text[label_end + 1] != '(') return null;
+    const target_end = std.mem.indexOfScalarPos(u8, text, label_end + 2, ')') orelse return null;
+    const label = text[open + 1 .. label_end];
+    if (label.len == 0) return null;
+    return .{
+        .label = unwrapCodeSpan(label),
+        .target = text[label_end + 2 .. target_end],
+        .end = target_end + 1,
+    };
+}
+
+fn unwrapCodeSpan(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '`' and s[s.len - 1] == '`') return s[1 .. s.len - 1];
+    return s;
+}
+
+fn markdownLinkTarget(target: []const u8) ?LinkTarget {
+    if (target.len == 0) return null;
+    for (target) |c| if (c <= ' ' or c == 0x7f) return null;
+    if (isWebUrl(target)) return .{ .web = target };
+    if (target[0] == '#' or target[0] == '~') return null;
+    if (std.mem.indexOfScalar(u8, target, ':')) |colon| {
+        if (!isDriveLetterPath(target) and !isLineSpec(target[colon + 1 ..])) return null;
+    }
+    const path = stripLocation(target);
+    if (path.len == 0) return null;
+    return .{ .path = path };
+}
+
+fn codeSpanLinkTarget(code: []const u8) ?LinkTarget {
+    if (code.len == 0) return null;
+    for (code) |c| if (!isPathChar(c)) return null;
+    if (isWebUrl(code)) return .{ .web = code };
+    if (code[0] == '-' or code[0] == '~') return null;
+    const path = stripLocation(code);
+    if (path.len == 0 or std.mem.indexOf(u8, path, "://") != null) return null;
+    if (std.mem.indexOfScalar(u8, path, ':') != null and !isDriveLetterPath(path)) return null;
+    const separator = std.mem.lastIndexOfAny(u8, path, "/\\");
+    if (separator == null and path.len == code.len) return null;
+    const base = if (separator) |sep| path[sep + 1 ..] else path;
+    if (!isAbsolutePath(path) and std.mem.indexOfScalar(u8, base, '.') == null) return null;
+    return .{ .path = path };
+}
+
+fn isWebUrl(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "https://") or std.mem.startsWith(u8, s, "http://");
+}
+
+fn isPathChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c >= 0x80 or std.mem.indexOfScalar(u8, "._-/\\:+@~", c) != null;
+}
+
+fn isDriveLetterPath(path: []const u8) bool {
+    return path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and (path[2] == '/' or path[2] == '\\');
+}
+
+fn isAbsolutePath(path: []const u8) bool {
+    return path.len > 0 and (path[0] == '/' or path[0] == '\\' or isDriveLetterPath(path));
+}
+
+fn isLineSpec(s: []const u8) bool {
+    if (s.len == 0 or !std.ascii.isDigit(s[0])) return false;
+    for (s) |c| if (!std.ascii.isDigit(c) and c != '-' and c != ':') return false;
+    return true;
+}
+
+fn stripLocation(target: []const u8) []const u8 {
+    var path = target;
+    while (std.mem.lastIndexOfScalar(u8, path, ':')) |colon| {
+        if (!isLineSpec(path[colon + 1 ..])) break;
+        path = path[0..colon];
+    }
+    return path;
+}
+
+fn appendHyperlinkOpen(target: LinkTarget, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !bool {
+    switch (target) {
+        .web => |url| {
+            try out.appendSlice(allocator, ansi.hyperlink.open_prefix);
+            try out.appendSlice(allocator, url);
+        },
+        .path => |path| {
+            var cwd_buf: [4096]u8 = undefined;
+            const base: []const u8 = if (isAbsolutePath(path)) "" else pfs.getCwd(&cwd_buf) orelse return false;
+            try out.appendSlice(allocator, ansi.hyperlink.open_prefix);
+            try out.appendSlice(allocator, "file://");
+            if (base.len > 0) {
+                try appendFileUrlPath(base, out, allocator);
+                const last = base[base.len - 1];
+                if (last != '/' and last != '\\') try out.append(allocator, '/');
+            }
+            var relative = path;
+            while (base.len > 0 and std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
+            try appendFileUrlPath(if (base.len > 0) relative else path, out, allocator);
+        },
+    }
+    try out.appendSlice(allocator, ansi.hyperlink.open_suffix);
+    return true;
+}
+
+fn appendFileUrlPath(path: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    if (isDriveLetterPath(path)) try out.append(allocator, '/');
+    for (path) |c| {
+        if (c == '\\') {
+            try out.append(allocator, '/');
+        } else if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._~/:", c) != null) {
+            try out.append(allocator, c);
+        } else {
+            var hex: [3]u8 = undefined;
+            try out.appendSlice(allocator, std.fmt.bufPrint(&hex, "%{X:0>2}", .{c}) catch unreachable);
+        }
     }
 }
 
@@ -612,18 +761,6 @@ fn inlineDisplayWidth(text: []const u8) usize {
     return w;
 }
 
-/// 从 s[i]=ESC 起扫完整转义序列,返回其后第一个字节索引(SGR-aware 折行原子透传)。
-fn scanEsc(s: []const u8, i: usize) usize {
-    var j = i + 1;
-    if (j < s.len and s[j] == '[') {
-        j += 1;
-        while (j < s.len and !std.ascii.isAlphabetic(s[j])) : (j += 1) {}
-        if (j < s.len) j += 1;
-        return j;
-    }
-    return @min(i + 2, s.len);
-}
-
 /// 把已渲成 ANSI 的 cell 折成多物理子行,每行可见宽 ≤ width。
 /// ASCII 空格处贪心折;单 token 超列宽按 codepoint 硬折(CJK 无空格必须硬折,不切多字节);
 /// ESC 序列零宽原子透传。返回 owned 子行列表(每条 owned),调用方释放。
@@ -657,7 +794,7 @@ fn wrapCell(rendered: []const u8, width: usize, allocator: std.mem.Allocator) !s
     const s = rendered;
     while (i < s.len) {
         if (s[i] == 0x1b) {
-            const e = scanEsc(s, i);
+            const e = ansi.escapeEnd(s, i);
             try word.appendSlice(allocator, s[i..e]); // ESC 跟随当前 word,零宽
             i = e;
             continue;
@@ -943,7 +1080,7 @@ fn visibleWidth(s: []const u8) usize {
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == 0x1b) {
-            i = scanEsc(s, i);
+            i = ansi.escapeEnd(s, i);
             continue;
         }
         const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
@@ -1220,13 +1357,91 @@ fn stripAnsi(s: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == 0x1b) {
-            i = scanEsc(s, i);
+            i = ansi.escapeEnd(s, i);
             continue;
         }
         try out.append(allocator, s[i]);
         i += 1;
     }
     return try out.toOwnedSlice(allocator);
+}
+
+fn expectRendersLink(md: []const u8, url: []const u8, visible: []const u8) !void {
+    const out = try renderToOwned(md, testing.allocator);
+    defer testing.allocator.free(out);
+    const open = try std.mem.concat(testing.allocator, u8, &.{ ansi.hyperlink.open_prefix, url, ansi.hyperlink.open_suffix });
+    defer testing.allocator.free(open);
+    try testing.expect(std.mem.indexOf(u8, out, open) != null);
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.close) != null);
+    const plain = try stripAnsi(out, testing.allocator);
+    defer testing.allocator.free(plain);
+    try testing.expectEqualStrings(visible, plain);
+}
+
+fn expectRendersNoLink(md: []const u8) !void {
+    const out = try renderToOwned(md, testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.open_prefix) == null);
+}
+
+test "markdown link to an absolute file renders as a file hyperlink showing its label" {
+    try expectRendersLink("已生成:[credentials.txt](/Users/me/.export/credentials.txt)", "file:///Users/me/.export/credentials.txt", "已生成:credentials.txt");
+    try expectRendersLink("[`render.zig:42`](/repo/src/render.zig:42)", "file:///repo/src/render.zig", "render.zig:42");
+    try expectRendersLink("[docs](https://example.com/a?b=1)", "https://example.com/a?b=1", "docs");
+    try expectRendersLink("[f](C:\\work\\a.zig:3)", "file:///C:/work/a.zig", "f");
+}
+
+test "markdown link to a relative file resolves against the working directory" {
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd = pfs.getCwd(&cwd_buf) orelse return error.SkipZigTest;
+    var url: std.ArrayList(u8) = .empty;
+    defer url.deinit(testing.allocator);
+    try url.appendSlice(testing.allocator, "file://");
+    try appendFileUrlPath(cwd, &url, testing.allocator);
+    try url.appendSlice(testing.allocator, "/src/main.zig");
+    try expectRendersLink("[main](./src/main.zig:10:2)", url.items, "main");
+    try expectRendersLink("see `src/main.zig:10`", url.items, "see src/main.zig:10");
+}
+
+test "file url path percent-encodes bytes outside the unreserved set" {
+    var url: std.ArrayList(u8) = .empty;
+    defer url.deinit(testing.allocator);
+    try appendFileUrlPath("/tmp/数 #.txt", &url, testing.allocator);
+    try testing.expectEqualStrings("/tmp/%E6%95%B0%20%23.txt", url.items);
+}
+
+test "code spans link only when they read as file references" {
+    try expectRendersLink("open `/etc/hosts`", "file:///etc/hosts", "open /etc/hosts");
+    try expectRendersLink("`https://example.com/x`", "https://example.com/x", "https://example.com/x");
+    try expectRendersNoLink("`std.mem.eql`");
+    try expectRendersNoLink("`render.zig`");
+    try expectRendersNoLink("`src/repl`");
+    try expectRendersNoLink("`owner/repo#12`");
+    try expectRendersNoLink("`zig build test`");
+    try expectRendersNoLink("`--preview=a/b.c`");
+    try expectRendersNoLink("`~/notes.txt`");
+}
+
+test "markdown links without a usable target stay literal" {
+    try expectRendersNoLink("[mail](mailto:a@b.c)");
+    try expectRendersNoLink("[top](#intro)");
+    try expectRendersNoLink("[a](b c)");
+    try expectRendersNoLink("[](/tmp/x)");
+    const out = try renderToOwned("[mail](mailto:a@b.c)", testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("[mail](mailto:a@b.c)", out);
+}
+
+test "a rendered hyperlink is zero width when measured or wrapped" {
+    const out = try renderToOwned("[notes.txt](/tmp/notes.txt)", testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 9), visibleWidth(out));
+    var lines = try wrapCell(out, 20, testing.allocator);
+    defer {
+        for (lines.items) |l| testing.allocator.free(l);
+        lines.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 1), lines.items.len);
 }
 
 test "isTableSeparator true cases" {
