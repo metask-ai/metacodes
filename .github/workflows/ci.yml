@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   # Migration compatibility only: after the main ruleset disables the queue,
   # no merge_group event is emitted. This lets the migration PR itself land
   # under the old rules (doc/CI_DESIGN.md §3).
@@ -468,6 +469,7 @@ jobs:
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
+          METACODES_TEST_ROOT: src/platform
         run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform
       # The installed-adapter WorkBuddy suites (scripts/eval/tests/
       # test_workbuddy_adapter.py) run the overlay inside the real pinned

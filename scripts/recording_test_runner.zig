@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
     if (dir_path) |path| {
-        test_id_record.open(&test_ids, &test_ids_buffer, runner_io, path, args[0], "");
+        test_id_record.open(&test_ids, &test_ids_buffer, runner_io, init.environ, path, args[0], "");
         recording = true;
     }
 

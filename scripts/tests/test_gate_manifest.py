@@ -177,10 +177,9 @@ class GateManifestTest(unittest.TestCase):
         self.assertEqual(build.count("b.addTest("), 6, "a new test binary goes through addRecordedTest")
         self.assertIn("units_test_step.dependOn(&test_id_fixture_check.step);", build)
         self.assertIn("run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
-        label = (ROOT / ".github" / "workflows" / "test-ids-label.yml").read_text(encoding="utf-8")
-        self.assertIn("    name: Gates (Linux)\n", label)
-        self.assertIn("python3 scripts/test_ids.py label-verdict", label)
-        self.assertNotIn("write", label)
+        self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
+        self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
+        self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
         self.assertIn("needs: [gates-linux, test-ids]", workflow)
 
     def test_the_test_step_is_exactly_its_three_parts(self):

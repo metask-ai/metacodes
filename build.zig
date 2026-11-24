@@ -84,6 +84,10 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
+    if (artifact.root_module.root_source_file) |root| switch (root) {
+        .src_path => |source| run.setEnvironmentVariable("METACODES_TEST_ROOT", std.fs.path.dirnamePosix(source.sub_path) orelse ""),
+        else => {},
+    };
     if (g_sandbox_helper_install) |install| {
         run.step.dependOn(install);
         run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
@@ -2788,9 +2792,9 @@ pub fn build(b: *std.Build) void {
     });
     test_id_fixture_check.addDirectoryArg(test_id_fixture_records);
     test_id_fixture_check.expectStdOutEqual(
-        "zig:<unnamed>\ttest_id_fixture\tpass\t1\n" ++
-            "zig:passes\ttest_id_fixture\tpass\t1\n" ++
-            "zig:skips\ttest_id_fixture\tskip\t1\n",
+        "zig:<unnamed>\tscripts.test_id_fixture\tpass\t1\n" ++
+            "zig:passes\tscripts.test_id_fixture\tpass\t1\n" ++
+            "zig:skips\tscripts.test_id_fixture\tskip\t1\n",
     );
     units_test_step.dependOn(&test_id_fixture_check.step);
     const test_ids_check_cmd = b.addSystemCommand(&.{

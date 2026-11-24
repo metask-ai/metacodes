@@ -111,7 +111,9 @@ The remaining boundaries are deliberately narrow:
 ## 3. PR-only validation and merge policy
 
 Run full primary-platform CI on `pull_request`, then merge the exact reviewed
-head. Ordinary pushes to `main` do not repeat that run. The four required
+head. A label change runs it again (the `labeled` and `unlabeled` events),
+because the test ID comparison and the version state gate judge the
+labels the PR has when they run. Ordinary pushes to `main` do not repeat that run. The four required
 check names and their GitHub Actions source stay unchanged. `Protect main`
 must require branches to be up to date and must not require a merge queue.
 If main advances, merge main into the PR branch and repeat review and CI.
@@ -269,19 +271,17 @@ The rules that keep the split from dropping coverage:
   native `zig test src/platform/platform.zig` step, through
   `scripts/recording_test_runner.zig`, which speaks the build runner's
   protocol as Zig's default runner does, so `--test-timeout` still applies.
-  So do the `scripts/tests` suites and the evaluation shards. The legs upload
-  the records as `test-ids-raw-<leg>`; no test runs twice for it.
+  `METACODES_TEST_ROOT` tells both where the binary's root file lives, so a
+  test's namespace is the same whichever root compiled it. The
+  `scripts/tests` suites and the evaluation shards record too. The legs
+  upload the records as `test-ids-raw-<leg>`; no test runs twice for it.
   `Test IDs (Linux)` waits for every Linux leg to pass, merges the records
   into the `test-ids` artifact (kept 90 days) and, on a pull request,
   compares it with the IDs recorded on the base's tree. The comparison goes
   to the job summary. It fails a PR labelled `migration` that drops a test
   without explaining it in `tests/test_ids/` in that PR, or whose base has
   no IDs recorded on its tree, and `Gates (Linux)` needs it, so the
-  required check fails too. When a PR's labels change after its CI ran,
-  `.github/workflows/test-ids-label.yml` runs a read-only job also named
-  `Gates (Linux)`: it waits for the head's CI run and judges its Linux legs
-  and its `test-ids` artifact again with the current labels, so the newest
-  `Gates (Linux)` on the commit follows the label, on fork PRs too
+  required check fails too. Adding or removing the label runs CI again
   ([tests/README.md](../tests/README.md)).
 
 What it costs:

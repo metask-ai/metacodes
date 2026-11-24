@@ -116,7 +116,7 @@ def main(argv: list[str]) -> int:
         return 1
     verbosity = 2 if "-v" in argv[1:] else 1
     arm_watchdog(SHARD_TIMEOUT_S)
-    result_class = test_ids.recording_result_class("eval")
+    result_class = test_ids.recording_result_class("eval", "scripts/eval/tests")
     result = unittest.TextTestRunner(verbosity=verbosity, resultclass=result_class).run(selected)
     return 0 if result.wasSuccessful() else 1
 

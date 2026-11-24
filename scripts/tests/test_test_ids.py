@@ -16,9 +16,10 @@ def ids(*lines):
     return test_ids.parse_ids("".join(line + "\n" for line in lines))
 
 
-def raw(*records):
+def raw(*records, root=""):
     with tempfile.TemporaryDirectory() as tmp:
-        Path(tmp, "zig-suite-Debug--1.tsv").write_text("".join(f"pass\t{name}\n" for name in records), encoding="utf-8")
+        Path(tmp, "zig-suite-Debug--1.tsv").write_text(f"root\t{root}\n" + "".join(f"pass\t{name}\n" for name in records),
+                                                       encoding="utf-8")
         return test_ids.collect(Path(tmp), None)[0]
 
 
@@ -33,6 +34,12 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(test_ids.zig_entry("sub.b.test.name with .test. inside"), ("zig:name with .test. inside", "sub.b"))
         self.assertEqual(test_ids.zig_entry("main.decltest.foo"), ("zig:decltest foo", "main"))
         self.assertEqual(test_ids.zig_entry("sub.b.test_3"), ("zig:<unnamed>", "sub.b"))
+
+    def test_the_test_root_qualifies_the_namespace(self):
+        self.assertEqual(test_ids.zig_entry("platform.process.test.echo", "src"), ("zig:echo", "src.platform.process"))
+        self.assertEqual(test_ids.zig_entry("process.test.echo", "src/platform"), ("zig:echo", "src.platform.process"))
+        self.assertEqual(test_ids.python_entry("test_analysis.AnalysisTest.test_x", "scripts/eval/tests"),
+                         ("py:AnalysisTest.test_x", "scripts.eval.tests.test_analysis"))
 
     def test_a_python_entry_is_the_class_method_and_its_module(self):
         self.assertEqual(test_ids.python_entry("scripts.tests.test_ci_scope.ScopeTest.test_docs"), ("py:ScopeTest.test_docs", "scripts.tests.test_ci_scope"))
@@ -49,32 +56,35 @@ class CollectTest(unittest.TestCase):
         (self.raw / name).write_text(text, encoding="utf-8")
 
     def test_records_become_sorted_counts_with_skips_apart(self):
-        self.write("zig-metacodes-core-test-Debug-0of2--a1.tsv", "pass\tcore.a.test.same name\nskip\tcore.b.test.skipped\n")
-        self.write("zig-metacodes-core-test-Debug-1of2--b2.tsv", "pass\ttools.a.test.same name\npass\tcore.a.test_0\n")
-        self.write("zig-provider-test-Debug--c3.tsv", "pass\tcapability.test.unique\n")
-        self.write("py-scripts-tests--abc.tsv", "pass\tscripts.tests.test_x.XTest.test_one\n")
+        self.write("zig-metacodes-core-test-Debug-0of2--a1.tsv", "root\tsrc\npass\tcore.a.test.same name\nskip\tcore.b.test.skipped\n")
+        self.write("zig-metacodes-core-test-Debug-1of2--b2.tsv", "root\tsrc\npass\ttools.a.test.same name\npass\tcore.a.test_0\n")
+        self.write("zig-provider-test-Debug--c3.tsv", "root\tsrc/provider\npass\tcapability.test.unique\n")
+        self.write("py-scripts-tests--abc.tsv", "root\t\npass\tscripts.tests.test_x.XTest.test_one\n")
         counts, sources = test_ids.collect(self.raw, None)
         self.assertEqual(test_ids.format_ids(counts),
                          "py:XTest.test_one\tscripts.tests.test_x\tpass\t1\n"
-                         "zig:<unnamed>\tcore.a\tpass\t1\n"
-                         "zig:same name\tcore.a\tpass\t1\n"
-                         "zig:same name\ttools.a\tpass\t1\n"
-                         "zig:skipped\tcore.b\tskip\t1\n"
-                         "zig:unique\tcapability\tpass\t1\n")
+                         "zig:<unnamed>\tsrc.core.a\tpass\t1\n"
+                         "zig:same name\tsrc.core.a\tpass\t1\n"
+                         "zig:same name\tsrc.tools.a\tpass\t1\n"
+                         "zig:skipped\tsrc.core.b\tskip\t1\n"
+                         "zig:unique\tsrc.provider.capability\tpass\t1\n")
         self.assertEqual(sources, {"zig-metacodes-core-test-Debug": Counter({"pass": 3, "skip": 1}),
                                    "zig-provider-test-Debug": Counter({"pass": 1}),
                                    "py-scripts-tests": Counter({"pass": 1})})
 
     def test_a_failed_run_is_not_a_test_id_set(self):
-        self.write("zig-suite-Debug--1.tsv", "fail\tcore.a.test.broken\n")
+        self.write("zig-suite-Debug--1.tsv", "root\tsrc\nfail\tcore.a.test.broken\n")
         with self.assertRaisesRegex(test_ids.TestIdError, "1 tests failed"):
             test_ids.collect(self.raw, None)
 
     def test_malformed_and_missing_records_fail(self):
         with self.assertRaisesRegex(test_ids.TestIdError, "no test ID records"):
             test_ids.collect(self.raw, None)
-        self.write("zig-suite-Debug--1.tsv", "ok core.a.test.x\n")
+        self.write("zig-suite-Debug--1.tsv", "root\tsrc\nok core.a.test.x\n")
         with self.assertRaisesRegex(test_ids.TestIdError, "malformed record"):
+            test_ids.collect(self.raw, None)
+        self.write("zig-suite-Debug--1.tsv", "pass\tcore.a.test.x\n")
+        with self.assertRaisesRegex(test_ids.TestIdError, "without the test root"):
             test_ids.collect(self.raw, None)
 
     def test_tty_cases_are_listed_by_function_name(self):
@@ -83,7 +93,7 @@ class CollectTest(unittest.TestCase):
         (cases / "test_menu.py").write_text("from x import test_helper\n\ndef test_opens():\n    pass\n\ndef helper():\n    pass\n",
                                             encoding="utf-8")
         (cases / "helpers.py").write_text("def test_not_a_case():\n    pass\n", encoding="utf-8")
-        self.write("py-eval--1.tsv", "pass\ttest_a.ATest.test_a\n")
+        self.write("py-eval--1.tsv", "root\tscripts/eval/tests\npass\ttest_a.ATest.test_a\n")
         counts, sources = test_ids.collect(self.raw, cases)
         self.assertEqual(counts[("tty:test_opens", "test_menu", "listed")], 1)
         self.assertEqual(sources["tty-cases"], Counter(listed=1))
@@ -107,12 +117,12 @@ class RecordingTest(unittest.TestCase):
             raw_dir.mkdir()
             program = ("import sys, unittest\nsys.path.insert(0, sys.argv[1])\nfrom scripts import test_ids\n"
                        "suite = unittest.defaultTestLoader.discover(sys.argv[2])\n"
-                       "unittest.TextTestRunner(resultclass=test_ids.recording_result_class('sample')).run(suite)\n")
+                       "unittest.TextTestRunner(resultclass=test_ids.recording_result_class('sample', 'suite')).run(suite)\n")
             subprocess.run([sys.executable, "-c", program, str(ROOT), str(suite_dir)], check=True, capture_output=True,
                            env={**os.environ, test_ids.IDS_DIR_ENV: str(raw_dir)})
             counts, sources = test_ids.collect(raw_dir, None)
         self.assertEqual(test_ids.format_ids(counts),
-                         "py:SampleTest.test_runs\ttest_sample\tpass\t1\npy:SampleTest.test_skipped\ttest_sample\tskip\t1\n")
+                         "py:SampleTest.test_runs\tsuite.test_sample\tpass\t1\npy:SampleTest.test_skipped\tsuite.test_sample\tskip\t1\n")
         self.assertEqual(list(sources), ["py-sample"])
 
     def test_without_the_directory_nothing_is_recorded(self):
@@ -146,11 +156,26 @@ class CompareTest(unittest.TestCase):
         head = raw("provider.anthropic.root.test_0", "provider.gemini.root.test_0")
         self.assertEqual(missing(base, head), ["zig:<unnamed> @provider.openai.root"])
 
-    def test_one_test_compiled_into_two_roots_is_one_test(self):
-        base = raw("platform.process.test_0", "process.test_0", "platform.fs.test_0", "fs.test_0")
-        head = raw("base.platform.process.test_0", "process.test_0", "base.platform.fs.test_0", "fs.test_0")
-        self.assertEqual(missing(base, head), ["zig:<unnamed> @platform.fs", "zig:<unnamed> @platform.process"])
-        self.assertEqual(missing(base, head, [("@platform", "@base.platform")]), [])
+    def test_one_file_compiled_into_two_roots_is_one_place(self):
+        def run(cc_names, platform_names):
+            cc, platform = raw(*cc_names, root="src"), raw(*platform_names, root="src/platform")
+            return Counter(cc) + Counter(platform)
+
+        base = run(["platform.process.test_0", "platform.fs.test_0"], ["process.test_0", "fs.test_0"])
+        self.assertEqual(test_ids.locations(base), {"zig:<unnamed>": {"src.platform.process", "src.platform.fs"}})
+        head = run(["base.platform.process.test_0", "base.platform.fs.test_0"], ["process.test_0", "fs.test_0"])
+        self.assertEqual(missing(base, head), ["zig:<unnamed> @src.platform.fs", "zig:<unnamed> @src.platform.process"])
+        self.assertEqual(missing(base, head, [("@src.platform", "@src.base.platform")]), [])
+
+    def test_a_new_file_whose_namespace_ends_like_another_is_not_that_file(self):
+        self.assertEqual(missing(raw("a.test.dup", "b.test.dup"), raw("a.test.dup", "b.test.dup", "sub.a.test.dup")), [])
+        self.assertEqual(missing(raw("root.test_0", "alpha.root.test_0"), raw("alpha.root.test_0", "beta.alpha.root.test_0")),
+                         ["zig:<unnamed> @root"])
+
+    def test_a_partial_move_keeps_every_run_of_the_test(self):
+        base = raw("old.test.a", "old.test.a")
+        head = raw("old.test.a", "new.test.a")
+        self.assertEqual(missing(base, head, [("@old", "@new")]), [])
 
     def test_a_directory_move_is_explained_by_one_namespace_entry(self):
         base = raw("core.tools.a.test_0", "core.tools.b.test_0", "core.c.test_0")
@@ -301,68 +326,6 @@ class BaseTest(unittest.TestCase):
         base = test_ids.find_base("o/r", "b" * 40, "t", self.query, lambda repo, run: None)
         self.assertIsNone(base.counts)
         self.assertIn("nothing to compare", base.note)
-
-
-class LabelVerdictTest(unittest.TestCase):
-    HEAD = ids("zig:a\tx\tpass\t1")
-
-    def query(self, jobs, labels=("migration",), runs=None):
-        states = iter([{"id": 5, "status": "in_progress"}, {"id": 5, "status": "completed"}])
-
-        def answer(path):
-            if path.endswith("event=pull_request&per_page=20"):
-                return {"workflow_runs": runs if runs is not None else [
-                    {"id": 4, "created_at": "1", "status": "completed"}, {"id": 5, "created_at": "2", "status": "queued"}]}
-            if path.endswith("/runs/5"):
-                return next(states)
-            if "/labels" in path:
-                return [{"name": name} for name in labels]
-            return {"jobs": jobs}
-        return answer
-
-    def verdict(self, jobs, labels=("migration",), tree="t", runs=None, judged=("compared", False)):
-        calls = []
-
-        def judge(head, base_sha, repository, enforced):
-            calls.append((head, base_sha, enforced))
-            return judged
-
-        found = (self.HEAD, {"tree": tree})
-        result = test_ids.label_verdict("o/r", 9, "h" * 40, "b" * 40, "t", 600, self.query(jobs, labels, runs),
-                                        lambda repo, run: found, judge, sleep=lambda seconds: None, clock=lambda: 0)
-        return result, calls
-
-    LEGS = [{"name": "Gates (Linux) / units", "conclusion": "success"}, {"name": "Gates (Linux) / checks", "conclusion": "success"}]
-
-    def test_adding_the_label_judges_the_finished_run_with_it(self):
-        jobs = self.LEGS + [{"name": test_ids.CI_JOB, "conclusion": "success"}]
-        (report, failed), calls = self.verdict(jobs, judged=("missing zig:b", True))
-        self.assertEqual((report, failed), ("missing zig:b", True))
-        self.assertEqual(calls, [(self.HEAD, "b" * 40, True)])
-        (report, failed), calls = self.verdict(jobs, labels=(), judged=("report", False))
-        self.assertEqual((failed, calls[0][2]), (False, False))
-
-    def test_failed_legs_fail_whatever_the_labels(self):
-        jobs = [{"name": "Gates (Linux) / units", "conclusion": "failure"}, {"name": test_ids.CI_JOB, "conclusion": "skipped"}]
-        (report, failed), calls = self.verdict(jobs, labels=())
-        self.assertTrue(failed)
-        self.assertEqual(calls, [])
-
-    def test_a_run_without_a_comparison_passes_with_its_legs(self):
-        (report, failed), calls = self.verdict(self.LEGS + [{"name": test_ids.CI_JOB, "conclusion": "skipped"}])
-        self.assertFalse(failed)
-        self.assertIn("compared no test IDs", report)
-
-    def test_a_migration_pr_tested_on_another_merge_fails(self):
-        jobs = self.LEGS + [{"name": test_ids.CI_JOB, "conclusion": "success"}]
-        (report, failed), calls = self.verdict(jobs, tree="older merge")
-        self.assertTrue(failed)
-        self.assertIn("another merge", report)
-
-    def test_no_ci_run_yet_leaves_the_verdict_to_it(self):
-        (report, failed), calls = self.verdict([], runs=[])
-        self.assertFalse(failed)
-        self.assertIn("No CI run", report)
 
 
 if __name__ == "__main__":

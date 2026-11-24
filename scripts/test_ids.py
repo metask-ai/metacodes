@@ -9,7 +9,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from collections import Counter
 from dataclasses import dataclass, field
@@ -26,12 +25,10 @@ RENAMED = Path("tests/test_ids/renamed.tsv")
 REMOVED = Path("tests/test_ids/removed.tsv")
 TTY_CASES = Path("tests/tty/cases")
 CI_WORKFLOW = "ci.yml"
-CI_JOB = "Test IDs (Linux)"
 ARTIFACT = "test-ids"
 MIGRATION_LABEL = "migration"
 UNNAMED_ZIG_TEST = re.compile(r"\.test_\d+$")
 SUMMARY_LIST_LIMIT = 50
-POLL_SECONDS = 60
 
 Entry = Tuple[str, str, str]
 IdCounts = Dict[Entry, int]
@@ -41,7 +38,11 @@ class TestIdError(Exception):
     pass
 
 
-def zig_entry(name: str) -> Tuple[str, str]:
+def qualified(root: str, namespace: str) -> str:
+    return ".".join(part for part in (root.replace("/", "."), namespace) if part)
+
+
+def zig_entry(name: str, root: str = "") -> Tuple[str, str]:
     markers = [(name.find(marker), label) for marker, label in ((".test.", ""), (".decltest.", "decltest "))]
     found = [(index, label) for index, label in markers if index >= 0]
     if found:
@@ -51,14 +52,14 @@ def zig_entry(name: str) -> Tuple[str, str]:
     else:
         unnamed = UNNAMED_ZIG_TEST.search(name)
         if unnamed is None:
-            return "zig:" + name, ""
+            return "zig:" + name, qualified(root, "")
         namespace, test_id = name[:unnamed.start()], "zig:<unnamed>"
-    return test_id, namespace
+    return test_id, qualified(root, namespace)
 
 
-def python_entry(test_id: str) -> Tuple[str, str]:
+def python_entry(test_id: str, root: str = "") -> Tuple[str, str]:
     parts = test_id.split(".")
-    return "py:" + ".".join(parts[-2:]), ".".join(parts[:-2])
+    return "py:" + ".".join(parts[-2:]), qualified(root, ".".join(parts[:-2]))
 
 
 def raw_source(path: Path) -> str:
@@ -79,14 +80,20 @@ def read_raw(raw_dir: Path) -> Tuple[IdCounts, Dict[str, Counter]]:
     for path in files:
         source = raw_source(path)
         tally = sources.setdefault(source, Counter())
+        root: Optional[str] = None
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line:
                 continue
             status, sep, name = line.partition("\t")
+            if status == "root" and sep and number == 1:
+                root = name
+                continue
             if not sep or status not in RAW_STATUSES or not name:
                 raise TestIdError(f"{path.name}:{number}: malformed record {line!r}")
+            if root is None:
+                raise TestIdError(f"{path.name}: records without the test root they are relative to (METACODES_TEST_ROOT)")
             tally[status] += 1
-            test_id, location = zig_entry(name) if source.startswith("zig-") else python_entry(name)
+            test_id, location = zig_entry(name, root) if source.startswith("zig-") else python_entry(name, root)
             counts[(test_id, location, status)] += 1
     failed = sum(tally["fail"] for tally in sources.values())
     if failed:
@@ -224,22 +231,6 @@ def keyed(counts: IdCounts, key: Callable[[str, str], str]) -> Dict[str, List[in
     return table
 
 
-def is_segment_suffix(short: str, long: str) -> bool:
-    return long == short or long.endswith("." + short)
-
-
-def clusters(namespaces: Set[str]) -> Dict[str, str]:
-    representatives: List[str] = []
-    found: Dict[str, str] = {}
-    for namespace in sorted(namespaces, key=lambda ns: (-ns.count("."), -len(ns), ns)):
-        representative = next((rep for rep in representatives if is_segment_suffix(namespace, rep)), None)
-        if representative is None:
-            representatives.append(namespace)
-            representative = namespace
-        found[namespace] = representative
-    return found
-
-
 def apply_moves(location: str, moves: Sequence[Tuple[str, str]], used: Set[Tuple[str, str]]) -> str:
     for old, new in moves:
         if is_segment_prefix(new[1:], location):
@@ -257,22 +248,20 @@ def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], 
     moves = [pair for pair in renamed if pair[0].startswith("@")]
     renamed = [pair for pair in renamed if not pair[0].startswith("@")]
     used_moves: Set[Tuple[str, str]] = set()
-    head = Counter({(test_id, apply_moves(location, moves, used_moves), status): count
-                    for (test_id, location, status), count in head.items()})
+    moved: IdCounts = Counter()
+    for (test_id, location, status), count in head.items():
+        moved[(test_id, apply_moves(location, moves, used_moves), status)] += count
+    head = moved
     result.unused.extend(f"{RENAMED.as_posix()}: {old} → {new}" for old, new in moves if (old, new) not in used_moves)
-    base_clusters = {test_id: clusters(found) for test_id, found in locations(base).items()}
-    head_clusters = {test_id: clusters(found) for test_id, found in locations(head).items()}
+    base_locations, head_locations = locations(base), locations(head)
 
-    def keyer(side: Dict[str, Dict[str, str]]) -> Callable[[str, str], str]:
-        def key(test_id: str, location: str) -> str:
-            if (len(set(base_clusters.get(test_id, {}).values())) <= 1
-                    and len(set(head_clusters.get(test_id, {}).values())) <= 1):
-                return test_id
-            return f"{test_id} @{side[test_id][location]}"
-        return key
+    def key(test_id: str, location: str) -> str:
+        if len(base_locations.get(test_id, ())) <= 1 and len(head_locations.get(test_id, ())) <= 1:
+            return test_id
+        return f"{test_id} @{location}"
 
-    base_table = keyed(base, keyer(base_clusters))
-    head_table = keyed(head, keyer(head_clusters))
+    base_table = keyed(base, key)
+    head_table = keyed(head, key)
     original_head = {test_key: tuple(pair) for test_key, pair in head_table.items()}
     renamed_from: Dict[str, str] = {}
     for old, new in renamed:
@@ -357,7 +346,7 @@ def render(comparison: Comparison, base: IdCounts, head: IdCounts, base_note: st
     return "\n".join(lines) + "\n"
 
 
-def recording_result_class(source: str):
+def recording_result_class(source: str, root: str = ""):
     directory = os.environ.get(IDS_DIR_ENV)
     if not directory:
         return None
@@ -367,6 +356,7 @@ def recording_result_class(source: str):
             super().startTestRun()
             handle, path = tempfile.mkstemp(prefix=f"py-{source}--", suffix=".tsv", dir=directory)
             self._test_ids = os.fdopen(handle, "w", encoding="utf-8")
+            self._test_ids.write(f"root\t{root}\n")
 
         def stopTestRun(self):
             self._test_ids.close()
@@ -490,37 +480,6 @@ def judge(head: IdCounts, base_sha: str, repository: str, enforced: bool, root: 
     return ci_report(head, base_finder(repository, base_sha, tree), renamed, removed, enforced)
 
 
-def label_verdict(repository: str, pr: int, head_sha: str, base_sha: str, merge_tree: str, wait_seconds: float,
-                  query: Callable = github_json, download: Callable = download_ids, judge_ids: Callable = judge,
-                  sleep: Callable = time.sleep, clock: Callable = time.monotonic) -> Tuple[str, bool]:
-    runs = query(f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={head_sha}&event=pull_request&per_page=20")["workflow_runs"]
-    if not runs:
-        return f"No CI run for `{head_sha[:12]}` yet; its Gates (Linux) reads the labels when it runs.\n", False
-    ci_run = max(runs, key=lambda candidate: candidate.get("created_at", ""))
-    deadline = clock() + wait_seconds
-    while ci_run.get("status") != "completed":
-        if clock() >= deadline:
-            return f"CI run {ci_run['id']} did not finish in time; re-run this job once it has.\n", True
-        sleep(POLL_SECONDS)
-        ci_run = query(f"repos/{repository}/actions/runs/{ci_run['id']}")
-    jobs = query(f"repos/{repository}/actions/runs/{ci_run['id']}/jobs?filter=latest&per_page=100")["jobs"]
-    legs = [job for job in jobs if job.get("name", "").startswith("Gates (Linux) / ")]
-    if not legs or any(job.get("conclusion") != "success" for job in legs):
-        return f"The Linux gate legs of CI run {ci_run['id']} did not all pass.\n", True
-    compared = next((job for job in jobs if job.get("name") == CI_JOB), None)
-    if compared is None or compared.get("conclusion") == "skipped":
-        return f"CI run {ci_run['id']} compared no test IDs (no suite ran).\n", False
-    enforced = MIGRATION_LABEL in pr_labels(repository, pr, query)
-    found = download(repository, ci_run["id"])
-    if found is None:
-        return f"CI run {ci_run['id']} has no `{ARTIFACT}` artifact.\n", enforced
-    head, meta = found
-    if enforced and meta.get("tree") != merge_tree:
-        return (f"CI run {ci_run['id']} tested another merge of this PR than the current one; "
-                "merge main or re-run CI so the test IDs match what would be merged.\n"), True
-    return judge_ids(head, base_sha, repository, enforced)
-
-
 def cmd_collect(args) -> int:
     counts, sources = collect(Path(args.raw), Path(args.tty) if args.tty else None)
     text = format_ids(counts)
@@ -557,13 +516,6 @@ def cmd_ci_compare(args) -> int:
     head = parse_ids(Path(args.head).read_text(encoding="utf-8"), args.head)
     enforced = MIGRATION_LABEL in pr_labels(args.repository, args.pr)
     report, failed = judge(head, git("rev-parse", args.base), args.repository, enforced)
-    write_report(report, args.summary)
-    return 1 if failed else 0
-
-
-def cmd_label_verdict(args) -> int:
-    report, failed = label_verdict(args.repository, args.pr, args.head_sha, git("rev-parse", args.base),
-                                   git("rev-parse", "HEAD^{tree}"), args.wait_minutes * 60)
     write_report(report, args.summary)
     return 1 if failed else 0
 
@@ -611,14 +563,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ci.add_argument("--pr", type=int, required=True)
     ci.add_argument("--summary")
     ci.set_defaults(handler=cmd_ci_compare)
-    verdict = commands.add_parser("label-verdict", help="judge the head's Linux gates and test IDs again with the PR's current labels")
-    verdict.add_argument("--repository", required=True)
-    verdict.add_argument("--pr", type=int, required=True)
-    verdict.add_argument("--head-sha", required=True)
-    verdict.add_argument("--base", required=True)
-    verdict.add_argument("--wait-minutes", type=float, default=100)
-    verdict.add_argument("--summary")
-    verdict.set_defaults(handler=cmd_label_verdict)
     check = commands.add_parser("check", help=f"check the format of {RENAMED.as_posix()} and {REMOVED.as_posix()}")
     check.add_argument("--root", default=str(ROOT))
     check.set_defaults(handler=cmd_check)

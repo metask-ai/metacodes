@@ -86,7 +86,7 @@ fn openTestIds(record: *test_id_record.Record, buffer: []u8, io: std.Io, environ
     const allocator = std.heap.page_allocator;
     const argv = args.toSlice(allocator) catch @panic("cannot read the test binary path");
     const suffix = std.fmt.allocPrint(allocator, "-{}of{}", .{ shard.index, shard.count }) catch @panic("OOM");
-    test_id_record.open(record, buffer, io, dir_path, argv[0], suffix);
+    test_id_record.open(record, buffer, io, environ, dir_path, argv[0], suffix);
     return true;
 }
 
