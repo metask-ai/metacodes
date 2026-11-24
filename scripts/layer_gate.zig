@@ -560,7 +560,21 @@ const Base = struct {
 
 fn growth(arena: std.mem.Allocator, base: Base, manifest: Manifest, baseline: Baseline) !usize {
     var problems: usize = 0;
-    inline for (.{ Category.upward, Category.deep, Category.wiring, Category.wide_roots }) |category| {
+    const base_layers = try resolveLayers(arena, base.manifest);
+    var base_edges: std.StringHashMapUnmanaged(void) = .empty;
+    for (try baselineKeys(arena, .upward, base.baseline)) |key| try base_edges.put(arena, key, {});
+    for (try baselineKeys(arena, .deep, base.baseline)) |key| try base_edges.put(arena, key, {});
+    inline for (.{ Category.upward, Category.deep }) |category| {
+        for (@field(baseline, @tagName(category))) |entry| {
+            const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ entry[0], entry[1] });
+            if (base_edges.contains(key)) continue;
+            const owner = base_layers.owner(entry[0]);
+            if (owner != null and owner == base_layers.owner(entry[1])) continue;
+            problems += 1;
+            std.debug.print("layer_baseline.zon: {s} entry `{s}` is not in the base's baseline, which only shrinks\n", .{ @tagName(category), key });
+        }
+    }
+    inline for (.{ Category.wiring, Category.wide_roots }) |category| {
         var before: std.StringHashMapUnmanaged(void) = .empty;
         for (try baselineKeys(arena, category, base.baseline)) |key| try before.put(arena, key, {});
         for (try baselineKeys(arena, category, baseline)) |key| {
@@ -586,14 +600,23 @@ fn growth(arena: std.mem.Allocator, base: Base, manifest: Manifest, baseline: Ba
         std.debug.print("layers.zon: kernel_budget gains `{s}`; it only shrinks\n", .{dependency});
     }
     for (manifest.packages) |package| {
-        const before = basePackage(base.manifest, package.name) orelse continue;
+        const before = packageNamed(base.manifest, package.name) orelse continue;
         for (package.allowed_dependencies) |dependency| {
             if (indexOfPath(before.allowed_dependencies, dependency) < before.allowed_dependencies.len) continue;
+            if (packageNamed(base.manifest, dependency) == null and reachesNoFurther(manifest, dependency, before)) continue;
             problems += 1;
             std.debug.print("layers.zon: `{s}` newly allows `{s}`; allowed_dependencies do not widen\n", .{ package.name, dependency });
         }
     }
     return problems;
+}
+
+fn reachesNoFurther(manifest: Manifest, new_package: []const u8, before: Package) bool {
+    const added = packageNamed(manifest, new_package) orelse return false;
+    for (added.allowed_dependencies) |dependency| {
+        if (indexOfPath(before.allowed_dependencies, dependency) == before.allowed_dependencies.len) return false;
+    }
+    return true;
 }
 
 fn withinSomeCycle(members: []const []const u8, cycles: []const []const []const u8) bool {
@@ -605,7 +628,7 @@ fn withinSomeCycle(members: []const []const u8, cycles: []const []const []const 
     return false;
 }
 
-fn basePackage(manifest: Manifest, package_name: []const u8) ?Package {
+fn packageNamed(manifest: Manifest, package_name: []const u8) ?Package {
     for (manifest.packages) |package| {
         if (std.mem.eql(u8, package.name, package_name)) return package;
     }
@@ -956,4 +979,73 @@ test "a shrinking baseline and budget pass against the base" {
         \\
     ;
     try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, shrunk_layers, shrunk_baseline, test_wiring, base));
+}
+
+const split_layers =
+    \\.{
+    \\    .packages = .{
+    \\        .{ .name = "base", .paths = .{ "src/util/", "src/types.zig", "src/util_root.zig" }, .allowed_dependencies = .{} },
+    \\        .{ .name = "kernel", .paths = .{"src/core/agent_loop.zig"}, .allowed_dependencies = .{"base"} },
+    \\        .{ .name = "coding", .paths = .{ "src/core/", "src/tools/" }, .allowed_dependencies = .{ "base", "kernel" } },
+    \\        .{ .name = "facade", .paths = .{"src/main.zig"}, .allowed_dependencies = .{ "base", "kernel", "coding" } },
+    \\        .{ .name = "cli", .paths = .{"src/repl/"}, .allowed_dependencies = .{ "base", "kernel", "coding", "facade" } },
+    \\        .{ .name = "tests", .paths = .{"tests/"}, .allowed_dependencies = .{ "base", "kernel", "coding", "facade", "cli" } },
+    \\    },
+    \\    .kernel_budget = .{ .package = "kernel", .max_lines = 3, .max_dependencies = .{ "base", "coding" } },
+    \\}
+    \\
+;
+
+const split_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/bash.zig" },
+    \\        .{ "src/repl/view.zig", "src/main.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\}
+    \\
+;
+
+test "splitting a package records its inner edges without growing against the base" {
+    const base = [2][:0]const u8{ test_layers, test_baseline };
+    const split_wiring = "module\tsrc/util/platform.zig\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, split_layers, split_baseline, split_wiring, base));
+    const tree = withFile("src/tools/grep.zig", "const fs = @import(\"../util/fs.zig\");\n");
+    const grown = comptime blk: {
+        const needle = "    .deep = .{\n";
+        const at = std.mem.indexOf(u8, split_baseline, needle).?;
+        break :blk split_baseline[0 .. at + needle.len] ++ "        .{ \"src/tools/grep.zig\", \"src/util/fs.zig\" },\n" ++ split_baseline[at + needle.len ..];
+    };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, split_layers, grown, split_wiring, base));
+}
+
+test "a new package is allowed only when it reaches no package the dependent could not" {
+    const shim_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"shim\", .paths = .{\"src/shim/\"}, .allowed_dependencies = .{ \"base\", \"kernel\" } },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"shim\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const base = [2][:0]const u8{ test_layers, test_baseline };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, shim_layers, test_baseline, test_wiring, base));
+    const narrower = comptime blk: {
+        const needle = "\"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++ "\"src/tools/\" }, .allowed_dependencies = .{\"base\"} }," ++ test_layers[at + needle.len ..];
+    };
+    const narrower_base = [2][:0]const u8{ narrower, test_baseline };
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&clean_tree, shim_layers, test_baseline, test_wiring, narrower_base));
 }
