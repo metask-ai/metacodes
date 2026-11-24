@@ -101,6 +101,8 @@ def main(argv: list[str]) -> int:
     # `python3 -m unittest` has the working directory, the repository root,
     # on sys.path; the suite imports `scripts.eval`.
     sys.path.insert(0, str(ROOT))
+    from scripts import test_ids
+
     modules = list(unittest.defaultTestLoader.discover(str(HERE)))
     groups = select_shard(group_modules(modules, module_group), index, count)
     selected = unittest.TestSuite([module for group in groups for module in group])
@@ -114,7 +116,8 @@ def main(argv: list[str]) -> int:
         return 1
     verbosity = 2 if "-v" in argv[1:] else 1
     arm_watchdog(SHARD_TIMEOUT_S)
-    result = unittest.TextTestRunner(verbosity=verbosity).run(selected)
+    result_class = test_ids.recording_result_class("eval")
+    result = unittest.TextTestRunner(verbosity=verbosity, resultclass=result_class).run(selected)
     return 0 if result.wasSuccessful() else 1
 
 

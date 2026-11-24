@@ -262,6 +262,18 @@ The rules that keep the split from dropping coverage:
   by itself after the shards; every case has a time limit there, so one
   hang (#569) fails that case instead of stalling the run
   ([tests/tty/README.md](../tests/tty/README.md)).
+- **The tests that ran are recorded by ID.** On Linux the `units`,
+  `product` and `checks` legs set `METACODES_TEST_IDS_DIR` before their
+  suites, so the sharded Zig runner, the `scripts/tests` suites and the
+  evaluation shards record every test they run, and the legs upload the
+  records as `test-ids-raw-<leg>`; no test runs twice for it. `Test IDs
+  (Linux)` waits for every Linux leg to pass, merges the records into the
+  `test-ids` artifact (kept 90 days) and, on a pull request, compares it with
+  the base's: the IDs of the PR that merged the base, on the same tree, or
+  else of main's latest nightly or dispatched run. The comparison goes to
+  the job summary. It fails only a PR labelled `migration` that drops a test
+  without explaining it in `tests/test_ids/`
+  ([tests/README.md](../tests/README.md)). It is not a required check.
 
 What it costs:
 

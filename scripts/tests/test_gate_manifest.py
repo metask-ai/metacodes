@@ -157,6 +157,23 @@ class GateManifestTest(unittest.TestCase):
             self.assertIn("%s.dependOn(&zig_api_snapshot.step);" % step, build)
         self.assertIn("contract_step.dependOn(&contract_run.step);", build)
 
+    def test_the_linux_legs_record_the_tests_they_run(self):
+        lines = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
+        names = [line.strip() for line in lines if line.strip().startswith("- name: ")]
+        record = names.index("- name: Record the executed test IDs")
+        for suite in ("- name: Offline test suite (units and integration)", "- name: Offline test suite (product)",
+                      "- name: ReleaseSafe core gate", "- name: Gate manifest unit tests"):
+            self.assertLess(record, names.index(suite), suite)
+        self.assertGreater(names.index("- name: Upload the executed test IDs"), names.index("- name: Diff whitespace check"))
+        workflow = "\n".join(lines)
+        self.assertIn("name: Test IDs (Linux)\n    needs: [release-fast-path, scope, gates-linux]", workflow)
+        self.assertIn("python3 scripts/test_ids.py collect --raw", workflow)
+        self.assertIn("python3 scripts/test_ids.py ci-compare --head", workflow)
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn("gate_static_step.dependOn(&test_ids_check_cmd.step);", build)
+        self.assertIn("units_test_step.dependOn(&test_ids_test_cmd.step);", build)
+        self.assertIn("METACODES_TEST_IDS_DIR", (ROOT / "scripts" / "sharded_test_runner.zig").read_text(encoding="utf-8"))
+
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn('const units_test_step = b.step("test:units",', build)

@@ -10,6 +10,7 @@ const std = @import("std");
 
 const shard_count_env = "METACODES_TEST_SHARD_COUNT";
 const shard_index_env = "METACODES_TEST_SHARD_INDEX";
+const test_ids_dir_env = "METACODES_TEST_IDS_DIR";
 const fnv1a_offset_basis: u64 = 14_695_981_039_346_656_037;
 const fnv1a_prime: u64 = 1_099_511_628_211;
 const partition = "fnv1a64-name-v1";
@@ -80,6 +81,25 @@ fn stableEnviron(environ: std.process.Environ) std.process.Environ {
     return .{ .block = .{ .slice = copy } };
 }
 
+fn testIdsFileName(allocator: std.mem.Allocator, argv0: []const u8, shard: ShardConfig) ![]u8 {
+    return std.fmt.allocPrint(allocator, "zig-{s}-{t}-{}of{}.tsv", .{ std.fs.path.stem(argv0), builtin.mode, shard.index, shard.count });
+}
+
+fn createTestIdsFile(io: std.Io, environ: std.process.Environ, args: std.process.Args, shard: ShardConfig) ?std.Io.File {
+    const allocator = std.heap.page_allocator;
+    const dir_path = environ.getAlloc(allocator, test_ids_dir_env) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        else => std.debug.panic("cannot read {s}: {t}", .{ test_ids_dir_env, err }),
+    };
+    const argv = args.toSlice(allocator) catch @panic("cannot read the test binary path");
+    const file_name = testIdsFileName(allocator, argv[0], shard) catch @panic("cannot name the test ID file");
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |err|
+        std.debug.panic("cannot open {s}={s}: {t}", .{ test_ids_dir_env, dir_path, err });
+    defer dir.close(io);
+    return dir.createFile(io, file_name, .{}) catch |err|
+        std.debug.panic("cannot create {s} in {s}: {t}", .{ file_name, dir_path, err });
+}
+
 fn elapsedMs(elapsed_ns: u64) f64 {
     return @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
 }
@@ -99,6 +119,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), runner_io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
+    const test_ids_file = createTestIdsFile(runner_io, environ, init.args, shard);
+    var test_ids_buffer: [4096]u8 = undefined;
+    var test_ids_file_writer: ?std.Io.File.Writer = if (test_ids_file) |file| .init(file, runner_io, &test_ids_buffer) else null;
 
     var selected_total: usize = 0;
     var all_fingerprint: Fingerprint = .{};
@@ -163,6 +186,14 @@ pub fn main(init: std.process.Init.Minimal) void {
             );
         }
 
+        const status: []const u8 = if (result) |_| "pass" else |err| switch (err) {
+            error.SkipZigTest => "skip",
+            else => "fail",
+        };
+        if (test_ids_file_writer) |*writer| {
+            writer.interface.print("{s}\t{s}\n", .{ status, test_fn.name }) catch @panic("failed to write a test ID");
+        }
+
         if (result) |_| {
             passed = std.math.add(usize, passed, 1) catch
                 @panic("passed test count overflow");
@@ -192,11 +223,21 @@ pub fn main(init: std.process.Init.Minimal) void {
         .{ shard.index, shard.count, selected_total, passed, skipped, failed, leaked, elapsedMs(total_ns), partition, selected_fingerprint.xor, selected_fingerprint.sum },
     ) catch @panic("failed to write test shard summary");
     stdout.flush() catch @panic("failed to flush test shard summary");
+    if (test_ids_file_writer) |*writer| {
+        writer.interface.flush() catch @panic("failed to flush the test IDs");
+        test_ids_file.?.close(runner_io);
+    }
     if (failed != 0 or leaked != 0) std.process.exit(1);
 }
 
 test "stable FNV partition does not drift" {
     try std.testing.expectEqual(@as(usize, 1), shardForTest("cli.test.example", 4));
+}
+
+test "test ID file names carry the suite, mode and shard" {
+    const name = try testIdsFileName(std.testing.allocator, "/cache/o/abc/metacodes-core-test", .{ .count = 4, .index = 2 });
+    defer std.testing.allocator.free(name);
+    try std.testing.expectEqualStrings("zig-metacodes-core-test-" ++ @tagName(builtin.mode) ++ "-2of4.tsv", name);
 }
 
 test "each test name belongs to exactly one shard" {

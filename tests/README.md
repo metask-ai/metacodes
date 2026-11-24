@@ -151,6 +151,51 @@ zig build test:contract -Dupdate-contract
 Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成快照;它不能和拆包、删除或改名
 公开导出放在同一个 PR 里,这样快照的 diff 只能来自一个原因。
 
+## 实际执行的测试 ID(scripts/test_ids.py)
+
+快照证明对外字节没变,这一项证明迁移前后**实际跑过的测试一个没少**:只比数量看不出一个测试
+被换成了另一个,或者悄悄不再执行。
+
+设置了 `METACODES_TEST_IDS_DIR` 时,测试运行器把每个跑过的测试记一行(`pass`、`skip`、`fail`
+分开记):
+
+| 来源 | 记录方 | ID |
+|---|---|---|
+| Zig core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig`,每个分片一个 `zig-<套件>-<优化模式>-<i>of<n>.tsv` | `zig:<test 名>`:去掉文件和命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 都记为 `zig:<unnamed>` |
+| `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,去掉模块路径 |
+| `scripts/eval/tests` | `scripts/eval/tests/run_shard.py` | 同上 |
+| TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,只报告,不强制 |
+
+ID 不含路径和模块前缀,所以只搬文件不会改变 ID。同名的测试按次数计:两个都叫 `zig:basic` 的
+测试删掉一个,也算少了一个。同一个测试在几个步骤里都跑(比如 Debug 和 ReleaseSafe 的 core
+套件),次数照实累加,base 和 head 在同样的 CI 布局下比较。`time_test_runner.zig` 是诊断入口,不记录;
+`test:provider`、`test:lsp` 等用 Zig 默认运行器的隔离根暂时不在 ID 集合里。
+
+本地看一次完整离线测试的 ID 集合(各来源的条数打印到 stderr,和各套件的汇总行对得上):
+
+```bash
+python3 scripts/test_ids.py run --output test-ids.tsv                 # 跑 zig build test
+python3 scripts/test_ids.py run --output lib.tsv -- zig build test:lib  # 只跑某一部分
+python3 scripts/test_ids.py compare --base before.tsv --head after.tsv [--enforce]
+```
+
+输出每行 `<ID>\t<pass|skip|listed>\t<次数>`,按 ID 排序。
+
+CI:Gates (Linux) 的 `units`、`product`、`checks` 三条腿在跑测试时顺手记录并上传,不多跑测试;
+`Test IDs (Linux)` 汇总成 `test-ids` artifact(保留 90 天),再和 base 比较,结果写进 job summary。
+base 的 ID 集合取合并出 base 提交的那个 PR 的 CI 产物(要求树相同),没有就取 main 最近一次
+nightly 或手动触发的 CI 产物,并在 summary 里注明是哪一次。
+
+比较的规则:
+
+- base 跑过的测试,head 里次数变少,或者从 `pass` 变成 `skip`,都算**消失**;新增的测试允许。
+- 消失的 ID 要在 `tests/test_ids/renamed.tsv`(`<旧 ID>\t<新 ID>`,新 ID 在 head 里多出来的次数
+  抵掉旧 ID 少掉的)或 `tests/test_ids/removed.tsv`(`<ID>\t<删除原因>`)里说明。两个文件的格式由
+  `scripts/test_ids.py check` 检查,它在 `gate:static` 里;自测 `scripts.tests.test_test_ids` 在 `test:units`。
+- PR 带 `migration` 标签时,未说明的消失让 `Test IDs (Linux)` 失败,并列出 ID;其他 PR 只出报告。
+  base 没有记录时,migration PR 也失败:在 main 上手动触发一次 CI 再重跑这个 job。
+- 说明条目合并后留在文件里不影响后续 PR,summary 会把用不上的条目列成 Unused,下一个迁移 PR 可以清掉。
+
 ## 已知执行覆盖缺口(登记非沉默)
 
 以下工具无法在纯 L2 自动化里做执行冒烟,只有 schema 覆盖

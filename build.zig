@@ -2765,6 +2765,21 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
+    const test_ids_check_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_ids.py",
+        "check",
+    });
+    const test_ids_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_test_ids",
+        "-v",
+    });
+    const test_ids_test_step = b.step("test:test-ids", "Test the executed-test ID lists and their base comparison");
+    test_ids_test_step.dependOn(&test_ids_test_cmd.step);
+    units_test_step.dependOn(&test_ids_test_cmd.step);
     const pr_loop_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2843,6 +2858,7 @@ pub fn build(b: *std.Build) void {
     gate_static_step.dependOn(&builtin_egress_test_cmd.step);
     gate_static_step.dependOn(&http_answer_test_cmd.step);
     gate_static_step.dependOn(&keep_server_open_test_cmd.step);
+    gate_static_step.dependOn(&test_ids_check_cmd.step);
     gate_static_step.dependOn(&gate_diff_check.step);
     const gate_lint = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
