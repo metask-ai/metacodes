@@ -48,6 +48,16 @@ const WaitDeadline = struct {
     }
 };
 
+/// 一次等待里睡满(timedWait 超时返回)的分片时长之和。墙钟含调度延迟,这个和不含:
+/// 测试据此判断等待没有越过 deadline 多睡一片(#741)。被唤醒的分片不计。
+const SleptTime = struct {
+    ns: u64 = 0,
+
+    fn wait(self: *SleptTime, cond: *sync.Condition, mutex: *sync.Mutex, slice_ns: u64) void {
+        if (!cond.timedWait(mutex, slice_ns)) self.ns += slice_ns;
+    }
+};
+
 pub const DiagnosticsWait = enum { published, skipped_silent, timed_out, aborted, server_exited };
 
 pub const WaitToken = struct {
@@ -79,6 +89,8 @@ pub const Client = struct {
 
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
+    /// 最近一次结束的 sendRequest / waitForDiagnostics 睡满的分片时长,只供测试读取(#741)。
+    last_wait_slept_ns: u64 = 0,
 
     pending: std.AutoHashMap(i64, *Pending),
     next_id: i64 = 1,
@@ -255,10 +267,12 @@ pub const Client = struct {
         // remove 后 reader 的 get(id)=null,再不能写 p;已写入的 result 在此被捕获。
         self.lock();
         const deadline = WaitDeadline.after(timeout_ms);
+        var slept: SleptTime = .{};
         while (!p.done and self.running and !self.abortedDuringWait()) {
             const slice_ns = deadline.nextSliceNs() orelse break;
-            _ = self.cond.timedWait(&self.mutex, slice_ns);
+            slept.wait(&self.cond, &self.mutex, slice_ns);
         }
+        self.last_wait_slept_ns = slept.ns;
         _ = self.pending.remove(id);
         const result = p.result;
         const done = p.done;
@@ -394,10 +408,12 @@ pub const Client = struct {
         defer self.unlock();
         if (self.server_silent or self.silent_paths.contains(path)) return .skipped_silent;
         const deadline = WaitDeadline.after(timeout_ms);
+        var slept: SleptTime = .{};
         while (self.running and self.push_counter <= wait_token.pushes and !self.abortedDuringWait()) {
             const slice_ns = deadline.nextSliceNs() orelse break;
-            _ = self.cond.timedWait(&self.mutex, slice_ns);
+            slept.wait(&self.cond, &self.mutex, slice_ns);
         }
+        self.last_wait_slept_ns = slept.ns;
         if (self.push_counter > wait_token.pushes) return .published;
         if (!self.running) return .server_exited;
         if (self.abortedDuringWait()) return .aborted;
@@ -713,6 +729,8 @@ test "Client: a seed push swallowed during the window does not silence the path 
 }
 
 const WINDOW_MS: u64 = 4 * WAIT_POLL_MS;
+/// 墙钟上限只兜底等待不收尾;多睡一片由睡满的分片时长判断,这里给负载高的机器留出调度延迟。
+const WAIT_HANG_MS: u64 = 2 * WINDOW_MS;
 const MIN_WAKEUPS: u64 = 2 * WINDOW_MS / WAIT_POLL_MS;
 const ECHO_PACE_MS: u64 = 5;
 const FLOOD_PARAMS = "{\"uri\":\"file:///tmp/proj/other.zig\",\"count\":400,\"interval_ms\":5}";
@@ -740,11 +758,22 @@ fn expectFullWindow(wait: []const u8, elapsed_ms: i64) !void {
     }
 }
 
-fn expectEndsAtWindow(wait: []const u8, elapsed_ms: i64) !void {
+fn lastWaitSleptMs(cl: *Client) u64 {
+    cl.lock();
+    defer cl.unlock();
+    return cl.last_wait_slept_ns / std.time.ns_per_ms;
+}
+
+fn expectEndsAtWindow(cl: *Client, wait: []const u8, elapsed_ms: i64) !void {
     try expectFullWindow(wait, elapsed_ms);
-    if (elapsed_ms >= @as(i64, WINDOW_MS + WAIT_POLL_MS)) {
-        std.debug.print("the {s} wait of {d} ms took {d} ms\n", .{ wait, WINDOW_MS, elapsed_ms });
+    const slept_ms = lastWaitSleptMs(cl);
+    if (slept_ms >= WINDOW_MS + WAIT_POLL_MS) {
+        std.debug.print("the {s} wait of {d} ms slept {d} ms in timed-out slices\n", .{ wait, WINDOW_MS, slept_ms });
         return error.WaitOverran;
+    }
+    if (elapsed_ms >= @as(i64, WAIT_HANG_MS)) {
+        std.debug.print("the {s} wait of {d} ms took {d} ms\n", .{ wait, WINDOW_MS, elapsed_ms });
+        return error.WaitHung;
     }
 }
 
@@ -809,7 +838,7 @@ test "Client: a diagnostics wait nothing wakes ends at its timeout (#741)" {
     const elapsed = util_time.nowMs() - started;
 
     try testing.expectEqual(DiagnosticsWait.timed_out, outcome);
-    try expectEndsAtWindow("diagnostics", elapsed);
+    try expectEndsAtWindow(cl, "diagnostics", elapsed);
 }
 
 test "Client: a request wait nothing wakes ends at its timeout (#741)" {
@@ -821,7 +850,7 @@ test "Client: a request wait nothing wakes ends at its timeout (#741)" {
     const elapsed = util_time.nowMs() - started;
 
     try testing.expectError(error.Timeout, answer);
-    try expectEndsAtWindow("request", elapsed);
+    try expectEndsAtWindow(cl, "request", elapsed);
 }
 
 test "Client: a diagnostics wait woken by answers to other requests still lasts its timeout (#741)" {
