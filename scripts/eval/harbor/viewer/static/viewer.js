@@ -198,6 +198,7 @@ const profileActive = (b) => ['queued', 'running', 'cancelling'].includes(b.stat
 const profileName = (b) => b.name || b.default_name || b.id;
 const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
 const featuresText = (b) => (b.features || []).join(', ') || '未开启';
+const skippedFeatures = (b, item) => item.features ? (b.features || []).filter((name) => !item.features.includes(name)) : [];
 
 // Fills the run form for another run on profile `b` with one model (the
 // page's model filter, else the last run's): that model's suites and tasks
@@ -408,7 +409,7 @@ async function renderProfile(id) {
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
       h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
         item.concurrency ? `并发 ${item.concurrency}` : null,
-        (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
+        skippedFeatures(b, item).length ? `未开启 ${skippedFeatures(b, item).join(', ')}（WorkBuddy 不支持）` : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
       h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * (item.attempts || 1)}` }),

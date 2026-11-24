@@ -298,11 +298,11 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profile/rename', {'id': 'profile-elsewhere', 'name': 'x'})
         self.assertTrue(self.client.request('api/jobs?profile=all')['can_run'])
 
-    def test_features_are_refused_for_a_workbuddy_suite_and_left_out_by_a_profile(self):
-        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持选择高级功能'):
+    def test_a_workbuddy_suite_takes_only_the_run_gates(self):
+        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持这些高级功能：execute_code'):
             self.manager.launch({'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],
-                                 'attempts': 1, 'concurrency': 1, 'features': ['execute_code']})
-        self.assertEqual(profiles.run_features(['execute_code'], 'workbuddy-code'), [])
+                                 'attempts': 1, 'concurrency': 1, 'features': ['stall_gate', 'execute_code']})
+        self.assertEqual(profiles.run_features(['stall_gate', 'execute_code'], 'workbuddy-code'), ['stall_gate'])
         self.assertEqual(profiles.run_features(['execute_code'], 'terminal-bench-2.1'), ['execute_code'])
 
     def test_a_single_run_takes_the_page_default_features(self):

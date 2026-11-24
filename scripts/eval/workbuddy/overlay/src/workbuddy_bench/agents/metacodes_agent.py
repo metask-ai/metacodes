@@ -419,6 +419,20 @@ class MetacodesAgent(BaseInstalledAgent):
             )
         self._requirement_ledger = ledger
         self._requirement_ledger_observe = ledger_observe
+        test_integrity = kwargs.pop("METACODES_TEST_INTEGRITY", False)
+        delivery_cadence = kwargs.pop("METACODES_DELIVERY_CADENCE", False)
+        stall_gate = kwargs.pop("METACODES_STALL_GATE", False)
+        if not all(
+            isinstance(value, bool)
+            for value in (test_integrity, delivery_cadence, stall_gate)
+        ):
+            raise ValueError(
+                "METACODES_TEST_INTEGRITY/DELIVERY_CADENCE/STALL_GATE must be "
+                "explicit booleans"
+            )
+        self._test_integrity = test_integrity
+        self._delivery_cadence = delivery_cadence
+        self._stall_gate = stall_gate
         memory_accumulation = kwargs.pop("METACODES_MEMORY_ACCUMULATION", False)
         if not isinstance(memory_accumulation, bool):
             raise ValueError(
@@ -839,6 +853,12 @@ class MetacodesAgent(BaseInstalledAgent):
             flags.append("--requirement-ledger")
         if self._requirement_ledger_observe:
             flags.append("--requirement-ledger-observe")
+        if self._test_integrity:
+            flags.append("--test-integrity")
+        if self._delivery_cadence:
+            flags.append("--delivery-cadence")
+        if self._stall_gate:
+            flags.append("--stall-gate")
 
         project_setup = ""
         project_postcheck = ""
@@ -1029,6 +1049,9 @@ class MetacodesAgent(BaseInstalledAgent):
                 "verification_final_observe": self._verification_final_observe,
                 "requirement_ledger": self._requirement_ledger,
                 "requirement_ledger_observe": self._requirement_ledger_observe,
+                "test_integrity": self._test_integrity,
+                "delivery_cadence": self._delivery_cadence,
+                "stall_gate": self._stall_gate,
                 "project_control": project_contract,
                 "instruction_delivery": "stdin-uploaded-file",
                 "instruction_sha256": instruction_sha,

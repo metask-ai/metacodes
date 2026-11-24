@@ -434,8 +434,11 @@ class RunManager:
             raise ValueError("suite 与 dataset 不一致")
         suite = suites.resolved(suites.get(suite_id))
         features = chosen_features(request.get("features"))
-        if features and suite.runner == suites.WORKBUDDY:
-            raise ValueError("WorkBuddy 评测暂不支持选择高级功能，请选择 Harbor 评测集")
+        if suite.runner == suites.WORKBUDDY:
+            from scripts.eval.harbor.suites import workbuddy
+            unsupported = [name for name in features if name not in workbuddy.FEATURE_PARAMS]
+            if unsupported:
+                raise ValueError("WorkBuddy 评测暂不支持这些高级功能：" + "、".join(unsupported))
         if self.setup_running():  # checked again under the lock below
             raise ValueError("一键配置正在进行（可能重启 Docker），请等配置结束再启动评测")
         catalog = self.catalog(bundle_supplied=frozen is not None or bundle is not None)

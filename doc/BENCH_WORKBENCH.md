@@ -1073,13 +1073,19 @@ and the preview features `execute_code` (`--preview=execute_code`),
 `ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The
 profile and each of its runs record the chosen names (`features`), and the
 run passes them to the adapter as `--ak features=<names>`. An unknown name is
-refused. A WorkBuddy suite's overlay launches metacodes itself, so its
-datasets run without the profile's features: the queued dataset and its run
-record list none, and the profile page marks them; a direct launch that asks
-for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
+refused. A WorkBuddy suite's overlay launches metacodes itself and takes
+only the run gates: the workbench writes each one as a harness parameter of
+the WorkBuddy job (`FEATURE_PARAMS` in `scripts/eval/harbor/suites/workbuddy.py`,
+for example `METACODES_STALL_GATE: true`), and the overlay turns it into the
+same flag. Its datasets run without the profile's preview features: the
+queued dataset and its run record list only the gates, and the profile page
+names the features left out; a direct launch that asks for a preview feature
+on a WorkBuddy suite is refused. A WorkBuddy checkout whose installed overlay
+differs from this checkout's refuses a run with features until
+`install_overlay` reinstalls it. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork, 7 since model prices): an older node is refused until
+features (4 since teamwork, 7 since model prices, 8 since WorkBuddy gates): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 

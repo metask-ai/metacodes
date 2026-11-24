@@ -622,6 +622,8 @@ def workbuddy_checkout(root, *, head=WORKBUDDY_PINNED_COMMIT, subset="code"):
     (repo / ".git/HEAD").write_text(head + "\n")
     (repo / ".venv").mkdir()
     atomic_json(repo / wb.OVERLAY, {"workbuddy_commit": WORKBUDDY_PINNED_COMMIT})
+    (repo / wb.AGENT).parent.mkdir(parents=True)
+    shutil.copy(wb.OVERLAY_SOURCE / wb.AGENT, repo / wb.AGENT)
     (repo / wb.HARNESS_CONTEXT).mkdir(parents=True)
     (repo / wb.HARNESS_CONTEXT / "Dockerfile").write_text("FROM scratch\nCOPY artifacts/bin/ /bin/\n")
     (repo / wb.HARNESS_VERSIONS).mkdir(parents=True)
@@ -810,7 +812,12 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertEqual(job["task_selection"], {"mode": "name", "names": ["bug_fix-easy-alpha", "data_quality-hard-beta"]})
         self.assertEqual(job["jobs_dir"], str(job_root / "workbuddy"))
         self.assertEqual(job["orchestrator_override"], {"n_concurrent_trials": 2})
-        self.assertEqual(job["harness_params_override"], {"METACODES_REASONING_EFFORT": "max"})
+        self.assertEqual(run["features"], ["verification_final_gate", "requirement_ledger", "test_integrity",
+                                           "delivery_cadence", "stall_gate"])
+        self.assertEqual(job["harness_params_override"], {
+            "METACODES_REASONING_EFFORT": "max", "METACODES_VERIFICATION_FINAL_GATE": True,
+            "METACODES_REQUIREMENT_LEDGER": True, "METACODES_TEST_INTEGRITY": True,
+            "METACODES_DELIVERY_CADENCE": True, "METACODES_STALL_GATE": True})
         self.assertNotIn("llm_judge_override", job)
         self.assertIsNone(observed["judge"])
         self.assertEqual(observed["model"]["model"]["name"], "session-model")
@@ -914,6 +921,15 @@ class SuiteLaunchTest(unittest.TestCase):
         self.assertTrue(any("固定提交" in r for r in reasons), reasons)
         ctx = suites.Context({"workbuddy_checkout": str(repo), "provider_config": "/x"}, self.root)
         self.assertTrue(any("Metask" in r for r in suites.readiness(suites.get("workbuddy-sec"), ctx)))
+
+    def test_workbuddy_features_need_the_current_overlay(self):
+        repo = workbuddy_checkout(self.root)
+        self.assertTrue(wb.overlay_current(repo))
+        (repo / wb.AGENT).write_text("# an older overlay\n")
+        spec = {"name": "bench-x", "features": ["stall_gate"], "workbuddy": {"checkout": str(repo), "subset": "code"}}
+        with self.assertRaisesRegex(ValueError, "install_overlay"):
+            wb.launch(spec, {})
+        self.assertFalse((repo / "configs/jobs/metacodes-bench-x.yaml").exists())
 
 
 if __name__ == "__main__":
