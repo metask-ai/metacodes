@@ -84,11 +84,20 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
+    if (sourcePath(b, artifact.root_module)) |root| {
+        run.setEnvironmentVariable("METACODES_TEST_ROOT", std.fs.path.dirnamePosix(root) orelse "");
+    }
     if (g_sandbox_helper_install) |install| {
         run.step.dependOn(install);
         run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
     }
     return run;
+}
+
+fn addRecordedTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Compile {
+    var recorded = options;
+    recorded.test_runner = .{ .path = b.path("scripts/recording_test_runner.zig"), .mode = .server };
+    return b.addTest(recorded);
 }
 
 /// A nested `zig build` is part of the caller's build graph, so it must honor
@@ -1388,7 +1397,7 @@ pub fn build(b: *std.Build) void {
     const http_status_gate_run = b.addRunArtifact(http_status_gate_exe);
     http_status_gate_run.setCwd(b.path("."));
     http_status_gate_run.addArg(".");
-    const http_status_gate_unit = b.addTest(.{
+    const http_status_gate_unit = addRecordedTest(b, .{
         .name = "http-status-boundary-gate-unit",
         .root_module = http_status_gate_mod,
     });
@@ -1485,25 +1494,25 @@ pub fn build(b: *std.Build) void {
 
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
     agentcore_test_step.dependOn(http_status_gate_step);
-    const agentcore_abi_test = b.addTest(.{
+    const agentcore_abi_test = addRecordedTest(b, .{
         .name = "agentcore-abi-unit",
         .root_module = agentcore_abi_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test).step);
-    const agentcore_types_test = b.addTest(.{
+    const agentcore_types_test = addRecordedTest(b, .{
         .name = "agentcore-types-unit",
         .root_module = agentcore_types_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test).step);
-    const agentcore_protocol_test = b.addTest(.{
+    const agentcore_protocol_test = addRecordedTest(b, .{
         .name = "agentcore-protocol-unit",
         .root_module = agentcore_protocol_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test).step);
-    const agentcore_sdk_test = b.addTest(.{
+    const agentcore_sdk_test = addRecordedTest(b, .{
         .name = "agentcore-sdk-unit",
         .root_module = agentcore_sdk_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1514,7 +1523,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
-    const agentcore_zig_package_build_test = b.addTest(.{
+    const agentcore_zig_package_build_test = addRecordedTest(b, .{
         .name = "agentcore-zig-package-build-unit",
         .root_module = agentcore_zig_package_build_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1525,7 +1534,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const agentcore_manifest_contract_test = b.addTest(.{
+    const agentcore_manifest_contract_test = addRecordedTest(b, .{
         .name = "agentcore-manifest-contract",
         .root_module = agentcore_manifest_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1546,7 +1555,7 @@ pub fn build(b: *std.Build) void {
         .name = "agentcore-manifest",
         .root_module = agentcore_manifest_tool_mod,
     });
-    const agentcore_manifest_tool_test = b.addTest(.{
+    const agentcore_manifest_tool_test = addRecordedTest(b, .{
         .name = "agentcore-manifest-unit",
         .root_module = agentcore_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1581,12 +1590,12 @@ pub fn build(b: *std.Build) void {
         .name = "release-manifest",
         .root_module = release_manifest_tool_mod,
     });
-    const release_manifest_tool_test = b.addTest(.{
+    const release_manifest_tool_test = addRecordedTest(b, .{
         .name = "release-manifest-unit",
         .root_module = release_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const manifest_common_test = b.addTest(.{
+    const manifest_common_test = addRecordedTest(b, .{
         .name = "manifest-common-unit",
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/manifest_common.zig"),
@@ -1595,7 +1604,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const release_contract_test = b.addTest(.{
+    const release_contract_test = addRecordedTest(b, .{
         .name = "release-manifest-contract",
         .root_module = b.createModule(.{
             .root_source_file = b.path("release/manifest_contract.zig"),
@@ -1716,7 +1725,7 @@ pub fn build(b: *std.Build) void {
         .name = "agentcore-symbol-gate",
         .root_module = agentcore_symbol_gate_mod,
     });
-    const agentcore_symbol_gate_test = b.addTest(.{
+    const agentcore_symbol_gate_test = addRecordedTest(b, .{
         .name = "agentcore-symbol-gate-unit",
         .root_module = agentcore_symbol_gate_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1760,7 +1769,7 @@ pub fn build(b: *std.Build) void {
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     agentcore_contract_mod.addImport("metacodes-core", core_mod);
     addPlatform(b, agentcore_contract_mod);
-    const agentcore_contract_test = b.addTest(.{
+    const agentcore_contract_test = addRecordedTest(b, .{
         .name = "agentcore-abi-contract",
         .root_module = agentcore_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -2302,7 +2311,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    const shard_reporter_tests = b.addTest(.{
+    const shard_reporter_tests = addRecordedTest(b, .{
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/sharded_test_reporter.zig"),
             .target = b.graph.host,
@@ -2311,7 +2320,7 @@ pub fn build(b: *std.Build) void {
     });
     const core_shard_harness_step = b.step("test:lib-shard-harness", "Test core shard partition and aggregate fail-closed checks");
     core_shard_harness_step.dependOn(&b.addRunArtifact(shard_runner_tests).step);
-    core_shard_harness_step.dependOn(&b.addRunArtifact(shard_reporter_tests).step);
+    core_shard_harness_step.dependOn(&addTestRunArtifact(b, shard_reporter_tests).step);
 
     // Diagnostic companion to test:lib. It runs the identical test graph and
     // semantics, but emits per-test timings plus slow-test buckets/top-N so
@@ -2342,7 +2351,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
-    const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
+    const lsp_test = addRecordedTest(b, .{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
     lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
 
@@ -2356,7 +2365,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, mcp_test_mod);
-    const mcp_test = b.addTest(.{
+    const mcp_test = addRecordedTest(b, .{
         .name = "mcp-test",
         .root_module = mcp_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -2379,7 +2388,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
-    const provider_test = b.addTest(.{ .name = "provider-test", .root_module = provider_test_mod });
+    const provider_test = addRecordedTest(b, .{ .name = "provider-test", .root_module = provider_test_mod });
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
@@ -2405,7 +2414,7 @@ pub fn build(b: *std.Build) void {
     const subsystem_boundary_run = b.addRunArtifact(subsystem_boundary_exe);
     subsystem_boundary_run.setCwd(b.path("."));
     subsystem_boundary_run.addArg(".");
-    const subsystem_boundary_unit = b.addTest(.{
+    const subsystem_boundary_unit = addRecordedTest(b, .{
         .name = "subsystem-boundary-gate-unit",
         .root_module = subsystem_boundary_mod,
     });
@@ -2428,7 +2437,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, picker_test_mod);
-    const picker_test = b.addTest(.{ .name = "picker-test", .root_module = picker_test_mod });
+    const picker_test = addRecordedTest(b, .{ .name = "picker-test", .root_module = picker_test_mod });
     const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
     picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
 
@@ -2442,7 +2451,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const platform_test = b.addTest(.{ .name = "platform-test", .root_module = platform_test_mod });
+    const platform_test = addRecordedTest(b, .{ .name = "platform-test", .root_module = platform_test_mod });
     const platform_test_step = b.step("test:platform", "Test the portable platform abstraction layer");
     const platform_test_run = addTestRunArtifact(b, platform_test);
     platform_test_step.dependOn(&platform_test_run.step);
@@ -2765,6 +2774,44 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
+    const test_id_fixture = addRecordedTest(b, .{
+        .name = "test-id-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/test_id_fixture.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const test_id_fixture_run = addTestRunArtifact(b, test_id_fixture);
+    const test_id_fixture_records = test_id_fixture_run.addPrefixedOutputDirectoryArg("--test-ids-dir=", "test-ids");
+    const test_id_fixture_check = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_ids.py",
+        "collect",
+        "--raw",
+    });
+    test_id_fixture_check.addDirectoryArg(test_id_fixture_records);
+    test_id_fixture_check.expectStdOutEqual(
+        "zig:<unnamed>\tscripts.test_id_fixture\tpass\t1\n" ++
+            "zig:passes\tscripts.test_id_fixture\tpass\t1\n" ++
+            "zig:skips\tscripts.test_id_fixture\tskip\t1\n",
+    );
+    units_test_step.dependOn(&test_id_fixture_check.step);
+    const test_ids_check_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_ids.py",
+        "check",
+    });
+    const test_ids_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_test_ids",
+        "-v",
+    });
+    const test_ids_test_step = b.step("test:test-ids", "Test the executed-test ID lists and their base comparison");
+    test_ids_test_step.dependOn(&test_ids_test_cmd.step);
+    test_ids_test_step.dependOn(&test_id_fixture_check.step);
+    units_test_step.dependOn(&test_ids_test_cmd.step);
     const pr_loop_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2843,6 +2890,7 @@ pub fn build(b: *std.Build) void {
     gate_static_step.dependOn(&builtin_egress_test_cmd.step);
     gate_static_step.dependOn(&http_answer_test_cmd.step);
     gate_static_step.dependOn(&keep_server_open_test_cmd.step);
+    gate_static_step.dependOn(&test_ids_check_cmd.step);
     gate_static_step.dependOn(&gate_diff_check.step);
     const gate_lint = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
@@ -2896,7 +2944,7 @@ pub fn build(b: *std.Build) void {
     contract_mod.addImport("agentcore_binary", b.createModule(.{ .root_source_file = b.path("scripts/agentcore_binary.zig") }));
     contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     addPlatform(b, contract_mod);
-    const contract_test = b.addTest(.{
+    const contract_test = addRecordedTest(b, .{
         .name = "contract",
         .root_module = contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -2944,7 +2992,7 @@ pub fn build(b: *std.Build) void {
     contract_run.step.dependOn(&install_mock_mcp.step);
     contract_step.dependOn(&contract_run.step);
 
-    const contract_units = b.addTest(.{
+    const contract_units = addRecordedTest(b, .{
         .name = "contract-units",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/contract/units.zig"),
@@ -2954,7 +3002,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     units_test_step.dependOn(&addTestRunArtifact(b, contract_units).step);
-    const test_obj = b.addTest(.{
+    const test_obj = addRecordedTest(b, .{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3241,7 +3289,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         if (!shared_harness) addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "spike",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3348,7 +3396,7 @@ pub fn build(b: *std.Build) void {
     dispatcher_metadata_mod.addImport("metacodes-core", core_mod);
     dispatcher_metadata_mod.addImport("agentcore-abi", agentcore_abi_test_mod);
     addPlatform(b, dispatcher_metadata_mod);
-    const dispatcher_metadata_test = b.addTest(.{
+    const dispatcher_metadata_test = addRecordedTest(b, .{
         .name = "tool-dispatcher-metadata",
         .root_module = dispatcher_metadata_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3379,7 +3427,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "skill-runtime",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3394,7 +3442,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, skill_runtime_unit_mod);
-    const skill_runtime_unit = b.addTest(.{
+    const skill_runtime_unit = addRecordedTest(b, .{
         .name = "skill-runtime-unit",
         .root_module = skill_runtime_unit_mod,
         .filters = &.{
@@ -3490,7 +3538,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod); // 共享模块(见 integ 循环前注释:perf)
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装(setEnv、clientRoundtrip)
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "new-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3510,7 +3558,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "agentdef-fields",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3536,7 +3584,7 @@ pub fn build(b: *std.Build) void {
             m.addImport("harness", test_harness_mod); // 共享模块(见 integ 循环前注释:perf)
             m.addImport("cc", test_cc_mod);
             addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装
-            const t = b.addTest(.{
+            const t = addRecordedTest(b, .{
                 .name = "mem-l2",
                 .root_module = m,
                 .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3558,7 +3606,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "kg-governance-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG governance:"},
@@ -3583,7 +3631,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "kg-ontology-feedback-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG ontology feedback:"},
@@ -3608,7 +3656,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "kg-experience-feedback-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG experience feedback:"},
@@ -3722,7 +3770,7 @@ fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_st
     layer_run.addFileInput(b.path("layers.zon"));
     layer_run.addFileInput(b.path("layer_baseline.zon"));
     layer_run.has_side_effects = true;
-    const layer_unit = b.addTest(.{ .name = "layer-gate-unit", .root_module = layer_mod });
+    const layer_unit = addRecordedTest(b, .{ .name = "layer-gate-unit", .root_module = layer_mod });
     const layer_step = b.step("layer:check", "Enforce layers.zon: owned files, downward imports, no package cycles, module wiring, a shrinking baseline");
     layer_step.dependOn(&layer_run.step);
     layer_step.dependOn(&addTestRunArtifact(b, layer_unit).step);

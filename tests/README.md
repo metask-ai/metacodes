@@ -151,6 +151,66 @@ zig build test:contract -Dupdate-contract
 Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成快照;它不能和拆包、删除或改名
 公开导出放在同一个 PR 里,这样快照的 diff 只能来自一个原因。
 
+## 实际执行的测试 ID(scripts/test_ids.py)
+
+快照证明对外字节没变,这一项证明迁移前后**实际跑过的测试一个没少**:只比数量看不出一个测试
+被换成了另一个,或者悄悄不再执行。
+
+设置了 `METACODES_TEST_IDS_DIR` 时,测试运行器把每个跑过的测试记一行(`pass`、`skip`、`fail`
+分开记),每个进程一个文件:
+
+| 来源 | 记录方 | ID 和位置 |
+|---|---|---|
+| core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig` | `zig:<test 名>`,去掉命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 记为 `zig:<unnamed>`。位置是完整的命名空间(`core.agent_loop`) |
+| 其余所有 Zig 测试二进制(`cc-test`、`provider-test`、`mcp-test`、`lsp-test`……),以及 CI 里直接 `zig test src/platform/platform.zig` 的原生进程测试 | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变;也接受 `--test-ids-dir=<目录>`。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
+| `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,位置是模块路径 |
+| `scripts/eval/tests` | `scripts/eval/tests/run_shard.py` | 同上 |
+| TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,位置是文件名;只报告,不强制 |
+
+两个运行器共用 `scripts/test_id_record.zig` 写记录。`build.zig` 的 `addTestRunArtifact` 把测试根文件所在的
+目录(相对仓库根)经 `METACODES_TEST_ROOT` 传给运行器,记录的第一行写上它,命名空间据此补成
+相对仓库根的完整路径(`src/platform` 根里的 `process.test.x` 和 `src` 根里的 `platform.process.test.x`
+都是 `src.platform.process`);没有这一行的 Zig 记录,`collect` 拒收。`test:units` 用 `scripts/test_id_fixture.zig` 端到端地
+核对记录(一个通过、一个跳过、一个无名测试)。`time_test_runner.zig` 是诊断入口,不记录。
+
+比较时一个测试的**键**:ID 在 base 和 head 里都只出现在一处(一个完整命名空间)时,键就是 ID,
+搬目录、改文件名都不会改变它;同一个 ID 出现在多处时(同名测试、无名 `test {}`),键是
+`<ID> @<完整命名空间>`,所以换掉同名测试里的一个,哪怕文件名相同、只是目录不同,也能看出来。
+这类测试搬了目录,用一条命名空间搬迁说明整个目录(见下)。
+同一个键的测试按次数计;同一个测试在几个二进制里都跑(比如 `cc-test` 和 core 套件),次数照实累加,
+base 和 head 在同样的 CI 布局下比较。
+
+本地看一次完整离线测试的 ID 集合(各来源的条数打印到 stderr,和各套件的汇总行对得上):
+
+```bash
+python3 scripts/test_ids.py run --output test-ids.tsv                 # 跑 zig build test
+python3 scripts/test_ids.py run --output lib.tsv -- zig build test:lib  # 只跑某一部分
+python3 scripts/test_ids.py compare --base before.tsv --head after.tsv [--since <base 提交>] [--enforce]
+```
+
+输出每行 `<ID>\t<位置>\t<pass|skip|listed>\t<次数>`,排好序。
+
+CI:Gates (Linux) 的 `units`、`product`、`checks` 三条腿在跑测试时顺手记录并上传,不多跑测试;
+`Test IDs (Linux)` 汇总成 `test-ids` artifact(保留 90 天),再和 base 比较,结果写进 job summary。
+必需检查 `Gates (Linux)` 等这个 job,它失败,`Gates (Linux)` 也失败。
+
+比较的规则:
+
+- base 跑过的测试,head 里次数变少,或者从 `pass` 变成 `skip`,都算**消失**;新增的测试允许。
+- 消失的键要在**本 PR 新增或改动的**说明里列出:`tests/test_ids/renamed.tsv`(`<旧键>\t<新键>`,
+  新键在 head 里多出来的次数抵掉旧键少掉的;或者 `@<旧命名空间前缀>\t@<新命名空间前缀>`,说明整个
+  目录搬了家,比如 `@src.platform\t@src.base.platform`;搬迁后的次数和留在原处的次数相加)或 `tests/test_ids/removed.tsv`(`<键>\t<删除原因>`)。
+  base 里已有的条目不算数,旧理由不能替新的删除放行。两个文件的格式由 `scripts/test_ids.py check`
+  检查,它在 `gate:static` 里;自测 `scripts.tests.test_test_ids` 和 `test-id-record` 在 `test:units`。
+- PR 带 `migration` 标签时强制执行:未说明的消失让 `Test IDs (Linux)`、进而让 `Gates (Linux)` 失败,
+  并列出键。其他 PR 只出报告。
+- base 的 ID 集合取合并出 base 提交的那个 PR 的 CI 产物,或者 main 上该提交的 nightly、手动触发
+  的 CI 产物,都要求树和 base 相同。找不到时,普通 PR 退而用 main 最近一次的产物出报告;
+  migration PR 直接失败:等 main 的头就是 PR 的 base 时在 main 上手动触发一次 CI
+  (`gh workflow run ci.yml --ref main`),再重跑这个 job。
+- CI 在 PR 的标签变化时(`labeled`、`unlabeled`)也会重跑,比较时读的是当时的标签,所以先跑完 CI
+  再加 `migration` 标签,也会得到强制模式的 `Gates (Linux)`。
+
 ## 已知执行覆盖缺口(登记非沉默)
 
 以下工具无法在纯 L2 自动化里做执行冒烟,只有 schema 覆盖

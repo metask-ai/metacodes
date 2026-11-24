@@ -111,7 +111,9 @@ The remaining boundaries are deliberately narrow:
 ## 3. PR-only validation and merge policy
 
 Run full primary-platform CI on `pull_request`, then merge the exact reviewed
-head. Ordinary pushes to `main` do not repeat that run. The four required
+head. A label change runs it again (the `labeled` and `unlabeled` events),
+because the test ID comparison and the version state gate judge the
+labels the PR has when they run. Ordinary pushes to `main` do not repeat that run. The four required
 check names and their GitHub Actions source stay unchanged. `Protect main`
 must require branches to be up to date and must not require a merge queue.
 If main advances, merge main into the PR branch and repeat review and CI.
@@ -262,6 +264,25 @@ The rules that keep the split from dropping coverage:
   by itself after the shards; every case has a time limit there, so one
   hang (#569) fails that case instead of stalling the run
   ([tests/tty/README.md](../tests/tty/README.md)).
+- **The tests that ran are recorded by ID.** On Linux the `units`,
+  `product` and `checks` legs set `METACODES_TEST_IDS_DIR` before their
+  suites. Every Zig test binary records the tests it runs: the sharded
+  suites through `scripts/sharded_test_runner.zig`, all the others, and the
+  native `zig test src/platform/platform.zig` step, through
+  `scripts/recording_test_runner.zig`, which speaks the build runner's
+  protocol as Zig's default runner does, so `--test-timeout` still applies.
+  `METACODES_TEST_ROOT` tells both where the binary's root file lives, so a
+  test's namespace is the same whichever root compiled it. The
+  `scripts/tests` suites and the evaluation shards record too. The legs
+  upload the records as `test-ids-raw-<leg>`; no test runs twice for it.
+  `Test IDs (Linux)` waits for every Linux leg to pass, merges the records
+  into the `test-ids` artifact (kept 90 days) and, on a pull request,
+  compares it with the IDs recorded on the base's tree. The comparison goes
+  to the job summary. It fails a PR labelled `migration` that drops a test
+  without explaining it in `tests/test_ids/` in that PR, or whose base has
+  no IDs recorded on its tree, and `Gates (Linux)` needs it, so the
+  required check fails too. Adding or removing the label runs CI again
+  ([tests/README.md](../tests/README.md)).
 
 What it costs:
 
@@ -303,7 +324,7 @@ ones that land nowhere:
 | Adding | Goes into | Runs on | Enforced by |
 |---|---|---|---|
 | A Zig test in an existing root (`src/**`, `tests/component`, the integration inventory) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
-| A new test binary or build step | `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
+| A new test binary or build step | A test binary is created with `addRecordedTest` (its tests then appear in the test IDs); `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire, unless it holds a fixed host resource (a fixed port or path) that another case also uses: then mark it `tty_driver.runs_alone`, and local `--jobs` runs it by itself | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |

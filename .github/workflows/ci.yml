@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   # Migration compatibility only: after the main ruleset disables the queue,
   # no merge_group event is emitted. This lets the migration PR itself land
   # under the old rules (doc/CI_DESIGN.md §3).
@@ -377,6 +378,9 @@ jobs:
       - name: Install Python development dependencies
         if: env.FAST_PATH != 'true'
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
+      - name: Record the executed test IDs
+        if: runner.os == 'Linux' && (matrix.units || matrix.product || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: mkdir -p "$RUNNER_TEMP/test-ids" && echo "METACODES_TEST_IDS_DIR=$RUNNER_TEMP/test-ids" >> "$GITHUB_ENV"
       # A version without -dev is legal only on its tagged commit, the release
       # PR, or main's run of the release merge commit; in the latter two the
       # gate tags HEAD locally so the release-layout steps below can run the
@@ -465,7 +469,8 @@ jobs:
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
-        run: zig test src/platform/platform.zig -lc
+          METACODES_TEST_ROOT: src/platform
+        run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform
       # The installed-adapter WorkBuddy suites (scripts/eval/tests/
       # test_workbuddy_adapter.py) run the overlay inside the real pinned
       # WorkBuddy-Bench, against its locked environment; without a checkout
@@ -727,6 +732,14 @@ jobs:
       - name: Diff whitespace check
         if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
+      - name: Upload the executed test IDs
+        if: runner.os == 'Linux' && (matrix.units || matrix.product || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-ids-raw-${{ matrix.leg }}
+          path: ${{ env.METACODES_TEST_IDS_DIR }}
+          if-no-files-found: error
+          retention-days: 3
       # main's warm run saves what this leg built from an empty cache, so the
       # entry holds only what the current tree needs and does not grow night
       # after night. A failed leg saves nothing and the previous night's entry
@@ -1349,17 +1362,17 @@ jobs:
   # the same way so that it can become required.
   gates-linux-result:
     name: Gates (Linux)
-    needs: gates-linux
+    needs: [gates-linux, test-ids]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: &result-steps
-      - name: Every leg passed
+    steps:
+      - name: Every leg passed, and the test ID comparison where it ran
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -c 'map_values(.result)'
-          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
+          echo "$NEEDS" | jq -e '.["gates-linux"].result == "success" and (.["test-ids"].result == "success" or .["test-ids"].result == "skipped")' > /dev/null
 
   # Gates (macOS) and Gates (Windows) pass when the gates passed where they
   # ran: the pool job (through the watch), or the hosted legs
@@ -1396,7 +1409,13 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: *result-steps
+    steps: &result-steps
+      - name: Every leg passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -c 'map_values(.result)'
+          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
 
   tty-windows-result:
     name: TTY (Windows)
@@ -1405,6 +1424,36 @@ jobs:
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps: *result-steps
+
+  test-ids:
+    name: Test IDs (Linux)
+    needs: [release-fast-path, scope, gates-linux]
+    if: ${{ !cancelled() && needs.gates-linux.result == 'success' && needs.release-fast-path.outputs.fast != 'true' && needs.scope.outputs.suites != 'false' }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: test-ids-raw-*
+          path: ${{ runner.temp }}/test-ids-raw
+      - name: Collect the executed test IDs
+        run: python3 scripts/test_ids.py collect --raw "$RUNNER_TEMP/test-ids-raw" --tty tests/tty/cases --output "$RUNNER_TEMP/test-ids/test-ids.tsv" --meta "$RUNNER_TEMP/test-ids/test-ids-meta.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-ids
+          path: ${{ runner.temp }}/test-ids
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      - name: Compare with the base's test IDs
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 scripts/test_ids.py ci-compare --head "$RUNNER_TEMP/test-ids/test-ids.tsv" --base HEAD^1 --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --summary "$GITHUB_STEP_SUMMARY"
 
   full-pr-evidence:
     name: Full PR evidence
