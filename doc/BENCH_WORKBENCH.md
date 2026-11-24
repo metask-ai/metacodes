@@ -103,7 +103,9 @@ taubench.com), `TAU2_USER_REASONING_EFFORT` and `TAU2_NL_ASSERTIONS_MODEL`,
 in every authentication mode; a suite's `required_env` and `host_env` in the
 catalog name them and SSH executors receive them like an adapter's
 `HOST_ENV`. Scores with another user model are not comparable with the
-public board.
+public board. A launch is refused when the agent's key variable is one of
+these names (the worker replaces it with the run's relay placeholder, which
+the simulator would then receive); give the provider another `key_env`.
 
 `frontier-harness-eval-1.1` is the pinned task set of the
 [FrontierHarness Eval](https://frontierharness.org/) leaderboard (a Hub
