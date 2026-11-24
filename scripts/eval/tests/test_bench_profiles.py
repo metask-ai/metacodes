@@ -379,6 +379,31 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
 
+    def test_one_dataset_is_cancelled_stopped_resumed_or_run_again_while_the_queue_goes_on(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request())
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            with self.assertRaisesRegex(ValueError, '还在等待或运行'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'cancel'})
+            record = self.wait_profile(created['id'])
+        self.assertEqual(record['status'], 'finished')
+        self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
+        with self.assertRaisesRegex(ValueError, '没有在等待或运行'):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'run'})
+        record = self.wait_profile(created['id'])
+        self.assertEqual([(i['suite'], i['status']) for i in record['items'][2:]],
+                         [('terminal-bench-2.1', 'finished'), ('terminal-bench-2.0', 'finished')])
+        self.assertEqual(record['items'][2]['tasks'], ['fix-git'])
+        with self.assertRaisesRegex(ValueError, '没有要运行的题'):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'resume'})
+
     def test_concurrency_changes_while_the_profile_runs(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
             created = self.client.request('api/profiles/run', self.request())

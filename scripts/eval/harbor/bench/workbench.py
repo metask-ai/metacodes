@@ -371,6 +371,28 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.profiles.cancel(profile)
 
+    def profile_item(self, profile, index, action) -> Dict[str, Any]:
+        """Act on one queued dataset: `cancel` a waiting or running one, `resume`
+        a stopped one with the tasks it has not finished, `run` one again."""
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        if action == "cancel":
+            return self.profiles.cancel_item(profile, index)
+        if action not in ("resume", "run"):
+            raise ValueError("action 只能是 cancel、resume 或 run")
+        _, item = self.profiles.record_item(profile, index)
+        tasks = item.get("tasks") or []
+        if action == "resume":
+            view = self.job_view(item["run"]) if item.get("run") else None
+            if view is None:
+                raise ValueError("这个评测集还没有结果，请直接运行")
+            finished = {}
+            for row in view["rows"]:
+                if row["status"] not in ("running", "invalid"):
+                    finished[row["task"]] = finished.get(row["task"], 0) + 1
+            tasks = [t for t in tasks if finished.get(t, 0) < (item.get("attempts") or 1)]
+        return self.profiles.requeue_item(profile, index, tasks)
+
     def set_profile_concurrency(self, profile, concurrency) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
