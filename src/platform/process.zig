@@ -247,8 +247,7 @@ pub fn spawnService(argv: []const ?[*:0]const u8, log_fd: c_int) CaptureError!vo
     last_spawn_failure = null;
     if (is_windows) {
         const handle = try spawnToFilesWithEnv(argv, log_fd, log_fd, null, true);
-        win.CloseHandle(handle.process);
-        if (handle.job) |job| win.CloseHandle(job);
+        releaseExited(handle);
         return;
     }
     g_fork_serial.lock();
@@ -768,7 +767,7 @@ pub const ProcHandle = if (is_windows) WindowsProc else std.c.pid_t;
 
 const WindowsProc = struct {
     process: win.HANDLE,
-    job: ?win.HANDLE,
+    job: win.HANDLE,
 };
 
 extern "c" fn _get_osfhandle(fd: c_int) callconv(.c) usize; // MSVCRT fd → HANDLE（intptr）
@@ -865,16 +864,22 @@ pub fn spawnToFilesWithEnv(
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();
         if (created == .FALSE) return windowsSpawnFailure(create_error, cwd);
-        const job = jobContaining(pi.hProcess);
+        const job = jobContaining(pi.hProcess) orelse {
+            _ = TerminateProcess(pi.hProcess, 1);
+            _ = WaitForSingleObject(pi.hProcess, 2000);
+            win.CloseHandle(pi.hThread);
+            win.CloseHandle(pi.hProcess);
+            return error.SpawnFailed;
+        };
+        const proc: WindowsProc = .{ .process = pi.hProcess, .job = job };
         if (ResumeThread(pi.hThread) == std.math.maxInt(win.DWORD)) {
-            const proc: WindowsProc = .{ .process = pi.hProcess, .job = job };
             win.CloseHandle(pi.hThread);
             killJob(proc);
             reapBlocking(proc);
             return error.SpawnFailed;
         }
         win.CloseHandle(pi.hThread);
-        return .{ .process = pi.hProcess, .job = job };
+        return proc;
     }
     g_fork_serial.lock();
     const report = ReportPipe.open() orelse {
@@ -928,21 +933,39 @@ fn reapPid(h: if (is_windows) win.HANDLE else std.c.pid_t) ReapStatus {
     return .{ .exited = posixExitCode(status) };
 }
 
-/// 杀子进程树。POSIX killpg（-pid=杀整组，因 spawnToFiles 已 setpgid(pid,pid) 使 pgid==pid）：
-/// TERM→200ms→KILL；不在这里收尸，未收尸的 leader 让 pgid 不被复用。
-/// Windows TerminateJobObject（整棵树；不在 Job 里时 TerminateProcess）。之后须 reapBlocking 收尸。
+pub const KILL_GRACE_MS: u64 = 200;
+
+/// 杀子进程树 = terminate → KILL_GRACE_MS → forceKill。POSIX killpg（-pid=杀整组，因
+/// spawnToFiles 已 setpgid(pid,pid) 使 pgid==pid）；不在这里收尸，未收尸的 leader 让 pgid 不被复用。
+/// Windows TerminateJobObject（整棵树）。之后须 reapBlocking 收尸。
 pub fn killJob(h: ProcHandle) void {
-    if (is_windows) {
-        if (h.job) |job| {
-            if (TerminateJobObject(job, 1) != 0) return;
-        }
-        _ = TerminateProcess(h.process, 1);
-    } else {
-        _ = std.c.kill(-h, std.c.SIG.TERM);
-        const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+    terminate(h);
+    if (!is_windows) {
+        const req = std.c.timespec{ .sec = 0, .nsec = @intCast(KILL_GRACE_MS * std.time.ns_per_ms) };
         var rem: std.c.timespec = undefined;
         _ = std.c.nanosleep(&req, &rem);
-        _ = std.c.kill(-h, std.c.SIG.KILL);
+    }
+    forceKill(h);
+}
+
+pub fn terminate(h: ProcHandle) void {
+    if (is_windows) {
+        if (TerminateJobObject(h.job, 1) == 0) _ = TerminateProcess(h.process, 1);
+    } else {
+        _ = std.c.kill(-h, std.c.SIG.TERM);
+    }
+}
+
+pub fn forceKill(h: ProcHandle) void {
+    if (!is_windows) _ = std.c.kill(-h, std.c.SIG.KILL);
+}
+
+/// reapNonblock 报告 .exited 后释放句柄：Windows 关进程与 Job 句柄（不终止 Job，进程自己
+/// 留下的后代照常运行）；POSIX 已由 waitpid 收尸，无事可做。
+pub fn releaseExited(h: ProcHandle) void {
+    if (is_windows) {
+        win.CloseHandle(h.process);
+        win.CloseHandle(h.job);
     }
 }
 
@@ -951,7 +974,7 @@ pub fn reapBlocking(h: ProcHandle) void {
     if (is_windows) {
         _ = WaitForSingleObject(h.process, 2000);
         win.CloseHandle(h.process);
-        if (h.job) |job| win.CloseHandle(job);
+        win.CloseHandle(h.job);
     } else {
         _ = waitpidRetry(h);
     }

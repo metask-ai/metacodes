@@ -3855,6 +3855,7 @@ metacodes-core.job_registry.Watchdog.limit_ms: u64
 metacodes-core.job_registry.Watchdog.output_bytes: u64 = 0
 metacodes-core.job_registry.Watchdog.output_changed_ms: util_time.Millis
 metacodes-core.job_registry.Watchdog.expired: bool = false
+metacodes-core.job_registry.Watchdog.kill_at_ms: ?util_time.Millis = null
 metacodes-core.job_registry.Watchdog.input_notice_sent: bool = false
 metacodes-core.job_registry.JobEventKind: union(enum)
 metacodes-core.job_registry.JobEventKind.ended
