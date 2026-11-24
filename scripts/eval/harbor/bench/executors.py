@@ -1189,9 +1189,14 @@ class RemoteRun:
         # How long a lost channel is reattached before the run counts as
         # lost; the remote driver keeps Harbor running exactly as long.
         self.reconnect_window = float(os.environ.get("METACODES_BENCH_RECONNECT_WINDOW") or self.RECONNECT_WINDOW)
+        self.heartbeat_timeout = float(os.environ.get("METACODES_BENCH_HEARTBEAT_TIMEOUT") or self.HEARTBEAT_TIMEOUT)
         self.lost_at = None
         self.next_attach = 0.0
         self.reconnects = 0
+        # "run" until the first session is lost, then "attach": only the
+        # first session may be started again (a refused tunnel port).
+        self.action = None
+        self.dropped = False  # this side ended a silent session
         # egress "workbench": this run's proxy on the workbench loopback and
         # the executor loopback port its `ssh -R` forward listens on.
         self.proxy = None
@@ -1367,7 +1372,9 @@ class RemoteRun:
         return True
 
     def forward_was_refused(self) -> bool:
-        if self.tunnel_port is None or self.events or self.process is None or self.process.poll() != 255:
+        """The first session failed to set up its reverse forward."""
+        if (self.action != "run" or self.tunnel_port is None or self.events or self.process is None
+                or self.process.poll() != 255):
             return False
         if self.stderr_relay is not None:
             self.stderr_relay.join(10)
@@ -1404,6 +1411,7 @@ class RemoteRun:
         self.open_session("run", first, credential)
 
     def open_session(self, action: str, first: Dict, credential: Optional[str]) -> None:
+        self.action = action
         self.concurrency = None
         argv = node_argv(self.executor, action, self.remote_spec_path, reverse=self.start_egress(), binary=self.node)
         self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
@@ -1430,12 +1438,13 @@ class RemoteRun:
         later); False once the driver is gone, the remote command itself
         failed (an exit status other than ssh's 255, or a refused forward),
         a cancel has waited a minute, or reconnect_window has passed. A
-        session lost before its first event is attached too: its start
-        request may have reached the node."""
+        session lost before its first event, or ended here because it went
+        silent (drop), is attached too: its start request may have reached
+        the node."""
         if self.exit_code() is not None or self.error_message():
             return False
-        if self.lost_at is None and not self.events and (self.process.returncode != 255
-                                                         or self.forward_was_refused()):
+        if (self.action == "run" and not self.events and not self.dropped
+                and (self.process.returncode != 255 or self.forward_was_refused())):
             return False
         now_s = time.monotonic()
         if cancelled_at is not None and now_s - cancelled_at > 60:
@@ -1458,6 +1467,11 @@ class RemoteRun:
             if cancelled_at is not None:
                 self.cancel()
         return True
+
+    def drop(self) -> None:
+        """End a session that went silent; the run is attached anew."""
+        self.dropped = True
+        self.process.kill()
 
     def lost_message(self) -> Optional[str]:
         if self.lost_at is None:

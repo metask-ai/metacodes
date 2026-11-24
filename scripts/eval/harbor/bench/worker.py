@@ -232,10 +232,9 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
             remote.hang_up()
         if cancelled_at and now_s - cancelled_at > 60:
             remote.process.kill()
-        if now_s - remote.last_event > remote.HEARTBEAT_TIMEOUT and remote.process.poll() is None:
-            # A silent channel is a lost one: end it and attach anew.
+        if now_s - remote.last_event > remote.heartbeat_timeout and remote.process.poll() is None:
             remote.log("远程执行机器心跳超时，断开重连")
-            remote.process.kill()
+            remote.drop()
         if spec.get("runner") != "workbuddy" and cancelled_at is None:
             wanted = adjusted_concurrency(spec_path, record)
             if remote.concurrency != wanted:

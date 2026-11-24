@@ -218,7 +218,7 @@ elif name == "ssh":
         # life of the session (ExitOnForwardFailure: a busy port fails it).
         import socket, threading
         _, rport, _, lport = reverse.split(":")
-        refusals = env.get("FAKE_REFUSED_FORWARDS")
+        refusals = env.get("FAKE_REFUSED_ATTACH_FORWARDS" if " node attach " in command else "FAKE_REFUSED_FORWARDS")
         listener = socket.socket()
         try:
             if refusals and int(Path(refusals).read_text()) > 0:
@@ -1139,6 +1139,19 @@ class SshRunTest(SetupFixture):
         end = self.remote_home / ".metacodes-bench/runs" / run["name"] / remote.END_EVENT
         self.assertEqual(json.loads(end.read_text())["code"], 0)
         self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
+    def test_a_session_silent_before_its_first_event_is_ended_and_attached(self):
+        manager, client, _ = self.prepare_remote()
+        drops = self.root / "drops"
+        drops.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="120", FAKE_SSH_DROP_SILENT="1",
+                          FAKE_BENCH_DELAY="6", METACODES_BENCH_HEARTBEAT_TIMEOUT="2")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"], final["reconnects"]), ("finished", 0, 1), (final, log))
+        self.assertIn("心跳超时，断开重连", log)
+        self.assertEqual(len([c for c in self.calls("ssh") if " node run " in c[1][-1]]), 1)
 
     def test_the_attach_socket_is_short_and_private_for_a_deep_state_dir(self):
         self.prepare_remote()
@@ -2090,6 +2103,29 @@ class EgressRunTest(SetupFixture):
         self.assertEqual(len(set(ports)), len(ports), ports)
         self.assertTrue(all(20000 <= port < LOWEST_EPHEMERAL_PORT for port in ports), ports)
         return manager, run["name"], final, ports, int(refusals.read_text())
+
+    def test_a_refused_attach_forward_attaches_again_and_never_starts_the_run_twice(self):
+        manager, client, _ = self.prepare_remote()
+        self.harbor_local_suite()
+        self.egress_executor(egress="workbench")
+        drops, refusals = self.root / "drops", self.root / "refused-attach-forwards"
+        drops.write_text("1")
+        refusals.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="0", FAKE_SSH_DROP_SILENT="1",
+                          FAKE_REFUSED_ATTACH_FORWARDS=str(refusals), FAKE_BENCH_DELAY="4")
+        run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
+                                          "tasks": ["humaneval-7"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"], timeout=90)
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"]), ("finished", 0), (final, log))
+        self.assertEqual(refusals.read_text(), "0")
+        actions = [re.search(r" node (run|attach) ", c[1][-1]).group(1) for c in self.calls("ssh")
+                   if re.search(r" node (run|attach) ", c[1][-1])]
+        self.assertEqual(actions.count("run"), 1, actions)
+        self.assertGreaterEqual(actions.count("attach"), 2, actions)
+        sessions = [c[1] for c in self.calls("ssh") if "-R" in c[1]]
+        ports = [int(session[session.index("-R") + 1].split(":")[1]) for session in sessions]
+        self.assertEqual(len(set(ports)), len(ports), ports)
 
     def test_a_refused_tunnel_port_is_retried_on_another_one_and_the_run_finishes(self):
         manager, name, final, ports, left = self.run_refusing_forwards(1, FAKE_EGRESS_FETCH="1")
