@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const term = @import("tui/term.zig");
+const screen_mirror = @import("tui/screen_mirror.zig");
 
 /// Columns before the result text: `  ⎿  ` and the continuation indent.
 pub const INDENT: usize = 5;
@@ -199,6 +200,7 @@ pub fn flushEcho() void {
     const line = echo orelse return;
     echo = null;
     defer std.heap.c_allocator.free(line);
+    screen_mirror.feed(2, line);
     std.debug.print("{s}", .{line});
 }
 
@@ -218,7 +220,10 @@ pub fn end() void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.heap.c_allocator);
     b.finish(&out) catch {};
-    if (out.items.len > 0) std.debug.print("{s}", .{out.items});
+    if (out.items.len > 0) {
+        screen_mirror.feed(2, out.items);
+        std.debug.print("{s}", .{out.items});
+    }
 }
 
 /// Whether a block is open (a handler running as a local command).
@@ -228,14 +233,20 @@ pub fn active() bool {
 
 /// `std.debug.print`, shaped when a block is open.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
-    const b = if (block) |*value| value else return std.debug.print(fmt, args);
-    flushEcho();
     const text = std.fmt.allocPrint(std.heap.c_allocator, fmt, args) catch return std.debug.print(fmt, args);
     defer std.heap.c_allocator.free(text);
+    const b = if (block) |*value| value else {
+        screen_mirror.feed(2, text);
+        return std.debug.print("{s}", .{text});
+    };
+    flushEcho();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.heap.c_allocator);
     b.feed(&out, text) catch return std.debug.print("{s}", .{text});
-    if (out.items.len > 0) std.debug.print("{s}", .{out.items});
+    if (out.items.len > 0) {
+        screen_mirror.feed(2, out.items);
+        std.debug.print("{s}", .{out.items});
+    }
 }
 
 /// What a `!cmd` run printed, from the Bash tool's JSON result: stdout as
@@ -271,6 +282,7 @@ pub fn notice(cols: usize, marker: []const u8, text: []const u8) void {
     defer out.deinit(std.heap.c_allocator);
     noticeInto(&out, std.heap.c_allocator, cols, marker, text) catch
         return std.debug.print("{s} {s}\n", .{ marker, text });
+    screen_mirror.feed(2, out.items);
     std.debug.print("{s}", .{out.items});
 }
 

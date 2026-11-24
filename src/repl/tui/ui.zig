@@ -449,6 +449,7 @@ pub fn exitHint(state: *const UiState) ?[]const u8 {
 pub fn aboveBoxNotice(state: *const UiState) ?[]const u8 {
     const p = state.inputPhaseConst() orelse return null;
     if (p.press.kind == .clear_input) return "Esc again to clear";
+    if (p.copied) return "Copied to clipboard";
     if (p.paste_hint) return "Ctrl+Y to paste deleted text";
     return null;
 }
