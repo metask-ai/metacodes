@@ -134,6 +134,8 @@ pub const JobRegistry = struct {
     /// BashOutput)会并发 spawnBackground(append+put)/get/reapExited/kill → 无锁则 ArrayList/HashMap
     /// 数据竞争 + 堆损坏(Linus HIGH-1)。全仓惯例 std.c.pthread_*(裁剪 std 无 Thread.Mutex)。
     mu: sync.Mutex = .{},
+    sweeper: ?std.Thread = null,
+    sweeper_stop: std.atomic.Value(bool) = .init(false),
 
     fn lock(self: *JobRegistry) void {
         _ = self.mu.lock();
@@ -166,6 +168,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn deinit(self: *JobRegistry) void {
+        if (self.sweeper) |thread| {
+            self.sweeper_stop.store(true, .release);
+            thread.join();
+            self.sweeper = null;
+        }
         // 杀所有 running job 并 reap（防孤儿进程）。可移植:killJob(TERM→等→KILL)+reapBlocking(收尸)。
         for (self.jobs.items) |*j| {
             if (j.status == .running) {
@@ -241,9 +248,27 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnMonitorOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, description: []const u8, timeout_ms: ?u64) !JobEntry {
+        if (timeout_ms != null) try self.startSweeper();
         const owned_description = try self.allocator.dupe(u8, description);
         errdefer self.allocator.free(owned_description);
         return self.spawn(command, cwd, .background, owner, true, .{ .monitor = monitor_stream.State.init(owned_description, timeout_ms, util_time.nowMs()) });
+    }
+
+    const SWEEP_INTERVAL_MS: u64 = 100;
+
+    fn startSweeper(self: *JobRegistry) !void {
+        self.lock();
+        defer self.unlock();
+        if (self.sweeper != null) return;
+        self.sweeper = try @import("platform").thread.spawn(.waiter, sweep, .{self});
+    }
+
+    fn sweep(self: *JobRegistry) void {
+        while (!self.sweeper_stop.load(.acquire)) {
+            util_time.sleepMs(SWEEP_INTERVAL_MS);
+            if (self.sweeper_stop.load(.acquire)) return;
+            self.stopExpiredMonitors(null, util_time.nowMs());
+        }
     }
 
     /// Same spawn, for output that only one synchronous call will ever read.
@@ -605,18 +630,43 @@ pub const JobRegistry = struct {
     }
 
     pub fn takeMonitorEvents(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now: util_time.Millis) ![]monitor_stream.Notice {
-        self.stopOverdueMonitors(owner, now);
-        self.lock();
-        defer self.unlock();
-        self.reapExitedLocked();
-        const Commit = struct { index: usize, state: monitor_stream.State, announce: bool };
+        self.stopExpiredMonitors(owner, now);
         var notices = std.ArrayList(monitor_stream.Notice).empty;
         errdefer {
             for (notices.items) |*notice| notice.deinit(allocator);
             notices.deinit(allocator);
         }
+        var flooding = std.ArrayList([12]u8).empty;
+        defer flooding.deinit(allocator);
+        try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
+        if (flooding.items.len > 0) {
+            for (flooding.items) |id| self.kill(id[0..]) catch {};
+            try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
+        }
+        return try notices.toOwnedSlice(allocator);
+    }
+
+    fn collectMonitorNotices(
+        self: *JobRegistry,
+        owner: SessionId,
+        allocator: std.mem.Allocator,
+        now: util_time.Millis,
+        notices: *std.ArrayList(monitor_stream.Notice),
+        flooding: *std.ArrayList([12]u8),
+    ) !void {
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+        const Commit = struct { index: usize, state: monitor_stream.State, announce: bool };
         var commits = std.ArrayList(Commit).empty;
         defer commits.deinit(allocator);
+        const first_new = notices.items.len;
+        errdefer {
+            for (notices.items[first_new..]) |*notice| notice.deinit(allocator);
+            notices.shrinkRetainingCapacity(first_new);
+        }
+        const first_flooding = flooding.items.len;
+        errdefer flooding.shrinkRetainingCapacity(first_flooding);
         for (self.jobs.items, 0..) |*entry, index| {
             const current = switch (entry.kind) {
                 .plain => continue,
@@ -636,6 +686,10 @@ pub const JobRegistry = struct {
             var event_owned = true;
             defer if (event_owned) allocator.free(batch.event);
             next.stdout_cursor += batch.consumed;
+            if (!ended and next.stop == null and next.overBudgetTooLong(now)) {
+                next.stop = .too_much_output;
+                try flooding.append(allocator, entry.id);
+            }
             const end: ?monitor_stream.End = if (mode == .final) monitorEnd(entry, next) else null;
             if (batch.event.len > 0 or end != null) {
                 const description = try allocator.dupe(u8, next.description);
@@ -645,30 +699,27 @@ pub const JobRegistry = struct {
             }
             try commits.append(allocator, .{ .index = index, .state = next, .announce = end != null });
         }
-        const owned = try notices.toOwnedSlice(allocator);
         for (commits.items) |commit| {
             const entry = &self.jobs.items[commit.index];
             entry.kind = .{ .monitor = commit.state };
             if (commit.announce) entry.exit_announced = true;
         }
-        return owned;
     }
 
-    fn stopOverdueMonitors(self: *JobRegistry, owner: SessionId, now: util_time.Millis) void {
+    fn stopExpiredMonitors(self: *JobRegistry, owner: ?SessionId, now: util_time.Millis) void {
         while (true) {
             var id: ?[12]u8 = null;
             self.lock();
             self.reapExitedLocked();
             for (self.jobs.items) |*entry| {
-                if (entry.status != .running or !std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
+                if (entry.status != .running) continue;
+                if (owner) |wanted| if (!std.mem.eql(u8, &entry.owner.bytes, &wanted.bytes)) continue;
                 switch (entry.kind) {
                     .plain => {},
-                    .monitor => |*state| if (state.stop == null) {
-                        if (state.overdue(entry.started_ms, now)) |stop| {
-                            state.stop = stop;
-                            id = entry.id;
-                            break;
-                        }
+                    .monitor => |*state| if (state.stop == null and state.expired(entry.started_ms, now)) {
+                        state.stop = .expired;
+                        id = entry.id;
+                        break;
                     },
                 }
             }
@@ -764,6 +815,8 @@ fn monitorEnd(entry: *const JobEntry, state: monitor_stream.State) monitor_strea
         .expired => .{ .expired = .{ .after_ms = state.timeout_ms orelse 0, .events_delivered = state.events_delivered } },
         .too_much_output => .too_much_output,
     };
+    if (state.timeout_ms != null and entry.ended_ms != null and state.expired(entry.started_ms, entry.ended_ms.?))
+        return .{ .expired = .{ .after_ms = state.timeout_ms.?, .events_delivered = state.events_delivered } };
     if (entry.status == .exited) {
         const code = entry.exit_code orelse 0;
         return if (code == 0) .stream_ended else .{ .script_failed = code };
@@ -1120,4 +1173,128 @@ test "spawn: cwd 已消失 → 子进程的报告原样上抛,不登记一个 ex
     try std.testing.expectEqual(@as(c_int, 0), std.c.rmdir(dir.ptr));
     try std.testing.expectError(error.ChildChdirFailed, r.spawnSynchronous("echo hello", dir));
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+fn monitorIndex(r: *JobRegistry, id: []const u8) usize {
+    return r.index.get(id[0..12].*).?;
+}
+
+fn waitForStdout(r: *JobRegistry, id: []const u8) !void {
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        if ((spoolFileSize(r.get(id).?.stdout_path) catch 0) > 0) return;
+        util_time.sleepMs(10);
+    }
+    return error.NoMonitorOutput;
+}
+
+test "an expired monitor is stopped on time without any poll and still gets the expiry notice" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const marker = try std.fmt.allocPrintSentinel(a, "{s}/late-side-effect", .{root}, 0);
+    defer a.free(marker);
+
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnMonitorOwned("sleep 2; touch late-side-effect", root, owner, "slow", 1_000);
+    util_time.sleepMs(2_500);
+    try std.testing.expect(!pfs.exists(marker));
+    try std.testing.expect(r.get(j.idSlice()).?.status != .running);
+
+    const notices = try r.takeMonitorEvents(owner, a, util_time.nowMs());
+    defer monitor_stream.freeNotices(a, notices);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqual(@as(usize, 0), notices[0].event.len);
+    try std.testing.expectEqual(@as(?monitor_stream.End, .{ .expired = .{ .after_ms = 1_000, .events_delivered = 0 } }), notices[0].end);
+}
+
+test "a monitor that went quiet after one dropped batch is not stopped for too much output" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnMonitorOwned("echo burst; sleep 60", null, owner, "quiet", null);
+    try waitForStdout(&r, j.idSlice());
+    const t0: util_time.Millis = 1_000_000;
+    {
+        r.lock();
+        defer r.unlock();
+        r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor.tokens = 0;
+        r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor.refilled_ms = t0;
+    }
+    const dropped = try r.takeMonitorEvents(owner, a, t0);
+    defer monitor_stream.freeNotices(a, dropped);
+    try std.testing.expectEqual(@as(usize, 0), dropped.len);
+    try std.testing.expectEqual(@as(u32, 1), r.get(j.idSlice()).?.kind.monitor.suppressed);
+
+    const later = try r.takeMonitorEvents(owner, a, t0 + monitor_stream.OVER_BUDGET_STOP_MS + 1_000);
+    defer monitor_stream.freeNotices(a, later);
+    try std.testing.expectEqual(@as(usize, 0), later.len);
+    try std.testing.expectEqual(JobStatus.running, r.get(j.idSlice()).?.status);
+    try std.testing.expectEqual(@as(?monitor_stream.Stop, null), r.get(j.idSlice()).?.kind.monitor.stop);
+}
+
+test "a monitor that keeps flooding past the budget for 30 s is stopped with a notice" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnMonitorOwned("while :; do echo spam; sleep 0.01; done", null, owner, "flood", null);
+    try waitForStdout(&r, j.idSlice());
+    const t0: util_time.Millis = 1_000_000;
+    {
+        r.lock();
+        defer r.unlock();
+        r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor.tokens = 0;
+        r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor.refilled_ms = std.math.maxInt(i64) / 2;
+    }
+    const dropped = try r.takeMonitorEvents(owner, a, t0);
+    defer monitor_stream.freeNotices(a, dropped);
+    try std.testing.expectEqual(@as(usize, 0), dropped.len);
+    const cursor = r.get(j.idSlice()).?.kind.monitor.stdout_cursor;
+    var attempts: usize = 0;
+    while (attempts < 500 and (spoolFileSize(r.get(j.idSlice()).?.stdout_path) catch 0) <= cursor) : (attempts += 1) util_time.sleepMs(10);
+
+    const stopped = try r.takeMonitorEvents(owner, a, t0 + monitor_stream.OVER_BUDGET_STOP_MS);
+    defer monitor_stream.freeNotices(a, stopped);
+    try std.testing.expectEqual(@as(usize, 1), stopped.len);
+    try std.testing.expectEqual(@as(?monitor_stream.End, .too_much_output), stopped[0].end);
+    try std.testing.expect(r.get(j.idSlice()).?.status != .running);
+}
+
+test "a monitor stdout line longer than one read is delivered once, then the next line" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const j = try r.spawnMonitorOwned("head -c 140000 /dev/zero | tr '\\0' x; echo; echo normal", null, owner, "long", null);
+    try waitUntilExited(&r, j.idSlice());
+    var lines = std.ArrayList(u8).empty;
+    defer lines.deinit(a);
+    var ended = false;
+    var takes: usize = 0;
+    while (!ended and takes < 10) : (takes += 1) {
+        const notices = try r.takeMonitorEvents(owner, a, util_time.nowMs());
+        defer monitor_stream.freeNotices(a, notices);
+        for (notices) |notice| {
+            if (notice.event.len > 0) {
+                if (lines.items.len > 0) try lines.append(a, '\n');
+                try lines.appendSlice(a, notice.event);
+            }
+            if (notice.end != null) ended = true;
+        }
+    }
+    try std.testing.expect(ended);
+    var expected: [monitor_stream.LINE_MAX_BYTES + "\nnormal".len]u8 = undefined;
+    @memset(expected[0..monitor_stream.LINE_MAX_BYTES], 'x');
+    @memcpy(expected[monitor_stream.LINE_MAX_BYTES..], "\nnormal");
+    try std.testing.expectEqualStrings(&expected, lines.items);
 }

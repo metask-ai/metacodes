@@ -24,19 +24,20 @@ pub const State = struct {
     over_budget_since_ms: ?util_time.Millis = null,
     events_delivered: u32 = 0,
     stop: ?Stop = null,
+    skipping_line: bool = false,
 
     pub fn init(description: []const u8, timeout_ms: ?u64, now: util_time.Millis) State {
         return .{ .description = description, .timeout_ms = timeout_ms, .refilled_ms = now };
     }
 
-    pub fn overdue(self: *const State, started_ms: util_time.Millis, now: util_time.Millis) ?Stop {
-        if (self.timeout_ms) |limit| {
-            if (now - started_ms >= @as(util_time.Millis, @intCast(limit))) return .expired;
-        }
-        if (self.over_budget_since_ms) |since| {
-            if (now - since >= OVER_BUDGET_STOP_MS) return .too_much_output;
-        }
-        return null;
+    pub fn expired(self: *const State, started_ms: util_time.Millis, now: util_time.Millis) bool {
+        const limit = self.timeout_ms orelse return false;
+        return now - started_ms >= @as(util_time.Millis, @intCast(limit));
+    }
+
+    pub fn overBudgetTooLong(self: *const State, now: util_time.Millis) bool {
+        const since = self.over_budget_since_ms orelse return false;
+        return now - since >= OVER_BUDGET_STOP_MS;
     }
 
     fn refill(self: *State, now: util_time.Millis) void {
@@ -94,10 +95,24 @@ pub const Mode = enum { streaming, final };
 
 pub fn take(allocator: std.mem.Allocator, state: *State, chunk: []const u8, mode: Mode, now: util_time.Millis) !Batch {
     state.refill(now);
-    const consumed = completeLength(chunk, mode);
+    var skipped: usize = 0;
+    if (state.skipping_line) {
+        if (std.mem.indexOfScalar(u8, chunk, '\n')) |newline| {
+            skipped = newline + 1;
+        } else if (mode == .streaming) {
+            return .{ .consumed = chunk.len, .event = &.{} };
+        } else {
+            skipped = chunk.len;
+        }
+        state.skipping_line = false;
+    }
+    const body = chunk[skipped..];
+    const body_len = completeLength(body, mode, chunk.len >= READ_MAX_BYTES);
+    if (mode == .streaming and body_len > 0 and body[body_len - 1] != '\n') state.skipping_line = true;
+    const consumed = skipped + body_len;
     var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(allocator);
-    var it = std.mem.splitScalar(u8, chunk[0..consumed], '\n');
+    var it = std.mem.splitScalar(u8, body[0..body_len], '\n');
     while (it.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0) continue;
@@ -122,10 +137,10 @@ pub fn take(allocator: std.mem.Allocator, state: *State, chunk: []const u8, mode
     return .{ .consumed = consumed, .event = event };
 }
 
-fn completeLength(chunk: []const u8, mode: Mode) usize {
-    if (mode == .final) return chunk.len;
-    if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |at| return at + 1;
-    if (chunk.len >= READ_MAX_BYTES) return chunk.len;
+fn completeLength(body: []const u8, mode: Mode, chunk_full: bool) usize {
+    if (mode == .final) return body.len;
+    if (std.mem.lastIndexOfScalar(u8, body, '\n')) |at| return at + 1;
+    if (chunk_full) return body.len;
     return 0;
 }
 
@@ -226,15 +241,15 @@ test "monitor stream stops a source that stays over budget and forgives one that
         const batch = try take(testing.allocator, &state, "spam\n", .streaming, now);
         testing.allocator.free(batch.event);
     }
-    try testing.expectEqual(@as(?Stop, .too_much_output), state.overdue(0, now));
+    try testing.expect(state.overBudgetTooLong(now));
 
     var calm = testState();
     calm.tokens = 0;
     const dropped = try take(testing.allocator, &calm, "spam\n", .streaming, 0);
     try testing.expectEqual(@as(usize, 0), dropped.event.len);
-    const quiet = try take(testing.allocator, &calm, "", .streaming, 200);
+    const quiet = try take(testing.allocator, &calm, "", .streaming, OVER_BUDGET_STOP_MS + 1_000);
     try testing.expectEqual(@as(usize, 0), quiet.event.len);
-    try testing.expectEqual(@as(?Stop, null), calm.overdue(0, OVER_BUDGET_STOP_MS + 1_000));
+    try testing.expect(!calm.overBudgetTooLong(OVER_BUDGET_STOP_MS + 1_000));
 }
 
 test "monitor stream final batch bypasses the bucket and reports leftover suppression" {
@@ -248,11 +263,38 @@ test "monitor stream final batch bypasses the bucket and reports leftover suppre
 
 test "monitor stream expiry follows the timeout and persistent monitors never expire" {
     const state = State.init("watch", 1_000, 0);
-    try testing.expectEqual(@as(?Stop, null), state.overdue(500, 1_499));
-    try testing.expectEqual(@as(?Stop, .expired), state.overdue(500, 1_500));
+    try testing.expect(!state.expired(500, 1_499));
+    try testing.expect(state.expired(500, 1_500));
     const persistent = State.init("watch", null, 0);
-    try testing.expectEqual(@as(?Stop, null), persistent.overdue(0, std.math.maxInt(i32)));
+    try testing.expect(!persistent.expired(0, std.math.maxInt(i32)));
     try testing.expectEqual(DEFAULT_TIMEOUT_MS, clampTimeout(null));
     try testing.expectEqual(MIN_TIMEOUT_MS, clampTimeout(1));
     try testing.expectEqual(MAX_TIMEOUT_MS, clampTimeout(99_999_999));
+}
+
+test "monitor stream emits a line longer than one read once and skips the rest of it" {
+    var state = testState();
+    const first_chunk = try testing.allocator.alloc(u8, READ_MAX_BYTES);
+    defer testing.allocator.free(first_chunk);
+    @memset(first_chunk, 'x');
+    const first = try take(testing.allocator, &state, first_chunk, .streaming, 0);
+    defer testing.allocator.free(first.event);
+    try testing.expectEqual(READ_MAX_BYTES, first.consumed);
+    try testing.expectEqual(LINE_MAX_BYTES, first.event.len);
+    try testing.expect(state.skipping_line);
+
+    const middle = try testing.allocator.alloc(u8, 1_000);
+    defer testing.allocator.free(middle);
+    @memset(middle, 'x');
+    const still_long = try take(testing.allocator, &state, middle, .streaming, 0);
+    try testing.expectEqual(@as(usize, 1_000), still_long.consumed);
+    try testing.expectEqual(@as(usize, 0), still_long.event.len);
+
+    const rest = try take(testing.allocator, &state, "xxxx\nnormal\n", .streaming, 0);
+    defer testing.allocator.free(rest.event);
+    try testing.expectEqualStrings("normal", rest.event);
+    try testing.expectEqual(@as(usize, "xxxx\nnormal\n".len), rest.consumed);
+    try testing.expect(!state.skipping_line);
+    try testing.expectEqual(@as(u32, 2), state.events_delivered);
+    try testing.expectEqual(BUCKET_CAPACITY - 2, state.tokens);
 }
