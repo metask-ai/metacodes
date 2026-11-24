@@ -31,6 +31,10 @@ pub const AUTO_BACKGROUND_MS: u64 = 15_000;
 pub const BACKGROUND_LIMIT_DEFAULT_MS: u64 = 1_800_000;
 pub const BACKGROUND_LIMIT_MAX_MS: u64 = 7_200_000;
 
+fn treeStopFor(background_limit_ms: ?u64) process.TreeStop {
+    return if (background_limit_ms == null) .best_effort else .required;
+}
+
 fn backgroundLimitMs(ctx: *const ToolContext, args: []const u8) ?u64 {
     if (!ctx.preview.background_watchdog) return null;
     const requested = common.extractJsonArg(args, "timeout") orelse return BACKGROUND_LIMIT_DEFAULT_MS;
@@ -750,8 +754,9 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-                const j = registry.spawnBackgroundOwned(command, cwd_opt, ctx.session) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
-                if (backgroundLimitMs(ctx, args)) |limit_ms| registry.armWatchdog(j.idSlice(), limit_ms);
+                const limit = backgroundLimitMs(ctx, args);
+                const j = registry.spawnBackgroundStopping(command, cwd_opt, ctx.session, treeStopFor(limit)) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
+                if (limit) |limit_ms| registry.armWatchdog(j.idSlice(), limit_ms);
                 // Nothing watches what a detached command writes. Say so on
                 // the file-change contract instead of reporting no changes.
                 if (observesFileChanges(ctx, args)) ctx.file_change_sink.?.noteIncomplete();
@@ -912,7 +917,11 @@ fn runAutoBackgroundable(
     // Spooled as private to this call. Every exit below either renders the
     // output and releases the files, or hands the job id to the model and
     // promotes the job so its spool survives for `BashOutput` (issue #37).
-    const j_entry = try registry.spawnSynchronousOwned(command, cwd, owner);
+    const background_limit = switch (auto_background) {
+        .never => null,
+        .after => |after| after.limit_ms,
+    };
+    const j_entry = try registry.spawnSynchronousStopping(command, cwd, owner, treeStopFor(background_limit));
     const job_id = j_entry.id; // 值拷贝，不持指针（registry 可能扩容移动）
 
     const allow_auto_background = auto_background != .never;
@@ -947,7 +956,7 @@ fn runAutoBackgroundable(
             // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
             // → 转为 background 保留期。
             registry.promoteToBackground(job_id[0..]);
-            if (auto_background.after.limit_ms) |limit_ms| registry.armWatchdog(job_id[0..], limit_ms);
+            if (background_limit) |limit_ms| registry.armWatchdog(job_id[0..], limit_ms);
             outlived.* = true;
             return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }
@@ -1183,17 +1192,62 @@ test "BashTool run_in_background arms the watchdog only with background_watchdog
     const off_result = try execute(&off, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\",\"timeout\":60000}");
     defer a.free(off_result);
     try std.testing.expectEqual(@as(?@import("../core/job_registry.zig").Watchdog, null), registry.jobs.items[0].watchdog);
+    try std.testing.expectEqual(process.TreeStop.best_effort, registry.jobs.items[0].tree_stop);
 
     const on = ToolContext{ .allocator = a, .jobs = &registry, .preview = .{ .background_watchdog = true } };
     const default_result = try execute(&on, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\"}");
     defer a.free(default_result);
     try std.testing.expectEqual(BACKGROUND_LIMIT_DEFAULT_MS, registry.jobs.items[1].watchdog.?.limit_ms);
+    try std.testing.expectEqual(process.TreeStop.required, registry.jobs.items[1].tree_stop);
     const capped_result = try execute(&on, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\",\"timeout\":99999999}");
     defer a.free(capped_result);
     try std.testing.expectEqual(BACKGROUND_LIMIT_MAX_MS, registry.jobs.items[2].watchdog.?.limit_ms);
     const short_result = try execute(&on, "{\"command\":\"sleep 30\",\"run_in_background\":\"true\",\"timeout\":60000}");
     defer a.free(short_result);
     try std.testing.expectEqual(@as(u64, 60_000), registry.jobs.items[3].watchdog.?.limit_ms);
+}
+
+test "BashTool requires whole-tree stop for a foreground command only with background_watchdog on" {
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+
+    const off = ToolContext{ .allocator = a, .jobs = &registry };
+    const off_result = try execute(&off, "{\"command\":\"echo ok\"}");
+    defer a.free(off_result);
+    try std.testing.expectEqual(process.TreeStop.best_effort, registry.jobs.items[0].tree_stop);
+
+    const on = ToolContext{ .allocator = a, .jobs = &registry, .preview = .{ .background_watchdog = true } };
+    const on_result = try execute(&on, "{\"command\":\"echo ok\"}");
+    defer a.free(on_result);
+    try std.testing.expectEqual(process.TreeStop.required, registry.jobs.items[1].tree_stop);
+}
+
+test "BashTool on a host that refuses Job Objects: preview-off commands run, watchdog jobs fail to spawn" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var registry = try @import("../core/job_registry.zig").JobRegistry.init(a);
+    defer registry.deinit();
+    process.test_refuse_job_assignment = true;
+    defer process.test_refuse_job_assignment = false;
+
+    const off = ToolContext{ .allocator = a, .jobs = &registry };
+    const off_result = try execute(&off, "{\"command\":\"echo ok\"}");
+    defer a.free(off_result);
+    try std.testing.expect(std.mem.indexOf(u8, off_result, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off_result, "\"exit_code\":0") != null);
+
+    var marker_buf: [512]u8 = undefined;
+    const marker = @import("test_tmp.zig").path(&marker_buf, "refused-job-object-marker");
+    std.Io.Dir.cwd().deleteFile(std.testing.io, marker) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, marker) catch {};
+    var args_buf: [1024]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"command\":\"echo x > \\\"{s}\\\"\",\"run_in_background\":true}}", .{marker});
+    const on = ToolContext{ .allocator = a, .jobs = &registry, .preview = .{ .background_watchdog = true } };
+    try std.testing.expectError(error.SpawnFailed, execute(&on, args));
+    try std.testing.expectEqual(@as(usize, 1), registry.jobs.items.len);
+    util_time.sleepMs(500);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, marker, .{}));
 }
 
 test "Bash description with background_watchdog off is byte-identical to the base description" {

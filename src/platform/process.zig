@@ -767,8 +767,12 @@ pub const ProcHandle = if (is_windows) WindowsProc else std.c.pid_t;
 
 const WindowsProc = struct {
     process: win.HANDLE,
-    job: win.HANDLE,
+    job: ?win.HANDLE,
 };
+
+pub const TreeStop = enum { required, best_effort };
+
+pub var test_refuse_job_assignment: bool = false;
 
 extern "c" fn _get_osfhandle(fd: c_int) callconv(.c) usize; // MSVCRT fd → HANDLE（intptr）
 extern "c" fn _wopen(path: [*:0]const u16, oflag: c_int, ...) callconv(.c) c_int;
@@ -801,6 +805,22 @@ pub fn spawnToFilesWithEnv(
     err_fd: c_int,
     cwd: ?[]const u8,
     inherit_env: bool,
+) CaptureError!ProcHandle {
+    return spawnToFilesStopping(argv, out_fd, err_fd, cwd, inherit_env, .best_effort);
+}
+
+/// `.required`: the Windows child runs only inside its own Job Object, so
+/// `killJob` reaches every descendant; a host that refuses the job gets
+/// `SpawnFailed`. `.best_effort` keeps the job when it can be had and
+/// otherwise runs the child alone, stopped by `TerminateProcess`. POSIX
+/// stops the process group either way.
+pub fn spawnToFilesStopping(
+    argv: []const ?[*:0]const u8,
+    out_fd: c_int,
+    err_fd: c_int,
+    cwd: ?[]const u8,
+    inherit_env: bool,
+    tree_stop: TreeStop,
 ) CaptureError!ProcHandle {
     last_spawn_failure = null;
     if (is_windows) {
@@ -864,13 +884,14 @@ pub fn spawnToFilesWithEnv(
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();
         if (created == .FALSE) return windowsSpawnFailure(create_error, cwd);
-        const job = jobContaining(pi.hProcess) orelse {
+        const job = jobContaining(pi.hProcess);
+        if (job == null and tree_stop == .required) {
             _ = TerminateProcess(pi.hProcess, 1);
             _ = WaitForSingleObject(pi.hProcess, 2000);
             win.CloseHandle(pi.hThread);
             win.CloseHandle(pi.hProcess);
             return error.SpawnFailed;
-        };
+        }
         const proc: WindowsProc = .{ .process = pi.hProcess, .job = job };
         if (ResumeThread(pi.hThread) == std.math.maxInt(win.DWORD)) {
             win.CloseHandle(pi.hThread);
@@ -950,7 +971,8 @@ pub fn killJob(h: ProcHandle) void {
 
 pub fn terminate(h: ProcHandle) void {
     if (is_windows) {
-        if (TerminateJobObject(h.job, 1) == 0) _ = TerminateProcess(h.process, 1);
+        const stopped_tree = if (h.job) |job| TerminateJobObject(job, 1) != 0 else false;
+        if (!stopped_tree) _ = TerminateProcess(h.process, 1);
     } else {
         _ = std.c.kill(-h, std.c.SIG.TERM);
     }
@@ -965,7 +987,7 @@ pub fn forceKill(h: ProcHandle) void {
 pub fn releaseExited(h: ProcHandle) void {
     if (is_windows) {
         win.CloseHandle(h.process);
-        win.CloseHandle(h.job);
+        if (h.job) |job| win.CloseHandle(job);
     }
 }
 
@@ -974,7 +996,7 @@ pub fn reapBlocking(h: ProcHandle) void {
     if (is_windows) {
         _ = WaitForSingleObject(h.process, 2000);
         win.CloseHandle(h.process);
-        win.CloseHandle(h.job);
+        if (h.job) |job| win.CloseHandle(job);
     } else {
         _ = waitpidRetry(h);
     }
@@ -1540,6 +1562,7 @@ extern "kernel32" fn TerminateJobObject(hJob: win.HANDLE, uExitCode: win.UINT) c
 extern "kernel32" fn ResumeThread(hThread: win.HANDLE) callconv(.winapi) win.DWORD;
 
 fn jobContaining(process: win.HANDLE) ?win.HANDLE {
+    if (builtin.is_test and test_refuse_job_assignment) return null;
     const job = CreateJobObjectW(null, null) orelse return null;
     if (AssignProcessToJobObject(job, process) != 0) return job;
     win.CloseHandle(job);

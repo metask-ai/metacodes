@@ -108,6 +108,7 @@ pub const JobEntry = struct {
     spool_released: bool = false,
     watchdog: ?Watchdog = null,
     stop_in_progress: bool = false,
+    tree_stop: process.TreeStop = .best_effort,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..];
@@ -308,7 +309,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
-        return self.spawn(command, cwd, .background, owner, true);
+        return self.spawn(command, cwd, .background, owner, true, .best_effort);
+    }
+
+    pub fn spawnBackgroundStopping(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, tree_stop: process.TreeStop) !JobEntry {
+        return self.spawn(command, cwd, .background, owner, true, tree_stop);
     }
 
     /// Same spawn, for output that only one synchronous call will ever read.
@@ -319,7 +324,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry {
-        return self.spawn(command, cwd, .synchronous, owner, false);
+        return self.spawn(command, cwd, .synchronous, owner, false, .best_effort);
+    }
+
+    pub fn spawnSynchronousStopping(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, tree_stop: process.TreeStop) !JobEntry {
+        return self.spawn(command, cwd, .synchronous, owner, false, tree_stop);
     }
 
     fn spawn(
@@ -329,6 +338,7 @@ pub const JobRegistry = struct {
         retention: Retention,
         owner: SessionId,
         notify_on_exit: bool,
+        tree_stop: process.TreeStop,
     ) !JobEntry {
         const id = try genId();
 
@@ -356,7 +366,7 @@ pub const JobRegistry = struct {
         defer self.allocator.free(cmd_z);
         var argv: [6]?[*:0]const u8 = undefined;
         shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
-        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd, cwd) catch |e| return switch (e) {
+        const proc = process.spawnToFilesStopping(argv[0..], out_fd, err_fd, cwd, true, tree_stop) catch |e| return switch (e) {
             // 子进程自己交代的失败原样上抛:Bash 据此告诉模型是 cwd 没了还是 shell 起不来,
             // 而不是登记一个 exit 127、双空流的 job 让模型去猜。
             error.ChildChdirFailed, error.ChildExecFailed => e,
@@ -389,6 +399,7 @@ pub const JobRegistry = struct {
             .notify_on_exit = notify_on_exit,
             .status = .running,
             .retention = retention,
+            .tree_stop = tree_stop,
         };
         try self.registerEntry(entry);
         log.info("job", "bg spawn id={s} cmd={s}", .{ id[0..], preview });
