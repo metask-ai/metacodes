@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -386,7 +387,8 @@ FIXTURE_BASELINE = """.{
     .wide_roots = .{},
 }
 """
-FIXTURE_BUILD = """const x = b.step("test:low", "");
+FIXTURE_BUILD = """const s = &.{ "python3", "-m", "unittest", "scripts.tests.test_everywhere" };
+const x = b.step("test:low", "");
 const y = b.step(
     "test:mid",
     "",
@@ -490,11 +492,38 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(chosen([("M", "tests/tty/cases/a.py")]), (True, False, False, (), False))
         self.assertEqual(chosen([("A", "scripts/tests/test_lint.py"), ("D", "scripts/tests/test_old.py")]),
                          (False, False, False, ("scripts.tests.test_lint",), False))
+        # A shared fixture may feed the TTY cases too.
+        self.assertEqual(chosen([("M", "tests/fixtures/vterm/screen_parity.jsonl")]), (True, True, True, (), True))
         self.assertEqual(chosen([("M", "tests/component/x_test.zig"), ("M", "scripts/eval/cli.py")]),
-                         (False, True, True, (), True))
+                         (True, True, True, (), True))
+        # A suite build.zig runs (on every platform) keeps test:units; only
+        # the others run by name, and a complete run names none, so no test
+        # runs twice and records twice.
+        self.assertEqual(chosen([("M", "scripts/tests/test_everywhere.py"), ("M", "scripts/tests/test_lint.py")]),
+                         (False, True, False, ("scripts.tests.test_lint",), False))
+        self.assertEqual(chosen([("M", "tests/component/x_test.zig"), ("M", "scripts/tests/test_lint.py")]),
+                         (True, True, True, (), True))
         # A suite test next to a package change keeps all of test:units.
         both = ci_scope.select("packages", [("M", "src/top/a.zig"), ("M", "tests/component/x_test.zig")], layout)
         self.assertEqual((both.packages, both.package_tests, both.complete), (("top",), (), True))
+        script = ci_scope.select("packages", [("M", "src/top/a.zig"), ("M", "scripts/tests/test_lint.py")], layout)
+        self.assertEqual((script.package_tests, script.script_tests), (("test:top",), ("scripts.tests.test_lint",)))
+
+    def test_a_package_outside_src_is_still_a_product_dependent(self) -> None:
+        moved = fixture_layout(".{}").cleared()
+        moved = ci_scope.replace(moved, paths=tuple(("apps/top/", owner) if owner == "top" else (entry, owner)
+                                                     for entry, owner in moved.paths))
+        self.assertEqual(moved.affected(["mid"]), ("mid", "top"))
+        self.assertEqual(ci_scope.classify(["apps/top/main.zig"], layout=moved)[0], "packages")
+
+    def test_a_migration_pull_request_is_the_full_scope(self) -> None:
+        def diff(base, candidate):
+            return [("M", "doc/A.md")]
+
+        self.assertEqual(ci_scope.decide("pull_request", "HEAD^1", "HEAD", diff)[0], "docs")
+        scope, reason = ci_scope.decide("pull_request", "HEAD^1", "HEAD", diff, labels=["bug", "migration"])
+        self.assertEqual(scope, "full")
+        self.assertIn("migration", reason)
 
     def test_local_commands_follow_the_selection(self) -> None:
         layout = fixture_layout()
@@ -507,6 +536,22 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(ci_scope.local_commands("docs", ci_scope.select("docs"), "zig"), [])
         tty = ci_scope.select("tests", [("M", "tests/tty/cases/a.py")], layout)
         self.assertEqual(ci_scope.local_commands("tests", tty, "zig")[0], ["zig", "build", "test:contract"])
+        self.assertEqual(ci_scope.local_commands("tests", tty, "zig", windows=True)[1:],
+                         [["zig", "build", "windows:tty", "-Dtarget=x86_64-windows-gnu"]])
+
+    def test_the_local_run_never_reaches_a_real_model(self) -> None:
+        seen = []
+
+        def run(command, cwd, env, check):
+            seen.append(env.get("TTY_SKIP_MODEL"))
+            return subprocess.CompletedProcess(command, 0)
+
+        tty = ci_scope.select("tests", [("M", "tests/tty/cases/a.py")], fixture_layout())
+        with mock.patch.dict(os.environ, {"TTY_SKIP_MODEL": ""}), mock.patch.object(ci_scope.subprocess, "run", run), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(ci_scope.run_local(ROOT, "tests", tty, "zig"), 0)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"1"})
 
 
 class PackageScopeMainTest(unittest.TestCase):
@@ -587,6 +632,65 @@ class PackageScopeMainTest(unittest.TestCase):
         self.commit("side")
         self.assertEqual(self.run_main("--event", "pull_request", "--base", "HEAD^1")["scope"], "packages")
         self.assertEqual(self.run_main("--event", "pull_request", "--base", "HEAD~2")["scope"], "full")
+
+    def test_a_migration_label_writes_the_full_scope_and_the_record(self) -> None:
+        self.edit("src/mid/a.zig")
+        self.commit("mid")
+        record = self.repo / "record.json"
+        got = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", "migration,ci", "--record", str(record))
+        self.assertEqual((got["scope"], got["complete"]), ("full", "true"))
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8"))["scope"], "full")
+        narrowed = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", "", "--record", str(record))
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")),
+                         {"scope": "packages", "packages": ["mid", "top"], "reason": narrowed["reason"]})
+
+    def test_the_nightly_report_reads_what_each_pull_request_recorded(self) -> None:
+        self.edit("src/mid/a.zig")
+        self.commit("mid (#7)")
+        self.edit("src/side/a.zig")
+        self.commit("side (#8)")
+        mid, side = (self.git("rev-parse", rev).strip() for rev in ("HEAD^1", "HEAD"))
+
+        def query(path):
+            if "/commits/" in path:
+                sha = path.split("/commits/")[1].split("/")[0]
+                return [{"merged_at": "x", "merge_commit_sha": sha, "head": {"sha": "h" + sha[:8]}}]
+            return {"workflow_runs": [{"id": 1, "created_at": "a"}, {"id": 2, "created_at": "b"}]}
+
+        records = {("h" + mid[:8], 2): {"scope": "packages", "packages": ["mid", "top"], "reason": "r"}}
+        asked = []
+
+        def download(repository, run_id):
+            asked.append(run_id)
+            return records.get((asked_head[0], run_id))
+
+        asked_head = [""]
+
+        def tracking_query(path):
+            if "head_sha=" in path:
+                asked_head[0] = path.split("head_sha=")[1].split("&")[0]
+            return query(path)
+
+        rows = ci_scope.merged(self.repo, [side, mid], "o/r", tracking_query, download)
+        self.assertEqual([(scope, packages) for _, _, scope, packages, _ in rows],
+                         [("unknown", ()), ("packages", ("mid", "top"))])
+        self.assertEqual(asked[:2], [2, 1])
+        report = ci_scope.replay_report(rows, "Merged")
+        self.assertIn("| unknown | 1 | 50% |", report)
+        self.assertIn("| #8 | unknown | - |", report)
+
+    def test_replay_keeps_a_documentation_only_protocol_edit_in_docs(self) -> None:
+        (self.repo / "doc").mkdir()
+        (self.repo / "doc/A.md").write_text("a\n", encoding="utf-8")
+        (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig", "doc/A.md"]}),
+                                                   encoding="utf-8")
+        self.commit("pin a document")
+        self.git("mv", "doc/A.md", "doc/B.md")
+        (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig", "doc/B.md"]}),
+                                                   encoding="utf-8")
+        self.commit("move it")
+        rows = ci_scope.replay(self.repo, [self.git("rev-parse", "HEAD").strip()], None, False)
+        self.assertEqual(rows[0][2], "docs")
 
     def test_a_local_run_diffs_the_working_tree_against_the_merge_base(self) -> None:
         self.git("branch", "main-copy")
@@ -958,7 +1062,16 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(job["if"], "${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}")
         self.assertNotIn("needs", job)
         self.assertEqual(job["steps"][0]["with"]["fetch-depth"], 0)
-        self.assertIn('python3 scripts/ci_scope.py replay --since "24 hours ago"', job["steps"][1]["run"])
+        self.assertEqual(job["steps"][1]["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertIn('python3 scripts/ci_scope.py merged --since "24 hours ago" --repository "$GITHUB_REPOSITORY"',
+                      job["steps"][1]["run"])
+        decide = next(step for step in self.jobs["scope"]["steps"] if step.get("id") == "decide")
+        self.assertEqual(decide["env"]["PR_LABELS"], "${{ join(github.event.pull_request.labels.*.name, ',') }}")
+        self.assertIn('--labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json"', decide["run"])
+        upload = self.jobs["scope"]["steps"][-1]
+        self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
+        self.assertEqual((upload["with"]["name"], upload["with"]["path"]),
+                         (ci_scope.SCOPE_ARTIFACT, "${{ runner.temp }}/" + ci_scope.SCOPE_RECORD))
         triggers = self.workflow.get("on", self.workflow.get(True))
         self.assertIn("schedule", triggers)
         self.assertIn("workflow_dispatch", triggers)

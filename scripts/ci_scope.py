@@ -24,10 +24,12 @@ Scopes, narrowest first:
   binary; the TTY suites, which drive the interactive binary and read
   neither, report success without running: `suites=true`, `tty=false`.
 - `tests`: every changed path is documentation, the evaluation harness or
-  a test: `scripts/tests/test_*.py` (`script_tests` names the modules),
+  a test: `scripts/tests/test_*.py` (a suite build.zig names runs in
+  test:units, on Windows too; `script_tests` names the others),
   `tests/tty/**` (`tty=true`), or another file of the `tests` package in
-  layers.zon (`units` and `product` run). The gate legs run their checks;
-  a suite no changed test belongs to reports success without running.
+  layers.zon, which may be a fixture both suites read (`units`, `product`
+  and `tty` run). The gate legs run their checks; a suite no changed test
+  belongs to reports success without running.
 - `packages`: every changed path is one of the above or a file of a product
   package in layers.zon, and every package in the affected set (the changed
   packages and every package that depends on them, directly or not) has no
@@ -35,9 +37,10 @@ Scopes, narrowest first:
   then is the declared dependency graph the real one, so the unit step runs
   `package_tests` (those steps) instead of `test:units`; integration,
   product, TTY and the contract snapshots still run.
-- `full`: anything else, every manual run, an empty diff, a package with a
-  baseline entry or without its test step anywhere in the affected set, and
-  any error: `suites=true`, `tty=true`.
+- `full`: anything else, every manual run, an empty diff, a `migration`
+  pull request (its test IDs are compared on a complete run), a package with
+  a baseline entry or without its test step anywhere in the affected set,
+  and any error: `suites=true`, `tty=true`.
 
 ci.yml: `ci_scope.py --event "$GITHUB_EVENT_NAME" --base <rev> --candidate
 HEAD --github-output "$GITHUB_OUTPUT"`, with the base `HEAD^1` on a pull
@@ -47,8 +50,9 @@ package_tests, script_tests, complete, doc_references, release_docs and
 reason outputs. It always exits 0: a doubt is the full scope, never a red
 job. `--event local --run` (`zig build test:affected`) applies the same
 decision to the working tree against origin/main and runs what it selects;
-`replay` reports the decision for commits already on main (the nightly run's
-summary). Python 3.9, stdlib only; tests in scripts/tests/test_ci_scope.py.
+`merged` reports the scope each merged pull request's CI run recorded
+(`--record`; the nightly run's summary), and `replay` recomputes the
+decision for commits already on main, to measure the rules. Python 3.9, stdlib only; tests in scripts/tests/test_ci_scope.py.
 """
 from __future__ import annotations
 
@@ -59,6 +63,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -78,7 +83,10 @@ BUILD = "build.zig"
 SCRIPT_TESTS = "scripts/tests/"
 TTY_TESTS = "tests/tty/"
 TESTS_PACKAGE = "tests"
+TEST_PACKAGES = ("testing", TESTS_PACKAGE)
 TEST_STEP = re.compile(r'\bb\.step\(\s*"(test:[\w-]+)"')
+BUILD_SCRIPT_SUITE = re.compile(r'"(scripts\.tests\.test_\w+)"')
+MIGRATION_LABEL = "migration"
 SHOWN = 5
 
 
@@ -154,6 +162,7 @@ class Layout:
     dependencies: Dict[str, Tuple[str, ...]]
     violations: Dict[str, int]
     test_steps: frozenset
+    build_suites: frozenset = frozenset()
 
     def owner(self, path: str) -> Optional[str]:
         best, best_len = None, -1
@@ -165,8 +174,7 @@ class Layout:
 
     @property
     def products(self) -> Tuple[str, ...]:
-        return tuple(package for package in self.order
-                     if all(entry.startswith("src/") for entry, owner in self.paths if owner == package))
+        return tuple(package for package in self.order if package not in TEST_PACKAGES)
 
     def affected(self, changed: Sequence[str]) -> Tuple[str, ...]:
         """The changed packages and every product package that depends on
@@ -190,13 +198,15 @@ class Layout:
 def load_layout(read: Callable[[str], str]) -> Layout:
     manifest = parse_zon(read(LAYERS))
     baseline = parse_zon(read(LAYER_BASELINE)) or {}
+    build = read(BUILD)
     packages = manifest["packages"]
     layout = Layout(
         order=tuple(package["name"] for package in packages),
         paths=tuple((entry, package["name"]) for package in packages for entry in package["paths"]),
         dependencies={package["name"]: tuple(package["allowed_dependencies"]) for package in packages},
         violations={},
-        test_steps=frozenset(TEST_STEP.findall(read(BUILD))),
+        test_steps=frozenset(TEST_STEP.findall(build)),
+        build_suites=frozenset(BUILD_SCRIPT_SUITE.findall(build)),
     )
     violations: Counter = Counter()
 
@@ -294,16 +304,23 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
     if scope not in ("tests", "packages") or layout is None:
         return Selection(suites=True, tty=True, units=True, product=True, packages=layout.products if layout else ())
     kinds = {path: path_kind(path, layout, release_sources) for _, path in changes}
-    script_tests = tuple(sorted({"scripts.tests." + PurePosixPath(path).stem
-                                 for status, path in changes if status != "D" and kinds[path] == "script-test"}))
+    modules = {"scripts.tests." + PurePosixPath(path).stem
+               for status, path in changes if status != "D" and kinds[path] == "script-test"}
+    # A shared fixture under tests/ can feed the TTY cases as well as the Zig
+    # suites; a script suite build.zig names runs in test:units on every
+    # platform, Windows included, so it keeps test:units.
     suites = any(kind in ("suite-test", "eval") for kind in kinds.values())
+    units = suites or bool(modules & layout.build_suites)
     if scope == "tests":
-        tty = any(kind == "tty-test" for kind in kinds.values())
-        return Selection(suites=True, tty=tty, units=suites, product=suites, script_tests=script_tests)
-    affected = layout.affected(sorted({layout.owner(path) for path, kind in kinds.items() if kind == "package"}))
-    package_tests = () if suites else tuple(f"test:{package}" for package in affected)
-    return Selection(suites=True, tty=True, units=True, product=True, packages=affected,
-                     package_tests=package_tests, script_tests=script_tests)
+        tty = any(kind in ("tty-test", "suite-test") for kind in kinds.values())
+        chosen = Selection(suites=True, tty=tty, units=units, product=suites)
+    else:
+        affected = layout.affected(sorted({layout.owner(path) for path, kind in kinds.items() if kind == "package"}))
+        package_tests = () if units else tuple(f"test:{package}" for package in affected)
+        chosen = Selection(suites=True, tty=True, units=True, product=True, packages=affected, package_tests=package_tests)
+    if chosen.complete:
+        return chosen
+    return replace(chosen, script_tests=tuple(sorted(modules - layout.build_suites)))
 
 
 Change = Tuple[str, str]  # (git status letter, path)
@@ -392,9 +409,12 @@ def decide(
     protocol_change: Optional[Callable[[str, Optional[str]], bool]] = None,
     release_sources: Sequence[str] = RELEASE_DOCS,
     layout: Optional[Callable[[], Layout]] = None,
+    labels: Sequence[str] = (),
 ) -> Tuple[str, str]:
     if event not in DIFF_EVENTS:
         return "full", f"full scope: {event or 'unknown'} run"
+    if MIGRATION_LABEL in labels:
+        return "full", f"full scope: a {MIGRATION_LABEL} pull request compares the complete set of executed test IDs"
     if not base:
         return "full", f"full scope: no base for the {event} run"
     try:
@@ -456,9 +476,10 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
         handle.write("\n".join(lines) + "\n")
 
 
-def local_commands(scope: str, selection: Selection, zig: str = "zig") -> List[List[str]]:
+def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: bool = False) -> List[List[str]]:
     """What `zig build test:affected` runs for a decision: the test part of
-    CI's selection. The rest of the AGENTS.md checklist runs on its own."""
+    CI's selection, offline (run_local sets TTY_SKIP_MODEL, as CI does). The
+    rest of the AGENTS.md checklist runs on its own."""
     if not selection.suites:
         return []
     if scope in ("full", "eval"):
@@ -473,16 +494,19 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig") -> List[L
     commands = [[zig, "build", *steps]]
     if selection.script_tests:
         commands.append([sys.executable, "-m", "unittest", *selection.script_tests])
-    if selection.tty:
+    if selection.tty and windows:
+        commands.append([zig, "build", "windows:tty", "-Dtarget=x86_64-windows-gnu"])
+    elif selection.tty:
         commands.append([zig, "build", "dev", "test:harness"])
         commands.append([sys.executable, "tests/tty/run_tty_tests.py", "--bin", "zig-out/bin/metacodes-debug"])
     return commands
 
 
 def run_local(root: Path, scope: str, selection: Selection, zig: str) -> int:
-    for command in local_commands(scope, selection, zig):
+    env = dict(os.environ, TTY_SKIP_MODEL="1")
+    for command in local_commands(scope, selection, zig, windows=os.name == "nt"):
         print("+ " + " ".join(command), flush=True)
-        status = subprocess.run(command, cwd=str(root), check=False).returncode
+        status = subprocess.run(command, cwd=str(root), env=env, check=False).returncode
         if status:
             return status
     return 0
@@ -512,7 +536,12 @@ def replay(root: Path, commits: Sequence[str], rules: Optional[str], cleared: bo
             observed.extend(changed_paths(root, base, candidate))
             return observed
 
-        scope, reason = decide("merge_group", f"{commit}^1", commit, changes, None, release_sources, layout)
+        def protocol_change(base: str, candidate: Optional[str]) -> bool:
+            def payload(rev: str) -> dict:
+                return json.loads(tree_reader(root, rev)(PROTOCOL))
+            return protocol_documents_only(payload(base), payload(candidate or commit), release_sources)
+
+        scope, reason = decide("merge_group", f"{commit}^1", commit, changes, protocol_change, release_sources, layout)
         try:
             packages = select(scope, observed, layout(), release_sources).packages if scope == "packages" else ()
         except Exception:
@@ -530,7 +559,7 @@ def replay_report(rows: Sequence[Tuple[str, str, str, Tuple[str, ...], str]], ti
     if not rows:
         return "\n".join(lines + ["No commits in the window.", ""])
     lines.extend(["| Scope | Commits | Share |", "|---|---|---|"])
-    for scope in ("docs", "eval", "tests", "packages", "full"):
+    for scope in ("docs", "eval", "tests", "packages", "full") + (("unknown",) if counts["unknown"] else ()):
         lines.append(f"| {scope} | {counts[scope]} | {100 * counts[scope] / len(rows):.0f}% |")
     lines.extend(["", "| Commit | PR | Scope | Packages | Reason |", "|---|---|---|---|---|"])
     for commit, subject, scope, packages, reason in rows:
@@ -538,6 +567,90 @@ def replay_report(rows: Sequence[Tuple[str, str, str, Tuple[str, ...], str]], ti
         pr = f"#{match.group(1)}" if match else cell(subject[:60])
         lines.append(f"| `{commit[:12]}` | {pr} | {scope} | {', '.join(packages) or '-'} | {cell(reason)} |")
     return "\n".join(lines) + "\n"
+
+
+CI_WORKFLOW = "ci.yml"
+SCOPE_ARTIFACT = "change-scope"
+SCOPE_RECORD = "change-scope.json"
+
+
+def gh_json(path: str):
+    return json.loads(subprocess.run(["gh", "api", path], capture_output=True, check=True).stdout)
+
+
+def download_scope(repository: str, run_id: int) -> Optional[dict]:
+    with tempfile.TemporaryDirectory(prefix="metacodes-change-scope-") as tmp:
+        proc = subprocess.run(["gh", "run", "download", str(run_id), "--repo", repository, "--name", SCOPE_ARTIFACT,
+                               "--dir", tmp], capture_output=True, check=False)
+        if proc.returncode:
+            return None
+        try:
+            return json.loads((Path(tmp) / SCOPE_RECORD).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+
+def recorded_scope(repository: str, sha: str, query: Callable = gh_json,
+                   download: Callable = download_scope) -> Optional[dict]:
+    """The scope the newest CI run of the pull request merged as `sha`
+    recorded (the scope job's change-scope artifact), or None."""
+    for pr in query(f"repos/{repository}/commits/{sha}/pulls?per_page=100"):
+        if not (pr.get("merged_at") and pr.get("merge_commit_sha") == sha):
+            continue
+        runs = query(f"repos/{repository}/actions/workflows/{CI_WORKFLOW}/runs"
+                     f"?head_sha={pr['head']['sha']}&event=pull_request&per_page=20")["workflow_runs"]
+        for run in sorted(runs, key=lambda run: run.get("created_at", ""), reverse=True):
+            found = download(repository, run["id"])
+            if found is not None:
+                return found
+    return None
+
+
+def merged(root: Path, commits: Sequence[str], repository: str, query: Callable = gh_json,
+           download: Callable = download_scope) -> List[Tuple[str, str, str, Tuple[str, ...], str]]:
+    rows = []
+    for commit in commits:
+        subject = git_bytes(root, "log", "-1", "--format=%s", commit).decode("utf-8").strip()
+        try:
+            found = recorded_scope(repository, commit, query, download)
+        except Exception as exc:
+            found, missing = None, f"the lookup failed: {exc}"
+        else:
+            missing = "its pull request's CI runs recorded no change scope"
+        if found is None:
+            rows.append((commit, subject, "unknown", (), missing))
+        else:
+            rows.append((commit, subject, str(found.get("scope", "unknown")),
+                         tuple(found.get("packages", ())), " ".join(str(found.get("reason", "")).split())))
+    return rows
+
+
+def first_parent_commits(root: Path, ref: str, since: Optional[str], max_count: Optional[int]) -> List[str]:
+    log = ["log", "--first-parent", "--format=%H"]
+    if since:
+        log.append(f"--since={since}")
+    if max_count:
+        log.append(f"--max-count={max_count}")
+    return [line for line in git_bytes(root, *log, ref).decode("utf-8").split() if line]
+
+
+def merged_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ci_scope.py merged",
+                                     description="Report the change scope each merged pull request's CI run recorded.")
+    parser.add_argument("--since", default="24 hours ago", help="commits after this date (git log --since)")
+    parser.add_argument("--ref", default="HEAD")
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--github-summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
+    parser.add_argument("--repo-root", default=str(ROOT))
+    args = parser.parse_args(argv)
+    root = Path(args.repo_root)
+    rows = merged(root, first_parent_commits(root, args.ref, args.since, None), args.repository)
+    report = replay_report(rows, f"Scopes the merges since {args.since} ran")
+    print(report, end="")
+    if args.github_summary:
+        with open(args.github_summary, "a", encoding="utf-8") as handle:
+            handle.write(report)
+    return 0
 
 
 def replay_main(argv: Sequence[str]) -> int:
@@ -553,12 +666,7 @@ def replay_main(argv: Sequence[str]) -> int:
     parser.add_argument("--repo-root", default=str(ROOT))
     args = parser.parse_args(argv)
     root = Path(args.repo_root)
-    log = ["log", "--first-parent", "--format=%H"]
-    if args.since:
-        log.append(f"--since={args.since}")
-    if args.max_count:
-        log.append(f"--max-count={args.max_count}")
-    commits = [line for line in git_bytes(root, *log, args.ref).decode("utf-8").split() if line]
+    commits = first_parent_commits(root, args.ref, args.since, args.max_count)
     try:
         release_sources: Sequence[str] = document_inputs(root).release_sources
     except Exception:
@@ -576,6 +684,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["replay"]:
         return replay_main(argv[1:])
+    if argv[:1] == ["merged"]:
+        return merged_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--event", required=True)
     parser.add_argument("--base", default="")
@@ -585,6 +695,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--repo-root", default=str(ROOT))
     parser.add_argument("--run", action="store_true", help="run the selected tests (zig build test:affected)")
     parser.add_argument("--zig", default="zig")
+    parser.add_argument("--labels", default="", help="the pull request's labels, comma-separated")
+    parser.add_argument("--record", help=f"write the decision as JSON here (the {SCOPE_ARTIFACT} artifact)")
     args = parser.parse_args(argv)
     root = Path(args.repo_root)
     candidate = args.candidate or None
@@ -614,7 +726,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return protocol_documents_only(payload(base), payload(candidate), inputs.release_sources)
 
         scope, reason = decide(args.event, base, candidate, changes,
-                               protocol_change, inputs.release_sources, layout)
+                               protocol_change, inputs.release_sources, layout,
+                               [label for label in args.labels.split(",") if label])
         doc_references, release_docs = document_checks(scope, observed, inputs)
     except Exception as exc:
         scope, reason = "full", f"full scope: document input attribution failed: {exc}"
@@ -642,6 +755,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"doc_references={flag(doc_references)}\n"
                 f"release_docs={flag(release_docs)}\n"
             )
+    if args.record:
+        with open(args.record, "w", encoding="utf-8") as handle:
+            json.dump({"scope": scope, "packages": list(selection.packages), "reason": reason}, handle, sort_keys=True)
+            handle.write("\n")
     if args.github_summary:
         write_summary(args.github_summary, args.event, base, args.candidate or "(working tree)", scope, reason, observed,
                       selection=selection, doc_references=doc_references, release_docs=release_docs,

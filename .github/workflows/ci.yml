@@ -128,10 +128,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 2
+      # PR_LABELS: the labels in the event, which a `labeled` or
+      # `unlabeled` run carries current; a migration PR takes the full scope.
       - name: Decide
         id: decide
         env:
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           case "$GITHUB_EVENT_NAME" in
             pull_request) base=HEAD^1 ;;
@@ -141,7 +144,15 @@ jobs:
               ;;
             *) base="" ;;
           esac
-          python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT" --labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json"
+      # What main's nightly run reports for this PR once it is merged
+      # (`merged-scopes`).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: change-scope
+          path: ${{ runner.temp }}/change-scope.json
+          if-no-files-found: warn
+          retention-days: 90
 
   # Where the macOS and Windows gates run (scripts/ci_pool_plan.py plan,
   # doc/CI_DESIGN.md §6): a platform's pool when .github/runner-pools.json
@@ -1539,9 +1550,10 @@ jobs:
 
   # main's nightly run, which is a full run on every platform, also lists the
   # commits merged in the day before it and the scope each one's pull request
-  # ran (scripts/ci_scope.py replay). When the full run fails and the day's
-  # pull requests ran narrowed scopes, the list names the candidates that
-  # skipped the failing suite (doc/CI_DESIGN.md §2).
+  # ran, as its CI run recorded it (the scope job's change-scope artifact;
+  # `unknown` without one). When the full run fails and the day's pull
+  # requests ran narrowed scopes, the list names the candidates that skipped
+  # the failing suite (doc/CI_DESIGN.md §2).
   merged-scopes:
     name: Scopes of the day's merges
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
@@ -1551,5 +1563,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - name: Replay the change scope of the day's merges
-        run: python3 scripts/ci_scope.py replay --since "24 hours ago"
+      - name: Report the change scope of the day's merges
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_scope.py merged --since "24 hours ago" --repository "$GITHUB_REPOSITORY"

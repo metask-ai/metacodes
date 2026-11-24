@@ -56,12 +56,13 @@ inputs; moving into a code/input tree takes the wider scope.
 |---|---|---|
 | `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
-| `tests` | one of the above or a test: `scripts/tests/test_*.py`, `tests/tty/**`, or another file of the `tests` package in `layers.zon` | The gates' checks; the unit, integration and product suites only for a changed `tests/**` file or harness file, TTY only for a changed `tests/tty/**` file, and the changed script suites by name |
+| `tests` | one of the above or a test: `scripts/tests/test_*.py`, `tests/tty/**`, or another file of the `tests` package in `layers.zon` | The gates' checks. A changed `tests/**` file outside `tests/tty/` (a fixture may feed both) or harness file runs the unit, integration, product and TTY suites; a changed `tests/tty/**` file runs TTY; a changed script suite that `build.zig` runs keeps `test:units` (Windows included), the others run by name |
 | `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`; integration, product, release, contract snapshots, TTY and SDK as in `full` |
 | `full` | anything else | Everything |
 
-Manual and scheduled runs are always `full`, and so are an empty diff and
-any error. Neither CI workflow runs on ordinary pushes to main; their nightly
+Manual and scheduled runs are always `full`, and so are a pull request
+labelled `migration` (the labels come from the event, so labelling reruns
+CI), an empty diff and any error. Neither CI workflow runs on ordinary pushes to main; their nightly
 run on main is a full run on all three platforms that saves the caches (§5).
 
 ### Affected packages
@@ -105,25 +106,31 @@ Only a run of every Zig and script suite (`complete=true`: `full`, `eval`,
 and `tests` when the suites ran) records and uploads its executed test IDs.
 A narrowed run's IDs are a subset that `scripts/test_ids.py` would report as
 missing tests, so the **Test IDs (Linux)** job neither compares nor keeps
-them; a `migration` PR on a narrowed run fails there, since its comparison
-needs a complete run. Bases come from complete runs and main's nightly run.
+them. A `migration` PR always takes the full scope, so its comparison runs;
+on a narrowed run it would fail there. Bases come from complete runs and
+main's nightly run. **Changed script unit suites** runs only on runs that
+are not complete, so no test is recorded twice.
 
 `zig build test:affected` applies the same decision to the working tree,
-untracked files included, against its merge base with `origin/main`, and
-runs the selected suites (`zig build test` for `full` and `eval`); the
-AGENTS.md checklist uses it in place of `zig build test`.
+untracked files included, against its merge base with `origin/main`
+(`-Daffected-base=<rev>`), and runs the selected suites offline
+(`TTY_SKIP_MODEL=1`; `zig build test` for `full` and `eval`, `windows:tty`
+for TTY on Windows); the AGENTS.md checklist uses it in place of
+`zig build test`.
 
 ### The nightly backstop
 
 main's nightly run (`schedule`, or `gh workflow run ci.yml --ref main`) is
-`full` on Linux, macOS and Windows. Its **Scopes of the day's merges** job
-replays the decision for every first-parent commit of the last 24 hours
-(`scripts/ci_scope.py replay`) and writes them to the job summary: commit,
-PR, scope, packages and reason. When the nightly run fails, the `packages`
-and `tests` rows are the pull requests that did not run the failing suite.
-The same command over a longer window measures the rules:
-`python3 scripts/ci_scope.py replay --max-count 300 --rules HEAD`, with
-`--assume-cleared` for the end state of the migration.
+`full` on Linux, macOS and Windows. Every scope job records its decision as
+the `change-scope` artifact (90 days). The nightly **Scopes of the day's
+merges** job (`scripts/ci_scope.py merged`) finds the pull request of every
+first-parent commit of the last 24 hours, reads the record of its newest CI
+run and writes commit, PR, scope, packages and reason to the job summary;
+a pull request without a record is `unknown`. When the nightly run fails,
+the `packages`, `tests` and `unknown` rows are the pull requests that may
+not have run the failing suite. Recomputing the decision measures the rules
+instead: `python3 scripts/ci_scope.py replay --max-count 300 --rules HEAD`,
+with `--assume-cleared` for the end state of the migration.
 
 The scope step writes a **CI change attribution** job summary: the base,
 event, effective scope, reason, planned checks and a status/path/scope table.
