@@ -653,7 +653,7 @@ fn reachesNoFurther(layers: Layers, base_layers: Layers, files: []const SourceFi
     }
     for (files) |file| {
         if (layers.owner(file.path) != added) continue;
-        const owner_before = base_layers.owner(file.path) orelse continue;
+        const owner_before = base_layers.owner(file.path) orelse return false;
         if (!base_layers.mayDepend(before, owner_before)) return false;
     }
     return true;
@@ -1152,4 +1152,18 @@ test "a deep entry may not turn into an upward one" {
     try std.testing.expectEqual(@as(usize, 0), try checkTree(&clean_tree, narrower, upgraded, test_wiring));
     const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
     try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&clean_tree, narrower, upgraded, test_wiring, base));
+}
+
+test "a new package may not take files from paths the base did not own" {
+    const tree = withFile("src/leaf/view.zig", "");
+    const leaf_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"leaf\", .paths = .{\"src/leaf/\"}, .allowed_dependencies = .{} },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"leaf\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &withFile("src/repl/leaf.zig", "") };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, leaf_layers, test_baseline, "module\tsrc/util/platform.zig\n", base));
 }
