@@ -639,6 +639,7 @@ async function renderNewRun() {
     featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性')) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
   const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
+  const blocked = h('small', { class: 'muted', role: 'status' });
 
   function setupReasons() {
     const harbor = [...state.suitePick.keys()].some((id) => (byId.get(id) || {}).runner !== 'workbuddy');
@@ -648,8 +649,21 @@ async function renderNewRun() {
   function syncSubmit() {
     const picked = [...state.suitePick.entries()];
     const total = picked.reduce((acc, [, e]) => acc + (e ? e.selected.size : 0), 0);
-    const problems = picked.filter(([id, e]) => !comboReady(byId.get(id)) || !e || !e.selected.size || e.selected.size > byId.get(id).max_tasks);
-    submit.disabled = !picked.length || !chosenModels.size || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
+    const reasons = [];
+    if (!picked.length) reasons.push('请选择评测集');
+    if (!chosenModels.size) reasons.push('请至少选择一个模型');
+    for (const [id, e] of picked) {
+      const s = byId.get(id);
+      if (!comboReady(s)) reasons.push(`${s.name} 在当前执行机器上待配置`);
+      else if (!e) reasons.push(`${s.name} 正在读取任务列表`);
+      else if (e.error && !e.tasks.length) reasons.push(`${s.name} 读取任务失败：${e.error}`);
+      else if (!e.selected.size) reasons.push(`${s.name} 还没有选择任务`);
+      else if (e.selected.size > s.max_tasks) reasons.push(`${s.name} 已选 ${e.selected.size} 题，超过上限 ${s.max_tasks}`);
+    }
+    if (!c.can_run) reasons.push('只读模式，不能发起评测');
+    if (!fixed && !bundles.length) reasons.push('还没有可用的 metacodes 版本');
+    submit.disabled = reasons.length > 0;
+    blocked.textContent = reasons.length ? '无法开始：' + reasons.join('；') : '';
     const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
     submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '开始评测';
   }
@@ -768,7 +782,7 @@ async function renderNewRun() {
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
-    h('div', { class: 'form-submit' }, submit, feedback));
+    h('div', { class: 'form-submit' }, submit, blocked, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     submit.disabled = true;
