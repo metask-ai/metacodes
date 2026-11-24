@@ -384,10 +384,8 @@ class Workbench:
         tasks = item.get("tasks") or []
         if action == "resume":
             view = self.job_view(item["run"]) if item.get("run") else None
-            if view is None:
-                raise ValueError("这个评测集还没有结果，请直接运行")
             finished = {}
-            for row in view["rows"]:
+            for row in view["rows"] if view else []:
                 if row["status"] not in ("running", "invalid"):
                     finished[row["task"]] = finished.get(row["task"], 0) + 1
             tasks = [t for t in tasks if finished.get(t, 0) < (item.get("attempts") or 1)]
