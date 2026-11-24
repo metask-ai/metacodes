@@ -213,6 +213,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     expired = False
     last_write = 0.0
     def channel_open():
+        remote.follow_handoff(source.current, cancelled_at is not None)
         if remote.process.poll() is None:
             return True
         if cancelled_at is None and remote.retry_tunnel(secret_env, source.current):

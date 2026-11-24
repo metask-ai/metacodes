@@ -1197,6 +1197,10 @@ class RemoteRun:
         # first session may be started again (a refused tunnel port).
         self.action = None
         self.dropped = False  # this side ended a silent session
+        # Sessions of drivers a newer one took over (`bench node upgrade`):
+        # each ends once its driver finished the requests it had accepted.
+        self.handed_over = None
+        self.retired: List = []
         # egress "workbench": this run's proxy on the workbench loopback and
         # the executor loopback port its `ssh -R` forward listens on.
         self.proxy = None
@@ -1332,6 +1336,9 @@ class RemoteRun:
 
     def close(self) -> None:
         """Stop the run's workbench proxy (idempotent)."""
+        for process in self.retired:
+            if process.poll() is None:
+                process.kill()
         if self.stderr_relay is not None:
             self.stderr_relay.join(5)
         if self.proxy is not None:
@@ -1468,6 +1475,23 @@ class RemoteRun:
                 self.cancel()
         return True
 
+    def follow_handoff(self, credential: Callable[[], Optional[str]], cancelled: bool) -> None:
+        """The node replaced the run's driver (`handoff` event): attach a
+        session to the new one. The old session is left to end by itself:
+        its tunnel may still carry connections the old driver finishes."""
+        if self.handed_over is None or self.handed_over is not self.process:
+            return
+        self.handed_over = None
+        self.retired.append(self.process)
+        self.log(f"执行机器 {self.executor.name} 上这次运行的驱动已换成新版本，连接新驱动")
+        first = {}
+        if self.tunnel_port is not None:
+            self.tunnel_ports.append(tunnel_port(self.tunnel_ports))
+            first["tunnel_port"] = self.tunnel_port
+        self.open_session("attach", first, credential())
+        if cancelled:
+            self.cancel()
+
     def drop(self) -> None:
         """End a session that went silent; the run is attached anew."""
         self.dropped = True
@@ -1486,6 +1510,9 @@ class RemoteRun:
             except ValueError:
                 continue
             if isinstance(event, dict):
+                if event.get("event") == "handoff":
+                    self.handed_over = process
+                    continue
                 self.events.append(event)
                 self.last_event = time.monotonic()
                 if self.lost_at is not None and process is self.process:

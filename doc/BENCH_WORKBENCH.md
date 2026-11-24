@@ -280,6 +280,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
+| 正在运行的评测（换用新驱动） (`ssh` executors) | Runs `metacodes bench node upgrade <state_dir>/runs` with the node just installed: every run going on there is handed to a driver of that version without stopping it (see [Updating a node under running runs](#updating-a-node-under-running-runs)). A run whose driver predates this, or one the handoff fails for, goes on with its own driver, and the step says so |
 | 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy. A tunnel port the executor cannot listen on is retried on another one, up to 5 ports, and then the step says the tunnel port could not be bound; any other failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
@@ -811,15 +812,43 @@ is still starting (its pid is in `runs/<name>/driver.pid`) `attach` exits
 without an event and the worker tries again. The new session then
 carries the events and control lines, the current access token, and the
 egress tunnel on a fresh `ssh -R` port, which the driver's forwarder follows.
-While no session is attached, the driver's and Harbor's output goes to
-`<state_dir>/runs/<name>/driver.log`. The run's terminal event is also kept
-there, so a session that attaches after Harbor exited still receives it. The
+Harbor runs under a small keeper process that writes its output to
+`<state_dir>/runs/<name>/harbor.log` and its exit status to `harbor.exit`
+there; the driver copies that output to the attached session, and while no
+session is attached its own output goes to `driver.log` there. The run's
+terminal event is also kept there, so a session that attaches after Harbor exited still receives it. The
 record counts the reattached sessions in `reconnects`. Both sides give up
 after 30 minutes (`METACODES_BENCH_RECONNECT_WINDOW` seconds on the
 workbench, which passes the value to the driver as the spec's
 `detach_grace`): the driver interrupts Harbor, so a lost connection never
 leaves trials running unsupervised, and the run fails with what is still on
 the executor.
+
+### Updating a node under running runs
+
+`metacodes bench setup --executor NAME` (its 正在运行的评测 step), or
+`metacodes bench node upgrade <state_dir>/runs/<name>/spec.json` run on the
+executor by the newer node, replaces the driver of a running Harbor run
+without interrupting it:
+
+- Harbor stays with its keeper, so its trials go on and the new driver reads
+  its exit status from the run directory.
+- The relay's TLS key and CA are in `runs/<name>/relay-tls/` (owner only),
+  so the CA path Harbor gave the containers stays valid. The old driver
+  passes the relay's and the egress forwarder's listening sockets to the new
+  one over a Unix socket next to the attach socket (SCM_RIGHTS): the
+  address does not change and no connection is refused. The new driver
+  takes over the current access token, the placeholders and the request
+  counter.
+- The old driver stops accepting and finishes the requests it had already
+  accepted (a streaming model response completes), then exits. Its session
+  gets a `handoff` event, and the worker attaches to the new driver, with a
+  fresh token and egress tunnel port, while the old session ends by itself.
+- A handoff that fails before the old driver let go (another handoff
+  version, the new driver dying, a run already ending or being cancelled)
+  leaves the run with the old driver. Runs started by a driver from before
+  node protocol 8, and WorkBuddy runs, finish with the driver that started
+  them.
 
 ### Network-restricted executors
 

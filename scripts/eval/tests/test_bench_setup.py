@@ -29,7 +29,7 @@ import unittest
 import urllib.error
 import urllib.request
 from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -175,7 +175,8 @@ elif name == "ssh":
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
                 "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
-                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT"):
+                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT", "FAKE_BENCH_RELEASE_FILE",
+                "FAKE_LATE_TRAFFIC"):
         if key in env:
             remote[key] = env[key]
     if " pack " in command:
@@ -1181,24 +1182,142 @@ class SshRunTest(SetupFixture):
         self.assertNotEqual(final["exit_code"], 0)
         self.assertTrue((manager.jobs_dir / run["name"] / "argv.json").exists())
 
-    def start_driver(self, grace):
-        """A remote driver whose Harbor runs 30 s, and its first session."""
+    def start_driver(self, grace, delay=30, name="eof", relay=None, env=None, credential=None):
+        """A remote driver whose Harbor runs `delay` s, and its first session."""
         self.prepare_remote()
-        relay = executors.find(self.cfg(), "relay-4090")
+        executor = executors.find(self.cfg(), "relay-4090")
         jobs = self.remote_home / "jobs"
         spec = {"argv": [str(self.remote_home / ".local/bin/harbor"), "run", "-m", "metask/x", "-k", "1",
-                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None,
+                         "-o", str(jobs), "--job-name", name], "key_env": "METASK_API_KEY", "relay": relay,
                 "detach_grace": grace}
-        (self.remote_home / "runs/eof").mkdir(parents=True)
-        (self.remote_home / "runs/eof/spec.json").write_text(json.dumps(spec))
-        env = {**os.environ, "FAKE_BENCH_DELAY": "30"}
-        process = subprocess.Popen(executors.node_argv(relay, "run", "runs/eof/spec.json"), stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, env=env)
+        (self.remote_home / "runs" / name).mkdir(parents=True)
+        (self.remote_home / "runs" / name / "spec.json").write_text(json.dumps(spec))
+        process = subprocess.Popen(executors.node_argv(executor, "run", f"runs/{name}/spec.json"),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   env={**os.environ, "FAKE_BENCH_DELAY": str(delay), **(env or {})})
         self.addCleanup(process.kill)
-        process.stdin.write(b'{"env": {"METASK_API_KEY": "k"}}\n')
+        first = {"env": {"METASK_API_KEY": "k"}, **({"credential": credential} if credential else {})}
+        process.stdin.write(json.dumps(first).encode() + b"\n")
         process.stdin.flush()
         self.assertEqual(json.loads(process.stdout.readline())["event"], "started")
-        return relay, process
+        return executor, process
+
+    def streaming_upstream(self, events=10, pause=0.6):
+        """A model endpoint whose first answer streams for `events` x `pause`
+        seconds (`streaming` is set once it has begun), the others at once."""
+        streaming, seen = threading.Event(), []
+
+        class Endpoint(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                seen.append(self.headers.get("Authorization"))
+                slow = len(seen) == 1
+                parts = ([{"type": "message_start", "message": {"usage": {"input_tokens": 5}}}] +
+                         [{"type": "content_block_delta", "delta": {"text": "x"}}] * events +
+                         [{"type": "message_delta", "usage": {"output_tokens": events}}, {"type": "message_stop"}])
+                chunks = [b"data: " + json.dumps(part).encode() + b"\n\n" for part in parts]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(sum(len(chunk) for chunk in chunks)))
+                self.end_headers()
+                for index, chunk in enumerate(chunks):
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    if slow and index < events:
+                        streaming.set()
+                        time.sleep(pause)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Endpoint)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        return upstream, streaming, seen
+
+    def test_a_driver_upgrade_mid_stream_completes_the_request_and_the_run(self):
+        """`node upgrade` replaces the driver while a model request streams
+        through its relay: that request completes, the later ones go through
+        the new driver with the same placeholder and CA, and the run ends as
+        it would have without the upgrade."""
+        upstream, streaming, seen = self.streaming_upstream()
+        metrics = "jobs/up/.bench-metrics"
+        relay, process = self.start_driver(
+            grace=60, delay=1, name="up", credential="real-token",
+            env={"FAKE_RELAY_REQUESTS": "3", "FAKE_RELAY_INTERVAL": "0"},
+            relay={"upstream": f"http://127.0.0.1:{upstream.server_port}", "bind": "127.0.0.1",
+                   "auth_header": "Authorization", "auth_prefix": "Bearer ", "metrics_dir": metrics, "record": True})
+        run_dir = self.remote_home / "runs/up"
+        self.assertTrue(streaming.wait(30))
+        before = (run_dir / remote.DRIVER_PID).read_text()
+        done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/up/spec.json"), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        outcome = json.loads(done.stdout)
+        self.assertEqual((outcome["run"], outcome["result"]), ("up", "upgraded"), outcome)
+        self.assertEqual(len(seen), 1)  # the first request is still streaming
+        self.assertNotEqual(str(outcome["pid"]), before)
+        self.assertEqual((run_dir / remote.DRIVER_PID).read_text(), str(outcome["pid"]))
+        events = []
+        for line in process.stdout:
+            events.append(json.loads(line)["event"])
+            if events[-1] == "handoff":
+                break
+        self.assertEqual(events[-1], "handoff", events)
+        # The old driver ends once the request it had accepted is complete.
+        self.assertEqual(process.wait(30), 0)
+        session = subprocess.Popen(executors.node_argv(relay, "attach", "runs/up/spec.json"),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(session.kill)
+        session.stdin.write(b'{"credential": "fresh-token"}\n')
+        session.stdin.flush()
+        ends = [json.loads(line) for line in session.stdout]
+        self.assertIn({"event": "credential", "pushes": 1}, ends)
+        self.assertEqual(ends[-1], {"event": "exit", "code": 0, "cancelled": False})
+        self.assertEqual(json.loads((self.remote_home / "jobs/up/relay-statuses.json").read_text()), [200, 200, 200])
+        rows = [json.loads(line) for line in
+                (self.remote_home / metrics / "fix-git__fake.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["request"], r["http_status"], r["complete"]) for r in rows],
+                         [(1, 200, True), (2, 200, True), (3, 200, True)])
+        self.assertEqual(seen[0], "Bearer real-token")
+        self.assertTrue(set(seen) <= {"Bearer real-token", "Bearer fresh-token"}, seen)
+        self.assertTrue((self.remote_home / "jobs/up/fix-git__fake/result.json").exists())
+        self.assertFalse((run_dir / remote.RELAY_TLS).exists())
+
+    def test_a_failed_driver_upgrade_leaves_the_run_to_its_driver(self):
+        relay, process = self.start_driver(grace=60, delay=4)
+        path = remote.handoff_socket(self.remote_home / "runs/eof")
+        deadline = time.monotonic() + 10
+        while not os.path.exists(path):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.connect(path)
+            conn.sendall(b'{"handoff": 0}\n')
+            self.assertIn("refused", json.loads(conn.makefile("rb").readline()))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            # A new driver that dies once it has the run's state.
+            conn.connect(path)
+            conn.sendall(json.dumps({"handoff": remote.HANDOFF}).encode() + b"\n")
+            state, fds, _flags, _address = socket.recv_fds(conn, 65536, 4)
+            for fd in fds:
+                os.close(fd)
+            self.assertGreater(json.loads(state)["harbor"], 0)
+        # A run whose driver predates hot upgrade finishes with it.
+        old = self.remote_home / "runs/old"
+        old.mkdir()
+        (old / "spec.json").write_text("{}")
+        (old / remote.DRIVER_PID).write_text(str(os.getpid()))
+        done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/old/spec.json"), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(done.stdout), {"run": "old", "result": "unsupported"}, done.stderr)
+        events = [json.loads(line) for line in process.stdout]
+        self.assertNotIn("handoff", [e["event"] for e in events])
+        self.assertEqual(events[-1], {"event": "exit", "code": 0, "cancelled": False})
+        self.assertTrue((self.remote_home / "jobs/eof/fix-git__fake/result.json").exists())
 
     def test_closed_channel_stops_remote_harbor_after_the_grace_period(self):
         _, process = self.start_driver(grace=1)
@@ -2087,6 +2206,38 @@ class EgressRunTest(SetupFixture):
         self.assertFalse((self.home / ".docker/config.json").exists())
         log = data.tail(manager.records / (run["name"] + ".log"))
         self.assertIn("出网代理已停止", log)
+
+    def test_setup_hands_a_running_run_to_a_new_driver_without_stopping_it(self):
+        """Setup after a node update (its `runs` step): Harbor goes on, the
+        worker follows the new driver, and a model request and a container
+        fetch after the switch go through the relay and forwarder it took
+        over, with the CA and proxy address Harbor got at start."""
+        manager, client, _ = self.prepare_remote(profile=True)
+        self.harbor_local_suite()
+        self.egress_executor(egress="workbench")
+        release = self.root / "release"
+        os.environ.update(FAKE_EGRESS_FETCH="1", FAKE_LATE_TRAFFIC="1", FAKE_BENCH_RELEASE_FILE=str(release))
+        run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
+                                          "tasks": ["humaneval-7"], "executor": "relay-4090"})
+        remote_job = self.remote_home / ".metacodes-bench/jobs" / run["name"]
+        deadline = time.monotonic() + 60
+        while not (remote_job / "egress-probe.txt").exists():
+            self.assertLess(time.monotonic(), deadline, data.tail(manager.records / (run["name"] + ".log")))
+            time.sleep(0.1)
+        run_dir = self.remote_home / ".metacodes-bench/runs" / run["name"]
+        before = (run_dir / remote.DRIVER_PID).read_text()
+        progress = setup.Setup(self.config, "relay-4090").execute([("runs", "正在运行的评测", setup.step_runs)])
+        step = progress["steps"][0]
+        self.assertEqual((step["status"], step["detail"]), ("done", "1 个运行已换用新版本驱动"), step)
+        self.assertNotEqual((run_dir / remote.DRIVER_PID).read_text(), before)
+        release.touch()
+        final = wait_run(manager, run["name"], timeout=60)
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"]), ("finished", 0), (final, log))
+        self.assertIn("驱动已换成新版本", log)
+        late = json.loads((manager.jobs_dir / run["name"] / "late-traffic.json").read_text())
+        self.assertEqual((late["relay"], late["egress"]), (200, "metacodes-bench-egress-ok"), late)
+        self.assertFalse((run_dir / remote.RELAY_TLS).exists())
 
     def run_refusing_forwards(self, refused, **env):
         manager, client, _ = self.prepare_remote()

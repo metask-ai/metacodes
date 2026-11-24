@@ -42,6 +42,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -99,19 +100,29 @@ def stop_listening(sock: socket.socket) -> None:
 
 
 class _Listener:
-    """A TCP listener that hands each connection to `handle` on a thread."""
+    """A TCP listener that hands each connection to `handle` on a thread.
+    `sock` is a listening socket to serve instead of binding a new one."""
 
-    def __init__(self, bind: str, port: int = 0):
-        family = socket.AF_INET6 if ":" in bind else socket.AF_INET
-        self.sock = socket.socket(family, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((bind, port))
-        self.sock.listen(64)
+    def __init__(self, bind: str, port: int = 0, sock: Optional[socket.socket] = None):
+        if sock is None:
+            family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind, port))
+            sock.listen(64)
+        self.sock = sock
+        # Polled, so pause() returns without shutting the socket down: another
+        # process may be serving it.
+        self.sock.settimeout(0.5)
         self.address = self.sock.getsockname()[:2]
         self.closed = threading.Event()
-        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread = None
+        self.connections = threading.Condition()
+        self.open = 0
 
     def start(self):
+        self.closed.clear()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
         return self
 
@@ -119,8 +130,12 @@ class _Listener:
         while not self.closed.is_set():
             try:
                 conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
+            with self.connections:
+                self.open += 1
             threading.Thread(target=self._guarded, args=(conn,), daemon=True).start()
 
     def _guarded(self, conn):
@@ -131,6 +146,26 @@ class _Listener:
                 conn.close()
             except OSError:
                 pass
+        finally:
+            with self.connections:
+                self.open -= 1
+                self.connections.notify_all()
+
+    def pause(self):
+        """Stop accepting; the listening socket stays open."""
+        self.closed.set()
+        if self.thread is not None:
+            self.thread.join()
+
+    def release(self, timeout):
+        """Once another process serves the listening socket: let the
+        connections accepted here finish, then close this copy of it."""
+        self.pause()
+        deadline = time.monotonic() + timeout
+        with self.connections:
+            while self.open and time.monotonic() < deadline:
+                self.connections.wait(max(0.0, min(1.0, deadline - time.monotonic())))
+        self.sock.close()
 
     def handle(self, conn):  # pragma: no cover - overridden
         conn.close()
@@ -398,8 +433,8 @@ class Forwarder(_Listener):
     """Listen on `bind` (the Docker bridge gateway) and relay every
     connection to `target` (the tunnel's loopback end)."""
 
-    def __init__(self, bind: str, target: Tuple[str, int], port: int = 0):
-        super().__init__(bind, port)
+    def __init__(self, bind: str, target: Tuple[str, int], port: int = 0, sock: Optional[socket.socket] = None):
+        super().__init__(bind, port, sock)
         self.target = target
 
     def handle(self, conn):
