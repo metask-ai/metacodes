@@ -1,5 +1,5 @@
 //! L2 for the next step after a rejected sign-in or a used-up balance
-//! (`src/repl/next_step.zig`), through the real CLI.
+//! (`apps/cli/src/repl/next_step.zig`), through the real CLI.
 //!
 //! The CLI (`METACODES_TEST_CLI_BIN`, started through a symlink named
 //! `metacodes-dev`, as a side-by-side install is) runs `-p` with a state root

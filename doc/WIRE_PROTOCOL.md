@@ -2,7 +2,7 @@
 
 Status: implemented contract. Normative for every Host that carries a Session
 across a process or network boundary: the bundled `--web`/`serve` HTTP
-surface (`src/web/`), `SessionHost` behind an embedder's transport
+surface (`apps/cli/src/web/`), `SessionHost` behind an embedder's transport
 (`src/core/session_host.zig`), and any Host in another language. The
 encoder and parser are `src/core/protocol/wire.zig`; routing by declared
 capabilities is `src/core/protocol/frontend_capabilities.zig`. Conformance

@@ -817,7 +817,7 @@ fn startupFacts(allocator: std.mem.Allocator, config: types.Config, local: *cons
 /// Levels 2, 3 and 6 of the startup order (#489): the preset `--preset` (or
 /// `METACODES_PRESET` in the shell) names, the one the working directory
 /// remembers, and `METACODES_PRESET` in `local`, each judged against
-/// config.json (`src/app/presets.zig`). `with_routes` names each found
+/// config.json (`apps/cli/src/app/presets.zig`). `with_routes` names each found
 /// preset's route (`login status`), which builds the provider runtime once
 /// more. Reads files, sends nothing; everything is in `arena`.
 fn presetFacts(arena: std.mem.Allocator, config: types.Config, local: *const state_env_mod.Loaded, with_routes: bool) presets_mod.Facts {
@@ -1435,7 +1435,7 @@ pub fn main(init: std.process.Init) !void {
 
     // --- <state root>/.env (#486) ---
     // The install's local configuration, read once: a layer below the process
-    // environment for the names it may set (src/app/state_env.zig), never
+    // environment for the names it may set (apps/cli/src/app/state_env.zig), never
     // setenv. It outlives every App built from `config`: they borrow it.
     var local_config = loadLocalConfig(init.gpa, allocator, config.state_root);
     defer local_config.deinit();
@@ -1474,7 +1474,7 @@ pub fn main(init: std.process.Init) !void {
     // declarative route so the legacy napi endpoint cannot win when a new
     // session exists. An explicit METASK_GATEWAY_URL is the documented local
     // development override and is an origin, never a /v1/messages URL.
-    // The levels, decided once from what they read (src/app/startup_order.zig;
+    // The levels, decided once from what they read (apps/cli/src/app/startup_order.zig;
     // `metacodes login status` shows the same decision).
     const preset_facts = presetFacts(allocator, config, &local_config, false);
     // The file's METASK_API_KEY as the historical path reads it: everywhere
@@ -2614,7 +2614,7 @@ fn resolveResumeSession(allocator: std.mem.Allocator, state_root: []const u8, qu
 }
 
 /// The state root this host resolved at startup ("" when there is none).
-/// Host-only: src/main.zig hands it down; library code never reads it.
+/// Host-only: apps/cli/src/main.zig hands it down; library code never reads it.
 fn hostRoot() []const u8 {
     const resolved = @import("metacodes-internal").util.state_root.resolve() catch return "";
     return resolved.path;
@@ -3978,7 +3978,7 @@ fn promptChoice(allocator: std.mem.Allocator, count: usize) !usize {
 }
 
 /// `metacodes login status`: which credential a plain start here uses and
-/// why, the startup order's decision (src/app/startup_order.zig, the one
+/// why, the startup order's decision (apps/cli/src/app/startup_order.zig, the one
 /// `main` applies), then what each of its seven levels holds. Names, paths
 /// and an expiry only: never a key or a token.
 fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {

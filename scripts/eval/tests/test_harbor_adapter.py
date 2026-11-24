@@ -175,7 +175,7 @@ class ModelAndFlagsTest(unittest.TestCase):
 
     def test_every_feature_flag_is_one_metacodes_parses(self):
         root = Path(__file__).resolve().parents[3]
-        main = (root / "src" / "main.zig").read_text(encoding="utf-8")
+        main = (root / "apps" / "cli" / "src" / "main.zig").read_text(encoding="utf-8")
         types = (root / "src" / "types.zig").read_text(encoding="utf-8")
         preview = types.split("pub const PreviewFeature = enum {", 1)[1].split("pub fn", 1)[0]
         for name, entry in cmd.ADVANCED_FEATURES.items():

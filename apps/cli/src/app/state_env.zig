@@ -30,13 +30,13 @@
 //!   `METACODES_PROVIDER` and `METACODES_MODEL` here apply only when no flag
 //!   or environment variable names a provider or a preset, the working
 //!   directory remembers no preset, no `/model` default is stored, and no
-//!   Metask sign-in exists (`src/app/startup_order.zig`). The file's preset
+//!   Metask sign-in exists (`apps/cli/src/app/startup_order.zig`). The file's preset
 //!   comes before its provider. Without either, a file holding one
 //!   provider's key uses that provider (`Loaded.choice`); keys that merely
 //!   exist in the shell environment never select one.
-//! - **Host-only.** `src/main.zig` loads it once at startup and hands the
+//! - **Host-only.** `apps/cli/src/main.zig` loads it once at startup and hands the
 //!   layer down (`types.Config.credential_env_fallback`), so an edit applies
-//!   on the next start. `src/app/` is outside metacodes-core
+//!   on the next start. `apps/cli/src/app/` is outside metacodes-core
 //!   (`zig build subsystem:boundary`), so the library and AgentCore cannot
 //!   read it.
 //!
@@ -71,7 +71,7 @@ pub const example_file_name = ".env.example";
 pub const provider_variable = "METACODES_PROVIDER";
 pub const model_variable = "METACODES_MODEL";
 /// A preset of config.json by name (#489); in the file it comes before the
-/// file's `METACODES_PROVIDER` (`src/app/startup_order.zig`, level 6).
+/// file's `METACODES_PROVIDER` (`apps/cli/src/app/startup_order.zig`, level 6).
 pub const preset_variable = "METACODES_PRESET";
 /// The how-to page every hint about the file links.
 pub const guide_url = "https://github.com/metask-ai/metacodes/blob/main/doc/LOCAL_CONFIG.md";

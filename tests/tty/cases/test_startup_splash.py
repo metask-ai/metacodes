@@ -1,4 +1,4 @@
-"""启动动画(src/repl/tui/splash.zig + splash_player.zig)在真二进制上的 L2 证据。
+"""启动动画(apps/cli/src/repl/tui/splash.zig + splash_player.zig)在真二进制上的 L2 证据。
 
 动画默认开;tty_driver 为其它用例默认关(METACODES_NO_STARTUP_ANIMATION=1),本文件经
 env 传 None 打开。断言的都是用户看得见的结果:原地重绘了几十帧、定格的 "Metask Lab"

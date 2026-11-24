@@ -4,7 +4,7 @@
 //! continuation request) is marked `host` by the real `agent_loop.run`, still
 //! reaches the model as a user turn, survives the transcript, and the replay
 //! of the resumed conversation leaves it out while keeping the turns around
-//! it (src/repl/replay.zig).
+//! it (apps/cli/src/repl/replay.zig).
 
 const std = @import("std");
 const harness = @import("harness");

@@ -89,9 +89,9 @@ fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("metacodes
 
 /// How the REPL starts.
 pub const Startup = struct {
-    /// `--resume <id>`: what src/main.zig restored before the REPL started.
+    /// `--resume <id>`: what apps/cli/src/main.zig restored before the REPL started.
     resumed: ?app_mod.App.ResumedConversation = null,
-    /// The startup splash, as src/main.zig left it.
+    /// The startup splash, as apps/cli/src/main.zig left it.
     splash: Splash = .not_started,
     /// The descriptor the prompt reads: stdin, or a pipe in tests.
     input_fd: c_int = 0,

@@ -301,7 +301,7 @@ a service that accepts and never answers.
 
 A CLI session needs no `metacodes kgd`. When its readiness probe finds the
 install's service unconfigured or not listening, the host
-(`src/app/kg_autostart.zig`, through `KgClient.Autostart`) does, under one
+(`apps/cli/src/app/kg_autostart.zig`, through `KgClient.Autostart`) does, under one
 cross-process lock per state root (`<state root>/kg/kgd.autostart.lock`):
 
 1. provision it like `kg install` when the default `<state root>/kg/daemon.json`

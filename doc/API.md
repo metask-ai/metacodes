@@ -307,7 +307,7 @@ path unchanged.
 ## Session command surface (UI-neutral)
 
 All three interactive hosts (terminal REPL, `--web`, `serve`/`serve --sessions N`)
-share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
+share one input pipeline (`apps/cli/src/session_intent.zig` + `apps/cli/src/session_service.zig`):
 
     raw input → session_intent.parse → InputIntent
       → SessionService.dispatch (validate → mutate → optional RunPlan)
@@ -693,7 +693,7 @@ the executable belongs to up to date from the source its install record names
 the working directory (an id or id prefix, the rule `/resume <id>` uses) with
 its conversation, goal and model route restored, and appends to the same
 transcript. Under the banner, the REPL writes the conversation back as its
-turns were shown live (`src/repl/replay.zig`: prompts, replies and tool cards
+turns were shown live (`apps/cli/src/repl/replay.zig`: prompts, replies and tool cards
 through the live rendering paths; at most the last 200 messages, opening at a
 typed prompt, after a dim count of the rest; Ctrl+O shows all of it). What the
 live view never showed stays out: messages the runtime wrote itself
@@ -1141,7 +1141,7 @@ serializes byte-identically to before.
 `metacodes serve [port]` (one session) and `metacodes serve --sessions N
 [--max-sessions M] [--uds <path>] [port]` (the multi-session daemon: N
 sessions at startup, N ≥ 0, then created and destroyed over HTTP, at most M
-live) serve one HTTP/1.1 surface (`src/web/server.zig`). Port 0 lets the
+live) serve one HTTP/1.1 surface (`apps/cli/src/web/server.zig`). Port 0 lets the
 kernel pick; the startup line prints the address actually bound,
 `<label>: http://<address>:<port>  (Ctrl+C to quit)`.
 

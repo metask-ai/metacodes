@@ -12,7 +12,7 @@
 - `headless.zig` / `stream_json_backend.zig` — `-p/--print` 无 REPL 运行与
   NDJSON 输出。
 - `tui/` — 状态驱动 TUI(架构见
-  [doc/TUI_STATE_ARCHITECTURE.md](../../doc/TUI_STATE_ARCHITECTURE.md);
+  [doc/TUI_STATE_ARCHITECTURE.md](../../../../doc/TUI_STATE_ARCHITECTURE.md);
   谁能往屏幕和 scrollback 写字节见
-  [doc/TUI_VIEWPORT_OWNERSHIP.md](../../doc/TUI_VIEWPORT_OWNERSHIP.md),
+  [doc/TUI_VIEWPORT_OWNERSHIP.md](../../../../doc/TUI_VIEWPORT_OWNERSHIP.md),
   `zig build test:scrollback` 执行)。

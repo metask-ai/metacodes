@@ -6,7 +6,7 @@
 //!   - `install --help` prints the option names of the installer contract
 //!     (doc/UPDATE_DESIGN.md §4), or `METACODES_UPDATE_PROBE_HELP` instead;
 //!   - `--help` names the `update` command;
-//!   - `install …` runs the real installer (src/app/install.zig) from the unit
+//!   - `install …` runs the real installer (apps/cli/src/app/install.zig) from the unit
 //!     around this executable, without the `doctor --strict` self check, unless
 //!     `METACODES_UPDATE_PROBE_EXIT` asks for a failure exit first;
 //!   - `sleep <ms>` stands for a session: it runs from the prefix and waits;

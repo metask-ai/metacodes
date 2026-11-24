@@ -3,7 +3,7 @@
 //!
 //! A fixture release is a real unit directory — manifest v2, file digests —
 //! whose `bin/metacodes` is `zig-out/bin/update_unit_probe`: its `install`
-//! runs the real installer (src/app/install.zig, no doctor), every other call
+//! runs the real installer (apps/cli/src/app/install.zig, no doctor), every other call
 //! is only recorded. The mirror serves `latest` as a 302 to `…/tag/<v>`, the
 //! release's SHA256SUMS and its archive (`.tar.gz`, `.zip` on Windows), and
 //! records every request. So each test sees what update sent over the wire,

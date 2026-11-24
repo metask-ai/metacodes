@@ -14,7 +14,7 @@ inventory below is the record that nothing was dropped on the way.
 | Transport adapters | `transport.zig`, `transport_stdio.zig`, `transport_http.zig`, `transport_sse.zig`, `host_transport.zig`, `oauth.zig`, `url.zig` | stdio, Streamable HTTP, HTTP+SSE, a Host connection. One message-stream interface |
 | Connection and catalog management | `runtime.zig`, `instance_pool.zig`, `catalog.zig` | A connected server with its canonical catalog, leases, immutable generations, refresh, expiry, declarative apply |
 | Shared runtime integration | `core/tool_exec` (the kernel), `tool_invocation.zig`, `agentcore/mcp_session.zig`, `registry_bridge.zig` | Tool selection, permission, budget, result admission. Every call ends in `McpClient.invokeTool` under the same kernel |
-| CLI/App | `src/app.zig`, `src/app/mcp_startup.zig`, `src/app/mcp_cli.zig`, `src/mcp/config.zig`, `launch.zig`, `naming.zig`, `param_headers.zig` | Configuration imports, startup policy, status presentation |
+| CLI/App | `apps/cli/src/app.zig`, `apps/cli/src/app/mcp_startup.zig`, `apps/cli/src/app/mcp_cli.zig`, `src/mcp/config.zig`, `launch.zig`, `naming.zig`, `param_headers.zig` | Configuration imports, startup policy, status presentation |
 | AgentCore facade | `src/agentcore/abi_v1.zig`, `mcp_session.zig`, `mcp_checkpoint.zig` | Public contracts, handles, ABI conversion, callback bridging, Session selection, checkpoints |
 
 `zig build test:mcp` builds and runs the shared module alone, and

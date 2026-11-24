@@ -7,7 +7,7 @@ install with its own state root.
 .DESCRIPTION
 This script only unpacks (and refuses a downgrade for a release up to 0.5.0,
 whose own install does not); the install itself is `bin\metacodes.exe install`
-inside the unit (src/app/install.zig), the same code on every platform
+inside the unit (apps/cli/src/app/install.zig), the same code on every platform
 (doc/INSTALL_DESIGN.md §4). By default the install's bin directory is added
 to the user PATH so `metacodes` runs in any new terminal; -NoPath skips that.
 An archive with an `<archive>.sha256` sidecar beside it is checked first.
@@ -78,7 +78,7 @@ function Expand-Unit([string]$Path, [string]$Name, [string]$Work) {
 
 # BEGIN version order
 # Whether version $Candidate precedes $Installed in semantic-version order, as
-# the installer itself orders them (src/app/install.zig isOlder over
+# the installer itself orders them (apps/cli/src/app/install.zig isOlder over
 # std.SemanticVersion): pre-releases before their release, build metadata
 # ignored, and a version that does not parse is never older. install.sh
 # version_older mirrors it; scripts/tests/test_install_scripts.py checks both

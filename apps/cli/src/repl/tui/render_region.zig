@@ -1916,7 +1916,7 @@ pub const RenderRegion = struct {
     /// does (`/clear`, `/resume` print first). ED 2 clears the screen and
     /// leaves the scrollback in place; ED 3 would wipe it, the user's history
     /// from before the session included, and is never sent. This is the one
-    /// place in src/repl that erases more than ED 0 (doc/TUI_VIEWPORT_OWNERSHIP.md).
+    /// place in apps/cli/src/repl that erases more than ED 0 (doc/TUI_VIEWPORT_OWNERSHIP.md).
     pub fn resetScreen(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();

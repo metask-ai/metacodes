@@ -53,7 +53,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 ## 结构
 
 - `screen.py` —— 终端模拟器:最小 ANSI 解释器(CSI A/C/G/K/H/m + \r\n 底部上滚)
-  → 虚拟 grid + 光标 + SGR border_class;`char_width` 复刻 `src/repl/tui/term.zig` 的 CJK/emoji 宽度表。
+  → 虚拟 grid + 光标 + SGR border_class;`char_width` 复刻 `apps/cli/src/repl/tui/term.zig` 的 CJK/emoji 宽度表。
   它的 Zig 移植 `tests/component/vterm.zig` 给组件测试用(不起 pty)。两者由 golden 向量钉成同一行为:
   `vterm_parity.py` 用 screen.py 回放一组固定字节流(手写语义用例 + 固定 seed 随机流)写出
   `tests/fixtures/vterm/screen_parity.jsonl`,`cases/test_vterm_parity.py` 检查它仍是 screen.py 的答案,

@@ -54,8 +54,7 @@ test "model routing source guard rejects direct case-sensitive model matching" {
         @embedFile("dialects/qwen.zig"),          @embedFile("dialects/minimax.zig"),      @embedFile("dialects/mistral.zig"),
         @embedFile("dialects/openrouter.zig"),    @embedFile("dialects/gemini.zig"),       @embedFile("dialects/registry.zig"),
         @embedFile("dialects/openai_compat.zig"), @embedFile("model_context.zig"),         @embedFile("../util/pricing.zig"),
-        @embedFile("../util/model.zig"),          @embedFile("../core/system_prompt.zig"), @embedFile("../repl/model_command.zig"),
-        @embedFile("../main.zig"),                @embedFile("../plugin/runtime.zig"),
+        @embedFile("../util/model.zig"),          @embedFile("../core/system_prompt.zig"), @embedFile("../plugin/runtime.zig"),
     };
     const forbidden = [_][]const u8{
         "std.mem.indexOf(u8, model", "std.mem.eql(u8, model", "std.mem.startsWith(u8, model", "std.mem.eql(u8, e.model_id",

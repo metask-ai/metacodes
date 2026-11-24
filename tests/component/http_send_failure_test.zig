@@ -277,6 +277,7 @@ test "L2 send failure: every HTTP send in src goes through http_connection" {
         files.deinit(allocator);
     }
     try collectZigFiles(allocator, "src", &files);
+    try collectZigFiles(allocator, "apps", &files);
     try std.testing.expect(files.items.len > 100);
 
     var scan: SendScan = .{};

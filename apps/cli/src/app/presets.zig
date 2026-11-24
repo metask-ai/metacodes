@@ -25,7 +25,7 @@
 //!   effort for this run; `--provider` and `--offer` name a route of their
 //!   own (level 1), and the preset is not applied. Nothing is written back.
 //!
-//! Host-only, like the rest of `src/app/`.
+//! Host-only, like the rest of `apps/cli/src/app/`.
 
 const std = @import("std");
 const types = @import("metacodes-internal").types;

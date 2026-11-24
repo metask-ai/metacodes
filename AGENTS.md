@@ -38,12 +38,12 @@ These rules apply to the entire repository.
   `std.Thread.spawn`: std's 16 MiB default stack is a 16 MiB commit per thread
   on Windows. Pick the `Stack` class by what the thread runs; outside test
   blocks `zig build test:thread-stack` enforces it.
-- The REPL's SIGWINCH handler has no SA_RESTART either. In `src/repl/`, read
+- The REPL's SIGWINCH handler has no SA_RESTART either. In `apps/cli/src/repl/`, read
   keys through `input.readKey` or check `input.retryInterruptedRead` right
   after a raw read, and write to the terminal through `pfs.writeAll`; a call
   that cannot see EINTR says `// no EINTR: <reason>` on its line
   (`zig build test:terminal-io` enforces it).
-- The TUI's scrollback has no undo: in `src/repl/`, only the Renderer
+- The TUI's scrollback has no undo: in `apps/cli/src/repl/`, only the Renderer
   (`RenderRegion`) erases the screen or writes past the inline region. Erase
   with ED 0, reset the screen only through `RenderRegion.resetScreen`, climb
   with relative moves instead of saving the cursor, and send scrollback text
@@ -159,7 +159,7 @@ all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
 - Document it in the same change: the feature table in
   [doc/API.md](doc/API.md#preview-features), the feature list in
   [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#preview-features), the `--preview`
-  help text in `src/main.zig`, and `CHANGELOG.md`.
+  help text in `apps/cli/src/main.zig`, and `CHANGELOG.md`.
 - The AgentCore ABI has no per-feature selection: `RuntimeConfigV1.preview = 1`
   enables every feature. Adding one there is an ABI revision.
 

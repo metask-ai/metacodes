@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Where product Zig lives. `src` is the binary and its library; the rest ship or
 # build with it. Missing `src` is an error, not an empty scan.
-SCAN_ROOTS = ("src", "sdk", "lib", "example", "scripts")
+SCAN_ROOTS = ("src", "apps", "sdk", "lib", "example", "scripts")
 SKIPPED_DIRS = {".git", ".zig-cache", "zig-out", ".lake", "node_modules", "deps", "vendor"}
 
 # Cleartext destinations the product is allowed to name, keyed by
@@ -231,7 +231,7 @@ class BuiltinEgressDisciplineTest(unittest.TestCase):
 
     def test_the_cli_decision_is_off_and_is_what_main_and_doctor_read(self):
         runtime = (ROOT / "src" / "jev" / "runtime.zig").read_text(encoding="utf-8")
-        main = (ROOT / "src" / "main.zig").read_text(encoding="utf-8")
+        main = (ROOT / "apps" / "cli" / "src" / "main.zig").read_text(encoding="utf-8")
         self.assertRegex(runtime, r"pub const CLI_USES_BUILTIN_DEFAULT = false;")
         # The session and doctor both take it from the constant, so they cannot disagree.
         self.assertIn("config.jev_builtin_default = @import(\"metacodes-internal\").jev.runtime.CLI_USES_BUILTIN_DEFAULT;", main)

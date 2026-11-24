@@ -164,11 +164,11 @@ pub const UiBackend = struct {
 - `src/core/protocol/ui_event.zig` —— CoreEvent / UiEvent / Phase(原 repl/ui_event.zig)
 - `src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
 - `src/core/protocol/ui_request.zig` —— UiRequest/UiResponse/UiRequestFn(原 repl/ui_request.zig)
-- `src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
+- `apps/cli/src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
 - `src/core/writer_backend.zig` —— WriterBackend(print-only sink)
 - `src/core/headless_backend.zig` —— HeadlessBackend(JSON 行)
 - `src/core/agent_loop.zig` —— `run(... backend: *const UiBackend ...)`,只发 CoreEvent
-- `src/repl/loop.zig` —— 编排:构造 backend、startInput/stopInput
+- `apps/cli/src/repl/loop.zig` —— 编排:构造 backend、startInput/stopInput
 
 
 ## 6. 可测试性(本框架最大收益之一)

@@ -228,7 +228,7 @@ pub const cursor = struct {
     pub const home = "\x1b[H"; // (1, 1)
     // 无 save/restore(DECSC/DECRC、SCO 的 CSI s/u):保存的是绝对屏幕行,区画在屏底时帧内
     // \r\n 滚屏后它不跟着滚(Warp 也不还原 DECRC)。回区顶用相对上移(reflow.Anchor),见
-    // doc/TUI_VIEWPORT_OWNERSHIP.md;`zig build test:scrollback` 禁止它们回到 src/repl。
+    // doc/TUI_VIEWPORT_OWNERSHIP.md;`zig build test:scrollback` 禁止它们回到 apps/cli/src/repl。
 
     /// 移动到 (row, col),1-based。`\x1b[{R};{C}H`。
     pub fn move(row: u32, col: u32, buf: []u8) []const u8 {

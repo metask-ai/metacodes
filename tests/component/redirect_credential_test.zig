@@ -445,6 +445,7 @@ test "L2 redirect: every HTTP request in src names its redirect policy" {
         files.deinit(allocator);
     }
     try collectZigFiles(allocator, "src", &files);
+    try collectZigFiles(allocator, "apps", &files);
     try std.testing.expect(files.items.len > 100);
 
     var sites: usize = 0;

@@ -443,7 +443,7 @@ defer catalog.deinit();
 
 const arguments_json = try sdk.encodeSkillArguments(
     allocator,
-    &.{ "src/main.zig", "deep" },
+    &.{ "apps/cli/src/main.zig", "deep" },
 );
 defer allocator.free(arguments_json);
 ```

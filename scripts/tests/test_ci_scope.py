@@ -156,8 +156,8 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(ci_scope.document_checks("full", [], inputs), (True, True))
 
     def test_protocol_document_relocation_cannot_change_other_inputs(self) -> None:
-        before = {"implementation_paths": ["src/main.zig", "doc/A.md"], "budget": 0}
-        moved = {"implementation_paths": ["src/main.zig", "doc/B.md"], "budget": 0}
+        before = {"implementation_paths": ["apps/cli/src/main.zig", "doc/A.md"], "budget": 0}
+        moved = {"implementation_paths": ["apps/cli/src/main.zig", "doc/B.md"], "budget": 0}
         self.assertTrue(ci_scope.protocol_documents_only(before, moved))
         for after in ({**moved, "budget": 1}, {**moved, "budget": False},
                       {**moved, "implementation_paths": ["src/other.zig", "doc/B.md"]}):
@@ -176,9 +176,9 @@ class ClassifyTest(unittest.TestCase):
                 self.assertEqual(ci_scope.classify(paths)[0], "eval")
 
     def test_anything_else_is_the_full_scope_and_is_named(self) -> None:
-        scope, reason = ci_scope.classify(["scripts/eval/cli.py", "src/main.zig"])
+        scope, reason = ci_scope.classify(["scripts/eval/cli.py", "apps/cli/src/main.zig"])
         self.assertEqual(scope, "full")
-        self.assertIn("src/main.zig", reason)
+        self.assertIn("apps/cli/src/main.zig", reason)
         self.assertNotIn("scripts/eval/cli.py", reason)
         for path in ("build.zig", "scripts/release_cut.py", ".github/workflows/ci.yml", "tests/tty/tty_driver.py", "scripts/evaluate.py"):
             with self.subTest(path=path):
@@ -297,7 +297,7 @@ class MainTest(unittest.TestCase):
     def test_summary_escapes_paths_and_does_not_truncate_the_decision(self) -> None:
         name = "doc/a|`<img>.md"
         destination = self.repo / "report.md"
-        changes = [("M", name)] + [("M", f"doc/{i}.md") for i in range(200)] + [("M", "src/main.zig")]
+        changes = [("M", name)] + [("M", f"doc/{i}.md") for i in range(200)] + [("M", "apps/cli/src/main.zig")]
         scope, reason = ci_scope.classify([path for _, path in changes])
         ci_scope.write_summary(str(destination), "pull_request", "base", "HEAD", scope, reason, changes)
         summary = destination.read_text(encoding="utf-8")

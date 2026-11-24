@@ -2,10 +2,10 @@
 when the release unit predates that check in `metacodes install` (releases up
 to 0.5.0), and leave the decision to a unit that carries it.
 
-Both scripts copy the installer's semantic-version order (src/app/install.zig
+Both scripts copy the installer's semantic-version order (apps/cli/src/app/install.zig
 `isOlder` over std.SemanticVersion): install.sh `version_older` (sh + awk) and
 install.ps1 `Test-OlderVersion`. They are held to the rows of
-src/app/install.zig `version_order_cases`, the table `isOlder` itself is tested
+apps/cli/src/app/install.zig `version_order_cases`, the table `isOlder` itself is tested
 against, so the three cannot drift apart unnoticed.
 
 install.sh runs end to end against a stand-in release unit whose executable
@@ -40,7 +40,7 @@ INSTALL_ZIG = ROOT / "src" / "app" / "install.zig"
 
 def order_cases():
     """(candidate, installed, candidate precedes installed) rows of
-    `version_order_cases` in src/app/install.zig."""
+    `version_order_cases` in apps/cli/src/app/install.zig."""
     text = INSTALL_ZIG.read_text(encoding="utf-8")
     block = text.split("// BEGIN version order cases", 1)[1].split("// END version order cases", 1)[0]
     rows = [(a, b, c == "true") for a, b, c in re.findall(r'\.\{ "([^"]*)", "([^"]*)", (true|false) \}', block)]

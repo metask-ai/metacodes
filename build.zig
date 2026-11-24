@@ -933,7 +933,7 @@ pub fn build(b: *std.Build) void {
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
     const release_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("apps/cli/src/main.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
@@ -945,7 +945,7 @@ pub fn build(b: *std.Build) void {
         // (doc/PERF_MEMORY_PRINCIPLES.md §3f). Windows x64 needs its unwind
         // data for SEH; macOS is left as is.
         .unwind_tables = if (target.result.os.tag == .linux) std.builtin.UnwindTables.none else null,
-        // With symbols the link keeps DWARF for the split below. src/main.zig
+        // With symbols the link keeps DWARF for the split below. apps/cli/src/main.zig
         // turns stack tracing off for every ReleaseSmall build, which DWARF
         // would otherwise switch on (~100 KB), so the code stays within a few
         // bytes of a stripped link's.
@@ -1002,7 +1002,7 @@ pub fn build(b: *std.Build) void {
     // but formal blocks are observed rather than actuated.  There is no env or
     // CLI switch and this artifact is deliberately absent from default install.
     const project_harness_shadow_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("apps/cli/src/main.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
@@ -1253,7 +1253,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const debug_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("apps/cli/src/main.zig"),
         .target = target,
         .optimize = .Debug,
         .link_libc = true,
@@ -1280,7 +1280,7 @@ pub fn build(b: *std.Build) void {
     // 复用 debug_mod(少一个模块实例,非少一次编译)。
     const test_cc_mod = if (optimize == .Debug) debug_mod else blk: {
         const m2 = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("apps/cli/src/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -1336,10 +1336,10 @@ pub fn build(b: *std.Build) void {
     const install_selfexe_probe = b.addInstallArtifact(selfexe_probe_exe, .{});
 
     // update_unit_probe 二进制:`metacodes update` 组件测试里 fixture release unit 的
-    // `bin/metacodes`。`install …` 跑真安装器(src/app/install.zig,不做 doctor 自检),
+    // `bin/metacodes`。`install …` 跑真安装器(apps/cli/src/app/install.zig,不做 doctor 自检),
     // 其余调用只记 argv;只链 platform + 安装器那一小块,不拖整个 app 图。
     const install_probe_root_mod = b.createModule(.{
-        .root_source_file = b.path("src/install_root.zig"),
+        .root_source_file = b.path("apps/cli/src/install_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -2413,7 +2413,7 @@ pub fn build(b: *std.Build) void {
     // may import only what their doc comments say, and so may every file they
     // reach; nothing metacodes-core reaches from `src/lib.zig` may import the
     // application side beyond a baseline that only shrinks (#448), and no
-    // file under `src/daemon/` or `src/web/` may import the AgentLoop beyond
+    // file under `apps/cli/src/daemon/` or `apps/cli/src/web/` may import the AgentLoop beyond
     // another such baseline (#445). The
     // compile-from-a-narrow-root gates and `test:lib` cannot enforce it: their
     // module root is `src/`, so any file under it is importable, and lazy
@@ -2448,7 +2448,7 @@ pub fn build(b: *std.Build) void {
     // provider kernel and the terminal theme is enforced by
     // `subsystem:boundary`.
     const picker_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/picker_test_root.zig"),
+        .root_source_file = b.path("apps/cli/src/picker_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -2867,7 +2867,7 @@ pub fn build(b: *std.Build) void {
     const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
     units_test_step.dependOn(&rule_control_test_cmd.step);
-    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
+    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "apps", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
     else
@@ -3790,7 +3790,7 @@ pub fn build(b: *std.Build) void {
     }
 
     _ = b.addFmt(.{
-        .paths = &.{"src/"},
+        .paths = &.{ "src/", "apps/" },
         .exclude_paths = &.{},
     });
 
