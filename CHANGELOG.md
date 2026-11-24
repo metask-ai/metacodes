@@ -254,6 +254,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A provider overload is retried like a 503.** HTTP 529 was an unnamed
+  status that ended the turn after one attempt; it is now
+  `ServiceUnavailable` and goes through the connect retry (attempt limit,
+  backoff, `Retry-After`). An overload declared inside an accepted stream
+  (Anthropic's `overloaded_error` frame, an OpenAI-compatible or Gemini
+  `error` object, a Responses `response.failed`, a Bedrock
+  `serviceUnavailableException`) ends the stream as `ServiceUnavailable` too,
+  and the agent loop re-sends the request with the same attempt limit and
+  backoff unless a tool call had started. When the attempts run out the
+  failure reads `API 错误帧(重试 N 次后放弃): …`, as the HTTP path does. This
+  holds for `-p`, the TUI, `serve`/`--web` and AgentCore sessions.
+
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to
   `http://localhost:1455`, which on a machine reached over SSH is not where

@@ -1415,6 +1415,7 @@ pub const EventIterator = struct {
                         self.context_window_numbers = error_class.parseContextWindowNumbers(err_obj);
                         return error.ContextWindowExceededEvent;
                     }
+                    if (model_error.isOverloaded(err_obj)) return error.OverloadedEvent;
                     return error.ApiErrorEvent;
                 },
                 // ping / unknown → 跳过
