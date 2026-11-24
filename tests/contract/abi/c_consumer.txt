@@ -1,0 +1,5 @@
+$ agentcore-contract-c-consumer <AGENTCORE_SHARED>
+exit: 0
+--- stdout
+AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, stream retry budget, rewind to a user message, goal, host-scheduled team, credential rotation and lifecycle OK
+--- stderr

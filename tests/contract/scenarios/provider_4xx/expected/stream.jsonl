@@ -1,0 +1,3 @@
+{"type":"turn_begin","turn":1}
+{"type":"run_end","turns":0,"tool_calls":0,"stop_reason":"api_error"}
+{"type":"result","stop_reason":"api_error","turns":0,"tool_calls":0,"continuations":0,"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cost_usd":0.000000,"usage_status":"unknown","text":"","text_kind":"none","file_changes":{"schema_version":"metacodes-file-change-v1","truncated":false,"changes":[]}}

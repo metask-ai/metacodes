@@ -21,6 +21,8 @@ import json
 import math
 import re
 import secrets
+import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -318,7 +320,8 @@ def subject_alt_names(*hosts):
 class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
                  auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None,
-                 token=None, record=True, judge_token=None, judge_credential=None, connect=None):
+                 token=None, record=True, judge_token=None, judge_credential=None, connect=None,
+                 cert_dir=None, listener=None, sequence=0):
         # `credential` is the real upstream credential (a string or a source
         # with current()/refresh(stale)); `token` is the placeholder the
         # containers present (a fresh one when omitted). `record=False`
@@ -328,6 +331,10 @@ class TimingRelay:
         # `public_host` is the address containers dial when it differs from
         # the bind address: Colima's VM reaches the Mac's loopback through
         # its user-mode gateway (host.lima.internal, 192.168.5.2).
+        # `cert_dir` keeps the TLS key and CA in a directory that outlives
+        # this process (reused when they are already there), and `listener`
+        # is a listening socket to serve instead of binding a new one: a
+        # newer driver takes over a running relay with both (remote.py).
         public_host = public_host or bind
         origin = urlsplit(target)
         if origin.scheme not in ("http", "https") or not origin.hostname or origin.username or origin.password or origin.query or origin.fragment:
@@ -344,9 +351,17 @@ class TimingRelay:
         self.recording = record
         self.metrics_dir = Path(metrics_dir)
         self.lock = threading.Lock()
-        self.sequence = 0
+        self.sequence = sequence
         self.cert_dir = None
         self.ca_path = None
+        # `busy`: connections in a TLS handshake, before their first request
+        # or in one; `idle`: those between keep-alive requests. One lock, so
+        # draining never misses a connection turning busy.
+        self.connections = threading.Condition()
+        self.busy = set()
+        self.idle = set()
+        self.draining = False
+        self.serving = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -366,6 +381,20 @@ class TimingRelay:
                         self.upstream.close()
                 finally:
                     super().finish()
+
+            def handle(self):
+                self.close_connection = True
+                self.handle_one_request()
+                while not self.close_connection and owner.rest(self.request):
+                    self.handle_one_request()
+
+            def parse_request(self):
+                if not owner.wake(self.request):
+                    # Arrived on an idle connection once draining began: not
+                    # forwarded, so the client may send it again elsewhere.
+                    self.close_connection = True
+                    return False
+                return super().parse_request()
 
             def do_GET(self):
                 self.forward(False)
@@ -438,6 +467,9 @@ class TimingRelay:
                         if name.lower() not in HOP:
                             self.send_header(name, value)
                     self.send_header("Transfer-Encoding", "chunked")
+                    if owner.draining:
+                        self.send_header("Connection", "close")
+                        self.close_connection = True
                     self.end_headers()
                     while True:
                         chunk = response.read1(65536)
@@ -491,6 +523,7 @@ class TimingRelay:
 
             def get_request(self):
                 connection, address = super().get_request()
+                connection.setblocking(True)  # BSD sockets inherit the listener's O_NONBLOCK
                 if owner.tls_context:
                     try:
                         connection = owner.tls_context.wrap_socket(
@@ -498,29 +531,60 @@ class TimingRelay:
                     except Exception:
                         connection.close()
                         raise
+                with owner.connections:
+                    owner.busy.add(connection)
                 return connection, address
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    with owner.connections:
+                        owner.busy.discard(request)
+                        owner.idle.discard(request)
+                        owner.connections.notify_all()
 
             def handle_error(self, request, client_address):
                 if not isinstance(sys.exc_info()[1], (ssl.SSLError, TimeoutError)):
                     super().handle_error(request, client_address)
 
         self.tls_context = None
-        self.server = DirectServer((bind, port), Handler)
+        reused = False
+        if listener is None:
+            self.server = DirectServer((bind, port), Handler)
+        else:
+            self.server = DirectServer(listener.getsockname()[:2], Handler, bind_and_activate=False)
+            self.server.socket.close()
+            self.server.socket = listener
+            self.server.server_name, self.server.server_port = listener.getsockname()[:2]
+        # Another process may accept on the same socket: a woken accept()
+        # that finds nothing there must not block.
+        self.server.socket.setblocking(False)
         self.server.daemon_threads = True
         try:
             if tls:
-                self.cert_dir = tempfile.TemporaryDirectory(prefix="metacodes-bench-relay-")
-                self.ca_path = Path(self.cert_dir.name) / "ca.pem"
-                key = Path(self.cert_dir.name) / "key.pem"
-                config = Path(self.cert_dir.name) / "openssl.cnf"
-                # Zig 0.16 verifies dNSName SANs only; retain
-                # the IP SAN for other TLS clients as well.
-                config.write_text("[req]\ndistinguished_name = dn\nx509_extensions = relay\n[dn]\n[relay]\n"
-                                  "basicConstraints = critical,CA:TRUE\n"
-                                  "subjectAltName = " + subject_alt_names(public_host, bind) + "\n", encoding="ascii")
-                subprocess.run(["openssl", "req", "-x509", "-config", str(config), "-newkey", "rsa:2048", "-sha256", "-days", "2",
-                                "-nodes", "-subj", "/CN=metacodes-bench-relay", "-keyout", str(key), "-out", str(self.ca_path)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if cert_dir is None:
+                    self.cert_dir = tempfile.TemporaryDirectory(prefix="metacodes-bench-relay-")
+                    directory = Path(self.cert_dir.name)
+                else:
+                    self.cert_dir = directory = Path(cert_dir)
+                    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                self.ca_path = directory / "ca.pem"
+                key = directory / "key.pem"
+                reused = self.ca_path.is_file() and key.is_file()
+                if not reused:
+                    config = directory / "openssl.cnf"
+                    # Zig 0.16 verifies dNSName SANs only; retain
+                    # the IP SAN for other TLS clients as well.
+                    config.write_text("[req]\ndistinguished_name = dn\nx509_extensions = relay\n[dn]\n[relay]\n"
+                                      "basicConstraints = critical,CA:TRUE\n"
+                                      "subjectAltName = " + subject_alt_names(public_host, bind) + "\n",
+                                      encoding="ascii")
+                    subprocess.run(["openssl", "req", "-x509", "-config", str(config), "-newkey", "rsa:2048",
+                                    "-sha256", "-days", "2", "-nodes", "-subj", "/CN=metacodes-bench-relay",
+                                    "-keyout", str(key), "-out", str(self.ca_path)],
+                                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    key.chmod(0o600)
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 context.load_cert_chain(str(self.ca_path), str(key))
                 # Handshakes run in request threads, so an idle TCP probe
@@ -528,10 +592,16 @@ class TimingRelay:
                 self.tls_context = context
         except Exception:
             self.server.server_close()
-            if self.cert_dir:
-                self.cert_dir.cleanup()
+            if not reused:  # a running relay's files are not this one's to remove
+                self.remove_files()
             raise
         self.url = f"{'https' if tls else 'http'}://{public_host}:{self.server.server_port}"
+
+    def remove_files(self):
+        if isinstance(self.cert_dir, tempfile.TemporaryDirectory):
+            self.cert_dir.cleanup()
+        elif self.cert_dir is not None:
+            shutil.rmtree(self.cert_dir, ignore_errors=True)
 
     def record(self, trial, metric):
         with self.lock:
@@ -541,19 +611,69 @@ class TimingRelay:
 
     def __enter__(self):
         try:
-            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+            self.resume()
         except RuntimeError:
             self.server.server_close()
-            if self.cert_dir:
-                self.cert_dir.cleanup()
+            self.remove_files()
             raise
         return self
 
     def __exit__(self, *_args):
-        self.server.shutdown()
+        self.pause()
         self.server.server_close()
-        if self.cert_dir:
-            self.cert_dir.cleanup()
+        self.remove_files()
+
+    def resume(self):
+        """Accept connections (again)."""
+        self.draining = False
+        self.serving = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.serving.start()
+
+    def pause(self):
+        """Stop accepting; the listening socket stays open (and shared)."""
+        if self.serving is not None:
+            self.server.shutdown()
+            self.serving = None
+
+    def rest(self, connection):
+        """A response is done: wait for the connection's next request, or
+        False (close it) once draining."""
+        with self.connections:
+            if self.draining:
+                return False
+            self.busy.discard(connection)
+            self.idle.add(connection)
+            self.connections.notify_all()
+            return True
+
+    def wake(self, connection):
+        """A request line arrived: False when it came on an idle connection
+        after draining began."""
+        with self.connections:
+            if connection in self.idle:
+                if self.draining:
+                    return False
+                self.idle.discard(connection)
+                self.busy.add(connection)
+            return True
+
+    def release(self):
+        """Once a newer driver serves the listening socket: finish every
+        handshake and request this relay accepted, however long a response
+        streams, each connection closing after its response; close the
+        connections idle between requests; then close this process's copy
+        of the socket. The TLS files stay for the new relay."""
+        self.pause()
+        with self.connections:
+            self.draining = True
+            for connection in self.idle:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            while self.busy:
+                self.connections.wait(1.0)
+        self.server.server_close()
 
 
 def route_problem(spec):

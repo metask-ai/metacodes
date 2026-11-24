@@ -42,13 +42,17 @@ do not start a service or call a model.
 
 ## Benchmarks
 
-The 新建评测 page groups the suites by category. `metacodes bench info` and
+The 新建评测 page groups the suites by category; each suite card and each
+selected suite's box show the suite's one-line description (what it tests,
+how it is scored, how many tasks), and so does the 榜单 page for the chosen
+suite. `metacodes bench info` and
 `GET /api/workbench` (`suites`, `categories`) list each suite with its task
 count and readiness; `GET /api/suite?id=<suite>` returns its task ids and
 default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 
 | Category | Suite id | Runner | Harbor 0.26 source | Tasks (cap per launch) |
 |---|---|---|---|---|
+| 软件工程 | `swe-bench-verified` | harbor-registry | `-d swe-bench/swe-bench-verified@2` | 500 (500) |
 | 代码生成 | `humaneval` | harbor-local | adapter `humaneval` (openai/human-eval, pinned) | 164 (164) |
 | 基础编程 | `mbpp` | harbor-local | adapter `mbpp` (full test split, pinned) | 500 (200) |
 | 基础编程 | `mbpp-sanitized` | harbor-local | adapter `mbpp_sanitized` (sanitized test split, pinned) | 257 (200) |
@@ -61,6 +65,7 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 终端工程 | `terminal-bench-2.0` | harbor-registry | `-d terminal-bench@2.0` | 89 (89) |
 | 终端工程 | `frontier-harness-eval-1.1` | harbor-registry | `-d frontier-harness-eval/frontier-harness-eval@v1.1.0` | 62 (62) |
 | 通用 Agent | `gaia2-cli` | harbor-local | adapter `gaia2_cli` (Harbor `adapters/gaia2 --cli`) | 800 (100) |
+| 客服对话 | `tau3-airline`, `tau3-retail`, `tau3-telecom`, `tau3-banking-knowledge` | harbor-registry | `-d sierra-research/tau3-bench@1`, one domain each | 50 / 114 / 114 / 97 (all) |
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
@@ -80,6 +85,27 @@ is in neither registry, so `gaia2-cli` runs a locally generated dataset with
 `-p`. Its tasks reach the agent's tools through an MCP sidecar
 (`[[environment.mcp_servers]]`), which the metacodes Harbor agent writes into
 the trial's `mcpServers`.
+
+`swe-bench-verified` and the `tau3-*` suites pin a Hub revision (`@2`,
+`@1`). Their task ids, read from that revision, are in
+`scripts/eval/harbor/suites/registry_tasks.json` (500 SWE-bench Verified
+instances named `<owner>__<repo>-<number>`; 375 τ³-bench tasks named
+`tau3-bench__tau3-<domain>-...`, up to 238 characters, which is why task ids
+may be up to 255 characters). taubench.com scores each τ³ domain on its own,
+so each domain is one suite over the same dataset.
+
+τ³-bench tasks talk to an LLM-simulated customer through an MCP sidecar
+(`tau3-runtime`), and the banking verifier grades natural-language
+assertions with an LLM. Both read the execution host's `OPENAI_API_KEY`
+(required; readiness names it when missing) and optionally
+`OPENAI_BASE_URL`, `TAU2_USER_MODEL` (default `gpt-5.2`, as on
+taubench.com), `TAU2_USER_REASONING_EFFORT` and `TAU2_NL_ASSERTIONS_MODEL`,
+in every authentication mode; a suite's `required_env` and `host_env` in the
+catalog name them and SSH executors receive them like an adapter's
+`HOST_ENV`. Scores with another user model are not comparable with the
+public board. A launch is refused when the agent's key variable is one of
+these names (the worker replaces it with the run's relay placeholder, which
+the simulator would then receive); give the provider another `key_env`.
 
 `frontier-harness-eval-1.1` is the pinned task set of the
 [FrontierHarness Eval](https://frontierharness.org/) leaderboard (a Hub
@@ -280,6 +306,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
+| 正在运行的评测（换用新驱动） (`ssh` executors) | Runs `metacodes bench node upgrade <state_dir>/runs` with the node just installed: every run going on there is handed to a driver of that version without stopping it (see [Updating a node under running runs](#updating-a-node-under-running-runs)). A run whose driver predates this, or one the handoff fails for, goes on with its own driver, and the step says so |
 | 容器出网（经工作台） (`ssh` executors) | With `egress` other than `direct`: a container on a fresh user-defined Docker network fetches the workbench proxy's probe page through the forwarder and `ssh -R` (workbench mode), or connects to the site proxy. A tunnel port the executor cannot listen on is retried on another one, up to 5 ports, and then the step says the tunnel port could not be bound; any other failure names the gateway and the firewall to check |
 | 工作台 Harbor (`ssh` executors) | Harbor on the workbench machine itself, which downloads registry suites for SSH executors; installed with the local `uv` when missing, otherwise the command is reported |
 | psycopg | Only when `workbench.json` has `"store": {"backend": "postgres"}`: `pip install --user psycopg[binary]` pinned for the workbench's Python |
@@ -811,15 +838,50 @@ is still starting (its pid is in `runs/<name>/driver.pid`) `attach` exits
 without an event and the worker tries again. The new session then
 carries the events and control lines, the current access token, and the
 egress tunnel on a fresh `ssh -R` port, which the driver's forwarder follows.
-While no session is attached, the driver's and Harbor's output goes to
-`<state_dir>/runs/<name>/driver.log`. The run's terminal event is also kept
-there, so a session that attaches after Harbor exited still receives it. The
+Harbor runs under a small keeper process that writes its output to
+`<state_dir>/runs/<name>/harbor.log` and its exit status to `harbor.exit`
+there; the driver copies that output to the attached session, and while no
+session is attached its own output goes to `driver.log` there. The run's
+terminal event is also kept there, so a session that attaches after Harbor exited still receives it. The
 record counts the reattached sessions in `reconnects`. Both sides give up
 after 30 minutes (`METACODES_BENCH_RECONNECT_WINDOW` seconds on the
 workbench, which passes the value to the driver as the spec's
 `detach_grace`): the driver interrupts Harbor, so a lost connection never
 leaves trials running unsupervised, and the run fails with what is still on
 the executor.
+
+### Updating a node under running runs
+
+`metacodes bench setup --executor NAME` (its 正在运行的评测 step), or
+`metacodes bench node upgrade <state_dir>/runs/<name>/spec.json` run on the
+executor by the newer node, replaces the driver of a running Harbor run
+without interrupting it:
+
+- Harbor stays with its keeper, so its trials go on and the new driver reads
+  its exit status from the run directory.
+- The relay's TLS key and CA are in `runs/<name>/relay-tls/` (owner only),
+  so the CA path Harbor gave the containers stays valid. The old driver
+  passes every listening socket of the run to the new one over a Unix
+  socket next to the attach socket (SCM_RIGHTS): the relay, the egress
+  forwarder, the attach socket and that handoff socket itself. Nothing is
+  bound again, no address changes and no connection is refused, and the new
+  driver serves them all before it reports the takeover. It also takes over
+  the current access token, the placeholders and the request counter.
+- The old driver stops accepting and finishes what it had accepted, however
+  long it takes: TLS handshakes and requests in progress (a streaming model
+  response completes), and forwarded connections until they close or the
+  run ends. A keep-alive connection idle between requests is closed; a
+  request that still arrives on it is not forwarded, so the client can send
+  it again. Its session gets a `handoff` event, and the worker attaches to
+  the new driver with a fresh token and egress tunnel port. The old driver,
+  and with it the old session and its tunnel, ends only once the newest
+  driver has its own tunnel (passed back along several handoffs in a row),
+  so container egress has a path throughout.
+- A handoff that fails before the old driver let go (another handoff
+  version, the new driver dying, a run already ending or being cancelled)
+  leaves the run with the old driver. Runs started by a driver from before
+  node protocol 8, and WorkBuddy runs, finish with the driver that started
+  them.
 
 ### Network-restricted executors
 
@@ -1281,7 +1343,9 @@ tasks it scored, its source (name, URL, the date it was read, what its score
 means) and its entries (agent or harness, model, score in percent, and the
 standard error, cost per task and date when the source gives them). A board
 may list `tasks`, the part of the suite it scored (the AIME 2024 board on
-`aime`). On each board a finished job of the suite scores the mean reward of
+`aime`). SWE-bench Verified has two boards from swebench.com (mini-SWE-agent
+bash-only runs with cost, and other agents' submissions); each τ³ domain has
+the taubench.com text board for that domain (pass^1). On each board a finished job of the suite scores the mean reward of
 its finished trials on the board's tasks, an invalid trial counting 0, with
 cost per task as the mean over tasks of each task's mean priced cost; it is
 ranked when it covers at least 80% of those tasks, and a job ranked on no
@@ -1489,7 +1553,10 @@ Jobs refresh every ten seconds while active; per-trial trajectories become
 available when Harbor copies the agent logs back from the container.
 
 The run endpoint (`POST /api/runs`) accepts `suite`, `tasks`, `model`,
-`attempts`, `concurrency` and `features` (names from the 高级功能 list); the original `dataset:
+`attempts`, `concurrency`, `features` (names from the 高级功能 list) and an optional
+`max_tokens` (1024–131072), the output-token cap of each model request; `POST
+/api/profiles/run` takes the same `max_tokens` for every suite it queues. Without it
+metacodes uses the model's own cap (WorkBuddy runs keep 32768). The original `dataset:
 "terminal-bench/terminal-bench-2-1"` field is still accepted and means
 `suite: "terminal-bench-2.1"`. It takes task/model selections, not shell
 commands, paths, keys, or arbitrary Harbor flags. Full task names are passed as separate argv

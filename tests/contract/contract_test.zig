@@ -15,6 +15,7 @@ const Env = struct {
     mock_mcp: []const u8,
     agentcore_header: []const u8,
     agentcore_shared: []const u8,
+    c_consumer: []const u8,
     version: []const u8,
     tinykg: []const u8,
     tinykgd: []const u8,
@@ -27,6 +28,7 @@ const Env = struct {
             .mock_mcp = try required("METACODES_CONTRACT_MOCK_MCP"),
             .agentcore_header = try required("METACODES_CONTRACT_AGENTCORE_HEADER"),
             .agentcore_shared = try required("METACODES_CONTRACT_AGENTCORE_SHARED"),
+            .c_consumer = try required("METACODES_CONTRACT_C_CONSUMER"),
             .version = try required("METACODES_CONTRACT_VERSION"),
             .tinykg = try required("METACODES_TEST_TINYKG_BIN"),
             .tinykgd = try required("METACODES_TEST_TINYKGD_BIN"),
@@ -84,6 +86,22 @@ test "AgentCore C ABI: symbols the shared library exports" {
     try env.store().expect(a, "abi/exports.txt", try abi.exports(a, bytes));
 }
 
+test "AgentCore C ABI: a C consumer built from the shipped header alone runs against the shared library" {
+    const env = try Env.load();
+    var scratch: Scratch = undefined;
+    try scratch.init();
+    defer scratch.deinit();
+    const a = scratch.arena();
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    for ([_][]const u8{ env.c_consumer, env.agentcore_shared }) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    try argv.append(a, null);
+    const out = try cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 120_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, scratch.work);
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(a, "$ agentcore-contract-c-consumer <AGENTCORE_SHARED>\nexit: {d}\n--- stdout\n{s}--- stderr\n{s}", .{ out.exit_code, out.stdout, out.stderr });
+    const rules: normalize.Rules = .{ .literals = try literals(&scratch, env, &.{.{ .needle = env.agentcore_shared, .placeholder = "<AGENTCORE_SHARED>" }}) };
+    try env.store().expect(a, "abi/c_consumer.txt", try normalize.apply(a, text.items, rules));
+}
+
 const Scratch = struct {
     arena_state: std.heap.ArenaAllocator,
     root: []const u8,
@@ -127,10 +145,10 @@ const Run = struct {
     stderr: []const u8,
 };
 
-fn runCli(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []const []const u8) !Run {
+fn cliArgv(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []const []const u8) ![]const []const u8 {
     const a = scratch.arena();
-    var argv: std.ArrayList(?[*:0]const u8) = .empty;
-    const base = [_][]const u8{
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(a, &.{
         "/usr/bin/env",
         "-i",
         try std.fmt.allocPrint(a, "HOME={s}", .{scratch.home}),
@@ -141,14 +159,74 @@ fn runCli(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []co
         "METACODES_JEV_URL=off",
         "METACODES_NO_PROBE=1",
         "METACODES_NO_UPDATE_CHECK=1",
-    };
-    for (base) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
-    for (extra_env) |assignment| try argv.append(a, (try a.dupeZ(u8, assignment)).ptr);
-    try argv.append(a, (try a.dupeZ(u8, env.cli)).ptr);
-    for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    });
+    try argv.appendSlice(a, extra_env);
+    try argv.append(a, env.cli);
+    try argv.appendSlice(a, args);
+    return argv.items;
+}
+
+fn runCli(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []const []const u8) !Run {
+    const a = scratch.arena();
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    for (try cliArgv(scratch, env, extra_env, args)) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
     try argv.append(a, null);
     const out = try cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 120_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, scratch.work);
     return .{ .exit_code = out.exit_code, .stdout = out.stdout, .stderr = out.stderr };
+}
+
+const interrupt_deadline_ms = 60_000;
+
+fn runCliInterrupted(scratch: *Scratch, env: Env, extra_env: []const []const u8, args: []const []const u8, interrupt: Interrupt) !Run {
+    const a = scratch.arena();
+    const stdout_path = try std.fs.path.join(a, &.{ scratch.root, "stdout" });
+    const stderr_path = try std.fs.path.join(a, &.{ scratch.root, "stderr" });
+    const exit_code = exit: {
+        const stdout_file = try std.Io.Dir.cwd().createFile(io, stdout_path, .{});
+        defer stdout_file.close(io);
+        const stderr_file = try std.Io.Dir.cwd().createFile(io, stderr_path, .{});
+        defer stderr_file.close(io);
+        var child = try std.process.spawn(io, .{
+            .argv = try cliArgv(scratch, env, extra_env, args),
+            .cwd = .{ .path = scratch.work },
+            .stdin = .ignore,
+            .stdout = .{ .file = stdout_file },
+            .stderr = .{ .file = stderr_file },
+        });
+        errdefer child.kill(io);
+        try waitForInterruptPoint(scratch, stdout_path, interrupt);
+        try std.posix.kill(child.id.?, .INT);
+        break :exit switch (try child.wait(io)) {
+            .exited => |code| @as(i32, code),
+            .signal => |signal| 128 + @as(i32, @intCast(@intFromEnum(signal))),
+            else => return error.ChildStoppedUnexpectedly,
+        };
+    };
+    return .{
+        .exit_code = exit_code,
+        .stdout = try std.Io.Dir.cwd().readFileAlloc(io, stdout_path, a, .limited(64 << 20)),
+        .stderr = try std.Io.Dir.cwd().readFileAlloc(io, stderr_path, a, .limited(64 << 20)),
+    };
+}
+
+fn waitForInterruptPoint(scratch: *Scratch, stdout_path: []const u8, interrupt: Interrupt) !void {
+    const a = scratch.arena();
+    const deadline = cc.util_time.nowMs() + interrupt_deadline_ms;
+    while (cc.util_time.nowMs() < deadline) : (cc.util_time.sleepMs(20)) {
+        switch (interrupt) {
+            .none => return,
+            .after_output => |needle| {
+                const stdout = try std.Io.Dir.cwd().readFileAlloc(io, stdout_path, a, .limited(64 << 20));
+                if (std.mem.indexOf(u8, stdout, needle) != null) return;
+            },
+            .after_file => |name| {
+                const path = try std.fs.path.join(a, &.{ scratch.work, name });
+                if (std.Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+            },
+        }
+    }
+    std.debug.print("the run never reached its interrupt point {any}\n", .{interrupt});
+    return error.InterruptPointNeverReached;
 }
 
 const weekdays = [_][]const u8{ "Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday" };
@@ -239,10 +317,25 @@ test "CLI: help text and the exit codes of the main error paths" {
     try checker.finish();
 }
 
+const Provider = union(enum) {
+    cassette,
+    status_lines: []const []const u8,
+    cut_response: usize,
+    event_interval_ms: u32,
+};
+
+const Interrupt = union(enum) {
+    none,
+    after_output: []const u8,
+    after_file: []const u8,
+};
+
 const Scenario = struct {
     name: []const u8,
     args: []const []const u8,
     env: []const []const u8 = &.{},
+    provider: Provider = .cassette,
+    interrupt: Interrupt = .none,
 };
 
 const scenarios = [_]Scenario{
@@ -254,6 +347,12 @@ const scenarios = [_]Scenario{
     .{ .name = "mcp_tool", .args = &.{ "--allowedTools", "mcp__mock__echo", "-p", "echo ping" } },
     .{ .name = "skill_activation", .args = &.{ "-p", "greet me" } },
     .{ .name = "compaction", .args = &.{ "-p", "read the notes" }, .env = &.{ "METACODES_FORCE_COMPACT_AT=20000", "METACODES_FORCE_COMPACT_KEEP=1" } },
+    .{ .name = "provider_4xx", .args = &.{ "-p", "say hi" }, .provider = .{ .status_lines = &.{"HTTP/1.1 400 Bad Request"} } },
+    .{ .name = "provider_5xx_retry", .args = &.{ "-p", "say hi" }, .provider = .{ .status_lines = &.{ "HTTP/1.1 500 Internal Server Error", "HTTP/1.1 503 Service Unavailable", "HTTP/1.1 200 OK" } } },
+    .{ .name = "provider_529", .args = &.{ "-p", "say hi" }, .provider = .{ .status_lines = &.{"HTTP/1.1 529 Overloaded"} } },
+    .{ .name = "sse_cut", .args = &.{ "-p", "say hi" }, .provider = .{ .cut_response = 0 } },
+    .{ .name = "user_interrupt", .args = &.{ "-p", "say hi" }, .provider = .{ .event_interval_ms = 1000 }, .interrupt = .{ .after_output = "\"type\":\"usage\"" } },
+    .{ .name = "tool_abort", .args = &.{ "--allowedTools", "Bash", "-p", "run the slow check" }, .interrupt = .{ .after_file = "started" } },
 };
 
 test "provider request bytes, stream-json events and session files of fixed scenarios" {
@@ -278,13 +377,21 @@ fn runScenario(env: Env, checker: *Checker, scenario: Scenario) !void {
     try copyTree(a, try std.fs.path.join(a, &.{ dir, "work" }), scratch.work, &.{});
     try copyTree(a, try std.fs.path.join(a, &.{ dir, "state" }), scratch.state, &substitutions);
     const bodies = try loadCassette(a, dir);
-    const server = try harness.MockServer.startCassette(bodies, 0);
+    const server = switch (scenario.provider) {
+        .cassette => try harness.MockServer.startCassette(bodies, 0),
+        .status_lines => |lines| try harness.MockServer.startHttpCassette(bodies, lines),
+        .cut_response => |index| try harness.MockServer.startCassetteMidStreamCut(bodies, index),
+        .event_interval_ms => |interval| try harness.MockServer.startCassette(bodies, interval),
+    };
     defer server.stop();
     const base_url = try server.urlOwned(a);
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(a, &.{ "--state-dir", scratch.state, "--api-key", "sk-contract", "--base-url", base_url, "--json", "--stream-json" });
     try args.appendSlice(a, scenario.args);
-    const run = try runCli(&scratch, env, scenario.env, args.items);
+    const run = switch (scenario.interrupt) {
+        .none => try runCli(&scratch, env, scenario.env, args.items),
+        else => try runCliInterrupted(&scratch, env, scenario.env, args.items, scenario.interrupt),
+    };
 
     const provider = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
     const rules: normalize.Rules = .{ .literals = try literals(&scratch, env, &.{.{ .needle = provider, .placeholder = "<PROVIDER>" }}) };
@@ -497,24 +604,8 @@ test "on-disk session written by an earlier build reads back the same" {
 const pnet = @import("platform").net;
 
 fn spawnCli(scratch: *Scratch, env: Env, args: []const []const u8) !std.process.Child {
-    const a = scratch.arena();
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(a, &.{
-        "/usr/bin/env",
-        "-i",
-        try std.fmt.allocPrint(a, "HOME={s}", .{scratch.home}),
-        "PATH=/usr/bin:/bin",
-        "TZ=UTC",
-        "LANG=C",
-        "METACODES_KG_AUTOSTART=0",
-        "METACODES_JEV_URL=off",
-        "METACODES_NO_PROBE=1",
-        "METACODES_NO_UPDATE_CHECK=1",
-        env.cli,
-    });
-    try argv.appendSlice(a, args);
     return std.process.spawn(io, .{
-        .argv = argv.items,
+        .argv = try cliArgv(scratch, env, &.{}, args),
         .cwd = .{ .path = scratch.work },
         .stdin = .ignore,
         .stdout = .ignore,
