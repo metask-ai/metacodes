@@ -51,12 +51,16 @@ from harbor.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from harbor.trial.queue import TrialQueue
 
 from scripts.eval.harbor import command as cmd
+from scripts.eval.harbor import live_concurrency
 from scripts.eval.harbor.profiling import TRUST_BUNDLE, routed_config
 
 # Set instead of `--ak bundle=...` when every trial of a job uses one bundle.
 BUNDLE_ENV = "METACODES_HARBOR_BUNDLE"
+
+live_concurrency.install(TrialQueue)
 
 
 class TeamworkNotEngaged(RuntimeError):

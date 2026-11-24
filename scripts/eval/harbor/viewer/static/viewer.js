@@ -384,8 +384,10 @@ async function renderProfile(id) {
       state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
     } }, '重命名') : null);
   const m = b.metacodes || {};
+  const liveItem = b.items.find((i) => i.status === 'running') || b.items.find((i) => i.status === 'pending');
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
     h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
+    liveItem ? h('dt', { text: '并发数' }) : null, liveItem ? h('dd', {}, concurrencyControl(b, liveItem)) : null,
     h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
     h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
     h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
@@ -399,6 +401,7 @@ async function renderProfile(id) {
     const j = item.job; const js = j?.summary;
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
       h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
+        item.concurrency ? `并发 ${item.concurrency}` : null,
         (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
@@ -458,6 +461,26 @@ async function renderProfile(id) {
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
   return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, tasks, compositionPanel(s, '最新结果均值'));
+}
+
+function concurrencyControl(b, item) {
+  if (!b.can_run || !profileActive(b)) return h('span', { class: 'mono', text: String(item.concurrency ?? '—') });
+  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, max: 16, step: 1, required: true, value: item.concurrency ?? '',
+    'aria-label': '并发数', onfocus: () => { state.editing = true; },
+    onblur: () => { if (input.value === String(item.concurrency ?? '')) state.editing = false; } });
+  const feedback = h('span', { class: 'muted', role: 'status', text: '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中的评测集也按新值运行' });
+  const form = h('form', { class: 'rename' }, input, h('button', { type: 'submit', class: 'button primary' }, '应用'), feedback);
+  form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.editing = false; render(); } });
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    feedback.textContent = '正在应用…';
+    try {
+      await api('/api/profile/concurrency', { id: b.id, concurrency: Number(input.value) });
+      state.editing = false;
+      render();
+    } catch (error) { feedback.textContent = error.message; }
+  });
+  return form;
 }
 
 // The latest results of each model side by side, when the profile has several:

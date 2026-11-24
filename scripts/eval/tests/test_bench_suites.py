@@ -496,6 +496,14 @@ class McpForwardingTest(unittest.TestCase):
         with stubbed_harbor() as agent_module:
             self.assertTrue(agent_module.MetacodesAgent.capabilities.get("mcp_servers"))
 
+    def test_agent_puts_harbor_trials_under_the_live_concurrency_file(self):
+        with patch.dict(os.environ, {"METACODES_BENCH_CONCURRENCY_FILE": "/run/concurrency"}), \
+                stubbed_harbor():
+            self.assertTrue(hasattr(sys.modules["harbor.trial.queue"].TrialQueue, "_run_trial"))
+        with patch.dict(os.environ), stubbed_harbor():
+            os.environ.pop("METACODES_BENCH_CONCURRENCY_FILE", None)
+            self.assertFalse(hasattr(sys.modules["harbor.trial.queue"].TrialQueue, "_run_trial"))
+
     def test_agent_uploads_task_mcp_servers_in_the_trial_config(self):
         with stubbed_harbor() as agent_module:
             agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
@@ -547,7 +555,8 @@ def stubbed_harbor():
     """Load metacodes_agent.py against minimal Harbor doubles."""
     names = ("harbor", "harbor.agents", "harbor.agents.capabilities", "harbor.agents.installed",
              "harbor.agents.installed.base", "harbor.environments", "harbor.environments.base",
-             "harbor.models", "harbor.models.agent", "harbor.models.agent.context", "harbor.models.trajectories")
+             "harbor.models", "harbor.models.agent", "harbor.models.agent.context", "harbor.models.trajectories",
+             "harbor.trial", "harbor.trial.queue")
     modules = {name: types.ModuleType(name) for name in names}
     modules["harbor.agents.capabilities"].AgentCapabilities = lambda **kw: kw
 
@@ -562,6 +571,7 @@ def stubbed_harbor():
     modules["harbor.agents.installed.base"].with_prompt_template = lambda f: f
     modules["harbor.environments.base"].BaseEnvironment = object
     modules["harbor.models.agent.context"].AgentContext = object
+    modules["harbor.trial.queue"].TrialQueue = type("TrialQueue", (), {})
     for name in ("Agent", "FinalMetrics", "Observation", "ObservationResult", "Step", "ToolCall", "Trajectory"):
         setattr(modules["harbor.models.trajectories"], name, type(name, (), {}))
     with patch.dict(sys.modules, modules):

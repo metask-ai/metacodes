@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from scripts.eval.harbor import suites
+from scripts.eval.harbor import live_concurrency, suites
 from scripts.eval.harbor.command import check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
@@ -403,6 +403,28 @@ class ProfileManager:
             record["name"] = name
             self.save(record)
         return {"id": record["id"], "name": name}
+
+    def set_concurrency(self, profile: Any, concurrency: Any) -> Dict[str, Any]:
+        if type(concurrency) is not int or not 1 <= concurrency <= live_concurrency.MAX_CONCURRENCY:
+            raise ValueError(f"concurrency 必须是 1–{live_concurrency.MAX_CONCURRENCY} 的整数")
+        with self.lock:
+            record = self.get(profile)
+            if record is None:
+                raise ValueError("评测配置不存在")
+            if record["status"] not in PROFILE_ACTIVE:
+                raise ValueError("评测配置没有正在运行或排队的评测集")
+            active = {r["name"] for r in self.runs.runs() if r.get("status") in ACTIVE}
+            for item in record["items"]:
+                if item["status"] not in ("pending", "running"):
+                    continue
+                applied = min(concurrency, suites.resolved(suites.get(item["suite"])).max_concurrency)
+                if item["status"] == "running" and item.get("run") in active:
+                    self.runs.set_concurrency(item["run"], applied)
+                item["concurrency"] = applied
+                if isinstance(item.get("request"), dict):
+                    item["request"]["concurrency"] = applied
+            self.save(record)
+        return {"id": record["id"], "concurrency": concurrency}
 
     def cancel(self, profile: Any) -> Dict[str, Any]:
         with self.lock:

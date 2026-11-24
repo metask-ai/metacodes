@@ -1153,6 +1153,18 @@ given, `--features ""` for none), and is refused while
 a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
 of its queue.
 
+While a profile runs, its concurrency can be changed (`POST /api/profile/concurrency`
+with `id` and `concurrency`, 1–16; 并发数 on its page). The value is capped per
+suite and applies to the running dataset at once and to the datasets still
+waiting in the queue. Lowering it lets the trials already running finish;
+raising it starts more within about a second. The workbench writes the value
+to `<jobs>/.bench-runs/<run>.concurrency`; on an SSH executor the worker sends
+it over the run's control channel and the node writes it beside the run's
+spec. Harbor reads that file (named by `METACODES_BENCH_CONCURRENCY_FILE`)
+through `scripts/eval/harbor/live_concurrency.py`, which the metacodes agent
+installs in Harbor's trial queue in place of its fixed `-n` semaphore. A
+WorkBuddy run keeps the concurrency it started with.
+
 A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
 replaced runs as the task's history. A run that stopped (cancelled,

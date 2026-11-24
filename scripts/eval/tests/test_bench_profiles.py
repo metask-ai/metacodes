@@ -322,6 +322,38 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
 
+    def test_concurrency_changes_while_the_profile_runs(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request())
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            run = self.manager.profiles.get(created['id'])['items'][0]['run']
+            with self.assertRaisesRegex(ValueError, '1–16'):
+                self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 17})
+
+            changed = self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 2})
+
+            self.assertEqual(changed, {'id': created['id'], 'concurrency': 2})
+            limit_file = self.manager.records / (run + '.concurrency')
+            self.assertEqual(limit_file.read_text(), '2')
+            record = self.manager.profiles.get(created['id'])
+            self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']], [(2, 2), (2, 2)])
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (self.manager.jobs_dir / run / 'harbor-env.json').exists():
+                time.sleep(.05)
+            harbor_env = json.loads((self.manager.jobs_dir / run / 'harbor-env.json').read_text())
+            self.assertEqual(harbor_env['METACODES_BENCH_CONCURRENCY_FILE'], str(limit_file))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and next(r for r in self.manager.runs() if r['name'] == run)['concurrency'] != 2:
+                time.sleep(.1)
+            self.assertEqual(next(r for r in self.manager.runs() if r['name'] == run)['concurrency'], 2)
+            self.client.request('api/profile/cancel', {'id': created['id']})
+            self.wait_profile(created['id'])
+        with self.assertRaisesRegex(ValueError, '没有正在运行'):
+            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3})
+
     def test_deleting_a_profile_removes_its_runs_results_and_rows(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         doomed = self.wait_profile(self.client.request('api/profiles/run', one)['id'])

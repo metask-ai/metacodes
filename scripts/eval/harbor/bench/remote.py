@@ -18,6 +18,8 @@ Later stdin lines are control messages:
 - `{"credential": "<new token>"}`: a refreshed access token from the
   workbench (which alone holds the refresh token); the relay swaps it in
   atomically, and keeps the previous one if none arrives;
+- `{"concurrency": N}`: the most trials Harbor runs at once from now on,
+  written to the file its trial queue reads (live_concurrency.py);
 - `cancel`, or the channel closing: interrupt Harbor (SIGINT, then SIGKILL
   after 20 s).
 
@@ -51,6 +53,8 @@ import threading
 import time
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
+
+from scripts.eval.harbor import live_concurrency
 
 DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
 
@@ -102,6 +106,8 @@ def run(spec_path):
     # Harbor imports the agent from this node's own runtime.
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
     env["PYTHONUNBUFFERED"] = "1"
+    limit_path = Path(spec_path).resolve().parent / "concurrency"
+    env[live_concurrency.FILE_ENV] = str(limit_path)
     relay = None
     credential = None
     session = None
@@ -155,7 +161,7 @@ def run(spec_path):
             env["DOCKER_CONFIG"] = str(session.directory)
             emit("egress", mode=spec["egress"]["mode"], proxy=session.proxy_url, no_proxy=session.no_proxy)
         return supervise(spec, argv, env, credential, stop, hung_up,
-                         egress if spec.get("ghcr_mirror") else None)
+                         egress if spec.get("ghcr_mirror") else None, limit_path=limit_path)
     finally:
         if session is not None:
             session.close()
@@ -196,7 +202,8 @@ def cancelled_exit():
     return 130
 
 
-def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None, finish=None):
+def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None, prepare=None, finish=None,
+              limit_path=None):
     """Run Harbor: control channel, heartbeats, cancel; the exit code.
 
     `prepare(stop)`, when given, runs first under heartbeats and with cancel
@@ -212,8 +219,17 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
                 stop.set()
             elif line.startswith(b"{"):
                 try:
-                    update = json.loads(line).get("credential")
+                    message = json.loads(line)
+                    update = message.get("credential")
+                    concurrency = message.get("concurrency")
                 except (ValueError, AttributeError):
+                    continue
+                if concurrency is not None:
+                    if type(concurrency) is int and limit_path is not None:
+                        try:
+                            live_concurrency.write(limit_path, concurrency)
+                        except OSError:
+                            pass
                     continue
                 if credential is not None:
                     credential.set(update)

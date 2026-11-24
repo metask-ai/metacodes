@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from scripts.eval.harbor import suites
+from scripts.eval.harbor import live_concurrency, suites
 from scripts.eval.harbor.command import ADVANCED_FEATURES, TEAMWORK, TEAMWORK_TIMEOUT_MULTIPLIER, check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
@@ -610,6 +610,15 @@ class RunManager:
                 atomic_json(self.records / (name + ".json"), {**record, "status": "failed", "error": "无法启动执行进程"})
                 raise ValueError("无法启动执行进程")
             return record
+
+    def set_concurrency(self, name, concurrency):
+        record = next((r for r in self.runs() if r["name"] == name), None)
+        if record is None or record["status"] not in ACTIVE:
+            raise ValueError("运行不存在或已结束")
+        if record.get("runner") == suites.WORKBUDDY:
+            raise ValueError("WorkBuddy 评测运行中不能调整并发")
+        live_concurrency.write(self.records / (name + ".concurrency"), concurrency)
+        return {"name": name, "concurrency": concurrency}
 
     def cancel(self, name):
         if not isinstance(name, str) or not data.NAME.fullmatch(name):

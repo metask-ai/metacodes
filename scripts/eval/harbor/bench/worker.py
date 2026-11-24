@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 
+from scripts.eval.harbor import live_concurrency
 from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_for, judge_argv, placeholder,
@@ -174,6 +175,11 @@ def stamp_credential(record, source):
         record["credential"] = {"container": "placeholder", **source.status()}
 
 
+def adjusted_concurrency(spec_path, record):
+    record["concurrency"] = live_concurrency.read(spec_path.with_suffix(".concurrency"), record["concurrency"])
+    return record["concurrency"]
+
+
 def supervise_remote(remote, spec, env, spec_path, record_path, record, source=None):
     """Run Harbor on an SSH executor: heartbeat, cancel, background sync.
 
@@ -223,6 +229,10 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
             record["error"] = "远程执行机器心跳超时"
             cancelled_at = now_s
             remote.hang_up()
+        if spec.get("runner") != "workbuddy" and cancelled_at is None:
+            wanted = adjusted_concurrency(spec_path, record)
+            if remote.concurrency != wanted:
+                remote.set_concurrency(wanted)
         if now_s - last_write > 2:
             stamp_credential(record, source)
             atomic_json(record_path, record)
@@ -321,6 +331,8 @@ def main(argv=None):
         if remote is not None:
             supervise_remote(remote, spec, env, spec_path, record_path, record, source)
             return 0 if record.get("status") == "finished" else 1
+        if spec.get("runner") != "workbuddy":
+            env[live_concurrency.FILE_ENV] = str(spec_path.with_suffix(".concurrency"))
         argv, cwd, child_env = child_process(spec, env)
         process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
@@ -352,6 +364,7 @@ def main(argv=None):
                 else:
                     signal_group(process, signal.SIGKILL)
             if time.monotonic() - last_write > 2:
+                adjusted_concurrency(spec_path, record)
                 stamp_credential(record, source)
                 atomic_json(record_path, record)
                 last_write = time.monotonic()
