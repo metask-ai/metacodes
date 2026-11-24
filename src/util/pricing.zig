@@ -81,7 +81,7 @@ pub fn installedConfigured() []const ModelPrice {
 }
 
 /// The rates a session is charged: the configured price of `model` (also
-/// matched without a `provider/` prefix), else the built-in table.
+/// matched without its first `provider/` segment), else the built-in table.
 pub fn effectiveRates(model: []const u8) Rates {
     return configuredRates(model) orelse rateFor(model);
 }
@@ -91,7 +91,7 @@ pub fn effectiveProvenance(model: []const u8) []const u8 {
 }
 
 fn configuredRates(model: []const u8) ?Rates {
-    const bare = if (std.mem.lastIndexOfScalar(u8, model, '/')) |slash| model[slash + 1 ..] else model;
+    const bare = if (std.mem.indexOfScalar(u8, model, '/')) |slash| model[slash + 1 ..] else model;
     for (configured) |price| {
         if (model_name.eqlIgnoreCase(price.model, model) or model_name.eqlIgnoreCase(price.model, bare)) return price.rates;
     }
@@ -240,6 +240,21 @@ test "configured prices win over the built-in table, also without a provider pre
     try std.testing.expectEqual(@as(f64, 0.15), rates.cache_write_per_mtok);
     try std.testing.expectEqualStrings(CONFIGURED_PROVENANCE, effectiveProvenance("DeepSeek-V4.1-Flash-1017"));
     try std.testing.expectEqual(DEFAULT_RATES, effectiveRates("some-other-model"));
+    try std.testing.expectEqual(DEFAULT_RATES, effectiveRates("gateway/acme/deepseek-v4.1-flash-1017"));
+}
+
+test "a namespaced configured price matches the model behind its provider prefix only" {
+    const gpa = std.testing.allocator;
+    const prices = (try parseConfigured(gpa,
+        \\{"model_prices": {"acme/model": {"input": 1, "output": 2}}}
+    )).?;
+    defer gpa.free(prices);
+    defer freeConfigured(gpa, prices);
+    installConfigured(prices);
+    defer installConfigured(&.{});
+    try std.testing.expectEqual(@as(f64, 1), effectiveRates("gateway/acme/model").input_per_mtok);
+    try std.testing.expectEqual(@as(f64, 1), effectiveRates("acme/model").input_per_mtok);
+    try std.testing.expectEqual(DEFAULT_RATES, effectiveRates("other/model"));
 }
 
 test "a malformed model_prices table is refused and an absent one is null" {

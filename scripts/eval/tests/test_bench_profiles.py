@@ -993,6 +993,10 @@ class ModelPriceTest(unittest.TestCase):
         self.assertIsNone(prices.price_for("metask/twin", self.MODELS))
         self.assertIsNone(prices.price_for("x/unpriced", self.MODELS))
         self.assertIsNone(prices.price_for("nobody/else", self.MODELS))
+        self.assertIsNone(prices.price_for("gateway/acme/model", {"other/model": {"prompt": "1", "completion": "1"}}))
+        self.assertEqual(prices.price_for("gateway/acme/model", {"acme/model": {"prompt": "0.000001", "completion": "0.000002"},
+                                                                 "other/model": {"prompt": "1", "completion": "1"}}),
+                         {"openrouter_id": "acme/model", "input": 1.0, "output": 2.0})
 
     def test_the_catalog_is_cached_for_a_day_and_a_failed_fetch_keeps_the_cached_copy(self):
         from scripts.eval.harbor.bench import prices
@@ -1011,6 +1015,14 @@ class ModelPriceTest(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             later = 1000.0 + prices.MAX_AGE_S + 1
             self.assertEqual(prices.catalog(Path(tmp), failing, now=lambda: later), {"v/m": {"prompt": "1", "completion": "2"}})
+        def truncated():
+            import http.client
+            raise http.client.IncompleteRead(b"{\"data\": [", 1000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0)
+            stale = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), truncated, now=lambda: stale), {"v/m": {"prompt": "1", "completion": "2"}})
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(prices.catalog(Path(tmp), failing), {})
 

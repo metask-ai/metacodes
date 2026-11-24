@@ -1123,7 +1123,9 @@ the other features' flags, and only on an SSH executor whose entry sets
 A Harbor run's model is priced from OpenRouter: at launch the workbench
 matches the model to the one OpenRouter model whose id without its `vendor/`
 prefix is the run's request model id (case-insensitive, so
-`metask/DeepSeek-V4.1-Flash-1017` is `deepseek/deepseek-v4.1-flash-1017`),
+`metask/DeepSeek-V4.1-Flash-1017` is `deepseek/deepseek-v4.1-flash-1017`;
+a request id with its own namespace, such as `acme/model` behind
+`gateway/`, matches only the OpenRouter id `acme/model`),
 records it on the run as `model_price` (USD per million tokens and the
 `openrouter_id`), and the adapter writes it to the trial's `config.json` as
 `model_prices`, which every metacodes cost meter charges first (`doc/API.md`,

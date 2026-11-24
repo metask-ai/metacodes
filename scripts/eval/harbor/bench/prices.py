@@ -4,7 +4,8 @@ metacodes charges a model missing from its built-in table at the Sonnet
 fallback rates, far above what most open models cost, and teamwork's budget
 ledger and isolated verifier stop on that estimate. A run's model is matched
 to the one OpenRouter model whose id, without its `vendor/` prefix, is the
-run's request model id (case-insensitive); its price goes to the trial's
+run's request model id (case-insensitive; a request id with its own
+namespace must equal the OpenRouter id); its price goes to the trial's
 config.json as `model_prices`, which metacodes charges first. The catalog is
 cached beside workbench.json for a day; when OpenRouter cannot be reached the
 cached copy is used, and without one the run keeps metacodes' own estimate.
@@ -12,6 +13,7 @@ cached copy is used, and without one the run keeps metacodes' own estimate.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.request
@@ -19,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from scripts.eval.harbor.bench.runner import atomic_json
+from scripts.eval.harbor.command import split_model
 
 OPENROUTER = "openrouter"
 CATALOG_URL = "https://openrouter.ai/api/v1/models"
@@ -46,7 +49,7 @@ def catalog(state_dir: Path, fetcher=None, now=time.time) -> Dict[str, Dict[str,
         return cached.get("models") or {}
     try:
         models = (fetcher or fetch)()
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return (cached or {}).get("models") or {}
     atomic_json(path, {"fetched_at": now(), "source": CATALOG_URL, "models": models})
     return models
@@ -62,9 +65,14 @@ def per_million(value: Any) -> Optional[float]:
 
 def price_for(model: str, models: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The run model's price in USD per million tokens and the OpenRouter id
-    it came from, or None when no single OpenRouter model matches."""
-    request_id = model.rsplit("/", 1)[-1].lower()
-    matches = [i for i in models if i.rsplit("/", 1)[-1].lower() == request_id]
+    it came from, or None when no single OpenRouter model matches. A request
+    model id with its own namespace (`acme/model`) matches that OpenRouter id
+    only; a bare one matches the single id ending in `/<model>`."""
+    request_id = split_model(model)[1].lower()
+    if "/" in request_id:
+        matches = [i for i in models if i.lower() == request_id]
+    else:
+        matches = [i for i in models if i.rsplit("/", 1)[-1].lower() == request_id]
     if len(matches) != 1:
         return None
     pricing = models[matches[0]]
