@@ -219,16 +219,16 @@ fn importsOf(arena: std.mem.Allocator, source: [:0]const u8) ![]const FileImport
     var line: usize = 1;
     var scanned: usize = 0;
     var previous: [2]std.zig.Token.Tag = .{ .invalid, .invalid };
-    var builtin_start: usize = 0;
+    var builtin_is_import = false;
     while (true) {
         const token = tokenizer.next();
         if (token.tag == .eof) break;
         defer {
             previous = .{ previous[1], token.tag };
-            if (token.tag == .builtin) builtin_start = token.loc.start;
+            if (token.tag == .builtin) builtin_is_import = std.mem.eql(u8, source[token.loc.start..token.loc.end], "@import");
         }
         if (token.tag != .string_literal or previous[1] != .l_paren or previous[0] != .builtin) continue;
-        if (!std.mem.startsWith(u8, source[builtin_start..], "@import(")) continue;
+        if (!builtin_is_import) continue;
         line += std.mem.count(u8, source[scanned..token.loc.start], "\n");
         scanned = token.loc.start;
         try imports.append(arena, .{ .literal = source[token.loc.start + 1 .. token.loc.end - 1], .line = line });
@@ -799,6 +799,14 @@ test "imports in comments and strings are not edges, imports in tests are" {
         \\
     );
     try std.testing.expectEqual(@as(usize, 0), try checkTree(&prose, test_layers, test_baseline, test_wiring));
+    const split = withFile("src/util/log.zig",
+        \\const view = @import // UI dependency
+        \\    ("../repl/view.zig");
+        \\const spaced = @import ( "../repl/view.zig" );
+        \\const other = @importer("../repl/view.zig");
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 3), try checkTree(&split, test_layers, test_baseline, test_wiring));
     const in_test = withFile("src/util/log.zig",
         \\test "view" {
         \\    _ = @import("../tools/bash.zig");
