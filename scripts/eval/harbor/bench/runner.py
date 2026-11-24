@@ -486,6 +486,16 @@ class RunManager:
                                                             "provider_config": config})
             if problem:
                 raise ValueError(problem)
+        if suite.runner != suites.WORKBUDDY and not suites.judge(suite, settings(self.config_path)):
+            # The worker replaces the agent's key variable with the run's
+            # relay placeholder, so a task reading the same name would get it.
+            cfg = settings(self.config_path)
+            agent_key_env = PROVIDER_KEY_ENV if imported else (
+                provider_key_env(cfg, provider_config(cfg), model) if catalog["authentication"]["kind"] == "provider"
+                else catalog["key_env"])
+            if agent_key_env in suites.host_env(suite):
+                raise ValueError(f"{suite.name} 的任务要在执行机器上读取 {agent_key_env}，模型 {model} 的密钥也用这个变量，"
+                                 "运行时它会被换成本次评测的 relay 占位令牌；请给模型的 provider 改用另一个密钥变量（key_env）")
         ctx = self.suite_context()
         tasks = suites.validate_tasks(suite, ctx, request.get("tasks"), known=self.node_tasks(suite, state["name"]))
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)

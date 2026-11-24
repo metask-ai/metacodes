@@ -709,6 +709,7 @@ async function renderNewRun() {
             drawPicker(); drawNotes(); drawBoxes(); syncSubmit();
           },
         }, h('span', { class: 'suite-name', text: s.name }),
+        s.description ? h('span', { class: 'suite-desc', text: s.description }) : null,
         h('span', { class: 'sub', text: (s.task_count === null ? '任务待准备' : s.task_count + ' 题') + ' · ' + (RUNNERS[s.runner] || s.runner) }),
         h('span', { class: 'suite-state ' + (comboReady(s) ? 'ok' : s.available ? 'todo' : 'off'), text: (state.suitePick.has(s.id) ? '已加入 · ' : '') + (comboReady(s) ? '可运行' : s.available ? '待配置' : '尚未接入') })))));
     }).filter(Boolean));
@@ -717,7 +718,7 @@ async function renderNewRun() {
     const shown = new Set(setupReasons());
     const reasons = comboReasons(s).filter((text) => !shown.has(text));
     const remove = h('button', { type: 'button', class: 'button', onclick: () => { state.suitePick.delete(s.id); drawPicker(); drawBoxes(); syncSubmit(); } }, '移出');
-    const head = h('div', { class: 'suite-box-head' }, h('span', {}), remove);
+    const head = h('div', { class: 'suite-box-head' }, h('span', { class: 'muted', text: s.description || '' }), remove);
     const box = h('fieldset', {}, h('legend', { text: `${s.name} · ${(c.categories || []).find((x) => x.id === s.category)?.name || ''}` }), head,
       reasons.length ? h('div', { class: 'callout' }, reasons.map((text) => h('p', { text }))) : null);
     if (!entry) { box.append(h('div', { class: 'empty', text: '读取任务列表…' })); return box; }
@@ -1611,7 +1612,8 @@ async function renderLeaderboard(suiteId) {
     h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', { text: j.name }), h('td', { text: j.model || '—' }),
       h('td', { class: 'num', text: `${j.tasks} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.score, 1) }))))))) : null;
-  return h('div', {}, h('div', { class: 'board-bar' }, suitePicker), d.boards.map((b) => boardPanel(b)), rest);
+  const about = d.description ? h('p', { class: 'muted', text: d.description }) : null;
+  return h('div', {}, h('div', { class: 'board-bar' }, suitePicker), about, d.boards.map((b) => boardPanel(b)), rest);
 }
 
 // ------------------------------------------------------------ settings (database)

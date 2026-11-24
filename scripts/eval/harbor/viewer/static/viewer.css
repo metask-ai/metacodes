@@ -16,6 +16,7 @@ fieldset{border:1px solid var(--border);border-radius:5px;padding:14px}
 .suite-card{display:grid;gap:4px;text-align:left;border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;background:var(--ground);color:var(--text);cursor:pointer;min-width:0}
 .suite-card:hover{border-color:var(--muted)}.suite-card[aria-pressed=true]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
 .suite-name{font-weight:600;overflow-wrap:anywhere}.suite-card .sub{font-size:11px;color:var(--muted)}
+.suite-desc{font-size:12px;line-height:1.4;color:var(--muted)}
 .suite-state{font-size:11px;color:var(--muted)}.suite-state.ok{color:var(--positive)}.suite-state.todo{color:var(--warning)}.suite-state.off{color:var(--faint)}
 .task-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0 12px}
 .task-tools input[type=search]{flex:1 1 220px;min-width:0;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;padding:7px 10px;font:inherit}
