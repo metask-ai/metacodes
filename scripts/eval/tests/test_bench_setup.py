@@ -1290,12 +1290,11 @@ class SshRunTest(SetupFixture):
         self.assertTrue((self.remote_home / "jobs/up/fix-git__fake/result.json").exists())
         self.assertFalse((run_dir / remote.RELAY_TLS).exists())
 
-    def test_the_old_tunnel_carries_egress_until_the_new_driver_has_its_own(self):
-        """Handed over, the forwarder keeps the old session's tunnel port
-        until a session brings the new driver its own; the old driver (and
-        with it that session and tunnel) ends only then."""
+    def tunnels(self, *labels):
+        """Stand-ins for the executor ends of `ssh -R` tunnels: each answers
+        a connection with its label. {label: port}."""
         tunnels = {}
-        for label in ("old", "new"):
+        for label in labels:
             listener = socket.socket()
             listener.bind(("127.0.0.1", 0))
             listener.listen(8)
@@ -1311,14 +1310,28 @@ class SshRunTest(SetupFixture):
                         conn.sendall(label.encode())
             threading.Thread(target=answer, daemon=True).start()
             tunnels[label] = listener.getsockname()[1]
-        relay, process = self.start_driver(grace=60, delay=60, name="tun", egress={
-            "mode": "workbench", "tunnel_port": tunnels["old"], "bind": "127.0.0.1", "no_proxy": []})
+        return tunnels
+
+    def start_egress_driver(self, name, port):
+        """A driver with workbench egress on tunnel `port`, and a function
+        connecting through its forwarder (the address stays the same across
+        handoffs) that returns what the tunnel answered."""
+        relay, process = self.start_driver(grace=60, delay=60, name=name, egress={
+            "mode": "workbench", "tunnel_port": port, "bind": "127.0.0.1", "no_proxy": []})
         proxy = next(e for e in self.driver_events if e["event"] == "egress")["proxy"]
-        address = tuple(proxy.removeprefix("http://").rsplit(":", 1))
+        host, forwarder_port = proxy.removeprefix("http://").rsplit(":", 1)
 
         def through_forwarder():
-            with socket.create_connection((address[0], int(address[1])), timeout=10) as conn:
+            with socket.create_connection((host, int(forwarder_port)), timeout=10) as conn:
                 return conn.recv(16).decode()
+        return relay, process, through_forwarder
+
+    def test_the_old_tunnel_carries_egress_until_the_new_driver_has_its_own(self):
+        """Handed over, the forwarder keeps the old session's tunnel port
+        until a session brings the new driver its own; the old driver (and
+        with it that session and tunnel) ends only then."""
+        tunnels = self.tunnels("old", "new")
+        relay, process, through_forwarder = self.start_egress_driver("tun", tunnels["old"])
 
         self.assertEqual(through_forwarder(), "old")
         for _ in range(2):  # twice before any session attaches
@@ -1342,6 +1355,45 @@ class SshRunTest(SetupFixture):
         session.stdin.write(b"cancel\n")
         session.stdin.flush()
         self.assertEqual([json.loads(line) for line in session.stdout][-1]["event"], "exit")
+
+    def test_a_tunnel_brought_during_a_handoff_reaches_the_next_driver(self):
+        """A session attaches to B with a new tunnel while B is handing the
+        run to C (C has B's state, B awaits `ready`): A may end, and C must
+        start with the new tunnel, not A's port from that state."""
+        from scripts.eval.harbor.bench import egress
+        tunnels = self.tunnels("a", "b")
+        relay, process, _ = self.start_egress_driver("mid", tunnels["a"])
+        done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/mid/spec.json"), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(done.stdout)["result"], "upgraded", done.stderr)
+        run_dir = self.remote_home / "runs/mid"
+        # This test is driver C.
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(conn.close)
+        conn.connect(remote.handoff_socket(run_dir))
+        conn.sendall(json.dumps({"handoff": remote.HANDOFF}).encode() + b"\n")
+        data, fds, _flags, _address = socket.recv_fds(conn, 65536, 4)
+        reader = conn.makefile("rb")
+        state = json.loads(data if data.endswith(b"\n") else data + reader.readline())
+        sockets = dict(zip(state["sockets"], (socket.socket(fileno=fd) for fd in fds)))
+        for sock in sockets.values():
+            self.addCleanup(sock.close)
+        self.addCleanup(os.killpg, state["harbor"], signal.SIGKILL)
+        self.assertEqual(state["forwarder"]["target"][1], tunnels["a"])
+        session = subprocess.Popen(executors.node_argv(relay, "attach", "runs/mid/spec.json"),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(session.kill)
+        session.stdin.write(json.dumps({"tunnel_port": tunnels["b"]}).encode() + b"\n")
+        session.stdin.flush()
+        self.assertEqual(process.wait(30), 0)  # B has its own tunnel: A may end
+        conn.sendall(b'{"ready": true}\n')
+        released = json.loads(reader.readline())
+        self.assertEqual((released["released"], released["target"][1]), (True, tunnels["b"]))
+        forwarder = egress.Forwarder("", tuple(released["target"]), sock=sockets.pop("forwarder")).start()
+        self.addCleanup(forwarder.close)
+        with socket.create_connection(forwarder.address, timeout=10) as through:
+            self.assertEqual(through.recv(16), b"b")
+        conn.sendall(b'{"tunnel": true}\n')
 
     def test_a_failed_driver_upgrade_leaves_the_run_to_its_driver(self):
         relay, process = self.start_driver(grace=60, delay=4)

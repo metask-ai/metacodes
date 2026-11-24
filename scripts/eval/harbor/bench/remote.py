@@ -426,7 +426,8 @@ class Handoff:
     with the run's state and passes the listening sockets it serves (relay,
     egress forwarder, attach, handoff; SCM_RIGHTS), so nothing is bound
     again; the new one answers {"ready": true} once it can serve them all;
-    this one stops accepting, says {"released": true} and tells its session
+    this one stops accepting, says {"released": true, "target": <the
+    forwarder's target now>} and tells its session
     (`handoff` event) to attach again. Until then any failure leaves this
     driver running the run as before. Afterwards it finishes the requests it
     had accepted, and keeps its session's egress tunnel until the new driver
@@ -524,7 +525,8 @@ class Handoff:
                 return False
             self.pause()
             try:
-                conn.sendall(b'{"released": true}\n')
+                target = list(self.forwarder.target) if self.forwarder is not None else None
+                conn.sendall(json.dumps({"released": True, "target": target}).encode() + b"\n")
             except OSError:
                 self.restore()
                 return False
@@ -556,6 +558,15 @@ class Handoff:
         self.acceptor.start()
         self.harbor.detached = False
 
+    def retarget(self, port, then=None):
+        """Point the forwarder at a session's tunnel; then `then()` unless
+        the run was handed over. Under the handoff's lock, so `released`
+        carries the target that is current when the new driver starts."""
+        with self.lock:
+            self.forwarder.target = ("127.0.0.1", port)
+            if then is not None and not self.done.is_set():
+                then()
+
     def wait_successor(self, timeout):
         """Until the new driver has its own egress tunnel, or `timeout`."""
         if self.successor is None:
@@ -570,16 +581,14 @@ class Handoff:
 
 class Predecessor:
     """The new driver's side of the connection Handoff keeps open: reports
-    its own egress tunnel (the first `tunnel_port` a session brings), after
-    which the old driver may end and with it the old session's tunnel."""
+    its own egress tunnel (the first `tunnel_port` a session brings, unless
+    the run went on to a newer driver first; then at this driver's end,
+    once that one reported), after which the old driver may end and with it
+    the old session's tunnel."""
 
-    def __init__(self, conn, forwarder):
-        self.conn, self.forwarder = conn, forwarder
+    def __init__(self):
+        self.conn = None
         self.lock = threading.Lock()
-
-    def retarget(self, port):
-        self.forwarder.target = ("127.0.0.1", port)
-        self.report()
 
     def report(self):
         with self.lock:
@@ -709,7 +718,8 @@ def run(spec_path):
         handoff = Handoff(run_dir, relay, forwarder, docker_config, credential, judge_real)
         code = supervise(spec, argv, env, credential, stop, hung_up,
                          egress if spec.get("ghcr_mirror") else None, limit_path=limit_path,
-                         run_dir=run_dir, retarget=retargeting(forwarder), handoff=handoff)
+                         run_dir=run_dir, retarget=handoff.retarget if forwarder is not None else None,
+                         handoff=handoff)
         return 0 if code is None else code
     finally:
         wind_down(handoff, relay, forwarder, docker_config)
@@ -730,12 +740,6 @@ def start_relay(options, run_dir, credential, token, judge_token, judge_credenti
                         judge_credential=judge_credential, connect=connect, cert_dir=run_dir / RELAY_TLS,
                         listener=listener, sequence=sequence)
     return relay if listener is not None else relay.__enter__()
-
-
-def retargeting(forwarder):
-    if forwarder is None:
-        return None
-    return lambda port: setattr(forwarder, "target", ("127.0.0.1", port))
 
 
 def dataset_selection(argv):
@@ -955,22 +959,26 @@ def take_over(spec_path, report):
             forwarder = Forwarder("", tuple(state["forwarder"]["target"]), sock=sockets["forwarder"])
         credential = relay.credential if relay is not None else None
         stop, hung_up = threading.Event(), threading.Event()
-        predecessor = Predecessor(None, None)
-        retarget = predecessor.retarget if forwarder is not None else None
-        control = Control(run_dir, control_lines(stop, credential, run_dir / LIMIT_FILE, retarget), grace)
-        control.adopt(sockets["attach"])
+        predecessor = Predecessor()
         handoff = Handoff(run_dir, relay, forwarder, state.get("docker_config"), credential,
                           state.get("judge_credential"), listener=sockets["handoff"])
+        retarget = (lambda port: handoff.retarget(port, predecessor.report)) if forwarder is not None else None
+        control = Control(run_dir, control_lines(stop, credential, run_dir / LIMIT_FILE, retarget), grace)
+        control.adopt(sockets["attach"])
         conn.sendall(b'{"ready": true}\n')
-        if json.loads(reader.readline() or b"null") != {"released": True}:
+        released = json.loads(reader.readline() or b"null")
+        if not isinstance(released, dict) or released.get("released") is not True:
             raise ValueError("原驱动没有交出这次运行")
+        if forwarder is not None:
+            # A session may have brought the old driver a tunnel meanwhile.
+            forwarder.target = tuple(released["target"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         for sock in sockets.values():
             sock.close()  # this process's copies only; the old driver keeps serving
         conn.close()
         report({"result": "failed", "message": f"{type(exc).__name__}: {exc}"})
         return 1
-    predecessor.conn, predecessor.forwarder = conn, forwarder
+    predecessor.conn = conn
     if forwarder is None:
         predecessor.report()
     if relay is not None:
