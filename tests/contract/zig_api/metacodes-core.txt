@@ -257,6 +257,9 @@ metacodes-core.agent_loop.StopReason.max_tokens_exhausted
 metacodes-core.agent_loop.StopReason.stalled
 metacodes-core.agent_loop.MAX_ENVIRONMENT_FAULTS: const u32 = 3
 metacodes-core.agent_loop.STREAM_RETRIES_PER_REQUEST: const u8 = 1
+metacodes-core.agent_loop.CONTINUE_AFTER_TRUNCATION: const = "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating."
+metacodes-core.agent_loop.RESPOND_AFTER_SILENT_TRUNCATION: const = "Your previous response reached the output token limit before producing any visible output. Stop deliberating: give a brief response or make a tool call right away."
+metacodes-core.agent_loop.RESTART_AFTER_STREAM_CUT: const = "Your previous response was cut off mid-stream and none of it was kept. Answer again from the start and get to the point: reason briefly, then give the response or make a tool call."
 metacodes-core.agent_loop.STREAM_RETRY_BACKOFF_MS: const u32 = 500
 metacodes-core.agent_loop.isEnvironmentFault: fn isEnvironmentFault(content: []const u8) bool
 metacodes-core.agent_loop.EventProjection: enum
