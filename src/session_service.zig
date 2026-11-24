@@ -16,18 +16,18 @@
 
 const std = @import("std");
 const app_mod = @import("app.zig");
-const types = @import("types.zig");
+const types = @import("metacodes-internal").types;
 const model_command = @import("repl/model_command.zig");
-const model_availability = @import("api/model_availability.zig");
+const model_availability = @import("metacodes-internal").api.model_availability;
 const theme_mod = @import("repl/tui/theme.zig");
 const session_intent = @import("session_intent.zig");
-const agent_loop = @import("core/agent_loop.zig");
-const conversation_mod = @import("core/conversation.zig");
-const permission_mode = @import("permission/mode.zig");
-const util_json = @import("util/json.zig");
-const util_time = @import("util/time.zig");
-const log = @import("util/log.zig");
-const swarm_tools = @import("swarm/tools.zig");
+const agent_loop = @import("metacodes-internal").core.agent_loop;
+const conversation_mod = @import("metacodes-internal").core.conversation;
+const permission_mode = @import("metacodes-internal").permission.mode;
+const util_json = @import("metacodes-internal").util.json;
+const util_time = @import("metacodes-internal").util.time;
+const log = @import("metacodes-internal").util.log;
+const swarm_tools = @import("metacodes-internal").swarm.tools;
 
 /// Teammates' replies and notices waiting in the swarm lead's inbox, for a
 /// driver that idles between messages (issue #277). The REPL reads the inbox
@@ -428,7 +428,7 @@ pub fn writeEditableMessages(w: *std.Io.Writer, conversation: *const conversatio
         };
         const body = std.mem.trim(u8, text, " \t\r\n");
         const first_line = std.mem.trimEnd(u8, body[0 .. std.mem.indexOfScalar(u8, body, '\n') orelse body.len], " \t\r");
-        const end = @import("util/utf8.zig").prefixEnd(first_line, PREVIEW_BYTES);
+        const end = @import("metacodes-internal").util.utf8.prefixEnd(first_line, PREVIEW_BYTES);
         const more = end < first_line.len or first_line.len < body.len;
         try w.print("  {d: >4}  {s}{s}", .{ i + 1, first_line[0..end], if (more) " …" else "" });
         if (images > 0) try w.print(" [{d} image{s}]", .{ images, if (images == 1) "" else "s" });
@@ -571,8 +571,8 @@ pub fn prepareEditImpl(self: *SessionService, args: []const u8) Dispatched {
 /// `!cmd` 业务核:执行 Bash 工具(用户显式 ! = 授权)+ 把命令与输出追加进对话
 /// 上下文。返回 owned 工具结果 JSON(caller free;TUI 据此渲染 stdout/stderr)。
 pub fn shellExecImpl(self: *SessionService, alloc: std.mem.Allocator, command: []const u8) ![]u8 {
-    const bash = @import("tools/bash.zig");
-    var tool_ctx = @import("tools.zig").ToolContext{
+    const bash = @import("metacodes-internal").tools.bash;
+    var tool_ctx = @import("metacodes-internal").tools_root.ToolContext{
         .allocator = alloc,
         .abort = &self.app.abort,
         .jobs = if (self.app.jobs) |*j| j else null,
@@ -620,9 +620,9 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
     // The REPL joins at its own join points (interruptibly); a path that got
     // here without one still sends the complete tool list, it only blocks.
     if (!app.toolSurfaceReady()) {
-        @import("util/log.zig").warn("mcp", "a run was assembled before the MCP join; joining now", .{});
+        @import("metacodes-internal").util.log.warn("mcp", "a run was assembled before the MCP join; joining now", .{});
         app.publishMcpServers() catch |err| {
-            @import("util/log.zig").err("mcp", "tool surface unavailable: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.err("mcp", "tool surface unavailable: {s}", .{@errorName(err)});
         };
     }
     // 会话根目录的唯一校验点:改名了就先跟过去,再装配(cwd_abs / project_dir / system_prompt
@@ -632,7 +632,7 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .session = app.session_id,
         .preview = app.config.preview.features(),
         // Span recording into the session store and the OTLP exporter (observer only).
-        .telemetry = @import("telemetry/telemetry.zig").forSession(app.sessionDir()),
+        .telemetry = @import("metacodes-internal").telemetry.telemetry.forSession(app.sessionDir()),
         .verbose = app.config.verbose,
         .abort = &app.abort,
         // background_request 是**宿主契约字段**(.backgrounded 停由宿主尾声消化 + 复位,
@@ -725,7 +725,7 @@ test "SessionService: vim toggle → vim_changed + render" {
 test "SessionService: compact → compacted + 结构化 data + render" {
     const a = testing.allocator;
     var app: app_mod.App = undefined;
-    app.conversation = @import("core/conversation.zig").Conversation.init(a);
+    app.conversation = @import("metacodes-internal").core.conversation.Conversation.init(a);
     defer app.conversation.deinit();
     var svc = SessionService.init(&app);
     const o = svc.exec(testing.allocator, "compact", "");
@@ -748,7 +748,7 @@ test "SessionService: add-dir 无参 → noop + usage 提示" {
 test "U11: /mode 命名设置(含连字符归一)与非法名" {
     var app: app_mod.App = undefined;
     app.config = types.Config{};
-    app.permission_ctx = @import("permission.zig").createContext(.default, testing.allocator);
+    app.permission_ctx = @import("metacodes-internal").permission_root.createContext(.default, testing.allocator);
     var svc = SessionService.init(&app);
 
     const o1 = svc.exec(testing.allocator, "mode", "dont-ask");
@@ -773,15 +773,15 @@ test "U11: /mode 命名设置(含连字符归一)与非法名" {
 test "U11: execLine 管线 —— prompt/宏 append + RunPlan;失败前零 mutation" {
     const a = testing.allocator;
     var app: app_mod.App = undefined;
-    app.conversation = @import("core/conversation.zig").Conversation.init(a);
+    app.conversation = @import("metacodes-internal").core.conversation.Conversation.init(a);
     defer app.conversation.deinit();
     // submitPrompt 走 clearActiveSkill:置零其触达的三处状态(最小 App 惯例)。
     app.active_skill = null;
-    app.permission_ctx = @import("permission.zig").createContext(.default, a);
-    app.session_id = @import("core/session_id.zig").SessionId.single;
+    app.permission_ctx = @import("metacodes-internal").permission_root.createContext(.default, a);
+    app.session_id = @import("metacodes-internal").core.session_id.SessionId.single;
     var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
-    app.skill_runtime = @import("skills/cli_adapter.zig").Runtime.init(a, io_rt.io());
+    app.skill_runtime = @import("metacodes-internal").skills.cli_adapter.Runtime.init(a, io_rt.io());
     defer app.skill_runtime.deinit();
     var svc = SessionService.init(&app);
 
@@ -811,7 +811,7 @@ test "U11: execLine 管线 —— prompt/宏 append + RunPlan;失败前零 mutat
 test "U11: /retry 回卷到最后一条 user;空对话 err 零 mutation" {
     const a = testing.allocator;
     var app: app_mod.App = undefined;
-    app.conversation = @import("core/conversation.zig").Conversation.init(a);
+    app.conversation = @import("metacodes-internal").core.conversation.Conversation.init(a);
     defer app.conversation.deinit();
     var svc = SessionService.init(&app);
 
@@ -836,7 +836,7 @@ test "U11: /retry 回卷穿过 compact_boundary → boundary 钳制,重发的 us
     // 无 user 消息),其后追加的消息也隐形。修复后 boundary ≤ user_idx。
     const a = testing.allocator;
     var app: app_mod.App = undefined;
-    app.conversation = @import("core/conversation.zig").Conversation.init(a);
+    app.conversation = @import("metacodes-internal").core.conversation.Conversation.init(a);
     defer app.conversation.deinit();
     var svc = SessionService.init(&app);
 

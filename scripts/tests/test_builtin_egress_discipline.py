@@ -234,7 +234,7 @@ class BuiltinEgressDisciplineTest(unittest.TestCase):
         main = (ROOT / "src" / "main.zig").read_text(encoding="utf-8")
         self.assertRegex(runtime, r"pub const CLI_USES_BUILTIN_DEFAULT = false;")
         # The session and doctor both take it from the constant, so they cannot disagree.
-        self.assertIn("config.jev_builtin_default = @import(\"jev/runtime.zig\").CLI_USES_BUILTIN_DEFAULT;", main)
+        self.assertIn("config.jev_builtin_default = @import(\"metacodes-internal\").jev.runtime.CLI_USES_BUILTIN_DEFAULT;", main)
         self.assertIn("jev.resolve(arena, io, state_root, jev.CLI_USES_BUILTIN_DEFAULT, jev.rawFromEnv())", main)
 
     def test_scanner_reads_literals_not_comments_tests_or_placeholders(self):

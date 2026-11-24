@@ -10,7 +10,7 @@ const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_paths = @import("platform").paths;
 const sync = @import("platform").sync;
-const login_worker = @import("api/login_worker.zig");
+const login_worker = @import("metacodes-internal").api.login_worker;
 
 /// **U5 B1:slice-safe snapshot 发布缓存(A')**。UAF-critical、运行时会 free+reassign 的 slice
 /// 字段(model/dirs)的 owned dup，mutex 守护。核心不变式：这些 slice 的 free+reassign（driver 侧
@@ -49,7 +49,7 @@ const SnapshotCache = struct {
         // (旧 model, 新 seq)= U5 B3 无缺口不变式在此 OOM 下降级(同 journal.append 自身 OOM 丢行,
         // 整层 best-effort)。故 warn(不静默),对齐 journal.zig:48 的 drop 记账。
         const dup = self.allocator.dupe(u8, m) catch {
-            @import("util/log.zig").warn("web", "snapshot cache model refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
+            @import("metacodes-internal").util.log.warn("web", "snapshot cache model refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
             return;
         };
         if (self.model.len > 0) self.allocator.free(self.model);
@@ -60,7 +60,7 @@ const SnapshotCache = struct {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
         var out = self.allocator.alloc([]u8, dirs.len) catch {
-            @import("util/log.zig").warn("web", "snapshot cache dirs refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
+            @import("metacodes-internal").util.log.warn("web", "snapshot cache dirs refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
             return; // OOM:保留旧(同 setModel:best-effort,warn 不静默)
         };
         var n: usize = 0;
@@ -68,7 +68,7 @@ const SnapshotCache = struct {
             out[n] = self.allocator.dupe(u8, d) catch {
                 for (out[0..n]) |x| self.allocator.free(x);
                 self.allocator.free(out);
-                @import("util/log.zig").warn("web", "snapshot cache dirs refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
+                @import("metacodes-internal").util.log.warn("web", "snapshot cache dirs refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
                 return; // OOM:保留旧
             };
             n += 1;
@@ -96,78 +96,78 @@ const SnapshotCache = struct {
         return .{ .model = m, .dirs = d };
     }
 };
-const types = @import("types.zig");
-const client_mod = @import("client.zig");
-const api_keys_mod = @import("api/api_keys.zig");
-const models_cache_mod = @import("api/models_cache.zig");
-const openrouter_catalog_mod = @import("api/openrouter_catalog.zig");
-const openai_mod = @import("api/openai_client.zig");
-const gemini_mod = @import("api/gemini_client.zig");
-const bedrock_mod = @import("api/bedrock_client.zig");
-const provider_host_mod = @import("provider/host.zig");
-const provider_binding_mod = @import("provider/runtime_binding.zig");
-const provider_api_key_store = @import("provider/api_key_store.zig");
-const provider_control_plane = @import("provider/control_plane.zig");
-const provider_config_store = @import("provider/config_store.zig");
-const provider_selection_mod = @import("provider/selection.zig");
-const provider_ids_mod = @import("provider/ids.zig");
-const provider_credential_mod = @import("provider/credential.zig");
-const provider_config_doc = @import("provider/config_doc.zig");
+const types = @import("metacodes-internal").types;
+const client_mod = @import("metacodes-internal").client;
+const api_keys_mod = @import("metacodes-internal").api.api_keys;
+const models_cache_mod = @import("metacodes-internal").api.models_cache;
+const openrouter_catalog_mod = @import("metacodes-internal").api.openrouter_catalog;
+const openai_mod = @import("metacodes-internal").api.openai_client;
+const gemini_mod = @import("metacodes-internal").api.gemini_client;
+const bedrock_mod = @import("metacodes-internal").api.bedrock_client;
+const provider_host_mod = @import("metacodes-internal").provider.host;
+const provider_binding_mod = @import("metacodes-internal").provider.runtime_binding;
+const provider_api_key_store = @import("metacodes-internal").provider.api_key_store;
+const provider_control_plane = @import("metacodes-internal").provider.control_plane;
+const provider_config_store = @import("metacodes-internal").provider.config_store;
+const provider_selection_mod = @import("metacodes-internal").provider.selection;
+const provider_ids_mod = @import("metacodes-internal").provider.ids;
+const provider_credential_mod = @import("metacodes-internal").provider.credential;
+const provider_config_doc = @import("metacodes-internal").provider.config_doc;
 const model_picker_mod = @import("repl/model_picker.zig");
 const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
 const sign_out_mod = @import("app/sign_out.zig");
 const presets_mod = @import("app/presets.zig");
 const providers_cli_mod = @import("app/providers_cli.zig");
-const provider_startup_mod = @import("provider/startup.zig");
-const kg_provider_audit = @import("kg/provider_audit.zig");
-const provider_alias_mod = @import("provider/alias.zig");
-const provider_oauth_mod = @import("provider/oauth.zig");
-const oauth_exchange_mod = @import("api/oauth_exchange.zig");
-const oauth_revoke_mod = @import("api/oauth_revoke.zig");
-const metask_oauth_mod = @import("api/metask_oauth.zig");
-const provider_mod = @import("api/provider.zig");
-const request_overrides = @import("api/request_overrides.zig");
-const dialect_mod = @import("api/dialect.zig");
-const json_mod = @import("json.zig");
-const tools_mod = @import("tools.zig");
-const permission_mod = @import("permission.zig");
-const Conversation = @import("core/conversation.zig").Conversation;
-const AbortSignal = @import("util/abort.zig").AbortSignal;
-const SkillSet = @import("skills/skill.zig").SkillSet;
-const ReadState = @import("core/read_state.zig").ReadState;
-const transcript = @import("core/transcript.zig");
-const pricing = @import("util/pricing.zig");
-const agent_loop = @import("core/agent_loop.zig");
-const api_stream = @import("api/stream.zig");
-const JobRegistry = @import("core/job_registry.zig").JobRegistry;
-const TaskStore = @import("core/task_store.zig").TaskStore;
-const system_prompt_mod = @import("core/system_prompt.zig");
-const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
-const skill_tool_mod = @import("skills/tool.zig");
-const SKILL_TOOL_NAME = @import("skills/runtime/model_tool.zig").TOOL_NAME;
-const skill_cli_adapter = @import("skills/cli_adapter.zig");
-const skill_overrides_mod = @import("skills/overrides.zig");
-const plugin_mod = @import("plugin/root.zig");
-const path_util = @import("util/path.zig");
-const McpClient = @import("mcp/client.zig").McpClient;
+const provider_startup_mod = @import("metacodes-internal").provider.startup;
+const kg_provider_audit = @import("metacodes-internal").kg.provider_audit;
+const provider_alias_mod = @import("metacodes-internal").provider.alias;
+const provider_oauth_mod = @import("metacodes-internal").provider.oauth;
+const oauth_exchange_mod = @import("metacodes-internal").api.oauth_exchange;
+const oauth_revoke_mod = @import("metacodes-internal").api.oauth_revoke;
+const metask_oauth_mod = @import("metacodes-internal").api.metask_oauth;
+const provider_mod = @import("metacodes-internal").api.provider;
+const request_overrides = @import("metacodes-internal").api.request_overrides;
+const dialect_mod = @import("metacodes-internal").api.dialect;
+const json_mod = @import("metacodes-internal").json;
+const tools_mod = @import("metacodes-internal").tools_root;
+const permission_mod = @import("metacodes-internal").permission_root;
+const Conversation = @import("metacodes-internal").core.conversation.Conversation;
+const AbortSignal = @import("metacodes-internal").util.abort.AbortSignal;
+const SkillSet = @import("metacodes-internal").skills.skill.SkillSet;
+const ReadState = @import("metacodes-internal").core.read_state.ReadState;
+const transcript = @import("metacodes-internal").core.transcript;
+const pricing = @import("metacodes-internal").util.pricing;
+const agent_loop = @import("metacodes-internal").core.agent_loop;
+const api_stream = @import("metacodes-internal").api.stream;
+const JobRegistry = @import("metacodes-internal").core.job_registry.JobRegistry;
+const TaskStore = @import("metacodes-internal").core.task_store.TaskStore;
+const system_prompt_mod = @import("metacodes-internal").core.system_prompt;
+const DynRegistry = @import("metacodes-internal").tools.dynamic.DynRegistry;
+const skill_tool_mod = @import("metacodes-internal").skills.tool;
+const SKILL_TOOL_NAME = @import("metacodes-internal").skills.runtime.model_tool.TOOL_NAME;
+const skill_cli_adapter = @import("metacodes-internal").skills.cli_adapter;
+const skill_overrides_mod = @import("metacodes-internal").skills.overrides;
+const plugin_mod = @import("metacodes-internal").plugin.root;
+const path_util = @import("metacodes-internal").util.path;
+const McpClient = @import("metacodes-internal").mcp.client.McpClient;
 const mcp_startup = @import("app/mcp_startup.zig");
 const mcp_hotplug = @import("app/mcp_hotplug.zig");
-const mcp_config_mod = @import("mcp/config.zig");
-const tool_changes_mod = @import("core/tool_changes.zig");
-const util_time_mod = @import("util/time.zig");
+const mcp_config_mod = @import("metacodes-internal").mcp.config;
+const tool_changes_mod = @import("metacodes-internal").core.tool_changes;
+const util_time_mod = @import("metacodes-internal").util.time;
 const kg_startup = @import("app/kg_startup.zig");
-const time_context_mod = @import("core/time_context.zig");
-const McpSession = @import("mcp/registry_bridge.zig").McpSession;
-const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
-const AgentSet = @import("agents/set.zig").AgentSet;
-const WorktreeEntry = @import("tools/worktree.zig").WorktreeEntry;
-const CronRegistry = @import("core/cron_registry.zig").CronRegistry;
-const GoalState = @import("core/goal.zig").State;
+const time_context_mod = @import("metacodes-internal").core.time_context;
+const McpSession = @import("metacodes-internal").mcp.registry_bridge.McpSession;
+const ActiveSkillState = @import("metacodes-internal").skills.active.ActiveSkillState;
+const AgentSet = @import("metacodes-internal").agents.set.AgentSet;
+const WorktreeEntry = @import("metacodes-internal").tools.worktree.WorktreeEntry;
+const CronRegistry = @import("metacodes-internal").core.cron_registry.CronRegistry;
+const GoalState = @import("metacodes-internal").core.goal.State;
 
 /// 跨 turn 累加的 token 计数。L1:类型下沉到 core/usage.zig(usage 走 CoreEvent 总线后
 /// 需 core 可引用);app 只 re-export,行为不变(app.usage / costUsd / 各 UI 读法照旧)。
-pub const UsageTotals = @import("core/usage.zig").UsageTotals;
+pub const UsageTotals = @import("metacodes-internal").core.usage.UsageTotals;
 
 /// 全局 AbortSignal 指针，供 signal handler 访问。installSigintHandler 绑定后非 null。
 /// signal handler 只读该指针 + 调 abort.abort()——不分配、不 IO、不获锁。
@@ -230,11 +230,11 @@ fn appendCliPluginSources(
 }
 
 fn executeCliProcessTool(
-    ctx: *const @import("tools/context.zig").ToolContext,
+    ctx: *const @import("metacodes-internal").tools.context.ToolContext,
     args: []const u8,
     raw: ?*anyopaque,
-) anyerror!@import("core/tool_result.zig").ToolResultBody {
-    var body: @import("core/tool_result.zig").ToolResultBody = undefined;
+) anyerror!@import("metacodes-internal").core.tool_result.ToolResultBody {
+    var body: @import("metacodes-internal").core.tool_result.ToolResultBody = undefined;
     try executeCliProcessToolInto(&body, ctx, args, raw);
     return body;
 }
@@ -243,12 +243,12 @@ fn executeCliProcessTool(
 /// returning a ToolResultBody, each `return error.X` would copy a 3.7 KiB
 /// constant, one per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
 fn executeCliProcessToolInto(
-    out: *@import("core/tool_result.zig").ToolResultBody,
-    ctx: *const @import("tools/context.zig").ToolContext,
+    out: *@import("metacodes-internal").core.tool_result.ToolResultBody,
+    ctx: *const @import("metacodes-internal").tools.context.ToolContext,
     args: []const u8,
     raw: ?*anyopaque,
 ) anyerror!void {
-    const isolated: *const @import("core/tool_catalog.zig").IsolatedTool =
+    const isolated: *const @import("metacodes-internal").core.tool_catalog.IsolatedTool =
         @ptrCast(@alignCast(raw orelse return error.ProcessPluginUnavailable));
     const outcome = try isolated.execute(isolated.ctx, ctx, args);
     out.* = switch (outcome) {
@@ -268,7 +268,7 @@ fn executeCliProcessToolInto(
 }
 
 fn installCliProcessError(
-    ctx: *const @import("tools/context.zig").ToolContext,
+    ctx: *const @import("metacodes-internal").tools.context.ToolContext,
     detail: ?[]u8,
 ) void {
     const bytes = detail orelse return;
@@ -281,7 +281,7 @@ fn installCliProcessError(
 
 /// 一个已连接 MCP server 的资源捆绑：name（owned）+ heap-allocated client + session。
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
-pub const McpSessionEntry = @import("core/mcp_session.zig").McpSessionEntry;
+pub const McpSessionEntry = @import("metacodes-internal").core.mcp_session.McpSessionEntry;
 
 pub const PendingOverlay = enum {
     none,
@@ -539,9 +539,9 @@ pub const App = struct {
     /// The route is live regardless; what is lost is surviving a `/resume`.
     last_persist_error: ?[]const u8 = null,
     /// 模型档位表(<state root>/config.json 的 model_tiers;null=未配置)。
-    model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
+    model_tiers_table: ?@import("metacodes-internal").api.model_tiers.TierTable = null,
     /// `config.json` `model_prices`, installed for every cost meter while this App lives.
-    model_prices: ?[]@import("util/pricing.zig").ModelPrice = null,
+    model_prices: ?[]@import("metacodes-internal").util.pricing.ModelPrice = null,
     pending_previous_model_for_compact: ?[]u8 = null,
     pending_previous_model_context_window: ?u32 = null,
     pending_current_model_context_window: ?u32 = null,
@@ -555,14 +555,14 @@ pub const App = struct {
     /// 但 M6 本身没有第二个 session 在跑。剩 g_abort_signal 待 M7 路由。
     /// session_id 用于把本会话的 emit/UiRequest 路由到对应 UI 视图。init 时 gen() 一个。
     /// **TODO**:本 id 与 transcript 目录名 id 是两个独立 gen(),将来应统一(App 生成、transcript 复用)。
-    session_id: @import("core/session_id.zig").SessionId = @import("core/session_id.zig").SessionId.single,
+    session_id: @import("metacodes-internal").core.session_id.SessionId = @import("metacodes-internal").core.session_id.SessionId.single,
     /// Sessions this foreground handed to the background with Ctrl+B, oldest
     /// first. A background job keeps its origin session for routing, so the
     /// foreground that rotated away from it would otherwise lose sight of it
     /// (#219); the agent tree and switcher show `agentJobScope()`, which adds
     /// these. `/resume` clears the list: the resumed conversation is not their
     /// successor. Owned by `allocator`.
-    handed_off_sessions: std.ArrayList(@import("core/session_id.zig").SessionId) = .empty,
+    handed_off_sessions: std.ArrayList(@import("metacodes-internal").core.session_id.SessionId) = .empty,
 
     // ── ProcessContainer 区(进程级,逻辑上只读)──────────────────────────────
     // config / api_key / api_client / tool_defs / enabled_tool_names / skills / agents /
@@ -618,7 +618,7 @@ pub const App = struct {
     permission_ctx: permission_mod.PermissionContext,
     /// Session 级权限记忆(always-allow / session-deny)。挂到 permission_ctx.session_rules。
     /// 每 App(= 每 session)一份;多 Session 化后随 SessionContext 走,不再进程全局。
-    session_rules: @import("permission/session_rules.zig").SessionRules = .{},
+    session_rules: @import("metacodes-internal").permission.session_rules.SessionRules = .{},
     abort: AbortSignal,
     /// Ctrl+B 转后台请求信号(地址稳定:watcher 线程 store、agent_loop turn 边界 load)。
     /// 与 abort 分开:abort=用户中断(对话留前台),background=主对话转后台续跑。
@@ -637,20 +637,20 @@ pub const App = struct {
     read_state: ReadState,
     /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 hl-zig 着色;
     /// 不进对话历史。session 退出 deinit。
-    edit_hl_cache: @import("core/edit_hl_cache.zig").EditHlCache,
+    edit_hl_cache: @import("metacodes-internal").core.edit_hl_cache.EditHlCache,
     /// LSP 服务(默认开;`--no-lsp` 或创建失败时为 null)。Edit/Write finalizeWrite 取诊断,
     /// CodeMap/FindSymbol/Read-outline 取符号。session 退出 shutdown。
-    lsp_service: ?*@import("lsp/service.zig").Service = null,
+    lsp_service: ?*@import("metacodes-internal").lsp.service.Service = null,
     /// Session transcript writer；失败初始化则保持 null（日志落盘 fallback）
     transcript_writer: ?transcript.Writer = null,
     /// `sessionDir()` published for other threads (web `GET /spans`); kept in
     /// step with `transcript_writer` by `publishSessionDir`.
-    session_dir_cell: @import("telemetry/store.zig").DirCell = .{},
+    session_dir_cell: @import("metacodes-internal").telemetry.store.DirCell = .{},
     /// 本 session 累计用量（跨多 turn）
     usage: UsageTotals = .{},
     /// Internal-only large-result projection/recovery counters. Evaluation
     /// and formal observation adapters may snapshot these; no UI owns them.
-    tool_result_metrics: @import("core/tool_result_metrics.zig").Metrics = .{},
+    tool_result_metrics: @import("metacodes-internal").core.tool_result_metrics.Metrics = .{},
     /// 本 session 的文件修改结果账本(见 core/file_change.zig)。Run 及其子执行产生的每条
     /// 文件修改都记这里,上层无需解析 tool_result 里工具私有的 gitDiff。
     ///
@@ -658,19 +658,19 @@ pub const App = struct {
     /// 并会往里写(见 agent.zig 三处 spawn 的 file_change_journal 透传)。Journal 的 mutex 只
     /// 串行化它自己的调用,串行化不了 allocator;App GPA 非线程安全(teammate.zig 头注已立此
     /// 铁律),拿它给 teammate 线程用就是堆损坏。init 在下面补上。
-    file_change_journal: @import("core/file_change.zig").Journal = .{ .allocator = undefined },
+    file_change_journal: @import("metacodes-internal").core.file_change.Journal = .{ .allocator = undefined },
     /// 从 config.json 加载的细粒度权限规则；null 时仅靠四模式兜底
     rule_set: ?permission_mod.RuleSet = null,
     /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories + disable flags)。
     /// 启动时 loader.load;挂到 permission_ctx.settings。
     settings: ?permission_mod.MergedSettings = null,
     /// Sandbox 配置(从 settings 的 sandbox 段解析,跨层合并)。
-    sandbox_settings: ?@import("sandbox/config.zig").SandboxSettings = null,
+    sandbox_settings: ?@import("metacodes-internal").sandbox.config.SandboxSettings = null,
     /// PreToolUse hooks(从 settings.hooks.PreToolUse 解析)。
-    hooks: ?@import("permission/hooks.zig").HookSet = null,
+    hooks: ?@import("metacodes-internal").permission.hooks.HookSet = null,
     /// 最近一次 loadHooks 发现的坏配置(每处被跳过的文件/事件/entry/hook 一条)。
     /// 坏 hook 不报错只是永不触发——`/hooks` 列出,启动横幅与 `/doctor` 计数。
-    hook_diagnostics: ?@import("permission/hooks.zig").Diagnostics = null,
+    hook_diagnostics: ?@import("metacodes-internal").permission.hooks.Diagnostics = null,
     /// 会话根目录:启动时对进程 cwd 拍的字符串快照。读它的有七处(Bash 子进程 chdir、
     /// Read/Write/Edit/Glob 的 base_dir、权限 match_ctx.cwd、沙箱 profile、系统提示词、
     /// project_dir、KG 项目目录),而 agent 的工作本身就会改名/搬走目录。写它的只有两条路:
@@ -692,7 +692,7 @@ pub const App = struct {
     /// **配置变更事件出口(U4)**:driver(TUI/web)经 setConfigEventSink 设。model/dirs/reasoning
     /// 单写侧(switchModel/addDirectory/setReasoningEffort)经它 emit config_changed;mode 走
     /// permission_ctx.event_sink(setConfigEventSink 同步设)。null = 无 UI/headless(不 emit)。
-    config_event_sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink = null,
+    config_event_sink: ?@import("metacodes-internal").core.protocol.ui_event.ConfigEventSink = null,
     /// **U5 B1:slice-safe snapshot 发布缓存**。UAF-critical slice(model/dirs)的 mutex 守护 owned dup，
     /// refresh 骑 emitConfig；/state(HTTP 线程)经 snapshotSlices 安全读。setConfigEventSink 装配时
     /// seed + 每 emit refresh。null 化在 deinit。见 SnapshotCache。
@@ -704,16 +704,16 @@ pub const App = struct {
     /// 后台 Bash 作业注册表（失败初始化则 null）
     jobs: ?JobRegistry = null,
     /// 后台 subagent 作业注册表（Task run_in_background）。失败初始化则 null。
-    agent_jobs: ?@import("core/agent_job_registry.zig").AgentJobRegistry = null,
+    agent_jobs: ?@import("metacodes-internal").core.agent_job_registry.AgentJobRegistry = null,
     /// Swarm 会话状态（teams/teammates）。lead(主 App)持有;TeamCreate 时惰性建 teammates
     /// registry。teammate 不 spawn teammate → subagent 侧不挂 swarm。
-    swarm: @import("swarm/context.zig").SwarmContext = undefined,
+    swarm: @import("metacodes-internal").swarm.context.SwarmContext = undefined,
     /// 本 session 的 memdir 绝对路径(通道 B 自动记忆;`{home}/.metacodes/projects/<hash>/memory`,
     /// owned)。init 时算一次,挂 permission_ctx.memdir_abs(写豁免)。空串=禁用/无 home。
     memdir_abs: []u8 = &.{},
     /// TinyKG 客户端(记忆/计划/DAG;设计 KG_DESIGN v3-final)。null = 未初始化
     /// (缺 home 等);non-null 但 !ready = degraded。工具经 ctx.kg 拿指针。
-    kg: ?@import("kg/client.zig").KgClient = null,
+    kg: ?@import("metacodes-internal").kg.client.KgClient = null,
     /// Starts this install's TinyKG service when a session needs it; owned
     /// here, shared by `kg` and every clone of it (address-stable).
     kg_autostart: ?*@import("app/kg_autostart.zig").Autostart = null,
@@ -723,7 +723,7 @@ pub const App = struct {
     kg_summary: []u8 = &.{},
     kg_startup: ?*kg_startup.Startup = null,
     /// System-One advisor runtime (`src/jev/runtime.zig`); null = not configured.
-    jev: ?*@import("jev/runtime.zig").Runtime = null,
+    jev: ?*@import("metacodes-internal").jev.runtime.Runtime = null,
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
     /// Session-scoped objective state for /goal and /loop.
@@ -731,21 +731,21 @@ pub const App = struct {
     /// Issue #277: charges `goal_state` for every Run on this App - REPL,
     /// web, daemon, headless alike - and writes goal.json when it changes.
     /// Set once `app` has its final address.
-    goal_meter: ?@import("core/goal.zig").Meter = null,
+    goal_meter: ?@import("metacodes-internal").core.goal.Meter = null,
     /// User-controlled automatic continuation. /loop on sets enabled + remaining budget;
     /// the REPL starts continuations only from idle boundaries via agent_loop.run().
     loop_enabled: bool = false,
     loop_remaining: u32 = 0,
     /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
     system_prompt: ?[]u8 = null,
-    rsi_policy: ?@import("skills/rsi.zig").Loaded = null,
+    rsi_policy: ?@import("metacodes-internal").skills.rsi.Loaded = null,
     /// 首条 user-context message(CLAUDE.md 链 + AutoMem + currentDate,`<system-reminder>` 包裹)。
     /// init 时构建一次(memoize),agent_loop 每轮 prepend。owned;deinit free。
     /// null = 无记忆内容 / CLAUDE_CODE_DISABLE_CLAUDE_MDS。
     user_context: ?[]u8 = null,
     /// Issue #276: the date `user_context` states and the date the model was
     /// last told; runs announce a later local date once (agent_loop).
-    time_announcer: ?@import("core/time_context.zig").Announcer = null,
+    time_announcer: ?@import("metacodes-internal").core.time_context.Announcer = null,
     session_start: i64 = 0,
     session_zone: time_context_mod.Zone = .utc_unknown,
     /// 运行时工具表（Skill + MCP 工具都注册到这里）。
@@ -755,7 +755,7 @@ pub const App = struct {
     mcp_sessions: std.ArrayList(McpSessionEntry),
     /// Every configured MCP server and its startup outcome (for /mcp).
     mcp_report: McpReport = .{},
-    mcp_unavailable: []const @import("core/mcp_session.zig").McpUnavailable = &.{},
+    mcp_unavailable: []const @import("metacodes-internal").core.mcp_session.McpUnavailable = &.{},
     /// Owns the resolved MCP configuration, the startup jobs and `mcp_report`
     /// (child of `allocator`, released in deinit). Null until MCP servers are
     /// loaded.
@@ -797,7 +797,7 @@ pub const App = struct {
     /// Session 级 cron 调度。CronCreate/Delete/List 用;REPL 读 prompt 前 collectDue。
     cron_registry: CronRegistry,
     /// 模型上下文窗口表(~/.metacode/models.toml)。api_client.model_context 借用它做 auto-compact 阈值。
-    model_context: @import("api/model_context.zig").ModelContext,
+    model_context: @import("metacodes-internal").api.model_context.ModelContext,
 
     /// What a host settles before `App.init` instead of leaving it to init.
     pub const InitOptions = struct {
@@ -846,7 +846,7 @@ pub const App = struct {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
         var active_config = config;
-        active_config.preview = try @import("core/file_config.zig").resolvePreview(allocator, config.state_root, config.preview);
+        active_config.preview = try @import("metacodes-internal").core.file_config.resolvePreview(allocator, config.state_root, config.preview);
 
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,
@@ -867,11 +867,11 @@ pub const App = struct {
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
             .session_id = if (config.session_id) |s|
-                (@import("core/session_id.zig").SessionId.fromSlice(s) orelse @import("core/session_id.zig").gen())
+                (@import("metacodes-internal").core.session_id.SessionId.fromSlice(s) orelse @import("metacodes-internal").core.session_id.gen())
             else
-                @import("core/session_id.zig").gen(),
+                @import("metacodes-internal").core.session_id.gen(),
             .conversation = Conversation.init(allocator),
-            .file_change_journal = @import("core/file_change.zig").Journal.init(std.heap.c_allocator),
+            .file_change_journal = @import("metacodes-internal").core.file_change.Journal.init(std.heap.c_allocator),
             .io = io,
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
             .tool_defs = &.{}, // 占位，下面重建
@@ -883,7 +883,7 @@ pub const App = struct {
             .skill_overrides = skill_overrides_mod.Overrides.init(allocator),
             .activated_tools = std.StringHashMap(void).init(allocator),
             .read_state = ReadState.init(allocator),
-            .edit_hl_cache = @import("core/edit_hl_cache.zig").EditHlCache.init(allocator),
+            .edit_hl_cache = @import("metacodes-internal").core.edit_hl_cache.EditHlCache.init(allocator),
             .tasks = TaskStore.init(allocator),
             .goal_state = GoalState.init(allocator),
             .loop_enabled = false,
@@ -893,12 +893,12 @@ pub const App = struct {
             .agents = AgentSet.init(allocator),
             .worktree_stack = .empty,
             .cron_registry = CronRegistry.init(allocator),
-            .model_context = @import("api/model_context.zig").ModelContext.init(allocator),
+            .model_context = @import("metacodes-internal").api.model_context.ModelContext.init(allocator),
         };
         // The CLI resolves the state root (src/main.zig) and passes it in. An App
         // built without one keeps the historical `$HOME/.metacodes`.
         if (app.config.state_root.len == 0) if (platform_paths.homeDir()) |home| {
-            app.state_root_default = try @import("util/state_root.zig").legacyDefault(allocator, home);
+            app.state_root_default = try @import("metacodes-internal").util.state_root.legacyDefault(allocator, home);
             app.config.state_root = app.state_root_default.?;
         };
         errdefer if (app.state_root_default) |owned| allocator.free(owned);
@@ -906,7 +906,7 @@ pub const App = struct {
 
         if (app.config.rsi) {
             const path = config.rsi_policy_path orelse return error.SkillPolicyRequired;
-            app.rsi_policy = try @import("skills/rsi.zig").Loaded.load(allocator, path);
+            app.rsi_policy = try @import("metacodes-internal").skills.rsi.Loaded.load(allocator, path);
         }
         errdefer if (app.rsi_policy) |*policy| policy.deinit();
 
@@ -954,7 +954,7 @@ pub const App = struct {
         // 启动时先事务化解析 CLI data packages，再由 canonical Runtime 一次性解析
         // enterprise / personal / project / plugin Skill sources。插件失败不降级：用户
         // 显式声明的 package 若不可信或 Host 不支持，启动必须 fail closed。
-        const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
+        const cwd_for_skills = @import("metacodes-internal").util.fs.getCwd(allocator) catch null;
         defer if (cwd_for_skills) |c| allocator.free(c);
         if ((config.plugin_dirs != null or config.process_plugin_dirs != null) and cwd_for_skills == null)
             return error.GetCwdFailed;
@@ -1007,7 +1007,7 @@ pub const App = struct {
                 plugin_skill_sources,
                 &app.skills,
             ) catch |err| {
-                @import("util/log.zig").warn(
+                @import("metacodes-internal").util.log.warn(
                     "skill",
                     "canonical catalog load failed: {s}",
                     .{@errorName(err)},
@@ -1024,7 +1024,7 @@ pub const App = struct {
         };
         // 缓存 project root(供 ${CLAUDE_PROJECT_DIR} 替换)
         if (cwd_for_skills) |cwd| {
-            app.project_dir = @import("skills/skill.zig").findRepoRoot(allocator, cwd) catch null;
+            app.project_dir = @import("metacodes-internal").skills.skill.findRepoRoot(allocator, cwd) catch null;
             app.cwd_abs = allocator.dupe(u8, cwd) catch null;
         }
 
@@ -1036,12 +1036,12 @@ pub const App = struct {
         // 模型档位表(model_tiers):同一份 <state root>/config.json。解析失败降级为
         // 未配置(档位名全 inherit)并告警——配置拼写错误不该炸启动,但绝不静默。
         if (app.stateRoot().len > 0) {
-            app.model_tiers_table = @import("api/model_tiers.zig").loadFromHome(allocator, app.stateRoot()) catch |err| tier_err: {
-                @import("util/log.zig").warn("config", "model_tiers 解析失败({s}),按未配置处理", .{@errorName(err)});
+            app.model_tiers_table = @import("metacodes-internal").api.model_tiers.loadFromHome(allocator, app.stateRoot()) catch |err| tier_err: {
+                @import("metacodes-internal").util.log.warn("config", "model_tiers 解析失败({s}),按未配置处理", .{@errorName(err)});
                 break :tier_err null;
             };
             app.model_prices = pricing.loadConfiguredFromHome(allocator, app.stateRoot()) catch |err| prices_err: {
-                @import("util/log.zig").warn("config", "model_prices 解析失败({s}),按内置价格表计费", .{@errorName(err)});
+                @import("metacodes-internal").util.log.warn("config", "model_prices 解析失败({s}),按内置价格表计费", .{@errorName(err)});
                 break :prices_err null;
             };
             if (app.model_prices) |prices| pricing.installConfigured(prices);
@@ -1063,7 +1063,7 @@ pub const App = struct {
             @import("platform").paths.homeDir() orelse "",
             app.project_dir orelse app.cwd_abs,
         ) catch |err| {
-            @import("util/log.zig").warn("skill", "skillOverrides not loaded: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("skill", "skillOverrides not loaded: {s}", .{@errorName(err)});
         };
         app.skill_runtime.overrides = &app.skill_overrides;
         app.skills.overrides = &app.skill_overrides;
@@ -1072,7 +1072,7 @@ pub const App = struct {
         // at least one model-invocable record.
         if (app.skill_runtime.hasModelInvocable()) {
             skill_tool_mod.registerSkillTool(&app.dyn_registry, &app.skill_runtime) catch |err| {
-                @import("util/log.zig").warn("skill", "register Skill tool failed: {s}", .{@errorName(err)});
+                @import("metacodes-internal").util.log.warn("skill", "register Skill tool failed: {s}", .{@errorName(err)});
             };
         }
         app.adoptSkillWatch();
@@ -1126,29 +1126,29 @@ pub const App = struct {
                 else
                     std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
                 if (gateway.len == 0 or !metask_oauth_mod.isGatewayOrigin(gateway)) {
-                    @import("util/log.zig").warn("catalog", "Metask gateway origin unavailable; keeping the compiled route", .{});
+                    @import("metacodes-internal").util.log.warn("catalog", "Metask gateway origin unavailable; keeping the compiled route", .{});
                     break :metask_catalog;
                 }
                 const models_url = std.fmt.allocPrint(app.allocator, "{s}/v1/models", .{gateway}) catch {
-                    @import("util/log.zig").warn("catalog", "Metask catalog URL allocation failed", .{});
+                    @import("metacodes-internal").util.log.warn("catalog", "Metask catalog URL allocation failed", .{});
                     break :metask_catalog;
                 };
                 defer app.allocator.free(models_url);
-                const fetched = @import("api/catalog_fetch.zig").fetchModelPages(app.allocator, io, .{
+                const fetched = @import("metacodes-internal").api.catalog_fetch.fetchModelPages(app.allocator, io, .{
                     .url = models_url,
                     .bearer = app.api_key,
                     .timeout_ms = models_cache_mod.STARTUP_WAIT_MS,
                 }) catch |err| {
-                    @import("util/log.zig").warn("catalog", "Metask /v1/models fetch failed: {s}", .{@errorName(err)});
+                    @import("metacodes-internal").util.log.warn("catalog", "Metask /v1/models fetch failed: {s}", .{@errorName(err)});
                     break :metask_catalog;
                 };
                 defer app.allocator.free(fetched.body);
                 const host = app.providerHost() catch |err| {
-                    @import("util/log.zig").warn("catalog", "Metask provider host unavailable: {s}", .{@errorName(err)});
+                    @import("metacodes-internal").util.log.warn("catalog", "Metask provider host unavailable: {s}", .{@errorName(err)});
                     break :metask_catalog;
                 };
                 host.ingestMetask(gateway, fetched.body, .messages_and_chat) catch |err| {
-                    @import("util/log.zig").warn("catalog", "Metask model ingestion failed: {s}", .{@errorName(err)});
+                    @import("metacodes-internal").util.log.warn("catalog", "Metask model ingestion failed: {s}", .{@errorName(err)});
                 };
                 // The route selected before App construction was derived
                 // from this same gateway origin; re-seed it after the
@@ -1156,7 +1156,7 @@ pub const App = struct {
                 // state points at the new offer generation.
                 app.seedStartupSelection(host);
                 app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
-                    @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
+                    @import("metacodes-internal").util.log.debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
                 };
                 app.syncClientCatalogs();
                 // No snapshot refresh here: the registry and swarm do not exist yet; their
@@ -1185,20 +1185,20 @@ pub const App = struct {
         errdefer if (app.metask_key_route) |*route| route.deinit(allocator);
         if (config.provider_kind == .anthropic) {
             if (!bound) {
-                @import("util/log.zig").debug("catalog", "probeModels skipped (no model is set up)", .{});
+                @import("metacodes-internal").util.log.debug("catalog", "probeModels skipped (no model is set up)", .{});
             } else if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
                 // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
                 app.api_key_catalog_load = .deferred;
                 app.loadModelCatalog(options.models_cache);
                 app.background_catalogs = options.models_cache;
             } else {
-                @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
+                @import("metacodes-internal").util.log.debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
             }
             // CLI --max-tokens 覆盖(仅作用于 anthropic api_client)
             app.api_client.setMaxTokensOverride(config.max_tokens);
             app.api_client.reasoning_effort = config.reasoning_effort;
         } else {
-            @import("util/log.zig").debug("catalog", "probeModels skipped (provider={s})", .{@tagName(config.provider_kind)});
+            @import("metacodes-internal").util.log.debug("catalog", "probeModels skipped (provider={s})", .{@tagName(config.provider_kind)});
         }
 
         // 初始化 transcript writer：需要 cwd + HOME
@@ -1206,7 +1206,7 @@ pub const App = struct {
         // can happen in it worth keeping until a route binds, which opens the
         // writer then (`adoptBoundRoute`). A resumed one reopens its own.
         if (bound or config.session_id != null) app.initTranscriptWriter() catch |err| {
-            @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
 
         // 计算本 session 的 memdir 路径(通道 B 自动记忆)+ mkdir + 挂权限豁免。
@@ -1219,21 +1219,21 @@ pub const App = struct {
         // System-One advisor (Jev): METACODES_JEV_* over `jev` in
         // <state root>/config.json over the built-in default (CLI only).
         // Off with an empty url. Never fatal.
-        app.jev = @import("jev/runtime.zig").load(app.allocator, app.api_client.http_client.io, app.homeDir(), app.stateRoot(), app.config.jev_builtin_default);
+        app.jev = @import("metacodes-internal").jev.runtime.load(app.allocator, app.api_client.http_client.io, app.homeDir(), app.stateRoot(), app.config.jev_builtin_default);
 
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {
-            @import("util/log.zig").debug("permission", "no rules loaded: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("permission", "no rules loaded: {s}", .{@errorName(err)});
         };
 
         // 加载 5 层 settings（新 schema permissions.allow/ask/deny）并挂到 permission_ctx
         app.loadSettings() catch |err| {
-            @import("util/log.zig").debug("permission", "no settings loaded: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("permission", "no settings loaded: {s}", .{@errorName(err)});
         };
 
         // 初始化 job registry
         app.jobs = JobRegistry.init(allocator) catch |err| blk: {
-            @import("util/log.zig").warn("job", "registry init failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("job", "registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -1244,13 +1244,13 @@ pub const App = struct {
         // on c_allocator (the provider/agent_loop allocator must match too).
         // registry/swarm receive an owned snapshot here and are refreshed after every parent
         // catalog mutation; workers never read &app.api_client.catalog concurrently.
-        const model_limits = @import("api/model_limits.zig").ModelLimitsSource{
+        const model_limits = @import("metacodes-internal").api.model_limits.ModelLimitsSource{
             .catalog = &app.api_client.catalog,
             .model_context = &app.model_context,
             .max_tokens_override = config.max_tokens,
         };
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app.config.openai_protocol, app_dialect_resolver) catch |err| blk: {
-            @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
+        app.agent_jobs = @import("metacodes-internal").core.agent_job_registry.AgentJobRegistry.initWithDialectResolver(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind, app.config.openai_protocol, app_dialect_resolver) catch |err| blk: {
+            @import("metacodes-internal").util.log.warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
         if (app.agent_jobs) |*jobs| try jobs.setLimits(model_limits);
@@ -1285,7 +1285,7 @@ pub const App = struct {
         // best-effort:创建失败仅 log,不阻断启动。
         // abort 适配:app.abort(AbortSignal)→ LSP 中立 AbortCheck,让 LSP 等待可 Ctrl+C 中断(M2)。
         if (config.lsp_enabled) {
-            const lsp_abort = @import("lsp/transport.zig").AbortCheck{
+            const lsp_abort = @import("metacodes-internal").lsp.transport.AbortCheck{
                 .ctx = @ptrCast(&app.abort),
                 .isAbortedFn = struct {
                     fn f(c: *anyopaque) bool {
@@ -1293,11 +1293,11 @@ pub const App = struct {
                     }
                 }.f,
             };
-            app.lsp_service = @import("lsp/service.zig").Service.create(allocator, app.cwdAbs(), lsp_abort) catch |err| blk: {
-                @import("util/log.zig").warn("lsp", "service init failed: {s} (LSP disabled)", .{@errorName(err)});
+            app.lsp_service = @import("metacodes-internal").lsp.service.Service.create(allocator, app.cwdAbs(), lsp_abort) catch |err| blk: {
+                @import("metacodes-internal").util.log.warn("lsp", "service init failed: {s} (LSP disabled)", .{@errorName(err)});
                 break :blk null;
             };
-            if (app.lsp_service != null) @import("util/log.zig").info("lsp", "language server integration enabled (disable with --no-lsp)", .{});
+            if (app.lsp_service != null) @import("metacodes-internal").util.log.info("lsp", "language server integration enabled (disable with --no-lsp)", .{});
         }
 
         // Wait for the MCP servers, register their tools and build the tool
@@ -1308,8 +1308,8 @@ pub const App = struct {
 
         // One instant and zone for the session-start date text and the
         // announcer that tracks what the model was told since (issue #276).
-        const time_context = @import("core/time_context.zig");
-        app.session_start = @import("util/time.zig").nowUnix();
+        const time_context = @import("metacodes-internal").core.time_context;
+        app.session_start = @import("metacodes-internal").util.time.nowUnix();
         app.session_zone = time_context.systemZone(app.session_start);
         app.time_announcer = time_context.Announcer.init(app.session_start, &app.session_zone, time_context.Announcer.defaultNow);
         app.goal_meter = .{
@@ -1320,7 +1320,7 @@ pub const App = struct {
 
         // The process OTLP exporter lives while any App does; the last
         // `deinit` flushes it (telemetry.zig). Nothing fails after this point.
-        @import("telemetry/telemetry.zig").acquire(@import("version.zig").semver);
+        @import("metacodes-internal").telemetry.telemetry.acquire(@import("metacodes-internal").version.semver);
         return app;
     }
 
@@ -1331,12 +1331,12 @@ pub const App = struct {
         const allocator = app.allocator;
         const auto_mem: []u8 = blk: {
             if (app.memdir_abs.len == 0) break :blk &.{};
-            const memdir = @import("core/memory/memdir.zig");
+            const memdir = @import("metacodes-internal").core.memory.memdir;
             const idx = memdir.readIndexTruncated(allocator, app.stateRoot(), app.cwdAbs()) catch null;
             break :blk (idx orelse &.{});
         };
         defer if (auto_mem.len > 0) allocator.free(auto_mem);
-        return @import("core/memory/user_context.zig").build(allocator, .{
+        return @import("metacodes-internal").core.memory.user_context.build(allocator, .{
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
             .state_root = app.stateRoot(),
@@ -1345,7 +1345,7 @@ pub const App = struct {
             .now = app.session_start,
             .zone = app.session_zone,
         }) catch |err| blk: {
-            @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;
         };
     }
@@ -1366,7 +1366,7 @@ pub const App = struct {
             .io = app.api_client.http_client.io,
             .token_url = token_url,
         };
-        return session.refreshIfStale(@import("util/time.zig").nowUnix(), exchange.exchange(), stale_access_token);
+        return session.refreshIfStale(@import("metacodes-internal").util.time.nowUnix(), exchange.exchange(), stale_access_token);
     }
 
     /// Install `refreshMetaskToken` on the clients that can run the Metask
@@ -1440,7 +1440,7 @@ pub const App = struct {
     fn adoptBoundRoute(app: *App, origin: route_state_mod.CredentialOrigin) void {
         app.route_state = .{ .bound = origin };
         if (app.transcript_writer == null) app.initTranscriptWriter() catch |err| {
-            @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
     }
 
@@ -1485,8 +1485,8 @@ pub const App = struct {
     /// for that provider which is read before the stored key (the shell's,
     /// else this install's `.env`), written into `buffer`; null when none is
     /// set. Names only, never a value.
-    pub fn storedKeyShadowNotice(app: *const App, profile: *const @import("provider/profile.zig").ProviderProfile, buffer: []u8) ?[]const u8 {
-        const provider_login = @import("api/provider_login.zig");
+    pub fn storedKeyShadowNotice(app: *const App, profile: *const @import("metacodes-internal").provider.profile.ProviderProfile, buffer: []u8) ?[]const u8 {
+        const provider_login = @import("metacodes-internal").api.provider_login;
         const shadow = provider_login.keyShadowedBy(profile, provider_credential_mod.EnvLookup.process(), app.config.credential_env_fallback) orelse return null;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const root = app.stateRoot();
@@ -1521,7 +1521,7 @@ pub const App = struct {
             if (!seen) try names.append(arena, name);
         }
         const login_capable = profile.api_key_setup != null or
-            if (@import("api/provider_login.zig").requireOAuthCapable(profile)) |_| true else |_| false;
+            if (@import("metacodes-internal").api.provider_login.requireOAuthCapable(profile)) |_| true else |_| false;
         return .{
             .display_name = profile.display_name,
             .variables = names.items,
@@ -1637,9 +1637,9 @@ pub const App = struct {
                 .route = MetaskKeyRoute{ .gateway_origin = gateway, .startup_key = key, .models_json = models_json },
             };
         };
-        var catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        var catalog = @import("metacodes-internal").api.catalog.Catalog.init(app.allocator);
         catalog.loadFromModelsListJson(document) catch |err| {
-            @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
         };
 
         // What the attempt replaces.
@@ -1697,12 +1697,12 @@ pub const App = struct {
         app.models_picker_key_index = null;
         app.models_picker_model_index = null;
         app.refreshChildCatalogSnapshots() catch |err| {
-            @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
         };
         // A picker kept open lists the new inventory.
         app.refreshModelPicker() catch app.model_picker.markFailed();
         if (sign_in.effort) |effort| app.setReasoningEffort(effort) catch |err| {
-            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+            @import("metacodes-internal").util.log.warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
         };
     }
 
@@ -1772,9 +1772,9 @@ pub const App = struct {
         const host = try app.providerHost();
         const messages_url = try std.fmt.allocPrint(app.allocator, "{s}/v1/messages", .{gateway});
         defer app.allocator.free(messages_url);
-        var catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        var catalog = @import("metacodes-internal").api.catalog.Catalog.init(app.allocator);
         catalog.loadFromModelsListJson(sign_in.models_json) catch |err| {
-            @import("util/log.zig").debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("catalog", "sign-in /v1/models unusable: {s}", .{@errorName(err)});
         };
 
         // What the attempt replaces.
@@ -1848,12 +1848,12 @@ pub const App = struct {
         app.models_picker_key_index = null;
         app.models_picker_model_index = null;
         app.refreshChildCatalogSnapshots() catch |err| {
-            @import("util/log.zig").warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
         };
         // A picker kept open lists the new inventory.
         app.refreshModelPicker() catch app.model_picker.markFailed();
         if (sign_in.effort) |effort| app.setReasoningEffort(effort) catch |err| {
-            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+            @import("metacodes-internal").util.log.warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
         };
     }
 
@@ -1867,10 +1867,10 @@ pub const App = struct {
         app: *App,
         sign_in: MetaskSession,
         token_json: []const u8,
-        diagnostic: ?*@import("api/provider_login.zig").ImportDiagnostic,
+        diagnostic: ?*@import("metacodes-internal").api.provider_login.ImportDiagnostic,
     ) SignInApplied {
         var applied: SignInApplied = .{};
-        const auth = @import("core/auth.zig");
+        const auth = @import("metacodes-internal").core.auth;
         var had_auth = true;
         var previous = auth.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
             error.NotFound, error.NoHome => blk: {
@@ -1902,7 +1902,7 @@ pub const App = struct {
         };
         defer snapshot.deinit();
 
-        @import("api/provider_login.zig").importTokenResponse(
+        @import("metacodes-internal").api.provider_login.importTokenResponse(
             app.allocator,
             app.stateRoot(),
             provider_ids_mod.Slug.lit("metask"),
@@ -1942,14 +1942,14 @@ pub const App = struct {
     fn rollbackMetaskSession(
         app: *App,
         snapshot: *const provider_oauth_mod.StoredSnapshot,
-        previous: *const @import("core/auth.zig").StoredCredentials,
+        previous: *const @import("metacodes-internal").core.auth.StoredCredentials,
         had_auth: bool,
     ) ?anyerror {
         var first_error: ?anyerror = null;
         snapshot.restore() catch |err| {
             first_error = err;
         };
-        const auth = @import("core/auth.zig");
+        const auth = @import("metacodes-internal").core.auth;
         if (had_auth) {
             auth.saveDefault(app.allocator, app.stateRoot(), previous.*) catch |err| {
                 if (first_error == null) first_error = err;
@@ -1968,11 +1968,11 @@ pub const App = struct {
     fn restoreMetaskOffers(
         app: *App,
         host: *provider_host_mod.Host,
-        profile: ?@import("provider/profile.zig").ProviderProfile,
+        profile: ?@import("metacodes-internal").provider.profile.ProviderProfile,
         selection: ?provider_selection_mod.RuntimeSelection,
     ) void {
         if (profile) |value| host.restoreMetask(value) catch |err| {
-            @import("util/log.zig").warn("catalog", "the previous Metask models were not restored: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("catalog", "the previous Metask models were not restored: {s}", .{@errorName(err)});
         };
         if (selection) |value| host.kernel.replaceSessionSelection(value) else host.kernel.forgetSessionSelection();
         app.refreshModelPicker() catch app.model_picker.markFailed();
@@ -2038,7 +2038,7 @@ pub const App = struct {
         };
         const host = try app.providerHost();
         const cleared_revision = sign_out_mod.clearMetaskDefault(app.allocator, root, host.kernel.catalogSnapshot()) catch |err| blk: {
-            @import("util/log.zig").warn("provider", "the stored default could not be checked: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("provider", "the stored default could not be checked: {s}", .{@errorName(err)});
             break :blk null;
         };
         if (cleared_revision) |revision| {
@@ -2064,8 +2064,8 @@ pub const App = struct {
                 if (app.bindLocalRoute(host, local)) |switched| {
                     session = .{ .switched = switched };
                 } else |err| switch (local) {
-                    .provider => |chosen| @import("util/log.zig").warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
-                    .preset => |preset| @import("util/log.zig").warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
+                    .provider => |chosen| @import("metacodes-internal").util.log.warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
+                    .preset => |preset| @import("metacodes-internal").util.log.warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
                 }
             }
             if (session == .unbound) app.unbindRoute(.signed_out);
@@ -2145,7 +2145,7 @@ pub const App = struct {
         var manage_url: ?[]u8 = null;
         defer if (manage_url) |url| app.allocator.free(url);
         if (host.registry.findById(provider_id)) |found| if (found.key_grant) |grant| {
-            const openrouter_login = @import("api/openrouter_login.zig");
+            const openrouter_login = @import("metacodes-internal").api.openrouter_login;
             manage_url = openrouter_login.storedKeyManageUrl(app.allocator, app.stateRoot(), provider_id, openrouter_login.origin(grant), grant);
         };
         const removed = try provider_api_key_store.remove(app.allocator, app.stateRoot(), provider_id);
@@ -2223,7 +2223,7 @@ pub const App = struct {
         if (!std.mem.eql(u8, offer.endpoint_ref, app.config.base_url orelse "") or
             !std.mem.eql(u8, offer.request_model_id, app.activeModel())) return false;
         app.bindCommittedSelection(host, selection) catch |err| {
-            @import("util/log.zig").warn("provider", "/login {s}: the session keeps its previous credential ({s})", .{ provider_id.slice(), @errorName(err) });
+            @import("metacodes-internal").util.log.warn("provider", "/login {s}: the session keeps its previous credential ({s})", .{ provider_id.slice(), @errorName(err) });
             return false;
         };
         return true;
@@ -2309,7 +2309,7 @@ pub const App = struct {
         });
         if (committed != .committed) return error.SelectionRefused;
         if (resolved.reasoning_effort) |effort| app.setReasoningEffort(effort) catch |err| {
-            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+            @import("metacodes-internal").util.log.warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
         };
         return .{
             .name = profile.display_name,
@@ -2324,7 +2324,7 @@ pub const App = struct {
 
     /// The Metask key in `local`, the host's `.env` layer: borrowed from it,
     /// which lives for the process. Null when it holds none.
-    fn localMetaskKey(local: provider_credential_mod.EnvLookup, profile: *const @import("provider/profile.zig").ProviderProfile) ?[]const u8 {
+    fn localMetaskKey(local: provider_credential_mod.EnvLookup, profile: *const @import("metacodes-internal").provider.profile.ProviderProfile) ?[]const u8 {
         for (profile.env_aliases) |alias| {
             if (local.get(alias.name)) |value| if (value.len > 0) return value;
         }
@@ -2333,7 +2333,7 @@ pub const App = struct {
 
     /// 当前 provider 的模型档位表(low/mid/high)。未配置 → null(档位名全 inherit)。
     /// 返回指针借用 App 生命周期的表,启动后只读——后台 worker 线程读安全。
-    pub fn activeModelTiers(app: *const App) ?*const @import("api/model_tiers.zig").ProviderTiers {
+    pub fn activeModelTiers(app: *const App) ?*const @import("metacodes-internal").api.model_tiers.ProviderTiers {
         const table = &(app.model_tiers_table orelse return null);
         return table.forKind(app.config.provider_kind);
     }
@@ -2505,7 +2505,7 @@ pub const App = struct {
         if (app.user_context) |u| app.allocator.free(u);
         app.allocator.destroy(app);
         // Every Run of this App has ended: send what is queued (last App only).
-        @import("telemetry/telemetry.zig").release();
+        @import("metacodes-internal").telemetry.telemetry.release();
     }
 
     /// Fill `api_key_catalog` for the `/models` key menu, once, the first time
@@ -2524,7 +2524,7 @@ pub const App = struct {
         // unavailable, and loads it once the session is back.
         if (!app.onMetaskKeyRoute()) return;
         const load = api_keys_mod.Load.start(app.api_client.base_url, app.api_key, app.stateRoot()) catch |err| {
-            @import("util/log.zig").debug("auth", "api key list not started: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("auth", "api key list not started: {s}", .{@errorName(err)});
             app.api_key_catalog_load = .loaded;
             app.fallBackToCurrentApiKey();
             return;
@@ -2550,7 +2550,7 @@ pub const App = struct {
                 std.heap.c_allocator.free(body);
             }
             app.api_key_catalog.loadFromJson(body) catch |err| {
-                @import("util/log.zig").debug("auth", "api key list unreadable: {s}", .{@errorName(err)});
+                @import("metacodes-internal").util.log.debug("auth", "api key list unreadable: {s}", .{@errorName(err)});
             };
         }
         app.fallBackToCurrentApiKey();
@@ -2560,7 +2560,7 @@ pub const App = struct {
     fn fallBackToCurrentApiKey(app: *App) void {
         if (app.api_key_catalog.entries.items.len != 0) return;
         app.api_key_catalog.addCurrentKeyFallback(app.api_key) catch |err| {
-            @import("util/log.zig").debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
         };
     }
 
@@ -2607,13 +2607,13 @@ pub const App = struct {
     /// the answer is fetched before init returns, within the page deadline.
     fn loadModelCatalog(app: *App, use_cache: bool) void {
         if (!use_cache) return app.probeModelCatalog();
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         const auth = app.routeAuthHeader() orelse return app.probeModelCatalog();
         defer app.freeRouteAuthHeader(auth);
         const header: std.http.Header = .{ .name = auth.name, .value = auth.value };
         const base_url = app.api_client.base_url;
         const key = models_cache_mod.Key.of(base_url, header);
-        const now = @import("util/time.zig").nowUnix();
+        const now = @import("metacodes-internal").util.time.nowUnix();
 
         if (models_cache_mod.load(app.allocator, app.stateRoot(), key, base_url, now, models_cache_mod.TTL_SECONDS)) |body| {
             defer app.allocator.free(body);
@@ -2628,7 +2628,7 @@ pub const App = struct {
             } else |err| {
                 log.debug("catalog", "cached /v1/models unusable ({s}); fetching", .{@errorName(err)});
                 app.api_client.catalog.deinit();
-                app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+                app.api_client.catalog = @import("metacodes-internal").api.catalog.Catalog.init(app.allocator);
             }
         }
 
@@ -2655,11 +2655,11 @@ pub const App = struct {
     /// The credential header the Anthropic client's requests carry now
     /// (owned; `freeRouteAuthHeader`). Null when it cannot build one, as the
     /// client's own requests would then fail.
-    fn routeAuthHeader(app: *App) ?@import("api/auth_header.zig").Header {
+    fn routeAuthHeader(app: *App) ?@import("metacodes-internal").api.auth_header.Header {
         return app.api_client.credential.header(app.allocator, app.api_client.auth_scheme) catch null;
     }
 
-    fn freeRouteAuthHeader(app: *App, header: @import("api/auth_header.zig").Header) void {
+    fn freeRouteAuthHeader(app: *App, header: @import("metacodes-internal").api.auth_header.Header) void {
         std.crypto.secureZero(u8, header.value);
         app.allocator.free(header.value);
     }
@@ -2688,7 +2688,7 @@ pub const App = struct {
         refresh.release();
         const fresh_body = body orelse return false;
         defer std.heap.c_allocator.free(fresh_body);
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
 
         const auth = app.routeAuthHeader() orelse return false;
         defer app.freeRouteAuthHeader(auth);
@@ -2696,7 +2696,7 @@ pub const App = struct {
             log.debug("catalog", "background /v1/models answer is for another route; dropped", .{});
             return false;
         }
-        var fresh = @import("api/catalog.zig").Catalog.init(app.allocator);
+        var fresh = @import("metacodes-internal").api.catalog.Catalog.init(app.allocator);
         fresh.loadFromModelsListJson(fresh_body) catch |err| {
             fresh.deinit();
             log.debug("catalog", "background /v1/models answer unusable: {s}", .{@errorName(err)});
@@ -2716,12 +2716,12 @@ pub const App = struct {
     /// the local tables still answer.
     fn probeModelCatalog(app: *App) void {
         const body = app.api_client.fetchModelsList() catch |err| {
-            @import("util/log.zig").debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
             return;
         };
         defer app.api_client.allocator.free(body);
         app.api_client.catalog.loadFromModelsListJson(body) catch |err| {
-            @import("util/log.zig").debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
         };
         app.adoptMetaskKeyModels(app.api_client.base_url, body);
     }
@@ -2741,7 +2741,7 @@ pub const App = struct {
         const origin = MetaskKeyRoute.gatewayOriginOf(probed_messages_url) orelse return;
         if (!std.mem.eql(u8, origin, route.gateway_origin)) return;
         const owned = app.allocator.dupe(u8, document) catch {
-            @import("util/log.zig").warn("catalog", "Metask gateway models not kept: out of memory", .{});
+            @import("metacodes-internal").util.log.warn("catalog", "Metask gateway models not kept: out of memory", .{});
             return;
         };
         if (route.models_json) |previous| app.allocator.free(previous);
@@ -2762,7 +2762,7 @@ pub const App = struct {
         const route = app.metask_key_route orelse return;
         const document = route.models_json orelse return;
         host.ingestMetask(route.gateway_origin, document, .messages) catch |err| {
-            @import("util/log.zig").warn("catalog", "Metask gateway models not offered ({s}); the picker keeps the previous list", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("catalog", "Metask gateway models not offered ({s}); the picker keeps the previous list", .{@errorName(err)});
         };
     }
 
@@ -2793,7 +2793,7 @@ pub const App = struct {
         errdefer host.destroy();
         // `METACODES_OPENROUTER_URL` (development, tests) moves every
         // OpenRouter address, its requests included.
-        @import("api/openrouter_login.zig").applyOriginOverride(host);
+        @import("metacodes-internal").api.openrouter_login.applyOriginOverride(host);
         // Seed the durable revision and any previously committed global
         // selection, so `selection.commit` compares against the number the
         // store actually holds rather than an invented one.
@@ -2807,14 +2807,14 @@ pub const App = struct {
             // Reported once, when the host is built. A broken section otherwise
             // surfaces much later as "unknown provider" with nothing to connect
             // it to the configuration that caused it.
-            @import("util/log.zig").warn(
+            @import("metacodes-internal").util.log.warn(
                 "provider",
                 "part of <state root>/config.json did not apply ({s}); run `metacodes --check-providers`",
                 .{why},
             );
         }
         var shadowed_buf: [256]u8 = undefined;
-        if (host.shadowedNotice(&shadowed_buf)) |notice| @import("util/log.zig").warn("provider", "{s}", .{notice});
+        if (host.shadowedNotice(&shadowed_buf)) |notice| @import("metacodes-internal").util.log.warn("provider", "{s}", .{notice});
         app.applyMetaskKeyCatalog(host);
         app.adoptOpenRouterListing(host);
         app.seedStartupSelection(host);
@@ -2829,14 +2829,14 @@ pub const App = struct {
         const kept = openrouter_catalog_mod.adoptKept(host, app.allocator, app.stateRoot());
         if (kept == .fresh or !app.openrouter_background or app.openrouter_refresh != null) return;
         app.startOpenRouterRefreshIn(host, kept == .none) catch |err| {
-            @import("util/log.zig").debug("catalog", "OpenRouter listing refresh not started: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.debug("catalog", "OpenRouter listing refresh not started: {s}", .{@errorName(err)});
         };
     }
 
     /// Take a finished background fetch of OpenRouter's listing into the
     /// live catalog. Called where the REPL takes `models_refresh`.
     pub fn adoptOpenRouterRefresh(app: *App) void {
-        if (app.takeOpenRouterRefresh(@import("util/time.zig").nowMs()).listed) {
+        if (app.takeOpenRouterRefresh(@import("metacodes-internal").util.time.nowMs()).listed) {
             app.refreshModelPicker() catch app.model_picker.markFailed();
         }
     }
@@ -2858,7 +2858,7 @@ pub const App = struct {
         app.openrouter_refresh = refresh;
         app.openrouter_refresh_shown = shown;
         app.openrouter_failure = null;
-        app.openrouter_progress = .{ .at_ms = @import("util/time.zig").nowMs() };
+        app.openrouter_progress = .{ .at_ms = @import("metacodes-internal").util.time.nowMs() };
     }
 
     fn dropOpenRouterRefresh(app: *App) void {
@@ -3103,7 +3103,7 @@ pub const App = struct {
     fn resolvedProfileFor(
         host: *provider_host_mod.Host,
         selection: provider_selection_mod.RuntimeSelection,
-    ) ?*const @import("provider/profile.zig").ProviderProfile {
+    ) ?*const @import("metacodes-internal").provider.profile.ProviderProfile {
         const resolution = provider_selection_mod.resolve(host.kernel.catalogSnapshot(), selection) catch
             return null;
         return host.registry.findById(resolution.primary().provider_id);
@@ -3116,7 +3116,7 @@ pub const App = struct {
     /// token endpoint has no lifecycle to run.
     pub fn oauthAccessToken(
         app: *App,
-        built: *const @import("provider/profile.zig").ProviderProfile,
+        built: *const @import("metacodes-internal").provider.profile.ProviderProfile,
         now_seconds: i64,
     ) !?[]u8 {
         if (built.id.eqlText("metask") and !app.config.metask_oauth_selected) return null;
@@ -3253,7 +3253,7 @@ pub const App = struct {
         try listing.ready.resize(app.allocator, offers.len);
         @memset(listing.ready.items, false);
         const snapshot = host.kernel.catalogSnapshot();
-        const now = @import("util/time.zig").nowUnix();
+        const now = @import("metacodes-internal").util.time.nowUnix();
         var pool: CredentialPool = .{};
         pool.load(app, null);
         defer pool.deinit();
@@ -3323,7 +3323,7 @@ pub const App = struct {
     /// own, not a constant. A profile that accepts only `openai_codex_oauth`
     /// would reject a token labelled `openai_oauth`, and the failure would
     /// look like a missing credential rather than a mislabelled one.
-    fn oauthKindOf(built: *const @import("provider/profile.zig").ProviderProfile) provider_credential_mod.CredentialKind {
+    fn oauthKindOf(built: *const @import("metacodes-internal").provider.profile.ProviderProfile) provider_credential_mod.CredentialKind {
         for (built.accepted_credential_kinds) |kind| {
             if (provider_oauth_mod.servesKind(kind)) return kind;
         }
@@ -3333,7 +3333,7 @@ pub const App = struct {
     /// Whether a commit onto `built` would get an OAuth token from a stored
     /// login, judged without a request: `oauthAccessToken`'s conditions,
     /// with the login on disk standing for the token a refresh would give.
-    fn oauthLoginStored(app: *App, built: *const @import("provider/profile.zig").ProviderProfile) bool {
+    fn oauthLoginStored(app: *App, built: *const @import("metacodes-internal").provider.profile.ProviderProfile) bool {
         if (built.id.eqlText("metask") and !app.config.metask_oauth_selected) return false;
         if (built.oauth_token_url == null) return false;
         var serves = false;
@@ -3392,7 +3392,7 @@ pub const App = struct {
             var stored: StoredKey = .{ .allocator = app.allocator };
             const id = provider_id orelse return stored;
             stored.file = provider_api_key_store.load(app.allocator, app.stateRoot(), id) catch |err| blk: {
-                if (report == .warn) @import("util/log.zig").warn("provider", "the stored key for {s} cannot be used: {s}", .{ id.slice(), @errorName(err) });
+                if (report == .warn) @import("metacodes-internal").util.log.warn("provider", "the stored key for {s} cannot be used: {s}", .{ id.slice(), @errorName(err) });
                 break :blk null;
             };
             if (stored.file == null and id.eqlText("metask") and app.metask_key_route == null and !app.config.metask_oauth_selected) {
@@ -3419,7 +3419,7 @@ pub const App = struct {
 
     /// The API key `metacodes login` stored in `auth.json` (owned), or null.
     fn metaskLoginKey(app: *App) ?[]u8 {
-        const auth = @import("core/auth.zig");
+        const auth = @import("metacodes-internal").core.auth;
         const path = auth.authFilePath(app.allocator, app.stateRoot()) catch return null;
         defer app.allocator.free(path);
         var stored = auth.loadFromPath(app.allocator, path) catch return null;
@@ -3550,7 +3550,7 @@ pub const App = struct {
         if (value != .text) return;
         const effort = types.ReasoningEffort.parse(value.text.slice()) orelse return;
         app.setReasoningEffort(effort) catch |err| {
-            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+            @import("metacodes-internal").util.log.warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
         };
     }
 
@@ -3644,7 +3644,7 @@ pub const App = struct {
         selection: provider_selection_mod.RuntimeSelection,
     ) !void {
         var reference_buffer: [provider_ids_mod.MAX_SLUG_LEN]u8 = undefined;
-        const now = @import("util/time.zig").nowUnix();
+        const now = @import("metacodes-internal").util.time.nowUnix();
 
         // An OAuth provider's live access token is obtained (and refreshed, and
         // persisted) before resolution, so the resolver sees ordinary stored
@@ -3663,7 +3663,7 @@ pub const App = struct {
                 // A dead login is worth saying out loud: resolution will fall
                 // through to an environment key, and "it silently used a
                 // different credential" is the confusing outcome.
-                @import("util/log.zig").warn(
+                @import("metacodes-internal").util.log.warn(
                     "provider",
                     "OAuth token for '{s}' unavailable ({s}); falling back to other credentials",
                     .{ built.id.slice(), @errorName(err) },
@@ -3902,7 +3902,7 @@ pub const App = struct {
         app.api_client.credential = .{ .fixed = owned };
 
         app.api_client.catalog.deinit();
-        app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        app.api_client.catalog = @import("metacodes-internal").api.catalog.Catalog.init(app.allocator);
         try app.refreshChildCatalogSnapshots();
         app.models_picker_key_index = idx;
         try app.startModelsRefresh();
@@ -3926,7 +3926,7 @@ pub const App = struct {
         inline for (.{ &app.openai_client, &app.gemini_client, &app.bedrock_client }) |slot| {
             if (slot.*) |*client| sync: {
                 const copy = app.api_client.catalog.clone(app.allocator) catch |err| {
-                    @import("util/log.zig").warn("catalog", "client catalog copy failed: {s}", .{@errorName(err)});
+                    @import("metacodes-internal").util.log.warn("catalog", "client catalog copy failed: {s}", .{@errorName(err)});
                     break :sync;
                 };
                 if (client.catalog) |*old| old.deinit();
@@ -3938,7 +3938,7 @@ pub const App = struct {
     /// Refresh worker-owned catalog snapshots after the mutable parent catalog changes.
     fn refreshChildCatalogSnapshots(app: *App) !void {
         app.syncClientCatalogs();
-        const source = @import("api/model_limits.zig").ModelLimitsSource{
+        const source = @import("metacodes-internal").api.model_limits.ModelLimitsSource{
             .catalog = &app.api_client.catalog,
             .model_context = &app.model_context,
             .max_tokens_override = app.config.max_tokens,
@@ -3966,8 +3966,8 @@ pub const App = struct {
         gemini_client: ?*gemini_mod.GeminiClient,
         bedrock_client: ?*bedrock_mod.BedrockClient,
         transcript_writer: ?*transcript.Writer,
-        agent_jobs: ?*@import("core/agent_job_registry.zig").AgentJobRegistry,
-        swarm: *@import("swarm/context.zig").SwarmContext,
+        agent_jobs: ?*@import("metacodes-internal").core.agent_job_registry.AgentJobRegistry,
+        swarm: *@import("metacodes-internal").swarm.context.SwarmContext,
     ) !void {
         // agent_jobs 内部 dupe，可 OOM → 最前，失败时其它镜像未动(最小一致)。
         if (agent_jobs) |aj| try aj.setModel(model);
@@ -4028,13 +4028,13 @@ pub const App = struct {
         app.emitConfig(.{ .model = app.activeModel() });
 
         // The prompt names the switched model from here on (promptModelName).
-        const sw_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        const sw_cwd = @import("metacodes-internal").util.fs.getCwd(app.allocator) catch "";
         defer if (sw_cwd.len > 0) app.allocator.free(sw_cwd);
         if (app.buildSystemPrompt(sw_cwd)) |sp| {
             if (app.system_prompt) |old| app.allocator.free(old);
             app.system_prompt = sp;
         } else |err| {
-            @import("util/log.zig").warn("sysprompt", "not rebuilt after the model switch: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("sysprompt", "not rebuilt after the model switch: {s}", .{@errorName(err)});
         }
     }
 
@@ -4051,7 +4051,7 @@ pub const App = struct {
     }
 
     fn refreshSkillListings(app: *App) void {
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         // Descriptions live in the tool-definition arena, which outlives every
         // borrower of `tool_defs` (jobs copy them when they start).
         _ = app.skill_runtime.refreshModelTool(app.tool_defs, app.tool_defs_arena.allocator()) catch |err| {
@@ -4126,11 +4126,11 @@ pub const App = struct {
     }
 
     pub fn persistLoginSelection(app: *App) void {
-        const auth_mod = @import("core/auth.zig");
+        const auth_mod = @import("metacodes-internal").core.auth;
         var stored = auth_mod.loadDefault(app.allocator, app.stateRoot()) catch |err| switch (err) {
             error.NotFound, error.NoHome => auth_mod.StoredCredentials{},
             else => {
-                @import("util/log.zig").warn("auth", "load for selection persist failed: {s}", .{@errorName(err)});
+                @import("metacodes-internal").util.log.warn("auth", "load for selection persist failed: {s}", .{@errorName(err)});
                 return;
             },
         };
@@ -4146,7 +4146,7 @@ pub const App = struct {
         stored.selected_model = app.allocator.dupe(u8, app.activeModel()) catch return; // U3:持久化当前 model
         stored.reasoning_effort = app.config.reasoning_effort;
         auth_mod.saveDefault(app.allocator, app.stateRoot(), stored) catch |err| {
-            @import("util/log.zig").warn("auth", "persist selection failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("auth", "persist selection failed: {s}", .{@errorName(err)});
         };
     }
 
@@ -4174,7 +4174,7 @@ pub const App = struct {
         app.publishSessionDir();
         // An unbound session opens its directory when a route binds (#484).
         if (app.route_state == .bound) app.initTranscriptWriter() catch |err| {
-            @import("util/log.zig").warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("transcript", "rotate writer failed: {s}", .{@errorName(err)});
         };
         // R4-3:goal 属于被转走的旧会话——不清则旧 goal 记进新会话目录、用量记错账,
         // /resume 旧会话时又读到陈旧快照。新会话从无 goal 起步(对齐"新空会话"语义)。
@@ -4246,7 +4246,7 @@ pub const App = struct {
     /// session. App.init creates a writer before command-line teammate mode is
     /// known, so close that writer and reopen the exact parent directory before
     /// the first turn is persisted.
-    pub fn adoptSessionIdentity(app: *App, session: @import("core/session_id.zig").SessionId) !void {
+    pub fn adoptSessionIdentity(app: *App, session: @import("metacodes-internal").core.session_id.SessionId) !void {
         if (std.mem.eql(u8, app.session_id.asSlice(), session.asSlice())) return;
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
@@ -4255,7 +4255,7 @@ pub const App = struct {
         app.permission_ctx.session = session;
         app.swarm.session = session;
         app.initTranscriptWriter() catch |err| {
-            @import("util/log.zig").warn("transcript", "adopt session writer failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("transcript", "adopt session writer failed: {s}", .{@errorName(err)});
             return err;
         };
     }
@@ -4264,7 +4264,7 @@ pub const App = struct {
         const state_dir = app.stateRoot();
         if (state_dir.len == 0) return error.NoHome;
 
-        const cwd = try @import("util/fs.zig").getCwd(app.allocator);
+        const cwd = try @import("metacodes-internal").util.fs.getCwd(app.allocator);
         defer app.allocator.free(cwd);
 
         // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
@@ -4284,7 +4284,7 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
     }
 
-    fn goalChanged(raw: *anyopaque, _: *const GoalState, _: @import("core/goal.zig").Meter.Change) void {
+    fn goalChanged(raw: *anyopaque, _: *const GoalState, _: @import("metacodes-internal").core.goal.Meter.Change) void {
         const app: *App = @ptrCast(@alignCast(raw));
         app.persistGoal();
     }
@@ -4293,7 +4293,7 @@ pub const App = struct {
     pub fn persistGoal(app: *App) void {
         const dir = app.sessionDir() orelse return;
         app.goal_state.persistToDir(dir) catch |err| {
-            @import("util/log.zig").warn("goal", "persist failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("goal", "persist failed: {s}", .{@errorName(err)});
         };
     }
 
@@ -4302,7 +4302,7 @@ pub const App = struct {
         app.goal_state.loadFromDir(dir) catch |err| switch (err) {
             error.NotFound => app.goal_state.clearInMemory(),
             else => {
-                @import("util/log.zig").warn("goal", "load failed: {s}", .{@errorName(err)});
+                @import("metacodes-internal").util.log.warn("goal", "load failed: {s}", .{@errorName(err)});
                 app.goal_state.clearInMemory();
             },
         };
@@ -4333,7 +4333,7 @@ pub const App = struct {
         app.loadGoalFromSessionDir(dir_owned);
         const route = app.restoreSessionRoute();
         if (route == .unavailable) {
-            @import("util/log.zig").warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(route.unavailable) });
+            @import("metacodes-internal").util.log.warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(route.unavailable) });
         }
         return .{ .messages = app.conversation.len(), .route = route };
     }
@@ -4408,7 +4408,7 @@ pub const App = struct {
     /// 计算本 session 的 memdir 绝对路径(通道 B)+ mkdir + 挂权限豁免。
     /// memdir 禁用(env)或无 home/cwd → 留空串(降级:不豁免、不注入 AutoMem)。
     fn initMemdir(app: *App) void {
-        const memdir = @import("core/memory/memdir.zig");
+        const memdir = @import("metacodes-internal").core.memory.memdir;
         if (!app.config.long_horizon_arm.usesAutoMemory(memdir.isEnabled())) return;
         const state_dir = app.stateRoot();
         const cwd = app.cwdAbs();
@@ -4455,13 +4455,13 @@ pub const App = struct {
             provider_id,
             credential_id,
             class,
-            @import("util/time.zig").nowUnix(),
+            @import("metacodes-internal").util.time.nowUnix(),
             CREDENTIAL_COOLDOWN_SECONDS,
             null,
         ) catch |err| {
             // Not fatal — the request already failed — but a limit that cannot
             // be recorded is a limit rediscovered by hitting it every run.
-            @import("util/log.zig").warn(
+            @import("metacodes-internal").util.log.warn(
                 "provider",
                 "could not record the credential failure for '{s}' ({s})",
                 .{ credential_id.slice(), @errorName(err) },
@@ -4525,7 +4525,7 @@ pub const App = struct {
         const live = app.liveRoute() orelse return false;
         if (!live.oauth) return false;
         const built = host.registry.findById(live.provider) orelse return false;
-        const token = (try app.oauthAccessToken(built, @import("util/time.zig").nowUnix())) orelse
+        const token = (try app.oauthAccessToken(built, @import("metacodes-internal").util.time.nowUnix())) orelse
             return false;
         errdefer {
             std.crypto.secureZero(u8, token);
@@ -4731,7 +4731,7 @@ pub const App = struct {
             else
                 null;
 
-            const models = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+            const models = @import("metacodes-internal").api.catalog_fetch.fetch(app.allocator, io, .{
                 .url = models_url,
                 .bearer = bearer,
             }) catch |err| {
@@ -4749,7 +4749,7 @@ pub const App = struct {
                 if (list == .array) {
                     for (list.array.items) |item| {
                         const url = stringField(item) orelse continue;
-                        const document = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                        const document = @import("metacodes-internal").api.catalog_fetch.fetch(app.allocator, io, .{
                             .url = url,
                             .bearer = bearer,
                         }) catch |err| {
@@ -4799,7 +4799,7 @@ pub const App = struct {
         if (replay.events.len == 0) return .{};
 
         const Bridge = struct {
-            client: *@import("kg/client.zig").KgClient,
+            client: *@import("metacodes-internal").kg.client.KgClient,
             fn append(ctx: *anyopaque, line: []const u8, schema_type: []const u8) anyerror!u64 {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 // `.decision` is what these are, and session-scoped rather than
@@ -4842,7 +4842,7 @@ pub const App = struct {
         // domain,否则记忆按 cwd 碎片化——BM25/隔离/global 全建立在"一仓一 domain"上)。
         // project_dir = findRepoRoot(沿 cwd 上溯 .git);非 git repo 退 cwd。
         const anchor = app.project_dir orelse cwd;
-        const anchor_hash = @import("core/transcript.zig").hashCwd(anchor);
+        const anchor_hash = @import("metacodes-internal").core.transcript.hashCwd(anchor);
         app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/projects/{s}", .{ state_dir, anchor_hash[0..] }) catch return;
         // **必须建目录**(Linus H1):否则从 git 子目录启动时 anchor_hash != cwd_hash,
         // projects/<anchor_hash> 无人 mkdir → plan 落图的 kg_root 指针 writeIdPointer 失败
@@ -4855,7 +4855,7 @@ pub const App = struct {
         else
             null;
         const domain = app.computeKgDomain(anchor, anchor_hash, domain_override) catch |err| {
-            @import("util/log.zig").warn("kg", "project domain override rejected: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("kg", "project domain override rejected: {s}", .{@errorName(err)});
             return;
         };
         defer app.allocator.free(domain);
@@ -4863,7 +4863,7 @@ pub const App = struct {
         // Nobody should have to remember `metacodes kgd`: the client asks this
         // host to provision and start the install's service when it needs it.
         if (app.kg_autostart == null) app.kg_autostart = @import("app/kg_autostart.zig").Autostart.create(app.allocator, state_dir);
-        var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
+        var client = @import("metacodes-internal").kg.client.KgClient.init(app.allocator, .{
             .state_root = state_dir,
             .domain = domain,
             .config_bin = null, // config.json kg_bin(P2 接线)
@@ -4879,14 +4879,14 @@ pub const App = struct {
                 app.kg_startup = startup;
                 return;
             } else |err| {
-                @import("util/log.zig").warn("kg", "background readiness unavailable, probing now: {s}", .{@errorName(err)});
+                @import("metacodes-internal").util.log.warn("kg", "background readiness unavailable, probing now: {s}", .{@errorName(err)});
             }
         }
         const outcome = kg_startup.prepare(app.allocator, &client, app.kg_projects_dir, identity);
         app.adoptKg(client, outcome);
     }
 
-    fn adoptKg(app: *App, client: @import("kg/client.zig").KgClient, outcome: kg_startup.Outcome) void {
+    fn adoptKg(app: *App, client: @import("metacodes-internal").kg.client.KgClient, outcome: kg_startup.Outcome) void {
         app.kg = client;
         const kg = &app.kg.?;
         if (kg.ready) {
@@ -4910,13 +4910,13 @@ pub const App = struct {
         ) catch return;
         defer app.allocator.free(mirror_path);
         app.tasks.setMirror(mirror_path) catch |err| {
-            @import("util/log.zig").warn("kg", "degraded task mirror setup failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("kg", "degraded task mirror setup failed: {s}", .{@errorName(err)});
             return;
         };
         // 启动时重开共享 mirror；损坏时保留 mirror 配置，让后续 Task* 在写前
         // fail closed，而不是用局部状态覆盖仍可取证的坏文件。
         app.tasks.loadFromMirror() catch |err| {
-            @import("util/log.zig").warn("kg", "degraded task mirror reopen failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("kg", "degraded task mirror reopen failed: {s}", .{@errorName(err)});
         };
     }
 
@@ -4949,17 +4949,17 @@ pub const App = struct {
     /// 从 kg_inbox frontier 重建内存 store 镜像,入参显式(组件测试用真 TinyKG 直接驱动)。
     pub fn mirrorInboxFrontier(
         allocator: std.mem.Allocator,
-        kg: *@import("kg/client.zig").KgClient,
+        kg: *@import("metacodes-internal").kg.client.KgClient,
         kg_projects_dir: []const u8,
-        tasks: *@import("core/task_store.zig").TaskStore,
+        tasks: *@import("metacodes-internal").core.task_store.TaskStore,
     ) void {
         applyInboxMirror(kg, kg_startup.readInboxFrontier(allocator, kg, kg_projects_dir), tasks);
     }
 
     fn applyInboxMirror(
-        kg: *@import("kg/client.zig").KgClient,
-        rows: []@import("kg/client.zig").FrontierRow,
-        tasks: *@import("core/task_store.zig").TaskStore,
+        kg: *@import("metacodes-internal").kg.client.KgClient,
+        rows: []@import("metacodes-internal").kg.client.FrontierRow,
+        tasks: *@import("metacodes-internal").core.task_store.TaskStore,
     ) void {
         defer kg_startup.freeRows(kg, rows);
         for (rows) |r| {
@@ -4969,7 +4969,7 @@ pub const App = struct {
             const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch continue;
             const nl = std.mem.indexOfScalar(u8, r.text, '\n');
             const subject = if (nl) |i| r.text[0..i] else r.text;
-            const status: @import("core/task_store.zig").TaskStatus = if (r.status == .claimed) .in_progress else .pending;
+            const status: @import("metacodes-internal").core.task_store.TaskStatus = if (r.status == .claimed) .in_progress else .pending;
             // 记下真实的租约持有者:它可能是别的会话或队友,任务锚/关闭提示/溯源据此
             // 只看本 agent 认领的行(本进程的身份要到 agent_loop.run 才声明)。
             tasks.createWithIdHeldBy(kg_id, subject, r.text, status, r.claimed_by) catch {};
@@ -4981,7 +4981,7 @@ pub const App = struct {
     fn mkdirKgProjectsDir(allocator: std.mem.Allocator, state_dir: []const u8, hash: [16]u8) void {
         // The state root itself is created with its parents (an install's
         // `<prefix>/state` or a --state-dir); below it, one level at a time.
-        @import("util/fs.zig").mkdirParents(state_dir) catch return;
+        @import("metacodes-internal").util.fs.mkdirParents(state_dir) catch return;
         {
             const dir = std.fmt.allocPrint(allocator, "{s}/projects", .{state_dir}) catch return;
             defer allocator.free(dir);
@@ -5149,7 +5149,7 @@ pub const App = struct {
     }
 
     /// sandbox 配置指针(供 agent_loop opts 注入 ToolContext)。null = 未启用。
-    pub fn sandboxPtr(app: *const App) ?*const @import("sandbox/config.zig").SandboxSettings {
+    pub fn sandboxPtr(app: *const App) ?*const @import("metacodes-internal").sandbox.config.SandboxSettings {
         if (app.sandbox_settings) |*s| return s;
         return null;
     }
@@ -5159,7 +5159,7 @@ pub const App = struct {
     /// 这样 snapshotJobs/runningCount 里 listLock 锁的是**真 registry 的 mutex**,
     /// 与后台线程注册新 job 时锁的是同一把,不会锁到栈副本(那是 race)。
     /// @constCast 去掉 const 是诚实的:快照只动 mutex 不改逻辑状态(同 sandboxPtr 理据)。
-    pub fn agentJobsPtr(app: *const App) ?*@import("core/agent_job_registry.zig").AgentJobRegistry {
+    pub fn agentJobsPtr(app: *const App) ?*@import("metacodes-internal").core.agent_job_registry.AgentJobRegistry {
         if (app.agent_jobs) |*aj| return @constCast(aj);
         return null;
     }
@@ -5167,7 +5167,7 @@ pub const App = struct {
     /// The agent jobs this foreground shows and lets the user stop: its own
     /// plus those of the sessions it handed off with Ctrl+B. Borrows
     /// `handed_off_sessions`; use it within one registry call.
-    pub fn agentJobScope(app: *const App) @import("core/agent_job_registry.zig").SessionScope {
+    pub fn agentJobScope(app: *const App) @import("metacodes-internal").core.agent_job_registry.SessionScope {
         return .{ .current = app.session_id, .handed_off = app.handed_off_sessions.items };
     }
 
@@ -5205,7 +5205,7 @@ pub const App = struct {
         path_buf[current.len] = 0;
         if (pfs.exists(@ptrCast(&path_buf))) return .unchanged;
 
-        const resolved = @import("util/fs.zig").getCwd(app.allocator) catch return .missing;
+        const resolved = @import("metacodes-internal").util.fs.getCwd(app.allocator) catch return .missing;
         if (std.mem.eql(u8, resolved, current)) {
             app.allocator.free(resolved);
             return .missing;
@@ -5216,11 +5216,11 @@ pub const App = struct {
 
     /// 把会话根切到 `resolved`(owned,接管所有权),并重建每个捕获过旧字符串的消费者。
     fn adoptWorkspaceRoot(app: *App, resolved: []u8) void {
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         log.warn("workspace", "working directory renamed: {s} -> {s}", .{ app.cwdAbs(), resolved });
         // project_dir 沿 cwd 上溯 .git;旧值可能就在改名的目录下。
         if (app.project_dir) |old| app.retireWorkspaceString(old);
-        app.project_dir = @import("skills/skill.zig").findRepoRoot(app.allocator, resolved) catch null;
+        app.project_dir = @import("metacodes-internal").skills.skill.findRepoRoot(app.allocator, resolved) catch null;
         const old_root = app.cwd_abs;
         app.cwd_abs = resolved;
         // permission match_ctx 借的是 cwd_abs 的切片,settings 的 project 层按 project_dir 找:
@@ -5264,7 +5264,7 @@ pub const App = struct {
     }
 
     /// The configured System-One advisor, if any (address-stable for the App's lifetime).
-    pub fn jevAdvisor(app: *App) ?*@import("jev/advisor.zig").Advisor {
+    pub fn jevAdvisor(app: *App) ?*@import("metacodes-internal").jev.advisor.Advisor {
         const runtime = app.jev orelse return null;
         return &runtime.advisor;
     }
@@ -5332,7 +5332,7 @@ pub const App = struct {
             if (app.system_prompt) |old| app.retireWorkspaceString(old);
             app.system_prompt = sp;
         } else |err| {
-            @import("util/log.zig").warn("workspace", "system prompt rebuild after a worktree switch failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("workspace", "system prompt rebuild after a worktree switch failed: {s}", .{@errorName(err)});
         }
         if (old_root) |old| app.retireWorkspaceString(old);
         app.root_missing_warned = false;
@@ -5354,7 +5354,7 @@ pub const App = struct {
     /// 加载 5 层 settings(managed/cli/project local+shared/user)+ CLI inline 规则,
     /// 挂到 permission_ctx.settings,并填 match_ctx(cwd/project_root/home)。
     fn loadSettings(app: *App) !void {
-        const loader = @import("permission/loader.zig");
+        const loader = @import("metacodes-internal").permission.loader;
         const home: ?[]const u8 = @import("platform").paths.homeDir();
 
         const ms = try loader.load(app.allocator, .{
@@ -5372,7 +5372,7 @@ pub const App = struct {
         // (addDirectory 重载路径)。失败不致命:降级为空集(add-dir 语义静默失效比崩溃好,
         // 但 warn 出来)。
         app.rebuildAdditionalDirs(home) catch |e| {
-            @import("util/log.zig").warn("permission", "additionalDirectories resolve failed: {s}", .{@errorName(e)});
+            @import("metacodes-internal").util.log.warn("permission", "additionalDirectories resolve failed: {s}", .{@errorName(e)});
         };
         app.permission_ctx.match_ctx = .{
             .cwd = app.cwd_abs orelse "",
@@ -5382,29 +5382,29 @@ pub const App = struct {
             // B1:路径规则匹配前 canonicalize(unescape + 折叠 ..)需要 allocator。
             .alloc = app.allocator,
         };
-        @import("util/log.zig").info("permission", "settings loaded: {d} layer(s)", .{app.settings.?.layers.len});
+        @import("metacodes-internal").util.log.info("permission", "settings loaded: {d} layer(s)", .{app.settings.?.layers.len});
 
         // disableBypassPermissionsMode / disableAutoMode 强制:若 settings 禁用了某模式
         // 而当前正处于该模式,降级到 default + 警告(对齐官方:这两个开关是硬约束)。
         // U2 S2:读走 permMode()(单一源),降级只写 ctx。init 时 ctx 已由 createContext 播种。
-        const canon = @import("permission/mode.zig").canonical(app.permMode());
+        const canon = @import("metacodes-internal").permission.mode.canonical(app.permMode());
         if (app.settings.?.isBypassDisabled() and canon == .bypass_permissions) {
-            @import("util/log.zig").warn("permission", "bypassPermissions disabled by settings → downgraded to default", .{});
+            @import("metacodes-internal").util.log.warn("permission", "bypassPermissions disabled by settings → downgraded to default", .{});
             app.permission_ctx.setMode(.default);
         }
         if (app.settings.?.isAutoModeDisabled() and canon == .auto) {
-            @import("util/log.zig").warn("permission", "auto mode disabled by settings → downgraded to default", .{});
+            @import("metacodes-internal").util.log.warn("permission", "auto mode disabled by settings → downgraded to default", .{});
             app.permission_ctx.setMode(.default);
         }
 
         // 解析 sandbox 段(project shared + user;managed/cli 罕见配沙箱,本期跳过)
         app.loadSandboxConfig(home) catch |e| {
-            @import("util/log.zig").debug("sandbox", "no sandbox config: {s}", .{@errorName(e)});
+            @import("metacodes-internal").util.log.debug("sandbox", "no sandbox config: {s}", .{@errorName(e)});
         };
 
         // 解析 hooks 段(同样从 project/user settings 收集 PreToolUse)
         app.loadHooks(home) catch |e| {
-            @import("util/log.zig").debug("hook", "no hooks: {s}", .{@errorName(e)});
+            @import("metacodes-internal").util.log.debug("hook", "no hooks: {s}", .{@errorName(e)});
         };
     }
 
@@ -5416,7 +5416,7 @@ pub const App = struct {
         const raw = try app.settings.?.collectAdditionalDirs(app.allocator);
         defer app.allocator.free(raw); // 元素 borrow settings,不 free
         if (raw.len == 0) return;
-        const settings_mod = @import("permission/settings.zig");
+        const settings_mod = @import("metacodes-internal").permission.settings;
         app.additional_dirs_abs = try settings_mod.resolveAdditionalDirs(
             app.allocator,
             raw,
@@ -5471,7 +5471,7 @@ pub const App = struct {
     /// **配置变更事件 sink 装配(U4)**:driver(TUI/web)在 session 装配时调。同步设 App 的
     /// sink(model/dirs/reasoning emit)+ permission_ctx.event_sink(mode emit),两者一致。
     /// null 清除(deinit / 无 UI)。
-    pub fn setConfigEventSink(app: *App, sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink) void {
+    pub fn setConfigEventSink(app: *App, sink: ?@import("metacodes-internal").core.protocol.ui_event.ConfigEventSink) void {
         app.config_event_sink = sink;
         app.permission_ctx.event_sink = sink;
         // U5 B1:装配 sink 时 seed slice-safe 缓存(首个 emit 前 /state 也有值可读)。
@@ -5485,7 +5485,7 @@ pub const App = struct {
     /// 内部:向 config 事件 sink emit 一条(有 sink 才发)。model/dirs/reasoning 单写侧调。
     /// **U5 B1:refresh 骑 emit**——slice 轴(model/dirs)顺手刷 snapshot_cache(emit⟺refresh 一个
     /// 不变式,不手工 per-mutation refresh,零枚举债)。
-    fn emitConfig(app: *App, ev: @import("core/protocol/ui_event.zig").ConfigChange) void {
+    fn emitConfig(app: *App, ev: @import("metacodes-internal").core.protocol.ui_event.ConfigChange) void {
         if (app.snapshot_cache) |*c| switch (ev) {
             .model => |m| c.setModel(m),
             .dirs => c.setDirs(app.additionalDirs()), // dirs 全量刷(ev.dirs 只是新增项)
@@ -5522,8 +5522,8 @@ pub const App = struct {
     /// 再按 warn 打日志。`.claude/settings.local.json` 与 `--settings` 不读 hook,其中写了
     /// `hooks` 也报告,而不是静默不生效。
     fn loadHooks(app: *App, home: ?[]const u8) !void {
-        const hooks_mod = @import("permission/hooks.zig");
-        const log = @import("util/log.zig");
+        const hooks_mod = @import("metacodes-internal").permission.hooks;
+        const log = @import("metacodes-internal").util.log;
         var diag = hooks_mod.Diagnostics.init(app.allocator);
         errdefer diag.deinit();
 
@@ -5583,7 +5583,7 @@ pub const App = struct {
     /// 读 project/.claude/settings.json + ~/.claude/settings.json 的 sandbox 段,
     /// 取第一个 enabled 的(简化:不跨层合并 filesystem 数组,本期足够)。
     fn loadSandboxConfig(app: *App, home: ?[]const u8) !void {
-        const sb_config = @import("sandbox/config.zig");
+        const sb_config = @import("metacodes-internal").sandbox.config;
         const candidates = [_]?[]const u8{
             app.config.settings_path,
             if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{r}) catch null) else null,
@@ -5607,13 +5607,13 @@ pub const App = struct {
                 // 权限链与 Bash 工具看同一份设置:autoAllowBashIfSandboxed 只放行
                 // sandbox_exec.plan 判为 .sandboxed 的调用(不再凭"设置开着"放行)。
                 app.permission_ctx.sandbox = app.sandboxPtr();
-                @import("util/log.zig").info("sandbox", "enabled (from {s})", .{path});
-                if (!@import("sandbox/exec.zig").hostSupported()) {
+                @import("metacodes-internal").util.log.info("sandbox", "enabled (from {s})", .{path});
+                if (!@import("metacodes-internal").sandbox.exec.hostSupported()) {
                     const consequence = if (sb.fail_if_unavailable)
                         "failIfUnavailable refuses every Bash command"
                     else
                         "Bash commands run unsandboxed and autoAllowBashIfSandboxed does not apply";
-                    @import("util/log.zig").warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec, or a Linux bubblewrap at /usr/bin/bwrap, /bin/bwrap or $METACODES_BWRAP that can create user namespaces): {s}", .{ path, consequence });
+                    @import("metacodes-internal").util.log.warn("sandbox", "enabled in {s}, but this host has no sandbox backend (macOS sandbox-exec, or a Linux bubblewrap at /usr/bin/bwrap, /bin/bwrap or $METACODES_BWRAP that can create user namespaces): {s}", .{ path, consequence });
                 }
                 return;
             }
@@ -5709,7 +5709,7 @@ pub const App = struct {
 
         app.rule_set = rs;
         app.permission_ctx.rules = &app.rule_set.?;
-        @import("util/log.zig").info("permission", "loaded {d} rule(s) from config", .{app.rule_set.?.rules.items.len});
+        @import("metacodes-internal").util.log.info("permission", "loaded {d} rule(s) from config", .{app.rule_set.?.rules.items.len});
     }
 
     /// Start connecting every MCP server the configuration sources declare
@@ -5720,7 +5720,7 @@ pub const App = struct {
     /// server (`mcp_report`, `/mcp`) and never stop the App.
     fn beginMcpStartup(app: *App) void {
         if (app.config.mcp_connect == .disabled) return;
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         const arena_state = app.allocator.create(std.heap.ArenaAllocator) catch |err| {
             log.warn("mcp", "no servers connected: {s}", .{@errorName(err)});
             return;
@@ -5798,7 +5798,7 @@ pub const App = struct {
                 app.tool_surface = .unbuilt;
                 app.registerMcpOutcomes(startup);
                 app.adoptMcpConfiguration(startup.sources, startup.servers, startup.problems) catch |err| {
-                    @import("util/log.zig").warn("mcp", "configuration changes during this session will not be picked up: {s}", .{@errorName(err)});
+                    @import("metacodes-internal").util.log.warn("mcp", "configuration changes during this session will not be picked up: {s}", .{@errorName(err)});
                 };
             },
             .unbuilt => {},
@@ -5973,7 +5973,7 @@ pub const App = struct {
         if (now - app.skill_reload_ms < MCP_RELOAD_INTERVAL_MS) return;
         if (!watch.changed()) return;
         app.skill_reload_ms = now;
-        app.reloadSkills() catch |err| @import("util/log.zig").warn("skill", "Skills could not be read again: {s}", .{@errorName(err)});
+        app.reloadSkills() catch |err| @import("metacodes-internal").util.log.warn("skill", "Skills could not be read again: {s}", .{@errorName(err)});
     }
 
     fn reloadSkills(app: *App) !void {
@@ -6039,7 +6039,7 @@ pub const App = struct {
     const MCP_HOT_POLL_MS: u64 = 20;
 
     fn pollMcpChanges(app: *App, abort: ?*const AbortSignal) void {
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         var started_here = false;
         if (app.mcp_hot == null) {
             if (app.startMcpRelists()) app.waitForMcpRelists(abort);
@@ -6073,7 +6073,7 @@ pub const App = struct {
         const resolved = try mcp_config_mod.load(sa, mcp_startup.Startup.loadInputs(app.mcpStartupInputs(), environment));
         for (resolved.problems) |problem| {
             if (problem.server.len != 0 or app.mcpSourceWasBad(problem.origin_path)) continue;
-            if (!app.mcp_reload_blocked) @import("util/log.zig").warn("mcp", "{s} cannot be read as it stands ({s}); MCP changes wait until it can", .{ problem.origin_path, problem.message });
+            if (!app.mcp_reload_blocked) @import("metacodes-internal").util.log.warn("mcp", "{s} cannot be read as it stands ({s}); MCP changes wait until it can", .{ problem.origin_path, problem.message });
             app.mcp_reload_blocked = true;
             app.mcp_watch_dirty = true;
             return;
@@ -6148,7 +6148,7 @@ pub const App = struct {
         };
         var scratch = std.heap.ArenaAllocator.init(app.allocator);
         defer scratch.deinit();
-        const path = @import("mcp/oauth.zig").storePath(scratch.allocator(), app.stateRoot(), server.name, http.url) catch return false;
+        const path = @import("metacodes-internal").mcp.oauth.storePath(scratch.allocator(), app.stateRoot(), server.name, http.url) catch return false;
         const seen = mcp_hotplug.observe(path);
         if (!seen.present) return false;
         const gop = app.mcp_logins_tried.getOrPut(app.allocator, server.name) catch return false;
@@ -6174,7 +6174,7 @@ pub const App = struct {
         if (app.mcp_logins_tried.contains(server.name)) return;
         var scratch = std.heap.ArenaAllocator.init(app.allocator);
         defer scratch.deinit();
-        const path = @import("mcp/oauth.zig").storePath(scratch.allocator(), app.stateRoot(), server.name, http.url) catch return;
+        const path = @import("metacodes-internal").mcp.oauth.storePath(scratch.allocator(), app.stateRoot(), server.name, http.url) catch return;
         const key = app.allocator.dupe(u8, server.name) catch return;
         app.mcp_logins_tried.put(app.allocator, key, mcp_hotplug.observe(path)) catch app.allocator.free(key);
     }
@@ -6354,7 +6354,7 @@ pub const App = struct {
     }
 
     fn settleMcpJob(app: *App, job: *mcp_startup.Job) McpServerStatus {
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         const a = app.mcpArena();
         var status = McpServerStatus{
             .name = job.server.name,
@@ -6472,7 +6472,7 @@ pub const App = struct {
     }
 
     fn collectMcpRelists(app: *App) void {
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         var index: usize = 0;
         var changed = false;
         while (index < app.mcp_relists.items.len) {
@@ -6512,7 +6512,7 @@ pub const App = struct {
     /// record each server's outcome in `mcp_report`. A client that cannot be
     /// registered is closed here; none is left without an owner.
     fn registerMcpOutcomes(app: *App, startup: *mcp_startup.Startup) void {
-        const log = @import("util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         const a = app.mcp_arena.?.allocator();
         const previous = app.mcp_report.servers;
         var statuses = std.ArrayList(McpServerStatus).initCapacity(a, startup.jobs.len + previous.len) catch null;
@@ -6575,16 +6575,16 @@ pub const App = struct {
         app.mcp_unavailable = unavailableServers(a, app.mcp_report.servers);
     }
 
-    pub fn mcpLateProbe(app: *App) ?@import("core/mcp_session.zig").McpLateProbe {
+    pub fn mcpLateProbe(app: *App) ?@import("metacodes-internal").core.mcp_session.McpLateProbe {
         if (app.config.mcp_connect == .disabled) return null;
         return .{ .ctx = app, .list = lateMcpServers };
     }
 
-    fn lateMcpServers(raw: *anyopaque, arena: std.mem.Allocator) []const @import("core/mcp_session.zig").McpLate {
-        const McpLate = @import("core/mcp_session.zig").McpLate;
+    fn lateMcpServers(raw: *anyopaque, arena: std.mem.Allocator) []const @import("metacodes-internal").core.mcp_session.McpLate {
+        const McpLate = @import("metacodes-internal").core.mcp_session.McpLate;
         const app: *App = @ptrCast(@alignCast(raw));
         if (!app.toolSurfaceReady()) return &.{};
-        const mcp_config = @import("mcp/config.zig");
+        const mcp_config = @import("metacodes-internal").mcp.config;
         const cwd = app.cwdAbs();
         const workspace_root = app.project_dir_or_empty();
         const resolved = mcp_config.load(arena, .{
@@ -6605,8 +6605,8 @@ pub const App = struct {
         return late.items;
     }
 
-    fn unavailableServers(a: std.mem.Allocator, servers: []const McpServerStatus) []const @import("core/mcp_session.zig").McpUnavailable {
-        const McpUnavailable = @import("core/mcp_session.zig").McpUnavailable;
+    fn unavailableServers(a: std.mem.Allocator, servers: []const McpServerStatus) []const @import("metacodes-internal").core.mcp_session.McpUnavailable {
+        const McpUnavailable = @import("metacodes-internal").core.mcp_session.McpUnavailable;
         var list: std.ArrayList(McpUnavailable) = .empty;
         for (servers) |status| {
             if (status.state == .connected) continue;
@@ -6693,10 +6693,10 @@ pub const App = struct {
         // cutoff；真实 transport model 仍独立驱动 provider、catalog、pricing 与 context。
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
         // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
-        const cli_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        const cli_cwd = @import("metacodes-internal").util.fs.getCwd(app.allocator) catch "";
         defer if (cli_cwd.len > 0) app.allocator.free(cli_cwd);
         const built = app.buildSystemPrompt(cli_cwd) catch |err| blk: {
-            @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
+            @import("metacodes-internal").util.log.warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
         // A prompt an interactive REPL rebuilt before its first join (`/model`,
@@ -6707,7 +6707,7 @@ pub const App = struct {
 
     /// Move a connected client into App ownership and publish its tools.
     /// Returns the number of tools registered.
-    fn registerMcpServer(app: *App, server: @import("mcp/config.zig").Server, client: *McpClient, tools_json: []const u8) !usize {
+    fn registerMcpServer(app: *App, server: @import("metacodes-internal").mcp.config.Server, client: *McpClient, tools_json: []const u8) !usize {
         // Reserve every App-owned resource before publishing any tool
         // definition into dyn_registry. After registration succeeds the
         // final session append is infallible, so registry ctx_ptr values
@@ -6837,7 +6837,7 @@ const McpRelist = struct {
 /// One configured MCP server and what became of it at startup (for /mcp).
 pub const McpServerStatus = struct {
     name: []const u8,
-    origin: @import("mcp/config.zig").Origin,
+    origin: @import("metacodes-internal").mcp.config.Origin,
     origin_path: []const u8,
     /// `needs_auth`: the server answered 401/403 (a failure with its own
     /// remedy: credentials, not a restart).
@@ -6853,9 +6853,9 @@ pub const McpServerStatus = struct {
 
 pub const McpReport = struct {
     servers: []const McpServerStatus = &.{},
-    pending: []const @import("mcp/config.zig").Pending = &.{},
+    pending: []const @import("metacodes-internal").mcp.config.Pending = &.{},
     disabled: []const []const u8 = &.{},
-    problems: []const @import("mcp/config.zig").Problem = &.{},
+    problems: []const @import("metacodes-internal").mcp.config.Problem = &.{},
 };
 
 /// 从 Config 的方言字段构造 RequestOverrides(给 OpenAI/Gemini client 用)。
@@ -6883,7 +6883,7 @@ fn buildOverridesFromConfig(config: types.Config) request_overrides.RequestOverr
 /// **U9**:置进程级 shutdown flag(daemon 主循环 poll 它优雅关所有 session)+ 戳 g_abort_signal
 /// (唤醒 N=1 宿主的 run,兼容既有行为;daemon 未绑单 session 时此指针为 null,靠 accept EINTR 醒)。
 fn onSigint() void {
-    @import("core/shutdown.zig").request();
+    @import("metacodes-internal").core.shutdown.request();
     if (@atomicLoad(?*AbortSignal, &g_abort_signal, .seq_cst)) |s| {
         s.abort(.user_ctrl_c);
     }
@@ -7000,7 +7000,7 @@ test "nextPermMode: Shift+Tab 循环状态机" {
 }
 
 test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同步 mode sink" {
-    const ui_event = @import("core/protocol/ui_event.zig");
+    const ui_event = @import("metacodes-internal").core.protocol.ui_event;
     const Recorder = struct {
         last: ?ui_event.ConfigChange = null,
         count: usize = 0,
@@ -7107,7 +7107,7 @@ test "U5 B3: 附着无缺口不变式——快照(seq,model)绝不撕出漏读�
     //   降级出 (旧 model, 新 seq) 缺口(同 journal.append 自身 OOM 丢行,整层 best-effort)。本测
     //   在充足内存下证不变式;OOM 路径 setModel 已 warn 记账(不静默)。
     const a = std.testing.allocator;
-    const EventJournal = @import("core/event_journal.zig").EventJournal; // test-scoped:不进 app.zig 非测试面
+    const EventJournal = @import("metacodes-internal").core.event_journal.EventJournal; // test-scoped:不进 app.zig 非测试面
     const N: usize = 3000;
 
     var journal = EventJournal.init(a);
@@ -7170,7 +7170,7 @@ test "U5 B3(判别性): 确定性证明读序**必须** seq→cache——正序�
     //   · 逆序(cache 先) → 驱动器在两读之间步进 → 快照给出(旧 model, 新 seq)= 缺口。
     // 这是"读序 load-bearing"的真凭据,非并发运气。
     const a = std.testing.allocator;
-    const EventJournal = @import("core/event_journal.zig").EventJournal;
+    const EventJournal = @import("metacodes-internal").core.event_journal.EventJournal;
 
     var journal = EventJournal.init(a);
     defer journal.deinit();
@@ -7258,7 +7258,7 @@ test "U2 S1: compactWindow 结构化返回 {dropped,before,after}(loop/web 共�
     const a = std.testing.allocator;
     var app: App = undefined;
     app.conversation = Conversation.init(a);
-    app.file_change_journal = @import("core/file_change.zig").Journal.init(std.heap.c_allocator);
+    app.file_change_journal = @import("metacodes-internal").core.file_change.Journal.init(std.heap.c_allocator);
     defer app.conversation.deinit();
     // 空对话:compact 无可丢 → dropped=0, before=after=0(投影语义,活跃计数)
     const r = app.compactWindow();
@@ -7293,9 +7293,9 @@ test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 �
     // client(借用镜像)+ agent_jobs(dupe 自持镜像)+ swarm(借用镜像,U3 前漏同步)。
     var client = client_mod.Client.initWithBaseUrl(a, io, "test-key", "model-A", null);
     defer client.deinit();
-    var jobs = try @import("core/agent_job_registry.zig").AgentJobRegistry.init(a, "test-key", null, "model-A", .anthropic);
+    var jobs = try @import("metacodes-internal").core.agent_job_registry.AgentJobRegistry.init(a, "test-key", null, "model-A", .anthropic);
     defer jobs.deinit();
-    var swarm = @import("swarm/context.zig").SwarmContext{ .allocator = a, .model = "model-A" };
+    var swarm = @import("metacodes-internal").swarm.context.SwarmContext{ .allocator = a, .model = "model-A" };
 
     // 切到 model-B:seam 必须把全部镜像刷成 B。
     try App.syncModelMirrors("model-B", &client, null, null, null, null, &jobs, &swarm);

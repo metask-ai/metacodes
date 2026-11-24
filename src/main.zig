@@ -1,29 +1,29 @@
 const std = @import("std");
-const model_name = @import("api/model_name.zig");
+const model_name = @import("metacodes-internal").api.model_name;
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
 const terminal_prompt = @import("app/terminal_prompt.zig");
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_net = @import("platform").net;
-const types = @import("types.zig");
-const client = @import("client.zig");
+const types = @import("metacodes-internal").types;
+const client = @import("metacodes-internal").client;
 const app_mod = @import("app.zig");
 const repl = @import("repl/loop.zig");
-const auth = @import("core/auth.zig");
-const api_keys_mod = @import("api/api_keys.zig");
-const oauth_login = @import("api/oauth_login.zig");
-const provider_login = @import("api/provider_login.zig");
-const openrouter_login = @import("api/openrouter_login.zig");
-const openrouter_catalog = @import("api/openrouter_catalog.zig");
-const metask_oauth_mod = @import("api/metask_oauth.zig");
-const oauth_exchange_mod = @import("api/oauth_exchange.zig");
-const catalog_mod = @import("api/catalog.zig");
-const provider_oauth_mod = @import("provider/oauth.zig");
-const provider_ids_mod = @import("provider/ids.zig");
-const version_info = @import("version_info.zig");
+const auth = @import("metacodes-internal").core.auth;
+const api_keys_mod = @import("metacodes-internal").api.api_keys;
+const oauth_login = @import("metacodes-internal").api.oauth_login;
+const provider_login = @import("metacodes-internal").api.provider_login;
+const openrouter_login = @import("metacodes-internal").api.openrouter_login;
+const openrouter_catalog = @import("metacodes-internal").api.openrouter_catalog;
+const metask_oauth_mod = @import("metacodes-internal").api.metask_oauth;
+const oauth_exchange_mod = @import("metacodes-internal").api.oauth_exchange;
+const catalog_mod = @import("metacodes-internal").api.catalog;
+const provider_oauth_mod = @import("metacodes-internal").provider.oauth;
+const provider_ids_mod = @import("metacodes-internal").provider.ids;
+const version_info = @import("metacodes-internal").version_info;
 const invocation = @import("app/invocation.zig");
-pub const doctor = @import("core/doctor.zig"); // pub: component tests build the report by hand
+pub const doctor = @import("metacodes-internal").core.doctor; // pub: component tests build the report by hand
 pub const app_state_env = @import("app/state_env.zig"); // pub: component tests read the template and the parser
 const state_env_mod = app_state_env;
 pub const app_route_state = @import("app/route_state.zig"); // pub: component tests read the banner and the reminder
@@ -34,14 +34,14 @@ const app_startup_order = @import("app/startup_order.zig");
 const startup_order = app_startup_order;
 pub const app_presets = @import("app/presets.zig");
 const presets_mod = app_presets;
-pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
-pub const kgd_install = @import("kg/kgd/install.zig");
-pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
+pub const kgd_server = @import("metacodes-internal").kg.kgd.server; // pub: component tests drive a real supervisor
+pub const kgd_install = @import("metacodes-internal").kg.kgd.install;
+pub const kgd_runtime_exports = @import("metacodes-internal").kg.kgd.runtime; // pub: the component test exercises the install-to-service handoff
 pub const kg_autostart = @import("app/kg_autostart.zig"); // pub: the component test drives the host start against a squatted port
-const kgd_runtime = @import("kg/kgd/runtime.zig");
+const kgd_runtime = @import("metacodes-internal").kg.kgd.runtime;
 const build_options = @import("build_info");
 
-pub const VERSION = @import("version.zig").semver;
+pub const VERSION = @import("metacodes-internal").version.semver;
 
 /// `unexpected_error_tracing`: Debug builds of Zig 0.16.0 print
 /// `error.Unexpected NTSTATUS=…` and a stack trace to stderr for every status
@@ -83,187 +83,187 @@ fn panicAfterPendingOutput(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 // Public re-exports for tests and future consumers.
-pub const api_stream = @import("api/stream.zig");
-pub const api_provider = @import("api/provider.zig");
-pub const api_provider_factory = @import("api/provider_factory.zig");
-pub const api_auth_header = @import("api/auth_header.zig");
-pub const api_credential_cell = @import("api/credential_cell.zig");
-pub const api_connection_gate = @import("api/connection_gate.zig");
-pub const fs_util = @import("util/fs.zig");
+pub const api_stream = @import("metacodes-internal").api.stream;
+pub const api_provider = @import("metacodes-internal").api.provider;
+pub const api_provider_factory = @import("metacodes-internal").api.provider_factory;
+pub const api_auth_header = @import("metacodes-internal").api.auth_header;
+pub const api_credential_cell = @import("metacodes-internal").api.credential_cell;
+pub const api_connection_gate = @import("metacodes-internal").api.connection_gate;
+pub const fs_util = @import("metacodes-internal").util.fs;
 // issue #16 provider offer kernel — re-exported for L2 component tests and for
 // embedders that drive model selection through the control plane.
-pub const provider_ids = @import("provider/ids.zig");
-pub const provider_offer = @import("provider/offer.zig");
-pub const provider_controls = @import("provider/controls.zig");
-pub const provider_credential = @import("provider/credential.zig");
-pub const provider_profile = @import("provider/profile.zig");
-pub const provider_registry = @import("provider/registry.zig");
-pub const provider_selection = @import("provider/selection.zig");
-pub const provider_config_doc = @import("provider/config_doc.zig");
-pub const provider_config_store = @import("provider/config_store.zig");
-pub const provider_control_plane = @import("provider/control_plane.zig");
-pub const provider_runtime_binding = @import("provider/runtime_binding.zig");
-pub const provider_startup = @import("provider/startup.zig");
-pub const provider_host = @import("provider/host.zig");
-pub const provider_alias = @import("provider/alias.zig");
-pub const provider_custom = @import("provider/custom_provider.zig");
-pub const provider_oauth = @import("provider/oauth.zig");
-pub const provider_api_key_store = @import("provider/api_key_store.zig");
-pub const provider_metask_catalog = @import("provider/metask_catalog.zig");
-pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
-pub const kg_provider_audit = @import("kg/provider_audit.zig");
-pub const api_oauth_exchange = @import("api/oauth_exchange.zig");
-pub const api_oauth_login = @import("api/oauth_login.zig");
-pub const api_oauth_revoke = @import("api/oauth_revoke.zig"); // L2 reads a provider sign-out's revocation outcome
-pub const api_provider_login = @import("api/provider_login.zig");
-pub const api_openrouter_login = @import("api/openrouter_login.zig");
-pub const api_openrouter_catalog = @import("api/openrouter_catalog.zig");
-pub const api_login_worker = @import("api/login_worker.zig");
-pub const api_metask_sign_in = @import("api/metask_sign_in.zig"); // `/login`'s browser sign-in on a worker (#485)
-pub const api_metask_oauth = @import("api/metask_oauth.zig");
-pub const api_catalog_fetch = @import("api/catalog_fetch.zig");
-pub const api_capability = @import("api/capability.zig");
-pub const api_capability_activation = @import("api/capability_activation.zig");
-pub const api_cache = @import("api/cache.zig");
-pub const api_http_status = @import("api/http_status.zig");
-pub const api_http_connection = @import("api/http_connection.zig"); // L2 send-failure tests drive it on a raw std client
-pub const api_openai = @import("api/openai_client.zig");
-pub const api_gemini = @import("api/gemini_client.zig");
-pub const api_bedrock = @import("api/bedrock_client.zig"); // Bedrock Converse + AWS event stream
-pub const api_aws_event_stream = @import("api/aws_event_stream.zig");
-pub const api_dialect = @import("api/dialect.zig");
-pub const api_request = @import("api/request.zig");
-pub const api_request_overrides = @import("api/request_overrides.zig");
-pub const model_adapter = @import("api/model_adapter.zig");
-pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
-pub const tool_changes = @import("core/tool_changes.zig");
-pub const skill_changes = @import("core/skill_changes.zig");
-pub const image_capability = @import("api/image_capability.zig");
-pub const model_tiers = @import("api/model_tiers.zig");
-pub const model_availability = @import("api/model_availability.zig"); // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
+pub const provider_ids = @import("metacodes-internal").provider.ids;
+pub const provider_offer = @import("metacodes-internal").provider.offer;
+pub const provider_controls = @import("metacodes-internal").provider.controls;
+pub const provider_credential = @import("metacodes-internal").provider.credential;
+pub const provider_profile = @import("metacodes-internal").provider.profile;
+pub const provider_registry = @import("metacodes-internal").provider.registry;
+pub const provider_selection = @import("metacodes-internal").provider.selection;
+pub const provider_config_doc = @import("metacodes-internal").provider.config_doc;
+pub const provider_config_store = @import("metacodes-internal").provider.config_store;
+pub const provider_control_plane = @import("metacodes-internal").provider.control_plane;
+pub const provider_runtime_binding = @import("metacodes-internal").provider.runtime_binding;
+pub const provider_startup = @import("metacodes-internal").provider.startup;
+pub const provider_host = @import("metacodes-internal").provider.host;
+pub const provider_alias = @import("metacodes-internal").provider.alias;
+pub const provider_custom = @import("metacodes-internal").provider.custom_provider;
+pub const provider_oauth = @import("metacodes-internal").provider.oauth;
+pub const provider_api_key_store = @import("metacodes-internal").provider.api_key_store;
+pub const provider_metask_catalog = @import("metacodes-internal").provider.metask_catalog;
+pub const provider_metask_ledger = @import("metacodes-internal").provider.metask_ledger;
+pub const kg_provider_audit = @import("metacodes-internal").kg.provider_audit;
+pub const api_oauth_exchange = @import("metacodes-internal").api.oauth_exchange;
+pub const api_oauth_login = @import("metacodes-internal").api.oauth_login;
+pub const api_oauth_revoke = @import("metacodes-internal").api.oauth_revoke; // L2 reads a provider sign-out's revocation outcome
+pub const api_provider_login = @import("metacodes-internal").api.provider_login;
+pub const api_openrouter_login = @import("metacodes-internal").api.openrouter_login;
+pub const api_openrouter_catalog = @import("metacodes-internal").api.openrouter_catalog;
+pub const api_login_worker = @import("metacodes-internal").api.login_worker;
+pub const api_metask_sign_in = @import("metacodes-internal").api.metask_sign_in; // `/login`'s browser sign-in on a worker (#485)
+pub const api_metask_oauth = @import("metacodes-internal").api.metask_oauth;
+pub const api_catalog_fetch = @import("metacodes-internal").api.catalog_fetch;
+pub const api_capability = @import("metacodes-internal").api.capability;
+pub const api_capability_activation = @import("metacodes-internal").api.capability_activation;
+pub const api_cache = @import("metacodes-internal").api.cache;
+pub const api_http_status = @import("metacodes-internal").api.http_status;
+pub const api_http_connection = @import("metacodes-internal").api.http_connection; // L2 send-failure tests drive it on a raw std client
+pub const api_openai = @import("metacodes-internal").api.openai_client;
+pub const api_gemini = @import("metacodes-internal").api.gemini_client;
+pub const api_bedrock = @import("metacodes-internal").api.bedrock_client; // Bedrock Converse + AWS event stream
+pub const api_aws_event_stream = @import("metacodes-internal").api.aws_event_stream;
+pub const api_dialect = @import("metacodes-internal").api.dialect;
+pub const api_request = @import("metacodes-internal").api.request;
+pub const api_request_overrides = @import("metacodes-internal").api.request_overrides;
+pub const model_adapter = @import("metacodes-internal").api.model_adapter;
+pub const time_context = @import("metacodes-internal").core.time_context; // date + time zone for the model (#276)
+pub const tool_changes = @import("metacodes-internal").core.tool_changes;
+pub const skill_changes = @import("metacodes-internal").core.skill_changes;
+pub const image_capability = @import("metacodes-internal").api.image_capability;
+pub const model_tiers = @import("metacodes-internal").api.model_tiers;
+pub const model_availability = @import("metacodes-internal").api.model_availability; // tier names + provider guard, shared by /model, web/daemon messages and SessionHost (#445)
 pub const client_mod = client; // alias for L2 component tests
 pub const api_api_keys = api_keys_mod;
-pub const api_model_error = @import("api/model_error.zig"); // L2 provider lifecycle tests read the structured failure detail
-pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness tests read the TUI-facing error text
-pub const task_store = @import("core/task_store.zig"); // L2 requirement-ledger tests
-pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 ledger decide tests
-pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
-pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
-pub const check_gate = @import("core/check_gate.zig"); // L2 host check gate / Stop hook block tests
-pub const isolated_verifier = @import("core/isolated_verifier.zig"); // L2 isolated verifier tests
-pub const agent_isolation = @import("agents/isolation.zig"); // L2 verifier snapshot tests
-pub const learning_turn = @import("core/learning_turn.zig"); // L2 learning turn tests
-pub const learning_end_of_run = @import("core/learning_end_of_run.zig"); // L2 end-of-run learning turn tests
-pub const kg_lesson = @import("kg/lesson.zig"); // lesson envelope (learning turn)
-pub const test_integrity = @import("core/test_integrity.zig"); // L2 test-integrity obligation tests
-pub const stall_gate = @import("core/stall_gate.zig"); // L2 stall-gate tests
+pub const api_model_error = @import("metacodes-internal").api.model_error; // L2 provider lifecycle tests read the structured failure detail
+pub const api_last_error = @import("metacodes-internal").api.last_error; // L2 stream liveness tests read the TUI-facing error text
+pub const task_store = @import("metacodes-internal").core.task_store; // L2 requirement-ledger tests
+pub const requirement_ledger = @import("metacodes-internal").core.requirement_ledger; // L2 ledger decide tests
+pub const delivery_cadence = @import("metacodes-internal").core.delivery_cadence; // L2 delivery-cadence tests
+pub const progress_updates = @import("metacodes-internal").core.progress_updates; // L2 progress-update tests (#114)
+pub const check_gate = @import("metacodes-internal").core.check_gate; // L2 host check gate / Stop hook block tests
+pub const isolated_verifier = @import("metacodes-internal").core.isolated_verifier; // L2 isolated verifier tests
+pub const agent_isolation = @import("metacodes-internal").agents.isolation; // L2 verifier snapshot tests
+pub const learning_turn = @import("metacodes-internal").core.learning_turn; // L2 learning turn tests
+pub const learning_end_of_run = @import("metacodes-internal").core.learning_end_of_run; // L2 end-of-run learning turn tests
+pub const kg_lesson = @import("metacodes-internal").kg.lesson; // lesson envelope (learning turn)
+pub const test_integrity = @import("metacodes-internal").core.test_integrity; // L2 test-integrity obligation tests
+pub const stall_gate = @import("metacodes-internal").core.stall_gate; // L2 stall-gate tests
 pub const types_mod = types;
-pub const json_mod = @import("json.zig");
-pub const util_abort = @import("util/abort.zig");
-pub const util_fs = @import("util/fs.zig");
-pub const util_file_lock = @import("util/file_lock.zig");
-pub const conversation = @import("core/conversation.zig");
-pub const message = @import("core/message.zig");
-pub const compact_summary = @import("core/compact_summary.zig");
-pub const agent_loop = @import("core/agent_loop.zig");
-pub const harnessmm = @import("core/harnessmm.zig");
-pub const skill_rsi = @import("skills/rsi.zig");
-pub const agent_session = @import("core/agent_session.zig");
-pub const execution_effect = @import("core/execution_effect.zig");
-pub const response_candidate = @import("core/response_candidate.zig");
-pub const compaction_control = @import("core/compaction_control.zig");
-pub const run_recovery = @import("core/run_recovery.zig");
-pub const run_input = @import("core/run_input.zig");
-pub const plugin = @import("plugin/root.zig");
-pub const tool_catalog = @import("core/tool_catalog.zig");
-pub const workspace_policy = @import("core/workspace_policy.zig");
-pub const core_subagent = @import("core/subagent.zig");
-pub const agent_job_registry = @import("core/agent_job_registry.zig");
-pub const job_registry = @import("core/job_registry.zig");
-pub const util_time = @import("util/time.zig");
-pub const models_cache = @import("api/models_cache.zig");
-pub const util_json = @import("util/json.zig");
-pub const util_toolchain = @import("util/toolchain.zig");
-pub const tools = @import("tools.zig");
-pub const tool_prompt_ctx = @import("tools/prompt_context.zig");
-pub const task_tools = @import("tools/task_tools.zig");
-pub const task_output_tool = @import("tools/task_output.zig");
-pub const agent_tool = @import("tools/agent.zig");
-pub const core_task_store = @import("core/task_store.zig");
-pub const kg_client = @import("kg/client.zig");
-pub const scoped_recall = @import("kg/scoped_recall.zig");
-pub const kg_transport = @import("kg/transport.zig");
-pub const swarm_team = @import("swarm/team.zig");
-pub const swarm_mailbox = @import("swarm/mailbox.zig");
-pub const swarm_teammate = @import("swarm/teammate.zig");
-pub const swarm_context = @import("swarm/context.zig");
-pub const swarm_tools = @import("swarm/tools.zig");
-pub const swarm_teammate_process = @import("swarm/teammate_process.zig");
-pub const tools_common = @import("tools/common.zig");
+pub const json_mod = @import("metacodes-internal").json;
+pub const util_abort = @import("metacodes-internal").util.abort;
+pub const util_fs = @import("metacodes-internal").util.fs;
+pub const util_file_lock = @import("metacodes-internal").util.file_lock;
+pub const conversation = @import("metacodes-internal").core.conversation;
+pub const message = @import("metacodes-internal").core.message;
+pub const compact_summary = @import("metacodes-internal").core.compact_summary;
+pub const agent_loop = @import("metacodes-internal").core.agent_loop;
+pub const harnessmm = @import("metacodes-internal").core.harnessmm;
+pub const skill_rsi = @import("metacodes-internal").skills.rsi;
+pub const agent_session = @import("metacodes-internal").core.agent_session;
+pub const execution_effect = @import("metacodes-internal").core.execution_effect;
+pub const response_candidate = @import("metacodes-internal").core.response_candidate;
+pub const compaction_control = @import("metacodes-internal").core.compaction_control;
+pub const run_recovery = @import("metacodes-internal").core.run_recovery;
+pub const run_input = @import("metacodes-internal").core.run_input;
+pub const plugin = @import("metacodes-internal").plugin.root;
+pub const tool_catalog = @import("metacodes-internal").core.tool_catalog;
+pub const workspace_policy = @import("metacodes-internal").core.workspace_policy;
+pub const core_subagent = @import("metacodes-internal").core.subagent;
+pub const agent_job_registry = @import("metacodes-internal").core.agent_job_registry;
+pub const job_registry = @import("metacodes-internal").core.job_registry;
+pub const util_time = @import("metacodes-internal").util.time;
+pub const models_cache = @import("metacodes-internal").api.models_cache;
+pub const util_json = @import("metacodes-internal").util.json;
+pub const util_toolchain = @import("metacodes-internal").util.toolchain;
+pub const tools = @import("metacodes-internal").tools_root;
+pub const tool_prompt_ctx = @import("metacodes-internal").tools.prompt_context;
+pub const task_tools = @import("metacodes-internal").tools.task_tools;
+pub const task_output_tool = @import("metacodes-internal").tools.task_output;
+pub const agent_tool = @import("metacodes-internal").tools.agent;
+pub const core_task_store = @import("metacodes-internal").core.task_store;
+pub const kg_client = @import("metacodes-internal").kg.client;
+pub const scoped_recall = @import("metacodes-internal").kg.scoped_recall;
+pub const kg_transport = @import("metacodes-internal").kg.transport;
+pub const swarm_team = @import("metacodes-internal").swarm.team;
+pub const swarm_mailbox = @import("metacodes-internal").swarm.mailbox;
+pub const swarm_teammate = @import("metacodes-internal").swarm.teammate;
+pub const swarm_context = @import("metacodes-internal").swarm.context;
+pub const swarm_tools = @import("metacodes-internal").swarm.tools;
+pub const swarm_teammate_process = @import("metacodes-internal").swarm.teammate_process;
+pub const tools_common = @import("metacodes-internal").tools.common;
 pub const platform_fs = @import("platform").fs;
 pub const platform_test_support = @import("platform").test_support; // 组件测试的链接/枚举夹具
-pub const kg_inject = @import("kg/inject.zig");
-pub const kg_scoped_recall = @import("kg/scoped_recall.zig");
-pub const abort = @import("util/abort.zig");
-pub const kg_plan_commit = @import("kg/plan_commit.zig");
-pub const kg_plan_view = @import("kg/plan_view.zig");
-pub const kg_task_projection = @import("kg/task_projection.zig");
-pub const formal_runtime = @import("formal/runtime.zig");
-pub const formal_test_kernel = @import("formal/test_kernel.zig"); // test-only: staged Lean kernel resolution
-pub const util_state_root = @import("util/state_root.zig");
-pub const formal_artifact_store = @import("formal/artifact_store.zig");
-pub const formal_provenance = @import("formal/provenance.zig");
-pub const formal_task_audit = @import("formal/task_audit.zig");
-pub const formal_memory_migration = @import("formal/memory_migration.zig");
-pub const kg_memory_migration_adapter = @import("kg/memory_migration_adapter.zig");
-pub const kg_ontology_rule_snapshot_adapter = @import("kg/ontology_rule_snapshot_adapter.zig");
-pub const formal_artifact_verification = @import("formal/artifact_verification.zig");
-pub const kg_tools = @import("tools/kg_tools.zig");
-pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig");
-pub const jev_question = @import("jev/question.zig");
-pub const jev_client = @import("jev/client.zig");
-pub const jev_advisor = @import("jev/advisor.zig");
-pub const jev_runtime = @import("jev/runtime.zig");
-pub const jev_excerpt = @import("jev/excerpt.zig");
-pub const telemetry = @import("telemetry/telemetry.zig");
-pub const core_goal = @import("core/goal.zig");
+pub const kg_inject = @import("metacodes-internal").kg.inject;
+pub const kg_scoped_recall = @import("metacodes-internal").kg.scoped_recall;
+pub const abort = @import("metacodes-internal").util.abort;
+pub const kg_plan_commit = @import("metacodes-internal").kg.plan_commit;
+pub const kg_plan_view = @import("metacodes-internal").kg.plan_view;
+pub const kg_task_projection = @import("metacodes-internal").kg.task_projection;
+pub const formal_runtime = @import("metacodes-internal").formal.runtime;
+pub const formal_test_kernel = @import("metacodes-internal").formal.test_kernel; // test-only: staged Lean kernel resolution
+pub const util_state_root = @import("metacodes-internal").util.state_root;
+pub const formal_artifact_store = @import("metacodes-internal").formal.artifact_store;
+pub const formal_provenance = @import("metacodes-internal").formal.provenance;
+pub const formal_task_audit = @import("metacodes-internal").formal.task_audit;
+pub const formal_memory_migration = @import("metacodes-internal").formal.memory_migration;
+pub const kg_memory_migration_adapter = @import("metacodes-internal").kg.memory_migration_adapter;
+pub const kg_ontology_rule_snapshot_adapter = @import("metacodes-internal").kg.ontology_rule_snapshot_adapter;
+pub const formal_artifact_verification = @import("metacodes-internal").formal.artifact_verification;
+pub const kg_tools = @import("metacodes-internal").tools.kg_tools;
+pub const kg_lexical_query_plan = @import("metacodes-internal").kg.lexical_query_plan;
+pub const jev_question = @import("metacodes-internal").jev.question;
+pub const jev_client = @import("metacodes-internal").jev.client;
+pub const jev_advisor = @import("metacodes-internal").jev.advisor;
+pub const jev_runtime = @import("metacodes-internal").jev.runtime;
+pub const jev_excerpt = @import("metacodes-internal").jev.excerpt;
+pub const telemetry = @import("metacodes-internal").telemetry.telemetry;
+pub const core_goal = @import("metacodes-internal").core.goal;
 pub const core_auth = auth;
-pub const core_read_state = @import("core/read_state.zig");
-pub const core_context_caps = @import("core/context_caps.zig");
-pub const core_context_pressure = @import("core/context_pressure.zig");
-pub const core_edit_hl_cache = @import("core/edit_hl_cache.zig");
-pub const tool_exec = @import("core/tool_exec.zig");
-pub const file_change = @import("core/file_change.zig");
-pub const file_reference = @import("core/file_reference.zig");
-pub const output_semantics = @import("core/output_semantics.zig");
-pub const message_repair = @import("core/message_repair.zig");
-pub const tool_result_artifact = @import("core/tool_result_artifact.zig");
-pub const tool_result = @import("core/tool_result.zig");
-pub const result_projection = @import("core/result_projection.zig");
-pub const result_budget = @import("core/result_budget.zig");
-pub const tool_result_metrics = @import("core/tool_result_metrics.zig");
-pub const read_artifact = @import("tools/read_artifact.zig");
-pub const tools_bash_output = @import("tools/bash_output.zig"); // 预算常量供 schema 防分叉守卫绑定
-pub const result_spool = @import("tools/result_spool.zig"); // 内联阈值缝合点,供 L2 行为测试直接驱动
-pub const cache_break = @import("core/cache_break.zig");
-pub const core_message = @import("core/message.zig");
-pub const transcript = @import("core/transcript.zig");
+pub const core_read_state = @import("metacodes-internal").core.read_state;
+pub const core_context_caps = @import("metacodes-internal").core.context_caps;
+pub const core_context_pressure = @import("metacodes-internal").core.context_pressure;
+pub const core_edit_hl_cache = @import("metacodes-internal").core.edit_hl_cache;
+pub const tool_exec = @import("metacodes-internal").core.tool_exec;
+pub const file_change = @import("metacodes-internal").core.file_change;
+pub const file_reference = @import("metacodes-internal").core.file_reference;
+pub const output_semantics = @import("metacodes-internal").core.output_semantics;
+pub const message_repair = @import("metacodes-internal").core.message_repair;
+pub const tool_result_artifact = @import("metacodes-internal").core.tool_result_artifact;
+pub const tool_result = @import("metacodes-internal").core.tool_result;
+pub const result_projection = @import("metacodes-internal").core.result_projection;
+pub const result_budget = @import("metacodes-internal").core.result_budget;
+pub const tool_result_metrics = @import("metacodes-internal").core.tool_result_metrics;
+pub const read_artifact = @import("metacodes-internal").tools.read_artifact;
+pub const tools_bash_output = @import("metacodes-internal").tools.bash_output; // 预算常量供 schema 防分叉守卫绑定
+pub const result_spool = @import("metacodes-internal").tools.result_spool; // 内联阈值缝合点,供 L2 行为测试直接驱动
+pub const cache_break = @import("metacodes-internal").core.cache_break;
+pub const core_message = @import("metacodes-internal").core.message;
+pub const transcript = @import("metacodes-internal").core.transcript;
 pub const repl_headless = @import("repl/headless.zig");
 pub const repl_next_step = @import("repl/next_step.zig"); // pub: the component test reads the route a /model pick moved to
 pub const repl_stream_json = @import("repl/stream_json_backend.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
-pub const teamwork_command = @import("teamwork/command.zig");
-pub const teamwork_runtime = @import("teamwork/runtime.zig");
-pub const teamwork_config = @import("teamwork/config.zig");
-pub const teamwork_types = @import("teamwork/types.zig");
-pub const teamwork_progress = @import("teamwork/progress.zig");
+pub const teamwork_command = @import("metacodes-internal").teamwork.command;
+pub const teamwork_runtime = @import("metacodes-internal").teamwork.runtime;
+pub const teamwork_config = @import("metacodes-internal").teamwork.config;
+pub const teamwork_types = @import("metacodes-internal").teamwork.types;
+pub const teamwork_progress = @import("metacodes-internal").teamwork.progress;
 // Integration binds the MCP server here; all preparation and lifecycle
 // ownership remain in teamwork_command (stdin/stdout belong to the callback).
-pub const teamwork_mcp_server = @import("teamwork/mcp_server.zig");
+pub const teamwork_mcp_server = @import("metacodes-internal").teamwork.mcp_server;
 pub const teamwork_mcp_host: ?teamwork_command.McpHost = .{ .serveFn = serveTeamworkMcp };
 
-fn serveTeamworkMcp(gpa: std.mem.Allocator, run: *@import("teamwork/runtime.zig").Run) !void {
+fn serveTeamworkMcp(gpa: std.mem.Allocator, run: *@import("metacodes-internal").teamwork.runtime.Run) !void {
     var server = teamwork_mcp_server.Server.init(gpa, run);
     try server.serve();
 }
@@ -274,113 +274,113 @@ pub const app_install = @import("app/install.zig");
 pub const app_update = @import("app/update.zig");
 pub const app_release_source = @import("app/release_source.zig");
 pub const app_archive_fixture = @import("app/archive_fixture.zig");
-pub const tool_context = @import("tools/context.zig");
-pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
-pub const tool_error = @import("core/tool_error.zig");
-pub const bash = @import("tools/bash.zig");
-pub const grep = @import("tools/grep.zig");
-pub const glob = @import("tools/glob.zig");
-pub const read_tool = @import("tools/read.zig");
-pub const find_symbol_tool = @import("tools/find_symbol.zig");
-pub const code_map_tool = @import("tools/code_map.zig");
-pub const symbol_provider = @import("tools/symbol_provider.zig");
-pub const lsp = @import("lsp/lsp.zig");
-pub const write_tool = @import("tools/write.zig");
-pub const edit_tool = @import("tools/edit.zig");
-pub const mcp_client = @import("mcp/client.zig");
-pub const mcp_transport_http = @import("mcp/transport_http.zig");
-pub const mcp_transport_sse = @import("mcp/transport_sse.zig");
-pub const mcp_transport = @import("mcp/transport.zig");
-pub const mcp_oauth = @import("mcp/oauth.zig");
-pub const mcp_url = @import("mcp/url.zig");
-pub const mcp_protocol = @import("mcp/protocol.zig");
-pub const mcp_config = @import("mcp/config.zig");
-pub const mcp_launch = @import("mcp/launch.zig");
-pub const mcp_naming = @import("mcp/naming.zig");
-pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
-pub const mcp_session = @import("core/mcp_session.zig");
-pub const skills = @import("skills/skill.zig");
-pub const skill_overrides = @import("skills/overrides.zig");
-pub const skills_runtime = @import("skills/runtime/root.zig");
-pub const skills_cli_adapter = @import("skills/cli_adapter.zig");
-pub const skills_sealed_protocol = @import("skills/sealed/protocol.zig");
-pub const skills_sealed_transport = @import("skills/sealed/transport.zig");
-pub const skills_sealed_pin = @import("skills/sealed/pin.zig");
-pub const skills_sealed_ledger = @import("skills/sealed/ledger.zig");
-pub const skills_sealed_provider = @import("skills/sealed/provider.zig");
-pub const skills_sealed_gateway = @import("skills/sealed/gateway.zig");
-pub const skills_sealed_provider_pool = @import("skills/sealed/provider_pool.zig");
-pub const skills_sealed_credentials = @import("skills/sealed/credentials.zig");
-pub const skills_sealed_disclosure = @import("skills/sealed/disclosure.zig");
-pub const skills_tool = @import("skills/tool.zig");
-pub const skills_render = @import("skills/render.zig");
-pub const skills_discovery = @import("skills/discovery.zig");
-pub const active_skill = @import("skills/active.zig");
-pub const permission = @import("permission.zig");
-pub const permission_session_rules = @import("permission/session_rules.zig");
-pub const permission_rule_spec = @import("permission/rule_spec.zig");
-pub const permission_settings = @import("permission/settings.zig");
-pub const permission_decision = @import("permission/decision.zig");
-pub const permission_bash_readonly = @import("permission/bash_readonly.zig"); // L2:Bash 免询问/并发只读判定
-pub const permission_hooks = @import("permission/hooks.zig");
-pub const sandbox_profile = @import("sandbox/profile.zig");
-pub const sandbox_config = @import("sandbox/config.zig"); // L2 测试构造 SandboxSettings
-pub const sandbox_exec = @import("sandbox/exec.zig"); // L2:本机是否真有沙箱(autoAllowBashIfSandboxed 期望值)
-pub const agents_def = @import("agents/def.zig");
-pub const agents_set = @import("agents/set.zig");
-pub const agents_filter = @import("agents/filter.zig");
-pub const agents_preload = @import("agents/preload.zig");
-pub const tools_dynamic = @import("tools/dynamic.zig");
-pub const tools_task_batch = @import("tools/task_batch.zig");
-pub const system_prompt = @import("core/system_prompt.zig");
-pub const prompt_sections = @import("core/prompt_sections.zig");
-pub const user_context = @import("core/memory/user_context.zig");
-pub const memdir = @import("core/memory/memdir.zig");
-pub const util_log = @import("util/log.zig");
+pub const tool_context = @import("metacodes-internal").tools.context;
+pub const project_rule_gate_protocol = @import("metacodes-internal").tools.project_rule_gate;
+pub const tool_error = @import("metacodes-internal").core.tool_error;
+pub const bash = @import("metacodes-internal").tools.bash;
+pub const grep = @import("metacodes-internal").tools.grep;
+pub const glob = @import("metacodes-internal").tools.glob;
+pub const read_tool = @import("metacodes-internal").tools.read;
+pub const find_symbol_tool = @import("metacodes-internal").tools.find_symbol;
+pub const code_map_tool = @import("metacodes-internal").tools.code_map;
+pub const symbol_provider = @import("metacodes-internal").tools.symbol_provider;
+pub const lsp = @import("metacodes-internal").lsp.lsp;
+pub const write_tool = @import("metacodes-internal").tools.write;
+pub const edit_tool = @import("metacodes-internal").tools.edit;
+pub const mcp_client = @import("metacodes-internal").mcp.client;
+pub const mcp_transport_http = @import("metacodes-internal").mcp.transport_http;
+pub const mcp_transport_sse = @import("metacodes-internal").mcp.transport_sse;
+pub const mcp_transport = @import("metacodes-internal").mcp.transport;
+pub const mcp_oauth = @import("metacodes-internal").mcp.oauth;
+pub const mcp_url = @import("metacodes-internal").mcp.url;
+pub const mcp_protocol = @import("metacodes-internal").mcp.protocol;
+pub const mcp_config = @import("metacodes-internal").mcp.config;
+pub const mcp_launch = @import("metacodes-internal").mcp.launch;
+pub const mcp_naming = @import("metacodes-internal").mcp.naming;
+pub const mcp_registry_bridge = @import("metacodes-internal").mcp.registry_bridge;
+pub const mcp_session = @import("metacodes-internal").core.mcp_session;
+pub const skills = @import("metacodes-internal").skills.skill;
+pub const skill_overrides = @import("metacodes-internal").skills.overrides;
+pub const skills_runtime = @import("metacodes-internal").skills.runtime.root;
+pub const skills_cli_adapter = @import("metacodes-internal").skills.cli_adapter;
+pub const skills_sealed_protocol = @import("metacodes-internal").skills.sealed.protocol;
+pub const skills_sealed_transport = @import("metacodes-internal").skills.sealed.transport;
+pub const skills_sealed_pin = @import("metacodes-internal").skills.sealed.pin;
+pub const skills_sealed_ledger = @import("metacodes-internal").skills.sealed.ledger;
+pub const skills_sealed_provider = @import("metacodes-internal").skills.sealed.provider;
+pub const skills_sealed_gateway = @import("metacodes-internal").skills.sealed.gateway;
+pub const skills_sealed_provider_pool = @import("metacodes-internal").skills.sealed.provider_pool;
+pub const skills_sealed_credentials = @import("metacodes-internal").skills.sealed.credentials;
+pub const skills_sealed_disclosure = @import("metacodes-internal").skills.sealed.disclosure;
+pub const skills_tool = @import("metacodes-internal").skills.tool;
+pub const skills_render = @import("metacodes-internal").skills.render;
+pub const skills_discovery = @import("metacodes-internal").skills.discovery;
+pub const active_skill = @import("metacodes-internal").skills.active;
+pub const permission = @import("metacodes-internal").permission_root;
+pub const permission_session_rules = @import("metacodes-internal").permission.session_rules;
+pub const permission_rule_spec = @import("metacodes-internal").permission.rule_spec;
+pub const permission_settings = @import("metacodes-internal").permission.settings;
+pub const permission_decision = @import("metacodes-internal").permission.decision;
+pub const permission_bash_readonly = @import("metacodes-internal").permission.bash_readonly; // L2:Bash 免询问/并发只读判定
+pub const permission_hooks = @import("metacodes-internal").permission.hooks;
+pub const sandbox_profile = @import("metacodes-internal").sandbox.profile;
+pub const sandbox_config = @import("metacodes-internal").sandbox.config; // L2 测试构造 SandboxSettings
+pub const sandbox_exec = @import("metacodes-internal").sandbox.exec; // L2:本机是否真有沙箱(autoAllowBashIfSandboxed 期望值)
+pub const agents_def = @import("metacodes-internal").agents.def;
+pub const agents_set = @import("metacodes-internal").agents.set;
+pub const agents_filter = @import("metacodes-internal").agents.filter;
+pub const agents_preload = @import("metacodes-internal").agents.preload;
+pub const tools_dynamic = @import("metacodes-internal").tools.dynamic;
+pub const tools_task_batch = @import("metacodes-internal").tools.task_batch;
+pub const system_prompt = @import("metacodes-internal").core.system_prompt;
+pub const prompt_sections = @import("metacodes-internal").core.prompt_sections;
+pub const user_context = @import("metacodes-internal").core.memory.user_context;
+pub const memdir = @import("metacodes-internal").core.memory.memdir;
+pub const util_log = @import("metacodes-internal").util.log;
 pub const tui_render_region = @import("repl/tui/render_region.zig");
-pub const ui_event = @import("core/protocol/ui_event.zig");
-pub const ui_backend = @import("core/protocol/ui_backend.zig");
-pub const ui_request = @import("core/protocol/ui_request.zig");
-pub const wire = @import("core/protocol/wire.zig");
-pub const frontend_capabilities = @import("core/protocol/frontend_capabilities.zig");
-pub const session_id = @import("core/session_id.zig");
+pub const ui_event = @import("metacodes-internal").core.protocol.ui_event;
+pub const ui_backend = @import("metacodes-internal").core.protocol.ui_backend;
+pub const ui_request = @import("metacodes-internal").core.protocol.ui_request;
+pub const wire = @import("metacodes-internal").core.protocol.wire;
+pub const frontend_capabilities = @import("metacodes-internal").core.protocol.frontend_capabilities;
+pub const session_id = @import("metacodes-internal").core.session_id;
 pub const tui_backend = @import("repl/tui/tui_backend.zig");
-pub const writer_backend = @import("core/writer_backend.zig");
-pub const headless_backend = @import("core/headless_backend.zig");
-pub const suspend_state = @import("core/suspend_state.zig");
-pub const ui_request_store = @import("core/ui_request_store.zig");
-pub const tee_backend = @import("core/tee_backend.zig");
-pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
-pub const evaluation_backend = @import("core/evaluation_backend.zig");
-pub const tool_observation_journal = @import("core/tool_observation_journal.zig");
-pub const rule_impact_stats = @import("core/rule_impact_stats.zig");
-pub const rule_impact_operational_observation = @import("core/rule_impact_operational_observation.zig");
-pub const rule_impact_evidence = @import("core/rule_impact_evidence.zig");
-pub const rule_impact_receipt = @import("core/rule_impact_receipt.zig");
-pub const rule_impact_aggregate_receipt = @import("core/rule_impact_aggregate_receipt.zig");
-pub const ontology_rule_projection = @import("core/ontology_rule_projection.zig");
-pub const rule_author = @import("core/rule_author.zig");
-pub const project_rule_evolution = @import("core/project_rule_evolution.zig");
-pub const self_evolution = @import("core/self_evolution.zig");
-pub const verdict = @import("core/verdict.zig");
-pub const host_check = @import("core/host_check.zig");
-pub const obligation_gate = @import("core/obligation_gate.zig");
-pub const rule_source_receipt = @import("core/rule_source_receipt.zig");
-pub const project_rule_spec = @import("core/project_rule_spec.zig");
-pub const rule_candidate = @import("core/rule_candidate.zig");
-pub const rule_lifecycle = @import("core/rule_lifecycle.zig");
-pub const rule_build_bundle = @import("core/rule_build_bundle.zig");
-pub const rule_evaluation = @import("core/rule_evaluation.zig");
-pub const project_harness_runtime = @import("formal/project_harness_runtime.zig");
-pub const project_rule_bundle = @import("core/project_rule_bundle.zig");
-pub const project_rule_gate = @import("core/project_rule_gate.zig");
-pub const project_rule_activation = @import("core/project_rule_activation.zig");
+pub const writer_backend = @import("metacodes-internal").core.writer_backend;
+pub const headless_backend = @import("metacodes-internal").core.headless_backend;
+pub const suspend_state = @import("metacodes-internal").core.suspend_state;
+pub const ui_request_store = @import("metacodes-internal").core.ui_request_store;
+pub const tee_backend = @import("metacodes-internal").core.tee_backend;
+pub const diagnostics_backend = @import("metacodes-internal").core.diagnostics_backend;
+pub const evaluation_backend = @import("metacodes-internal").core.evaluation_backend;
+pub const tool_observation_journal = @import("metacodes-internal").core.tool_observation_journal;
+pub const rule_impact_stats = @import("metacodes-internal").core.rule_impact_stats;
+pub const rule_impact_operational_observation = @import("metacodes-internal").core.rule_impact_operational_observation;
+pub const rule_impact_evidence = @import("metacodes-internal").core.rule_impact_evidence;
+pub const rule_impact_receipt = @import("metacodes-internal").core.rule_impact_receipt;
+pub const rule_impact_aggregate_receipt = @import("metacodes-internal").core.rule_impact_aggregate_receipt;
+pub const ontology_rule_projection = @import("metacodes-internal").core.ontology_rule_projection;
+pub const rule_author = @import("metacodes-internal").core.rule_author;
+pub const project_rule_evolution = @import("metacodes-internal").core.project_rule_evolution;
+pub const self_evolution = @import("metacodes-internal").core.self_evolution;
+pub const verdict = @import("metacodes-internal").core.verdict;
+pub const host_check = @import("metacodes-internal").core.host_check;
+pub const obligation_gate = @import("metacodes-internal").core.obligation_gate;
+pub const rule_source_receipt = @import("metacodes-internal").core.rule_source_receipt;
+pub const project_rule_spec = @import("metacodes-internal").core.project_rule_spec;
+pub const rule_candidate = @import("metacodes-internal").core.rule_candidate;
+pub const rule_lifecycle = @import("metacodes-internal").core.rule_lifecycle;
+pub const rule_build_bundle = @import("metacodes-internal").core.rule_build_bundle;
+pub const rule_evaluation = @import("metacodes-internal").core.rule_evaluation;
+pub const project_harness_runtime = @import("metacodes-internal").formal.project_harness_runtime;
+pub const project_rule_bundle = @import("metacodes-internal").core.project_rule_bundle;
+pub const project_rule_gate = @import("metacodes-internal").core.project_rule_gate;
+pub const project_rule_activation = @import("metacodes-internal").core.project_rule_activation;
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
 pub const repl_history = @import("repl/history.zig");
 pub const repl_user_echo = @import("repl/user_echo.zig");
 pub const repl_replay = @import("repl/replay.zig");
-pub const event_journal = @import("core/event_journal.zig");
-pub const session_host = @import("core/session_host.zig");
+pub const event_journal = @import("metacodes-internal").core.event_journal;
+pub const session_host = @import("metacodes-internal").core.session_host;
 pub const web_backend = @import("web/backend.zig");
 pub const web_server = @import("web/server.zig");
 pub const web_session = @import("web/session.zig");
@@ -392,7 +392,7 @@ pub const daemon_app_driver = @import("daemon/app_driver.zig"); // U10-D:真 App
 pub const daemon_serve = @import("daemon/serve.zig"); // U10-D:serve(单 session daemon MVP)
 pub const daemon_serve_multi = @import("daemon/serve_multi.zig"); // U10-C/#254:multi-session daemon (component tests drive it)
 pub const daemon_uds = @import("daemon/uds.zig"); // U10-B:UDS+NDJSON 绑定(组件测试驱动 message op)
-pub const core_shutdown = @import("core/shutdown.zig"); // U9:进程级停机信号
+pub const core_shutdown = @import("metacodes-internal").core.shutdown; // U9:进程级停机信号
 pub const tui_status_bar = @import("repl/tui/widget/status_bar.zig");
 pub const tui_verbs = @import("repl/tui/verbs.zig");
 pub const tui_ui_state = @import("repl/tui/ui_state.zig");
@@ -407,8 +407,8 @@ pub const repl_complete = @import("repl/complete.zig");
 pub const repl_model_picker = @import("repl/model_picker.zig");
 pub const repl_model_picker_view = @import("repl/model_picker_view.zig");
 pub const repl_picker_host = @import("repl/picker_host.zig");
-pub const answer_queue = @import("core/answer_queue.zig");
-pub const recorder = @import("core/recorder.zig");
+pub const answer_queue = @import("metacodes-internal").core.answer_queue;
+pub const recorder = @import("metacodes-internal").core.recorder;
 
 /// 测试钩子:暴露 parseArgs 给 L2(base_url_flag_test 等)。
 /// 传入 argv(含 argv[0] 占位),返回解析后的 Config。
@@ -460,7 +460,7 @@ fn applyProviderRoute(
     allocator: std.mem.Allocator,
     profile_name: ?[]const u8,
 ) void {
-    const startup = @import("provider/startup.zig");
+    const startup = @import("metacodes-internal").provider.startup;
     const host = buildProviderHost(allocator) orelse {
         std.debug.print("error: provider registry initialization failed\n", .{});
         std.process.exit(2);
@@ -634,7 +634,7 @@ fn localConfigAllowlist(arena: std.mem.Allocator) state_env_mod.Allowlist {
 /// and the names it sets that are ignored (never a value). To the log only
 /// while the TUI owns the terminal; `metacodes doctor` shows the same.
 fn warnLocalConfig(allocator: std.mem.Allocator, local: *const state_env_mod.Loaded, to: enum { stderr, log }) void {
-    const log = @import("util/log.zig");
+    const log = @import("metacodes-internal").util.log;
     const quiet = to == .log;
     const problem: ?[]const u8 = switch (local.status) {
         .unreadable => "cannot be read",
@@ -824,7 +824,7 @@ fn presetFacts(arena: std.mem.Allocator, config: types.Config, local: *const sta
     var inputs: presets_mod.Inputs = .{
         .flag = config.preset,
         .local = local.get(state_env_mod.preset_variable),
-        .cwd = @import("util/fs.zig").getCwd(arena) catch null,
+        .cwd = @import("metacodes-internal").util.fs.getCwd(arena) catch null,
     };
     var store = provider_config_store.Store.initHome(arena, hostRoot()) catch
         return presets_mod.gather(arena, inputs) catch presetFactsOutOfMemory();
@@ -915,7 +915,7 @@ fn applyDecidedPreset(
             std.debug.print("error: {s}\n", .{why.message(allocator, found.name, facts.config_path) catch "the preset cannot be applied"});
             std.process.exit(2);
         },
-        .applied => |applied| @import("util/log.zig").info("config", "preset {s}: provider {s}", .{ found.name, applied.provider }),
+        .applied => |applied| @import("metacodes-internal").util.log.info("config", "preset {s}: provider {s}", .{ found.name, applied.provider }),
     }
     return true;
 }
@@ -1130,7 +1130,7 @@ fn applyStartupOutcome(
             // endpoint are shown before any request is sent. The endpoint is a
             // channel base URL and carries no credential; the credential itself
             // is never printed or logged.
-            @import("util/log.zig").info(
+            @import("metacodes-internal").util.log.info(
                 "provider",
                 "route provider={s} channel={s} protocol={s} region={s} model={s} endpoint={s} offer={s}",
                 .{
@@ -1272,7 +1272,7 @@ pub fn main(init: std.process.Init) !void {
     // The release layout resolves rg beside the executable before PATH (#79);
     // the library learns the layout here, before anything — `doctor`
     // included — can resolve it.
-    @import("util/toolchain.zig").setLayout(if (build_options.release_layout) .release else .development);
+    @import("metacodes-internal").util.toolchain.setLayout(if (build_options.release_layout) .release else .development);
 
     // `metacodes --help` (or `-h`) answers before the rest of startup. The
     // state-dir option, subcommand dispatch and the full Config change nothing
@@ -1338,11 +1338,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     if (config.teammate_name.len > 0 and config.teammate_parent_session.len > 0) {
-        const parent = @import("core/session_id.zig").SessionId.fromSlice(config.teammate_parent_session) orelse {
+        const parent = @import("metacodes-internal").core.session_id.SessionId.fromSlice(config.teammate_parent_session) orelse {
             std.debug.print("error: invalid --parent-session-id\n", .{});
             std.process.exit(2);
         };
-        if (@import("core/session_id.zig").SessionId.fromSlice(config.teammate_lease_id) == null) {
+        if (@import("metacodes-internal").core.session_id.SessionId.fromSlice(config.teammate_lease_id) == null) {
             std.debug.print("error: invalid --teammate-lease-id\n", .{});
             std.process.exit(2);
         }
@@ -1382,16 +1382,16 @@ pub fn main(init: std.process.Init) !void {
     // a session's request and memory excerpts leave the machine for the
     // advisor only when config.json or METACODES_JEV_URL names one. `doctor`
     // reads the same constant.
-    config.jev_builtin_default = @import("jev/runtime.zig").CLI_USES_BUILTIN_DEFAULT;
+    config.jev_builtin_default = @import("metacodes-internal").jev.runtime.CLI_USES_BUILTIN_DEFAULT;
     if (config.state_root.len > 0) {
         // Every subsystem writes beneath the root; create it (and an install's
         // `<prefix>/state` parent chain) once, owner-only, before any of them
         // run. A root that cannot be created (read-only or missing home) is
         // what a missing $HOME always was: each subsystem degrades on its own.
-        @import("util/fs.zig").mkdirParents(config.state_root) catch |err| {
+        @import("metacodes-internal").util.fs.mkdirParents(config.state_root) catch |err| {
             std.debug.print("warning: cannot create the state root {s} ({s}); sessions, credentials and memory will not persist\n", .{ config.state_root, @errorName(err) });
         };
-        @import("core/context_caps.zig").configureStateRoot(config.state_root);
+        @import("metacodes-internal").core.context_caps.configureStateRoot(config.state_root);
     }
 
     // `--resume <id>` binds the App to the stored session before it is built,
@@ -1403,7 +1403,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
-    const log = @import("util/log.zig");
+    const log = @import("metacodes-internal").util.log;
     log.initFromEnv();
     if (config.verbose) log.enableVerbose();
 
@@ -1776,7 +1776,7 @@ pub fn main(init: std.process.Init) !void {
                 unbound = .nothing_configured;
                 break :blk null;
             }
-            @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
+            @import("metacodes-internal").util.log.err("auth", "credential resolution failed: {s}", .{@errorName(err)});
             std.debug.print(auth_required_hint, .{ .command = invokedCommand(allocator) });
             printLocalConfigHint(&local_config, unchosen_local_providers);
             std.debug.print(no_token_printed, .{});
@@ -2190,7 +2190,7 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
 /// in render order, each with its id, order, class, origin, size and digest,
 /// then the prompt digest checked against the prompt App actually built.
 fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
-    const cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+    const cwd = @import("metacodes-internal").util.fs.getCwd(app.allocator) catch "";
     const listing = app.cliPromptInput(cwd).list(app.allocator) catch |err| {
         var buf: [96]u8 = undefined;
         dumpWrite(std.fmt.bufPrint(&buf, "prompt sections unavailable: {s}\n", .{@errorName(err)}) catch "prompt sections unavailable\n");
@@ -2241,8 +2241,8 @@ fn metaskUsesDeviceFlow(mode: LoginMode) bool {
 /// Builds the doctor's KG object with the read-only probe (a diagnosis command
 /// must never create or migrate a store). Owned strings only; any allocation
 /// failure leaves the report without a `kg` object instead of mixing in statics.
-pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").KgClient, state_root: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
-    const kclient = kg orelse return try kgDiagnosisOwned(allocator, "unconfigured", "unconfigured", "-", @import("kg/client.zig").KgClient.hintFor(.unconfigured));
+pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("metacodes-internal").kg.client.KgClient, state_root: []const u8) error{OutOfMemory}!?doctor.KgDiagnosis {
+    const kclient = kg orelse return try kgDiagnosisOwned(allocator, "unconfigured", "unconfigured", "-", @import("metacodes-internal").kg.client.KgClient.hintFor(.unconfigured));
     kclient.ensureReadyReadOnly();
     const state: []const u8 = if (kclient.ready) "ready" else @tagName(kclient.degradedKind() orelse .unconfigured);
     const transport = kclient.transportName();
@@ -2271,11 +2271,11 @@ pub fn kgDiagnosis(allocator: std.mem.Allocator, kg: ?*@import("kg/client.zig").
 /// the CLI takes it: `jev.CLI_USES_BUILTIN_DEFAULT`), judged without
 /// contacting the service. Strings live in `arena`.
 fn jevDiagnosis(arena: std.mem.Allocator, io: std.Io, state_root: []const u8) doctor.JevDiagnosis {
-    const jev = @import("jev/runtime.zig");
+    const jev = @import("metacodes-internal").jev.runtime;
     return switch (jev.resolve(arena, io, state_root, jev.CLI_USES_BUILTIN_DEFAULT, jev.rawFromEnv())) {
         .off => |source| .{ .state = "off", .source = @tagName(source) },
         .invalid => |invalid| .{ .state = "invalid", .source = @tagName(invalid.source), .err = @errorName(invalid.err) },
-        .on => |on| if (!@import("jev/client.zig").validOrigin(std.mem.trimEnd(u8, on.settings.origin, "/")))
+        .on => |on| if (!@import("metacodes-internal").jev.client.validOrigin(std.mem.trimEnd(u8, on.settings.origin, "/")))
             .{ .state = "invalid", .url = on.settings.origin, .source = @tagName(on.source), .err = "InvalidOrigin" }
         else
             .{ .state = @tagName(on.settings.mode), .url = on.settings.origin, .source = @tagName(on.source) },
@@ -2452,21 +2452,21 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
         return 1;
     };
     const state_dir = hostRoot();
-    report.state_root = if (@import("util/state_root.zig").resolve()) |resolved|
+    report.state_root = if (@import("metacodes-internal").util.state_root.resolve()) |resolved|
         .{ .path = resolved.path, .source = resolved.source.label(), .err = null }
     else |err|
         .{ .path = null, .source = null, .err = @errorName(err) };
-    const cwd = @import("util/fs.zig").getCwd(allocator) catch "";
+    const cwd = @import("metacodes-internal").util.fs.getCwd(allocator) catch "";
     defer if (cwd.len > 0) allocator.free(cwd);
-    const hash = @import("core/transcript.zig").hashCwd(cwd);
+    const hash = @import("metacodes-internal").core.transcript.hashCwd(cwd);
     const domain = std.fmt.allocPrint(allocator, "doctor-{s}", .{hash[0..8]}) catch "doctor";
     defer if (!std.mem.eql(u8, domain, "doctor")) allocator.free(domain);
-    var kg = @import("kg/client.zig").KgClient.init(allocator, .{ .state_root = state_dir, .domain = domain, .io = io }) catch null;
+    var kg = @import("metacodes-internal").kg.client.KgClient.init(allocator, .{ .state_root = state_dir, .domain = domain, .io = io }) catch null;
     defer if (kg) |*kclient| kclient.deinit();
     // KG diagnosis is all-or-nothing: KgDiagnosis.deinit frees every field, so
     // no static fallback string may ever be stored in it. OOM → no kg object.
     report.kg = kgDiagnosis(allocator, if (kg) |*kclient| kclient else null, state_dir) catch |err| blk: {
-        @import("util/log.zig").warn("doctor", "unable to allocate KG diagnosis ({s}); omitting kg object", .{@errorName(err)});
+        @import("metacodes-internal").util.log.warn("doctor", "unable to allocate KG diagnosis ({s}); omitting kg object", .{@errorName(err)});
         break :blk null;
     };
     defer report.deinit(allocator);
@@ -2483,7 +2483,7 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
     var version_buf: [version_info.MAX_VERSION_LEN]u8 = undefined;
     report.version = version_info.fullVersion(&version_buf, VERSION, version_info.BuildInfo.fromOptions(build_options));
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (@import("platform").paths.selfExeRealPath(&exe_buf)) |exe| report.install_prefix = @import("util/state_root.zig").prefixOf(exe);
+    if (@import("platform").paths.selfExeRealPath(&exe_buf)) |exe| report.install_prefix = @import("metacodes-internal").util.state_root.prefixOf(exe);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     // A person at a terminal gets the readable report; a pipe, a script and
@@ -2543,7 +2543,7 @@ fn stateDirUsage() noreturn {
 /// Records `--state-dir`, made absolute against the cwd so a relative root
 /// cannot drift when a tool or teammate later changes directory.
 fn applyStateDir(dir: []const u8) void {
-    const state_root = @import("util/state_root.zig");
+    const state_root = @import("metacodes-internal").util.state_root;
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     var join_buf: [std.fs.max_path_bytes]u8 = undefined;
     const absolute = if (std.fs.path.isAbsolute(dir)) dir else blk: {
@@ -2569,7 +2569,7 @@ fn applyStateDir(dir: []const u8) void {
 /// exit code 2 instead of falling back to another install's state; no
 /// root at all (no $HOME) is "" and subsystems degrade as before.
 fn hostStateRoot() error{StateRootRejected}![]const u8 {
-    const state_root = @import("util/state_root.zig");
+    const state_root = @import("metacodes-internal").util.state_root;
     const resolved = state_root.resolve() catch |err| {
         switch (err) {
             error.StateRootNotAbsolute => std.debug.print("error: the state root must be an absolute path (--state-dir / {s})\n", .{state_root.env_variable}),
@@ -2616,7 +2616,7 @@ fn resolveResumeSession(allocator: std.mem.Allocator, state_root: []const u8, qu
 /// The state root this host resolved at startup ("" when there is none).
 /// Host-only: src/main.zig hands it down; library code never reads it.
 fn hostRoot() []const u8 {
-    const resolved = @import("util/state_root.zig").resolve() catch return "";
+    const resolved = @import("metacodes-internal").util.state_root.resolve() catch return "";
     return resolved.path;
 }
 
@@ -2703,7 +2703,7 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
         std.debug.print("error: cannot locate this executable\n", .{});
         return 1;
     };
-    const source_root = @import("util/state_root.zig").prefixOf(exe) orelse {
+    const source_root = @import("metacodes-internal").util.state_root.prefixOf(exe) orelse {
         std.debug.print("error: this executable is not inside a release unit (<root>/bin/metacodes)\n", .{});
         return 1;
     };
@@ -2815,7 +2815,7 @@ fn runUpdate(args: *std.process.Args.Iterator, init: std.process.Init, allocator
         std.debug.print("error: cannot locate this executable\n", .{});
         return 1;
     };
-    options.prefix = @import("util/state_root.zig").prefixOf(exe) orelse {
+    options.prefix = @import("metacodes-internal").util.state_root.prefixOf(exe) orelse {
         std.debug.print("error: this executable is not inside an install (<prefix>/bin/metacodes)\n", .{});
         return 1;
     };
@@ -2960,9 +2960,9 @@ fn maybePrepareTeamwork(init: std.process.Init, arena: std.mem.Allocator, leadin
         };
         std.process.exit(0);
     }
-    const cwd = try @import("util/fs.zig").getCwd(arena);
+    const cwd = try @import("metacodes-internal").util.fs.getCwd(arena);
     options.host_config.preview = leading_preview.overlay(options.host_config.preview);
-    if (options.approve) options.host_config.preview = try @import("core/file_config.zig").resolvePreview(arena, state_root, options.host_config.preview);
+    if (options.approve) options.host_config.preview = try @import("metacodes-internal").core.file_config.resolvePreview(arena, state_root, options.host_config.preview);
     const prepared = teamwork_command.prepare(arena, options, state_root, cwd) catch |err| {
         std.debug.print("error: teamwork: {s}\n", .{@errorName(err)});
         std.process.exit(2);
@@ -2996,7 +2996,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "update")) return runUpdate(&args, init, allocator);
     const state_dir = hostStateRoot() catch return 2;
     if (std.mem.eql(u8, cmd, "bench")) return @import("app/bench_cli.zig").run(&args, allocator, init.io, state_dir);
-    if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
+    if (state_dir.len > 0) @import("metacodes-internal").core.context_caps.configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
@@ -3012,7 +3012,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
             std.debug.print("usage: metacodes ledger metask\n", .{});
             return 2;
         }
-        const bytes = @import("provider/metask_ledger.zig").read(allocator, state_dir) catch |err| {
+        const bytes = @import("metacodes-internal").provider.metask_ledger.read(allocator, state_dir) catch |err| {
             if (err == error.NotFound) return 0;
             std.debug.print("error: could not read Metask ledger ({s})\n", .{@errorName(err)});
             return 1;
@@ -3368,7 +3368,7 @@ fn finishMetaskSignIn(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         return 1;
     };
     const models_url = std.fmt.allocPrint(arena.allocator(), "{s}/v1/models", .{gateway}) catch return 1;
-    const fetched = @import("api/catalog_fetch.zig").fetchModelPages(allocator, io, .{ .url = models_url, .bearer = outcome.access_token }) catch |err| {
+    const fetched = @import("metacodes-internal").api.catalog_fetch.fetchModelPages(allocator, io, .{ .url = models_url, .bearer = outcome.access_token }) catch |err| {
         std.debug.print("Signed in, but the models could not be listed ({s}); nothing was stored.\n", .{@errorName(err)});
         return 1;
     };
@@ -3908,7 +3908,7 @@ fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: 
         std.debug.print("error: unknown provider '{s}'\n", .{name});
         return 2;
     };
-    return logoutProviderProfile(allocator, state_dir, profile, @import("api/oauth_revoke.zig").DEFAULT_WAIT_MS);
+    return logoutProviderProfile(allocator, state_dir, profile, @import("metacodes-internal").api.oauth_revoke.DEFAULT_WAIT_MS);
 }
 
 /// `logoutProviderKey` for a resolved profile; `revoke_wait_ms` bounds the
@@ -3919,7 +3919,7 @@ pub fn logoutProviderProfile(
     profile: *const provider_profile.ProviderProfile,
     revoke_wait_ms: u64,
 ) u8 {
-    const oauth_revoke = @import("api/oauth_revoke.zig");
+    const oauth_revoke = @import("metacodes-internal").api.oauth_revoke;
     // A key a provider's site created (OpenRouter) outlives this file: only
     // its owner can delete it there, so its page is named before the file,
     // which holds the key it is computed from, goes.
@@ -4350,7 +4350,7 @@ fn resolveMetaskBearer(allocator: std.mem.Allocator, io: std.Io) MetaskSessionEr
         .io = io,
         .token_url = token_url,
     };
-    return session.accessToken(@import("util/time.zig").nowUnix(), exchange.exchange());
+    return session.accessToken(@import("metacodes-internal").util.time.nowUnix(), exchange.exchange());
 }
 
 /// Provider-scoped credential resolution (issue #16).
@@ -4514,7 +4514,7 @@ fn runMetaskDeviceLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []c
     // The session this one replaces (#560), revoked once it is stored.
     var replaced = metask_oauth_mod.Replaced.capture(allocator, hostRoot());
     defer replaced.deinit();
-    session.importOutcome(outcome, @import("util/time.zig").nowUnix()) catch |err| {
+    session.importOutcome(outcome, @import("metacodes-internal").util.time.nowUnix()) catch |err| {
         std.debug.print("error: could not store the Metask OAuth session ({s})\n", .{@errorName(err)});
         return 2;
     };
@@ -4947,7 +4947,7 @@ pub fn providerSignInToken(
         .io = io_runtime.io(),
         .endpoint = .{ .token_url = token_url, .client_id = session.clientIdFor(profile.oauth_client_id) },
     };
-    return try session.accessToken(@import("util/time.zig").nowUnix(), exchange.exchange());
+    return try session.accessToken(@import("metacodes-internal").util.time.nowUnix(), exchange.exchange());
 }
 
 /// Whether a start reads `profile`'s own OAuth sign-in at all: it declares a
@@ -4980,7 +4980,7 @@ fn providerSignInStored(
 /// `command` is the command the user ran (`invokedCommand`); `local_path`
 /// this install's `<state root>/.env` ("" when it has no state root).
 fn printProviderCredentialHelp(
-    profile: @import("provider/profile.zig").ProviderProfile,
+    profile: @import("metacodes-internal").provider.profile.ProviderProfile,
     err: anyerror,
     command: []const u8,
     local_path: []const u8,
@@ -5133,7 +5133,7 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 setParseError(config, allocator, "missing value for {s}", .{arg});
                 return;
             };
-            config.permission_mode = @import("permission/mode.zig").parseStrict(m) orelse {
+            config.permission_mode = @import("metacodes-internal").permission.mode.parseStrict(m) orelse {
                 setParseError(config, allocator, "invalid permission mode '{s}'", .{m});
                 return;
             };
@@ -5764,7 +5764,7 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
 }
 
 fn parsePermMode(s: []const u8) types.PermissionMode {
-    return @import("permission/mode.zig").parse(s);
+    return @import("metacodes-internal").permission.mode.parse(s);
 }
 
 /// 累加一个 \x00 分隔的列表(--add-dir / --plugin-dir 可重复)。返回新分配的串,
@@ -6080,85 +6080,12 @@ test "the sign-in hints name the command that was run, the default sign-in first
 }
 
 test {
-    _ = &@import("json.zig");
-    _ = &@import("client.zig");
-    _ = &@import("api/credential_cell.zig");
-    _ = &@import("tools.zig");
-    _ = &@import("symbols/symbol.zig");
-    _ = &@import("tools/symbol_provider.zig");
-    _ = &@import("core/edit_hl_cache.zig");
-    _ = &@import("core/goal.zig");
-    _ = &@import("core/auth.zig");
-    _ = &@import("permission.zig");
-    _ = &@import("permission/rule_spec.zig");
-    _ = &@import("permission/bash_parser.zig");
-    _ = &@import("permission/bash_readonly.zig");
-    _ = &@import("permission/credential_store.zig");
-    _ = &@import("core/mcp_session.zig");
-    _ = &@import("permission/settings.zig");
-    _ = &@import("permission/loader.zig");
-    _ = &@import("permission/hooks.zig");
-    _ = &@import("permission/settings_writer.zig");
-    _ = &@import("sandbox/profile.zig");
-    _ = &@import("sandbox/config.zig");
-    _ = &@import("sandbox/exec.zig");
-    _ = &@import("sandbox/bwrap.zig");
-    _ = &@import("core/message.zig");
-    _ = &@import("core/conversation.zig");
-    _ = &@import("core/agent_loop.zig");
     _ = &@import("repl/stream_json_backend.zig");
-    _ = &@import("core/verdict.zig");
-    _ = &@import("core/host_check.zig");
-    _ = &@import("core/check_gate.zig");
-    _ = &@import("core/isolated_verifier.zig");
-    _ = &@import("agents/isolation.zig");
-    _ = &@import("core/learning_turn.zig");
-    _ = &@import("core/learning_end_of_run.zig");
-    _ = &@import("kg/lesson.zig");
-    _ = &@import("kg/reserved_types.zig");
-    _ = &@import("core/test_integrity.zig");
-    _ = &@import("swarm/team.zig");
-    _ = &@import("swarm/mailbox.zig");
-    _ = &@import("swarm/teammate.zig");
-    _ = &@import("swarm/context.zig");
-    _ = &@import("swarm/tools.zig");
-    _ = &@import("swarm/teammate_process.zig");
-    _ = &@import("teamwork/types.zig");
-    _ = &@import("teamwork/config.zig");
-    _ = &@import("teamwork/run_dir.zig");
-    _ = &@import("teamwork/ledger.zig");
-    _ = &@import("teamwork/issues.zig");
-    _ = &@import("teamwork/reviewer.zig");
-    _ = &@import("teamwork/stub_driver.zig");
-    _ = &@import("teamwork/charters.zig");
-    _ = &@import("teamwork/drivers/common.zig");
-    _ = &@import("teamwork/drivers/write_scope.zig");
-    _ = &@import("teamwork/drivers/metacodes.zig");
-    _ = &@import("teamwork/drivers/claude_code.zig");
-    _ = &@import("teamwork/drivers/factory.zig");
-    _ = &@import("teamwork/drivers/drivers_test.zig");
-    _ = &@import("teamwork/audit.zig");
-    _ = &@import("teamwork/merge_back.zig");
-    _ = &@import("teamwork/runtime.zig");
-    _ = &@import("teamwork/swe_loop.zig");
-    _ = &@import("teamwork/verifier_auditor.zig");
-    _ = &@import("teamwork/runtime_test.zig");
-    _ = &@import("teamwork/interview.zig");
-    _ = &@import("teamwork/progress.zig");
-    _ = &@import("teamwork/judge.zig");
-    _ = &@import("teamwork/command.zig");
     _ = &@import("repl/teamwork.zig");
-    _ = &@import("core/memory/import.zig");
-    _ = &@import("core/memory/claudemd.zig");
-    _ = &@import("core/memory/user_context.zig");
-    _ = &@import("core/memory/memdir.zig");
-    _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/mcp_hotplug.zig");
-    _ = &@import("core/tool_changes.zig");
-    _ = &@import("core/skill_changes.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/invocation.zig");
     _ = &@import("app/state_env.zig");
@@ -6181,40 +6108,11 @@ test {
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("repl/replay.zig");
-    _ = &@import("util/abort.zig");
-    _ = &@import("util/file_lock.zig");
-    _ = &@import("util/toolchain.zig");
-    _ = &@import("util/log.zig");
-    _ = &@import("util/model.zig");
-    _ = &@import("util/path.zig");
-    _ = &@import("api/catalog.zig");
-    _ = &@import("api/model_name_consumers_test.zig");
-    _ = &@import("tools/context.zig");
     _ = &@import("repl/input.zig");
     _ = &@import("repl/model_command.zig");
     _ = &@import("repl/model_picker.zig");
     _ = &@import("repl/model_picker_view.zig");
     _ = &@import("repl/picker_host.zig");
-    _ = &@import("provider/host.zig");
-    _ = &@import("provider/api_key_store.zig");
-    _ = &@import("provider/alias.zig");
-    _ = &@import("provider/custom_provider.zig");
-    _ = &@import("provider/model_listing.zig");
-    _ = &@import("provider/oauth.zig");
-    _ = &@import("kg/provider_audit.zig");
-    _ = &@import("api/oauth_exchange.zig");
-    _ = &@import("api/oauth_login.zig");
-    _ = &@import("api/openrouter_login.zig");
-    _ = &@import("api/openrouter_catalog.zig");
-    _ = &@import("api/provider_login.zig");
-    _ = &@import("api/oauth_revoke.zig");
-    _ = &@import("api/codex_usage.zig");
-    _ = &@import("api/catalog_fetch.zig");
-    _ = &@import("api/deadline_race.zig");
-    _ = &@import("api/model_probe.zig");
-    _ = &@import("api/models_pages.zig");
-    _ = &@import("api/gemini_signatures.zig");
-    _ = &@import("api/models_cache.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/user_echo.zig");
@@ -6242,18 +6140,7 @@ test {
     _ = &@import("repl/tui/layout.zig");
     _ = &@import("repl/tui/test_capture.zig");
     _ = &@import("repl/tui/render_region.zig");
-    _ = &@import("core/protocol/ui_event.zig");
-    _ = &@import("core/protocol/ui_backend.zig");
-    _ = &@import("core/protocol/ui_request.zig");
-    _ = &@import("core/protocol/wire.zig");
-    _ = &@import("core/protocol/frontend_capabilities.zig");
     _ = &@import("repl/tui/tui_backend.zig");
-    _ = &@import("core/writer_backend.zig");
-    _ = &@import("core/headless_backend.zig");
-    _ = &@import("core/tee_backend.zig");
-    _ = &@import("core/diagnostics_backend.zig");
-    _ = &@import("telemetry/telemetry.zig");
-    _ = &@import("core/suspend_state.zig");
     _ = &@import("repl/tui/ui_state.zig");
     _ = &@import("repl/tui/ui.zig");
     _ = &@import("repl/tui/event.zig");
@@ -6263,66 +6150,10 @@ test {
     _ = &@import("repl/tui/widget/thinking.zig");
     _ = &@import("repl/tui/widget/pager.zig");
     _ = &@import("repl/tui/config.zig");
-    _ = &@import("mcp/protocol.zig");
-    _ = &@import("mcp/transport_stdio.zig");
-    _ = &@import("mcp/client.zig");
-    _ = &@import("mcp/registry_bridge.zig");
-    _ = &@import("mcp/config.zig");
-    _ = &@import("mcp/launch.zig");
-    _ = &@import("mcp/naming.zig");
-    _ = &@import("mcp/param_headers.zig");
-    _ = &@import("mcp/transport.zig");
-    _ = &@import("mcp/transport_http.zig");
-    _ = &@import("mcp/transport_sse.zig");
-    _ = &@import("mcp/oauth.zig");
-    _ = &@import("mcp/url.zig");
-    _ = &@import("mcp/canonical.zig");
-    _ = &@import("mcp/json_admission.zig");
-    _ = &@import("mcp/wire.zig");
-    _ = &@import("mcp/era_modern.zig");
-    _ = &@import("mcp/era_classic.zig");
-    _ = &@import("mcp/negotiation.zig");
-    _ = &@import("mcp/schema.zig");
-    _ = &@import("mcp/result_stream.zig");
-    _ = &@import("mcp/host_transport.zig");
-    _ = &@import("mcp/runtime.zig");
-    _ = &@import("mcp/instance_pool.zig");
-    _ = &@import("mcp/catalog.zig");
-    _ = &@import("mcp/tool_invocation.zig");
-    _ = &@import("mcp/conformance.zig");
-    _ = &@import("mcp/result_commit_test.zig");
     _ = &@import("app/mcp_cli.zig");
     _ = &@import("app/mcp_config_edit.zig");
     _ = &@import("app/terminal_prompt.zig");
     _ = &@import("app/providers_cli.zig");
-    _ = &@import("util/toml.zig");
-    _ = &@import("skills/runtime/frontmatter.zig");
-    _ = &@import("tools/dynamic.zig");
-    _ = &@import("skills/skill.zig");
-    _ = &@import("skills/overrides.zig");
-    _ = &@import("skills/tool_pool_filter.zig");
-    _ = &@import("skills/render.zig");
-    _ = &@import("skills/discovery.zig");
-    _ = &@import("agents/def.zig");
-    _ = &@import("agents/set.zig");
-    _ = &@import("agents/filter.zig");
-    _ = &@import("agents/preload.zig");
-    _ = &@import("tools/monitor.zig");
-    _ = &@import("tools/notebook_edit.zig");
-    _ = &@import("tools/tool_search.zig");
-    _ = &@import("tools/web_search.zig");
-    _ = &@import("tools/worktree.zig");
-    _ = &@import("tools/mcp_resources.zig");
-    _ = &@import("tools/push_notification.zig");
-    _ = &@import("tools/cron.zig");
-    _ = &@import("tools/prompt_context.zig");
-    _ = &@import("tools/descriptions.zig");
-    _ = &@import("core/cron_registry.zig");
-    _ = &@import("skills/tool.zig");
-    _ = &@import("core/file_config.zig");
-    _ = &@import("core/subagent.zig");
-    _ = &@import("core/patch.zig");
-    _ = &@import("core/event_journal.zig");
     _ = &@import("web/backend.zig");
     _ = &@import("web/server.zig");
     _ = &@import("web/session.zig");
@@ -6332,5 +6163,4 @@ test {
     _ = &@import("daemon/serve.zig"); // U10-D
     _ = &@import("daemon/serve_multi.zig"); // U10-C:强制编译分析(否则死代码藏编译错)
     _ = &@import("daemon/uds.zig"); // U10-B:UDS+NDJSON 绑定
-    _ = &@import("core/shutdown.zig");
 }
