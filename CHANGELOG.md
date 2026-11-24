@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Models can be priced in config.json, and bench runs use OpenRouter
+  prices.** `model_prices` in `~/.metacodes/config.json` prices a model in
+  USD per million tokens; every cost meter (the session cost, evaluation
+  budgets, the isolated verifier, the Teamwork ledger) charges it before the
+  built-in table, whose Sonnet fallback overstates most open models 20–100×.
+  A bench run looks its model up in OpenRouter's catalog (cached for a day),
+  records the price on the run and writes it into the trial's config, so
+  Teamwork budgets and verifier caps mean real dollars. `"model_prices":
+  "off"` in workbench.json skips the lookup; the bench node protocol is now 7.
+
 - **A directory can be left without a default** (part of #489). With
   `"global_default": false` at the top level of `config.json`, the `/model`
   default, a Metask sign-in and `.env`'s choice (levels 4 to 6 of the startup

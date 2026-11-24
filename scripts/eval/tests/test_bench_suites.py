@@ -512,6 +512,7 @@ class McpForwardingTest(unittest.TestCase):
                 logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[types.SimpleNamespace(
                     name="are", transport="streamable-http", url="http://are-sidecar:8000/mcp", headers={})],
                 config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=False,
+                _model_prices=None,
                 _account_gateway=None)
             environment = CapturingEnvironment()
             asyncio.run(agent.run("solve it", environment, None))
@@ -520,12 +521,25 @@ class McpForwardingTest(unittest.TestCase):
         self.assertTrue(any('/config.json"' in c for c in environment.agent_commands))
 
 
+    def test_agent_writes_the_models_price_into_the_trial_config(self):
+        with stubbed_harbor() as agent_module:
+            agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
+            agent.__dict__.update(
+                logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[], config_source=None, _flags=["--model", "m"],
+                _provider=None, _metrics_proxy=None, _teamwork=False, _account_gateway=None,
+                _model_prices={"m": {"input": 0.15, "output": 0.6}})
+            environment = CapturingEnvironment()
+            asyncio.run(agent.run("solve it", environment, None))
+        configs = [json.loads(body) for path, body in environment.uploads if "metacodes-config-" in path]
+        self.assertEqual(configs, [{"model_prices": {"m": {"input": 0.15, "output": 0.6}}}])
+
     def test_a_teamwork_trial_killed_on_timeout_still_keeps_its_run_records(self):
         with stubbed_harbor() as agent_module, tempfile.TemporaryDirectory() as tmp:
             agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
             agent.__dict__.update(
                 logs_dir=Path(tmp) / "trial-x" / "agent", mcp_servers=[], config_source=None,
-                _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=True, _account_gateway=None)
+                _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=True, _account_gateway=None,
+                _model_prices=None)
 
             async def killed(environment, command):
                 raise asyncio.TimeoutError("agent timeout")

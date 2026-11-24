@@ -2444,7 +2444,7 @@ fn runCounted(
     var kg_context_repair_attempts: u8 = 0;
     var kg_coverage_borrowed_turns: u32 = 0;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
-    const cost_rates = @import("../util/pricing.zig").rateFor(opts.model_override orelse provider.model());
+    const cost_rates = @import("../util/pricing.zig").effectiveRates(opts.model_override orelse provider.model());
     var run_cost_usd: f64 = 0;
 
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。

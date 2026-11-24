@@ -497,6 +497,10 @@ class RunManager:
                 raise ValueError(problem)
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
                     "executor": state["name"], "features": features}
+        from scripts.eval.harbor.bench import prices
+        model_price = None if suite.runner == suites.WORKBUDDY or \
+            settings(self.config_path).get("model_prices", prices.OPENROUTER) != prices.OPENROUTER else \
+            prices.price_for(model, prices.catalog(self.config_path.parent))
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
@@ -537,6 +541,8 @@ class RunManager:
                 record["features"] = features
             if TEAMWORK in features:
                 record["agent_timeout_multiplier"] = TEAMWORK_TIMEOUT_MULTIPLIER
+            if model_price:
+                record["model_price"] = model_price
             route = None
             if imported:
                 # The run's own config (endpoint, model names, key variable)

@@ -540,6 +540,8 @@ pub const App = struct {
     last_persist_error: ?[]const u8 = null,
     /// 模型档位表(<state root>/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("api/model_tiers.zig").TierTable = null,
+    /// `config.json` `model_prices`, installed for every cost meter while this App lives.
+    model_prices: ?[]@import("util/pricing.zig").ModelPrice = null,
     pending_previous_model_for_compact: ?[]u8 = null,
     pending_previous_model_context_window: ?u32 = null,
     pending_current_model_context_window: ?u32 = null,
@@ -1038,6 +1040,11 @@ pub const App = struct {
                 @import("util/log.zig").warn("config", "model_tiers 解析失败({s}),按未配置处理", .{@errorName(err)});
                 break :tier_err null;
             };
+            app.model_prices = pricing.loadConfiguredFromHome(allocator, app.stateRoot()) catch |err| prices_err: {
+                @import("util/log.zig").warn("config", "model_prices 解析失败({s}),按内置价格表计费", .{@errorName(err)});
+                break :prices_err null;
+            };
+            if (app.model_prices) |prices| pricing.installConfigured(prices);
         }
 
         // Session 级权限记忆挂到 permission_ctx(persist 路径复用 match_ctx.home/project_root,
@@ -2384,6 +2391,11 @@ pub const App = struct {
         }
         if (app.model_switch_owned) |m| app.allocator.free(m);
         if (app.model_tiers_table) |*t| t.deinit();
+        if (app.model_prices) |prices| {
+            if (pricing.installedConfigured().ptr == prices.ptr) pricing.installConfigured(&.{});
+            pricing.freeConfigured(app.allocator, prices);
+            app.allocator.free(prices);
+        }
         if (app.pending_previous_model_for_compact) |m| app.allocator.free(m);
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();

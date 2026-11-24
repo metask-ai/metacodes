@@ -886,6 +886,17 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profiles/run', self.request(features=['teamwork']))
         self.assertEqual(self.manager.profiles.records(), [])
 
+    def test_a_run_records_its_models_openrouter_price_and_passes_it_to_harbor(self):
+        from scripts.eval.harbor.bench import prices
+        atomic_json(self.config, {**json.loads(self.config.read_text()), 'model_prices': 'openrouter'})
+        catalog = {'vendor/test-model': {'prompt': '0.00000015', 'completion': '0.0000006'}}
+        with patch.object(prices, 'fetch', return_value=catalog):
+            run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})
+        self.assertEqual(run['model_price'], {'openrouter_id': 'vendor/test-model', 'input': 0.15, 'output': 0.6})
+        wait_run(self.manager, run['name'])
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('model_price={"input":0.15,"output":0.6}', argv)
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
@@ -1001,6 +1012,64 @@ class TeamworkRunTest(unittest.TestCase):
         alone = executors.with_teamwork(None, ["teamwork"], opted)
         self.assertEqual(alone["services"]["main"]["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
 
+
+
+class ModelPriceTest(unittest.TestCase):
+    MODELS = {"deepseek/deepseek-v4.1-flash-1017": {"prompt": "0.00000015", "completion": "0.0000006",
+                                                     "input_cache_read": "0.000000003"},
+              "deepseek/deepseek-v4.1-flash-1017:batch": {"prompt": "0.000000035", "completion": "0.000000149"},
+              "a/twin": {"prompt": "1", "completion": "1"}, "b/twin": {"prompt": "2", "completion": "2"},
+              "x/unpriced": {"prompt": None, "completion": "1"}}
+
+    def test_a_run_model_matches_one_openrouter_model_by_its_request_id(self):
+        from scripts.eval.harbor.bench import prices
+        price = prices.price_for("metask/DeepSeek-V4.1-Flash-1017", self.MODELS)
+        self.assertEqual(price, {"openrouter_id": "deepseek/deepseek-v4.1-flash-1017", "input": 0.15, "output": 0.6,
+                                 "cached_input": 0.003})
+        self.assertIsNone(prices.price_for("metask/twin", self.MODELS))
+        self.assertIsNone(prices.price_for("x/unpriced", self.MODELS))
+        self.assertIsNone(prices.price_for("nobody/else", self.MODELS))
+        self.assertIsNone(prices.price_for("gateway/acme/model", {"other/model": {"prompt": "1", "completion": "1"}}))
+        self.assertEqual(prices.price_for("gateway/acme/model", {"acme/model": {"prompt": "0.000001", "completion": "0.000002"},
+                                                                 "other/model": {"prompt": "1", "completion": "1"}}),
+                         {"openrouter_id": "acme/model", "input": 1.0, "output": 2.0})
+
+    def test_the_catalog_is_cached_for_a_day_and_a_failed_fetch_keeps_the_cached_copy(self):
+        from scripts.eval.harbor.bench import prices
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return {"v/m": {"prompt": "1", "completion": "2"}}
+
+        def failing():
+            raise OSError("offline")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0), {"v/m": {"prompt": "1", "completion": "2"}})
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0 + 3600)
+            self.assertEqual(len(calls), 1)
+            later = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), failing, now=lambda: later), {"v/m": {"prompt": "1", "completion": "2"}})
+        def truncated():
+            import http.client
+            raise http.client.IncompleteRead(b"{\"data\": [", 1000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0)
+            stale = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), truncated, now=lambda: stale), {"v/m": {"prompt": "1", "completion": "2"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(prices.catalog(Path(tmp), failing), {})
+
+    def test_the_harbor_command_carries_the_price_numbers_only(self):
+        from scripts.eval.harbor.bench.worker import command
+        spec = {"harbor": "harbor", "dataset": "d", "model": "m", "bundle": "/b", "key_env": "K", "attempts": 1,
+                "concurrency": 1, "jobs_dir": "/j", "name": "run", "tasks": ["t"],
+                "model_price": {"openrouter_id": "v/m", "input": 0.15, "output": 0.6}}
+        self.assertEqual([a for a in command(spec) if a.startswith("model_price=")],
+                         ['model_price={"input":0.15,"output":0.6}'])
+        self.assertFalse([a for a in command({**spec, "model_price": None}) if a.startswith("model_price=")])
 
 if __name__ == '__main__':
     unittest.main()
