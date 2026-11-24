@@ -70,6 +70,7 @@ pub const Drag = struct {
 var g_drag: ?Drag = null;
 
 pub fn handle(gpa: std.mem.Allocator, region: *RenderRegion, key: input.Key) Outcome {
+    if (!input.mouseSelectionOn()) return .not_mine;
     const step = Drag.onKey(&g_drag, key) orelse return .not_mine;
     switch (step) {
         .none => return .consumed,

@@ -11,15 +11,33 @@ pub const Point = struct {
     }
 };
 
-const blank: u21 = ' ';
-const wide_tail: u21 = 0;
+const Cell = struct {
+    cp: u21 = ' ',
+    marks: [2]u21 = .{ 0, 0 },
+
+    fn isWideTail(self: Cell) bool {
+        return self.cp == 0;
+    }
+
+    fn isFiller(self: Cell) bool {
+        return self.cp == 0 or self.cp == wrap_pad.cp;
+    }
+
+    fn isBlank(self: Cell) bool {
+        return (self.cp == ' ' and self.marks[0] == 0) or self.cp == wrap_pad.cp;
+    }
+};
+
+const blank: Cell = .{};
+const wide_tail: Cell = .{ .cp = 0 };
+const wrap_pad: Cell = .{ .cp = std.math.maxInt(u21) };
 const max_params = 16;
 
 pub const Screen = struct {
     gpa: std.mem.Allocator,
     cols: u16,
     rows: u16,
-    cells: []u21,
+    cells: []Cell,
     wrapped: []bool,
     row: u16 = 0,
     col: u16 = 0,
@@ -39,7 +57,7 @@ pub const Screen = struct {
     pub fn init(gpa: std.mem.Allocator, cols: u16, rows: u16) !Screen {
         const c = @max(cols, 1);
         const r = @max(rows, 1);
-        const cells = try gpa.alloc(u21, @as(usize, c) * r);
+        const cells = try gpa.alloc(Cell, @as(usize, c) * r);
         errdefer gpa.free(cells);
         const wrapped = try gpa.alloc(bool, r);
         @memset(cells, blank);
@@ -52,10 +70,11 @@ pub const Screen = struct {
         self.gpa.free(self.wrapped);
     }
 
-    pub fn resize(self: *Screen, cols: u16, rows: u16) !void {
+    pub fn resize(self: *Screen, cols: u16, rows: u16, reflow: bool) !void {
         const c = @max(cols, 1);
         const r = @max(rows, 1);
         if (c == self.cols and r == self.rows) return;
+        if (reflow and c != self.cols) return self.rewrap(c, r);
         var next = try Screen.init(self.gpa, c, r);
         const shift: u16 = if (self.row >= r) self.row - (r - 1) else 0;
         for (0..r) |dst| {
@@ -75,6 +94,95 @@ pub const Screen = struct {
         self.col = @min(self.col, c - 1);
         self.pending_wrap = false;
         if (self.query_row) |q| self.query_row = if (q >= shift) q - shift else null;
+    }
+
+    const Rows = struct {
+        gpa: std.mem.Allocator,
+        cols: u16,
+        cells: std.ArrayList(Cell) = .empty,
+        wrapped: std.ArrayList(bool) = .empty,
+
+        fn deinit(self: *Rows) void {
+            self.cells.deinit(self.gpa);
+            self.wrapped.deinit(self.gpa);
+        }
+
+        fn count(self: *const Rows) usize {
+            return self.wrapped.items.len;
+        }
+
+        fn add(self: *Rows) !void {
+            try self.cells.appendNTimes(self.gpa, blank, self.cols);
+            try self.wrapped.append(self.gpa, false);
+        }
+
+        fn put(self: *Rows, col: usize, cell: Cell) void {
+            self.cells.items[(self.count() - 1) * self.cols + col] = cell;
+        }
+    };
+
+    fn usedCells(self: *Screen, row: u16) usize {
+        const cells = self.rowCells(row);
+        var used = cells.len;
+        while (used > 0 and cells[used - 1].isBlank()) used -= 1;
+        if (row == self.row) used = @max(used, @as(usize, self.col) + @intFromBool(self.pending_wrap));
+        return used;
+    }
+
+    fn rewrap(self: *Screen, c: u16, r: u16) !void {
+        var out: Rows = .{ .gpa = self.gpa, .cols = c };
+        defer out.deinit();
+        const Spot = struct { row: usize, col: usize, pending: bool };
+        var cursor: ?Spot = null;
+        var query: ?usize = null;
+        const old: usize = self.cols;
+        var first: u16 = 0;
+        while (first < self.rows) {
+            var last = first;
+            while (last + 1 < self.rows and self.wrapped[last]) last += 1;
+            const len = (last - first) * old + self.usedCells(last);
+            const cursor_at: ?usize = if (self.row >= first and self.row <= last) (self.row - first) * old + self.col + @intFromBool(self.pending_wrap) else null;
+            const query_at: ?usize = if (self.query_row) |q| (if (q >= first and q <= last) (q - first) * old else null) else null;
+            try out.add();
+            var col: usize = 0;
+            for (0..len) |i| {
+                if (query_at != null and query == null and i >= query_at.?) query = out.count() - 1;
+                const cell = self.cells[first * old + i];
+                if (cell.isFiller()) continue;
+                const width: usize = if (i + 1 < len and self.cells[first * old + i + 1].isWideTail()) 2 else 1;
+                if (col + width > c) {
+                    if (col < c) out.put(col, wrap_pad);
+                    out.wrapped.items[out.count() - 1] = true;
+                    try out.add();
+                    col = 0;
+                }
+                if (cursor_at != null and cursor == null and i >= cursor_at.?) cursor = .{ .row = out.count() - 1, .col = col, .pending = false };
+                out.put(col, cell);
+                if (width == 2) out.put(col + 1, wide_tail);
+                col += width;
+            }
+            if (query_at != null and query == null) query = out.count() - 1;
+            if (cursor_at != null and cursor == null) {
+                cursor = if (col >= c) Spot{ .row = out.count() - 1, .col = c - 1, .pending = true } else Spot{ .row = out.count() - 1, .col = col, .pending = false };
+            }
+            first = last + 1;
+        }
+        const at = cursor orelse Spot{ .row = 0, .col = 0, .pending = false };
+        const top: usize = if (at.row + 1 > r) at.row + 1 - r else 0;
+        var next = try Screen.init(self.gpa, c, r);
+        const kept = @min(out.count() - top, r);
+        @memcpy(next.cells[0 .. kept * c], out.cells.items[top * c ..][0 .. kept * c]);
+        @memcpy(next.wrapped[0..kept], out.wrapped.items[top..][0..kept]);
+        self.gpa.free(self.cells);
+        self.gpa.free(self.wrapped);
+        self.cells = next.cells;
+        self.wrapped = next.wrapped;
+        self.cols = c;
+        self.rows = r;
+        self.row = @intCast(at.row - top);
+        self.col = @intCast(at.col);
+        self.pending_wrap = at.pending;
+        self.query_row = if (query) |q| (if (q >= top) @intCast(q - top) else null) else null;
     }
 
     pub fn feed(self: *Screen, bytes: []const u8) void {
@@ -232,14 +340,14 @@ pub const Screen = struct {
             return;
         }
         const width: usize = self.cols;
-        std.mem.copyForwards(u21, self.cells[0 .. self.cells.len - width], self.cells[width..]);
+        std.mem.copyForwards(Cell, self.cells[0 .. self.cells.len - width], self.cells[width..]);
         @memset(self.cells[self.cells.len - width ..], blank);
         std.mem.copyForwards(bool, self.wrapped[0 .. self.wrapped.len - 1], self.wrapped[1..]);
         self.wrapped[self.wrapped.len - 1] = false;
         if (self.query_row) |q| self.query_row = if (q > 0) q - 1 else null;
     }
 
-    fn rowCells(self: *Screen, row: u16) []u21 {
+    fn rowCells(self: *Screen, row: u16) []Cell {
         return self.cells[@as(usize, row) * self.cols ..][0..self.cols];
     }
 
@@ -279,16 +387,17 @@ pub const Screen = struct {
 
     fn print(self: *Screen, cp: u21) void {
         if (self.alternate) return;
+        if (isCombining(cp)) return self.combine(cp);
         const width: u16 = @intCast(term.codepointDisplayWidth(cp));
         if (width == 0) return;
         if (self.pending_wrap or (width == 2 and self.col + 1 >= self.cols and self.cols > 1)) {
-            if (!self.pending_wrap) self.rowCells(self.row)[self.col] = blank;
+            if (!self.pending_wrap) self.rowCells(self.row)[self.col] = wrap_pad;
             self.wrapped[self.row] = true;
             self.carriageReturn();
             self.lineFeed();
         }
         const cells = self.rowCells(self.row);
-        cells[self.col] = cp;
+        cells[self.col] = .{ .cp = cp };
         if (width == 2 and self.col + 1 < self.cols) cells[self.col + 1] = wide_tail;
         const next = self.col + width;
         if (next >= self.cols) {
@@ -296,6 +405,18 @@ pub const Screen = struct {
             self.pending_wrap = true;
         } else {
             self.col = next;
+        }
+    }
+
+    fn combine(self: *Screen, mark: u21) void {
+        var col = if (self.pending_wrap) self.col else if (self.col > 0) self.col - 1 else return;
+        const cells = self.rowCells(self.row);
+        if (cells[col].isWideTail() and col > 0) col -= 1;
+        for (&cells[col].marks) |*slot| {
+            if (slot.* == 0) {
+                slot.* = mark;
+                return;
+            }
         }
     }
 
@@ -313,11 +434,12 @@ pub const Screen = struct {
                 const first: usize = if (row == start.row) @min(start.col, self.cols - 1) else 0;
                 const last: usize = if (row == end.row) @min(end.col, self.cols - 1) else self.cols - 1;
                 const line_start = out.items.len;
-                for (cells[first .. last + 1]) |cp| {
-                    if (cp == wide_tail) continue;
-                    var buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(cp, &buf) catch continue;
-                    try out.appendSlice(gpa, buf[0..len]);
+                for (cells[first .. last + 1]) |cell| {
+                    if (cell.isFiller()) continue;
+                    try appendCodepoint(&out, gpa, cell.cp);
+                    for (cell.marks) |mark| {
+                        if (mark != 0) try appendCodepoint(&out, gpa, mark);
+                    }
                 }
                 if (!(wrapped and row != end.row)) {
                     while (out.items.len > line_start and out.items[out.items.len - 1] == ' ') out.items.len -= 1;
@@ -329,7 +451,21 @@ pub const Screen = struct {
     }
 };
 
+fn isCombining(cp: u21) bool {
+    return switch (cp) {
+        0x0300...0x036F, 0x0483...0x0489, 0x0591...0x05BD, 0x0610...0x061A, 0x064B...0x065F, 0x0E31, 0x0E34...0x0E3A, 0x0E47...0x0E4E, 0x1AB0...0x1AFF, 0x1DC0...0x1DFF, 0x200C, 0x200D, 0x20D0...0x20FF, 0x3099, 0x309A, 0xFE00...0xFE0F, 0xFE20...0xFE2F, 0xE0100...0xE01EF => true,
+        else => false,
+    };
+}
+
+fn appendCodepoint(out: *std.ArrayList(u8), gpa: std.mem.Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(cp, &buf) catch return;
+    try out.appendSlice(gpa, buf[0..len]);
+}
+
 var g_mutex: sync.Mutex = .{};
+var g_reflow: bool = false;
 var g_screen: ?Screen = null;
 
 pub fn enable(fd: c_int) void {
@@ -338,13 +474,14 @@ pub fn enable(fd: c_int) void {
     if (g_screen != null) return;
     const size = term.getSize(fd) orelse term.TermSize{ .cols = 80, .rows = 24 };
     g_screen = Screen.init(std.heap.c_allocator, size.cols, size.rows) catch null;
+    g_reflow = term.reflowFromEnv();
 }
 
 pub fn feed(fd: c_int, bytes: []const u8) void {
     g_mutex.lock();
     defer g_mutex.unlock();
     const screen = if (g_screen) |*s| s else return;
-    if (term.getSize(fd)) |size| screen.resize(size.cols, size.rows) catch {};
+    if (term.getSize(fd)) |size| screen.resize(size.cols, size.rows, g_reflow) catch {};
     screen.feed(bytes);
 }
 
@@ -423,7 +560,40 @@ test "mirror: shrinking keeps the cursor row and drops rows above it" {
     var s = try Screen.init(testing.allocator, 6, 4);
     defer s.deinit();
     s.feed("1\n2\n3\n4\x1b[6n");
-    try s.resize(6, 2);
+    try s.resize(6, 2, false);
     try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 1, .col = 5 }, "3\n4");
     try testing.expectEqual(@as(?u16, 1), s.query_row);
+}
+
+test "mirror: a narrower reflowing terminal rewraps lines, so the second half of an old line can be selected" {
+    var s = try Screen.init(testing.allocator, 8, 4);
+    defer s.deinit();
+    s.feed("abcdefgh\nxy\x1b[6n");
+    try s.resize(4, 4, true);
+    try expectText(&s, .{ .row = 1, .col = 0 }, .{ .row = 1, .col = 3 }, "efgh");
+    try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 2, .col = 3 }, "abcdefgh\nxy");
+    try testing.expectEqual(@as(u16, 2), s.row);
+    try testing.expectEqual(@as(u16, 2), s.col);
+    try testing.expectEqual(@as(?u16, 2), s.query_row);
+    try s.resize(8, 4, true);
+    try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 1, .col = 7 }, "abcdefgh\nxy");
+    try testing.expectEqual(@as(u16, 1), s.row);
+}
+
+test "mirror: rewrapping keeps a wide character whole and the cursor row on the screen" {
+    var s = try Screen.init(testing.allocator, 6, 2);
+    defer s.deinit();
+    s.feed("ab中文");
+    try s.resize(3, 2, true);
+    try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 1, .col = 2 }, "中文");
+    try testing.expectEqual(@as(u16, 1), s.row);
+}
+
+test "mirror: a combining mark stays with the character before it" {
+    var s = try Screen.init(testing.allocator, 8, 2);
+    defer s.deinit();
+    s.feed("e\u{301}XY");
+    try expectText(&s, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, "XY");
+    try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 0 }, "e\u{301}");
+    try testing.expectEqual(@as(u16, 3), s.col);
 }

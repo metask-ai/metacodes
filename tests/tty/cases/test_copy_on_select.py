@@ -5,6 +5,7 @@ import os
 from tty_driver import IS_WINDOWS, READY, case_tmpdir, run, wait_for
 
 MOUSE_ON = b"\x1b[?1002h\x1b[?1006h"
+CURSOR_QUERY = b"\x1b[6n"
 ENV = {"TERM": "xterm-256color", "SSH_CONNECTION": "10.0.0.1 22 10.0.0.2 22"}
 
 
@@ -32,8 +33,9 @@ def test_only_its_own_switch_turns_mouse_reporting_on(bin_path):
         (["--preview", "--no-preview=copy_on_select"], False),
         (["--preview=copy_on_select"], True),
     ):
-        raw = run(bin_path, [READY, "strictsleep:0.3"], extra_args=args, env=ENV)
+        raw = run(bin_path, [READY, "raw:\\x1b[<0;3;2M", "strictsleep:0.3"], extra_args=args, env=ENV)
         assert (MOUSE_ON in raw) == on, args
+        assert (CURSOR_QUERY in raw) == on, args
 
 
 def test_saved_preview_config_turns_it_on(bin_path):
