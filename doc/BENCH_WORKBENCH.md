@@ -1288,7 +1288,9 @@ With 自动重跑 on (`POST /api/profile/auto-rerun` with `id` and `enabled`,
 the 自动重跑无效的题 checkbox on its page), a dataset that finishes with invalid
 trials is queued again at the end of the profile's queue with only those
 tasks, at most twice per dataset (the item's `auto_rerun` counts the round).
-A dataset that was stopped, cancelled or failed is not rerun automatically.
+A dataset that was stopped, cancelled or failed is not rerun automatically;
+when its results cannot be read, the item records why (`auto_rerun_error`)
+and the queue goes on.
 A profile can be renamed at any time (`POST /api/profile/rename` with `id`
 and `name`, 重命名 on its page; an empty name falls back to the id).
 Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除评测配置

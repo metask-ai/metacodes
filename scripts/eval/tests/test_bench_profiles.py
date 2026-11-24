@@ -430,6 +430,19 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn('auto_rerun', record['items'][3])
         invalid.assert_not_called()
 
+    def test_an_unreadable_result_skips_the_auto_rerun_and_the_queue_goes_on(self):
+        first = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        self.client.request('api/profile/auto-rerun', {'id': first['id'], 'enabled': True})
+        second = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}],
+                                                                       features=['execute_code']))
+        self.assertNotEqual(first['id'], second['id'])
+        with patch.object(self.manager.profiles, 'invalid_tasks', side_effect=PermissionError('denied')):
+            record = self.wait_profile(first['id'])
+            self.assertEqual(len(record['items']), 1)
+            self.assertEqual(record['items'][0]['status'], 'finished')
+            self.assertIn('denied', record['items'][0]['auto_rerun_error'])
+            self.assertEqual(self.wait_profile(second['id'])['items'][0]['status'], 'finished')
+
     def test_invalid_tasks_are_read_from_the_job_directory(self):
         job = self.manager.jobs_dir / 'job-a'
         for task, rewards in (('fix-git', None), ('hello', {'reward': 1.0})):

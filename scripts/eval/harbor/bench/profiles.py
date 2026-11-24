@@ -544,7 +544,11 @@ class ProfileManager:
             return
         if not item.get("run") or not isinstance(item.get("request"), dict):
             return
-        tasks = self.invalid_tasks(item["run"])
+        try:
+            tasks = self.invalid_tasks(item["run"])
+        except (OSError, ValueError) as exc:
+            item["auto_rerun_error"] = f"读取结果失败，没有自动重跑无效的题：{exc}"
+            return
         if tasks:
             record["items"].append({**rerun(item, tasks, next_round), "queued_at": now()})
 
@@ -685,7 +689,7 @@ class ProfileManager:
 def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
     """An ended dataset queued again with `tasks`; `auto_round` counts the
     automatic reruns of invalid tasks it descends from (0: asked for)."""
-    again = {key: value for key, value in item.items() if key not in ("waiting", "auto_rerun")}
+    again = {key: value for key, value in item.items() if key not in ("waiting", "auto_rerun", "auto_rerun_error")}
     again.update(tasks=list(tasks), request={**item["request"], "tasks": list(tasks)}, status="pending",
                  run=None, error=None, started_at=None, finished_at=None)
     if auto_round:
