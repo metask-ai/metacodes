@@ -97,6 +97,7 @@ const Findings = struct {
     deep_counts: [][]usize,
     depends: [][]bool,
     kernel_lines: usize = 0,
+    owned_roots: usize = 0,
 };
 
 const Category = enum {
@@ -263,6 +264,7 @@ fn analyze(arena: std.mem.Allocator, layers: Layers, files: []const SourceFile, 
     }
     for (wiring.roots) |root| {
         const package = layers.owner(root) orelse continue;
+        findings.owned_roots += 1;
         const dir = std.fs.path.dirnamePosix(root) orelse "";
         for (files) |file| {
             if (dir.len != 0 and !(std.mem.startsWith(u8, file.path, dir) and file.path.len > dir.len and file.path[dir.len] == '/')) continue;
@@ -370,6 +372,10 @@ fn checkBudget(layers: Layers, findings: Findings) usize {
 
 fn check(arena: std.mem.Allocator, layers: Layers, findings: Findings, baseline: Baseline) !usize {
     var problems: usize = 0;
+    if (findings.owned_roots == 0) {
+        problems += 1;
+        std.debug.print("build.zig: the module wiring names no module rooted in a package\n", .{});
+    }
     for (findings.unowned.keys()) |path| {
         problems += 1;
         std.debug.print("{s}: belongs to no package in layers.zon\n", .{path});
@@ -651,6 +657,10 @@ test "a module rooted above packages it may not reach fails" {
     const wiring = test_wiring ++ "module\tsrc/util_root.zig\n";
     const tree = withFile("src/util_root.zig", "");
     try std.testing.expectEqual(@as(usize, 1), try checkTree(&tree, test_layers, test_baseline, wiring));
+}
+
+test "wiring that names no module root in a package fails" {
+    try std.testing.expectEqual(@as(usize, 1), try checkTree(&clean_tree, test_layers, test_baseline, "import\tsrc\\main.zig\tplatform\tsrc\\util\\platform.zig\n"));
 }
 
 test "a removed violation must be removed from the baseline" {

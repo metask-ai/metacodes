@@ -3777,7 +3777,7 @@ fn addModuleWiring(
 fn sourcePath(b: *std.Build, module: *std.Build.Module) ?[]const u8 {
     const file = module.root_source_file orelse return null;
     return switch (file) {
-        .src_path => |source| if (source.owner == b) source.sub_path else null,
+        .src_path => |source| if (source.owner == b) std.mem.replaceOwned(u8, b.allocator, source.sub_path, "\\", "/") catch @panic("OOM") else null,
         else => null,
     };
 }
