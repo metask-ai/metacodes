@@ -2372,6 +2372,43 @@ test "teamwork manager L2: a budget pause keeps the run locked until the manager
     try testing.expectEqual(runtime.State.implementing, resumed.state);
 }
 
+test "teamwork manager L2: a cap raise must cover the manager's hold and the pending candidates before it is saved" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-manager-candidates-raise");
+    defer fx.deinit();
+    try writeFile(fx.repo(), hidden_test.path, hidden_test.bytes);
+    var fake: FakeManager = .{};
+    fake.command_len = (try std.fmt.bufPrint(&fake.command_buf, "{s}/bin/claude-manager", .{fx.root.slice()})).len;
+    const plans = [_]Plan{
+        .{ .seat = "implementer-1", .require = "hidden-test.sh", .files = &.{feature} },
+        .{ .seat = "reviewer-1", .review = approve_hidden },
+        .{ .seat = "implementer-2", .charge_usd = 4.5 },
+        .{ .seat = "implementer-3", .files = &.{.{ .path = "feature.txt", .bytes = "wrong\n" }} },
+        .{ .seat = "reviewer-2", .review = approve_hidden },
+        .{ .seat = "judge-1", .seat_files = &.{.{ .path = "judgment.json", .bytes = "{\"selected\":\"candidate-1\",\"eliminated\":[{\"candidate\":\"candidate-2\",\"reason\":\"It fails the hidden test.\"}]}" }} },
+    };
+    var seats: ScriptedSeats = .{ .plans = &plans, .user_repo = fx.repo() };
+    defer seats.deinit();
+    var auditor: audit.UnavailableAuditor = .{};
+    const deps: runtime.Deps = .{ .preview = .all, .seats = seats.source(), .auditor = auditor.auditor() };
+    const extra = try std.fmt.allocPrint(fx.arena.allocator(), ",\"manager_budget_usd\":1,\"candidates\":2,\"candidate_estimate_usd\":0.5,\"seats\":{{\"manager\":{{\"harness\":\"claude_code\",\"command\":\"{s}\"}}}}", .{fake.command()});
+    var cfg = try candidatesCfg(&fx, extra);
+    cfg.budget_usd = 4.5;
+    const id = fx.options().run_id;
+    {
+        const run = try runtime.Run.start(testing.allocator, deps, .{ .text = request_text, .source = .request_file }, cfg, fx.options());
+        defer run.destroy();
+        try testing.expectEqual(runtime.State{ .budget_exhausted = .approved }, try swe_loop.drive(run));
+    }
+    try testing.expectError(error.CapNotRaised, runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 5.75));
+    const run = try runtime.Run.reopenWithCap(testing.allocator, deps, cfg, fx.state(), id, 6);
+    defer run.destroy();
+    const manager_seat = try run.openManager();
+    try run.holdManager(manager_seat);
+    try testing.expectEqual(runtime.CandidatesResult{ .selected = 1 }, try run.runCandidates());
+}
+
 test "teamwork manager L2: the controller's death kills the manager's whole process group" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;

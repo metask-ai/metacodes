@@ -590,8 +590,7 @@ pub const Run = struct {
         errdefer self.destroy();
         if (raised_cap_usd != null and self.ledger.isExhausted()) return error.CapNotRaised;
         self.candidates = saved.candidates;
-        if (raised_cap_usd != null and self.state == .approved and self.pendingCandidateEstimate() > self.ledger.remainingUsd())
-            return error.CapNotRaised;
+        if (raised_cap_usd != null and !self.raisedCapCoversNextStep()) return error.CapNotRaised;
         for (self.candidates[0..cfg.candidates.len], 1..) |candidate, number| {
             if (candidate.status != .selected) continue;
             const selected = try self.candidateWorktree(number);
@@ -950,6 +949,14 @@ pub const Run = struct {
             },
         };
         return .added;
+    }
+
+    fn raisedCapCoversNextStep(self: *const Run) bool {
+        const remaining = self.ledger.remainingUsd();
+        const allowance = self.cfg.manager_budget_usd orelse 0;
+        if (self.cfg.manager_budget_usd != null and allowance >= remaining) return false;
+        if (self.state != .approved) return true;
+        return self.pendingCandidateEstimate() <= remaining - allowance;
     }
 
     fn pendingCandidateEstimate(self: *const Run) f64 {

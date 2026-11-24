@@ -558,7 +558,8 @@ FAIL 第一次进入修复轮;UNVERIFIED 第一次进入 leads 轮:报告里 ver
 (`{"resume":"implementing"}`;评审已批准或审计中则为 `review_approved` 加树 id;候选阶段停下为
 `approved`)。worktree 和账本都保留,停下的审计不计入审计次数。候选阶段续跑时,已有结论的候选
 (通过或未通过,连同通过时的 reviewer seat)保留,未完成的候选在原 worktree 里接着做(implementer
-已完成的只重跑 reviewer),之后照常择优。新上限不够未完成候选的预估费用时 `CapNotRaised`,
+已完成的只重跑 reviewer),之后照常择优。新上限扣掉外部 Manager 的额度(`manager_budget_usd`)后不够未完成候选的预估费用,
+或不够留出这份额度时 `CapNotRaised`,
 运行保持暂停;续跑的候选 seat 仍受原批准的每角色派发次数限制,超出即 `rounds_exhausted`。`wallclock_only` seat 用完时间也停在 `budget_exhausted`,
 但 `detail` 为 null:提高美元上限解决不了,不能续跑。外部 Manager 还持有额度时,停下后仍保留运行锁,
 等 `finishManager` 结算完才释放,续跑不会把同一笔额度再按预留扣一次。只有用户显式批准更高上限
