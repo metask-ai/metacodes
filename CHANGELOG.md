@@ -228,31 +228,47 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- **Closing the terminal or `kill` ends an idle metacodes at once** (#758).
-  SIGHUP and SIGTERM were acted on only at a turn boundary, so while the
-  prompt waited for input the process lived on until the 45-second fallback
-  alarm ended it, without the normal shutdown. The prompt now checks for them
-  while it waits and leaves the normal way within a fraction of a second,
-  with the resume hint where the terminal is still open.
+- **Signing in over SSH no longer waits forever for a browser that cannot come
+  back** (#722). `metacodes login` and `/login` sent the browser back to
+  `http://localhost:1455`, which on a machine reached over SSH is not where
+  the browser is: the sign-in waited with no limit and said nothing.
+  - In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set) `metacodes login`
+    takes Metask's device code by itself and says why, and `/login` asks which
+    way with the code selected, as OpenRouter's sign-in already did;
+    `--no-browser` keeps the browser sign-in.
+  - A browser sign-in finished on another computer ends on a page that does
+    not load: paste that page's address at the prompt, or into the `/login`
+    pane, and the sign-in finishes here (Metask's, and another provider's
+    OAuth such as ChatGPT's). An address from another sign-in is refused and
+    the wait goes on.
+  - Every sign-in that waits for a localhost callback (Metask's, ChatGPT's,
+    another provider's OAuth, OpenRouter's browser way) prints the forward it
+    needs over SSH, with the port it bound:
+    `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`.
+  - `metacodes login` stops waiting for the browser after ten minutes
+    (`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`, `0` for no limit), stores nothing,
+    and names the device-code sign-in.
 
-- **`\` then Enter starts a new line while the model answers** (#757). At
-  the prompt a `\` at the end of a line followed by Enter is a newline, the
-  way Apple Terminal users start one; during a reply Enter queued the draft
-  with the `\` still in it. It is a newline there as well now.
+- **`metacodes mcp login` over SSH no longer waits forever for a browser that
+  cannot come back** (#740). It sent the browser to
+  `http://localhost:<port>/callback` on the machine it runs on and waited with
+  no limit. As `metacodes login` does since #722:
+  - in an SSH session it prints the forward its callback needs, with the port
+    it bound: `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`;
+  - the address a browser on another computer ended on can be pasted at the
+    prompt, and is judged as the callback would be, so one from another login
+    is refused and the wait goes on;
+  - it stops waiting after `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes
+    by default, `0` for no limit), exits 1 and stores nothing.
 
-- **What you type while the model answers is still in the box when it ends**
-  (#756). Text typed into the input box during a reply and not sent was
-  dropped when the reply ended, and the prompt came back empty. It now stays,
-  with the cursor where it was, also through the reply to a message queued
-  before it.
-
-- **A paste while the model answers stays whole in the input box** (#755).
-  During a reply each line break of a pasted text acted as Enter: the first
-  line was queued on its own and sent as soon as the reply ended, and the
-  rest stayed in the box. The paste now goes into the box whole, line breaks
-  included, as at the prompt; a paste of more than three lines or 1,600 bytes
-  is held as `[Pasted text #N +M lines]` there too, and the model gets the
-  whole text when it is sent.
+- **Refusing on the authorization page now ends `metacodes mcp login` and
+  Metask's browser sign-in** (#749). Their loopback callback answered a
+  redirect that carried an `error` with an error page and kept waiting:
+  `mcp login` until Ctrl+C, `metacodes login` up to its bound and `/login`
+  until Esc, without saying why. As another provider's OAuth already did, a
+  redirect with the sign-in's `state` and an `error` now ends the wait: the
+  terminal says what the authorization server said (`The sign-in was
+  refused: <error> (<description>).`), and nothing is stored.
 
 - **On Windows a sign-in opens its whole URL in the browser** (#727). The
   browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
@@ -295,6 +311,32 @@ status, compatibility boundaries, and entry points are defined by
   and off sends `{"type":"disabled"}`. `none` on a gateway model that lists
   levels and can be turned off now sends `disabled` as well. A model with a
   single choice is no longer asked for one.
+
+- **Closing the terminal or `kill` ends an idle metacodes at once** (#758).
+  SIGHUP and SIGTERM were acted on only at a turn boundary, so while the
+  prompt waited for input the process lived on until the 45-second fallback
+  alarm ended it, without the normal shutdown. The prompt now checks for them
+  while it waits and leaves the normal way within a fraction of a second,
+  with the resume hint where the terminal is still open.
+
+- **`\` then Enter starts a new line while the model answers** (#757). At
+  the prompt a `\` at the end of a line followed by Enter is a newline, the
+  way Apple Terminal users start one; during a reply Enter queued the draft
+  with the `\` still in it. It is a newline there as well now.
+
+- **What you type while the model answers is still in the box when it ends**
+  (#756). Text typed into the input box during a reply and not sent was
+  dropped when the reply ended, and the prompt came back empty. It now stays,
+  with the cursor where it was, also through the reply to a message queued
+  before it.
+
+- **A paste while the model answers stays whole in the input box** (#755).
+  During a reply each line break of a pasted text acted as Enter: the first
+  line was queued on its own and sent as soon as the reply ended, and the
+  rest stayed in the box. The paste now goes into the box whole, line breaks
+  included, as at the prompt; a paste of more than three lines or 1,600 bytes
+  is held as `[Pasted text #N +M lines]` there too, and the model gets the
+  whole text when it is sent.
 
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to

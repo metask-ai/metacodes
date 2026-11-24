@@ -3059,7 +3059,18 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
                 std.debug.print("Login setup needs an interactive terminal: {s}\n", .{@errorName(err)});
                 return 1;
             };
-            const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser }) catch |err| {
+            if (open_browser and auth.sshSession()) {
+                std.debug.print("This looks like an SSH session: signing in with a code you confirm on any device. (--no-browser keeps the browser sign-in.)\n", .{});
+                return runMetaskDeviceLogin(allocator, init.io, state_dir, false);
+            }
+            const timeout_ms = auth.loginCallbackTimeoutMs();
+            var stdin_paste: terminal_prompt.StdinPaste = .{};
+            const token_json = auth.loginWithBrowserTokenJson(allocator, .{ .open_browser = open_browser, .timeout_ms = timeout_ms, .paste = stdin_paste.source() }) catch |err| {
+                if (err == error.CallbackTimedOut) {
+                    var wait_buf: [48]u8 = undefined;
+                    std.debug.print("No answer from the browser in {s}; nothing was stored. Signing in on another computer? Run `metacodes login --provider metask`.\n", .{terminal_prompt.waitText(&wait_buf, timeout_ms.?)});
+                    return 1;
+                }
                 std.debug.print("OAuth browser login failed: {s}\n", .{@errorName(err)});
                 return 1;
             };
@@ -3132,7 +3143,14 @@ fn printLoginHelp() void {
         \\  metacodes logout --provider <id>
         \\
         \\Default login starts a local browser OAuth flow on /auth/metask/callback.
-        \\Use --no-browser to print the URL without launching a browser.
+        \\Use --no-browser to print the URL without launching a browser. In an SSH
+        \\session, where the browser cannot come back to this machine, it signs in
+        \\with the device code instead (--no-browser keeps the browser sign-in, and
+        \\prints the ssh -L forward it needs). It waits for the browser 10 minutes
+        \\(METACODES_LOGIN_CALLBACK_TIMEOUT_MS; 0 waits without a limit). A browser
+        \\on another computer ends on a page that does not load: paste that page's
+        \\address at the prompt to finish the sign-in here (also for --provider
+        \\sign-ins that wait for a localhost callback).
         \\
         \\`login --provider <id>` signs in to that provider and stores the token
         \\in its own OAuth session, never the Metask credential store. It uses a
@@ -3377,7 +3395,7 @@ fn runProviderKeyGrantLogin(allocator: std.mem.Allocator, io: std.Io, state_dir:
     var other_device = request.other_device;
     // Over SSH a loopback redirect lands on this machine, and the browser
     // that would follow it is on another one.
-    if (!other_device and request.open_browser and openrouter_login.sshSession()) {
+    if (!other_device and request.open_browser and auth.sshSession()) {
         std.debug.print("This looks like an SSH session: sign in on another device instead. (--no-browser keeps the browser sign-in.)\n", .{});
         other_device = true;
     }
@@ -4358,11 +4376,13 @@ fn runProviderOAuthLogin(
     };
     // Every refusal is decided in the kernel before anything is contacted;
     // this only says which one, in the words the CLI has always used.
+    var stdin_paste: terminal_prompt.StdinPaste = .{};
     const prepared = provider_login.prepareProfileWith(built, .{
         .method = options.method,
         .open_browser = options.open_browser,
         .client_id = options.client_id,
         .state_root = hostRoot(),
+        .paste = if (options.method == .loopback) stdin_paste.source() else null,
     }, host.oauthClientIdFor(built.id)) catch |err| switch (err) {
         error.ProviderHasNoTokenEndpoint, error.ProviderAcceptsNoOAuthKind => {
             _ = requireOAuthCapableProvider(built);

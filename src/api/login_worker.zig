@@ -14,6 +14,7 @@
 //! copy is mutated only before `start`.
 const std = @import("std");
 const provider_login = @import("provider_login.zig");
+const auth = @import("../core/auth.zig");
 const oauth_login = @import("oauth_login.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const sync = @import("platform").sync;
@@ -49,6 +50,7 @@ pub const LoginWorker = struct {
     /// points into `owned` (set by `ownFlow`); only then is it this worker's
     /// to zero.
     owns_secret: bool = false,
+    paste_box: auth.PasteBox = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, prepared: provider_login.Prepared) LoginWorker {
         return initFlow(allocator, io, .{ .oauth = prepared });
@@ -152,6 +154,7 @@ pub const LoginWorker = struct {
             return error.ThreadSpawnFailed;
         };
         self.flow.options().abort_signal = &self.abort_signal;
+        if (self.takesPastedAddress()) self.flow.options().paste = self.paste_box.source();
         self.thread = @import("platform").thread.spawn(.full, run, .{self}) catch {
             self.wipeSecret();
             _ = self.owned.reset(.free_all);
@@ -174,6 +177,21 @@ pub const LoginWorker = struct {
             return;
         };
         self.state.store(@intFromEnum(State.succeeded), .release);
+    }
+
+    pub fn takesPastedAddress(self: *const LoginWorker) bool {
+        return switch (self.flow) {
+            .oauth => |prepared| prepared.options.method == .loopback,
+            else => false,
+        };
+    }
+
+    pub fn pasteAddress(self: *LoginWorker, text: []const u8) void {
+        self.paste_box.submit(text);
+    }
+
+    pub fn pasteRefusal(self: *const LoginWorker) ?auth.PasteRefusal {
+        return self.paste_box.refusal();
     }
 
     /// Ends the flow at its next 100 ms check; the state becomes `cancelled`.
