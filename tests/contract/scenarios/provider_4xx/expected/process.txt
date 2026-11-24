@@ -1,0 +1,6 @@
+exit: 1
+requests: 1
+--- stderr
+[31m[ERROR client req=<ID>][0m HTTP 400 bad_request: body={"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}
+[31m[ERROR client][0m stream connect failed after 1 attempt(s): ContextWindowExceeded
+[31m[ERROR agent][0m context-window recovery impossible turn=1 active_msgs=1

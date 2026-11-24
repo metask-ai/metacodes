@@ -18,7 +18,7 @@ status, compatibility boundaries, and entry points are defined by
   metacodes flag. Preview features still run on Harbor suites only, and the
   profile page names what a WorkBuddy dataset left out. Reinstall the overlay
   (`python3 -m scripts.eval.workbuddy.install_overlay <checkout>`) on every
-  WorkBuddy checkout; the bench node protocol is now 8, so rerun
+  WorkBuddy checkout; the bench node protocol is now 9, so rerun
   `metacodes bench setup --executor <name>`.
 
 - **Models can be priced in config.json, and bench runs use OpenRouter

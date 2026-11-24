@@ -7,6 +7,12 @@ These rules apply to the entire repository.
 - Use the Zig version declared by `build.zig.zon` and CI. Verify unfamiliar
   standard-library APIs against the installed toolchain instead of relying on
   memory from another Zig release.
+- Toolchain compatibility and Zig API compatibility are separate contracts. The
+  Zig API snapshot records the Zig version it was generated with, and
+  `test:contract` fails when the toolchain differs from it or from
+  `build.zig.zon`. Upgrade the toolchain in its own PR and regenerate the
+  snapshot there with `-Dupdate-contract`; never combine it with a package
+  split or with removing or renaming public exports (`tests/README.md`).
 - Develop type first: define the state model and signatures, then let the compiler
   drive the implementation.
 - Make illegal states unrepresentable. Prefer tagged unions, distinct ID types,

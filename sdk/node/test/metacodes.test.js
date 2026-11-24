@@ -87,6 +87,16 @@ test('a model failure reaches the result and a later success clears it', { skip 
   assert.equal(recovered.modelError, null);
 });
 
+const RESTART_AFTER_STREAM_CUT =
+  'Your previous response was cut off mid-stream and none of it was kept. Answer ag' +
+  'ain from the start and get to the point: reason briefly, then give the response or make a tool call.';
+
+function withRestartRequest(request) {
+  const expected = structuredClone(request);
+  expected.messages.at(-1).content.push({ type: 'text', text: RESTART_AFTER_STREAM_CUT });
+  return expected;
+}
+
 test('a stream cut after thinking is sent again under the budget (Revision 28)', { skip }, async (t) => {
   // Issue #452: thinking, then the body ends with no stop reason.
   const provider = await withProvider(t, [['thinking_cut', 'private reasoning'], ['text', 'recovered']]);
@@ -97,7 +107,7 @@ test('a stream cut after thinking is sent again under the budget (Revision 28)',
   assert.equal(result.text, 'recovered');
   assert.equal(result.modelError, null);
   assert.equal(provider.requests.length, 2);
-  assert.deepEqual(provider.requests[1], provider.requests[0]);
+  assert.deepEqual(provider.requests[1], withRestartRequest(provider.requests[0]));
   const payloads = (tag) => events.filter((event) => tag in event).map((event) => event[tag]);
   assert.deepEqual(payloads('thinking_discarded'), [{ index: 0, turn: 1, group: 0, bytes: 17 }]);
   // One failed stream of at most three: the first attempt, the request's own
@@ -119,7 +129,7 @@ test('without a budget a request cut twice after thinking ends the Run', { skip 
   const result = await session.run('think', { onEvent: (event) => events.push(event) });
   assert.equal(result.stopReason, 'api_error');
   assert.equal(provider.requests.length, 2);
-  assert.deepEqual(provider.requests[1], provider.requests[0]);
+  assert.deepEqual(provider.requests[1], withRestartRequest(provider.requests[0]));
   const payloads = (tag) => events.filter((event) => tag in event).map((event) => event[tag]);
   assert.deepEqual(payloads('thinking_discarded'), [{ index: 0, turn: 1, group: 0, bytes: 17 }]);
   assert.deepEqual(payloads('retry_notice'), [{ attempt: 1, max: 2, delay_ms: 500 }]);
