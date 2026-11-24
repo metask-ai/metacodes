@@ -193,11 +193,12 @@ function compositionPanel(summary, scopeText) {
 
 // ------------------------------------------------------------ overview
 const PROFILE_STATUS = { queued: '排队中', running: '运行中', cancelling: '正在停止', finished: '空闲', cancelled: '已停止' };
-const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '跳过' };
+const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '已取消' };
 const profileActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
 const profileName = (b) => b.name || b.default_name || b.id;
 const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
 const featuresText = (b) => (b.features || []).join(', ') || '未开启';
+const skippedFeatures = (b, item) => item.features ? (b.features || []).filter((name) => !item.features.includes(name)) : [];
 
 // Fills the run form for another run on profile `b` with one model (the
 // page's model filter, else the last run's): that model's suites and tasks
@@ -246,6 +247,27 @@ async function stopProfile(b, button) {
   button.disabled = true;
   try { await api('/api/profile/cancel', { id: b.id }); state.countdown = 1; }
   catch (error) { button.disabled = false; setConnection(false, error.message); }
+}
+const ITEM_ACTIONS = {
+  cancel: { label: '取消', ask: '取消这个评测集？它不再运行，队列里的其他评测集照常运行。' },
+  stop: { label: '停止', ask: '停止这个评测集？已经跑完的题保留结果，队列接着运行下一个评测集。' },
+  resume: { label: '继续', ask: null },
+  run: { label: '运行', ask: null },
+};
+function itemActions(b, index) {
+  const item = b.items[index];
+  const names = item.status === 'pending' ? ['cancel'] : item.status === 'running' ? ['stop']
+    : ['cancelled', 'interrupted', 'failed'].includes(item.status) && item.run ? ['resume', 'run'] : ['run'];
+  return names.map((name) => h('button', { type: 'button', class: 'button',
+    title: { resume: '只运行还没跑完的题', run: '把这个评测集的题全部再运行一次' }[name] || null,
+    onclick: async (event) => {
+      event.stopPropagation();
+      const button = event.currentTarget;
+      if (ITEM_ACTIONS[name].ask && !confirm(ITEM_ACTIONS[name].ask)) return;
+      button.disabled = true;
+      try { await api('/api/profile/item', { id: b.id, index, action: name }); state.countdown = 1; }
+      catch (error) { button.disabled = false; setConnection(false, error.message); }
+    } }, ITEM_ACTIONS[name].label));
 }
 function profileActions(b, compact) {
   const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
@@ -403,12 +425,12 @@ async function renderProfile(id) {
     h('dt', { text: '模型' }), h('dd', { text: b.models.join('、') || '—' }),
     h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })));
 
-  const itemRows = [...b.items].reverse().map((item) => {
+  const itemRow = (item, index) => {
     const j = item.job; const js = j?.summary;
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
       h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
         item.concurrency ? `并发 ${item.concurrency}` : null,
-        (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
+        skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
       h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * (item.attempts || 1)}` }),
@@ -417,11 +439,21 @@ async function renderProfile(id) {
       h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
       h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
       h('td', { class: 'num', text: when(item.queued_at) }),
-      h('td', { class: 'mono', text: item.run || '—' }));
-  });
-  const items = panel('运行历史', `${b.items.length} 次`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业'].map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : null, text: t })))),
-    h('tbody', {}, itemRows))));
+      h('td', { class: 'mono', text: item.run || '—' }),
+      b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index))) : null);
+  };
+  const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业', ...(b.can_run ? ['操作'] : [])];
+  const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, itemHeads.map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : i === 10 ? 'pinned' : null, text: t })))),
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: itemHeads.length, class: 'empty', text: empty })))));
+  const indexed = b.items.map((item, index) => [item, index]).reverse();
+  const live = indexed.filter(([item]) => ['pending', 'running'].includes(item.status));
+  const ended = indexed.filter(([item]) => !['pending', 'running'].includes(item.status));
+  const running = live.filter(([item]) => item.status === 'running').length;
+  const items = panel('正在运行的任务', `${running} 个运行中 · ${live.length - running} 个等待`,
+    itemTable(live.reverse().map(([item, index]) => itemRow(item, index)), '没有正在运行或等待的评测集'));
+  const endedItems = ended.length ? panel('已结束的任务', `${ended.length} 个`,
+    itemTable(ended.map(([item, index]) => itemRow(item, index)), '')) : null;
 
   // Per task: each (suite, model, task)'s latest attempts in order.
   const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
@@ -466,7 +498,7 @@ async function renderProfile(id) {
   const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, tasks, compositionPanel(s, '最新结果均值'));
+  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, endedItems, tasks, compositionPanel(s, '最新结果均值'));
 }
 
 function concurrencyControl(b, item) {
@@ -573,7 +605,7 @@ async function historyGroup(b, jobName, taskName) {
 
 // ------------------------------------------------------------ run workbench
 const SETUP_STATUS = { running: '进行中', ok: '已就绪', done: '已完成', planned: '将执行', manual: '需要你操作',
-  failed: '失败', skipped: '跳过' };
+  failed: '失败', skipped: '已取消' };
 const SETUP_RESULT = { running: '进行中', ready: '已就绪', planned: '预演完成', needs_user: '还有需要你操作的步骤',
   failed: '有步骤失败', interrupted: '已中断' };
 const RUN_STATUS = { queued: '等待启动', starting: '准备环境', running: '运行中',

@@ -45,6 +45,15 @@ BASE_URL_ENV = "METACODES_BENCH_WORKBUDDY_BASE_URL"
 JUDGE_BASE_URL_ENV = "METACODES_BENCH_WORKBUDDY_JUDGE_BASE_URL"
 KEY_ENV = "METACODES_BENCH_WORKBUDDY_API_KEY"
 RESULTS_DIR = "workbuddy"
+FEATURE_PARAMS = {
+    "verification_final_gate": "METACODES_VERIFICATION_FINAL_GATE",
+    "requirement_ledger": "METACODES_REQUIREMENT_LEDGER",
+    "test_integrity": "METACODES_TEST_INTEGRITY",
+    "delivery_cadence": "METACODES_DELIVERY_CADENCE",
+    "stall_gate": "METACODES_STALL_GATE",
+}
+AGENT = Path("src/workbuddy_bench/agents/metacodes_agent.py")
+OVERLAY_SOURCE = Path(__file__).resolve().parents[2] / "workbuddy" / "overlay"
 
 
 def dataset_rel(subset: str) -> str:
@@ -148,6 +157,8 @@ def job_documents(spec) -> Tuple[dict, dict]:
     params = {}
     if spec.get("reasoning_effort"):
         params["METACODES_REASONING_EFFORT"] = spec["reasoning_effort"]
+    for feature in spec.get("features") or []:
+        params[FEATURE_PARAMS[feature]] = True
     # A run with its own mount image names it through its own harness version.
     harness = "metacodes/" + slug(spec["name"]) if spec["workbuddy"].get("harness_image") else HARNESS
     job = {"model": slug(spec["name"]), "harness": harness, "dataset": dataset_rel(spec["workbuddy"]["subset"]),
@@ -164,6 +175,13 @@ def job_documents(spec) -> Tuple[dict, dict]:
     if spec.get("workbuddy_judge"):
         job["llm_judge_override"] = {"enabled": True, "mode": "in_container", "model": judge_slug(spec)}
     return model, job
+
+
+def overlay_current(repo: Path) -> bool:
+    try:
+        return (repo / AGENT).read_bytes() == (OVERLAY_SOURCE / AGENT).read_bytes()
+    except OSError:
+        return False
 
 
 def config_paths(spec) -> List[Path]:
@@ -195,6 +213,9 @@ def launch(spec, env) -> Tuple[List[str], str, Dict[str, str]]:
     wb = spec["workbuddy"]
     if wb["subset"] in JUDGED_SUBSETS and not spec.get("workbuddy_judge"):
         raise ValueError(f"WorkBuddy {wb['subset']} 需要 LLM judge，但本次运行没有评委模型；请把工作台和执行节点更新到同一版本")
+    if spec.get("features") and not overlay_current(Path(wb["checkout"])):
+        raise ValueError("WorkBuddy checkout 的 metacodes overlay 不是当前版本，不能开启高级功能："
+                         "python3 -m scripts.eval.workbuddy.install_overlay <checkout> 重新安装")
     model, job = job_documents(spec)
     documents = [json.dumps(model, indent=2), json.dumps(job, indent=2)]
     if wb.get("harness_image"):
