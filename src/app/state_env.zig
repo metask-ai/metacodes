@@ -61,10 +61,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const pfs = @import("platform").fs;
-const credential = @import("../provider/credential.zig");
-const profile_mod = @import("../provider/profile.zig");
-const registry_mod = @import("../provider/registry.zig");
-const config_doc = @import("../provider/config_doc.zig");
+const credential = @import("metacodes-internal").provider.credential;
+const profile_mod = @import("metacodes-internal").provider.profile;
+const registry_mod = @import("metacodes-internal").provider.registry;
+const config_doc = @import("metacodes-internal").provider.config_doc;
 
 pub const file_name = ".env";
 pub const example_file_name = ".env.example";

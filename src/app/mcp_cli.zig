@@ -13,12 +13,12 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const paths = @import("platform").paths;
-const mcp_config = @import("../mcp/config.zig");
-const mcp_oauth = @import("../mcp/oauth.zig");
+const mcp_config = @import("metacodes-internal").mcp.config;
+const mcp_oauth = @import("metacodes-internal").mcp.oauth;
 const mcp_startup = @import("mcp_startup.zig");
 const mcp_config_edit = @import("mcp_config_edit.zig");
-const util_time = @import("../util/time.zig");
-const core_auth = @import("../core/auth.zig");
+const util_time = @import("metacodes-internal").util.time;
+const core_auth = @import("metacodes-internal").core.auth;
 const terminal_prompt = @import("terminal_prompt.zig");
 
 const USAGE =
@@ -168,7 +168,7 @@ fn unknownArgument(arg: []const u8) u8 {
 fn resolveServers(arena: std.mem.Allocator, state_root: []const u8) !mcp_config.Resolved {
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = try arena.dupe(u8, pfs.getCwd(&cwd_buffer) orelse "");
-    const workspace_root = @import("../skills/skill.zig").findRepoRoot(arena, cwd) catch cwd;
+    const workspace_root = @import("metacodes-internal").skills.skill.findRepoRoot(arena, cwd) catch cwd;
     return mcp_config.load(arena, .{
         .state_root = state_root,
         .home = paths.homeDir() orelse "",
@@ -327,7 +327,7 @@ fn checkServers(arena: std.mem.Allocator, io: std.Io, state_root: []const u8, se
     status.* = .{};
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = arena.dupe(u8, pfs.getCwd(&cwd_buffer) orelse "") catch return null;
-    const workspace_root = @import("../skills/skill.zig").findRepoRoot(arena, cwd) catch cwd;
+    const workspace_root = @import("metacodes-internal").skills.skill.findRepoRoot(arena, cwd) catch cwd;
     const startup = mcp_startup.Startup.begin(arena, status, .{
         .io = io,
         .state_root = state_root,

@@ -51,10 +51,10 @@ const builtin = @import("builtin");
 const platform = @import("platform");
 const pfs = platform.fs;
 const net = platform.net;
-const log = @import("../util/log.zig");
-const time = @import("../util/time.zig");
-const KgClient = @import("../kg/client.zig").KgClient;
-const kgd_install = @import("../kg/kgd/install.zig");
+const log = @import("metacodes-internal").util.log;
+const time = @import("metacodes-internal").util.time;
+const KgClient = @import("metacodes-internal").kg.client.KgClient;
+const kgd_install = @import("metacodes-internal").kg.kgd.install;
 
 pub const ENV_DISABLE = "METACODES_KG_AUTOSTART";
 /// How long a start may take before the session gives up and degrades: the
@@ -258,7 +258,7 @@ pub const Autostart = struct {
 
 /// Whether a CLI session would start the service for a client degraded this
 /// way: `doctor` then shows a stopped service as normal rather than a fault.
-pub fn wouldStart(kind: @import("../kg/client.zig").DegradedKind) bool {
+pub fn wouldStart(kind: @import("metacodes-internal").kg.client.DegradedKind) bool {
     if (!enabled()) return false;
     if (envSet("METACODES_KG_URL") or envSet("METACODES_KG_API_KEY") or envSet("METACODES_KG_EXPECTED_BUILD_ID")) return false;
     return switch (kind) {
@@ -444,7 +444,7 @@ const Lock = struct {
     path: [:0]u8,
 
     fn acquire(a: std.mem.Allocator, dir: []const u8) !?Lock {
-        @import("../util/fs.zig").mkdirParents(dir) catch {};
+        @import("metacodes-internal").util.fs.mkdirParents(dir) catch {};
         const path = try std.fs.path.joinZ(a, &.{ dir, "kgd.autostart.lock" });
         errdefer a.free(path);
         var attempt: u8 = 0;

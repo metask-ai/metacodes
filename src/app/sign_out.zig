@@ -18,12 +18,12 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
-const auth = @import("../core/auth.zig");
-const provider_oauth = @import("../provider/oauth.zig");
-const provider_ids = @import("../provider/ids.zig");
-const config_store = @import("../provider/config_store.zig");
-const selection_mod = @import("../provider/selection.zig");
-const registry_mod = @import("../provider/registry.zig");
+const auth = @import("metacodes-internal").core.auth;
+const provider_oauth = @import("metacodes-internal").provider.oauth;
+const provider_ids = @import("metacodes-internal").provider.ids;
+const config_store = @import("metacodes-internal").provider.config_store;
+const selection_mod = @import("metacodes-internal").provider.selection;
+const registry_mod = @import("metacodes-internal").provider.registry;
 
 /// What was on disk and is gone.
 pub const Removed = struct {

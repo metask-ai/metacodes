@@ -6,7 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
-const auth = @import("../core/auth.zig");
+const auth = @import("metacodes-internal").core.auth;
 
 /// Both ends a prompt needs are terminals: stdin to answer on, stderr to ask
 /// on. Without them a command takes its answers as arguments instead.

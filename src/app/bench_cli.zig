@@ -4,7 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform");
 const assets = @import("bench_assets");
-const version = @import("../version.zig");
+const version = @import("metacodes-internal").version;
 
 fn environmentValue(entries: []const [:0]const u8, key: []const u8) ?[]const u8 {
     for (entries) |entry| {

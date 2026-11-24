@@ -16,14 +16,14 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const paths = @import("platform").paths;
 const platform_signal = @import("platform").signal;
-const util_time = @import("../util/time.zig");
-const shutdown = @import("../core/shutdown.zig");
-const protocol = @import("../skills/sealed/protocol.zig");
-const transport = @import("../skills/sealed/transport.zig");
-const pin_mod = @import("../skills/sealed/pin.zig");
-const ledger = @import("../skills/sealed/ledger.zig");
-const credentials = @import("../skills/sealed/credentials.zig");
-const gateway_mod = @import("../skills/sealed/gateway.zig");
+const util_time = @import("metacodes-internal").util.time;
+const shutdown = @import("metacodes-internal").core.shutdown;
+const protocol = @import("metacodes-internal").skills.sealed.protocol;
+const transport = @import("metacodes-internal").skills.sealed.transport;
+const pin_mod = @import("metacodes-internal").skills.sealed.pin;
+const ledger = @import("metacodes-internal").skills.sealed.ledger;
+const credentials = @import("metacodes-internal").skills.sealed.credentials;
+const gateway_mod = @import("metacodes-internal").skills.sealed.gateway;
 
 const USAGE =
     \\usage: metacodes sealed install <gateway-url> <skill_id> [--token-env NAME] [--yes]

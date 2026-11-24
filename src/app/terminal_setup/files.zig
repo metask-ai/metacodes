@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
-const util_fs = @import("../../util/fs.zig");
+const util_fs = @import("metacodes-internal").util.fs;
 
 pub const Error = error{ OutOfMemory, NotFound, ReadFailed, WriteFailed, TooLarge, PathTooLong };
 

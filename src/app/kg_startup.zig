@@ -1,7 +1,7 @@
 const std = @import("std");
-const kg_client = @import("../kg/client.zig");
-const inject = @import("../kg/inject.zig");
-const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const kg_client = @import("metacodes-internal").kg.client;
+const inject = @import("metacodes-internal").kg.inject;
+const AbortSignal = @import("metacodes-internal").util.abort.AbortSignal;
 
 const KgClient = kg_client.KgClient;
 const FrontierRow = kg_client.FrontierRow;

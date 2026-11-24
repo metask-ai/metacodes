@@ -29,8 +29,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const state_root = @import("../util/state_root.zig");
-const util_fs = @import("../util/fs.zig");
+const state_root = @import("metacodes-internal").util.state_root;
+const util_fs = @import("metacodes-internal").util.fs;
 const release_source = @import("release_source.zig");
 pub const UpdateSource = release_source.UpdateSource;
 

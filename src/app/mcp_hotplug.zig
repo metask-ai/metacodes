@@ -1,6 +1,6 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
-const mcp_config = @import("../mcp/config.zig");
+const mcp_config = @import("metacodes-internal").mcp.config;
 
 pub fn deepCopy(arena: std.mem.Allocator, comptime T: type, value: T) error{OutOfMemory}!T {
     switch (@typeInfo(T)) {
