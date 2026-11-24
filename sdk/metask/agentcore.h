@@ -670,6 +670,11 @@ typedef struct {
     metask_agentcore_bytes_view_v1 base_url;
     metask_agentcore_bytes_view_v1 workspace_root;
     metask_agentcore_bytes_view_v1 workspace_home;
+    /* Selects the Runtime catalog's built-in and Host-registered tools the
+     * Session offers. ReadArtifact is offered automatically; mcp_selection
+     * and the Skill catalog can offer further tools. No permission mode adds
+     * a tool: under PERMISSION_FULL_ACCESS a list without Read leaves Read
+     * unavailable. */
     const metask_agentcore_bytes_view_v1 *allowed_tools;
     uint64_t allowed_tool_count;
     metask_agentcore_skill_catalog *skill_catalog;

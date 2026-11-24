@@ -321,7 +321,7 @@ pub fn renderResult(
     if (output_text.len > 0) {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(alloc);
-        try renderResultBody(alloc, th, tool_name, output_text, &body, opts, kind);
+        try renderResultBody(alloc, th, tool_name, output_text, &body, opts, kind, elapsed_ms);
         try appendWithGutter(alloc, th, body.items, &out);
     }
 
@@ -537,6 +537,7 @@ fn renderResultBody(
     out: *std.ArrayList(u8),
     opts: RenderOpts,
     kind: ResultKind,
+    elapsed_ms: u64,
 ) !void {
     if (kind == .err) {
         return renderErrorBody(alloc, th, output_text, out, opts);
@@ -604,7 +605,7 @@ fn renderResultBody(
         return renderBashResult(alloc, th, tool_name, output_text, out, opts);
     }
     if (std.mem.startsWith(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) {
-        return renderTaskResult(alloc, th, tool_name, output_text, out, opts);
+        return renderTaskResult(alloc, th, tool_name, output_text, out, elapsed_ms);
     }
     return renderGenericFold(alloc, th, output_text, out, opts);
 }
@@ -832,8 +833,7 @@ fn renderBashOutputResult(alloc: std.mem.Allocator, th: Theme, output_text: []co
 }
 
 /// Task 系列结果:不显示裸 JSON,显示人类可读摘要。
-fn renderTaskResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
-    _ = opts;
+fn renderTaskResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, output_text: []const u8, out: *std.ArrayList(u8), elapsed_ms: u64) !void {
     // TaskCreate: {"task":{"id":"1","subject":".."}} → ✓ created task #1: subject
     if (std.mem.eql(u8, tool_name, "TaskCreate")) {
         const id = extractField(output_text, "id") orelse "?";
@@ -843,7 +843,7 @@ fn renderTaskResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, 
         try appendLine(alloc, out, th.dim, line, th.reset);
         return;
     }
-    // Task / Agent spawn(同步):{"subagent_type":..,"final_text":..,"tool_calls":N,"tokens":N,"elapsed_ms":N}
+    // Task / Agent spawn(同步):{"subagent_type":..,"final_text":..,"tool_calls":N,"tokens":N};耗时取宿主侧工具计时。
     // 完成态塌缩卡(对齐实拍 `⎿ Done (2 tool uses · 18.1k tokens · 8s)`)。
     if (std.mem.eql(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) {
         const st = extractField(output_text, "subagent_type") orelse "subagent";
@@ -858,7 +858,6 @@ fn renderTaskResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, 
         if (extractField(output_text, "final_text") != null or extractNumberField(output_text, "tool_calls") != null) {
             const tc = extractNumberField(output_text, "tool_calls") orelse 0;
             const tokens = extractNumberField(output_text, "tokens") orelse 0;
-            const elapsed_ms = extractNumberField(output_text, "elapsed_ms") orelse 0;
             var line: std.ArrayList(u8) = .empty;
             defer line.deinit(alloc);
             try line.appendSlice(alloc, "Done (");
