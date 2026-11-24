@@ -12,6 +12,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench reruns invalid tasks, and can do it automatically.** The profile
+  page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest
+  attempts include an invalid one (network or environment failures), not the
+  ones the model failed. Turning on 自动重跑无效的题 on a profile queues a
+  finished dataset's invalid tasks again, at most two rounds per dataset.
+
 - **Dragging over text in the TUI can copy it** (preview `copy_on_select`).
   With `--preview=copy_on_select` or `{"preview": {"copy_on_select": true}}`
   the interactive TUI reports the mouse; releasing a left-button drag copies

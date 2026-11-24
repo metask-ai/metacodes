@@ -1279,10 +1279,18 @@ A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
 replaced runs as the task's history. A run that stopped (cancelled,
 interrupted or failed) with only invalid attempts of a task leaves that
-task's earlier result in place. 再次运行 and 重跑未通过的题 use one model: the
+task's earlier result in place. 再次运行 and 重跑无效的题 use one model: the
 page's model filter, else the last run's. The profile page's 再次运行 opens the 评测
 page on that profile with its datasets, tasks and last parameters, and
-重跑未通过的题 keeps only the tasks whose latest attempts did not all pass.
+重跑无效的题 keeps only the tasks whose latest attempts include an invalid one
+(an infrastructure failure such as a network error, not a failed answer).
+With 自动重跑 on (`POST /api/profile/auto-rerun` with `id` and `enabled`,
+the 自动重跑无效的题 checkbox on its page), a dataset that finishes with invalid
+trials is queued again at the end of the profile's queue with only those
+tasks, at most twice per dataset (the item's `auto_rerun` counts the round).
+A dataset that was stopped, cancelled or failed is not rerun automatically;
+when its results cannot be read, the item records why (`auto_rerun_error`)
+and the queue goes on.
 A profile can be renamed at any time (`POST /api/profile/rename` with `id`
 and `name`, 重命名 on its page; an empty name falls back to the id).
 Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除评测配置
