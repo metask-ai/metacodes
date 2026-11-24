@@ -1040,7 +1040,7 @@ pub const Screen = struct {
 };
 
 /// Display width the terminal gives a code point. Same table as screen.py
-/// `char_width` and src/repl/tui/term.zig (vterm_test.zig pins all three):
+/// `char_width` and apps/cli/src/repl/tui/term.zig (vterm_test.zig pins all three):
 /// controls 0, East Asian wide and emoji blocks 2, everything else 1.
 pub fn charWidth(cp: u21) u2 {
     if (cp < 0x20 or cp == 0x7F) return 0;

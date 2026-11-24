@@ -29,7 +29,7 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
    `zig build subsystem:boundary`(`scripts/subsystem_boundary_gate.zig`)在源码层沿每条
    `@import`(含函数体与 test 块)检查这条规则;现存的几条边记在只减不增的 baseline 里,
    `src/core/` 没有 baseline。前端再多,core 不被污染,core 不依赖任何前端。
-   同一个 gate 也管反方向的一条(#445):`src/daemon/`、`src/web/` 下的文件不得直接
+   同一个 gate 也管反方向的一条(#445):`apps/cli/src/daemon/`、`apps/cli/src/web/` 下的文件不得直接
    import `src/core/agent_loop.zig`(宿主经 `core/session_host.zig` 驱动内核),现存的两条
    (`daemon/app_driver.zig`、`web/session.zig`)记在只减不增的 baseline 里。
 

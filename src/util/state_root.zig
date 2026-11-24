@@ -203,7 +203,7 @@ pub fn setFlagOverride(dir: []const u8) Error!void {
 }
 
 /// The process's state root, resolved once and cached (errors included).
-/// Host entry points only (src/main.zig); see the module comment.
+/// Host entry points only (apps/cli/src/main.zig); see the module comment.
 pub fn resolve() Error!Resolved {
     _ = init_mutex.lock();
     defer _ = init_mutex.unlock();

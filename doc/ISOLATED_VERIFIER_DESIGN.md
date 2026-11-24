@@ -771,7 +771,7 @@ claim.
 | 5. `Grounding.contested` and the verifier evidence sentence | `src/core/learning_turn.zig` (after #292) | Tests mirroring a `contested_learns_failed` theorem |
 | 6. End-of-run qualifier: `"verifier"` field and tree id on the `host_run` row; effective rank in the selector | `src/core/host_check.zig`, `src/core/verdict.zig`, history readers | Tests: an old-format row reads as before; a contested row loses only at equal reward |
 | 7. Lean: `Qualifier`, `effectiveRank` and §4's theorems; an `IsolatedVerifier.lean` with `infra_never_verdict`, `pass_never_promotes`, `spawns_bounded` and `leads_bounded` | `control-plane/lean/MetaCodesControl/` | `zig build test` with the kernel |
-| 8. Flags `--verifier`, `--verifier-observe` and `--verifier-model`, with `METACODES_VERIFIER` for the adapter. Requires an armed check gate, else a parse error | `src/main.zig` | CLI tests as for `--check-gate` without `--host-check` |
+| 8. Flags `--verifier`, `--verifier-observe` and `--verifier-model`, with `METACODES_VERIFIER` for the adapter. Requires an armed check gate, else a parse error | `apps/cli/src/main.zig` | CLI tests as for `--check-gate` without `--host-check` |
 | 9. Record, `trace.py` validation, replay driver, experiment file | `src/tools/observation.zig`, `scripts/eval/`, `evals/experiments/isolated-verifier-v1.md` | Fixtures; the §9 protocol |
 
 Steps 1–3 can be done and tested without a provider. Step 9's replay driver

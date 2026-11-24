@@ -106,7 +106,7 @@ def chain_kg_domain(task_id: str) -> str:
     """The TinyKG project domain of every attempt at `task_id`.
 
     The binary's default is `<git-root basename>-<8 hex of the git-root
-    hash>` (src/app.zig `computeKgDomain`). A chained attempt's workspace is
+    hash>` (apps/cli/src/app.zig `computeKgDomain`). A chained attempt's workspace is
     a new run directory, and with `GIT_INIT=1` a new git root, so the default
     changes every attempt while lessons are written to the session's project
     and recalled only from it and `global` (src/kg/client.zig

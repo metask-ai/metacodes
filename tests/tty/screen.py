@@ -9,7 +9,7 @@
   ESC[?25l/h 光标显隐、SGR(颜色→border_class)。
 未知 final byte(?2004h / >4;1m 等)安静吞掉。
 
-char_width 逐行复刻 src/repl/tui/term.zig:codepointDisplayWidth,
+char_width 逐行复刻 apps/cli/src/repl/tui/term.zig:codepointDisplayWidth,
 否则光标列断言与实现对不齐。
 """
 

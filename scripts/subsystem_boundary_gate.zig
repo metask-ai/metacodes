@@ -33,8 +33,8 @@
 //! is gone fails too, and no file under `src/core/` may have one at all.
 //!
 //! The last rule is a ratchet for #445: `serve` and `--web` are to become
-//! transports over `src/core/session_host.zig`, so no file under `src/daemon/`
-//! or `src/web/` may drive the kernel by importing `src/core/agent_loop.zig`.
+//! transports over `src/core/session_host.zig`, so no file under `apps/cli/src/daemon/`
+//! or `apps/cli/src/web/` may drive the kernel by importing `src/core/agent_loop.zig`.
 //! `HOST_KERNEL`'s baseline names the files that still do; like the library's,
 //! it may only shrink.
 //!
@@ -95,14 +95,14 @@ const SUBSYSTEMS = [_]Subsystem{
         // The picker is a *client* of the control plane: the provider kernel
         // and the terminal theme, and nothing else. Not `App`, not a client.
         .name = "model picker",
-        .dir = "src/repl",
+        .dir = "apps/cli/src/repl",
         .recursive = false,
         .only = &.{ "model_picker.zig", "model_picker_view.zig" },
         .modules = &.{ "std", "platform" },
         .reaches = &.{
-            "src/repl/tui/ansi.zig",
-            "src/repl/tui/theme.zig",
-            "src/repl/tui/term.zig",
+            "apps/cli/src/repl/tui/ansi.zig",
+            "apps/cli/src/repl/tui/theme.zig",
+            "apps/cli/src/repl/tui/term.zig",
             "src/provider/ids.zig",
             "src/provider/offer.zig",
             "src/provider/controls.zig",
@@ -227,14 +227,14 @@ const LIBRARY = Library{
     .name = "metacodes-core",
     .root = "src/lib.zig",
     .app_side = &.{
-        "src/repl/",
-        "src/web/",
-        "src/daemon/",
-        "src/app/",
-        "src/main.zig",
-        "src/app.zig",
-        "src/session_service.zig",
-        "src/session_intent.zig",
+        "apps/cli/src/repl/",
+        "apps/cli/src/web/",
+        "apps/cli/src/daemon/",
+        "apps/cli/src/app/",
+        "apps/cli/src/main.zig",
+        "apps/cli/src/app.zig",
+        "apps/cli/src/session_service.zig",
+        "apps/cli/src/session_intent.zig",
     },
     .unbaselined = &.{"src/core/"},
     .baseline = &.{},
@@ -263,13 +263,13 @@ const Ratchet = struct {
 /// by running the AgentLoop themselves.
 const HOST_KERNEL = Ratchet{
     .name = "single session host (#445)",
-    .dirs = &.{ "src/daemon/", "src/web/" },
+    .dirs = &.{ "apps/cli/src/daemon/", "apps/cli/src/web/" },
     .target = "src/core/agent_loop.zig",
     .baseline = &.{
         // The daemon's per-session driver runs an `App` Run itself.
-        "src/daemon/app_driver.zig",
+        "apps/cli/src/daemon/app_driver.zig",
         // `--web`'s driver loop, which `app_driver.zig` mirrors.
-        "src/web/session.zig",
+        "apps/cli/src/web/session.zig",
     },
 };
 
@@ -1113,18 +1113,18 @@ test "the library baseline admits no core file, no duplicate, and only app-side 
 
 test "the real library's application side is the one #448 names" {
     for ([_][]const u8{
-        "src/repl/tui/theme.zig",
-        "src/web/server.zig",
-        "src/daemon/main.zig",
-        "src/app/config.zig",
-        "src/main.zig",
-        "src/app.zig",
-        "src/session_service.zig",
-        "src/session_intent.zig",
+        "apps/cli/src/repl/tui/theme.zig",
+        "apps/cli/src/web/server.zig",
+        "apps/cli/src/daemon/main.zig",
+        "apps/cli/src/app/config.zig",
+        "apps/cli/src/main.zig",
+        "apps/cli/src/app.zig",
+        "apps/cli/src/session_service.zig",
+        "apps/cli/src/session_intent.zig",
     }) |path| try std.testing.expect(isAppSide(LIBRARY, path));
     try std.testing.expect(!isAppSide(LIBRARY, "src/api/model_context.zig"));
-    try std.testing.expect(!isAppSide(LIBRARY, "src/application.zig"));
-    try std.testing.expect(!isAppSide(LIBRARY, "src/app_extra.zig"));
+    try std.testing.expect(!isAppSide(LIBRARY, "apps/cli/src/application.zig"));
+    try std.testing.expect(!isAppSide(LIBRARY, "apps/cli/src/app_extra.zig"));
 }
 
 /// A miniature of `HOST_KERNEL`, with one baseline file.

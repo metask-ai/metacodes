@@ -3,7 +3,7 @@
 The REPL draws its input box and spinner in a region at the bottom of the main
 screen and lets everything above it flow into the terminal's own scrollback,
 which has no undo. doc/TUI_VIEWPORT_OWNERSHIP.md is the ownership model; this
-scan enforces the part of it that is visible in the source of ``src/repl/``:
+scan enforces the part of it that is visible in the source of ``apps/cli/src/repl/``:
 
 * **erase**: nothing erases more of the display than ED 0. The ED 1/2/3 bytes
   are spelled only in ``tui/ansi.zig``, and its ``clear.screen``,
@@ -35,56 +35,56 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCOPE = Path("src/repl")
+SCOPE = Path("apps/cli/src/repl")
 ADR = "doc/TUI_VIEWPORT_OWNERSHIP.md"
 
 # Where the wide-erase bytes may be spelled: the escape table defines them.
-WIDE_ERASE_BYTES_ALLOWED = {Path("src/repl/tui/ansi.zig")}
+WIDE_ERASE_BYTES_ALLOWED = {Path("apps/cli/src/repl/tui/ansi.zig")}
 # Who may use ansi.zig's wide-erase names: the one user-requested screen reset.
-WIDE_ERASE_NAMES_ALLOWED = {(Path("src/repl/tui/render_region.zig"), "resetScreenInFrame")}
+WIDE_ERASE_NAMES_ALLOWED = {(Path("apps/cli/src/repl/tui/render_region.zig"), "resetScreenInFrame")}
 
 # (file, function) -> why it may write to a terminal (or a file) directly.
 # "*" is every function in the file. Every entry must still match a write.
 ALLOWED_SINKS = {
     # The Renderer. Every frame, and every byte for the scrollback while the
     # region exists, leaves through here.
-    (Path("src/repl/tui/render_region.zig"), "flush"): "the Renderer's one write to the terminal",
+    (Path("apps/cli/src/repl/tui/render_region.zig"), "flush"): "the Renderer's one write to the terminal",
     # Slash-command output and the banner: printed before the first read, or
     # after readLineRaw's defer erased the region; the next read draws it again.
-    (Path("src/repl/cmd_output.zig"), "flushEcho"): "command echo, region erased",
-    (Path("src/repl/cmd_output.zig"), "end"): "command result block, region erased",
-    (Path("src/repl/cmd_output.zig"), "print"): "command result text, region erased",
-    (Path("src/repl/cmd_output.zig"), "notice"): "command notice, region erased",
-    (Path("src/repl/loop.zig"), "printResumeHint"): "exit hint, after the last read",
+    (Path("apps/cli/src/repl/cmd_output.zig"), "flushEcho"): "command echo, region erased",
+    (Path("apps/cli/src/repl/cmd_output.zig"), "end"): "command result block, region erased",
+    (Path("apps/cli/src/repl/cmd_output.zig"), "print"): "command result text, region erased",
+    (Path("apps/cli/src/repl/cmd_output.zig"), "notice"): "command notice, region erased",
+    (Path("apps/cli/src/repl/loop.zig"), "printResumeHint"): "exit hint, after the last read",
     # Command dialogs drawn in the region's place after readLineRaw erased it,
     # or while enterExclusiveOverlay holds the render lock with the region
     # erased. Each tracks its own rows and erases them with ED 0.
-    (Path("src/repl/tui/dialog/pane.zig"), "writeAll"): "bottom pane, region erased",
-    (Path("src/repl/tui/dialog/permission.zig"), "writeAll"): "permission dialog, region frozen",
-    (Path("src/repl/tui/dialog/ask_question.zig"), "writeAll"): "AskUserQuestion dialog, region frozen",
+    (Path("apps/cli/src/repl/tui/dialog/pane.zig"), "writeAll"): "bottom pane, region erased",
+    (Path("apps/cli/src/repl/tui/dialog/permission.zig"), "writeAll"): "permission dialog, region frozen",
+    (Path("apps/cli/src/repl/tui/dialog/ask_question.zig"), "writeAll"): "AskUserQuestion dialog, region frozen",
     # The alternate screen. The terminal restores the main screen on exit;
     # nothing reaches the scrollback.
-    (Path("src/repl/transcript_viewer.zig"), "writeAll"): "transcript viewer, alternate screen",
-    (Path("src/repl/tui/overlay.zig"), "writeAll"): "alternate screen enter/exit",
-    (Path("src/repl/tui/widget/pager.zig"), "writeAll"): "pager, alternate screen",
+    (Path("apps/cli/src/repl/transcript_viewer.zig"), "writeAll"): "transcript viewer, alternate screen",
+    (Path("apps/cli/src/repl/tui/overlay.zig"), "writeAll"): "alternate screen enter/exit",
+    (Path("apps/cli/src/repl/tui/widget/pager.zig"), "writeAll"): "pager, alternate screen",
     # Before the region exists.
-    (Path("src/repl/tui/splash_player.zig"), "writeAll"): "startup splash, before the first read",
+    (Path("apps/cli/src/repl/tui/splash_player.zig"), "writeAll"): "startup splash, before the first read",
     # Modes, queries and titles: nothing lands on the grid.
-    (Path("src/repl/input.zig"), "emitEnableSequences"): "keyboard protocol, bracketed paste and win32-input-mode on",
-    (Path("src/repl/input.zig"), "emitDisableSequences"): "keyboard protocol, bracketed paste and win32-input-mode off",
-    (Path("src/repl/tui/bg_probe.zig"), "sendQuery"): "OSC 11, Kitty flags and DA1 queries at startup",
-    (Path("src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title",
+    (Path("apps/cli/src/repl/input.zig"), "emitEnableSequences"): "keyboard protocol, bracketed paste and win32-input-mode on",
+    (Path("apps/cli/src/repl/input.zig"), "emitDisableSequences"): "keyboard protocol, bracketed paste and win32-input-mode off",
+    (Path("apps/cli/src/repl/tui/bg_probe.zig"), "sendQuery"): "OSC 11, Kitty flags and DA1 queries at startup",
+    (Path("apps/cli/src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title",
     # Regular files, not the terminal.
-    (Path("src/repl/history.zig"), "saveToFile"): "history file",
-    (Path("src/repl/paste.zig"), "store"): "pasted-text file",
-    (Path("src/repl/tui/config.zig"), "writeFile"): "TUI config file",
-    (Path("src/repl/input.zig"), "externalEdit"): "the editor's temporary file",
+    (Path("apps/cli/src/repl/history.zig"), "saveToFile"): "history file",
+    (Path("apps/cli/src/repl/paste.zig"), "store"): "pasted-text file",
+    (Path("apps/cli/src/repl/tui/config.zig"), "writeFile"): "TUI config file",
+    (Path("apps/cli/src/repl/input.zig"), "externalEdit"): "the editor's temporary file",
     # No region at all.
-    (Path("src/repl/headless.zig"), "*"): "-p/--print, never a RenderRegion",
+    (Path("apps/cli/src/repl/headless.zig"), "*"): "-p/--print, never a RenderRegion",
     # Failure output of assertion helpers only tests call.
-    (Path("src/repl/tui/test_capture.zig"), "expectContains"): "test assertion diagnostics",
-    (Path("src/repl/tui/test_capture.zig"), "expectNoAnsi"): "test assertion diagnostics",
-    (Path("src/repl/stream_json_backend.zig"), "expectStrictNdjson"): "test assertion diagnostics",
+    (Path("apps/cli/src/repl/tui/test_capture.zig"), "expectContains"): "test assertion diagnostics",
+    (Path("apps/cli/src/repl/tui/test_capture.zig"), "expectNoAnsi"): "test assertion diagnostics",
+    (Path("apps/cli/src/repl/stream_json_backend.zig"), "expectStrictNdjson"): "test assertion diagnostics",
 }
 
 # Erase in display (CSI J) beyond ED 0, or with a parameter only known at run
@@ -179,7 +179,7 @@ def split_line(line: str) -> tuple[str, list[str]]:
 
 
 def governed_sources(root: Path) -> list[Path]:
-    """Root-relative Zig files under src/repl, sorted."""
+    """Root-relative Zig files under apps/cli/src/repl, sorted."""
     base = root / SCOPE
     if not base.is_dir():
         raise NotADirectoryError(str(base))
@@ -310,9 +310,9 @@ class ScrollbackDisciplineTest(unittest.TestCase):
     def test_the_rule_still_sees_the_renderer(self):
         # An empty scan would pass trivially; the Renderer's own sink and the
         # screen reset must be in it.
-        self.assertIn(Path("src/repl/tui/render_region.zig"), governed_sources(ROOT))
+        self.assertIn(Path("apps/cli/src/repl/tui/render_region.zig"), governed_sources(ROOT))
         self.assertIn(
-            (Path("src/repl/tui/render_region.zig"), "flush"),
+            (Path("apps/cli/src/repl/tui/render_region.zig"), "flush"),
             {(relative, function) for relative, _, function, _ in sink_hits(ROOT)},
         )
         self.assertEqual(
@@ -333,7 +333,7 @@ class ScannerTest(unittest.TestCase):
     def test_wide_erase_bytes_are_reported_however_they_are_spelled(self):
         found = self.scan(
             {
-                "src/repl/tui/tui_backend.zig": (
+                "apps/cli/src/repl/tui/tui_backend.zig": (
                     "fn handleKey() void {\n"
                     '    region.emitTerminal("\\x1b[2J\\x1b[H");\n'
                     '    region.emitTerminal("\\u{1b}[3J");\n'
@@ -347,19 +347,19 @@ class ScannerTest(unittest.TestCase):
         )
         self.assertEqual(
             found,
-            [f"src/repl/tui/tui_backend.zig:{n}: erase: ED 1/2/3 bytes outside tui/ansi.zig" for n in range(2, 8)],
+            [f"apps/cli/src/repl/tui/tui_backend.zig:{n}: erase: ED 1/2/3 bytes outside tui/ansi.zig" for n in range(2, 8)],
         )
 
     def test_ed0_comments_fixtures_and_the_escape_table_are_not_wide_erases(self):
         found = self.scan(
             {
-                "src/repl/tui/ansi.zig": (
+                "apps/cli/src/repl/tui/ansi.zig": (
                     "pub const clear = struct {\n"
                     '    pub const screen = "\\x1b[2J";\n'
                     '    pub const to_end_of_screen = "\\x1b[0J";\n'
                     "};\n"
                 ),
-                "src/repl/tui/render_region.zig": (
+                "apps/cli/src/repl/tui/render_region.zig": (
                     "fn eraseRegion(w: anytype) void {\n"
                     "    w.writeAll(ansi.clear.to_end_of_screen); // never \\x1b[2J here\n"
                     '    w.writeAll("\\x1b[J\\x1b[0J\\x1b[2K");\n'
@@ -373,12 +373,12 @@ class ScannerTest(unittest.TestCase):
                 ),
             }
         )
-        self.assertEqual(found, ["src/repl/tui/render_region.zig:4: erase: ED 1/2/3 bytes outside tui/ansi.zig"])
+        self.assertEqual(found, ["apps/cli/src/repl/tui/render_region.zig:4: erase: ED 1/2/3 bytes outside tui/ansi.zig"])
 
     def test_wide_erase_names_only_in_reset_screen(self):
         found = self.scan(
             {
-                "src/repl/tui/render_region.zig": (
+                "apps/cli/src/repl/tui/render_region.zig": (
                     "    fn resetScreenInFrame(self: *RenderRegion) void {\n"
                     "        self.scratch.writer.writeAll(ansi.clear.screen_and_home) catch {};\n"
                     "    }\n"
@@ -393,16 +393,16 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual(
             found,
             [
-                "src/repl/tui/render_region.zig:5: erase: wide erase outside RenderRegion.resetScreen",
-                "src/repl/tui/render_region.zig:6: erase: wide erase outside RenderRegion.resetScreen",
+                "apps/cli/src/repl/tui/render_region.zig:5: erase: wide erase outside RenderRegion.resetScreen",
+                "apps/cli/src/repl/tui/render_region.zig:6: erase: wide erase outside RenderRegion.resetScreen",
             ],
         )
 
     def test_cursor_save_restore_is_reported_even_in_the_escape_table(self):
         found = self.scan(
             {
-                "src/repl/tui/ansi.zig": 'pub const save = "\\x1b7";\npub const restore = "\\u{1b}8";\n',
-                "src/repl/tui/render_region.zig": (
+                "apps/cli/src/repl/tui/ansi.zig": 'pub const save = "\\x1b7";\npub const restore = "\\u{1b}8";\n',
+                "apps/cli/src/repl/tui/render_region.zig": (
                     "fn frame() void {\n"
                     '    w.writeAll("\\x1b[s");\n'
                     '    w.writeAll("\\x1b" ++ "[u");\n'
@@ -413,17 +413,17 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual(
             found,
             [
-                "src/repl/tui/ansi.zig:1: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
-                "src/repl/tui/ansi.zig:2: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
-                "src/repl/tui/render_region.zig:2: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
-                "src/repl/tui/render_region.zig:3: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
+                "apps/cli/src/repl/tui/ansi.zig:1: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
+                "apps/cli/src/repl/tui/ansi.zig:2: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
+                "apps/cli/src/repl/tui/render_region.zig:2: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
+                "apps/cli/src/repl/tui/render_region.zig:3: anchor: cursor save/restore (DECSC/DECRC, CSI s/u)",
             ],
         )
 
     def test_sequences_that_merely_contain_7_8_s_or_u_are_not_save_restore(self):
         found = self.scan(
             {
-                "src/repl/input.zig": (
+                "apps/cli/src/repl/input.zig": (
                     "fn emitEnableSequences() void {\n"
                     '    const kbd = "\\x1b[>1u\\x1b[<u\\x1b[?u\\x1b[=1;1u";\n'
                     '    const sgr = "\\x1b[37m\\x1b[38;5;78m\\x1b[?7h";\n'
@@ -437,7 +437,7 @@ class ScannerTest(unittest.TestCase):
     def test_terminal_writes_outside_the_allowlist_are_reported(self):
         found = self.scan(
             {
-                "src/repl/tui/tui_backend.zig": (
+                "apps/cli/src/repl/tui/tui_backend.zig": (
                     "const print = std.debug.print;\n"
                     "fn handleKey(self: *TuiBackend) void {\n"
                     '    std.debug.print("{s}", .{text});\n'
@@ -448,7 +448,7 @@ class ScannerTest(unittest.TestCase):
                     "    _ = std.c.write(2, bytes.ptr, bytes.len);\n"
                     "}\n"
                 ),
-                "src/repl/tui/render_region.zig": (
+                "apps/cli/src/repl/tui/render_region.zig": (
                     "    fn flush(self: *RenderRegion) void {\n"
                     '        std.debug.print("{s}", .{bytes});\n'
                     "    }\n"
@@ -461,21 +461,21 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual(
             found,
             [
-                "src/repl/tui/render_region.zig:5: sink: std.debug.print in drawGenRegion writes past the Renderer",
-                "src/repl/tui/tui_backend.zig:1: sink: std.debug.print in top level writes past the Renderer",
-                "src/repl/tui/tui_backend.zig:3: sink: std.debug.print in handleKey writes past the Renderer",
-                'src/repl/tui/tui_backend.zig:4: sink: @import("std").debug.print in handleKey writes past the Renderer',
-                "src/repl/tui/tui_backend.zig:5: sink: pfs.writeAll in handleKey writes past the Renderer",
-                'src/repl/tui/tui_backend.zig:6: sink: @import("platform").fs.writeAll in handleKey writes past the Renderer',
-                "src/repl/tui/tui_backend.zig:7: sink: File.stderr in handleKey writes past the Renderer",
-                "src/repl/tui/tui_backend.zig:8: sink: std.c.write in handleKey writes past the Renderer",
+                "apps/cli/src/repl/tui/render_region.zig:5: sink: std.debug.print in drawGenRegion writes past the Renderer",
+                "apps/cli/src/repl/tui/tui_backend.zig:1: sink: std.debug.print in top level writes past the Renderer",
+                "apps/cli/src/repl/tui/tui_backend.zig:3: sink: std.debug.print in handleKey writes past the Renderer",
+                'apps/cli/src/repl/tui/tui_backend.zig:4: sink: @import("std").debug.print in handleKey writes past the Renderer',
+                "apps/cli/src/repl/tui/tui_backend.zig:5: sink: pfs.writeAll in handleKey writes past the Renderer",
+                'apps/cli/src/repl/tui/tui_backend.zig:6: sink: @import("platform").fs.writeAll in handleKey writes past the Renderer',
+                "apps/cli/src/repl/tui/tui_backend.zig:7: sink: File.stderr in handleKey writes past the Renderer",
+                "apps/cli/src/repl/tui/tui_backend.zig:8: sink: std.c.write in handleKey writes past the Renderer",
             ],
         )
 
     def test_allowed_writers_comments_strings_and_tests_are_not_sinks(self):
         found = self.scan(
             {
-                "src/repl/tui/render_region.zig": (
+                "apps/cli/src/repl/tui/render_region.zig": (
                     "    /// flush goes through std.debug.print (lockStderr)\n"
                     "    fn flush(self: *RenderRegion) void {\n"
                     '        std.debug.print("{s}", .{bytes});\n'
@@ -487,8 +487,8 @@ class ScannerTest(unittest.TestCase):
                     '    std.debug.print("debug {d}\\n", .{1});\n'
                     "}\n"
                 ),
-                "src/repl/headless.zig": 'pub fn run() void {\n    std.debug.print("error\\n", .{});\n}\n',
-                "src/repl/tui/overlay.zig": (
+                "apps/cli/src/repl/headless.zig": 'pub fn run() void {\n    std.debug.print("error\\n", .{});\n}\n',
+                "apps/cli/src/repl/tui/overlay.zig": (
                     "fn writeAll(fd: c_int, bytes: []const u8) void {\n"
                     "    _ = pfs.writeAll(fd, bytes);\n"
                     "}\n"
@@ -500,7 +500,7 @@ class ScannerTest(unittest.TestCase):
     def test_functions_are_tracked_across_signatures_one_liners_and_nesting(self):
         found = self.scan(
             {
-                "src/repl/loop.zig": (
+                "apps/cli/src/repl/loop.zig": (
                     "fn printResumeHint(\n"
                     "    app: *App,\n"
                     ") void {\n"
@@ -520,20 +520,20 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual(
             found,
             [
-                "src/repl/loop.zig:6: sink: std.debug.print in call writes past the Renderer",
-                "src/repl/loop.zig:12: sink: std.debug.print in quick writes past the Renderer",
-                "src/repl/loop.zig:13: sink: std.debug.print in top level writes past the Renderer",
+                "apps/cli/src/repl/loop.zig:6: sink: std.debug.print in call writes past the Renderer",
+                "apps/cli/src/repl/loop.zig:12: sink: std.debug.print in quick writes past the Renderer",
+                "apps/cli/src/repl/loop.zig:13: sink: std.debug.print in top level writes past the Renderer",
             ],
         )
 
     def test_a_renamed_function_leaves_its_allowance_stale(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write(root, "src/repl/tui/render_region.zig", "fn flushFrame() void {\n    std.debug.print(\"x\", .{});\n}\n")
+            write(root, "apps/cli/src/repl/tui/render_region.zig", "fn flushFrame() void {\n    std.debug.print(\"x\", .{});\n}\n")
             stale = stale_allowances(root)
-            self.assertIn("src/repl/tui/render_region.zig:flush", stale)
-            self.assertIn("src/repl/tui/render_region.zig:resetScreenInFrame", stale)
-            self.assertIn("src/repl/headless.zig:*", stale)
+            self.assertIn("apps/cli/src/repl/tui/render_region.zig:flush", stale)
+            self.assertIn("apps/cli/src/repl/tui/render_region.zig:resetScreenInFrame", stale)
+            self.assertIn("apps/cli/src/repl/headless.zig:*", stale)
 
     def test_missing_scope_is_an_error_not_an_empty_scan(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -98,18 +98,7 @@
         },
         .{
             .name = "cli",
-            .paths = .{
-                "src/repl/",
-                "src/web/",
-                "src/daemon/",
-                "src/app/",
-                "src/main.zig",
-                "src/app.zig",
-                "src/session_service.zig",
-                "src/session_intent.zig",
-                "src/install_root.zig",
-                "src/picker_test_root.zig",
-            },
+            .paths = .{"apps/cli/"},
             .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore" },
         },
         .{

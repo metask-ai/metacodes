@@ -895,7 +895,7 @@ pub const App = struct {
             .cron_registry = CronRegistry.init(allocator),
             .model_context = @import("metacodes-internal").api.model_context.ModelContext.init(allocator),
         };
-        // The CLI resolves the state root (src/main.zig) and passes it in. An App
+        // The CLI resolves the state root (apps/cli/src/main.zig) and passes it in. An App
         // built without one keeps the historical `$HOME/.metacodes`.
         if (app.config.state_root.len == 0) if (platform_paths.homeDir()) |home| {
             app.state_root_default = try @import("metacodes-internal").util.state_root.legacyDefault(allocator, home);

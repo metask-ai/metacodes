@@ -457,9 +457,9 @@ share a key:
 Named selections are kept beside them (#489): `presets` maps a name to a
 selection in the `global_selection` shape, and `directory_presets` maps an
 absolute directory to a preset name, never to a route. A start applies at most
-one, chosen by `src/app/startup_order.zig` (`--preset`/`METACODES_PRESET`, then
+one, chosen by `apps/cli/src/app/startup_order.zig` (`--preset`/`METACODES_PRESET`, then
 the working directory's), by lowering it into the fields the flags naming the
-same route would set (`src/app/presets.zig`); nothing is persisted by using
+same route would set (`apps/cli/src/app/presets.zig`); nothing is persisted by using
 one. A preset written by hand is written back as it was by every other commit
 (`config_doc.Preset.raw`). `"global_default": false` keeps the global selection,
 a Metask sign-in and `.env`'s choice from deciding for any directory: a start
@@ -855,7 +855,7 @@ A `global` commit therefore reports `requires_persist`; the embedder writes it
 and feeds the resulting revision back.
 
 The order-preserving merge (`src/util/json_merge.zig`) also fixed a pre-existing
-data-loss bug: `src/app/config.zig`'s writer serialized only its own five fields
+data-loss bug: `apps/cli/src/app/config.zig`'s writer serialized only its own five fields
 and therefore deleted `theme`, `mcp_servers`, `permission_rules`, and
 `model_tiers` on every theme change. It now merges, and refuses to overwrite a
 document it cannot parse.
@@ -969,7 +969,7 @@ than being re-checked at three call sites. For a provider defined in
 its `providers.<id>` left the definition in the file, and the provider came
 back at the next start.
 
-`metacodes providers add|probe|list|remove` (`src/app/providers_cli.zig`;
+`metacodes providers add|probe|list|remove` (`apps/cli/src/app/providers_cli.zig`;
 the user's guide is [PROVIDERS.md](PROVIDERS.md#a-model-api-of-your-own))
 writes and reads the same section without hand-written JSON:
 
@@ -1220,7 +1220,7 @@ protocols, and accounts, so a name-only broadcast announces a change an
 out-of-process client cannot tell apart from another. The credential reference
 travels; the secret never does.
 
-`src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
+`apps/cli/src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
 drawing, and `picker_host.zig` performs the commit against the session.
 `zig build test:picker` compiles the first two from a root that reaches the
 provider kernel and the terminal theme and nothing else — the mirror of
@@ -1305,7 +1305,7 @@ session from then on.
 | `src/provider/registry.zig` | the extension point + offer catalog |
 | `src/provider/selection.zig` | `RuntimeSelection`, `RoutePolicy`, resolution, legacy migration |
 | `src/provider/alias.zig` | pinned/floating alias resolution |
-| `src/app/route_strings.zig` | one-generation retention of the live route's strings |
+| `apps/cli/src/app/route_strings.zig` | one-generation retention of the live route's strings |
 | `src/provider/config_doc.zig` | versioned document model and serialization |
 | `src/provider/config_store.zig` | atomic, revisioned, idempotent writer |
 | `src/provider/control_plane.zig` | UI-independent kernel API and event journal |
@@ -1315,7 +1315,7 @@ session from then on.
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization; rendering and patching a definition |
 | `src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
 | `src/api/model_probe.zig` | the model-listing GET (`providers probe`, `add --probe`) |
-| `src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`); the removal `/providers remove` shares |
+| `apps/cli/src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`); the removal `/providers remove` shares |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, router entries, preferences → `RoutePolicy`, router metadata |
 | `src/provider/profiles/openrouter.zig` | the built-in OpenRouter: the `auto` router channel, the key grant, the key page |
 | `src/api/openrouter_login.zig` | OpenRouter's key grant: browser and other-device ways, the exchange, the key description, the manage page |
@@ -1337,9 +1337,9 @@ session from then on.
 | `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
 | `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
-| `src/repl/model_picker.zig` | picker state machine (pure) |
-| `src/repl/model_picker_view.zig` | picker rendering |
-| `src/repl/picker_host.zig` | commit + rebind against the session |
+| `apps/cli/src/repl/model_picker.zig` | picker state machine (pure) |
+| `apps/cli/src/repl/model_picker_view.zig` | picker rendering |
+| `apps/cli/src/repl/picker_host.zig` | commit + rebind against the session |
 | `src/api/auth_header.zig` | transport-side auth materialization |
 | `src/util/json_merge.zig` | order-preserving JSON object merge |
 | `src/util/json.zig` | canonical JSON string escaping and UTF-8 repair |

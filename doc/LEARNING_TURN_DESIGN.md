@@ -5,8 +5,8 @@ Status: all eight steps of §11 implemented 2026-10-17. The in-run path
 `src/core/agent_loop.zig`, `src/tools/kg_tools.zig` and
 `src/kg/scoped_recall.zig`; the end-of-run form in
 `src/core/learning_end_of_run.zig` and `src/core/host_check.zig`; the flags
-in `src/main.zig` (`resolveLearningTurn`), `src/repl/loop.zig` and
-`src/repl/headless.zig`; the proofs in
+in `apps/cli/src/main.zig` (`resolveLearningTurn`), `apps/cli/src/repl/loop.zig` and
+`apps/cli/src/repl/headless.zig`; the proofs in
 `control-plane/lean/MetaCodesControl/LearningTurn.lean`; the protocol in
 [learning-turn-v1.md](../evals/experiments/learning-turn-v1.md), not yet run.
 Tests: `tests/component/learning_turn_test.zig` and
@@ -439,7 +439,7 @@ negative result for the design, not a partial success.
 | 3. **Done** (without the memory-section change, §12). `lesson` envelope and acceptance on the `KgRemember` path | `src/tools/kg_tools.zig` | component test: an accepted envelope is stored with schema type `lesson` and recalled by its marker; a refused one is not stored |
 | 4. **Done.** Same-task lesson section in the outcome note | `src/kg/scoped_recall.zig` | injection test: newest 3 unsuperseded lessons, 320-byte bodies, byte-identical note when no lesson exists |
 | 5. **Done.** End-of-run form | `src/core/host_check.zig`, `src/core/self_evolution.zig` | headless test: `METACODES_LEARNING_TURN=enforce` with a pinned failing check → one provider request → ≥ 1 `remember` call; caps honoured |
-| 6. **Done** (no `doctor` line, §12). Flags, parse errors, `doctor` line | `src/main.zig` | CLI tests like `--check-gate` without `--host-check` |
+| 6. **Done** (no `doctor` line, §12). Flags, parse errors, `doctor` line | `apps/cli/src/main.zig` | CLI tests like `--check-gate` without `--host-check` |
 | 7. **Done.** `LearningTurn.lean`; trace validation; CHANGELOG | `control-plane/lean/...`, `scripts/eval/workbuddy/trace.py` | `zig build test` with the kernel; `trace.py` fixtures |
 | 8. **Done** (not run). Pre-registered experiment file | `evals/experiments/learning-turn-v1.md` | the protocol of §9 |
 

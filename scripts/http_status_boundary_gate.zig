@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     defer root.close(init.io);
 
     var violations: usize = 0;
-    inline for (.{ "src", "tests" }) |name| {
+    inline for (.{ "src", "apps", "tests" }) |name| {
         var child = try root.openDir(init.io, name, .{
             .iterate = true,
             .follow_symlinks = false,
