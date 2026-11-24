@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const LineEditor = @import("input.zig").LineEditor;
 
 /// 触发外部存储的阈值：行数 > 此值 或 字节数 > 此值。
 /// 真 cc v2.1.172 实测(record_input_behavior.py threshold.txt):≤3 行内联,≥4 行转占位符
@@ -119,6 +120,45 @@ pub fn expandPlaceholders(allocator: std.mem.Allocator, state_root: []const u8, 
     }
     return try out.toOwnedSlice(allocator);
 }
+
+/// 插入一段粘贴的文字:小粘贴内联;大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
+pub fn insert(
+    editor: *LineEditor,
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    text: []const u8,
+) !void {
+    if (text.len == 0) return;
+
+    if (isLarge(text)) {
+        if (state_root.len > 0) {
+            g_paste_id += 1;
+            if (store(allocator, state_root, g_paste_id, text) catch null) |placeholder| {
+                defer allocator.free(placeholder);
+                try insertAtCursor(editor, allocator, placeholder);
+                return;
+            }
+        }
+        // store 失败 / 无 HOME → 退回内联
+    }
+    try insertAtCursor(editor, allocator, text);
+}
+
+/// 在光标处插入一段文本，光标移到插入末尾。
+fn insertAtCursor(editor: *LineEditor, allocator: std.mem.Allocator, text: []const u8) !void {
+    const line = editor.view();
+    var nl = std.ArrayList(u8).empty;
+    defer nl.deinit(allocator);
+    try nl.appendSlice(allocator, line[0..editor.cursor]);
+    try nl.appendSlice(allocator, text);
+    try nl.appendSlice(allocator, line[editor.cursor..]);
+    const new_cursor = editor.cursor + text.len;
+    try editor.setLine(nl.items);
+    editor.cursor = new_cursor;
+}
+
+/// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
+var g_paste_id: usize = 0;
 
 // ============================================================================
 // Tests

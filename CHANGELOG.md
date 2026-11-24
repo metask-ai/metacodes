@@ -312,6 +312,32 @@ status, compatibility boundaries, and entry points are defined by
   levels and can be turned off now sends `disabled` as well. A model with a
   single choice is no longer asked for one.
 
+- **Closing the terminal or `kill` ends an idle metacodes at once** (#758).
+  SIGHUP and SIGTERM were acted on only at a turn boundary, so while the
+  prompt waited for input the process lived on until the 45-second fallback
+  alarm ended it, without the normal shutdown. The prompt now checks for them
+  while it waits and leaves the normal way within a fraction of a second,
+  with the resume hint where the terminal is still open.
+
+- **`\` then Enter starts a new line while the model answers** (#757). At
+  the prompt a `\` at the end of a line followed by Enter is a newline, the
+  way Apple Terminal users start one; during a reply Enter queued the draft
+  with the `\` still in it. It is a newline there as well now.
+
+- **What you type while the model answers is still in the box when it ends**
+  (#756). Text typed into the input box during a reply and not sent was
+  dropped when the reply ended, and the prompt came back empty. It now stays,
+  with the cursor where it was, also through the reply to a message queued
+  before it.
+
+- **A paste while the model answers stays whole in the input box** (#755).
+  During a reply each line break of a pasted text acted as Enter: the first
+  line was queued on its own and sent as soon as the reply ended, and the
+  rest stayed in the box. The paste now goes into the box whole, line breaks
+  included, as at the prompt; a paste of more than three lines or 1,600 bytes
+  is held as `[Pasted text #N +M lines]` there too, and the model gets the
+  whole text when it is sent.
+
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
   8 s before the write and 6 s after it, so a server that answered
