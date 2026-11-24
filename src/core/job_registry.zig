@@ -251,32 +251,41 @@ pub const JobRegistry = struct {
     }
 
     pub fn spawnMonitorOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, description: []const u8, timeout_ms: ?u64) !JobEntry {
+        if (timeout_ms != null) try self.ensureSweeper();
         const owned_description = try self.allocator.dupe(u8, description);
         errdefer self.allocator.free(owned_description);
         const entry = try self.spawn(command, cwd, .background, owner, true, .{ .monitor = monitor_stream.State.init(owned_description, timeout_ms, util_time.nowMs()) });
-        if (timeout_ms != null) self.startSweeper();
+        if (timeout_ms != null) self.wakeSweeper();
         return entry;
     }
 
     const SWEEP_MAX_WAIT_MS: u64 = 250;
     const STOP_WAIT_SLICE_MS: u64 = 10;
 
-    fn startSweeper(self: *JobRegistry) void {
+    pub var fail_sweeper_spawn_in_tests: bool = false;
+
+    fn ensureSweeper(self: *JobRegistry) !void {
         self.lock();
         defer self.unlock();
-        if (self.sweeper != null) {
-            self.sweeper_wake.signal();
-            return;
-        }
-        self.sweeper = platform_thread.spawn(.waiter, sweepDeadlines, .{self}) catch |err| blk: {
-            log.warn("job", "monitor sweeper not started ({s}); timeouts are enforced when events are collected", .{@errorName(err)});
-            break :blk null;
-        };
+        if (self.sweeper != null) return;
+        if (@import("builtin").is_test and fail_sweeper_spawn_in_tests) return error.SystemResources;
+        self.sweeper = try platform_thread.spawn(.waiter, sweepDeadlines, .{self});
+    }
+
+    fn wakeSweeper(self: *JobRegistry) void {
+        self.lock();
+        defer self.unlock();
+        if (self.sweeper != null) self.sweeper_wake.signal();
     }
 
     fn sweepDeadlines(self: *JobRegistry) void {
+        var steps: std.ArrayList(ExpiryStep) = .empty;
+        defer steps.deinit(self.allocator);
         while (true) {
-            _ = self.advanceExpiry(null, util_time.nowMs());
+            steps.clearRetainingCapacity();
+            self.claimExpired(null, util_time.nowMs(), &steps);
+            self.sendTerm(steps.items);
+            self.killDue(util_time.nowMs());
             self.lock();
             defer self.unlock();
             if (self.sweeper_quit) return;
@@ -292,7 +301,7 @@ pub const JobRegistry = struct {
     fn nextExpiryWaitLocked(self: *JobRegistry, now_ms: util_time.Millis) ?u64 {
         var next: ?util_time.Millis = null;
         for (self.jobs.items) |*entry| {
-            const due = expiryStepDue(entry, null) orelse continue;
+            const due = expiryStepDue(entry) orelse continue;
             next = if (next) |n| @min(n, due) else due;
         }
         const due = next orelse return null;
@@ -300,64 +309,109 @@ pub const JobRegistry = struct {
         return @min(@as(u64, @intCast(due - now_ms)), SWEEP_MAX_WAIT_MS);
     }
 
-    fn expiryStepDue(entry: *const JobEntry, owner: ?SessionId) ?util_time.Millis {
+    fn expiryStepDue(entry: *const JobEntry) ?util_time.Millis {
         const state = switch (entry.kind) {
             .plain => return null,
             .monitor => |*state| state,
         };
         if (entry.status != .running) return null;
-        if (owner) |o| if (!std.mem.eql(u8, &entry.owner.bytes, &o.bytes)) return null;
         if (state.kill_at_ms) |kill_at| return kill_at;
-        if (entry.stop_in_progress or state.stop != null) return null;
+        return expiryDeadline(entry);
+    }
+
+    fn expiryDeadline(entry: *const JobEntry) ?util_time.Millis {
+        const state = switch (entry.kind) {
+            .plain => return null,
+            .monitor => |*state| state,
+        };
+        if (entry.status != .running or entry.stop_in_progress or state.stop != null) return null;
         const limit = state.timeout_ms orelse return null;
         return entry.started_ms + @as(util_time.Millis, @intCast(limit));
     }
 
     const ExpiryStep = struct { id: [12]u8, proc: process.ProcHandle };
 
-    fn advanceExpiry(self: *JobRegistry, owner: ?SessionId, now_ms: util_time.Millis) bool {
-        var to_terminate: std.ArrayList(ExpiryStep) = .empty;
-        defer to_terminate.deinit(self.allocator);
+    fn claimExpired(self: *JobRegistry, owner: ?SessionId, now_ms: util_time.Millis, steps: *std.ArrayList(ExpiryStep)) void {
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+        for (self.jobs.items) |*entry| {
+            if (owner) |o| if (!std.mem.eql(u8, &entry.owner.bytes, &o.bytes)) continue;
+            const deadline = expiryDeadline(entry) orelse continue;
+            if (deadline > now_ms) continue;
+            steps.append(self.allocator, .{ .id = entry.id, .proc = entry.proc }) catch break;
+            entry.stop_in_progress = true;
+            entry.kind.monitor.stop = .expired;
+            log.info("job", "monitor timeout reached id={s}", .{entry.id[0..]});
+        }
+    }
+
+    fn sendTerm(self: *JobRegistry, steps: []const ExpiryStep) void {
+        for (steps) |step| {
+            process.terminate(step.proc);
+            const kill_at = util_time.nowMs() + @as(util_time.Millis, @intCast(process.KILL_GRACE_MS));
+            self.lock();
+            defer self.unlock();
+            const entry = self.getPtrLocked(step.id[0..]) orelse continue;
+            entry.kind.monitor.kill_at_ms = kill_at;
+            if (self.sweeper != null) self.sweeper_wake.signal();
+        }
+    }
+
+    fn killDue(self: *JobRegistry, now_ms: util_time.Millis) void {
         var to_kill: std.ArrayList(ExpiryStep) = .empty;
         defer to_kill.deinit(self.allocator);
         self.lock();
-        self.reapExitedLocked();
         for (self.jobs.items) |*entry| {
-            const due = expiryStepDue(entry, owner) orelse continue;
-            if (due > now_ms) continue;
-            const state = &entry.kind.monitor;
-            const step: ExpiryStep = .{ .id = entry.id, .proc = entry.proc };
-            if (state.kill_at_ms != null) {
-                to_kill.append(self.allocator, step) catch break;
-                state.kill_at_ms = null;
-            } else {
-                to_terminate.append(self.allocator, step) catch break;
-                entry.stop_in_progress = true;
-                state.stop = .expired;
-                state.kill_at_ms = now_ms + @as(util_time.Millis, @intCast(process.KILL_GRACE_MS));
-                log.info("job", "monitor timeout reached id={s}", .{entry.id[0..]});
-            }
+            const state = switch (entry.kind) {
+                .plain => continue,
+                .monitor => |*state| state,
+            };
+            const kill_at = state.kill_at_ms orelse continue;
+            if (kill_at > now_ms) continue;
+            to_kill.append(self.allocator, .{ .id = entry.id, .proc = entry.proc }) catch break;
+            state.kill_at_ms = null;
         }
         self.unlock();
-        for (to_terminate.items) |step| process.terminate(step.proc);
-        for (to_kill.items) |step| process.forceKill(step.proc);
-        for (to_kill.items) |step| process.reapBlocking(step.proc);
-        if (to_kill.items.len > 0) {
-            self.lock();
-            defer self.unlock();
-            for (to_kill.items) |step| self.commitStoppedLocked(step.id[0..]);
+        self.forceKillAndReap(to_kill.items);
+    }
+
+    fn killScheduled(self: *JobRegistry, steps: []const ExpiryStep) void {
+        var to_kill: std.ArrayList(ExpiryStep) = .empty;
+        defer to_kill.deinit(self.allocator);
+        self.lock();
+        for (steps) |step| {
+            const entry = self.getPtrLocked(step.id[0..]) orelse continue;
+            const state = &entry.kind.monitor;
+            if (state.kill_at_ms == null) continue;
+            to_kill.append(self.allocator, step) catch break;
+            state.kill_at_ms = null;
         }
-        return to_terminate.items.len > 0;
+        self.unlock();
+        self.forceKillAndReap(to_kill.items);
+    }
+
+    fn forceKillAndReap(self: *JobRegistry, steps: []const ExpiryStep) void {
+        if (steps.len == 0) return;
+        for (steps) |step| process.forceKill(step.proc);
+        for (steps) |step| process.reapBlocking(step.proc);
+        self.lock();
+        defer self.unlock();
+        for (steps) |step| self.commitStoppedLocked(step.id[0..]);
+    }
+
+    fn stopWithGrace(self: *JobRegistry, steps: []const ExpiryStep) void {
+        if (steps.len == 0) return;
+        self.sendTerm(steps);
+        util_time.sleepMs(process.KILL_GRACE_MS);
+        self.killScheduled(steps);
     }
 
     fn stopExpired(self: *JobRegistry, owner: SessionId, now_ms: util_time.Millis) void {
-        if (!self.advanceExpiry(owner, now_ms)) return;
-        self.finishGrace(owner, now_ms);
-    }
-
-    fn finishGrace(self: *JobRegistry, owner: SessionId, now_ms: util_time.Millis) void {
-        util_time.sleepMs(process.KILL_GRACE_MS);
-        _ = self.advanceExpiry(owner, now_ms + @as(util_time.Millis, @intCast(process.KILL_GRACE_MS)));
+        var steps: std.ArrayList(ExpiryStep) = .empty;
+        defer steps.deinit(self.allocator);
+        self.claimExpired(owner, now_ms, &steps);
+        self.stopWithGrace(steps.items);
     }
 
     fn commitStoppedLocked(self: *JobRegistry, id: []const u8) void {
@@ -738,21 +792,18 @@ pub const JobRegistry = struct {
         defer flooding.deinit(allocator);
         try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
         if (flooding.items.len > 0) {
-            var to_terminate = std.ArrayList(ExpiryStep).empty;
-            defer to_terminate.deinit(allocator);
-            try to_terminate.ensureTotalCapacity(allocator, flooding.items.len);
+            var to_stop = std.ArrayList(ExpiryStep).empty;
+            defer to_stop.deinit(allocator);
+            try to_stop.ensureTotalCapacity(allocator, flooding.items.len);
             self.lock();
             for (flooding.items) |id| {
                 const entry = self.getPtrLocked(id[0..]) orelse continue;
                 if (entry.status != .running or entry.stop_in_progress) continue;
                 entry.stop_in_progress = true;
-                entry.kind.monitor.kill_at_ms = now + @as(util_time.Millis, @intCast(process.KILL_GRACE_MS));
-                to_terminate.appendAssumeCapacity(.{ .id = entry.id, .proc = entry.proc });
+                to_stop.appendAssumeCapacity(.{ .id = entry.id, .proc = entry.proc });
             }
-            if (self.sweeper != null) self.sweeper_wake.signal();
             self.unlock();
-            for (to_terminate.items) |step| process.terminate(step.proc);
-            if (to_terminate.items.len > 0) self.finishGrace(owner, now);
+            self.stopWithGrace(to_stop.items);
             try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
         }
         return try notices.toOwnedSlice(allocator);
@@ -1588,4 +1639,53 @@ test "an expired monitor's worker that ignores TERM does not outlive the grace p
     defer monitor_stream.freeNotices(a, notices);
     try std.testing.expectEqual(@as(usize, 1), notices.len);
     try std.testing.expectEqual(@as(?monitor_stream.End, .{ .expired = .{ .after_ms = 1_000, .events_delivered = 0 } }), notices[0].end);
+}
+
+test "a flooding monitor stopped in the same take as an expiry gets TERM before KILL" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const termed = try std.fmt.allocPrintSentinel(a, "{s}/termed", .{root}, 0);
+    defer a.free(termed);
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const expiring = try r.spawnMonitorOwned("sleep 30", root, owner, "expiring", 60_000);
+    const flooding = try r.spawnMonitorOwned("trap 'touch termed; exit 0' TERM; while :; do echo spam; sleep 0.01; done", root, owner, "flooding", null);
+    try waitForStdout(&r, flooding.idSlice());
+    const now = util_time.nowMs();
+    {
+        r.lock();
+        defer r.unlock();
+        r.jobs.items[monitorIndex(&r, expiring.idSlice())].started_ms = now - 60_000;
+        const state = &r.jobs.items[monitorIndex(&r, flooding.idSlice())].kind.monitor;
+        state.tokens = 0;
+        state.refilled_ms = std.math.maxInt(i64) / 2;
+        state.over_budget_since_ms = now - monitor_stream.OVER_BUDGET_STOP_MS;
+    }
+    var saw_expired = false;
+    var saw_flood_stop = false;
+    var takes: usize = 0;
+    while (takes < 20 and !(saw_expired and saw_flood_stop)) : (takes += 1) {
+        const notices = try r.takeMonitorEvents(owner, a, if (takes == 0) now else util_time.nowMs());
+        defer monitor_stream.freeNotices(a, notices);
+        for (notices) |notice| {
+            const end = notice.end orelse continue;
+            if (std.mem.eql(u8, &notice.id, &expiring.id)) saw_expired = end == .expired;
+            if (std.mem.eql(u8, &notice.id, &flooding.id)) saw_flood_stop = end == .too_much_output;
+        }
+        if (!(saw_expired and saw_flood_stop)) util_time.sleepMs(50);
+    }
+    try std.testing.expect(pfs.exists(termed));
+    try std.testing.expect(saw_expired);
+    try std.testing.expect(saw_flood_stop);
+    for ([_][12]u8{ expiring.id, flooding.id }) |id| {
+        const entry = r.get(id[0..]).?;
+        try std.testing.expect(entry.status != .running);
+        try std.testing.expect(!entry.stop_in_progress);
+        try std.testing.expectEqual(@as(?util_time.Millis, null), entry.kind.monitor.kill_at_ms);
+    }
 }

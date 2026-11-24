@@ -3906,6 +3906,7 @@ metacodes-core.job_registry.JobRegistry.promoteToBackground: fn promoteToBackgro
 metacodes-core.job_registry.JobRegistry.spawnBackground: fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackgroundOwned: fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnMonitorOwned: fn spawnMonitorOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, description: []const u8, timeout_ms: ?u64) !JobEntry
+metacodes-core.job_registry.JobRegistry.fail_sweeper_spawn_in_tests: var bool = false
 metacodes-core.job_registry.JobRegistry.spawnSynchronous: fn spawnSynchronous(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnSynchronousOwned: fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
 metacodes-core.job_registry.JobRegistry.runningCount: fn runningCount(self: *JobRegistry) usize

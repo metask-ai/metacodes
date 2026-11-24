@@ -381,3 +381,31 @@ test "Monitor with monitor_events: persistent monitors report no timeout" {
     const job_id = common.extractJsonArg(out, "job_id") orelse return error.MissingJobId;
     try testing.expectEqual(@as(?u64, null), (jobs.get(job_id) orelse return error.JobNotFound).kind.monitor.timeout_ms);
 }
+
+test "Monitor with monitor_events: a timed monitor whose timer cannot start is not spawned" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    const marker = try std.fmt.allocPrintSentinel(a, "{s}/ran", .{root}, 0);
+    defer a.free(marker);
+    var jobs = try JobRegistry.init(a);
+    defer jobs.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.jobs = &jobs;
+    ctx.preview = .{ .monitor_events = true };
+    ctx.cwd_abs = root;
+
+    JobRegistry.fail_sweeper_spawn_in_tests = true;
+    defer JobRegistry.fail_sweeper_spawn_in_tests = false;
+    const out = try execute(&ctx, "{\"command\":\"touch ran\",\"description\":\"timed\",\"timeout_ms\":5000}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"error\":\"spawn_failed\"") != null);
+    try testing.expect(common.extractJsonArg(out, "job_id") == null);
+    try testing.expectEqual(@as(usize, 0), jobs.jobs.items.len);
+    @import("../util/time.zig").sleepMs(300);
+    try testing.expect(!@import("platform").fs.exists(marker));
+}
