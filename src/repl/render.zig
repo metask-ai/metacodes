@@ -805,7 +805,9 @@ fn wrapCell(rendered: []const u8, width: usize, allocator: std.mem.Allocator) !s
 
     const flushLine = struct {
         fn f(ls: *std.ArrayList([]u8), c: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-            try ls.append(a, try a.dupe(u8, c.items));
+            const line = try a.dupe(u8, c.items);
+            errdefer a.free(line);
+            try ls.append(a, line);
             c.clearRetainingCapacity();
         }
     }.f;
@@ -869,8 +871,8 @@ fn wrapCell(rendered: []const u8, width: usize, allocator: std.mem.Allocator) !s
         i = end;
     }
     // 收尾:落最后的 word。
-    if (word_w > 0) {
-        if (cur_w + word_w > width and cur_w > 0) {
+    if (word.items.len > 0) {
+        if (word_w > 0 and cur_w + word_w > width and cur_w > 0) {
             try flushLine(&lines, &cur, allocator);
             cur_w = 0;
         }
@@ -899,8 +901,9 @@ fn carryStylesAcrossLines(lines: [][]u8, allocator: std.mem.Allocator) !void {
             i = next;
         }
         try carried.appendSuspend(&fixed, allocator);
+        const replacement = try fixed.toOwnedSlice(allocator);
         allocator.free(line.*);
-        line.* = try fixed.toOwnedSlice(allocator);
+        line.* = replacement;
     }
 }
 
@@ -1512,6 +1515,31 @@ test "a link label wrapped inside a table cell stays inside its cell" {
         if (std.mem.indexOf(u8, line, ansi.hyperlink.open_prefix ++ "file:///tmp/notes.txt") != null) opens += 1;
     }
     try testing.expect(opens >= 2);
+}
+
+test "a link label ending in a space closes before the next cell of a one-line row" {
+    const rows = [_][]const u8{
+        "| file | note |",
+        "|---|---|",
+        "| [笔记 ](/tmp/n.md) | 普通文本 |",
+    };
+    const out = try renderTable(&rows, 80, testing.allocator);
+    defer testing.allocator.free(out);
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| try testing.expect(!styledAtBorder(line));
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.close) != null);
+}
+
+test "wrapCell frees every line exactly once when an allocation fails" {
+    const out = try renderToOwned("[a long link label here](/tmp/notes.txt)", testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.checkAllAllocationFailures(testing.allocator, wrapCellAndFree, .{ out, 6 });
+}
+
+fn wrapCellAndFree(allocator: std.mem.Allocator, rendered: []const u8, width: usize) !void {
+    var lines = try wrapCell(rendered, width, allocator);
+    for (lines.items) |l| allocator.free(l);
+    lines.deinit(allocator);
 }
 
 test "table column width counts a link by its label, not its path" {
