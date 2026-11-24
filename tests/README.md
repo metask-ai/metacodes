@@ -100,24 +100,30 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 | 契约面 | 快照 | 怎么得到 |
 |---|---|---|
 | AgentCore C ABI | `abi/agentcore_h.txt`、`abi/exports.txt` | translate-c 后的 `agentcore.h`:每个 struct 的大小、对齐、字段偏移和大小,函数和函数指针签名,常量(含 `METASK_AGENTCORE_ABI_REVISION`),头文件 sha256;共享库实际导出的符号 |
-| Zig 源码 API | `zig_api/metacodes-core.txt` | 从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;超过 600 字节的值记长度和摘要 |
-| 发给模型的请求 | `scenarios/<场景>/expected/request-NNN.txt` | 已安装的 CLI 用 `-p` 跑场景,回放 mock provider 收到的请求头和完整请求体 |
-| 事件流 | `scenarios/<场景>/expected/stream.jsonl`、`process.txt` | 同一次运行的 `--json --stream-json` 输出、退出码、stderr |
+| AgentCore 运行与 checkpoint | `scenarios/abi_session/expected/*` | 用 `std.DynLib` 加载发布的共享库,经 `sdk/zig` 跑一次带工具的 Run,记 CoreEvent 和请求;再把检入的 `scenarios/abi_session/checkpoint.bin` 恢复成新 Session 并跑一次,记恢复报告、CoreEvent 和请求 |
+| Zig 源码 API | `zig_api/metacodes-core.txt` | 从 `src/lib.zig` 沿 `@import` 走源码,列出每个 pub 名字、签名、字段;别名记录目标函数的原型或目标常量的值;超过 600 字节的值记长度和摘要 |
+| 发给模型的请求 | `scenarios/<场景>/expected/request-NNN.txt` | 已安装的 CLI 跑场景,回放 mock provider 收到的请求头和完整请求体 |
+| 事件流 | `scenarios/<场景>/expected/stream.jsonl`、`process.txt` | 同一次运行的 `--json --stream-json` 输出、退出码、stderr;`tool_result` 的 `content_bytes` 先和原始内容的长度核对 |
+| `serve` 和 `--web` | `scenarios/daemon_session/expected/{serve,web}/*` | 启动 `serve --uds` 和 `--web`,经 UDS attach 和 `GET /events` 读一次 Run 的 journal 行,以及这次 Run 的请求 |
+| KG 注入 | `scenarios/kg_injection/expected/*` | 用 staged TinyKG,第一次运行经 KgRemember 记一条记忆,第二次运行的请求里带上注入的 Knowledge Graph 段;测试结束停掉自己的 tinykgd |
 | 落盘格式(写) | `scenarios/<场景>/expected/session-N/*`、`state-files.txt` | 运行后的 transcript.jsonl、meta.json 和 state 目录文件清单 |
 | 落盘格式(读) | `state_fixture/read-back.txt` | 检入的旧 session(`state_fixture/projects/PROJECT/`)用当前代码读回,再序列化 |
 | CLI 外观 | `cli/*.txt` | `--help`、子命令 help、主要错误路径的退出码和输出 |
 
-场景:`single_turn`、`tool_multi_turn`(Read 后 Write)、`parallel_tools`(一轮两个 Read)、
-`permission_denied`(无人确认时 Bash 被拒)、`subagent`(Task 派 Explore)、`mcp_tool`
+`-p` 场景:`single_turn`、`tool_multi_turn`(Read 后 Write)、`parallel_tools`(一轮两个 Read)、
+`permission_denied`(无人确认时 Write 被拒、规则禁止 Bash)、`subagent`(Task 派 Explore)、`mcp_tool`
 (stdio mock MCP 的 echo)、`skill_activation`(项目 skill)、`compaction`(强制自动压缩)。
 每个场景目录里放输入:`sse-NNN.txt` 是 provider 依次回的 SSE,`work/` 复制到工作目录,
-`state/` 复制到 state 目录(其中 `<MOCK_MCP>` 换成 mock MCP 的路径)。
+`state/` 复制到 state 目录(其中 `<MOCK_MCP>` 换成 mock MCP 的路径)。CLI 在 `/tmp` 下的
+工作目录里用 `env -i` 跑,`TZ=UTC`;测试进程本身也设 `TZ=UTC`、`SHELL=/bin/sh`。
 
 不稳定的值按 `tests/contract/normalize.zig` 的规则换成占位符,规则的自测在 `test:units`:
-临时根目录 → `<ROOT>`,CLI、mock MCP 路径 → `<CLI>`、`<MOCK_MCP>`,mock provider 的
-地址 → `<PROVIDER>`,版本号 → `<VERSION>`;日期、时间戳 → `<DATE>`、`<TIMESTAMP>`;
-`Platform:`、`OS Version:`、`Time zone:` 后面的值;键名以 `_ms`、`_ns`、`_at`、`_unix`、
-`Nano` 结尾的数字 → `<N>`;UUID → `<UUID>`;16 位以上含数字的十六进制串 → `<HEXn>`(`offer-` 后面的 offer id 是固定的,保留)。
+临时根目录 → `<ROOT>`,CLI、mock MCP、TinyKG 路径 → `<CLI>`、`<MOCK_MCP>`、`<TINYKG>`、
+`<TINYKGD>`,mock provider 的地址 → `<PROVIDER>`,版本号 → `<VERSION>`;今天的日期 → `<DATE>`,
+日期加时间 → `<TIMESTAMP>`;本机的 `Platform: <值>`、`OS Version: <uname>` 只换这个值本身,
+后面的字节保留;键名以 `_ms`、`_ns`、`_at`、`_unix`、`Nano` 结尾的数字和 `content_bytes`
+→ `<N>`;`trace_id` 的字符串值 → `<ID>`;UUID → `<UUID>`;16 位以上含数字的十六进制串 →
+`<HEXn>`(`offer-` 后面的 offer id 是固定的,保留)。
 请求体在每个 `{`、`[`、`,` 之后和字符串里每个 `\n` 转义之后断行,去掉所有换行就是原始字节。
 
 改动确实要改变契约时,显式更新快照,并把快照的 diff 和代码放进同一个 PR:
@@ -126,7 +132,9 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 zig build test:contract -Dupdate-contract
 ```
 
-`src/lib.zig` 的 API 快照只读源码,也在 `gate:static` 和 `test:units` 里跑。
+`-Dupdate-contract` 不会重写 `checkpoint.bin` 和 `state_fixture/` 这类旧数据 fixture:它们
+代表旧版本写下的数据,新代码要能读。`src/lib.zig` 的 API 快照只读源码,也在 `gate:static`
+和 `test:units` 里跑。
 
 ## 已知执行覆盖缺口(登记非沉默)
 

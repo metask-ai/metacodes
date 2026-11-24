@@ -1,5 +1,5 @@
 metacodes-core: file
-metacodes-core.VERSION: const = @import("version.zig").semver
+metacodes-core.VERSION: const = "<VERSION>"
 metacodes-core.util_fs: file
 metacodes-core.util_fs.MkdirError: const = error{ PathTooLong, MkdirFailed, }
 metacodes-core.util_fs.mkdirParents: fn mkdirParents(dir: []const u8) MkdirError!void
@@ -555,8 +555,8 @@ metacodes-core.agent_session.HostResultSink: struct
 metacodes-core.agent_session.HostResultSink.ctx: *anyopaque
 metacodes-core.agent_session.HostResultSink.writeFn: *const fn (ctx: *anyopaque, bytes: []const u8) HostResultSinkError!void
 metacodes-core.agent_session.HostResultSink.write: fn write(self: *const HostResultSink, bytes: []const u8) HostResultSinkError!void
-metacodes-core.agent_session.HostResultSinkError: const = tool_catalog.HostResultSinkError
-metacodes-core.agent_session.HostStreamExecuteError: const = tool_catalog.HostStreamExecuteError
+metacodes-core.agent_session.HostResultSinkError: const = error{ Aborted, ArtifactTooLarge, ArtifactSinkFailed, ArtifactSinkClosed, }
+metacodes-core.agent_session.HostStreamExecuteError: const = error{ OutOfMemory, Aborted, ArtifactTooLarge, ArtifactSinkFailed, ArtifactSinkClosed, }
 metacodes-core.agent_session.HostStreamMediaType: enum
 metacodes-core.agent_session.HostStreamMediaType.text_utf8
 metacodes-core.agent_session.HostStreamMediaType.json
@@ -946,9 +946,9 @@ metacodes-core.workspace_policy.freeDirs: fn freeDirs(allocator: std.mem.Allocat
 metacodes-core.conversation: file
 metacodes-core.conversation.TOOL_RESULT_CLEARED_STUB: const = "[tool result cleared to save context]"
 metacodes-core.conversation.TOOL_RESULT_COMMITMENT_PREFIX: const = "[tool-result-commitment "
-metacodes-core.conversation.TOOL_RESULT_CONTEXT_MIN_BYTES: const = result_budget.PER_RESULT_MIN_BYTES
-metacodes-core.conversation.TOOL_RESULT_CONTEXT_MAX_BYTES: const = result_budget.PER_RESULT_MAX_BYTES
-metacodes-core.conversation.TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: const = result_budget.PER_RESULT_WINDOW_DIVISOR
+metacodes-core.conversation.TOOL_RESULT_CONTEXT_MIN_BYTES: const usize = 8 * 1024
+metacodes-core.conversation.TOOL_RESULT_CONTEXT_MAX_BYTES: const usize = 64 * 1024
+metacodes-core.conversation.TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: const usize = 8
 metacodes-core.conversation.IMAGE_TOKEN_ESTIMATE: const usize = types.IMAGE_TOKEN_ESTIMATE
 metacodes-core.conversation.REASONING_ITEM_TOKEN_ESTIMATE: const usize = 2048
 metacodes-core.conversation.toolResultContextBytes: fn toolResultContextBytes(max_input_tokens: usize) usize
@@ -2062,8 +2062,8 @@ metacodes-core.tool_result.withdrawAttachmentFromJson: fn withdrawAttachmentFrom
 metacodes-core.tool_result.resolveAttachments: fn resolveAttachments(allocator: std.mem.Allocator, bytes: []u8, handles: *SealedHandles) error{OutOfMemory}![]u8
 metacodes-core.tool_result.renderArtifactEnvelope: fn renderArtifactEnvelope(allocator: std.mem.Allocator, result: ArtifactReceipt) error{OutOfMemory}![]u8
 metacodes-core.result_projection: file
-metacodes-core.result_projection.SCHEMA: const = tool_result.PROJECTION_SCHEMA
-metacodes-core.result_projection.ENVELOPE_PREFIX: const = tool_result.ENVELOPE_PREFIX
+metacodes-core.result_projection.SCHEMA: const = "metacodes.tool-result-projection.v1"
+metacodes-core.result_projection.ENVELOPE_PREFIX: const = "{\"schema_version\":\"" ++ PROJECTION_SCHEMA ++ "\",\"projection\":"
 metacodes-core.result_projection.BASH_SCHEMA: const = "metacodes.bash-result.v2"
 metacodes-core.result_projection.ENVELOPE_OVERHEAD_BYTES: const result_budget.Encoded = .of(640)
 metacodes-core.result_projection.IMAGE_RESULT_BUDGET_BYTES: const usize = conversation_mod.IMAGE_TOKEN_ESTIMATE * BUDGET_BYTES_PER_TOKEN
@@ -4517,7 +4517,7 @@ metacodes-core.typed_submission.TemplateError: const = error{ InvalidSubmissionT
 metacodes-core.typed_submission.checkTemplate: fn checkTemplate(template: []const u8) TemplateError!void
 metacodes-core.typed_submission.render: fn render(allocator: std.mem.Allocator, template: []const u8, fields: Fields) (TemplateError || error{OutOfMemory})![]u8
 metacodes-core.idempotency_ledger: file
-metacodes-core.idempotency_ledger.Digest: const = typed_submission.Digest
+metacodes-core.idempotency_ledger.Digest: const = [Sha256.digest_length]u8
 metacodes-core.idempotency_ledger.file_name: const = "idempotency.jsonl"
 metacodes-core.idempotency_ledger.max_file_bytes: const usize = 64 * 1024 * 1024
 metacodes-core.idempotency_ledger.Verdict: enum
@@ -5230,7 +5230,7 @@ metacodes-core.teamwork_run_dir.merge_patch_file: const = "merge.patch"
 metacodes-core.teamwork_run_dir.merge_conflicts_file: const = "merge-conflicts.txt"
 metacodes-core.teamwork_run_dir.seat_relative_original_request: const = "../../" ++ original_request_file
 metacodes-core.teamwork_run_dir.seat_relative_open_issues: const = "../../" ++ open_issues_file
-metacodes-core.teamwork_run_dir.seat_relative_open_issues_copy: const = open_issues_file
+metacodes-core.teamwork_run_dir.seat_relative_open_issues_copy: const = "open_issues.json"
 metacodes-core.teamwork_run_dir.seat_relative_first_audit_report: const = "../../" ++ audits_dir ++ "/audit-1.md"
 metacodes-core.teamwork_run_dir.RunFile: enum
 metacodes-core.teamwork_run_dir.RunFile.original_request
@@ -5341,7 +5341,7 @@ metacodes-core.teamwork_ledger.Ledger.isExhausted: fn isExhausted(self: *const L
 metacodes-core.teamwork_ledger.Ledger.remainingUsd: fn remainingUsd(self: *const Ledger) f64
 metacodes-core.teamwork_ledger.hold_suffix: const = ".hold"
 metacodes-core.teamwork_issues: file
-metacodes-core.teamwork_issues.IssueId: const = types.IssueId
+metacodes-core.teamwork_issues.IssueId: const = Id("issue")
 metacodes-core.teamwork_issues.NewIssue: struct
 metacodes-core.teamwork_issues.NewIssue.id: ?IssueId = null
 metacodes-core.teamwork_issues.NewIssue.title: []const u8
@@ -5784,7 +5784,7 @@ metacodes-core.teamwork_runtime.Run.finishManager: fn finishManager(self: *Run, 
 metacodes-core.teamwork_runtime.Run.seatDir: fn seatDir(self: *const Run, buf: *run_dir.PathBuf, id: SeatId) Error![]const u8
 metacodes-core.teamwork_runtime.goalOf: fn goalOf(request: []const u8) []const u8
 metacodes-core.teamwork_swe_loop: file
-metacodes-core.teamwork_swe_loop.Error: const = runtime.Error
+metacodes-core.teamwork_swe_loop.Error: const = run_dir.Error || error{ PreviewDisabled, RunBusy, LeaseFailed, UnsupportedPlatform, RunEnded, RoleNotDispatchable, NothingToReview, CandidatesPending, NoCandidates, CandidateBudgetExceeded, NotApproved, InstructionsNameRunState, RoundsExhausted, BudgetExhausted, Aborted, IllegalTransition, }
 metacodes-core.teamwork_swe_loop.drive: fn drive(run: *runtime.Run) Error!runtime.State
 metacodes-core.teamwork_verifier_auditor: file
 metacodes-core.teamwork_verifier_auditor.VerifierAuditor: struct
@@ -6827,7 +6827,7 @@ metacodes-core.kg_memory_migration_adapter.execute: fn execute( allocator: std.m
 metacodes-core.kg_memory_migration_adapter.prepare: fn prepare( allocator: std.mem.Allocator, transport: StoragePrimitives, source: Source, config: runtime.Config, abort: ?*const AbortSignal, ) !Prepared
 metacodes-core.kg_memory_migration_adapter.commitPrepared: fn commitPrepared( transport: StoragePrimitives, prepared: *Prepared, ) !Result
 metacodes-core.kg_ontology_rule_snapshot_adapter: file
-metacodes-core.kg_ontology_rule_snapshot_adapter.CAPABILITY: const = projection.SOURCE_CAPABILITY
+metacodes-core.kg_ontology_rule_snapshot_adapter.CAPABILITY: const = "tinykg-ontology-rule-snapshot-v1"
 metacodes-core.kg_ontology_rule_snapshot_adapter.SOURCE_SCHEMA: const = "tinykg-ontology-rule-snapshot-v1"
 metacodes-core.kg_ontology_rule_snapshot_adapter.MAX_SOURCE_BYTES: const usize = projection.MAX_SNAPSHOT_BYTES
 metacodes-core.kg_ontology_rule_snapshot_adapter.MAX_PROVENANCE_REFS: const usize = 16
@@ -7254,7 +7254,7 @@ metacodes-core.formal_project_provenance.loadAdjacent: fn loadAdjacent( allocato
 metacodes-core.formal_task_audit: file
 metacodes-core.formal_task_audit.RECEIPT_SCHEMA: const = "metacodes-formal-audit-receipt-v1"
 metacodes-core.formal_task_audit.PROPOSAL_SCHEMA: const = "metacodes-formal-proposal-v1"
-metacodes-core.formal_task_audit.TELEMETRY_SCHEMA: const = artifact_store.INDEX_SCHEMA
+metacodes-core.formal_task_audit.TELEMETRY_SCHEMA: const = "metacodes-formal-event-index-v1"
 metacodes-core.formal_task_audit.WORK_CELL_RECEIPT_SCHEMA: const = "metacodes-control-work-cell-receipt-v1"
 metacodes-core.formal_task_audit.Facts: struct
 metacodes-core.formal_task_audit.Facts.schema_supported: bool
@@ -8057,8 +8057,8 @@ metacodes-core.api_credential_cell.Replacement.bytes: []u8
 metacodes-core.api_credential_cell.Replacement.publish: fn publish(self: *Replacement) u64
 metacodes-core.api_credential_cell.Replacement.discard: fn discard(self: *Replacement) void
 metacodes-core.api_metask_oauth: file
-metacodes-core.api_metask_oauth.DEFAULT_SITE_URL: const = auth.METASK_SITE_URL
-metacodes-core.api_metask_oauth.CLIENT_ID: const = auth.OAUTH_CLIENT_ID
+metacodes-core.api_metask_oauth.DEFAULT_SITE_URL: const = "https://www.metask-ai.com"
+metacodes-core.api_metask_oauth.CLIENT_ID: const = "metacodes"
 metacodes-core.api_metask_oauth.DeviceCode: struct
 metacodes-core.api_metask_oauth.DeviceCode.device_code: []const u8
 metacodes-core.api_metask_oauth.DeviceCode.user_code: []const u8
@@ -8731,7 +8731,7 @@ metacodes-core.api_request.serializeMessagesRequestWithDialectReport: fn seriali
 metacodes-core.api_request.ImageResult: struct
 metacodes-core.api_request.ImageResult.media_type: []const u8
 metacodes-core.api_request.ImageResult.data: []const u8
-metacodes-core.api_request.extractImageResult: const = dialect_mod.extractImageResult
+metacodes-core.api_request.extractImageResult: fn extractImageResult(content: []const u8) ?types.ImageBlock
 metacodes-core.api_request.serializeOneTool: fn serializeOneTool(tool: ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void
 metacodes-core.api_request.serializeInputSchema: fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void
 metacodes-core.api_request_overrides: file
@@ -8854,20 +8854,20 @@ metacodes-core.json.ToolDefinition = metacodes-core.api_request.ToolDefinition
 metacodes-core.json.ModelToolActivation = metacodes-core.api_request.ModelToolActivation
 metacodes-core.json.InputSchema = metacodes-core.api_request.InputSchema
 metacodes-core.json.PropSpec = metacodes-core.api_request.PropSpec
-metacodes-core.json.serializeMessagesRequest: const = api_request.serializeMessagesRequest
-metacodes-core.json.serializeCanonicalRequestProjection: const = api_request.serializeCanonicalRequestProjection
-metacodes-core.json.serializeMessagesRequestWithDialect: const = api_request.serializeMessagesRequestWithDialect
-metacodes-core.json.serializeMessagesRequestWithDialectReport: const = api_request.serializeMessagesRequestWithDialectReport
+metacodes-core.json.serializeMessagesRequest: fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8
+metacodes-core.json.serializeCanonicalRequestProjection: fn serializeCanonicalRequestProjection(req: MessagesRequest, allocator: std.mem.Allocator) ![]u8
+metacodes-core.json.serializeMessagesRequestWithDialect: fn serializeMessagesRequestWithDialect( req: MessagesRequest, allocator: std.mem.Allocator, dialect: @import("dialect.zig").Dialect, ) ![]u8
+metacodes-core.json.serializeMessagesRequestWithDialectReport: fn serializeMessagesRequestWithDialectReport( req: MessagesRequest, allocator: std.mem.Allocator, dialect: @import("dialect.zig").Dialect, report: *SerializationReport, ) ![]u8
 metacodes-core.json.SerializationReport = metacodes-core.api_request.SerializationReport
-metacodes-core.json.extractImageResult: const = api_request.extractImageResult
+metacodes-core.json.extractImageResult: fn extractImageResult(content: []const u8) ?types.ImageBlock
 metacodes-core.json.ImageResult = metacodes-core.api_request.ImageResult
 metacodes-core.json.SseParser = metacodes-core.api_stream.SseParser
 metacodes-core.json.SseEventType = metacodes-core.api_stream.SseEventType
-metacodes-core.json.parseEventType: const = api_stream.parseEventType
+metacodes-core.json.parseEventType: fn parseEventType(data: []const u8) SseEventType
 metacodes-core.json.ToolUseResult = metacodes-core.api_stream.ToolUseResult
-metacodes-core.json.extractTextDelta: const = api_stream.extractTextDelta
-metacodes-core.json.extractToolUse: const = api_stream.extractToolUse
-metacodes-core.json.serializeString: const = util_json.serializeString
+metacodes-core.json.extractTextDelta: fn extractTextDelta(data: []const u8, allocator: std.mem.Allocator) !?[]u8
+metacodes-core.json.extractToolUse: fn extractToolUse(data: []const u8) ?ToolUseResult
+metacodes-core.json.serializeString: fn serializeString(s: []const u8, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void
 metacodes-core.json.ApiError: struct
 metacodes-core.json.ApiError.@"error": struct { type: []const u8, message: []const u8, }
 metacodes-core.json.parseApiError: fn parseApiError(data: []const u8) ?ApiError
@@ -9818,7 +9818,7 @@ metacodes-core.tools_bash_output.execute: fn execute(ctx: *const ToolContext, ar
 metacodes-core.tools_dynamic: file
 metacodes-core.tools_dynamic.DynLegacyExecuteFn: const = *const fn ( ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque, ) anyerror![]u8
 metacodes-core.tools_dynamic.DynExecuteBodyFn: const = *const fn ( ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque, ) anyerror!ToolResultBody
-metacodes-core.tools_dynamic.DynExecuteFn: const = DynLegacyExecuteFn
+metacodes-core.tools_dynamic.DynExecuteFn: const = *const fn ( ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque, ) anyerror![]u8
 metacodes-core.tools_dynamic.DynExecutor: union(enum)
 metacodes-core.tools_dynamic.DynExecutor.legacy_inline: DynLegacyExecuteFn
 metacodes-core.tools_dynamic.DynExecutor.result_body: DynExecuteBodyFn
@@ -9890,8 +9890,8 @@ metacodes-core.permission.RiskLevel: enum
 metacodes-core.permission.RiskLevel.low
 metacodes-core.permission.RiskLevel.medium
 metacodes-core.permission.RiskLevel.high
-metacodes-core.permission.getToolCategory: const = category_mod.getToolCategory
-metacodes-core.permission.getRiskLevel: const = category_mod.getRiskLevel
+metacodes-core.permission.getToolCategory: fn getToolCategory(tool_name: []const u8) ToolCategory
+metacodes-core.permission.getRiskLevel: fn getRiskLevel(tool_name: []const u8) RiskLevel
 metacodes-core.permission.RuleSet: struct
 metacodes-core.permission.RuleSet.allocator: std.mem.Allocator
 metacodes-core.permission.RuleSet.rules: std.ArrayList(Rule)
@@ -9954,7 +9954,7 @@ metacodes-core.permission.PermissionContext.scopedDerive: fn scopedDerive(self: 
 metacodes-core.permission.createContext: fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext
 metacodes-core.permission.checkPermission: fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult
 metacodes-core.permission.checkPermissionClassified: fn checkPermissionClassified( ctx: *const PermissionContext, tool_name: []const u8, args: []const u8, category: ?ToolCategory, ) PermissionResult
-metacodes-core.permission.PromptUnanswered: const = prompt_mod.Unanswered
+metacodes-core.permission.PromptUnanswered: const = error{ PromptUnrenderable, PromptTimedOut, PromptCancelled, PromptAnswerUnreadable, PromptNobodyToAsk, PromptRequestFailed, }
 metacodes-core.permission.promptUser: fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool
 metacodes-core.permission.promptUserForced: fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool
 metacodes-core.permission.ConfirmGate: struct
@@ -10217,8 +10217,8 @@ metacodes-core.skills.definition.parseStringList: fn parseStringList(allocator: 
 metacodes-core.skills.definition.freeStringList: fn freeStringList(allocator: std.mem.Allocator, values: []const []const u8) void
 metacodes-core.skills.ExecContext = metacodes-core.skills.definition.ExecContext
 metacodes-core.skills.Skill = metacodes-core.skills.definition.Skill
-metacodes-core.skills.parseSkillMdWithFallback: const = definition.parseSkillMdWithFallback
-metacodes-core.skills.parseSkillMd: const = definition.parseSkillMd
+metacodes-core.skills.parseSkillMdWithFallback: fn parseSkillMdWithFallback( allocator: std.mem.Allocator, md: []const u8, source_path: []const u8, dir_name: []const u8, ) ParseError!Skill
+metacodes-core.skills.parseSkillMd: fn parseSkillMd( allocator: std.mem.Allocator, md: []const u8, source_path: []const u8, ) ParseError!Skill
 metacodes-core.skills.SkillSet: struct
 metacodes-core.skills.SkillSet.allocator: std.mem.Allocator
 metacodes-core.skills.SkillSet.skills: std.ArrayList(Skill)
@@ -11112,7 +11112,7 @@ metacodes-core.skills_sealed_disclosure.Redacted.spans: usize
 metacodes-core.skills_sealed_disclosure.redactText: fn redactText(allocator: std.mem.Allocator, corpus: *const Corpus, text: []const u8) !Redacted
 metacodes-core.skills_sealed_disclosure.redactJsonStrings: fn redactJsonStrings(allocator: std.mem.Allocator, corpus: *const Corpus, json: []const u8) !Redacted
 metacodes-core.skills_tool: file
-metacodes-core.skills_tool.registerSkillTool: const = @import("cli_adapter.zig").registerModelTool
+metacodes-core.skills_tool.registerSkillTool: fn registerModelTool(registry: *DynRegistry, skill_runtime: *Runtime) !void
 metacodes-core.skills_render: file
 metacodes-core.skills_render.RenderOptions: struct
 metacodes-core.skills_render.RenderOptions.arguments: []const []const u8 = &.{}
@@ -11131,8 +11131,8 @@ metacodes-core.skills_render.RenderOptions.additional_dirs: []const []const u8 =
 metacodes-core.skills_render.renderBody: fn renderBody(allocator: std.mem.Allocator, body: []const u8, opts: RenderOptions) ![]u8
 metacodes-core.skills_render.hasShellInjection: fn hasShellInjection(body: []const u8) bool
 metacodes-core.mcp_client: file
-metacodes-core.mcp_client.MODERN_VERSION: const = canonical.MODERN_VERSION
-metacodes-core.mcp_client.CLASSIC_VERSION: const = canonical.CLASSIC_2025_11_VERSION
+metacodes-core.mcp_client.MODERN_VERSION: const = "2026-07-28"
+metacodes-core.mcp_client.CLASSIC_VERSION: const = "2025-11-25"
 metacodes-core.mcp_client.CLASSIC_VERSIONS: const = [_][]const u8{ canonical.CLASSIC_2025_11_VERSION, canonical.CLASSIC_2025_06_VERSION, canonical.CLASSIC_2025_03_VERSION, canonical.CLASSIC_2024_11_VERSION, }
 metacodes-core.mcp_client.ElicitHandler: struct
 metacodes-core.mcp_client.ElicitHandler.ctx: *anyopaque
@@ -11722,7 +11722,7 @@ metacodes-core.mcp_protocol.runtime.ConnectionPurpose = metacodes-core.mcp_proto
 metacodes-core.mcp_protocol.runtime.Cancellation = metacodes-core.mcp_protocol.host_transport.Cancellation
 metacodes-core.mcp_protocol.runtime.ExchangeResponse = metacodes-core.mcp_protocol.host_transport.ExchangeResponse
 metacodes-core.mcp_protocol.runtime.ExchangeOutcome = metacodes-core.mcp_protocol.host_transport.ExchangeOutcome
-metacodes-core.mcp_protocol.runtime.ToolResponseSinkError: const = host.ToolResponseSinkError
+metacodes-core.mcp_protocol.runtime.ToolResponseSinkError: const = error{ Cancelled, ResourceLimit, IoFailure, Closed, }
 metacodes-core.mcp_protocol.runtime.ToolResponseSink = metacodes-core.mcp_protocol.host_transport.ToolResponseSink
 metacodes-core.mcp_protocol.runtime.ToolStreamExchangeOutcome = metacodes-core.mcp_protocol.host_transport.ToolStreamExchangeOutcome
 metacodes-core.mcp_protocol.runtime.ToolRequestExecutor = metacodes-core.mcp_protocol.host_transport.ToolRequestExecutor
@@ -12531,7 +12531,7 @@ metacodes-core.protocol.frontend_capabilities.Slot.install: fn install(self: *Sl
 metacodes-core.protocol.frontend_capabilities.Slot.route: fn route(self: *Slot, request: *const UiRequest) Route
 metacodes-core.protocol.frontend_capabilities.Slot.acceptedLine: fn acceptedLine(self: *Slot, allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8
 metacodes-core.protocol.PermissionChoice = metacodes-core.protocol.ui_request.PermissionChoice
-metacodes-core.protocol.CHAT_SENTINEL: const = @import("chat_sentinel.zig").CHAT_SENTINEL
+metacodes-core.protocol.CHAT_SENTINEL: const = "\x00__cc_chat_about_this__"
 metacodes-core.mcp_session: file
 metacodes-core.mcp_session.McpSessionEntry: struct
 metacodes-core.mcp_session.McpSessionEntry.name: []u8

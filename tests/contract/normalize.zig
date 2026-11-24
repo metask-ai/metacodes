@@ -9,14 +9,9 @@ pub const Rules = struct {
     literals: []const Literal = &.{},
 };
 
-const line_values = [_]Literal{
-    .{ .needle = "Platform: ", .placeholder = "<PLATFORM>" },
-    .{ .needle = "OS Version: ", .placeholder = "<OS_VERSION>" },
-    .{ .needle = "Time zone: ", .placeholder = "<TIME_ZONE>" },
-};
-
 const volatile_number_suffixes = [_][]const u8{ "_ms", "_ns", "_at", "_unix", "Nano" };
 const volatile_number_keys = [_][]const u8{"content_bytes"};
+const volatile_string_keys = [_][]const u8{"trace_id"};
 
 pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
     var current = try gpa.dupe(u8, input);
@@ -32,8 +27,8 @@ pub fn apply(gpa: std.mem.Allocator, input: []const u8, rules: Rules) ![]u8 {
     }
     const passes = [_]*const fn (std.mem.Allocator, []const u8) anyerror![]u8{
         replaceTimestamps,
-        replaceLineValues,
         replaceVolatileNumbers,
+        replaceVolatileStrings,
         replaceUuids,
         replaceHexRuns,
     };
@@ -107,35 +102,6 @@ fn replaceTimestamps(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-fn valueEnd(s: []const u8, from: usize) usize {
-    var end = from;
-    while (end < s.len) : (end += 1) {
-        if (s[end] == '\n' or s[end] == '"') return end;
-        if (s[end] == '\\' and end + 1 < s.len and (s[end + 1] == 'n' or s[end + 1] == '"')) return end;
-        if (s[end] == '.' and (end + 1 == s.len or s[end + 1] == '\\' or s[end + 1] == '\n' or s[end + 1] == '"')) return end;
-    }
-    return end;
-}
-
-fn replaceLineValues(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    outer: while (i < s.len) {
-        for (line_values) |rule| {
-            if (std.mem.startsWith(u8, s[i..], rule.needle)) {
-                try out.appendSlice(gpa, rule.needle);
-                try out.appendSlice(gpa, rule.placeholder);
-                i = valueEnd(s, i + rule.needle.len);
-                continue :outer;
-            }
-        }
-        try out.append(gpa, s[i]);
-        i += 1;
-    }
-    return out.toOwnedSlice(gpa);
-}
-
 fn isKeyChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
@@ -181,6 +147,28 @@ fn replaceVolatileNumbers(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
         i = value_end;
     }
     return out.toOwnedSlice(gpa);
+}
+
+fn replaceVolatileStrings(gpa: std.mem.Allocator, s: []const u8) anyerror![]u8 {
+    var current = try gpa.dupe(u8, s);
+    for (volatile_string_keys) |key| {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        const needle = try std.fmt.allocPrint(gpa, "\"{s}\":\"", .{key});
+        defer gpa.free(needle);
+        var rest: []const u8 = current;
+        while (std.mem.indexOf(u8, rest, needle)) |at| {
+            const start = at + needle.len;
+            const end = std.mem.indexOfScalarPos(u8, rest, start, '"') orelse break;
+            try out.appendSlice(gpa, rest[0..start]);
+            try out.appendSlice(gpa, "<ID>");
+            rest = rest[end..];
+        }
+        try out.appendSlice(gpa, rest);
+        gpa.free(current);
+        current = try out.toOwnedSlice(gpa);
+    }
+    return current;
 }
 
 fn uuidLen(s: []const u8, at: usize) usize {

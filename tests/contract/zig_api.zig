@@ -20,9 +20,13 @@ const File = struct {
     tree: Ast,
 };
 
+const Located = struct { file: *File, node: Ast.Node.Index };
+
 const Target = union(enum) {
     file: *File,
-    container: struct { file: *File, node: Ast.Node.Index },
+    container: Located,
+    function: Located,
+    decl: Located,
     opaque_expr,
 };
 
@@ -93,13 +97,12 @@ pub const Walker = struct {
             if (tree.fullFnProto(&proto_buf, member)) |proto| {
                 if (proto.visib_token == null) continue;
                 const name = tree.tokenSlice(proto.name_token orelse continue);
-                const last = tree.lastToken(proto.ast.proto_node);
-                try walker.out.print(walker.arena, "{s}.{s}: {s}\n", .{ path, name, try walker.tokens(file, proto.ast.fn_token, last) });
+                try walker.out.print(walker.arena, "{s}.{s}: {s}\n", .{ path, name, try walker.protoText(file, member) });
                 continue;
             }
             if (tree.fullVarDecl(member)) |var_decl| {
                 if (var_decl.visib_token == null) continue;
-                try walker.listDecl(file, var_decl, path);
+                try walker.listDecl(file, member, path);
             }
         }
     }
@@ -115,26 +118,53 @@ pub const Walker = struct {
         try walker.out.print(walker.arena, "{s}\n", .{line.items});
     }
 
-    fn listDecl(walker: *Walker, file: *File, var_decl: Ast.full.VarDecl, path: []const u8) !void {
+    fn protoText(walker: *Walker, file: *File, member: Ast.Node.Index) ![]const u8 {
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = file.tree.fullFnProto(&buf, member).?;
+        return walker.tokens(file, proto.ast.fn_token, file.tree.lastToken(proto.ast.proto_node));
+    }
+
+    fn declText(walker: *Walker, file: *File, member: Ast.Node.Index) ![]const u8 {
         const tree = &file.tree;
+        const var_decl = tree.fullVarDecl(member).?;
+        var line: std.ArrayList(u8) = .empty;
+        try line.appendSlice(walker.arena, tree.tokenSlice(var_decl.ast.mut_token));
+        if (var_decl.ast.type_node.unwrap()) |type_node| try line.print(walker.arena, " {s}", .{try walker.nodeText(file, type_node)});
+        if (var_decl.ast.init_node.unwrap()) |init| try line.print(walker.arena, " = {s}", .{try walker.valueText(file, init)});
+        return line.items;
+    }
+
+    fn listDecl(walker: *Walker, file: *File, member: Ast.Node.Index, path: []const u8) !void {
+        const tree = &file.tree;
+        const var_decl = tree.fullVarDecl(member).?;
         const name = tree.tokenSlice(var_decl.ast.mut_token + 1);
         const child = try std.fmt.allocPrint(walker.arena, "{s}.{s}", .{ path, name });
-        const init = var_decl.ast.init_node.unwrap() orelse {
+        if (var_decl.ast.init_node == .none) {
             try walker.out.print(walker.arena, "{s}: extern\n", .{child});
             return;
+        }
+        const text = switch (try walker.resolveMember(file, member, 0)) {
+            .file => |target| return walker.walkFile(target, child),
+            .container => |target| return walker.walkContainer(target.file, target.node, child),
+            .function => |target| try walker.protoText(target.file, target.node),
+            .decl => |target| try walker.declText(target.file, target.node),
+            .opaque_expr => unreachable,
         };
+        try walker.out.print(walker.arena, "{s}: {s}\n", .{ child, text });
+    }
+
+    fn resolveMember(walker: *Walker, file: *File, member: Ast.Node.Index, depth: usize) anyerror!Target {
+        const tree = &file.tree;
+        var buf: [1]Ast.Node.Index = undefined;
+        if (tree.fullFnProto(&buf, member) != null) return .{ .function = .{ .file = file, .node = member } };
+        const var_decl = tree.fullVarDecl(member).?;
         if (tree.tokenTag(var_decl.ast.mut_token) == .keyword_const and var_decl.ast.type_node == .none) {
-            switch (try walker.resolve(file, init, 0)) {
-                .file => |target| return walker.walkFile(target, child),
-                .container => |target| return walker.walkContainer(target.file, target.node, child),
-                .opaque_expr => {},
+            if (var_decl.ast.init_node.unwrap()) |init| {
+                const target = try walker.resolve(file, init, depth);
+                if (target != .opaque_expr) return target;
             }
         }
-        var line: std.ArrayList(u8) = .empty;
-        try line.print(walker.arena, "{s}: {s}", .{ child, tree.tokenSlice(var_decl.ast.mut_token) });
-        if (var_decl.ast.type_node.unwrap()) |type_node| try line.print(walker.arena, " {s}", .{try walker.nodeText(file, type_node)});
-        try line.print(walker.arena, " = {s}", .{try walker.valueText(file, init)});
-        try walker.out.print(walker.arena, "{s}\n", .{line.items});
+        return .{ .decl = .{ .file = file, .node = member } };
     }
 
     fn resolve(walker: *Walker, file: *File, node: Ast.Node.Index, depth: usize) anyerror!Target {
@@ -157,25 +187,23 @@ pub const Walker = struct {
             .identifier => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
                 const found = findDecl(tree, tree.rootDecls(), name) orelse return .opaque_expr;
-                return walker.resolve(file, found, depth + 1);
+                return walker.resolveMember(file, found, depth + 1);
             },
             .field_access => {
                 const lhs, const name_token = tree.nodeData(node).node_and_token;
                 const base = try walker.resolve(file, lhs, depth + 1);
                 const name = tree.tokenSlice(name_token);
-                switch (base) {
-                    .file => |target| {
-                        const found = findDecl(&target.tree, target.tree.rootDecls(), name) orelse return .opaque_expr;
-                        return walker.resolve(target, found, depth + 1);
-                    },
-                    .container => |target| {
-                        var buf: [2]Ast.Node.Index = undefined;
-                        const members = target.file.tree.fullContainerDecl(&buf, target.node).?.ast.members;
-                        const found = findDecl(&target.file.tree, members, name) orelse return .opaque_expr;
-                        return walker.resolve(target.file, found, depth + 1);
-                    },
-                    .opaque_expr => return .opaque_expr,
-                }
+                const scope: Located = switch (base) {
+                    .file => |target| .{ .file = target, .node = .root },
+                    .container => |target| target,
+                    else => return .opaque_expr,
+                };
+                const members = if (scope.node == .root) scope.file.tree.rootDecls() else blk: {
+                    var buf: [2]Ast.Node.Index = undefined;
+                    break :blk scope.file.tree.fullContainerDecl(&buf, scope.node).?.ast.members;
+                };
+                const found = findDecl(&scope.file.tree, members, name) orelse return .opaque_expr;
+                return walker.resolveMember(scope.file, found, depth + 1);
             },
             else => return .opaque_expr,
         }
@@ -183,11 +211,14 @@ pub const Walker = struct {
 
     fn findDecl(tree: *const Ast, members: []const Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
         for (members) |member| {
+            var buf: [1]Ast.Node.Index = undefined;
+            if (tree.fullFnProto(&buf, member)) |proto| {
+                const name_token = proto.name_token orelse continue;
+                if (std.mem.eql(u8, tree.tokenSlice(name_token), name)) return member;
+                continue;
+            }
             const var_decl = tree.fullVarDecl(member) orelse continue;
-            if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) continue;
-            if (var_decl.ast.type_node != .none) continue;
-            if (!std.mem.eql(u8, tree.tokenSlice(var_decl.ast.mut_token + 1), name)) continue;
-            return var_decl.ast.init_node.unwrap();
+            if (std.mem.eql(u8, tree.tokenSlice(var_decl.ast.mut_token + 1), name)) return member;
         }
         return null;
     }
@@ -262,13 +293,16 @@ pub fn main(init: std.process.Init) !void {
     const root_name = args.next() orelse return usage();
     const contract_root = args.next() orelse return usage();
     const snapshot_path = args.next() orelse return usage();
+    const version = args.next() orelse return usage();
     var mode: golden.Mode = .check;
     if (args.next()) |flag| {
         if (!std.mem.eql(u8, flag, "--update")) return usage();
         mode = .update;
     }
     var disk: DiskSource = .{ .io = init.io };
-    const text = try snapshot(arena, .{ .ctx = &disk, .readFn = DiskSource.read }, root_path, root_name);
+    const raw = try snapshot(arena, .{ .ctx = &disk, .readFn = DiskSource.read }, root_path, root_name);
+    const quoted_version = try std.fmt.allocPrint(arena, "\"{s}\"", .{version});
+    const text = try std.mem.replaceOwned(u8, arena, raw, quoted_version, "\"<VERSION>\"");
     const store: golden.Store = .{ .io = init.io, .root = contract_root, .mode = mode };
     store.expect(arena, snapshot_path, text) catch |err| switch (err) {
         error.ContractDrift, error.ContractSnapshotMissing => std.process.exit(1),
@@ -277,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: zig-api-snapshot <root.zig> <root name> <contract dir> <snapshot path> [--update]\n", .{});
+    std.debug.print("usage: zig-api-snapshot <root.zig> <root name> <contract dir> <snapshot path> <version> [--update]\n", .{});
     return error.InvalidArguments;
 }
 
@@ -377,7 +411,7 @@ test "import paths in printed text keep only the file name, so moving a file kee
         .{ "src/core/version.zig", "pub const semver = \"1.0.0\";\n" },
     },
         \\lib: file
-        \\lib.VERSION: const = @import("version.zig").semver
+        \\lib.VERSION: const = "1.0.0"
         \\lib.v: file
         \\lib.v.semver: const = "1.0.0"
         \\
@@ -389,6 +423,20 @@ test "long values are summarised by length and digest" {
     try expectSnapshot(&.{.{ "src/lib.zig", long }},
         \\lib: file
         \\lib.TEXT: const = <702 bytes, sha256 157cc2e33bed>
+        \\
+    );
+}
+
+test "an alias of a function or a typed constant in another file records the target's signature and value" {
+    try expectSnapshot(&.{
+        .{ "src/lib.zig", "pub const tool = @import(\"skills/tool.zig\");\n" },
+        .{ "src/skills/tool.zig", "pub const registerSkillTool = @import(\"cli_adapter.zig\").registerModelTool;\npub const LIMIT = @import(\"cli_adapter.zig\").limit;\n" },
+        .{ "src/skills/cli_adapter.zig", "pub fn registerModelTool(registry: *Registry, max: u32) !void {}\npub const limit: usize = 8;\n" },
+    },
+        \\lib: file
+        \\lib.tool: file
+        \\lib.tool.registerSkillTool: fn registerModelTool(registry: *Registry, max: u32) !void
+        \\lib.tool.LIMIT: const usize = 8
         \\
     );
 }

@@ -2871,7 +2871,7 @@ pub fn build(b: *std.Build) void {
     const zig_api_snapshot = b.addRunArtifact(zig_api_snapshot_tool);
     zig_api_snapshot.has_side_effects = true;
     zig_api_snapshot.setCwd(b.path("."));
-    zig_api_snapshot.addArgs(&.{ "src/lib.zig", "metacodes-core", "tests/contract", "zig_api/metacodes-core.txt" });
+    zig_api_snapshot.addArgs(&.{ "src/lib.zig", "metacodes-core", "tests/contract", "zig_api/metacodes-core.txt", manifest.version });
     if (update_contract) zig_api_snapshot.addArg("--update");
     gate_static_step.dependOn(&zig_api_snapshot.step);
     units_test_step.dependOn(&zig_api_snapshot.step);
@@ -2894,6 +2894,7 @@ pub fn build(b: *std.Build) void {
     contract_mod.addImport("cc", test_cc_mod);
     contract_mod.addImport("agentcore_h", agentcore_h.createModule());
     contract_mod.addImport("agentcore_binary", b.createModule(.{ .root_source_file = b.path("scripts/agentcore_binary.zig") }));
+    contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     addPlatform(b, contract_mod);
     const contract_test = b.addTest(.{
         .name = "contract",
@@ -2902,6 +2903,8 @@ pub fn build(b: *std.Build) void {
     });
     const contract_run = addTestRunArtifact(b, contract_test);
     contract_run.setCwd(b.path("."));
+    contract_run.setEnvironmentVariable("TZ", "UTC");
+    contract_run.setEnvironmentVariable("SHELL", "/bin/sh");
     contract_run.setEnvironmentVariable("METACODES_CONTRACT_ROOT", b.pathFromRoot("tests/contract"));
     contract_run.setEnvironmentVariable("METACODES_CONTRACT_UPDATE", if (update_contract) "1" else "0");
     contract_run.setEnvironmentVariable("METACODES_CONTRACT_VERSION", manifest.version);
@@ -2916,6 +2919,8 @@ pub fn build(b: *std.Build) void {
     });
     contract_run.setEnvironmentVariable("METACODES_CONTRACT_AGENTCORE_SHARED", b.getInstallPath(.{ .custom = "contract" }, agentcore_shared_lib.out_filename));
     contract_run.step.dependOn(&contract_agentcore_shared.step);
+    wireTinyKgTestInput(contract_run, staged_tinykg);
+    wireTinyKgdTestInput(contract_run, staged_tinykgd);
     contract_run.step.dependOn(install_cli);
     contract_run.step.dependOn(&install_mock_mcp.step);
     contract_step.dependOn(&contract_run.step);

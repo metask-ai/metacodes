@@ -18,10 +18,15 @@ test "timestamps become placeholders, a bare date does not" {
     try expectApplied("Today's date is 2026-11-23 (Monday).", .{ .literals = &.{.{ .needle = "2026-11-23 (Monday)", .placeholder = "<DATE>" }} }, "Today's date is <DATE>.");
 }
 
-test "platform, OS version and time zone values end at the line, the escaped line or the sentence" {
-    try expectApplied(" - Platform: darwin\n - OS Version: Darwin 27.2.0\n", .{}, " - Platform: <PLATFORM>\n - OS Version: <OS_VERSION>\n");
-    try expectApplied("\"Platform: linux\\n - Shell: unknown\"", .{}, "\"Platform: <PLATFORM>\\n - Shell: unknown\"");
-    try expectApplied("Time zone: UTC (UTC+00:00).\\n", .{}, "Time zone: <TIME_ZONE>.\\n");
+test "runtime environment values are replaced only where they occur, keeping what follows" {
+    try expectApplied(
+        " - Platform: darwin (beta)\\n - OS Version: Darwin 27.2.0\\n",
+        .{ .literals = &.{
+            .{ .needle = "Platform: darwin", .placeholder = "Platform: <PLATFORM>" },
+            .{ .needle = "OS Version: Darwin 27.2.0", .placeholder = "OS Version: <OS_VERSION>" },
+        } },
+        " - Platform: <PLATFORM> (beta)\\n - OS Version: <OS_VERSION>\\n",
+    );
 }
 
 test "numbers under timing keys become <N>, also inside escaped JSON" {
@@ -29,6 +34,10 @@ test "numbers under timing keys become <N>, also inside escaped JSON" {
     try expectApplied("\"{\\\"elapsed_ms\\\":3}\"", .{}, "\"{\\\"elapsed_ms\\\":<N>}\"");
     try expectApplied("{\"startTimeUnixNano\":\"1795\",\"last_modified_ns\":9}", .{}, "{\"startTimeUnixNano\":\"<N>\",\"last_modified_ns\":<N>}");
     try expectApplied("{\"bytes\":12,\"content_bytes\":145}", .{}, "{\"bytes\":12,\"content_bytes\":<N>}");
+}
+
+test "string values under identifier keys become <ID>, null stays" {
+    try expectApplied("{\"trace_id\":\"db9832d00000\",\"x\":1},{\"trace_id\":null}", .{}, "{\"trace_id\":\"<ID>\",\"x\":1},{\"trace_id\":null}");
 }
 
 test "hex identifiers of 16 or more characters and UUIDs become placeholders" {

@@ -1,0 +1,4 @@
+run: stop_reason 1, turns 2, tool_calls 1
+export: generation 1
+restore report: {"schema":"agentcore.restore-report/v1","health":"complete","session_id":"<HEX24>","checkpoint_generation":1,"policy_generation":2,"catalog_generation":0,"skill":{"disposition":"not_bound","checkpoint_enabled":0,"restored_enabled":0,"invalidated":0},"permission":{"restored_rules":0,"invalidated_rules":0},"mcp":{"restored_bindings":0,"invalidated_bindings":0},"issues":[]}
+run after restore: stop_reason 1, turns 1, tool_calls 0

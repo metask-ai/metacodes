@@ -1,0 +1,12 @@
+{"run_state":{"run_id":2,"transition_seq":1,"phase":"starting","turn":0,"tool_calls":0,"in_flight_tools":[]}}
+{"prompt_manifest":{"sha256":"<HEX64>","sections":[{"id":"metacodes:identity","order":-1000,"origin":"kernel","class":"replaceable","sha256":"<HEX64>"},{"id":"metacodes:safety-policy","order":-900,"origin":"kernel","class":"locked","sha256":"<HEX64>"},{"id":"metacodes:system","order":100,"origin":"kernel","class":"locked","sha256":"<HEX64>"},{"id":"metacodes:doing-tasks","order":200,"origin":"kernel","class":"replaceable","sha256":"<HEX64>"},{"id":"metacodes:validation","order":300,"origin":"kernel","class":"replaceable","sha256":"<HEX64>"},{"id":"metacodes:actions","order":400,"origin":"kernel","class":"replaceable","sha256":"<HEX64>"},{"id":"metacodes:using-tools","order":1000,"origin":"kernel","class":"replaceable","sha256":"<HEX64>"},{"id":"metacodes:tone","order":2000,"origin":"kernel","class":"removable","sha256":"<HEX64>"},{"id":"metacodes:output-efficiency","order":2100,"origin":"kernel","class":"removable","sha256":"<HEX64>"},{"id":"metacodes:progress","order":2200,"origin":"kernel","class":"removable","sha256":"<HEX64>"},{"id":"metacodes:env","order":9000,"origin":"kernel","class":"generated","sha256":"<HEX64>"}]}}
+{"run_state":{"run_id":2,"transition_seq":2,"phase":"generating","turn":1,"tool_calls":0,"in_flight_tools":[]}}
+{"progress":{"turn":1,"tool_name":"","tool_input":"","tool_calls":0}}
+{"output_segment_begin":{"index":0,"turn":1,"group":0}}
+{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"text_chunk":"They said alpha."}
+{"usage":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"stream_done":{}}
+{"output_segment_end":{"index":0,"turn":1,"group":0,"disposition":"final","bytes":16}}
+{"run_state":{"run_id":2,"transition_seq":3,"phase":"finalizing","turn":1,"tool_calls":0,"in_flight_tools":[]}}
+{"run_state":{"run_id":2,"transition_seq":4,"phase":"completed","turn":1,"tool_calls":0,"in_flight_tools":[]}}
