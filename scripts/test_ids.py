@@ -167,17 +167,17 @@ def file_at(root: Path, rev: Optional[str], rel: Path) -> str:
 
 def read_explanations(root: Path, since: Optional[str] = None) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
     def pairs(rel: Path, what: str, rev: Optional[str]) -> List[Tuple[str, str]]:
-        return parse_pairs(file_at(root, rev, rel), f"{rel}" + (f"@{rev}" if rev else ""), what, rel == RENAMED)
+        return parse_pairs(file_at(root, rev, rel), rel.as_posix() + (f"@{rev}" if rev else ""), what, rel == RENAMED)
 
     renamed = pairs(RENAMED, "new key", None)
     removed = pairs(REMOVED, "reason", None)
     for old, new in renamed:
         if old == new:
-            raise TestIdError(f"{RENAMED}: {old} is renamed to itself")
+            raise TestIdError(f"{RENAMED.as_posix()}: {old} is renamed to itself")
         if old.startswith("@") != new.startswith("@"):
-            raise TestIdError(f"{RENAMED}: {old} → {new} mixes a namespace move with a test key")
+            raise TestIdError(f"{RENAMED.as_posix()}: {old} → {new} mixes a namespace move with a test key")
         if not old.startswith("@") and old.split(":", 1)[0] != new.split(":", 1)[0]:
-            raise TestIdError(f"{RENAMED}: {old} and {new} are different kinds of test")
+            raise TestIdError(f"{RENAMED.as_posix()}: {old} and {new} are different kinds of test")
     if since is not None:
         renamed_before, removed_before = set(pairs(RENAMED, "new key", since)), set(pairs(REMOVED, "reason", since))
         renamed = [pair for pair in renamed if pair not in renamed_before]
@@ -259,7 +259,7 @@ def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], 
     used_moves: Set[Tuple[str, str]] = set()
     head = Counter({(test_id, apply_moves(location, moves, used_moves), status): count
                     for (test_id, location, status), count in head.items()})
-    result.unused.extend(f"{RENAMED}: {old} → {new}" for old, new in moves if (old, new) not in used_moves)
+    result.unused.extend(f"{RENAMED.as_posix()}: {old} → {new}" for old, new in moves if (old, new) not in used_moves)
     base_clusters = {test_id: clusters(found) for test_id, found in locations(base).items()}
     head_clusters = {test_id: clusters(found) for test_id, found in locations(head).items()}
 
@@ -282,7 +282,7 @@ def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], 
         new_head = head_table.get(new, [0, 0])
         moved = [max(0, min(new_head[i] - new_base[i], old_base[i] - old_head[i])) for i in range(2)]
         if not any(moved):
-            result.unused.append(f"{RENAMED}: {old} → {new}")
+            result.unused.append(f"{RENAMED.as_posix()}: {old} → {new}")
             continue
         for i in range(2):
             old_head[i] += moved[i]
@@ -308,7 +308,7 @@ def compare(base: IdCounts, head: IdCounts, renamed: Sequence[Tuple[str, str]], 
             result.renamed.append(Change(test_key, base_pair, original_head.get(new, (0, 0)), f"now `{new}`"))
         elif sum(head_pair) > sum(base_pair) or head_pair[0] > base_pair[0]:
             result.added.append(Change(test_key, base_pair, shown_head))
-    result.unused.extend(f"{REMOVED}: {test_key}" for test_key in sorted(set(removed) - used_removed))
+    result.unused.extend(f"{REMOVED.as_posix()}: {test_key}" for test_key in sorted(set(removed) - used_removed))
     base_tty = {test_id for (test_id, _, _), count in base.items() if test_id.startswith("tty:") and count}
     head_tty = {test_id for (test_id, _, _), count in head.items() if test_id.startswith("tty:") and count}
     result.tty_missing = sorted(base_tty - head_tty)
@@ -344,7 +344,7 @@ def render(comparison: Comparison, base: IdCounts, head: IdCounts, base_note: st
     lines.append("")
     if comparison.missing:
         verdict = "fails: this is a migration PR" if enforced else "report only: the PR has no `migration` label"
-        lines += [f"Tests that no longer run, unexplained — {verdict}. Add each key below to `{RENAMED}` or `{REMOVED}` in this PR.", ""]
+        lines += [f"Tests that no longer run, unexplained — {verdict}. Add each key below to `{RENAMED.as_posix()}` or `{REMOVED.as_posix()}` in this PR.", ""]
     else:
         lines += ["Every test the base ran still runs, or this PR explains why not.", ""]
     lines += bullet_list("Missing", [change.describe() for change in comparison.missing])
@@ -526,10 +526,11 @@ def cmd_collect(args) -> int:
     text = format_ids(counts)
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(text, encoding="utf-8")
+        Path(args.output).write_bytes(text.encode("utf-8"))
         sys.stderr.write(format_sources(sources))
     else:
-        sys.stdout.write(text)
+        sys.stdout.flush()
+        sys.stdout.buffer.write(text.encode("utf-8"))
     if args.meta:
         meta = {"commit": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}")}
         Path(args.meta).write_text(json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
@@ -618,7 +619,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     verdict.add_argument("--wait-minutes", type=float, default=100)
     verdict.add_argument("--summary")
     verdict.set_defaults(handler=cmd_label_verdict)
-    check = commands.add_parser("check", help=f"check the format of {RENAMED} and {REMOVED}")
+    check = commands.add_parser("check", help=f"check the format of {RENAMED.as_posix()} and {REMOVED.as_posix()}")
     check.add_argument("--root", default=str(ROOT))
     check.set_defaults(handler=cmd_check)
     args = parser.parse_args(argv)
