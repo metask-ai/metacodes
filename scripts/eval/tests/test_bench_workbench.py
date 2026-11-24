@@ -127,6 +127,17 @@ if release_file:
  while not pathlib.Path(release_file).exists():
   if time.monotonic() >= deadline: sys.exit(8)
   time.sleep(.05)
+if os.environ.get('FAKE_LATE_TRAFFIC'):
+ # After the release file: a model request through the relay and a fetch
+ # through the container egress proxy, with the CA and proxy given at start.
+ import ssl, urllib.request
+ relay = next(args[i + 1].removeprefix('metrics_proxy=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_proxy='))
+ ca = next(args[i + 1].removeprefix('metrics_ca=') for i, a in enumerate(args) if a == '--ak' and args[i + 1].startswith('metrics_ca='))
+ req = urllib.request.Request(relay + '/fix-git__fake/v1/messages', data=b'{{}}', headers={{'Authorization':'Bearer ' + os.environ[key_env], 'Content-Type':'application/json'}})
+ with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context(cafile=ca)) as response: late = {{'relay': response.status, 'body': len(response.read())}}
+ proxy = json.loads((pathlib.Path(os.environ['DOCKER_CONFIG']) / 'config.json').read_text())['proxies']['default']['httpProxy']
+ with urllib.request.urlopen(proxy + '/metacodes-bench-egress-probe', timeout=10) as response: late['egress'] = response.read().decode()
+ (root / 'late-traffic.json').write_text(json.dumps(late))
 time.sleep(float(os.environ.get('FAKE_BENCH_DELAY', '.2')))
 if os.environ.get('FAKE_BENCH_FAIL'): sys.exit(7)
 t = root / 'fix-git__fake'; t.mkdir()
@@ -588,6 +599,17 @@ class WorkbenchTest(unittest.TestCase):
         self.assertIn(run['name'], final['url'])
         # A new manager still sees the durable worker receipt after restart.
         self.assertEqual(RunManager(self.manager.jobs_dir, self.manager.config_path).runs()[0]['status'], 'finished')
+
+    def test_a_run_can_cap_the_output_tokens_of_each_model_request(self):
+        for bad in (100, 131073, '32000', True):
+            with self.assertRaisesRegex(ValueError, 'max_tokens'):
+                self.manager.launch({**self.request(), 'max_tokens': bad})
+        run = self.client.request('api/runs', {**self.request(), 'max_tokens': 32000})
+        final = wait_run(self.manager, run['name'])
+        self.assertEqual(final['status'], 'finished', final)
+        self.assertEqual(final['max_tokens'], 32000)
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('max_tokens=32000', argv)
 
     def test_provider_mode_reads_the_config_of_the_workbench_state_root(self):
         native = json.loads((self.root / 'provider.json').read_text())['custom_providers']['tokenjoy']

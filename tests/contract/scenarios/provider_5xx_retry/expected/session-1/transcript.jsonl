@@ -1,0 +1,2 @@
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"say hi"}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"Hello there."}]}

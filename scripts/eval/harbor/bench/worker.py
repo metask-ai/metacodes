@@ -35,6 +35,8 @@ def command(spec):
         argv += ["--ak", "account_gateway=" + spec["account_gateway"]]
     if spec.get("reasoning_effort"):
         argv += ["--ak", "reasoning_effort=" + spec["reasoning_effort"]]
+    if spec.get("max_tokens"):
+        argv += ["--ak", "max_tokens=" + str(spec["max_tokens"])]
     if spec.get("features"):
         argv += ["--ak", "features=" + ",".join(spec["features"])]
     if spec.get("model_price"):
@@ -213,6 +215,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     expired = False
     last_write = 0.0
     def channel_open():
+        remote.follow_handoff(source.current, cancelled_at is not None)
         if remote.process.poll() is None:
             return True
         if cancelled_at is None and remote.retry_tunnel(secret_env, source.current):
