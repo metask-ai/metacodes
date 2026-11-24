@@ -96,6 +96,7 @@ class MetacodesAgent(BaseInstalledAgent):
         metrics_ca: Optional[str] = None,
         account_gateway: Optional[str] = None,
         features: Optional[str] = None,
+        model_price: Optional[Any] = None,
         **kwargs: Any,
     ):
         bundle_path = bundle or os.environ.get(BUNDLE_ENV)
@@ -122,6 +123,7 @@ class MetacodesAgent(BaseInstalledAgent):
         # Validate the model and flags now: a bad value fails the job before
         # any container starts.
         self._provider, self._model = cmd.split_model(self.model_name)
+        self._model_prices = cmd.model_prices_config(self._model, model_price)
         chosen = cmd.checked_features(name for name in (features or "").split(",") if name)
         self._teamwork = cmd.TEAMWORK in chosen
         if self._teamwork:
@@ -240,7 +242,7 @@ class MetacodesAgent(BaseInstalledAgent):
             await environment.upload_file(local_instruction, remote_instruction)
             config = self.config_source
             servers = cmd.mcp_servers_config(self.mcp_servers)
-            if config is not None or servers:
+            if config is not None or servers or self._model_prices:
                 local_config = Path(scratch) / "config.json"
                 document = {} if config is None else (
                     config if isinstance(config, dict) else json.loads(Path(config).read_text(encoding="utf-8")))
@@ -249,6 +251,8 @@ class MetacodesAgent(BaseInstalledAgent):
                 if servers:
                     # The task's own MCP servers (GAIA2 CLI's ARE sidecar).
                     document = {**document, "mcpServers": {**(document.get("mcpServers") or {}), **servers}}
+                if self._model_prices:
+                    document = {**document, "model_prices": {**(document.get("model_prices") or {}), **self._model_prices}}
                 local_config.write_text(json.dumps(document), encoding="utf-8")
                 remote_config = f"/tmp/metacodes-config-{trial}.json"
                 await environment.upload_file(local_config, remote_config)

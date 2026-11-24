@@ -23,7 +23,7 @@ pub const UsageTotals = struct {
 
     pub fn costUsd(self: *const UsageTotals, model: []const u8) f64 {
         return pricing.computeCost(
-            pricing.rateFor(model),
+            pricing.effectiveRates(model),
             self.input_tokens,
             self.output_tokens,
             self.cache_read_input_tokens,

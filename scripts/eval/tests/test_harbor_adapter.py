@@ -155,6 +155,16 @@ class ModelAndFlagsTest(unittest.TestCase):
         self.assertEqual(cmd.teamwork_allow_rules(["are"])[-1], "mcp__are")
         self.assertEqual(cmd.teamwork_allow_rules()[:len(cmd.TEAMWORK_ALLOWED_TOOLS)], list(cmd.TEAMWORK_ALLOWED_TOOLS))
 
+    def test_a_model_price_becomes_the_models_model_prices_entry(self):
+        self.assertIsNone(cmd.model_prices_config("m", None))
+        self.assertEqual(cmd.model_prices_config("m", {"input": 0.15, "output": 0.6}), {"m": {"input": 0.15, "output": 0.6}})
+        self.assertEqual(cmd.model_prices_config("m", '{"input":1,"output":2,"cached_input":0.1}'),
+                         {"m": {"input": 1, "output": 2, "cached_input": 0.1}})
+        for bad in ({"input": 1}, {"input": 1, "output": -1}, {"input": 1, "output": True},
+                    {"input": 1, "output": 1, "currency": "USD"}, [1, 2]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                cmd.model_prices_config("m", bad)
+
     def test_teamwork_runs_alone(self):
         self.assertEqual(cmd.checked_features(["teamwork"]), ["teamwork"])
         self.assertEqual(cmd.checked_features(["execute_code", "stall_gate"]), ["execute_code", "stall_gate"])

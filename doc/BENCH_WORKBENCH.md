@@ -1060,7 +1060,7 @@ record list none, and the profile page marks them; a direct launch that asks
 for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork): an older node is refused until
+features (4 since teamwork, 7 since model prices): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 
@@ -1111,12 +1111,28 @@ the other features' flags, and only on an SSH executor whose entry sets
 - **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
   `task.toml` (easy $20, medium $40, hard $80, otherwise $40), and the trial
   gets `--agent-timeout-multiplier 3`, recorded on the run as
-  `agent_timeout_multiplier`. The cap is in metacodes' price-table
-  estimate, not a provider bill: a model without its own price (most
-  imported and Metask models) is charged at the Sonnet fallback rates
-  (`src/util/pricing.zig`), so the cap stops far earlier than real spend
-  would. A first real-model run at easy $5 ran out before the reviewer
-  finished.
+  `agent_timeout_multiplier`. The cap is in metacodes' price estimate,
+  not a provider bill; without the run's OpenRouter price (below) a model
+  missing from metacodes' table is charged at the Sonnet fallback rates
+  (`src/util/pricing.zig`), and the cap, and the isolated verifier's own
+  $0.20, stop far earlier than real spend would. The first real-model runs
+  without it ran out of budget or ended with no audit verdict.
+
+#### Model prices
+
+A Harbor run's model is priced from OpenRouter: at launch the workbench
+matches the model to the one OpenRouter model whose id without its `vendor/`
+prefix is the run's request model id (case-insensitive, so
+`metask/DeepSeek-V4.1-Flash-1017` is `deepseek/deepseek-v4.1-flash-1017`),
+records it on the run as `model_price` (USD per million tokens and the
+`openrouter_id`), and the adapter writes it to the trial's `config.json` as
+`model_prices`, which every metacodes cost meter charges first (`doc/API.md`,
+"Model prices"). The catalog (`https://openrouter.ai/api/v1/models`) is
+cached beside `workbench.json` as `openrouter-prices.json` for a day; when
+OpenRouter cannot be reached the cached copy is used. A model with no single
+match, or without a cached catalog, keeps metacodes' own estimate and
+records no `model_price`. `"model_prices": "off"` in `workbench.json` skips
+the lookup.
 - **Validity**: `teamwork status --json` lands in the trial's agent logs,
   and the run directory without its worktrees (`teamwork-run/`: ledger,
   seat records and logs) beside it. A run that wrote no status, or in which

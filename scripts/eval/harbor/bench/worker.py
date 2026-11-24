@@ -37,6 +37,9 @@ def command(spec):
         argv += ["--ak", "reasoning_effort=" + spec["reasoning_effort"]]
     if spec.get("features"):
         argv += ["--ak", "features=" + ",".join(spec["features"])]
+    if spec.get("model_price"):
+        price = {k: v for k, v in spec["model_price"].items() if k in ("input", "output", "cached_input", "cache_write")}
+        argv += ["--ak", "model_price=" + json.dumps(price, separators=(",", ":"))]
     if spec.get("agent_timeout_multiplier"):
         argv += ["--agent-timeout-multiplier", str(spec["agent_timeout_multiplier"])]
     if spec.get("metrics_proxy"):

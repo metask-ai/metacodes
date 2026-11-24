@@ -781,6 +781,27 @@ status line label that top level with the route's own word: a catalog whose
 Explicit `effort:` in an agent definition wins over the tier's effort. The
 built-in `Explore` agent pins the `low` tier.
 
+### Model prices
+
+Cost estimates (the session's cost line, `/cost`, evaluation budgets, the
+isolated verifier and the Teamwork ledger) use metacodes' built-in price
+table, which charges a model it does not know at the Sonnet fallback rates.
+`~/.metacodes/config.json` can price models itself, in USD per million
+tokens:
+
+```json
+"model_prices": {
+  "DeepSeek-V4.1-Flash-1017": {"input": 0.15, "output": 0.6, "cached_input": 0.003}
+}
+```
+
+A key matches the session's model case-insensitively, with or without its
+`provider/` prefix. `input` and `output` are required; `cached_input` and
+`cache_write` default to `input`. A malformed table (an unknown field, a
+negative or non-numeric price) is ignored with a warning, and costs keep the
+built-in table. A configured price is a declaration, not a bill: its
+evaluation provenance is `user_config_model_prices`.
+
 ### Multimodal image input
 
 User messages can carry first-class image content alongside text. Core

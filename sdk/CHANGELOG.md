@@ -16,6 +16,12 @@ empty `### Migration`.
 
 ### Changed
 
+- No change a Host can see. The inputs moved for configured model prices:
+  `pricing.effectiveRates` (a table installed with
+  `pricing.installConfigured`, else the built-in rates) now feeds the
+  session, evaluation, isolated-verifier and Teamwork cost meters. Only the
+  CLI App installs a table, from `config.json` `model_prices`; without one
+  every rate is the built-in one, as before.
 - No change a Host can see. The inputs moved for Teamwork progress (#524):
   a Zig host's `teamwork_runtime.Deps.observer` gets every seat status and
   phase change with a `teamwork_progress.Snapshot`, and `metacodes teamwork

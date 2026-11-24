@@ -391,7 +391,8 @@ class SetupFixture(unittest.TestCase):
             "models": [{"request_model_id": "test-model"}]}}})
         atomic_json(self.config, {"auth_mode": "provider", "provider_config": str(native), "model": "tokenjoy/test-model",
                                   "key_env": "TOKENJOY_API_KEY", "jobs_dir": str(self.state / "bench/jobs"),
-                                  "metacodes": {"binary": str(self.templates / "metacodes"), "version": "9.9.9"}})
+                                  "metacodes": {"binary": str(self.templates / "metacodes"), "version": "9.9.9"},
+                                  "model_prices": "off"})
 
     def calls(self, tool=None, side=None):
         if not self.log.exists():
