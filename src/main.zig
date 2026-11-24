@@ -6123,6 +6123,7 @@ test {
     _ = &@import("repl/tui/term.zig");
     _ = &@import("repl/tui/overlay.zig");
     _ = &@import("repl/tui/screen_mirror.zig");
+    _ = &@import("repl/tui/zero_width.zig");
     _ = &@import("repl/tui/copy_select.zig");
     _ = &@import("repl/tui/theme.zig");
     _ = &@import("repl/tui/bg_probe.zig");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const sync = @import("platform").sync;
 const term = @import("term.zig");
+const zero_width = @import("zero_width.zig");
 
 pub const Point = struct {
     row: i32,
@@ -149,7 +150,8 @@ pub const Screen = struct {
                 if (query_at != null and query == null and i >= query_at.?) query = out.count() - 1;
                 const cell = self.cells[first * old + i];
                 if (cell.isFiller()) continue;
-                const width: usize = if (i + 1 < len and self.cells[first * old + i + 1].isWideTail()) 2 else 1;
+                const wide = i + 1 < len and self.cells[first * old + i + 1].isWideTail();
+                const width: usize = if (wide and c > 1) 2 else 1;
                 if (col + width > c) {
                     if (col < c) out.put(col, wrap_pad);
                     out.wrapped.items[out.count() - 1] = true;
@@ -387,7 +389,7 @@ pub const Screen = struct {
 
     fn print(self: *Screen, cp: u21) void {
         if (self.alternate) return;
-        if (isCombining(cp)) return self.combine(cp);
+        if (zero_width.isZeroWidth(cp)) return self.combine(cp);
         const width: u16 = @intCast(term.codepointDisplayWidth(cp));
         if (width == 0) return;
         if (self.pending_wrap or (width == 2 and self.col + 1 >= self.cols and self.cols > 1)) {
@@ -450,13 +452,6 @@ pub const Screen = struct {
         return out.toOwnedSlice(gpa);
     }
 };
-
-fn isCombining(cp: u21) bool {
-    return switch (cp) {
-        0x0300...0x036F, 0x0483...0x0489, 0x0591...0x05BD, 0x0610...0x061A, 0x064B...0x065F, 0x0E31, 0x0E34...0x0E3A, 0x0E47...0x0E4E, 0x1AB0...0x1AFF, 0x1DC0...0x1DFF, 0x200C, 0x200D, 0x20D0...0x20FF, 0x3099, 0x309A, 0xFE00...0xFE0F, 0xFE20...0xFE2F, 0xE0100...0xE01EF => true,
-        else => false,
-    };
-}
 
 fn appendCodepoint(out: *std.ArrayList(u8), gpa: std.mem.Allocator, cp: u21) !void {
     var buf: [4]u8 = undefined;
@@ -596,4 +591,21 @@ test "mirror: a combining mark stays with the character before it" {
     try expectText(&s, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, "XY");
     try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 0 }, "e\u{301}");
     try testing.expectEqual(@as(u16, 3), s.col);
+}
+
+test "mirror: a wide character rewrapped into one column keeps only its head cell" {
+    var s = try Screen.init(testing.allocator, 2, 2);
+    defer s.deinit();
+    s.feed("中");
+    try s.resize(1, 2, true);
+    s.feed("a");
+    try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 1, .col = 0 }, "中a");
+}
+
+test "mirror: a virama takes no cell, so the letters after it keep their columns" {
+    var s = try Screen.init(testing.allocator, 8, 2);
+    defer s.deinit();
+    s.feed("\u{915}\u{94D}XY");
+    try expectText(&s, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 }, "XY");
+    try expectText(&s, .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 0 }, "\u{915}\u{94D}");
 }
