@@ -11,14 +11,14 @@
 //! ESC / Ctrl+C → error.InputAborted(取消整个 AskUserQuestion,对齐 cc)。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const ansi = @import("../ansi.zig");
 const input_mod = @import("../../input.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
 const reflow = @import("../reflow.zig");
-const ctx = @import("../../../tools/context.zig");
+const ctx = @import("metacodes-internal").tools.context;
 const Theme = theme_mod.Theme;
 
 const MAX_DESC_PREVIEW = 72;
@@ -44,7 +44,7 @@ const CURSOR_BLOCK_ASCII = "_";
 /// Chat about this 选中提交时返回的哨兵(对齐 cc onRespondToClaude:取消结构化问答转自由回复)。
 /// 上层 ask_user/agent_loop 识别此值 → 不把它当答案塞给模型(留空答案,用户自由输入)。
 /// 已移到中立协议位置;此处 re-export 保 UI 端引用兼容。
-pub const CHAT_SENTINEL = @import("../../../core/protocol/chat_sentinel.zig").CHAT_SENTINEL;
+pub const CHAT_SENTINEL = @import("metacodes-internal").core.protocol.chat_sentinel.CHAT_SENTINEL;
 
 fn isUnicode(th: Theme) bool {
     // mono 主题 box_h = "-"(ASCII);其余 = "─"(unicode)。借此判降级。
@@ -513,7 +513,7 @@ const MAX_OPT = 16;
 
 comptime {
     // 容量必须容得下工具层放行的最大问题数,否则合法输入会在 run() 里越界/被错误兜底。
-    std.debug.assert(MAX_Q >= @import("../../../tools/ask_user.zig").MAX_QUESTIONS);
+    std.debug.assert(MAX_Q >= @import("metacodes-internal").tools.ask_user.MAX_QUESTIONS);
 }
 
 /// 单问的可变状态(wizard 跨视图保留)。
@@ -1244,7 +1244,7 @@ test "run reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at
     defer _ = pfs.close(sink);
     const Later = struct {
         fn send(fd: c_int, bytes: []const u8) void {
-            @import("platform").sync.sleepMs(300);
+            @import("metacodes-internal").platform.sync.sleepMs(300);
             _ = pfs.writeAll(fd, bytes);
             _ = std.c.close(fd);
         }

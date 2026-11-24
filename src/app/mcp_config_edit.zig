@@ -1,8 +1,8 @@
 const std = @import("std");
-const pfs = @import("platform").fs;
-const mcp_config = @import("../mcp/config.zig");
-const json_merge = @import("../util/json_merge.zig");
-const file_lock = @import("../util/file_lock.zig");
+const pfs = @import("metacodes-internal").platform.fs;
+const mcp_config = @import("metacodes-internal").mcp.config;
+const json_merge = @import("metacodes-internal").util.json_merge;
+const file_lock = @import("metacodes-internal").util.file_lock;
 
 pub const SERVERS_KEY = "mcpServers";
 const LEGACY_KEY = "mcp_servers";
@@ -154,7 +154,7 @@ pub fn change(gpa: std.mem.Allocator, path: []const u8, name: []const u8, reques
         error.PathTooLong => return error.PathTooLong,
         error.NoParentDir => blk: {
             const parent = std.fs.path.dirname(path) orelse return error.WriteFailed;
-            @import("../util/fs.zig").mkdirParents(parent) catch return error.WriteFailed;
+            @import("metacodes-internal").util.fs.mkdirParents(parent) catch return error.WriteFailed;
             break :blk file_lock.acquire(path, .{}) catch |retry| switch (retry) {
                 error.PathTooLong => return error.PathTooLong,
                 error.LockBusy, error.NoParentDir => return error.LockBusy,
@@ -177,7 +177,7 @@ pub fn change(gpa: std.mem.Allocator, path: []const u8, name: []const u8, reques
     };
     const updated = try apply(scratch, original, name, entry_json);
     const document = try std.mem.concat(scratch, u8, &.{ updated, "\n" });
-    @import("../provider/oauth.zig").writeAtomicPrivate(gpa, path, document) catch return error.WriteFailed;
+    @import("metacodes-internal").provider.oauth.writeAtomicPrivate(gpa, path, document) catch return error.WriteFailed;
     return .{ .before = before, .written = true };
 }
 

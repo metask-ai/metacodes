@@ -16,9 +16,9 @@
 //! REPL colours them.
 
 const std = @import("std");
-const credential = @import("../provider/credential.zig");
-const profile_mod = @import("../provider/profile.zig");
-const ids = @import("../provider/ids.zig");
+const credential = @import("metacodes-internal").provider.credential;
+const profile_mod = @import("metacodes-internal").provider.profile;
+const ids = @import("metacodes-internal").provider.ids;
 
 /// Where the credential of the route a session runs on came from: who bills
 /// the session (第十节第 2 条 of the login/logout design, #484). The banner
@@ -416,7 +416,7 @@ test "environment keys: declared aliases the environment sets, once each, Metask
     const env: credential.EnvLookup = .{ .ctx = @ptrCast(&Env.anchor), .getFn = Env.get };
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const registry = @import("../provider/registry.zig");
+    const registry = @import("metacodes-internal").provider.registry;
     const names = try environmentKeys(arena.allocator(), &registry.BUILTIN_PROFILES, env);
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(testing.allocator);

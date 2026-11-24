@@ -26,7 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const platform = @import("platform");
+const platform = @import("metacodes-internal").platform;
 const release_source = @import("release_source.zig");
 
 pub const max_sums_bytes: u64 = 64 << 10;

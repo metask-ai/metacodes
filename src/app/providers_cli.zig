@@ -22,25 +22,25 @@
 //! else.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const ids = @import("../provider/ids.zig");
-const profile_mod = @import("../provider/profile.zig");
-const custom_provider = @import("../provider/custom_provider.zig");
-const config_store = @import("../provider/config_store.zig");
-const config_doc = @import("../provider/config_doc.zig");
-const provider_host = @import("../provider/host.zig");
-const credential = @import("../provider/credential.zig");
-const api_key_store = @import("../provider/api_key_store.zig");
-const provider_oauth = @import("../provider/oauth.zig");
-const model_listing = @import("../provider/model_listing.zig");
-const selection_mod = @import("../provider/selection.zig");
-const registry_mod = @import("../provider/registry.zig");
-const Vendor = @import("../provider/vendor.zig").Vendor;
-const model_probe = @import("../api/model_probe.zig");
-const dialect_registry = @import("../api/dialects/registry.zig");
+const pfs = @import("metacodes-internal").platform.fs;
+const ids = @import("metacodes-internal").provider.ids;
+const profile_mod = @import("metacodes-internal").provider.profile;
+const custom_provider = @import("metacodes-internal").provider.custom_provider;
+const config_store = @import("metacodes-internal").provider.config_store;
+const config_doc = @import("metacodes-internal").provider.config_doc;
+const provider_host = @import("metacodes-internal").provider.host;
+const credential = @import("metacodes-internal").provider.credential;
+const api_key_store = @import("metacodes-internal").provider.api_key_store;
+const provider_oauth = @import("metacodes-internal").provider.oauth;
+const model_listing = @import("metacodes-internal").provider.model_listing;
+const selection_mod = @import("metacodes-internal").provider.selection;
+const registry_mod = @import("metacodes-internal").provider.registry;
+const Vendor = @import("metacodes-internal").provider.vendor.Vendor;
+const model_probe = @import("metacodes-internal").api.model_probe;
+const dialect_registry = @import("metacodes-internal").api.dialects.registry;
 const state_env = @import("state_env.zig");
 const prompt = @import("terminal_prompt.zig");
-const time = @import("../util/time.zig");
+const time = @import("metacodes-internal").util.time;
 
 const Slug = ids.Slug;
 const Wire = model_listing.Wire;
@@ -1239,7 +1239,7 @@ fn copyAuth(arena: std.mem.Allocator, auth: profile_mod.AuthScheme) error{OutOfM
 }
 
 /// The transport family `wire` reaches, as model-name inference names it.
-fn adapterKindOf(wire: Wire) @import("../api/model_adapter.zig").ProviderKind {
+fn adapterKindOf(wire: Wire) @import("metacodes-internal").api.model_adapter.ProviderKind {
     return switch (wire) {
         .anthropic_messages => .anthropic,
         .openai_chat, .openai_responses => .openai,

@@ -13,26 +13,26 @@
 //! mutex 只管"擦/画"这组动作的逻辑原子性,不用裸 writeAll(2) 绕过。
 
 const std = @import("std");
-const sync = @import("platform").sync;
+const sync = @import("metacodes-internal").platform.sync;
 const screen_mirror = @import("screen_mirror.zig");
 const app_mod = @import("../../app.zig");
-const types = @import("../../types.zig");
+const types = @import("metacodes-internal").types;
 const ansi = @import("ansi.zig");
 const term = @import("term.zig");
 const reflow = @import("reflow.zig");
 const theme_mod = @import("theme.zig");
 const verbs = @import("verbs.zig");
 const StatusBar = @import("widget/status_bar.zig").StatusBar;
-const util_time = @import("../../util/time.zig");
+const util_time = @import("metacodes-internal").util.time;
 const complete = @import("../complete.zig");
 /// `/` 菜单最多同时显示的行数(超出时按选中项滚动)。
 const SLASH_MENU_MAX_ROWS: usize = 10;
 const model_command = @import("../model_command.zig");
 const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
-const teamwork_progress = @import("../../teamwork/progress.zig");
-const agent_job_registry = @import("../../core/agent_job_registry.zig");
-const task_store = @import("../../core/task_store.zig");
+const teamwork_progress = @import("metacodes-internal").teamwork.progress;
+const agent_job_registry = @import("metacodes-internal").core.agent_job_registry;
+const task_store = @import("metacodes-internal").core.task_store;
 const ui_mod = @import("ui.zig");
 const frame_scheduler = @import("frame_scheduler.zig");
 const model_picker_view = @import("../model_picker_view.zig");
@@ -40,7 +40,7 @@ const event_mod = @import("event.zig");
 const input = @import("../input.zig");
 const ui_state_mod = @import("ui_state.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
-const Conversation = @import("../../core/conversation.zig").Conversation;
+const Conversation = @import("metacodes-internal").core.conversation.Conversation;
 
 const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
@@ -490,7 +490,7 @@ pub const RenderRegion = struct {
         const m = &(self.merge orelse return);
         if (!m.timer) return;
         if (m.thread == null) {
-            m.thread = @import("platform").thread.spawn(.full, timerMain, .{self}) catch {
+            m.thread = @import("metacodes-internal").platform.thread.spawn(.full, timerMain, .{self}) catch {
                 self.merge = null;
                 self.paintLocked(.as_needed, "");
                 return;
@@ -1229,8 +1229,8 @@ pub const RenderRegion = struct {
         const entries = app.api_client.catalog.entries.items;
         const model_idx = app.models_picker_model_index orelse 0;
         const mask = if (model_idx < entries.len) entries[model_idx].reasoning_mask else 0;
-        var efforts_buf: @import("../../api/catalog.zig").ReasoningOptions = undefined;
-        const efforts = @import("../../api/catalog.zig").reasoningOptions(mask, &efforts_buf);
+        var efforts_buf: @import("metacodes-internal").api.catalog.ReasoningOptions = undefined;
+        const efforts = @import("metacodes-internal").api.catalog.reasoningOptions(mask, &efforts_buf);
         var rows: u16 = 0;
 
         w.writeAll(ansi.clear.line) catch {};
@@ -1249,7 +1249,7 @@ pub const RenderRegion = struct {
             const selected = i == selected_idx;
             const color = if (selected) th.accent else th.dim;
             w.writeAll(ansi.clear.line) catch {};
-            w.print("  {s}{s} {s}{s}", .{ color, if (selected) ">" else " ", @import("../../api/catalog.zig").effortLabel(vocabulary, effort), th.reset }) catch {};
+            w.print("  {s}{s} {s}{s}", .{ color, if (selected) ">" else " ", @import("metacodes-internal").api.catalog.effortLabel(vocabulary, effort), th.reset }) catch {};
             w.writeAll("\r\n") catch {};
             rows += 1;
         }
@@ -1282,7 +1282,7 @@ pub const RenderRegion = struct {
 
         if (entries.len == 0) {
             w.writeAll(ansi.clear.line) catch {};
-            w.print("  {s}login with OAuth, or set {s} to the account API-key endpoint{s}", .{ th.dim, @import("../../api/api_keys.zig").API_KEYS_URL_ENV, th.reset }) catch {};
+            w.print("  {s}login with OAuth, or set {s} to the account API-key endpoint{s}", .{ th.dim, @import("metacodes-internal").api.api_keys.API_KEYS_URL_ENV, th.reset }) catch {};
             w.writeAll("\r\n") catch {};
             return rows + 1;
         }
@@ -3647,15 +3647,15 @@ const MergeFixture = struct {
     /// `merge` false keeps the default paint-through region.
     fn init(f: *MergeFixture, merge: bool) !void {
         const a = std.testing.allocator;
-        const ppaths = @import("platform").paths;
-        const util_fs = @import("../../util/fs.zig");
+        const ppaths = @import("metacodes-internal").platform.paths;
+        const util_fs = @import("metacodes-internal").util.fs;
         f.home = util_fs.testing.perPidDir(&f.home_buf, "cc-zig-merge-window");
-        _ = @import("platform").fs.mkdir(f.home.ptr, 0o755);
+        _ = @import("metacodes-internal").platform.fs.mkdir(f.home.ptr, 0o755);
         f.old_home = std.c.getenv("HOME");
         ppaths.setEnv("HOME", f.home.ptr);
         ppaths.setEnv("METACODES_NO_PROBE", "1");
         f.app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        f.io_rt = @import("platform").signal.threadedIo(a, .{});
+        f.io_rt = @import("metacodes-internal").platform.signal.threadedIo(a, .{});
         f.app = try app_mod.App.init(f.app_arena.allocator(), f.io_rt.io(), .{ .model = "claude-sonnet-4-20250514" }, "test-key");
         f.out = .init(a);
         f.r = RenderRegion.init(a, -1, theme_mod.select(.monochrome, .none), .none);
@@ -3671,9 +3671,9 @@ const MergeFixture = struct {
         f.app.deinit();
         f.io_rt.deinit();
         f.app_arena.deinit();
-        const ppaths = @import("platform").paths;
+        const ppaths = @import("metacodes-internal").platform.paths;
         if (f.old_home) |h| ppaths.setEnv("HOME", h) else ppaths.unsetEnv("HOME");
-        @import("../../util/fs.zig").testing.rmrfBestEffort(f.home);
+        @import("metacodes-internal").util.fs.testing.rmrfBestEffort(f.home);
     }
 
     /// Frames that drew the region (each is one DEC 2026 synchronized update).

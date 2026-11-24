@@ -37,12 +37,12 @@
 //! back.
 
 const std = @import("std");
-const net = @import("platform").net;
-const log = @import("../util/log.zig");
-const time = @import("../util/time.zig");
+const net = @import("metacodes-internal").platform.net;
+const log = @import("metacodes-internal").util.log;
+const time = @import("metacodes-internal").util.time;
 const server_mod = @import("../web/server.zig");
 const submission_mod = @import("../web/submission.zig");
-const wire = @import("../core/protocol/wire.zig");
+const wire = @import("metacodes-internal").core.protocol.wire;
 const SessionView = server_mod.SessionView;
 const Lease = server_mod.Lease;
 
@@ -81,7 +81,7 @@ pub const UdsServer = struct {
             .path = try allocator.dupe(u8, path),
         };
         errdefer allocator.free(self.path);
-        self.accept_thread = try @import("platform").thread.spawn(.full, acceptLoop, .{self});
+        self.accept_thread = try @import("metacodes-internal").platform.thread.spawn(.full, acceptLoop, .{self});
         return self;
     }
 
@@ -131,7 +131,7 @@ pub const UdsServer = struct {
                 continue;
             }
             _ = self.live_conns.fetchAdd(1, .acq_rel);
-            const t = @import("platform").thread.spawn(.full, handleConn, .{ self, conn }) catch {
+            const t = @import("metacodes-internal").platform.thread.spawn(.full, handleConn, .{ self, conn }) catch {
                 net.closeSocket(conn);
                 _ = self.live_conns.fetchSub(1, .acq_rel);
                 continue;

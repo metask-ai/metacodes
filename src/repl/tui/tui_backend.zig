@@ -29,19 +29,19 @@
 //! 卡渲染用 alloc(堆),渲染完即 free,TuiBackend 不持有跨调用。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const sync = @import("platform").sync;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const sync = @import("metacodes-internal").platform.sync;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const render_region = @import("render_region.zig");
-const ui_backend = @import("../../core/protocol/ui_backend.zig");
-const ui_event = @import("../../core/protocol/ui_event.zig");
+const ui_backend = @import("metacodes-internal").core.protocol.ui_backend;
+const ui_event = @import("metacodes-internal").core.protocol.ui_event;
 const msg_queue = @import("../msg_queue.zig");
 const history_mod = @import("../history.zig");
 const user_echo = @import("../user_echo.zig");
 const session_intent = @import("../../session_intent.zig");
-const abort = @import("../../util/abort.zig");
-const util_time = @import("../../util/time.zig");
-const api_stream = @import("../../api/stream.zig");
+const abort = @import("metacodes-internal").util.abort;
+const util_time = @import("metacodes-internal").util.time;
+const api_stream = @import("metacodes-internal").api.stream;
 const tool_card = @import("widget/tool_card.zig");
 const theme_mod = @import("theme.zig");
 const input = @import("../input.zig");
@@ -54,7 +54,7 @@ const paste_mod = @import("../paste.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
-const ui_request = @import("../../core/protocol/ui_request.zig");
+const ui_request = @import("metacodes-internal").core.protocol.ui_request;
 const terminal_title = @import("terminal_title.zig");
 
 const RenderRegion = render_region.RenderRegion;
@@ -125,7 +125,7 @@ pub const TuiBackend = struct {
     theme: ?*const Theme = null,
     alloc: ?std.mem.Allocator = null,
     /// Edit/Write diff 的 tree-sitter 高亮缓存(loop.zig 注入 &app.edit_hl_cache)。
-    edit_hl_cache: ?*@import("../../core/edit_hl_cache.zig").EditHlCache = null,
+    edit_hl_cache: ?*@import("metacodes-internal").core.edit_hl_cache.EditHlCache = null,
     /// 颜色括号(stream_begin/stream_done)+ retry 着色。
     colorize: bool = false,
     /// verbose:tool_start 前打 `[Tool: name]` 行(对齐旧 agent_loop:387)。
@@ -134,7 +134,7 @@ pub const TuiBackend = struct {
     show_retry: bool = false,
     /// usage 累加目标(L1:usage 走 CoreEvent.usage 总线;TuiBackend 累加进 app.usage)。
     /// 指向 &app.usage(core UsageTotals)。null = 不累加(测试/无 App)。
-    usage_acc: ?*@import("../../core/usage.zig").UsageTotals = null,
+    usage_acc: ?*@import("metacodes-internal").core.usage.UsageTotals = null,
     /// poll 输入源(可选)。
     queue: ?*msg_queue.MsgQueue = null,
     /// 生成期被 agent_loop 取走的消息也要进 readline 历史(与 REPL 在两个 Run 之间消费队列时
@@ -494,7 +494,7 @@ pub const TuiBackend = struct {
         self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
         self.cancel_sent = false;
-        self.input_thread = try @import("platform").thread.spawn(.full, watcherMain, .{self});
+        self.input_thread = try @import("metacodes-internal").platform.thread.spawn(.full, watcherMain, .{self});
     }
 
     /// SIGINT 桥:abort 标志已置但连接还没被 shutdown → 代 handler 调 provider.cancel(一次)。
@@ -1008,7 +1008,7 @@ test "a paste during a reply with no picker open goes into the draft whole, its 
 
 test "a long paste during a reply is held as a placeholder, and the queued message reaches the model whole (#755)" {
     const a = std.testing.allocator;
-    const test_fs = @import("../../util/fs.zig").testing;
+    const test_fs = @import("metacodes-internal").util.fs.testing;
     var root_buf: [512]u8 = undefined;
     const state_root = test_fs.perPidDir(&root_buf, "cc-zig-reply-paste-root");
     _ = pfs.mkdir(state_root.ptr, 0o700);

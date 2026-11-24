@@ -48,17 +48,17 @@
 //! only access control and takes no token.
 
 const std = @import("std");
-const time = @import("../util/time.zig");
-const journal_mod = @import("../core/event_journal.zig");
+const time = @import("metacodes-internal").util.time;
+const journal_mod = @import("metacodes-internal").core.event_journal;
 const backend_mod = @import("backend.zig");
 const submission_mod = @import("submission.zig");
-const abort_mod = @import("../util/abort.zig");
-const log = @import("../util/log.zig");
-const net = @import("platform").net;
-const http = @import("../util/http.zig");
-const util_json = @import("../util/json.zig");
-const SessionId = @import("../core/session_id.zig").SessionId;
-const wire = @import("../core/protocol/wire.zig");
+const abort_mod = @import("metacodes-internal").util.abort;
+const log = @import("metacodes-internal").util.log;
+const net = @import("metacodes-internal").platform.net;
+const http = @import("metacodes-internal").util.http;
+const util_json = @import("metacodes-internal").util.json;
+const SessionId = @import("metacodes-internal").core.session_id.SessionId;
+const wire = @import("metacodes-internal").core.protocol.wire;
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
@@ -343,7 +343,7 @@ pub const WebServer = struct {
             .version = surface.version,
             .deps = deps,
         };
-        self.accept_thread = try @import("platform").thread.spawn(.full, acceptLoop, .{self});
+        self.accept_thread = try @import("metacodes-internal").platform.thread.spawn(.full, acceptLoop, .{self});
         return self;
     }
 
@@ -427,7 +427,7 @@ pub const WebServer = struct {
             }
             // 计数在 spawn 前加(accept 线程侧):避免"已 accept 未及计数"时 stop 误判 0。
             _ = self.live_conns.fetchAdd(1, .acq_rel);
-            const t = @import("platform").thread.spawn(.full, handleConn, .{ self, conn_fd }) catch {
+            const t = @import("metacodes-internal").platform.thread.spawn(.full, handleConn, .{ self, conn_fd }) catch {
                 _ = self.live_conns.fetchSub(1, .acq_rel);
                 net.closeSocket(conn_fd);
                 continue;
@@ -1415,7 +1415,7 @@ test "loopback: /message 入队(不回显), /state 快照, 404" {
 }
 
 test "loopback: /spans serves the session span store as OTLP/JSON, /trace serves the viewer" {
-    const telemetry = @import("../telemetry/telemetry.zig");
+    const telemetry = @import("metacodes-internal").telemetry.telemetry;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;

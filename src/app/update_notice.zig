@@ -1,13 +1,13 @@
 //! The update notice of an interactive session (doc/UPDATE_DESIGN.md §13).
 
 const std = @import("std");
-const platform = @import("platform");
+const platform = @import("metacodes-internal").platform;
 const install = @import("install.zig");
 const release_fetch = @import("release_fetch.zig");
 const update = @import("update.zig");
 const files = @import("terminal_setup/files.zig");
-const state_root_mod = @import("../util/state_root.zig");
-const time = @import("../util/time.zig");
+const state_root_mod = @import("metacodes-internal").util.state_root;
+const time = @import("metacodes-internal").util.time;
 
 pub const file_name = "update-check.json";
 pub const check_interval_s: i64 = 24 * 60 * 60;

@@ -9,7 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const complete = @import("../complete.zig");
-const types = @import("../../types.zig");
+const types = @import("metacodes-internal").types;
 
 /// 回合阶段(#330:widget 生命周期的唯一驱动)。一个阶段实例 = 一次输入读取(`input`)
 /// 或一次回复/等待(`generating`);两次之间是 `idle`(固定区不在屏上,没有任何 widget)。

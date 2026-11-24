@@ -162,7 +162,7 @@ Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成
 | 来源 | 记录方 | ID 和位置 |
 |---|---|---|
 | core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig` | `zig:<test 名>`,去掉命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 记为 `zig:<unnamed>`。位置是完整的命名空间(`core.agent_loop`) |
-| 其余所有 Zig 测试二进制(`cc-test`、`provider-test`、`mcp-test`、`lsp-test`……),以及 CI 里直接 `zig test src/platform/platform.zig` 的原生进程测试 | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变;也接受 `--test-ids-dir=<目录>`。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
+| 其余所有 Zig 测试二进制(`cc-test`、`internal-test`、`provider-test`、`mcp-test`、`lsp-test`……),以及 CI 里直接 `zig test src/platform/platform.zig` 的原生进程测试 | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变;也接受 `--test-ids-dir=<目录>`。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
 | `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,位置是模块路径 |
 | `scripts/eval/tests` | `scripts/eval/tests/run_shard.py` | 同上 |
 | TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,位置是文件名;只报告,不强制 |

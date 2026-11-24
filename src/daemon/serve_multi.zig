@@ -48,20 +48,20 @@
 //! 之前(freeSlot 的顺序)。
 
 const std = @import("std");
-const sync = @import("platform").sync;
-const pfs = @import("platform").fs;
+const sync = @import("metacodes-internal").platform.sync;
+const pfs = @import("metacodes-internal").platform.fs;
 const app_mod = @import("../app.zig");
-const types = @import("../types.zig");
-const time = @import("../util/time.zig");
-const log = @import("../util/log.zig");
-const util_fs = @import("../util/fs.zig");
-const abort_mod = @import("../util/abort.zig");
+const types = @import("metacodes-internal").types;
+const time = @import("metacodes-internal").util.time;
+const log = @import("metacodes-internal").util.log;
+const util_fs = @import("metacodes-internal").util.fs;
+const abort_mod = @import("metacodes-internal").util.abort;
 const registry = @import("registry.zig");
 const app_driver = @import("app_driver.zig");
-const shutdown = @import("../core/shutdown.zig");
-const transcript = @import("../core/transcript.zig");
-const session_id_mod = @import("../core/session_id.zig");
-const EventJournal = @import("../core/event_journal.zig").EventJournal;
+const shutdown = @import("metacodes-internal").core.shutdown;
+const transcript = @import("metacodes-internal").core.transcript;
+const session_id_mod = @import("metacodes-internal").core.session_id;
+const EventJournal = @import("metacodes-internal").core.event_journal.EventJournal;
 const SubmissionQueue = @import("../web/submission.zig").SubmissionQueue;
 const web_session = @import("../web/session.zig");
 const server_mod = @import("../web/server.zig");
@@ -621,7 +621,7 @@ pub const MultiDaemon = struct {
         errdefer md.gpa.destroy(slot);
         const io_rt = try md.gpa.create(std.Io.Threaded);
         errdefer md.gpa.destroy(io_rt);
-        io_rt.* = @import("platform").signal.threadedIo(md.gpa, .{});
+        io_rt.* = @import("metacodes-internal").platform.signal.threadedIo(md.gpa, .{});
         errdefer io_rt.deinit();
         slot.* = .{ .id = id, .id_text = id.bytes, .io_rt = io_rt, .app = undefined };
         var config = md.config;

@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const app_mod = @import("../../../app.zig");
-const types = @import("../../../types.zig");
+const types = @import("metacodes-internal").types;
 const verbs = @import("../verbs.zig");
 const Theme = @import("../theme.zig").Theme;
 

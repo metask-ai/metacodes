@@ -18,8 +18,8 @@
 //! command then prints its one-line outcome (`⎿  Login interrupted`).
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal;
+const pfs = @import("metacodes-internal").platform.fs;
+const platform_term = @import("metacodes-internal").platform.terminal;
 const ansi = @import("../ansi.zig");
 const term = @import("../term.zig");
 const reflow = @import("../reflow.zig");

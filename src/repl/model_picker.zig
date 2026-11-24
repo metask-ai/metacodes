@@ -42,11 +42,11 @@
 //!   (`Stage.setup`) and nothing else: no sign-in, no key field, no request.
 
 const std = @import("std");
-const control_plane = @import("../provider/control_plane.zig");
-const offer_mod = @import("../provider/offer.zig");
-const controls_mod = @import("../provider/controls.zig");
-const selection_mod = @import("../provider/selection.zig");
-const ids = @import("../provider/ids.zig");
+const control_plane = @import("metacodes-internal").provider.control_plane;
+const offer_mod = @import("metacodes-internal").provider.offer;
+const controls_mod = @import("metacodes-internal").provider.controls;
+const selection_mod = @import("metacodes-internal").provider.selection;
+const ids = @import("metacodes-internal").provider.ids;
 
 pub const OfferSummary = control_plane.OfferSummary;
 pub const Slug = ids.Slug;

@@ -2,8 +2,8 @@
 //! (UTF-8 paths reach the same file on Windows as the wide-character checks).
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const util_fs = @import("../../util/fs.zig");
+const pfs = @import("metacodes-internal").platform.fs;
+const util_fs = @import("metacodes-internal").util.fs;
 
 pub const Error = error{ OutOfMemory, NotFound, ReadFailed, WriteFailed, TooLarge, PathTooLong };
 
@@ -174,8 +174,8 @@ test "files: link tells a plain file, a symbolic link and a dangling one apart" 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "real.json", .data = "[]" });
-    try @import("platform").test_support.symlinkOrSkip(tmp.dir, testing.io, "real.json", "link.json", .{});
-    try @import("platform").test_support.symlinkOrSkip(tmp.dir, testing.io, "missing.json", "dangling.json", .{});
+    try @import("metacodes-internal").platform.test_support.symlinkOrSkip(tmp.dir, testing.io, "real.json", "link.json", .{});
+    try @import("metacodes-internal").platform.test_support.symlinkOrSkip(tmp.dir, testing.io, "missing.json", "dangling.json", .{});
 
     try testing.expect(try link(arena, try std.fs.path.join(arena, &.{ root, "real.json" })) == .none);
     try testing.expect(try link(arena, try std.fs.path.join(arena, &.{ root, "nothing.json" })) == .none);

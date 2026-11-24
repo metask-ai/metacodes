@@ -19,15 +19,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const platform = @import("platform");
+const platform = @import("metacodes-internal").platform;
 const process_scan = platform.process_scan;
 const pprocess = platform.process;
 const install = @import("install.zig");
 const release_source = @import("release_source.zig");
 const release_fetch = @import("release_fetch.zig");
 const unit_archive = @import("unit_archive.zig");
-const state_root = @import("../util/state_root.zig");
-const time = @import("../util/time.zig");
+const state_root = @import("metacodes-internal").util.state_root;
+const time = @import("metacodes-internal").util.time;
 
 pub const Pid = process_scan.Pid;
 
@@ -453,7 +453,7 @@ fn runRelease(
     return outcome;
 }
 
-pub const user_agent = "metacodes-update/" ++ @import("../version.zig").semver;
+pub const user_agent = "metacodes-update/" ++ @import("metacodes-internal").version.semver;
 
 fn reportFetch(log: Log, report: release_fetch.Report) void {
     if (report.url.len == 0 or report.curl_exit == 0) return;

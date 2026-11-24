@@ -1,10 +1,10 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const cmd_output = @import("cmd_output.zig");
-const command = @import("../teamwork/command.zig");
-const interview = @import("../teamwork/interview.zig");
-const types = @import("../teamwork/types.zig");
-const progress = @import("../teamwork/progress.zig");
+const command = @import("metacodes-internal").teamwork.command;
+const interview = @import("metacodes-internal").teamwork.interview;
+const types = @import("metacodes-internal").teamwork.types;
+const progress = @import("metacodes-internal").teamwork.progress;
 const agent_tree = @import("tui/widget/agent_tree.zig");
 
 pub const LineReader = struct {
@@ -228,7 +228,7 @@ fn eqlAny(text: []const u8, options: []const []const u8) bool {
 }
 
 test "teamwork REPL: an interview that starts no run leaves no progress panel behind" {
-    const runtime = @import("../teamwork/runtime.zig");
+    const runtime = @import("metacodes-internal").teamwork.runtime;
     var board = progress.Board.init(std.testing.allocator);
     defer board.deinit();
     const id = try types.RunId.parse("run-1");

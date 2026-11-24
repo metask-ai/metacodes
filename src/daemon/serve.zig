@@ -11,11 +11,11 @@
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
-const time = @import("../util/time.zig");
-const log = @import("../util/log.zig");
+const time = @import("metacodes-internal").util.time;
+const log = @import("metacodes-internal").util.log;
 const registry = @import("registry.zig");
 const app_driver = @import("app_driver.zig");
-const shutdown = @import("../core/shutdown.zig");
+const shutdown = @import("metacodes-internal").core.shutdown;
 const web_session = @import("../web/session.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
 const server_mod = @import("../web/server.zig");

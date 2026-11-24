@@ -13,17 +13,17 @@
 //!   own and calls the model over each client's route (§8.1).
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const paths = @import("platform").paths;
-const platform_signal = @import("platform").signal;
-const util_time = @import("../util/time.zig");
-const shutdown = @import("../core/shutdown.zig");
-const protocol = @import("../skills/sealed/protocol.zig");
-const transport = @import("../skills/sealed/transport.zig");
-const pin_mod = @import("../skills/sealed/pin.zig");
-const ledger = @import("../skills/sealed/ledger.zig");
-const credentials = @import("../skills/sealed/credentials.zig");
-const gateway_mod = @import("../skills/sealed/gateway.zig");
+const pfs = @import("metacodes-internal").platform.fs;
+const paths = @import("metacodes-internal").platform.paths;
+const platform_signal = @import("metacodes-internal").platform.signal;
+const util_time = @import("metacodes-internal").util.time;
+const shutdown = @import("metacodes-internal").core.shutdown;
+const protocol = @import("metacodes-internal").skills.sealed.protocol;
+const transport = @import("metacodes-internal").skills.sealed.transport;
+const pin_mod = @import("metacodes-internal").skills.sealed.pin;
+const ledger = @import("metacodes-internal").skills.sealed.ledger;
+const credentials = @import("metacodes-internal").skills.sealed.credentials;
+const gateway_mod = @import("metacodes-internal").skills.sealed.gateway;
 
 const USAGE =
     \\usage: metacodes sealed install <gateway-url> <skill_id> [--token-env NAME] [--yes]
@@ -315,7 +315,7 @@ fn bind(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, state_ro
             return 1;
         }
     else blk: {
-        if (@import("platform").terminal.isatty(0)) std.debug.print("Secret for {s} ({s}), then Enter: ", .{ ref, manifest.name });
+        if (@import("metacodes-internal").platform.terminal.isatty(0)) std.debug.print("Secret for {s} ({s}), then Enter: ", .{ ref, manifest.name });
         const n = pfs.read(0, &secret_buf);
         if (n <= 0) {
             std.debug.print("error: no secret on stdin\n", .{});

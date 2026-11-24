@@ -28,13 +28,13 @@
 //! Host-only, like the rest of `src/app/`.
 
 const std = @import("std");
-const types = @import("../types.zig");
-const config_doc = @import("../provider/config_doc.zig");
-const registry_mod = @import("../provider/registry.zig");
-const provider_startup = @import("../provider/startup.zig");
+const types = @import("metacodes-internal").types;
+const config_doc = @import("metacodes-internal").provider.config_doc;
+const registry_mod = @import("metacodes-internal").provider.registry;
+const provider_startup = @import("metacodes-internal").provider.startup;
 const startup_order = @import("startup_order.zig");
 const state_env = @import("state_env.zig");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 
 /// `METACODES_PRESET`.
 pub const variable = state_env.preset_variable;
@@ -202,7 +202,7 @@ fn judge(
 /// worktree root when `cwd` is inside one, else `cwd` without trailing
 /// separators. In `arena`.
 pub fn directoryKey(arena: std.mem.Allocator, cwd: []const u8) error{OutOfMemory}![]const u8 {
-    const root = @import("../skills/skill.zig").findRepoRoot(arena, cwd) catch |err| switch (err) {
+    const root = @import("metacodes-internal").skills.skill.findRepoRoot(arena, cwd) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return arena.dupe(u8, trimSeparators(cwd)),
     };
@@ -520,13 +520,13 @@ test "a preset lowers into the fields the flags would set, and a flag keeps its 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const host = try @import("../provider/host.zig").Host.create(testing.allocator);
+    const host = try @import("metacodes-internal").provider.host.Host.create(testing.allocator);
     defer host.destroy();
     const registry = &host.registry;
 
     // An auto_route selector: provider, channel and model, no offer.
     var auto = try config_doc.RuntimeSelection.auto("deepseek-v4-pro", .{}, .session);
-    try auto.controls.set("reasoning_effort", try @import("../provider/controls.zig").Value.fromText("high"));
+    try auto.controls.set("reasoning_effort", try @import("metacodes-internal").provider.controls.Value.fromText("high"));
     var config: types.Config = .{};
     try testing.expect((try apply(arena, registry, auto, &config)) == .applied);
     try testing.expectEqualStrings("deepseek", config.provider_profile.?);
@@ -544,7 +544,7 @@ test "a preset lowers into the fields the flags would set, and a flag keeps its 
 
     // A pinned offer is that offer, unless a flag or a moved endpoint
     // changes one of its fields.
-    var catalog = try registry.buildCatalog(testing.allocator, .{ .only_provider = @import("../provider/ids.zig").Slug.lit("deepseek") });
+    var catalog = try registry.buildCatalog(testing.allocator, .{ .only_provider = @import("metacodes-internal").provider.ids.Slug.lit("deepseek") });
     defer catalog.deinit();
     const offer = catalog.items()[0];
     const pinned = config_doc.RuntimeSelection.pinned(offer.offer_id, offer.offer_revision, .session);
@@ -564,7 +564,7 @@ test "a preset lowers into the fields the flags would set, and a flag keeps its 
 
     // What it cannot apply, it refuses, and says why in one line.
     var bad_effort = auto;
-    try bad_effort.controls.set("reasoning_effort", try @import("../provider/controls.zig").Value.fromText("extreme"));
+    try bad_effort.controls.set("reasoning_effort", try @import("metacodes-internal").provider.controls.Value.fromText("extreme"));
     config = .{};
     const refused = try apply(arena, registry, bad_effort, &config);
     try testing.expectEqualStrings(
@@ -622,12 +622,12 @@ test "the preset .env falls back to resolves as level 6 of a start does (#489)" 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const host = try @import("../provider/host.zig").Host.create(testing.allocator);
+    const host = try @import("metacodes-internal").provider.host.Host.create(testing.allocator);
     defer host.destroy();
     const registry = &host.registry;
 
     var auto = try config_doc.RuntimeSelection.auto("deepseek-v4-pro", .{}, .session);
-    try auto.controls.set("reasoning_effort", try @import("../provider/controls.zig").Value.fromText("high"));
+    try auto.controls.set("reasoning_effort", try @import("metacodes-internal").provider.controls.Value.fromText("high"));
     const plain = (try resolveLocal(arena, registry, .{ .preset = .{ .name = "fast", .selection = auto } })) orelse return error.TestUnexpectedResult;
     try testing.expect(plain.route.provider_id.eqlText("deepseek"));
     try testing.expectEqualStrings("deepseek-v4-pro", plain.route.request_model_id);
@@ -638,7 +638,7 @@ test "the preset .env falls back to resolves as level 6 of a start does (#489)" 
     try testing.expectEqualStrings("deepseek-flash", refined.route.request_model_id);
     try testing.expectEqual(@as(?types.ReasoningEffort, .high), refined.reasoning_effort);
 
-    var catalog = try registry.buildCatalog(testing.allocator, .{ .only_provider = @import("../provider/ids.zig").Slug.lit("deepseek") });
+    var catalog = try registry.buildCatalog(testing.allocator, .{ .only_provider = @import("metacodes-internal").provider.ids.Slug.lit("deepseek") });
     defer catalog.deinit();
     const pro = for (catalog.items()) |*offer| {
         if (std.mem.eql(u8, offer.request_model_id, "deepseek-v4-pro")) break offer;

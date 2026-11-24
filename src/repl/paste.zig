@@ -10,7 +10,7 @@
 //! 占位符 → 真实内容的还原由调用方在提交时做（expandPlaceholders）。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const LineEditor = @import("input.zig").LineEditor;
 
 /// 触发外部存储的阈值：行数 > 此值 或 字节数 > 此值。
@@ -188,9 +188,9 @@ test "isLarge by bytes" {
 test "store + load + expand round trip" {
     const a = testing.allocator;
     var home_buf: [512]u8 = undefined;
-    const state_root = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-state_root");
+    const state_root = @import("metacodes-internal").util.fs.testing.perPidDir(&home_buf, "cc-zig-paste-state_root");
     _ = pfs.mkdir(state_root.ptr, 0o700);
-    defer @import("../util/fs.zig").testing.rmrfBestEffort(state_root);
+    defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(state_root);
     defer {
         // cleanup
         var pz: [256]u8 = undefined;
@@ -220,9 +220,9 @@ test "store + load + expand round trip" {
 test "store placeholder count = lines - 1 (cc v2.1.172)" {
     const a = testing.allocator;
     var home_buf: [512]u8 = undefined;
-    const state_root = @import("../util/fs.zig").testing.perPidDir(&home_buf, "cc-zig-paste-state_root");
+    const state_root = @import("metacodes-internal").util.fs.testing.perPidDir(&home_buf, "cc-zig-paste-state_root");
     _ = pfs.mkdir(state_root.ptr, 0o700);
-    defer @import("../util/fs.zig").testing.rmrfBestEffort(state_root);
+    defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(state_root);
     defer {
         var pz: [256]u8 = undefined;
         inline for (.{ 4, 20 }) |id| {

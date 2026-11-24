@@ -11,14 +11,14 @@
 //! list a provider sees is fixed by the outcomes, never by when they arrived.
 
 const std = @import("std");
-const pfs = @import("platform").fs;
-const mcp_config = @import("../mcp/config.zig");
-const mcp_launch = @import("../mcp/launch.zig");
-const mcp_transport = @import("../mcp/transport.zig");
-const McpClient = @import("../mcp/client.zig").McpClient;
-const mcp_oauth = @import("../mcp/oauth.zig");
-const AbortSignal = @import("../util/abort.zig").AbortSignal;
-const util_time = @import("../util/time.zig");
+const pfs = @import("metacodes-internal").platform.fs;
+const mcp_config = @import("metacodes-internal").mcp.config;
+const mcp_launch = @import("metacodes-internal").mcp.launch;
+const mcp_transport = @import("metacodes-internal").mcp.transport;
+const McpClient = @import("metacodes-internal").mcp.client.McpClient;
+const mcp_oauth = @import("metacodes-internal").mcp.oauth;
+const AbortSignal = @import("metacodes-internal").util.abort.AbortSignal;
+const util_time = @import("metacodes-internal").util.time;
 
 /// What a renderer on any thread may read about the startup: counters only,
 /// never a pointer into the startup's memory. Lives in the App.
@@ -135,7 +135,7 @@ pub const Job = struct {
         // c_allocator: the client allocates and frees per request for the
         // whole session; an arena could never reclaim that.
         const abort: *const AbortSignal = &job.owner.cancel;
-        const options: @import("../mcp/client.zig").ConnectOptions = .{
+        const options: @import("metacodes-internal").mcp.client.ConnectOptions = .{
             .spawn = .{ .argv = &.{} },
             .startup_timeout_ms = job.server.startup_timeout_ms,
             .request_timeout_ms = job.server.tool_timeout_ms,
@@ -161,7 +161,7 @@ pub const Job = struct {
                 // (a network round trip) before the first request.
                 const auth = if (job.oauth_state_root.len != 0)
                     mcp_oauth.TokenSource.load(std.heap.c_allocator, job.io, job.oauth_state_root, job.server.name, http.url) catch |err| no_login: {
-                        @import("../util/log.zig").warn("mcp", "server '{s}': stored OAuth login unreadable ({s}); connecting without it", .{ job.server.name, @errorName(err) });
+                        @import("metacodes-internal").util.log.warn("mcp", "server '{s}': stored OAuth login unreadable ({s}); connecting without it", .{ job.server.name, @errorName(err) });
                         break :no_login null;
                     }
                 else
@@ -287,7 +287,7 @@ pub const Startup = struct {
         resolved: mcp_config.Resolved,
         environment: mcp_config.Environment,
     ) !*Startup {
-        const log = @import("../util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         for (resolved.problems) |problem| {
             log.warn("mcp", "{s} ({s}){s}{s}: {s}", .{
                 problem.origin_path,
@@ -357,7 +357,7 @@ pub const Startup = struct {
                     continue;
                 },
             }
-            thread.* = @import("platform").thread.spawn(.full, Job.run, .{job}) catch blk: {
+            thread.* = @import("metacodes-internal").platform.thread.spawn(.full, Job.run, .{job}) catch blk: {
                 job.run();
                 break :blk null;
             };
@@ -458,7 +458,7 @@ fn openLog(arena: std.mem.Allocator, state_root: []const u8, server: []const u8,
     if (state_root.len == 0) return "";
     const name = mcp_launch.logFileName(arena, server) catch return "";
     const dir = std.fs.path.join(arena, &.{ state_root, "logs", "mcp" }) catch return "";
-    @import("../util/fs.zig").mkdirParents(dir) catch return "";
+    @import("metacodes-internal").util.fs.mkdirParents(dir) catch return "";
     const path = std.fs.path.join(arena, &.{ dir, name }) catch return "";
     const path_z = arena.dupeZ(u8, path) catch return "";
     // Close-on-exec: every log is open while the servers start in
@@ -466,7 +466,7 @@ fn openLog(arena: std.mem.Allocator, state_root: []const u8, server: []const u8,
     // the flag each server, and anything else spawned meanwhile, would
     // also hold every other server's log open. The fork lock keeps a
     // concurrent spawn out of the gap between open and fcntl.
-    const process = @import("platform").process;
+    const process = @import("metacodes-internal").platform.process;
     process.forkSerialLock();
     defer process.forkSerialUnlock();
     const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));

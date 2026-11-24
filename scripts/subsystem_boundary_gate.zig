@@ -37,6 +37,12 @@
 //! or `src/web/` may drive the kernel by importing `src/core/agent_loop.zig`.
 //! `HOST_KERNEL`'s baseline names the files that still do; like the library's,
 //! it may only shrink.
+//!
+//! The application side reaches the lower packages through one named module,
+//! `metacodes-internal`, rooted at `src/internal.zig`. Each use names the file
+//! it means, `@import("metacodes-internal").core.agent_loop`, so the rules
+//! above read it as an import of `src/core/agent_loop.zig`; a use that names no
+//! file of the entry counts as an import nothing is allowed.
 
 const std = @import("std");
 
@@ -379,10 +385,146 @@ fn isListed(list: []const []const u8, name: []const u8) bool {
     return false;
 }
 
+/// The lower-package files and named modules `src/internal.zig` re-exports to
+/// the application side, by the namespace path a use spells after the module
+/// name.
+const Internal = struct {
+    entries: []const Entry = &.{},
+
+    const name = "metacodes-internal";
+    const root = "src/internal.zig";
+
+    const Entry = struct {
+        chain: []const u8,
+        /// A repository-relative file, or the name of a named module.
+        target: []const u8,
+        module: bool,
+    };
+
+    fn load(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Internal {
+        const source = dir.readFileAllocOptions(io, root, allocator, .limited(4 * 1024 * 1024), .of(u8), 0) catch |err| switch (err) {
+            error.FileNotFound => return .{},
+            else => return err,
+        };
+        return parse(allocator, source);
+    }
+
+    fn parse(allocator: std.mem.Allocator, source: [:0]const u8) !Internal {
+        var entries: std.ArrayList(Entry) = .empty;
+        var namespaces: std.ArrayList(struct { name: []const u8, depth: usize }) = .empty;
+        var depth: usize = 0;
+        var tokens: std.ArrayList(std.zig.Token) = .empty;
+        var tokenizer = std.zig.Tokenizer.init(source);
+        while (true) {
+            const token = tokenizer.next();
+            if (token.tag == .eof) break;
+            try tokens.append(allocator, token);
+        }
+        const all = tokens.items;
+        for (all, 0..) |token, index| {
+            switch (token.tag) {
+                .l_brace => depth += 1,
+                .r_brace => {
+                    depth -|= 1;
+                    if (namespaces.items.len > 0 and namespaces.items[namespaces.items.len - 1].depth == depth) _ = namespaces.pop();
+                },
+                .keyword_pub => {
+                    if (index + 5 >= all.len) continue;
+                    if (all[index + 1].tag != .keyword_const or all[index + 2].tag != .identifier or all[index + 3].tag != .equal) continue;
+                    const decl = source[all[index + 2].loc.start..all[index + 2].loc.end];
+                    const value = all[index + 4];
+                    if (value.tag == .keyword_struct and all[index + 5].tag == .l_brace) {
+                        try namespaces.append(allocator, .{ .name = decl, .depth = depth });
+                        continue;
+                    }
+                    if (value.tag != .builtin or !std.mem.eql(u8, source[value.loc.start..value.loc.end], "@import")) continue;
+                    if (index + 6 >= all.len or all[index + 6].tag != .string_literal) continue;
+                    const literal = source[all[index + 6].loc.start + 1 .. all[index + 6].loc.end - 1];
+                    var buffer: [512]u8 = undefined;
+                    const file = resolve(&buffer, root, literal);
+                    var chain: std.ArrayList(u8) = .empty;
+                    for (namespaces.items) |namespace| {
+                        try chain.appendSlice(allocator, namespace.name);
+                        try chain.append(allocator, '.');
+                    }
+                    try chain.appendSlice(allocator, decl);
+                    try entries.append(allocator, .{
+                        .chain = chain.items,
+                        .target = try allocator.dupe(u8, file orelse literal),
+                        .module = file == null,
+                    });
+                },
+                else => {},
+            }
+        }
+        return .{ .entries = entries.items };
+    }
+
+    /// The entry a use names: `rest` is the source after the closing quote
+    /// of `@import("metacodes-internal"`.
+    fn use(internal: Internal, rest: []const u8) ?Entry {
+        var cursor = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+        cursor += 1;
+        var chain_end: usize = 0;
+        var chain_start: ?usize = null;
+        var found: ?Entry = null;
+        while (true) {
+            while (cursor < rest.len and std.ascii.isWhitespace(rest[cursor])) cursor += 1;
+            if (cursor >= rest.len or rest[cursor] != '.') break;
+            cursor += 1;
+            while (cursor < rest.len and std.ascii.isWhitespace(rest[cursor])) cursor += 1;
+            const start = cursor;
+            while (cursor < rest.len and (std.ascii.isAlphanumeric(rest[cursor]) or rest[cursor] == '_')) cursor += 1;
+            if (cursor == start) break;
+            if (chain_start == null) chain_start = start;
+            chain_end = cursor;
+            const spelled = rest[chain_start.?..chain_end];
+            for (internal.entries) |entry| {
+                if (sameChain(entry.chain, spelled)) found = entry;
+            }
+        }
+        return found;
+    }
+
+    fn fileOf(internal: Internal, rest: []const u8) ?[]const u8 {
+        const entry = internal.use(rest) orelse return null;
+        return if (entry.module) null else entry.target;
+    }
+};
+
+/// True when `spelled`, source text that may carry blanks around its dots,
+/// is the namespace path `chain`.
+fn sameChain(chain: []const u8, spelled: []const u8) bool {
+    var at: usize = 0;
+    for (spelled) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        if (at == chain.len or chain[at] != byte) return false;
+        at += 1;
+    }
+    return at == chain.len;
+}
+
+/// The file `target`, imported at `rest` of `path`, names: a relative path
+/// resolved against `path`, or a file the internal entry re-exports.
+fn importedFile(buffer: []u8, internal: Internal, path: []const u8, target: []const u8, rest: []const u8) ?[]const u8 {
+    if (resolve(buffer, path, target)) |resolved| return resolved;
+    if (!std.mem.eql(u8, target, Internal.name)) return null;
+    return internal.fileOf(rest);
+}
+
+/// The named module `target`, imported at `rest`, stands for: the module a
+/// use of the internal entry names, or `target` itself.
+fn namedModule(internal: Internal, target: []const u8, rest: []const u8) []const u8 {
+    if (!std.mem.eql(u8, target, Internal.name)) return target;
+    const entry = internal.use(rest) orelse return target;
+    return if (entry.module) entry.target else target;
+}
+
 /// The files one subsystem reaches, each with the file it was reached from
 /// (null for the subsystem's own files), and those still to be checked.
 const Walk = struct {
     allocator: std.mem.Allocator,
+    internal: Internal = .{},
     reached_from: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     pending: std.ArrayList([]const u8) = .empty,
 
@@ -406,8 +548,9 @@ pub fn main(init: std.process.Init) !void {
     defer root.close(init.io);
 
     var violations: usize = 0;
+    const internal = try Internal.load(allocator, init.io, root);
     for (SUBSYSTEMS, 0..) |subsystem, index| {
-        var walk: Walk = .{ .allocator = allocator };
+        var walk: Walk = .{ .allocator = allocator, .internal = internal };
         var dir = try root.openDir(init.io, subsystem.dir, .{ .iterate = true, .follow_symlinks = false });
         defer dir.close(init.io);
         try seed(allocator, init.io, dir, subsystem, subsystem.dir, &walk);
@@ -536,6 +679,7 @@ fn staleBaseline(library: Library, used: []const bool) usize {
 /// a file the baseline does not name, and every baseline entry whose import is
 /// gone.
 fn checkRatchet(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, ratchet: Ratchet) !usize {
+    const internal = try Internal.load(allocator, io, root);
     const used = try allocator.alloc(bool, ratchet.baseline.len);
     defer allocator.free(used);
     @memset(used, false);
@@ -548,7 +692,7 @@ fn checkRatchet(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, ratc
             else => return err,
         };
         defer dir.close(io);
-        try checkRatchetDir(allocator, io, root, dir, prefix, ratchet, used, &violations);
+        try checkRatchetDir(allocator, io, root, dir, prefix, ratchet, internal, used, &violations);
     }
     for (ratchet.baseline, used) |file, still| {
         if (still) continue;
@@ -568,6 +712,7 @@ fn checkRatchetDir(
     dir: std.Io.Dir,
     prefix: []const u8,
     ratchet: Ratchet,
+    internal: Internal,
     used: []bool,
     violations: *usize,
 ) !void {
@@ -579,7 +724,7 @@ fn checkRatchetDir(
             .directory => {
                 var child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
                 defer child.close(io);
-                try checkRatchetDir(allocator, io, root, child, path, ratchet, used, violations);
+                try checkRatchetDir(allocator, io, root, child, path, ratchet, internal, used, violations);
             },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
@@ -589,7 +734,7 @@ fn checkRatchetDir(
                     continue;
                 };
                 defer allocator.free(source);
-                checkRatchetFile(source, path, ratchet, used, violations);
+                checkRatchetFile(source, path, ratchet, internal, used, violations);
             },
             else => {},
         }
@@ -599,7 +744,7 @@ fn checkRatchetDir(
 /// Check every `@import` in `source`, the text of `path`: mark the baseline
 /// entry of a listed file that still imports the target, and count every
 /// other import of it.
-fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, used: []bool, violations: *usize) void {
+fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, internal: Internal, used: []bool, violations: *usize) void {
     const needle = "@import(\"";
     var cursor: usize = 0;
     var line: usize = 1;
@@ -614,7 +759,16 @@ fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, used
         const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..found], '\n')) |newline| newline + 1 else 0;
         if (isProse(source[line_start..found])) continue;
         var buffer: [512]u8 = undefined;
-        const resolved = resolve(&buffer, path, source[start..end]) orelse continue;
+        const target = source[start..end];
+        const resolved = importedFile(&buffer, internal, path, target, source[end + 1 ..]) orelse {
+            if (!std.mem.eql(u8, target, Internal.name) or internal.use(source[end + 1 ..]) != null) continue;
+            violations.* += 1;
+            std.debug.print(
+                "{s}:{d}: uses {s} without naming a file of {s}, so the {s} rule cannot see what it reaches\n",
+                .{ path, line, Internal.name, Internal.root, ratchet.name },
+            );
+            continue;
+        };
         if (!std.mem.eql(u8, resolved, ratchet.target)) continue;
         if (ratchetIndex(ratchet, path)) |index| {
             used[index] = true;
@@ -682,7 +836,7 @@ fn check(
         cursor = end + 1;
         const target = source[start..end];
         var buffer: [512]u8 = undefined;
-        if (resolve(&buffer, path, target)) |resolved| {
+        if (importedFile(&buffer, walk.internal, path, target, source[end + 1 ..])) |resolved| {
             if (isMember(subsystem, resolved)) {
                 try walk.visit(resolved, path);
                 continue;
@@ -691,7 +845,7 @@ fn check(
                 if (!ownedElsewhere(subsystems, index, resolved)) try walk.visit(resolved, path);
                 continue;
             }
-        } else if (isListed(subsystem.modules, target)) continue;
+        } else if (isListed(subsystem.modules, namedModule(walk.internal, target, source[end + 1 ..]))) continue;
 
         violations.* += 1;
         std.debug.print(
@@ -1043,4 +1197,92 @@ test "the host ratchet's baseline is under its directories and has no duplicate"
     ratchet = TEST_RATCHET;
     ratchet.dirs = &.{"src/web"};
     try std.testing.expect(ratchetError(ratchet) != null);
+}
+
+const test_internal =
+    \\const std = @import("std");
+    \\
+    \\pub const platform = @import("platform");
+    \\pub const tools_root = @import("tools.zig");
+    \\pub const core = struct {
+    \\    pub const agent_loop = @import("core/agent_loop.zig");
+    \\};
+    \\pub const kg = struct {
+    \\    pub const kgd = struct {
+    \\        pub const server = @import("kg/kgd/server.zig");
+    \\    };
+    \\    pub const store = @import("kg/store.zig");
+    \\};
+    \\pub const provider = struct {
+    \\    pub const ids = @import("provider/ids.zig");
+    \\};
+    \\
+    \\test {
+    \\    std.testing.refAllDecls(core);
+    \\}
+    \\
+;
+
+test "a use of the internal entry names the file its namespace path re-exports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const internal = try Internal.parse(arena.allocator(), test_internal);
+    try std.testing.expectEqual(@as(usize, 6), internal.entries.len);
+    try std.testing.expectEqualStrings("src/tools.zig", internal.fileOf(").tools_root.ToolContext").?);
+    try std.testing.expectEqualStrings("src/core/agent_loop.zig", internal.fileOf(").core.agent_loop.AgentLoop").?);
+    try std.testing.expectEqualStrings("src/kg/kgd/server.zig", internal.fileOf(")\n    . kg .kgd. server;").?);
+    try std.testing.expectEqualStrings("src/kg/store.zig", internal.fileOf(").kg.store").?);
+    try std.testing.expect(internal.fileOf(");") == null);
+    try std.testing.expect(internal.fileOf(").kg;") == null);
+    try std.testing.expect(internal.fileOf(").kg.missing") == null);
+    try std.testing.expect(internal.fileOf(").platform.fs") == null);
+    try std.testing.expectEqualStrings("platform", namedModule(internal, "metacodes-internal", ").platform.fs"));
+    try std.testing.expectEqualStrings("metacodes-internal", namedModule(internal, "metacodes-internal", ").core.agent_loop"));
+    try std.testing.expectEqualStrings("hl", namedModule(internal, "hl", ")"));
+}
+
+test "the picker's reach through the internal entry is held to its lists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subsystems = [_]Subsystem{.{
+        .name = "picker",
+        .dir = "src/repl",
+        .recursive = false,
+        .only = &.{"model_picker.zig"},
+        .modules = &.{"std"},
+        .reaches = &.{"src/provider/ids.zig"},
+    }};
+    var walk: Walk = .{ .allocator = arena.allocator(), .internal = try Internal.parse(arena.allocator(), test_internal) };
+    var violations: usize = 0;
+    var with_platform = subsystems;
+    with_platform[0].modules = &.{ "std", "platform" };
+    try check(&walk, "const fs = @import(\"metacodes-internal\").platform.fs;", "src/repl/model_picker.zig", &with_platform, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 0), violations);
+    try check(&walk, "const fs = @import(\"metacodes-internal\").platform.fs;", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations);
+    violations = 0;
+    try check(&walk, "const ids = @import(\"metacodes-internal\").provider.ids;", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 0), violations);
+    try std.testing.expect(walk.reached_from.contains("src/provider/ids.zig"));
+    try check(&walk, "const loop = @import(\"metacodes-internal\").core.agent_loop;", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations);
+    try check(&walk, "const internal = @import(\"metacodes-internal\");", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 2), violations);
+}
+
+test "a host file may not reach the AgentLoop through the internal entry either" {
+    const driver = [2][]const u8{ "src/daemon/app_driver.zig", "const agent_loop = @import(\"metacodes-internal\").core.agent_loop;\n" };
+    const entry = [2][]const u8{ "src/internal.zig", test_internal };
+    const clean = [_][2][]const u8{
+        entry,
+        driver,
+        .{ "src/web/server.zig", "const ids = @import(\"metacodes-internal\").provider.ids;\nconst fs = @import(\"metacodes-internal\").platform.fs;\n" },
+    };
+    try std.testing.expectEqual(@as(usize, 0), try checkRatchetTree(TEST_RATCHET, &clean));
+    var named = clean;
+    named[2][1] = "const Loop = @import(\"metacodes-internal\").core.agent_loop.AgentLoop;\n";
+    try std.testing.expectEqual(@as(usize, 1), try checkRatchetTree(TEST_RATCHET, &named));
+    var aliased = clean;
+    aliased[2][1] = "const internal = @import(\"metacodes-internal\");\nconst Loop = internal.core.agent_loop.AgentLoop;\n";
+    try std.testing.expectEqual(@as(usize, 1), try checkRatchetTree(TEST_RATCHET, &aliased));
 }

@@ -12,30 +12,30 @@
 //! 不带 `--json` 时，失败原因写 stderr（`stopNotice`），stdout 只放模型文本。
 
 const std = @import("std");
-const pfs = @import("platform").fs;
+const pfs = @import("metacodes-internal").platform.fs;
 const app_mod = @import("../app.zig");
-const agent_loop = @import("../core/agent_loop.zig");
-const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
-const check_gate_mod = @import("../core/check_gate.zig");
-const isolated_verifier_mod = @import("../core/isolated_verifier.zig");
-const learning_turn_mod = @import("../core/learning_turn.zig");
-const learning_end_of_run_mod = @import("../core/learning_end_of_run.zig");
-const test_integrity_mod = @import("../core/test_integrity.zig");
-const stall_gate_mod = @import("../core/stall_gate.zig");
-const output_semantics = @import("../core/output_semantics.zig");
-const McpUnavailable = @import("../core/mcp_session.zig").McpUnavailable;
-const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
-const permission_mod = @import("../permission.zig");
-const project_activation = @import("../core/project_rule_activation.zig");
-const run_journal = @import("../core/tool_observation_journal.zig");
-const self_evolution_mod = @import("../core/self_evolution.zig");
-const request_gate_mod = @import("../core/request_gate.zig");
-const tee_backend_mod = @import("../core/tee_backend.zig");
-const tool_context_mod = @import("../tools/context.zig");
-const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
-const writer_backend = @import("../core/writer_backend.zig");
+const agent_loop = @import("metacodes-internal").core.agent_loop;
+const delivery_cadence_mod = @import("metacodes-internal").core.delivery_cadence;
+const check_gate_mod = @import("metacodes-internal").core.check_gate;
+const isolated_verifier_mod = @import("metacodes-internal").core.isolated_verifier;
+const learning_turn_mod = @import("metacodes-internal").core.learning_turn;
+const learning_end_of_run_mod = @import("metacodes-internal").core.learning_end_of_run;
+const test_integrity_mod = @import("metacodes-internal").core.test_integrity;
+const stall_gate_mod = @import("metacodes-internal").core.stall_gate;
+const output_semantics = @import("metacodes-internal").core.output_semantics;
+const McpUnavailable = @import("metacodes-internal").core.mcp_session.McpUnavailable;
+const evaluation_backend_mod = @import("metacodes-internal").core.evaluation_backend;
+const permission_mod = @import("metacodes-internal").permission_root;
+const project_activation = @import("metacodes-internal").core.project_rule_activation;
+const run_journal = @import("metacodes-internal").core.tool_observation_journal;
+const self_evolution_mod = @import("metacodes-internal").core.self_evolution;
+const request_gate_mod = @import("metacodes-internal").core.request_gate;
+const tee_backend_mod = @import("metacodes-internal").core.tee_backend;
+const tool_context_mod = @import("metacodes-internal").tools.context;
+const ui_backend_mod = @import("metacodes-internal").core.protocol.ui_backend;
+const writer_backend = @import("metacodes-internal").core.writer_backend;
 const stream_json_mod = @import("stream_json_backend.zig");
-const util_json = @import("../util/json.zig");
+const util_json = @import("metacodes-internal").util.json;
 
 /// A headless invocation must not wait forever on a child that never exits.
 pub const HEADLESS_JOB_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -93,10 +93,10 @@ fn buildImageUserMessage(
     allocator: std.mem.Allocator,
     text: []const u8,
     image_paths_nul: ?[]const u8,
-) !@import("../core/message.zig").Message {
-    const msg_mod = @import("../core/message.zig");
-    const read_tool = @import("../tools/read.zig");
-    const common = @import("../tools/common.zig");
+) !@import("metacodes-internal").core.message.Message {
+    const msg_mod = @import("metacodes-internal").core.message;
+    const read_tool = @import("metacodes-internal").tools.read;
+    const common = @import("metacodes-internal").tools.common;
 
     var blocks: std.ArrayList(msg_mod.Block) = .empty;
     errdefer {
@@ -157,7 +157,7 @@ pub fn run(
     prompt: []const u8,
     images: ?[]const u8,
     json_output: bool,
-    model_error_out: ?*?@import("../api/model_error.zig").Detail,
+    model_error_out: ?*?@import("metacodes-internal").api.model_error.Detail,
 ) !u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
     if (trimmed.len == 0 and images == null) {
@@ -225,14 +225,14 @@ pub fn run(
     // 项目规则 gate。装载失败/降级一律回退到普通 gate,绝不放倒 Run。
     const self_evo_enabled = self_evolution_mod.enabledFromEnv();
     // host-run 裁决:开工即钉住检查命令(内容哈希),收尾比对后由 host 执行。
-    const host_check_mod = @import("../core/host_check.zig");
+    const host_check_mod = @import("metacodes-internal").core.host_check;
     const host_check_pin: ?host_check_mod.Pin = if (self_evo_enabled) host_check_mod.Pin.fromEnv() else null;
     var self_evo_ingested: usize = 0;
     var provisional_gate: ?*self_evolution_mod.ProvisionalGate = null;
     defer if (provisional_gate) |pg| pg.deinit();
     // 任务范围收尾义务:上一轮 author 为本任务学得的环境规则(hint 绑定,
     // 有界 nudge)。装载失败 → null,不影响 Run。
-    const obligation_gate_mod = @import("../core/obligation_gate.zig");
+    const obligation_gate_mod = @import("metacodes-internal").core.obligation_gate;
     var obligation_runtime: ?*obligation_gate_mod.Runtime = null;
     defer if (obligation_runtime) |runtime| {
         runtime.deinit();
@@ -296,7 +296,7 @@ pub fn run(
     const eval_tee_ui = eval_tee.backend();
     const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else &be;
     // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
-    const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+    const scoped_recall_mod = @import("metacodes-internal").kg.scoped_recall;
     var scoped_recall_result: ?scoped_recall_mod.BuildResult = if (app.kg) |*k|
         (scoped_recall_mod.buildWithReceipt(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null)
     else
@@ -386,7 +386,7 @@ pub fn run(
                 const b = control.journal.runBinding() catch break :blk "unbound";
                 break :blk b.run_id.asSlice();
             } else "unbound";
-            _ = @import("../core/obligation_gate.zig").writeTelemetry(allocator, known_graph, runtime, hint, rid);
+            _ = @import("metacodes-internal").core.obligation_gate.writeTelemetry(allocator, known_graph, runtime, hint, rid);
         }
     }
 
@@ -427,7 +427,7 @@ pub fn run(
                     .mode = v.mode,
                     .model = v.model,
                     .task_statement = prompt,
-                    .repo = @import("platform").fs.getCwd(&cwd_buf) orelse "",
+                    .repo = @import("metacodes-internal").platform.fs.getCwd(&cwd_buf) orelse "",
                     .deps = .{
                         .provider = app.provider(),
                         .tool_defs = app.tool_defs,
@@ -446,7 +446,7 @@ pub fn run(
                 pin,
                 hint,
                 note,
-                @intCast(@import("../util/time.zig").nowWallNs()),
+                @intCast(@import("metacodes-internal").util.time.nowWallNs()),
                 if (learning_mode != null) &learning_evidence else null,
                 if (end_verifier) |*v| v else null,
             );
@@ -485,7 +485,7 @@ pub fn run(
             .actor_identity = actor_identity,
             .model = app.activeModel(),
             .run_binding = binding,
-            .now_ns = @import("../util/time.zig").nowWallNs(),
+            .now_ns = @import("metacodes-internal").util.time.nowWallNs(),
             .stop_reason = @tagName(result.stop_reason),
             .provisional_active_count = if (provisional_gate) |pg| pg.provisional_count else 0,
             .outcomes_ingested = self_evo_ingested,
@@ -493,7 +493,7 @@ pub fn run(
             .provisional_bundle_sha256 = if (provisional_gate) |pg| pg.active.bundle_sha256 else null,
             .abort = &app.abort,
         });
-        const log = @import("../util/log.zig");
+        const log = @import("metacodes-internal").util.log;
         log.info("self-evolution", "outcome={s}", .{@tagName(evo_outcome)});
     }
 
@@ -510,7 +510,7 @@ pub fn run(
     if (result.suspend_info) |si| {
         defer si.deinit();
         if (app.sessionDir()) |dir| {
-            const suspend_state = @import("../core/suspend_state.zig");
+            const suspend_state = @import("metacodes-internal").core.suspend_state;
             suspend_state.writeFromSuspendInfo(dir, si, allocator) catch |e| {
                 std.debug.print("warning: suspend.json write failed: {s}\n", .{@errorName(e)});
             };
@@ -544,10 +544,10 @@ pub fn run(
 /// scoped_recall = 本轮尾注入的召回记忆(fresh run 传;resume 传 null——续跑不重新召回)。
 /// **task#20:headless 挂起 requester**。恒返 .pending → UI 工具(ask_user/custom)返 error.UiPending
 /// → agent_loop 挂起(写 suspend.json)。out 不写(响应经 subprocess resume 的 --resume-response 迟来)。
-const ui_request_mod = @import("../core/protocol/ui_request.zig");
+const ui_request_mod = @import("metacodes-internal").core.protocol.ui_request;
 fn pendingRequestFn(
     _: *anyopaque,
-    _: @import("../core/session_id.zig").SessionId,
+    _: @import("metacodes-internal").core.session_id.SessionId,
     _: std.mem.Allocator,
     _: *const ui_request_mod.UiRequest,
     _: *ui_request_mod.UiResponse,
@@ -563,9 +563,9 @@ pub fn buildOptions(
     request_gate: ?request_gate_mod.Gate,
     execution_policy: ?tool_context_mod.ToolExecutionPolicy,
     emit_semantic_tool_events: bool,
-    tool_observer: ?@import("../tools/context.zig").ToolObservationSink,
-    execution_boundary: ?@import("../core/execution_effect.zig").Boundary,
-    project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
+    tool_observer: ?@import("metacodes-internal").tools.context.ToolObservationSink,
+    execution_boundary: ?@import("metacodes-internal").core.execution_effect.Boundary,
+    project_rule_gate: ?@import("metacodes-internal").tools.context.ProjectRuleGate,
 ) agent_loop.Options {
     const check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
     return .{
@@ -575,7 +575,7 @@ pub fn buildOptions(
         .session = app.session_id,
         .preview = app.config.preview.features(),
         // Span recording, as session_service.buildRunOptions does for the other frontends.
-        .telemetry = @import("../telemetry/telemetry.zig").forSession(app.sessionDir()),
+        .telemetry = @import("metacodes-internal").telemetry.telemetry.forSession(app.sessionDir()),
         // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
         .ui_requester = if (app.config.suspendable)
             .{ .ctx = @ptrCast(&pending_requester_dummy), .requestFn = &pendingRequestFn }
@@ -691,8 +691,8 @@ pub fn resumeSuspended(
     const previous_no_interactive = enterNonInteractivePermissionBoundary(&app.permission_ctx);
     defer restoreInteractivePermissionBoundary(&app.permission_ctx, previous_no_interactive);
 
-    const suspend_state = @import("../core/suspend_state.zig");
-    const transcript = @import("../core/transcript.zig");
+    const suspend_state = @import("metacodes-internal").core.suspend_state;
+    const transcript = @import("metacodes-internal").core.transcript;
     const dir = app.sessionDir() orelse {
         std.debug.print("error: resume 需要 session 目录(--session/持久化 transcript)\n", .{});
         return 1;
@@ -913,7 +913,7 @@ fn fallbackTextKind(text: []const u8) []const u8 {
 }
 
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。
-pub fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversation, allocator: std.mem.Allocator) ![]const u8 {
+pub fn lastAssistantText(conv: *const @import("metacodes-internal").core.conversation.Conversation, allocator: std.mem.Allocator) ![]const u8 {
     var i: usize = conv.messages.items.len;
     while (i > 0) {
         i -= 1;
@@ -944,7 +944,7 @@ fn emitJson(
     allocator: std.mem.Allocator,
     final_text: []const u8,
     text_kind: []const u8,
-    changes: ?*@import("../core/file_change.zig").Journal,
+    changes: ?*@import("metacodes-internal").core.file_change.Journal,
     integrity: ?*const test_integrity_mod.Report,
     mcp_unavailable: []const McpUnavailable,
     result: agent_loop.RunResult,
@@ -966,7 +966,7 @@ pub fn buildResultLine(
     /// 本 Run 的文件修改账本(见 core/file_change.zig)。非 null → 结果行带 `file_changes`
     /// 信封(`{schema_version, truncated, changes[]}`,由该模块自己拼,不在这里散装),
     /// 消费者拿实际改动不解析 tool_result 里的工具私有 gitDiff。
-    changes: ?*@import("../core/file_change.zig").Journal,
+    changes: ?*@import("metacodes-internal").core.file_change.Journal,
     /// Test-integrity end state (core/test_integrity.zig). Filled → the line
     /// carries a `test_integrity` object; unfilled or null → no field.
     integrity: ?*const test_integrity_mod.Report,
@@ -1018,7 +1018,7 @@ pub fn buildResultLine(
     try aw.writer.writeAll(",\"text_kind\":");
     try util_json.writeJsonString(&aw.writer, text_kind);
     if (changes) |journal| {
-        const file_change = @import("../core/file_change.zig");
+        const file_change = @import("metacodes-internal").core.file_change;
         const records = journal.acquire();
         defer journal.release();
         try aw.writer.writeAll(",\"file_changes\":");
@@ -1145,7 +1145,7 @@ fn stdoutStreamSink() stream_json_mod.Sink {
 
 test "lastAssistantText extracts trailing assistant text" {
     const a = std.testing.allocator;
-    var conv = @import("../core/conversation.zig").Conversation.init(a);
+    var conv = @import("metacodes-internal").core.conversation.Conversation.init(a);
     defer conv.deinit();
     try conv.appendText(.user, "hi");
     try conv.appendText(.assistant, "hello there");
@@ -1156,7 +1156,7 @@ test "lastAssistantText extracts trailing assistant text" {
 
 test "lastAssistantText empty when no assistant" {
     const a = std.testing.allocator;
-    var conv = @import("../core/conversation.zig").Conversation.init(a);
+    var conv = @import("metacodes-internal").core.conversation.Conversation.init(a);
     defer conv.deinit();
     try conv.appendText(.user, "hi");
     const t = try lastAssistantText(&conv, a);
@@ -1167,7 +1167,7 @@ test "lastAssistantText empty when no assistant" {
 test "buildImageUserMessage: 文件 → text+image 按序构造(MIME/base64 正确)" {
     const a = std.testing.allocator;
     var tmp_buf: [512]u8 = undefined;
-    const dir = @import("../tools/test_tmp.zig").dir(&tmp_buf);
+    const dir = @import("metacodes-internal").tools.test_tmp.dir(&tmp_buf);
     const path = try std.fmt.allocPrint(a, "{s}/cc-headless-img-test.png", .{dir});
     defer a.free(path);
     {
@@ -1175,7 +1175,7 @@ test "buildImageUserMessage: 文件 → text+image 按序构造(MIME/base64 正�
         defer _ = pfs.close(fd);
         _ = pfs.write(fd, "PNGDATA");
     }
-    defer @import("../util/fs.zig").testing.rmrfBestEffort(path);
+    defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(path);
 
     var paths_nul: std.ArrayList(u8) = .empty;
     defer paths_nul.deinit(a);

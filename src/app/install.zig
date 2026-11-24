@@ -29,8 +29,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const state_root = @import("../util/state_root.zig");
-const util_fs = @import("../util/fs.zig");
+const state_root = @import("metacodes-internal").util.state_root;
+const util_fs = @import("metacodes-internal").util.fs;
 const release_source = @import("release_source.zig");
 pub const UpdateSource = release_source.UpdateSource;
 
@@ -574,7 +574,7 @@ fn planLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []c
     const file_name = if (is_windows) try std.fmt.allocPrint(arena, "{s}.cmd", .{name}) else name;
     const path = try std.fs.path.join(arena, &.{ dir, file_name });
     const body = try launcherBody(arena, executable);
-    const pfs = @import("platform").fs;
+    const pfs = @import("metacodes-internal").platform.fs;
     const path_z = try arena.dupeZ(u8, path);
     // Never write through a symlink: `~/.local/bin/metacodes -> <a build>` is
     // common, and following it would overwrite that binary with this script.
@@ -609,7 +609,7 @@ fn planLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []c
 
 fn writeLauncher(arena: std.mem.Allocator, io: std.Io, plan: Launcher, log: *std.Io.Writer) ![]const u8 {
     const cwd = std.Io.Dir.cwd();
-    const pfs = @import("platform").fs;
+    const pfs = @import("metacodes-internal").platform.fs;
     const path_z = try arena.dupeZ(u8, plan.path);
     if (plan.replace_symlink) pfs.unlinkPath(path_z.ptr) catch return error.LinkOccupied;
     try cwd.createDirPath(io, plan.dir);
@@ -679,14 +679,14 @@ pub fn launcherBody(arena: std.mem.Allocator, executable: []const u8) ![]const u
     return std.fmt.allocPrint(
         arena,
         "#!/bin/sh\n# metacodes launcher written by `metacodes install`\nexport {s}=\"$0\"\nexec {s} \"$@\"\n",
-        .{ @import("platform").paths.launcher_env_name, quoted.items },
+        .{ @import("metacodes-internal").platform.paths.launcher_env_name, quoted.items },
     );
 }
 
 /// The installed executable vouches for itself: every runtime asset resolves
 /// adjacent and matches, and the state root comes from this install's record.
 fn selfCheck(arena: std.mem.Allocator, outcome: Outcome, log: *std.Io.Writer) !void {
-    const process = @import("platform").process;
+    const process = @import("metacodes-internal").platform.process;
     const exe_z = try arena.dupeZ(u8, outcome.executable);
     const argv = [_]?[*:0]const u8{ exe_z.ptr, "doctor", "--strict", null };
     // An empty environment on POSIX: no HOME, no METACODES_HOME, no override

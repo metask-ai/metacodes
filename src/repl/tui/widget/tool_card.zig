@@ -23,8 +23,8 @@ const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
 const render_mod = @import("../../render.zig");
-const highlight = @import("../../../highlight/highlight.zig");
-const hl_adapter = @import("../../../highlight/hl_adapter.zig");
+const highlight = @import("metacodes-internal").highlight.highlight;
+const hl_adapter = @import("metacodes-internal").highlight.hl_adapter;
 const Theme = theme_mod.Theme;
 
 pub const RenderOpts = struct {
@@ -39,7 +39,7 @@ pub const RenderOpts = struct {
     /// transcript 历史视图(对齐 cc isTranscriptMode):语义同 verbose(展开)。
     transcript: bool = false,
     /// Edit/Write diff 的 hl-zig 高亮缓存(按 tool_id 取新旧全文)。null → 退回关键字表。
-    edit_hl_cache: ?*@import("../../../core/edit_hl_cache.zig").EditHlCache = null,
+    edit_hl_cache: ?*@import("metacodes-internal").core.edit_hl_cache.EditHlCache = null,
     /// 本次 tool_use id(查 edit_hl_cache 用)。
     tool_id: []const u8 = "",
 };

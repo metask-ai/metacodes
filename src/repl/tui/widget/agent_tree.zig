@@ -20,11 +20,11 @@
 const std = @import("std");
 const Theme = @import("../theme.zig").Theme;
 const term = @import("../term.zig");
-const registry = @import("../../../core/agent_job_registry.zig");
+const registry = @import("metacodes-internal").core.agent_job_registry;
 const tool_card = @import("tool_card.zig");
-const util_time = @import("../../../util/time.zig");
-const progress = @import("../../../teamwork/progress.zig");
-const teamwork_types = @import("../../../teamwork/types.zig");
+const util_time = @import("metacodes-internal").util.time;
+const progress = @import("metacodes-internal").teamwork.progress;
+const teamwork_types = @import("metacodes-internal").teamwork.types;
 
 const JobSnapshot = registry.AgentJobRegistry.JobSnapshot;
 const JobStatus = registry.JobStatus;
@@ -446,7 +446,7 @@ test "agent_tree: dark 主题树形字符 ├└⎿" {
     try capture.expectContains(s, "Read: /x"); // 动作行冒号式带全路径
 }
 
-fn teamworkSeats() [3]@import("../../../teamwork/runtime.zig").SeatSnapshot {
+fn teamworkSeats() [3]@import("metacodes-internal").teamwork.runtime.SeatSnapshot {
     return .{
         .{ .id = teamwork_types.seatIdFor(.implementer, 1), .role = .implementer, .harness = .metacodes, .status = .done },
         .{ .id = teamwork_types.seatIdFor(.reviewer, 1), .role = .reviewer, .harness = .claude_code, .status = .working },
@@ -454,7 +454,7 @@ fn teamworkSeats() [3]@import("../../../teamwork/runtime.zig").SeatSnapshot {
     };
 }
 
-fn teamworkSnapshot(seats: []const @import("../../../teamwork/runtime.zig").SeatSnapshot, goal: []const u8) !progress.Snapshot {
+fn teamworkSnapshot(seats: []const @import("metacodes-internal").teamwork.runtime.SeatSnapshot, goal: []const u8) !progress.Snapshot {
     return .{
         .run_id = try teamwork_types.RunId.parse("run-1"),
         .goal = goal,
@@ -520,7 +520,7 @@ test "agent_tree teamwork: control bytes count as the spaces they become when fi
 test "agent_tree teamwork: parallel candidates show their statuses under the summary" {
     const seats = teamworkSeats();
     var snapshot = try teamworkSnapshot(seats[0..1], "Add feature.txt");
-    const candidates = [_]@import("../../../teamwork/runtime.zig").CandidateSnapshot{ .{ .status = .rejected }, .{ .status = .selected }, .{ .status = .eliminated } };
+    const candidates = [_]@import("metacodes-internal").teamwork.runtime.CandidateSnapshot{ .{ .status = .rejected }, .{ .status = .selected }, .{ .status = .eliminated } };
     snapshot.phase = .candidates;
     snapshot.candidates = &candidates;
     const s = try renderTeamwork(testing.allocator, theme_mod.dark, snapshot, 80);
