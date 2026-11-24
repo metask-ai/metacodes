@@ -26,15 +26,17 @@ import json
 import re
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.command import check_bundle
+from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
-from scripts.eval.harbor.bench.runner import ACTIVE, DEFAULT_FEATURES, atomic_json, chosen_features, now, settings
+from scripts.eval.harbor.bench.runner import (ACTIVE, DEFAULT_FEATURES, ExecutorUnreachable, atomic_json,
+                                              chosen_features, now, settings)
 
 MAX_ITEMS = 16
 MAX_MODELS = 8
@@ -42,6 +44,7 @@ NAME_LIMIT = 80
 PROFILE_ACTIVE = ("queued", "running", "cancelling")
 LEGACY_BATCHES_DIR = ".bench-batches"
 ITEM_DONE = ("finished", "failed", "cancelled", "interrupted", "skipped")
+FINAL_RELEASE = re.compile(r"^v?\d+\.\d+\.\d+$")
 DEV_NAME = re.compile(r"^metacodes-dev-([0-9a-f]{7,40}|worktree)-")
 
 
@@ -210,9 +213,28 @@ def profile_id(digest: str, features: List[str]) -> str:
     return "profile-" + hashlib.sha256(key.encode()).hexdigest()[:12]
 
 
+def default_name(record: Dict[str, Any]) -> str:
+    """How the page names a profile nobody named: `profile-<version>-<bits>`,
+    one bit per advanced feature in the order the page lists them."""
+    metacodes = record.get("metacodes") or {}
+    release, label = str(metacodes.get("release") or ""), str(metacodes.get("label") or "")
+    commit = metacodes.get("commit") or (release.split("+", 1)[1] if "+" in release else None)
+    development = not FINAL_RELEASE.match(release) or label.startswith(("dev ", "git "))
+    if development and commit:
+        version = str(commit)[:8]
+    else:
+        version = release or label or str(metacodes.get("digest") or "")[:8]
+    features = record.get("features") or []
+    bits = "".join("1" if name in features else "0" for name in ADVANCED_FEATURES)
+    return f"profile-{version}-{bits}"
+
+
 class ProfileManager:
     """Durable profiles over a RunManager; one profile's queue advances at a
     time, the one whose oldest waiting dataset was queued first."""
+
+    # How long a dataset waits for an SSH executor that does not answer.
+    UNREACHABLE_WAIT = 1800
 
     def __init__(self, runs):
         self.runs = runs
@@ -273,8 +295,8 @@ class ProfileManager:
             raise ValueError(f"每次需要 1–{MAX_ITEMS} 个评测集")
         name = checked_name(request.get("name"))
         concurrency = request.get("concurrency", 1)
-        if type(concurrency) is not int or not 1 <= concurrency <= 16:
-            raise ValueError("concurrency 必须是 1–16 的整数")
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("concurrency 必须是正整数")
         target = self.target(request)
         seen, planned = set(), []
         for item in items:
@@ -287,7 +309,7 @@ class ProfileManager:
             for model in models:
                 run_request = {"suite": suite.id, "model": model, "tasks": item.get("tasks"),
                                "attempts": request.get("attempts", 1),
-                               "concurrency": min(concurrency, suite.max_concurrency)}
+                               "concurrency": suites.capped_concurrency(suite, concurrency)}
                 if request.get("max_tokens") is not None:
                     run_request["max_tokens"] = request["max_tokens"]
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
@@ -314,9 +336,11 @@ class ProfileManager:
                 raise ValueError("评测配置 " + owner + " 的队列正在运行，请等它结束或先停止")
             record = self._append(target, None, [planned])
             self._step(record)
-            if record["items"][-1]["status"] == "failed":
+            item = record["items"][-1]
+            if item["status"] == "pending":  # `bench run` does not wait for an executor
+                item.update(status="failed", error=item.pop("waiting")["reason"], finished_at=now())
+            if item["status"] == "failed":
                 self._step(record)
-        item = record["items"][-1]
         if item["status"] == "failed":
             raise ValueError(item["error"])
         return next(r for r in self.runs.runs() if r["name"] == item["run"])
@@ -407,6 +431,28 @@ class ProfileManager:
             self.save(record)
         return {"id": record["id"], "name": name}
 
+    def set_concurrency(self, profile: Any, concurrency: Any) -> Dict[str, Any]:
+        if type(concurrency) is not int or concurrency < 1:
+            raise ValueError("concurrency 必须是正整数")
+        with self.lock:
+            record = self.get(profile)
+            if record is None:
+                raise ValueError("评测配置不存在")
+            if record["status"] not in PROFILE_ACTIVE:
+                raise ValueError("评测配置没有正在运行或排队的评测集")
+            active = {r["name"] for r in self.runs.runs() if r.get("status") in ACTIVE}
+            for item in record["items"]:
+                if item["status"] not in ("pending", "running"):
+                    continue
+                applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
+                if item["status"] == "running" and item.get("run") in active:
+                    self.runs.set_concurrency(item["run"], applied)
+                item["concurrency"] = applied
+                if isinstance(item.get("request"), dict):
+                    item["request"]["concurrency"] = applied
+            self.save(record)
+        return {"id": record["id"], "concurrency": concurrency}
+
     def cancel(self, profile: Any) -> Dict[str, Any]:
         with self.lock:
             record = self.get(profile)
@@ -479,9 +525,16 @@ class ProfileManager:
                 request["features"] = features
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
                                         pinned=pending.get("route"))
+            pending.pop("waiting", None)
             pending.update(status="running", run=launched["name"], started_at=now())
             record["status"] = "running"
             record["started_at"] = record.get("started_at") or now()
+        except ExecutorUnreachable as exc:
+            waiting = pending.setdefault("waiting", {"since": time.time()})
+            waiting["reason"] = str(exc)
+            if time.time() - waiting["since"] > self.UNREACHABLE_WAIT:
+                pending.update(status="failed", finished_at=now(),
+                               error=f"执行机器 {self.UNREACHABLE_WAIT // 60} 分钟内一直连不上：{exc}")
         except (ValueError, OSError) as exc:
             pending.update(status="failed", error=str(exc), finished_at=now())
         self.save(record)
@@ -564,6 +617,7 @@ def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]
 def public(record: Dict[str, Any]) -> Dict[str, Any]:
     """A profile record without the internal per-item launch requests."""
     value = json.loads(json.dumps(record))
+    value["default_name"] = default_name(record)
     for item in value.get("items") or []:
         item.pop("request", None)
         item.pop("route", None)

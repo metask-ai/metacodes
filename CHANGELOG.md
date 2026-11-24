@@ -12,6 +12,39 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Models can be priced in config.json, and bench runs use OpenRouter
+  prices.** `model_prices` in `~/.metacodes/config.json` prices a model in
+  USD per million tokens; every cost meter (the session cost, evaluation
+  budgets, the isolated verifier, the Teamwork ledger) charges it before the
+  built-in table, whose Sonnet fallback overstates most open models 20–100×.
+  A bench run looks its model up in OpenRouter's catalog (cached for a day),
+  records the price on the run and writes it into the trial's config, so
+  Teamwork budgets and verifier caps mean real dollars. `"model_prices":
+  "off"` in workbench.json skips the lookup; the bench node protocol is now 7.
+
+- **A directory can be left without a default** (part of #489). With
+  `"global_default": false` at the top level of `config.json`, the `/model`
+  default, a Metask sign-in and `.env`'s choice (levels 4 to 6 of the startup
+  order) decide for no directory: a start uses what it names (`--provider`,
+  `--offer`, `--preset`, `--api-key`, `METACODES_PROVIDER` or
+  `METACODES_PRESET` in the shell) or the preset its directory remembers. In a
+  directory that remembers none, the TUI opens without a model, and a message
+  gets a red note naming `/model`, the presets and the `directory_presets`
+  entry to add; `-p`, `serve` and `--web` stop with exit code 2 before any
+  request. So an unfamiliar repository uses no account until one is chosen for
+  it. Keys and sign-ins still serve the route that is chosen; `/logout` leaves
+  the session without a model instead of switching to `.env`'s choice, and
+  `metacodes login status` marks the levels left out. A value that is not a
+  boolean fails to load with `InvalidGlobalDefault`; a malformed preset does
+  not hide the setting ([LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#presets)).
+
+- **Teamwork trials no longer stop at permission prompts.** `teamwork run`
+  has no `--permission`, so its verifier asked for each command and, with
+  nobody to answer, the audit ended unavailable and nothing merged. A
+  teamwork trial now writes user-level allow rules for the built-in tools in
+  its disposable container, as a headless trial runs with
+  `bypassPermissions`.
+
 - **Teamwork trials get a cap that lasts.** The dollar cap now follows the
   difficulty at easy $20, medium $40, hard $80 (otherwise $40), since the
   ledger charges models without their own price at the Sonnet fallback
@@ -221,6 +254,48 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Signing in over SSH no longer waits forever for a browser that cannot come
+  back** (#722). `metacodes login` and `/login` sent the browser back to
+  `http://localhost:1455`, which on a machine reached over SSH is not where
+  the browser is: the sign-in waited with no limit and said nothing.
+  - In an SSH session (`SSH_CONNECTION` or `SSH_TTY` set) `metacodes login`
+    takes Metask's device code by itself and says why, and `/login` asks which
+    way with the code selected, as OpenRouter's sign-in already did;
+    `--no-browser` keeps the browser sign-in.
+  - A browser sign-in finished on another computer ends on a page that does
+    not load: paste that page's address at the prompt, or into the `/login`
+    pane, and the sign-in finishes here (Metask's, and another provider's
+    OAuth such as ChatGPT's). An address from another sign-in is refused and
+    the wait goes on.
+  - Every sign-in that waits for a localhost callback (Metask's, ChatGPT's,
+    another provider's OAuth, OpenRouter's browser way) prints the forward it
+    needs over SSH, with the port it bound:
+    `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`.
+  - `metacodes login` stops waiting for the browser after ten minutes
+    (`METACODES_LOGIN_CALLBACK_TIMEOUT_MS`, `0` for no limit), stores nothing,
+    and names the device-code sign-in.
+
+- **`metacodes mcp login` over SSH no longer waits forever for a browser that
+  cannot come back** (#740). It sent the browser to
+  `http://localhost:<port>/callback` on the machine it runs on and waited with
+  no limit. As `metacodes login` does since #722:
+  - in an SSH session it prints the forward its callback needs, with the port
+    it bound: `ssh -L <port>:127.0.0.1:<port> <you>@<this machine>`;
+  - the address a browser on another computer ended on can be pasted at the
+    prompt, and is judged as the callback would be, so one from another login
+    is refused and the wait goes on;
+  - it stops waiting after `METACODES_LOGIN_CALLBACK_TIMEOUT_MS` (ten minutes
+    by default, `0` for no limit), exits 1 and stores nothing.
+
+- **Refusing on the authorization page now ends `metacodes mcp login` and
+  Metask's browser sign-in** (#749). Their loopback callback answered a
+  redirect that carried an `error` with an error page and kept waiting:
+  `mcp login` until Ctrl+C, `metacodes login` up to its bound and `/login`
+  until Esc, without saying why. As another provider's OAuth already did, a
+  redirect with the sign-in's `state` and an `error` now ends the wait: the
+  terminal says what the authorization server said (`The sign-in was
+  refused: <error> (<description>).`), and nothing is stored.
+
 - **On Windows a sign-in opens its whole URL in the browser** (#727). The
   browser was launched with `cmd.exe /c start`, and `cmd.exe` ended the
   command at the first `&`: the browser got `…/oauth/authorize?response_type=code`
@@ -263,6 +338,32 @@ status, compatibility boundaries, and entry points are defined by
   levels and can be turned off now sends `disabled` as well. A model with a
   single choice is no longer asked for one.
 
+- **Closing the terminal or `kill` ends an idle metacodes at once** (#758).
+  SIGHUP and SIGTERM were acted on only at a turn boundary, so while the
+  prompt waited for input the process lived on until the 45-second fallback
+  alarm ended it, without the normal shutdown. The prompt now checks for them
+  while it waits and leaves the normal way within a fraction of a second,
+  with the resume hint where the terminal is still open.
+
+- **`\` then Enter starts a new line while the model answers** (#757). At
+  the prompt a `\` at the end of a line followed by Enter is a newline, the
+  way Apple Terminal users start one; during a reply Enter queued the draft
+  with the `\` still in it. It is a newline there as well now.
+
+- **What you type while the model answers is still in the box when it ends**
+  (#756). Text typed into the input box during a reply and not sent was
+  dropped when the reply ended, and the prompt came back empty. It now stays,
+  with the cursor where it was, also through the reply to a message queued
+  before it.
+
+- **A paste while the model answers stays whole in the input box** (#755).
+  During a reply each line break of a pasted text acted as Enter: the first
+  line was queued on its own and sent as soon as the reply ended, and the
+  rest stayed in the box. The paste now goes into the box whole, line breaks
+  included, as at the prompt; a paste of more than three lines or 1,600 bytes
+  is held as `[Pasted text #N +M lines]` there too, and the model gets the
+  whole text when it is sent.
+
 - **A language server that never publishes diagnostics no longer slows every
   Edit and Write** (#669). Each Edit and Write waited for diagnostics up to
   8 s before the write and 6 s after it, so a server that answered
@@ -299,6 +400,22 @@ status, compatibility boundaries, and entry points are defined by
   still counts toward the double-press exit, so the picker never traps the
   session.
 
+- **A background job that finishes while the model is answering wakes the
+  agent** (#719). When a job the model had started finished during the
+  model's last answer, the turn ended without waiting, because the job was no
+  longer running, and the exit only came with the next message: the agent
+  stopped although its job was done. The end of a turn now also counts a
+  finished job whose exit has not been announced, so the exit is delivered
+  and the agent goes on, as when the job finishes during the wait.
+
+- **The agent carries on when a background job it waits for finishes**
+  (#714). After the model said it would wait for a background job, the job
+  could finish and the agent stay idle until the next message, which then
+  brought the job's exit along. The wait looked for finished jobs, found
+  none, and then, if the job ended right then, found nothing running and
+  ended the turn. It now checks what is still running before it looks for
+  finished jobs.
+
 - **A foreground Bash command is collected as soon as it exits** (#670). The
   wait slept 100 ms before it first looked at the job, so every foreground
   call, even `true`, cost at least 100 ms. It now checks at once and then
@@ -330,6 +447,18 @@ status, compatibility boundaries, and entry points are defined by
   TUI ignored both. The key parser now reads both forms through one table, so
   modifyOtherKeys' Shift+Enter, Ctrl+Enter, Esc and Ctrl+letters work as
   their CSI u forms do (#643).
+
+- **FindSymbol and CodeMap no longer give up early on a language server
+  that is busy publishing diagnostics, and the LSP waits around Edit and Write
+  end on time** (#741). The LSP client counted its waits in 150 ms steps
+  instead of keeping a deadline, and every response or diagnostics push from
+  the server used up a step. A `documentSymbol` request to a server
+  publishing diagnostics for other files could fail long before its 10 s
+  limit, which FindSymbol and CodeMap reported as a language server that
+  could not be started. A wait that nothing woke ran one step past its limit,
+  plus the scheduling delay of every step: the 8 s diagnostics wait before an
+  Edit or Write took about 8.3 s on an idle machine. Both waits now end at
+  their deadline, and still check for an interrupt every 150 ms.
 
 - **The TTY relogin revocation cases replay the screen with line wrap**
   (#673). The `/login` dialog shows a sign-in URL wider than the terminal and
@@ -373,6 +502,19 @@ status, compatibility boundaries, and entry points are defined by
   mode: typing filters, Esc clears the filter and then closes it, Enter
   applies the model under the cursor, and the input box is left alone. Vim's
   keymap takes over again once the picker closes.
+
+- **A Metask key in `.env` no longer outranks the preset the same file
+  names** (#748, part of #489). A `<state root>/.env` with
+  `METACODES_PRESET=fast` (a DeepSeek preset, say) and `METASK_API_KEY`
+  started on Metask, without a word: the file's key counted as a Metask
+  sign-in (level 5 of the startup order) unless its `METACODES_PROVIDER`
+  named another provider, so the file's own preset (level 6) was never
+  reached. The file's preset now counts as its choice too: the key signs
+  Metask in only when that preset's route is Metask, and otherwise waits
+  until Metask is chosen, as beside `METACODES_PROVIDER`. A preset
+  `config.json` does not define holds the key back as well, so the start
+  reports the name instead of quietly using Metask. `metacodes login
+  status` says why the key waits.
 
 - **A stalled HTTP MCP server no longer holds `/exit` or the first message**
   (#671). The session DELETE a Streamable HTTP client sends at close now has

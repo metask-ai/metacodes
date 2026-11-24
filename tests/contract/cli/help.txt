@@ -1,0 +1,137 @@
+$ metacodes --state-dir <ROOT>/state --help
+exit: 0
+--- stdout
+metacodes — embeddable agent core and coding CLI
+Usage: metacodes [options]
+  teamwork run --request-file <file> --approve --budget-usd <cap> [options]
+  teamwork status <id> [--json] | teamwork resume <id> --approve
+                        Approved SWE loop with required sandbox; teamwork --help for options
+  --version             Print version and build identity and exit (--json: one JSON document)
+  bench [open|info|list|run|prepare|setup|db] [--url <workbench>] [--no-open]
+                        Open Bench workbench; pick a benchmark suite, tasks and model, run evaluations.
+                        bench run [--suite <id>] [--executor <name>] --task <name> --wait prints the result link.
+                        bench setup prepares an execution machine; bench db status|import|migrate.
+  doctor [--json | --plain] [--strict]
+                        Report where ripgrep and TinyKG resolve from and whether they match this build
+  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
+                        Bind Shift+Enter to a newline in Apple Terminal or VS Code (and forks),
+                        after a backup; --restore undoes it (terminal-setup --help for more)
+  mcp add <name> --url <url> | mcp add <name> -- <command> [<arg>...] | mcp remove <name>
+  | mcp list | mcp login <server> [--no-browser] | mcp logout <server>
+                        Install an MCP server in config.json (checked on the spot), list each
+                        server's state, OAuth login for HTTP ones; mcp --help for more
+  providers add <id> --base-url <url> --protocol <wire> [--model <id>]... [--probe] | providers probe <id>
+  | providers list | providers remove <id>
+                        A model API of your own (a relay, a gateway, a local server), in config.json;
+                        providers --help for more
+  update [--check] [--version X.Y.Z] [--release-base <url>] [--pull] [--allow-downgrade]
+         [--no-sdk] [--ignore-running] [--json]
+                        Bring this install up to date: the latest release (from its recorded
+                        mirror, if any), or a rebuild of the checkout a development install came from
+  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
+  -                     Headless: read prompt from stdin
+  --json                Headless: emit NDJSON result event
+  --stream-json         Headless: also stream per-event NDJSON lines live (text/tool/usage/turn)
+  --web [port]          Serve a web UI (HTTP+SSE) instead of the TUI (default port 7777)
+  --web-bind <addr>     --web/serve: IPv4 or IPv6 literal to bind (default 127.0.0.1; env
+                        METACODES_WEB_BIND). A non-loopback address needs a token or
+                        --web-allow-unauth
+  --web-token <token>   --web/serve: require 'Authorization: Bearer <token>' on every route but
+                        GET /health (a GET may pass ?token=). Prefer env METACODES_WEB_TOKEN:
+                        the flag is visible in ps
+  --web-allow-unauth    --web/serve: allow a non-loopback --web-bind without a token
+  --resume <id>         Start the REPL in a stored session of this directory (an id or id prefix, as
+                        /resume takes; an interactive exit prints the command for the current one)
+  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
+  --model <model>       Model (default: claude-sonnet-4-20250514)
+  --model-display-name <name>  Stable actor-visible model identity
+  --reasoning-effort <e> none|minimal|low|medium|high|xhigh (alias: max, the Anthropic-route name of the top level)
+  --temperature <f>    Override sampling temperature (dialect-gated fields)
+  --top-p <f>          Override nucleus sampling top_p
+  --prompt-cache-key <k>  Kimi K2.6 cache hint (gated by dialect capability)
+  --parallel-tool-calls <bool>  Mistral explicit parallel tools (dialect-gated)
+  --response-format <json_object|json_schema>  Structured output (dialect-gated)
+  --api-key <key>       API key (overrides stored credentials by default)
+  --permission <mode>   default | acceptEdits | auto | dontAsk | bypassPermissions
+  --settings <path>     Extra settings JSON (CLI layer)
+  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
+  --disallowedTools <l> Comma-separated deny rules
+  --preview             Enable every preview feature: execute_code, teamwork, comment_guard
+  --no-preview          Disable every preview feature, overriding config.json
+  --preview=<list>      Enable the listed preview features, e.g. --preview=execute_code,teamwork
+  --no-preview=<list>   Disable the listed preview features
+  --verification-checkpoint  Enable the experimental post-test checkpoint
+  --verification-final-gate  Enforce the session-end verification obligation
+  --verification-final-observe  Record (not enforce) the session-end verification obligation
+  --requirement-ledger  Enforce the requirement-ledger closure obligation
+  --requirement-ledger-observe  Record (not enforce) the requirement ledger
+  --delivery-cadence    Nudge a run that keeps exploring without writing any deliverable
+  --delivery-cadence-observe  Record (not enforce) the delivery-cadence obligation
+  --delivery-cadence-thresholds <a>,<b>  Exploration-call counts for the two nudges (default 40,80)
+  --host-check <cmd>    Check command the host runs itself for the check gate (pinned for the process)
+  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
+  --check-gate-observe  Run --host-check at the same points and only record the verdict
+  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
+  --harnessmm / --no-harnessmm  Preview: guarded decision reuse and callback certificates (default off)
+  --rsi / --no-rsi     Preview: evolved skills and learned routers (default off)
+  --rsi-policy <file>  Frozen RSI policy (doc/SKILL_RSI_PROTOCOL.md)
+  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
+                        for the next attempt (needs --check-gate[-observe], or in print mode
+                        METACODES_HOST_CHECK under METACODES_SELF_EVOLUTION with METACODES_TASK_HINT)
+  --learning-turn-observe  Only record whether a learning turn would have run
+  --verifier            After the pinned check passes, let an isolated read-only verifier audit
+                        the work against the task statement; a reproduced FAIL continues the run
+                        (needs --check-gate[-observe], or in print mode the self-evolution host check)
+  --verifier-observe    Run the isolated verifier at the same points and only record its verdict
+  --verifier-model <m>  Model or tier (low/mid/high) for the verifier (default: the session model)
+  --test-integrity      When the model stops with tests that existed before the run rewritten,
+                        deleted or disabled, ask once to restore them or quote the request
+  --test-integrity-observe  Only record and report changes to tests that existed before the run
+  --stall-gate          Stop a run whose tool rounds keep returning nothing new (default in
+                        the REPL and web sessions; off in print mode unless given)
+  --stall-gate-observe  Only record where the stall gate would have stopped the run
+  --no-stall-gate       Never stop a run for returning nothing new
+  --no-progress-updates  Do not ask the model for a progress note after silent tool rounds
+  --progress-updates-observe  Record (not enforce) the progress-update obligation
+  --max-tokens <n>      Override max output tokens per request
+  --session <id>        Explicit session id (resume a suspended session directory)
+  --suspendable         Headless: suspend on UI tools (write suspend.json) instead of failing
+  --image <path>        Headless: attach an image (png/jpg/jpeg/gif/webp) to the prompt (repeatable, order kept)
+  --dump-prompt         Print the assembled system prompt and exit
+  --sections            With --dump-prompt: list the named prompt sections (id, order, class, digest)
+  --dump-plugins        Print the immutable plugin inventory JSON and exit
+  serve [port]          Daemon mode (HTTP; default port 7777; GET /health is an unauthenticated
+                        liveness probe; --web-bind/--web-token apply here too)
+  --sessions <n>        Daemon: multi-session mode (sessions under /s/<id>/, created and destroyed
+                        over POST /sessions/create and /sessions/<id>/destroy); n sessions (0 or
+                        more) are built at startup
+  --max-sessions <m>    Daemon: cap on live sessions in multi-session mode (default 32); a create
+                        beyond it is refused with 429
+  --uds <path>          Daemon: additional UDS+NDJSON binding (implies multi-session mode)
+  --add-dir <path>      Extra read/write directory (repeatable)
+  --plugin-dir <path>   Enable a manifest-based data plugin package (repeatable)
+  --process-plugin-dir <path>  Enable a pinned executable plugin package (repeatable)
+  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
+  --base-url <url>      Override API endpoint (must end with /v1/messages)
+  --provider <id>       Provider profile id or alias (metask | openai | gemini | zai-coding-plan)
+  --channel <id>        Channel within the provider (e.g. cn-anthropic, global-openai)
+  --offer <offer-id>    Pin one exact model route (offer-...); see --provider output
+  --preset <name>       Use a preset from config.json "presets" (env METACODES_PRESET); --provider/--offer
+                        set it aside, --model/--channel/--reasoning-effort replace its field for this run
+  --check-providers     Validate provider configuration and list every route, then exit (no network)
+  --openai-protocol <p> OpenAI wire protocol: chat_completions (default; alias "chat") | responses (env METACODES_OPENAI_PROTOCOL)
+  --auth-precedence <p> api-key-first | oauth-first
+  --record <dir>        Record requests + SSE responses to dir (cassette)
+  --state-dir <dir>     State root for config, credentials, KG store, sessions (first
+                        argument to also apply to subcommands; else METACODES_HOME,
+                        <prefix>/etc/metacodes/install.json, ~/.metacodes)
+  --no-theme            Disable colors
+  --verbose             Verbose output
+  --lsp                 Enable language server integration (default; overrides an earlier --no-lsp)
+  --no-lsp              Disable language server integration (Edit/Write diagnostics, CodeMap,
+                        FindSymbol, Read outline). Servers are only started for a language
+                        whose server is installed, inside a git project with a build marker.
+  --agent-teams         Enable teams/teammates (TeamCreate/SendMessage; delegate to parallel teammate agents)
+  --teammate-mode <m>   Teammate spawn backend: "process" (out-of-process, worktree-isolated) or "thread" (default, in-process)
+  -h, --help            This help
+--- stderr

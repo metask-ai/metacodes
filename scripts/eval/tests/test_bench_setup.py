@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
-from scripts.eval.harbor.bench import data, executors, setup
+from scripts.eval.harbor.bench import data, executors, remote, setup
 from scripts.eval.harbor.bench import node as node_protocol
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
@@ -185,13 +185,40 @@ elif name == "ssh":
             sys.exit(1)
         time.sleep(float(env.get("FAKE_SSH_PACK_DELAY") or 0))
     os.chdir(home)
+    drops = env.get("FAKE_SSH_DROPS")
+    if drops and " node run " in command and int(Path(drops).read_text()) > 0:
+        # The network fails under a run's session: the driver's stdin ends
+        # and its stdout breaks while it keeps running. FAKE_SSH_DROP_SILENT:
+        # none of its events got through before that.
+        Path(drops).write_text(str(int(Path(drops).read_text()) - 1))
+        import threading
+        child = subprocess.Popen(["/bin/sh", "-c", command], env=remote, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, start_new_session=True)
+        sent = threading.Event()
+        def down():
+            for line in sys.stdin.buffer:
+                child.stdin.write(line)
+                child.stdin.flush()
+                sent.set()
+        def up():
+            for line in child.stdout:
+                if not env.get("FAKE_SSH_DROP_SILENT"):
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
+        threading.Thread(target=down, daemon=True).start()
+        threading.Thread(target=up, daemon=True).start()
+        sent.wait(30)
+        time.sleep(float(env.get("FAKE_SSH_DROP_AFTER") or 2))
+        child.stdin.close()
+        print("client_loop: send disconnect: Broken pipe", file=sys.stderr)
+        os._exit(255)
     if reverse:
         # `-R 127.0.0.1:R:127.0.0.1:L`: the "executor" is this machine, so
         # the remote end listens on loopback port R and relays to L, for the
         # life of the session (ExitOnForwardFailure: a busy port fails it).
         import socket, threading
         _, rport, _, lport = reverse.split(":")
-        refusals = env.get("FAKE_REFUSED_FORWARDS")
+        refusals = env.get("FAKE_REFUSED_ATTACH_FORWARDS" if " node attach " in command else "FAKE_REFUSED_FORWARDS")
         listener = socket.socket()
         try:
             if refusals and int(Path(refusals).read_text()) > 0:
@@ -315,6 +342,17 @@ class NodeProtocolTest(unittest.TestCase):
         self.assertIn("不兼容", executors.reach_reasons(relay, {"node": {"protocol": 4}})[0])
 
 
+    def test_only_network_failures_count_as_unreachable(self):
+        for detail in ("ssh: connect to host 203.0.113.7 port 107: No route to host",
+                       "ssh: connect to host 203.0.113.7 port 107: Operation timed out",
+                       "ssh: Could not resolve hostname relay: Name or service not known",
+                       "kex_exchange_identification: read: Connection reset by peer"):
+            self.assertTrue(executors.unreachable({"error": "ssh", "detail": detail}), detail)
+        self.assertTrue(executors.unreachable({"error": "timeout"}))
+        self.assertFalse(executors.unreachable({"error": "ssh", "detail": "bench@relay: Permission denied (publickey)."}))
+        self.assertFalse(executors.unreachable({"error": "noshell"}))
+
+
 @unittest.skipUnless(POSIX, "fake executables are POSIX shell scripts")
 class SetupFixture(unittest.TestCase):
     def setUp(self):
@@ -391,7 +429,8 @@ class SetupFixture(unittest.TestCase):
             "models": [{"request_model_id": "test-model"}]}}})
         atomic_json(self.config, {"auth_mode": "provider", "provider_config": str(native), "model": "tokenjoy/test-model",
                                   "key_env": "TOKENJOY_API_KEY", "jobs_dir": str(self.state / "bench/jobs"),
-                                  "metacodes": {"binary": str(self.templates / "metacodes"), "version": "9.9.9"}})
+                                  "metacodes": {"binary": str(self.templates / "metacodes"), "version": "9.9.9"},
+                                  "model_prices": "off"})
 
     def calls(self, tool=None, side=None):
         if not self.log.exists():
@@ -795,6 +834,47 @@ class SshExecutorTest(SetupFixture):
         info = subprocess.run(executors.node_argv(relay, "info", "--json"), capture_output=True, text=True)
         self.assertEqual(json.loads(info.stdout)["protocol"], node_protocol.PROTOCOL, info.stderr)
 
+    def test_a_run_keeps_its_node_when_setup_switches_the_entry(self):
+        self.add_ssh_executor(node=False)
+        entry = self.remote_home / ".metacodes-bench/bin/metacodes"
+        started = self.remote_home / ".metacodes-bench/bundles/old/bin/metacodes"
+        upgraded = self.remote_home / ".metacodes-bench/bundles/new/bin/metacodes"
+        for binary, script in ((started, node_script()), (upgraded, b"#!/bin/sh\nexit 3\n")):
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(script)
+            binary.chmod(0o755)
+        entry.parent.mkdir(parents=True)
+        entry.symlink_to(started)
+        relay = executors.find(self.cfg(), "relay-4090")
+        run = executors.RemoteRun({"name": "pinned", "executor": relay.spec(), "jobs_dir": str(self.root / "jobs")},
+                                  log=lambda _t: None)
+        run.node = executors.resolve_node(relay)
+        self.assertEqual(Path(run.node), started.resolve())
+        entry.unlink()
+        entry.symlink_to(upgraded)
+        self.assertEqual(run.job_sync().manifest(), {})
+        self.assertIn(run.node, executors.node_argv(relay, "run", "spec.json", binary=run.node)[-1])
+
+    def test_a_missing_node_refuses_the_run(self):
+        self.add_ssh_executor(node=False)
+        relay = executors.find(self.cfg(), "relay-4090")
+        with self.assertRaisesRegex(ValueError, "找不到 metacodes 节点"):
+            executors.resolve_node(relay)
+
+    def test_an_unreachable_executor_is_not_reported_as_a_missing_node(self):
+        self.add_ssh_executor()
+        relay = executors.find(self.cfg(), "relay-4090")
+
+        def runner(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 255, "", "ssh: connect to host 10.126.126.1: Connection refused")
+        with self.assertRaisesRegex(ValueError, "连接执行机器 relay-4090.*退出码 255.*Connection refused"):
+            executors.resolve_node(relay, runner)
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        with self.assertRaisesRegex(ValueError, "连接执行机器 relay-4090"):
+            executors.resolve_node(relay, timeout)
+
     def test_a_node_on_the_path_runs_with_the_configured_python(self):
         """No setup-managed entry: the `metacodes` on the executor's PATH is
         the node, started with the entry's `python`, for probe and commands."""
@@ -1029,6 +1109,62 @@ class SshRunTest(SetupFixture):
         self.assertEqual((local / "t__1/agent.log").read_bytes(), log.read_bytes())
         self.assertTrue(sync.complete())
 
+    def test_a_dropped_session_is_reattached_and_the_run_finishes(self):
+        manager, client, _ = self.prepare_remote()
+        drops = self.root / "drops"
+        drops.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="2", FAKE_BENCH_DELAY="6")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual(final["status"], "finished", (final, log))
+        self.assertEqual((final["exit_code"], final["reconnects"]), (0, 1), final)
+        self.assertEqual(drops.read_text(), "0")
+        self.assertIn("已重新连上执行机器 relay-4090", log)
+        self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
+    def test_a_session_lost_before_its_first_event_is_attached_too(self):
+        """The start request reached the node but no event came back: the
+        worker attaches (waiting while the driver starts) and gets the
+        remote run's own end."""
+        manager, client, _ = self.prepare_remote()
+        drops = self.root / "drops"
+        drops.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="0", FAKE_SSH_DROP_SILENT="1",
+                          FAKE_BENCH_DELAY="4")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"]), ("finished", 0), (final, log))
+        self.assertEqual(final["reconnects"], 1, final)
+        end = self.remote_home / ".metacodes-bench/runs" / run["name"] / remote.END_EVENT
+        self.assertEqual(json.loads(end.read_text())["code"], 0)
+        self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+
+    def test_a_session_silent_before_its_first_event_is_ended_and_attached(self):
+        manager, client, _ = self.prepare_remote()
+        drops = self.root / "drops"
+        drops.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="120", FAKE_SSH_DROP_SILENT="1",
+                          FAKE_BENCH_DELAY="6", METACODES_BENCH_HEARTBEAT_TIMEOUT="2")
+        run = client.request("api/runs", self.request())
+        final, _ = self.watch_until_done(manager, run["name"])
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"], final["reconnects"]), ("finished", 0, 1), (final, log))
+        self.assertIn("心跳超时，断开重连", log)
+        self.assertEqual(len([c for c in self.calls("ssh") if " node run " in c[1][-1]]), 1)
+
+    def test_the_attach_socket_is_short_and_private_for_a_deep_state_dir(self):
+        self.prepare_remote()
+        run_dir = self.remote_home / ("state/" * 12) / "runs" / "bench-20261124-055700-0a1b2c"
+        run_dir.mkdir(parents=True)
+        control = remote.Control(run_dir, lambda _line: None, 60)
+        self.addCleanup(control.close)
+        self.assertTrue(control.listen())
+        self.assertLess(len(control.path), 100)
+        self.assertEqual(control.path, remote.attach_socket(run_dir))
+        self.assertEqual(os.stat(os.path.dirname(control.path)).st_mode & 0o777, 0o700)
+
     def test_cancel_reaches_the_remote_harbor_process(self):
         manager, client, _ = self.prepare_remote()
         os.environ["FAKE_BENCH_DELAY"] = "30"
@@ -1045,25 +1181,53 @@ class SshRunTest(SetupFixture):
         self.assertNotEqual(final["exit_code"], 0)
         self.assertTrue((manager.jobs_dir / run["name"] / "argv.json").exists())
 
-    def test_closed_channel_stops_remote_harbor(self):
-        manager, _, _ = self.prepare_remote()
+    def start_driver(self, grace):
+        """A remote driver whose Harbor runs 30 s, and its first session."""
+        self.prepare_remote()
         relay = executors.find(self.cfg(), "relay-4090")
         jobs = self.remote_home / "jobs"
         spec = {"argv": [str(self.remote_home / ".local/bin/harbor"), "run", "-m", "metask/x", "-k", "1",
-                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None}
-        (self.remote_home / "spec.json").write_text(json.dumps(spec))
-        argv = executors.node_argv(relay, "run", "spec.json")
+                         "-o", str(jobs), "--job-name", "eof"], "key_env": "METASK_API_KEY", "relay": None,
+                "detach_grace": grace}
+        (self.remote_home / "runs/eof").mkdir(parents=True)
+        (self.remote_home / "runs/eof/spec.json").write_text(json.dumps(spec))
         env = {**os.environ, "FAKE_BENCH_DELAY": "30"}
-        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+        process = subprocess.Popen(executors.node_argv(relay, "run", "runs/eof/spec.json"), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, env=env)
+        self.addCleanup(process.kill)
         process.stdin.write(b'{"env": {"METASK_API_KEY": "k"}}\n')
         process.stdin.flush()
         self.assertEqual(json.loads(process.stdout.readline())["event"], "started")
+        return relay, process
+
+    def test_closed_channel_stops_remote_harbor_after_the_grace_period(self):
+        _, process = self.start_driver(grace=1)
         process.stdin.close()
-        events = [json.loads(line) for line in process.stdout]
         process.stdout.close()
         process.wait(30)
+        end = json.loads((self.remote_home / "runs/eof" / remote.END_EVENT).read_text())
+        self.assertEqual((end["event"], end["cancelled"]), ("exit", True))
+
+    def test_a_new_session_attaches_to_a_run_whose_channel_closed(self):
+        """A dropped SSH session leaves Harbor running; `node attach` takes
+        over its events and control lines, and gets the terminal event even
+        once the run has ended."""
+        relay, process = self.start_driver(grace=60)
+        process.stdin.close()
+        process.stdout.close()
+        attach = executors.node_argv(relay, "attach", "runs/eof/spec.json")
+        session = subprocess.Popen(attach, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(session.kill)
+        self.assertEqual(json.loads(session.stdout.readline())["event"], "heartbeat")
+        self.assertIsNone(process.poll())
+        session.stdin.write(b"cancel\n")
+        session.stdin.flush()
+        events = [json.loads(line) for line in session.stdout]
         self.assertEqual(events[-1]["event"], "exit")
         self.assertTrue(events[-1]["cancelled"])
+        process.wait(30)
+        late = subprocess.run(attach, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(json.loads(late.stdout), events[-1])
 
 
 class SuiteOnExecutorTest(SetupFixture):
@@ -1940,6 +2104,29 @@ class EgressRunTest(SetupFixture):
         self.assertEqual(len(set(ports)), len(ports), ports)
         self.assertTrue(all(20000 <= port < LOWEST_EPHEMERAL_PORT for port in ports), ports)
         return manager, run["name"], final, ports, int(refusals.read_text())
+
+    def test_a_refused_attach_forward_attaches_again_and_never_starts_the_run_twice(self):
+        manager, client, _ = self.prepare_remote()
+        self.harbor_local_suite()
+        self.egress_executor(egress="workbench")
+        drops, refusals = self.root / "drops", self.root / "refused-attach-forwards"
+        drops.write_text("1")
+        refusals.write_text("1")
+        os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="0", FAKE_SSH_DROP_SILENT="1",
+                          FAKE_REFUSED_ATTACH_FORWARDS=str(refusals), FAKE_BENCH_DELAY="4")
+        run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
+                                          "tasks": ["humaneval-7"], "executor": "relay-4090"})
+        final = wait_run(manager, run["name"], timeout=90)
+        log = data.tail(manager.records / (run["name"] + ".log"))
+        self.assertEqual((final["status"], final["exit_code"]), ("finished", 0), (final, log))
+        self.assertEqual(refusals.read_text(), "0")
+        actions = [re.search(r" node (run|attach) ", c[1][-1]).group(1) for c in self.calls("ssh")
+                   if re.search(r" node (run|attach) ", c[1][-1])]
+        self.assertEqual(actions.count("run"), 1, actions)
+        self.assertGreaterEqual(actions.count("attach"), 2, actions)
+        sessions = [c[1] for c in self.calls("ssh") if "-R" in c[1]]
+        ports = [int(session[session.index("-R") + 1].split(":")[1]) for session in sessions]
+        self.assertEqual(len(set(ports)), len(ports), ports)
 
     def test_a_refused_tunnel_port_is_retried_on_another_one_and_the_run_finishes(self):
         manager, name, final, ports, left = self.run_refusing_forwards(1, FAKE_EGRESS_FETCH="1")

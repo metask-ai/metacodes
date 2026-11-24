@@ -1,0 +1,15 @@
+config.json
+logs/
+logs/mcp/
+logs/mcp/mock.log
+models.toml
+projects/
+projects/<HEX16>/
+projects/<HEX16>/<HEX24>/
+projects/<HEX16>/<HEX24>/meta.json
+projects/<HEX16>/<HEX24>/spans.jsonl
+projects/<HEX16>/<HEX24>/tool-observations.jsonl
+projects/<HEX16>/<HEX24>/tool-results/
+projects/<HEX16>/<HEX24>/tool-results/spool/
+projects/<HEX16>/<HEX24>/transcript.jsonl
+projects/<HEX16>/memory/

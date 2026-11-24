@@ -281,14 +281,16 @@ pub fn signInWithBrowser(
     // Opened before the instructions say it was; "if it did not open" covers
     // a launcher that failed quietly.
     if (open_browser) auth.openBrowser(allocator, url) catch {};
+    var forward_buf: [160]u8 = undefined;
     const text = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\n{s}\n\n{s} shows this sign-in as \"localhost:{d}\". Approve the new API key there; you can give it a spending limit and an expiry.\n",
+        "{s}\n\n{s}\n\n{s} shows this sign-in as \"localhost:{d}\". Approve the new API key there; you can give it a spending limit and an expiry.\n{s}",
         .{
             if (open_browser) "Opened your browser. If it did not open, open this URL:" else "Open this URL to sign in:",
             url,
             target.provider_label,
             server.port,
+            if (auth.sshSession()) auth.sshForwardLine(&forward_buf, server.port) else "",
         },
     );
     defer allocator.free(text);
@@ -512,16 +514,6 @@ pub fn writeKeyStatus(w: *std.Io.Writer, path: []const u8, stored: *const api_ke
     } else {
         try w.writeAll(" · never expires");
     }
-}
-
-/// True in an SSH session, where a loopback redirect lands on the remote
-/// machine and the browser that would follow it is on another one.
-pub fn sshSession() bool {
-    for ([_][*:0]const u8{ "SSH_CONNECTION", "SSH_TTY" }) |name| {
-        const value = std.c.getenv(name) orelse continue;
-        if (std.mem.span(value).len > 0) return true;
-    }
-    return false;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

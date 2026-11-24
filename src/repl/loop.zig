@@ -17,6 +17,7 @@ const app_mod = @import("../app.zig");
 const provider_login = @import("../api/provider_login.zig");
 const oauth_login_mod = @import("../api/oauth_login.zig");
 const openrouter_login = @import("../api/openrouter_login.zig");
+const auth_mod = @import("../core/auth.zig");
 const api_key_store = @import("../provider/api_key_store.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
@@ -217,6 +218,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     // 逐条取出作为后续 input 续发,直到队空(对齐 Claude Code commandQueue)。
     var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
     defer msg_queue.deinit();
+    var unsent_draft: ?input.LineEditor = null;
+    defer if (unsent_draft) |*draft| draft.deinit();
 
     const turn_host: TurnHost = .{
         .app = app,
@@ -225,6 +228,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         .stdin_fd = stdin_fd,
         .region = if (tui_region) |*r| r else null,
         .msg_queue = &msg_queue,
+        .unsent_draft = &unsent_draft,
         .history = &history,
         .eval_runtime = &eval_runtime,
         .eval_execution_policy = eval_execution_policy,
@@ -276,10 +280,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             echoUserSubmission(app, q, if (tui_region) |*r| r else null);
             break :blk q; // q owned,与 readLine 返回所有权一致
         } else if (tty)
-            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?) catch |err| switch (err) {
+            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?, &unsent_draft) catch |err| switch (err) {
                 // The double-press exits leave quietly, as Claude Code does;
                 // only `/exit` says goodbye.
-                error.Eof, error.ExitRequested => break,
+                error.Eof, error.ExitRequested, error.TerminateRequested => break,
                 else => return err,
             }
         else
@@ -878,6 +882,7 @@ const TurnHost = struct {
     stdin_fd: c_int,
     region: ?*render_region_mod.RenderRegion,
     msg_queue: *msg_queue_mod.MsgQueue,
+    unsent_draft: *?input.LineEditor,
     history: *history_mod.History,
     eval_runtime: *?evaluation_backend_mod.RuntimeConfig,
     eval_execution_policy: ?@import("../tools.zig").ToolExecutionPolicy,
@@ -903,7 +908,7 @@ const TurnKind = enum { prompt, skill, macro };
 /// the caller's stack at a fixed address while its watcher runs.
 fn turnBackend(host: *const TurnHost, region: *render_region_mod.RenderRegion) tui_backend_mod.TuiBackend {
     const app = host.app;
-    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .input_abort = &app.abort };
+    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .state_root = app.stateRoot(), .unsent_draft = host.unsent_draft, .input_abort = &app.abort };
 }
 
 /// What the spinner says while a request waits on MCP servers.
@@ -1584,32 +1589,9 @@ fn pasteTarget(app: *app_mod.App, region: *render_region_mod.RenderRegion, edito
 
 fn routePaste(target: PasteTarget, allocator: std.mem.Allocator, state_root: []const u8, text: []const u8) !void {
     switch (target) {
-        .editor => |editor| try insertPaste(editor, allocator, state_root, text),
+        .editor => |editor| try paste_mod.insert(editor, allocator, state_root, text),
         .picker => |p| picker_host.onPaste(p.app, &p.region.ui, text, .of(p.region)),
     }
-}
-
-/// 插入一段粘贴的文字:小粘贴内联;大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
-fn insertPaste(
-    editor: *input.LineEditor,
-    allocator: std.mem.Allocator,
-    state_root: []const u8,
-    text: []const u8,
-) !void {
-    if (text.len == 0) return;
-
-    if (paste_mod.isLarge(text)) {
-        if (state_root.len > 0) {
-            g_paste_id += 1;
-            if (paste_mod.store(allocator, state_root, g_paste_id, text) catch null) |placeholder| {
-                defer allocator.free(placeholder);
-                try insertAtCursor(editor, allocator, placeholder);
-                return;
-            }
-        }
-        // store 失败 / 无 HOME → 退回内联
-    }
-    try insertAtCursor(editor, allocator, text);
 }
 
 const startup_text_cut = "Some of what was typed during startup did not fit in memory and was dropped.";
@@ -1626,28 +1608,12 @@ fn insertStartupText(
     state_root: []const u8,
     startup: *const input.StartupText,
 ) ?[]const u8 {
-    insertPaste(editor, allocator, state_root, startup.text()) catch {
+    paste_mod.insert(editor, allocator, state_root, startup.text()) catch {
         editor.reset();
         return startup_text_lost;
     };
     return if (startup.dropped) startup_text_cut else null;
 }
-
-/// 在光标处插入一段文本，光标移到插入末尾。
-fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text: []const u8) !void {
-    const line = editor.view();
-    var nl = std.ArrayList(u8).empty;
-    defer nl.deinit(allocator);
-    try nl.appendSlice(allocator, line[0..editor.cursor]);
-    try nl.appendSlice(allocator, text);
-    try nl.appendSlice(allocator, line[editor.cursor..]);
-    const new_cursor = editor.cursor + text.len;
-    try editor.setLine(nl.items);
-    editor.cursor = new_cursor;
-}
-
-/// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
-var g_paste_id: usize = 0;
 
 fn openRouterTick(app: *app_mod.App, region: *render_region_mod.RenderRegion) bool {
     const change = app.takeOpenRouterRefresh(util_time.nowMs());
@@ -1893,7 +1859,7 @@ const TeamworkReader = struct {
     fn read(ctx: *anyopaque) ?[]u8 {
         const self: *TeamworkReader = @ptrCast(@alignCast(ctx));
         const host = self.host;
-        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region) catch null;
+        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region, host.unsent_draft) catch null;
         return readLineBuffered(host.allocator, host.stdin_fd) catch null;
     }
 };
@@ -1910,6 +1876,7 @@ fn readLineRaw(
     history: *history_mod.History,
     app: *app_mod.App,
     region: *render_region_mod.RenderRegion,
+    unsent_draft: *?input.LineEditor,
 ) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
@@ -1917,7 +1884,8 @@ fn readLineRaw(
     };
     defer input.restoreMode(fd, orig);
 
-    var editor = input.LineEditor.init(allocator);
+    var editor = unsent_draft.* orelse input.LineEditor.init(allocator);
+    unsent_draft.* = null;
     defer editor.deinit();
 
     var parser = input.KeyParser{};
@@ -2012,6 +1980,7 @@ fn readLineRaw(
         // 用 poll 带超时读,而非阻塞 read:超时时检查 SIGWINCH(终端 resize)→ 立即重画
         // 输入框自适应新宽度(否则要等下次按键才更新,真机 resize 卡旧宽)。
         if (synthetic_key == null) while (true) {
+            if (app_mod.terminateRequested()) return error.TerminateRequested;
             _ = input.reconcileAfterResume(fd);
             if (g_winch.swap(false, .acquire)) {
                 redraw(region, &editor, app); // resize → 重测宽度重画
@@ -3244,7 +3213,10 @@ fn printLoginUsage() void {
         \\With no provider, sign in to Metask in the browser, as `metacodes login`
         \\does, and choose a model and a reasoning level; the session and new
         \\sessions use it. /login metask does the same with a code confirmed on
-        \\any device. With another provider, sign in to that provider; the login
+        \\any device; in an SSH session /login asks which way, the code first
+        \\(--no-browser keeps the browser there). A browser on another computer
+        \\ends on a page that does not load: paste that page's address into the
+        \\pane to finish the sign-in here. With another provider, sign in to that provider; the login
         \\is stored where `metacodes login --provider <id>` stores it. A provider
         \\whose site creates the key (OpenRouter) asks which way: the browser here,
         \\or another device (--device-code), whose page shows a code to paste back.
@@ -3342,10 +3314,12 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
             break :blk value.options;
         },
     };
-    // `/login` alone (or with `--no-browser`) is the Metask browser sign-in
-    // `metacodes login` runs (#485); the provider list is `/login <provider>`.
+    // `/login` alone (or with `--no-browser`) is the Metask sign-in
+    // `metacodes login` runs (#485); over SSH it asks which way, the device
+    // code first (#722); the provider list is `/login <provider>`.
     if (named == null and options.method == .loopback and options.client_id == null) {
-        return handleMetaskSignIn(app, options.open_browser, false);
+        const over_ssh = options.open_browser and auth_mod.sshSession();
+        return handleMetaskSignIn(app, options.open_browser, false, over_ssh);
     }
     const host = app.providerHost() catch |err| {
         cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
@@ -3357,7 +3331,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     // compiled default, which the gateway does not serve.
     if (named) |name| if (options.client_id == null) {
         for (host.registry.profiles.items) |*profile| {
-            if (profile.id.eqlText("metask") and profile.matchesName(name)) return handleMetaskSignIn(app, options.open_browser, true);
+            if (profile.id.eqlText("metask") and profile.matchesName(name)) return handleMetaskSignIn(app, options.open_browser, true, false);
         }
     };
 
@@ -3367,7 +3341,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         .key_options = .{ .state_root = app.stateRoot(), .open_browser = options.open_browser },
         // A key grant (OpenRouter) offers the other device first over SSH,
         // and starts there with `--device-code`.
-        .how_ssh = openrouter_login.sshSession(),
+        .how_ssh = auth_mod.sshSession(),
         .how_start = if (options.method == .device_code) .other_device else .ask,
     };
     defer dialog.deinit();
@@ -3538,7 +3512,7 @@ fn offerLogin(dialog: *dialogs.LoginDialog, start_at: *?usize, named: ?[]const u
 /// Metask becomes the default: a stored `/model` default (which would outrank
 /// the sign-in at the next start) is forgotten. Esc at any step stores and
 /// changes nothing.
-fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) !void {
+fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool, over_ssh: bool) !void {
     const th = app.theme;
     var dialog = dialogs.MetaskSignInDialog.init(app.allocator);
     defer dialog.deinit();
@@ -3557,7 +3531,11 @@ fn handleMetaskSignIn(app: *app_mod.App, open_browser: bool, device_code: bool) 
         }
     } else |_| {}
     dialog.others = others.items;
-    dialog.start(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    if (over_ssh) {
+        dialog.offerWays(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    } else {
+        dialog.start(app.io, .{ .open_browser = open_browser, .device_code = device_code });
+    }
     runDialog(dialogs.MetaskSignInDialog, &dialog, app);
     if (dialog.outcome != .chosen) {
         cmd_output.print("Login interrupted · nothing was changed\n", .{});

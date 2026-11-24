@@ -507,6 +507,24 @@ def node_argv(executor: SshExecutor, *args: str, reverse: Optional[Tuple[int, in
     return ssh_argv(executor, ["sh", "-c", script], reverse=reverse)
 
 
+def resolve_node(executor: SshExecutor, runner=subprocess.run) -> str:
+    script = (node_prelude(executor) + '[ -n "$n" ] || exit 127; '
+              'readlink -f "$n" 2>/dev/null || printf "%s\\n" "$n"')
+    try:
+        done = runner(shell_argv(executor, script), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                      timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败：{exc}") from None
+    if done.returncode == 127:
+        raise ValueError(f"执行机器 {executor.name} 上找不到 metacodes 节点；"
+                         f"运行 metacodes bench setup --executor {executor.name}")
+    lines = (done.stdout or "").strip().splitlines()
+    if done.returncode != 0 or not lines:
+        raise ValueError(f"连接执行机器 {executor.name} 查找 metacodes 节点失败（退出码 {done.returncode}）："
+                         f"{(done.stderr or '').strip()[-300:]}")
+    return lines[-1]
+
+
 def shell_argv(executor: Executor, script: str) -> List[str]:
     """argv that runs a POSIX shell script on the executor."""
     if isinstance(executor, SshExecutor):
@@ -637,6 +655,16 @@ def probe(executor: Executor, runner=subprocess.run, timeout=25) -> Dict:
             node = None
         facts["node"] = node if isinstance(node, dict) else {"error": "invalid"}
     return facts
+
+
+UNREACHABLE = re.compile(r"connect to host|Connection (timed out|refused|reset|closed)|Could not resolve hostname|"
+                         r"Network is unreachable|No route to host|Operation timed out|kex_exchange_identification")
+
+
+def unreachable(facts: Dict) -> bool:
+    """The probe failed on the network, not on the login: worth retrying."""
+    return facts.get("error") == "timeout" or (facts.get("error") == "ssh"
+                                                and bool(UNREACHABLE.search(facts.get("detail") or "")))
 
 
 def node_problem(executor: SshExecutor, facts: Dict) -> Optional[str]:
@@ -967,8 +995,8 @@ class JobSync:
     PASS_FILES = 2000
 
     def __init__(self, executor: SshExecutor, remote_dir: str, local_dir: Path,
-                 runner=subprocess.run, log=print, popen=subprocess.Popen):
-        self.executor, self.remote_dir = executor, remote_dir
+                 runner=subprocess.run, log=print, popen=subprocess.Popen, binary: Optional[str] = None):
+        self.executor, self.remote_dir, self.binary = executor, remote_dir, binary
         self.local_dir = Path(local_dir)
         self.runner, self.log, self.popen = runner, log, popen
         self.seen: Dict[str, List[int]] = {}
@@ -977,8 +1005,8 @@ class JobSync:
         self.pending = 0
 
     def manifest(self) -> Dict[str, List[int]]:
-        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir), stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=self.MANIFEST_TIMEOUT)
+        listing = self.runner(node_argv(self.executor, "manifest", self.remote_dir, binary=self.binary),
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=self.MANIFEST_TIMEOUT)
         if listing.returncode != 0:
             raise ValueError("读取远程作业目录失败")
         current = json.loads(listing.stdout or b"{}")
@@ -1036,7 +1064,7 @@ class JobSync:
         import tempfile
         requested = {item if isinstance(item, str) else item[0] for item in items}
         with tempfile.TemporaryFile() as errors:
-            process = self.popen(node_argv(self.executor, "pack", self.remote_dir), stdin=subprocess.PIPE,
+            process = self.popen(node_argv(self.executor, "pack", self.remote_dir, binary=self.binary), stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=errors)
             stream = _Watched(process.stdout)
             done = threading.Event()
@@ -1133,12 +1161,15 @@ class RemoteRun:
     HEARTBEAT_TIMEOUT = 90
     SYNC_INTERVAL = 10
     FINAL_SYNC_TIMEOUT = 1800
+    RECONNECT_WINDOW = 1800
+    RECONNECT_PAUSE = 10
 
     def __init__(self, spec: Dict, runner=subprocess.run, popen=subprocess.Popen, log=None):
         self.executor = parse({k: v for k, v in spec["executor"].items() if v is not None})
         self.spec = spec
         self.runner, self.popen = runner, popen
         self.log = log or (lambda text: print(text, flush=True))
+        self.node = None
         self.bundle = None
         self.dataset = None
         self.overlay = None
@@ -1155,6 +1186,17 @@ class RemoteRun:
         # How long the final copy may take before the run reports its
         # results as still on the executor (the environment can shorten it).
         self.final_timeout = float(os.environ.get("METACODES_BENCH_FINAL_SYNC_TIMEOUT") or self.FINAL_SYNC_TIMEOUT)
+        # How long a lost channel is reattached before the run counts as
+        # lost; the remote driver keeps Harbor running exactly as long.
+        self.reconnect_window = float(os.environ.get("METACODES_BENCH_RECONNECT_WINDOW") or self.RECONNECT_WINDOW)
+        self.heartbeat_timeout = float(os.environ.get("METACODES_BENCH_HEARTBEAT_TIMEOUT") or self.HEARTBEAT_TIMEOUT)
+        self.lost_at = None
+        self.next_attach = 0.0
+        self.reconnects = 0
+        # "run" until the first session is lost, then "attach": only the
+        # first session may be started again (a refused tunnel port).
+        self.action = None
+        self.dropped = False  # this side ended a silent session
         # egress "workbench": this run's proxy on the workbench loopback and
         # the executor loopback port its `ssh -R` forward listens on.
         self.proxy = None
@@ -1163,6 +1205,7 @@ class RemoteRun:
         self.remote_spec_path = None
         self.stderr_relay = None
         self.stderr_tail = ""
+        self.concurrency = None
 
     @property
     def tunnel_port(self) -> Optional[int]:
@@ -1175,6 +1218,7 @@ class RemoteRun:
     def stage(self) -> None:
         """Ship the bundle and the run's dataset. A WorkBuddy run needs only
         the bundle: the node runs its own WorkBuddy checkout."""
+        self.node = resolve_node(self.executor, self.runner)
         self.bundle = ship_bundle(self.executor, Path(self.spec["bundle"]), log=self.log,
                                   runner=self.runner, popen=self.popen)
         if self.spec.get("runner") == "workbuddy":
@@ -1218,7 +1262,7 @@ class RemoteRun:
         if self.spec.get("runner") == "workbuddy":
             # The node stages the run's mount image from this shipped bundle.
             return {"schema_version": 1, "runner": "workbuddy", "jobs_dir": self.executor.remote("jobs"),
-                    "bundle": self.bundle,
+                    "bundle": self.bundle, "detach_grace": self.reconnect_window,
                     **{k: self.spec.get(k) for k in ("name", "suite", "model", "tasks", "attempts", "concurrency",
                                                      "reasoning_effort", "account_gateway", "workbuddy_judge",
                                                      "max_tokens")}}
@@ -1257,7 +1301,7 @@ class RemoteRun:
             # The driver appends the judge's `--ve` once its relay listens.
             relay["judge"] = self.spec["judge"]
         return {"schema_version": 1, "name": self.spec["name"], "argv": command(remote),
-                "key_env": self.spec["key_env"], "relay": relay,
+                "key_env": self.spec["key_env"], "relay": relay, "detach_grace": self.reconnect_window,
                 "egress": self.egress_spec(), "ghcr_mirror": self.executor.ghcr_mirror}
 
     def egress_spec(self) -> Optional[Dict]:
@@ -1329,7 +1373,9 @@ class RemoteRun:
         return True
 
     def forward_was_refused(self) -> bool:
-        if self.tunnel_port is None or self.events or self.process is None or self.process.poll() != 255:
+        """The first session failed to set up its reverse forward."""
+        if (self.action != "run" or self.tunnel_port is None or self.events or self.process is None
+                or self.process.poll() != 255):
             return False
         if self.stderr_relay is not None:
             self.stderr_relay.join(10)
@@ -1356,33 +1402,86 @@ class RemoteRun:
 
     def spawn(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str]) -> None:
         self.remote_spec_path = remote_spec_path
-        argv = node_argv(self.executor, "run", remote_spec_path, reverse=self.start_egress())
-        self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
         # The secrets are the first line on the encrypted channel: `env` goes
         # to Harbor (the placeholder, a judge key), `credential` to the relay.
-        # Under the lock, so no pushed token can precede that line; a token
-        # pushed before the channel existed replaces the one given here.
+        first = {"env": secret_env}
+        if self.judge_credential:
+            # A fixed account key for the judge model (legacy group keys); a
+            # session login's pushed token serves both.
+            first["judge_credential"] = self.judge_credential
+        self.open_session("run", first, credential)
+
+    def open_session(self, action: str, first: Dict, credential: Optional[str]) -> None:
+        self.action = action
+        self.concurrency = None
+        argv = node_argv(self.executor, action, self.remote_spec_path, reverse=self.start_egress(), binary=self.node)
+        self.log("$ " + display(argv) + "  （密钥经 SSH stdin 传入）")
+        # Under the lock, so no pushed token can precede the first line; a
+        # token pushed before the channel existed replaces the one given here.
         with self.stdin_lock:
             self.process = self.popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       start_new_session=True)
             self.stderr_tail = ""
             self.last_event = time.monotonic()  # staging may have taken minutes
-            first = {"env": secret_env}
             credential = self.pending_credential or credential
             if credential:
-                first["credential"] = credential
-            if self.judge_credential:
-                # A fixed account key for the judge model (legacy group
-                # keys); a session login's pushed token serves both.
-                first["judge_credential"] = self.judge_credential
+                first = {**first, "credential": credential}
             self.process.stdin.write((json.dumps(first) + "\n").encode())
             self.process.stdin.flush()
-        threading.Thread(target=self.read_events, daemon=True).start()
+        threading.Thread(target=self.read_events, args=(self.process,), daemon=True).start()
         self.stderr_relay = threading.Thread(target=self.relay_stderr, args=(self.process,), daemon=True)
         self.stderr_relay.start()
 
-    def read_events(self) -> None:
-        for line in self.process.stdout:
+    def reconnect(self, credential: Callable[[], Optional[str]], cancelled_at: Optional[float]) -> bool:
+        """The channel closed without the run's terminal event: attach a new
+        session to the remote driver, which keeps Harbor running meanwhile.
+        True while the run goes on (attached, or the next attempt is due
+        later); False once the driver is gone, the remote command itself
+        failed (an exit status other than ssh's 255, or a refused forward),
+        a cancel has waited a minute, or reconnect_window has passed. A
+        session lost before its first event, or ended here because it went
+        silent (drop), is attached too: its start request may have reached
+        the node."""
+        if self.exit_code() is not None or self.error_message():
+            return False
+        if (self.action == "run" and not self.events and not self.dropped
+                and (self.process.returncode != 255 or self.forward_was_refused())):
+            return False
+        now_s = time.monotonic()
+        if cancelled_at is not None and now_s - cancelled_at > 60:
+            return False
+        if self.lost_at is None:
+            self.lost_at = now_s
+            self.log(f"与执行机器 {self.executor.name} 的连接中断；Harbor 继续在那边运行，"
+                     f"{self.reconnect_window / 60:g} 分钟内自动重连")
+        if now_s - self.lost_at > self.reconnect_window:
+            self.log(f"{self.reconnect_window / 60:g} 分钟内没能重新连上执行机器 {self.executor.name}")
+            return False
+        if now_s >= self.next_attach:
+            self.next_attach = now_s + self.RECONNECT_PAUSE
+            first = {}
+            if self.tunnel_port is not None:
+                # A fresh port: the lost session's forward may still hold the old one.
+                self.tunnel_ports.append(tunnel_port(self.tunnel_ports))
+                first["tunnel_port"] = self.tunnel_port
+            self.open_session("attach", first, credential())
+            if cancelled_at is not None:
+                self.cancel()
+        return True
+
+    def drop(self) -> None:
+        """End a session that went silent; the run is attached anew."""
+        self.dropped = True
+        self.process.kill()
+
+    def lost_message(self) -> Optional[str]:
+        if self.lost_at is None:
+            return None
+        return (f"与执行机器 {self.executor.name} 的连接中断，{self.reconnect_window / 60:g} 分钟内没能重新连上；"
+                "执行机器上的 Harbor 已按同样的时限停止")
+
+    def read_events(self, process) -> None:
+        for line in process.stdout:
             try:
                 event = json.loads(line)
             except ValueError:
@@ -1390,12 +1489,25 @@ class RemoteRun:
             if isinstance(event, dict):
                 self.events.append(event)
                 self.last_event = time.monotonic()
+                if self.lost_at is not None and process is self.process:
+                    self.log(f"已重新连上执行机器 {self.executor.name}（中断 {time.monotonic() - self.lost_at:.0f} 秒）")
+                    self.lost_at = None
+                    self.reconnects += 1
 
     def cancel(self) -> None:
         try:
             with self.stdin_lock:
                 self.process.stdin.write(b"cancel\n")
                 self.process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def set_concurrency(self, value: int) -> None:
+        try:
+            with self.stdin_lock:
+                self.process.stdin.write((json.dumps({"concurrency": value}) + "\n").encode())
+                self.process.stdin.flush()
+            self.concurrency = value
         except (BrokenPipeError, OSError, ValueError):
             pass
 
@@ -1440,7 +1552,7 @@ class RemoteRun:
 
     def job_sync(self) -> JobSync:
         return JobSync(self.executor, self.remote_job_dir, self.local_job_dir,
-                       runner=self.runner, log=self.log, popen=self.popen)
+                       runner=self.runner, log=self.log, popen=self.popen, binary=self.node)
 
     def sync(self) -> bool:
         """One pass; False when it failed (logged, retried by the caller)."""

@@ -1,0 +1,5 @@
+$ metacodes --state-dir <ROOT>/state --no-such-flag
+exit: 2
+--- stdout
+--- stderr
+error: unknown flag '--no-such-flag' (use --help to list supported flags)

@@ -29,6 +29,7 @@ const provider_credential = @import("../provider/credential.zig");
 const catalog_fetch = @import("catalog_fetch.zig");
 const model_probe = @import("model_probe.zig");
 const openrouter_login = @import("openrouter_login.zig");
+const auth = @import("../core/auth.zig");
 
 pub const Method = oauth_login.Method;
 
@@ -46,6 +47,7 @@ pub const Options = struct {
     timeout_seconds: u32 = 300,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
+    paste: ?auth.PasteSource = null,
     /// The host's state root: the login is stored under `<state_root>/oauth`
     /// (unless METACODES_OAUTH_DIR overrides it). No default: a caller that
     /// forgot it would finish the browser flow and then fail to store the
@@ -177,6 +179,7 @@ pub const Prepared = struct {
             .timeout_seconds = self.options.timeout_seconds,
             .abort_signal = self.options.abort_signal,
             .notify = notify,
+            .paste = self.options.paste,
         });
         defer {
             std.crypto.secureZero(u8, token_json);

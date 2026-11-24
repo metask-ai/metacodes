@@ -1,0 +1,4 @@
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"read both files"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"text","text":"Reading both."},{"type":"tool_use","id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}"},{"type":"tool_use","id":"toolu_02","name":"Read","input":"{\"file_path\":\"todo.txt\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"     1\talpha\n","is_error":false,"delivered":true},{"type":"tool_result","tool_use_id":"toolu_02","content":"     1\tbeta\n","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"notes.txt says alpha, todo.txt says beta."}]}

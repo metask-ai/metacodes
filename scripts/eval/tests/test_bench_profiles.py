@@ -23,7 +23,7 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.bench import data, executors, profiles
 from scripts.eval.harbor.viewer import server
-from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.runner import ExecutorUnreachable, RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
 from scripts.eval.harbor.bench import workbench as workbench_module
 from scripts.eval.harbor.bench.workbench import Workbench
@@ -242,6 +242,7 @@ class ProfileTest(unittest.TestCase):
         self.assertIn('execute_code', listed)
         created = self.client.request('api/profiles/run', self.request(features=['execute_code', 'verification_final_gate']))
         self.assertEqual(created['features'], ['verification_final_gate', 'execute_code'])
+        self.assertEqual(created['default_name'], 'profile-bundle-100001000')
         record = self.wait_profile(created['id'])
         self.assertEqual([i['status'] for i in record['items']], ['finished', 'finished'])
         runs = {r['name']: r for r in self.manager.runs()}
@@ -251,12 +252,32 @@ class ProfileTest(unittest.TestCase):
             self.assertIn('features=verification_final_gate,execute_code', argv)
         plain = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
         self.assertEqual(plain['features'], [])
+        self.assertEqual(plain['default_name'], 'profile-bundle-000000000')
         self.assertNotEqual(plain['id'], created['id'])
         self.assertEqual(plain['metacodes']['digest'], created['metacodes']['digest'])
         run = self.wait_profile(plain['id'])['items'][0]['run']
         self.assertNotIn('features', next(r for r in self.manager.runs() if r['name'] == run))
         argv = json.loads((self.manager.jobs_dir / run / 'argv.json').read_text())
         self.assertFalse([a for a in argv if a.startswith('features=')])
+
+    def test_an_unnamed_profile_is_named_by_its_version_and_feature_bits(self):
+        def name(**metacodes):
+            return profiles.default_name({'metacodes': metacodes, 'features': ['verification_final_gate']})
+        self.assertEqual(name(label='v0.12.0', release='v0.12.0', commit='0123456789ab'), 'profile-v0.12.0-100000000')
+        self.assertEqual(name(label='dev 0123456789ab（基于 v0.12.0）', release='v0.12.0', commit='0123456789ab'),
+                         'profile-01234567-100000000')
+        self.assertEqual(name(label='0.0.0-dev+0123456789ab', release='0.0.0-dev+0123456789ab', commit='0123456789ab'),
+                         'profile-01234567-100000000')
+        self.assertEqual(name(label='0.0.0-dev+0123456789ab', release='0.0.0-dev+0123456789ab'),
+                         'profile-01234567-100000000')
+
+    def test_a_dev_bundle_in_a_plain_directory_is_named_by_its_commit(self):
+        atomic_json(self.root / 'bundle' / 'manifest.json',
+                    {'target': {'os': 'linux'}, 'release': {'version': '0.0.0-dev+0123456789ab', 'channel': 'pre'},
+                     'source': {'commit': '0123456789ab'}})
+        created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        self.assertEqual(created['default_name'], 'profile-01234567-000000000')
+        self.wait_profile(created['id'])
 
     def test_a_profile_can_be_renamed_while_running_and_after_it_ends(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
@@ -305,6 +326,42 @@ class ProfileTest(unittest.TestCase):
         latest, _ = workbench_module.latest_results(record, {'a': view('a', 'pass'), 'b': view('b', 'fail')})
         self.assertEqual(latest[('terminal-bench-2.1', 'm', 'fix-git')][1], 'b')
 
+    def unreachable_launches(self, down):
+        """RunManager.launch refusing real launches while `down` is set, as
+        an SSH executor that does not answer would."""
+        launch = self.manager.launch
+
+        def flaky(request, **kwargs):
+            if not kwargs.get('dry_run') and down.is_set():
+                raise ExecutorUnreachable('无法通过 SSH 登录 relay-4090：ssh: connect to host 10.0.0.1 port 22: '
+                                          'No route to host')
+            return launch(request, **kwargs)
+        return patch.object(self.manager, 'launch', flaky)
+
+    def test_a_dataset_waits_while_its_executor_does_not_answer(self):
+        down = threading.Event()
+        down.set()
+        with self.unreachable_launches(down):
+            created = self.client.request('api/profiles/run', self.request())
+            for _ in range(3):
+                self.manager.profiles.advance()
+            waiting = self.manager.profiles.get(created['id'])['items'][0]
+            self.assertEqual((waiting['status'], waiting['run']), ('pending', None))
+            self.assertIn('No route to host', waiting['waiting']['reason'])
+            down.clear()
+            record = self.wait_profile(created['id'])
+        self.assertEqual([i['status'] for i in record['items']], ['finished', 'finished'])
+        self.assertNotIn('waiting', record['items'][0])
+
+    def test_a_dataset_fails_once_its_executor_stayed_unreachable(self):
+        down = threading.Event()
+        down.set()
+        with self.unreachable_launches(down), patch.object(profiles.ProfileManager, 'UNREACHABLE_WAIT', -1):
+            created = self.client.request('api/profiles/run', self.request())
+            record = self.wait_profile(created['id'])
+        self.assertEqual([i['status'] for i in record['items']], ['failed', 'failed'])
+        self.assertIn('分钟内一直连不上：无法通过 SSH 登录 relay-4090', record['items'][0]['error'])
+
     def test_single_launch_waits_and_cancel_skips_remaining_datasets(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
             created = self.client.request('api/profiles/run', self.request())
@@ -321,6 +378,41 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(record['status'], 'cancelled')
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
+
+    def test_concurrency_changes_while_the_profile_runs(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request())
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            run = self.manager.profiles.get(created['id'])['items'][0]['run']
+            with self.assertRaisesRegex(ValueError, '正整数'):
+                self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 0})
+            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 64})
+            record = self.manager.profiles.get(created['id'])
+            self.assertEqual([i['concurrency'] for i in record['items']], [64, 64])
+
+            changed = self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 2})
+
+            self.assertEqual(changed, {'id': created['id'], 'concurrency': 2})
+            limit_file = self.manager.records / (run + '.concurrency')
+            self.assertEqual(limit_file.read_text(), '2')
+            record = self.manager.profiles.get(created['id'])
+            self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']], [(2, 2), (2, 2)])
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (self.manager.jobs_dir / run / 'harbor-env.json').exists():
+                time.sleep(.05)
+            harbor_env = json.loads((self.manager.jobs_dir / run / 'harbor-env.json').read_text())
+            self.assertEqual(harbor_env['METACODES_BENCH_CONCURRENCY_FILE'], str(limit_file))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and next(r for r in self.manager.runs() if r['name'] == run)['concurrency'] != 2:
+                time.sleep(.1)
+            self.assertEqual(next(r for r in self.manager.runs() if r['name'] == run)['concurrency'], 2)
+            self.client.request('api/profile/cancel', {'id': created['id']})
+            self.wait_profile(created['id'])
+        with self.assertRaisesRegex(ValueError, '没有正在运行'):
+            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3})
 
     def test_deleting_a_profile_removes_its_runs_results_and_rows(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
@@ -358,6 +450,103 @@ class ProfileTest(unittest.TestCase):
                          (kept['items'][0]['run'],))
         self.assertEqual(orphans, [])
         self.assertEqual(json.loads(ingest.decode(*spec))['name'], kept['items'][0]['run'])
+
+    def test_deleting_a_job_removes_its_run_files_and_rows_and_keeps_its_profile(self):
+        record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
+        doomed, kept = [item['run'] for item in record['items']]
+        self.client.request('api/profile?id=' + record['id'])
+
+        deleted = self.client.request('api/job/delete', {'name': doomed})
+
+        self.assertEqual(deleted, {'name': doomed, 'deleted': True})
+        self.assertFalse((self.manager.jobs_dir / doomed).exists())
+        self.assertEqual(list(self.manager.records.glob(doomed + '.*')), [])
+        self.assertTrue((self.manager.jobs_dir / kept).is_dir())
+        listing = self.client.request('api/jobs?profile=all')
+        self.assertEqual([j['name'] for j in listing['jobs']], [kept])
+        self.assertEqual([b['id'] for b in listing['profiles']], [record['id']])
+        self.assertEqual({t['job'] for t in self.client.request('api/profile?id=' + record['id'])['tasks']}, {kept})
+        counts = self.client.request('api/store')['counts']
+        self.assertEqual((counts['profiles'], counts['jobs'], counts['runs']), (1, 1, 1))
+        with self.workbench.library.store.read() as tx:
+            orphans = tx.query("SELECT sha256 FROM blobs WHERE sha256 NOT IN (SELECT sha256 FROM files WHERE sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT tail_sha256 FROM files WHERE tail_sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT spec_sha256 FROM runs WHERE spec_sha256 IS NOT NULL) "
+                               "AND sha256 NOT IN (SELECT log_sha256 FROM runs WHERE log_sha256 IS NOT NULL)")
+        self.assertEqual(orphans, [])
+        for name in (doomed, '../' + kept, '.bench-runs'):
+            with self.assertRaisesRegex(ValueError, '不存在'):
+                self.client.request('api/job/delete', {'name': name})
+        self.assertEqual([i['run'] for i in self.manager.profiles.get(record['id'])['items']], [None, kept])
+        with self.workbench.library.store.read() as tx:
+            stored = json.loads(tx.one("SELECT record_json FROM profiles WHERE id = ?", (record['id'],))[0])
+        self.assertEqual([i['run'] for i in stored['items']], [None, kept])
+
+        _write(self.manager.jobs_dir / doomed / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(self.manager.jobs_dir / doomed / 'result.json', {'started_at': '2026-11-16T08:00:00Z',
+                                                                'finished_at': '2026-11-16T08:30:00Z', 'n_total_trials': 0})
+        self.workbench.library.sync()
+        self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
+        self.client.request('api/profile/delete', {'id': record['id']})
+        self.assertEqual(self.client.request('api/store')['counts']['profiles'], 0)
+        self.assertTrue((self.manager.jobs_dir / doomed).is_dir())
+        self.workbench.library.sync()
+        self.assertIn(doomed, [j['name'] for j in self.client.request('api/jobs?profile=all')['jobs']])
+
+    def test_a_profile_left_only_in_the_database_drops_a_deleted_job(self):
+        record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
+        doomed, kept = [item['run'] for item in record['items']]
+        self.client.request('api/profile?id=' + record['id'])
+        self.manager.profiles.path(record['id']).unlink()
+
+        self.client.request('api/job/delete', {'name': doomed})
+
+        with self.workbench.library.store.read() as tx:
+            stored = json.loads(tx.one("SELECT record_json FROM profiles WHERE id = ?", (record['id'],))[0])
+        self.assertEqual([i['run'] for i in stored['items']], [None, kept])
+        _write(self.manager.jobs_dir / doomed / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(self.manager.jobs_dir / doomed / 'result.json', {'started_at': '2026-11-16T08:00:00Z',
+                                                                'finished_at': '2026-11-16T08:30:00Z', 'n_total_trials': 0})
+        self.workbench.library.sync()
+        self.client.request('api/profile/delete', {'id': record['id']})
+        self.assertTrue((self.manager.jobs_dir / doomed).is_dir())
+        self.assertFalse((self.manager.jobs_dir / kept).exists())
+
+    def test_a_harbor_job_still_running_without_a_receipt_is_not_deleted(self):
+        job = self.manager.jobs_dir / 'harbor-by-hand'
+        _write(job / 'config.json', {'datasets': [{'name': 'terminal-bench/terminal-bench-2-1'}]})
+        _write(job / 'result.json', {'started_at': '2026-11-16T08:00:00Z', 'finished_at': None, 'n_total_trials': 1})
+        listed = {j['name']: j for j in self.client.request('api/jobs?profile=all')['jobs']}
+        self.assertTrue(listed['harbor-by-hand']['running'])
+        with self.assertRaisesRegex(ValueError, '先停止'):
+            self.client.request('api/job/delete', {'name': 'harbor-by-hand'})
+        self.assertTrue(job.is_dir())
+        self.assertEqual(self.client.request('api/store')['counts']['jobs'], 1)
+
+    def test_a_running_job_or_one_from_another_jobs_directory_is_not_deleted(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            run = self.manager.profiles.get(created['id'])['items'][0]['run']
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (self.manager.jobs_dir / run / 'result.json').exists():
+                time.sleep(.05)
+            with self.assertRaisesRegex(ValueError, '先停止'):
+                self.client.request('api/job/delete', {'name': run})
+            self.client.request('api/profile/cancel', {'id': created['id']})
+            self.wait_profile(created['id'])
+        self.client.request('api/profile?id=' + created['id'])
+        other = RunManager(self.root / 'jobs-b', self.config)
+        shutil.copytree(self.manager.jobs_dir / run, other.jobs_dir / run)
+        bench = Workbench(data.Library([other.jobs_dir]), other)
+        self.addCleanup(bench.close)
+        with self.assertRaisesRegex(ValueError, '请在那个 jobs 目录'):
+            bench.delete_job(run)
+        self.assertTrue((other.jobs_dir / run).is_dir())
+        self.assertTrue((self.manager.jobs_dir / run).is_dir())
 
     def test_a_profile_whose_files_cannot_be_removed_stays_for_a_retry(self):
         if os.geteuid() == 0:
@@ -700,6 +889,17 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profiles/run', self.request(features=['teamwork']))
         self.assertEqual(self.manager.profiles.records(), [])
 
+    def test_a_run_records_its_models_openrouter_price_and_passes_it_to_harbor(self):
+        from scripts.eval.harbor.bench import prices
+        atomic_json(self.config, {**json.loads(self.config.read_text()), 'model_prices': 'openrouter'})
+        catalog = {'vendor/test-model': {'prompt': '0.00000015', 'completion': '0.0000006'}}
+        with patch.object(prices, 'fetch', return_value=catalog):
+            run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})
+        self.assertEqual(run['model_price'], {'openrouter_id': 'vendor/test-model', 'input': 0.15, 'output': 0.6})
+        wait_run(self.manager, run['name'])
+        argv = json.loads((self.manager.jobs_dir / run['name'] / 'argv.json').read_text())
+        self.assertIn('model_price={"input":0.15,"output":0.6}', argv)
+
     def test_batches_of_an_earlier_version_merge_into_their_profiles(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
@@ -815,6 +1015,64 @@ class TeamworkRunTest(unittest.TestCase):
         alone = executors.with_teamwork(None, ["teamwork"], opted)
         self.assertEqual(alone["services"]["main"]["cap_add"], ["SYS_ADMIN", "NET_ADMIN"])
 
+
+
+class ModelPriceTest(unittest.TestCase):
+    MODELS = {"deepseek/deepseek-v4.1-flash-1017": {"prompt": "0.00000015", "completion": "0.0000006",
+                                                     "input_cache_read": "0.000000003"},
+              "deepseek/deepseek-v4.1-flash-1017:batch": {"prompt": "0.000000035", "completion": "0.000000149"},
+              "a/twin": {"prompt": "1", "completion": "1"}, "b/twin": {"prompt": "2", "completion": "2"},
+              "x/unpriced": {"prompt": None, "completion": "1"}}
+
+    def test_a_run_model_matches_one_openrouter_model_by_its_request_id(self):
+        from scripts.eval.harbor.bench import prices
+        price = prices.price_for("metask/DeepSeek-V4.1-Flash-1017", self.MODELS)
+        self.assertEqual(price, {"openrouter_id": "deepseek/deepseek-v4.1-flash-1017", "input": 0.15, "output": 0.6,
+                                 "cached_input": 0.003})
+        self.assertIsNone(prices.price_for("metask/twin", self.MODELS))
+        self.assertIsNone(prices.price_for("x/unpriced", self.MODELS))
+        self.assertIsNone(prices.price_for("nobody/else", self.MODELS))
+        self.assertIsNone(prices.price_for("gateway/acme/model", {"other/model": {"prompt": "1", "completion": "1"}}))
+        self.assertEqual(prices.price_for("gateway/acme/model", {"acme/model": {"prompt": "0.000001", "completion": "0.000002"},
+                                                                 "other/model": {"prompt": "1", "completion": "1"}}),
+                         {"openrouter_id": "acme/model", "input": 1.0, "output": 2.0})
+
+    def test_the_catalog_is_cached_for_a_day_and_a_failed_fetch_keeps_the_cached_copy(self):
+        from scripts.eval.harbor.bench import prices
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            return {"v/m": {"prompt": "1", "completion": "2"}}
+
+        def failing():
+            raise OSError("offline")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0), {"v/m": {"prompt": "1", "completion": "2"}})
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0 + 3600)
+            self.assertEqual(len(calls), 1)
+            later = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), failing, now=lambda: later), {"v/m": {"prompt": "1", "completion": "2"}})
+        def truncated():
+            import http.client
+            raise http.client.IncompleteRead(b"{\"data\": [", 1000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prices.catalog(Path(tmp), fetcher, now=lambda: 1000.0)
+            stale = 1000.0 + prices.MAX_AGE_S + 1
+            self.assertEqual(prices.catalog(Path(tmp), truncated, now=lambda: stale), {"v/m": {"prompt": "1", "completion": "2"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(prices.catalog(Path(tmp), failing), {})
+
+    def test_the_harbor_command_carries_the_price_numbers_only(self):
+        from scripts.eval.harbor.bench.worker import command
+        spec = {"harbor": "harbor", "dataset": "d", "model": "m", "bundle": "/b", "key_env": "K", "attempts": 1,
+                "concurrency": 1, "jobs_dir": "/j", "name": "run", "tasks": ["t"],
+                "model_price": {"openrouter_id": "v/m", "input": 0.15, "output": 0.6}}
+        self.assertEqual([a for a in command(spec) if a.startswith("model_price=")],
+                         ['model_price={"input":0.15,"output":0.6}'])
+        self.assertFalse([a for a in command({**spec, "model_price": None}) if a.startswith("model_price=")])
 
 if __name__ == '__main__':
     unittest.main()

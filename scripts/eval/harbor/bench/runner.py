@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from scripts.eval.harbor import suites
+from scripts.eval.harbor import live_concurrency, suites
 from scripts.eval.harbor.command import ADVANCED_FEATURES, TEAMWORK, TEAMWORK_TIMEOUT_MULTIPLIER, check_bundle
 from scripts.eval.harbor.profiling import route_problem
 from scripts.eval.harbor.store import config as store_config
@@ -128,6 +128,10 @@ def key_env_problems(key_env, model):
     return []
 
 
+class ExecutorUnreachable(ValueError):
+    """A launch refused only because the SSH executor did not answer."""
+
+
 class RunManager:
     # A worker rewrites its receipt every two seconds; one older than this
     # belongs to a worker that stopped.
@@ -181,6 +185,7 @@ class RunManager:
             if node:
                 public["label"] += f" · metacodes {node.get('version')}"
             states.append({**public, "ready": not problems, "reasons": problems,
+                           "unreachable": executors.unreachable(facts),
                            "default": executor.name == default, "harbor": facts.get("harbor") or None,
                            "node": {k: node.get(k) for k in ("version", "host")} if node else None,
                            "node_reach": executors.reach_reasons(executor, facts)
@@ -442,7 +447,7 @@ class RunManager:
         entry = next(s for s in catalog["suites"] if s["id"] == suite.id)
         problems = entry["executors"][state["name"]]["reasons"]
         if problems:
-            raise ValueError("；".join(problems))
+            raise (ExecutorUnreachable if state.get("unreachable") else ValueError)("；".join(problems))
         if TEAMWORK in features and not (state["kind"] == "ssh" and state.get("teamwork_privileged")):
             raise ValueError("Teamwork 评测只能在开启了 teamwork_privileged 的 SSH 执行机器上运行：任务容器要放开 bubblewrap "
                              "需要的权限，接近 privileged 容器，只适合用完即弃、没有凭证的专用节点")
@@ -485,8 +490,8 @@ class RunManager:
         tasks = suites.validate_tasks(suite, ctx, request.get("tasks"), known=self.node_tasks(suite, state["name"]))
         attempts, concurrency = request.get("attempts", 1), request.get("concurrency", 1)
         for name, value, limit in (("attempts", attempts, 5), ("concurrency", concurrency, suite.max_concurrency)):
-            if type(value) is not int or not 1 <= value <= limit:
-                raise ValueError(f"{name} 必须是 1–{limit} 的整数")
+            if type(value) is not int or value < 1 or (limit is not None and value > limit):
+                raise ValueError(f"{name} 必须是 1–{limit} 的整数" if limit is not None else f"{name} 必须是正整数")
         max_tokens = request.get("max_tokens")
         if max_tokens is not None and (type(max_tokens) is not int or not 1024 <= max_tokens <= MAX_OUTPUT_TOKENS):
             raise ValueError(f"max_tokens 必须是 1024–{MAX_OUTPUT_TOKENS} 的整数")
@@ -496,6 +501,10 @@ class RunManager:
                 raise ValueError(problem)
             return {"suite": suite.id, "tasks": tasks, "attempts": attempts, "concurrency": concurrency, "route": route,
                     "executor": state["name"], "features": features, "max_tokens": max_tokens}
+        from scripts.eval.harbor.bench import prices
+        model_price = None if suite.runner == suites.WORKBUDDY or \
+            settings(self.config_path).get("model_prices", prices.OPENROUTER) != prices.OPENROUTER else \
+            prices.price_for(model, prices.catalog(self.config_path.parent))
         with self.lock:
             if any(run.get("status") in ACTIVE for run in self.runs()):
                 raise ValueError("已有评测正在运行，请等待完成或先停止")
@@ -538,6 +547,8 @@ class RunManager:
                 record["features"] = features
             if TEAMWORK in features:
                 record["agent_timeout_multiplier"] = TEAMWORK_TIMEOUT_MULTIPLIER
+            if model_price:
+                record["model_price"] = model_price
             route = None
             if imported:
                 # The run's own config (endpoint, model names, key variable)
@@ -616,6 +627,15 @@ class RunManager:
                 atomic_json(self.records / (name + ".json"), {**record, "status": "failed", "error": "无法启动执行进程"})
                 raise ValueError("无法启动执行进程")
             return record
+
+    def set_concurrency(self, name, concurrency):
+        record = next((r for r in self.runs() if r["name"] == name), None)
+        if record is None or record["status"] not in ACTIVE:
+            raise ValueError("运行不存在或已结束")
+        if record.get("runner") == suites.WORKBUDDY:
+            raise ValueError("WorkBuddy 评测运行中不能调整并发")
+        live_concurrency.write(self.records / (name + ".concurrency"), concurrency)
+        return {"name": name, "concurrency": concurrency}
 
     def cancel(self, name):
         if not isinstance(name, str) or not data.NAME.fullmatch(name):

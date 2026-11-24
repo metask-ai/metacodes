@@ -178,7 +178,8 @@ def fixture(root):
     config = root / 'workbench.json'
     atomic_json(config, {'bundle': str(bundle), 'provider_config': str(native),
                          'harbor': str(harbor), 'model': 'tokenjoy/test-model',
-                         'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False, 'metrics_bind': '127.0.0.1'})
+                         'key_env': 'TOKENJOY_API_KEY', 'metrics_enabled': False, 'metrics_bind': '127.0.0.1',
+                         'model_prices': 'off'})
     return config, binary_dir
 
 
@@ -1425,13 +1426,37 @@ class ServiceReuseTest(unittest.TestCase):
                     patch.object(cli, 'stop_service') as stop, \
                     patch.object(cli, 'settings', side_effect=[earlier, started]), \
                     patch.object(cli.subprocess, 'Popen') as popen:
-                cli.ensure_service(argparse.Namespace(bind=None, port=None, public_url=None),
+                cli.ensure_service(argparse.Namespace(action='open', bind=None, port=None, public_url=None),
                                    root, self.CONFIG, jobs, self.store())
             stop.assert_called_once()
             self.assertEqual(popen.call_args.kwargs['env']['TMPDIR'], str(root / 'tmp'))
             self.assertTrue((root / 'tmp').is_dir())
             receipt = json.loads((root / 'service.json').read_text())
-            self.assertEqual(receipt, {**started, 'tmpdir': str(root / 'tmp')})
+            self.assertEqual(receipt, {**started, 'tmpdir': str(root / 'tmp'), 'runtime': str(cli.RUNTIME_ROOT)})
+
+    def test_opening_with_another_build_replaces_the_service_and_other_commands_reuse_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = str(root / 'jobs')
+            catalog = {'service': 'metacodes-bench', 'config_path': str(self.CONFIG.resolve())}
+            receipt = {'url': 'http://127.0.0.1:1/', 'listen_url': 'http://127.0.0.1:1/', 'bind': '127.0.0.1',
+                       'jobs_dir': jobs, 'store': self.STORE, 'tmpdir': str(root / 'tmp')}
+            cases = (('open', str(cli.RUNTIME_ROOT), False), ('open', '/state/bench/runtime/older', True),
+                     ('open', None, True), ('run', '/state/bench/runtime/older', False))
+            for action, runtime, replaced in cases:
+                saved = {**receipt, 'runtime': runtime} if runtime else receipt
+                with self.subTest(action=action, runtime=runtime), \
+                        patch.object(cli.Client, 'request', return_value=catalog), \
+                        patch.object(cli, 'stop_service') as stop, \
+                        patch.object(cli, 'settings', return_value=saved), \
+                        patch.object(cli.subprocess, 'Popen') as popen:
+                    try:
+                        cli.ensure_service(argparse.Namespace(action=action, bind=None, port=None, public_url=None),
+                                           root, self.CONFIG, jobs, self.store())
+                    except ValueError:
+                        pass
+                    self.assertEqual(stop.called, replaced)
+                    self.assertEqual(popen.called, replaced)
 
     def test_service_for_another_directory_is_not_reused(self):
         record = {'url': 'http://127.0.0.1:2/', 'jobs_dir': '/jobs/b', 'store': self.STORE}

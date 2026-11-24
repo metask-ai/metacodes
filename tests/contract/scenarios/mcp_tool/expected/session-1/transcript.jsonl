@@ -1,0 +1,4 @@
+{"role":"user","delivered":true,"blocks":[{"type":"text","text":"echo ping"}]}
+{"role":"assistant","delivered":true,"blocks":[{"type":"tool_use","id":"toolu_01","name":"mcp__mock__echo","input":"{\"message\":\"ping\"}"}]}
+{"role":"user","delivered":true,"blocks":[{"type":"tool_result","tool_use_id":"toolu_01","content":"{\"content\":[{\"type\":\"text\",\"text\":\"ping\"}]}","is_error":false,"delivered":true}]}
+{"role":"assistant","delivered":false,"blocks":[{"type":"text","text":"The server echoed ping."}]}

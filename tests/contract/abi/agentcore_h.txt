@@ -1,0 +1,845 @@
+agentcore.h sha256 900f8f4c9f384ba1b8bde2abadc8434836b16594086807d698461e7e95a0712e
+
+opaque metask_agentcore_runtime
+
+opaque metask_agentcore_session
+
+opaque metask_agentcore_skill_catalog
+
+struct metask_agentcore_bytes_view_v1 size 16 align 8
+     0   8 ptr: [*c]const u8
+     8   8 len: u64
+
+struct metask_agentcore_owned_bytes_v1 size 16 align 8
+     0   8 ptr: [*c]u8
+     8   8 len: u64
+
+struct metask_agentcore_run_context_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 session: ?*metask_agentcore_session
+    16   8 run_id: u64
+    24  16 session_id: metask_agentcore_bytes_view_v1
+    40  16 reserved: [2]u64
+
+typedef metask_agentcore_host_execute_fn_v1 = ?*const fn (?*anyopaque, [*c]const metask_agentcore_run_context_v1, metask_agentcore_bytes_view_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_host_release_fn_v1 = ?*const fn (?*anyopaque, [*c]metask_agentcore_owned_bytes_v1) void
+
+struct metask_agentcore_host_tool_v1 size 96 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16  16 name: metask_agentcore_bytes_view_v1
+    32  16 description: metask_agentcore_bytes_view_v1
+    48  16 input_schema_json: metask_agentcore_bytes_view_v1
+    64   8 execute: metask_agentcore_host_execute_fn_v1
+    72   8 release_result: metask_agentcore_host_release_fn_v1
+    80  16 reserved: [2]u64
+
+typedef metask_agentcore_host_result_write_fn_v1 = ?*const fn (?*anyopaque, metask_agentcore_bytes_view_v1) u32
+
+struct metask_agentcore_host_result_sink_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16   8 write: metask_agentcore_host_result_write_fn_v1
+    24   8 max_bytes: u64
+    32  24 reserved: [3]u64
+
+typedef metask_agentcore_host_stream_execute_fn_v1 = ?*const fn (?*anyopaque, [*c]const metask_agentcore_run_context_v1, metask_agentcore_bytes_view_v1, [*c]const metask_agentcore_host_result_sink_v1, [*c]u32, [*c]metask_agentcore_owned_bytes_v1) u32
+
+struct metask_agentcore_host_stream_tool_v1 size 96 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16  16 name: metask_agentcore_bytes_view_v1
+    32  16 description: metask_agentcore_bytes_view_v1
+    48  16 input_schema_json: metask_agentcore_bytes_view_v1
+    64   8 execute_stream: metask_agentcore_host_stream_execute_fn_v1
+    72   8 release_detail: metask_agentcore_host_release_fn_v1
+    80  16 reserved: [2]u64
+
+typedef metask_agentcore_mcp_is_cancelled_fn_v1 = ?*const fn (?*const anyopaque) u32
+
+struct metask_agentcore_mcp_cancellation_v1 size 40 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*const anyopaque
+    16   8 is_cancelled: metask_agentcore_mcp_is_cancelled_fn_v1
+    24  16 reserved: [2]u64
+
+struct metask_agentcore_mcp_response_v1 size 40 align 8
+     0   4 struct_size: u32
+     4   4 http_status: u32
+     8  16 body: metask_agentcore_owned_bytes_v1
+    24  16 reserved: [2]u64
+
+typedef metask_agentcore_mcp_open_fn_v1 = ?*const fn (?*anyopaque, u32, u32, u32, [*c]?*anyopaque) u32
+
+typedef metask_agentcore_mcp_request_fn_v1 = ?*const fn (?*anyopaque, ?*anyopaque, metask_agentcore_bytes_view_v1, u32, [*c]const metask_agentcore_mcp_cancellation_v1, [*c]metask_agentcore_mcp_response_v1) u32
+
+typedef metask_agentcore_mcp_request_tool_stream_fn_v1 = ?*const fn (?*anyopaque, ?*anyopaque, metask_agentcore_bytes_view_v1, u32, [*c]const metask_agentcore_mcp_cancellation_v1, [*c]const metask_agentcore_host_result_sink_v1) u32
+
+typedef metask_agentcore_mcp_notify_fn_v1 = ?*const fn (?*anyopaque, ?*anyopaque, metask_agentcore_bytes_view_v1, u32, [*c]const metask_agentcore_mcp_cancellation_v1) u32
+
+typedef metask_agentcore_mcp_close_fn_v1 = ?*const fn (?*anyopaque, ?*anyopaque) void
+
+typedef metask_agentcore_mcp_release_response_fn_v1 = ?*const fn (?*anyopaque, ?*anyopaque, [*c]metask_agentcore_owned_bytes_v1) void
+
+typedef metask_agentcore_mcp_retain_connector_fn_v1 = ?*const fn (?*anyopaque) void
+
+typedef metask_agentcore_mcp_release_connector_fn_v1 = ?*const fn (?*anyopaque) void
+
+struct metask_agentcore_mcp_connector_v1 size 88 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16   8 open: metask_agentcore_mcp_open_fn_v1
+    24   8 request: metask_agentcore_mcp_request_fn_v1
+    32   8 request_tool_stream: metask_agentcore_mcp_request_tool_stream_fn_v1
+    40   8 notify: metask_agentcore_mcp_notify_fn_v1
+    48   8 close: metask_agentcore_mcp_close_fn_v1
+    56   8 release_response: metask_agentcore_mcp_release_response_fn_v1
+    64   8 retain_connector: metask_agentcore_mcp_retain_connector_fn_v1
+    72   8 release_connector: metask_agentcore_mcp_retain_connector_fn_v1
+    80   8 reserved: [1]u64
+
+struct metask_agentcore_mcp_protocol_limits_v1 size 96 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 max_frame_bytes: u64
+    16   8 max_tools: u64
+    24   8 max_tool_name_bytes: u64
+    32   8 max_text_bytes: u64
+    40   8 max_schema_bytes: u64
+    48   8 max_json_depth: u64
+    56   8 max_json_nodes: u64
+    64   8 max_cursor_bytes: u64
+    72   8 max_versions: u64
+    80  16 reserved: [2]u64
+
+struct metask_agentcore_mcp_server_v1 size 232 align 8
+     0   4 struct_size: u32
+     4   4 transport_code: u32
+     8   4 negotiation_policy_code: u32
+    12   4 reserved0: u32
+    16  32 server_binding_identity: [32]u8
+    48  16 namespace_: metask_agentcore_bytes_view_v1
+    64  16 client_name: metask_agentcore_bytes_view_v1
+    80  16 client_version: metask_agentcore_bytes_view_v1
+    96   4 timeout_ms: u32
+   100   4 reserved1: u32
+   104  88 connector: metask_agentcore_mcp_connector_v1
+   192   8 protocol_limits: [*c]const metask_agentcore_mcp_protocol_limits_v1
+   200  32 configuration_fingerprint: [32]u8
+
+struct metask_agentcore_mcp_configuration_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 desired_revision: u64
+    16   8 servers: [*c]const metask_agentcore_mcp_server_v1
+    24   8 server_count: u64
+    32  32 reserved: [4]u64
+
+struct metask_agentcore_mcp_apply_report_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 disposition_code: u32
+     8   8 desired_revision: u64
+    16   8 active_revision: u64
+    24   8 catalog_generation: u64
+    32  32 reserved: [4]u64
+
+struct metask_agentcore_mcp_catalog_limits_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 max_servers: u64
+    16   8 max_namespace_bytes: u64
+    24   8 max_issues: u64
+    32  32 reserved: [4]u64
+
+struct metask_agentcore_runtime_config_v1 size 96 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 builtin_tools: [*c]const metask_agentcore_bytes_view_v1
+    16   8 builtin_tool_count: u64
+    24   8 host_tools: [*c]const metask_agentcore_host_tool_v1
+    32   8 host_tool_count: u64
+    40   8 mcp_servers: [*c]const metask_agentcore_mcp_server_v1
+    48   8 mcp_server_count: u64
+    56   8 mcp_catalog_limits: [*c]const metask_agentcore_mcp_catalog_limits_v1
+    64   8 enable_teams: u64
+    72   8 preview: u64
+    80  16 reserved: [2]u64
+
+struct metask_agentcore_process_plugin_source_v1 size 48 align 8
+     0   4 struct_size: u32
+     4   4 layer_code: u32
+     8  16 root: metask_agentcore_bytes_view_v1
+    24  24 reserved: [3]u64
+
+struct metask_agentcore_runtime_plugin_config_v1 size 72 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 process_plugins: [*c]const metask_agentcore_process_plugin_source_v1
+    16   8 process_plugin_count: u64
+    24   8 host_stream_tools: [*c]const metask_agentcore_host_stream_tool_v1
+    32   8 host_stream_tool_count: u64
+    40  32 reserved: [4]u64
+
+typedef metask_agentcore_on_event_fn_v1 = ?*const fn (?*anyopaque, [*c]const metask_agentcore_run_context_v1, metask_agentcore_bytes_view_v1) u32
+
+typedef metask_agentcore_on_ui_request_fn_v1 = ?*const fn (?*anyopaque, [*c]const metask_agentcore_run_context_v1, metask_agentcore_bytes_view_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_release_response_fn_v1 = ?*const fn (?*anyopaque, [*c]metask_agentcore_owned_bytes_v1) void
+
+struct metask_agentcore_session_callbacks_v1 size 72 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16   8 on_event: metask_agentcore_on_event_fn_v1
+    24   8 on_ui_request: metask_agentcore_host_execute_fn_v1
+    32   8 release_response: metask_agentcore_host_release_fn_v1
+    40  32 reserved: [4]u64
+
+struct metask_agentcore_skill_policy_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 granted_skill_ids: [*c]const metask_agentcore_bytes_view_v1
+    16   8 granted_skill_id_count: u64
+    24  32 reserved: [4]u64
+
+struct metask_agentcore_permission_rule_set_v1 size 88 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 allow: [*c]const metask_agentcore_bytes_view_v1
+    16   8 allow_count: u64
+    24   8 ask: [*c]const metask_agentcore_bytes_view_v1
+    32   8 ask_count: u64
+    40   8 deny: [*c]const metask_agentcore_bytes_view_v1
+    48   8 deny_count: u64
+    56  32 reserved: [4]u64
+
+struct metask_agentcore_mcp_selector_v1 size 80 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8  32 server_binding_identity: [32]u8
+    40  16 tool_name: metask_agentcore_bytes_view_v1
+    56  24 reserved: [3]u64
+
+struct metask_agentcore_mcp_selection_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 selectors: [*c]const metask_agentcore_mcp_selector_v1
+    16   8 selector_count: u64
+    24  32 reserved: [4]u64
+
+struct metask_agentcore_durable_budget_profile_v1 size 112 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 hard_bytes: u64
+    16   8 soft_bytes: u64
+    24   8 input_cap_bytes: u64
+    32   8 provider_request_cap_bytes: u64
+    40   8 provider_result_cap_bytes: u64
+    48   8 tool_result_cap_bytes: u64
+    56   8 mcp_result_cap_bytes: u64
+    64   8 audit_reserve_bytes: u64
+    72   8 terminal_reserve_bytes: u64
+    80  32 reserved: [4]u64
+
+struct metask_agentcore_model_capability_v1 size 40 align 8
+     0   4 struct_size: u32
+     4   4 image_input_code: u32
+     8  16 model: metask_agentcore_bytes_view_v1
+    24  16 reserved: [2]u64
+
+struct metask_agentcore_team_config_v1 size 88 align 8
+     0   4 struct_size: u32
+     4   4 role_code: u32
+     8  16 team_name: metask_agentcore_bytes_view_v1
+    24  16 member_name: metask_agentcore_bytes_view_v1
+    40  16 lead_session_id: metask_agentcore_bytes_view_v1
+    56  16 member_lease: metask_agentcore_bytes_view_v1
+    72  16 reserved: [2]u64
+
+struct metask_agentcore_session_host_config_v1 size 168 align 8
+     0   4 struct_size: u32
+     4   4 provider_kind_code: u32
+     8   4 permission_mode_code: u32
+    12   4 shell_policy_code: u32
+    16  16 api_key: metask_agentcore_bytes_view_v1
+    32  16 base_url: metask_agentcore_bytes_view_v1
+    48  16 workspace_root: metask_agentcore_bytes_view_v1
+    64  16 workspace_home: metask_agentcore_bytes_view_v1
+    80   8 allowed_tools: [*c]const metask_agentcore_bytes_view_v1
+    88   8 allowed_tool_count: u64
+    96   8 skill_catalog: ?*metask_agentcore_skill_catalog
+   104   8 skill_policy: [*c]const metask_agentcore_skill_policy_v1
+   112   8 permission_rules: [*c]const metask_agentcore_permission_rule_set_v1
+   120   8 mcp_selection: [*c]const metask_agentcore_mcp_selection_v1
+   128   8 durable_budget: [*c]const metask_agentcore_durable_budget_profile_v1
+   136   4 run_journal_mode_code: u32
+   140   4 protocol_kind_code: u32
+   144   8 model_capabilities: [*c]const metask_agentcore_model_capability_v1
+   152   8 model_capability_count: u64
+   160   8 team: [*c]const metask_agentcore_team_config_v1
+
+struct metask_agentcore_prompt_section_v1 size 72 align 8
+     0   4 struct_size: u32
+     4   4 op_code: u32
+     8  16 id: metask_agentcore_bytes_view_v1
+    24   8 order: i64
+    32  16 text: metask_agentcore_bytes_view_v1
+    48   4 interpolate: u32
+    52   4 reserved0: u32
+    56  16 reserved: [2]u64
+
+struct metask_agentcore_prompt_profile_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 sections: [*c]const metask_agentcore_prompt_section_v1
+    16   8 section_count: u64
+    24  32 reserved: [4]u64
+
+struct metask_agentcore_goal_set_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8  16 objective: metask_agentcore_bytes_view_v1
+    24   8 token_budget: u64
+    32  24 reserved: [3]u64
+
+struct metask_agentcore_goal_update_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 fields: u32
+     8  16 objective: metask_agentcore_bytes_view_v1
+    24   8 token_budget: u64
+    32   4 action_code: u32
+    36   4 reserved0: u32
+    40  24 reserved: [3]u64
+
+struct metask_agentcore_context_block_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8  16 label: metask_agentcore_bytes_view_v1
+    24  16 text: metask_agentcore_bytes_view_v1
+    40  16 reserved: [2]u64
+
+struct metask_agentcore_session_create_config_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 host: [*c]const metask_agentcore_session_host_config_v1
+    16  16 model: metask_agentcore_bytes_view_v1
+    32   8 prompt_profile: [*c]const metask_agentcore_prompt_profile_v1
+    40  24 reserved: [3]u64
+
+struct metask_agentcore_skill_source_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 scope_code: u32
+     8  16 root: metask_agentcore_bytes_view_v1
+    24  16 source_instance_id: metask_agentcore_bytes_view_v1
+    40   4 priority: i32
+    44   4 reserved0: u32
+    48  16 reserved: [2]u64
+
+struct metask_agentcore_skill_catalog_query_v1 size 80 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8  16 workspace_root: metask_agentcore_bytes_view_v1
+    24  16 workspace_home: metask_agentcore_bytes_view_v1
+    40  16 workspace_epoch: metask_agentcore_bytes_view_v1
+    56   8 additional_sources: [*c]const metask_agentcore_skill_source_v1
+    64   8 additional_source_count: u64
+    72   4 default_user_source_priority: i32
+    76   4 default_workspace_source_priority: i32
+
+struct metask_agentcore_run_input_part_v1 size 72 align 8
+     0   4 struct_size: u32
+     4   4 kind_code: u32
+     8  16 text: metask_agentcore_bytes_view_v1
+    24  16 media_type: metask_agentcore_bytes_view_v1
+    40  16 data: metask_agentcore_bytes_view_v1
+    56  16 reserved: [2]u64
+
+struct metask_agentcore_run_input_v1 size 104 align 8
+     0   4 struct_size: u32
+     4   4 kind_code: u32
+     8  16 text: metask_agentcore_bytes_view_v1
+    24  16 skill_id: metask_agentcore_bytes_view_v1
+    40  16 catalog_revision: metask_agentcore_bytes_view_v1
+    56  16 arguments_json: metask_agentcore_bytes_view_v1
+    72   8 parts: [*c]const metask_agentcore_run_input_part_v1
+    80   8 part_count: u64
+    88  16 reserved: [2]u64
+
+struct metask_agentcore_run_options_v1 size 40 align 8
+     0   4 struct_size: u32
+     4   4 max_turns: u32
+     8   8 context_blocks: [*c]const metask_agentcore_context_block_v1
+    16   8 context_block_count: u64
+    24   4 time_context_code: u32
+    28   4 utc_offset_minutes: i32
+    32   4 stream_retry_budget: u32
+    36   4 reserved0: u32
+
+struct metask_agentcore_run_result_v1 size 72 align 8
+     0   4 struct_size: u32
+     4   4 stop_reason_code: u32
+     8   4 turns: u32
+    12   4 tool_calls: u32
+    16   4 checkpoint_outcome_code: u32
+    20   4 result_flags: u32
+    24   8 durable_usage_bytes: u64
+    32   8 required_checkpoint_bytes: u64
+    40   4 input_accepted_count: u32
+    44   4 input_adopted_count: u32
+    48  24 reserved: [3]u64
+
+struct metask_agentcore_submitted_input_v1 size 48 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 input_id: u64
+    16  16 text: metask_agentcore_bytes_view_v1
+    32  16 reserved: [2]u64
+
+struct metask_agentcore_input_receipt_v1 size 24 align 8
+     0   4 struct_size: u32
+     4   4 sequence: u32
+     8  16 reserved: [2]u64
+
+struct metask_agentcore_compact_result_v1 size 88 align 8
+     0   4 struct_size: u32
+     4   4 outcome_code: u32
+     8   8 before_context_tokens: u64
+    16   8 after_context_tokens: u64
+    24   8 input_tokens: u64
+    32   8 output_tokens: u64
+    40   8 cache_read_input_tokens: u64
+    48   8 cache_creation_input_tokens: u64
+    56  32 reserved: [4]u64
+
+struct metask_agentcore_checkpoint_limits_v1 size 88 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 hard_bytes: u64
+    16   8 max_section_bytes: u64
+    24   8 max_string_bytes: u64
+    32   8 max_messages: u64
+    40   8 max_blocks_per_message: u64
+    48   4 chunk_bytes: u32
+    52   4 reserved1: u32
+    56  32 reserved: [4]u64
+
+typedef metask_agentcore_checkpoint_write_fn_v1 = ?*const fn (?*anyopaque, metask_agentcore_bytes_view_v1) u32
+
+struct metask_agentcore_checkpoint_sink_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16   8 write: metask_agentcore_host_result_write_fn_v1
+    24  32 reserved: [4]u64
+
+typedef metask_agentcore_checkpoint_read_fn_v1 = ?*const fn (?*anyopaque, [*c]u8, u64, [*c]u64) u32
+
+struct metask_agentcore_checkpoint_source_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 ctx: ?*anyopaque
+    16   8 read: metask_agentcore_checkpoint_read_fn_v1
+    24  32 reserved: [4]u64
+
+struct metask_agentcore_checkpoint_export_config_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 limits: [*c]const metask_agentcore_checkpoint_limits_v1
+    16   8 sink: [*c]const metask_agentcore_checkpoint_sink_v1
+    24  32 reserved: [4]u64
+
+struct metask_agentcore_checkpoint_export_result_v1 size 96 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 checkpoint_generation: u64
+    16   8 total_bytes: u64
+    24   8 chunk_count: u64
+    32  32 digest: [32]u8
+    64  32 reserved: [4]u64
+
+struct metask_agentcore_session_restore_config_v1 size 64 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 host: [*c]const metask_agentcore_session_host_config_v1
+    16   8 source: [*c]const metask_agentcore_checkpoint_source_v1
+    24   8 limits: [*c]const metask_agentcore_checkpoint_limits_v1
+    32  32 reserved: [4]u64
+
+typedef metask_agentcore_runtime_create_fn_v1 = ?*const fn ([*c]const metask_agentcore_runtime_config_v1, [*c]const metask_agentcore_runtime_plugin_config_v1, [*c]?*metask_agentcore_runtime, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_runtime_destroy_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_runtime_query_skill_catalog_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]const metask_agentcore_skill_catalog_query_v1, [*c]?*metask_agentcore_skill_catalog, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_skill_catalog_release_fn_v1 = ?*const fn (?*metask_agentcore_skill_catalog, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_runtime_refresh_mcp_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]u64, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_runtime_describe_mcp_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_runtime_apply_mcp_configuration_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]const metask_agentcore_mcp_configuration_v1, [*c]metask_agentcore_mcp_apply_report_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_create_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]const metask_agentcore_session_create_config_v1, [*c]const metask_agentcore_session_callbacks_v1, [*c]?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_restore_fn_v1 = ?*const fn (?*metask_agentcore_runtime, [*c]const metask_agentcore_session_restore_config_v1, [*c]const metask_agentcore_session_callbacks_v1, [*c]?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_destroy_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_describe_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_set_model_fn_v1 = ?*const fn (?*metask_agentcore_session, metask_agentcore_bytes_view_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_bind_skills_fn_v1 = ?*const fn (?*metask_agentcore_session, ?*metask_agentcore_skill_catalog, [*c]const metask_agentcore_skill_policy_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_update_permission_rules_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]const metask_agentcore_permission_rule_set_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_update_mcp_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]const metask_agentcore_mcp_selection_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_run_input_fn_v1 = ?*const fn (?*metask_agentcore_session, u64, [*c]const metask_agentcore_run_input_v1, [*c]const metask_agentcore_run_options_v1, [*c]metask_agentcore_run_result_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_abort_fn_v1 = ?*const fn (?*metask_agentcore_session, u64, u32, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_submit_input_fn_v1 = ?*const fn (?*metask_agentcore_session, u64, [*c]const metask_agentcore_submitted_input_v1, [*c]metask_agentcore_input_receipt_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_update_credential_fn_v1 = ?*const fn (?*metask_agentcore_session, metask_agentcore_bytes_view_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_compact_fn_v1 = ?*const fn (?*metask_agentcore_session, u64, [*c]metask_agentcore_compact_result_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_abort_compact_fn_v1 = ?*const fn (?*metask_agentcore_session, u64, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_export_checkpoint_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]const metask_agentcore_checkpoint_export_config_v1, [*c]metask_agentcore_checkpoint_export_result_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_set_prompt_profile_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]const metask_agentcore_prompt_profile_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_update_permission_mode_fn_v1 = ?*const fn (?*metask_agentcore_session, u32, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_session_rewind_to_user_message_fn_v1 = ?*const fn (?*metask_agentcore_session, u64, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_goal_get_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_goal_set_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]const metask_agentcore_goal_set_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_goal_update_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]const metask_agentcore_goal_update_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_goal_clear_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_team_describe_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_team_poll_fn_v1 = ?*const fn (?*metask_agentcore_session, [*c]metask_agentcore_owned_bytes_v1, [*c]metask_agentcore_owned_bytes_v1) u32
+
+typedef metask_agentcore_buffer_release_fn_v1 = ?*const fn ([*c]metask_agentcore_owned_bytes_v1) void
+
+struct metask_agentcore_runtime_api_v1 size 24 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 create: metask_agentcore_runtime_create_fn_v1
+    16   8 destroy: metask_agentcore_runtime_destroy_fn_v1
+
+struct metask_agentcore_session_api_v1 size 56 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 create: metask_agentcore_session_create_fn_v1
+    16   8 destroy: metask_agentcore_session_destroy_fn_v1
+    24   8 run_input: metask_agentcore_session_run_input_fn_v1
+    32   8 abort: metask_agentcore_session_abort_fn_v1
+    40   8 submit_input: metask_agentcore_session_submit_input_fn_v1
+    48   8 update_credential: metask_agentcore_session_set_model_fn_v1
+
+struct metask_agentcore_session_control_api_v1 size 88 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 restore: metask_agentcore_session_restore_fn_v1
+    16   8 describe: metask_agentcore_session_describe_fn_v1
+    24   8 set_model: metask_agentcore_session_set_model_fn_v1
+    32   8 update_permission_rules: metask_agentcore_session_update_permission_rules_fn_v1
+    40   8 compact: metask_agentcore_session_compact_fn_v1
+    48   8 abort_compact: metask_agentcore_session_abort_compact_fn_v1
+    56   8 export_checkpoint: metask_agentcore_session_export_checkpoint_fn_v1
+    64   8 set_prompt_profile: metask_agentcore_session_set_prompt_profile_fn_v1
+    72   8 update_permission_mode: metask_agentcore_session_update_permission_mode_fn_v1
+    80   8 rewind_to_user_message: metask_agentcore_session_abort_compact_fn_v1
+
+struct metask_agentcore_skill_api_v1 size 32 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 resolve_catalog: metask_agentcore_runtime_query_skill_catalog_fn_v1
+    16   8 release_catalog: metask_agentcore_skill_catalog_release_fn_v1
+    24   8 bind_policy: metask_agentcore_session_bind_skills_fn_v1
+
+struct metask_agentcore_mcp_api_v1 size 40 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 apply_configuration: metask_agentcore_runtime_apply_mcp_configuration_fn_v1
+    16   8 refresh: metask_agentcore_runtime_refresh_mcp_fn_v1
+    24   8 describe: metask_agentcore_runtime_describe_mcp_fn_v1
+    32   8 update_selection: metask_agentcore_session_update_mcp_fn_v1
+
+struct metask_agentcore_goal_api_v1 size 40 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 get: metask_agentcore_session_describe_fn_v1
+    16   8 set: metask_agentcore_goal_set_fn_v1
+    24   8 update: metask_agentcore_goal_update_fn_v1
+    32   8 clear: metask_agentcore_session_destroy_fn_v1
+
+struct metask_agentcore_team_api_v1 size 24 align 8
+     0   4 struct_size: u32
+     4   4 reserved0: u32
+     8   8 describe: metask_agentcore_session_describe_fn_v1
+    16   8 poll: metask_agentcore_session_describe_fn_v1
+
+struct metask_agentcore_api_v1 size 80 align 8
+     0   4 struct_size: u32
+     4   4 abi_version: u32
+     8   4 abi_revision: u32
+    12   4 reserved0: u32
+    16   8 buffer_release: metask_agentcore_buffer_release_fn_v1
+    24   8 runtime: [*c]const metask_agentcore_runtime_api_v1
+    32   8 session: [*c]const metask_agentcore_session_api_v1
+    40   8 session_control: [*c]const metask_agentcore_session_control_api_v1
+    48   8 skill: [*c]const metask_agentcore_skill_api_v1
+    56   8 mcp: [*c]const metask_agentcore_mcp_api_v1
+    64   8 goal: [*c]const metask_agentcore_goal_api_v1
+    72   8 team: [*c]const metask_agentcore_team_api_v1
+
+fn metask_agentcore_get_api: fn (u32) ?*const anyopaque
+
+fn metask_agentcore_bytes_view_v1_from: fn (?*const anyopaque, u64) metask_agentcore_bytes_view_v1
+
+fn metask_agentcore_owned_bytes_v1_empty: fn () metask_agentcore_owned_bytes_v1
+
+fn metask_agentcore_api_v1_is_compatible: fn ([*c]const metask_agentcore_api_v1) c_int
+
+fn metask_agentcore_api_v1_discover: fn () [*c]const metask_agentcore_api_v1
+
+fn metask_agentcore_owned_bytes_v1_release: fn ([*c]const metask_agentcore_api_v1, [*c]metask_agentcore_owned_bytes_v1) void
+const METASK_AGENTCORE_H: *const [0]u8
+const METASK_AGENTCORE_ABI_V1 = 1
+const METASK_AGENTCORE_ABI_REVISION = 29
+const METASK_AGENTCORE_STATUS_OK = 0
+const METASK_AGENTCORE_STATUS_INVALID_ARGUMENT = 1
+const METASK_AGENTCORE_STATUS_OUT_OF_MEMORY = 2
+const METASK_AGENTCORE_STATUS_BUSY = 3
+const METASK_AGENTCORE_STATUS_STALE_RUN = 4
+const METASK_AGENTCORE_STATUS_TOO_LATE = 5
+const METASK_AGENTCORE_STATUS_INVALID_STATE = 6
+const METASK_AGENTCORE_STATUS_CORE_ERROR = 7
+const METASK_AGENTCORE_STATUS_CALLBACK_FAILED = 8
+const METASK_AGENTCORE_STATUS_INTERNAL_ERROR = 9
+const METASK_AGENTCORE_STATUS_RESOURCE_LIMIT = 10
+const METASK_AGENTCORE_STATUS_SKILL_CATALOG_INVALID = 11
+const METASK_AGENTCORE_STATUS_STALE_CATALOG = 12
+const METASK_AGENTCORE_STATUS_SKILL_NOT_FOUND = 13
+const METASK_AGENTCORE_STATUS_INVALID_SKILL_ARGUMENTS = 14
+const METASK_AGENTCORE_STATUS_SKILL_POLICY_VIOLATION = 15
+const METASK_AGENTCORE_STATUS_SKILL_UNAVAILABLE = 16
+const METASK_AGENTCORE_STATUS_STALE_COMPACT = 17
+const METASK_AGENTCORE_STATUS_CHECKPOINT_BUDGET_REQUIRED = 18
+const METASK_AGENTCORE_STATUS_CHECKPOINT_CORRUPT = 19
+const METASK_AGENTCORE_STATUS_CHECKPOINT_UNSUPPORTED = 20
+const METASK_AGENTCORE_STATUS_CHECKPOINT_INCOMPATIBLE = 21
+const METASK_AGENTCORE_STATUS_CHECKPOINT_IO = 22
+const METASK_AGENTCORE_STATUS_LOGICAL_SESSION_CONFLICT = 23
+const METASK_AGENTCORE_STATUS_MCP_NOT_REFRESHED = 24
+const METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION = 25
+const METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE = 27
+const METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED = 28
+const METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN = 29
+const METASK_AGENTCORE_STATUS_GOAL_CONFLICT = 30
+const METASK_AGENTCORE_STATUS_MESSAGE_POSITION_OUT_OF_RANGE = 31
+const METASK_AGENTCORE_STATUS_NOT_USER_MESSAGE = 32
+const METASK_AGENTCORE_STATUS_MESSAGE_POSITION_COMPACTED = 33
+const METASK_AGENTCORE_PROVIDER_ANTHROPIC = 1
+const METASK_AGENTCORE_PROVIDER_OPENAI = 2
+const METASK_AGENTCORE_PROVIDER_GEMINI = 3
+const METASK_AGENTCORE_PROTOCOL_DEFAULT = 0
+const METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES = 1
+const METASK_AGENTCORE_PERMISSION_DEFAULT = 1
+const METASK_AGENTCORE_PERMISSION_ACCEPT_EDITS = 2
+const METASK_AGENTCORE_PERMISSION_AUTO = 3
+const METASK_AGENTCORE_PERMISSION_DONT_ASK = 4
+const METASK_AGENTCORE_PERMISSION_FULL_ACCESS = 5
+const METASK_AGENTCORE_SHELL_DISABLED = 1
+const METASK_AGENTCORE_SHELL_SANDBOXED = 2
+const METASK_AGENTCORE_SHELL_UNRESTRICTED = 3
+const METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL = 0
+const METASK_AGENTCORE_RUN_JOURNAL_DURABLE_WORKSPACE = 1
+const METASK_AGENTCORE_ABORT_USER_REQUEST = 1
+const METASK_AGENTCORE_ABORT_TIMEOUT = 2
+const METASK_AGENTCORE_STOP_END_TURN = 1
+const METASK_AGENTCORE_STOP_MAX_TURNS = 2
+const METASK_AGENTCORE_STOP_ABORTED = 3
+const METASK_AGENTCORE_STOP_TOOL_ERROR = 4
+const METASK_AGENTCORE_STOP_API_ERROR = 5
+const METASK_AGENTCORE_STOP_TOOL_LOOP = 6
+const METASK_AGENTCORE_STOP_CHECKPOINT_BUDGET_EXHAUSTED = 7
+const METASK_AGENTCORE_STOP_CHECKPOINT_RESOURCE_LIMIT = 8
+const METASK_AGENTCORE_MAX_TOOL_COUNT_V1 = 1024
+const METASK_AGENTCORE_MAX_TOOL_SCHEMA_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_TOOL_SCHEMA_DEPTH_V1 = 32
+const METASK_AGENTCORE_MAX_TOOL_SCHEMA_PROPERTIES_V1 = 1024
+const METASK_AGENTCORE_MAX_UI_RESPONSE_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_HOST_TOOL_RESULT_BYTES_V1 = 16777216
+const METASK_AGENTCORE_MAX_HOST_STREAM_ARTIFACT_BYTES_V1 = 134217728
+const METASK_AGENTCORE_MAX_MCP_TOOL_RESPONSE_BYTES_V1 = 135266304
+const METASK_AGENTCORE_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_SESSION_ID_BYTES_V1 = 64
+const METASK_AGENTCORE_MAX_METADATA_STRING_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_RUNTIME_METADATA_BYTES_V1 = 16777216
+const METASK_AGENTCORE_MAX_SESSION_METADATA_BYTES_V1 = 4194304
+const METASK_AGENTCORE_MAX_PROMPT_BYTES_V1 = 16777216
+const METASK_AGENTCORE_MAX_RUN_INPUT_PARTS_V1 = 64
+const METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 = 64
+const METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 = 16777216
+const METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 = 16384
+const METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 = 5000000
+const METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 = 256
+const METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 = 256
+const METASK_AGENTCORE_MAX_SKILL_CATALOG_SKILLS_V1 = 1024
+const METASK_AGENTCORE_MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 = 4194304
+const METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 = 16777216
+const METASK_AGENTCORE_MAX_SKILL_CONTENT_BYTES_V1 = 33554432
+const METASK_AGENTCORE_MAX_SKILL_FILES_V1 = 1024
+const METASK_AGENTCORE_MAX_SKILL_ENTRIES_V1 = 4096
+const METASK_AGENTCORE_MAX_SKILL_DIRECTORY_DEPTH_V1 = 64
+const METASK_AGENTCORE_MAX_SKILL_RELATIVE_PATH_BYTES_V1 = 4096
+const METASK_AGENTCORE_MAX_SKILL_CATALOG_CONTENT_BYTES_V1 = 67108864
+const METASK_AGENTCORE_MAX_SKILL_CATALOG_FILES_V1 = 16384
+const METASK_AGENTCORE_MAX_SKILL_CATALOG_TRAVERSAL_ENTRIES_V1 = 65536
+const METASK_AGENTCORE_MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1 = 268435456
+const METASK_AGENTCORE_MAX_SKILL_ARGUMENT_VALUES_V1 = 64
+const METASK_AGENTCORE_MAX_SKILL_ARGUMENT_JSON_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_PERMISSION_RULES_V1 = 1024
+const METASK_AGENTCORE_MAX_PERMISSION_RULE_BYTES_V1 = 65536
+const METASK_AGENTCORE_MAX_PERMISSION_RULE_TOTAL_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_MCP_SERVERS_V1 = 64
+const METASK_AGENTCORE_MAX_MCP_NAMESPACE_BYTES_V1 = 24
+const METASK_AGENTCORE_MAX_MCP_CATALOG_ISSUES_V1 = 4096
+const METASK_AGENTCORE_MAX_MCP_FRAME_BYTES_V1 = 8388608
+const METASK_AGENTCORE_MAX_MCP_TOOLS_V1 = 1024
+const METASK_AGENTCORE_MAX_MCP_TOOL_NAME_BYTES_V1 = 256
+const METASK_AGENTCORE_MAX_MCP_TEXT_BYTES_V1 = 65536
+const METASK_AGENTCORE_MAX_MCP_SCHEMA_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_MCP_CURSOR_BYTES_V1 = 16384
+const METASK_AGENTCORE_MAX_MCP_PROTOCOL_VERSIONS_V1 = 16
+const METASK_AGENTCORE_MAX_CHECKPOINT_BYTES_V1 = 1073741824
+const METASK_AGENTCORE_MAX_CHECKPOINT_CHUNK_BYTES_V1 = 1048576
+const METASK_AGENTCORE_MAX_DESCRIPTION_JSON_BYTES_V1 = 16777216
+const METASK_AGENTCORE_MAX_SKILL_SOURCES_V1 = 64
+const METASK_AGENTCORE_MAX_SKILL_SOURCE_ID_BYTES_V1 = 128
+const METASK_AGENTCORE_MAX_PROCESS_PLUGIN_SOURCES_V1 = 64
+const METASK_AGENTCORE_MAX_TURNS_V1 = 1000
+const METASK_AGENTCORE_MAX_STREAM_RETRY_BUDGET_V1 = 8
+const METASK_AGENTCORE_MAX_PROMPT_PROFILE_SECTIONS_V1 = 64
+const METASK_AGENTCORE_MAX_PROMPT_SECTION_TEXT_BYTES_V1 = 65536
+const METASK_AGENTCORE_MAX_PROMPT_PROFILE_TEXT_BYTES_V1 = 262144
+const METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_V1 = 32
+const METASK_AGENTCORE_MAX_CONTEXT_BLOCK_LABEL_BYTES_V1 = 64
+const METASK_AGENTCORE_MAX_CONTEXT_BLOCK_TEXT_BYTES_V1 = 65536
+const METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_TOTAL_BYTES_V1 = 262144
+const METASK_AGENTCORE_PLUGIN_LAYER_BUILTIN = 1
+const METASK_AGENTCORE_PLUGIN_LAYER_PERSONAL = 2
+const METASK_AGENTCORE_PLUGIN_LAYER_PROJECT = 3
+const METASK_AGENTCORE_PLUGIN_LAYER_SESSION = 4
+const METASK_AGENTCORE_PLUGIN_LAYER_MANAGED = 5
+const METASK_AGENTCORE_RUN_INPUT_TEXT = 1
+const METASK_AGENTCORE_RUN_INPUT_SKILL = 2
+const METASK_AGENTCORE_RUN_INPUT_MULTIMODAL = 3
+const METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION = 4
+const METASK_AGENTCORE_RUN_INPUT_PART_TEXT = 1
+const METASK_AGENTCORE_RUN_INPUT_PART_IMAGE = 2
+const METASK_AGENTCORE_CAPABILITY_SUPPORTED = 1
+const METASK_AGENTCORE_CAPABILITY_UNSUPPORTED = 2
+const METASK_AGENTCORE_TIME_CONTEXT_SYSTEM = 0
+const METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET = 1
+const METASK_AGENTCORE_TIME_CONTEXT_OFF = 2
+const METASK_AGENTCORE_MIN_UTC_OFFSET_MINUTES_V1 = -840
+const METASK_AGENTCORE_MAX_UTC_OFFSET_MINUTES_V1 = 840
+const METASK_AGENTCORE_GOAL_FIELD_OBJECTIVE = 1
+const METASK_AGENTCORE_GOAL_FIELD_TOKEN_BUDGET = 2
+const METASK_AGENTCORE_GOAL_FIELD_ACTION = 4
+const METASK_AGENTCORE_GOAL_ACTION_PAUSE = 1
+const METASK_AGENTCORE_GOAL_ACTION_ACTIVATE = 2
+const METASK_AGENTCORE_GOAL_ACTION_COMPLETE = 3
+const METASK_AGENTCORE_GOAL_ACTION_BLOCK = 4
+const METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 = 4000
+const METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_BYTES_V1 = 16384
+const METASK_AGENTCORE_PROMPT_OP_ADD = 1
+const METASK_AGENTCORE_PROMPT_OP_REPLACE = 2
+const METASK_AGENTCORE_PROMPT_OP_REMOVE = 3
+const METASK_AGENTCORE_SKILL_SOURCE_USER = 1
+const METASK_AGENTCORE_SKILL_SOURCE_WORKSPACE = 2
+const METASK_AGENTCORE_COMPACT_COMPACTED = 1
+const METASK_AGENTCORE_COMPACT_NO_CHANGE = 2
+const METASK_AGENTCORE_COMPACT_DEGRADED = 3
+const METASK_AGENTCORE_COMPACT_ABORTED = 4
+const METASK_AGENTCORE_RUN_CHECKPOINT_NONE = 0
+const METASK_AGENTCORE_RUN_CHECKPOINT_BUDGET_REQUIRED = 1
+const METASK_AGENTCORE_RUN_CHECKPOINT_BUDGET_EXHAUSTED = 2
+const METASK_AGENTCORE_RUN_CHECKPOINT_RESOURCE_LIMIT = 3
+const METASK_AGENTCORE_RUN_RESULT_COMPACTION_RECOMMENDED = 1
+const METASK_AGENTCORE_MCP_TRANSPORT_STDIO = 1
+const METASK_AGENTCORE_MCP_TRANSPORT_STREAMABLE_HTTP = 2
+const METASK_AGENTCORE_MCP_NEGOTIATION_AUTO = 1
+const METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY = 2
+const METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_ONLY = 3
+const METASK_AGENTCORE_MCP_NEGOTIATION_LEGACY_2025_06_ONLY = 4
+const METASK_AGENTCORE_MCP_ERA_2026_07_28 = 1
+const METASK_AGENTCORE_MCP_ERA_2025_11_25 = 2
+const METASK_AGENTCORE_MCP_ERA_2025_06_18 = 3
+const METASK_AGENTCORE_MCP_APPLY_APPLIED = 1
+const METASK_AGENTCORE_MCP_APPLY_SUPERSEDED = 2
+const METASK_AGENTCORE_MCP_APPLY_REJECTED = 3
+const METASK_AGENTCORE_MCP_CONNECTION_DISPOSABLE_PROBE = 1
+const METASK_AGENTCORE_MCP_CONNECTION_ACTUAL = 2
+const METASK_AGENTCORE_MCP_OPEN_OK = 0
+const METASK_AGENTCORE_MCP_OPEN_TIMEOUT = 1
+const METASK_AGENTCORE_MCP_OPEN_NETWORK_ERROR = 2
+const METASK_AGENTCORE_MCP_OPEN_AUTH_ERROR = 3
+const METASK_AGENTCORE_MCP_OPEN_SERVER_ERROR = 4
+const METASK_AGENTCORE_MCP_OPEN_CHILD_EXIT = 5
+const METASK_AGENTCORE_MCP_OPEN_FATAL = 6
+const METASK_AGENTCORE_MCP_EXCHANGE_RESPONSE = 0
+const METASK_AGENTCORE_MCP_EXCHANGE_TIMEOUT = 1
+const METASK_AGENTCORE_MCP_EXCHANGE_NETWORK_ERROR = 2
+const METASK_AGENTCORE_MCP_EXCHANGE_AUTH_ERROR = 3
+const METASK_AGENTCORE_MCP_EXCHANGE_SERVER_ERROR = 4
+const METASK_AGENTCORE_MCP_EXCHANGE_CHILD_EXIT = 5
+const METASK_AGENTCORE_MCP_EXCHANGE_CANCELLED = 6
+const METASK_AGENTCORE_MCP_EXCHANGE_INDETERMINATE = 7
+const METASK_AGENTCORE_MCP_EXCHANGE_FATAL = 8
+const METASK_AGENTCORE_MCP_NOTIFY_OK = 0
+const METASK_AGENTCORE_MCP_NOTIFY_FAILED = 1
+const METASK_AGENTCORE_CHECKPOINT_IO_OK = 0
+const METASK_AGENTCORE_CHECKPOINT_IO_FAILED = 1
+const METASK_AGENTCORE_CHECKPOINT_IO_FATAL = 2
+const METASK_AGENTCORE_EVENT_CONTINUE = 0
+const METASK_AGENTCORE_EVENT_FATAL = 1
+const METASK_AGENTCORE_UI_ANSWERED = 0
+const METASK_AGENTCORE_UI_UNAVAILABLE = 1
+const METASK_AGENTCORE_UI_FATAL = 2
+const METASK_AGENTCORE_UI_CANCELLED = 3
+const METASK_AGENTCORE_HOST_OK = 0
+const METASK_AGENTCORE_HOST_FAILED = 1
+const METASK_AGENTCORE_HOST_REJECTED = 2
+const METASK_AGENTCORE_HOST_FATAL = 3
+const METASK_AGENTCORE_HOST_STREAM_MEDIA_TEXT_UTF8 = 1
+const METASK_AGENTCORE_HOST_STREAM_MEDIA_JSON = 2
+const METASK_AGENTCORE_HOST_STREAM_MEDIA_BINARY = 3
+const METASK_AGENTCORE_HOST_SINK_OK = 0
+const METASK_AGENTCORE_HOST_SINK_ABORTED = 1
+const METASK_AGENTCORE_HOST_SINK_TOO_LARGE = 2
+const METASK_AGENTCORE_HOST_SINK_FAILED = 3
+const METASK_AGENTCORE_HOST_SINK_CLOSED = 4
+const METASK_AGENTCORE_TEAM_ROLE_LEAD = 1
+const METASK_AGENTCORE_TEAM_ROLE_MEMBER = 2
+const METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 = 64
+const METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 = 64

@@ -203,7 +203,7 @@ class CatalogTest(unittest.TestCase):
                                name="HumanEval+", default_tasks=["humaneval-1"], max_tasks=2, max_concurrency=99)
         with patch.dict(sys.modules, {adapter.__name__: adapter}):
             suite = suites.resolved(suites.get("humaneval"))
-            self.assertEqual((suite.name, suite.max_tasks, suite.max_concurrency), ("HumanEval+", 2, 16))
+            self.assertEqual((suite.name, suite.max_tasks, suite.max_concurrency), ("HumanEval+", 2, 99))
             self.assertIn("尚未准备", suites.readiness(suite, self.ctx)[0])
             adapter.prepare(self.ctx.dataset_dir(suite))
             self.assertEqual(suites.task_ids(suite, self.ctx), ["humaneval-0", "humaneval-1"])
@@ -292,6 +292,7 @@ class CatalogTest(unittest.TestCase):
         probe = ("import sys, json\n"
                  "import scripts.eval.harbor.cli, scripts.eval.harbor.viewer.server, scripts.eval.harbor.bench.worker\n"
                  "import scripts.eval.harbor.suites.workbuddy, scripts.eval.harbor.adapters.gaia2_cli\n"
+                 "import scripts.eval.workbuddy.stage_artifacts\n"
                  "print(json.dumps(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('scripts') and getattr(m, '__file__', None))))")
         loaded = json.loads(subprocess.run([sys.executable, "-c", probe], cwd=REPO, check=True,
                                            capture_output=True, text=True).stdout)
@@ -496,6 +497,14 @@ class McpForwardingTest(unittest.TestCase):
         with stubbed_harbor() as agent_module:
             self.assertTrue(agent_module.MetacodesAgent.capabilities.get("mcp_servers"))
 
+    def test_agent_puts_harbor_trials_under_the_live_concurrency_file(self):
+        with patch.dict(os.environ, {"METACODES_BENCH_CONCURRENCY_FILE": "/run/concurrency"}), \
+                stubbed_harbor():
+            self.assertTrue(hasattr(sys.modules["harbor.trial.queue"].TrialQueue, "_run_trial"))
+        with patch.dict(os.environ), stubbed_harbor():
+            os.environ.pop("METACODES_BENCH_CONCURRENCY_FILE", None)
+            self.assertFalse(hasattr(sys.modules["harbor.trial.queue"].TrialQueue, "_run_trial"))
+
     def test_agent_uploads_task_mcp_servers_in_the_trial_config(self):
         with stubbed_harbor() as agent_module:
             agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
@@ -503,6 +512,7 @@ class McpForwardingTest(unittest.TestCase):
                 logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[types.SimpleNamespace(
                     name="are", transport="streamable-http", url="http://are-sidecar:8000/mcp", headers={})],
                 config_source=None, _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=False,
+                _model_prices=None,
                 _account_gateway=None)
             environment = CapturingEnvironment()
             asyncio.run(agent.run("solve it", environment, None))
@@ -511,12 +521,25 @@ class McpForwardingTest(unittest.TestCase):
         self.assertTrue(any('/config.json"' in c for c in environment.agent_commands))
 
 
+    def test_agent_writes_the_models_price_into_the_trial_config(self):
+        with stubbed_harbor() as agent_module:
+            agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
+            agent.__dict__.update(
+                logs_dir=Path("/tmp/trial-x/agent"), mcp_servers=[], config_source=None, _flags=["--model", "m"],
+                _provider=None, _metrics_proxy=None, _teamwork=False, _account_gateway=None,
+                _model_prices={"m": {"input": 0.15, "output": 0.6}})
+            environment = CapturingEnvironment()
+            asyncio.run(agent.run("solve it", environment, None))
+        configs = [json.loads(body) for path, body in environment.uploads if "metacodes-config-" in path]
+        self.assertEqual(configs, [{"model_prices": {"m": {"input": 0.15, "output": 0.6}}}])
+
     def test_a_teamwork_trial_killed_on_timeout_still_keeps_its_run_records(self):
         with stubbed_harbor() as agent_module, tempfile.TemporaryDirectory() as tmp:
             agent = agent_module.MetacodesAgent.__new__(agent_module.MetacodesAgent)
             agent.__dict__.update(
                 logs_dir=Path(tmp) / "trial-x" / "agent", mcp_servers=[], config_source=None,
-                _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=True, _account_gateway=None)
+                _flags=["--model", "m"], _provider=None, _metrics_proxy=None, _teamwork=True, _account_gateway=None,
+                _model_prices=None)
 
             async def killed(environment, command):
                 raise asyncio.TimeoutError("agent timeout")
@@ -547,7 +570,8 @@ def stubbed_harbor():
     """Load metacodes_agent.py against minimal Harbor doubles."""
     names = ("harbor", "harbor.agents", "harbor.agents.capabilities", "harbor.agents.installed",
              "harbor.agents.installed.base", "harbor.environments", "harbor.environments.base",
-             "harbor.models", "harbor.models.agent", "harbor.models.agent.context", "harbor.models.trajectories")
+             "harbor.models", "harbor.models.agent", "harbor.models.agent.context", "harbor.models.trajectories",
+             "harbor.trial", "harbor.trial.queue")
     modules = {name: types.ModuleType(name) for name in names}
     modules["harbor.agents.capabilities"].AgentCapabilities = lambda **kw: kw
 
@@ -562,6 +586,7 @@ def stubbed_harbor():
     modules["harbor.agents.installed.base"].with_prompt_template = lambda f: f
     modules["harbor.environments.base"].BaseEnvironment = object
     modules["harbor.models.agent.context"].AgentContext = object
+    modules["harbor.trial.queue"].TrialQueue = type("TrialQueue", (), {})
     for name in ("Agent", "FinalMetrics", "Observation", "ObservationResult", "Step", "ToolCall", "Trajectory"):
         setattr(modules["harbor.models.trajectories"], name, type(name, (), {}))
     with patch.dict(sys.modules, modules):
@@ -678,7 +703,7 @@ class SuiteLaunchTest(unittest.TestCase):
         for override in ({"suite": "aime", "tasks": ["fix-git"]}, {"suite": "nope", "tasks": ["fix-git"]},
                          {"suite": "aime", "dataset": "terminal-bench/terminal-bench-2-1", "tasks": ["aime_60"]},
                          {"dataset": "aime@1.0", "tasks": ["aime_60"]},
-                         {"suite": "terminal-bench-2.1", "tasks": ["fix-git"], "concurrency": 17},
+                         {"suite": "terminal-bench-2.1", "tasks": ["fix-git"], "concurrency": 0},
                          {"suite": "aime-2025", "tasks": list(suites.AIME_2025) + ["aime_60"]},
                          {"suite": "humaneval", "tasks": ["humaneval-0"]},
                          {"suite": "workbuddy-code", "tasks": ["bug_fix-easy-alpha"]}):

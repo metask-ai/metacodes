@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 
+from scripts.eval.harbor import live_concurrency
 from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env
 from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_for, judge_argv, placeholder,
@@ -38,6 +39,9 @@ def command(spec):
         argv += ["--ak", "max_tokens=" + str(spec["max_tokens"])]
     if spec.get("features"):
         argv += ["--ak", "features=" + ",".join(spec["features"])]
+    if spec.get("model_price"):
+        price = {k: v for k, v in spec["model_price"].items() if k in ("input", "output", "cached_input", "cache_write")}
+        argv += ["--ak", "model_price=" + json.dumps(price, separators=(",", ":"))]
     if spec.get("agent_timeout_multiplier"):
         argv += ["--agent-timeout-multiplier", str(spec["agent_timeout_multiplier"])]
     if spec.get("metrics_proxy"):
@@ -176,13 +180,20 @@ def stamp_credential(record, source):
         record["credential"] = {"container": "placeholder", **source.status()}
 
 
+def adjusted_concurrency(spec_path, record):
+    record["concurrency"] = live_concurrency.read(spec_path.with_suffix(".concurrency"), record["concurrency"])
+    return record["concurrency"]
+
+
 def supervise_remote(remote, spec, env, spec_path, record_path, record, source=None):
     """Run Harbor on an SSH executor: heartbeat, cancel, background sync.
 
     The receipt is rewritten every two seconds whatever the copy-back is
     doing (RunManager shows a receipt older than 30 seconds as interrupted),
     and the run is `finished` only when the final copy was verified
-    complete; otherwise the receipt says where the results still are."""
+    complete; otherwise the receipt says where the results still are. A
+    channel that drops or goes silent is reattached (RemoteRun.reconnect):
+    Harbor keeps running on the executor meanwhile."""
     secret_env = {}
     if spec.get("runner") != "workbuddy":
         # The run's key plus the suite's execution-host variables (a judge
@@ -203,8 +214,14 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     cancelled_at = None
     expired = False
     last_write = 0.0
-    while (remote.process.poll() is None
-           or cancelled_at is None and remote.retry_tunnel(secret_env, source.current)):
+    def channel_open():
+        if remote.process.poll() is None:
+            return True
+        if cancelled_at is None and remote.retry_tunnel(secret_env, source.current):
+            return True
+        return remote.reconnect(source.current, cancelled_at)
+
+    while channel_open():
         now_s = time.monotonic()
         if credential_failed(source) and cancelled_at is None:
             # Fail fast instead of burning the remaining tasks on 401s.
@@ -220,12 +237,16 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
             remote.hang_up()
         if cancelled_at and now_s - cancelled_at > 60:
             remote.process.kill()
-        if now_s - remote.last_event > remote.HEARTBEAT_TIMEOUT and cancelled_at is None:
-            # A silent channel: closing it makes the driver stop Harbor.
-            record["error"] = "远程执行机器心跳超时"
-            cancelled_at = now_s
-            remote.hang_up()
+        if now_s - remote.last_event > remote.heartbeat_timeout and remote.process.poll() is None:
+            remote.log("远程执行机器心跳超时，断开重连")
+            remote.drop()
+        if spec.get("runner") != "workbuddy" and cancelled_at is None:
+            wanted = adjusted_concurrency(spec_path, record)
+            if remote.concurrency != wanted:
+                remote.set_concurrency(wanted)
         if now_s - last_write > 2:
+            if remote.reconnects:
+                record["reconnects"] = remote.reconnects
             stamp_credential(record, source)
             atomic_json(record_path, record)
             last_write = time.monotonic()
@@ -254,7 +275,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         complete = False
     code = remote.exit_code()
     if code is None:
-        lost = remote.error_message() or "SSH 连接中断"
+        lost = remote.error_message() or remote.lost_message() or "SSH 连接中断"
         if remote.forward_was_refused():
             lost = tunnel_unbound(remote.executor, remote.tunnel_ports)
         elif remote.tunnel_port is not None and not remote.events and remote.process.returncode == 255:
@@ -323,6 +344,8 @@ def main(argv=None):
         if remote is not None:
             supervise_remote(remote, spec, env, spec_path, record_path, record, source)
             return 0 if record.get("status") == "finished" else 1
+        if spec.get("runner") != "workbuddy":
+            env[live_concurrency.FILE_ENV] = str(spec_path.with_suffix(".concurrency"))
         argv, cwd, child_env = child_process(spec, env)
         process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
@@ -354,6 +377,7 @@ def main(argv=None):
                 else:
                     signal_group(process, signal.SIGKILL)
             if time.monotonic() - last_write > 2:
+                adjusted_concurrency(spec_path, record)
                 stamp_credential(record, source)
                 atomic_json(record_path, record)
                 last_write = time.monotonic()

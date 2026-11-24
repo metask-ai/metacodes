@@ -1,0 +1,5 @@
+$ metacodes --state-dir <ROOT>/state --permission sometimes -p x
+exit: 2
+--- stdout
+--- stderr
+error: invalid permission mode 'sometimes' (use --help to list supported flags)

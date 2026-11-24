@@ -195,7 +195,7 @@ function compositionPanel(summary, scopeText) {
 const PROFILE_STATUS = { queued: '排队中', running: '运行中', cancelling: '正在停止', finished: '空闲', cancelled: '已停止' };
 const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '跳过' };
 const profileActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
-const profileName = (b) => b.name || b.id;
+const profileName = (b) => b.name || b.default_name || b.id;
 const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
 const featuresText = (b) => (b.features || []).join(', ') || '未开启';
 
@@ -232,6 +232,14 @@ async function deleteProfile(b, button) {
   catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
   if (state.scope === b.id) state.scope = null;
   return true;
+}
+async function deleteJob(j, button) {
+  if (!confirm(`删除作业 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+  button.disabled = true;
+  try { await api('/api/job/delete', { name: j.name }); }
+  catch (error) { button.disabled = false; setConnection(false, error.message); return; }
+  state.selected.delete(j.name);
+  render();
 }
 async function stopProfile(b, button) {
   if (!confirm(`停止评测配置 ${profileName(b)} 的队列？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
@@ -298,10 +306,10 @@ async function renderOverview() {
     h('td', { class: 'num', text: pct(b.summary.first_pass_rate) }),
     h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
     h('td', { class: 'num', text: when(b.last_run_at) }),
-    body.can_run ? h('td', {}, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
+    body.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
   const profileHeads = ['评测配置', 'metacodes 版本', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
   const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
     h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
   h('a', { class: 'button', href: '#/new', text: '发起评测' }));
 
@@ -322,23 +330,21 @@ async function renderOverview() {
     box.checked = state.selected.has(j.name);
     return h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', {}, box),
-      h('td', {}, h('span', { text: j.name }), h('span', { class: 'sub', text: [j.category_name, j.suite_name || j.dataset, j.metacodes?.label ? 'metacodes ' + j.metacodes.label : null].filter(Boolean).join(' · ') + (j.running ? ' · 运行中' : '') })),
-      h('td', { text: j.model || '—' }),
+      h('td', { class: 'wrap' }, h('span', { class: 'name', text: j.name }), h('span', { class: 'model', text: j.model || '—' }), h('span', { class: 'sub', text: [j.category_name, j.suite_name || j.dataset, j.metacodes?.label ? 'metacodes ' + j.metacodes.label : null].filter(Boolean).join(' · ') + (j.running ? ' · 运行中' : '') })),
       h('td', {}, h('span', { class: 'num', text: `${done} / ${j.planned}` }), h('div', { class: 'track' }, h('span', { width: (j.planned ? 100 * done / j.planned : 0) + '%' }))),
       h('td', {}, outcomeBar(s.counts, s.trials)),
-      h('td', { class: 'num', text: pct(s.first_pass_rate) }, h('span', { class: 'sub', text: `${s.first_passed}/${s.first_valid} 首次有效` })),
-      h('td', { class: 'num', text: String(s.counts.invalid) }),
-      h('td', { class: 'num', text: compact(s.total_tokens) }, h('span', { class: 'sub', text: '缓存 ' + pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null) })),
-      h('td', { class: 'num', text: compact(s.initial_input_tokens_mean) }),
-      h('td', { class: 'num', text: tps(s.tps) }),
-      h('td', { class: 'num', text: ttft(s.ttft_ms) }),
+      h('td', { class: 'num', text: pct(s.first_pass_rate) }, h('span', { class: 'sub', text: `${s.first_passed}/${s.first_valid} 首次有效 · 无效 ${s.counts.invalid}` })),
+      h('td', { class: 'num', text: compact(s.total_tokens) }, h('span', { class: 'sub', text: `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)} · 初始 ${compact(s.initial_input_tokens_mean)}` })),
+      h('td', { class: 'num', text: tps(s.tps) }, h('span', { class: 'sub', text: 'TTFT ' + ttft(s.ttft_ms) })),
       h('td', { class: 'num', text: usd(s.cost_usd) }),
-      h('td', { class: 'num', text: dur(j.wall_s) }),
-      h('td', { class: 'num', text: when(j.started_at) }));
+      h('td', { class: 'num', text: when(j.started_at) }, h('span', { class: 'sub', text: '用时 ' + dur(j.wall_s) })),
+      body.can_run ? h('td', { class: 'pinned' }, j.running ? null : h('button', { type: 'button', class: 'button',
+        onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除')) : null);
   });
+  const jobHeads = ['', '作业 / 模型', '进度', '结局分布', '首次满分率', '任务总 Token', 'TPS', '估算成本', '开始', ...(body.can_run ? ['操作'] : [])];
   const table = h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['', '作业', '模型', '进度', '结局分布', '首次满分率', '无效', '任务总 Token', '初始 Token（均值）', 'TPS', 'TTFT', '估算成本', '用时', '开始'].map((t, i) => h('th', { class: i >= 5 ? 'num' : null, text: t })))),
-    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 14, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
+    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 4 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: jobHeads.length, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
   const loose = runs.filter((r) => !r.profile && !r.batch);
   const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次`,
     h('div', { class: 'launches' }, loose.map((r) => h('a', { class: 'launch', href: '#/run/' + r.name },
@@ -356,7 +362,7 @@ async function renderProfile(id) {
   const b = await api('/api/profile?id=' + encodeURIComponent(id));
   state.live = profileActive(b);
   $('#title').textContent = profileName(b);
-  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + b.id }]);
+  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + profileName(b) }]);
   const s = b.summary;
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
     metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
@@ -364,7 +370,7 @@ async function renderProfile(id) {
     metric('无效', String(s.counts.invalid)),
     s.budget_exhausted ? metric('预算用完', String(s.budget_exhausted), 'teamwork 用完上限后停下的尝试，按判分结果计入') : null);
 
-  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.id, 'aria-label': '评测配置名称' });
+  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.default_name || b.id, 'aria-label': '评测配置名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
   const closeRename = () => { state.editing = false; renameForm.hidden = true; nameRow.hidden = false; };
   const renameForm = h('form', { class: 'rename', hidden: true },
@@ -379,13 +385,15 @@ async function renderProfile(id) {
       render();
     } catch (error) { renameFeedback.textContent = error.message; }
   });
-  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（显示评测配置编号）' }),
+  const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（按版本和高级功能命名）' }),
     b.can_run ? h('button', { type: 'button', class: 'button', onclick: () => {
       state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
     } }, '重命名') : null);
   const m = b.metacodes || {};
+  const liveItem = b.items.find((i) => i.status === 'running') || b.items.find((i) => i.status === 'pending');
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
     h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
+    liveItem ? h('dt', { text: '并发数' }) : null, liveItem ? h('dd', {}, concurrencyControl(b, liveItem)) : null,
     h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
     h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
     h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
@@ -399,6 +407,7 @@ async function renderProfile(id) {
     const j = item.job; const js = j?.summary;
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
       h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
+        item.concurrency ? `并发 ${item.concurrency}` : null,
         (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
@@ -458,6 +467,26 @@ async function renderProfile(id) {
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
   return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, tasks, compositionPanel(s, '最新结果均值'));
+}
+
+function concurrencyControl(b, item) {
+  if (!b.can_run || !profileActive(b)) return h('span', { class: 'mono', text: String(item.concurrency ?? '—') });
+  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: item.concurrency ?? '',
+    'aria-label': '并发数', onfocus: () => { state.editing = true; },
+    onblur: () => { if (input.value === String(item.concurrency ?? '')) state.editing = false; } });
+  const feedback = h('span', { class: 'muted', role: 'status', text: '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中的评测集也按新值运行' });
+  const form = h('form', { class: 'rename' }, input, h('button', { type: 'submit', class: 'button primary' }, '应用'), feedback);
+  form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.editing = false; render(); } });
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    feedback.textContent = '正在应用…';
+    try {
+      await api('/api/profile/concurrency', { id: b.id, concurrency: Number(input.value) });
+      state.editing = false;
+      render();
+    } catch (error) { feedback.textContent = error.message; }
+  });
+  return form;
 }
 
 // The latest results of each model side by side, when the profile has several:
@@ -620,7 +649,7 @@ async function renderNewRun() {
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
-  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, max: 16, step: 1, required: true,
+  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, step: 1, required: true,
     oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,
@@ -639,6 +668,7 @@ async function renderNewRun() {
     featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性')) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
   const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
+  const blocked = h('small', { class: 'muted', role: 'status' });
 
   function setupReasons() {
     const harbor = [...state.suitePick.keys()].some((id) => (byId.get(id) || {}).runner !== 'workbuddy');
@@ -648,8 +678,21 @@ async function renderNewRun() {
   function syncSubmit() {
     const picked = [...state.suitePick.entries()];
     const total = picked.reduce((acc, [, e]) => acc + (e ? e.selected.size : 0), 0);
-    const problems = picked.filter(([id, e]) => !comboReady(byId.get(id)) || !e || !e.selected.size || e.selected.size > byId.get(id).max_tasks);
-    submit.disabled = !picked.length || !chosenModels.size || problems.length > 0 || !c.can_run || (!fixed && !bundles.length);
+    const reasons = [];
+    if (!picked.length) reasons.push('请选择评测集');
+    if (!chosenModels.size) reasons.push('请至少选择一个模型');
+    for (const [id, e] of picked) {
+      const s = byId.get(id);
+      if (!comboReady(s)) reasons.push(`${s.name} 在当前执行机器上待配置`);
+      else if (!e) reasons.push(`${s.name} 正在读取任务列表`);
+      else if (e.error && !e.tasks.length) reasons.push(`${s.name} 读取任务失败：${e.error}`);
+      else if (!e.selected.size) reasons.push(`${s.name} 还没有选择任务`);
+      else if (e.selected.size > s.max_tasks) reasons.push(`${s.name} 已选 ${e.selected.size} 题，超过上限 ${s.max_tasks}`);
+    }
+    if (!c.can_run) reasons.push('只读模式，不能发起评测');
+    if (!fixed && !bundles.length) reasons.push('还没有可用的 metacodes 版本');
+    submit.disabled = reasons.length > 0;
+    blocked.textContent = reasons.length ? '无法开始：' + reasons.join('；') : '';
     const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
     submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '开始评测';
   }
@@ -768,7 +811,7 @@ async function renderNewRun() {
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
     h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
       h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
-    h('div', { class: 'form-submit' }, submit, feedback));
+    h('div', { class: 'form-submit' }, submit, blocked, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     submit.disabled = true;
@@ -1301,7 +1344,6 @@ function svg(tag, attrs, ...children) {
   return el;
 }
 const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
-const rowGroup = (r) => (r.ours ? 'metacodes' : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
 const PALETTE = ['#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
 const SHAPES = ['diamond', 'square', 'circle', 'triangle', 'hexagon'];
@@ -1309,12 +1351,17 @@ function spareHue(i) {
   const hue = (i * 137.508 + 20) % 360;
   return hue > 185 && hue < 245 ? (hue + 60) % 360 : hue;
 }
-function harnessLooks(rows) {
-  const names = [...new Set(rows.filter((r) => !r.ours).map((r) => r.harness))];
-  const looks = new Map(names.map((name, i) => [name, {
+function soleHarness(board) {
+  const names = new Set(board.entries.map((e) => e.harness));
+  return names.size === 1 ? [...names][0] : null;
+}
+function rowLooks(rows, byModel) {
+  const groupOf = (r) => (r.ours ? 'metacodes' : byModel ? r.model || r.harness : r.harness);
+  const names = [...new Set(rows.filter((r) => !r.ours).map(groupOf))];
+  const looks = new Map(names.map((name, i) => [name, { name,
     color: PALETTE[i] || `hsl(${spareHue(i)} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
-  looks.set('metacodes', { color: 'var(--accent)', shape: 'star' });
-  return (r) => looks.get(rowGroup(r));
+  looks.set('metacodes', { name: 'metacodes', color: 'var(--accent)', shape: 'star' });
+  return (r) => looks.get(groupOf(r));
 }
 const glyph = (look) => h('i', { class: 'glyph', 'data-shape': look.shape, style: 'background:' + look.color });
 function niceTicks(lo, hi) {
@@ -1368,8 +1415,9 @@ function costScatter(rows, focus, lookOf) {
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
   const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
-  const repeated = new Set(points.filter((r, i) => points.findIndex((o) => rowName(o) === rowName(r)) !== i).map(rowName));
-  const name = (r) => (r.ours ? rowName(r) : repeated.has(r.harness) ? `${r.harness} · ${r.model}` : r.harness);
+  const label = (r) => (r.ours ? rowName(r) : lookOf(r).name);
+  const repeated = new Set(points.filter((r, i) => points.findIndex((o) => label(o) === label(r)) !== i).map(label));
+  const name = (r) => (!r.ours && repeated.has(label(r)) ? `${r.harness} · ${r.model}` : label(r));
   const order = [...points].sort((p, q) => Boolean(q.ours) - Boolean(p.ours) || frontier.includes(q) - frontier.includes(p) || q.score - p.score);
   const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' },
     svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
@@ -1406,28 +1454,20 @@ function costScatter(rows, focus, lookOf) {
     tip.style.bottom = py(a) + '%';
     tip.dataset.side = px(a) > 60 ? 'left' : 'right';
   });
-  const group = (g) => {
-    plot.toggleAttribute('data-group', Boolean(g));
-    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(g) && rowGroup(r) !== g);
+  const group = (look) => {
+    plot.toggleAttribute('data-group', Boolean(look));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(look) && lookOf(r) !== look);
   };
-  const legend = h('div', { class: 'scatter-legend' }, [...new Map(points.map((r) => [rowGroup(r), r])).values()].map((r) =>
-    h('span', { class: 'key', onmouseenter: () => group(rowGroup(r)), onmouseleave: () => group(null) }, glyph(lookOf(r)), rowGroup(r))));
+  const legend = h('div', { class: 'scatter-legend' }, [...new Set(points.map(lookOf))].map((look) =>
+    h('span', { class: 'key', onmouseenter: () => group(look), onmouseleave: () => group(null) }, glyph(look), look.name)));
   new ResizeObserver(() => arrangeLabels(plot)).observe(plot);
   return h('div', { class: 'scatter-box' }, legend, h('div', { class: 'scatter-frame' }, h('div', { class: 'axis-y', text: '分数' }), plot,
     h('div', { class: 'axis-x', text: '每题平均成本' })));
 }
 const BARS_TOP = 15;
-function scoreBars(rows, focus, lookOf) {
-  const shown = rows.filter((r, i) => i < BARS_TOP || r.ours);
-  if (shown.length < 2) return null;
-  const pub = rows.filter((r) => !r.ours);
-  const harnesses = new Set(pub.map((r) => r.harness)).size;
-  const byModel = harnesses * 2 <= pub.length;
-  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : !r.model ? [r.harness, null]
-    : harnesses === 1 ? [r.model, null] : byModel ? [r.model, r.harness] : [r.harness, r.model]);
-  const err = (r) => r.stderr || 0;
-  const top = Math.max(...shown.map((r) => r.score + err(r)));
-  const lo = Math.min(...shown.map((r) => r.score - err(r)), Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
+function scoreScale(lows, highs, rowCount) {
+  const top = Math.max(...highs);
+  const lo = Math.min(...lows, Math.max(0, top - 5)); const hi = Math.max(top, lo + 5);
   const { step } = niceTicks(Math.max(0, lo - (hi - lo) * 0.15), Math.min(100, hi));
   const x1 = Math.min(100, Math.ceil(hi / step) * step);
   const floor = Math.floor(lo / step) * step;
@@ -1435,9 +1475,17 @@ function scoreBars(rows, focus, lookOf) {
   const at = (v) => (Math.min(Math.max(v, x0), x1) - x0) / (x1 - x0) * 100;
   const marks = Array.from({ length: Math.round((x1 - x0) / step) + 1 }, (_, i) => +(x0 + i * step).toPrecision(12));
   const digits = step < 1 ? 1 : 0;
-  const lines = h('div', { class: 'bars-grid', style: `grid-row:1 / span ${shown.length}` },
+  const lines = h('div', { class: 'bars-grid', style: `grid-row:1 / span ${rowCount}` },
     marks.map((v) => h('i', { style: `left:${at(v)}%` })));
-  const axis = h('div', { class: 'bars-axis', style: `grid-row:${shown.length + 1}` }, marks.map((v) => h('span', { style: `left:${at(v)}%`, text: v.toFixed(digits) + '%' })));
+  const axis = h('div', { class: 'bars-axis', style: `grid-row:${rowCount + 1}` }, marks.map((v) => h('span', { style: `left:${at(v)}%`, text: v.toFixed(digits) + '%' })));
+  return { at, lines, axis };
+}
+function scoreBars(rows, focus, lookOf) {
+  const shown = rows.filter((r, i) => i < BARS_TOP || r.ours);
+  if (shown.length < 2) return null;
+  const err = (r) => r.stderr || 0;
+  const { at, lines, axis } = scoreScale(shown.map((r) => r.score - err(r)), shown.map((r) => r.score + err(r)), shown.length);
+  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : [r.model || r.harness, null]);
   const items = new Map(shown.map((r, i) => [r, h('div', { class: 'bar-row', 'data-ours': r.ours ? '1' : null, style: `--row:${i + 1}`,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
@@ -1449,6 +1497,52 @@ function scoreBars(rows, focus, lookOf) {
   focus.on((active) => { for (const [r, el] of items) el.toggleAttribute('data-current', r === active); });
   const note = rows.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 名${shown.some((r) => r.ours) ? '及我们的作业' : ''} · 共 ${rows.length} 条，完整列表见下表` }) : null;
   return h('div', { class: 'scatter-box bars-box' }, h('div', { class: 'bars' }, lines, ...items.values(), axis), note);
+}
+function modelDots(rows, focus, lookOf) {
+  const groups = new Map();
+  for (const r of rows) {
+    const key = modelKey(r.model) || r.id;
+    if (!groups.has(key)) groups.set(key, { model: r.model || r.harness, rows: [] });
+    groups.get(key).rows.push(r);
+  }
+  const all = [...groups.values()];
+  const shown = all.filter((g, i) => i < BARS_TOP || g.rows.some((r) => r.ours));
+  if (shown.length < 2) return null;
+  const entries = shown.flatMap((g) => g.rows);
+  const err = (r) => r.stderr || 0;
+  const { at, lines, axis } = scoreScale(entries.map((r) => r.score - err(r)), entries.map((r) => r.score + err(r)), shown.length);
+  const harnessOf = (r) => (r.ours ? 'metacodes' : r.harness);
+  const scoreText = (r) => score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '');
+  const ends = (r) => [scoreText(r), h('small', { text: ' ' + harnessOf(r) })];
+  const dots = new Map();
+  const rowNodes = shown.map((g, i) => {
+    const best = g.rows[0]; const worst = g.rows[g.rows.length - 1];
+    const whiskers = g.rows.filter(err).map((r) => h('i', { class: 'bar-err', style: `left:${at(r.score - err(r))}%;width:${at(r.score + err(r)) - at(r.score - err(r))}%` }));
+    const marks = g.rows.map((r) => {
+      const dot = h('button', { type: 'button', class: 'pair-dot', 'data-ours': r.ours ? '1' : null, style: `left:${at(r.score)}%`,
+        title: `${harnessOf(r)} · ${scoreText(r)}`, 'aria-label': `${g.model} · ${harnessOf(r)} · ${scoreText(r)}`,
+        onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
+        onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null }, glyph(lookOf(r)));
+      dots.set(r, dot);
+      return dot;
+    });
+    return h('div', { class: 'bar-row', style: `--row:${i + 1}` },
+      h('span', { class: 'bar-name', title: g.model }, h('span', { text: g.model })),
+      h('span', { class: 'bar-track pair-track' },
+        g.rows.length > 1 ? h('i', { class: 'pair-span', style: `left:${at(worst.score)}%;width:${at(best.score) - at(worst.score)}%` }) : null, ...whiskers, ...marks),
+      h('span', { class: 'bar-value num', title: g.rows.map((r) => `${harnessOf(r)} ${scoreText(r)}`).join('\n') },
+        ...(g.rows.length > 1 ? [...ends(worst), ' – ', ...ends(best)] : ends(best))));
+  });
+  const box = h('div', { class: 'bars pair-bars' }, lines, ...rowNodes, axis);
+  focus.on((active) => { for (const [r, dot] of dots) dot.toggleAttribute('data-current', r === active); });
+  const group = (look) => {
+    box.toggleAttribute('data-group', Boolean(look));
+    for (const [r, dot] of dots) dot.toggleAttribute('data-dim', Boolean(look) && lookOf(r) !== look);
+  };
+  const legend = h('div', { class: 'scatter-legend pair-legend' }, [...new Set([...dots.keys()].map(lookOf))].map((look) =>
+    h('span', { class: 'key', onmouseenter: () => group(look), onmouseleave: () => group(null) }, glyph(look), look.name)));
+  const note = all.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 个模型${shown.some((g) => g.rows.some((r) => r.ours)) ? '及我们的作业' : ''} · 共 ${all.length} 个模型、${rows.length} 条，完整列表见下表` }) : null;
+  return h('div', { class: 'scatter-box bars-box' }, legend, box, note);
 }
 function focusHub() {
   const listeners = [];
@@ -1472,7 +1566,9 @@ function boardPanel(board) {
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
-  const lookOf = harnessLooks(rows);
+  const harness = soleHarness(board);
+  const lookOf = rowLooks(rows, Boolean(harness));
+  const harnessNote = harness ? h('div', { class: 'board-harness muted', text: `Harness：${harness}（本榜公开条目都用它，图中标识按模型区分）` }) : null;
   const priced = rows.some((r) => r.cost_per_task_usd > 0);
   const src = board.source;
   const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
@@ -1486,8 +1582,8 @@ function boardPanel(board) {
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
     onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
   h('td', { class: 'num rank', text: String(r.rank) }),
-  h('td', {}, h('span', { class: 'harness' }, glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
-  h('td', { class: 'muted', text: r.model || '—' }),
+  h('td', {}, h('span', { class: 'harness' }, harness && !r.ours ? null : glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
+  h('td', { class: 'muted' }, h('span', { class: 'harness' }, harness && !r.ours ? glyph(lookOf(r)) : null, r.model || '—')),
   h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
     h('span', { class: 'num', text: score(r.score) }))),
   priced ? h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }) : null)]));
@@ -1497,7 +1593,7 @@ function boardPanel(board) {
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
     h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', priced ? '每题成本' : null].filter(Boolean).map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), costScatter(rows, focus, lookOf) || scoreBars(rows, focus, lookOf), table),
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, costScatter(rows, focus, lookOf) || (harness ? scoreBars : modelDots)(rows, focus, lookOf), table),
     h('div', { class: 'board-actions' }, picker, sourceLink));
 }
 async function renderLeaderboard(suiteId) {

@@ -46,7 +46,6 @@ SUITE = {
     "description": "OpenAI HumanEval 164 题：根据函数签名与文档字符串写出 Python 实现，由隐藏单元测试判定（全部通过得 1 分）。",
     "default_tasks": ["humaneval-0", "humaneval-13", "humaneval-42", "humaneval-101", "humaneval-163"],
     "max_tasks": 164,
-    "max_concurrency": 16,
     "arch": "amd64, arm64 (python:3.12-slim-bookworm multi-arch)",
 }
 

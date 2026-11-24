@@ -109,6 +109,7 @@ pub const Options = struct {
     force_state: ?[]const u8 = null,
     /// Checked between waits of the loopback flow and between polls of the device-code flow; null means the flow is bounded only by the user's browser or `timeout_seconds`.
     abort_signal: ?*const AbortSignal = null,
+    paste: ?auth.PasteSource = null,
 };
 
 pub const Error = error{
@@ -172,6 +173,7 @@ fn acquireByLoopback(
     // the flow ends with it instead of waiting on.
     var refusal: auth.Refusal = .{};
     server.refusal = &refusal;
+    server.paste = options.paste;
 
     const redirect_uri = try std.fmt.allocPrint(
         allocator,
@@ -193,10 +195,17 @@ fn acquireByLoopback(
     defer allocator.free(url);
 
     if (options.notify) |notify| {
+        var forward_buf: [160]u8 = undefined;
         const text = try std.fmt.allocPrint(
             allocator,
-            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n",
-            .{ endpoints.redirect_host, server.port, url },
+            "Waiting for the login callback on http://{s}:{d}.\nOpen this URL to authorize:\n\n{s}\n\n{s}{s}",
+            .{
+                endpoints.redirect_host,
+                server.port,
+                url,
+                if (auth.sshSession()) auth.sshForwardLine(&forward_buf, server.port) else "",
+                if (options.paste) |source| source.prompt orelse "" else "",
+            },
         );
         defer allocator.free(text);
         notify.say(text);
@@ -215,7 +224,10 @@ fn acquireByLoopback(
 
     const code = server.waitForAuthorizationCode(allocator, state, options.abort_signal) catch |err| switch (err) {
         error.OAuthAccessDenied => {
-            if (options.notify) |notify| sayRefusal(allocator, notify, &refusal);
+            if (options.notify) |notify| {
+                var line_buf: [400]u8 = undefined;
+                notify.say(refusal.line(&line_buf));
+            }
             return Error.OAuthAccessDenied;
         },
         else => return err,
@@ -248,17 +260,6 @@ fn sayPortsInUse(allocator: std.mem.Allocator, notify: Notify, ports: []const u1
     ) catch return;
     defer allocator.free(text);
     notify.say(text);
-}
-
-/// What the authorization server said when it refused.
-fn sayRefusal(allocator: std.mem.Allocator, notify: Notify, refusal: *const auth.Refusal) void {
-    const text = if (refusal.description().len > 0)
-        std.fmt.allocPrint(allocator, "The sign-in was refused: {s} ({s}).\n", .{ refusal.code(), refusal.description() })
-    else
-        std.fmt.allocPrint(allocator, "The sign-in was refused: {s}.\n", .{refusal.code()});
-    const line = text catch return;
-    defer allocator.free(line);
-    notify.say(line);
 }
 
 /// What the device authorization endpoint told us. Slices borrow the response

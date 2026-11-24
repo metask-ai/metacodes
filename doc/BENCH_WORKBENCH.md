@@ -64,8 +64,8 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 | 办公 Agent | `workbuddy-code`, `workbuddy-sec` | workbuddy | pinned WorkBuddy-Bench | 80 / 60 (80 / 60) |
 | 办公 Agent | `workbuddy-web`, `workbuddy-office` | workbuddy | pinned WorkBuddy-Bench, in-container LLM judge | 70 / 50 (70 / 50) |
 
-Each task runs 1–5 times; concurrency is 1–10 (AIME, the terminal suites
-the WorkBuddy subsets and the small-task adapters allow up to 16, GAIA2 2). The page starts at 4 runs
+Each task runs 1–5 times; concurrency has no upper limit (GAIA2 caps it at
+2 and ALFWorld at 10). The page starts at 4 runs
 per task and concurrency 10, capped by the chosen suite; the CLI defaults to
 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
@@ -198,7 +198,7 @@ in `ADAPTER_SUITES` (its id and category are authoritative) and listed in
 ```python
 SUITE_ID = "humaneval"                                 # the catalog id
 SUITE = {"name": "HumanEval", "description": "…", "default_tasks": [...],
-         "max_tasks": 164, "max_concurrency": 16, "arch": "amd64, arm64"}  # all optional
+         "max_tasks": 164, "max_concurrency": 4, "arch": "amd64, arm64"}  # all optional
 HOST_ENV = ("OPENAI_API_KEY",)        # optional: verifier env, forwarded to SSH executors
 JUDGE = {"default_model": "glm-5.3-flash",            # optional: an OpenAI-compatible LLM
          "env": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL",   # judge, routed
@@ -698,9 +698,14 @@ The local worker stays the durable owner of the run: it resolves the
 account (or provider) credential exactly as for a local run, and keeps
 refreshing a session login, then
 
-1. ships the Linux bundle the run evaluates as a tar stream over SSH into
-   `<state_dir>/bundles/<digest>`, once per content digest (complete
-   directories are marked and reused);
+1. resolves the node `<state_dir>/bin/metacodes` points at (the physical
+   path inside `<state_dir>/bundles/<digest>`) and runs every node command
+   of the run (`run`, `manifest`, `pack`) with that binary, so a
+   `metacodes bench setup --executor` that switches the node mid-run does
+   not change the driver under a running job; a run without a node stops
+   here. It then ships the Linux bundle the run evaluates as a tar stream
+   over SSH into `<state_dir>/bundles/<digest>`, once per content digest
+   (complete directories are marked and reused);
 2. uploads the run's secret-free spec (and provider configuration, if any) to
    `<state_dir>/runs/<name>/`;
 3. starts `<state_dir>/bin/metacodes bench node run …` over SSH and
@@ -793,9 +798,28 @@ are those of the default executor (the top level for the default suite).
 
 Cancel sends `cancel` on the channel: the driver interrupts Harbor (SIGINT,
 then SIGKILL after 20 seconds). A login that can no longer be refreshed
-cancels the same way and fails the run with the reason above. If the channel closes, or no heartbeat
-arrives for 90 seconds, the driver stops Harbor as well, so a lost connection
-never leaves trials running unsupervised.
+cancels the same way and fails the run with the reason above.
+
+A lost connection does not end the run. When the channel closes, or no
+heartbeat arrives for 90 seconds, the worker ends that session and starts
+`metacodes bench node attach <run spec>` over SSH every 10 seconds. The
+driver keeps Harbor and the relay running and accepts the new session on a
+Unix socket in `/tmp/metacodes-bench-<uid>/` (a directory only that user can
+enter; the socket is named after a hash of the run directory). A session
+lost before its first event is attached the same way, and while the driver
+is still starting (its pid is in `runs/<name>/driver.pid`) `attach` exits
+without an event and the worker tries again. The new session then
+carries the events and control lines, the current access token, and the
+egress tunnel on a fresh `ssh -R` port, which the driver's forwarder follows.
+While no session is attached, the driver's and Harbor's output goes to
+`<state_dir>/runs/<name>/driver.log`. The run's terminal event is also kept
+there, so a session that attaches after Harbor exited still receives it. The
+record counts the reattached sessions in `reconnects`. Both sides give up
+after 30 minutes (`METACODES_BENCH_RECONNECT_WINDOW` seconds on the
+workbench, which passes the value to the driver as the spec's
+`detach_grace`): the driver interrupts Harbor, so a lost connection never
+leaves trials running unsupervised, and the run fails with what is still on
+the executor.
 
 ### Network-restricted executors
 
@@ -983,18 +1007,26 @@ CLI) only need a trusted entry. Open it by IP, `localhost` or the
 viewer) is read-only. The service receipt is
 `<state root>/bench/service.json` (mode 0600 on POSIX).
 
-After upgrading the binary, a running workbench keeps serving the previous
-version. On the service host, use the existing state directory for both
-commands. Run `metacodes bench stop` and wait for the old listener to stop
-responding, then rerun `metacodes bench` with the same jobs directory and any
-bind, port, and public URL options. Active benchmark workers continue through the
-restart. A service from before the login was dropped still requires its
+The workbench updates while benchmarks run. The version a run evaluates is
+its frozen bundle, and each run's worker is a process of its own that runs
+the workbench files it started with (extracted per content digest under
+`<state root>/bench/runtime/`, never removed), so neither depends on the
+service. After upgrading the binary, `metacodes bench` (with the same jobs
+directory and state directory) finds the service of the previous build,
+stops it and starts this build's on the same bind, port and public URL; the
+receipt records the build as `runtime`. Other commands (`run`, `info`, …)
+keep using the running service. Active workers continue through the restart,
+the new service shows their progress and advances profile queues from where
+they stood, and later queue items launch with the new workbench code on the
+same frozen bundle. On an SSH executor, `metacodes bench setup --executor`
+may install the new node while runs are active: each run keeps the node it
+started with (see [How an SSH run works](#how-an-ssh-run-works)). A service from before the login was dropped still requires its
 link: `metacodes bench stop` and `metacodes bench` stop it with the
 capability from this machine's receipt (the only use of it left), and
 `metacodes bench` then starts the login-free service.
 
-When `metacodes bench` replaces a running service (a store change or the
-login-free upgrade), the new service keeps the old bind, port and public
+When `metacodes bench` replaces a running service (another build, a store
+change or the login-free upgrade), the new service keeps the old bind, port and public
 URL unless the command gives them. A receipt from before this release does
 not record the bind, so when the old service listens on 127.0.0.1 (or
 0.0.0.0) the command leaves it running and asks for `--bind`. The CLI acts
@@ -1017,7 +1049,7 @@ profile is run on as often as wanted. The 评测 page picks the version (the
 configured Linux bundle by default, or any valid bundle under
 `<state root>/bench/bundles/`, including those `metacodes bench build --ref`
 builds), the advanced features, several suites with their tasks, the model,
-attempts and concurrency (capped per suite). The profile's id is derived from
+attempts and concurrency (no upper limit unless a suite sets `max_concurrency`). The profile's id is derived from
 the bundle's content digest and the features, so the same version with the
 same features always lands on the same profile, and changing either is
 another profile. The first run on a profile validates every dataset, then
@@ -1047,7 +1079,7 @@ record list none, and the profile page marks them; a direct launch that asks
 for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork): an older node is refused until
+features (4 since teamwork, 7 since model prices): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 
@@ -1079,6 +1111,17 @@ the other features' flags, and only on an SSH executor whose entry sets
   directory without a commit gets one first (`git init` when it is no
   repository, then a snapshot commit of what the image put there); one with
   a commit is used as it is.
+- **Permissions**: a headless trial runs with `bypassPermissions`, but
+  `teamwork run` takes no `--permission`, and its seats and isolated
+  verifier would ask for every risky command with nobody to answer (the
+  first real runs ended `audit_unavailable`: the verifier stopped at its
+  prompts). The trial writes user-level allow rules for the built-in tools
+  (`TEAMWORK_ALLOWED_TOOLS`, WebFetch included) and every MCP server the
+  task declares (`mcp__<server>`) to `~/.claude/settings.json` in the
+  disposable container, unless the image has that file; seat commands still
+  run under bubblewrap. This is narrower than `bypassPermissions`: a
+  protected path (for example metacodes' own configuration) still asks, so a
+  seat that touches one is refused and the verifier can stop there.
 - **Request and approval**: the instruction is the approved request
   (`--approve`); text starting with `[` gets a heading, since a leading
   bracket would be read as an option segment. Every seat uses metacodes and
@@ -1087,12 +1130,30 @@ the other features' flags, and only on an SSH executor whose entry sets
 - **Budget and time**: `--budget-usd` follows the `difficulty` of the task's
   `task.toml` (easy $20, medium $40, hard $80, otherwise $40), and the trial
   gets `--agent-timeout-multiplier 3`, recorded on the run as
-  `agent_timeout_multiplier`. The cap is in metacodes' price-table
-  estimate, not a provider bill: a model without its own price (most
-  imported and Metask models) is charged at the Sonnet fallback rates
-  (`src/util/pricing.zig`), so the cap stops far earlier than real spend
-  would. A first real-model run at easy $5 ran out before the reviewer
-  finished.
+  `agent_timeout_multiplier`. The cap is in metacodes' price estimate,
+  not a provider bill; without the run's OpenRouter price (below) a model
+  missing from metacodes' table is charged at the Sonnet fallback rates
+  (`src/util/pricing.zig`), and the cap, and the isolated verifier's own
+  $0.20, stop far earlier than real spend would. The first real-model runs
+  without it ran out of budget or ended with no audit verdict.
+
+#### Model prices
+
+A Harbor run's model is priced from OpenRouter: at launch the workbench
+matches the model to the one OpenRouter model whose id without its `vendor/`
+prefix is the run's request model id (case-insensitive, so
+`metask/DeepSeek-V4.1-Flash-1017` is `deepseek/deepseek-v4.1-flash-1017`;
+a request id with its own namespace, such as `acme/model` behind
+`gateway/`, matches only the OpenRouter id `acme/model`),
+records it on the run as `model_price` (USD per million tokens and the
+`openrouter_id`), and the adapter writes it to the trial's `config.json` as
+`model_prices`, which every metacodes cost meter charges first (`doc/API.md`,
+"Model prices"). The catalog (`https://openrouter.ai/api/v1/models`) is
+cached beside `workbench.json` as `openrouter-prices.json` for a day; when
+OpenRouter cannot be reached the cached copy is used. A model with no single
+match, or without a cached catalog, keeps metacodes' own estimate and
+records no `model_price`. `"model_prices": "off"` in `workbench.json` skips
+the lookup.
 - **Validity**: `teamwork status --json` lands in the trial's agent logs,
   and the run directory without its worktrees (`teamwork-run/`: ledger,
   seat records and logs) beside it. A run that wrote no status, or in which
@@ -1127,7 +1188,22 @@ first runs until its queue is empty. A single launch (`POST /api/runs`,
 and its `features` (`bench run --features a,b`; the run gates when none are
 given, `--features ""` for none), and is refused while
 a queue or another run owns the executor. Stopping a profile cancels its running dataset and skips the rest
-of its queue.
+of its queue. A dataset whose SSH executor does not answer when it is due
+(the SSH connection fails or times out; a refused login does not count)
+stays pending, with the reason in its `waiting` field, and is retried until the executor
+answers. After 30 minutes it fails, and the queue moves on.
+
+While a profile runs, its concurrency can be changed (`POST /api/profile/concurrency`
+with `id` and `concurrency`, any positive integer; 并发数 on its page). A suite's
+`max_concurrency`, when set, caps it. The value applies to the running dataset
+at once and to the datasets still waiting in the queue. Lowering it lets the trials already running finish;
+raising it starts more within about a second. The workbench writes the value
+to `<jobs>/.bench-runs/<run>.concurrency`; on an SSH executor the worker sends
+it over the run's control channel and the node writes it beside the run's
+spec. Harbor reads that file (named by `METACODES_BENCH_CONCURRENCY_FILE`)
+through `scripts/eval/harbor/live_concurrency.py`, which the metacodes agent
+installs in Harbor's trial queue in place of its fixed `-n` semaphore. A
+WorkBuddy run keeps the concurrency it started with.
 
 A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
@@ -1148,6 +1224,13 @@ this service's jobs directory is deleted; one ingested from another jobs
 directory sharing the database is refused. When a file cannot be removed or
 the database delete fails, the request fails and the profile stays for a
 retry: the manifest goes last, after the rows are gone.
+A single job can be deleted the same way (`POST /api/job/delete` with `name`,
+删除 in the overview's job list): its run record and log, its job directory and
+its rows go; a profile that ran it drops the link to it (so a later job of the
+same name is not the profile's), keeps its other runs and shows the task's
+earlier result, if any. A running job, whether the workbench launched it or
+Harbor is still writing it, must be stopped first, and a job from another jobs
+directory is refused.
 Imports of a jobs directory (the service's sync, `bench db import`),
 `bench sync --run` and deletions from it take the same lock,
 `<jobs-dir>/.bench-store.lock`, so none of them can write a deleted profile

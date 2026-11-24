@@ -29,7 +29,7 @@ carries it. The module exposes::
         "description": "...",      # Chinese one-line description
         "default_tasks": [...],    # suggested sample (ids that exist)
         "max_tasks": 164,          # per-launch cap (<= MAX_TASKS)
-        "max_concurrency": 4,      # <= MAX_CONCURRENCY
+        "max_concurrency": 4,      # optional per-suite cap
     }
 
     def prepare(dest: Path) -> Path:      # or prepare(dest, ctx): the
@@ -74,7 +74,6 @@ RUNNERS = (HARBOR_REGISTRY, HARBOR_LOCAL, WORKBUDDY)
 
 TASK = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,160}$")
 MAX_TASKS = 200
-MAX_CONCURRENCY = 16
 DEFAULT_SUITE = "terminal-bench-2.1"
 
 # Ordered as the picker shows them.
@@ -173,7 +172,7 @@ class Suite:
     tasks: Optional[Tuple[str, ...]] = None      # None: listed at runtime
     default_tasks: Tuple[str, ...] = ()
     max_tasks: int = 20
-    max_concurrency: int = 10
+    max_concurrency: Optional[int] = None      # None: no cap
     # harbor-local: adapter module under scripts.eval.harbor.adapters.
     adapter: str = ""
     # workbuddy: dataset subset (code/web/office/sec).
@@ -189,41 +188,41 @@ SUITES: Tuple[Suite, ...] = (
           "89 道终端工程任务（2.1 版更新了题目内容），每题独立容器运行并自动判分",
           HARBOR_REGISTRY, dataset="terminal-bench/terminal-bench-2-1",
           filter_prefix="terminal-bench/", tasks=TERMINAL_BENCH_2,
-          default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89, max_concurrency=16),
+          default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89),
     Suite("terminal-bench-2.0", "terminal", "Terminal-Bench 2.0",
           "89 道终端工程任务的 2.0 原版，用于与公开榜单对齐",
           HARBOR_REGISTRY, dataset="terminal-bench@2.0", tasks=TERMINAL_BENCH_2,
-          default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89, max_concurrency=16),
+          default_tasks=TERMINAL_BENCH_SAMPLE, max_tasks=89),
     Suite("frontier-harness-eval-1.1", "terminal", "FrontierHarness Eval v1.1",
           "FrontierHarness 榜单的 62 道固定版本命令行任务（工程、科学、数据、系统、ML、安全），每题独立容器运行并自动判分",
           HARBOR_REGISTRY, dataset="frontier-harness-eval/frontier-harness-eval@v1.1.0",
           filter_prefix="terminal-bench/", tasks=FRONTIER_HARNESS_EVAL_1_1,
-          default_tasks=FRONTIER_HARNESS_EVAL_SAMPLE, max_tasks=62, max_concurrency=16),
+          default_tasks=FRONTIER_HARNESS_EVAL_SAMPLE, max_tasks=62),
     Suite("aime", "competition-math", "AIME 2024–2025",
           "60 道 AIME 竞赛题：2024 年 30 道，2025 年 I/II 卷各 15 道",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2024 + AIME_2025,
-          default_tasks=AIME_2024 + AIME_2025, max_tasks=60, max_concurrency=16),
+          default_tasks=AIME_2024 + AIME_2025, max_tasks=60),
     Suite("aime-2025", "competition-math", "AIME 2025",
           "单独实验：只跑 2025 年 I/II 卷 30 道题（与 aime 数据集相同来源）",
           HARBOR_REGISTRY, dataset="aime@1.0", tasks=AIME_2025,
-          default_tasks=AIME_2025, max_tasks=30, max_concurrency=16),
+          default_tasks=AIME_2025, max_tasks=30),
 )
 
 # harbor-local suites. The id/category here are authoritative; the adapter
 # module may refine name, description, sample and caps.
 ADAPTER_SUITES: Tuple[Suite, ...] = (
     Suite("humaneval", "code-generation", "HumanEval", "根据函数描述写出实现，通过单元测试",
-          HARBOR_LOCAL, adapter="humaneval", max_tasks=164, max_concurrency=16),
+          HARBOR_LOCAL, adapter="humaneval", max_tasks=164),
     Suite("mbpp", "basic-programming", "MBPP", "MBPP full 测试集 500 道 Python 编程任务",
-          HARBOR_LOCAL, adapter="mbpp", max_tasks=MAX_TASKS, max_concurrency=16),
+          HARBOR_LOCAL, adapter="mbpp", max_tasks=MAX_TASKS),
     Suite("mbpp-sanitized", "basic-programming", "MBPP sanitized", "MBPP sanitized 测试集 257 道人工校对的 Python 编程任务",
-          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=MAX_TASKS, max_concurrency=16),
+          HARBOR_LOCAL, adapter="mbpp_sanitized", max_tasks=MAX_TASKS),
     Suite("alfworld", "interactive-planning", "ALFWorld", "多步骤家庭任务的规划与执行",
           HARBOR_LOCAL, adapter="alfworld", max_tasks=134),
     Suite("searchqa", "question-answering", "SearchQA", "根据检索到的段落回答问题",
-          HARBOR_LOCAL, adapter="searchqa", max_tasks=MAX_TASKS, max_concurrency=16),
+          HARBOR_LOCAL, adapter="searchqa", max_tasks=MAX_TASKS),
     Suite("livemath", "math-reasoning", "LiveMath", "数学问题求解",
-          HARBOR_LOCAL, adapter="livemath", max_tasks=MAX_TASKS, max_concurrency=16),
+          HARBOR_LOCAL, adapter="livemath", max_tasks=MAX_TASKS),
     Suite("gaia2-cli", "general-agent", "GAIA2（CLI 模式）",
           "Meta GAIA2 的 Harbor CLI 变体：agent 通过 MCP 侧车调用 ARE 环境的 101 个工具完成动态场景任务",
           HARBOR_LOCAL, adapter="gaia2_cli", max_tasks=100),
@@ -231,13 +230,13 @@ ADAPTER_SUITES: Tuple[Suite, ...] = (
 
 WORKBUDDY_SUITES: Tuple[Suite, ...] = (
     Suite("workbuddy-code", "work-agent", "WorkBuddy Code", "WorkBuddy-Bench 代码子集（80 题），verifier 判分",
-          WORKBUDDY, subset="code", max_tasks=80, max_concurrency=16),
+          WORKBUDDY, subset="code", max_tasks=80),
     Suite("workbuddy-sec", "work-agent", "WorkBuddy Security", "WorkBuddy-Bench 安全子集（60 题），verifier 判分",
-          WORKBUDDY, subset="sec", max_tasks=60, max_concurrency=16),
+          WORKBUDDY, subset="sec", max_tasks=60),
     Suite("workbuddy-web", "work-agent", "WorkBuddy Web", "WorkBuddy-Bench 网页子集（70 题），LLM judge 判分",
-          WORKBUDDY, subset="web", max_tasks=70, max_concurrency=16),
+          WORKBUDDY, subset="web", max_tasks=70),
     Suite("workbuddy-office", "work-agent", "WorkBuddy Office", "WorkBuddy-Bench 办公文档子集（50 题），LLM judge 判分",
-          WORKBUDDY, subset="office", max_tasks=50, max_concurrency=16),
+          WORKBUDDY, subset="office", max_tasks=50),
 )
 
 ALL: Tuple[Suite, ...] = SUITES + ADAPTER_SUITES + WORKBUDDY_SUITES
@@ -249,7 +248,7 @@ def _validate():
         assert suite.id not in seen and TASK.fullmatch(suite.id), suite.id
         seen.add(suite.id)
         assert suite.category in CATEGORY_IDS and suite.runner in RUNNERS, suite.id
-        assert 1 <= suite.max_tasks <= MAX_TASKS and 1 <= suite.max_concurrency <= MAX_CONCURRENCY, suite.id
+        assert 1 <= suite.max_tasks <= MAX_TASKS and (suite.max_concurrency is None or suite.max_concurrency >= 1), suite.id
         if suite.tasks is not None:
             assert all(TASK.fullmatch(t) for t in suite.tasks) and len(set(suite.tasks)) == len(suite.tasks), suite.id
             assert set(suite.default_tasks) <= set(suite.tasks), suite.id
@@ -315,13 +314,17 @@ def resolved(suite: Suite) -> Suite:
     changes = {k: v for k, v in meta.items() if k in allowed}
     if "default_tasks" in changes:
         changes["default_tasks"] = tuple(changes["default_tasks"])
-    for key in ("max_tasks", "max_concurrency"):
-        limit = MAX_TASKS if key == "max_tasks" else MAX_CONCURRENCY
-        if key in changes and not (type(changes[key]) is int and 1 <= changes[key] <= limit):
-            changes.pop(key)
+    if "max_tasks" in changes and not (type(changes["max_tasks"]) is int and 1 <= changes["max_tasks"] <= MAX_TASKS):
+        changes.pop("max_tasks")
+    if "max_concurrency" in changes and not (type(changes["max_concurrency"]) is int and changes["max_concurrency"] >= 1):
+        changes.pop("max_concurrency")
     if not isinstance(changes.get("arch", ""), str):
         changes.pop("arch")
     return replace(suite, **changes)
+
+
+def capped_concurrency(suite: Suite, concurrency: int) -> int:
+    return concurrency if suite.max_concurrency is None else min(concurrency, suite.max_concurrency)
 
 
 def local_tasks(dataset: Path) -> List[str]:

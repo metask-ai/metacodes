@@ -97,6 +97,11 @@ TEAMWORK_PACKAGE_INSTALL = {
     "apk": "apk add --no-cache git bubblewrap",
 }
 TEAMWORK_TOOLS_CHECK = "command -v git >/dev/null 2>&1 && command -v bwrap >/dev/null 2>&1"
+# `teamwork run` takes no --permission: a headless trial runs with
+# bypassPermissions, and teamwork's seats and verifier would otherwise ask,
+# with nobody to answer. User-level allow rules in the disposable container
+# give them the same; their commands still run under bubblewrap.
+TEAMWORK_ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "NotebookEdit")
 # What a task container needs for bubblewrap to create its namespaces, as
 # root (no user namespace: SYS_ADMIN, NET_ADMIN for the loopback) or as
 # another user (unconfined seccomp, AppArmor and /proc).
@@ -264,6 +269,13 @@ def metacodes_flags(
     return flags
 
 
+def teamwork_allow_rules(mcp_servers: Iterable[str] = ()) -> List[str]:
+    """Allow rules for teamwork's seats and verifier: the built-in tools and
+    every MCP server the task declares."""
+
+    return list(TEAMWORK_ALLOWED_TOOLS) + ["mcp__" + name for name in mcp_servers]
+
+
 def teamwork_flags(*, provider: Optional[str], model: str, reasoning_effort: Optional[str]) -> List[str]:
     """The `teamwork run` arguments for one trial's model: provider and
     model, and the reasoning effort on the seats that take one (implementer
@@ -276,6 +288,24 @@ def teamwork_flags(*, provider: Optional[str], model: str, reasoning_effort: Opt
         seats = {role: {"effort": reasoning_effort} for role in ("implementer", "reviewer")}
         flags += ["--config-json", json.dumps({"seats": seats}, separators=(",", ":"))]
     return flags
+
+
+def model_prices_config(model: str, price: Any) -> Optional[Dict[str, Any]]:
+    """The config.json `model_prices` entry for the trial's model, from the
+    workbench's `model_price` (USD per million tokens), or None without one."""
+
+    if price is None:
+        return None
+    if isinstance(price, str):
+        price = json.loads(price)
+    if not isinstance(price, Mapping) or set(price) - {"input", "output", "cached_input", "cache_write"}:
+        raise ValueError("model_price must be an object of input/output/cached_input/cache_write")
+    if "input" not in price or "output" not in price:
+        raise ValueError("model_price needs input and output")
+    for value in price.values():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
+            raise ValueError("model_price values must be non-negative numbers")
+    return {model: dict(price)}
 
 
 def checked_features(features: Iterable[str]) -> List[str]:
@@ -417,6 +447,7 @@ def teamwork_run_command(
     budget_usd: float,
     flags: Iterable[str],
     config_path: Optional[str] = None,
+    mcp_servers: Iterable[str] = (),
     binary: str = REMOTE_BINARY,
     kg_bin: str = REMOTE_KG_BIN,
     logs_dir: str = REMOTE_LOGS,
@@ -461,13 +492,21 @@ def teamwork_run_command(
         "  { git rev-parse --show-toplevel >/dev/null 2>&1 || git init -q; } &&",
         f"  git add -A && git {identity} commit -q --allow-empty -m 'bench snapshot before teamwork' || exit 75",
         "fi",
+        'settings="${HOME:-/root}/.claude/settings.json"',
+        'if [ -e "$settings" ]; then',
+        f'  echo "keeping the image\'s own $settings: teamwork seats may ask for permissions" >>{logs}/{STDERR_FILENAME}',
+        "else",
+        '  mkdir -p "$(dirname "$settings")" &&'
+        f' printf %s {shlex.quote(json.dumps({"permissions": {"allow": teamwork_allow_rules(mcp_servers)}}))}'
+        ' > "$settings" || exit 78',
+        "fi",
         'request="$state/request.md"',
         f'{{ if [ "$(head -c 1 {shlex.quote(instruction_path)})" = "[" ]; then printf "Task:\\n\\n"; fi;'
         f' cat {shlex.quote(instruction_path)}; }} > "$request" || exit 76',
         f'{run} --preview=teamwork teamwork run --request-file "$request" --approve'
         f" --budget-usd {budget_usd:g} --id {shlex.quote(run_id)} --events "
         + " ".join(shlex.quote(flag) for flag in flags)
-        + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>{logs}/{STDERR_FILENAME}",
+        + f" >{logs}/{TEAMWORK_EVENTS_FILENAME} 2>>{logs}/{STDERR_FILENAME}",
         f'echo "teamwork run exited $?" >>{logs}/{STDERR_FILENAME}',
         teamwork_keep_run_command(state_dir=state_dir, run_id=run_id, logs_dir=logs_dir),
         f"{run} teamwork status {shlex.quote(run_id)} --json"
