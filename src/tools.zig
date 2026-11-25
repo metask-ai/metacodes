@@ -31,8 +31,6 @@ const formal_task_audit = @import("formal/task_audit.zig");
 const agent_tool = @import("tools/agent.zig");
 const tool_search_tool = @import("tools/tool_search.zig");
 const web_search_tool = @import("tools/web_search.zig");
-const code_map_tool = @import("tools/code_map.zig");
-const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
@@ -129,6 +127,7 @@ pub const ToolEntry = struct {
     /// 执行期必需的进程外可执行依赖。非 null 时 catalog 准入先探测可用性,
     /// 缺失则拒绝创建而不是广告后首调失败。
     runtime_dependency: ?RuntimeDependency = null,
+    embedding_only: bool = false,
 
     pub fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
         if (!self.previewAllowed(ctx.preview)) return error.PreviewFeatureDisabled;
@@ -202,6 +201,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Glob",
+        .embedding_only = true,
         .description = "Find files matching a glob pattern",
         .describe_fn = descriptions.describeGlob,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -215,6 +215,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Grep",
+        .embedding_only = true,
         .description = "Search for patterns in files, or inside a recovered tool-result artifact, using ripgrep",
         .describe_fn = descriptions.describeGrep,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -231,52 +232,9 @@ pub const registry: []const ToolEntry = &.{
         .result_production = .byte_zero_spool,
         .runtime_dependency = .ripgrep,
     },
-    // CodeMap:代码结构大纲(LSP documentSymbol,Y2 砍 tree-sitter 后)。排在搜索工具之后、Bash
-    // 之前——和 Grep/Glob 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
-    .{
-        .name = "CodeMap",
-        .description = "Produce a structural outline of source code: functions, types, classes, " ++
-            "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
-            "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
-            "src/**/*) to map many files. Far cheaper than reading whole files when you only " ++
-            "need to find where things are defined. Requires an installed language server " ++
-            "(zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); when one " ++
-            "is unavailable the output says so instead of appearing empty.",
-        .describe_fn = descriptions.describeCodeMap,
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
-        }, .required = &.{"path"} },
-        .execute = .{ .result_body = code_map_tool.executeBody },
-        .replay = .read_only,
-        .result_production = .byte_zero_spool,
-    },
-    // FindSymbol:跨文件找符号*定义*(LSP documentSymbol)。常驻默认工具菜单——A/B 实验(2026-06-08,
-    // 192 次真模型)证明 deferred(藏 ToolSearch 后)致"找定义题"压不动(命中率仅 17%,
-    // p=0.156 不显著),模型大量退回 Grep/ToolSearch。提为默认后无需激活即可直接调。
-    .{
-        .name = "FindSymbol",
-        .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
-            "Unlike Grep (which returns all occurrences), this returns only definitions, with " ++
-            "file:line and signature. Use this to jump to a function/type/class definition by " ++
-            "name when you don't know which file it lives in. Requires an installed language " ++
-            "server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an " ++
-            "empty result is qualified when one is unavailable, so `[]` alone means not defined.",
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "name", .type = "string", .description = "The symbol name to find the definition of" },
-            .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },
-            .{ .name = "path", .type = "string", .description = "Optional directory/glob to scope the search (defaults to cwd)" },
-        }, .required = &.{"name"} },
-        .execute = .{ .result_body = find_symbol_tool.executeBody },
-        .replay = .read_only,
-        .result_production = .byte_zero_spool,
-    },
-    // Bash 排在所有文件/搜索专用工具(Read/Write/Edit/Glob/Grep)之后,对齐 mecode 的
-    // 工具顺序(default.md 工具清单:…Glob, Grep, NotebookEdit, Bash…)。MiniMax 类模型
-    // 对工具顺序敏感:Bash(万能工具)若排在 Grep 前,模型易"先看到 Bash 就用",
-    // 即便提示词写了"用 Grep 别用 Bash grep"。把 Bash 后置降低这种误选。
     .{
         .name = "Bash",
-        .description = "Execute a bash command",
+        .description = "Run shell commands for workspace searches, builds, tests, and Git.",
         .describe_fn = descriptions.describeBash,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "command", .type = "string", .description = "The command to execute" },
@@ -808,7 +766,7 @@ pub fn toToolDefinitionsFull(
     // 此门会自动把 ToolSearch 放回。
     var has_deferred = false;
     for (registry) |tool| {
-        if (tool.swarm_gated and !teams_on) continue;
+        if (tool.embedding_only or (tool.swarm_gated and !teams_on)) continue;
         if (tool.tinykg_gated and !tinykg_on) continue;
         if (!tool.previewAllowed(preview)) continue;
         if (tool.deferred) {
@@ -829,7 +787,7 @@ pub fn toToolDefinitionsFull(
     }
 
     for (registry) |*tool| {
-        if (tool.swarm_gated and !teams_on) continue;
+        if (tool.embedding_only or (tool.swarm_gated and !teams_on)) continue;
         if (tool.tinykg_gated and !tinykg_on) continue;
         if (!tool.previewAllowed(preview)) continue;
         if (std.mem.eql(u8, tool.name, "ToolSearch") and !has_deferred) continue;
@@ -1046,6 +1004,7 @@ fn dispatchInto(out: *ToolDispatchOutcome, ctx: *const ToolContext, name: []cons
         return;
     }
     if (getTool(name)) |t| {
+        if (t.embedding_only and ctx.request_tools != null) return error.UnknownTool;
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
         out.* = .{ .ok = try t.run(ctx, args) };
@@ -1238,7 +1197,9 @@ const ToolNameIter = struct {
             return null;
         }
         while (self.static_idx < registry.len) {
-            if (!registry[self.static_idx].previewAllowed(self.ctx.preview)) {
+            if ((registry[self.static_idx].embedding_only and self.ctx.request_tools != null) or
+                !registry[self.static_idx].previewAllowed(self.ctx.preview))
+            {
                 self.static_idx += 1;
                 continue;
             }
@@ -1407,7 +1368,7 @@ test "toToolDefinitions includes ToolSearch when native formal audit is deferred
     // 是 deferred 静态工具，因此 ToolSearch 必须出现；只排除 swarm-gated 工具。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated and t.preview_feature == null) non_gated += 1;
+        if (!t.embedding_only and !t.swarm_gated and t.preview_feature == null) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated);
     // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
@@ -1447,7 +1408,7 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
     // prompt_ctx=null 门控 swarm。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated and t.preview_feature == null) non_gated += 1;
+        if (!t.embedding_only and !t.swarm_gated and t.preview_feature == null) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated + 1);
     // 动态工具在末尾。
@@ -1531,8 +1492,6 @@ test "native byte-zero roster is declared and wired through typed executors" {
     const expected = [_][]const u8{
         "Glob",
         "Grep",
-        "CodeMap",
-        "FindSymbol",
         "Bash",
         "ListMcpResourcesTool",
         "ReadMcpResourceTool",
@@ -1630,7 +1589,5 @@ test {
     _ = &ask_user_tool;
     _ = &task_tools;
     _ = &agent_tool;
-    _ = &code_map_tool;
-    _ = &find_symbol_tool;
     _ = &@import("tools/symbol_provider.zig");
 }

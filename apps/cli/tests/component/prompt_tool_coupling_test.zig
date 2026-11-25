@@ -52,8 +52,17 @@ test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, read.description, "cat -n format") != null);
     const edit = findDef(defs, "Edit").?;
     try std.testing.expect(std.mem.indexOf(u8, edit.description, "exact string replacements") != null);
-    const grep = findDef(defs, "Grep").?;
-    try std.testing.expect(std.mem.indexOf(u8, grep.description, "ALWAYS use Grep") != null);
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.request_tools = .{ .advertised = defs, .catalog = defs };
+    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
+        try std.testing.expect(findDef(defs, name) == null);
+        try std.testing.expectError(error.UnknownTool, cc.tools.dispatch(&ctx, name, "{}"));
+        var buffer: [80]u8 = undefined;
+        const args = try std.fmt.bufPrint(&buffer, "{{\"query\":\"select:{s}\"}}", .{name});
+        try std.testing.expectError(error.NoToolMatch, cc.tools.dispatch(&ctx, "ToolSearch", args));
+    }
+    const bash = findDef(defs, "Bash").?;
+    try std.testing.expect(std.mem.indexOf(u8, bash.description, "rg --files") != null);
     const write = findDef(defs, "Write").?;
     try std.testing.expect(std.mem.indexOf(u8, write.description, "MUST use the Read tool first") != null);
 }
@@ -272,20 +281,18 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
 test "L2: buildUsingTools 段按工具集裁剪" {
     const a = std.testing.allocator;
 
-    // 全量:含 Grep/Glob/TaskCreate 子条
     const full_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskCreate" };
     const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false, "/tmp");
     defer a.free(sp_full);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Grep instead of grep") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_full, "Bash for workspace searches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") == null);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "TaskCreate tool") != null);
 
-    // 裁剪:无 Grep / 无 TaskCreate
     const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Bash" };
     const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false, "/tmp");
     defer a.free(sp_slim);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null); // Glob 仍在
+    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Bash for workspace searches") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Break down and manage your work") == null);
 
     // 极简/文本 profile 不得残留不存在的基础工具指导。
@@ -295,7 +302,7 @@ test "L2: buildUsingTools 段按工具集裁剪" {
     try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To read files use Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To edit files use Edit") == null);
     try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To create files use Write") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "Reserve Bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "Bash for workspace searches") == null);
 
     const sp_text_only = try cc.system_prompt.buildFull(a, "model", null, null, &.{}, "", false, "/tmp");
     defer a.free(sp_text_only);
@@ -319,7 +326,7 @@ test "L2: per-turn policy projection removes hidden ordinary tool guidance" {
     defer a.free(projected);
     try std.testing.expect(std.mem.indexOf(u8, projected, "To read files use Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, projected, "To create files use Write") == null);
-    try std.testing.expect(std.mem.indexOf(u8, projected, "Reserve Bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "Bash for workspace searches") == null);
 
     // 同一个有效工具面再次投影不分配、不改变字节，保护 provider prefix cache。
     try std.testing.expect((try cc.system_prompt.projectUsingToolsForExecution(a, projected, &visible)) == null);
@@ -412,7 +419,7 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "cat -n format") != null); // Read 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "exact string replacements") != null); // Edit 长描述
-    try std.testing.expect(std.mem.indexOf(u8, tools_field, "ALWAYS use Grep") != null); // Grep 长描述
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "rg --files") != null);
 }
 
 test "L2 e2e: execution policy hides deferred tools from schema and system prompt" {

@@ -78,7 +78,7 @@ Runtime。热替换是 immutable generation replacement，不是修改活跃对�
 ### 3.1 System prompt 与缓存不变量
 
 Session 每次 Run 从同一份有效 `ToolCatalog` 同时生成 provider tool schema 和
-`# Using your tools`。Read/Edit/Write/Bash/Glob/Grep/CodeMap/Task 与 deferred catalog
+`# Using your tools`。Read/Edit/Write/Bash/Task 与 deferred catalog
 都按实际工具面投影；execution policy 或 provider capability 在 turn 边界继续缩窄工具时，
 普通工具指导、deferred catalog、Skill/子 Agent 章节及 TinyKG 的 recall/context/remember/task
 协议也一起缩窄。文本模式不会残留不存在的工具名。

@@ -526,7 +526,13 @@ test "L2 Grep #460: accept_edits auto-allows Grep and a denied Bash request has 
     var results = ToolResults{ .allocator = a };
     defer results.deinit();
     const backend = results.backend();
-    const result = try cc.agent_loop.run(&conversation, client.provider(), &.{}, &permission, .{
+    const names = [_][]const u8{ "Grep", "Bash" };
+    var catalog = try cc.tool_catalog.Catalog.initBuiltins(a, &names);
+    defer catalog.deinit();
+    var selection = try cc.tool_catalog.Selection.init(a, &catalog, &names);
+    defer selection.deinit();
+    const result = try cc.agent_loop.run(&conversation, client.provider(), selection.definitions, &permission, .{
+        .tool_dispatcher = selection.dispatcher(),
         .max_turns = 4,
         .emit_tool_cards = true,
         .colorize = false,

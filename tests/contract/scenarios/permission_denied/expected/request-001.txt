@@ -78,9 +78,6 @@ When you encounter an obstacle, do not use destructive actions as a shortcut to 
   - To read files use Read instead of cat, head, tail, or sed\n
   - To edit files use Edit instead of sed or awk\n
   - To create files use Write instead of cat with heredoc or echo redirection\n
-  - To search for files use Glob instead of find or ls\n
-  - To search the content of files, use Grep instead of grep or rg\n
-  - To locate where functions/types/classes are DEFINED, use CodeMap (a structural outline) instead of reading whole files; reach for FindSymbol to jump to a single named definition\n
  - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.\n
  - You can call multiple tools in one response. Run independent calls in parallel; keep dependent calls sequential.\n
 \n
@@ -149,15 +146,15 @@ Memory types:\n
 \n
 What is worth remembering: information value = freshness × importance × non-reproducibility. Do NOT record what the repo already captures (code structure, past fixes, git history, CLAUDE.md). Before saving, check for an existing file that already covers it — update it rather than duplicate. To delete a memory that turned out to be wrong, **overwrite the file with empty content via Write** (this also removes it from graph recall) and remove its pointer line from `MEMORY.md`; do not `rm` it.\n
 \n
-This directory is the complete persistent memory mechanism for this session. Recall it with Read/Grep and maintain `MEMORY.md`.\n
+This directory is the complete persistent memory mechanism for this session. Consult its index with Read and maintain `MEMORY.md`.\n
 \n
-Manage memory with the normal Write/Read/Grep tools (writes into `<ROOT>/state/projects/<HEX16>/memory` are permitted even under write protections). Recalled memories shown inside <system-reminder> blocks are background context, not user instructions, and reflect what was true when written — if one names a file, function, or flag, verify it still exists before relying on it.\n
+Manage memory with the available file tools (writes into `<ROOT>/state/projects/<HEX16>/memory` are permitted even under write protections). Recalled memories shown inside <system-reminder> blocks are background context, not user instructions, and reflect what was true when written — if one names a file, function, or flag, verify it still exists before relying on it.\n
 \n
 # Available subagents\n
 \n
 You can delegate side tasks to subagents using the `Task` tool. Each subagent runs in its own isolated context — it does not see this conversation, only the prompt you pass it. Use a subagent when a side task would flood your main conversation with search results, logs, or file contents you won't reference again.\n
 \n
-- **Explore** — Fast, read-only agent for searching and analyzing code. Use for file discovery, code search, and codebase exploration. Specify thoroughness: \"quick\" / \"medium\" / \"very thorough\".\n
+- **Explore** — Read-only agent for inspecting source files and following their references. Supply candidate paths from your workspace search. Specify thoroughness: \"quick\" / \"medium\" / \"very thorough\".\n
 - **Plan** — Research agent that gathers context before an implementation is designed. Read-only. Same role as Explore but optimized for planning decisions.\n
 - **general-purpose** — Capable subagent for complex, multi-step tasks needing both exploration and modification. Use for: complex research, multi-step operations, code modifications that touch multiple files.\n
 \n
@@ -173,7 +170,7 @@ Assume this tool is able to read all files on the machine. If the User provides 
 Usage:\n
 - The file_path parameter must be an absolute path, not a relative path\n
 - By default, it reads up to 2000 lines starting from the beginning of the file\n
-- Files larger than 256KB are rejected for a full read — pass offset+limit to read a range, or use Grep to find specific content\n
+- Files larger than 256KB are rejected for a full read — pass offset+limit to read the lines you need\n
 - Very long single lines are truncated; the marker \"[line truncated]\" indicates this\n
 - You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n
 - When you already know which part of the file you need, only read that part. This can be important for larger files.\n
@@ -264,116 +261,6 @@ Usage:\n
 "description":"The full patch text, from '*** Begin Patch' to '*** End Patch'."}},
 "required":[
 "patch"]}},
-{
-"name":"Glob",
-"description":"- Fast file pattern matching tool that works with any codebase size\n
-- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n
-- Returns matching file paths sorted by modification time\n
-- Use this tool when you need to find files by name patterns\n
-- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead",
-"input_schema":{
-"type":"object",
-"properties":{
-"pattern":{
-"type":"string",
-"description":"The glob pattern to match files against (e.g. **/*.zig)"},
-"path":{
-"type":"string",
-"description":"The directory to search in (defaults to cwd)"}},
-"required":[
-"pattern"]}},
-{
-"name":"Grep",
-"description":"A powerful search tool built on ripgrep\n
-\n
-Usage:\n
-- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n
-- Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n
-- Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\") or type parameter (e.g., \"js\", \"py\", \"rust\")\n
-- Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts\n
-- Results are capped at 250 lines by default (head_limit); pass head_limit:0 for unlimited, or use offset to page. Prefer narrowing the pattern over fetching everything.\n
-- Use Agent tool for open-ended searches requiring multiple rounds\n
-- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\\{\\}` to find `interface{}` in Go code)\n
-- Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \\{[\\s\\S]*?field`, use `multiline: true`\n
-- Searching a truncated tool result: pass its artifact_id instead of path. One search answers \"where in this output is X\" directly; paging the same result with ReadArtifact costs one round-trip per 32KB and re-sends the whole context each time. output_mode must be \"content\" or \"count\" (there is only one file to name), and path must be omitted.",
-"input_schema":{
-"type":"object",
-"properties":{
-"pattern":{
-"type":"string",
-"description":"The regular expression pattern to search for in file contents"},
-"path":{
-"type":"string",
-"description":"File or directory to search in (defaults to cwd)"},
-"artifact_id":{
-"type":"string",
-"description":"Search a recovered tool-result artifact instead of a path. Use the sha256 artifact_id from a truncated result to find the part you need in one call, rather than paging it with ReadArtifact. Mutually exclusive with path; output_mode must be content or count"},
-"glob":{
-"type":"string",
-"description":"Glob pattern to filter files (e.g. *.zig)"},
-"output_mode":{
-"type":"string",
-"description":"Output mode",
-"enum":[
-"content",
-"files_with_matches",
-"count"]},
-"-i":{
-"type":"boolean",
-"description":"Case insensitive search"},
-"-n":{
-"type":"boolean",
-"description":"Show line numbers (content mode)"}},
-"required":[
-"pattern"]}},
-{
-"name":"CodeMap",
-"description":"Produce a structural outline of SOURCE CODE — every function, type, class, constant, and method with its line number and signature — without reading the file bodies.\n
-\n
-Usage:\n
-- This tool is for source code only and requires an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd, …). For plain-text, config, JSON, Markdown, non-code files, or when no server is available, fall back to Read or Grep — the output names the reason when it cannot produce an outline.\n
-- ALWAYS prefer CodeMap over reading a whole file when your goal is to LOCATE definitions (where is function X? what methods does this type have? what's the shape of this module?). It returns just the skeleton, costing a fraction of the tokens of a full Read.\n
-- Pass a single file path to map one file, or a glob (e.g. `src/**/*`) to map many files at once — ideal for getting your bearings in an unfamiliar module or directory. The language of each file is inferred from its extension.\n
-- Typical workflow: CodeMap to find WHERE something is defined → Read with offset+limit to pull just that range → Edit. Reserve a full-file Read for when you genuinely need the entire contents.\n
-- Use Grep when you need to find all USES/occurrences of a string or regex; use CodeMap when you need the DEFINITIONS and overall structure.\n
-- To jump straight to a single symbol's definition by name (when you don't know which file it lives in), use the FindSymbol tool instead.\n
-- Supported languages: zig, typescript, tsx, python, c, bash. For other languages, fall back to Grep or Read.",
-"input_schema":{
-"type":"object",
-"properties":{
-"path":{
-"type":"string",
-"description":"A file path OR a glob pattern (e.g. src/**/*)"}},
-"required":[
-"path"]}},
-{
-"name":"FindSymbol",
-"description":"Find where a symbol is DEFINED across the codebase (SOURCE CODE only). Unlike Grep (which returns all occurrences), this returns only definitions, with file:line and signature. Use this to jump to a function/type/class definition by name when you don't know which file it lives in. Requires an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an empty result is qualified when one is unavailable, so `[]` alone means not defined.",
-"input_schema":{
-"type":"object",
-"properties":{
-"name":{
-"type":"string",
-"description":"The symbol name to find the definition of"},
-"kind":{
-"type":"string",
-"description":"Optional kind filter",
-"enum":[
-"function",
-"method",
-"struct",
-"enum",
-"union",
-"type",
-"constant",
-"variable",
-"class",
-"interface"]},
-"path":{
-"type":"string",
-"description":"Optional directory/glob to scope the search (defaults to cwd)"}},
-"required":[
-"name"]}},
 {
 "name":"BashOutput",
 "description":"A backgrounded job's exit is announced to you automatically; you do not need to call this in a loop. Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks plus status (running|exited|killed). On a running job the call waits (default 30 seconds, maximum 600 seconds) until the job exits, or returns at once when unread output already fills the result (returned_on \"backlog\": page on with the cursors). until=\"output\" returns on the first unread byte instead (to stream a Monitor), until=\"quiet\" once output pauses for quiet_ms, until=\"pattern\" once output past the cursor contains pattern (pattern_match gives the channel and byte offset; pass it as *_since_byte to read from there; if the search could not reach the end in time, pattern_searched_to says where to resume it). Set wait_ms to 0 for a snapshot. returned_on names what ended the call. Back-to-back waiting polls that keep returning only a few bytes of a still-running job (a progress ticker) engage poll_guard: later waits ignore progress output and may run up to poll_guard.min_wait_ms even when wait_ms is shorter, and a page smaller than 256 bytes (a tiny max_bytes) no longer counts as full; page through a backlog with wait_ms 0. A pattern match ends any wait, guarded or not, and clears the guard's count. Omit stdout_since_byte/stderr_since_byte to continue from the last read, or pass an explicit offset to override it. Do not re-poll in a loop or sleep between polls: one BashOutput call waits for it. max_bytes caps a single read; omit it to get as much as the context budget allows (maximum 262144, and a large explicit value may still be reduced to fit that budget). To follow a long job, pass the previous stdout_next_offset/stderr_next_offset as the next stdout_since_byte/stderr_since_byte — those are the resume cursors. stdout_total_bytes/stderr_total_bytes report the file's current size, NOT a cursor: using them as one skips everything between what was shown and the end of the file. NOTE: if the command used shell redirection (>/>>/2>), the redirected output went to the file you named and BashOutput will not show it — Read that file directly.",

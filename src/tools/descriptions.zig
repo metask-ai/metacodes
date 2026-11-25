@@ -26,7 +26,7 @@ const READ_DESC =
     \\Usage:
     \\- The file_path parameter must be an absolute path, not a relative path
     \\- By default, it reads up to 2000 lines starting from the beginning of the file
-    \\- Files larger than 256KB are rejected for a full read — pass offset+limit to read a range, or use Grep to find specific content
+    \\- Files larger than 256KB are rejected for a full read — pass offset+limit to read the lines you need
     \\- Very long single lines are truncated; the marker "[line truncated]" indicates this
     \\- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
     \\- When you already know which part of the file you need, only read that part. This can be important for larger files.
@@ -131,32 +131,6 @@ pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) any
 }
 
 // ============================================================================
-// CodeMap — tree-sitter 结构大纲。无 cc 对应物,描述自拟。
-// 动态:若 FindSymbol 在工具集(或可经 ToolSearch 激活)则提一句"找定义用它"。
-// 引导力度对齐 Grep:给明确 use case + "prefer over whole-file Read"。
-// ============================================================================
-pub fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    // FindSymbol 现为默认工具(2026-06-08 从 deferred 提出),无需 ToolSearch 激活;
-    // 描述里直接引导"按名找单个定义用 FindSymbol"。
-    _ = ctx;
-    return std.mem.concat(allocator, u8, &.{
-        \\Produce a structural outline of SOURCE CODE — every function, type, class, constant, and method with its line number and signature — without reading the file bodies.
-        \\
-        \\Usage:
-        \\- This tool is for source code only and requires an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd, …). For plain-text, config, JSON, Markdown, non-code files, or when no server is available, fall back to Read or Grep — the output names the reason when it cannot produce an outline.
-        \\- ALWAYS prefer CodeMap over reading a whole file when your goal is to LOCATE definitions (where is function X? what methods does this type have? what's the shape of this module?). It returns just the skeleton, costing a fraction of the tokens of a full Read.
-        \\- Pass a single file path to map one file, or a glob (e.g. `src/**/*`) to map many files at once — ideal for getting your bearings in an unfamiliar module or directory. The language of each file is inferred from its extension.
-        \\- Typical workflow: CodeMap to find WHERE something is defined → Read with offset+limit to pull just that range → Edit. Reserve a full-file Read for when you genuinely need the entire contents.
-        \\- Use Grep when you need to find all USES/occurrences of a string or regex; use CodeMap when you need the DEFINITIONS and overall structure.
-        ,
-        "\n- To jump straight to a single symbol's definition by name (when you don't know which file it lives in), use the FindSymbol tool instead.",
-        "\n",
-        \\- Supported languages: zig, typescript, tsx, python, c, bash. For other languages, fall back to Grep or Read.
-        ,
-    });
-}
-
-// ============================================================================
 // Bash — cc/src/tools/BashTool/prompt.ts
 // 动态:① background note;② Git 协议段(ctx.include_git);③ 只读 agent 提醒。
 // ============================================================================
@@ -185,6 +159,10 @@ const BASH_READONLY_NOTE =
 ;
 
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    const search =
+        "Use the shell to search the workspace, run builds and tests, and inspect Git. " ++
+        "Find files with `rg --files -g '*.zig'` and literal text with `rg -n -F -- 'text' src`. " ++
+        "Narrow the path where possible. When available, use Read for the matching lines, Edit for changes, and Write for new files.";
     const git_section = if (ctx.include_git and !ctx.isReadonlyAgent()) BASH_GIT_SECTION else "";
     const readonly_note = if (ctx.isReadonlyAgent()) BASH_READONLY_NOTE else "";
     // 复刻 codex 第③层:平台化工具描述。Windows 上用系统自带 PowerShell 跑(零 git-bash),
@@ -198,13 +176,13 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
             \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
             \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
             \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms); do not append '&'.
-            \\- VERY IMPORTANT: avoid search/read via the shell — use Grep, Glob, Read, LS tools instead of `Select-String`/`Get-Content`/`Get-ChildItem` for finding and reading files. If you still must grep, prefer ripgrep at `rg`.
+            \\- {s} If rg is unavailable, use Get-ChildItem and Select-String.
             \\- Chain multiple commands with ';'. DO NOT use newlines.
             \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
             \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
             \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-            \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
-        , .{ git_section, readonly_note });
+            \\- To read truncated output, pass its "<channel>_artifact_id" to ReadArtifact and continue at next_offset.{s}{s}
+        , .{ search, git_section, readonly_note });
     }
     return std.fmt.allocPrint(allocator,
         \\Executes a given bash command in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
@@ -214,12 +192,11 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
         \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
         \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.
-        \\- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Agent to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.
-        \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
+        \\- {s} If rg is unavailable, use find and grep within the project.
         \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
         \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-        \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
-    , .{ git_section, readonly_note });
+        \\- To read truncated output, pass its "<channel>_artifact_id" to ReadArtifact and continue at next_offset.{s}{s}
+    , .{ search, git_section, readonly_note });
 }
 
 // ============================================================================
@@ -307,23 +284,6 @@ test "describeGrep contains ALWAYS-use-Grep + agent line only when Agent enabled
     const d2 = try describeGrep(a, &no_agent);
     defer a.free(d2);
     try std.testing.expect(std.mem.indexOf(u8, d2, "open-ended searches") == null);
-}
-
-test "describeCodeMap guides toward definitions and prefers over whole-file Read" {
-    const a = std.testing.allocator;
-    const ctx = PromptContext{};
-    const d = try describeCodeMap(a, &ctx);
-    defer a.free(d);
-    try std.testing.expect(std.mem.indexOf(u8, d, "structural outline") != null);
-    // 核心引导:LOCATE 定义优先 CodeMap 而非整文件 Read
-    try std.testing.expect(std.mem.indexOf(u8, d, "prefer CodeMap over reading a whole file") != null);
-    // 提及 FindSymbol(已提为默认工具,不再需要 ToolSearch 激活)
-    try std.testing.expect(std.mem.indexOf(u8, d, "FindSymbol") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d, "ToolSearch") == null);
-    // 强调仅针对源代码
-    try std.testing.expect(std.mem.indexOf(u8, d, "source code only") != null);
-    // 含字面 glob 大括号不应导致格式化崩溃(用 concat 而非 allocPrint);语言中立 glob
-    try std.testing.expect(std.mem.indexOf(u8, d, "src/**/*`") != null);
 }
 
 test "describeBash includes Git section only when include_git and not readonly agent" {

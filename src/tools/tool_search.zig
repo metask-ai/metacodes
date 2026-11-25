@@ -129,7 +129,7 @@ fn visibleToModel(ctx: *const ToolContext, name: []const u8, deferred: bool) boo
 /// need their host contexts, standing in for the `tools.toToolDefinitionsFull`
 /// gates.
 fn staticVisible(ctx: *const ToolContext, t: *const tools.ToolEntry) bool {
-    if (!t.previewAllowed(ctx.preview)) return false;
+    if (t.embedding_only or !t.previewAllowed(ctx.preview)) return false;
     if (t.tinykg_gated and t.deferred and !kgReady(ctx)) return false;
     if (ctx.request_tools == null) {
         if (t.tinykg_gated and ctx.kg == null) return false;
@@ -484,9 +484,11 @@ test "ToolSearch: a miss names the loaded tools its keywords were after (#287)" 
     try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"file read write edit bash glob grep search\",\"max_results\":10}"));
     const d = detail orelse return error.TestExpectedDetail;
     const named = segment(d, NAMED_START, NAMED_END);
-    for ([_][]const u8{ "Read", "Write", "Edit", "Bash", "Glob", "Grep" }) |name| {
+    for ([_][]const u8{ "Read", "Write", "Edit", "Bash" }) |name| {
         try testing.expect(listHas(named, name));
     }
+    try testing.expect(!listHas(named, "Glob"));
+    try testing.expect(!listHas(named, "Grep"));
     try testing.expect(!listHas(named, "TaskCreate"));
     try testing.expect(!listHas(named, "ToolSearch"));
     try testing.expect(!listHas(named, "knowforge__search"));

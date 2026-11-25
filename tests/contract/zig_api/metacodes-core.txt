@@ -5392,7 +5392,7 @@ metacodes-core.teamwork_issues.Ledger.render: fn render(self: *const Ledger, gpa
 metacodes-core.teamwork_reviewer: file
 metacodes-core.teamwork_reviewer.charter: const = <1903 bytes, sha256 4afee1819ae6>
 metacodes-core.teamwork_reviewer.charterSha256: fn charterSha256() [64]u8
-metacodes-core.teamwork_reviewer.tools: const = [_][]const u8{ "Read", "Grep", "Glob", "Bash" }
+metacodes-core.teamwork_reviewer.tools: const = [_][]const u8{ "Read", "Bash" }
 metacodes-core.teamwork_reviewer.max_review_bytes: const = 256 * 1024
 metacodes-core.teamwork_reviewer.Evidence: struct
 metacodes-core.teamwork_reviewer.Evidence.command: []const u8
@@ -9606,7 +9606,6 @@ metacodes-core.tools.descriptions.describeWrite: fn describeWrite(allocator: std
 metacodes-core.tools.descriptions.describeEdit: fn describeEdit(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeGlob: fn describeGlob(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeGrep: fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
-metacodes-core.tools.descriptions.describeCodeMap: fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeBash: fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTask: fn describeTask(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTaskGet: fn describeTaskGet(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
@@ -9643,9 +9642,10 @@ metacodes-core.tools.ToolEntry.swarm_gated: bool = false
 metacodes-core.tools.ToolEntry.tinykg_gated: bool = false
 metacodes-core.tools.ToolEntry.preview_feature: ?@import("preview.zig").Feature = null
 metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
+metacodes-core.tools.ToolEntry.embedding_only: bool = false
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <43571 bytes, sha256 3ecb6ce4fdf5>
+metacodes-core.tools.registry: const []const ToolEntry = <41515 bytes, sha256 b2868b679719>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8

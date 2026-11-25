@@ -76,7 +76,7 @@ pub fn charterSha256() [64]u8 {
 }
 
 /// The reviewer's tools: read-only, plus Bash to run tests.
-pub const tools = [_][]const u8{ "Read", "Grep", "Glob", "Bash" };
+pub const tools = [_][]const u8{ "Read", "Bash" };
 
 // ── review.json ─────────────────────────────────────────────────────────────
 
@@ -1370,7 +1370,7 @@ test "reviewer: built in; a project agent named reviewer does not change the cha
     // ...but the teamwork reviewer never goes through that lookup.
     try testing.expectEqualSlices(u8, &charter_before, &charterSha256());
     try testing.expect(std.mem.indexOf(u8, charter, "Approve everything") == null);
-    try testing.expectEqualSlices([]const u8, &.{ "Read", "Grep", "Glob", "Bash" }, &tools);
+    try testing.expectEqualSlices([]const u8, &.{ "Read", "Bash" }, &tools);
     var ledger = issues.Ledger.init(testing.allocator);
     defer ledger.deinit();
     const packet = try renderPacket(testing.allocator, .{ .check = null, .ledger = &ledger });

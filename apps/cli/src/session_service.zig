@@ -330,7 +330,7 @@ pub const INIT_PROMPT =
     \\provided to future Claude Code sessions as project memory.
     \\
     \\What to do:
-    \\  1) Explore the codebase (use Read/Glob/Grep/CodeMap and the Bash tool for `git`/build files) to
+    \\  1) Explore the codebase (use Bash to find files and search code, then Read the relevant lines) to
     \\     understand: build & test & lint commands, the high-level architecture, key modules and how they
     \\     fit together, and any non-obvious conventions.
     \\  2) If a CLAUDE.md already exists, improve it rather than overwrite — preserve anything still correct.

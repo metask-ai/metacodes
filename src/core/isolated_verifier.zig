@@ -12,7 +12,7 @@
 //!     later boundary the previous verifier's failing probes. The actor's
 //!     transcript, handoff, task list, memory and commit messages are never
 //!     passed: there is no parameter that could carry them;
-//!   * tools — `Bash`, `Read`, `Grep`, `Glob` only; no file-writing tool, no
+//!   * tools — `Bash` and `Read` only; no file-writing tool, no
 //!     `Agent`, MCP, Skills, web or KG tool;
 //!   * `kg`, `dyn_registry`, `mcp_sessions`, `host_services`, `read_state`,
 //!     `file_change_journal`, `jobs`, `agent_jobs` — null;
@@ -97,7 +97,7 @@ pub fn charterSha256Hex() [64]u8 {
 /// The only tools the verifier can call. No file-writing tool, no `Agent`,
 /// no MCP, Skill, web or KG tool. `Bash` is the only write vector, and its
 /// working directory is the snapshot.
-pub const TOOL_NAMES = [_][]const u8{ "Bash", "Read", "Grep", "Glob" };
+pub const TOOL_NAMES = [_][]const u8{ "Bash", "Read" };
 
 // ── Bounds (§5.2, §6) ───────────────────────────────────────────────────────
 
@@ -110,7 +110,7 @@ pub const VERIFIER_WALL_MS: u64 = 300_000;
 pub const LEADS_MAX_TURNS: u32 = 3;
 pub const LEADS_MAX_BYTES: usize = 2048;
 /// Tools the actor may run during a leads round; everything else is refused.
-pub const LEADS_ALLOWED_TOOLS = [_][]const u8{ "Read", "Grep", "Glob" };
+pub const LEADS_ALLOWED_TOOLS = [_][]const u8{"Read"};
 
 pub const FAIL_MARKER = "[verifier] FAIL";
 pub const LEADS_MARKER = "[verifier] UNVERIFIED";
@@ -905,7 +905,7 @@ pub fn renderFailContinuation(allocator: std.mem.Allocator, evidence: []const Ev
 pub fn renderLeadsRequest(allocator: std.mem.Allocator, not_established: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, LEADS_MARKER ++ "\nAn isolated verifier could not establish the following about your work:\n{s}\n\n" ++
         "Reply with evidence leads only: commands to run, files to read, test names, and inputs that exercise each item. " ++
-        "Files cannot be changed in this round: only Read, Grep and Glob run, for at most {d} turns.", .{
+        "Files cannot be changed in this round: only Read runs, for at most {d} turns.", .{
         if (not_established.len > 0) not_established else "(no list was given)",
         LEADS_MAX_TURNS,
     });
@@ -989,7 +989,7 @@ test "compose: the verifier only demotes, unavailable is never a PASS" {
     try testing.expect(!compose(false, .{ .pass = report }).passed);
 }
 
-test "verifierToolDefs: only Bash, Read, Grep and Glob, never a write, Agent, MCP or Skill tool" {
+test "verifierToolDefs: only Bash and Read, never a write, Agent, MCP or Skill tool" {
     const a = testing.allocator;
     const defs = try @import("../tools.zig").toToolDefinitions(a);
     defer a.free(defs);

@@ -91,7 +91,7 @@ const NullBackend = struct {
 const FILES = 12;
 
 /// Temp root with `FILES` small files of distinct content, and the inputs the
-/// traces use: one Glob that always finds nothing, and one Read per file.
+/// traces use: one Read of an empty file, and one Read per file.
 const Fixture = struct {
     tmp: std.testing.TmpDir,
     root_buf: [std.fs.max_path_bytes]u8 = undefined,
@@ -103,7 +103,8 @@ const Fixture = struct {
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
         self.root = harness.normalizeSlashes(self.root_buf[0..try self.tmp.dir.realPath(std.testing.io, &self.root_buf)]);
-        self.poll = try std.fmt.allocPrint(allocator, "{{\"pattern\":\"*.none\",\"path\":\"{s}\"}}", .{self.root});
+        try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "empty", .data = "" });
+        self.poll = try std.fmt.allocPrint(allocator, "{{\"file_path\":\"{s}/empty\"}}", .{self.root});
         for (0..FILES) |i| {
             var name_buf: [16]u8 = undefined;
             var body_buf: [32]u8 = undefined;
@@ -195,7 +196,7 @@ const Responses = struct {
 fn pollingTrace(allocator: std.mem.Allocator, fx: *const Fixture, rounds: usize) !Responses {
     var out = Responses{};
     errdefer out.deinit(allocator);
-    for (0..rounds) |_| try out.round(allocator, &.{.{ .name = "Glob", .input = fx.poll }});
+    for (0..rounds) |_| try out.round(allocator, &.{.{ .name = "Read", .input = fx.poll }});
     try out.final(allocator);
     return out;
 }
@@ -218,13 +219,13 @@ test "L2 stall gate: the same call answered with the same bytes stops the run af
     try std.testing.expect(out.ends_with_tool_results);
     const report = out.result.stall.?;
     try std.testing.expectEqual(stall.Cause.repeating, report.cause);
-    try std.testing.expectEqualStrings("Glob", report.tool.slice());
+    try std.testing.expectEqualStrings("Read", report.tool.slice());
     try std.testing.expectEqual(@as(u32, 4), report.repeats);
     try std.testing.expectEqual(@as(u32, 4), report.stale_rounds);
     // What the REPL prints names the tool, the count and how to continue.
     const notice = try stall.renderStopNotice(a, report);
     defer a.free(notice);
-    try std.testing.expect(std.mem.indexOf(u8, notice, "Glob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, notice, "续接") != null);
 
     try std.testing.expectEqual(@as(usize, 1), out.record.records);
@@ -252,7 +253,7 @@ test "L2 stall gate: a run whose rounds each bring something new is never stoppe
     defer trace.deinit(a);
     // Every round repeats the same stale poll and reads one file not read
     // before: twelve rounds, twelve identical poll calls, no stop.
-    for (0..FILES) |i| try trace.round(a, &.{ .{ .name = "Glob", .input = fx.poll }, .{ .name = "Read", .input = fx.reads[i] } });
+    for (0..FILES) |i| try trace.round(a, &.{ .{ .name = "Read", .input = fx.poll }, .{ .name = "Read", .input = fx.reads[i] } });
     try trace.final(a);
 
     const out = try runTrace(a, &fx, trace.items.items, .enforce);

@@ -151,12 +151,17 @@ fn runTurn(a: std.mem.Allocator, mode: cc.types_mod.PermissionMode, root: []cons
     permission.no_interactive_prompt = true;
     var null_backend = NullBackend{};
     const backend = null_backend.backend();
+    const names = [_][]const u8{ "Grep", "Read" };
+    var catalog = try cc.tool_catalog.Catalog.initBuiltins(a, &names);
+    defer catalog.deinit();
+    var selection = try cc.tool_catalog.Selection.init(a, &catalog, &names);
+    defer selection.deinit();
     const result = try cc.agent_loop.run(
         &conversation,
         client.provider(),
-        &.{},
+        selection.definitions,
         &permission,
-        .{ .max_turns = 2, .cwd_abs = root, .resolve_relative_paths = true },
+        .{ .max_turns = 2, .cwd_abs = root, .resolve_relative_paths = true, .tool_dispatcher = selection.dispatcher() },
         &backend,
         a,
     );

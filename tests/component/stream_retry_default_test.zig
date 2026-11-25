@@ -326,18 +326,20 @@ test "issue #461: two distinct model requests in one Run each get their own re-i
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(&tmp, &root_buf);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "marker-461.md", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "marker-461.md", .data = "reissued-read-result" });
     var input: std.Io.Writer.Allocating = .init(a);
     defer input.deinit();
-    try input.writer.writeAll("{\"pattern\":\"*.md\",\"path\":");
-    try std.json.Stringify.encodeJsonString(root, .{}, &input.writer);
+    const marker = try std.fs.path.join(a, &.{ root, "marker-461.md" });
+    defer a.free(marker);
+    try input.writer.writeAll("{\"file_path\":");
+    try std.json.Stringify.encodeJsonString(marker, .{}, &input.writer);
     try input.writer.writeAll("}");
-    const glob_call = try toolCallSse(a, "toolu_glob", "Glob", input.written());
-    defer a.free(glob_call);
+    const read_call = try toolCallSse(a, "toolu_read", "Read", input.written());
+    defer a.free(read_call);
 
-    // Request 1 is cut, re-issued, and calls Glob; request 2 is cut,
+    // Request 1 is cut, re-issued, and reads the marker file; request 2 is cut,
     // re-issued, and answers.
-    var fx = try Fixture.init(a, &.{ TEXT_THEN_EOF, glob_call, THINKING_THEN_EOF, COMPLETE });
+    var fx = try Fixture.init(a, &.{ TEXT_THEN_EOF, read_call, THINKING_THEN_EOF, COMPLETE });
     defer fx.deinit();
     try fx.run(.{ .root = root });
 
@@ -346,7 +348,7 @@ test "issue #461: two distinct model requests in one Run each get their own re-i
     try expectRestartNudged(try fx.body(0), try fx.body(1));
     try expectRestartNudged(try fx.body(2), try fx.body(3));
     try std.testing.expect(!std.mem.eql(u8, try fx.body(1), try fx.body(2)));
-    try std.testing.expect(std.mem.indexOf(u8, try fx.body(3), "marker-461.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try fx.body(3), "reissued-read-result") != null);
     // The first turn's re-issue did not use up the second's: each is the
     // first of its request.
     try std.testing.expectEqual(@as(usize, 2), fx.events.count("retry 1/2 after 0\n"));

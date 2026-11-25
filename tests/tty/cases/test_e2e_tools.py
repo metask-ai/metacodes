@@ -79,31 +79,25 @@ def test_e2e_grep(bin_path):
     require_model()
     with open("/tmp/cc_e2e_grep.txt", "w") as f:
         f.write("noise\nGREP_E2E_NEEDLE\nmore\n")
-    # 自然提示词。MiniMax 在满工具集下选搜索工具高度不确定(实测同 prompt 多次在
-    # Grep/Bash/TaskCreate 间漂移)——接受 Grep 或 Bash 完成搜索都算"意图满足"。
-    # Grep 工具自身的 schema 正确性由 L2 tool_schema_coverage_test 守卫,不靠真模型采样。
     assert_tool_e2e(
         bin_path,
         "Search for the text GREP_E2E_NEEDLE in the file /tmp/cc_e2e_grep.txt",
-        "Grep",
-        required_keys=["pattern"],
+        "Bash",
+        required_keys=["command"],
         wait_s=14,
         require_card=False,
-        accept_tools=["Grep", "Bash"],
     )
 
 
 def test_e2e_glob(bin_path):
     require_model()
-    # 同 Grep:接受 Glob 或 Bash(ls/find)完成查找。
     assert_tool_e2e(
         bin_path,
         "Find all files matching *.txt in the /tmp directory",
-        "Glob",
-        required_keys=["pattern"],
+        "Bash",
+        required_keys=["command"],
         wait_s=14,
         require_card=False,
-        accept_tools=["Glob", "Bash"],
     )
 
 

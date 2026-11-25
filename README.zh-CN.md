@@ -147,7 +147,7 @@ TinyKG 是 Metask Lab 自研的图存储，用 Zig 编写。它的源码暂未�
 
 - **与模型无关。** 支持 Anthropic Messages、OpenAI Chat Completions 和 Responses、Gemini，并为 GLM、Kimi、DeepSeek、Qwen、MiniMax 提供模型族适配；自定义的 OpenAI 兼容端点同样可用，包括 loopback 上的本地服务。
 - **读取 Claude Code 和 Codex 的配置。** Skill、agent 和 MCP server 配置原样可用。支持 MCP 2026-07-28 以及更早的握手版本。
-- **懂语言服务器。** 编辑后有 LSP 诊断，另有 CodeMap 和 FindSymbol。
+- **懂语言服务器。** Read 可查看源码大纲，编辑后可获得 LSP 诊断。
 
 ### 安全与可观测性
 

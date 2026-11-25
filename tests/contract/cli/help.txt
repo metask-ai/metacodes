@@ -128,8 +128,8 @@ Usage: metacodes [options]
   --no-theme            Disable colors
   --verbose             Verbose output
   --lsp                 Enable language server integration (default; overrides an earlier --no-lsp)
-  --no-lsp              Disable language server integration (Edit/Write diagnostics, CodeMap,
-                        FindSymbol, Read outline). Servers are only started for a language
+  --no-lsp              Disable language server integration (Edit/Write diagnostics,
+                        Read outline). Servers are only started for a language
                         whose server is installed, inside a git project with a build marker.
   --agent-teams         Enable teams/teammates (TeamCreate/SendMessage; delegate to parallel teammate agents)
   --teammate-mode <m>   Teammate spawn backend: "process" (out-of-process, worktree-isolated) or "thread" (default, in-process)

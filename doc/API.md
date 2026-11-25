@@ -14,6 +14,15 @@ The Zig `sandbox_exec` namespace exposes platform discovery; no C ABI fields
 or wire layouts change. See [sandbox execution](SANDBOX_DESIGN.md) for the
 helper contract and the current network-policy limits.
 
+The CLI uses Bash for workspace file discovery and text search. Use `rg --files`
+to list matching paths and `rg -n -F` to locate literal text, then Read the
+matching lines. Supply the resulting paths when delegating to the read-only
+Explore or Plan agent. Use Edit and Write for file changes. For source structure,
+Read accepts `outline=true` when a language server is available. For captured
+output, page with ReadArtifact using the returned artifact ID and next offset.
+Embedding hosts can still select the AgentCore workspace search tools under
+their existing shell policy.
+
 ## Compatibility matrix
 
 | Interface | Entry point | Status | Compatibility rule |

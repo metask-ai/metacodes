@@ -311,7 +311,7 @@ query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入�
   kind `lesson` 写至多 4 条(`holds_when:` / `uncertain:` / `lesson:` / 可选 `supersedes:`)。
   只有接受了 lesson 且已有同题 lesson 时才发 reconcile 消息。每段至多 6 个模型轮次。
 - **边界**:答案在学习回合开始前已定为 final,学习文本一律是 commentary;学习段里只有
-  Read / Grep / Glob / KgRecall / KgContext / KgRemember 能跑,过程传感器与环境故障熔断都不计这些
+  Read / KgRecall / KgContext / KgRemember 能跑,过程传感器与环境故障熔断都不计这些
   轮次。`KgRemember` 在学习回合之外、或 lesson 头与宿主所见不符时拒绝写入;宿主自有、按类型读回的
   其它类型(`kg/reserved_types.zig`:临时规则、撤回、任务义务、结局行、义务遥测、provider 审计、
   本体快照四类)一律拒绝(`ReservedMemoryType`),因为读回方只按类型认节点,分不出作者。
@@ -335,7 +335,7 @@ query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入�
 起一个全新的子 agent,对照原始任务逐项找证据。它只能降级,不能升级。
 - **隔离**:不是 `AgentDef`,同名项目 agent 无法顶替;system prompt 是编译期常量 `CHARTER`(SHA-256
   进记录);唯一的 user 消息是 packet(任务原文、钉住检查与计数、快照路径与 `base`/`candidate` 两个
-  ref,第二个边界另带上次 FAIL 的 probe);工具只有 Bash / Read / Grep / Glob;kg、Skills、MCP、宿主
+  ref,第二个边界另带上次 FAIL 的 probe);工具只有 Bash / Read;kg、Skills、MCP、宿主
   服务、read state、文件改动账本、后台任务全为 null。工作目录是工作区的 git 快照(临时 index,不碰
   actor 的 index / HEAD / ref / stash;独立仓库经 alternates 读对象;结束后总是删除),绑定树 id **T**,
   返回后重算 T′,不等即 `unavailable`(`workspace_changed`)。
@@ -346,7 +346,7 @@ query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入�
 - **检查门接线**:`Options.isolated_verifier: ?isolated_verifier.Options`(需要 `check_gate`,根 Run,
   canonical `buildRunOptions` 不带)。enforce:FAIL 变成 `failed`(`State.last_source = .verifier`),
   在检查门同一个续跑预算内续跑,续跑消息只引用复现过的证据块;UNVERIFIED 且还有预算时开一轮只读
-  leads(至多 3 轮,只跑 Read / Grep / Glob,占一次续跑),再起一个新验证者看同一个 T。observe 只记录。
+  leads(至多 3 轮,只跑 Read,占一次续跑),再起一个新验证者看同一个 T。observe 只记录。
   每 Run 至多 2 个边界、每边界至多 2 次 spawn,单次 US$0.20、整 Run US$0.60、单次 300 s。
 - **收尾形态**:print 模式下检查门未武装时,`host_check.runAndIngestVerified` 在干净通过之后跑一次,
   enforce 在 `host_run` 行上写 `"verifier"` 限定(provenance 不变);`verdict.effectiveRank` 让
@@ -598,7 +598,7 @@ AgentCore v1 把它投影为 `tool_loop`(冻结的线上枚举不增值)。
 | 形态 | 何时 | 内容 | 可恢复 |
 |---|---|---|---|
 | **原文** | 结果 ≤ 本轮**水位线** | 逐字节原样 | — |
-| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` / `Grep(artifact_id)` |
+| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact`，显式提供 Grep 的宿主也可用 `Grep(artifact_id)` |
 | **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误),且捕获完整并 ≤ `PER_RESULT_MAX_BYTES` | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
 | **清空桩** | 仅压缩期,且**该结果没有 artifact** | `[tool result cleared to save context]` + 承诺行(`original_bytes` + sha256) | ❌ |
 
@@ -626,7 +626,7 @@ fallback 那一行的限定条件不是修辞:发布失败后要渲染 head/tail
 issue #29 的行为(不知道能取回,就改命令重跑)。
 
 **预算在字节存在之前就生效。** `ToolEntry.result_production` 把生产方式分三类,其中
-`byte_zero_spool`(Glob/Grep/CodeMap/FindSymbol/Bash/两个 MCP 读取/WebFetch)在第一个字节前
+`byte_zero_spool`(宿主 Glob/Grep、Bash/两个 MCP 读取/WebFetch)在第一个字节前
 就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
 
 **artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
@@ -881,7 +881,7 @@ glm-5.3-flash:catalog 推出的可用输入 917,504,实测 ≈883K 就拒)。所
 时,两个前端都渲染成 recovery 而非压缩。
 
 **恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
-O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。`Grep` 因此接受
+O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。提供 `Grep` 的 AgentCore 宿主可接受
 `artifact_id` 替代 `path`:blob 本来就是普通文件,一次 ripgrep 就能定位。CAS 路径
 **不得**进入模型可见结果(泄漏它等于让任意文件工具绕过有界恢复契约),故 artifact
 模式强制 `--no-filename`,并拒绝 `files_with_matches`——该模式的全部输出就是路径。
@@ -903,8 +903,7 @@ O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。
 
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回
-`legacy_inline` executor。当前原生 byte-zero 清单是 `Glob`、`Grep`、`CodeMap`、
-`FindSymbol`、`Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
+`legacy_inline` executor。当前原生 byte-zero 清单是 宿主的 `Glob`、`Grep`，以及 `Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
 其中 Bash 在第一个 stdout/stderr 字节前重定向到 JobRegistry 文件；没有长生命周期
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
 不会退回 pipe 全量捕获。已完成的 Bash 信封**不**给出 spool 路径:`<channel>_path` 曾经存在

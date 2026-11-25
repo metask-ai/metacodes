@@ -281,8 +281,6 @@ pub const bash = @import("metacodes-internal").tools.bash;
 pub const grep = @import("metacodes-internal").tools.grep;
 pub const glob = @import("metacodes-internal").tools.glob;
 pub const read_tool = @import("metacodes-internal").tools.read;
-pub const find_symbol_tool = @import("metacodes-internal").tools.find_symbol;
-pub const code_map_tool = @import("metacodes-internal").tools.code_map;
 pub const symbol_provider = @import("metacodes-internal").tools.symbol_provider;
 pub const lsp = @import("metacodes-internal").lsp.lsp;
 pub const write_tool = @import("metacodes-internal").tools.write;
@@ -5905,8 +5903,8 @@ fn printHelp() void {
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
         \\  --lsp                 Enable language server integration (default; overrides an earlier --no-lsp)
-        \\  --no-lsp              Disable language server integration (Edit/Write diagnostics, CodeMap,
-        \\                        FindSymbol, Read outline). Servers are only started for a language
+        \\  --no-lsp              Disable language server integration (Edit/Write diagnostics,
+        \\                        Read outline). Servers are only started for a language
         \\                        whose server is installed, inside a git project with a build marker.
         \\  --agent-teams         Enable teams/teammates (TeamCreate/SendMessage; delegate to parallel teammate agents)
         \\  --teammate-mode <m>   Teammate spawn backend: "process" (out-of-process, worktree-isolated) or "thread" (default, in-process)
