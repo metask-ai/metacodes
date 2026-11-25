@@ -59,9 +59,8 @@ def pull_sources(task: Path) -> Iterator[tuple[str, str]]:
 
 
 QUOTED = r'''(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')'''
-KEY = r"(" + QUOTED + r"""|[^\s"'{\[].*?)\s*:"""
-FLOW_PAIR = re.compile(KEY + r"\s*(.*)")
-BLOCK_PAIR = re.compile(KEY + r"(?:\s+(.*)|$)")
+FLOW_PAIR = re.compile(r"(" + QUOTED + r"|[^:,]+?)\s*:\s*(.*)")
+BLOCK_TOKEN = re.compile(QUOTED + r"|(?<!\S)#|:(?=\s|$)")
 COMMENT = re.compile(QUOTED + r"|(?<!\S)#[^\n]*")
 ANCHOR = re.compile(r"&([^\s,\[\]{}]+)(?:\s+|$)")
 DOCUMENT_LINE = re.compile(r"^(?:%.*|(?:---|\.\.\.)\s*(?:#.*)?)$")
@@ -125,6 +124,17 @@ def list_item(text):
     return text == "-" or text.startswith("- ")
 
 
+def block_pair(text):
+    if text.startswith(("&", "*", "{", "[", "|", ">", "!")):
+        return None
+    for token in BLOCK_TOKEN.finditer(text):
+        if token[0] == "#":
+            break
+        if token[0] == ":":
+            return text[:token.start()].rstrip(), text[token.end():].lstrip()
+    return None
+
+
 def compose_value(text, anchors, lines=(), parent_indent=None):
     anchor = ANCHOR.match(text)
     if anchor:
@@ -159,7 +169,7 @@ def compose_block(lines, anchors, *, root=False):
     depth = indent(lines[0])
     first = lines[0].lstrip()
     sequence = list_item(first)
-    if first.startswith("{") or (not root and not sequence and not BLOCK_PAIR.fullmatch(first)):
+    if first.startswith("{") or (not root and not sequence and not block_pair(first)):
         return compose_value(lines.popleft().strip(), anchors, lines, depth)
     block = [] if sequence else {}
     while lines and indent(lines[0]) >= depth:
@@ -173,9 +183,10 @@ def compose_block(lines, anchors, *, root=False):
         if sequence:
             block.append(compose_value(line[1:].strip(), anchors, lines, depth))
         else:
-            pair = BLOCK_PAIR.fullmatch(line)
+            pair = block_pair(line)
             if pair:
-                put(block, pair[1], compose_value(pair[2] or "", anchors, lines, depth))
+                key, text = pair
+                put(block, key, compose_value(text, anchors, lines, depth))
     return block
 
 
