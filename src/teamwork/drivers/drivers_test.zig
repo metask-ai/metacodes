@@ -1123,7 +1123,10 @@ fn expectSeatGroupKilled(mode: enum { timeout, wallclock, abort }) !void {
             signal.abort(.user_interrupt);
         }
     };
-    const thread = if (mode == .abort) try std.Thread.spawn(.{}, Aborter.run, .{ &abort, fake.pidfilePath().ptr }) else null;
+    const thread = if (mode == .abort)
+        try @import("platform").thread.spawn(.waiter, Aborter.run, .{ &abort, fake.pidfilePath().ptr })
+    else
+        null;
     defer if (thread) |t| t.join();
     const started = util_time.nowMs();
     var outcome = try impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
