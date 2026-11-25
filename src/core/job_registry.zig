@@ -312,10 +312,7 @@ pub const JobRegistry = struct {
         var steps: std.ArrayList(ExpiryStep) = .empty;
         defer steps.deinit(self.allocator);
         while (true) {
-            steps.clearRetainingCapacity();
-            self.claimExpired(null, util_time.nowMs(), &steps);
-            self.sendTerm(steps.items);
-            self.killDue(util_time.nowMs());
+            self.sweepDue(&steps, util_time);
             self.lock();
             defer self.unlock();
             if (self.sweeper_quit) return;
@@ -326,6 +323,13 @@ pub const JobRegistry = struct {
             }
             if (self.sweeper_quit) return;
         }
+    }
+
+    fn sweepDue(self: *JobRegistry, steps: *std.ArrayList(ExpiryStep), clock: anytype) void {
+        steps.clearRetainingCapacity();
+        self.claimExpired(null, clock.nowMs(), steps);
+        self.sendTerm(steps.items, clock);
+        self.killDue(clock.nowMs());
     }
 
     fn nextExpiryWaitLocked(self: *JobRegistry, now_ms: util_time.Millis) ?u64 {
@@ -937,11 +941,11 @@ pub const JobRegistry = struct {
         }
     }
 
-    fn sendTerm(self: *JobRegistry, steps: []const ExpiryStep) void {
+    fn sendTerm(self: *JobRegistry, steps: []const ExpiryStep, clock: anytype) void {
         for (steps) |step| {
             holdBeforeTermInTests();
             process.terminate(step.proc);
-            const kill_at = util_time.nowMs() + @as(util_time.Millis, @intCast(process.KILL_GRACE_MS));
+            const kill_at = clock.nowMs() + @as(util_time.Millis, @intCast(process.KILL_GRACE_MS));
             self.lock();
             defer self.unlock();
             const entry = self.getPtrLocked(step.id[0..]) orelse continue;
@@ -999,7 +1003,7 @@ pub const JobRegistry = struct {
 
     fn stopWithGrace(self: *JobRegistry, steps: []ExpiryStep) void {
         if (steps.len == 0) return;
-        self.sendTerm(steps);
+        self.sendTerm(steps, util_time);
         util_time.sleepMs(process.KILL_GRACE_MS);
         self.killScheduled(steps);
     }
@@ -2047,12 +2051,64 @@ test "a monitor stdout line longer than one read is delivered once, then the nex
     try std.testing.expectEqualStrings(&expected, lines.items);
 }
 
-fn expectMonitorsExpireWithoutWriting(
-    a: std.mem.Allocator,
-    count: usize,
-    stagger_ms: util_time.Millis,
-    write_after_s: []const u8,
-) !void {
+test "a monitor expiring during another monitor's grace period is signalled at its own deadline" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const command = "trap 'echo term' TERM; echo ready; while :; do sleep 0.05; done";
+    const first = try r.spawnMonitorOwned(command, null, owner, "first", null);
+    const second = try r.spawnMonitorOwned(command, null, owner, "second", null);
+    const jobs = [_]JobEntry{ first, second };
+    for (jobs, [_]util_time.Millis{ 0, 50 }) |job, start_ms| {
+        try waitForOutput(&r, job.idSlice(), "ready\n".len);
+        const entry = &r.jobs.items[monitorIndex(&r, job.idSlice())];
+        entry.started_ms = start_ms;
+        entry.kind.monitor.timeout_ms = 1_000;
+    }
+    var clock = struct {
+        ms: util_time.Millis,
+
+        fn nowMs(self: @This()) util_time.Millis {
+            return self.ms;
+        }
+    }{ .ms = 1_000 };
+    var steps: std.ArrayList(JobRegistry.ExpiryStep) = .empty;
+    defer steps.deinit(a);
+    r.sweepDue(&steps, clock);
+    try waitForOutput(&r, first.idSlice(), "ready\nterm\n".len);
+    try std.testing.expectEqual(@as(?monitor_stream.Stop, null), r.get(second.idSlice()).?.kind.monitor.stop);
+    const next = r.nextExpiryWaitLocked(clock.ms);
+    try std.testing.expectEqual(@as(?u64, 50), next);
+    clock.ms += @intCast(next.?);
+    r.sweepDue(&steps, clock);
+    try waitForOutput(&r, second.idSlice(), "ready\nterm\n".len);
+    for (jobs) |job| {
+        try std.testing.expectEqual(JobStatus.running, r.get(job.idSlice()).?.status);
+        try std.testing.expectEqual(process.ReapStatus.running, process.reapNonblock(job.proc));
+    }
+    clock.ms += process.KILL_GRACE_MS;
+    r.sweepDue(&steps, clock);
+    for (jobs) |job| try std.testing.expectEqual(JobStatus.killed, r.get(job.idSlice()).?.status);
+
+    const notices = try r.takeMonitorEvents(owner, a, clock.ms);
+    defer monitor_stream.freeNotices(a, notices);
+    try std.testing.expectEqual(@as(usize, 2), notices.len);
+    for (notices, jobs) |notice, job| {
+        try std.testing.expectEqual(job.id, notice.id);
+        try std.testing.expectEqualStrings("ready\nterm", notice.event);
+        try std.testing.expectEqual(@as(?monitor_stream.End, .{ .expired = .{
+            .after_ms = 1_000,
+            .events_delivered = 2,
+        } }), notice.end);
+    }
+}
+
+test "more monitors than one batch expiring together are all signalled at the deadline" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const count = 20;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2060,10 +2116,9 @@ fn expectMonitorsExpireWithoutWriting(
     var r = try JobRegistry.init(a);
     defer r.deinit();
     const owner = @import("session_id.zig").gen();
-    const ids = try a.alloc([12]u8, count);
-    defer a.free(ids);
-    for (ids, 0..) |*id, index| {
-        const command = try std.fmt.allocPrint(a, "sleep {s}; touch marker-{d}", .{ write_after_s, index });
+    var ids: [count][12]u8 = undefined;
+    for (&ids, 0..) |*id, index| {
+        const command = try std.fmt.allocPrint(a, "sleep 1.15; touch marker-{d}", .{index});
         defer a.free(command);
         id.* = (try r.spawnMonitorOwned(command, root, owner, "batch", 1_000)).id;
     }
@@ -2071,7 +2126,7 @@ fn expectMonitorsExpireWithoutWriting(
         r.lock();
         defer r.unlock();
         const base = r.jobs.items[monitorIndex(&r, ids[0][0..])].started_ms;
-        for (ids, 0..) |id, index| r.jobs.items[monitorIndex(&r, id[0..])].started_ms = base + stagger_ms * @as(util_time.Millis, @intCast(index));
+        for (ids) |id| r.jobs.items[monitorIndex(&r, id[0..])].started_ms = base;
     }
     util_time.sleepMs(1_800);
     for (0..count) |index| {
@@ -2083,16 +2138,6 @@ fn expectMonitorsExpireWithoutWriting(
     defer monitor_stream.freeNotices(a, notices);
     try std.testing.expectEqual(count, notices.len);
     for (notices) |notice| try std.testing.expectEqual(@as(?monitor_stream.End, .{ .expired = .{ .after_ms = 1_000, .events_delivered = 0 } }), notice.end);
-}
-
-test "a monitor expiring during another monitor's grace period is signalled at its own deadline" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try expectMonitorsExpireWithoutWriting(std.testing.allocator, 2, 50, "1.1");
-}
-
-test "more monitors than one batch expiring together are all signalled at the deadline" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try expectMonitorsExpireWithoutWriting(std.testing.allocator, 20, 0, "1.15");
 }
 
 test "an expired monitor's worker that ignores TERM does not outlive the grace period" {
