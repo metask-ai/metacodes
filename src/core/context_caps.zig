@@ -188,7 +188,7 @@ pub fn noteAccepted(endpoint: []const u8, model: []const u8, prompt_tokens: u64)
     }
 }
 
-/// Host entry point (src/main.zig): persist learned caps under `root`. Call
+/// Host entry point (apps/cli/src/main.zig): persist learned caps under `root`. Call
 /// before the first lookup; a later call reloads from the new location.
 pub fn configureStateRoot(root: []const u8) void {
     lock();

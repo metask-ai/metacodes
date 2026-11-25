@@ -93,6 +93,7 @@ const Findings = struct {
     wiring: Violations = .empty,
     wide_roots: Violations = .empty,
     unowned: Violations = .empty,
+    named: std.ArrayList([2][]const u8) = .empty,
     upward_counts: [][]usize,
     deep_counts: [][]usize,
     depends: [][]bool,
@@ -298,6 +299,7 @@ fn analyze(arena: std.mem.Allocator, layers: Layers, files: []const SourceFile, 
                 for (wiring.imports) |wired| {
                     if (!std.mem.eql(u8, wired.root, root) or !std.mem.eql(u8, wired.name, import.literal)) continue;
                     try addEdge(arena, layers, &findings, path, import.line, wired.target, .named);
+                    try findings.named.append(arena, .{ path, wired.target });
                 }
             }
         }
@@ -540,6 +542,8 @@ fn collect(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, prefix: []con
 fn readTree(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir) ![]const SourceFile {
     var files: std.ArrayList(SourceFile) = .empty;
     try collect(arena, io, root, "src", &files);
+    try collect(arena, io, root, "apps", &files);
+    try collect(arena, io, root, "packages", &files);
     try collect(arena, io, root, "tests", &files);
     std.mem.sort(SourceFile, files.items, {}, struct {
         fn lessThan(_: void, left: SourceFile, right: SourceFile) bool {
@@ -556,15 +560,56 @@ fn readZ(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8
 const Base = struct {
     manifest: Manifest,
     baseline: Baseline,
+    ref: ?[]const u8 = null,
+    files: []const [2][]const u8 = &.{},
+    moves: []const [2][]const u8 = &.{},
+
+    fn source(base: Base, arena: std.mem.Allocator, io: std.Io, path: []const u8) !?[:0]const u8 {
+        if (base.ref) |ref| {
+            const contents = try git(arena, io, &.{ "git", "show", try std.fmt.allocPrint(arena, "{s}:{s}", .{ ref, path }) }) orelse return null;
+            return try arena.dupeZ(u8, contents);
+        }
+        for (base.files) |file| {
+            if (std.mem.eql(u8, file[0], path)) return try arena.dupeZ(u8, file[1]);
+        }
+        return null;
+    }
 };
 
-fn growth(arena: std.mem.Allocator, base: Base, manifest: Manifest, baseline: Baseline) !usize {
+fn growth(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base: Base,
+    layers: Layers,
+    files: []const SourceFile,
+    findings: Findings,
+    baseline: Baseline,
+) !usize {
     var problems: usize = 0;
-    inline for (.{ Category.upward, Category.deep, Category.wiring, Category.wide_roots }) |category| {
+    const manifest = layers.manifest;
+    const base_layers = try resolveLayers(arena, base.manifest);
+    var base_upward: std.StringHashMapUnmanaged(void) = .empty;
+    for (try baselineKeys(arena, .upward, base.baseline)) |key| try base_upward.put(arena, key, {});
+    var base_violations = try base_upward.clone(arena);
+    for (try baselineKeys(arena, .deep, base.baseline)) |key| try base_violations.put(arena, key, {});
+    inline for (.{ Category.upward, Category.deep }) |category| {
+        const before = if (category == .upward) base_upward else base_violations;
+        for (@field(baseline, @tagName(category))) |entry| {
+            const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ entry[0], entry[1] });
+            if (before.contains(key)) continue;
+            if (try exposedBySplit(arena, io, base, base_layers, entry)) continue;
+            if (try carriedByMove(arena, io, base, base_layers, category, before, entry)) continue;
+            if (category == .deep and try reroutedThroughEntry(arena, base, findings, before, entry)) continue;
+            problems += 1;
+            std.debug.print("layer_baseline.zon: {s} entry `{s}` is not in the base's baseline, which only shrinks\n", .{ @tagName(category), key });
+        }
+    }
+    inline for (.{ Category.wiring, Category.wide_roots }) |category| {
         var before: std.StringHashMapUnmanaged(void) = .empty;
         for (try baselineKeys(arena, category, base.baseline)) |key| try before.put(arena, key, {});
         for (try baselineKeys(arena, category, baseline)) |key| {
             if (before.contains(key)) continue;
+            if (category == .wide_roots and sharesWideRoot(layers, base.baseline.wide_roots, key)) continue;
             problems += 1;
             std.debug.print("layer_baseline.zon: {s} entry `{s}` is not in the base's baseline, which only shrinks\n", .{ @tagName(category), key });
         }
@@ -586,14 +631,100 @@ fn growth(arena: std.mem.Allocator, base: Base, manifest: Manifest, baseline: Ba
         std.debug.print("layers.zon: kernel_budget gains `{s}`; it only shrinks\n", .{dependency});
     }
     for (manifest.packages) |package| {
-        const before = basePackage(base.manifest, package.name) orelse continue;
+        const before = base_layers.index(package.name) orelse continue;
         for (package.allowed_dependencies) |dependency| {
-            if (indexOfPath(before.allowed_dependencies, dependency) < before.allowed_dependencies.len) continue;
+            const allowed_before = base.manifest.packages[before].allowed_dependencies;
+            if (indexOfPath(allowed_before, dependency) < allowed_before.len) continue;
+            if (base_layers.index(dependency) == null and try reachesNoFurther(arena, io, base, layers, base_layers, files, dependency, before)) continue;
             problems += 1;
             std.debug.print("layers.zon: `{s}` newly allows `{s}`; allowed_dependencies do not widen\n", .{ package.name, dependency });
         }
     }
     return problems;
+}
+
+fn carriedByMove(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base: Base,
+    base_layers: Layers,
+    category: Category,
+    before: std.StringHashMapUnmanaged(void),
+    entry: [2][]const u8,
+) !bool {
+    const was = [2][]const u8{ pathInBase(base, entry[0]), pathInBase(base, entry[1]) };
+    if (std.mem.eql(u8, was[0], entry[0]) and std.mem.eql(u8, was[1], entry[1])) return false;
+    if (before.contains(try std.fmt.allocPrint(arena, "{s} -> {s}", .{ was[0], was[1] }))) return true;
+    return category == .deep and try exposedBySplit(arena, io, base, base_layers, was);
+}
+
+fn reroutedThroughEntry(
+    arena: std.mem.Allocator,
+    base: Base,
+    findings: Findings,
+    before: std.StringHashMapUnmanaged(void),
+    entry: [2][]const u8,
+) !bool {
+    for (findings.named.items) |named| {
+        if (!std.mem.eql(u8, named[1], entry[0])) continue;
+        const direct = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ named[0], entry[1] });
+        if (findings.deep.contains(direct) or findings.upward.contains(direct)) continue;
+        const key = try std.fmt.allocPrint(arena, "{s} -> {s}", .{ pathInBase(base, named[0]), pathInBase(base, entry[1]) });
+        if (before.contains(key)) return true;
+    }
+    return false;
+}
+
+fn sharesWideRoot(layers: Layers, base_roots: []const []const u8, root: []const u8) bool {
+    const package = layers.owner(root) orelse return false;
+    const dir = std.fs.path.dirnamePosix(root) orelse "";
+    for (base_roots) |other| {
+        if (layers.owner(other) != package) continue;
+        if (std.mem.eql(u8, std.fs.path.dirnamePosix(other) orelse "", dir)) return true;
+    }
+    return false;
+}
+
+fn pathInBase(base: Base, path: []const u8) []const u8 {
+    for (base.moves) |move| {
+        if (std.mem.eql(u8, move[1], path)) return move[0];
+    }
+    return path;
+}
+
+fn exposedBySplit(arena: std.mem.Allocator, io: std.Io, base: Base, base_layers: Layers, entry: [2][]const u8) !bool {
+    const owner = base_layers.owner(entry[0]) orelse return false;
+    if (base_layers.owner(entry[1]) != owner) return false;
+    const source = try base.source(arena, io, entry[0]) orelse return false;
+    for (try importsOf(arena, source)) |import| {
+        const target = try resolve(arena, entry[0], import.literal) orelse continue;
+        if (std.mem.eql(u8, target, entry[1])) return true;
+    }
+    return false;
+}
+
+fn reachesNoFurther(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base: Base,
+    layers: Layers,
+    base_layers: Layers,
+    files: []const SourceFile,
+    new_package: []const u8,
+    before: usize,
+) !bool {
+    const added = layers.index(new_package).?;
+    for (layers.manifest.packages[added].allowed_dependencies) |dependency| {
+        const target = base_layers.index(dependency) orelse return false;
+        if (!base_layers.mayDepend(before, target)) return false;
+    }
+    for (files) |file| {
+        if (layers.owner(file.path) != added) continue;
+        const owner_before = base_layers.owner(file.path) orelse return false;
+        if (!base_layers.mayDepend(before, owner_before)) return false;
+        if (try base.source(arena, io, file.path) == null) return false;
+    }
+    return true;
 }
 
 fn withinSomeCycle(members: []const []const u8, cycles: []const []const []const u8) bool {
@@ -603,13 +734,6 @@ fn withinSomeCycle(members: []const []const u8, cycles: []const []const []const 
         } else return true;
     }
     return false;
-}
-
-fn basePackage(manifest: Manifest, package_name: []const u8) ?Package {
-    for (manifest.packages) |package| {
-        if (std.mem.eql(u8, package.name, package_name)) return package;
-    }
-    return null;
 }
 
 fn parseBase(arena: std.mem.Allocator, layers_text: [:0]const u8, baseline_text: [:0]const u8) !Base {
@@ -647,7 +771,24 @@ fn readBase(arena: std.mem.Allocator, io: std.Io, ref: []const u8) !?Base {
         const contents = try git(arena, io, &.{ "git", "show", object }) orelse return error.InvalidBase;
         text.* = try arena.dupeZ(u8, contents);
     }
-    return try parseBase(arena, texts[0], texts[1]);
+    var base = try parseBase(arena, texts[0], texts[1]);
+    base.ref = ref;
+    base.moves = try movesSince(arena, io, ref);
+    return base;
+}
+
+fn movesSince(arena: std.mem.Allocator, io: std.Io, ref: []const u8) ![]const [2][]const u8 {
+    const listing = try git(arena, io, &.{ "git", "diff", "--name-status", "-M", "--diff-filter=R", ref, "--", "src", "apps", "packages", "tests" }) orelse return error.InvalidBase;
+    var moves: std.ArrayList([2][]const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        _ = fields.next();
+        const from = fields.next() orelse return error.InvalidBase;
+        const to = fields.next() orelse return error.InvalidBase;
+        try moves.append(arena, .{ from, to });
+    }
+    return moves.items;
 }
 
 const Outcome = struct {
@@ -660,9 +801,10 @@ fn run(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, wiring_text: []co
     const manifest = try parseZon(Manifest, arena, "layers.zon", try readZ(arena, io, root, "layers.zon"));
     const baseline = try parseZon(Baseline, arena, "layer_baseline.zon", try readZ(arena, io, root, "layer_baseline.zon"));
     const layers = try resolveLayers(arena, manifest);
-    const findings = try analyze(arena, layers, try readTree(arena, io, root), try parseWiring(arena, wiring_text));
+    const files = try readTree(arena, io, root);
+    const findings = try analyze(arena, layers, files, try parseWiring(arena, wiring_text));
     var problems = try check(arena, layers, findings, baseline);
-    if (base) |before| problems += try growth(arena, before, manifest, baseline);
+    if (base) |before| problems += try growth(arena, io, before, layers, files, findings, baseline);
     return .{ .layers = layers, .findings = findings, .problems = problems };
 }
 
@@ -750,6 +892,13 @@ const clean_tree = [_][2][]const u8{
     .{ "src/repl/view.zig", "const main = @import(\"../main.zig\");\n" },
 };
 
+const TestBase = struct {
+    layers: [:0]const u8,
+    baseline: [:0]const u8,
+    files: []const [2][]const u8 = &clean_tree,
+    moves: []const [2][]const u8 = &.{},
+};
+
 fn checkTree(files: []const [2][]const u8, layers_text: []const u8, baseline_text: []const u8, wiring: []const u8) !usize {
     return checkTreeAgainst(files, layers_text, baseline_text, wiring, null);
 }
@@ -759,7 +908,7 @@ fn checkTreeAgainst(
     layers_text: []const u8,
     baseline_text: []const u8,
     wiring: []const u8,
-    base_texts: ?[2][:0]const u8,
+    test_base: ?TestBase,
 ) !usize {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -771,7 +920,12 @@ fn checkTreeAgainst(
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const base = if (base_texts) |texts| try parseBase(arena.allocator(), texts[0], texts[1]) else null;
+    var base: ?Base = null;
+    if (test_base) |given| {
+        base = try parseBase(arena.allocator(), given.layers, given.baseline);
+        base.?.files = given.files;
+        base.?.moves = given.moves;
+    }
     const outcome = try run(arena.allocator(), std.testing.io, tmp.dir, wiring, base);
     return outcome.problems;
 }
@@ -909,7 +1063,7 @@ const grown_baseline =
 ;
 
 test "the baseline may not grow against the base, even when it matches the tree" {
-    const base = [2][:0]const u8{ test_layers, test_baseline };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
     try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, test_layers, test_baseline, test_wiring, base));
     const tree = withFile("src/util/log.zig", "const view = @import(\"../repl/view.zig\");\n");
     try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, test_layers, grown_baseline, test_wiring));
@@ -917,7 +1071,7 @@ test "the baseline may not grow against the base, even when it matches the tree"
 }
 
 test "the kernel budget and allowed_dependencies may not widen against the base" {
-    const base = [2][:0]const u8{ test_layers, test_baseline };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
     const raised = comptime blk: {
         const needle = ".max_lines = 3";
         const at = std.mem.indexOf(u8, test_layers, needle).?;
@@ -929,12 +1083,12 @@ test "the kernel budget and allowed_dependencies may not widen against the base"
         const at = std.mem.indexOf(u8, test_layers, needle).?;
         break :blk test_layers[0..at] ++ "\"src/tools/\" }, .allowed_dependencies = .{\"base\"} }," ++ test_layers[at + needle.len ..];
     };
-    const narrower_base = [2][:0]const u8{ narrower, test_baseline };
+    const narrower_base = TestBase{ .layers = narrower, .baseline = test_baseline };
     try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&clean_tree, test_layers, test_baseline, test_wiring, narrower_base));
 }
 
 test "a shrinking baseline and budget pass against the base" {
-    const base = [2][:0]const u8{ test_layers, test_baseline };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
     var tree = clean_tree;
     tree[2][1] = "const fs = @import(\"../util/fs.zig\");\n";
     const shrunk_layers = comptime blk: {
@@ -956,4 +1110,452 @@ test "a shrinking baseline and budget pass against the base" {
         \\
     ;
     try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, shrunk_layers, shrunk_baseline, test_wiring, base));
+}
+
+const split_layers =
+    \\.{
+    \\    .packages = .{
+    \\        .{ .name = "base", .paths = .{ "src/util/", "src/types.zig", "src/util_root.zig" }, .allowed_dependencies = .{} },
+    \\        .{ .name = "kernel", .paths = .{"src/core/agent_loop.zig"}, .allowed_dependencies = .{"base"} },
+    \\        .{ .name = "coding", .paths = .{ "src/core/", "src/tools/" }, .allowed_dependencies = .{ "base", "kernel" } },
+    \\        .{ .name = "facade", .paths = .{"src/main.zig"}, .allowed_dependencies = .{ "base", "kernel", "coding" } },
+    \\        .{ .name = "cli", .paths = .{"src/repl/"}, .allowed_dependencies = .{ "base", "kernel", "coding", "facade" } },
+    \\        .{ .name = "tests", .paths = .{"tests/"}, .allowed_dependencies = .{ "base", "kernel", "coding", "facade", "cli" } },
+    \\    },
+    \\    .kernel_budget = .{ .package = "kernel", .max_lines = 3, .max_dependencies = .{ "base", "coding" } },
+    \\}
+    \\
+;
+
+const split_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/bash.zig" },
+    \\        .{ "src/repl/view.zig", "src/main.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\}
+    \\
+;
+
+test "splitting a package records its inner edges without growing against the base" {
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    const split_wiring = "module\tsrc/util/platform.zig\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, split_layers, split_baseline, split_wiring, base));
+    const tree = withFile("src/tools/grep.zig", "const fs = @import(\"../util/fs.zig\");\n");
+    const grown = comptime blk: {
+        const needle = "    .deep = .{\n";
+        const at = std.mem.indexOf(u8, split_baseline, needle).?;
+        break :blk split_baseline[0 .. at + needle.len] ++ "        .{ \"src/tools/grep.zig\", \"src/util/fs.zig\" },\n" ++ split_baseline[at + needle.len ..];
+    };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, split_layers, grown, split_wiring, base));
+}
+
+test "a new package is allowed only when it reaches no package the dependent could not" {
+    const shim_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"shim\", .paths = .{\"src/shim/\"}, .allowed_dependencies = .{ \"base\", \"kernel\" } },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"shim\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, shim_layers, test_baseline, test_wiring, base));
+    const narrower = comptime blk: {
+        const needle = "\"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++ "\"src/tools/\" }, .allowed_dependencies = .{\"base\"} }," ++ test_layers[at + needle.len ..];
+    };
+    const narrower_base = TestBase{ .layers = narrower, .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&clean_tree, shim_layers, test_baseline, test_wiring, narrower_base));
+}
+
+test "a split only excuses edges the base tree already had" {
+    const split_wiring = "module\tsrc/util/platform.zig\n";
+    const tree = withFile("src/repl/extra.zig", "const main = @import(\"../main.zig\");\n");
+    const grown = comptime blk: {
+        const needle = "        .{ \"src/repl/view.zig\", \"src/main.zig\" },\n";
+        const at = std.mem.indexOf(u8, split_baseline, needle).?;
+        break :blk split_baseline[0..at] ++ "        .{ \"src/repl/extra.zig\", \"src/main.zig\" },\n" ++ split_baseline[at..];
+    };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, split_layers, grown, split_wiring, base));
+    const base_with_extra = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &tree };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, split_layers, grown, split_wiring, base_with_extra));
+}
+
+test "a new package may not carry files the dependent could not reach before" {
+    const tree = withFile("src/repl/leaf.zig", "");
+    const leaf_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"leaf\", .paths = .{\"src/repl/leaf.zig\"}, .allowed_dependencies = .{} },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"leaf\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &tree };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, leaf_layers, test_baseline, "module\tsrc/util/platform.zig\n", base));
+}
+
+test "a deep entry may not turn into an upward one" {
+    const narrower = comptime blk: {
+        const needle = "\"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++ "\"src/tools/\" }, .allowed_dependencies = .{\"base\"} }," ++ test_layers[at + needle.len ..];
+    };
+    const upgraded =
+        \\.{
+        \\    .upward = .{
+        \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+        \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\    },
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\    .cycles = .{
+        \\        .{ "kernel", "coding" },
+        \\    },
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&clean_tree, narrower, upgraded, test_wiring));
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&clean_tree, narrower, upgraded, test_wiring, base));
+}
+
+test "a new package may not take files from paths the base did not own" {
+    const tree = withFile("src/leaf/view.zig", "");
+    const leaf_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"leaf\", .paths = .{\"src/leaf/\"}, .allowed_dependencies = .{} },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"leaf\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &withFile("src/repl/leaf.zig", "") };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, leaf_layers, test_baseline, "module\tsrc/util/platform.zig\n", base));
+}
+
+test "a new package may not take files the base tree did not have, even under a path it assigned" {
+    const tree = withFile("src/core/leaf/view.zig", "");
+    const leaf_layers = comptime blk: {
+        const needle = "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\" } },";
+        const at = std.mem.indexOf(u8, test_layers, needle).?;
+        break :blk test_layers[0..at] ++
+            "        .{ .name = \"leaf\", .paths = .{\"src/core/leaf/\"}, .allowed_dependencies = .{} },\n" ++
+            "        .{ .name = \"coding\", .paths = .{ \"src/core/\", \"src/tools/\" }, .allowed_dependencies = .{ \"base\", \"kernel\", \"leaf\" } }," ++
+            test_layers[at + needle.len ..];
+    };
+    const wiring = "module\tsrc/util/platform.zig\n";
+    const moved = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &withFile("src/repl/leaf.zig", "") };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&tree, leaf_layers, test_baseline, wiring, moved));
+    const kept = TestBase{ .layers = test_layers, .baseline = test_baseline, .files = &tree };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, leaf_layers, test_baseline, wiring, kept));
+}
+
+const moved_tree = [_][2][]const u8{
+    .{ "src/util/fs.zig", "const std = @import(\"std\");\n" },
+    .{ "src/util/platform.zig", "" },
+    .{ "src/core/agent_loop.zig", "const fs = @import(\"../util/fs.zig\");\nconst bash = @import(\"../tools/shell.zig\");\n" },
+    .{ "src/tools/shell.zig", "const loop = @import(\"../core/agent_loop.zig\");\nconst fs = @import(\"../util/fs.zig\");\n" },
+    .{ "src/core/compact.zig", "const loop = @import(\"agent_loop.zig\");\n" },
+    .{ "src/main.zig", "const loop = @import(\"core/agent_loop.zig\");\nconst bash = @import(\"tools/shell.zig\");\n" },
+    .{ "src/repl/view.zig", "const main = @import(\"../main.zig\");\n" },
+};
+
+const moved_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/shell.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/shell.zig" },
+    \\        .{ "src/tools/shell.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/shell.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{},
+    \\}
+    \\
+;
+
+test "a file moved since the base keeps the entries it had there" {
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&moved_tree, test_layers, moved_baseline, test_wiring));
+    const unmoved = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 4), try checkTreeAgainst(&moved_tree, test_layers, moved_baseline, test_wiring, unmoved));
+    const moved = TestBase{ .layers = test_layers, .baseline = test_baseline, .moves = &.{.{ "src/tools/bash.zig", "src/tools/shell.zig" }} };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&moved_tree, test_layers, moved_baseline, test_wiring, moved));
+}
+
+test "a file moved into a lower package may not carry an import that is now upward" {
+    const tree = clean_tree[0..6].* ++ [_][2][]const u8{
+        .{ "src/util/view.zig", "const main = @import(\"../main.zig\");\n" },
+    };
+    const lowered =
+        \\.{
+        \\    .upward = .{
+        \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+        \\        .{ "src/util/view.zig", "src/main.zig" },
+        \\    },
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\    .cycles = .{
+        \\        .{ "base", "kernel", "coding", "cli" },
+        \\    },
+        \\    .wiring = .{},
+        \\    .wide_roots = .{},
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, test_layers, lowered, test_wiring));
+    const moved = TestBase{ .layers = test_layers, .baseline = test_baseline, .moves = &.{.{ "src/repl/view.zig", "src/util/view.zig" }} };
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&tree, test_layers, lowered, test_wiring, moved));
+}
+
+test "a file moved into a lower package keeps the imports that reach it from its old package" {
+    const tree = clean_tree[0..5].* ++ [_][2][]const u8{
+        .{ "src/main.zig", "const loop = @import(\"core/agent_loop.zig\");\nconst bash = @import(\"tools/bash.zig\");\nconst view = @import(\"core/view.zig\");\n" },
+        .{ "src/core/view.zig", "const fs = @import(\"../util/fs.zig\");\n" },
+    };
+    const base_tree = clean_tree[0..5].* ++ [_][2][]const u8{
+        .{ "src/main.zig", "const loop = @import(\"core/agent_loop.zig\");\nconst bash = @import(\"tools/bash.zig\");\nconst view = @import(\"repl/view.zig\");\n" },
+        .{ "src/repl/view.zig", "const fs = @import(\"../util/fs.zig\");\n" },
+    };
+    const base_baseline =
+        \\.{
+        \\    .upward = .{
+        \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+        \\    },
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/repl/view.zig", "src/util/fs.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\    .cycles = .{
+        \\        .{ "kernel", "coding" },
+        \\    },
+        \\    .wiring = .{},
+        \\    .wide_roots = .{},
+        \\}
+        \\
+    ;
+    const lowered =
+        \\.{
+        \\    .upward = .{
+        \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+        \\    },
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/core/view.zig", "src/util/fs.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/core/view.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\    .cycles = .{
+        \\        .{ "kernel", "coding" },
+        \\    },
+        \\    .wiring = .{},
+        \\    .wide_roots = .{},
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, test_layers, lowered, test_wiring));
+    const unmoved = TestBase{ .layers = test_layers, .baseline = base_baseline, .files = &base_tree };
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&tree, test_layers, lowered, test_wiring, unmoved));
+    const moved = TestBase{ .layers = test_layers, .baseline = base_baseline, .files = &base_tree, .moves = &.{.{ "src/repl/view.zig", "src/core/view.zig" }} };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, test_layers, lowered, test_wiring, moved));
+}
+
+const entry_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\        .{ "src/tools/entry.zig", "src/core/agent_loop.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{},
+    \\}
+    \\
+;
+
+const entry_kept_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\        .{ "src/tools/entry.zig", "src/core/agent_loop.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{},
+    \\}
+    \\
+;
+
+const entry_wider_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\        .{ "src/tools/entry.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/entry.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{},
+    \\}
+    \\
+;
+
+test "a deep import moved behind an entry module keeps the base's entry, only for its importers' targets and only once the direct import is gone" {
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    var tree = withFile("src/tools/entry.zig", "pub const loop = @import(\"../core/agent_loop.zig\");\npub const bash = @import(\"bash.zig\");\n");
+    tree[5][1] = "const internal = @import(\"internal\");\n";
+    const wiring = test_wiring ++ "module\tsrc/tools/entry.zig\nimport\tsrc/main.zig\tinternal\tsrc/tools/entry.zig\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, test_layers, entry_baseline, wiring));
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, test_layers, entry_baseline, wiring, base));
+
+    var wider = tree;
+    wider[wider.len - 1][1] = "pub const loop = @import(\"../core/agent_loop.zig\");\npub const fs = @import(\"../util/fs.zig\");\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&wider, test_layers, entry_wider_baseline, wiring));
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&wider, test_layers, entry_wider_baseline, wiring, base));
+
+    var kept = tree;
+    kept[5][1] = "const internal = @import(\"internal\");\nconst loop = @import(\"core/agent_loop.zig\");\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&kept, test_layers, entry_kept_baseline, wiring));
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&kept, test_layers, entry_kept_baseline, wiring, base));
+
+    var unimported = tree;
+    unimported[5][1] = "";
+    const unwired = test_wiring ++ "module\tsrc/tools/entry.zig\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&unimported, test_layers, entry_baseline, unwired));
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&unimported, test_layers, entry_baseline, unwired, base));
+}
+
+const entry_layers =
+    \\.{
+    \\    .packages = .{
+    \\        .{ .name = "base", .paths = .{ "src/util/", "src/types.zig", "src/util_root.zig", "src/util_entry.zig" }, .allowed_dependencies = .{} },
+    \\        .{ .name = "kernel", .paths = .{"src/core/agent_loop.zig"}, .allowed_dependencies = .{"base"} },
+    \\        .{ .name = "coding", .paths = .{ "src/core/", "src/tools/" }, .allowed_dependencies = .{ "base", "kernel" } },
+    \\        .{ .name = "cli", .paths = .{ "src/repl/", "src/main.zig" }, .allowed_dependencies = .{ "base", "kernel", "coding" } },
+    \\        .{ .name = "tests", .paths = .{"tests/"}, .allowed_dependencies = .{ "base", "kernel", "coding", "cli" } },
+    \\    },
+    \\    .kernel_budget = .{ .package = "kernel", .max_lines = 3, .max_dependencies = .{ "base", "coding" } },
+    \\}
+    \\
+;
+
+const wide_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/bash.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{ "src/util_entry.zig", "src/util_root.zig" },
+    \\}
+    \\
+;
+
+const wide_base_baseline =
+    \\.{
+    \\    .upward = .{
+    \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+    \\    },
+    \\    .deep = .{
+    \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+    \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/main.zig", "src/tools/bash.zig" },
+    \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+    \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+    \\    },
+    \\    .cycles = .{
+    \\        .{ "kernel", "coding" },
+    \\    },
+    \\    .wiring = .{},
+    \\    .wide_roots = .{"src/util_root.zig"},
+    \\}
+    \\
+;
+
+test "a new wide module root passes against the base only beside a wide root of its package" {
+    const tree = clean_tree ++ [_][2][]const u8{ .{ "src/util_root.zig", "" }, .{ "src/util_entry.zig", "" } };
+    const wiring = test_wiring ++ "module\tsrc/util_root.zig\nmodule\tsrc/util_entry.zig\n";
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, entry_layers, wide_baseline, wiring));
+    const beside = TestBase{ .layers = test_layers, .baseline = wide_base_baseline };
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, entry_layers, wide_baseline, wiring, beside));
+    const alone = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&tree, entry_layers, wide_baseline, wiring, alone));
 }

@@ -6,7 +6,7 @@ they may do with them.
 - **Status:** accepted, 2026-10-28. Describes the code as of this date;
   where the code and this record disagree, the code is the fact and this
   record is out of date.
-- **Scope:** `src/repl/` on an interactive terminal. `-p/--print`
+- **Scope:** `apps/cli/src/repl/` on an interactive terminal. `-p/--print`
   (`headless.zig`) has no region and is outside it.
 - **Enforced by:** `zig build test:scrollback`
   (`scripts/tests/test_scrollback_discipline.py`), part of `zig build test`
@@ -20,7 +20,7 @@ they may do with them.
 
 metacodes does not take over the screen. The input box, spinner, tool cards
 and footer are drawn as a *region* at the bottom of the main screen
-(`RenderRegion`, `src/repl/tui/render_region.zig`); the conversation is
+(`RenderRegion`, `apps/cli/src/repl/tui/render_region.zig`); the conversation is
 printed above it and scrolls into the terminal's own scrollback, like any
 command's output. The scrollback has no undo: a byte that lands in the wrong
 place stays in the user's history. A redraw cannot repair it, because the
@@ -177,7 +177,7 @@ row's place on the screen.
 
 ### Review checklist
 
-A change under `src/repl/` that writes to the terminal:
+A change under `apps/cli/src/repl/` that writes to the terminal:
 
 1. Does every byte that can appear while the region is on the screen go
    through the Renderer (`emitToScroll`, `emitTerminal`, `emitScrollback`,
@@ -202,7 +202,7 @@ A change under `src/repl/` that writes to the terminal:
 
 `zig build test:scrollback` runs
 [`scripts/tests/test_scrollback_discipline.py`](../scripts/tests/test_scrollback_discipline.py)
-over `src/repl/` (comments and `test` blocks excluded; string literals decoded
+over `apps/cli/src/repl/` (comments and `test` blocks excluded; string literals decoded
 as Zig reads them) and fails the build on:
 
 - ED 1/2/3 bytes outside `tui/ansi.zig`, or `ansi.clear.screen`,
@@ -215,12 +215,12 @@ as Zig reads them) and fails the build on:
 
 The scan is static. It cannot see *when* a listed function writes (that
 `cmd_output` prints only between reads, for example), writes outside
-`src/repl/`, or an alias of `platform.fs` under another name; invariants 2, 3
+`apps/cli/src/repl/`, or an alias of `platform.fs` under another name; invariants 2, 3
 and 6 are behaviour, held by the tests below and by review.
 
 Behaviour tests:
 
-- `src/repl/tui/render_region.zig`: "input-phase clear walks up the tracked
+- `apps/cli/src/repl/tui/render_region.zig`: "input-phase clear walks up the tracked
   rows and erases with ED0", "generation erase walks up from the edit row,
   clears with ED0, returns to the half line", "after the terminal narrows,
   both erase paths climb the rows it re-wrapped the last frame into", "a

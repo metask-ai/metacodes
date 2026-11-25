@@ -3,7 +3,7 @@
 //! `scripts/build-project-harness-kernel.sh`), field for field, with the
 //! runtime's own constants substituted, and the formal kernel's hash-bound
 //! receipt. Referenced only from `test` blocks and their helpers in
-//! `project_provenance.zig` and `app/doctor.zig`: the imports sit in those
+//! `project_provenance.zig` and `core/doctor.zig`: the imports sit in those
 //! files, but Zig's lazy analysis reaches this module only when a test is
 //! compiled, so the product binary never contains it. The import cycle with
 //! `project_provenance.zig` (for its schema constants) is likewise test-only.

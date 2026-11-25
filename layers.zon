@@ -78,7 +78,6 @@
             .paths = .{
                 "src/core/agent_session.zig",
                 "src/core/session_host.zig",
-                "src/lib.zig",
             },
             .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding" },
         },
@@ -88,25 +87,19 @@
             .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session" },
         },
         .{
-            .name = "agentcore",
-            .paths = .{"src/agentcore/"},
+            .name = "facade",
+            .paths = .{ "src/lib.zig", "src/internal.zig" },
             .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" },
         },
         .{
+            .name = "agentcore",
+            .paths = .{"packages/agentcore/"},
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade" },
+        },
+        .{
             .name = "cli",
-            .paths = .{
-                "src/repl/",
-                "src/web/",
-                "src/daemon/",
-                "src/app/",
-                "src/main.zig",
-                "src/app.zig",
-                "src/session_service.zig",
-                "src/session_intent.zig",
-                "src/install_root.zig",
-                "src/picker_test_root.zig",
-            },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "agentcore" },
+            .paths = .{"apps/cli/"},
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore" },
         },
         .{
             .name = "testing",
@@ -114,12 +107,12 @@
                 "tests/_harness/",
                 "tests/helpers/",
             },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "agentcore", "cli" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli" },
         },
         .{
             .name = "tests",
-            .paths = .{"tests/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "agentcore", "cli", "testing" },
+            .paths = .{ "tests/", "apps/cli/tests/" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli", "testing" },
         },
     },
     .kernel_budget = .{

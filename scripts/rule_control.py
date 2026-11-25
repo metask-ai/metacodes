@@ -662,7 +662,7 @@ def observe_memory_evidence_governance(repo: Path) -> Observation:
         "system": "src/core/system_prompt.zig",
         "context": "src/tools/kg_tools.zig",
         "tools": "src/tools.zig",
-        "test": "tests/component/kg_integration_test.zig",
+        "test": "apps/cli/tests/component/kg_integration_test.zig",
         "build": "build.zig",
     }
     paths: dict[str, Path] = {}
@@ -696,7 +696,7 @@ def observe_memory_evidence_governance(repo: Path) -> Observation:
         )
 
     step = build_step_slice(sources["build"], "test:kg-governance")
-    test_wired = step is not None and '"tests/component/kg_integration_test.zig"' in step
+    test_wired = step is not None and '"apps/cli/tests/component/kg_integration_test.zig"' in step
     if not test_wired:
         errors.append(
             "knowledge-governance L2 is not wired into build step test:kg-governance"
@@ -806,7 +806,7 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
         "client": "src/kg/client.zig",
         "ledger": "src/kg/execution_knowledge.zig",
         "task_tools": "src/tools/task_tools.zig",
-        "test": "tests/component/kg_integration_test.zig",
+        "test": "apps/cli/tests/component/kg_integration_test.zig",
         "build": "build.zig",
     }
     paths: dict[str, Path] = {}
@@ -926,7 +926,7 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
     step = build_step_slice(sources["build"], "test:kg-ontology-feedback")
     test_wired = (
         step is not None
-        and '"tests/component/kg_integration_test.zig"' in step
+        and '"apps/cli/tests/component/kg_integration_test.zig"' in step
         and "kg_ontology_feedback_step.dependOn(&run_t.step)" in step
     )
     feedback_checks = {
@@ -993,7 +993,7 @@ def observe_experience_feedback(repo: Path) -> Observation:
         "retrieval_protocol": "src/kg/retrieval_protocol.zig",
         "tool_exec": "src/core/tool_exec.zig",
         "task_protocol": "src/kg/task_protocol.zig",
-        "test": "tests/component/kg_integration_test.zig",
+        "test": "apps/cli/tests/component/kg_integration_test.zig",
         "build": "build.zig",
     }
     paths: dict[str, Path] = {}
@@ -1161,7 +1161,7 @@ def observe_experience_feedback(repo: Path) -> Observation:
     step = build_step_slice(sources["build"], "test:kg-experience-feedback")
     test_wired = (
         step is not None
-        and '"tests/component/kg_integration_test.zig"' in step
+        and '"apps/cli/tests/component/kg_integration_test.zig"' in step
         and "kg_experience_feedback_step.dependOn(&run_t.step)" in step
     )
     feedback_checks = {
@@ -2058,7 +2058,7 @@ def observe_treatment_activation(repo: Path) -> Observation:
     ]
     relative_sources = {
         "prompt": "src/kg/task_protocol.zig",
-        "prompt_test": "tests/component/prompt_tool_coupling_test.zig",
+        "prompt_test": "apps/cli/tests/component/prompt_tool_coupling_test.zig",
         "conversation": "src/core/conversation.zig",
         "microcompact_test": "tests/component/microcompact_test.zig",
         "attester": "scripts/eval/treatment_activation.py",

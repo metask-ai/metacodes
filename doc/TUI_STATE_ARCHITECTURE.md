@@ -62,7 +62,7 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 1. **dispatch 状态转移**(纯 state):`dispatch(空editor,'?')→overlay==help`;`dispatch(ctrl_o)→overlay main↔transcript 切换`(**Ctrl+O 现可纯单测,现状只能 pty**);spinner_tick 推进帧;tool_progress 更新卡片并要求重画。
 2. **render 帧内容**(CaptureWriter+stripAnsi):`render(overlay=help) 含 Ctrl+O/Shift+Tab`;`render(input) 不含 \x1b[2J`(不碰 scrollback);`render(spinner,now_ms=3000) 含 "(3s"`(时间注入→确定)。
 3. **全链路 事件→状态→帧**(不起终端/不连模型):送 `?`→render 出 help 帧→送任意键→render 回输入帧。
-挂 tests/component/ui_state_test.zig + ui_render_test.zig,经 main.zig 导出 tui_ui_state/tui_ui/tui_event。pty 测只留机制断言(光标/erase 不破 scrollback/resize),内容断言全下沉。
+挂 apps/cli/tests/component/ui_state_test.zig + ui_render_test.zig,经 main.zig 导出 tui_ui_state/tui_ui/tui_event。pty 测只留机制断言(光标/erase 不破 scrollback/resize),内容断言全下沉。
 
 ## §3 线程模型(保留并发,mutex 直接 dispatch,不引队列)
 
@@ -176,7 +176,7 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 
 ### 8.6 验证
 
-#298 的回归由 parity 测试守住(用例名以 "#298 parity" 开头):`render_region.zig` 的 "#298 parity" 两组用例重放 回复→读取、读取→回复、读取→读取 三种边界(含"agent 列表不吞下一次提示的输入"),`tests/component/ui_state_test.zig` 覆盖 teardown 全量性、会话状态保留、合法边、阶段外事件丢弃;TTY 套件的 #220 picker 用例(`test_model_picker.py`)守显式交接。
+#298 的回归由 parity 测试守住(用例名以 "#298 parity" 开头):`render_region.zig` 的 "#298 parity" 两组用例重放 回复→读取、读取→回复、读取→读取 三种边界(含"agent 列表不吞下一次提示的输入"),`apps/cli/tests/component/ui_state_test.zig` 覆盖 teardown 全量性、会话状态保留、合法边、阶段外事件丢弃;TTY 套件的 #220 picker 用例(`test_model_picker.py`)守显式交接。
 
 ## §9 生成期重画合并窗口(#328,2026-10-28)
 
@@ -222,5 +222,5 @@ WSL Ubuntu 22.04 的 POSIX pty(字节即 metacodes 写出的字节),Debug 构建
 ### 9.4 验证
 
 - **逻辑**:`frame_scheduler.zig` 的假时钟单测(窗口、期限、立即通道满足待画帧)。
-- **终端所见**(vterm oracle):`tests/component/redraw_window_contract_test.zig` 断言突发一帧写完、resize 时待画帧按新宽度排、`endScrollLine` 一个闭合帧、panic 钩子写出攒着的文本(以及锁被占时不动、region 释放后不再找它、整条路径不经分配器:区的分配器换成计数探针,攒下远超一帧的文本,钩子跑完计数为 0;窗口内终端变窄后 panic,区按新宽度擦干净、重排与截断两种终端都不留区行);`render_region_contract_test.zig` 的全部合约(emit/erase 配对、半行续接、阶段交接、严格自动换行、footer 截断)在合并窗口关、开两种模式下各跑一遍——开窗口时 harness 用假时钟,时钟只在有待画帧时走到它的期限,所以画完一帧后的每个请求都落在窗口里、等下一次 `sync` 画出合并帧;emit/erase 配对那条还断言请求当时没写终端、窗口内一行加一次 tick 只出一帧。`tests/component/picker_frame_race_test.zig`:定时线程那样的帧(`tickSpinner` 画开着的 picker)与目录刷新(全量与只剩一条交替 `publishListing`)并发;picker 写入在别的线程持 region 锁画帧时等着,帧画完才落下。
+- **终端所见**(vterm oracle):`apps/cli/tests/component/redraw_window_contract_test.zig` 断言突发一帧写完、resize 时待画帧按新宽度排、`endScrollLine` 一个闭合帧、panic 钩子写出攒着的文本(以及锁被占时不动、region 释放后不再找它、整条路径不经分配器:区的分配器换成计数探针,攒下远超一帧的文本,钩子跑完计数为 0;窗口内终端变窄后 panic,区按新宽度擦干净、重排与截断两种终端都不留区行);`render_region_contract_test.zig` 的全部合约(emit/erase 配对、半行续接、阶段交接、严格自动换行、footer 截断)在合并窗口关、开两种模式下各跑一遍——开窗口时 harness 用假时钟,时钟只在有待画帧时走到它的期限,所以画完一帧后的每个请求都落在窗口里、等下一次 `sync` 画出合并帧;emit/erase 配对那条还断言请求当时没写终端、窗口内一行加一次 tick 只出一帧。`apps/cli/tests/component/picker_frame_race_test.zig`:定时线程那样的帧(`tickSpinner` 画开着的 picker)与目录刷新(全量与只剩一条交替 `publishListing`)并发;picker 写入在别的线程持 region 锁画帧时等着,帧画完才落下。
 - **真二进制**:`tests/tty/cases/test_redraw_coalesce.py`。WebSearch 用例让 `Searching` 与 `Found 1 result` 两次进度在同一次写入里到达,所以结果行一定落在某个窗口里、卡离场时还在等,只有 `clearToolCard` 离场前画的那一帧能把它画出来;去掉那一帧,这条用例失败。

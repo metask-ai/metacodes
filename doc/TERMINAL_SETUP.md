@@ -196,7 +196,7 @@ under the `shift + ⏎` footer, and restore leaving the profile as it was before
 zsh binds `ESC CR` to `self-insert-unmeta`; bash leaves it unbound. The macOS
 CI suite runs the edit, the backup and the restore with the real `plutil` and
 `defaults` against a temporary settings domain
-(`src/app/terminal_setup/apple_terminal.zig`, `setup.zig`). The VS Code side was
+(`apps/cli/src/app/terminal_setup/apple_terminal.zig`, `setup.zig`). The VS Code side was
 driven the same way on Windows (VS Code 1.105, a separate instance with its own
 user data): Shift+Enter reached a console program as `0d` before setup and as
 `1b 0d` after, without a restart; a window opened with `--profile` (a profile

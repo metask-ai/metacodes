@@ -12,7 +12,7 @@
 //! `build_info`, so this file takes a plain `BuildInfo` and never imports the
 //! module itself.
 const std = @import("std");
-const config = @import("app/config.zig");
+const release_contract = @import("release_contract.zig");
 
 /// Everything `build_info` declares, in one value. `fromOptions` copies the
 /// module's declarations so `main.zig` is the only place that names it.
@@ -94,7 +94,7 @@ pub const Document = struct {
             .contract = .{
                 .binary_abi_version = info.abi_version,
                 .binary_abi_revision = info.abi_revision,
-                .config_schema_version = config.SCHEMA_VERSION,
+                .config_schema_version = release_contract.CONFIG_SCHEMA_VERSION,
             },
             .expected_runtime_assets = .{
                 .{ .name = "ripgrep", .version = info.ripgrep_version, .sha256 = info.ripgrep_sha256 },
@@ -128,7 +128,7 @@ pub fn writeText(w: *std.Io.Writer, semver: []const u8, info: BuildInfo) std.Io.
     try w.print("zig {s}\n", .{info.zig});
     try w.print("target {s} {s}\n", .{ info.target, info.optimize });
     try w.print("agentcore-abi v{d} revision {d}\n", .{ info.abi_version, info.abi_revision });
-    try w.print("config-schema {d}\n", .{config.SCHEMA_VERSION});
+    try w.print("config-schema {d}\n", .{release_contract.CONFIG_SCHEMA_VERSION});
     try writeAssetLine(w, "ripgrep", info.ripgrep_version, info.ripgrep_revision, info.ripgrep_sha256);
     try writeAssetLine(w, "tinykg", info.tinykg_version, info.tinykg_commit, info.tinykg_sha256);
     try w.print("layout {s}\n", .{if (info.release_layout) "release" else "development"});
@@ -199,7 +199,7 @@ test "version json has the documented shape" {
     const contract = root.get("contract").?.object;
     try std.testing.expectEqual(@as(i64, 1), contract.get("binary_abi_version").?.integer);
     try std.testing.expectEqual(@as(i64, 28), contract.get("binary_abi_revision").?.integer);
-    try std.testing.expectEqual(@as(i64, config.SCHEMA_VERSION), contract.get("config_schema_version").?.integer);
+    try std.testing.expectEqual(@as(i64, release_contract.CONFIG_SCHEMA_VERSION), contract.get("config_schema_version").?.integer);
     const assets = root.get("expected_runtime_assets").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), assets.len);
     try std.testing.expectEqualStrings("ripgrep", assets[0].object.get("name").?.string);

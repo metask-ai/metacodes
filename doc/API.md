@@ -307,7 +307,7 @@ path unchanged.
 ## Session command surface (UI-neutral)
 
 All three interactive hosts (terminal REPL, `--web`, `serve`/`serve --sessions N`)
-share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
+share one input pipeline (`apps/cli/src/session_intent.zig` + `apps/cli/src/session_service.zig`):
 
     raw input → session_intent.parse → InputIntent
       → SessionService.dispatch (validate → mutate → optional RunPlan)
@@ -328,7 +328,7 @@ share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
 - **Run assembly.** `session_service.buildRunOptions` is the only place App
   state is projected into `agent_loop.Options`; hosts add only host-specific
   fields (UI requester, run-control observers, budgets).
-- Equivalence is locked by `tests/component/session_api_parity_test.zig`.
+- Equivalence is locked by `apps/cli/tests/component/session_api_parity_test.zig`.
 
 ### Edit and rerun
 
@@ -392,7 +392,7 @@ the same root `"preview"` in `<state root>/config.json` and the same
 `--preview`, `--no-preview`, `--preview=teamwork` and `--no-preview=teamwork`
 flags as the other preview features. Flags may precede `teamwork` or follow
 the action; the last flag naming the feature wins and overrides the saved value. CLI dispatch
-before App initialization and App initialization share `app/config.zig`'s
+before App initialization and App initialization share `core/file_config.zig`'s
 `resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
 selects the feature; it does not approve a task or authorize spend.
 
@@ -693,7 +693,7 @@ the executable belongs to up to date from the source its install record names
 the working directory (an id or id prefix, the rule `/resume <id>` uses) with
 its conversation, goal and model route restored, and appends to the same
 transcript. Under the banner, the REPL writes the conversation back as its
-turns were shown live (`src/repl/replay.zig`: prompts, replies and tool cards
+turns were shown live (`apps/cli/src/repl/replay.zig`: prompts, replies and tool cards
 through the live rendering paths; at most the last 200 messages, opening at a
 typed prompt, after a dim count of the rest; Ctrl+O shows all of it). What the
 live view never showed stays out: messages the runtime wrote itself
@@ -1141,7 +1141,7 @@ serializes byte-identically to before.
 `metacodes serve [port]` (one session) and `metacodes serve --sessions N
 [--max-sessions M] [--uds <path>] [port]` (the multi-session daemon: N
 sessions at startup, N ≥ 0, then created and destroyed over HTTP, at most M
-live) serve one HTTP/1.1 surface (`src/web/server.zig`). Port 0 lets the
+live) serve one HTTP/1.1 surface (`apps/cli/src/web/server.zig`). Port 0 lets the
 kernel pick; the startup line prints the address actually bound,
 `<label>: http://<address>:<port>  (Ctrl+C to quit)`.
 
@@ -1539,7 +1539,7 @@ connecting or reconnecting:
 
 It also carries `session_id`, `additional_dirs`, token usage and cost, the
 agent roster, tasks and `plugin_inventory`.
-`tests/component/web_message_config_test.zig` holds both drivers (`--web` and
+`apps/cli/tests/component/web_message_config_test.zig` holds both drivers (`--web` and
 `serve`, over HTTP and UDS) to this section.
 
 ### SessionHost: a multi-session service for network Hosts

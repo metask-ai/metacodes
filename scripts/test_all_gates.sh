@@ -18,7 +18,7 @@ export METACODES_WB_CORPUS METACODES_WORKBUDDY_CHECKOUT METACODES_TEST_REQUIRE_L
 fail=0
 run() { echo "== $*"; "$@" || { echo "GATE FAILED: $*"; fail=1; }; }
 
-run zig fmt --check build.zig src tests
+run zig fmt --check build.zig src apps packages tests
 run python3 scripts/check_doc_links.py
 run zig build test
 run zig build test:lib

@@ -253,7 +253,7 @@ project layer is read only when `$CODEX_HOME/config.toml` marks the project
 
 `metacodes mcp add` writes one entry into `mcpServers` of
 `<state root>/config.json`, the first source above, and `metacodes mcp remove`
-takes it out again (`src/app/mcp_config_edit.zig`):
+takes it out again (`apps/cli/src/app/mcp_config_edit.zig`):
 
 ```sh
 metacodes mcp add docs https://example.com/mcp --header X-Team=core

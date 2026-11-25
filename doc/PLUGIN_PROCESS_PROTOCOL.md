@@ -184,7 +184,7 @@ The Host request is normally:
   "plugin_id": "acme.review",
   "plugin_version": "1.0.0",
   "tool": "lint",
-  "arguments": {"path": "src/main.zig"}
+  "arguments": {"path": "apps/cli/src/main.zig"}
 }
 ```
 

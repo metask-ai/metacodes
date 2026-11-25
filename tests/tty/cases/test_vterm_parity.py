@@ -1,8 +1,8 @@
-"""screen.py still gives the answers tests/component/vterm.zig is pinned to (#319).
+"""screen.py still gives the answers apps/cli/tests/component/vterm.zig is pinned to (#319).
 
 Offline: replays tests/tty/vterm_parity.py's corpus through screen.py (no
 binary, bin_path unused) and compares with the committed fixture that
-tests/component/vterm_test.zig replays through the Zig port.
+apps/cli/tests/component/vterm_test.zig replays through the Zig port.
 """
 import os
 import sys
@@ -24,5 +24,5 @@ def test_vterm_parity_fixture_matches_screen_py(bin_path):
         "screen.py answers differ from tests/fixtures/vterm/screen_parity.jsonl "
         f"(vectors {stale[:8]}, {len(committed)} committed vs {len(current)} built). "
         "If screen.py changed on purpose, run `python tests/tty/vterm_parity.py --write` "
-        "and make tests/component/vterm.zig agree."
+        "and make apps/cli/tests/component/vterm.zig agree."
     )

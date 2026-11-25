@@ -106,7 +106,7 @@ is linked once, with DWARF and a GNU build ID. Then binutils splits it:
 Zig 0.16's own `objcopy --extract-to` reports "unimplemented" for this
 executable.
 
-`src/main.zig` keeps stack tracing off in every ReleaseSmall build. Without
+`apps/cli/src/main.zig` keeps stack tracing off in every ReleaseSmall build. Without
 that, DWARF would link in about 100 KB of unwinding code; with it, a stripped
 build is byte-identical whether the line is there or not. Measured on x86_64
 Linux, the shipped executable is 256 bytes larger than a release-layout link
