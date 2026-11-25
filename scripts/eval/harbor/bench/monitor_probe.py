@@ -215,7 +215,7 @@ def lifecycle(jobs_dir, runs_dir=None, cap=2000, now=None, window=86400):
         result["trials"] += 1
         prepare = record.get("prepare") if isinstance(record.get("prepare"), dict) else {}
         for item in prepare.get("items") or []:
-            if not isinstance(item, dict) or item.get("status") not in PREPARED:
+            if not isinstance(item, dict) or item.get("status") not in PREPARED or item.get("shared"):
                 continue
             result[PREPARED[item["status"]]] += 1
             seconds = item.get("seconds") if isinstance(item.get("seconds"), (int, float)) else 0.0

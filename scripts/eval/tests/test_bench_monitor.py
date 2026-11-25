@@ -97,7 +97,9 @@ def write_lifecycle(jobs, runs):
         "aime__d": lifecycle_record("aime__d"),
         "aime__e": lifecycle_record("aime__e", **prepared, started_at="2026-11-25T03:03:00Z",
                                     finished_at="2026-11-25T03:09:00Z", prepare={"status": "prepared", "items": [
-                                        {"kind": "build", "image": "metacodes-prebuild-1", "status": "built", "seconds": 30.4}]}),
+                                        {"kind": "build", "image": "metacodes-prebuild-1", "status": "built", "seconds": 30.4},
+                                        {"kind": "pull", "image": "tb/regex-log", "status": "pulled", "seconds": 61.5,
+                                         "shared": True}]}),
     }
     ended = {
         "swe__f": lifecycle_record("swe__f", **prepared, started_at="2026-11-25T02:00:00Z",
