@@ -223,13 +223,19 @@ def classify_file(relpath: str, trials: Iterable[str]) -> Tuple[Optional[str], s
     return None, "job_other"
 
 
+def _lifecycle_path(prefix: str) -> str:
+    parent, _, name = prefix.rpartition("/")
+    return (parent + "/" if parent else "") + f"{data.LIFECYCLE_DIR}/{name}.json"
+
+
 def trial_inputs(prefix: str, relpaths: Iterable[str]) -> List[str]:
-    """The files a trial's projection reads: its directory and its request
-    metrics (beside the directory). data.trial_row and trial_detail never
-    read the job's config.json or result.json, so a running job rewriting
-    its result.json after each trial re-derives no other trial."""
-    metrics = _metrics_path(prefix)
-    return sorted(r for r in relpaths if r.startswith(prefix + "/") or r == metrics)
+    """The files a trial's projection reads: its directory, its request
+    metrics and its lifecycle record (both beside the directory).
+    data.trial_row and trial_detail never read the job's config.json or
+    result.json, so a running job rewriting its result.json after each trial
+    re-derives no other trial."""
+    beside = (_metrics_path(prefix), _lifecycle_path(prefix))
+    return sorted(r for r in relpaths if r.startswith(prefix + "/") or r in beside)
 
 
 def digest_inputs(relpaths: Iterable[str], files: Dict[str, StoredFile]) -> str:

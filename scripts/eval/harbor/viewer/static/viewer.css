@@ -104,6 +104,7 @@ th.center{text-align:center;height:auto;padding-top:8px;padding-bottom:8px}
 .legend b{color:var(--text);font-weight:500;font-family:var(--mono);margin-left:4px}
 .phase-bar{display:flex;height:6px;background:var(--raised);width:140px;border-radius:2px;overflow:hidden}
 .p-environment{background:#5b5d66}.p-setup{background:#8a8c95}.p-agent{background:var(--accent)}.p-verifier{background:var(--positive)}
+.l-prepare{background:var(--partial)}.l-ready{background:#3a393f}.l-running{background:var(--warning)}
 .key{display:inline-flex;align-items:center;gap:5px;margin-right:12px;font-size:11px;color:var(--muted)}
 .key i{display:inline-block;width:9px;height:6px;border-radius:1px}
 .track{height:3px;background:var(--raised);margin-top:6px;width:96px}

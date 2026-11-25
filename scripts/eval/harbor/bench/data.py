@@ -211,6 +211,74 @@ def request_rows(trial_dir):
     return rows
 
 
+LIFECYCLE_DIR = ".bench-lifecycle"
+PREPARE_STATUSES = ("present", "prepared", "failed", "skipped")
+PREPARE_ITEM_STATUSES = ("present", "pulled", "built", "failed")
+
+
+def span_seconds(start, end):
+    if start is None or end is None:
+        return None
+    return max(0.0, (end - start).total_seconds())
+
+
+def prepare_outcome(value):
+    if not isinstance(value, dict) or value.get("status") not in PREPARE_STATUSES:
+        return None
+    items = []
+    for item in value.get("items") or []:
+        if not isinstance(item, dict) or item.get("status") not in PREPARE_ITEM_STATUSES:
+            continue
+        items.append({"kind": "build" if item.get("kind") == "build" else "pull",
+                      "image": clip(item.get("image") or "", 300), "status": item["status"],
+                      "seconds": number(item.get("seconds")), "attempts": number(item.get("attempts")),
+                      "shared": item.get("shared") is True,
+                      "error": clip(item["error"], 600) if isinstance(item.get("error"), str) else None})
+    return {"status": value["status"], "items": items,
+            "error": clip(value["error"], 600) if isinstance(value.get("error"), str) else None}
+
+
+def lifecycle(trial_dir, finished, moment):
+    record = read_json(trial_dir.parent / LIFECYCLE_DIR / (trial_dir.name + ".json"))
+    if not isinstance(record, dict):
+        return None
+    queued, prepare_started, prepare_finished, slot, ended = (
+        parse_time(record.get(key)) for key in ("queued_at", "prepare_started_at", "prepare_finished_at",
+                                                 "started_at", "finished_at"))
+    if queued is None:
+        return None
+    ended = ended or finished
+    clock = min(prepare_started, slot) if prepare_started and slot else prepare_started or slot
+    ahead = prepare_started is not None and (slot is None or prepare_started < slot)
+    return {
+        "queued_at": queued.isoformat(),
+        "clock_started_at": clock.isoformat() if clock else None,
+        "finished_at": ended.isoformat() if ended else None,
+        "queue_s": span_seconds(queued, clock or ended or moment),
+        "prepare_s": span_seconds(prepare_started, min(prepare_finished or slot or moment, slot or moment))
+        if ahead else None,
+        "ready_wait_s": span_seconds(prepare_finished, slot)
+        if prepare_finished is not None and slot is not None and prepare_finished <= slot else None,
+        "prepare_running_s": span_seconds(max(prepare_started, slot), prepare_finished or ended or moment)
+        if prepare_started is not None and slot is not None and (prepare_finished is None or prepare_finished > slot)
+        else None,
+        "total_s": span_seconds(clock, ended or moment),
+        "prepare": prepare_outcome(record.get("prepare")),
+    }
+
+
+def refresh_running(row, moment):
+    started = parse_time(row.get("started_at"))
+    if started is not None and row.get("finished_at") is None:
+        row["elapsed_s"] = (moment - started).total_seconds()
+    timeline = row.get("lifecycle")
+    if timeline and timeline.get("finished_at") is None:
+        clock = parse_time(timeline.get("clock_started_at"))
+        if clock is not None:
+            timeline["total_s"] = span_seconds(clock, moment)
+    return row
+
+
 def percentile(values, quantile):
     values = sorted(values)
     if not values:
@@ -359,6 +427,7 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
         except OSError:
             started = None
     finished = parse_time(result.get("finished_at"))
+    moment = dt.datetime.now(dt.timezone.utc)
     exception = result.get("exception_info") or {}
     tests = test_summary(trial_dir / "verifier")
     input_tokens = number(agent_result.get("n_input_tokens"))
@@ -406,8 +475,9 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
         "started_at": started.isoformat() if started else None,
         "finished_at": finished.isoformat() if finished else None,
         "elapsed_s": (
-            ((finished or dt.datetime.now(dt.timezone.utc)) - started).total_seconds() if started else None
+            ((finished or moment) - started).total_seconds() if started else None
         ),
+        "lifecycle": lifecycle(trial_dir, finished, moment),
         "phases": {
             "environment": seconds(result.get("environment_setup")),
             "setup": seconds(result.get("agent_setup")),
