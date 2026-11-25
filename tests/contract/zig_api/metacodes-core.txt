@@ -127,9 +127,9 @@ metacodes-core.plugin.first_party.Profile.coding_interactive
 metacodes-core.plugin.first_party.Profile.offline_coding
 metacodes-core.plugin.first_party.Profile.parse: fn parse(raw: []const u8) ?Profile
 metacodes-core.plugin.first_party.Profile.canonical: fn canonical(self: Profile) []const u8
-metacodes-core.plugin.first_party.CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell", "WebSearch", "WebFetch", }
-metacodes-core.plugin.first_party.MINIMAL_TOOLS: const = [_][]const u8{ "Read", "Glob", "Grep", }
-metacodes-core.plugin.first_party.OFFLINE_CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell", }
+metacodes-core.plugin.first_party.CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Bash", "BashOutput", "KillShell", "WebSearch", "WebFetch", }
+metacodes-core.plugin.first_party.MINIMAL_TOOLS: const = [_][]const u8{ "Read", }
+metacodes-core.plugin.first_party.OFFLINE_CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Bash", "BashOutput", "KillShell", }
 metacodes-core.plugin.first_party.PREVIEW_TOOLS: const = [_][]const u8{"ExecuteCode"}
 metacodes-core.plugin.first_party.INTERACTION_TOOLS: const = [_][]const u8{"AskUserQuestion"}
 metacodes-core.plugin.first_party.ARTIFACT_TOOLS: const = [_][]const u8{"ReadArtifact"}
@@ -9608,8 +9608,6 @@ metacodes-core.tools.descriptions: file
 metacodes-core.tools.descriptions.describeRead: fn describeRead(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeWrite: fn describeWrite(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeEdit: fn describeEdit(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
-metacodes-core.tools.descriptions.describeGlob: fn describeGlob(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
-metacodes-core.tools.descriptions.describeGrep: fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeBash: fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTask: fn describeTask(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTaskGet: fn describeTaskGet(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
@@ -9646,10 +9644,9 @@ metacodes-core.tools.ToolEntry.swarm_gated: bool = false
 metacodes-core.tools.ToolEntry.tinykg_gated: bool = false
 metacodes-core.tools.ToolEntry.preview_feature: ?@import("preview.zig").Feature = null
 metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
-metacodes-core.tools.ToolEntry.embedding_only: bool = false
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <42925 bytes, sha256 b41bbc655382>
+metacodes-core.tools.registry: const []const ToolEntry = <40948 bytes, sha256 60ee661d1677>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8

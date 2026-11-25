@@ -35,9 +35,7 @@ pub fn isStreamable(name: []const u8) bool {
 
 /// 历史名(保留兼容/文档):纯只读工具白名单。现广播到全 concurrency-safe 集,门见 isStreamable。
 pub fn isPrefetchable(name: []const u8) bool {
-    return std.mem.eql(u8, name, "Read") or
-        std.mem.eql(u8, name, "Grep") or
-        std.mem.eql(u8, name, "Glob");
+    return std.mem.eql(u8, name, "Read");
 }
 
 const Entry = struct {
@@ -294,16 +292,20 @@ test "广播:只读 Bash 经 executeOne 流式执行(非 read-only 白名单也�
     }
 }
 
-test "Prefetch start+take:真 builtin Glob 结果正确落地(执行路径端到端)" {
+test "Prefetch start+take:真 builtin Read 结果正确落地(执行路径端到端)" {
     const a = std.testing.allocator;
     var p = Prefetch.init(a);
     defer p.deinit();
-    // 最小 ctx:Glob 只需 cwd。cwd_abs="." → 匹配当前目录(测试从 cc-zig 根跑,有 *.zig)。
+    // 最小 ctx:Read 只需 cwd。cwd_abs="." → 匹配当前目录(测试从 cc-zig 根跑,有 *.zig)。
     var ctx = ToolContext{ .allocator = a, .cwd_abs = "." };
-    p.start(&ctx, "gid", "Glob", "{\"pattern\":\"*.zig\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.start(&ctx, "gid", "Read", "{\"file_path\":\"build.zig\",\"limit\":1}", .{ .bytes = [_]u8{'0'} ** 12 });
     const r = p.take("gid");
     try std.testing.expect(r != null);
-    try std.testing.expect(r.?.content != null); // 预取线程真跑了 Glob 并存了结果
+    try std.testing.expect(r.?.content != null); // 预取线程真跑了 Read 并存了结果
+    if (r.?.file_refs) |refs| {
+        for (refs) |*ref| ref.deinit(a);
+        a.free(refs);
+    }
     if (r.?.content) |c| a.free(c); // take 转移所有权,调用方 free
     // 再取同 id → null(已取走);随机 id → null。
     try std.testing.expect(p.take("gid") == null);
@@ -317,16 +319,20 @@ test "Prefetch: after joinAll an abandoned attempt's result is never taken (#452
     var ctx = ToolContext{ .allocator = a, .cwd_abs = "." };
     // The id lives in the attempt's tool_use list, freed right after joinAll.
     const first_id = try a.dupe(u8, "toolu_1");
-    p.start(&ctx, first_id, "Glob", "{\"pattern\":\"*.zig\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.start(&ctx, first_id, "Read", "{\"file_path\":\"build.zig\",\"limit\":1}", .{ .bytes = [_]u8{'0'} ** 12 });
     p.joinAll();
     a.free(first_id);
     // A re-issued attempt that repeats the id finds nothing, so the call runs
     // for real instead of taking a released, empty result.
     try std.testing.expect(p.take("toolu_1") == null);
     // Its own prefetch of that id is found.
-    p.start(&ctx, "toolu_1", "Glob", "{\"pattern\":\"*.zig\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.start(&ctx, "toolu_1", "Read", "{\"file_path\":\"build.zig\",\"limit\":1}", .{ .bytes = [_]u8{'0'} ** 12 });
     const r = p.take("toolu_1") orelse return error.PrefetchMissing;
     try std.testing.expect(r.content != null);
+    if (r.file_refs) |refs| {
+        for (refs) |*ref| ref.deinit(a);
+        a.free(refs);
+    }
     if (r.content) |c| a.free(c);
 }
 
@@ -355,8 +361,8 @@ test "Prefetch:未取走的 entry 由 deinit join+释放(无泄漏,MED-2 abort/d
     // 起两个预取,**都不 take**(模拟 abort/stream-error 丢弃):joinAll(经 deinit)必须 join 线程 +
     // 释放各自 content,否则 testing.allocator 报泄漏 / 线程未 join 崩溃。
     var ctx = ToolContext{ .allocator = a, .cwd_abs = "." };
-    p.start(&ctx, "a", "Glob", "{\"pattern\":\"*.zig\"}", .{ .bytes = [_]u8{'0'} ** 12 });
-    p.start(&ctx, "b", "Glob", "{\"pattern\":\"*.md\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.start(&ctx, "a", "Read", "{\"file_path\":\"build.zig\",\"limit\":1}", .{ .bytes = [_]u8{'0'} ** 12 });
+    p.start(&ctx, "b", "Read", "{\"file_path\":\"build.zig\",\"limit\":1}", .{ .bytes = [_]u8{'0'} ** 12 });
     // 显式先 joinAll(幂等)——模拟早退分支在释放 borrow 源前的调用;再 deinit(再 joinAll no-op)。
     p.joinAll();
     p.joinAll(); // 幂等:第二次 no-op

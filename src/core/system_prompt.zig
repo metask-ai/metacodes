@@ -123,7 +123,7 @@ const ACTIONS_SECTION =
 ;
 
 /// getUsingYourToolsSection 的非 REPL / 非 embedded 分支。
-/// TS 用 ${FILE_READ_TOOL_NAME} 等变量，cc-zig 里的实际工具名是 Read/Write/Edit/Glob/Grep/Bash/TaskCreate。
+/// TS 用 ${FILE_READ_TOOL_NAME} 等变量，cc-zig 里的实际工具名是 Read/Write/Edit/Bash/TaskCreate。
 const USING_TOOLS_SECTION =
     \\# Using your tools
     \\ - Do NOT use the Bash to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:
@@ -1227,19 +1227,8 @@ fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u
         try buf.appendSlice(allocator, "\n  - To edit files use Edit instead of sed or awk");
     if (has(names, "Write"))
         try buf.appendSlice(allocator, "\n  - To create files use Write instead of cat with heredoc or echo redirection");
-    const has_glob = has(names, "Glob");
-    const has_grep = has(names, "Grep");
-    if (has_glob) {
-        try buf.appendSlice(allocator, "\n  - To search for files use Glob instead of find or ls");
-    }
-    if (has_grep) {
-        try buf.appendSlice(allocator, "\n  - To search the content of files, use Grep instead of grep or rg");
-    }
     if (has(names, "Bash")) {
-        try buf.appendSlice(allocator, if (has_glob or has_grep)
-            "\n  - Use Bash for workspace searches without a dedicated tool, builds, tests and Git commands."
-        else
-            "\n  - Use Bash for workspace searches, builds, tests and Git commands.");
+        try buf.appendSlice(allocator, "\n  - Use Bash for workspace searches, builds, tests and Git commands.");
     }
     if (has(names, "TaskCreate")) {
         try buf.appendSlice(allocator, "\n - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.");
@@ -1396,7 +1385,7 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "KgContext") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
-    try testing.expect(std.mem.indexOf(u8, without_kg, "# Deferred tools") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "- TaskList") != null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "FormalAuditTask") == null);
 }
 

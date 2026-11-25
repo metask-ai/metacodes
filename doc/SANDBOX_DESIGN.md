@@ -9,7 +9,7 @@ process tree inside the same platform boundary.
 host controller
   +-- metacodes worker
   |     +-- Read / Write / Edit -> confined filesystem helper -> exact fd
-  |     +-- Grep / Glob / Bash -> confined command and its children
+  |     +-- Bash -> confined command and its children
   +-- external harness -> confined harness and its children
 ```
 
@@ -70,8 +70,8 @@ executable. There is no PATH search or project setting for this executable.
 An embedded Host must deploy the helper beside itself or supply that absolute
 override; the bundle manifest inventories the helper and its digest.
 
-Read (including images), Write, Edit and the Grep/Glob command execution use
-this boundary when sandboxing is enabled; NotebookEdit uses it too. The Read outline optimization must
+Read (including images), Write, Edit and NotebookEdit use the filesystem
+helper when sandboxing is enabled. The Read outline optimization must
 not dispatch to an unconstrained LSP instead of the confined file read.
 Filesystem helper requests cannot turn off sandboxing or select a different
 policy. The policy is assembled by the controller before launching the helper.

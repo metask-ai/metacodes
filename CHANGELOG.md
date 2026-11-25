@@ -255,9 +255,10 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
-- The CLI uses Bash for finding files and searching source. Read can show a
-  file outline. The CLI no longer offers Glob, Grep, CodeMap or FindSymbol.
-  AgentCore hosts retain their existing Glob and Grep selections.
+- Removed the Glob, Grep, CodeMap and FindSymbol built-in tools from the CLI
+  and AgentCore. Embedded hosts that explicitly select them must update
+  their tool lists. Shell-enabled sessions search with Bash. Read can show
+  a single-file outline.
 
 - **Bench concurrency is set only on the profile page.** The 评测 page no
   longer has a 并发数 field and `POST /api/profiles/run` no longer takes

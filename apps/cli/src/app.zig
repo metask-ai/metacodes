@@ -639,7 +639,7 @@ pub const App = struct {
     /// 不进对话历史。session 退出 deinit。
     edit_hl_cache: @import("metacodes-internal").core.edit_hl_cache.EditHlCache,
     /// LSP 服务(默认开;`--no-lsp` 或创建失败时为 null)。Edit/Write finalizeWrite 取诊断,
-    /// CodeMap/FindSymbol/Read-outline 取符号。session 退出 shutdown。
+    /// Read-outline 取符号。session 退出 shutdown。
     lsp_service: ?*@import("metacodes-internal").lsp.service.Service = null,
     /// Session transcript writer；失败初始化则保持 null（日志落盘 fallback）
     transcript_writer: ?transcript.Writer = null,
@@ -672,7 +672,7 @@ pub const App = struct {
     /// 坏 hook 不报错只是永不触发——`/hooks` 列出,启动横幅与 `/doctor` 计数。
     hook_diagnostics: ?@import("metacodes-internal").permission.hooks.Diagnostics = null,
     /// 会话根目录:启动时对进程 cwd 拍的字符串快照。读它的有七处(Bash 子进程 chdir、
-    /// Read/Write/Edit/Glob 的 base_dir、权限 match_ctx.cwd、沙箱 profile、系统提示词、
+    /// Read/Write/Edit 的 base_dir、权限 match_ctx.cwd、沙箱 profile、系统提示词、
     /// project_dir、KG 项目目录),而 agent 的工作本身就会改名/搬走目录。写它的只有两条路:
     /// `refreshWorkspaceRoot`(每轮 run 装配前校验一次,改名了就整体跟过去)与
     /// `switchWorkingRoot`(EnterWorktree / ExitWorktree,run 中途也会发生;工具每次调用经
@@ -5349,6 +5349,12 @@ pub const App = struct {
 
     /// L5:把 App 提供给工具的宿主能力(Skill 激活 / ToolSearch 激活 / Worktree push-pop 与
     /// 当前工作根)聚合成一个 HostServices——一个 ctx(=app)+ 若干 trampoline。
+    pub fn backgroundSessionServices(app: *App) tools_mod.HostServices {
+        var services = app.hostServices().withoutWorktree();
+        services.activateToolFn = null;
+        return services;
+    }
+
     pub fn hostServices(app: *App) tools_mod.HostServices {
         return .{
             .ctx = @ptrCast(app),

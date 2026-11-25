@@ -279,9 +279,14 @@ test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目
         break :blk old_dir_buf[0..w.dir.len];
     } else null;
 
+    const background_services = app.backgroundSessionServices();
     try app.activateTool("TaskList");
     _ = try app.cron_registry.scheduleWakeup(60, "original session");
     app.rotateSessionIdentity();
+    var background = cc.tool_context.ToolContext.simple(std.testing.allocator);
+    background.host_services = background_services;
+    var discovered = try cc.tools.dispatch(&background, "ToolSearch", "{\"query\":\"select:TaskList\"}");
+    defer discovered.deinit(std.testing.allocator);
     try std.testing.expect(!app.activated_tools.contains("TaskList"));
     try std.testing.expect(app.cron_registry.pendingWakeup() == null);
 

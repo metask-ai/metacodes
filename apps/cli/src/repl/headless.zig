@@ -62,6 +62,7 @@ const HeadlessToolPolicy = struct {
     }
 
     fn deniesExactName(self: *const HeadlessToolPolicy, name: []const u8) bool {
+        if (std.mem.eql(u8, name, "ScheduleWakeup")) return true;
         var it = std.mem.tokenizeScalar(u8, self.disallowed_rules, ',');
         while (it.next()) |raw| {
             const rule = std.mem.trim(u8, raw, " \t\r\n");
@@ -289,7 +290,7 @@ pub fn run(
         .disallowed_rules = app.config.disallowed_tools orelse "",
         .parent = eval_execution_policy,
     };
-    const effective_execution_policy = if (headless_tool_policy.disallowed_rules.len > 0 or eval_execution_policy != null) headless_tool_policy.executionPolicy() else null;
+    const effective_execution_policy = headless_tool_policy.executionPolicy();
     defer if (eval_be) |*evaluation| evaluation.deinit();
     var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else be;
     var eval_tee = tee_backend_mod.TeeBackend{ .primary = &be, .secondary = &eval_ui };
@@ -750,10 +751,7 @@ pub fn resumeSuspended(
     var headless_tool_policy = HeadlessToolPolicy{
         .disallowed_rules = app.config.disallowed_tools orelse "",
     };
-    const execution_policy = if (headless_tool_policy.disallowed_rules.len > 0)
-        headless_tool_policy.executionPolicy()
-    else
-        null;
+    const execution_policy = headless_tool_policy.executionPolicy();
 
     var output_ledger = output_semantics.Ledger.init(allocator);
     defer output_ledger.deinit();
@@ -882,6 +880,8 @@ test "headless tool policy intersects exact CLI denies with its parent" {
         },
     };
     const execution = policy.executionPolicy();
+    try std.testing.expect(!execution.allowsTool("ScheduleWakeup"));
+    try std.testing.expect(!execution.allowsInvocation("ScheduleWakeup", "{}"));
     try std.testing.expect(!execution.allowsTool("TeamCreate"));
     try std.testing.expect(!execution.allowsInvocation("Agent", "{}"));
     try std.testing.expect(!execution.allowsTool("Write"));

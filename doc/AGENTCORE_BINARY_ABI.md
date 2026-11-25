@@ -299,8 +299,7 @@ explicit `-Dtarget=<triple>` so an artifact cannot silently inherit the build
 host. Files outside the manifest are local staging residue, not compatibility
 surface: consumers ignore them and the archive command never includes them.
 
-`bin/rg[.exe]` is the ripgrep runtime asset backing the built-in `Glob`/`Grep`
-tools. Bundle assembly stages it from the repository's manifest-pinned vendored
+`bin/rg[.exe]` is the bundled command-line search executable. Bundle assembly stages it from the repository's manifest-pinned vendored
 set (`vendor/ripgrep/manifest.json`, upstream official release binaries,
 SHA-256 verified at staging), records it in the manifest `files` whitelist, and
 declares it under `runtime_assets` (name, upstream version and revision, path,
@@ -1094,7 +1093,7 @@ exceptions: the budget fields on `CHECKPOINT_BUDGET_REQUIRED` (see durable
 budget), and `input_accepted_count` / `input_adopted_count`, which are defined
 on every status (see "Active-Run input").
 
-Relative paths supplied to `Read`, `Write`, `Edit`, `Glob`, and `Grep` resolve
+Relative paths supplied to `Read`, `Write`, and `Edit` resolve
 against `workspace_root`; Bash also runs with that directory as its cwd.
 `workspace_root` is an execution context, not a filesystem jail: absolute
 paths remain usable unless the Host selects and configures a separate sandbox
@@ -2285,8 +2284,7 @@ lists are the only Host-imported rules.
 Every other Tool takes only the bare form. A specifier on any other name parses
 but is read as a Bash pattern over a `command` argument, which no other
 built-in has, so such a rule never matches (and on a Host Tool it would match
-an unrelated `command` argument). `Glob` and `Grep` in particular take no path
-specifier. `WebFetch(...)` without `domain:` and an opening `(` without a final
+an unrelated `command` argument). `WebFetch(...)` without `domain:` and an opening `(` without a final
 `)` do not parse.
 
 **Bash patterns** describe one command. `git status` matches exactly;
@@ -2378,9 +2376,7 @@ Because both directories are inside the Workspace, `Write(/outputs/**)`,
 `Edit(/outputs/**)` and `Read(/secrets/**)` are equivalent. Writing
 `Write(/Users/me/MetaBrowser/outputs/**)` is a valid rule that never matches:
 it names `<workspace_root>/Users/me/...`. Path rules govern only the named file
-Tool: `Glob` and `Grep` still list `secrets`, and Bash reads whatever its own
-rules allow, so a Host that must keep a directory unreadable also denies
-`Glob`, `Grep` and the Bash commands concerned, or keeps the directory outside
+Tool. Configure the shell separately or keep sensitive directories outside
 the Workspace.
 
 ### Permission mode updates
@@ -2607,7 +2603,7 @@ through `update_permission_mode` (see "Permission mode updates"). Which modes
 a Host offers is the Host's policy: a Session's only settings are the
 Host-imported allow/ask/deny rules, which cannot disable a mode.
 
-ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`,
+ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`,
 `Bash`, `BashOutput`, `KillShell`, `WebSearch`, `WebFetch`, and
 `AskUserQuestion`. The kernel-owned `ReadArtifact` recovery tool is also
 present in every Runtime generation and is automatically selected for every
@@ -2640,29 +2636,7 @@ including Task, Cron, KG, MCP, worktree, and notification tools. Adding those
 requires a future explicit Host capability contract; they are not silently
 advertised with missing state.
 
-`Glob` and `Grep` execute through an external ripgrep executable (`rg`).
-Selecting either tool makes its resolution part of Runtime creation: the
-resolver probes `RG_BIN`, `PATH`, the directory containing the Host
-executable, and the documented system fallback locations. When no executable
-resolves, `runtime_create` fails with
-`METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` and a `ToolDependencyUnavailable`
-diagnostic naming the missing dependency and the accepted provisioning
-options, instead of advertising tools whose first invocation would fail with
-`RipgrepNotFound`. The bundle itself ships the matching executable as the
-`bin/rg[.exe]` runtime asset (see the bundle layout section), so a Host
-normally deploys that file next to its own executable — a location the probe
-resolves without additional configuration. Hosts that deliberately drop the
-asset must also omit `Glob`/`Grep` from `builtin_tools`.
-
-Model input never reaches ripgrep as an option (#460). `Grep` passes its
-`pattern` only as the value of `--regexp=` and its search path only after
-`--`. It joins every other value the model supplies to its flag in a single
-argument: `--glob=`, `--type=`, and `--before-context=`, `--after-context=`
-and `--context=` for `-B`/`-A`/`-C`. `Glob` passes its pattern as `--glob=`
-and its path after `--`. A pattern that begins with `-`, such as
-`--pre=<program>`, is searched as literal text and runs no program. That is
-why both tools can stay read-only: `accept_edits` runs them without a prompt,
-and `ShellPolicy.disabled` keeps them available.
+A request for a removed built-in name (`Glob`, `Grep`, `CodeMap`, or `FindSymbol`) is rejected during Runtime configuration. The minimal profile uses `Read`. Hosts that need workspace search can select `Bash` and enable shell access.
 
 ### Resource limits
 

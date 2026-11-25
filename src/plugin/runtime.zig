@@ -971,7 +971,7 @@ fn builtinBundle(id: []const u8, names: []const []const u8) StaticPlugin {
 }
 
 test "static builtin bundle publishes native tools and inventory provenance" {
-    const plugin = builtinBundle("acme.core", &.{ "Read", "Grep" });
+    const plugin = builtinBundle("acme.core", &.{ "Read", "Edit" });
     const snapshot = try Snapshot.create(std.testing.allocator, .{
         .generation = @enumFromInt(7),
         .supported_capabilities = contract.CapabilitySet.from(&.{.builtin_tool_bundle}),
@@ -981,7 +981,7 @@ test "static builtin bundle publishes native tools and inventory provenance" {
 
     try std.testing.expectEqual(@as(usize, 2), snapshot.builtin_tools.len);
     try std.testing.expectEqualStrings("Read", snapshot.builtin_tools[0]);
-    try std.testing.expectEqualStrings("Grep", snapshot.builtin_tools[1]);
+    try std.testing.expectEqualStrings("Edit", snapshot.builtin_tools[1]);
     const record = snapshot.find("acme.core") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 2), record.contribution_count);
     const inventory = try snapshot.describe(std.testing.allocator);

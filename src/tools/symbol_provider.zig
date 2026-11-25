@@ -1,29 +1,3 @@
-//! 统一符号来源。CodeMap/FindSymbol/Read-outline 三工具经此取符号。
-//!
-//! Y2 砍 tree-sitter 后**仅 LSP**:ctx.lsp 开、该文件有注册 server、且那个 server 的二进制此刻
-//! 真的可解析 → documentSymbol。任一条不满足 → `.unavailable(原因)`,三工具据此优雅降级
-//! **并说明原因**(CodeMap 打印原因行、FindSymbol 给限定空结果、Read-outline 回退正常读 + 附注)。
-//!
-//! **三态是硬要求**(issue #17):能力缺失 ≠ 查无符号。曾经两者都是空列表,模型把
-//! "没装 pyright" 读成"这个符号不存在"并据此走错路。状态词汇表见 `lsp/capability.zig`。
-//!
-//! **判定只有一份实现**:`capabilityForDef` 是唯一真理源,`capabilityFor` / `hasSymbolsFor` /
-//! `CapabilityCache.get` / `extractSymbols` 全部委托给它。新增入口必须继续委托——本 issue 的
-//! 病根就是有人在另一处**重新推导**了同一个问题,两份答案随即分叉。
-//!
-//! **语义**:kind 分类是 LSP server 的语义(如 zls 把 `pub const X = struct` 报成 Constant 而非
-//! Struct)。option A 接受(用户 2026-07-12 定案)。
-//!
-//! **已知性能/设计取舍**(Linus review 2026-07-12 登记):
-//!  - **D1 CodeMap glob 性能悬崖**:CodeMap 对目录逐文件 documentSymbol 往返。首文件 spawn+init
-//!    server(冷 2-5s),后续复用 warm client(~30ms/文件)。MAX_FILES=200 → warm ~11s。tree-sitter
-//!    时代进程内微秒级——option A 的数量级退化。慢 server 每文件最坏 REQUEST_TIMEOUT_MS=10s。缓解:
-//!    未来可并发 documentSymbol(需 client 支持并发 sendRequest)或对大 glob 降 cap/警告。
-//!    **FindSymbol 无此问题**:rg -w 预筛到"含该名字的少数文件",per-file 成本有界。
-//!  - **D2 FindSymbol 可迁 workspace/symbol**:一次请求全项目找名字更快;但 rg -w 不漏定义文件
-//!    (定义必含名字文本),故非正确性问题,仅纯性能优化,延后。
-//!  - **D3 打开文件不 didClose**:getSymbols 每次 openFile 不 didClose,长跑扫大量文件后 server 端
-//!    内存单增。延后(诊断路径也需文件保持 open)。
 const std = @import("std");
 const ToolContext = @import("context.zig").ToolContext;
 const symbol = @import("../symbols/symbol.zig");
@@ -49,7 +23,7 @@ pub const Outcome = union(enum) {
     unavailable: Unavailable,
 };
 
-/// 该文件是否可能产符号的**唯一**判定入口(CodeMap / FindSymbol / Read-outline 共用)。
+/// 该文件是否可能产符号的**唯一**判定入口。
 ///
 /// issue #17:这里曾只查静态注册表(`ctx.lsp != null and findServerForFile(file) != null`),
 /// 而真正干活的 `service.getOrSpawn` 还要过 `which` → spawn → broken-set。两个谓词对同一个
@@ -68,43 +42,6 @@ pub fn capabilityForDef(def: ?*const servers.ServerDef) Capability {
         return .{ .unavailable = .{ .reason = .server_not_installed, .detail = d.binary } };
     return .{ .available = d };
 }
-
-/// 逐文件循环用的能力记忆化器。**调用方持有,无全局状态**——生命周期只有那一次扫描,所以既
-/// 不会把"跑到一半才装上 server"钉死成永久不可用,也不会跨测试污染。
-///
-/// 为什么需要:能力只取决于文件扩展名,`findServerForFile` 至多产出 `SERVERS.len + 1` 种答案;
-/// 而每算一次都要 `binaryAvailable` 扫一遍 PATH(实测 30 段 PATH 下 36–43µs)。FindSymbol 会对
-/// **每个候选文件**问一次,候选上限量级 3200 → 116ms+ 纯 `access(2)`,且被门禁挡掉的文件此外
-/// 什么都不做,那部分是纯浪费。
-///
-/// 容量按"最多几种答案"配死(每个注册 server 一格 + "无注册 server" 一格),所以正常来源
-/// (`findServerForFile`)永远填不满;真填满了就直接不缓存,退化成逐次计算,不会答错。
-pub const CapabilityCache = struct {
-    lsp_present: bool,
-    entries: [servers.SERVERS.len + 1]Entry = undefined,
-    len: usize = 0,
-
-    const Entry = struct { def: ?*const servers.ServerDef, cap: Capability };
-
-    pub fn init(ctx: *const ToolContext) CapabilityCache {
-        return .{ .lsp_present = ctx.lsp != null };
-    }
-
-    /// 语义与 `capabilityFor(ctx, file)` 完全一致,只是同一扩展名不重复扫 PATH。
-    pub fn get(self: *CapabilityCache, file: []const u8) Capability {
-        if (!self.lsp_present) return .{ .unavailable = .{ .reason = .lsp_disabled } };
-        const def = servers.findServerForFile(file);
-        for (self.entries[0..self.len]) |e| {
-            if (e.def == def) return e.cap; // 可选指针相等:null==null 也命中
-        }
-        const fresh = capabilityForDef(def);
-        if (self.len < self.entries.len) {
-            self.entries[self.len] = .{ .def = def, .cap = fresh };
-            self.len += 1;
-        }
-        return fresh;
-    }
-};
 
 /// 布尔门(只关心"能不能"、不需要解释原因的调用点用,如 Read 的弱提示)。
 /// 语义严格等于 `capabilityFor(...) == .available`,不另立谓词。
@@ -186,6 +123,90 @@ test "convertLsp: LSP kind→中立 Kind + detail→signature" {
 // issue #17 回归:决策谓词(能不能出符号)必须与使用谓词(server 真在不在)一致
 // ============================================================================
 
+/// `renderOutlineForSource` 的三态结果。**不是 `?[]u8`**:调用方(Read 的 outline 模式)对
+/// "能力在位但文件没符号"和"能力缺失"要做不同的事——前者静默回退正常读取即可,后者必须交代
+/// 原因,否则又变成 issue #17 那种"静默降级冒充正常结果"。
+pub const Outline = union(enum) {
+    /// 渲染好的缩进文本树(调用方拥有)。
+    text: []u8,
+    /// 能力在位,但该文件确实没有符号 → 调用方可安静回退正常读取(Linus S1 的原意)。
+    no_symbols,
+    /// 能力缺失 → 调用方必须说明原因。
+    unavailable: Unavailable,
+};
+
+/// 渲染单文件大纲为缩进文本树(供 Read 工具的 outline 模式复用)。
+pub fn renderOutlineForSource(
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    file: []const u8,
+    source: []const u8,
+) !Outline {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+
+    // **不 catch**:唯一的错误来源是分配失败,而 `.no_symbols` 的含义是"能力在位、这文件真的
+    // 没符号"。把 OOM 折进去,调用方就会安静地按"没结构"处理——同一类谎报。下面的 renderTree /
+    // toOwnedSlice 本来也是直接上抛的,原先只 catch 这一处纯属不一致。
+    var outcome = try extractSymbols(ctx, allocator, file, source);
+    switch (outcome) {
+        .unavailable => |u| return .{ .unavailable = u },
+        .symbols => |*syms| {
+            defer syms.deinit();
+            if (syms.items.len == 0) return .no_symbols;
+            try renderTree(w, syms.items);
+            return .{ .text = try out.toOwnedSlice() };
+        },
+    }
+}
+
+/// 按 parent 关系渲染缩进树。v1:两级(顶层 + 直接 child),足够覆盖
+/// 方法/字段挂在 struct/class 下的常见情形。无 parent 的算顶层。
+fn renderTree(w: *std.Io.Writer, syms: []const symbol.Symbol) !void {
+    for (syms) |s| {
+        if (s.parent != null) continue; // 子符号在父项下输出
+        try renderRow(w, s, 1);
+        for (syms) |c| {
+            if (c.parent) |p| {
+                if (std.mem.eql(u8, p, s.name)) {
+                    try renderRow(w, c, 2);
+                }
+            }
+        }
+    }
+    // 兜底:parent 指向的名字不在本文件顶层时,这些子符号补在顶层缩进(否则漏掉)。
+    for (syms) |c| {
+        const p = c.parent orelse continue;
+        var has_parent_at_top = false;
+        for (syms) |s| {
+            if (s.parent == null and std.mem.eql(u8, s.name, p)) {
+                has_parent_at_top = true;
+                break;
+            }
+        }
+        if (!has_parent_at_top) {
+            try renderRow(w, c, 1);
+        }
+    }
+}
+
+fn renderRow(w: *std.Io.Writer, s: symbol.Symbol, depth: usize) !void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try w.writeAll("  ");
+    // "kind name" + 对齐填充到 ~28 列 + "(start-end)  signature"
+    const used = depth * 2 + s.kind.jsonName().len + 1 + s.name.len;
+    try w.print("{s} {s}", .{ s.kind.jsonName(), s.name });
+    const pad_to: usize = 28;
+    if (used < pad_to) {
+        var k: usize = used;
+        while (k < pad_to) : (k += 1) try w.writeByte(' ');
+    } else {
+        try w.writeByte(' ');
+    }
+    try w.print("({d}-{d})  {s}\n", .{ s.line_start, s.line_end, s.signature });
+}
+
 const testing = std.testing;
 
 /// 合成 def:binary 用绝对路径,可用/不可用两侧都不依赖机器上装了什么。
@@ -266,44 +287,4 @@ test "extractSymbols: 没有 LSP 服务 → .unavailable,绝不返回空符号�
         },
         .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
     }
-}
-
-test "CapabilityCache: 与 capabilityFor 逐文件同答,且同扩展名只算一次" {
-    const a = testing.allocator;
-    const ctx = ToolContext.simple(a); // 无 lsp → 恒 lsp_disabled
-    var cache = CapabilityCache.init(&ctx);
-    for ([_][]const u8{ "/p/a.zig", "/p/b.py", "/p/c.md", "/p/a.zig" }) |f| {
-        switch (cache.get(f)) {
-            .unavailable => |u| try testing.expectEqual(capability.Reason.lsp_disabled, u.reason),
-            .available => return error.TestUnexpectedResult,
-        }
-    }
-    // 没开 LSP 时压根不该去碰注册表/PATH,故不占槽位。
-    try testing.expectEqual(@as(usize, 0), cache.len);
-}
-
-test "CapabilityCache: 槽位按不同扩展名增长,重复扩展名不再增长" {
-    const a = testing.allocator;
-    var ctx = ToolContext.simple(a);
-    // 只需要 ctx.lsp 非 null 走真判定;这里不发请求,给个 dangling 指针会 UB,
-    // 故用真 Service(创建很轻:只起一个 idle reaper 线程)。
-    const Service = @import("../lsp/service.zig").Service;
-    const svc = try Service.create(a, "/nonexistent_xyz_cwd", null);
-    defer svc.shutdown();
-    ctx.lsp = svc;
-
-    var cache = CapabilityCache.init(&ctx);
-    const first = cache.get("/p/a.zig");
-    try testing.expectEqual(@as(usize, 1), cache.len);
-    _ = cache.get("/p/b.zig"); // 同扩展名 → 命中,不增长
-    try testing.expectEqual(@as(usize, 1), cache.len);
-    _ = cache.get("/p/c.md"); // 无注册 server → 另一格(null 键)
-    try testing.expectEqual(@as(usize, 2), cache.len);
-    _ = cache.get("/p/d.md");
-    try testing.expectEqual(@as(usize, 2), cache.len);
-
-    // 缓存值必须与直算一致(两侧都断言,不管本机装没装 zls)。
-    const direct = capabilityFor(&ctx, "/p/a.zig");
-    try testing.expectEqual(std.meta.activeTag(direct), std.meta.activeTag(first));
-    try testing.expectEqual(std.meta.activeTag(direct), std.meta.activeTag(cache.get("/p/e.zig")));
 }

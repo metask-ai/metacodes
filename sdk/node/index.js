@@ -9,10 +9,10 @@ const path = require('node:path');
 const ABI_REVISION = 29;
 const BUILTIN_TOOLS = [
   'ExecuteCode',
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
+  'Read', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',
 ];
-const DEFAULT_TOOLS = ['Read', 'Glob', 'Grep'];
+const DEFAULT_TOOLS = ['Read'];
 const SHELL_TOOLS = ['Bash', 'BashOutput', 'KillShell'];
 // The CLI agent loop's own default (src/core/agent_loop.zig Options.max_turns).
 const DEFAULT_MAX_TURNS = 400;
@@ -91,14 +91,6 @@ function loadNative(explicit) {
   );
   error.code = 'LIBRARY_NOT_FOUND';
   throw error;
-}
-
-function bundledRipgrep(libraryPath) {
-  const rg = process.platform === 'win32' ? 'rg.exe' : 'rg';
-  for (const candidate of [path.join(path.dirname(libraryPath), rg), path.join(path.dirname(libraryPath), '..', 'bin', rg)]) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
 }
 
 // JSON for a value a handler returned. A value JSON.stringify throws on (a
@@ -234,10 +226,6 @@ class Runtime {
     this.tools = [...tools];
     this.hostTools = [...hostTools];
     this.sessions = new Set();
-    if ((tools.includes('Glob') || tools.includes('Grep')) && !process.env.RG_BIN) {
-      const rg = bundledRipgrep(loadedLibrary);
-      if (rg) process.env.RG_BIN = rg;
-    }
     const specs = this.hostTools.map((hostTool) => ({
       name: hostTool.name,
       description: hostTool.description,

@@ -29,10 +29,10 @@ SHA-256 钉在 `manifest.json`。
 1. **AgentCore bundle 运行期资产**:`zig build agentcore:bundle` 经
    `scripts/stage_ripgrep_binary.py` 按 target 校验 SHA-256 后把对应二进制
    staging 为 bundle 内 `bin/rg[.exe]`,并进入 bundle manifest 的 `files`
-   allowlist 与 `runtime_assets` 声明——Glob/Grep 的执行依赖随包分发,
+   allowlist 与 `runtime_assets` 声明——命令行搜索程序随包分发,
    宿主部署时放到自身可执行文件旁(或以 `RG_BIN` 指向)即可。
 2. **开发/CI fallback**:`src/util/toolchain.zig` 的 fallback 路径按编译
-   target 指向本目录对应二进制——机器无系统 rg 时 Grep/Glob 工具与其测试
+   target 指向本目录对应二进制——机器无系统 rg 时 依赖 rg 的测试
    仍可用。
 
 ## 更新流程

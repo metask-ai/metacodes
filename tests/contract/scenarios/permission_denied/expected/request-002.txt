@@ -426,27 +426,6 @@ Usage:\n
 "required":[
 "message"]}},
 {
-"name":"ScheduleWakeup",
-"description":"Schedule the next one-shot check-in for a requested task in this live session. Choose a delay from 60 to 3600 seconds, explain it, and pass the prompt to resume. A new call replaces the pending wakeup. Set stop to cancel it. Fixed schedules are managed separately with CronCreate, CronList and CronDelete via ToolSearch.",
-"input_schema":{
-"type":"object",
-"properties":{
-"delaySeconds":{
-"type":"integer",
-"description":"Delay in seconds, clamped to 60..3600. Required unless stopping."},
-"prompt":{
-"type":"string",
-"description":"Instructions for the next check-in. Required unless stopping."},
-"reason":{
-"type":"string",
-"description":"Short reason for the chosen delay. Required unless stopping."},
-"noop":{
-"type":"boolean",
-"description":"Whether this iteration found no change. Required unless stopping."},
-"stop":{
-"type":"boolean",
-"description":"Cancel the pending dynamic wakeup in this session."}}}},
-{
 "name":"WebFetch",
 "description":"Fetch a URL and return its text content (HTML stripped). Use for reading web pages, API docs, articles.",
 "input_schema":{

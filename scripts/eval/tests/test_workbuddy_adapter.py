@@ -5722,7 +5722,8 @@ class WorkBuddyLeaderboardProtocolTest(unittest.TestCase):
         self.assertNotIn("temperature", first)
         tools = {tool["name"] for tool in first["tools"]}
         self.assertTrue({"WebSearch", "AskUserQuestion", "Agent", "Task"}.isdisjoint(tools), tools)
-        self.assertTrue({"Bash", "Read", "WebFetch", "Glob"}.issubset(tools), tools)
+        self.assertTrue({"Glob", "Grep", "CodeMap", "FindSymbol"}.isdisjoint(tools), tools)
+        self.assertTrue({"Bash", "Read", "WebFetch", "ToolSearch"}.issubset(tools), tools)
         user_text = json.dumps(first["messages"][-1], ensure_ascii=False)
         self.assertIn("tlsgateway-l2-marker", user_text)
 

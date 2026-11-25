@@ -49,6 +49,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         for (request.catalog) |definition| {
             if (matched.items.len >= max_results) break;
             if (!definition.deferred or !request.offersDeferred(definition.name)) continue;
+            if (tools.getTool(definition.name)) |tool| if (!staticVisible(ctx, tool)) continue;
             if (matchesKeywords(query, definition.name, definition.description)) try matched.append(allocator, definition.name);
         }
     } else {
@@ -144,7 +145,7 @@ fn visibleToModel(ctx: *const ToolContext, name: []const u8, deferred: bool) boo
 /// need their host contexts, standing in for the `tools.toToolDefinitionsFull`
 /// gates.
 fn staticVisible(ctx: *const ToolContext, t: *const tools.ToolEntry) bool {
-    if (t.embedding_only or !t.previewAllowed(ctx.preview)) return false;
+    if (!t.previewAllowed(ctx.preview)) return false;
     if (t.tinykg_gated and t.deferred and !kgReady(ctx)) return false;
     if (ctx.request_tools == null) {
         if (t.tinykg_gated and ctx.kg == null) return false;
@@ -649,4 +650,11 @@ test "ToolSearch: with a request at hand, it answers from the request's own tool
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"TeamCreate\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "knowforge__search") != null);
+}
+
+test "ToolSearch applies TinyKG readiness to keyword and exact catalog queries" {
+    const catalog = [_]json_mod.ToolDefinition{.{ .name = "FormalAuditTask", .description = "audit", .input_schema = .{}, .deferred = true }};
+    const ctx = ToolContext{ .allocator = testing.allocator, .request_tools = .{ .advertised = &.{}, .catalog = &catalog } };
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"audit\"}"));
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"select:FormalAuditTask\"}"));
 }

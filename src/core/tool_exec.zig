@@ -1565,10 +1565,14 @@ test "file change: host 派发的同名工具不冒充原生文件工具" {
 test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)" {
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "." };
-    const r = try executeOne(&ctx, "Glob", "{\"pattern\":\"*.zig\"}", "gid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    const r = try executeOne(&ctx, "Read", "{\"file_path\":\"build.zig\",\"limit\":1}", "gid", a, .{ .bytes = [_]u8{'0'} ** 12 });
     defer r.freeFileChanges(a);
     switch (r) {
         .done => |d| {
+            defer if (d.file_refs) |refs| {
+                for (refs) |*ref| ref.deinit(a);
+                a.free(refs);
+            };
             try std.testing.expect(!d.is_error);
             try std.testing.expect(d.content != null);
             if (d.content) |c| a.free(c);

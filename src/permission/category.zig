@@ -36,12 +36,7 @@ pub const ToolExecutionPolicy = struct {
 };
 
 pub fn getToolCategory(tool_name: []const u8) ToolCategory {
-    if (std.mem.eql(u8, tool_name, "Read") or
-        std.mem.eql(u8, tool_name, "Grep") or
-        std.mem.eql(u8, tool_name, "Glob"))
-    {
-        return .read;
-    }
+    if (std.mem.eql(u8, tool_name, "Read")) return .read;
     if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or
         std.mem.eql(u8, tool_name, "ApplyPatch") or std.mem.eql(u8, tool_name, "NotebookEdit"))
     {

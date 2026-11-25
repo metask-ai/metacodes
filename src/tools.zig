@@ -7,9 +7,7 @@ const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
 const apply_patch_tool = @import("tools/apply_patch.zig");
 const task_batch_tool = @import("tools/task_batch.zig");
-const glob_tool = @import("tools/glob.zig");
 const bash_tool = @import("tools/bash.zig");
-const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
 const read_artifact_tool = @import("tools/read_artifact.zig");
 const task_output_tool = @import("tools/task_output.zig");
@@ -127,7 +125,6 @@ pub const ToolEntry = struct {
     /// 执行期必需的进程外可执行依赖。非 null 时 catalog 准入先探测可用性,
     /// 缺失则拒绝创建而不是广告后首调失败。
     runtime_dependency: ?RuntimeDependency = null,
-    embedding_only: bool = false,
 
     pub fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
         if (!self.previewAllowed(ctx.preview)) return error.PreviewFeatureDisabled;
@@ -198,39 +195,6 @@ pub const registry: []const ToolEntry = &.{
         }, .required = &.{"patch"} },
         .execute = .{ .legacy_inline = apply_patch_tool.execute },
         .result_production = .input_derived,
-    },
-    .{
-        .name = "Glob",
-        .embedding_only = true,
-        .description = "Find files matching a glob pattern",
-        .describe_fn = descriptions.describeGlob,
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "pattern", .type = "string", .description = "The glob pattern to match files against (e.g. **/*.zig)" },
-            .{ .name = "path", .type = "string", .description = "The directory to search in (defaults to cwd)" },
-        }, .required = &.{"pattern"} },
-        .execute = .{ .result_body = glob_tool.executeBody },
-        .replay = .read_only,
-        .result_production = .byte_zero_spool,
-        .runtime_dependency = .ripgrep,
-    },
-    .{
-        .name = "Grep",
-        .embedding_only = true,
-        .description = "Search for patterns in files, or inside a recovered tool-result artifact, using ripgrep",
-        .describe_fn = descriptions.describeGrep,
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "pattern", .type = "string", .description = "The regular expression pattern to search for in file contents" },
-            .{ .name = "path", .type = "string", .description = "File or directory to search in (defaults to cwd)" },
-            .{ .name = "artifact_id", .type = "string", .description = "Search a recovered tool-result artifact instead of a path. Use the sha256 artifact_id from a truncated result to find the part you need in one call, rather than paging it with ReadArtifact. Mutually exclusive with path; output_mode must be content or count" },
-            .{ .name = "glob", .type = "string", .description = "Glob pattern to filter files (e.g. *.zig)" },
-            .{ .name = "output_mode", .type = "string", .description = "Output mode", .enum_values = &.{ "content", "files_with_matches", "count" } },
-            .{ .name = "-i", .type = "boolean", .description = "Case insensitive search" },
-            .{ .name = "-n", .type = "boolean", .description = "Show line numbers (content mode)" },
-        }, .required = &.{"pattern"} },
-        .execute = .{ .result_body = grep_tool.executeBody },
-        .replay = .read_only,
-        .result_production = .byte_zero_spool,
-        .runtime_dependency = .ripgrep,
     },
     .{
         .name = "Bash",
@@ -788,7 +752,7 @@ pub fn toToolDefinitionsFull(
     // 会诱导模型对已经带完整 schema 的常驻工具做 select:Write/KgRecall，徒增一轮。
     var has_deferred = false;
     for (registry) |tool| {
-        if (tool.embedding_only or (tool.swarm_gated and !teams_on)) continue;
+        if (tool.swarm_gated and !teams_on) continue;
         if (tool.tinykg_gated and !tinykg_on) continue;
         if (!tool.previewAllowed(preview)) continue;
         if (tool.deferred) {
@@ -809,7 +773,7 @@ pub fn toToolDefinitionsFull(
     }
 
     for (registry) |*tool| {
-        if (tool.embedding_only or (tool.swarm_gated and !teams_on)) continue;
+        if (tool.swarm_gated and !teams_on) continue;
         if (tool.tinykg_gated and !tinykg_on) continue;
         if (!tool.previewAllowed(preview)) continue;
         if (std.mem.eql(u8, tool.name, "ToolSearch") and !has_deferred) continue;
@@ -958,14 +922,6 @@ fn fieldSpecs(name: []const u8) []const FieldSpec {
         .{ .name = "timeout", .ty = .integer },
         .{ .name = "run_in_background", .ty = .boolean },
     };
-    if (std.mem.eql(u8, name, "Grep")) return &.{
-        .{ .name = "pattern", .ty = .string },
-        .{ .name = "path", .ty = .string },
-    };
-    if (std.mem.eql(u8, name, "Glob")) return &.{
-        .{ .name = "pattern", .ty = .string },
-        .{ .name = "path", .ty = .string },
-    };
     return &.{};
 }
 
@@ -1026,7 +982,6 @@ fn dispatchInto(out: *ToolDispatchOutcome, ctx: *const ToolContext, name: []cons
         return;
     }
     if (getTool(name)) |t| {
-        if (t.embedding_only and ctx.request_tools != null) return error.UnknownTool;
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
         out.* = .{ .ok = try t.run(ctx, args) };
@@ -1219,9 +1174,7 @@ const ToolNameIter = struct {
             return null;
         }
         while (self.static_idx < registry.len) {
-            if ((registry[self.static_idx].embedding_only and self.ctx.request_tools != null) or
-                !registry[self.static_idx].previewAllowed(self.ctx.preview))
-            {
+            if (!registry[self.static_idx].previewAllowed(self.ctx.preview)) {
                 self.static_idx += 1;
                 continue;
             }
@@ -1282,13 +1235,13 @@ fn similarity(a: []const u8, b: []const u8) f32 {
 
 /// 工具是否可与同批工具并发执行(对齐 cc isConcurrencySafe)。
 /// 安全 = 只读 + 不写任何共享态(或写的共享态已线程安全)。
-///   Read(read_state 已加锁)/Glob/Grep/WebFetch/BashOutput → safe。
+///   Read(read_state 已加锁)/ReadArtifact/WebFetch/BashOutput → safe。
 ///   WebSearch 的静态分类仍保守为 unsafe；tool_exec 只有在 ToolContext 提供 per-call
 ///   provider factory 时才动态升级为 safe，并由专用 admission gate 限制并发为 2。
 ///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
 /// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
 pub fn isConcurrencySafe(name: []const u8) bool {
-    const safe = [_][]const u8{ "Read", "ReadArtifact", "Glob", "Grep", "WebFetch", "BashOutput" };
+    const safe = [_][]const u8{ "Read", "ReadArtifact", "WebFetch", "BashOutput" };
     for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }
@@ -1354,7 +1307,7 @@ test "isConcurrencySafeInput: wrapper 剥离后判 readonly" {
 
 test "isConcurrencySafeInput: 非 Bash 工具沿用名单" {
     try std.testing.expect(isConcurrencySafeInput("Read", "{\"file_path\":\"/x\"}"));
-    try std.testing.expect(isConcurrencySafeInput("Grep", "{\"pattern\":\"x\"}"));
+    try std.testing.expect(isConcurrencySafeInput("ReadArtifact", "{}"));
     try std.testing.expect(!isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Edit", "{\"file_path\":\"/x\"}"));
 }
@@ -1363,9 +1316,7 @@ test "getTool by name" {
     try std.testing.expect(getTool("Read") != null);
     try std.testing.expect(getTool("Write") != null);
     try std.testing.expect(getTool("Edit") != null);
-    try std.testing.expect(getTool("Glob") != null);
     try std.testing.expect(getTool("Bash") != null);
-    try std.testing.expect(getTool("Grep") != null);
     try std.testing.expect(getTool("BashOutput") != null);
     try std.testing.expect(getTool("KillShell") != null);
     try std.testing.expect(getTool("WebFetch") != null);
@@ -1390,7 +1341,7 @@ test "toToolDefinitions includes ToolSearch when native formal audit is deferred
     // 是 deferred 静态工具，因此 ToolSearch 必须出现；只排除 swarm-gated 工具。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.embedding_only and !t.swarm_gated and t.preview_feature == null) non_gated += 1;
+        if (!t.swarm_gated and t.preview_feature == null) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated);
     // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
@@ -1430,7 +1381,7 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
     // prompt_ctx=null 门控 swarm。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.embedding_only and !t.swarm_gated and t.preview_feature == null) non_gated += 1;
+        if (!t.swarm_gated and t.preview_feature == null) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated + 1);
     // 动态工具在末尾。
@@ -1512,8 +1463,6 @@ test "ToolExecutor result_body preserves a native byte-zero artifact receipt" {
 
 test "native byte-zero roster is declared and wired through typed executors" {
     const expected = [_][]const u8{
-        "Glob",
-        "Grep",
         "Bash",
         "ListMcpResourcesTool",
         "ReadMcpResourceTool",
@@ -1539,12 +1488,20 @@ test "dispatch returns UnknownTool when missing everywhere" {
     try std.testing.expectError(error.UnknownTool, dispatch(&ctx, "NoSuchTool", "{}"));
 }
 
+test "removed workspace builtins have no executor or normalized alias" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol", "glob_tool", "grep", "code-map", "find_symbol" }) |name| {
+        try std.testing.expect(getTool(name) == null);
+        try std.testing.expect(resolveToolNameExact(&ctx, name) == null);
+        try std.testing.expectError(error.UnknownTool, dispatch(&ctx, name, "{}"));
+    }
+}
+
 test "resolveToolNameExact: 大小写/分隔归一化命中真工具" {
     var ctx = ToolContext.simple(std.testing.allocator);
     // 小写、全大写、连字符/空格 → 归一化命中(无损等价变换)。
     try std.testing.expectEqualStrings("Read", resolveToolNameExact(&ctx, "read").?);
     try std.testing.expectEqualStrings("Read", resolveToolNameExact(&ctx, "READ").?);
-    try std.testing.expectEqualStrings("Grep", resolveToolNameExact(&ctx, "grep").?);
     try std.testing.expectEqualStrings("Bash", resolveToolNameExact(&ctx, "bash").?);
 }
 
@@ -1572,11 +1529,9 @@ test "suggestToolName: 模糊近似作建议(≥0.7),差太远返 null" {
 }
 
 test "dispatch: 确定性归一化幻觉名改派到真工具(端到端)" {
-    // "grep"(大小写幻觉,归一化无损)→ resolveToolNameExact → "Grep" → 真执行。Grep 缺 pattern
-    // 会返错,但**不是 UnknownTool**——证明改派发生了(名字被归一化,进了 Grep 的执行/校验)。
     var ctx = ToolContext.simple(std.testing.allocator);
     ctx.cwd_abs = ".";
-    const err = dispatch(&ctx, "grep", "{}");
+    const err = dispatch(&ctx, "read", "{}");
     if (err) |r| {
         var outcome = r;
         outcome.deinit(std.testing.allocator);
@@ -1596,9 +1551,7 @@ test {
     _ = &write_tool;
     _ = &edit_tool;
     _ = &@import("tools/file_target.zig");
-    _ = &glob_tool;
     _ = &bash_tool;
-    _ = &grep_tool;
     _ = &bash_output_tool;
     _ = &kill_shell_tool;
     _ = &monitor_tool;

@@ -61,7 +61,7 @@ pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_part
 /// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
 /// deliberately rejected at Runtime creation instead of being advertised with
 /// null Host state. Membership here is a name-level claim only: built-ins that
-/// additionally need an external executable (Glob/Grep → ripgrep) are verified
+/// declare an external executable dependency are verified
 /// at catalog admission and fail Runtime creation with
 /// `error.ToolDependencyUnavailable` when the executable cannot be resolved.
 /// WebSearch is a Session-owned network capability backed by the configured
@@ -210,49 +210,23 @@ test "default AgentRuntime preserves the coding tool surface through first-party
     const inventory = try runtime.describePlugins(std.testing.allocator);
     defer std.testing.allocator.free(inventory);
     try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":8") != null);
 }
 
-test "Runtime creation refuses Glob/Grep when their ripgrep dependency is unresolvable" {
-    const toolchain = @import("../util/toolchain.zig");
-    toolchain.test_ripgrep_override = false;
-    defer toolchain.test_ripgrep_override = null;
-
-    // 默认 coding profile 含 Glob/Grep:依赖缺失必须在创建期报类型化配置错误,
-    // 而不是把工具广告给 Provider 后在首次调用时失败(issue 报告的桌面端形态)。
-    try std.testing.expectError(
-        error.ToolDependencyUnavailable,
-        AgentRuntime.create(std.testing.allocator, .{}),
-    );
-    // 显式选择同样被拒:消费者按名索取了一个无法执行的工具。
-    try std.testing.expectError(
-        error.ToolDependencyUnavailable,
-        AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Grep"} }),
-    );
-    // 不含 Glob/Grep 的显式选择在同一环境下仍可创建:门只跟随真实依赖。
-    const degraded = try AgentRuntime.create(std.testing.allocator, .{
-        .builtin_tools = &.{ "Read", "Write", "Bash" },
-    });
-    defer degraded.destroy() catch unreachable;
-    try std.testing.expect(degraded.catalog.find("Read") != null);
-    try std.testing.expect(degraded.catalog.find("Grep") == null);
-}
-
-test "Runtime creation admits Glob/Grep when ripgrep resolves" {
-    const toolchain = @import("../util/toolchain.zig");
-    toolchain.test_ripgrep_override = true;
-    defer toolchain.test_ripgrep_override = null;
+test "retired workspace tools have no builtin registration or explicit runtime selection" {
     const runtime = try AgentRuntime.create(std.testing.allocator, .{});
     defer runtime.destroy() catch unreachable;
-    try std.testing.expect(runtime.catalog.find("Glob") != null);
-    try std.testing.expect(runtime.catalog.find("Grep") != null);
+    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
+        try std.testing.expect(runtime.catalog.find(name) == null);
+        try std.testing.expectError(error.UnsupportedBuiltinTool, AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{name} }));
+    }
 }
 
 test "minimal and none core profiles retain the mandatory artifact recovery kernel" {
     const minimal = try AgentRuntime.create(std.testing.allocator, .{ .core_profile = .minimal });
     defer minimal.destroy() catch unreachable;
     try std.testing.expect(minimal.catalog.find("Read") != null);
-    try std.testing.expect(minimal.catalog.find("Grep") != null);
+    try std.testing.expect(minimal.catalog.find("Grep") == null);
     try std.testing.expect(minimal.catalog.find("Write") == null);
     try std.testing.expect(minimal.catalog.find("WebFetch") == null);
 
@@ -5977,7 +5951,7 @@ test "Workspace shell policy is an authority ceiling for Session tools" {
 }
 
 test "Sessions sharing one Runtime keep independent tool selections" {
-    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Grep" } });
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Edit" } });
     defer runtime.destroy() catch unreachable;
     const cwd = try testCwd();
     defer std.testing.allocator.free(cwd);
@@ -5989,20 +5963,20 @@ test "Sessions sharing one Runtime keep independent tool selections" {
         .allowed_tools = &.{"Read"},
     });
     defer read_session.destroy() catch unreachable;
-    const grep_session = try runtime.createSession(.{
+    const edit_session = try runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "grep-key",
         .model = "test-model",
         .workspace = .{ .root = cwd },
-        .allowed_tools = &.{"Grep"},
+        .allowed_tools = &.{"Edit"},
     });
-    defer grep_session.destroy() catch unreachable;
+    defer edit_session.destroy() catch unreachable;
 
     try std.testing.expect(read_session.tools.contains("Read"));
-    try std.testing.expect(!read_session.tools.contains("Grep"));
-    try std.testing.expect(grep_session.tools.contains("Grep"));
-    try std.testing.expect(!grep_session.tools.contains("Read"));
-    try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), grep_session.session_id.asSlice()));
+    try std.testing.expect(!read_session.tools.contains("Edit"));
+    try std.testing.expect(edit_session.tools.contains("Edit"));
+    try std.testing.expect(!edit_session.tools.contains("Read"));
+    try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), edit_session.session_id.asSlice()));
 }
 
 // —— T1 矩阵测试:session_id registry 生命周期(31/36)与 host identity 校验 ——

@@ -14,7 +14,7 @@ fn nowMs() util_time.Millis {
 }
 
 /// 写富错误 detail 到 ctx.error_detail 通道(传给模型可见)。slot 为 null 则静默。
-/// 与 edit.zig 的 setDetail 同模式,提到 common 供 grep/glob/find_symbol 等共享。
+/// 与 edit.zig 的 setDetail 同模式,提到 common 供内置工具共享。
 /// msg 用 allocator 分配(errorToJson 会拷贝,arena 释放前读取安全)。
 pub fn setErrorDetail(
     slot: ?*?[]const u8,

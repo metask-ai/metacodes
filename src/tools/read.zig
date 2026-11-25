@@ -5,7 +5,6 @@ const filesystem = @import("../sandbox/filesystem.zig");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
-const code_map = @import("code_map.zig");
 const utf8 = @import("../util/utf8.zig");
 const util_json = @import("../util/json.zig");
 const symbol_provider = @import("symbol_provider.zig");
@@ -338,8 +337,8 @@ fn isTrue(s: ?[]const u8) bool {
     return s != null and std.mem.eql(u8, s.?, "true");
 }
 
-/// outline 模式:打开文件、读全量、渲染符号大纲。三态见 `code_map.Outline`(调用方按态分流)。
-fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !code_map.Outline {
+/// outline 模式:打开文件、读全量、渲染符号大纲。三态见 `symbol_provider.Outline`(调用方按态分流)。
+fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !symbol_provider.Outline {
     const fd = filesystem.open(ctx, path, .{ .ACCMODE = .RDONLY }, 0, false) catch |err| {
         if (filesystem.enabled(ctx)) return err;
         return error.FileNotFound;
@@ -352,11 +351,11 @@ fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []co
     return try readOutlineFromFd(allocator, ctx, path, fd);
 }
 
-/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。三态见 `code_map.Outline`。
-fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: pfs.Fd) !code_map.Outline {
+/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。三态见 `symbol_provider.Outline`。
+fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: pfs.Fd) !symbol_provider.Outline {
     const source = try common.readAllFromFd(fd, allocator);
     defer allocator.free(source);
-    return try code_map.renderOutlineForSource(ctx, allocator, path, source);
+    return try symbol_provider.renderOutlineForSource(ctx, allocator, path, source);
 }
 
 /// 把切片按行加 "%6d\t" 前缀（对齐 TS cat -n）。

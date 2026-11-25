@@ -818,47 +818,6 @@ test "L2 native filesystem sandbox: missing or relative host helper fails closed
     try std.testing.expect(!pfs.exists(pz));
 }
 
-test "L2 native filesystem sandbox: confined Grep Glob omit denied files in inline and spooled paths" {
-    if (comptime !protocol.supported) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var fixture = try TestFixture.init();
-    defer fixture.deinit();
-    const blocked = try fixture.path("workspace/secret");
-    defer allocator.free(blocked);
-    try @import("../util/fs.zig").mkdirParents(blocked);
-    const hidden = try fixture.path("workspace/secret/hidden.txt");
-    defer allocator.free(hidden);
-    try TestFixture.write(hidden, "sandboxneedle\n");
-    const visible = try fixture.path("workspace/visible.txt");
-    defer allocator.free(visible);
-    try TestFixture.write(visible, "sandboxneedle\n");
-    const sb = @import("config.zig").SandboxSettings{ .enabled = true, .deny_read = &.{blocked} };
-    var ctx = fixture.context(&sb);
-    var detail: ?[]const u8 = null;
-    ctx.error_detail = &detail;
-    defer if (detail) |bytes| allocator.free(bytes);
-    const spool = try fixture.path("workspace/artifacts");
-    defer allocator.free(spool);
-    for ([_][]const u8{ "", spool }) |artifact_root| {
-        ctx.artifact_root = artifact_root;
-        if (artifact_root.len != 0) try @import("../util/fs.zig").mkdirParents(artifact_root);
-        var grep = @import("../tools/grep.zig").executeBody(&ctx, "{\"pattern\":\"sandboxneedle\",\"path\":\".\"}") catch |err| {
-            std.debug.print("confined grep: {s}\n", .{detail orelse @errorName(err)});
-            return err;
-        };
-        defer grep.deinit(allocator);
-        var glob = try @import("../tools/glob.zig").executeBody(&ctx, "{\"pattern\":\"*.txt\",\"path\":\".\"}");
-        defer glob.deinit(allocator);
-        // These bounded results stay inline in both paths.
-        const g = grep.@"inline".bytes;
-        const l = glob.@"inline".bytes;
-        try std.testing.expect(std.mem.indexOf(u8, g, "visible.txt") != null);
-        try std.testing.expect(std.mem.indexOf(u8, l, "visible.txt") != null);
-        try std.testing.expect(std.mem.indexOf(u8, g, "hidden.txt") == null);
-        try std.testing.expect(std.mem.indexOf(u8, l, "hidden.txt") == null);
-    }
-}
-
 test "native filesystem sandbox: unsupported hosts refuse explicit sandbox settings" {
     if (comptime protocol.supported) return error.SkipZigTest;
     const sb = @import("config.zig").SandboxSettings{ .enabled = true, .fail_if_unavailable = false };

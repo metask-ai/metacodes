@@ -363,7 +363,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 cmd_output.print("{s}MCP tools could not be registered: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
             };
             for (tools.registry) |t| {
-                if (t.embedding_only) continue;
                 cmd_output.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
             }
             // 动态工具（Skill / MCP）
@@ -422,7 +421,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                         \\⏺ 我来分析 mod0.py 的结构。
                         \\  ⎿ Read: /Users/x/mod0.py
                         \\⏺ 这是一个数据处理模块,核心是 transform 函数。
-                        \\  ⎿ Grep: def transform
+                        \\  ⎿ Bash: rg -n transform src
                         \\⏺ transform 在第 42 行,负责把原始记录归一化。
                         \\
                     ) catch {};
@@ -1468,7 +1467,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .agent_type = "main",
         // It shares the App with the foreground, and EnterWorktree would chdir the
         // whole process under it: it keeps the root it was handed.
-        .host_services = app.hostServices().withoutWorktree(),
+        .host_services = app.backgroundSessionServices(),
         // task#12(Linus review 第四处):Ctrl+B 转后台的是**主会话**(全权限+Bash),更不能丢 sandbox。
         // 前台 agent_loop 有 sandbox,转后台若不透传则主会话 Bash 突然脱离 sandbox。
         .sandbox = app.sandboxPtr(),

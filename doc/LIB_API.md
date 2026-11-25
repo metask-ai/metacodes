@@ -206,22 +206,14 @@ receipt 或 bounded structured error。两种 executor 不能同时存在，也�
 所有入口共用同一个 MCP client;`mcp_runtime.Client` 的中断参数是 `?*const AbortSignal`,
 模块布局与保留差异见 [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)。
 
-首方 byte-zero 工具为 宿主的 `Glob`、`Grep`，以及 `Bash`、
+首方 byte-zero 工具为 `Bash`、
 `ListMcpResourcesTool`、`ReadMcpResourceTool` 和 `WebFetch`。Bash 的 JobRegistry、
-MCP stdio、大型 WebFetch/curl、ripgrep 与代码索引输出都在子进程/生产者发出第一个字节前
+MCP stdio、大型 WebFetch/curl、Bash 输出都在子进程/生产者发出第一个字节前
 取得私有 capture；小而完整的最终投影仍可安全降为 inline。`Write`、`Edit`、
 `ApplyPatch`、`NotebookEdit` 明确归类为 `input_derived`：它们不复制一个未知外部输出流，
 不能与 byte-zero 迁移缺口混为一谈。
 
-`ToolEntry.runtime_dependency` 声明工具执行必需的进程外可执行依赖（当前仅
-`ripgrep`，`Glob`/`Grep` 声明之）。catalog 准入按声明探测可用性：解析不到 `rg`
-时 Runtime 创建返回 `error.ToolDependencyUnavailable`，而不是把工具广告给
-Provider 后在首次调用时报 `RipgrepNotFound`。嵌入宿主可用
-`util_toolchain.ripgrepPath()` 预探测（开发布局解析顺序：`RG_BIN` → `PATH` → 宿主可执行
-文件同目录 → 常见安装位；`util_toolchain.setLayout(.release)` 之后为 `RG_BIN` →
-宿主可执行文件同目录 → `PATH`,不再查询固定位置——metacodes 可执行文件按
-`-Drelease-layout` 在启动时设定,嵌入宿主自行决定,#79），据此决定是否在工具集中包含
-`Glob`/`Grep`。
+最小宿主配置提供 `Read`。启用 `Bash` 的宿主可以通过 shell 使用 `rg` 搜索工作区。
 
 Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byte rolling tail，
 并以 no-replace 原语原子发布到 Session 级 CAS；POSIX hard-link 发布会在 receipt

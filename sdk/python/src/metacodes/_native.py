@@ -94,8 +94,6 @@ BUILTIN_TOOLS = (
     "Read",
     "Write",
     "Edit",
-    "Glob",
-    "Grep",
     "Bash",
     "BashOutput",
     "KillShell",
@@ -448,10 +446,6 @@ def _library_file_name() -> str:
     return "libmetask_agentcore.so"
 
 
-def _rg_file_name() -> str:
-    return "rg.exe" if sys.platform == "win32" else "rg"
-
-
 def candidate_library_paths(explicit: Optional[str] = None) -> list:
     """Where the shared library is looked for, in order."""
     name = _library_file_name()
@@ -471,17 +465,6 @@ def candidate_library_paths(explicit: Optional[str] = None) -> list:
     return paths
 
 
-def _bundled_ripgrep(library_path: Path) -> Optional[Path]:
-    """The rg that ships beside the library: wheel `_lib/rg` or bundle `bin/rg`."""
-    for candidate in (
-        library_path.parent / _rg_file_name(),
-        library_path.parent.parent / "bin" / _rg_file_name(),
-    ):
-        if candidate.is_file():
-            return candidate
-    return None
-
-
 class Library:
     """A loaded, validated AgentCore shared library."""
 
@@ -496,7 +479,6 @@ class Library:
             raise AgentCoreError("metask_agentcore_get_api", 1, "library returned no ABI v1 table")
         self.api = ctypes.cast(raw, ctypes.POINTER(ApiV1)).contents
         self._validate()
-        self.ripgrep = _bundled_ripgrep(path)
 
     def _validate(self) -> None:
         api = self.api

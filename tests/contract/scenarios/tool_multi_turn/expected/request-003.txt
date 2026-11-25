@@ -321,7 +321,7 @@ Usage:\n
 Each call starts a fresh process in the session working directory. A directory change, variable assignment or shell option lasts only for that call. Supply the directory to the command when possible, e.g. `git -C \"project with spaces\" status --short`.\n
 \n
 # Choosing a tool\n
-Find files with `rg --files -g \"*.zig\"` and literal text with `rg -n -F -- \"text\" src`. Scope searches to the project or a relevant subdirectory. If rg is unavailable, list files with `find src -type f -name '*.zig'`. If rg is unavailable, search text with `grep -rnF -- 'text' src`. Use Read to inspect the matching lines. Use Edit for targeted replacements. Use Write to create files.\n
+Find files with `rg --files -g \"*.zig\"` and literal text with `rg -n -F -- \"text\" src`. Scope searches to the project or a relevant subdirectory. If rg is unavailable, list files with `find src -type f -name '*.zig'` and search text with `grep -rnF -- 'text' src`. Use Read to inspect the matching lines. Use Edit for targeted replacements. Use Write to create files.\n
 \n
 # Running commands\n
 Pass the command in `command`. Give the user a short description of its purpose, such as \"Run the parser regression tests\". Quote paths with spaces. Before creating files in an unfamiliar directory, verify the parent and destination.\n
@@ -480,27 +480,6 @@ Keep hooks, signing and Git configuration intact. Preserve existing history and 
 "description":"The notification body, under 200 chars, one line"}},
 "required":[
 "message"]}},
-{
-"name":"ScheduleWakeup",
-"description":"Schedule the next one-shot check-in for a requested task in this live session. Choose a delay from 60 to 3600 seconds, explain it, and pass the prompt to resume. A new call replaces the pending wakeup. Set stop to cancel it. Fixed schedules are managed separately with CronCreate, CronList and CronDelete via ToolSearch.",
-"input_schema":{
-"type":"object",
-"properties":{
-"delaySeconds":{
-"type":"integer",
-"description":"Delay in seconds, clamped to 60..3600. Required unless stopping."},
-"prompt":{
-"type":"string",
-"description":"Instructions for the next check-in. Required unless stopping."},
-"reason":{
-"type":"string",
-"description":"Short reason for the chosen delay. Required unless stopping."},
-"noop":{
-"type":"boolean",
-"description":"Whether this iteration found no change. Required unless stopping."},
-"stop":{
-"type":"boolean",
-"description":"Cancel the pending dynamic wakeup in this session."}}}},
 {
 "name":"WebFetch",
 "description":"Fetch a URL and return its text content (HTML stripped). Use for reading web pages, API docs, articles.",

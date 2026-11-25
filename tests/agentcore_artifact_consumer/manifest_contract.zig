@@ -183,7 +183,7 @@ pub fn validateManifestFiles(
 }
 
 /// The bundle must declare exactly one ripgrep runtime asset covering the
-/// staged `bin/rg[.exe]` file: the Glob/Grep execution dependency ships with
+/// staged `bin/rg[.exe]` file: the bundled workspace search executable ships with
 /// the bundle instead of being an ambient environment assumption.
 pub fn validateRuntimeAssets(assets: []const RuntimeAsset, ripgrep_path: []const u8) Error!void {
     if (assets.len != 1) return error.InvalidRuntimeAssets;
@@ -269,7 +269,7 @@ const valid_runtime_assets = [_]RuntimeAsset{.{
     .path = posix_ripgrep_path,
     .upstream = "https://github.com/BurntSushi/ripgrep",
     .license = "MIT OR Unlicense",
-    .role = "Glob/Grep execution dependency",
+    .role = "bundled workspace search executable",
 }};
 
 fn makeValidFiles() [fixed_artifact_files.len + 4]FileEntry {

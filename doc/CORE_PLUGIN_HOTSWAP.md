@@ -28,8 +28,8 @@ metacodes 的 agent loop、形式化+本体论和基于证据自我迭代三条�
 | Profile | 插件 | 原生工具 |
 |---|---|---|
 | `none` | 无 | 无 |
-| `minimal` | `metacodes.core.minimal@1.0.0` | Read, Glob, Grep |
-| `offline-coding` | `metacodes.core.offline-coding@1.0.0` | ExecuteCode, Read, Write, Edit, Glob, Grep, Bash, BashOutput, KillShell |
+| `minimal` | `metacodes.core.minimal@1.0.0` | Read |
+| `offline-coding` | `metacodes.core.offline-coding@1.0.0` | ExecuteCode, Read, Write, Edit, Bash, BashOutput, KillShell |
 | `coding` | `metacodes.core.coding@1.0.0` | 在 offline-coding 上增加 WebSearch、WebFetch |
 | `coding-interactive` | coding + `metacodes.core.interaction@1.0.0` | coding 再增加 AskUserQuestion |
 

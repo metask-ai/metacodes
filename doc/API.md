@@ -1024,13 +1024,7 @@ too large is recoverable; an unparseable result is not. `clearToolResultAt`
 already refuses to erase a result's only recovery capability for the same
 reason.
 
-Recovery has two primitives rather than one. `ReadArtifact` returns byte
-ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a
-question about the content; `Grep` therefore accepts `artifact_id` in place of
-`path` and searches the stored blob directly. The store path is never exposed:
-filename output is suppressed, `files_with_matches` — whose entire output would
-be that path — is rejected for artifact searches, and the child's stderr is
-scrubbed of it before it can reach a tool error.
+`ReadArtifact` returns bounded byte ranges from a stored result. The model receives the artifact ID and offset.
 
 `ReadArtifact` remains exempt from result projection, but its recovery cost is
 bounded per turn. Before the batch executes, the agent loop walks the turn's
@@ -1246,13 +1240,7 @@ requests, and destroys sessions before their owning runtime generation.
 sessions. Existing sessions remain pinned to their old generation. Failed staging
 does not consume a generation or mutate the active runtime.
 
-Runtime creation validates tool availability, not only tool names: built-ins
-that execute through an external binary (`Glob`/`Grep` → ripgrep) fail
-creation with `error.ToolDependencyUnavailable` when that executable cannot be
-resolved, instead of entering the catalog and failing on their first
-invocation. A host can probe the dependency up front with
-`mc.util_toolchain.ripgrepPath()` and select a tool set without `Glob`/`Grep`
-when it is absent.
+Runtime creation rejects unrecognized built-in names. The minimal profile provides read-only workspace access with `Read`.
 
 The recommended high-level lifecycle is:
 

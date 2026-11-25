@@ -278,19 +278,15 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
 test "L2: buildUsingTools 段按工具集裁剪" {
     const a = std.testing.allocator;
 
-    const full_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskCreate" };
+    const full_names = [_][]const u8{ "Read", "Write", "Edit", "Bash", "TaskCreate" };
     const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false, "/tmp");
     defer a.free(sp_full);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "Bash for workspace searches") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Grep instead of grep") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "TaskCreate tool") != null);
 
-    const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Bash" };
+    const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Bash" };
     const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false, "/tmp");
     defer a.free(sp_slim);
-    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Bash for workspace searches") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Break down and manage your work") == null);
 
@@ -352,7 +348,7 @@ test "L2: redescribeForContext 给只读 agent 的 Bash 加只读提醒" {
     const a = std.testing.allocator;
 
     // 先建一份主对话 defs(Bash 含 Git 段)
-    const names = [_][]const u8{ "Read", "Grep", "Glob", "Bash" };
+    const names = [_][]const u8{ "Read", "Bash" };
     var main_pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &main_pc);
     defer a.free(defs);
@@ -398,7 +394,7 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    const names = [_][]const u8{ "Read", "Edit", "Grep", "Bash" };
+    const names = [_][]const u8{ "Read", "Edit", "Bash" };
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &pc);
 

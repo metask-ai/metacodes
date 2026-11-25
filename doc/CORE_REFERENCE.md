@@ -441,7 +441,7 @@ Bash 观测没能覆盖)也照发一条空 `changes` 的事件,Run 账本同时�
 - **沙箱会话走沙箱**:会话启用沙箱时观测完全不调用 git——沙箱内的命令可以写工作区里的
   `.git/config`,而观测在沙箱外运行 git,被植入的 fsmonitor/clean filter 会越过沙箱执行。此时
   修改照报,只是不带 diff。非沙箱会话里也总带 `-c core.fsmonitor=false`。列举也在沙箱里跑
-  (与 Glob/Grep 同一个包装),每条变更发布前先经沙箱文件执行器打开、并核对打开的正是 lstat
+  ,每条变更发布前先经沙箱文件执行器打开、并核对打开的正是 lstat
   看到的那个文件(bubblewrap 把禁读文件绑成 `/dev/null`),内容也从那个句柄读:沙箱对命令藏起
   来的(`denyRead`),路径、大小、内容都不进事件和账本,打不开的变更不发布并置 `lost`。命令删掉
   或移走的文件已无从再打开,改按观测开始时解析好的 `denyRead` 规则判定(两种后端各自的 `~`、相对
@@ -599,7 +599,7 @@ AgentCore v1 把它投影为 `tool_loop`(冻结的线上枚举不增值)。
 | 形态 | 何时 | 内容 | 可恢复 |
 |---|---|---|---|
 | **原文** | 结果 ≤ 本轮**水位线** | 逐字节原样 | — |
-| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact`，显式提供 Grep 的宿主也可用 `Grep(artifact_id)` |
+| **artifact 信封** | 超水位线,且发布成功 | head + tail 摘录 + `artifact_id` + sha256 + 读取指令 | ✅ `ReadArtifact` |
 | **fallback 信封** | 超水位线,但**发布失败**(会话配额满、存储错误),且捕获完整并 ≤ `PER_RESULT_MAX_BYTES` | head + tail + `storage_error` 如实命名原因,无 `artifact_id` | ❌,但说得出为什么 |
 | **清空桩** | 仅压缩期,且**该结果没有 artifact** | `[tool result cleared to save context]` + 承诺行(`original_bytes` + sha256) | ❌ |
 
@@ -627,7 +627,7 @@ fallback 那一行的限定条件不是修辞:发布失败后要渲染 head/tail
 issue #29 的行为(不知道能取回,就改命令重跑)。
 
 **预算在字节存在之前就生效。** `ToolEntry.result_production` 把生产方式分三类,其中
-`byte_zero_spool`(宿主 Glob/Grep、Bash/两个 MCP 读取/WebFetch)在第一个字节前
+`byte_zero_spool`(Bash/两个 MCP 读取/WebFetch)在第一个字节前
 就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
 
 **artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
@@ -881,13 +881,7 @@ glm-5.3-flash:catalog 推出的可用输入 917,504,实测 ≈883K 就拒)。所
 `context_window_exceeded_recovery`(压缩应答了拒绝)或 `context_window_exceeded_trim`(退到削一对)
 时,两个前端都渲染成 recovery 而非压缩。
 
-**恢复面的两个原语**:`ReadArtifact` 只能取字节区间,恢复一个 N 字节结果要
-O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。提供 `Grep` 的 AgentCore 宿主可接受
-`artifact_id` 替代 `path`:blob 本来就是普通文件,一次 ripgrep 就能定位。CAS 路径
-**不得**进入模型可见结果(泄漏它等于让任意文件工具绕过有界恢复契约),故 artifact
-模式强制 `--no-filename`,并拒绝 `files_with_matches`——该模式的全部输出就是路径。
-`path` 与 `artifact_id` 互斥;无 artifact store 时传 `artifact_id` 报
-`ArtifactStoreRequired`,不会静默退化成 cwd 搜索。
+模型可用 `ReadArtifact` 指定偏移量分段读取已保存的输出。
 
 **配额与可见性**:`MAX_SESSION_BYTES` 检查每次发布都做一次全目录扫描,**刻意保持精确**
 ——session root 由子 agent 与跨进程 swarm teammate 共享,缓存总量只能是下界,信它就会
@@ -904,12 +898,12 @@ O(N/32KiB) 次完整往返,而且回答不了"这段输出里哪儿出错了"。
 
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回
-`legacy_inline` executor。当前原生 byte-zero 清单是 宿主的 `Glob`、`Grep`，以及 `Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
+`legacy_inline` executor。当前原生 byte-zero 清单是 `Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
 其中 Bash 在第一个 stdout/stderr 字节前重定向到 JobRegistry 文件；没有长生命周期
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
 不会退回 pipe 全量捕获。已完成的 Bash 信封**不**给出 spool 路径:`<channel>_path` 曾经存在
 并被 `hasRecoverableArtifact` 当作恢复句柄,后按上方 prompt-cache contract 一并移除(staging
-path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artifact_id`(配 `Grep(artifact_id)`
+path + 随机 id,两条都踩)。恢复面只有内容寻址的 `<channel>_artifact_id`(配 `ReadArtifact`
 就地搜索);捕获超过 `MAX_ARTIFACT_BYTES` 无法发布时就是**真的不可恢复**,由
 `<channel>_storage_error` 如实命名原因,而不是靠一条违约的句柄把它装成可恢复。后台作业则用
 稳定的 `job_id` + `BashOutput`(`*_next_offset` 是续读游标;运行中的作业默认最多等 30 秒直到退出,未读输出按渲染成本已填满一页时立即返回(`returned_on: backlog`);`until` 可改为任一未读字节 `output`、有输出后停顿 `quiet`(`quiet_ms`)或出现字面子串 `pattern`(`pattern_match` 给出通道与偏移,快照与已退出作业同样报告;在时限内搜不完时给出 `pattern_searched_to` 供续搜;命中 pattern 不计入轮询守卫),`wait_ms=0` 为快照;同一作业背靠背的等待调用连续只拿到零星进度字节时,轮询守卫 `poll_guard` 让后续等待忽略进度输出,等待上限取 `wait_ms` 与守卫下限(30 秒起逐次倍增,下限封顶 300 秒)中的较大者,作业结束或命中 pattern 仍立即返回,非 pattern 等待遇到整页输出也立即返回;守卫生效时小于 256 字节的页(很小的 `max_bytes`)不算整页,翻积压请用 `wait_ms=0`)。MCP stdio、AgentCore MCP

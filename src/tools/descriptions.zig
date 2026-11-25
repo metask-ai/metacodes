@@ -1,7 +1,7 @@
 //! 工具长描述生成(动态耦合)。
 //!
 //! 逐字移植 cc/src/tools/*/prompt.ts 的长描述,"Claude Code" → "MetaCode",
-//! 工具名用 cc-zig 实际名(Read/Write/Edit/Glob/Grep/Bash/Task)。
+//! 工具名用 cc-zig 实际名(Read/Write/Edit/Bash/Task)。
 //!
 //! 每个 describe* 函数签名:fn(allocator, *const PromptContext) anyerror![]u8,
 //! 返回 owned slice(调用方用 arena 管理,session 结束统一释放)。
@@ -84,56 +84,6 @@ pub fn describeEdit(allocator: std.mem.Allocator, ctx: *const PromptContext) any
 }
 
 // ============================================================================
-// Glob — cc/src/tools/GlobTool/prompt.ts DESCRIPTION
-// 动态:多轮搜索建议用 Agent,仅当 Agent/Task 在工具集时才提。
-// ============================================================================
-pub fn describeGlob(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    const agent_line = if (ctx.hasTool("Task") or ctx.hasTool("Agent"))
-        "\n- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead"
-    else
-        "";
-    return std.fmt.allocPrint(allocator,
-        \\- Fast file pattern matching tool that works with any codebase size
-        \\- Supports glob patterns like "**/*.js" or "src/**/*.ts"
-        \\- Returns matching file paths sorted by modification time
-        \\- Use this tool when you need to find files by name patterns{s}
-    , .{agent_line});
-}
-
-// ============================================================================
-// Grep — cc/src/tools/GrepTool/prompt.ts getDescription
-// 动态:多轮搜索用 Agent 一句仅当 Agent/Task 在工具集时才提。
-// ============================================================================
-pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    // 用 concat 而非 allocPrint:描述里有大量字面 `{` `}`(ripgrep 正则),
-    // allocPrint 会把它们当格式占位符。concat 不做格式解析,安全。
-    const agent_line = if (ctx.hasTool("Task") or ctx.hasTool("Agent"))
-        "\n- Use Agent tool for open-ended searches requiring multiple rounds"
-    else
-        "";
-    return std.mem.concat(allocator, u8, &.{
-        \\A powerful search tool built on ripgrep
-        \\
-        \\Usage:
-        \\- Use Grep to search file contents.
-        \\- Supports full regex syntax (e.g., "log.*Error", "function\s+\w+")
-        \\- Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
-        \\- Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
-        \\- Results are capped at 250 lines by default (head_limit); pass head_limit:0 for unlimited, or use offset to page. Prefer narrowing the pattern over fetching everything.
-        ,
-        agent_line,
-        "\n",
-        \\- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\{\}` to find `interface{}` in Go code)
-        \\- Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \{[\s\S]*?field`, use `multiline: true`
-        \\- Searching a truncated tool result: pass its artifact_id instead of path. One search answers "where in this output is X" directly; paging the same result with ReadArtifact costs one round-trip per 32KB and re-sends the whole context each time. output_mode must be "content" or "count" (there is only one file to name), and path must be omitted.
-        ,
-    });
-}
-
-// ============================================================================
-// Bash — cc/src/tools/BashTool/prompt.ts
-// 动态:① background note;② Git 协议段(ctx.include_git);③ 只读 agent 提醒。
-// ============================================================================
 const BASH_GIT_SECTION =
     \\
     \\
@@ -169,18 +119,11 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\
         \\# Choosing a tool
     );
-    try out.print("\nFind files with {s} and literal text with {s}. Scope searches to the project or a relevant subdirectory.", .{
-        if (ctx.hasTool("Glob")) "Glob" else "`rg --files -g \"*.zig\"`",
-        if (ctx.hasTool("Grep")) "Grep" else "`rg -n -F -- \"text\" src`",
-    });
-    if (!ctx.hasTool("Glob")) try out.writeAll(if (windows)
-        " In PowerShell, Get-ChildItem can list matching files when rg is unavailable."
+    try out.writeAll("\nFind files with `rg --files -g \"*.zig\"` and literal text with `rg -n -F -- \"text\" src`. Scope searches to the project or a relevant subdirectory.");
+    try out.writeAll(if (windows)
+        " In PowerShell, Get-ChildItem can list matching files and Select-String with -SimpleMatch can search known files when rg is unavailable."
     else
-        " If rg is unavailable, list files with `find src -type f -name '*.zig'`.");
-    if (!ctx.hasTool("Grep")) try out.writeAll(if (windows)
-        " In PowerShell, use Select-String with -SimpleMatch to search known files without rg."
-    else
-        " If rg is unavailable, search text with `grep -rnF -- 'text' src`.");
+        " If rg is unavailable, list files with `find src -type f -name '*.zig'` and search text with `grep -rnF -- 'text' src`.");
     if (ctx.hasTool("Read")) try out.writeAll(" Use Read to inspect the matching lines.");
     if (!readonly and ctx.hasTool("Edit")) try out.writeAll(" Use Edit for targeted replacements.");
     if (!readonly and ctx.hasTool("Write")) try out.writeAll(" Use Write to create files.");
@@ -285,20 +228,6 @@ test "describeEdit contains exact-replacement marker" {
     defer a.free(d);
     try std.testing.expect(std.mem.indexOf(u8, d, "exact string replacements") != null);
     try std.testing.expect(std.mem.indexOf(u8, d, "replace_all") != null);
-}
-
-test "describeGrep describes content search and mentions Agent only when enabled" {
-    const a = std.testing.allocator;
-    const with_agent = PromptContext{ .enabled_tool_names = &.{ "Grep", "Task" } };
-    const d1 = try describeGrep(a, &with_agent);
-    defer a.free(d1);
-    try std.testing.expect(std.mem.indexOf(u8, d1, "Use Grep to search file contents") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d1, "open-ended searches") != null);
-
-    const no_agent = PromptContext{ .enabled_tool_names = &.{"Grep"} };
-    const d2 = try describeGrep(a, &no_agent);
-    defer a.free(d2);
-    try std.testing.expect(std.mem.indexOf(u8, d2, "open-ended searches") == null);
 }
 
 test "describeBash includes Git section only when include_git and not readonly agent" {

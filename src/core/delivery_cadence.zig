@@ -148,9 +148,14 @@ pub const State = struct {
 };
 
 const EXPLORATION_TOOLS = [_][]const u8{
-    "Read",         "Grep",      "Glob",      "CodeMap",             "FindSymbol",
-    "ReadArtifact", "WebFetch",  "WebSearch", "ReadMcpResourceTool", "ListMcpResourcesTool",
-    "KgRecall",     "KgContext",
+    "Read",
+    "ReadArtifact",
+    "WebFetch",
+    "WebSearch",
+    "ReadMcpResourceTool",
+    "ListMcpResourcesTool",
+    "KgRecall",
+    "KgContext",
 };
 
 const NEUTRAL_TOOLS = [_][]const u8{
@@ -806,7 +811,7 @@ test "levels fire in order, at most once each, never past the budget" {
 test "classifier: read-only tools and read-only bash are exploration, bookkeeping is neutral, everything else disarms" {
     const a = std.testing.allocator;
     try std.testing.expectEqual(Class.exploration, classify(a, "Read", "{\"file_path\":\"x\"}"));
-    try std.testing.expectEqual(Class.exploration, classify(a, "Grep", "{}"));
+    try std.testing.expectEqual(Class.exploration, classify(a, "Read", "{}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"ls -la && git status\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"timeout 5 grep -rn foo src | head\"}"));
     try std.testing.expectEqual(Class.exploration, classify(a, "Bash", "{\"command\":\"ls 2>/dev/null\"}"));
