@@ -10,7 +10,6 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const types = @import("../types.zig");
 const msg = @import("message.zig");
-const result_projection = @import("result_projection.zig");
 const result_budget = @import("result_budget.zig");
 const json_mod = @import("../json.zig");
 
@@ -777,119 +776,6 @@ pub const Conversation = struct {
         return .{ .dropped = new_boundary - old_boundary, .summary_used = summary != null };
     }
 
-    /// Microcompact(批4,对齐 cc 的工具结果清理):把"较老"消息里的 tool_result 内容
-    /// 替换成短 stub(释放 token),但**保留消息结构**(对话流不断、不调 API)。
-    /// 比 compactKeepRecent 温和:不丢消息,只清旧工具结果(最占 token 的部分)。
-    /// keep_recent_n:最近 N 条消息的 tool_result 不动(可能还要引用)。
-    /// 返回清理的 tool_result 个数。
-    pub fn microcompactToolResults(self: *Conversation, keep_recent_n: usize) usize {
-        const total = self.messages.items.len;
-        if (total <= keep_recent_n) return 0;
-        const boundary = total - keep_recent_n; // [0, boundary) 是"老"消息
-        _ = self.snapshot_mutex.lock();
-        defer _ = self.snapshot_mutex.unlock();
-
-        var cleared: usize = 0;
-        var mi: usize = 0;
-        while (mi < boundary) : (mi += 1) {
-            const m = self.messages.items[mi];
-            for (m.blocks, 0..) |b, bi| {
-                switch (b) {
-                    .tool_result => |tr| {
-                        // 已是 stub 的不重复清(幂等)。
-                        if (isClearedToolResultProjection(tr.content)) continue;
-                        if (!tr.delivered and isImageResult(tr.content)) continue;
-                        if (self.clearToolResultAt(m, bi) == null) continue;
-                        self.noteShrinkAtLocked(mi);
-                        cleared += 1;
-                    },
-                    else => {},
-                }
-            }
-        }
-        if (cleared > 0) self.mutation_version +%= 1;
-        return cleared;
-    }
-
-    /// Codex-style tool output pressure valve: keep only the most recent K
-    /// tool_result blocks intact, independent of message boundaries. This avoids
-    /// the common failure mode where "recent N messages" preserves many old tool
-    /// outputs in a dense tool turn and full compact keeps firing with low savings.
-    pub fn microcompactToolResultsByRecentResults(self: *Conversation, keep_recent_results: usize) ToolResultReduction {
-        _ = self.snapshot_mutex.lock();
-        defer _ = self.snapshot_mutex.unlock();
-        var out = ToolResultReduction{};
-        var seen_recent: usize = 0;
-        var mi = self.messages.items.len;
-        while (mi > 0) {
-            mi -= 1;
-            const m = self.messages.items[mi];
-            var bi = m.blocks.len;
-            while (bi > 0) {
-                bi -= 1;
-                const b = m.blocks[bi];
-                if (b != .tool_result) continue;
-                seen_recent += 1;
-                if (seen_recent <= keep_recent_results) continue;
-                const tr = b.tool_result;
-                if (isClearedToolResultProjection(tr.content)) continue;
-                if (!tr.delivered and isImageResult(tr.content)) continue;
-                const before = tr.content.len;
-                const after = self.clearToolResultAt(m, bi) orelse continue;
-                self.noteShrinkAtLocked(mi);
-                out.cleared += 1;
-                out.bytes_before += before;
-                out.bytes_after += after;
-            }
-        }
-        if (out.changed()) self.mutation_version +%= 1;
-        return out;
-    }
-
-    /// Bound every inline tool_result. The latest result is still shown to the
-    /// model, but as a head/tail preview instead of an unbounded blob. This is
-    /// intentionally independent of full compact: a single recent tool result
-    /// can be enough to exceed the context window.
-    ///
-    /// `result_projection` bounds results only at the moment they are
-    /// committed, and never re-projects history. This pass is therefore the
-    /// only bound that applies to results which entered the Conversation under
-    /// a different budget: a transcript loaded by /resume, or a session that
-    /// switched to a smaller-window model. It runs beside the microcompact
-    /// clear pass in `maybeAutoCompact`; both are no-ops when every result
-    /// already fits.
-    pub fn truncateLargeToolResults(self: *Conversation, max_bytes: usize) ToolResultReduction {
-        _ = self.snapshot_mutex.lock();
-        defer _ = self.snapshot_mutex.unlock();
-        var out = ToolResultReduction{};
-        if (max_bytes == 0) return out;
-        for (self.messages.items, 0..) |m, mi| {
-            for (m.blocks, 0..) |b, bi| {
-                if (b != .tool_result) continue;
-                const tr = b.tool_result;
-                if (tr.content.len <= max_bytes) continue;
-                if (isCommittedToolResultProjection(tr.content)) continue;
-                // A truncated base64 payload is neither an image nor useful
-                // text; images are charged at IMAGE_TOKEN_ESTIMATE anyway.
-                if (isImageResult(tr.content)) continue;
-                const before = tr.content.len;
-                const new_content = boundToolResultContent(self.allocator, tr.content, max_bytes) orelse continue;
-                self.allocator.free(@constCast(tr.content));
-                m.blocks[bi] = .{ .tool_result = .{
-                    .tool_use_id = tr.tool_use_id,
-                    .content = new_content,
-                    .is_error = tr.is_error,
-                } };
-                self.noteShrinkAtLocked(mi);
-                out.truncated += 1;
-                out.bytes_before += before;
-                out.bytes_after += new_content.len;
-            }
-        }
-        if (out.changed()) self.mutation_version +%= 1;
-        return out;
-    }
-
     /// Delivery watermark: the entire retained history is treated as
     /// delivered — every active message was carried by the request just
     /// accepted, and compacted prefix messages were delivered before they
@@ -998,46 +884,6 @@ pub const Conversation = struct {
         remaining_over_cap: usize = 0,
     };
 
-    /// Keep the base64 bytes of active images under `cap` before a request.
-    /// The total counts image tool results *and* first-class `.image` blocks
-    /// (user inputs — never cleared, but they consume the allowance). Clears
-    /// (stubs, with the usual sha256 commitment) image result blocks whose
-    /// block-level watermark says the provider received the picture natively,
-    /// oldest first. Nothing else is ever cleared: an undelivered result (the
-    /// turn about to be sent, a placeholder-only picture, or a resumed record
-    /// whose persisted flag is false) is exactly what the watermark protects.
-    /// Envelopes and stubs are not images and are not counted. Returns what
-    /// was cleared and how far the non-trimmable remainder still exceeds the cap.
-    pub fn trimDeliveredImageBytes(self: *Conversation, cap: usize) ImageTrim {
-        _ = self.snapshot_mutex.lock();
-        defer _ = self.snapshot_mutex.unlock();
-        var out = ImageTrim{};
-        const active_start = @min(self.compact_boundary, self.messages.items.len);
-        var total = self.activeImageBytesLocked(active_start, false);
-        if (total <= cap) return out;
-        var mi = active_start;
-        while (mi < self.messages.items.len and total > cap) : (mi += 1) {
-            const m = self.messages.items[mi];
-            if (m.role != .user) continue;
-            for (m.blocks, 0..) |b, bi| {
-                if (total <= cap) break;
-                if (b != .tool_result) continue;
-                const tr = b.tool_result;
-                if (!tr.delivered or !isImageResult(tr.content)) continue;
-                const before = tr.content.len;
-                const after = self.clearToolResultAt(m, bi) orelse continue;
-                self.noteShrinkAtLocked(mi);
-                out.reduction.cleared += 1;
-                out.reduction.bytes_before += before;
-                out.reduction.bytes_after += after;
-                total -= before;
-            }
-        }
-        if (out.reduction.changed()) self.mutation_version +%= 1;
-        out.remaining_over_cap = total -| cap;
-        return out;
-    }
-
     /// Bytes of active images that no trim may clear: first-class `.image`
     /// blocks plus image results whose watermark is false. The agent loop
     /// projects a fresh tool turn against `cap - this`, so the request cannot
@@ -1049,7 +895,7 @@ pub const Conversation = struct {
         return self.activeImageBytesLocked(active_start, true);
     }
 
-    fn activeImageBytesLocked(self: *const Conversation, active_start: usize, only_non_trimmable: bool) usize {
+    pub fn activeImageBytesLocked(self: *const Conversation, active_start: usize, only_non_trimmable: bool) usize {
         var total: usize = 0;
         for (self.messages.items[active_start..]) |m| for (m.blocks) |b| switch (b) {
             .tool_result => |tr| if (isImageResult(tr.content)) {
@@ -1084,12 +930,10 @@ pub const Conversation = struct {
         }
     };
 
-    fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) ?usize {
-        const tr = m.blocks[bi].tool_result;
-        // Artifact envelopes are already compact and are the only recovery
-        // capability for the omitted bytes. Microcompact must not erase that
-        // capability merely because the result became old.
-        if (result_projection.hasRecoverableArtifact(tr.content)) return null;
+    pub fn clearToolResultLocked(self: *Conversation, message_index: usize, block_index: usize) ?usize {
+        const m = self.messages.items[message_index];
+        const tr = m.blocks[block_index].tool_result;
+        if (isClearedToolResultProjection(tr.content)) return null;
         const new_content = if (toolResultCommitmentLine(tr.content)) |commitment|
             std.fmt.allocPrint(
                 self.allocator,
@@ -1108,13 +952,21 @@ pub const Conversation = struct {
             self.allocator.free(new_content);
             return null;
         }
+        self.replaceToolResultContentLocked(message_index, block_index, new_content);
+        return new_content.len;
+    }
+
+    pub fn replaceToolResultContentLocked(self: *Conversation, message_index: usize, block_index: usize, content: []u8) void {
+        const m = self.messages.items[message_index];
+        const tr = m.blocks[block_index].tool_result;
         self.allocator.free(@constCast(tr.content));
-        m.blocks[bi] = .{ .tool_result = .{
+        m.blocks[block_index] = .{ .tool_result = .{
             .tool_use_id = tr.tool_use_id,
-            .content = new_content,
+            .content = content,
             .is_error = tr.is_error,
         } };
-        return new_content.len;
+        self.noteShrinkAtLocked(message_index);
+        self.mutation_version +%= 1;
     }
 };
 
@@ -1172,74 +1024,6 @@ fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
     return a.ptr == b.ptr and a.vtable == b.vtable;
 }
 
-/// Bring one oversized tool result under `max_bytes` without ever destroying
-/// the only way its omitted bytes can be recovered.
-///
-/// `truncateToolResultContent` is a *text* edit. Applied to an artifact
-/// envelope it produces unparseable JSON, which takes the artifact id, the
-/// digest and the read instruction down with it - and the next microcompact
-/// pass, no longer able to see a recoverable artifact, then clears the wreck
-/// to a stub. `clearToolResultAt` explicitly refuses to erase that capability;
-/// this pass has to keep the same promise, so an envelope is re-rendered by
-/// the layer that owns its shape and anything that layer cannot rewrite is
-/// left alone.
-///
-/// Returns null when the result must be left as it is.
-fn boundToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ?[]u8 {
-    // A recoverable artifact envelope is re-rendered by the layer that owns its
-    // shape, which knows how to recompute every counter exactly.
-    if (result_projection.shrinkRecoverableEnvelope(allocator, content, max_bytes)) |shrunk|
-        return shrunk;
-    // Anything else structured - `metacodes.bash-result.v2`, a non-recoverable
-    // fallback envelope, any tool's large JSON - keeps its shape by trimming
-    // only its long string values. The text path below would leave
-    // unparseable output and take `exit_code`, `storage_error` and every id
-    // and flag down with the one long string that made the result oversized.
-    if (result_projection.shrinkStructuredResult(allocator, content, max_bytes)) |shrunk|
-        return shrunk;
-    // Structured but unshrinkable - a result whose bulk is not in its strings,
-    // say a large numeric array. Trimming found nothing to give back, and the
-    // text path would emit unparseable output, so it is left oversized: that
-    // costs one request, where destroying the schema costs the result. Same
-    // reasoning as the recoverable-artifact case, and the reason the text path
-    // below is reserved for content that was never structured.
-    if (result_projection.hasRecoverableArtifact(content)) return null;
-    if (result_projection.isStructuredObject(content)) return null;
-    return truncateToolResultContent(allocator, content, max_bytes) catch null;
-}
-
-fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {
-    if (content.len <= max_bytes) return try allocator.dupe(u8, content);
-    const digest = sha256Hex(content);
-    if (max_bytes < 1024) {
-        return try std.fmt.allocPrint(
-            allocator,
-            "{s}original_bytes={d} sha256={s}]\n[tool output truncated to fit context]",
-            .{ TOOL_RESULT_COMMITMENT_PREFIX, content.len, digest[0..] },
-        );
-    }
-
-    const preview_budget = max_bytes - 512;
-    const wanted_head_len = preview_budget * 3 / 4;
-    const wanted_tail_len = preview_budget - wanted_head_len;
-    const content_is_valid_utf8 = std.unicode.utf8ValidateSlice(content);
-    const head_end = if (content_is_valid_utf8)
-        floorUtf8Boundary(content, wanted_head_len)
-    else
-        validUtf8PrefixLen(content, wanted_head_len);
-    var tail_start = if (content_is_valid_utf8)
-        ceilUtf8Boundary(content, content.len - wanted_tail_len)
-    else
-        content.len;
-    if (tail_start < head_end) tail_start = head_end;
-    const omitted = tail_start - head_end;
-    return try std.fmt.allocPrint(
-        allocator,
-        "{s}original_bytes={d} sha256={s}]\n[tool output truncated to fit context: shown_head_bytes={d}, shown_tail_bytes={d}]\n\n{s}\n\n...[truncated {d} bytes]...\n\n{s}",
-        .{ TOOL_RESULT_COMMITMENT_PREFIX, content.len, digest[0..], head_end, content.len - tail_start, content[0..head_end], omitted, content[tail_start..] },
-    );
-}
-
 pub fn isCommittedToolResultProjection(content: []const u8) bool {
     return isClearedToolResultProjection(content) or isTruncatedToolResultProjection(content);
 }
@@ -1294,37 +1078,6 @@ fn sha256Hex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
-}
-
-fn floorUtf8Boundary(s: []const u8, desired: usize) usize {
-    var end = @min(desired, s.len);
-    if (end == s.len) return end;
-    while (end > 0 and isUtf8ContinuationByte(s[end])) : (end -= 1) {}
-    return end;
-}
-
-fn ceilUtf8Boundary(s: []const u8, desired: usize) usize {
-    var start = @min(desired, s.len);
-    while (start < s.len and isUtf8ContinuationByte(s[start])) : (start += 1) {}
-    return start;
-}
-
-fn validUtf8PrefixLen(s: []const u8, desired: usize) usize {
-    var i: usize = 0;
-    var last: usize = 0;
-    const limit = @min(desired, s.len);
-    while (i < limit) {
-        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
-        if (n > limit - i) break;
-        _ = std.unicode.utf8Decode(s[i .. i + n]) catch break;
-        i += n;
-        last = i;
-    }
-    return last;
-}
-
-fn isUtf8ContinuationByte(b: u8) bool {
-    return (b & 0b1100_0000) == 0b1000_0000;
 }
 
 test "Conversation init / deinit empty" {
@@ -1532,175 +1285,6 @@ test "delivery watermark: a mixed report protects only the messages whose image 
     try std.testing.expect(c.messages.items[3].delivered);
 }
 
-test "trimDeliveredImageBytes stubs the oldest delivered images first and never an undelivered one" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const T = struct {
-        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8, data_len: usize) !void {
-            const tu = try al.alloc(msg.Block, 1);
-            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
-            try conv.append(.{ .role = .assistant, .blocks = tu });
-            const data = try al.alloc(u8, data_len);
-            defer al.free(data);
-            @memset(data, 'A');
-            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
-            const blocks = try al.alloc(msg.Block, 1);
-            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
-            try conv.append(.{ .role = .user, .blocks = blocks });
-        }
-    };
-    try T.imageTurn(&c, a, "t1", 4096); // 0,1 oldest
-    try T.imageTurn(&c, a, "t2", 4096); // 2,3
-    c.markDelivered(.{ .image_placeholder_ids = &.{} });
-    try T.imageTurn(&c, a, "t3", 4096); // 4,5 undelivered (current turn)
-    const one = c.messages.items[1].blocks[0].tool_result.content.len;
-    // Cap admits two images: only the oldest delivered one is stubbed; the undelivered
-    // current-turn image is never touched even though it is the newest.
-    const reduced = c.trimDeliveredImageBytes(2 * one + 16);
-    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
-    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
-    try std.testing.expect(isImageResult(c.messages.items[3].blocks[0].tool_result.content));
-    try std.testing.expect(isImageResult(c.messages.items[5].blocks[0].tool_result.content));
-    // A cap that only the undelivered image could satisfy still leaves it alone.
-    const tight = c.trimDeliveredImageBytes(one / 2);
-    try std.testing.expectEqual(@as(usize, 1), tight.reduction.cleared);
-    try std.testing.expect(isImageResult(c.messages.items[5].blocks[0].tool_result.content));
-    const rest = c.trimDeliveredImageBytes(one / 2);
-    try std.testing.expect(!rest.reduction.changed());
-    try std.testing.expectEqual(one - one / 2, rest.remaining_over_cap);
-}
-
-test "trimDeliveredImageBytes: a resumed history whose persisted flags are false stays protected and reports the remainder" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const T = struct {
-        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
-            const tu = try al.alloc(msg.Block, 1);
-            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
-            try conv.append(.{ .role = .assistant, .blocks = tu });
-            const data = try al.alloc(u8, 4096);
-            defer al.free(data);
-            @memset(data, 'A');
-            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
-            const blocks = try al.alloc(msg.Block, 1);
-            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
-            try conv.append(.{ .role = .user, .blocks = blocks });
-        }
-    };
-    try T.imageTurn(&c, a, "t1"); // 0,1 answered by 2
-    try c.appendText(.assistant, "first reply");
-    try T.imageTurn(&c, a, "t2"); // 3,4 answered by 5
-    try c.appendText(.assistant, "second reply");
-    try T.imageTurn(&c, a, "t3"); // 6,7 trailing, unanswered
-    // No watermark anywhere (an old transcript, or pictures a non-vision model
-    // never saw natively): nothing is trimmable, and the caller learns how far
-    // the request still exceeds the cap instead of silently losing a picture.
-    const one = c.messages.items[1].blocks[0].tool_result.content.len;
-    const trim = c.trimDeliveredImageBytes(one + 16);
-    try std.testing.expectEqual(@as(usize, 0), trim.reduction.cleared);
-    try std.testing.expectEqual(3 * one - (one + 16), trim.remaining_over_cap);
-    try std.testing.expect(isImageResult(c.messages.items[1].blocks[0].tool_result.content));
-    try std.testing.expectEqual(3 * one, c.nonTrimmableImageBytes());
-    // Once the watermark says the first two were received natively, they trim oldest first.
-    c.messages.items[1].blocks[0].tool_result.delivered = true;
-    c.messages.items[4].blocks[0].tool_result.delivered = true;
-    const trimmed = c.trimDeliveredImageBytes(one + 16);
-    try std.testing.expectEqual(@as(usize, 2), trimmed.reduction.cleared);
-    try std.testing.expectEqual(@as(usize, 0), trimmed.remaining_over_cap);
-    try std.testing.expect(isImageResult(c.messages.items[7].blocks[0].tool_result.content));
-}
-
-test "trimDeliveredImageBytes: once any watermark exists, a local assistant append cannot make an unseen image trimmable" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const T = struct {
-        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
-            const tu = try al.alloc(msg.Block, 1);
-            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
-            try conv.append(.{ .role = .assistant, .blocks = tu });
-            const data = try al.alloc(u8, 4096);
-            defer al.free(data);
-            @memset(data, 'A');
-            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
-            const blocks = try al.alloc(msg.Block, 1);
-            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
-            try conv.append(.{ .role = .user, .blocks = blocks });
-        }
-    };
-    try c.appendText(.user, "start");
-    c.markDelivered(.{ .image_placeholder_ids = &.{} }); // an accepted request exists: flags are authoritative
-    try T.imageTurn(&c, a, "t1"); // 1,2 undelivered: the next request was rejected...
-    try c.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}"); // ...and a local marker followed
-    const one = c.messages.items[2].blocks[0].tool_result.content.len;
-    // The marker is not delivery evidence: the unseen image is not trimmable.
-    try std.testing.expect(!c.trimDeliveredImageBytes(one / 2).reduction.changed());
-    try std.testing.expect(isImageResult(c.messages.items[2].blocks[0].tool_result.content));
-}
-
-test "trimDeliveredImageBytes: first-class user images consume the allowance but are never cleared" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const inputs = [_]msg.ImageInput{.{ .media_type = "image/png", .data = "A" ** 4096 }};
-    var user_image = try msg.userMessageWithImages(a, "look", &inputs);
-    errdefer user_image.deinit(a);
-    try c.append(user_image);
-    const tu = try a.alloc(msg.Block, 1);
-    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
-    try c.append(.{ .role = .assistant, .blocks = tu });
-    const data = try a.alloc(u8, 4096);
-    defer a.free(data);
-    @memset(data, 'B');
-    const img = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
-    const blocks = try a.alloc(msg.Block, 1);
-    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = img, .is_error = false } };
-    try c.append(.{ .role = .user, .blocks = blocks });
-    c.markDelivered(.{ .image_placeholder_ids = &.{} });
-    // Cap would admit the tool image alone, but the user image already takes 4096:
-    // the delivered tool image is cleared, the user image block stays.
-    const reduced = c.trimDeliveredImageBytes(img.len + 100);
-    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
-    try std.testing.expect(c.messages.items[0].blocks[1] == .image);
-    // The user image is what remains non-trimmable.
-    try std.testing.expectEqual(@as(usize, 4096), c.nonTrimmableImageBytes());
-    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[2].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
-}
-
-test "delivery watermark: a placeholder sibling in a parallel turn does not pin its natively-sent siblings" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const tu = try a.alloc(msg.Block, 2);
-    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_png"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
-    tu[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_webp"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
-    try c.append(.{ .role = .assistant, .blocks = tu });
-    const data = try a.alloc(u8, 4096);
-    defer a.free(data);
-    @memset(data, 'A');
-    const png = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
-    const webp = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/webp\",\"data\":\"{s}\"}}", .{data});
-    const blocks = try a.alloc(msg.Block, 2);
-    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_png"), .content = png, .is_error = false } };
-    blocks[1] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_webp"), .content = webp, .is_error = false } };
-    try c.append(.{ .role = .user, .blocks = blocks });
-    const placeholders = [_][]const u8{"t_webp"};
-    c.markDelivered(.{ .image_placeholder_ids = &placeholders });
-    try std.testing.expect(!c.messages.items[1].delivered);
-    try std.testing.expect(c.messages.items[1].blocks[0].tool_result.delivered);
-    try std.testing.expect(!c.messages.items[1].blocks[1].tool_result.delivered);
-    // The wire cap can trim the delivered PNG while the WebP stays protected.
-    const reduced = c.trimDeliveredImageBytes(webp.len + 16);
-    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
-    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, TOOL_RESULT_CLEARED_STUB));
-    try std.testing.expect(isImageResult(c.messages.items[1].blocks[1].tool_result.content));
-    // Microcompact under pressure likewise clears only the delivered block.
-    const micro = c.microcompactToolResultsByRecentResults(0);
-    try std.testing.expectEqual(@as(usize, 0), micro.cleared);
-}
-
 test "compact preview commit keeps a delivery watermark set while the preview was in flight" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -1767,79 +1351,6 @@ test "delivery watermark copied into a preview is cleared when the preview rewri
     try std.testing.expect(c.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
     try std.testing.expect(!c.messages.items[0].delivered);
     try std.testing.expect(c.messages.items[1].delivered);
-}
-
-test "usage anchor: microcompact clear invalidates it" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const blocks = try a.alloc(msg.Block, 1);
-    const content = try a.alloc(u8, 512);
-    @memset(content, 'x');
-    blocks[0] = .{ .tool_result = .{
-        .tool_use_id = try a.dupe(u8, "t1"),
-        .content = content,
-        .is_error = false,
-    } };
-    try c.append(.{ .role = .user, .blocks = blocks });
-    try c.appendText(.assistant, "done");
-    c.setUsageAnchor(50_000);
-    try std.testing.expect(c.usageAnchor() != null);
-
-    const reduced = c.microcompactToolResultsByRecentResults(0);
-    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
-    try std.testing.expect(c.usageAnchor() == null); // 前缀被改写,实计数不再可信
-}
-
-test "usage anchor: microcompact never expands a short result" {
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    const blocks = try a.alloc(msg.Block, 1);
-    blocks[0] = .{ .tool_result = .{
-        .tool_use_id = try a.dupe(u8, "t1"),
-        .content = try a.dupe(u8, "short result"),
-        .is_error = false,
-    } };
-    try c.append(.{ .role = .user, .blocks = blocks });
-    try c.appendText(.assistant, "done");
-    c.setUsageAnchor(50_000);
-
-    const reduced = c.microcompactToolResultsByRecentResults(0);
-    try std.testing.expectEqual(@as(usize, 0), reduced.cleared);
-    try std.testing.expectEqualStrings("short result", c.messages.items[0].blocks[0].tool_result.content);
-    try std.testing.expect(c.usageAnchor() != null);
-}
-
-test "usage anchor: truncating a post-anchor tool_result keeps the anchor (glm 逐轮截断回归)" {
-    // 实测回归(2026-07-06 fix2.log):每轮新 Read 结果被 preflight truncate,
-    // 粗粒度失效把锚点每轮打回冷路径字节估算 → 真实 106K 被估成 222K+ 误触发 microcompact。
-    const a = std.testing.allocator;
-    var c = Conversation.init(a);
-    defer c.deinit();
-    try c.appendText(.user, "read files");
-    c.setUsageAnchor(100_000); // 覆盖 messages[0..1]
-
-    // 锚点之后追加一条超大 tool_result(属于后缀)。
-    const blocks = try a.alloc(msg.Block, 1);
-    const huge = try a.alloc(u8, 100 * 1024);
-    @memset(huge, 'x');
-    blocks[0] = .{ .tool_result = .{
-        .tool_use_id = try a.dupe(u8, "t1"),
-        .content = huge,
-        .is_error = false,
-    } };
-    try c.append(.{ .role = .user, .blocks = blocks });
-
-    const reduced = c.truncateLargeToolResults(32 * 1024);
-    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
-    // 后缀截断不影响前缀实计数 → 锚点仍有效。
-    try std.testing.expect(c.usageAnchor() != null);
-
-    // 清后缀 result(index 1 ≥ msg_count 1,不在锚点覆盖区)同样保锚点。
-    const cleared = c.microcompactToolResultsByRecentResults(0);
-    try std.testing.expectEqual(@as(usize, 1), cleared.cleared);
-    try std.testing.expect(c.usageAnchor() != null);
 }
 
 test "usage anchor: zero usage from backend does not create an anchor" {

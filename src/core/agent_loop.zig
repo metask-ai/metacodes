@@ -3182,7 +3182,7 @@ fn runCounted(
             // every wired provider caps the request size with inline images. Stub
             // the oldest delivered image results until the history fits; the
             // current turn is bounded by the projection's per-turn image cap.
-            const image_trim = conversation.trimDeliveredImageBytes(opts.image_request_bytes_cap);
+            const image_trim = result_projection.trimDeliveredImageBytes(conversation, opts.image_request_bytes_cap);
             if (image_trim.reduction.changed()) {
                 log.info("agent", "image wire cap: cleared {d} delivered image result(s) bytes={d}->{d} cap={d}", .{ image_trim.reduction.cleared, image_trim.reduction.bytes_before, image_trim.reduction.bytes_after, opts.image_request_bytes_cap });
             }
@@ -6473,7 +6473,7 @@ fn runAutoCompactControlled(
     // kernel's own reduction of its preview still does (issue #430).
     const in_place_reduction = control == null;
     if (in_place_reduction and !forced and !durable_pressure and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
-        var reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        var reduced = result_projection.microcompactToolResultsByRecentResults(conversation, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
         // Clearing deliberately preserves the most recent results, and skips
         // anything whose artifact envelope is its only recovery capability.
         // Neither exemption bounds a single oversized result that entered the
@@ -6482,7 +6482,8 @@ fn runAutoCompactControlled(
         // history. Bound those here against the same per-result budget
         // projection uses, so the `truncated=` field of the line below stops
         // being structurally zero.
-        reduced.merge(conversation.truncateLargeToolResults(
+        reduced.merge(result_projection.truncateLargeToolResults(
+            conversation,
             conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
         ));
         if (reduced.changed()) {
@@ -6690,12 +6691,13 @@ fn runAutoCompactControlled(
 
     if (pressure.isAtBlockingLimit()) {
         if (in_place_reduction) {
-            var reduced = conversation.microcompactToolResultsByRecentResults(0);
+            var reduced = result_projection.microcompactToolResultsByRecentResults(conversation, 0);
             // Same rationale as the stale-result valve above, and it matters more
             // here: at the blocking limit the request is otherwise rejected, so a
             // single unbounded surviving result is the difference between
             // recovering and returning api_error.
-            reduced.merge(conversation.truncateLargeToolResults(
+            reduced.merge(result_projection.truncateLargeToolResults(
+                conversation,
                 conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
             ));
             if (reduced.changed()) {
@@ -8771,7 +8773,7 @@ test "auto-compact preflight keeps serialized request valid UTF-8 after multibyt
     } };
     try c.append(.{ .role = .user, .blocks = blocks });
 
-    const reduced = c.truncateLargeToolResults(limit);
+    const reduced = result_projection.truncateLargeToolResults(&c, limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
     try std.testing.expect(std.unicode.utf8ValidateSlice(c.messages.items[1].blocks[0].tool_result.content));
 
@@ -8897,7 +8899,7 @@ test "微压缩两趟都接线:clear 与 truncate 必须同时在生产路径上
     const src = @embedFile("agent_loop.zig");
     var count: usize = 0;
     var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, src, cursor, "reduced.merge(conversation.truncateLargeToolResults(")) |at| {
+    while (std.mem.indexOfPos(u8, src, cursor, "reduced.merge(result_projection.truncateLargeToolResults(")) |at| {
         cursor = at + 1;
         // 同一条语句里必须紧跟着按 provider 窗口派生的预算,不能各自造常量。
         const tail = src[at..@min(src.len, at + 240)];
@@ -9967,4 +9969,246 @@ test "sessionIdText prefers the explicit id, then the routing session, never the
     try std.testing.expectEqualStrings("a" ** 24, sessionIdText(&opts));
     opts.session_id = "explicit";
     try std.testing.expectEqualStrings("explicit", sessionIdText(&opts));
+}
+
+test "trimDeliveredImageBytes stubs the oldest delivered images first and never an undelivered one" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8, data_len: usize) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, data_len);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&c, a, "t1", 4096); // 0,1 oldest
+    try T.imageTurn(&c, a, "t2", 4096); // 2,3
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    try T.imageTurn(&c, a, "t3", 4096); // 4,5 undelivered (current turn)
+    const one = c.messages.items[1].blocks[0].tool_result.content.len;
+    // Cap admits two images: only the oldest delivered one is stubbed; the undelivered
+    // current-turn image is never touched even though it is the newest.
+    const reduced = result_projection.trimDeliveredImageBytes(&c, 2 * one + 16);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, conversation_mod.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[3].blocks[0].tool_result.content) != null);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[5].blocks[0].tool_result.content) != null);
+    // A cap that only the undelivered image could satisfy still leaves it alone.
+    const tight = result_projection.trimDeliveredImageBytes(&c, one / 2);
+    try std.testing.expectEqual(@as(usize, 1), tight.reduction.cleared);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[5].blocks[0].tool_result.content) != null);
+    const rest = result_projection.trimDeliveredImageBytes(&c, one / 2);
+    try std.testing.expect(!rest.reduction.changed());
+    try std.testing.expectEqual(one - one / 2, rest.remaining_over_cap);
+}
+
+test "trimDeliveredImageBytes: a resumed history whose persisted flags are false stays protected and reports the remainder" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&c, a, "t1"); // 0,1 answered by 2
+    try c.appendText(.assistant, "first reply");
+    try T.imageTurn(&c, a, "t2"); // 3,4 answered by 5
+    try c.appendText(.assistant, "second reply");
+    try T.imageTurn(&c, a, "t3"); // 6,7 trailing, unanswered
+    // No watermark anywhere (an old transcript, or pictures a non-vision model
+    // never saw natively): nothing is trimmable, and the caller learns how far
+    // the request still exceeds the cap instead of silently losing a picture.
+    const one = c.messages.items[1].blocks[0].tool_result.content.len;
+    const trim = result_projection.trimDeliveredImageBytes(&c, one + 16);
+    try std.testing.expectEqual(@as(usize, 0), trim.reduction.cleared);
+    try std.testing.expectEqual(3 * one - (one + 16), trim.remaining_over_cap);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[1].blocks[0].tool_result.content) != null);
+    try std.testing.expectEqual(3 * one, c.nonTrimmableImageBytes());
+    // Once the watermark says the first two were received natively, they trim oldest first.
+    c.messages.items[1].blocks[0].tool_result.delivered = true;
+    c.messages.items[4].blocks[0].tool_result.delivered = true;
+    const trimmed = result_projection.trimDeliveredImageBytes(&c, one + 16);
+    try std.testing.expectEqual(@as(usize, 2), trimmed.reduction.cleared);
+    try std.testing.expectEqual(@as(usize, 0), trimmed.remaining_over_cap);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[7].blocks[0].tool_result.content) != null);
+}
+
+test "trimDeliveredImageBytes: once any watermark exists, a local assistant append cannot make an unseen image trimmable" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try c.appendText(.user, "start");
+    c.markDelivered(.{ .image_placeholder_ids = &.{} }); // an accepted request exists: flags are authoritative
+    try T.imageTurn(&c, a, "t1"); // 1,2 undelivered: the next request was rejected...
+    try c.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}"); // ...and a local marker followed
+    const one = c.messages.items[2].blocks[0].tool_result.content.len;
+    // The marker is not delivery evidence: the unseen image is not trimmable.
+    try std.testing.expect(!result_projection.trimDeliveredImageBytes(&c, one / 2).reduction.changed());
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[2].blocks[0].tool_result.content) != null);
+}
+
+test "trimDeliveredImageBytes: first-class user images consume the allowance but are never cleared" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const inputs = [_]msg.ImageInput{.{ .media_type = "image/png", .data = "A" ** 4096 }};
+    var user_image = try msg.userMessageWithImages(a, "look", &inputs);
+    errdefer user_image.deinit(a);
+    try c.append(user_image);
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try a.alloc(u8, 4096);
+    defer a.free(data);
+    @memset(data, 'B');
+    const img = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = img, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    // Cap would admit the tool image alone, but the user image already takes 4096:
+    // the delivered tool image is cleared, the user image block stays.
+    const reduced = result_projection.trimDeliveredImageBytes(&c, img.len + 100);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
+    try std.testing.expect(c.messages.items[0].blocks[1] == .image);
+    // The user image is what remains non-trimmable.
+    try std.testing.expectEqual(@as(usize, 4096), c.nonTrimmableImageBytes());
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[2].blocks[0].tool_result.content, conversation_mod.TOOL_RESULT_CLEARED_STUB));
+}
+
+test "delivery watermark: a placeholder sibling in a parallel turn does not pin its natively-sent siblings" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const tu = try a.alloc(msg.Block, 2);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_png"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    tu[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_webp"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try a.alloc(u8, 4096);
+    defer a.free(data);
+    @memset(data, 'A');
+    const png = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const webp = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/webp\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_png"), .content = png, .is_error = false } };
+    blocks[1] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_webp"), .content = webp, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    const placeholders = [_][]const u8{"t_webp"};
+    c.markDelivered(.{ .image_placeholder_ids = &placeholders });
+    try std.testing.expect(!c.messages.items[1].delivered);
+    try std.testing.expect(c.messages.items[1].blocks[0].tool_result.delivered);
+    try std.testing.expect(!c.messages.items[1].blocks[1].tool_result.delivered);
+    // The wire cap can trim the delivered PNG while the WebP stays protected.
+    const reduced = result_projection.trimDeliveredImageBytes(&c, webp.len + 16);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, conversation_mod.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[1].blocks[1].tool_result.content) != null);
+    // Microcompact under pressure likewise clears only the delivered block.
+    const micro = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 0), micro.cleared);
+}
+
+test "usage anchor: microcompact clear invalidates it" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    const content = try a.alloc(u8, 512);
+    @memset(content, 'x');
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = content,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try c.appendText(.assistant, "done");
+    c.setUsageAnchor(50_000);
+    try std.testing.expect(c.usageAnchor() != null);
+
+    const reduced = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expect(c.usageAnchor() == null); // 前缀被改写,实计数不再可信
+}
+
+test "usage anchor: microcompact never expands a short result" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "short result"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try c.appendText(.assistant, "done");
+    c.setUsageAnchor(50_000);
+
+    const reduced = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 0), reduced.cleared);
+    try std.testing.expectEqualStrings("short result", c.messages.items[0].blocks[0].tool_result.content);
+    try std.testing.expect(c.usageAnchor() != null);
+}
+
+test "usage anchor: truncating a post-anchor tool_result keeps the anchor (glm 逐轮截断回归)" {
+    // 实测回归(2026-07-06 fix2.log):每轮新 Read 结果被 preflight truncate,
+    // 粗粒度失效把锚点每轮打回冷路径字节估算 → 真实 106K 被估成 222K+ 误触发 microcompact。
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "read files");
+    c.setUsageAnchor(100_000); // 覆盖 messages[0..1]
+
+    // 锚点之后追加一条超大 tool_result(属于后缀)。
+    const blocks = try a.alloc(msg.Block, 1);
+    const huge = try a.alloc(u8, 100 * 1024);
+    @memset(huge, 'x');
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = huge,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    const reduced = result_projection.truncateLargeToolResults(&c, 32 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    // 后缀截断不影响前缀实计数 → 锚点仍有效。
+    try std.testing.expect(c.usageAnchor() != null);
+
+    // 清后缀 result(index 1 ≥ msg_count 1,不在锚点覆盖区)同样保锚点。
+    const cleared = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 1), cleared.cleared);
+    try std.testing.expect(c.usageAnchor() != null);
 }
