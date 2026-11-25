@@ -6,6 +6,7 @@ store and the page API are read back over HTTP. No provider or Docker calls.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -621,6 +622,23 @@ class ProfileTest(unittest.TestCase):
                          (kept['items'][0]['run'],))
         self.assertEqual(orphans, [])
         self.assertEqual(json.loads(ingest.decode(*spec))['name'], kept['items'][0]['run'])
+
+    def test_profile_deletion_protects_worker_rows_even_after_receipt_loss(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        profile = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        name = profile['items'][0]['run']
+        self.workbench.library.sync()
+        (self.manager.records / (name + '.json')).unlink()
+        with self.workbench.library.store.transaction() as tx:
+            tx.execute("INSERT INTO worker_jobs (job, log_tail, ingested_at) VALUES (?, '', ?)", (name, profile['created_at']))
+            tx.execute("DELETE FROM runs WHERE name = ?", (name,))
+        self.client.request('api/profile/delete', {'id': profile['id']})
+        self.assertTrue((self.manager.jobs_dir / name / 'result.json').is_file())
+        self.assertEqual(self.client.request('api/store')['counts']['trials'], 1)
+        self.assertEqual(self.client.request('api/jobs')['jobs'], [])
+        with contextlib.closing(workbench_module.open_local(self.workbench.library.store.config, self.manager.jobs_dir)) as reopened:
+            self.assertEqual(reopened.overview(), [])
+            self.assertIsNone(reopened.job(name))
 
     def test_deleting_a_job_removes_its_run_files_and_rows_and_keeps_its_profile(self):
         record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])

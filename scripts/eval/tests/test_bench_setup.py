@@ -18,6 +18,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -181,7 +182,7 @@ elif name == "ssh":
                 "FAKE_LATE_TRAFFIC"):
         if key in env:
             remote[key] = env[key]
-    if " pack " in command:
+    if " results final " in command or " results summary " in command or " pack " in command:
         # A slow or broken copy-back of the job directory.
         if env.get("FAKE_SSH_PACK_FAIL"):
             print("pack refused", file=sys.stderr)
@@ -1004,17 +1005,24 @@ class SshRunTest(SetupFixture):
         return {"model": "metask/session-model", "tasks": ["fix-git"], "attempts": 1, "concurrency": 1,
                 "executor": "relay-4090"}
 
-    def test_run_on_ssh_executor_profiles_remotely_and_syncs_results(self):
+    def test_remote_details_stay_on_the_worker_and_are_read_on_demand(self):
         manager, client, calls = self.prepare_remote(profile=True)
         catalog = client.request("api/workbench")
         relay = next(e for e in catalog["executors"] if e["name"] == "relay-4090")
         self.assertTrue(relay["ready"], relay["reasons"])
         os.environ.update(FAKE_EXPECT_ACCOUNT_KEY="session-access", FAKE_PROFILE_REQUEST="1")
-        run = client.request("api/runs", self.request())
+        output = io.StringIO()
+        with patch("scripts.eval.harbor.bench.results.request", side_effect=AssertionError("CLI polled the worker")), \
+                contextlib.redirect_stdout(output):
+            code = cli.main(["--state-root", str(self.state), "run", "--url", client.url, "--task", "fix-git", "--executor", "relay-4090",
+                             "--model", "metask/session-model", "--wait", "--json"])
+        self.assertEqual(code, 0, output.getvalue())
+        run = json.loads(output.getvalue())
+        self.assertEqual(run["status"], "finished")
         final = wait_run(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
         self.assertEqual(final["executor"], "relay-4090")
-        local = manager.jobs_dir / run["name"]
+        local = self.remote_home / ".metacodes-bench/jobs" / run["name"]
         argv = json.loads((local / "argv.json").read_text())
         remote_root = str((self.remote_home / ".metacodes-bench").resolve())
         self.assertEqual(argv[argv.index("-o") + 1], remote_root + "/jobs")
@@ -1031,10 +1039,137 @@ class SshRunTest(SetupFixture):
         for path in list(self.remote_home.rglob("*")) + list(manager.records.iterdir()):
             if path.is_file():
                 self.assertNotIn(b"session-access", path.read_bytes(), path)
+        self.assertFalse((manager.jobs_dir / run["name"]).exists())
+        self.assertNotIn("rows", final["worker_summary"]["view"])
+        before = self.calls("ssh")
+        overview = client.request("api/jobs")
+        self.assertEqual(overview["jobs"][0]["summary"]["counts"]["pass"], 1)
+        self.assertEqual(self.calls("ssh"), before)
+        self.assertEqual(client.request("api/store")["counts"]["trials"], 0)
         view = client.request("api/job?name=" + run["name"])
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
         self.assertEqual((view["rows"][0]["requests"], view["rows"][0]["total_tokens"]), (1, 70))
         self.assertTrue(list((local / ".bench-metrics").glob("*.jsonl")))
+        detail = client.request("api/trial?job=" + run["name"] + "&trial=fix-git__fake")
+        self.assertEqual(detail["row"]["status"], "pass")
+        self.assertEqual(client.request("api/store")["counts"]["trials"], 0)
+        self.assertFalse((manager.jobs_dir / run["name"]).exists())
+
+        from scripts.eval.harbor.bench.results import WorkerUnavailable
+        with patch("scripts.eval.harbor.bench.results.request", side_effect=WorkerUnavailable("worker 离线")) as request:
+            self.assertEqual(client.request("api/jobs")["jobs"][0]["summary"]["counts"]["pass"], 1)
+            self.assertEqual(client.request("api/run?name=" + run["name"])["status"], "finished")
+            request.assert_not_called()
+            logged = client.request("api/run?log=1&name=" + run["name"])
+            self.assertEqual((logged["status"], logged["log_error"]), ("finished", "worker 离线"))
+            with self.assertRaisesRegex(ValueError, "worker 离线"):
+                client.request("api/job?name=" + run["name"])
+            client.request("api/job/delete", {"name": run["name"]})
+        self.assertTrue(local.is_dir())
+        self.assertFalse(client.request("api/jobs")["jobs"])
+
+    def test_shared_worker_store_serves_details_even_when_worker_is_offline(self):
+        manager, client, _ = self.prepare_remote()
+        node_config = self.remote_home / ".metacodes/bench/workbench.json"
+        atomic_json(node_config, {"store": {"backend": "sqlite", "path": str(self.config.parent / "bench.sqlite3")}})
+        run = client.request("api/runs", self.request())
+        name = run["name"]
+        self.assertEqual(wait_run(manager, name)["status"], "finished")
+        self.assertFalse((manager.jobs_dir / name).exists())
+        with patch("scripts.eval.harbor.bench.results.request", side_effect=AssertionError("unexpected SSH read")):
+            self.assertEqual(client.request("api/jobs")["jobs"][0]["name"], name)
+            self.assertEqual(client.request("api/job?name=" + name)["rows"][0]["status"], "pass")
+            trial = client.request("api/trial?job=" + name + "&trial=fix-git__fake")
+            self.assertEqual(trial["row"]["attempt_number"], 1)
+            logged = client.request("api/run?log=1&name=" + name)
+            self.assertNotIn("log_error", logged)
+            with contextlib.closing(sqlite3.connect(self.config.parent / "bench.sqlite3")) as db, db:
+                db.execute("UPDATE jobs SET source_dir = ? WHERE name = ?", (str(manager.jobs_dir / name), name))
+            client.request("api/job/delete", {"name": name})
+            self.assertFalse(client.request("api/jobs")["jobs"])
+            with self.assertRaisesRegex(ValueError, "不存在"):
+                client.request("api/job/delete", {"name": name})
+            with self.assertRaisesRegex(ValueError, "no such job"):
+                client.request("api/job?name=" + name)
+            self.assertEqual(client.request("api/store")["counts"]["trials"], 1)
+        self.assertTrue((self.remote_home / ".metacodes-bench/jobs" / name / "result.json").exists())
+
+    def test_failed_worker_start_log_is_available_before_any_summary(self):
+        manager, client, _ = self.prepare_remote()
+        harbor = self.remote_home / ".local/bin/harbor"
+        harbor.write_text(harbor.read_text().replace("root = pathlib.Path(arg('-o'))",
+                          "print('Harbor initialization failed', file=sys.stderr)\nsys.exit(7)\nroot = pathlib.Path(arg('-o'))"))
+        name = client.request("api/runs", self.request())["name"]
+        record = wait_run(manager, name)
+        self.assertEqual(record["status"], "failed")
+        self.assertNotIn("worker_summary", record)
+        self.assertNotIn("Harbor initialization failed", client.request("api/run?name=" + name)["log"])
+        self.assertIn("Harbor initialization failed", client.request("api/run?log=1&name=" + name)["log"])
+
+    def test_manual_sync_repairs_and_preserves_a_historical_mirror(self):
+        manager, client, _ = self.prepare_remote()
+        name = client.request("api/runs", self.request())["name"]
+        self.assertEqual(wait_run(manager, name)["status"], "finished")
+        local = manager.jobs_dir / name
+        original = self.remote_home / ".metacodes-bench/jobs" / name
+        shutil.copytree(original, local)
+        for suffix in (".spec", ".json"):
+            path = manager.records / (name + suffix)
+            old = json.loads(path.read_text())
+            old.pop("result_owner")
+            old.pop("worker_summary", None)
+            if suffix == ".json":
+                old.update(status="failed", remote_results={"message": "copy incomplete"}, error="copy incomplete")
+            atomic_json(path, old)
+        trial = local / "fix-git__fake/result.json"
+        trial.unlink()
+        for _ in range(2):
+            reply = executors.sync_run(manager.jobs_dir, name, timeout=10)
+            self.assertEqual((reply["local_dir"], reply["status"]), (str(local), "finished"))
+            self.assertEqual(trial.read_bytes(), (original / "fix-git__fake/result.json").read_bytes())
+            record = next(r for r in manager.runs() if r["name"] == name)
+            self.assertNotIn("result_owner", record)
+            self.assertNotIn("worker_summary", record)
+        with patch("scripts.eval.harbor.bench.results.request", side_effect=AssertionError("unexpected SSH read")):
+            self.assertEqual(client.request("api/job?name=" + name)["rows"][0]["status"], "pass")
+            client.request("api/job/delete", {"name": name})
+            self.assertEqual(client.request("api/jobs")["jobs"], [])
+        self.assertFalse(local.exists())
+        self.assertTrue(original.is_dir())
+
+    def test_manual_sync_preserves_a_database_only_historical_mirror(self):
+        manager, client, _ = self.prepare_remote()
+        name = client.request("api/runs", self.request())["name"]
+        self.assertEqual(wait_run(manager, name)["status"], "finished")
+        original = self.remote_home / ".metacodes-bench/jobs" / name
+        local = manager.jobs_dir / name
+        shutil.copytree(original, local)
+        for suffix in (".spec", ".json"):
+            path = manager.records / (name + suffix)
+            old = json.loads(path.read_text())
+            old.pop("result_owner")
+            old.pop("worker_summary", None)
+            if suffix == ".spec":
+                old["store"] = {"backend": "sqlite", "path": str(self.root / "retired.sqlite3")}
+            atomic_json(path, old)
+        self.assertEqual(client.request("api/job?name=" + name)["rows"][0]["status"], "pass")
+        shutil.rmtree(local)
+        with patch.object(executors, "probe", side_effect=AssertionError("unexpected SSH probe")), \
+                patch("scripts.eval.harbor.bench.results.request", side_effect=AssertionError("unexpected worker read")):
+            for attempt in range(2):
+                if attempt:
+                    receipt = manager.records / (name + ".json")
+                    atomic_json(receipt, {**json.loads(receipt.read_text()), "result_owner": "relay-4090"})
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(cli.main(["--state-root", str(self.state), "sync", "--run", name, "--json"]), 0)
+                self.assertTrue(json.loads(output.getvalue())["archived"])
+                self.assertFalse(local.exists())
+                self.assertEqual(client.request("api/trial?job=" + name + "&trial=fix-git__fake")["row"]["status"], "pass")
+            client.request("api/job/delete", {"name": name})
+            self.assertEqual(client.request("api/jobs")["jobs"], [])
+            self.assertEqual(client.request("api/store")["counts"]["trials"], 0)
+        self.assertTrue((original / "fix-git__fake/result.json").is_file())
 
     def test_container_mirrors_reach_harbor_as_a_compose_overlay(self):
         manager, client, _ = self.prepare_remote()
@@ -1048,7 +1183,7 @@ class SshRunTest(SetupFixture):
         run = client.request("api/runs", self.request())
         final = wait_run(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
-        argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+        argv = json.loads((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "argv.json").read_text())
         overlay = self.remote_home / ".metacodes-bench/runs" / run["name"] / executors.COMPOSE_OVERLAY
         self.assertEqual(argv[argv.index("--extra-docker-compose") + 1], str(overlay.resolve()))
         # Nothing answers as the apt cache here: apt keeps the task's own sources.
@@ -1071,7 +1206,7 @@ class SshRunTest(SetupFixture):
         run = client.request("api/runs", self.request())
         final, _ = self.watch_until_done(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
-        local = manager.jobs_dir / run["name"]
+        local = self.remote_home / ".metacodes-bench/jobs" / run["name"]
         # Every request through the remote relay was authorized upstream,
         # across 2.5 token lifetimes: the executor holds no refresh token, so
         # the newer tokens it used can only have arrived over the channel.
@@ -1120,7 +1255,7 @@ class SshRunTest(SetupFixture):
             final, shown = self.watch_until_done(manager, run["name"])
             self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
             self.assertNotIn("interrupted", shown)
-            self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+            self.assertTrue((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "fix-git__fake" / "result.json").exists())
 
             os.environ["FAKE_BENCH_DELAY"] = "30"
             second = client.request("api/runs", self.request())
@@ -1148,13 +1283,18 @@ class SshRunTest(SetupFixture):
         local = manager.jobs_dir / run["name"]
         self.assertFalse((local / "fix-git__fake" / "result.json").exists())
 
+        spec_path = manager.records / (run["name"] + ".spec")
+        previous_spec = json.loads(spec_path.read_text())
+        previous_spec.pop("result_owner")
+        atomic_json(spec_path, previous_spec)
         del os.environ["FAKE_SSH_PACK_FAIL"]
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
             code = cli.main(["--state-root", str(self.state), "sync", "--run", run["name"], "--json"])
         self.assertEqual(code, 0, output.getvalue())
         self.assertEqual(json.loads(output.getvalue())["status"], "finished")
-        self.assertTrue((local / "fix-git__fake" / "result.json").exists())
+        self.assertFalse(local.exists())
+        self.assertEqual(client.request("api/job?name=" + run["name"])["summary"]["counts"]["pass"], 1)
         record = next(r for r in manager.runs() if r["name"] == run["name"])
         self.assertEqual((record["status"], record.get("error"), record.get("remote_results")), ("finished", None, None))
 
@@ -1202,7 +1342,7 @@ class SshRunTest(SetupFixture):
         self.assertEqual((final["exit_code"], final["reconnects"]), (0, 1), final)
         self.assertEqual(drops.read_text(), "0")
         self.assertIn("已重新连上执行机器 relay-4090", log)
-        self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+        self.assertTrue((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "fix-git__fake" / "result.json").exists())
 
     def test_a_session_lost_before_its_first_event_is_attached_too(self):
         """The start request reached the node but no event came back: the
@@ -1220,7 +1360,7 @@ class SshRunTest(SetupFixture):
         self.assertEqual(final["reconnects"], 1, final)
         end = self.remote_home / ".metacodes-bench/runs" / run["name"] / remote.END_EVENT
         self.assertEqual(json.loads(end.read_text())["code"], 0)
-        self.assertTrue((manager.jobs_dir / run["name"] / "fix-git__fake" / "result.json").exists())
+        self.assertTrue((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "fix-git__fake" / "result.json").exists())
 
     def test_a_session_silent_before_its_first_event_is_ended_and_attached(self):
         manager, client, _ = self.prepare_remote()
@@ -1260,7 +1400,7 @@ class SshRunTest(SetupFixture):
         self.assertEqual(final["status"], "cancelled", final)
         self.assertLess(time.monotonic() - started, 15)
         self.assertNotEqual(final["exit_code"], 0)
-        self.assertTrue((manager.jobs_dir / run["name"] / "argv.json").exists())
+        self.assertTrue((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "argv.json").exists())
 
     def start_driver(self, grace, delay=30, name="eof", relay=None, env=None, credential=None, egress=None):
         """A remote driver whose Harbor runs `delay` s, and its first session."""
@@ -1759,7 +1899,7 @@ class SuiteOnExecutorTest(SetupFixture):
                                           "attempts": 1, "concurrency": 2, "executor": "relay-4090"})
         final = wait_run(manager, run["name"], timeout=60)
         self.assertEqual(final["status"], "finished", data.tail(manager.records / (run["name"] + ".log")))
-        local = manager.jobs_dir / run["name"]
+        local = self.remote_home / ".metacodes-bench/jobs" / run["name"]
         observed = json.loads((local / "observed.json").read_text())
         self.assertEqual(Path(observed["cwd"]).resolve(), repo.resolve())
         self.assertEqual(final["features"], run["features"])
@@ -1801,7 +1941,7 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertFalse((repo / wb_suite.HARNESS_VERSIONS / (slug + ".yaml")).exists())
         self.assertIn(["image", "rm", tag], [c[1] for c in self.calls("docker", "remote")])
         self.assertTrue((images / wb_suite.HARNESS_IMAGE.replace("/", "_")).exists())
-        self.assertIsNotNone(json.loads((manager.jobs_dir / run["name"] / "result.json").read_text())["finished_at"])
+        self.assertIsNotNone(json.loads((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "result.json").read_text())["finished_at"])
         remote_files = [p for p in self.remote_home.rglob("*") if p.is_file() and ".metacodes-bench/" in str(p)]
         public = b"".join(p.read_bytes() for p in remote_files + list(manager.records.iterdir())
                           + [p for p in local.rglob("*") if p.is_file()])
@@ -1952,7 +2092,7 @@ class SuiteOnExecutorTest(SetupFixture):
             self.assertEqual((run["suite"], run["executor"]), (suite_id, "relay-4090"))
             final = wait_run(manager, run["name"])
             self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
-            argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+            argv = json.loads((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "argv.json").read_text())
             self.assertNotIn("-d", argv)
             digest = executors.tree_digest(cache / "aime", executors.tree_files(cache / "aime"))
             self.assertEqual(argv[argv.index("-p") + 1], str(remote_root / "datasets" / digest))
@@ -1965,7 +2105,7 @@ class SuiteOnExecutorTest(SetupFixture):
         log = data.tail(manager.records / (names[1] + ".log"))
         self.assertIn("复用工作台已下载的注册表数据集 aime@1.0", log)
         # Synced back, ingested by the worker: the store serves it without files.
-        shutil.rmtree(manager.jobs_dir / names[0])
+        self.assertFalse((manager.jobs_dir / names[0]).exists())
         view = client.request("api/job?name=" + names[0])
         self.assertEqual((view["suite"], view["category_name"]), ("aime-2025", "竞赛数学"))
         self.assertEqual(view["summary"]["counts"]["pass"], 1)
@@ -1976,7 +2116,7 @@ class SuiteOnExecutorTest(SetupFixture):
                                           "executor": "relay-4090"})
         final = wait_run(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
-        argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+        argv = json.loads((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "argv.json").read_text())
         # `-d` matched `terminal-bench/fix-git`; the exported `-p` copy names it `fix-git`.
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], ["fix-git", "kv-store-grpc"])
         shipped = Path(argv[argv.index("-p") + 1])
@@ -2007,7 +2147,8 @@ class SuiteOnExecutorTest(SetupFixture):
         remote_harbor.write_text(remote_harbor.read_text().replace(
             "(root / 'argv.json').write_text(json.dumps(args))",
             "(root / 'argv.json').write_text(json.dumps(args))\n"
-            "(root / 'judge.json').write_text(json.dumps(os.environ.get('FAKE_JUDGE_KEY')))"))
+            "import hashlib\n"
+            "(root / 'judge.json').write_text(json.dumps(hashlib.sha256(os.environ['FAKE_JUDGE_KEY'].encode()).hexdigest()))"))
         os.environ.update(FAKE_EXPECT_ACCOUNT_KEY="session-access", FAKE_JUDGE_KEY="judge-secret")
         catalog = client.request("api/workbench")
         humaneval = next(s for s in catalog["suites"] if s["id"] == "humaneval")
@@ -2022,18 +2163,19 @@ class SuiteOnExecutorTest(SetupFixture):
         remote_root = (self.remote_home / ".metacodes-bench").resolve()
         digest = executors.tree_digest(dataset, executors.tree_files(dataset))
         for name in names:
-            argv = json.loads((manager.jobs_dir / name / "argv.json").read_text())
+            argv = json.loads((self.remote_home / ".metacodes-bench/jobs" / name / "argv.json").read_text())
             self.assertEqual(argv[argv.index("-p") + 1], str(remote_root / "datasets" / digest))
             self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], ["humaneval-7"])
             # The judge key reached the remote Harbor over the SSH stdin only.
-            self.assertEqual(json.loads((manager.jobs_dir / name / "judge.json").read_text()), "judge-secret")
+            self.assertEqual(json.loads((remote_root / "jobs" / name / "judge.json").read_text()),
+                             hashlib.sha256(os.environ["FAKE_JUDGE_KEY"].encode()).hexdigest())
         shipped = remote_root / "datasets" / digest
         self.assertEqual((shipped / "humaneval-7/tests/test.sh").read_text(), "exit 0\n")
         self.assertEqual([p.name for p in (remote_root / "datasets").iterdir()], [digest])  # shipped once
         for row in self.calls("ssh"):
             self.assertNotIn("judge-secret", json.dumps(row))
         for path in list(self.remote_home.rglob("*")) + list(manager.records.iterdir()):
-            if path.is_file() and path.name != "judge.json":
+            if path.is_file():
                 self.assertNotIn(b"judge-secret", path.read_bytes(), path)
         spec = json.loads((manager.records / (names[0] + ".spec")).read_text())
         self.assertEqual(spec["forward_env"], ["FAKE_JUDGE_KEY"])
@@ -2052,7 +2194,7 @@ class SuiteOnExecutorTest(SetupFixture):
         final = wait_run(manager, run["name"])
         self.assertEqual(final["status"], "finished", (final, data.tail(manager.records / (run["name"] + ".log"))))
         self.assertEqual(final["judge"], {"model": "glm-5.3-flash", "via": "metask"})
-        local = manager.jobs_dir / run["name"]
+        local = self.remote_home / ".metacodes-bench/jobs" / run["name"]
         argv = json.loads((local / "argv.json").read_text())
         relay = next(a.removeprefix("metrics_proxy=") for a in argv if a.startswith("metrics_proxy="))
         verifier = json.loads((local / "verifier-env.json").read_text())
@@ -2107,7 +2249,7 @@ class SuiteOnExecutorTest(SetupFixture):
                                                   "tasks": [task], "executor": "relay-4090"})
                 final = wait_run(manager, run["name"])
                 self.assertEqual(final["status"], "finished", data.tail(manager.records / (run["name"] + ".log")))
-                argv = json.loads((manager.jobs_dir / run["name"] / "argv.json").read_text())
+                argv = json.loads((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "argv.json").read_text())
                 shipped = Path(argv[argv.index("-p") + 1])
                 self.assertEqual(shipped.parent, remote_root / "datasets")
                 self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-i"], [task])
@@ -2501,7 +2643,7 @@ class EgressRunTest(SetupFixture):
         self.assertIn("ExitOnForwardFailure=yes", session)
         # Only the run session carries the forward.
         self.assertEqual([c for c in self.calls("ssh") if "-R" in c[1] and " node run " not in c[1][-1]], [])
-        local = manager.jobs_dir / run["name"]
+        local = self.remote_home / ".metacodes-bench/jobs" / run["name"]
         harbor_env = json.loads((local / "harbor-env.json").read_text())
         self.assertEqual(harbor_env["TZ"], "UTC")
         docker_config = Path(harbor_env["DOCKER_CONFIG"])
@@ -2552,7 +2694,7 @@ class EgressRunTest(SetupFixture):
         log = data.tail(manager.records / (run["name"] + ".log"))
         self.assertEqual((final["status"], final["exit_code"]), ("finished", 0), (final, log))
         self.assertIn("驱动已换成新版本", log)
-        late = json.loads((manager.jobs_dir / run["name"] / "late-traffic.json").read_text())
+        late = json.loads((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "late-traffic.json").read_text())
         self.assertEqual((late["relay"], late["egress"]), (200, "metacodes-bench-egress-ok"), late)
         self.assertFalse((run_dir / remote.RELAY_TLS).exists())
 
@@ -2605,7 +2747,7 @@ class EgressRunTest(SetupFixture):
         self.assertIn(f"Error: remote port forwarding failed for listen port {ports[0]}", log)
         relay = executors.find(self.cfg(), "relay-4090")
         self.assertIn(executors.tunnel_retry_note(relay, ports[0], ports[1], 2), log)
-        self.assertEqual((manager.jobs_dir / name / "egress-probe.txt").read_bytes(), b"metacodes-bench-egress-ok")
+        self.assertEqual((self.remote_home / ".metacodes-bench/jobs" / name / "egress-probe.txt").read_bytes(), b"metacodes-bench-egress-ok")
 
     def test_a_tunnel_refused_on_every_port_fails_the_run_with_the_executor_side_cause(self):
         _, _, final, ports, left = self.run_refusing_forwards(100)

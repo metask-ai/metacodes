@@ -24,7 +24,7 @@ metacodes bench run --suite aime --executor relay-4090 --wait   # on an SSH exec
 metacodes bench run --task fix-git --features ""      # without the default run gates
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090   # pre-pull/pre-build task images
-metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
+metacodes bench sync --run NAME         # retry an SSH run's final summary
 metacodes bench monitor [--executor NAME] [--json]   # load, network, mirrors, Docker and caches of an execution machine
 metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
 metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
@@ -774,9 +774,9 @@ node command resolve it the same way.
   directions: the SSH executors this node's own `workbench.json` drives and
   the workbenches that drove it. Either side can therefore see the other,
   even when only one of them can open an SSH connection.
-- `node run <spec>` executes one run on the node (below); `node manifest`,
-  `node pack` and `node egress-probe` are the job copy-back and setup's
-  container egress check.
+- `node run <spec>` executes one run. `node results` publishes aggregates
+  and answers job, trial and log queries. `node manifest` and `node pack`
+  support recovery of older runs. Setup uses `node egress-probe` to check container networking.
 
 A node keeps its own state root (`~/.metacodes` by default) and
 `workbench.json`. What is prepared on the node itself is read from there:
@@ -793,7 +793,7 @@ refreshing a session login, then
 
 1. resolves the node `<state_dir>/bin/metacodes` points at (the physical
    path inside `<state_dir>/bundles/<digest>`) and runs every node command
-   of the run (`run`, `manifest`, `pack`) with that binary, so a
+   of the run (`run`, `results`) with that binary, so a
    `metacodes bench setup --executor` that switches the node mid-run does
    not change the driver under a running job; a run without a node stops
    here. It then ships the Linux bundle the run evaluates as a tar stream
@@ -817,25 +817,19 @@ refreshing a session login, then
 4. the driver starts the credential relay next to the remote Docker daemon
    (on the executor's `metrics_bind`; the executor's `metrics_enabled:
    false` turns off only the metrics capture), runs Harbor in its own
-   process group and prints heartbeats; Harbor's output reaches the local
-   run log;
-5. the worker copies the remote job directory into the local jobs directory
-   on a background thread, every 10 seconds, transferring only files whose
-   size or modification time changed. Each pass is bounded (128 MiB or 2000
-   files, smallest first, at least one file) and is extracted while it
-   streams, so every pass finishes and makes progress; a file that only grew
-   since its last copy is sent as an append (checked against the 64 KiB
-   before its old end). The heartbeat and cancel handling never wait for a
-   copy. The viewer and other readers of local job directories see ordinary
-   Harbor files;
-6. after Harbor exits, the worker copies what is left until a fresh remote
-   listing matches the local copy (up to 30 minutes,
-   `METACODES_BENCH_FINAL_SYNC_TIMEOUT` seconds if set). Only then is a run
-   `finished`. Otherwise the run is `failed` (keeping Harbor's `exit_code`),
-   its `error` says that the results are still on the executor and where,
-   `remote_results` names the executor and path, and
-   `metacodes bench sync --run NAME` copies them later; a run whose Harbor
-   exited 0 then becomes `finished`.
+   process group and reports heartbeats. Harbor's output stays on the worker;
+5. the worker indexes job files into its configured SQLite or PostgreSQL
+   database. Every ten seconds the manager requests job and per-task
+   aggregates, including outcome counts, scores, usage and timing
+   distributions. It persists these with the launch receipt. The dashboard
+   and leaderboard can show the last received aggregates while the worker is offline;
+6. after Harbor exits the manager requests a final verified summary.
+   If delivery fails, the receipt identifies the executor and job directory.
+   `metacodes bench sync --run NAME` retries delivery. An older SSH run with
+   an existing manager-side mirror verifies and repairs its files in place.
+   If the manager has already archived the completed mirror in its active
+   database and cleared the directory, sync keeps the archive readable offline.
+   An older receipt without a mirror can fetch a summary from an upgraded worker.
 
 Suites on an SSH executor: a `harbor-registry` suite is always downloaded on
 the workbench machine (its own Harbor, `harbor download <ref> -o <dir>`), so
@@ -1335,7 +1329,7 @@ refuses a job carrying `METACODES_TEST_INTEGRITY`, `METACODES_DELIVERY_CADENCE`
 or `METACODES_STALL_GATE`, which its receipt's `evaluation_treatment` does not record. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork, 7 since model prices, 9 since WorkBuddy gates): an older node is refused until
+features (4 since teamwork, 7 since model prices, 9 since WorkBuddy gates, 10 since worker-owned results): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 
@@ -1675,7 +1669,7 @@ fetch from the executor's own network and are only valid with `direct`.
 | Single-run full-score rate | Independent valid runs with reward >= 1 / all valid runs. Every failed attempt remains in the denominator when a later independent run succeeds |
 | First-attempt full-score rate | Tasks with reward >= 1 on their earliest trial / tasks whose earliest trial has a valid outcome. Later attempts never replace the first score. Infrastructure-invalid and running first trials are shown separately |
 | Generation TPS | Sum of reported output tokens / sum of generation seconds, from first semantic output until response completion. Tool execution and first-token waiting are excluded |
-| TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The global mean and P50/P95 pool request samples across jobs |
+| TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The pooled mean uses total duration and request count. Remote P50/P95 use fixed histogram buckets, eight per doubling from 1 ms through about 37 hours, with longer durations in the last bucket |
 | Estimated cost | The metacodes binary's catalog estimate, including cache pricing. It is not the provider's settlement. Missing/zero unknown prices are shown as unknown with coverage counts |
 | Pass rate 95% interval | Wilson score interval of the single-run full-score rate over valid runs. It treats every run as independent, so repeated attempts of a task and pooled jobs make it narrower than a task-level interval |
 | Solved at least once | Tasks with at least one passing run / tasks with at least one valid run |
@@ -1710,9 +1704,28 @@ token sums report their coverage so missing data cannot look like zero cost.
 
 ### Data storage
 
-All results are ordinary files on the workbench's machine (an SSH
-executor's job directory is copied back into the same layout, and from
-there into the evaluation database):
+The **manager** is the metacodes installation serving the Bench UI and API.
+The **worker** is the metacodes installation executing the job, independently
+of the bundle being evaluated. A local run puts both roles on one machine.
+For an SSH run the worker owns the ordinary Harbor files in
+`<executor state_dir>/jobs/<job>/` and indexes them in its own evaluation store.
+The manager retains the launch receipt, control log and aggregates.
+
+Opening a job, trial, CSV or execution log queries the worker over SSH. The
+manager returns that response to the browser without persisting it. When
+the worker's database ID and the job's recorded source match the manager's
+active store, the manager reads that database directly. With separate stores
+an unreachable worker leaves the dashboard available and detail requests
+report which worker is unavailable. The run page and CLI read status from
+the manager receipt. Expanding the execution log reads the worker's Harbor
+output even if startup failed before the first result. Historical jobs already copied back are
+read from their existing store. Deleting a worker-owned job from the manager
+removes its manager record and aggregates and preserves the worker's files
+and detail records. On the worker, `bench list --jobs-dir <executor state_dir>/jobs`
+lists the originals in that directory, including jobs whose manager uses a separate
+database. A deleted manager entry stays hidden in that manager's jobs directory.
+
+The layout on the machine that owns the data is:
 
 ```text
 <jobs-dir>/
@@ -1734,15 +1747,13 @@ WorkBuddy trials under `workbuddy/<harbor run>/` are ingested as trials of
 the workbench job, with the same projection as top-level trials (request
 metrics are read from `.bench-metrics/` beside them).
 
-The page reads the [evaluation database](#evaluation-database), which holds
-all of these files and the values computed from them. The overview shows the
+The page reads the [evaluation database](#evaluation-database) of the machine that owns the requested data. The overview shows the
 database and the synced jobs directories. Run files are not synced back to a
 developer checkout.
 
 ### Evaluation database
 
-Every job directory and launch record is copied into one database: SQLite by
-default (`<state root>/bench/bench.sqlite3`, beside `workbench.json`, with
+Each node indexes the job directories it owns. The manager also indexes launch receipts and their aggregates. Each installation uses SQLite by default (`<state root>/bench/bench.sqlite3`, beside `workbench.json`, with
 the same `--state-dir`/`METACODES_HOME` rules) or a remote PostgreSQL. The
 service syncs its jobs directory when it starts, every ten seconds, and
 before API reads (at most once every two seconds). The worker also syncs its

@@ -44,6 +44,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/bench/credentials.py", .bytes = @embedFile("eval/harbor/bench/credentials.py") },
     .{ .path = "scripts/eval/harbor/bench/executors.py", .bytes = @embedFile("eval/harbor/bench/executors.py") },
     .{ .path = "scripts/eval/harbor/bench/egress.py", .bytes = @embedFile("eval/harbor/bench/egress.py") },
+    .{ .path = "scripts/eval/harbor/bench/results.py", .bytes = @embedFile("eval/harbor/bench/results.py") },
     .{ .path = "scripts/eval/harbor/bench/remote.py", .bytes = @embedFile("eval/harbor/bench/remote.py") },
     .{ .path = "scripts/eval/harbor/bench/node.py", .bytes = @embedFile("eval/harbor/bench/node.py") },
     .{ .path = "scripts/eval/harbor/bench/setup.py", .bytes = @embedFile("eval/harbor/bench/setup.py") },

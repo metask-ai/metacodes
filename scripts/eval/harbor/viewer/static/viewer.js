@@ -93,7 +93,7 @@ function measurementCards(s) {
     metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), `${s.initial_token_trials || 0} 次有数据`, false,
       s.initial_composition_mean ? stackBar(compositionSegments(s.initial_composition_mean), true) : null),
     metric('TPS（生成）', tps(s.tps), `${s.profiled_requests || 0}/${s.requests || 0} 个请求`),
-    metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_samples_ms?.length || 0} 个请求`),
+    metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_count ?? s.ttft_samples_ms?.length ?? 0} 个请求`),
     metric('估算成本', usd(s.cost_usd), `${s.cost_trials || 0}/${s.trials || 0} 次有价格`),
     metric('至少通过一次', pct(s.solved_rate), `${s.tasks_solved || 0} / ${s.tasks_attempted || 0} 道`),
     metric('每题平均成本', usd(s.cost_per_task), `${s.task_cost_tasks || 0} 道`),
@@ -243,7 +243,7 @@ function runAgain(b, onlyInvalid) {
   location.hash = '#/new';
 }
 async function deleteProfile(b, button) {
-  if (!confirm(`删除Profile ${profileName(b)}？它的所有运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
+  if (!confirm(`删除 Profile ${profileName(b)}？工作台会删除运行记录、本机评测结果和汇总。远程 worker 会保留作业详情。`)) return false;
   button.disabled = true;
   try { await api('/api/profile/delete', { id: b.id }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
@@ -251,7 +251,8 @@ async function deleteProfile(b, button) {
   return true;
 }
 async function deleteJob(j, button) {
-  if (!confirm(`删除评测结果 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+  const impact = j.result_owner ? `工作台会删除运行记录和汇总，作业详情保留在 ${j.result_owner}。` : '工作台会删除运行记录、日志和评测结果，不能恢复。';
+  if (!confirm(`删除评测结果 ${j.name}？${impact}`)) return;
   button.disabled = true;
   try { await api('/api/job/delete', { name: j.name }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return; }
@@ -1057,9 +1058,17 @@ async function renderNewRun() {
 }
 
 async function renderRun(name) {
-  const run = await api('/api/run?name=' + encodeURIComponent(name));
+  const endpoint = '/api/run?name=' + encodeURIComponent(name);
+  const run = await api(endpoint);
   let results;
-  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建评测记录' }); }
+  if (run.result_owner) {
+    const view = run.worker_summary?.view;
+    results = view ? panel('评测结果', run.result_owner, h('div', { class: 'panel-body' },
+      outcomeBar(view.summary.counts, view.summary.trials, true), legend(view.summary.counts),
+      link('#/job/' + encodeURIComponent(name), '查看评测详情'))) : null;
+  } else {
+    try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建评测记录' }); }
+  }
   state.live = ['queued', 'starting', 'running', 'cancelling'].includes(run.status);
   navCurrent('overview');
   $('#title').textContent = RUN_STATUS[run.status] || run.status;
@@ -1078,7 +1087,14 @@ async function renderRun(name) {
     h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}${run.judge ? ' · ' + judgeText(run.judge) : ''}` }),
     run.error ? h('p', { class: 'muted', text: run.error }) : null,
     h('a', { class: 'mono', href: url, text: url }));
-  const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
+  const logText = h('pre', { text: run.log || '正在准备执行环境…' });
+  const log = h('details', { class: 'panel', 'data-key': 'runlog', ontoggle: async (event) => {
+    if (!event.currentTarget.open || !run.result_owner) return;
+    try {
+      const detail = await api(endpoint + '&log=1');
+      logText.textContent = [detail.log, detail.log_error].filter(Boolean).join('\n') || '暂无执行日志';
+    } catch (error) { logText.textContent = [run.log, error.message].filter(Boolean).join('\n'); }
+  } }, h('summary', { text: '执行日志' }), logText);
   return h('div', {}, panel('运行状态', RUN_STATUS[run.status], summary, h('div', { class: 'header-actions' }, copy, stop)), log, results);
 }
 
@@ -1102,6 +1118,12 @@ const COLUMNS = [
   ['elapsed_s', '总用时', (r) => r.elapsed_s ?? -1],
 ];
 
+function resultLocation(value) {
+  if (!value.result_owner) return null;
+  const source = value.detail_source === 'database' ? '共用数据库' : 'worker 节点';
+  return h('div', { class: 'muted', text: `作业所在节点 · ${value.result_owner}　详情来源 · ${source}` });
+}
+
 async function renderJob(name) {
   navCurrent('overview');
   const job = await api('/api/job?name=' + encodeURIComponent(name));
@@ -1118,6 +1140,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
+    resultLocation(job),
     h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（Profile冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
@@ -1360,7 +1383,7 @@ async function renderTrial(jobName, trialName) {
   state.live = r.status === 'running';
   $('#title').textContent = r.task;
   crumbs([{ text: 'Profiles', href: '#/' }, { text: jobName, href: '#/job/' + encodeURIComponent(jobName) }, { text: r.trial }]);
-  return h('div', {}, trialBody(t));
+  return h('div', {}, resultLocation(t), trialBody(t));
 }
 
 // ------------------------------------------------------------ compare
