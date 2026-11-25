@@ -15,8 +15,8 @@ def test_tools_lists_cli_builtins(bin_path):
     raw = run(bin_path, [READY, "type:/tools", "key:enter", READY, "type:/exit", "key:enter"])
     output = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", raw)
     names = set(re.findall(rb"\b([A-Z][A-Za-z0-9]+) - ", output))
-    assert {b"Read", b"Bash"} <= names, names
-    assert names.isdisjoint({b"Glob", b"Grep", b"CodeMap", b"FindSymbol"}), names
+    assert {b"Read", b"Bash", b"CodeMap", b"FindSymbol"} <= names, names
+    assert names.isdisjoint({b"Glob", b"Grep"}), names
 
 
 def test_T18_slash_menu_appears(bin_path):

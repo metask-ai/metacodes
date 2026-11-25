@@ -52,9 +52,11 @@ test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, read.description, "cat -n format") != null);
     const edit = findDef(defs, "Edit").?;
     try std.testing.expect(std.mem.indexOf(u8, edit.description, "exact string replacements") != null);
+    try std.testing.expect(findDef(defs, "CodeMap") != null);
+    try std.testing.expect(findDef(defs, "FindSymbol") != null);
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.request_tools = .{ .advertised = defs, .catalog = defs };
-    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
+    for ([_][]const u8{ "Glob", "Grep" }) |name| {
         try std.testing.expect(findDef(defs, name) == null);
         try std.testing.expectError(error.UnknownTool, cc.tools.dispatch(&ctx, name, "{}"));
         var buffer: [80]u8 = undefined;

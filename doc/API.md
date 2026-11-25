@@ -17,11 +17,12 @@ helper contract and the current network-policy limits.
 The CLI uses Bash for workspace file discovery and text search. Use `rg --files`
 to list matching paths and `rg -n -F` to locate literal text, then Read the
 matching lines. Supply the resulting paths when delegating to the read-only
-Explore or Plan agent. Use Edit and Write for file changes. For source structure,
-Read accepts `outline=true` when a language server is available. For captured
-output, page with ReadArtifact using the returned artifact ID and next offset.
-Embedding hosts can still select the AgentCore workspace search tools under
-their existing shell policy.
+Explore or Plan agent. Use Edit and Write for file changes. CodeMap outlines a source file or glob,
+and FindSymbol locates named definitions across files. Both are available in
+the CLI's initial tool set and use the project's language server. Read also
+accepts `outline=true` for one file. For captured output, page with ReadArtifact
+using the returned artifact ID and next offset. Embedded hosts can opt in to
+Bash for workspace searches. The minimal profile provides Read.
 
 ## Compatibility matrix
 

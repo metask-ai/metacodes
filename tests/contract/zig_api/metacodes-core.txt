@@ -9665,6 +9665,7 @@ metacodes-core.tools.descriptions: file
 metacodes-core.tools.descriptions.describeRead: fn describeRead(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeWrite: fn describeWrite(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeEdit: fn describeEdit(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
+metacodes-core.tools.descriptions.describeCodeMap: fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeBash: fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTask: fn describeTask(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTaskGet: fn describeTaskGet(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
@@ -9703,7 +9704,7 @@ metacodes-core.tools.ToolEntry.preview_feature: ?@import("preview.zig").Feature 
 metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <40948 bytes, sha256 60ee661d1677>
+metacodes-core.tools.registry: const []const ToolEntry = <43040 bytes, sha256 5e7376a9f2b0>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8

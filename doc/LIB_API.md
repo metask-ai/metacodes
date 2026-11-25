@@ -206,7 +206,7 @@ receipt 或 bounded structured error。两种 executor 不能同时存在，也�
 所有入口共用同一个 MCP client;`mcp_runtime.Client` 的中断参数是 `?*const AbortSignal`,
 模块布局与保留差异见 [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)。
 
-首方 byte-zero 工具为 `Bash`、
+首方 byte-zero 工具为 `CodeMap`、`FindSymbol`、`Bash`、
 `ListMcpResourcesTool`、`ReadMcpResourceTool` 和 `WebFetch`。Bash 的 JobRegistry、
 MCP stdio、大型 WebFetch/curl、Bash 输出都在子进程/生产者发出第一个字节前
 取得私有 capture；小而完整的最终投影仍可安全降为 inline。`Write`、`Edit`、

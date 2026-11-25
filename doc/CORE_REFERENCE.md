@@ -643,7 +643,7 @@ fallback 那一行的限定条件不是修辞:发布失败后要渲染 head/tail
 issue #29 的行为(不知道能取回,就改命令重跑)。
 
 **预算在字节存在之前就生效。** `ToolEntry.result_production` 把生产方式分三类,其中
-`byte_zero_spool`(Bash/两个 MCP 读取/WebFetch)在第一个字节前
+`byte_zero_spool`(CodeMap/FindSymbol/Bash/两个 MCP 读取/WebFetch)在第一个字节前
 就重定向到内核 Spool,**全量内容从不进内核内存**。所以这不是"先拿到 40MB 再截断"。
 
 **artifact 有两个产生点,但只有一个阈值。** 工具层(`result_spool.finishCaptureAsBody`)在捕获
@@ -914,7 +914,7 @@ glm-5.3-flash:catalog 推出的可用输入 917,504,实测 ≈883K 就拒)。所
 
 静态 `ToolEntry.result_production` 把生产方式收成三种不可混淆的状态：`bounded_inline`、
 `input_derived`、`byte_zero_spool`；comptime 断言禁止 `byte_zero_spool` 工具接回
-`legacy_inline` executor。当前原生 byte-zero 清单是 `Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
+`legacy_inline` executor。当前原生 byte-zero 清单是 `CodeMap`、`FindSymbol`、`Bash`、`ListMcpResourcesTool`、`ReadMcpResourceTool`、`WebFetch`。
 其中 Bash 在第一个 stdout/stderr 字节前重定向到 JobRegistry 文件；没有长生命周期
 JobRegistry 的源码嵌入者只要提供 `artifact_root`，内核就为该次同步调用建立临时 registry，
 不会退回 pipe 全量捕获。已完成的 Bash 信封**不**给出 spool 路径:`<channel>_path` 曾经存在

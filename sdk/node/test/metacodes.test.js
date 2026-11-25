@@ -186,7 +186,7 @@ test('the built-in Read tool reads the workspace', { skip }, async (t) => {
   assert.match(result.text, /the secret is 42/);
 });
 
-test('retired workspace builtins are rejected', () => {
+test('unsupported workspace builtins are rejected', () => {
   for (const name of ['Glob', 'Grep', 'CodeMap', 'FindSymbol']) {
     assert.throws(() => new metacodes.Runtime({ tools: [name] }), /unknown built-in tools/);
   }

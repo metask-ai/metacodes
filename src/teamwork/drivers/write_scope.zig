@@ -445,7 +445,7 @@ test "write scope: the reviewer's tools are reviewer.tools plus Write" {
     try testing.expect(contains(toolsFor(.implementer), "Edit"));
 }
 
-test "teamwork roles exclude removed workspace tools" {
+test "teamwork roles exclude standalone workspace navigation and search tools" {
     for (std.enums.values(types.Role)) |role| {
         for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
             try testing.expect(!contains(toolsFor(role), name));

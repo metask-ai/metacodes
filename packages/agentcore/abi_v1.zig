@@ -13216,7 +13216,7 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     try std.testing.expect(runtime == null);
 }
 
-test "ABI Runtime rejects retired workspace tools before publishing a handle" {
+test "ABI Runtime rejects unsupported workspace tools before publishing a handle" {
     for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
         const names = [_]wire.BytesViewV1{view(name)};
         var config = std.mem.zeroes(wire.RuntimeConfigV1);

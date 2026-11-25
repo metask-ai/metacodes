@@ -265,7 +265,7 @@ class PythonSdkTest(unittest.TestCase):
         self.assertIn("ExecuteCode", [tool["name"] for tool in provider.requests[0]["tools"]])
         self.assertNotIn("INTERMEDIATE_MUST_STAY_LOCAL", str(provider.requests))
 
-    def test_retired_workspace_tools_are_rejected(self) -> None:
+    def test_unsupported_workspace_tools_are_rejected(self) -> None:
         for name in ("Glob", "Grep", "CodeMap", "FindSymbol"):
             with self.subTest(tool=name), self.assertRaisesRegex(ValueError, "unknown built-in tools"):
                 metacodes.Runtime(tools=[name])

@@ -213,7 +213,7 @@ test "default AgentRuntime preserves the coding tool surface through first-party
     try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":8") != null);
 }
 
-test "retired workspace tools have no builtin registration or explicit runtime selection" {
+test "standalone navigation and retired search tools are outside the embedded tool catalog" {
     const runtime = try AgentRuntime.create(std.testing.allocator, .{});
     defer runtime.destroy() catch unreachable;
     for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {

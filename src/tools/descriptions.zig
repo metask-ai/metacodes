@@ -107,6 +107,14 @@ const BASH_BACKGROUND_LIMIT_NOTE =
     \\- A background job is stopped when it reaches its background time limit. With `run_in_background`, `timeout` sets that limit (default 1800000 ms = 30 minutes, maximum 7200000 ms = 2 hours); a command moved to the background after 15s gets the default. If a background job seems to be waiting for interactive input, you are told once: kill it with KillShell and re-run it non-interactively.
 ;
 
+pub fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    return std.mem.concat(allocator, u8, &.{
+        "Produce a structural outline of source code using its language server. Pass one file path or a glob to list definitions, line numbers and signatures. An unavailable language server is reported explicitly.",
+        if (ctx.hasTool("FindSymbol")) " Use FindSymbol to locate a named definition across files." else "",
+        if (ctx.hasTool("Read")) " Use Read with offset and limit to inspect a definition's body." else "",
+    });
+}
+
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
     const windows = @import("builtin").os.tag == .windows;
     const readonly = ctx.isReadonlyAgent();

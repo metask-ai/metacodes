@@ -130,6 +130,8 @@ const USING_TOOLS_SECTION =
     \\  - To read files use Read instead of cat, head, tail, or sed
     \\  - To edit files use Edit instead of sed or awk
     \\  - To create files use Write instead of cat with heredoc or echo redirection
+    \\  - Use CodeMap to outline definitions in a source file or a group of files.
+    \\  - Use FindSymbol to locate named definitions across files.
     \\  - Use Bash for workspace searches, builds, tests and Git commands.
     \\ - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.
     \\ - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.
@@ -1227,6 +1229,8 @@ fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u
         try buf.appendSlice(allocator, "\n  - To edit files use Edit instead of sed or awk");
     if (has(names, "Write"))
         try buf.appendSlice(allocator, "\n  - To create files use Write instead of cat with heredoc or echo redirection");
+    if (has(names, "CodeMap")) try buf.appendSlice(allocator, "\n  - Use CodeMap to outline definitions in a source file or a group of files.");
+    if (has(names, "FindSymbol")) try buf.appendSlice(allocator, "\n  - Use FindSymbol to locate named definitions across files.");
     if (has(names, "Bash")) {
         try buf.appendSlice(allocator, "\n  - Use Bash for workspace searches, builds, tests and Git commands.");
     }

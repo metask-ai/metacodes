@@ -2,6 +2,8 @@ const std = @import("std");
 const json = @import("json.zig");
 const util_json = @import("util/json.zig");
 
+const code_map_tool = @import("tools/code_map.zig");
+const find_symbol_tool = @import("tools/find_symbol.zig");
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
@@ -202,6 +204,40 @@ pub const registry: []const ToolEntry = &.{
         }, .required = &.{"patch"} },
         .execute = .{ .legacy_inline = apply_patch_tool.execute },
         .result_production = .input_derived,
+    },
+    .{
+        .name = "CodeMap",
+        .description = "Produce a structural outline of source code: functions, types, classes, " ++
+            "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
+            "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
+            "src/**/*) to map many files. Far cheaper than reading whole files when you only " ++
+            "need to find where things are defined. Requires an installed language server " ++
+            "(zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); when one " ++
+            "is unavailable the output says so instead of appearing empty.",
+        .describe_fn = descriptions.describeCodeMap,
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
+        }, .required = &.{"path"} },
+        .execute = .{ .result_body = code_map_tool.executeBody },
+        .replay = .read_only,
+        .result_production = .byte_zero_spool,
+    },
+    .{
+        .name = "FindSymbol",
+        .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
+            "Returns definitions with " ++
+            "file:line and signature. Use this to jump to a function/type/class definition by " ++
+            "name when you don't know which file it lives in. Requires an installed language " ++
+            "server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an " ++
+            "empty result is qualified when one is unavailable, so `[]` alone means not defined.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "name", .type = "string", .description = "The symbol name to find the definition of" },
+            .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },
+            .{ .name = "path", .type = "string", .description = "Optional directory/glob to scope the search (defaults to cwd)" },
+        }, .required = &.{"name"} },
+        .execute = .{ .result_body = find_symbol_tool.executeBody },
+        .replay = .read_only,
+        .result_production = .byte_zero_spool,
     },
     .{
         .name = "Bash",
@@ -1520,6 +1556,8 @@ test "ToolExecutor result_body preserves a native byte-zero artifact receipt" {
 
 test "native byte-zero roster is declared and wired through typed executors" {
     const expected = [_][]const u8{
+        "CodeMap",
+        "FindSymbol",
         "Bash",
         "ListMcpResourcesTool",
         "ReadMcpResourceTool",
@@ -1547,7 +1585,7 @@ test "dispatch returns UnknownTool when missing everywhere" {
 
 test "removed workspace builtins have no executor or normalized alias" {
     var ctx = ToolContext.simple(std.testing.allocator);
-    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol", "glob_tool", "grep", "code-map", "find_symbol" }) |name| {
+    for ([_][]const u8{ "Glob", "Grep", "glob_tool", "grep" }) |name| {
         try std.testing.expect(getTool(name) == null);
         try std.testing.expect(resolveToolNameExact(&ctx, name) == null);
         try std.testing.expectError(error.UnknownTool, dispatch(&ctx, name, "{}"));
@@ -1621,5 +1659,7 @@ test {
     _ = &ask_user_tool;
     _ = &task_tools;
     _ = &agent_tool;
+    _ = &code_map_tool;
+    _ = &find_symbol_tool;
     _ = &@import("tools/symbol_provider.zig");
 }

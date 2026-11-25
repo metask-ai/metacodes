@@ -2636,7 +2636,7 @@ including Task, Cron, KG, MCP, worktree, and notification tools. Adding those
 requires a future explicit Host capability contract; they are not silently
 advertised with missing state.
 
-A request for a removed built-in name (`Glob`, `Grep`, `CodeMap`, or `FindSymbol`) is rejected during Runtime configuration. The minimal profile uses `Read`. Hosts that need workspace search can select `Bash` and enable shell access.
+Runtime configuration rejects the removed `Glob` and `Grep` tools. The CLI provides `CodeMap` and `FindSymbol` with its language-server integration. The minimal profile uses `Read`. Hosts that need workspace search can select `Bash` and enable shell access.
 
 ### Resource limits
 

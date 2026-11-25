@@ -95,6 +95,8 @@ When you encounter an obstacle, do not use destructive actions as a shortcut to 
   - To read files use Read instead of cat, head, tail, or sed\n
   - To edit files use Edit instead of sed or awk\n
   - To create files use Write instead of cat with heredoc or echo redirection\n
+  - Use CodeMap to outline definitions in a source file or a group of files.\n
+  - Use FindSymbol to locate named definitions across files.\n
   - Use Bash for workspace searches, builds, tests and Git commands.\n
  - You can call multiple tools in one response. Run independent calls in parallel; keep dependent calls sequential.\n
 \n
@@ -315,6 +317,45 @@ Usage:\n
 "description":"The full patch text, from '*** Begin Patch' to '*** End Patch'."}},
 "required":[
 "patch"]}},
+{
+"name":"CodeMap",
+"description":"Produce a structural outline of source code using its language server. Pass one file path or a glob to list definitions, line numbers and signatures. An unavailable language server is reported explicitly. Use FindSymbol to locate a named definition across files. Use Read with offset and limit to inspect a definition's body.",
+"input_schema":{
+"type":"object",
+"properties":{
+"path":{
+"type":"string",
+"description":"A file path OR a glob pattern (e.g. src/**/*)"}},
+"required":[
+"path"]}},
+{
+"name":"FindSymbol",
+"description":"Find where a symbol is DEFINED across the codebase (SOURCE CODE only). Returns definitions with file:line and signature. Use this to jump to a function/type/class definition by name when you don't know which file it lives in. Requires an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an empty result is qualified when one is unavailable, so `[]` alone means not defined.",
+"input_schema":{
+"type":"object",
+"properties":{
+"name":{
+"type":"string",
+"description":"The symbol name to find the definition of"},
+"kind":{
+"type":"string",
+"description":"Optional kind filter",
+"enum":[
+"function",
+"method",
+"struct",
+"enum",
+"union",
+"type",
+"constant",
+"variable",
+"class",
+"interface"]},
+"path":{
+"type":"string",
+"description":"Optional directory/glob to scope the search (defaults to cwd)"}},
+"required":[
+"name"]}},
 {
 "name":"Bash",
 "description":"Run a shell command through /bin/sh. Use portable shell syntax, or invoke a specific interpreter when the task requires it.\n

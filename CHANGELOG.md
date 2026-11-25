@@ -292,10 +292,10 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
-- Removed the Glob, Grep, CodeMap and FindSymbol built-in tools from the CLI
+- Removed the Glob and Grep built-in tools from the CLI
   and AgentCore. Embedded hosts that explicitly select them must update
-  their tool lists. Shell-enabled sessions search with Bash. Read can show
-  a single-file outline.
+  their tool lists. Use Bash for filename and text searches. The CLI keeps
+  CodeMap for source outlines and FindSymbol for locating definitions.
 - **Zig source API: tool-result reduction moved out of `Conversation`, and
   the packages no longer form a cycle.** `Conversation.microcompactToolResults`,
   `microcompactToolResultsByRecentResults`, `truncateLargeToolResults` and

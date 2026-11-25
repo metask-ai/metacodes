@@ -148,6 +148,8 @@ pub const State = struct {
 };
 
 const EXPLORATION_TOOLS = [_][]const u8{
+    "CodeMap",
+    "FindSymbol",
     "Read",
     "ReadArtifact",
     "WebFetch",
