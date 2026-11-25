@@ -12,6 +12,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench prepares each task shortly before its turn and shows what its time
+  is made of.** Inside a run, trials now take their slots in the order they
+  were queued, and the next wave of waiting trials pulls or builds its task
+  image ahead of time (the local image store first, the registry only when
+  the image is missing, up to 3 tries). A trial that is ready before its turn
+  starts at once; one whose turn comes first keeps preparing in its slot. The
+  task page's 耗时 panel and the job page's 时间分段 bar show 预准备, 就绪等待
+  and 开始后准备 before Harbor's own phases, with the time spent queued shown
+  apart, and list the images preparation found, pulled or built. A failed
+  preparation is recorded beside the trial and never decides its result; the
+  wait after it is shown as 准备失败后等待, not as ready.
+- **Bench executors can cache what task containers download.**
+  `"download_cache": true` on an SSH executor makes `metacodes bench setup`
+  run `metacodes-download-cache` on the executor, and every run's task
+  containers then fetch PyPI, npm, Go, conda and rustup packages and GitHub
+  release assets (uv, uv's Python) through it: a file is downloaded from the
+  `container_mirrors` mirror once and served from the executor afterwards,
+  concurrent trials share one download, and index pages are served from the
+  stored copy when the mirror is down. `GET <metrics_bind>:3143/_stats`
+  reports hits, misses and bytes per kind. apt keeps its apt-cacher-ng
+  cache; Hugging Face, Docker images and git traffic are not behind it.
+
 - **Bench task containers can take GitHub release and Hugging Face mirrors.**
   `container_mirrors` on an SSH executor accepts `github` (a URL standing for
   `https://github.com`, such as `https://gh-proxy.com/https://github.com`)
@@ -316,6 +338,13 @@ status, compatibility boundaries, and entry points are defined by
   `max_queued`.
 
 ### Fixed
+
+- **`bench pull` also pulls verifier and sidecar images.** It took only the
+  first `docker_image` of a task's `task.toml`, which in the FrontierHarness
+  tasks is the separate verifier's, so their environment images and the
+  sidecars of their `docker-compose.yaml` were never pre-pulled and a trial
+  could finish the agent and then fail on a missing verifier image. The
+  summary now also shows how many of the selected tasks are ready.
 
 - **Bench no longer shows a negative 用时 for a running job.** Harbor writes a
   job's start and finish times in the executing machine's local time without

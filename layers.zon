@@ -13,8 +13,10 @@
                 "src/release_contract.zig",
                 "src/api/model_name.zig",
                 "src/tools/test_tmp.zig",
+                "src/base.zig",
             },
             .allowed_dependencies = .{},
+            .root = "src/base.zig",
         },
         .{
             .name = "ai",
@@ -29,8 +31,10 @@
                 "src/core/auth.zig",
                 "src/core/recorder.zig",
                 "src/core/context_pressure.zig",
+                "src/ai.zig",
             },
             .allowed_dependencies = .{"base"},
+            .root = "src/ai.zig",
         },
         .{
             .name = "kernel",
@@ -39,6 +43,8 @@
                 "src/core/message.zig",
                 "src/core/session_id.zig",
                 "src/core/result_budget.zig",
+                "src/core/kernel.zig",
+                "src/core/kernel/",
             },
             .allowed_dependencies = .{ "base", "ai" },
         },
@@ -146,7 +152,8 @@
     },
     .kernel_budget = .{
         .package = "kernel",
-        .max_lines = 2775,
+        .max_lines = 4600,
         .max_dependencies = .{ "base", "ai" },
+        .raise_reason = "migration 3.2a (GitHub #775): the pi-agent-core style minimal kernel (loop, hooks, tool interface, sequential and parallel executor) and its fake-provider tests, measured at 1001 lines on top of 3264, plus room for review fixes; 3.2b onward moves agent_loop onto it and takes the budget back down",
     },
 }

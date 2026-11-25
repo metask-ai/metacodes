@@ -197,7 +197,12 @@ metacodes bench pull --suite terminal-bench-2.1 --task fix-git --task regex-log 
 It runs on the workbench machine. Registry suites are read from the same
 download a run uses (`<state root>/bench/registry-cache/`), harbor-local
 suites from their prepared dataset. It first runs `docker info` on the
-executor and stops with its error when Docker cannot be reached. A named
+executor and stops with its error when Docker cannot be reached. The images
+a task names are its own (`[environment] docker_image`), every other
+`docker_image` of its `task.toml` (a separate verifier's
+`[verifier.environment]`, as in the FrontierHarness tasks), and the
+`image:` of the services in `environment/docker-compose.yaml` that have no
+`build:` (sidecars). A named
 image is checked with `docker image inspect` (over SSH for an SSH executor)
 and pulled only when missing; an executor's `ghcr_mirror` is used for
 `ghcr.io` images, which are then tagged back, and `docker_mirrors` apply
@@ -213,8 +218,59 @@ then takes every step from the build cache, without network access. Pulls
 and builds are tried up to 3 times with a backoff. `--dry-run` only
 inspects (a build counts as ready when its tag exists). Without `--task`
 every task of the suite is covered. WorkBuddy suites prepare their own
-environments and are refused. The exit status is 1 when any image could not
-be pulled or built.
+environments and are refused. The summary also counts the tasks whose
+images are all present (`tasks: {total, ready}` in `--json`). The exit
+status is 1 when any image could not be pulled or built.
+
+### Preparation ahead of the queue
+
+A run also prepares each task by itself, shortly before its turn, so a run
+started without `bench pull` does not pay for every image inside a trial.
+The trial queue hook the metacodes agent installs in Harbor
+(`scripts/eval/harbor/live_concurrency.py`, with the queue in
+`scripts/eval/harbor/trial_lifecycle.py`) gives every trial three stages:
+
+1. **排队**: the trial waits. Slots go to the trials in the order Harbor
+   submitted them, oldest first.
+2. **准备**: once the trial is among the next wave (as many waiting trials
+   as the profile's concurrency), the hook does for its task what
+   `bench pull` does, on the machine Harbor runs on: every image the task
+   names (its `docker_image`, a separate verifier's image and the images of
+   its compose sidecars) is checked with `docker image inspect` and pulled
+   only when the local image store lacks it; a task built from `environment/` is built under its
+   `metacodes-prebuild-<digest>` tag unless that tag exists. Pulls and builds
+   are tried up to 3 times. At most 4 of these run at once, and trials that
+   need the same image or build wait for one operation. The task's clock
+   starts here.
+3. **运行**: the trial takes its slot. When its preparation finished earlier
+   it starts at once (就绪等待 is the time in between; after a preparation
+   that failed the same wait is 准备失败后等待, and Harbor pulls or builds
+   again once the trial starts). When its turn comes
+   while it is still preparing, it keeps preparing inside its slot (开始后准备)
+   and starts when that ends; the first wave of a run always does.
+
+Preparation never decides a trial's result: when it fails, or the task has
+no local directory (a `-d` registry run on the local executor), Harbor
+starts the environment itself as before, and the failure is recorded beside
+the trial, not as its outcome. A WorkBuddy run drives its own Harbor and has
+no such stages.
+
+Each trial's stages are in `<job>/.bench-lifecycle/<trial>.json`, rewritten
+at every transition: `queued_at`, `prepare_started_at`,
+`prepare_finished_at`, `started_at` (the slot), `finished_at`, and `prepare`
+with its `status` (`present` when everything was already there, `prepared`,
+`failed`, `skipped`) and one item per image (`kind` `pull` or `build`,
+`image`, `status` `present` / `pulled` / `built` / `failed`, `seconds`,
+`attempts`, `error`, and `shared` when the trial waited for another trial's
+operation). A trial's row in `GET /api/job` and `GET /api/trial` carries
+`lifecycle`: `queue_s`, `prepare_s` (预准备, before the slot),
+`ready_wait_s` (from a preparation that left everything ready to the slot),
+`unprepared_wait_s` (the same wait after a preparation that failed: the
+page says so, and that Harbor pulls or builds again once the trial starts),
+`prepare_running_s`, `total_s` (from the start of
+preparation, or from the slot when there was none, to the end) and
+`prepare`; it is `null` for a trial without a record. `elapsed_s` and
+`phases` keep their meaning (Harbor's own trial).
 
 ### Adding a harbor-local suite
 
@@ -304,6 +360,7 @@ that is not a dry run is in progress; the service checks both under one lock.
 | Docker | macOS: Homebrew `docker docker-compose docker-buildx colima`, the plugin directory in `~/.docker/config.json`, then `colima start` (see [Colima](#colima-on-apple-silicon)); Linux: `get.docker.com` with passwordless sudo, otherwise the command for the user; also starts the daemon, adds the user to the `docker` group and installs the compose and buildx plugins when needed |
 | Docker 镜像加速 (`ssh` executors) | With `docker_mirrors`: merges them into `/etc/docker/daemon.json`'s `registry-mirrors` (other keys kept) through `sudo -n`, then `sudo -n systemctl reload docker` (reloadable; Docker is never restarted). Without passwordless sudo the step prints the exact command |
 | apt 缓存（任务容器） (`ssh` executors) | With `container_mirrors.apt`: builds `metacodes-apt-cache` and runs it on `<metrics_bind>:3142` with `--restart unless-stopped`, then checks that it answers; a running cache with the same mirror is kept (see [Package mirrors and the apt cache](#package-mirrors-and-the-apt-cache-in-task-containers)) |
+| 下载缓存（任务容器） (`ssh` executors) | With `download_cache`: builds `metacodes-download-cache` and runs it on `<metrics_bind>:3143` with `--restart unless-stopped`, one route per cacheable `container_mirrors` key, then checks that `/_stats` answers; a running cache built from the same script and routes is kept (see [The download cache](#the-download-cache)) |
 | OpenSSL | Generates a throwaway certificate exactly as the timing relay does |
 | Linux bundle | See [the release bundle](#the-linux-release-bundle) |
 | metacodes 节点 (`ssh` executors) | Ships the bundle (below) and runs its `metacodes bench node info` by the bundle's own path; only when that node speaks the workbench's protocol is `<state_dir>/bin/metacodes` switched to it (atomically), and `~/.local/bin/metacodes` linked to that entry when the name is free. A failed check leaves the installed node in place (see [Bench nodes](#bench-nodes)) |
@@ -664,7 +721,8 @@ does the same):
 An `ssh` entry also accepts `harbor` (written by setup), `python`
 (default `python3`), `metrics_bind` (default `172.17.0.1`),
 `metrics_enabled`, and the network settings `egress`, `egress_ports`,
-`pypi_index`, `docker_mirrors` and `ghcr_mirror` (see
+`pypi_index`, `docker_mirrors`, `ghcr_mirror`, `container_mirrors` and
+`download_cache` (see
 [Network-restricted executors](#network-restricted-executors)). Names, hosts, users and paths are validated before any
 `ssh` argv is built; unknown fields are refused. `harbor` and `python` may
 contain spaces and `@` (a home directory can), since they only travel as one
@@ -906,6 +964,7 @@ proposes these when its network probe finds those hosts slow or blocked:
 | `docker_mirrors` | Added to the daemon's `registry-mirrors` by setup (sudo, reload, never restart). They cover Docker Hub images only |
 | `ghcr_mirror` | Before each run, ghcr.io images the selected tasks name (`FROM` lines of their Dockerfiles, `image:` of their compose files, `docker_image` in `task.toml`) that are missing locally are pulled as `<mirror>/<path>` and tagged back to their `ghcr.io/` name; other registries are left alone. A failed pull is logged and Harbor pulls from ghcr.io itself |
 | `container_mirrors` | Package mirrors and the apt cache for the runs' task containers (see [below](#package-mirrors-and-the-apt-cache-in-task-containers)) |
+| `download_cache` | `true` puts a cache on the executor in front of those mirrors: a download goes to the cache first and to the mirror only when the cache does not have it (see [The download cache](#the-download-cache)). Only with `egress` = `direct` |
 
 `"egress": "workbench"` builds this path for each run, and only for it:
 
@@ -970,7 +1029,9 @@ task container --HTTP(S)_PROXY--> forwarder on the executor's Docker gateway (17
 `container_mirrors` on an `ssh` executor points every run's task containers
 at package mirrors, and `apt` adds a shared apt cache on the executor, so
 packages that trials and verifiers install (`apt-get install curl`, `pip`,
-`uv`) are fetched from a nearby mirror and, for apt, once per executor:
+`uv`) are fetched from a nearby mirror and, for apt, once per executor
+([the download cache](#the-download-cache) does the same for the other
+keys):
 
 ```json
 "container_mirrors": {
@@ -1031,6 +1092,107 @@ packages, then checks that `/acng-report.html` answers. A running container
 already labeled with the same mirror is kept; another mirror replaces it.
 The volume survives that replacement. The cache answers containers on
 Harbor's compose networks the same way the egress forwarder does.
+
+### The download cache
+
+Mirrors make a download closer, not rarer: every trial is a fresh container,
+so the same wheels, the same uv binary and the same Python are fetched again
+for each one (about 107 MB of PyPI packages per SWE-bench trial, about
+50 MB from GitHub per Terminal-Bench 2.1 trial). `"download_cache": true`
+on an `ssh` executor adds one cache on the executor that every run's task
+containers ask first; only what it does not have is fetched from the
+mirror, once, and kept:
+
+```json
+{"name": "relay-4090", "kind": "ssh", "host": "10.126.126.1",
+ "download_cache": true,
+ "container_mirrors": {
+   "apt": "http://mirrors.aliyun.com",
+   "pypi": "https://pypi.tuna.tsinghua.edu.cn/simple",
+   "npm": "https://registry.npmmirror.com",
+   "github": "https://gh-proxy.com/https://github.com"}}
+```
+
+The cache is `scripts/eval/harbor/download_cache.py`, a caching reverse
+proxy on Python's standard library. Each cacheable `container_mirrors` key
+is a route `http://<metrics_bind>:3143/<key>/…` whose upstream is that
+key's mirror, and a run's compose overlay points the same variables at the
+route instead of the mirror:
+
+| Key | In the task container when cached | Kept for good | Fetched again after 10 minutes |
+|---|---|---|---|
+| `pypi` | `PIP_INDEX_URL` and `UV_DEFAULT_INDEX` = `<cache>/pypi/simple/`, `PIP_TRUSTED_HOST=<metrics_bind>` (pip refuses a plain-http index on another host without it; uv needs nothing) | `/packages/…` | `/simple/…` |
+| `npm` | `NPM_CONFIG_REGISTRY=<cache>/npm/` | `<package>/-/<file>.tgz` | package metadata |
+| `go` | `GOPROXY=<cache>/go,direct` | `@v/<semver>.info`, `.mod`, `.zip` | `@v/list`, `@latest`, `sumdb/…` |
+| `conda` | `CONDA_CHANNEL_ALIAS=<cache>/conda/cloud`, `CONDA_DEFAULT_CHANNELS=<cache>/conda/pkgs/main,<cache>/conda/pkgs/r` | `*.conda`, `*.tar.bz2` | `repodata` |
+| `rustup` | `RUSTUP_DIST_SERVER=<cache>/rustup`, `RUSTUP_UPDATE_ROOT=<cache>/rustup/rustup` | `dist/<date>/…`, `rustup/archive/…` | channel manifests |
+| `github` | `UV_INSTALLER_GITHUB_BASE_URL=<cache>/github`, `UV_PYTHON_INSTALL_MIRROR=<cache>/github/astral-sh/python-build-standalone/releases/download` | `<owner>/<repo>/releases/download/<tag>/<file>` (nothing else is routed) | — |
+
+- **One download per file.** The first request for a file starts one
+  download from the mirror; that request and every other request for the
+  same file meanwhile are served from it as the bytes arrive, so four
+  attempts of a task starting together cost one download and a large wheel
+  does not run into pip's read timeout. A client that leaves does not stop
+  the download. A file is published in the cache only when it arrived
+  complete; redirects (GitHub release assets) are followed by the cache.
+- **Mirror down.** A page that is fetched again after 10 minutes (an index
+  page, package metadata) is served from the stored copy when the mirror
+  fails or answers 5xx, so a run whose files are already cached does not
+  need the mirror at all. Answers other than 200 are passed on and not
+  stored.
+- **Ranges.** A `Range` request is answered from the stored file; while a
+  file is not stored yet the whole file is sent, which uv accepts (it then
+  reads the wheel it was sent).
+- **npm.** Mirror metadata names tarballs by absolute URL, so the cache
+  rewrites the mirror's address to its own in metadata; a lockfile written
+  during a run therefore names the cache.
+- **Pick mirrors that are fast over HTTP/1.1.** The cache, like pip, speaks
+  HTTP/1.1. `mirrors.aliyun.com/pypi` served a 23 MB wheel at about
+  175 KB/s over HTTP/1.1 and in one second over HTTP/2 (measured from two
+  networks in November 2026); the Tsinghua, USTC and Huawei Cloud indexes
+  sent it at about 12 MB/s over HTTP/1.1.
+- **`pypi` needs a `/simple` index URL** (`…/simple` or `…/simple/`) whose
+  file links stay under the same root, as the Tsinghua and Aliyun indexes
+  do; another shape keeps going to the mirror directly.
+- **Reach.** Only GET and HEAD, only the configured routes, and paths with
+  `..` are refused. The container publishes the port on `metrics_bind`
+  only, like the apt cache. Before a run the worker reads `/_stats` over
+  SSH and points a key's variables at the cache only when the running
+  cache has that route with the mirror the entry names now. A cache that
+  does not answer, a key added to `container_mirrors` since the last
+  setup, or a mirror changed since then leaves those keys on the plain
+  mirror variables for that run, and the run log names the setup command.
+- **Changing a mirror.** A stored file belongs to the mirror it came from:
+  after a route's mirror changes, the cache fetches from the new one and
+  never serves (not even as a stale copy) what the old one sent. The old
+  files stay on the volume, unused, until it is cleared.
+
+Not behind this cache, each for its own reason:
+
+- **apt** keeps its own cache (apt-cacher-ng, above), which already works
+  this way.
+- **Docker images.** Their cache is the executor's Docker image store:
+  `bench pull` and Harbor pull an image only when `docker image inspect`
+  does not find it.
+- **Hugging Face.** `hf` stays a plain mirror: the Hub client needs the
+  `ETag`, `X-Repo-Commit` and redirect answers of the Hub, which this cache
+  does not reproduce.
+- **`https://astral.sh/uv/<version>/install.sh`**, the installer script
+  itself (a few KB): its URL is written in each task's `test.sh`.
+- **An agent's own git traffic**, which no variable redirects.
+
+`GET http://<metrics_bind>:3143/_stats` reports, per route, `requests`,
+`hits`, `misses`, `stale`, `errors`, `bytes_cached` (served from the cache)
+and `bytes_fetched` (downloaded from the mirror), plus `entries` and
+`disk_bytes`; the counters are stored with the cache and survive a restart.
+Setup's 下载缓存 step builds the image `metacodes-download-cache`
+(`debian:bookworm-slim` with Python and the script) and runs the container
+of the same name with `--restart unless-stopped` and the named volume
+`metacodes-download-cache`. A running container built from the same script
+and routes is kept; anything else replaces it, and the volume survives.
+Nothing is evicted in this version: `docker rm -f metacodes-download-cache
+&& docker volume rm metacodes-download-cache`, then setup again, starts
+from empty.
 
 ### Colima on Apple Silicon
 
@@ -1355,9 +1517,14 @@ detail:
   apportions the request's measured input tokens by those shares; the
   initial-token metric shows the first request's composition, averaged over
   trials. Runs recorded before this existed show `未采集`.
-- **Time**: Harbor's phases, and the agent phase split into waiting on the
-  model (request durations), running tools (each call's measured execution
-  from the metacodes event stream) and the rest; a per-tool timing table.
+- **Time**: what the task's time is made of, in order: 预准备, 就绪等待 (or
+  准备失败后等待) and 开始后准备 (see [Preparation ahead of the queue](#preparation-ahead-of-the-queue)), then
+  Harbor's phases (环境, 安装, agent, 判分), with the images preparation
+  pulled, built or found. The total counts from the start of preparation;
+  排队 is shown beside it and not counted. The agent phase is split into
+  waiting on the model (request durations), running tools (each call's
+  measured execution from the metacodes event stream) and the rest; a
+  per-tool timing table. The job page's 时间分段 bar has the same parts.
 - **Trajectory**: every step, with each tool call's execution time.
 
 The 数据库 page shows the active store and its contents. It tests a SQLite path or a PostgreSQL DSN (no password in the
@@ -1445,6 +1612,7 @@ there into the evaluation database):
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage
+    .bench-lifecycle/<trial>.json  # queue, preparation and slot times of the trial
     <trial>/
       config.json, result.json     # trial score, timings and usage
       agent/                      # NDJSON, transcript, ATIF trajectory, stderr
