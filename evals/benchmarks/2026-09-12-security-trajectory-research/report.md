@@ -96,7 +96,7 @@ false-positive-trap-bind 则需要区别对待。轨迹中 `/workdir` 的 owner 
 
 原始二进制搜索一个普通临时文本文件：不存在的模式返回系统错误；实际存在的 `->needle` 被当成选项；普通模式 `ordinary` 正常返回行号。这同时给出了两个失败和一个正向对照。
 
-根因一是生产 `executeBody` 分支把零字节结果送进 `Capture.seal()`，后者明确拒绝空内容。根因二是组装 ripgrep argv 时直接追加 pattern，缺少 `-e` 或选项终止分隔；legacy 和 spool 分支都有同样的参数问题。[Grep 参数组装](../../../src/tools/grep.zig#L141)、[空输出封存](../../../src/tools/grep.zig#L226)、[CAS 空内容约束](../../../src/core/tool_result_artifact.zig#L198)
+根因一是生产 `executeBody` 分支把零字节结果送进 `Capture.seal()`，后者明确拒绝空内容。根因二是组装 ripgrep argv 时直接追加 pattern，缺少 `-e` 或选项终止分隔；legacy 和 spool 分支都有同样的参数问题。[Grep 参数组装](https://github.com/metask-ai/metacodes/blob/7aa4aca40d6d2934054a0c92b880f5b71f7e6d11/src/tools/grep.zig#L141)、[空输出封存](https://github.com/metask-ai/metacodes/blob/7aa4aca40d6d2934054a0c92b880f5b71f7e6d11/src/tools/grep.zig#L226)、[CAS 空内容约束](../../../src/core/tool_result_artifact.zig#L198)
 
 应在工具层把 `rg` 的合法无匹配解释为成功的空结果，而不是放宽所有 artifact 的封存约束。回归用例必须进入 `executeBody`、配置真实 artifact store，并覆盖无匹配、分页越界、连字符开头模式、普通命中、真实启动错误。现有许多测试调用的是 legacy `execute`，不能代表生产 spool 路径。30 次错误的分数代价仍然未知：模型有时能改用 Bash 绕过，但多轮反复搜索明显值得避免。
 
