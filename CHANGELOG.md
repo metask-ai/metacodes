@@ -23,6 +23,13 @@ status, compatibility boundaries, and entry points are defined by
   apart, and list the images preparation found, pulled or built. A failed
   preparation is recorded beside the trial and never decides its result; the
   wait after it is shown as 准备失败后等待, not as ready.
+- **Bench task containers can take GitHub release and Hugging Face mirrors.**
+  `container_mirrors` on an SSH executor accepts `github` (a URL standing for
+  `https://github.com`, such as `https://gh-proxy.com/https://github.com`)
+  and `hf`. A run's task containers then get `UV_INSTALLER_GITHUB_BASE_URL`
+  and `UV_PYTHON_INSTALL_MIRROR`, so the uv binary and the Python a
+  verifier's `uvx` downloads come from the mirror, and `HF_ENDPOINT`. Git
+  traffic and Docker Hub images are not redirected.
 
 - **Bench reruns invalid tasks, and can do it automatically.** The profile
   page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest
