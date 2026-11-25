@@ -89,11 +89,13 @@ class GateManifestTest(unittest.TestCase):
         script = str(ROOT / "scripts/check_eval_python.py")
         good = subprocess.run([sys.executable, script], capture_output=True, text=True)
         self.assertEqual(good.returncode, 0, good.stderr)
-        missing = subprocess.run(
-            [sys.executable, "-I", "-S", script], capture_output=True, text=True,
-        )
+        isolated = [sys.executable, "-I", "-S"]
+        missing = subprocess.run([*isolated, script], capture_output=True, text=True)
         self.assertNotEqual(missing.returncode, 0)
-        args = [sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]
+        executable = subprocess.check_output(
+            [*isolated, "-c", "import sys; print(sys.executable)"], text=True,
+        ).rstrip("\r\n")
+        args = [executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]
         repair = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
         self.assertIn(repair, missing.stderr)
         self.assertIn("-m venv .venv", missing.stderr)
