@@ -16685,7 +16685,10 @@ const ProcessCost = struct {
                 var count: usize = 0;
                 var more = win_cost.Thread32First(snapshot, &entry) != 0;
                 while (more) : (more = win_cost.Thread32Next(snapshot, &entry) != 0) {
-                    if (entry.th32OwnerProcessID == pid) count += 1;
+                    if (entry.th32OwnerProcessID == pid) {
+                        count += 1;
+                        if (win_cost.print_ids) win_cost.describe(entry.th32ThreadID);
+                    }
                 }
                 return count;
             },
@@ -16703,6 +16706,7 @@ const ProcessCost = struct {
 };
 
 const win_cost = struct {
+    var print_ids = false;
     const HANDLE = std.os.windows.HANDLE;
     const TH32CS_SNAPTHREAD: u32 = 0x4;
     const ThreadEntry32 = extern struct {
@@ -16732,6 +16736,22 @@ const win_cost = struct {
     extern "kernel32" fn Thread32Next(snapshot: HANDLE, entry: *ThreadEntry32) callconv(.winapi) i32;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
     extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    extern "kernel32" fn OpenThread(access: u32, inherit: i32, tid: u32) callconv(.winapi) ?HANDLE;
+    extern "ntdll" fn NtQueryInformationThread(thread: HANDLE, class: u32, out: *usize, len: u32, written: ?*u32) callconv(.winapi) i32;
+    extern "kernel32" fn GetModuleHandleExW(flags: u32, addr: usize, out: *usize) callconv(.winapi) i32;
+    extern "kernel32" fn GetModuleFileNameW(module: usize, name: [*]u16, size: u32) callconv(.winapi) u32;
+    fn describe(tid: u32) void {
+        const thread = OpenThread(0x40, 0, tid) orelse return;
+        defer std.os.windows.CloseHandle(thread);
+        var addr: usize = 0;
+        if (NtQueryInformationThread(thread, 9, &addr, @sizeOf(usize), null) != 0) return;
+        var module: usize = 0;
+        if (GetModuleHandleExW(6, addr, &module) == 0) return;
+        var path: [512]u16 = undefined;
+        const len = GetModuleFileNameW(module, &path, path.len);
+        const base = if (std.mem.lastIndexOfScalar(u16, path[0..len], '\\')) |at| at + 1 else 0;
+        std.debug.print("probe tid {d} {f}+{x}\n", .{ tid, std.unicode.fmtUtf16Le(path[base..len]), addr - module });
+    }
     extern "kernel32" fn K32GetProcessMemoryInfo(process: HANDLE, counters: *ProcessMemoryCountersEx, cb: u32) callconv(.winapi) i32;
 };
 
@@ -16772,9 +16792,25 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
 
+    if (std.c.getenv("IDLE_PROBE_WARM") != null) {
+        var warm: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, &warm, &diagnostic));
+        defer std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(warm, &diagnostic)) catch unreachable;
+        var opts = std.mem.zeroes(wire.RunOptionsV1);
+        opts.struct_size = @sizeOf(wire.RunOptionsV1);
+        opts.max_turns = 1;
+        var result = std.mem.zeroes(wire.RunResultV1);
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(warm, 1, sdk.bytesView("warm"), &opts, &result, &diagnostic));
+    }
+    win_cost.print_ids = true;
     const baseline = ProcessCost.now();
+    win_cost.print_ids = false;
     std.debug.print("probe baseline {any}\n", .{baseline});
-    defer std.debug.print("probe after session teardown {any}\n", .{ProcessCost.now()});
+    defer {
+        win_cost.print_ids = true;
+        std.debug.print("probe after session teardown {any}\n", .{ProcessCost.now()});
+        win_cost.print_ids = false;
+    }
     var sessions = [_]?*wire.SessionHandle{null} ** idle_sessions;
     defer for (sessions) |session| if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
