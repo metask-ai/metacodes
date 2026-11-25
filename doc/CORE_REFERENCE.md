@@ -60,11 +60,11 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 
 | 包 | 现在的路径(按前缀归属,长前缀优先) | 可以 import 的包 |
 |----|------------------------------------|------------------|
-| `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
+| `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `code/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
 | `ai` | `api/`(`model_name` 除外) · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
-| `kernel` | `core/` 里的 `agent_loop` · `conversation` · `message` · `tool_exec` · `session_id` · `protocol/` | base、ai |
-| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `result_budget` · `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
-| `coding` | `core/` 其余文件 · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `code/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
+| `kernel` | `core/` 里的 `conversation` · `message` · `session_id` · `result_budget` | base、ai |
+| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice` · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
+| `coding` | `core/` 其余文件(含 `agent_loop` · `tool_exec` · `protocol/` 其余文件) · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
 | `session` | `core/agent_session` · `core/session_host` | 以上各包 |
 | `teamwork` | `teamwork/` | 以上各包 |
 | `facade` | `lib.zig`(`metacodes-core` 的对外门面,汇总导出以上各包) · `internal.zig`(cli 访问下层的唯一入口,不对外) | 以上各包 |
@@ -127,6 +127,19 @@ provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/conte
 `platform.paths`,`transcript.hashCwd` 签名不变、转调它,`memdir` 直接用它,`transcript` 留在 `coding`。越层 import 94
 (`guard → coding` 清零,`kernel` 对 `test_tmp` 的 2 条也随之消失),深层 import 1804(新增的 154 条都是基线代码里已有的 import:147 条原在同一个包里,7 条原是越层 import)。
 
+迁移 3.1 按 pi 的分法重新划定 kernel。pi 的 `pi-agent-core` 只有一个最小的 `agentLoop`,外设靠钩子接入,带全套外设的
+`AgentSession` 在 `pi-coding-agent` 里。metacodes 现在的 `agent_loop`(`Options` 带 kg、jev、telemetry、swarm、skills 等全部外设)
+和 `tool_exec`(直接调 apply_patch、read_artifact、kg、project_rule)就是这个「全套外设循环」,`protocol/` 是宿主协议,所以它们改归
+`coding`,对应 pi 的 `AgentSession`;最小内核循环在 3.2 抽进 kernel,`agent_loop` 再逐步改为调用它,`Options` 不变。kernel 现在只有
+`conversation`、`message`、`session_id`,加上 `conversation` 用来算单条工具结果上限的 `result_budget`(它对 artifact 读取上限的
+引用改成私有常量,`tools/read_artifact.zig` 里的测试保证两者相等)。`code/`(QuickJS 引擎的 Zig 包装,只依赖 std)改归 `base`。
+`protocol/` 里 `ui_event`、`ui_request`、`permission_choice` 是 `PermissionContext` 公开字段的类型,改归 `coding` 会让 `guard`
+新增越层边,所以归 `guard`;`AskQuestion`、`AskOption` 挪到 `ui_request.zig` 定义,`tools/context.zig` 用别名保留,`ui_request`
+不再依赖 `tools/context`。路径、Zig API 快照、测试 ID 都不变。越层 import 94 → 5,深层 import 1799,kernel 3264 行,依赖 base、ai、coding。
+包间环 kernel、guard、coding 还在,剩下的 5 条越层边都卡在 Zig API 快照里的公开类型上:`conversation → result_projection` 1 条
+(`Conversation` 的 microcompact、截断等公开方法要认得 artifact 信封),`ui_event → file_change`、`file_reference`、`goal`、
+`output_semantics` 4 条(`CoreEvent` 的载荷类型)。在 3.2 抽最小循环时一并处理。
+
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。
 
@@ -134,7 +147,7 @@ provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/conte
 
 | 模块 | 职责 | 关键导出 |
 |------|------|----------|
-| `agent_loop` | 一个 agent 回合的完整循环:流式请求→收 tool_use→执行→回灌→再循环 | `run()`, `Options`, `RunResult`, `StopReason`, `UsageSink`, `ProgressReporter` |
+| `agent_loop` | 一个 agent 回合的完整循环(带全套外设,属于 `coding`):流式请求→收 tool_use→执行→回灌→再循环 | `run()`, `Options`, `RunResult`, `StopReason`, `UsageSink`, `ProgressReporter` |
 | `conversation` / `message` | 对话状态(messages → blocks);压缩/microcompact | `Conversation`, `Message`, `Block`(text/tool_use/tool_result/thinking/image/reasoning_item) |
 | `subagent` | 父 agent spawn 子 agent(隔离 Conversation + TaskStore) | `spawnAgent`, `spawnAgentSink`, `SpawnOptions`, `SubagentResult` |
 | `tool_exec` | 工具批量执行(按并发安全分批;每 job 独立 arena + per-worker 值拷贝 ctx) | `executeSlots`, `Slot` |
