@@ -12,10 +12,6 @@
 import sys
 import json
 import os
-import threading
-import time
-
-write_lock = threading.Lock()
 
 def read_message():
     # 读 header 到 \r\n\r\n
@@ -34,10 +30,9 @@ def read_message():
 
 def send(obj):
     data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    with write_lock:
-        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data))
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data))
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
 
 def diagnostic(line, message):
     return {
@@ -54,11 +49,6 @@ def publish(uri, version, diagnostics):
         "method": "textDocument/publishDiagnostics",
         "params": {"uri": uri, "version": version, "diagnostics": diagnostics},
     })
-
-def flood(uri, count, interval_s):
-    for _ in range(count):
-        publish(uri, 0, [diagnostic(0, "MOCK_LSP_FLOOD")])
-        time.sleep(interval_s)
 
 def document_text(msg):
     params = msg["params"]
@@ -104,13 +94,8 @@ def main():
             pass
         elif method == "mock/echo":
             send({"jsonrpc": "2.0", "id": mid, "result": None})
-        elif method == "mock/flood":
-            params = msg["params"]
-            threading.Thread(
-                target=flood,
-                args=(params["uri"], params["count"], params["interval_ms"] / 1000.0),
-                daemon=True,
-            ).start()
+        elif method == "mock/publish":
+            publish(msg["params"]["uri"], 0, [diagnostic(0, "MOCK_LSP_DIAG")])
         elif method == "shutdown":
             send({"jsonrpc": "2.0", "id": mid, "result": None})
         elif method == "exit":
