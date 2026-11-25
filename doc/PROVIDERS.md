@@ -66,13 +66,16 @@ removes both files, and forgets a default model that was a Metask one. A
 A manager signed in with `metacodes login` can provide model access to a named
 SSH executor between jobs. The node can start its own ordinary conversations
 and local Bench runs. Its provider talks to its loopback port through SSH.
-The manager reads its Metask session for each model request and refreshes it
-when needed. Both account tokens stay on the manager.
+The node verifies the manager's TLS certificate before sending a model request.
+The manager and its running CLI share a refresh lock and read the latest
+session before renewing it. Both account tokens stay on the manager.
 
 On the manager, configure the node as an
 [SSH executor](BENCH_WORKBENCH.md#execution-machines) and verify its SSH host
 key. Start the share with a dedicated pairing file for this node. The
-manager creates the private file on first use and reuses it on later starts.
+manager uses OpenSSL to create a private pairing file and an adjacent
+`node-b.env.identity` directory on first use. Keep that directory on the
+manager. It holds the TLS private key and its one-year certificate.
 The node's SSH server must permit reverse forwarding to loopback
 (`GatewayPorts no` or `clientspecified`).
 
@@ -82,6 +85,7 @@ metacodes bench share --executor node-b --peer-env node-b.env
 
 In a second terminal, copy just the pairing file to B once with
 `scp -p node-b.env node-b:manager-pair.env`, using B's SSH destination.
+Use a version of Metacodes with certificate pairing on both machines.
 Keep the share command running. It reconnects after an
 SSH disconnect and uses port 18767 on the node by default. `--port` changes
 that port. Ctrl-C closes the share.
@@ -95,7 +99,7 @@ models. For a plain start on an install with several provider keys, select
 ```sh
 model=glm-5.3-flash
 metacodes providers add manager --display-name "Metask manager" \
-  --base-url http://127.0.0.1:18767 --protocol anthropic_messages \
+  --base-url https://127.0.0.1:18767 --protocol anthropic_messages \
   --auth bearer --key-env MODEL_MANAGER_KEY --model "$model"
 metacodes login status
 metacodes
@@ -103,10 +107,12 @@ metacodes bench --auth provider --model "manager/$model"
 ```
 
 The node can list models and make inference requests while the manager
-provides access. Signing out on the manager prevents subsequent requests.
+provides access. During a disconnect the node checks the certificate on
+each new connection before sending its pairing key or prompt. Signing out
+on the manager prevents subsequent requests.
 To withdraw access from one node, stop its share. To pair it with a fresh
-key, replace its pairing file and the matching line on the node and restart
-the share and the node's clients.
+identity before its certificate expires, start the share with a new pairing
+filename, copy the new pairing line to the node and restart its clients.
 
 ## A built-in vendor
 

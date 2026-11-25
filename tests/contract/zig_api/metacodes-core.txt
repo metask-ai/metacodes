@@ -7553,6 +7553,7 @@ metacodes-core.client.AnthropicProvider.retryAttempt: fn retryAttempt(self: Prov
 metacodes-core.client.ANTHROPIC_API_URL: const = "https://napi.metask-ai.com/v1/messages"
 metacodes-core.client.StreamResult: struct
 metacodes-core.client.StreamResult.request: *http.Client.Request
+metacodes-core.client.StreamResult.manager_client: ?*http.Client = null
 metacodes-core.client.StreamResult.response: http.Client.Response
 metacodes-core.client.StreamResult.transfer_buf: [8192]u8
 metacodes-core.client.StreamResult.id: log.RequestId

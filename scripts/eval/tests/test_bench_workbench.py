@@ -440,7 +440,7 @@ class RotatingGateway:
                     self.reply(*gateway.refresh(body))
                 elif self.path == '/v1/messages':
                     if not gateway.accept(self.bearer()):
-                        self.reply({'error': 'expired'}, 401)
+                        self.reply({'error': {'code': 'token_expired', 'message': 'expired'}}, 401)
                         return
                     events = (
                         {'type': 'message_start', 'message': {'id': 'msg-1', 'role': 'assistant', 'type': 'message',
@@ -460,7 +460,7 @@ class RotatingGateway:
                     self.reply({}, 404)
 
             def do_GET(self):
-                if self.path != '/v1/models':
+                if self.path.partition('?')[0] != '/v1/models':
                     self.reply({}, 404)
                 elif not gateway.valid(self.bearer()):
                     self.reply({}, 401)

@@ -13,6 +13,7 @@ The loopback/Docker hop is part of the benchmark harness, not a provider SLA.
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hmac
 import http.client
@@ -317,11 +318,23 @@ def subject_alt_names(*hosts):
     return ",".join(names)
 
 
+def manager_tls(origin, key):
+    if not key.startswith("mcpeer-"):
+        return None
+    match = re.fullmatch(r"mcpeer-[0-9a-f]{64}\.([A-Za-z0-9_-]{1,3500})", key)
+    if not match or origin.scheme != "https" or origin.hostname != "127.0.0.1":
+        raise ValueError("配对凭据需要经过验证的本机 HTTPS 管理接口")
+    encoded = match[1]
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cadata=base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    return context
+
+
 class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
                  auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None,
                  token=None, record=True, judge_token=None, judge_credential=None, connect=None,
-                 cert_dir=None, listener=None, sequence=0, model_gateway=False):
+                 cert_dir=None, listener=None, sequence=0, model_gateway=False, server_context=None):
         # `credential` is the real upstream credential (a string or a source
         # with current()/refresh(stale)); `token` is the placeholder the
         # containers present (a fresh one when omitted). `record=False`
@@ -369,6 +382,7 @@ class TimingRelay:
 
             def setup(self):
                 self.upstream = None
+                self.upstream_peer = None
                 if isinstance(self.request, ssl.SSLSocket):
                     self.request.settimeout(15)
                     self.request.do_handshake()
@@ -497,6 +511,10 @@ class TimingRelay:
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                     complete = True
+                except (ssl.SSLCertVerificationError, ValueError):
+                    if status == 0:
+                        self.send_error(502, "Model endpoint verification failed")
+                    self.close_connection = True
                 except (OSError, http.client.HTTPException):
                     self.close_connection = True
                 finally:
@@ -505,11 +523,17 @@ class TimingRelay:
                                                 **({"composition": shape} if shape else {})})
 
             def exchange(self, upstream_path, body, headers, secret):
+                peer = secret if secret.startswith("mcpeer-") else None
+                if self.upstream and peer != self.upstream_peer:
+                    self.upstream.close()
+                    self.upstream = None
+                self.upstream_peer = peer
                 while True:
                     reused = self.upstream is not None
                     if not reused:
                         cls = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
-                        self.upstream = cls(origin.hostname, origin.port, timeout=1800)
+                        options = {"context": manager_tls(origin, peer)} if peer else {}
+                        self.upstream = cls(origin.hostname, origin.port, timeout=1800, **options)
                         if connect:
                             self.upstream._create_connection = connect
                     try:
@@ -563,7 +587,7 @@ class TimingRelay:
                 if not isinstance(sys.exc_info()[1], (ssl.SSLError, TimeoutError)):
                     super().handle_error(request, client_address)
 
-        self.tls_context = None
+        self.tls_context = server_context
         reused = False
         if listener is None:
             self.server = DirectServer((bind, port), Handler)
@@ -610,7 +634,7 @@ class TimingRelay:
             if not reused:  # a running relay's files are not this one's to remove
                 self.remove_files()
             raise
-        self.url = f"{'https' if tls else 'http'}://{public_host}:{self.server.server_port}"
+        self.url = f"{'https' if self.tls_context else 'http'}://{public_host}:{self.server.server_port}"
 
     def remove_files(self):
         if isinstance(self.cert_dir, tempfile.TemporaryDirectory):

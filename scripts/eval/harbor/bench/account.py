@@ -46,16 +46,15 @@ class SessionLogin:
         origin_url(doc["gateway_url"])
         return doc
 
-    def bearer(self, request, stale=None):
-        return self.access(request, stale)["access_token"]
-
-    def access(self, request, stale=None, margin=300):
+    def access(self, request, stale=None, margin=300, *, expected_gateway):
         """The current access token and its expiry, refreshed when it expires
         within `margin` seconds (or, with `stale`, when it is still the one
         the gateway rejected). Re-read under the lock: another process may
         have rotated the refresh token, which must not be reused."""
         with refresh_lock(self.path.parent):
             current = self.read()
+            if current["gateway_url"] != expected_gateway:
+                raise ValueError("Metask 会话已更换网关，请重新连接")
             if stale is not None and current["access_token"] != stale:
                 return current
             if stale is None and current["expires_at"] > time.time() + margin:
@@ -67,6 +66,8 @@ class SessionLogin:
                     or any(not isinstance(token.get(k), str) or not token[k] for k in ("access_token", "refresh_token"))):
                 raise ValueError("Metask 登录刷新失败，请重新运行 metacodes login")
             latest = self.read()
+            if latest["gateway_url"] != expected_gateway or token.get("gateway_url", expected_gateway) != expected_gateway:
+                raise ValueError("Metask 会话已更换网关，请重新连接")
             if latest["refresh_token"] != current["refresh_token"]:
                 return latest
             updated = {**latest, **{k: token[k] for k in (
@@ -145,11 +146,8 @@ class Account:
         self.auth_path = Path(os.environ.get("METACODES_AUTH_FILE") or self.state_dir / "auth.json")
         session_path = Path(os.environ.get("METACODES_OAUTH_DIR") or self.state_dir / "oauth") / "metask.json"
         self.session = SessionLogin(session_path, origin_url(os.environ.get("METASK_SITE_URL", SITE).rstrip("/"))) if session_path.exists() else None
-        self.gateway_override = origin_url(gateway.rstrip("/")) if gateway else None
-
-    @property
-    def gateway(self):
-        return self.gateway_override or (self.session.read()["gateway_url"] if self.session else GATEWAY)
+        self.session_gateway = self.session.read()["gateway_url"] if self.session else None
+        self.gateway = origin_url(gateway.rstrip("/")) if gateway else self.session_gateway or GATEWAY
 
     def fingerprint(self):
         def stamp(path):
@@ -202,7 +200,7 @@ class Account:
 
     def oauth_bearer(self, stale=None):
         if self.session:
-            return self.session.bearer(self.request, stale)
+            return self.session_access(stale)[0]
         with refresh_lock(self.state_dir):
             login = self.login()
             oauth = login.get("oauth") or {}
@@ -240,7 +238,7 @@ class Account:
         """(access token, expires_at) of the current CLI session login."""
         if not self.session:
             raise ValueError("当前登录没有可刷新的 Metask 会话")
-        doc = self.session.access(self.request, stale, margin)
+        doc = self.session.access(self.request, stale, margin, expected_gateway=self.session_gateway)
         return doc["access_token"], doc["expires_at"]
 
     def keys(self):

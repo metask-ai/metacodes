@@ -52,6 +52,7 @@ const RequestResult = union(enum) {
 /// 修法：Request 放 heap，StreamResult 持有 owned `*Request`，deinit 时 destroy。
 pub const StreamResult = struct {
     request: *http.Client.Request,
+    manager_client: ?*http.Client = null,
     response: http.Client.Response,
     transfer_buf: [8192]u8,
     id: log.RequestId,
@@ -1403,7 +1404,10 @@ pub const Client = struct {
         // process-wide connection_gate(MAX_CONNECTING_REQUESTS) 限制，不重新引入陈旧池连接。
         // std 只在收到响应头后才执行 keep_alive=false:receiveHead 失败它自己关连接,
         // 发送失败的连接靠 http_connection 丢弃。
-        req_ptr.* = client.http_client.request(.POST, uri, .{
+        const manager = try http_connection.managerClient(&client.http_client, uri, auth.value);
+        errdefer http_connection.releaseManagerClient(manager);
+        const transport = manager orelse &client.http_client;
+        req_ptr.* = transport.request(.POST, uri, .{
             .keep_alive = false,
             // The key rides in a header; a redirect would carry it to another host.
             .redirect_behavior = no_redirects,
@@ -1538,6 +1542,7 @@ pub const Client = struct {
             out.* = .{
                 .streaming_response = .{
                     .request = req_ptr,
+                    .manager_client = manager,
                     .response = http_response,
                     .transfer_buf = undefined,
                     .id = rid,
@@ -1573,6 +1578,7 @@ pub const Client = struct {
         };
         req_ptr.deinit();
         client.allocator.destroy(req_ptr);
+        http_connection.releaseManagerClient(manager);
         log.infoId("client", rid, "response complete bytes={d} total_ms={d}", .{ response_body.len, timestampMs() - t_start });
         out.* = .{ .full_body = .{ .body = response_body, .id = rid, .server_request_id = client.serverRequestId() } };
     }
@@ -1680,7 +1686,10 @@ fn getModelsPage(
             break :blk .{ .name = built.?.name, .value = built.?.value };
         },
     };
-    var req = http_client.request(.GET, uri, .{
+    const manager = try http_connection.managerClient(http_client, uri, header.value);
+    defer http_connection.releaseManagerClient(manager);
+    const transport = manager orelse http_client;
+    var req = transport.request(.GET, uri, .{
         .keep_alive = false, // 同 POST:不复用陈旧连接
         .redirect_behavior = no_redirects, // 同 POST:key 不随重定向去别的主机
         .extra_headers = &.{
@@ -1942,6 +1951,7 @@ pub const StreamResponse = struct {
             registry.unregister(self.stream_result.request);
         self.stream_result.request.deinit();
         self.allocator.destroy(self.stream_result.request);
+        http_connection.releaseManagerClient(self.stream_result.manager_client);
     }
 
     // ── 中立化:把 *堆分配* 的 StreamResponse 包成 provider 无关的 StreamHandle ──
