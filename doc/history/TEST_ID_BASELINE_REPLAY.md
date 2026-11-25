@@ -21,12 +21,16 @@ IDs, so the measurement isolates additional baseline work.
 
 ## Result
 
-Both collectors produced the same 9,402 rows (14,399 occurrences, including
-TTY listings), byte for byte. SHA-256 of each `test-ids.tsv` was
+The historical main run and the Linux replay each collected 84 raw files
+with matching per-leg source and shard counts. Their aggregate `test-ids.tsv`
+files were byte-for-byte identical across all 9,402 rows (14,399 occurrences,
+including TTY listings). Both had SHA-256
 `7f1ab7890bc7b8177ee08d04c2fb6737db02cfd2426f76cb87751e5b5808eb32`.
-The per-leg source and shard counts matched across all 84 raw files. Both
-baselines passed the original PR head and rejected the head with a test
-removed. Omitting one raw integration shard failed the inventory check.
+
+The #809 PR head had 85 raw files. Its extra `checks` file recorded a second
+execution of the same 29 layer-gate tests that `units` ran. Both baselines
+passed this head and rejected the head with a test removed. Omitting one raw
+integration shard from the replay failed the inventory check.
 
 | Baseline collection | Linux runner time | macOS runner time | Windows runner time | Dispatch to IDs | Dispatch to last job |
 | --- | ---: | ---: | ---: | ---: | ---: |
