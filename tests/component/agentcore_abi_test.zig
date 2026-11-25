@@ -16773,6 +16773,7 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
     callbacks.on_event = acceptEvent;
 
     const baseline = ProcessCost.now();
+    errdefer std.debug.print("#503 process cost: baseline {any}, after Session teardown {any}\n", .{ baseline, ProcessCost.now() });
     var sessions = [_]?*wire.SessionHandle{null} ** idle_sessions;
     defer for (sessions) |session| if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
@@ -16794,6 +16795,7 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
     // request. What stays per Session is its provider's Io pool, at most the
     // two workers std's connect used.
     var idle = ProcessCost.now();
+    errdefer std.debug.print("#503 idle process cost: {any}\n", .{idle});
     var waited_ms: u64 = 0;
     if (baseline.threads) |before| {
         while (idle.threads.? > before + 2 * idle_sessions and waited_ms < 5_000) : (waited_ms += 50) {
