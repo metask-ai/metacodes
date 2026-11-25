@@ -45,6 +45,8 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
 
+from scripts.eval.harbor.bench import task_files
+
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
 USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
@@ -193,17 +195,7 @@ def task_owned_settings(dataset: Path, mirrors: Dict[str, str]) -> List[str]:
                    **container_mirror_env(mirrors, "http://cache", DOWNLOAD_CACHE_KINDS)}) \
         + ([APT_PROXY_SETTING] if "apt" in mirrors else [])
     found = set()
-    for path in Path(dataset).rglob("*"):
-        name = path.name.lower()
-        if not (name == "task.toml" or name.startswith("dockerfile") or
-                (name.endswith((".yaml", ".yml")) and "compose" in name)):
-            continue
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+    for _, text in task_files.sources(Path(dataset), dockerfile_suffix=False):
         found.update(setting for setting in wanted if setting in text)
     return sorted(found)
 

@@ -2641,6 +2641,10 @@ pub fn build(b: *std.Build) void {
     const units_test_step = b.step("test:units", "Run the unit and component test binaries and the script unit suites (part of `test`)");
     const integration_test_step = b.step("test:integration", "Run the integration suite against the installed CLI, and the spikes (part of `test`)");
     const product_test_step = b.step("test:product", "Run the built product end to end: evaluation harness, smokes, daemon (part of `test`)");
+    const product_runtime_step = b.step("test:product-runtime", "Run product runtime smokes for a change outside the evaluation harness");
+    const eval_test_step = b.step("test:eval", "Test the harness evaluation framework");
+    product_test_step.dependOn(product_runtime_step);
+    product_test_step.dependOn(eval_test_step);
     test_step.dependOn(units_test_step);
     test_step.dependOn(integration_test_step);
     test_step.dependOn(product_test_step);
@@ -2652,7 +2656,7 @@ pub fn build(b: *std.Build) void {
     units_test_step.dependOn(cli_test_step);
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
-    product_test_step.dependOn(&jev_recall_eval_driver.step);
+    eval_test_step.dependOn(&jev_recall_eval_driver.step);
     // The same holds for the rule-author probe and the project-rule pilot:
     // left to their eval steps, both stopped compiling when the state root
     // became an explicit parameter and nothing noticed. Check-only compiles
@@ -2660,16 +2664,16 @@ pub fn build(b: *std.Build) void {
     // and hermetic, so macOS also runs it: a drifted TinyKG daemon or provider
     // contract fails here rather than on the next manual run.
     if (@import("builtin").os.tag != .windows) {
-        product_test_step.dependOn(&b.addExecutable(.{
+        eval_test_step.dependOn(&b.addExecutable(.{
             .name = "rule-author-feasibility-check",
             .root_module = rule_author_trial_mod,
         }).step);
-        product_test_step.dependOn(&b.addExecutable(.{
+        eval_test_step.dependOn(&b.addExecutable(.{
             .name = "project-rule-mac-pilot-check",
             .root_module = project_rule_mac_pilot_mod,
         }).step);
     }
-    if (@import("builtin").os.tag == .macos) product_test_step.dependOn(&project_rule_mac_pilot_run.step);
+    if (@import("builtin").os.tag == .macos) eval_test_step.dependOn(&project_rule_mac_pilot_run.step);
     units_test_step.dependOn(release_test_step);
     units_test_step.dependOn(http_status_gate_step);
     units_test_step.dependOn(subsystem_boundary_step);
@@ -3171,12 +3175,11 @@ pub fn build(b: *std.Build) void {
     kg_transport_runtime.addArtifactArg(kg_transport_probe);
     const kg_transport_step = b.step("test:kg-daemon-transport", "Run authenticated shared-Store daemon transport L2");
     kg_transport_step.dependOn(&kg_transport_runtime.step);
-    product_test_step.dependOn(&kg_transport_runtime.step);
+    product_runtime_step.dependOn(&kg_transport_runtime.step);
 
     // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
     // compare/gate）。Python 合同测试 + 同宿主原生零付费 smoke；不访问真实模型，
     // 默认 test 也执行，避免评估器或 native 接线漂移后继续给出看似可信的分数。
-    const eval_test_step = b.step("test:eval", "Test the harness evaluation framework");
     const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
     // The suite runs as shards (scripts/eval/tests/run_shard.py: every N-th
     // module), each with its output captured. As one process inheriting the
@@ -3195,7 +3198,6 @@ pub fn build(b: *std.Build) void {
         });
         eval_test_cmd.expectExitCode(0);
         eval_test_step.dependOn(&eval_test_cmd.step);
-        product_test_step.dependOn(&eval_test_cmd.step);
         slot.* = eval_test_cmd;
     }
     const runtime_tests_can_execute_target =
@@ -3205,7 +3207,7 @@ pub fn build(b: *std.Build) void {
         const bench_cli_smoke = b.addSystemCommand(&.{ eval_python_exe, "scripts/eval/bench_cli_smoke.py", "--binary" });
         bench_cli_smoke.addArtifactArg(exe);
         eval_test_step.dependOn(&bench_cli_smoke.step);
-        product_test_step.dependOn(&bench_cli_smoke.step);
+        product_runtime_step.dependOn(&bench_cli_smoke.step);
         if (staged_tinykg) |tinykg| {
             // Native Python cases discover the installed TinyKG by path.  On
             // a clean checkout they must wait for installation; otherwise
@@ -3231,7 +3233,6 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArgs(&.{ "--expected-version", manifest.version });
             wireTinyKgdTestInput(arm_smoke, staged_tinykgd);
             eval_test_step.dependOn(&arm_smoke.step);
-            product_test_step.dependOn(&arm_smoke.step);
 
             // A session must not keep what it frees: memory growth over a
             // scripted tool session stays below the bytes it sent, and the
@@ -3245,7 +3246,7 @@ pub fn build(b: *std.Build) void {
                     "--binary",
                 });
                 session_memory_smoke.addArtifactArg(binary);
-                product_test_step.dependOn(&session_memory_smoke.step);
+                product_runtime_step.dependOn(&session_memory_smoke.step);
             }
 
             // A replay fixture cannot prove that memory adapters cross the
@@ -3276,7 +3277,6 @@ pub fn build(b: *std.Build) void {
                 memory_runtime_smoke.addArg("--tinykg-binary");
                 memory_runtime_smoke.addFileArg(tinykg.artifact);
                 eval_test_step.dependOn(&memory_runtime_smoke.step);
-                product_test_step.dependOn(&memory_runtime_smoke.step);
 
                 // Startup/resume over a persistent store: two fresh processes and
                 // the state root's local service (`kg install` + `kgd`), which
@@ -3290,7 +3290,7 @@ pub fn build(b: *std.Build) void {
                     process_resume_smoke.step.dependOn(tinykg.install_step);
                     process_resume_smoke.step.dependOn(daemon.install_step);
                     process_resume_smoke.setEnvironmentVariable("METACODES_PROCESS_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-                    product_test_step.dependOn(&process_resume_smoke.step);
+                    product_runtime_step.dependOn(&process_resume_smoke.step);
 
                     // Chained attempts carry memory (scripts/eval/chained_runner.py):
                     // the real E2E harness, TinyKG daemon, store export/import and
@@ -3309,7 +3309,6 @@ pub fn build(b: *std.Build) void {
                     chained_memory_smoke.addArg("--tinykgd-binary");
                     chained_memory_smoke.addFileArg(daemon.artifact);
                     eval_test_step.dependOn(&chained_memory_smoke.step);
-                    product_test_step.dependOn(&chained_memory_smoke.step);
                 }
             }
         }
@@ -3333,7 +3332,7 @@ pub fn build(b: *std.Build) void {
                 const daemon_e2e = b.addSystemCommand(&.{ "bash", script });
                 daemon_e2e.step.dependOn(b.getInstallStep());
                 daemon_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-                product_test_step.dependOn(&daemon_e2e.step);
+                product_runtime_step.dependOn(&daemon_e2e.step);
             }
         }
         // The capability exchange (doc/WIRE_PROTOCOL.md §2) end to end: the
@@ -3347,7 +3346,7 @@ pub fn build(b: *std.Build) void {
             });
             caps_e2e.step.dependOn(b.getInstallStep());
             caps_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-            product_test_step.dependOn(&caps_e2e.step);
+            product_runtime_step.dependOn(&caps_e2e.step);
         }
         // What plain `-p` says when a Run fails (#417): real exit code, stdout
         // and stderr against a loopback mock on all four wires.
@@ -3358,7 +3357,7 @@ pub fn build(b: *std.Build) void {
             });
             stop_notice_e2e.step.dependOn(b.getInstallStep());
             stop_notice_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-            product_test_step.dependOn(&stop_notice_e2e.step);
+            product_runtime_step.dependOn(&stop_notice_e2e.step);
         }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed

@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
+from scripts.eval.harbor.bench import task_files
+
 DEFAULT_PORTS = (443, 80)
 PROBE_PATH = "/metacodes-bench-egress-probe"
 PROBE_BODY = b"metacodes-bench-egress-ok"
@@ -541,33 +543,13 @@ class Session:
 
 # ------------------------------------------------------------------ ghcr.io mirror
 
-FROM_LINE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)", re.I | re.M)
-COMPOSE_IMAGE = re.compile(r"(?:^\s*|[{,]\s*)[\"']?image[\"']?:\s*[\"']?([^\"'\s#,}]+)", re.M)
-TOML_IMAGE = re.compile(r"^\s*docker_image\s*=\s*[\"']([^\"']+)[\"']", re.M)
 IMAGE_REF = re.compile(r"^ghcr\.io/[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]{1,128})?(?:@sha256:[0-9a-f]{64})?$")
 
 
 def task_images(task_dir: Path) -> List[str]:
     """Image references a task's Dockerfiles, compose files and task.toml name."""
-    found = []
-    for path in sorted(Path(task_dir).rglob("*")):
-        if not path.is_file() or path.is_symlink():
-            continue
-        name = path.name.lower()
-        if name.startswith("dockerfile") or name.endswith(".dockerfile"):
-            pattern = FROM_LINE
-        elif name.endswith((".yaml", ".yml")) and "compose" in name:
-            pattern = COMPOSE_IMAGE
-        elif name == "task.toml":
-            pattern = TOML_IMAGE
-        else:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        found += pattern.findall("\n".join(line.split("#", 1)[0] for line in text.splitlines()))
-    return found
+    refs = task_files.references(task_files.sources(Path(task_dir)))
+    return list(refs.images(include_builds=True))
 
 
 def selected_tasks(dataset: Path, patterns: Sequence[str]) -> List[Path]:
@@ -595,45 +577,14 @@ HARBOR_SERVICES = ("main",)
 SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
 
-def compose_services(text: str) -> List[str]:
-    """The keys under a compose file's top-level `services:` (no YAML
-    library: block style, the form task compose files use)."""
-    names, inside, indent = [], False, None
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        depth = len(line) - len(line.lstrip(" "))
-        if depth == 0:
-            inside = line.strip() == "services:"
-            indent = None
-            continue
-        if not inside:
-            continue
-        if indent is None:
-            indent = depth
-        if depth == indent:
-            key = line.strip()
-            if key.endswith(":"):
-                key = key[:-1].strip().strip("\"'")
-                if SERVICE_NAME.fullmatch(key):
-                    names.append(key)
-    return names
-
-
 def task_services(dataset: Path, patterns: Sequence[str]) -> List[str]:
     """Compose service names of the selected tasks plus Harbor's `main`:
     containers address their sidecars by these names, which must never go
     through the proxy (it cannot resolve them)."""
     found = list(HARBOR_SERVICES)
     for task in selected_tasks(dataset, patterns):
-        for path in sorted(task.rglob("*")):
-            name = path.name.lower()
-            if path.is_file() and not path.is_symlink() and name.endswith((".yaml", ".yml")) and "compose" in name:
-                try:
-                    found += compose_services(path.read_text(encoding="utf-8", errors="replace"))
-                except OSError:
-                    continue
+        refs = task_files.references(task_files.sources(task, compose_only=True))
+        found.extend(service.name for service in refs.services if SERVICE_NAME.fullmatch(service.name))
     return list(dict.fromkeys(found))
 
 
