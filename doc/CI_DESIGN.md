@@ -361,9 +361,17 @@ The rules that keep the split from dropping coverage:
   into the `test-ids` artifact (kept 90 days) and, on a pull request,
   compares it with the IDs recorded on the base's tree. The comparison goes
   to the job summary. It fails a PR labelled `migration` that drops a test
-  without explaining it in `tests/test_ids/` in that PR, or whose base has
-  no IDs recorded on its tree, and `Gates (Linux)` needs it, so the
-  required check fails too. Adding or removing the label runs CI again
+  without explaining it in `tests/test_ids/` in that PR. The required `Gates (Linux)` check needs this verdict.
+  Full-scope migration runs pin the tested merge, its first parent and both
+  trees after scope selection. A verified complete artifact for the same base
+  tree is reused. On a miss, three independent Linux jobs replay the parent
+  revision's own test setup and recording steps while the head gates run.
+  The base checkout supplies the collector and TTY inventory. The collector
+  verifies each leg, source, root and shard against
+  `tests/test_ids/linux-sources.tsv` at the corresponding revision. Update
+  that inventory alongside changes to the Linux recording plan. Old artifacts
+  require the producer's full-scope record and raw shards for validation.
+  Incomplete head scope or baseline evidence fails the migration check. Adding or removing the label runs CI again
   ([tests/README.md](../tests/README.md)).
 
 What it costs:

@@ -1495,10 +1495,82 @@ jobs:
     runs-on: ubuntu-latest
     steps: *result-steps
 
+  migration-baseline:
+    name: Locate migration baseline
+    needs: [release-fast-path, scope]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'migration') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.find.outputs.mode }}
+      base: ${{ steps.find.outputs.base }}
+      tree: ${{ steps.find.outputs.tree }}
+      merge: ${{ steps.find.outputs.merge }}
+      head_tree: ${{ steps.find.outputs.head_tree }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCOPE: ${{ needs.scope.outputs.scope }}
+          COMPLETE: ${{ needs.scope.outputs.complete }}
+          FAST: ${{ needs.release-fast-path.outputs.fast }}
+        run: python3 scripts/test_id_baseline.py plan --scope "$SCOPE" --complete "$COMPLETE" --fast "$FAST" --directory "$RUNNER_TEMP/migration-base"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.find.outputs.mode == 'cache'
+        with:
+          name: migration-base
+          path: ${{ runner.temp }}/migration-base
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 3
+
+  migration-replay:
+    name: Migration baseline (Linux) / ${{ matrix.leg }}
+    needs: migration-baseline
+    if: needs.migration-baseline.outputs.mode == 'replay'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        leg: [units, product, checks]
+    env:
+      BASE_SHA: ${{ needs.migration-baseline.outputs.base }}
+      BASE_TREE: ${{ needs.migration-baseline.outputs.tree }}
+      LEG: ${{ matrix.leg }}
+      COMPLETE: 'true'
+      ZIG_BUILD_JOBS: '8'
+      WARM_CACHE: 'false'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the pinned base's Linux leg
+        run: |
+          cp scripts/test_id_replay.py "$RUNNER_TEMP/"
+          git checkout --detach "$BASE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$BASE_TREE"
+          /usr/bin/python3 "$RUNNER_TEMP/test_id_replay.py" "$LEG" .git/test-id-replay
+      - uses: ./.git/test-id-replay
+      - name: Record baseline revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          jq -nc --arg sha "$BASE_SHA" --arg tree "$BASE_TREE" --arg leg "$LEG" '[$sha,$tree,$leg]' > "$RUNNER_TEMP/test-ids/revision.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: migration-raw-${{ matrix.leg }}
+          path: ${{ runner.temp }}/test-ids
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 3
+
   test-ids:
     name: Test IDs (Linux)
-    needs: [release-fast-path, scope, gates-linux]
-    if: ${{ !cancelled() && needs.gates-linux.result == 'success' && needs.release-fast-path.outputs.fast != 'true' && needs.scope.outputs.suites != 'false' }}
+    needs: [release-fast-path, scope, gates-linux, migration-baseline, migration-replay]
+    if: ${{ !cancelled() && needs.gates-linux.result == 'success' && ((github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'migration')) || (needs.release-fast-path.outputs.fast != 'true' && needs.scope.outputs.suites != 'false')) }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
@@ -1514,6 +1586,9 @@ jobs:
       - name: Collect the executed test IDs
         if: needs.scope.outputs.complete != 'false'
         run: python3 scripts/test_ids.py collect --raw "$RUNNER_TEMP/test-ids-raw" --tty tests/tty/cases --output "$RUNNER_TEMP/test-ids/test-ids.tsv" --meta "$RUNNER_TEMP/test-ids/test-ids-meta.json"
+      - name: Verify all full-scope Linux test ID sources
+        if: needs.scope.outputs.scope == 'full' && needs.scope.outputs.complete == 'true'
+        run: python3 scripts/test_id_baseline.py attest --directory "$RUNNER_TEMP/test-ids" --raw "$RUNNER_TEMP/test-ids-raw"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: needs.scope.outputs.complete != 'false'
         with:
@@ -1523,12 +1598,38 @@ jobs:
           retention-days: 90
           overwrite: true
       - name: Compare with the base's test IDs
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'migration')
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           COMPLETE: ${{ needs.scope.outputs.complete }}
-        run: python3 scripts/test_ids.py ci-compare --head "$RUNNER_TEMP/test-ids/test-ids.tsv" --base HEAD^1 --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --summary "$GITHUB_STEP_SUMMARY" --scope-complete "$COMPLETE"
+        run: python3 scripts/test_ids.py ci-compare --head "$RUNNER_TEMP/test-ids/test-ids.tsv" --base HEAD^1 --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --summary "$GITHUB_STEP_SUMMARY" --scope-complete "$COMPLETE" --require-unlabelled
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.migration-baseline.outputs.mode == 'cache'
+        with:
+          name: migration-base
+          path: ${{ runner.temp }}/migration-base
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.migration-baseline.outputs.mode == 'replay' && needs.migration-replay.result == 'success'
+        with:
+          pattern: migration-raw-*
+          path: ${{ runner.temp }}/migration-raw
+      - name: Enforce the pinned migration comparison
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'migration')
+        env:
+          PLAN_RESULT: ${{ needs.migration-baseline.result }}
+          MODE: ${{ needs.migration-baseline.outputs.mode }}
+          PIN_BASE: ${{ needs.migration-baseline.outputs.base }}
+          PIN_TREE: ${{ needs.migration-baseline.outputs.tree }}
+          PIN_MERGE: ${{ needs.migration-baseline.outputs.merge }}
+          PIN_HEAD_TREE: ${{ needs.migration-baseline.outputs.head_tree }}
+          REPLAY_RESULT: ${{ needs.migration-replay.result }}
+          SCOPE: ${{ needs.scope.outputs.scope }}
+          COMPLETE: ${{ needs.scope.outputs.complete }}
+        run: |
+          test "$PLAN_RESULT" = success
+          python3 scripts/test_id_baseline.py compare --mode "$MODE" --scope "$SCOPE" --complete "$COMPLETE" --directory "$RUNNER_TEMP/migration-base" --raw "$RUNNER_TEMP/migration-raw" --head "$RUNNER_TEMP/test-ids/test-ids.tsv"
 
   full-pr-evidence:
     name: Full PR evidence

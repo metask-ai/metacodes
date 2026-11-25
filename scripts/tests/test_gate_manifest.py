@@ -167,7 +167,7 @@ class GateManifestTest(unittest.TestCase):
             self.assertLess(record, names.index(suite), suite)
         self.assertGreater(names.index("- name: Upload the executed test IDs"), names.index("- name: Diff whitespace check"))
         workflow = "\n".join(lines)
-        self.assertIn("name: Test IDs (Linux)\n    needs: [release-fast-path, scope, gates-linux]", workflow)
+        self.assertIn("name: Test IDs (Linux)\n    needs: [release-fast-path, scope, gates-linux, migration-baseline, migration-replay]", workflow)
         self.assertIn("python3 scripts/test_ids.py collect --raw", workflow)
         self.assertIn("python3 scripts/test_ids.py ci-compare --head", workflow)
         build = (ROOT / "build.zig").read_text(encoding="utf-8")

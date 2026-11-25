@@ -1094,7 +1094,7 @@ class WorkflowTest(unittest.TestCase):
         for name in ("Record the executed test IDs", "Upload the executed test IDs"):
             self.assertTrue(steps[name]["if"].endswith("&& env.COMPLETE != 'false'"), name)
         job = self.jobs["test-ids"]
-        kept = [step for step in job["steps"] if step.get("uses", "").startswith(("actions/download-artifact@", "actions/upload-artifact@"))
+        kept = [step for step in job["steps"] if step.get("with", {}).get("name") == "test-ids" or step.get("with", {}).get("pattern") == "test-ids-raw-*"
                 or step.get("name") == "Collect the executed test IDs"]
         self.assertEqual(len(kept), 3)
         for step in kept:
