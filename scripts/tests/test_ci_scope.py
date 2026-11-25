@@ -427,7 +427,8 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
                 self.assertTrue(chosen.product and chosen.tty)
-        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "kernel")
+        self.assertEqual(layout.owner("src/core/conversation.zig"), "kernel")
+        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "coding")
         self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
         self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
 
