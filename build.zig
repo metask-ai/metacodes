@@ -1877,6 +1877,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test).step);
+    b.step("idle-probe-build", "Install the ABI contract probe").dependOn(&b.addInstallArtifact(agentcore_contract_test, .{}).step);
 
     const agentcore_lib = b.addLibrary(.{
         .name = "metask_agentcore",

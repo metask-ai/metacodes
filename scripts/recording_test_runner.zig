@@ -151,6 +151,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     var leaked: usize = 0;
     var logged_errors: usize = 0;
     for (builtin.test_functions) |test_fn| {
+        if (std.c.getenv("IDLE_PROBE_SINGLE") != null and std.mem.indexOf(u8, test_fn.name, "L2 #503") == null) continue;
         testing.log_level = .warn;
         const outcome = runTest(init, test_fn);
         logged_errors += log_err_count;

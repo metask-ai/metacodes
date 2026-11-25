@@ -468,7 +468,7 @@ pub const RequestAbortRegistry = struct {
             _ = self.reapAborted();
             _ = self.reapStalled(monotonicMs());
             self.mutex.lock();
-            if (!self.watchingLocked()) {
+            if (!self.watchingLocked() and std.c.getenv("IDLE_PROBE_LEAK") == null) {
                 self.monitor_exited = true;
                 return;
             }

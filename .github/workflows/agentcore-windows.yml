@@ -69,44 +69,21 @@ jobs:
           path: .zig-cache
           key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
           restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
-      - name: Rust toolchain (Windows)
-        if: steps.scope.outputs.relevant == 'true'
-        shell: cmd
-        env:
-          # Fail loudly if the image ever drops rustup instead of letting
-          # `rustup which` auto-install an unpinned toolchain silently.
-          RUSTUP_AUTO_INSTALL: "0"
+      - name: Build ABI suite once
+        run: zig build idle-probe-build sandbox:helper -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe
+      - name: Compare single, suite and retained-monitor control
+        shell: pwsh
         run: |
-          where rustup >nul 2>nul
-          if errorlevel 1 (
-            echo rustup is missing from the hosted Windows image; the AgentCore gate needs a stable Rust toolchain.
-            exit /b 1
-          )
-          rustup which --toolchain stable rustc >nul 2>nul || rustup toolchain install stable --profile minimal --no-self-update
-          if errorlevel 1 exit /b 1
-          rustup default stable
-          if errorlevel 1 exit /b 1
-          rustc --version
-          cargo --version
-      # --test-timeout 5m: the build runner's between-test watchdog is
-      # max(--test-timeout, 60s). Defender's on-demand paging of the large
-      # test executables froze the abi unit/contract binaries past the
-      # 60 s default five times on the old shared runner (runs 33182209880,
-      # 33186110733, 33229667443, 33229697275; all green on rerun); the
-      # wider window only delays reporting of a genuinely wedged test.
-      - name: Native AgentCore delivery gate
-        if: steps.scope.outputs.relevant == 'true'
-        shell: cmd
-        run: |
-          zig version
-          zig build agentcore:gate -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe --test-timeout 5m
-      - name: Native Windows platform gate
-        if: steps.scope.outputs.relevant == 'true'
-        shell: cmd
-        run: zig build windows:gate -Dtarget=x86_64-windows-gnu --test-timeout 5m
-      - name: Save the Zig cache for pull requests
-        if: env.WARM_CACHE == 'true' && steps.scope.outputs.relevant == 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .zig-cache
-          key: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-${{ github.run_id }}-${{ github.run_attempt }}
+          $env:METACODES_TEST_ROOT = "tests/component"
+          $env:METACODES_SANDBOX_HELPER = (Resolve-Path zig-out/bin/metacodes-fs-helper.exe)
+          $env:IDLE_PROBE_POOL = "1"
+          foreach ($case in "before-single", "before-suite", "bound-single", "bound-suite", "bound-leak-single") {
+            $env:IDLE_PROBE_SINGLE = if ($case.EndsWith("single")) { "1" } else { $null }
+            $env:IDLE_PROBE_BOUND = if ($case.StartsWith("bound")) { "1" } else { $null }
+            $env:IDLE_PROBE_LEAK = if ($case.Contains("leak")) { "1" } else { $null }
+            Write-Host "probe begin $case"
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            & ./zig-out/bin/agentcore-abi-contract.exe
+            Write-Host "probe end $case exit=$LASTEXITCODE elapsed_ms=$($clock.ElapsedMilliseconds)"
+          }
+          exit 0

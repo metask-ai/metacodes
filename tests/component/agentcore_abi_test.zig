@@ -16773,6 +16773,8 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
     callbacks.on_event = acceptEvent;
 
     const baseline = ProcessCost.now();
+    std.debug.print("probe baseline {any}\n", .{baseline});
+    defer std.debug.print("probe after session teardown {any}\n", .{ProcessCost.now()});
     var sessions = [_]?*wire.SessionHandle{null} ** idle_sessions;
     defer for (sessions) |session| if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
@@ -16787,6 +16789,7 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
             wire.STATUS_OK,
             api.session().runText(session.*, 1, sdk.bytesView("stream once, then idle"), &options, &result, &diagnostic),
         );
+        std.debug.print("probe run complete {any}\n", .{ProcessCost.now()});
         try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     }
 
@@ -16800,6 +16803,7 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
             sync.sleepMs(50);
             idle = ProcessCost.now();
         }
+        std.debug.print("probe idle {any} waited_ms={d}\n", .{idle, waited_ms});
         errdefer std.debug.print("#503 threads: {d} before {d} idle Sessions, {d} after\n", .{ before, idle_sessions, idle.threads.? });
         try std.testing.expect(idle.threads.? <= before + 2 * idle_sessions);
     }

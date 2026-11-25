@@ -79,6 +79,8 @@ pub const OwnedProvider = struct {
                 a.destroy(c);
             },
         }
+        if (std.c.getenv("IDLE_PROBE_POOL") != null)
+            std.debug.print("probe provider pool={d}\n", .{self.io.wait_group.state.load(.acquire) / 2});
         self.io.deinit();
         a.destroy(self.io);
     }
@@ -163,7 +165,7 @@ pub fn makeProviderWithOptions(
     const io_rt = try a.create(std.Io.Threaded);
     errdefer a.destroy(io_rt);
     @import("../util/log.zig").info("mp", "io_rt created, calling Threaded.init", .{});
-    io_rt.* = @import("platform").signal.threadedIo(a, .{});
+    io_rt.* = @import("platform").signal.threadedIo(a, .{ .async_limit = if (std.c.getenv("IDLE_PROBE_BOUND") != null) .limited(2) else null });
     errdefer io_rt.deinit();
     @import("../util/log.zig").info("mp", "Threaded.init done, creating client", .{});
 
