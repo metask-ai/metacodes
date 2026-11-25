@@ -321,7 +321,7 @@ class TimingRelay:
     def __init__(self, target, credential, metrics_dir, *, bind="172.17.0.1", port=0,
                  auth_header="Authorization", auth_prefix="Bearer ", tls=False, public_host=None,
                  token=None, record=True, judge_token=None, judge_credential=None, connect=None,
-                 cert_dir=None, listener=None, sequence=0):
+                 cert_dir=None, listener=None, sequence=0, model_gateway=False):
         # `credential` is the real upstream credential (a string or a source
         # with current()/refresh(stale)); `token` is the placeholder the
         # containers present (a fresh one when omitted). `record=False`
@@ -404,26 +404,32 @@ class TimingRelay:
 
             def forward(self, measured):
                 path = urlsplit(self.path)
-                parts = path.path.split("/", 2)
-                if len(parts) != 3 or not NAME.fullmatch(parts[1]):
-                    self.send_error(404)
-                    return
-                suffix = "/" + parts[2]
+                trial = None
+                suffix = path.path
+                if not model_gateway:
+                    parts = path.path.split("/", 2)
+                    if len(parts) != 3 or not NAME.fullmatch(parts[1]):
+                        self.send_error(404)
+                        return
+                    trial, suffix = parts[1], "/" + parts[2]
                 if suffix not in ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1/models"):
                     self.send_error(404)
+                    return
+                if model_gateway and (path.scheme or path.netloc or (self.command == "GET") != (suffix == "/v1/models")):
+                    self.send_error(405)
                     return
                 presented = self.headers.get(auth_header, "")
                 credential = owner.credential
                 if owner.judge_token and same_secret(presented, auth_prefix + owner.judge_token):
                     # The verifier's judge: one route, one endpoint, no metrics.
-                    if parts[1] != JUDGE_ROUTE or suffix != "/v1/chat/completions" or not measured:
+                    if trial != JUDGE_ROUTE or suffix != "/v1/chat/completions" or not measured:
                         self.send_error(403)
                         return
                     credential, measured = owner.judge_credential, False
                 elif not same_secret(presented, auth_prefix + owner.token):
                     self.send_error(401)
                     return
-                elif parts[1] == JUDGE_ROUTE:
+                elif trial == JUDGE_ROUTE:
                     self.send_error(403)  # the agent's token never reaches the judge route
                     return
                 try:
@@ -451,6 +457,9 @@ class TimingRelay:
                 try:
                     headers = {k: v for k, v in self.headers.items()
                                if k.lower() not in HOP and k.lower() != auth_header.lower()}
+                    if model_gateway:
+                        headers = {k: v for k, v in headers.items() if k.lower() in
+                                   ("content-type", "accept", "anthropic-version", "anthropic-beta")}
                     headers["Accept-Encoding"] = "identity"
                     upstream_path = suffix + ("?" + path.query if path.query else "")
                     response = self.exchange(upstream_path, body, headers, secret)
@@ -462,6 +471,10 @@ class TimingRelay:
                             response.read()
                             response = self.exchange(upstream_path, body, headers, fresh)
                     status = response.status
+                    if model_gateway and 300 <= status < 400:
+                        self.close_connection = True
+                        self.send_error(502)
+                        return
                     self.send_response(status)
                     for name, value in response.getheaders():
                         if name.lower() not in HOP:
@@ -488,7 +501,7 @@ class TimingRelay:
                     self.close_connection = True
                 finally:
                     if measured:
-                        owner.record(parts[1], {"request": sequence, "started_at": started_at, **metric.finish(status, complete),
+                        owner.record(trial, {"request": sequence, "started_at": started_at, **metric.finish(status, complete),
                                                 **({"composition": shape} if shape else {})})
 
             def exchange(self, upstream_path, body, headers, secret):
@@ -545,6 +558,8 @@ class TimingRelay:
                         owner.connections.notify_all()
 
             def handle_error(self, request, client_address):
+                if model_gateway and isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+                    return
                 if not isinstance(sys.exc_info()[1], (ssl.SSLError, TimeoutError)):
                     super().handle_error(request, client_address)
 

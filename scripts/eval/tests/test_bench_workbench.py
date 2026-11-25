@@ -442,10 +442,15 @@ class RotatingGateway:
                     if not gateway.accept(self.bearer()):
                         self.reply({'error': 'expired'}, 401)
                         return
-                    payload = b''.join(b'data: ' + json.dumps(e).encode() + b'\n\n' for e in (
-                        {'type': 'message_start', 'message': {'usage': {'input_tokens': 5}}},
-                        {'type': 'content_block_delta', 'delta': {'text': 'ok'}},
-                        {'type': 'message_delta', 'usage': {'output_tokens': 2}}, {'type': 'message_stop'}))
+                    events = (
+                        {'type': 'message_start', 'message': {'id': 'msg-1', 'role': 'assistant', 'type': 'message',
+                                                              'content': [], 'usage': {'input_tokens': 5}}},
+                        {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}},
+                        {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': 'ok'}},
+                        {'type': 'content_block_stop', 'index': 0},
+                        {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 2}},
+                        {'type': 'message_stop'})
+                    payload = ''.join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/event-stream')
                     self.send_header('Content-Length', str(len(payload)))
