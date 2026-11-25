@@ -434,6 +434,13 @@ class MigrationBaselineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'wrong checks'):
             baseline.compare(self.args)
         check_stamp.write_text(original)
+        nested = self.args.raw / 'migration-raw-checks/nested'
+        nested.mkdir()
+        extra = nested / 'py-scripts-tests--extra.tsv'
+        extra.write_text('root\ttests\npass\tscripts.B.test_extra\n')
+        with self.assertRaisesRegex(ValueError, 'unexpected raw test source'):
+            baseline.compare(self.args)
+        extra.unlink()
         next(self.args.raw.rglob('zig-*.tsv')).unlink()
         with self.assertRaisesRegex(ValueError, 'inventory mismatch'):
             baseline.compare(self.args)

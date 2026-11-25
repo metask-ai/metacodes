@@ -58,15 +58,25 @@ def expected_sources(rev, event):
 
 def check_raw(raw, expected, prefix='test-ids-raw-'):
     found = Counter()
-    for leg in LEGS:
-        directory = raw / f'{prefix}{leg}'
-        for record in directory.glob('*.tsv'):
-            with record.open(encoding='utf-8') as handle:
-                header = handle.readline().rstrip('\r\n')
-                require(header.startswith('root\t') and handle.readline(), f'empty or incomplete record: {record.name}')
-            source, separator, _ = record.stem.partition('--')
-            require(separator, f'unrecognized source: {record.name}')
-            found[leg, source, header[5:] or '.'] += 1
+    leg_dirs = {prefix + leg: leg for leg in LEGS}
+    seen_python_tests = {leg: set() for leg in LEGS}
+    for record in raw.rglob('*.tsv'):
+        parts = record.relative_to(raw).parts
+        require(len(parts) == 2 and parts[0] in leg_dirs, f'unexpected raw test source: {record}')
+        leg = leg_dirs[parts[0]]
+        source, separator, _ = record.stem.partition('--')
+        require(separator, f'unrecognized source: {record.name}')
+        with record.open(encoding='utf-8') as handle:
+            header = handle.readline().rstrip('\r\n')
+            require(header.startswith('root\t'), f'missing test root: {record.name}')
+            if source.startswith('py-'):
+                tests = {line.rstrip('\r\n').partition('\t')[2] for line in handle}
+                require(tests and '' not in tests, f'empty Python record: {record.name}')
+                require(not tests.intersection(seen_python_tests[leg]), f'overlapping Python records: {record.name}')
+                seen_python_tests[leg].update(tests)
+            else:
+                require(handle.readline(), f'empty Zig record: {record.name}')
+        found[leg, source, header[5:] or '.'] += 1
     require(found == expected, f'Linux source inventory mismatch: missing {expected-found}, extra {found-expected}')
 
 
