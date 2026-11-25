@@ -288,35 +288,62 @@ class LifecycleTest(LifecycleCase):
         self.assertGreater(rows["second__b"]["prepare_s"], 0)
 
     def test_a_trial_whose_turn_comes_while_preparing_keeps_preparing_in_its_slot(self):
-        def operations(task_dir):
-            seconds = 0.5 if task_dir.name == "second" else 0.0
-            return instant(seconds=seconds)(task_dir)
-
-        queue = self.queue(1, operations)
-        entered = {}
-        execute = queue._execute_trial_with_retries
-
-        async def timed(trial_config):
-            entered[trial_config.trial_name] = trial_lifecycle.utc_now()
-            return await execute(trial_config)
-
-        queue._execute_trial_with_retries = timed
+        prepare_start = "2026-01-01T00:00:00.000000Z"
+        slot_start = "2026-01-01T00:00:03.000000Z"
+        prepare_end = "2026-01-01T00:00:10.000000Z"
 
         async def main():
-            return await asyncio.gather(queue._run_trial(self.trial("first__a", seconds=0.1)),
-                                        queue._run_trial(self.trial("second__b")))
+            now = prepare_start
+            loop = asyncio.get_running_loop()
+            preparing = asyncio.Event()
+            release_first = asyncio.Event()
+            finish_pull = threading.Event()
 
-        self.assertEqual(asyncio.run(main()), ["first__a", "second__b"])
+            def pull():
+                loop.call_soon_threadsafe(preparing.set)
+                finish_pull.wait()
+                return {"status": "pulled"}
+
+            def operations(task_dir):
+                if task_dir.name == "first":
+                    return []
+                return [trial_lifecycle.Operation("pull:second", "pull", "second", pull)]
+
+            async def execute(trial):
+                if trial.trial_name == "first__a":
+                    await release_first.wait()
+                else:
+                    self.assertEqual(self.record("second__b")["prepare_finished_at"], prepare_end)
+                return trial.trial_name
+
+            scheduler = trial_lifecycle.Scheduler(lambda: 1, lambda: 0.01, operations, now=lambda: now)
+            trials = [asyncio.create_task(scheduler.run(self.trial(name), execute))
+                      for name in ("first__a", "second__b")]
+            try:
+                await preparing.wait()
+                slot = scheduler.waiting[0].slot
+                now = slot_start
+                release_first.set()
+                await slot
+                now = prepare_end
+            finally:
+                finish_pull.set()
+                release_first.set()
+            return await asyncio.gather(*trials)
+
+        self.assertEqual(asyncio.run(asyncio.wait_for(main(), timeout=20)), ["first__a", "second__b"])
         second = self.record("second__b")
-        self.assertLess(second["prepare_started_at"], second["started_at"])
-        self.assertLess(second["started_at"], second["prepare_finished_at"])
-        self.assertLessEqual(second["prepare_finished_at"], entered["second__b"])
+        self.assertEqual(second["prepare_started_at"], prepare_start)
+        self.assertEqual(self.record("first__a")["finished_at"], slot_start)
+        self.assertEqual(second["started_at"], slot_start)
+        self.assertEqual(second["prepare_finished_at"], prepare_end)
+        self.assertEqual(second["prepare"]["status"], "prepared")
         self.write_trial_dirs("second__b")
         life = data.job_view(self.job)["rows"][0]["lifecycle"]
-        self.assertGreater(life["prepare_s"], 0.05)
-        self.assertGreater(life["prepare_running_s"], 0.2)
+        self.assertEqual(life["prepare_s"], 3)
+        self.assertEqual(life["prepare_running_s"], 7)
         self.assertIsNone(life["ready_wait_s"])
-        self.assertGreaterEqual(life["prepare_s"] + life["prepare_running_s"], 0.5)
+        self.assertEqual(life["prepare_s"] + life["prepare_running_s"], 10)
 
     def test_a_preparation_that_failed_before_the_turn_is_not_shown_as_ready(self):
         def operations(task_dir):
