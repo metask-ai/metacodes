@@ -155,7 +155,7 @@ class Store:
         os.replace(staging, self.directory / STATS_FILE)
 
     def body_path(self, kind: str, key: str) -> Path:
-        digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
+        digest = hashlib.sha256((self.routes[kind] + "\n" + key).encode("utf-8", "surrogatepass")).hexdigest()
         return self.objects / kind / digest[:2] / digest
 
     def read_entry(self, body: Path, fresh_only: bool, immutable: bool) -> Optional[Entry]:

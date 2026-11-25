@@ -1100,9 +1100,16 @@ route instead of the mirror:
   do; another shape keeps going to the mirror directly.
 - **Reach.** Only GET and HEAD, only the configured routes, and paths with
   `..` are refused. The container publishes the port on `metrics_bind`
-  only, like the apt cache. Before a run the worker checks over SSH that
-  `/_stats` answers; when it does not, that run's containers get the plain
-  mirror variables and the run log names the setup command.
+  only, like the apt cache. Before a run the worker reads `/_stats` over
+  SSH and points a key's variables at the cache only when the running
+  cache has that route with the mirror the entry names now. A cache that
+  does not answer, a key added to `container_mirrors` since the last
+  setup, or a mirror changed since then leaves those keys on the plain
+  mirror variables for that run, and the run log names the setup command.
+- **Changing a mirror.** A stored file belongs to the mirror it came from:
+  after a route's mirror changes, the cache fetches from the new one and
+  never serves (not even as a stale copy) what the old one sent. The old
+  files stay on the volume, unused, until it is cleared.
 
 Not behind this cache, each for its own reason:
 

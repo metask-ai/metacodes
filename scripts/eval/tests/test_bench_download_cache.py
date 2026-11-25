@@ -364,6 +364,31 @@ class RestartTest(CacheFixture):
         self.assertEqual((whole["entries"], whole["disk_bytes"]), (1, 11))
         self.assertEqual(len(self.upstream.seen), 1)
 
+    def test_another_upstream_never_gets_the_objects_of_the_previous_one(self):
+        self.upstream.pages["/npm-root/left-pad/-/left-pad-1.3.0.tgz"] = (200, b"from the first registry", {})
+        self.upstream.pages["/go-root/example.com/mod/@v/list"] = (200, b"v1.0.0\n", {"Content-Type": "text/plain"})
+        tarball, listing = "/npm/left-pad/-/left-pad-1.3.0.tgz", "/go/example.com/mod/@v/list"
+        self.assertEqual(self.get(tarball)[2], b"from the first registry")
+        self.assertEqual(self.get(listing)[2], b"v1.0.0\n")
+        self.cache.close()
+        other = Upstream()
+        self.addCleanup(other.close)
+        other.pages["/npm-root/left-pad/-/left-pad-1.3.0.tgz"] = (200, b"from the second registry", {})
+        routes = {kind: f"{other.url}/{kind}-root" for kind in self.KINDS}
+        moved = download_cache.DownloadCache(self.directory, routes, ttl=0.0).start()
+        self.addCleanup(moved.close)
+        status, headers, body = self.get(tarball, cache=moved)
+        self.assertEqual((status, body, headers["X-Metacodes-Cache"]), (200, b"from the second registry", "miss"))
+        self.assertEqual(self.get(tarball, cache=moved)[1]["X-Metacodes-Cache"], "hit")
+        self.assertEqual(other.paths(), ["/npm-root/left-pad/-/left-pad-1.3.0.tgz"])
+        other.close()
+        status, headers, _ = self.get(listing, cache=moved)
+        self.assertEqual((status, headers["X-Metacodes-Cache"]), (502, "error"))
+        moved.close()
+        back = self.open_cache()
+        self.assertEqual(self.get(tarball, cache=back)[2], b"from the first registry")
+        self.assertEqual(len(self.upstream.seen), 2)
+
     def test_the_script_runs_alone_and_saves_its_counters_on_sigterm(self):
         self.upstream.pages["/pypi-root/packages/demo.whl"] = (200, b"standalone", {})
         directory = Path(self.tmp.name) / "standalone"

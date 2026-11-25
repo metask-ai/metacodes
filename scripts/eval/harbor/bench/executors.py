@@ -106,9 +106,33 @@ def apt_cache_probe(executor: "SshExecutor", attempts: int) -> str:
                                                     executor.apt_cache_url + "/acng-report.html", str(attempts)))
 
 
+DOWNLOAD_CACHE_PROBE = r'''
+import sys, time, urllib.request
+for _ in range(int(sys.argv[2])):
+    try:
+        with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+            if response.status != 200:
+                sys.exit(1)
+            sys.stdout.write(response.read(1 << 20).decode("utf-8", "replace"))
+            sys.exit(0)
+    except OSError:
+        time.sleep(0.5)
+sys.exit(1)
+'''
+
+
 def download_cache_probe(executor: "SshExecutor", attempts: int) -> str:
-    return " ".join(shlex.quote(part) for part in (executor.python, "-c", APT_CACHE_PROBE,
+    return " ".join(shlex.quote(part) for part in (executor.python, "-c", DOWNLOAD_CACHE_PROBE,
                                                     executor.download_cache_url + DOWNLOAD_CACHE_STATS, str(attempts)))
+
+
+def served_routes(stats_text: str) -> Dict[str, str]:
+    try:
+        routes = json.loads(stats_text)["routes"]
+        return {kind: row["upstream"].rstrip("/") for kind, row in routes.items()
+                if isinstance(row, dict) and isinstance(row.get("upstream"), str)}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {}
 
 
 def download_cache_routes(mirrors: Dict[str, str]) -> Dict[str, str]:
@@ -125,19 +149,21 @@ def download_cache_routes(mirrors: Dict[str, str]) -> Dict[str, str]:
     return routes
 
 
-def cached_mirrors(mirrors: Dict[str, str], cache_url: str) -> Dict[str, str]:
+def cached_mirrors(mirrors: Dict[str, str], cache_url: str, kinds: Collection[str]) -> Dict[str, str]:
     cached = dict(mirrors)
     for kind in download_cache_routes(mirrors):
-        cached[kind] = cache_url + "/" + kind + ("/simple/" if kind == "pypi" else "/" if kind == "npm" else "")
+        if kind in kinds:
+            cached[kind] = cache_url + "/" + kind + ("/simple/" if kind == "pypi" else "/" if kind == "npm" else "")
     return cached
 
 
-def container_mirror_env(mirrors: Dict[str, str], cache_url: Optional[str] = None) -> Dict[str, str]:
+def container_mirror_env(mirrors: Dict[str, str], cache_url: Optional[str] = None,
+                         cached: Collection[str] = ()) -> Dict[str, str]:
     env: Dict[str, str] = {}
     if cache_url:
-        if "pypi" in download_cache_routes(mirrors):
+        if "pypi" in cached and "pypi" in download_cache_routes(mirrors):
             env["PIP_TRUSTED_HOST"] = urlsplit(cache_url).hostname or ""
-        mirrors = cached_mirrors(mirrors, cache_url)
+        mirrors = cached_mirrors(mirrors, cache_url, cached)
     if "pypi" in mirrors:
         env.update(PIP_INDEX_URL=mirrors["pypi"], UV_DEFAULT_INDEX=mirrors["pypi"])
     if "conda" in mirrors:
@@ -163,7 +189,8 @@ def container_mirror_env(mirrors: Dict[str, str], cache_url: Optional[str] = Non
 def task_owned_settings(dataset: Path, mirrors: Dict[str, str]) -> List[str]:
     """The mirror settings (environment variables, apt's proxy) that a task
     of `dataset` names in its compose files, task.toml or Dockerfiles."""
-    wanted = list({**container_mirror_env(mirrors), **container_mirror_env(mirrors, "http://cache")}) \
+    wanted = list({**container_mirror_env(mirrors),
+                   **container_mirror_env(mirrors, "http://cache", DOWNLOAD_CACHE_KINDS)}) \
         + ([APT_PROXY_SETTING] if "apt" in mirrors else [])
     found = set()
     for path in Path(dataset).rglob("*"):
@@ -269,16 +296,16 @@ class SshExecutor:
     def download_cache_routes(self) -> Dict[str, str]:
         return download_cache_routes(dict(self.container_mirrors)) if self.download_cache else {}
 
-    def compose_overlay(self, left_out: Collection[str] = (), cached: bool = False) -> Optional[Dict]:
+    def compose_overlay(self, left_out: Collection[str] = (), cached: Collection[str] = ()) -> Optional[Dict]:
         """The Harbor compose overlay that points a run's task containers at
         container_mirrors, or None without any. Settings in `left_out`
-        (environment variables, APT_PROXY_SETTING) are not set. With
-        `cached`, the kinds the download cache routes point at the cache."""
+        (environment variables, APT_PROXY_SETTING) are not set. The kinds
+        in `cached` that the download cache routes point at the cache."""
         mirrors = dict(self.container_mirrors)
         if APT_PROXY_SETTING in left_out:
             mirrors.pop("apt", None)
         cache_url = self.download_cache_url if cached and self.download_cache else None
-        env = {k: v for k, v in container_mirror_env(mirrors, cache_url).items() if k not in left_out}
+        env = {k: v for k, v in container_mirror_env(mirrors, cache_url, cached).items() if k not in left_out}
         if "PIP_INDEX_URL" not in env:
             env.pop("PIP_TRUSTED_HOST", None)
         if not env and "apt" not in mirrors:
@@ -1322,23 +1349,31 @@ class RemoteRun:
                 self.log(f"apt 缓存 {self.executor.apt_cache_url} 没有响应：本次运行的任务容器直接使用自己的 apt 源；"
                          f"运行 metacodes bench setup --executor {self.executor.name} 重新启动缓存")
                 left_out.append(APT_PROXY_SETTING)
-        return self.executor.compose_overlay(left_out, cached=self.download_cache_answers())
+        return self.executor.compose_overlay(left_out, cached=self.download_cache_kinds())
 
-    def download_cache_answers(self) -> bool:
+    def download_cache_kinds(self) -> List[str]:
         routes = self.executor.download_cache_routes()
         if not routes:
-            return False
+            return []
+        url = self.executor.download_cache_url
+        setup = f"运行 metacodes bench setup --executor {self.executor.name} "
         try:
-            answered = self.runner(shell_argv(self.executor, download_cache_probe(self.executor, 3)),
-                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=60).returncode == 0
+            done = self.runner(shell_argv(self.executor, download_cache_probe(self.executor, 3)),
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.TimeoutExpired):
-            answered = False
-        if answered:
-            self.log(f"下载缓存 {self.executor.download_cache_url}：" + "、".join(sorted(routes)) + " 先走缓存，未命中再回源")
-        else:
-            self.log(f"下载缓存 {self.executor.download_cache_url} 没有响应：本次运行的任务容器直接使用镜像源；"
-                     f"运行 metacodes bench setup --executor {self.executor.name} 重新启动缓存")
-        return answered
+            done = None
+        if done is None or done.returncode != 0:
+            self.log(f"下载缓存 {url} 没有响应：本次运行的任务容器直接使用镜像源；{setup}重新启动缓存")
+            return []
+        served = served_routes(done.stdout or "")
+        kinds = sorted(kind for kind, upstream in routes.items() if served.get(kind) == upstream)
+        if kinds:
+            self.log(f"下载缓存 {url}：" + "、".join(kinds) + " 先走缓存，未命中再回源")
+        stale = sorted(set(routes) - set(kinds))
+        if stale:
+            self.log(f"下载缓存 {url} 还没有按当前配置提供 " + "、".join(stale) + "（缺少路由或回源地址不同）："
+                     f"本次运行这些类型直接使用镜像源；{setup}更新缓存")
+        return kinds
 
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command
