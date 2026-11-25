@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import venv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -120,13 +121,13 @@ class PythonToolTest(unittest.TestCase):
     def test_child_uses_the_selected_interpreter_and_preserves_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            python = root / "test user's python"
-            python.symlink_to(sys.executable)
+            environment = root / "test user's venv"
+            venv.EnvBuilder(symlinks=True).create(environment)
             tool = root / 'fake tool'
-            with patch.object(sys, 'executable', str(python)):
-                write_python_tool(tool, 'import json, sys\nprint(json.dumps([sys.executable, *sys.argv[1:]]))')
+            with patch.object(sys, 'executable', str(environment / 'bin' / 'python')):
+                write_python_tool(tool, 'import json, sys\nprint(json.dumps([sys.prefix, *sys.argv[1:]]))')
             output = subprocess.check_output([str(tool), 'two words', ''], text=True)
-            self.assertEqual(json.loads(output), [str(python), 'two words', ''])
+            self.assertEqual(json.loads(output), [str(environment), 'two words', ''])
 
 
 @unittest.skipUnless(POSIX, 'process groups are POSIX')
