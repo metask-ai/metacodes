@@ -1245,7 +1245,7 @@ test "BashTool watches a command only when it can reach the background with back
     const cases = [_]struct { ctx: *const ToolContext, args: []const u8, supervision: Supervision }{
         .{ .ctx = &off, .args = "{\"command\":\"echo ok\"}", .supervision = .unwatched },
         .{ .ctx = &on, .args = "{\"command\":\"echo ok\"}", .supervision = .watchdog },
-        .{ .ctx = &on, .args = "{\"command\":\"echo ok\",\"timeout\":1000}", .supervision = .unwatched },
+        .{ .ctx = &on, .args = "{\"command\":\"echo ok\",\"timeout\":10000}", .supervision = .unwatched },
         .{ .ctx = &on, .args = "{\"command\":\"echo ok\",\"run_in_background\":true}", .supervision = .watchdog },
         .{ .ctx = &off, .args = "{\"command\":\"echo ok\",\"run_in_background\":true}", .supervision = .unwatched },
     };
@@ -1278,7 +1278,7 @@ test "BashTool spawns no watched command when the deadline sweeper cannot start"
     util_time.sleepMs(300);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, marker, .{}));
 
-    const short = try execute(&on, "{\"command\":\"echo ok\",\"timeout\":1000}");
+    const short = try execute(&on, "{\"command\":\"echo ok\",\"timeout\":10000}");
     defer a.free(short);
     try std.testing.expect(std.mem.indexOf(u8, short, "\"exit_code\":0") != null);
 }
@@ -1298,7 +1298,7 @@ test "BashTool on a host that refuses Job Objects: preview-off commands run, wat
     try std.testing.expect(std.mem.indexOf(u8, off_result, "\"exit_code\":0") != null);
 
     const on = ToolContext{ .allocator = a, .jobs = &registry, .preview = .{ .background_watchdog = true } };
-    const short_result = try execute(&on, "{\"command\":\"echo ok\",\"timeout\":1000}");
+    const short_result = try execute(&on, "{\"command\":\"echo ok\",\"timeout\":10000}");
     defer a.free(short_result);
     try std.testing.expect(std.mem.indexOf(u8, short_result, "ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, short_result, "\"exit_code\":0") != null);
