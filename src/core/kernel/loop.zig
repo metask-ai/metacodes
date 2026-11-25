@@ -57,6 +57,7 @@ const Step = struct {
 fn runTurn(options: Options, events: *types.Dispatcher, turn: u32) !Step {
     const conversation = options.conversation;
     const reply = try streamReply(options, events);
+    defer options.stream_gpa.free(reply.offered);
     var calls: std.ArrayList(types.ToolCall) = .empty;
     defer calls.deinit(options.stream_gpa);
     if (reply.message) |assistant| {
@@ -71,7 +72,7 @@ fn runTurn(options: Options, events: *types.Dispatcher, turn: u32) !Step {
             else => {},
         };
     }
-    if (calls.items.len != 0) try runTools(options, events, calls.items);
+    if (calls.items.len != 0) try runTools(options, events, calls.items, reply.offered);
     var decision: types.TurnDecision = if (calls.items.len == 0) .no_opinion else .continue_run;
     const report: types.TurnReport = .{ .turn = turn, .tool_calls = calls.items.len, .stop_reason = reply.stop_reason };
     for (options.hooks) |hook| {
@@ -91,11 +92,11 @@ fn runTurn(options: Options, events: *types.Dispatcher, turn: u32) !Step {
     } };
 }
 
-fn runTools(options: Options, events: *types.Dispatcher, calls: []const types.ToolCall) !void {
+fn runTools(options: Options, events: *types.Dispatcher, calls: []const types.ToolCall, offered: []const bool) !void {
     const gpa = options.stream_gpa;
     const tasks = try gpa.alloc(executor.Task, calls.len);
     defer gpa.free(tasks);
-    for (calls, tasks) |call, *task| task.* = .init(gpa, call, findTool(options.tools, call.name));
+    for (calls, tasks) |call, *task| task.* = .init(gpa, call, findTool(options.tools, offered, call.name));
     defer for (tasks) |*task| task.deinit();
     var turn_arena: std.heap.ArenaAllocator = .init(gpa);
     defer turn_arena.deinit();
@@ -107,6 +108,10 @@ fn runTools(options: Options, events: *types.Dispatcher, calls: []const types.To
         const batch = tasks[start..end];
         for (batch) |*task| {
             events.emit(.{ .tool_start = task.call });
+            if (options.abort.isAborted()) {
+                task.result = executor.aborted_result;
+                continue;
+            }
             gate(options.hooks, arena, task) catch |err| {
                 hook_failure = hook_failure orelse err;
                 task.result = .{ .content = @errorName(err), .is_error = true };
@@ -146,11 +151,21 @@ fn gate(hooks: []const types.Hook, arena: std.mem.Allocator, task: *executor.Tas
     }
 }
 
-fn findTool(tools: []const types.Tool, name: []const u8) ?*const types.Tool {
-    for (tools) |*tool| {
-        if (std.mem.eql(u8, tool.name, name)) return tool;
+fn findTool(tools: []const types.Tool, offered: []const bool, name: []const u8) ?*const types.Tool {
+    for (tools, offered) |*tool, available| {
+        if (available and std.mem.eql(u8, tool.name, name)) return tool;
     }
     return null;
+}
+
+fn offeredTools(gpa: std.mem.Allocator, tools: []const types.Tool, definitions: []const ai.ToolDefinition) ![]bool {
+    const offered = try gpa.alloc(bool, tools.len);
+    for (tools, offered) |tool, *available| {
+        available.* = for (definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, tool.name)) break true;
+        } else false;
+    }
+    return offered;
 }
 
 fn appendResults(conversation: *Conversation, events: *types.Dispatcher, tasks: []const executor.Task) !void {
@@ -179,6 +194,7 @@ fn appendResults(conversation: *Conversation, events: *types.Dispatcher, tasks: 
 const Reply = struct {
     message: ?message.Message,
     stop_reason: ai.StopReason,
+    offered: []bool,
 };
 
 fn streamReply(options: Options, events: *types.Dispatcher) !Reply {
@@ -189,13 +205,17 @@ fn streamReply(options: Options, events: *types.Dispatcher) !Reply {
         const prepare = hook.prepare_request orelse continue;
         try prepare(hook.context, &request);
     }
+    const offered = try offeredTools(options.stream_gpa, options.tools, request.tools.items);
+    errdefer options.stream_gpa.free(offered);
     const tools = if (request.tools.items.len == 0) null else request.tools.items;
     const handle = try options.provider.sendStream(request.messages.items, request.system, tools, options.abort, request.model_override, request.tool_choice, "");
     defer handle.deinit();
     var draft: Draft = .{ .gpa = options.conversation.allocator, .stream_gpa = options.stream_gpa };
     defer draft.deinit();
+    errdefer if (draft.started) events.emit(.{ .message_discarded = .assistant });
     while (try handle.next()) |event| try draft.take(events, event);
-    return .{ .message = try draft.finish(options.provider.model()), .stop_reason = handle.stopReason() };
+    const model = request.model_override orelse options.provider.model();
+    return .{ .message = try draft.finish(model), .stop_reason = handle.stopReason(), .offered = offered };
 }
 
 fn buildRequest(arena: std.mem.Allocator, options: Options) !types.Request {
@@ -207,6 +227,7 @@ fn buildRequest(arena: std.mem.Allocator, options: Options) !types.Request {
         try request.messages.append(arena, .{ .role = .assistant, .content = content });
     };
     for (conversation.activeMessages()) |item| {
+        if (!carriesContent(item)) continue;
         const content = try arena.alloc(ai.ApiContent, item.blocks.len);
         for (item.blocks, content) |block, *part| part.* = switch (block) {
             .text => |text| .{ .text = text },
@@ -222,6 +243,14 @@ fn buildRequest(arena: std.mem.Allocator, options: Options) !types.Request {
         try request.tools.append(arena, .{ .name = tool.name, .description = tool.description, .input_schema = tool.input_schema });
     }
     return request;
+}
+
+fn carriesContent(item: message.Message) bool {
+    for (item.blocks) |block| switch (block) {
+        .thinking, .reasoning_item => {},
+        else => return true,
+    };
+    return false;
 }
 
 const Draft = struct {

@@ -89,6 +89,7 @@ pub const Event = union(enum) {
     message_start: message.Role,
     message_update: Delta,
     message_end: *const message.Message,
+    message_discarded: message.Role,
     tool_start: ToolCall,
     tool_update: struct { call: ToolCall, data: []const u8 },
     tool_end: struct { call: ToolCall, result: ToolResult },

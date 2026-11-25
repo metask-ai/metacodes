@@ -10,6 +10,7 @@ const gpa = std.testing.allocator;
 const Scripted = union(enum) {
     text: []const u8,
     thinking: []const u8,
+    reasoning: []const u8,
     tool: struct { id: []const u8, name: []const u8, input: []const u8 = "{}" },
 };
 
@@ -108,6 +109,7 @@ const FakeStream = struct {
         return switch (stream.script.events[stream.position]) {
             .text => |text| .{ .text = try gpa.dupe(u8, text) },
             .thinking => |text| .{ .thinking = try gpa.dupe(u8, text) },
+            .reasoning => |json| .{ .reasoning_item = try gpa.dupe(u8, json) },
             .tool => |tool| .{ .tool_use_start = .{
                 .id = try gpa.dupe(u8, tool.id),
                 .name = try gpa.dupe(u8, tool.name),
@@ -182,6 +184,8 @@ const Observer = struct {
     rewrite: ?[]const u8 = null,
     decision: kernel.TurnDecision = .no_opinion,
     system: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    withdraw_tools: bool = false,
     fail_after_tool: bool = false,
 
     fn hook(observer: *Observer) kernel.Hook {
@@ -203,6 +207,8 @@ const Observer = struct {
         const observer = of(context);
         observer.log.add("{s} prepare {d}", .{ observer.label, request.messages.items.len });
         if (observer.system) |system| request.system = system;
+        if (observer.model) |model| request.model_override = model;
+        if (observer.withdraw_tools) request.tools.clearRetainingCapacity();
     }
 
     fn before(context: *anyopaque, _: std.mem.Allocator, call: kernel.ToolCall) anyerror!kernel.ToolGate {
@@ -240,6 +246,7 @@ const Observer = struct {
                 .thinking => |text| observer.log.add("thinking {s}", .{text}),
             },
             .message_end => |message| observer.log.add("message_end {s}", .{@tagName(message.role)}),
+            .message_discarded => |role| observer.log.add("message_discarded {s}", .{@tagName(role)}),
             .tool_start => |call| observer.log.add("tool_start {s}", .{call.name}),
             .tool_update => |update| observer.log.add("tool_update {s} {s}", .{ update.call.name, update.data }),
             .tool_end => |end| observer.log.add("tool_end {s} {s}", .{ end.call.name, end.result.content }),
@@ -401,12 +408,13 @@ test "an abort during a tool stops the run with every call answered" {
     } };
     var log: Log = .{};
     var recorder: Recorder = .{ .log = &log, .abort = &harness.abort };
-    const outcome = harness.run(&fake, &.{recorder.tool("edit", .sequential)}, &.{}, 10);
+    var gate: Observer = .{ .log = &log, .label = "G", .fail_after_tool = true };
+    const outcome = harness.run(&fake, &.{recorder.tool("edit", .sequential)}, &.{gate.hook()}, 10);
     try std.testing.expectEqual(kernel.Stop.aborted, outcome.stop);
     try std.testing.expectEqual(@as(usize, 1), fake.requests);
     try std.testing.expectEqualStrings("edit done", harness.result(2, 0).content);
     try std.testing.expectEqualStrings("aborted before the tool ran", harness.result(2, 1).content);
-    try std.testing.expectEqualStrings("run edit {};", log.text());
+    try std.testing.expectEqualStrings("G prepare 1;G before edit;run edit {};G after edit;G after edit;", log.text());
 }
 
 test "a provider error fails the run and leaves the conversation as it was" {
@@ -417,7 +425,13 @@ test "a provider error fails the run and leaves the conversation as it was" {
     try std.testing.expectEqual(kernel.Stop{ .failed = error.ProviderDown }, outcome.stop);
     try std.testing.expectEqual(@as(usize, 1), harness.conversation.messages.items.len);
     var broken: FakeProvider = .{ .scripts = &.{.{ .events = &.{ .{ .text = "par" }, .{ .tool = .{ .id = "t1", .name = "x" } } }, .break_after = error.ConnectionReset }} };
-    const broken_outcome = harness.run(&broken, &.{}, &.{}, 10);
+    var log: Log = .{};
+    var observer: Observer = .{ .log = &log, .label = "A" };
+    const broken_outcome = harness.run(&broken, &.{}, &.{observer.hook()}, 10);
+    try std.testing.expectEqualStrings(
+        "agent_start;turn_start 1;A prepare 1;message_start assistant;text par;message_discarded assistant;turn_end 1;agent_end failed;",
+        log.text(),
+    );
     try std.testing.expectEqual(kernel.Stop{ .failed = error.ConnectionReset }, broken_outcome.stop);
     try std.testing.expectEqual(@as(usize, 1), harness.conversation.messages.items.len);
 }
@@ -462,4 +476,45 @@ test "an empty reply completes the run without writing a message" {
     try std.testing.expectEqual(kernel.Stop.completed, outcome.stop);
     try std.testing.expectEqual(@as(usize, 1), harness.conversation.messages.items.len);
     try std.testing.expectEqualStrings("agent_start;turn_start 1;A prepare 1;A finish 1;turn_end 1;agent_end completed;", log.text());
+}
+
+test "the request names the model that answers, and reasoning is recorded under it" {
+    var harness = try Harness.init();
+    defer harness.deinit();
+    var fake: FakeProvider = .{ .scripts = &.{.{ .events = &.{ .{ .reasoning = "{\"id\":\"r1\"}" }, .{ .text = "ok" } } }} };
+    var log: Log = .{};
+    var switcher: Observer = .{ .log = &log, .label = "M", .model = "model-b" };
+    _ = harness.run(&fake, &.{}, &.{switcher.hook()}, 10);
+    const item = harness.conversation.messages.items[1].blocks[0].reasoning_item;
+    try std.testing.expectEqualStrings("model-b", item.model);
+    try std.testing.expectEqualStrings("{\"id\":\"r1\"}", item.json);
+}
+
+test "a history message with only thinking is kept locally but not sent" {
+    var harness = try Harness.init();
+    defer harness.deinit();
+    const blocks = try gpa.alloc(@import("../message.zig").Block, 1);
+    blocks[0] = .{ .thinking = try gpa.dupe(u8, "ran out of tokens") };
+    try harness.conversation.append(.{ .role = .assistant, .blocks = blocks });
+    try harness.conversation.appendText(.user, "again");
+    var fake: FakeProvider = .{ .scripts = &.{.{ .events = &.{.{ .text = "ok" }} }} };
+    _ = harness.run(&fake, &.{}, &.{}, 10);
+    try std.testing.expectEqual(@as(usize, 2), fake.seen_messages[0]);
+    try std.testing.expectEqual(@as(usize, 4), harness.conversation.messages.items.len);
+}
+
+test "a tool withdrawn from the request does not run even when the model calls it" {
+    var harness = try Harness.init();
+    defer harness.deinit();
+    var fake: FakeProvider = .{ .scripts = &.{
+        .{ .events = &.{.{ .tool = .{ .id = "t1", .name = "read" } }}, .stop_reason = .tool_use },
+        .{ .events = &.{.{ .text = "ok" }} },
+    } };
+    var log: Log = .{};
+    var recorder: Recorder = .{ .log = &log };
+    var narrower: Observer = .{ .log = &log, .label = "N", .withdraw_tools = true };
+    _ = harness.run(&fake, &.{recorder.tool("read", .sequential)}, &.{narrower.hook()}, 10);
+    try std.testing.expectEqual(@as(usize, 0), fake.seen_tools);
+    try std.testing.expectEqualStrings("unknown tool `read`+N", harness.result(2, 0).content);
+    try std.testing.expect(std.mem.indexOf(u8, log.text(), "run read") == null);
 }
