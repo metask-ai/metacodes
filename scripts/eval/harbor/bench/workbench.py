@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.suites import leaderboards
-from scripts.eval.harbor.bench import builds, data, executors, results
+from scripts.eval.harbor.bench import builds, data, executors, monitor, results
 from scripts.eval.harbor.bench.profiles import PROFILE_ACTIVE, ProfileManager, public as public_profile, runs_of
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
@@ -174,6 +174,7 @@ class Workbench:
         self.setups = SetupManager(manager.config_path) if manager else None
         self.logins = LoginManager(manager.config_path) if manager else None
         self.builds = builds.BuildManager(manager.config_path) if manager else None
+        self.monitors = monitor.Monitor() if manager else None
         if manager is not None:
             manager.setup_running = self.setups.mutating
             if getattr(manager, "profiles", None) is None:
@@ -583,6 +584,23 @@ class Workbench:
                 path.unlink(missing_ok=True)
         except OSError as exc:
             raise ValueError(f"删除文件失败（{exc}），记录已保留，处理后可以重试") from None
+
+    def monitor(self, executor=None) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        value = self.monitors.snapshot(settings(self.manager.config_path), executor or None,
+                                       self.manager.config_path.parent, self.manager.jobs_dir)
+        return {**value, "busy": any(run.get("status") in ACTIVE for run in self.manager.runs()),
+                "setup_running": self.setups.mutating()}
+
+    def save_mirrors(self, payload) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        with self.manager.lock:
+            if self.setups.mutating():
+                raise ValueError("一键配置正在进行，结束后再保存")
+            name = monitor.save_mirrors(self.manager.config_path, payload)
+        return self.monitor(name)
 
     def start_setup(self, request) -> Dict[str, Any]:
         if not self.manager:

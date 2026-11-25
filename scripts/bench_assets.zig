@@ -48,6 +48,8 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/bench/node.py", .bytes = @embedFile("eval/harbor/bench/node.py") },
     .{ .path = "scripts/eval/harbor/bench/setup.py", .bytes = @embedFile("eval/harbor/bench/setup.py") },
     .{ .path = "scripts/eval/harbor/bench/images.py", .bytes = @embedFile("eval/harbor/bench/images.py") },
+    .{ .path = "scripts/eval/harbor/bench/monitor.py", .bytes = @embedFile("eval/harbor/bench/monitor.py") },
+    .{ .path = "scripts/eval/harbor/bench/monitor_probe.py", .bytes = @embedFile("eval/harbor/bench/monitor_probe.py") },
     .{ .path = "scripts/eval/harbor/bench/providers.py", .bytes = @embedFile("eval/harbor/bench/providers.py") },
     .{ .path = "scripts/eval/harbor/viewer/__init__.py", .bytes = @embedFile("eval/harbor/viewer/__init__.py") },
     .{ .path = "scripts/eval/harbor/viewer/server.py", .bytes = @embedFile("eval/harbor/viewer/server.py") },

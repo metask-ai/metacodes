@@ -2915,6 +2915,27 @@ class NetworkSetupTest(SetupFixture):
         self.assertEqual(self.step(changed, "download_cache")["status"], "done", self.step(changed, "download_cache"))
         self.assertEqual(len(builds()), 2)
 
+    def test_setup_after_enabling_the_download_cache_keeps_the_direct_egress_it_needs(self):
+        from scripts.eval.harbor.bench import monitor
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors={"go": "https://goproxy.example"})
+        self.remote_docker()
+        monitor.save_mirrors(self.config, {"executor": "relay-4090", "settings": {"download_cache": True}})
+        self.assertNotIn("egress", next(e for e in self.cfg()["executors"] if e["name"] == "relay-4090"))
+        blocked = self.closed_port_url()
+        targets = {"pypi": blocked, "dockerhub": self.reachable, "ghcr": self.reachable, "github": blocked}
+        with patch.object(setup, "NETWORK_TARGETS", targets):
+            progress = setup.run_setup(self.config, "relay-4090")
+        network = self.step(progress, "network")
+        self.assertEqual(network["status"], "done", network)
+        self.assertIn("pypi_index", network["detail"])
+        self.assertNotIn("egress", network["detail"])
+        entry = next(e for e in self.cfg()["executors"] if e["name"] == "relay-4090")
+        self.assertEqual((entry.get("egress"), entry["download_cache"], entry["pypi_index"]),
+                         (None, True, setup.DEFAULT_PYPI_INDEX))
+        relay = executors.find(self.cfg(), "relay-4090")
+        self.assertEqual((relay.egress, relay.download_cache), ("direct", True))
+        self.assertNotEqual(self.step(progress, "download_cache")["status"], "skipped")
+
     def test_a_run_uses_the_download_cache_only_while_it_answers(self):
         cache = self.start_download_cache({"pypi": "https://pypi.example", "go": "https://goproxy.example"})
         self.add_ssh_executor(metrics_bind="127.0.0.1", download_cache=True, container_mirrors={
