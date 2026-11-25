@@ -8,6 +8,17 @@ const STATUS = {
 };
 const ORDER = ['pass', 'partial', 'fail', 'timeout', 'invalid', 'running'];
 const PHASES = [['environment', '环境'], ['setup', '安装'], ['agent', 'agent'], ['verifier', '判分']];
+const PREPARE_PARTS = [['prepare_s', '预准备', 'l-prepare'], ['ready_wait_s', '就绪等待', 'l-ready'], ['unprepared_wait_s', '准备失败后等待', 'l-unprepared'], ['prepare_running_s', '开始后准备', 'l-running']];
+const PREPARE_RESULTS = { present: '命中', pulled: '拉取', built: '构建', failed: '失败' };
+function timeParts(r) {
+  const own = r.lifecycle ? PREPARE_PARTS.map(([k, l, cls]) => [cls, r.lifecycle[k], l]) : [];
+  return own.concat(PHASES.map(([k, l]) => ['p-' + k, r.phases[k], l]));
+}
+function timeTotal(r) { return timeParts(r).reduce((acc, [, v]) => acc + (v || 0), 0); }
+function timeTitle(r) {
+  const queue = r.lifecycle ? `排队 ${dur(r.lifecycle.queue_s)}（不计入） · ` : '';
+  return queue + timeParts(r).filter(([, v]) => v !== null && v !== undefined).map(([, v, l]) => `${l} ${dur(v)}`).join(' · ');
+}
 const REFRESH_S = 10;
 
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
@@ -1114,10 +1125,10 @@ async function renderJob(name) {
       .filter((r) => state.jobFilter === 'all' || r.status === state.jobFilter)
       .filter((r) => !q || r.task.toLowerCase().includes(q))
       .sort((a, b) => { const x = getter(a), y = getter(b); return (x < y ? -1 : x > y ? 1 : 0) * state.sort.dir; });
-    const maxTime = Math.max(1, ...job.rows.map((r) => PHASES.reduce((acc, [k]) => acc + (r.phases[k] || 0), 0)));
+    const maxTime = Math.max(1, ...job.rows.map(timeTotal));
     tbody.replaceChildren(...(rows.length ? rows.map((r) => {
-      const bar = h('div', { class: 'phase-bar', title: PHASES.map(([k, l]) => `${l} ${dur(r.phases[k])}`).join(' · ') },
-        PHASES.map(([k]) => r.phases[k] ? h('span', { class: 'p-' + k, width: (100 * r.phases[k] / maxTime) + '%' }) : null));
+      const bar = h('div', { class: 'phase-bar', title: timeTitle(r) },
+        timeParts(r).map(([cls, v]) => v ? h('span', { class: cls, width: (100 * v / maxTime) + '%' }) : null));
       return h('tr', { class: 'link', onclick: () => { location.hash = `#/job/${encodeURIComponent(job.name)}/${encodeURIComponent(r.trial)}`; } },
         h('td', {}, h('span', { text: r.task }), h('span', { class: 'sub mono', text: `${r.first_attempt ? '首次执行' : '第 ' + r.attempt_number + ' 次'} · ${r.trial.split('__')[1] || ''}` })),
         h('td', {}, badge(r.status, r.cause), r.cause ? h('span', { class: 'sub', text: r.cause }) : null),
@@ -1139,7 +1150,8 @@ async function renderJob(name) {
   }
   drawRows();
 
-  const keys = h('div', { class: 'panel-body' }, PHASES.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'p-' + k }), l)));
+  const timed = job.rows.some((r) => r.lifecycle) ? PREPARE_PARTS.map(([, l, cls]) => [cls, l]) : [];
+  const keys = h('div', { class: 'panel-body' }, timed.concat(PHASES.map(([k, l]) => ['p-' + k, l])).map(([cls, l]) => h('span', { class: 'key' }, h('i', { class: cls }), l)));
   const table = h('div', {}, h('div', { class: 'panel-body toolbar' }, filters, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, head), tbody)), keys);
   const csv = h('a', { class: 'button', href: '/api/job.csv?name=' + encodeURIComponent(job.name), text: '下载 CSV' });
@@ -1196,13 +1208,50 @@ function tokenPanel(t) {
         h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['请求', '开始', '用时', 'TTFT', '输入', '缓存', '输出', '上下文组成', 'HTTP'].map((x, i) => h('th', { class: i === 7 ? null : 'num', text: x })))), h('tbody', {}, rows))))));
 }
 
+function prepareCase(life) {
+  if (!life.prepare || life.prepare.status === 'skipped') return '没有预准备：' + (life.prepare && life.prepare.error ? life.prepare.error : '这道题的环境由 Harbor 在开始后自己准备');
+  const failed = life.prepare.status === 'failed';
+  const handover = '环境交给 Harbor 在开始后重新拉取或构建';
+  if (life.unprepared_wait_s !== null && life.unprepared_wait_s !== undefined) return `提前准备失败，之后等待 ${dur(life.unprepared_wait_s)} 才排到；${handover}`;
+  if (life.ready_wait_s !== null) return `准备好后等待 ${dur(life.ready_wait_s)} 才排到，排到后直接运行`;
+  const outcome = failed ? `；准备失败，${handover}` : '';
+  if (life.prepare_s !== null) return `排到时仍在准备：预准备 ${dur(life.prepare_s)}，开始后又准备了 ${dur(life.prepare_running_s)}${outcome}`;
+  return `排到时还没开始准备，开始后准备了 ${dur(life.prepare_running_s)}${outcome}`;
+}
+function prepareItems(prepare) {
+  if (!prepare || !prepare.items.length) return null;
+  return h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, ['准备动作', '镜像', '结果', '用时'].map((x, i) => h('th', { class: i === 3 ? 'num' : null, text: x })))),
+    h('tbody', {}, prepare.items.map((x) => h('tr', {},
+      h('td', { text: x.kind === 'build' ? '构建' : '拉取' }),
+      h('td', {}, h('span', { class: 'mono', text: x.image }), x.error ? h('span', { class: 'sub flag', text: x.error }) : null),
+      h('td', { class: x.status === 'failed' ? 'flag' : null, text: (PREPARE_RESULTS[x.status] || x.status) + (x.shared ? '（与同镜像的题共用）' : '')
+        + (x.attempts > 1 ? (x.status === 'failed' ? ` · 试了 ${x.attempts} 次` : ` · 第 ${x.attempts} 次成功`) : '') }),
+      h('td', { class: 'num', text: dur(x.seconds) }))))));
+}
+function timeRest(r) { return r.lifecycle && r.lifecycle.total_s !== null ? Math.max(0, r.lifecycle.total_s - timeTotal(r)) : null; }
+function lifecycleBlock(r) {
+  const life = r.lifecycle;
+  if (!life) return null;
+  const segments = timeParts(r).concat([['t-other', timeRest(r), '其他（创建与收尾）']]);
+  const total = segments.reduce((acc, [, v]) => acc + (v || 0), 0);
+  const bar = h('div', { class: 'stack-bar', role: 'img', 'aria-label': timeTitle(r) },
+    total > 0 ? segments.map(([cls, v, l]) => v ? h('span', { class: cls, width: (100 * v / total) + '%', title: `${l} ${dur(v)}（${pct(v / total)}）` }) : null) : null);
+  return h('div', {},
+    h('p', { class: 'muted', text: `从开始准备到结束 ${dur(life.total_s)} · 此前排队 ${dur(life.queue_s)}（不计入）` }),
+    bar,
+    h('p', { class: 'muted', text: prepareCase(life) }),
+    prepareItems(life.prepare));
+}
 function timePanel(t) {
   const r = t.row;
   const split = t.time_split || {};
-  const phaseTotal = PHASES.reduce((acc, [k]) => acc + (r.phases[k] || 0), 0);
-  const phases = h('div', { class: 'split' }, PHASES.map(([k, l]) => h('div', { class: 'split-row' }, h('span', { text: l }),
-    h('div', { class: 'stack-bar' }, h('span', { class: 'p-' + k, width: (phaseTotal ? 100 * (r.phases[k] || 0) / phaseTotal : 0) + '%' })),
-    h('span', { class: 'num muted', text: dur(r.phases[k]) }))));
+  const rows = (r.lifecycle ? [['l-queue', r.lifecycle.queue_s, '排队（不计入）']] : []).concat(timeParts(r),
+    r.lifecycle ? [['t-other', timeRest(r), '其他（创建与收尾）']] : []);
+  const phaseTotal = timeTotal(r) + (timeRest(r) || 0);
+  const phases = h('div', { class: 'split' }, rows.map(([cls, v, l]) => h('div', { class: 'split-row' }, h('span', { text: l }),
+    h('div', { class: 'stack-bar' }, cls === 'l-queue' ? null : h('span', { class: cls, width: (phaseTotal ? 100 * (v || 0) / phaseTotal : 0) + '%' })),
+    h('span', { class: 'num muted', text: dur(v) }))));
   const agent = split.agent_s;
   const segs = [['t-model', split.model_s, '等待模型'], ['t-tool', split.tool_s, '执行工具'], ['t-other', split.other_s, '其他（harness、I/O）']];
   const agentBlock = agent !== null && agent !== undefined && (split.model_s !== null || split.tool_s !== null) ? h('div', {},
@@ -1223,7 +1272,8 @@ function timePanel(t) {
       h('td', { class: 'num', text: msf(x.mean_ms) }),
       h('td', { class: 'num', text: msf(x.max_ms) })))))) : h('div', { class: 'empty', text: '没有工具调用' });
   return h('div', { class: 'grid-2' },
-    panel('耗时', `总用时 ${dur(r.elapsed_s)}`, h('div', { class: 'panel-body split' }, phases, agentBlock)),
+    panel('耗时', r.lifecycle ? `总用时 ${dur(r.lifecycle.total_s)}（从开始准备算起）` : `总用时 ${dur(r.elapsed_s)}`,
+      h('div', { class: 'panel-body split' }, lifecycleBlock(r), phases, agentBlock)),
     panel('工具耗时', `${timing.reduce((a, x) => a + x.calls, 0)} 次`, tools));
 }
 
@@ -1239,7 +1289,7 @@ function trialBody(t) {
     metric('TPS（生成）', tps(r.tps)),
     metric('TTFT（均值）', ttft(r.ttft_ms), `P50 ${ttft(r.ttft_p50_ms)} · P95 ${ttft(r.ttft_p95_ms)}`),
     metric('估算成本', usd(r.cost_usd)),
-    metric('用时', dur(r.elapsed_s), PHASES.map(([k, l]) => `${l} ${dur(r.phases[k])}`).join(' · ')));
+    metric('用时', dur(r.lifecycle ? r.lifecycle.total_s : r.elapsed_s), timeTitle(r)));
   const parts = [metrics];
   if (t.exception_message) parts.push(h('div', { class: 'callout', text: `${r.exception}: ${t.exception_message}` }));
   if (r.initial_composition) {

@@ -83,6 +83,24 @@ def build_fixture(root: Path) -> None:
     _trial(job, "provider__ddd", reward=0.0, exception="NonZeroAgentExitCodeError", stop="api_error")
     _trial(job, "running__eee", finished=False)
     _write(job / "kv-store__aaa" / "verifier" / "test-stdout.txt", "line\n" * 3000)
+    _lifecycle(job, "kv-store__aaa", queued_at="07:50:00", prepare_started_at="07:58:00",
+               prepare_finished_at="07:58:40", started_at="07:59:59", finished_at="08:05:01",
+               prepare={"status": "prepared", "items": [
+                   {"kind": "pull", "image": "alexgshaw/kv-store:1", "status": "pulled", "seconds": 38.5, "attempts": 2},
+                   {"kind": "pull", "image": "alexgshaw/verifier:1", "status": "present", "seconds": 0.1,
+                    "shared": True}]})
+    _lifecycle(job, "compressor__bbb", queued_at="07:50:00", prepare_started_at="07:59:30",
+               started_at="07:59:50", prepare_finished_at="08:00:00", finished_at="08:05:02",
+               prepare={"status": "failed", "items": [
+                   {"kind": "build", "image": "metacodes-prebuild-abc", "status": "failed", "seconds": 30,
+                    "attempts": 3, "error": "pip install failed"},
+                   {"kind": "pull", "image": "x", "status": "exploded"}]})
+    _lifecycle(job, "torch__ccc", queued_at="07:59:00", started_at="08:00:00", finished_at="08:05:00",
+               prepare={"status": "skipped"})
+    _lifecycle(job, "running__eee", queued_at="08:30:00", started_at="08:35:00", prepare_started_at="08:35:00.200000",
+               prepare_finished_at="08:36:00", prepare={"status": "present", "items": []})
+    _lifecycle(job, "queued__zzz", queued_at="08:39:00")
+    _write(job / data.LIFECYCLE_DIR / "provider__ddd.json", "{not json")
     _write(job / "kv-store__aaa" / "agent" / "metacodes-stderr.log", "warning: x\n")
     _job(root, "qwen-pilot", "qwen/qwen3.8-max", planned=1)
 
@@ -123,6 +141,15 @@ def build_fixture(root: Path) -> None:
     nostart = _trial(metrics, "nostart__x", finished=False)
     os.utime(nostart / "config.json", ns=(1_700_000_000_123_456_789, 1_700_000_000_123_456_789))
     del first
+
+
+def _lifecycle(job: Path, trial: str, **fields) -> None:
+    record = {"schema_version": 1, "trial": trial, "task": trial.split("__")[0], "queued_at": None,
+              "prepare_started_at": None, "prepare_finished_at": None, "started_at": None, "finished_at": None,
+              "prepare": None}
+    for key, value in fields.items():
+        record[key] = f"2026-11-16T{value}Z" if key.endswith("_at") else value
+    _write(job / data.LIFECYCLE_DIR / (trial + ".json"), record)
 
 
 def file_outputs(root: Path):
@@ -203,7 +230,32 @@ class EquivalenceTest(StoreCase):
         row = next(r for r in metrics["rows"] if r["trial"] == "one__aaa")
         self.assertEqual((row["tps"], row["ttft_ms"], row["initial_input_tokens"]), (25, 200, 920))
         self.assertEqual(metrics["summary"]["first_pass_rate"], 0.75)
+        lives = {r["trial"]: r["lifecycle"] for r in actual["jobs"]["glm-pilot"]["rows"]}
+        ready = lives["kv-store__aaa"]
+        self.assertEqual([ready[k] for k in ("queue_s", "prepare_s", "ready_wait_s", "unprepared_wait_s",
+                                             "prepare_running_s", "total_s")], [480, 40, 79, None, None, 421])
+        self.assertEqual(ready["prepare"], {"status": "prepared", "error": None, "items": [
+            {"kind": "pull", "image": "alexgshaw/kv-store:1", "status": "pulled", "seconds": 38.5, "attempts": 2,
+             "shared": False, "error": None},
+            {"kind": "pull", "image": "alexgshaw/verifier:1", "status": "present", "seconds": 0.1, "attempts": None,
+             "shared": True, "error": None}]})
+        caught = lives["compressor__bbb"]
+        self.assertEqual([caught[k] for k in ("queue_s", "prepare_s", "ready_wait_s", "prepare_running_s", "total_s")],
+                         [570, 20, None, 10, 332])
+        self.assertEqual([(i["status"], i["error"]) for i in caught["prepare"]["items"]],
+                         [("failed", "pip install failed")])
+        unprepared = lives["torch__ccc"]
+        self.assertEqual([unprepared[k] for k in ("queue_s", "prepare_s", "ready_wait_s", "prepare_running_s",
+                                                  "total_s")], [60, None, None, None, 300])
+        self.assertEqual(unprepared["prepare"]["status"], "skipped")
+        going = lives["running__eee"]
+        self.assertEqual([going[k] for k in ("queue_s", "prepare_s", "ready_wait_s", "prepare_running_s", "total_s",
+                                             "finished_at")], [300, None, None, 59.8, 300, None])
+        self.assertIsNone(lives["provider__ddd"])
+        self.assertNotIn("queued__zzz", lives)
+        self.assertTrue(all(r["lifecycle"] is None for r in metrics["rows"]))
         detail = actual["trials"]["glm-pilot|kv-store__aaa"]
+        self.assertEqual(detail["row"]["lifecycle"], ready)
         self.assertIn("more chars", detail["steps"][1]["observations"][0]["content"])
         self.assertTrue(detail["verifier_output"].startswith("…"))
 
@@ -242,6 +294,11 @@ class EquivalenceTest(StoreCase):
         shutil.rmtree(self.root / "metrics-job")  # served from the store now
         self.assertEqual(json.loads(get("/api/job?name=metrics-job")), labelled(expected["jobs"]["metrics-job"]))
         self.assertEqual(get("/api/job.csv?name=metrics-job").decode(), expected["csv"]["metrics-job"])
+        shutil.rmtree(self.root / "glm-pilot")
+        served = json.loads(get("/api/job?name=glm-pilot"))
+        self.assertEqual(served, labelled(expected["jobs"]["glm-pilot"]))
+        self.assertEqual({r["trial"]: (r["lifecycle"] or {}).get("ready_wait_s") for r in served["rows"]}["kv-store__aaa"], 79)
+        self.assertEqual(json.loads(get("/api/trial?job=glm-pilot&trial=compressor__bbb"))["row"]["lifecycle"]["prepare_running_s"], 10)
         detail = json.loads(get("/api/trial?job=metrics-job&trial=one__aaa"))
         file_row = next(r for r in expected["jobs"]["metrics-job"]["rows"] if r["trial"] == "one__aaa")
         self.assertEqual(detail, {**expected["trials"]["metrics-job|one__aaa"], "row": file_row})
@@ -868,6 +925,30 @@ class IncrementalTest(StoreCase):
             after = tx.query("SELECT name, ingested_at, inputs_digest FROM trials ORDER BY name")
             self.assertEqual(tx.one("SELECT planned FROM jobs"), (4,))  # the header follows result.json
         self.assertEqual(after[:2], before)
+
+    def test_a_lifecycle_record_rederives_only_its_own_trial(self):
+        job = _job(self.root, "live", "m", planned=2, finished=False)
+        _trial(job, "a__1", reward=1.0)
+        _trial(job, "b__2", reward=0.0)
+        _lifecycle(job, "a__1", queued_at="07:59:00", started_at="08:00:00")
+        store = self.sqlite()
+        library = StoreLibrary(store, [self.root])
+        library.sync()
+        with store.read() as tx:
+            before = dict((name, stamp) for name, stamp in tx.query("SELECT name, inputs_digest FROM trials"))
+        row = next(r for r in library.job_view("live")["rows"] if r["trial"] == "a__1")
+        self.assertEqual((row["lifecycle"]["queue_s"], row["lifecycle"]["prepare"]), (60, None))
+        _lifecycle(job, "a__1", queued_at="07:59:00", started_at="08:00:00", finished_at="08:05:00",
+                   prepare={"status": "skipped"})
+        result = ingest.ingest_job(store, job)
+        self.assertEqual((result.outcome, result.trials_derived), ("updated", 1))
+        with store.read() as tx:
+            after = dict((name, stamp) for name, stamp in tx.query("SELECT name, inputs_digest FROM trials"))
+        self.assertEqual(after["b__2"], before["b__2"])
+        self.assertNotEqual(after["a__1"], before["a__1"])
+        row = next(r for r in library.job_view("live")["rows"] if r["trial"] == "a__1")
+        self.assertEqual((row["lifecycle"]["total_s"], row["lifecycle"]["prepare"]["status"]), (300, "skipped"))
+        self.assertEqual(normal(row), normal(next(r for r in data.job_view(job)["rows"] if r["trial"] == "a__1")))
 
     def test_oversize_files_project_like_the_live_files(self):
         """Files over the stored size keep their size and tail: stderr

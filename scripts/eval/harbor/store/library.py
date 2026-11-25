@@ -20,10 +20,7 @@ from scripts.eval.harbor.bench import data
 
 
 def _refresh(row: Dict[str, Any], moment: dt.datetime) -> Dict[str, Any]:
-    started = data.parse_time(row.get("started_at"))
-    if started is not None and row.get("finished_at") is None:
-        row["elapsed_s"] = (moment - started).total_seconds()
-    return row
+    return data.refresh_running(row, moment)
 
 
 class StoreLibrary:
