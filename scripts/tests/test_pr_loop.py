@@ -1,7 +1,7 @@
 """Zero-provider integration evidence: real Git, stdio Codex and GitHub argv."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -451,6 +451,63 @@ class LoopIntegrationTest(unittest.TestCase):
         with self.assertRaisesRegex(LoopError, "already bound"):
             self.store.bind(replace(self.binding, number=8))
         self.store.bind(self.binding)  # repeated registration is idempotent
+
+    def legacy_row(self, **fields):
+        value = asdict(self.binding)
+        del value["max_rounds"], value["max_agent_runs"]
+        value.update(fields)
+        with self.store.db:
+            self.store.db.execute("UPDATE prs SET binding=? WHERE number=7", (json.dumps(value),))
+        return self.row()
+
+    def test_mixed_bindings_reserve_source_fork_and_worktree_until_closed(self):
+        with self.store.db:
+            self.store.db.execute("ALTER TABLE prs ADD COLUMN worker_thread TEXT")
+            self.store.db.execute("UPDATE prs SET worker_thread='fork-7'")
+        legacy = self.legacy_row(agent="claude", reviewer="codex", attended=True, attended_timeout=3600, mirror=True)
+        new = replace(self.binding, number=8, worktree=str(self.root / "other"), thread="worker-8")
+        for conflict in (replace(new, thread=self.binding.thread), replace(new, thread="fork-7"),
+                         replace(new, worktree=self.binding.worktree), self.binding):
+            with self.subTest(conflict=conflict), self.assertRaisesRegex(LoopError, "already bound"):
+                self.store.bind(conflict)
+            self.assertEqual([dict(row) for row in self.store.rows()], [legacy])
+        self.store.bind(new)
+        before_retry = list(self.store.db.iterdump())
+        self.store.bind(new)
+        self.assertEqual(list(self.store.db.iterdump()), before_retry)
+        with patch.object(self.controller, "tick") as tick:
+            self.controller.once()
+            tick.assert_called_once_with(new)
+        self.assertEqual(self.row(), legacy)
+        self.store.update(self.binding, State.CLOSED)
+        self.store.bind(replace(self.binding, number=9, thread="fork-7"))
+        with self.assertRaisesRegex(LoopError, "immutable"):
+            self.store.bind(self.binding)
+
+    def test_legacy_decision_cannot_be_rewritten_as_a_current_worker(self):
+        self.store.update(self.binding, State.DECISION)
+        for fields in ({}, {"agent": "codex", "reviewer": "claude"}):
+            legacy = self.legacy_row(**fields)
+            with self.assertRaisesRegex(LoopError, "#7 requires its original PR controller"):
+                self.store.answer(DEFAULT_REPO, 7, "Continue")
+            self.assertEqual(self.row(), legacy)
+
+    def test_unrecognized_stored_binding_names_the_row_and_rejects_registration(self):
+        original = asdict(self.binding)
+        for encoded, reason in ((json.dumps(dict(original, agent="unknown", reviewer="codex")), "agent"),
+                                (json.dumps(dict(original, reviewer="claude")), "agent"),
+                                (json.dumps(dict(original, agent="codex")), "reviewer"),
+                                (json.dumps(dict(original, future_owner="other")), "future_owner"),
+                                (json.dumps(dict(original, number=1)), "SQLite key"),
+                                ('{"agent":"codex","agent":"claude"}', "duplicate binding field 'agent'"),
+                                ("[]", "must be an object")):
+            with self.subTest(reason=reason):
+                with self.store.db:
+                    self.store.db.execute("UPDATE prs SET binding=?", (encoded,))
+                before = list(self.store.db.iterdump())
+                with self.assertRaisesRegex(LoopError, f"#7: .*{reason}"):
+                    self.store.bind(replace(self.binding, number=8, thread="worker-8", worktree=str(self.root)))
+                self.assertEqual(list(self.store.db.iterdump()), before)
 
     def test_submit_creates_upstream_pr_and_persists_explicit_worker_and_limits(self):
         from pr_loop import __main__ as cli

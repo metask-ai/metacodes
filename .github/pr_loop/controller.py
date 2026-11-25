@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import time
@@ -16,6 +17,58 @@ from .model import Binding, Busy, IN_FLIGHT, LoopError, REPORT_SCHEMA, State, Ve
 
 def default_state():
     return Path.home() / ".local" / "state" / "metacodes" / "pr-loop.sqlite3"
+
+
+@dataclass(frozen=True)
+class LegacyBinding(Binding):
+    agent: str = "codex"
+    worker_thread: str | None = None
+
+    def controller_required(self):
+        return f"{self.repo}#{self.number} requires its original PR controller (legacy {self.agent} binding)"
+
+
+def stored_binding(row):
+    def unique_fields(pairs):
+        fields = {}
+        for key, value in pairs:
+            if key in fields:
+                raise ValueError(f"duplicate binding field {key!r}")
+            fields[key] = value
+        return fields
+
+    try:
+        value = json.loads(row["binding"], object_pairs_hook=unique_fields)
+        if not isinstance(value, dict):
+            raise ValueError("binding must be an object")
+        if (value.get("repo"), value.get("number")) != (row["repo"], row["number"]):
+            raise ValueError("binding repo/number differs from SQLite key")
+        for key in ("number", "timeout", "max_rounds", "max_agent_runs", "attended_timeout"):
+            if key in value and (type(value[key]) is not int or value[key] < 1):
+                raise ValueError(f"{key} must be a positive integer")
+        fork = row["worker_thread"] if "worker_thread" in row.keys() else None
+        if fork is not None and (not isinstance(fork, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", fork)):
+            raise ValueError("invalid legacy worker_thread")
+        if fork is not None and fork == value.get("thread"):
+            raise ValueError("legacy worker_thread must differ from the source thread")
+        legacy_fields = {"agent", "reviewer", "attended", "attended_timeout", "mirror"}
+        if value.keys() & legacy_fields:
+            for key in ("agent", "reviewer"):
+                if value.get(key) not in ("codex", "claude"):
+                    raise ValueError(f"missing or unknown {key}, expected codex or claude")
+            agent = value.pop("agent")
+            del value["reviewer"]
+            for key in ("attended", "mirror"):
+                if key in value and type(value.pop(key)) is not bool:
+                    raise ValueError(f"{key} must be a boolean")
+            value.pop("attended_timeout", None)
+        elif fork is not None or not (value.keys() & {"max_rounds", "max_agent_runs"}):
+            agent = "codex"
+        else:
+            return Binding(**value)
+        return LegacyBinding(**value, agent=agent, worker_thread=fork)
+    except (ValueError, TypeError, AttributeError, LoopError) as exc:
+        raise LoopError(f"invalid stored binding for {row['repo']}#{row['number']}: {exc}") from exc
 
 
 class Store:
@@ -76,7 +129,7 @@ class Store:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             for row in self.rows():
-                other = Binding(**json.loads(row["binding"]))
+                other = stored_binding(row)
                 if (other.repo, other.number) == (binding.repo, binding.number):
                     if other == binding:
                         return
@@ -84,6 +137,8 @@ class Store:
                 if row["state"] not in (State.MERGED.value, State.CLOSED.value):
                     if other.worktree == binding.worktree or other.thread == binding.thread:
                         raise LoopError("worktree or thread is already bound to another active PR")
+                    if isinstance(other, LegacyBinding) and other.worker_thread == binding.thread:
+                        raise LoopError("worker thread is already bound to another active PR")
             self.db.execute("INSERT INTO prs(repo,number,binding) VALUES(?,?,?)",
                             (binding.repo, binding.number, json.dumps(asdict(binding))))
 
@@ -118,7 +173,9 @@ class Store:
             raise LoopError("answer requires a pending decision and a non-empty response")
         if min(extra_rounds, extra_agent_runs) < 0:
             raise LoopError("budget extensions cannot be negative")
-        binding = Binding(**json.loads(row["binding"]))
+        binding = stored_binding(row)
+        if isinstance(binding, LegacyBinding):
+            raise LoopError(binding.controller_required())
         binding = replace(binding, max_rounds=binding.max_rounds + extra_rounds,
                           max_agent_runs=binding.max_agent_runs + extra_agent_runs)
         with self.db:
@@ -349,4 +406,9 @@ class Controller:
     def once(self):
         with self.store.lock():
             for row in self.store.rows():
-                self.tick(Binding(**json.loads(row["binding"])))
+                binding = stored_binding(row)
+                if isinstance(binding, LegacyBinding):
+                    if row["state"] not in (State.MERGED.value, State.CLOSED.value):
+                        print(binding.controller_required(), file=sys.stderr)
+                    continue
+                self.tick(binding)
