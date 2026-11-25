@@ -42,8 +42,7 @@
 
 const std = @import("std");
 const util_json = @import("../util/json.zig");
-const file_reference = @import("file_reference.zig");
-const ToolContext = @import("../tools/context.zig").ToolContext;
+const observation = @import("../tools/observation.zig");
 // 裁剪 std 无 Thread.Mutex;全仓惯例走 platform.sync(pthread 包装)。
 const sync = @import("platform").sync;
 
@@ -122,8 +121,8 @@ pub const Draft = struct {
 
 /// One recorded change. All slices are owned by the record's allocator.
 pub const Record = struct {
-    locator: file_reference.Locator,
-    from_locator: ?file_reference.Locator = null,
+    locator: observation.Locator,
+    from_locator: ?observation.Locator = null,
     kind: Kind,
     status: Status,
     /// Dispatched tool name, e.g. "Write" / "Edit" / "NotebookEdit" / "ApplyPatch".
@@ -181,13 +180,13 @@ pub const Record = struct {
     }
 };
 
-fn freeLocator(allocator: std.mem.Allocator, locator: file_reference.Locator) void {
+fn freeLocator(allocator: std.mem.Allocator, locator: observation.Locator) void {
     switch (locator) {
         inline else => |value| allocator.free(value),
     }
 }
 
-fn cloneLocator(allocator: std.mem.Allocator, locator: file_reference.Locator) !file_reference.Locator {
+fn cloneLocator(allocator: std.mem.Allocator, locator: observation.Locator) !observation.Locator {
     return switch (locator) {
         .workspace_path => |v| .{ .workspace_path = try allocator.dupe(u8, v) },
         .absolute_path => |v| .{ .absolute_path = try allocator.dupe(u8, v) },
@@ -221,139 +220,6 @@ pub const Sink = struct {
         self.incompleteFn(self.ctx);
     }
 };
-
-/// Per-dispatch accumulator installed by `tool_exec.executeOne`. It copies each
-/// draft into `allocator` (the parent allocator) so records outlive the tool's
-/// arena.
-///
-/// Recording never fails a tool: a copy that cannot be made sets `lost`, as does
-/// a tool that says it could not observe everything it may have changed
-/// (`Sink.noteIncomplete`); an over-cap publication sets `overflow`. Both travel
-/// with the result — even with no record at all — so a consumer can say
-/// "incomplete" instead of quietly showing less than happened.
-pub const Collector = struct {
-    allocator: std.mem.Allocator,
-    ctx: *const ToolContext,
-    tool: []const u8,
-    tool_use_id: []const u8,
-    agent_depth: u8,
-    items: std.ArrayList(Record) = .empty,
-    overflow: bool = false,
-    lost: bool = false,
-
-    pub fn sink(self: *Collector) Sink {
-        return .{ .ctx = @ptrCast(self), .publishFn = publishTrampoline, .incompleteFn = incompleteTrampoline };
-    }
-
-    fn publishTrampoline(ctx: *anyopaque, draft: Draft) void {
-        const self: *Collector = @ptrCast(@alignCast(ctx));
-        self.publish(draft);
-    }
-
-    fn incompleteTrampoline(ctx: *anyopaque) void {
-        const self: *Collector = @ptrCast(@alignCast(ctx));
-        self.lost = true;
-    }
-
-    pub fn publish(self: *Collector, draft: Draft) void {
-        if (self.items.items.len >= MAX_FILE_CHANGES_PER_TOOL_RESULT_V1) {
-            self.overflow = true;
-            return;
-        }
-        const record = self.build(draft) catch {
-            self.lost = true;
-            return;
-        };
-        var owned = record;
-        self.items.append(self.allocator, owned) catch {
-            owned.deinit(self.allocator);
-            self.lost = true;
-        };
-    }
-
-    fn build(self: *Collector, draft: Draft) !Record {
-        const target = (try file_reference.classifyPath(self.allocator, self.ctx, draft.path, .unobserved)) orelse
-            return error.UnclassifiablePath;
-        defer self.allocator.free(target.path);
-        const locator = try locatorFor(self.allocator, target);
-        errdefer freeLocator(self.allocator, locator);
-
-        var from_locator: ?file_reference.Locator = null;
-        errdefer if (from_locator) |loc| freeLocator(self.allocator, loc);
-        if (draft.from_path) |from| {
-            if (try file_reference.classifyPath(self.allocator, self.ctx, from, .unobserved)) |from_target| {
-                defer self.allocator.free(from_target.path);
-                from_locator = try locatorFor(self.allocator, from_target);
-            }
-        }
-
-        const tool = try self.allocator.dupe(u8, self.tool);
-        errdefer self.allocator.free(tool);
-        const tool_use_id = try self.allocator.dupe(u8, self.tool_use_id);
-        errdefer self.allocator.free(tool_use_id);
-
-        var diff_complete = draft.diff_complete;
-        var diff: ?[]const u8 = null;
-        if (draft.unified_diff) |raw| {
-            if (raw.len > MAX_UNIFIED_DIFF_BYTES_V1) {
-                diff = try self.allocator.dupe(u8, raw[0..MAX_UNIFIED_DIFF_BYTES_V1]);
-                diff_complete = false;
-            } else {
-                diff = try self.allocator.dupe(u8, raw);
-            }
-        } else if (draft.status.changedDisk() and draft.kind != .deleted) {
-            // A real content change with no diff attached is incomplete
-            // evidence; say so rather than letting the consumer read the
-            // missing diff as "nothing changed".
-            diff_complete = false;
-        }
-
-        return .{
-            .locator = locator,
-            .from_locator = from_locator,
-            .kind = draft.kind,
-            .status = draft.status,
-            .tool = tool,
-            .tool_use_id = tool_use_id,
-            .agent_depth = self.agent_depth,
-            .before_bytes = draft.before_bytes,
-            .after_bytes = draft.after_bytes,
-            .unified_diff = diff,
-            .diff_complete = diff_complete,
-        };
-    }
-
-    /// Transfer the collected records to the caller. The collector is **always**
-    /// left empty — including when the transfer itself fails — so a later
-    /// `deinit` is a no-op, a caller without a `defer deinit` cannot leak, and a
-    /// double free is impossible. A failed transfer sets `lost`; it never
-    /// silently reports "nothing changed".
-    pub fn toOwnedSlice(self: *Collector) ?[]Record {
-        if (self.items.items.len == 0) return null;
-        return self.items.toOwnedSlice(self.allocator) catch {
-            for (self.items.items) |*r| r.deinit(self.allocator);
-            self.items.clearRetainingCapacity();
-            self.lost = true;
-            return null;
-        };
-    }
-
-    pub fn deinit(self: *Collector) void {
-        for (self.items.items) |*r| r.deinit(self.allocator);
-        self.items.deinit(self.allocator);
-    }
-};
-
-fn locatorFor(
-    allocator: std.mem.Allocator,
-    target: file_reference.ResolvedFileTarget,
-) !file_reference.Locator {
-    return switch (target.locator_kind) {
-        .workspace_path => .{ .workspace_path = try allocator.dupe(u8, target.path) },
-        .absolute_path => .{ .absolute_path = try allocator.dupe(u8, target.path) },
-        .uri => .{ .uri = try allocator.dupe(u8, target.path) },
-    };
-}
 
 /// Run-scoped accumulation of every file change, including those made by sub
 /// executions. The caller owns it and passes a pointer via
@@ -518,193 +384,6 @@ pub fn writeJsonArray(w: *std.Io.Writer, records: []const Record) !void {
 
 const testing = std.testing;
 
-fn testCollector(a: std.mem.Allocator, ctx: *const ToolContext) Collector {
-    return .{
-        .allocator = a,
-        .ctx = ctx,
-        .tool = "Write",
-        .tool_use_id = "tu-1",
-        .agent_depth = 0,
-    };
-}
-
-test "collector: a workspace write is classified relative and carries its diff" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    collector.sink().publish(.{
-        .path = "/work/src/main.zig",
-        .kind = .created,
-        .status = .applied,
-        .before_bytes = 0,
-        .after_bytes = 12,
-        .unified_diff = "--- a\n+++ b\n@@ -0,0 +1 @@\n+hi\n",
-    });
-
-    try testing.expectEqual(@as(usize, 1), collector.items.items.len);
-    const rec = collector.items.items[0];
-    try testing.expectEqualStrings("src/main.zig", rec.locator.workspace_path);
-    try testing.expectEqualStrings("src/main.zig", rec.path());
-    try testing.expectEqual(Kind.created, rec.kind);
-    try testing.expectEqual(Status.applied, rec.status);
-    try testing.expect(rec.diff_complete);
-    try testing.expect(std.mem.indexOf(u8, rec.unified_diff.?, "+hi") != null);
-    try testing.expectEqualStrings("Write", rec.tool);
-    try testing.expectEqualStrings("tu-1", rec.tool_use_id);
-}
-
-test "collector: a move keeps both the vacated and the new locator" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    collector.publish(.{
-        .path = "/work/dst.txt",
-        .from_path = "/work/src.txt",
-        .kind = .moved,
-        .status = .applied,
-        .before_bytes = 4,
-        .after_bytes = 4,
-        .unified_diff = "",
-    });
-
-    const rec = collector.items.items[0];
-    try testing.expectEqualStrings("dst.txt", rec.locator.workspace_path);
-    try testing.expectEqualStrings("src.txt", rec.from_locator.?.workspace_path);
-    try testing.expectEqual(Kind.moved, rec.kind);
-}
-
-test "collector: a real change without a diff is reported as incomplete evidence" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    collector.publish(.{
-        .path = "/work/bin.dat",
-        .kind = .modified,
-        .status = .applied,
-        .before_bytes = 10,
-        .after_bytes = 20,
-        .unified_diff = null,
-    });
-
-    const rec = collector.items.items[0];
-    try testing.expect(rec.unified_diff == null);
-    try testing.expect(!rec.diff_complete);
-}
-
-test "collector: a deletion needs no diff to be complete evidence" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    collector.publish(.{ .path = "/work/gone.txt", .kind = .deleted, .status = .applied, .before_bytes = 7 });
-    const rec = collector.items.items[0];
-    try testing.expectEqual(Kind.deleted, rec.kind);
-    try testing.expect(rec.diff_complete);
-}
-
-test "collector: an oversized diff is truncated and flagged, never silently shortened" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    const big = try a.alloc(u8, MAX_UNIFIED_DIFF_BYTES_V1 + 32);
-    defer a.free(big);
-    @memset(big, '+');
-    collector.publish(.{
-        .path = "/work/huge.txt",
-        .kind = .modified,
-        .status = .applied,
-        .after_bytes = big.len,
-        .unified_diff = big,
-    });
-
-    const rec = collector.items.items[0];
-    try testing.expectEqual(MAX_UNIFIED_DIFF_BYTES_V1, rec.unified_diff.?.len);
-    try testing.expect(!rec.diff_complete);
-}
-
-test "collector: publishing past the per-call cap sets overflow instead of dropping silently" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    var i: usize = 0;
-    while (i < MAX_FILE_CHANGES_PER_TOOL_RESULT_V1 + 3) : (i += 1) {
-        collector.publish(.{ .path = "/work/f.txt", .kind = .modified, .status = .applied });
-    }
-    try testing.expectEqual(MAX_FILE_CHANGES_PER_TOOL_RESULT_V1, collector.items.items.len);
-    try testing.expect(collector.overflow);
-}
-
-test "collector: toOwnedSlice hands ownership over and leaves nothing to double free" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-
-    collector.publish(.{ .path = "/work/a.txt", .kind = .created, .status = .applied, .unified_diff = "d" });
-    const taken = collector.toOwnedSlice().?;
-    defer freeRecords(a, taken);
-    try testing.expectEqual(@as(usize, 1), taken.len);
-    try testing.expectEqual(@as(usize, 0), collector.items.items.len);
-    try testing.expect(collector.toOwnedSlice() == null);
-}
-
-test "journal: clones records so it outlives the dispatch that produced them" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var journal = Journal.init(a);
-    defer journal.deinit();
-
-    {
-        var collector = testCollector(a, &ctx);
-        defer collector.deinit();
-        collector.publish(.{
-            .path = "/work/a.txt",
-            .kind = .modified,
-            .status = .applied,
-            .before_bytes = 1,
-            .after_bytes = 2,
-            .unified_diff = "-a\n+b\n",
-        });
-        journal.recordAll(collector.items.items);
-    }
-
-    try testing.expectEqual(@as(usize, 1), journal.count());
-    const records = journal.acquire();
-    defer journal.release();
-    const rec = records[0];
-    try testing.expectEqualStrings("a.txt", rec.path());
-    try testing.expectEqualStrings("-a\n+b\n", rec.unified_diff.?);
-    try testing.expect(!journal.truncated);
-}
-
-test "journal: exceeding the retention cap reports truncation" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var journal = Journal.init(a);
-    defer journal.deinit();
-
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-    collector.publish(.{ .path = "/work/a.txt", .kind = .modified, .status = .applied });
-
-    var i: usize = 0;
-    while (i < MAX_JOURNAL_ENTRIES_V1 + 2) : (i += 1) journal.recordAll(collector.items.items);
-
-    try testing.expectEqual(MAX_JOURNAL_ENTRIES_V1, journal.count());
-    try testing.expect(journal.truncated);
-}
-
 test "json projection: v1 field names, locator kind, and move provenance" {
     const a = testing.allocator;
     const records = [_]Record{
@@ -750,66 +429,6 @@ test "json projection: v1 field names, locator kind, and move provenance" {
     try testing.expectEqual(@as(i64, 1), arr[1].object.get("agent_depth").?.integer);
     // A deletion/move with no diff must not fabricate one.
     try testing.expect(arr[1].object.get("unified_diff") == null);
-}
-
-test "journal: over the diff budget it keeps the change, drops only the text" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var journal = Journal.init(a);
-    defer journal.deinit();
-
-    const big = try a.alloc(u8, MAX_UNIFIED_DIFF_BYTES_V1);
-    defer a.free(big);
-    @memset(big, '+');
-
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-    collector.publish(.{
-        .path = "/work/big.txt",
-        .kind = .modified,
-        .status = .applied,
-        .after_bytes = big.len,
-        .unified_diff = big,
-    });
-
-    var rounds: usize = 0;
-    while (rounds < (MAX_JOURNAL_DIFF_BYTES_V1 / MAX_UNIFIED_DIFF_BYTES_V1) + 2) : (rounds += 1) {
-        journal.recordAll(collector.items.items);
-    }
-
-    try testing.expect(journal.truncated);
-    try testing.expect(journal.diff_bytes <= MAX_JOURNAL_DIFF_BYTES_V1);
-    const records = journal.acquire();
-    defer journal.release();
-    try testing.expectEqual(rounds, records.len); // every change still recorded
-    var dropped: usize = 0;
-    for (records) |rec| {
-        try testing.expectEqualStrings("big.txt", rec.path());
-        try testing.expectEqual(Status.applied, rec.status);
-        if (rec.unified_diff == null) {
-            dropped += 1;
-            try testing.expect(!rec.diff_complete);
-        }
-    }
-    try testing.expect(dropped > 0);
-}
-
-test "journal: reset drops the retained session and its budget" {
-    const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var journal = Journal.init(a);
-    defer journal.deinit();
-
-    var collector = testCollector(a, &ctx);
-    defer collector.deinit();
-    collector.publish(.{ .path = "/work/a.txt", .kind = .created, .status = .applied, .unified_diff = "+a\n" });
-    journal.recordAll(collector.items.items);
-    try testing.expectEqual(@as(usize, 1), journal.count());
-
-    journal.reset();
-    try testing.expectEqual(@as(usize, 0), journal.count());
-    try testing.expectEqual(@as(usize, 0), journal.diff_bytes);
-    try testing.expect(!journal.truncated);
 }
 
 test "json envelope: carries the schema version and the truncation flag" {

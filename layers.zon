@@ -65,6 +65,7 @@
                 "src/core/tool_result_artifact.zig",
                 "src/core/answer_queue.zig",
                 "src/core/execution_effect.zig",
+                "src/core/file_change.zig",
                 "src/core/memory/memdir.zig",
                 "src/core/project_rule_spec.zig",
                 "src/core/prompt_sections.zig",
@@ -152,7 +153,7 @@
     .kernel_budget = .{
         .package = "kernel",
         .max_lines = 4600,
-        .max_dependencies = .{ "base", "ai", "coding" },
+        .max_dependencies = .{ "base", "ai" },
         .raise_reason = "migration 3.2a (GitHub #775): the pi-agent-core style minimal kernel (loop, hooks, tool interface, sequential and parallel executor) and its fake-provider tests, measured at 1001 lines on top of 3264, plus room for review fixes; 3.2b onward moves agent_loop onto it and takes the budget back down",
     },
 }

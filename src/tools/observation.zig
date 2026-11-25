@@ -164,6 +164,40 @@ pub const FileTargetState = enum {
     unavailable,
 };
 
+pub const Locator = union(enum) {
+    workspace_path: []const u8,
+    absolute_path: []const u8,
+    uri: []const u8,
+};
+
+pub const Range = struct {
+    start: Position,
+    end: Position,
+};
+
+pub const Position = struct {
+    line: u32,
+    column: u32,
+};
+
+pub const FileReference = struct {
+    locator: Locator,
+    title: []const u8,
+    kind: []const u8,
+    range: ?Range = null,
+
+    pub fn deinit(self: *FileReference, allocator: std.mem.Allocator) void {
+        switch (self.locator) {
+            inline else => |value| allocator.free(value),
+        }
+        allocator.free(self.title);
+        allocator.free(self.kind);
+        self.* = undefined;
+    }
+};
+
+pub const LocatorKind = enum { workspace_path, absolute_path, uri };
+
 pub const FormalCandidateDecision = struct {
     operation: FormalOperation = .pre_decision,
     result: FormalResult,

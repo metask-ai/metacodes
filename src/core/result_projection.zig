@@ -11,6 +11,8 @@ const artifact = @import("tool_result_artifact.zig");
 const tool_result = @import("tool_result.zig");
 const types = @import("../types.zig");
 const conversation_mod = @import("conversation.zig");
+const Conversation = conversation_mod.Conversation;
+const ToolResultReduction = Conversation.ToolResultReduction;
 const result_budget = @import("result_budget.zig");
 const json_mod = @import("../json.zig");
 const util_json = @import("../util/json.zig");
@@ -1039,7 +1041,7 @@ fn alignedCut(source: []const u8, desired: usize) usize {
 /// different budget, and their generic head/tail truncation is a *text* edit:
 /// applied to an envelope it produces unparseable JSON, which destroys the
 /// artifact id, the digest and the read instruction - the only way the omitted
-/// bytes can ever be recovered. `clearToolResultAt` already refuses to erase
+/// bytes can ever be recovered. `mayClear` already refuses to erase
 /// that capability; this is how the truncation pass keeps the same promise
 /// while still doing its job. No store access: the preview is re-cut from the
 /// one the envelope already carries.
@@ -1283,6 +1285,226 @@ fn literalTotal(items: []const Item) usize {
     var total: usize = 0;
     for (items) |item| total +|= item.content.*.len;
     return total;
+}
+
+/// Microcompact(批4,对齐 cc 的工具结果清理):把"较老"消息里的 tool_result 内容
+/// 替换成短 stub(释放 token),但**保留消息结构**(对话流不断、不调 API)。
+/// 比 compactKeepRecent 温和:不丢消息,只清旧工具结果(最占 token 的部分)。
+/// keep_recent_n:最近 N 条消息的 tool_result 不动(可能还要引用)。
+/// 返回清理的 tool_result 个数。
+pub fn microcompactToolResults(conversation: *Conversation, keep_recent_n: usize) usize {
+    const total = conversation.messages.items.len;
+    if (total <= keep_recent_n) return 0;
+    const boundary = total - keep_recent_n;
+    conversation.lockSnapshot();
+    defer conversation.unlockSnapshot();
+
+    var cleared: usize = 0;
+    for (conversation.messages.items[0..boundary], 0..) |m, mi| {
+        for (m.blocks, 0..) |b, bi| {
+            if (b != .tool_result) continue;
+            if (!mayClear(b.tool_result.content, b.tool_result.delivered)) continue;
+            if (conversation.clearToolResultLocked(mi, bi) == null) continue;
+            cleared += 1;
+        }
+    }
+    return cleared;
+}
+
+/// Codex-style tool output pressure valve: keep only the most recent K
+/// tool_result blocks intact, independent of message boundaries. This avoids
+/// the common failure mode where "recent N messages" preserves many old tool
+/// outputs in a dense tool turn and full compact keeps firing with low savings.
+pub fn microcompactToolResultsByRecentResults(conversation: *Conversation, keep_recent_results: usize) ToolResultReduction {
+    conversation.lockSnapshot();
+    defer conversation.unlockSnapshot();
+    var out = ToolResultReduction{};
+    var seen_recent: usize = 0;
+    var mi = conversation.messages.items.len;
+    while (mi > 0) {
+        mi -= 1;
+        const m = conversation.messages.items[mi];
+        var bi = m.blocks.len;
+        while (bi > 0) {
+            bi -= 1;
+            const b = m.blocks[bi];
+            if (b != .tool_result) continue;
+            seen_recent += 1;
+            if (seen_recent <= keep_recent_results) continue;
+            if (!mayClear(b.tool_result.content, b.tool_result.delivered)) continue;
+            const before = b.tool_result.content.len;
+            const after = conversation.clearToolResultLocked(mi, bi) orelse continue;
+            out.cleared += 1;
+            out.bytes_before += before;
+            out.bytes_after += after;
+        }
+    }
+    return out;
+}
+
+/// Bound every inline tool_result. The latest result is still shown to the
+/// model, but as a head/tail preview instead of an unbounded blob. This is
+/// intentionally independent of full compact: a single recent tool result
+/// can be enough to exceed the context window.
+///
+/// `project` bounds results only at the moment they are committed, and never
+/// re-projects history. This pass is therefore the only bound that applies to
+/// results which entered the Conversation under a different budget: a
+/// transcript loaded by /resume, or a session that switched to a
+/// smaller-window model. It runs beside the microcompact clear pass in
+/// `maybeAutoCompact`; both are no-ops when every result already fits.
+pub fn truncateLargeToolResults(conversation: *Conversation, max_bytes: usize) ToolResultReduction {
+    conversation.lockSnapshot();
+    defer conversation.unlockSnapshot();
+    var out = ToolResultReduction{};
+    if (max_bytes == 0) return out;
+    for (conversation.messages.items, 0..) |m, mi| {
+        for (m.blocks, 0..) |b, bi| {
+            if (b != .tool_result) continue;
+            const tr = b.tool_result;
+            if (tr.content.len <= max_bytes) continue;
+            if (conversation_mod.isCommittedToolResultProjection(tr.content)) continue;
+            // A truncated base64 payload is neither an image nor useful
+            // text; images are charged at IMAGE_TOKEN_ESTIMATE anyway.
+            if (isImageResult(tr.content)) continue;
+            const before = tr.content.len;
+            const new_content = boundToolResultContent(conversation.allocator, tr.content, max_bytes) orelse continue;
+            conversation.replaceToolResultContentLocked(mi, bi, new_content);
+            out.truncated += 1;
+            out.bytes_before += before;
+            out.bytes_after += new_content.len;
+        }
+    }
+    return out;
+}
+
+/// Keep the base64 bytes of active images under `cap` before a request.
+/// The total counts image tool results *and* first-class `.image` blocks
+/// (user inputs — never cleared, but they consume the allowance). Clears
+/// (stubs, with the usual sha256 commitment) image result blocks whose
+/// block-level watermark says the provider received the picture natively,
+/// oldest first. Nothing else is ever cleared: an undelivered result (the
+/// turn about to be sent, a placeholder-only picture, or a resumed record
+/// whose persisted flag is false) is exactly what the watermark protects.
+/// Envelopes and stubs are not images and are not counted. Returns what
+/// was cleared and how far the non-trimmable remainder still exceeds the cap.
+pub fn trimDeliveredImageBytes(conversation: *Conversation, cap: usize) Conversation.ImageTrim {
+    conversation.lockSnapshot();
+    defer conversation.unlockSnapshot();
+    var out = Conversation.ImageTrim{};
+    const active_start = conversation.activeStart();
+    var total = conversation.activeImageBytesLocked(active_start, false);
+    if (total <= cap) return out;
+    var mi = active_start;
+    while (mi < conversation.messages.items.len and total > cap) : (mi += 1) {
+        const m = conversation.messages.items[mi];
+        if (m.role != .user) continue;
+        for (m.blocks, 0..) |b, bi| {
+            if (total <= cap) break;
+            if (b != .tool_result) continue;
+            const tr = b.tool_result;
+            if (!tr.delivered or !isImageResult(tr.content)) continue;
+            if (hasRecoverableArtifact(tr.content)) continue;
+            const before = tr.content.len;
+            const after = conversation.clearToolResultLocked(mi, bi) orelse continue;
+            out.reduction.cleared += 1;
+            out.reduction.bytes_before += before;
+            out.reduction.bytes_after += after;
+            total -= before;
+        }
+    }
+    out.remaining_over_cap = total -| cap;
+    return out;
+}
+
+/// Artifact envelopes are already compact and are the only recovery
+/// capability for the omitted bytes. Microcompact must not erase that
+/// capability merely because the result became old.
+fn mayClear(content: []const u8, delivered: bool) bool {
+    if (!delivered and isImageResult(content)) return false;
+    return !hasRecoverableArtifact(content);
+}
+
+/// Bring one oversized tool result under `max_bytes` without ever destroying
+/// the only way its omitted bytes can be recovered.
+///
+/// `truncateToolResultContent` is a *text* edit. Applied to an artifact
+/// envelope it produces unparseable JSON, which takes the artifact id, the
+/// digest and the read instruction down with it - and the next microcompact
+/// pass, no longer able to see a recoverable artifact, then clears the wreck
+/// to a stub. `mayClear` explicitly refuses to erase that capability;
+/// this pass has to keep the same promise, so an envelope is re-rendered by
+/// the layer that owns its shape and anything that layer cannot rewrite is
+/// left alone.
+///
+/// Returns null when the result must be left as it is.
+fn boundToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ?[]u8 {
+    // A recoverable artifact envelope is re-rendered by the layer that owns its
+    // shape, which knows how to recompute every counter exactly.
+    if (shrinkRecoverableEnvelope(allocator, content, max_bytes)) |shrunk|
+        return shrunk;
+    // Anything else structured - `metacodes.bash-result.v2`, a non-recoverable
+    // fallback envelope, any tool's large JSON - keeps its shape by trimming
+    // only its long string values. The text path below would leave
+    // unparseable output and take `exit_code`, `storage_error` and every id
+    // and flag down with the one long string that made the result oversized.
+    if (shrinkStructuredResult(allocator, content, max_bytes)) |shrunk|
+        return shrunk;
+    // Structured but unshrinkable - a result whose bulk is not in its strings,
+    // say a large numeric array. Trimming found nothing to give back, and the
+    // text path would emit unparseable output, so it is left oversized: that
+    // costs one request, where destroying the schema costs the result. Same
+    // reasoning as the recoverable-artifact case, and the reason the text path
+    // below is reserved for content that was never structured.
+    if (hasRecoverableArtifact(content)) return null;
+    if (isStructuredObject(content)) return null;
+    return truncateToolResultContent(allocator, content, max_bytes) catch null;
+}
+
+fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {
+    if (content.len <= max_bytes) return try allocator.dupe(u8, content);
+    const digest = artifact.sha256Hex(content);
+    if (max_bytes < 1024) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}original_bytes={d} sha256={s}]\n[tool output truncated to fit context]",
+            .{ conversation_mod.TOOL_RESULT_COMMITMENT_PREFIX, content.len, digest[0..] },
+        );
+    }
+
+    const preview_budget = max_bytes - 512;
+    const wanted_head_len = preview_budget * 3 / 4;
+    const wanted_tail_len = preview_budget - wanted_head_len;
+    const content_is_valid_utf8 = std.unicode.utf8ValidateSlice(content);
+    const head_end = if (content_is_valid_utf8)
+        result_budget.floorUtf8Boundary(content, wanted_head_len)
+    else
+        validUtf8PrefixLen(content, wanted_head_len);
+    var tail_start = if (content_is_valid_utf8)
+        result_budget.ceilUtf8Boundary(content, content.len - wanted_tail_len)
+    else
+        content.len;
+    if (tail_start < head_end) tail_start = head_end;
+    const omitted = tail_start - head_end;
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}original_bytes={d} sha256={s}]\n[tool output truncated to fit context: shown_head_bytes={d}, shown_tail_bytes={d}]\n\n{s}\n\n...[truncated {d} bytes]...\n\n{s}",
+        .{ conversation_mod.TOOL_RESULT_COMMITMENT_PREFIX, content.len, digest[0..], head_end, content.len - tail_start, content[0..head_end], omitted, content[tail_start..] },
+    );
+}
+
+fn validUtf8PrefixLen(s: []const u8, desired: usize) usize {
+    var i: usize = 0;
+    var last: usize = 0;
+    const limit = @min(desired, s.len);
+    while (i < limit) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
+        if (n > limit - i) break;
+        _ = std.unicode.utf8Decode(s[i .. i + n]) catch break;
+        i += n;
+        last = i;
+    }
+    return last;
 }
 
 test "structured spill remains valid JSON and exposes no local path" {

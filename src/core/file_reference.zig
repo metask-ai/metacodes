@@ -8,6 +8,7 @@ const ToolContext = @import("../tools/context.zig").ToolContext;
 const common = @import("../tools/common.zig");
 const json_util = @import("../util/json.zig");
 const path_mod = @import("../util/path.zig");
+const observation = @import("../tools/observation.zig");
 
 pub const MAX_FILE_REFS_PER_TOOL_RESULT_V1: usize = 32;
 pub const MAX_FILE_REF_PATH_BYTES_V1: usize = 4096;
@@ -15,39 +16,11 @@ pub const MAX_FILE_REF_URI_BYTES_V1: usize = 8192;
 pub const MAX_FILE_REF_TITLE_BYTES_V1: usize = 256;
 pub const MAX_FILE_REF_KIND_BYTES_V1: usize = 64;
 
-pub const Locator = union(enum) {
-    workspace_path: []const u8,
-    absolute_path: []const u8,
-    uri: []const u8,
-};
-
-pub const Range = struct {
-    start: Position,
-    end: Position,
-};
-
-pub const Position = struct {
-    line: u32,
-    column: u32,
-};
-
-pub const FileReference = struct {
-    locator: Locator,
-    title: []const u8,
-    kind: []const u8,
-    range: ?Range = null,
-
-    pub fn deinit(self: *FileReference, allocator: std.mem.Allocator) void {
-        switch (self.locator) {
-            inline else => |value| allocator.free(value),
-        }
-        allocator.free(self.title);
-        allocator.free(self.kind);
-        self.* = undefined;
-    }
-};
-
-pub const LocatorKind = enum { workspace_path, absolute_path, uri };
+pub const Locator = observation.Locator;
+pub const Range = observation.Range;
+pub const Position = observation.Position;
+pub const FileReference = observation.FileReference;
+pub const LocatorKind = observation.LocatorKind;
 
 /// Execution-context output. It is resolved and classified at the dispatch
 /// seam; the projection below accepts only this value and performs no path

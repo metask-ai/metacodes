@@ -270,6 +270,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Zig source API: tool-result reduction moved out of `Conversation`, and
+  the packages no longer form a cycle.** `Conversation.microcompactToolResults`,
+  `microcompactToolResultsByRecentResults`, `truncateLargeToolResults` and
+  `trimDeliveredImageBytes` are now `result_projection` functions that take the
+  `*Conversation` first: `conv.truncateLargeToolResults(n)` becomes
+  `result_projection.truncateLargeToolResults(&conv, n)`. `Conversation` gains
+  `clearToolResultLocked`, `replaceToolResultContentLocked` and a public
+  `activeImageBytesLocked`, called between `lockSnapshot` and `unlockSnapshot`.
+  `file_change.Collector` is now `tool_exec.Collector`, unchanged. The pure
+  data types of `file_reference` (`Locator`, `Range`, `Position`,
+  `FileReference`, `LocatorKind`) are defined in `tools/observation.zig`;
+  `file_reference` keeps them as aliases, so existing names still resolve, and
+  `resolveFileTarget` / `classifyPath` keep their signatures.
+  The C ABI, `agentcore.h`, the ABI revision, event JSON, stream-json, request
+  bytes and transcripts are unchanged; AgentCore consumers are not affected.
+  `layer:check` now reports 0 upward imports and 0 package cycles.
+
 - **Bench concurrency is set only on the profile page.** The 评测 page no
   longer has a 并发数 field and `POST /api/profiles/run` no longer takes
   `concurrency`. A profile has one concurrency (10 when it is created); its
