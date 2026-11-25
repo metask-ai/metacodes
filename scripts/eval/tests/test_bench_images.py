@@ -169,6 +169,7 @@ class TaskReferencesTest(unittest.TestCase):
         main, db = "ghcr.io/org/env:1", "ghcr.io/org/db:2"
         cases = [
             ("block", "services:\n  db:\n    image: IMAGE", True, True),
+            ("next-line image", "--- # compose\nservices:\n  db:\n    image:\n      IMAGE", True, True),
             ("flow", "services:\n  db: {restart: always, image: IMAGE}", True, True),
             ("multiline flow", "services:\n  db: {environment: {NOTE: 'a,#b'}, # sidecar\n    image: IMAGE\n  }",
              True, True),
@@ -176,9 +177,14 @@ class TaskReferencesTest(unittest.TestCase):
             ("scalar anchor", "x-image: &base IMAGE\nservices:\n  db:\n    image: *base", True, True),
             ("mapping anchor", "x-db: &base\n  image: IMAGE\nservices:\n  db: *base", True, True),
             ("merge", "x-db: &base {image: IMAGE}\nservices:\n  db:\n    <<: *base", True, True),
+            ("block merge list", "x-db: &base\n  image: IMAGE\nservices:\n  db:\n    <<:\n      - *base", True, True),
+            ("indentless merge list", "x-db: &base {image: IMAGE}\nx-old: &old {image: ghcr.io/org/old}\n"
+             "services:\n  db:\n    <<:\n    - *base\n    - *old", True, True),
             ("override", "x-db: &base {image: ghcr.io/org/unused}\nservices:\n  db: {image: IMAGE, <<: *base}",
              True, True),
             ("build", "x-local: &local {build: .}\nservices:\n  db: {<<: *local, image: IMAGE}", False, True),
+            ("inherited build", "x-local: &base {image: IMAGE, build: .}\nservices:\n  db:\n    <<:\n      - *base",
+             False, True),
             ("variable", "services:\n  db: {image: 'ghcr.io/org/db:$TAG'}", False, False),
             ("environment key", "services:\n  db:\n    environment:\n      image: IMAGE", False, False),
         ]

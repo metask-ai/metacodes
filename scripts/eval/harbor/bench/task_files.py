@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections import deque
 from dataclasses import dataclass, field
-from itertools import chain
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -59,17 +59,21 @@ def pull_sources(task: Path) -> Iterator[tuple[str, str]]:
 
 
 QUOTED = r'''(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')'''
-PAIR = re.compile(r"(" + QUOTED + r"|[\w.<>-]+)\s*:\s*(.*)")
+KEY = r"(" + QUOTED + r"|[\w.<>-]+)\s*:"
+FLOW_PAIR = re.compile(KEY + r"\s*(.*)")
+BLOCK_PAIR = re.compile(KEY + r"(?:\s+(.*)|$)")
 COMMENT = re.compile(QUOTED + r"|(?<!\S)#[^\n]*")
 ANCHOR = re.compile(r"&([^\s,\[\]{}]+)(?:\s+|$)")
+DOCUMENT_LINE = re.compile(r"^(?:%.*|(?:---|\.\.\.)\s*(?:#.*)?)$")
 
 
-def flow_items(value: str, lines: Iterator[str]) -> Iterator[str]:
+def flow_items(value: str, lines) -> Iterator[str]:
     parts = []
     depth = 1
     quote = ""
     escaped = False
-    for line in chain((value[1:],), lines):
+    line = value[1:]
+    while True:
         start = 0
         for index, char in enumerate(line):
             if quote:
@@ -98,6 +102,9 @@ def flow_items(value: str, lines: Iterator[str]) -> Iterator[str]:
                 start = index + 1
         parts.append(line[start:])
         escaped = False
+        if not lines:
+            return
+        line = lines.popleft()
 
 
 def put(mapping, key, value):
@@ -110,20 +117,32 @@ def put(mapping, key, value):
         mapping[key.strip("\"'")] = value
 
 
-def compose_value(text, anchors, lines):
+def indent(line):
+    return len(line) - len(line.lstrip())
+
+
+def list_item(text):
+    return text == "-" or text.startswith("- ")
+
+
+def compose_value(text, anchors, lines=(), parent_indent=None):
     anchor = ANCHOR.match(text)
     if anchor:
         text = text[anchor.end():]
     if not text or text.startswith("#"):
-        value = {}
+        value = None
+        if lines and parent_indent is not None:
+            depth = indent(lines[0])
+            if depth > parent_indent or (depth == parent_indent and list_item(lines[0].lstrip())):
+                value = compose_block(lines, anchors)
     elif text.startswith("{"):
         value = {}
         for item in flow_items(text, lines):
-            pair = PAIR.fullmatch(item)
+            pair = FLOW_PAIR.fullmatch(item)
             if pair:
-                put(value, pair[1], compose_value(pair[2], anchors, iter(())))
+                put(value, pair[1], compose_value(pair[2], anchors))
     elif text.startswith("["):
-        value = [compose_value(item, anchors, iter(())) for item in flow_items(text, lines)]
+        value = [compose_value(item, anchors) for item in flow_items(text, lines)]
     else:
         comment = next((m.start() for m in COMMENT.finditer(text) if m[0].startswith("#")), len(text))
         scalar = text[:comment].rstrip()
@@ -136,28 +155,35 @@ def compose_value(text, anchors, lines):
     return value
 
 
-def compose_services(text: str) -> Iterator[Service]:
-    root, anchors = {}, {}
-    parents = [(-1, root)]
-    lines = iter(text.splitlines())
-    for line in lines:
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
+def compose_block(lines, anchors):
+    depth = indent(lines[0])
+    first = lines[0].lstrip()
+    sequence = list_item(first)
+    if not sequence and not BLOCK_PAIR.fullmatch(first):
+        return compose_value(lines.popleft().strip(), anchors, lines, depth)
+    block = [] if sequence else {}
+    while lines and indent(lines[0]) >= depth:
+        line = lines[0].lstrip()
+        if indent(lines[0]) > depth:
+            lines.popleft()
             continue
-        depth = len(line) - len(stripped)
-        while depth <= parents[-1][0]:
-            parents.pop()
-        parent = parents[-1][1]
-        pair = PAIR.fullmatch(stripped)
-        if isinstance(parent, dict) and stripped.startswith("{"):
-            parent.update(compose_value(stripped, anchors, lines))
-        elif isinstance(parent, dict) and pair:
-            value = compose_value(pair[2], anchors, lines)
-            put(parent, pair[1], value)
-            parents.append((depth, value))
+        if sequence != list_item(line):
+            break
+        lines.popleft()
+        if sequence:
+            block.append(compose_value(line[1:].strip(), anchors, lines, depth))
         else:
-            parents.append((depth, None))
-    services = root.get("services")
+            pair = BLOCK_PAIR.fullmatch(line)
+            if pair:
+                put(block, pair[1], compose_value(pair[2] or "", anchors, lines, depth))
+    return block
+
+
+def compose_services(text: str) -> Iterator[Service]:
+    lines = deque(line.rstrip() for line in text.splitlines()
+                  if line.strip() and not line.lstrip().startswith("#") and not DOCUMENT_LINE.fullmatch(line))
+    root = compose_block(lines, {}) if lines else {}
+    services = root.get("services") if isinstance(root, dict) else None
     if isinstance(services, dict):
         for name, config in services.items():
             config = config if isinstance(config, dict) else {}
