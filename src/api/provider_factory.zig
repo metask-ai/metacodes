@@ -151,6 +151,27 @@ pub fn makeProviderWithDialectResolver(
 
 /// `credential` is borrowed: fixed bytes or a replaceable cell must outlive
 /// the returned provider.
+fn holdLookup(userdata: ?*anyopaque, host: std.Io.net.HostName, queue: *std.Io.Queue(std.Io.net.HostName.LookupResult), options: std.Io.net.HostName.LookupOptions) std.Io.net.HostName.LookupError!void {
+    const rt: *std.Io.Threaded = @ptrCast(@alignCast(userdata.?));
+    const io = rt.io();
+    try io.vtable.netLookup(userdata, host, queue, options);
+    std.Io.sleep(io, .fromMilliseconds(40), .awake) catch {};
+}
+
+fn probeIo(rt: *std.Io.Threaded) std.Io {
+    var io = rt.io();
+    if (std.c.getenv("IDLE_PROBE_OVERLAP") != null) {
+        const table = comptime blk: {
+            var dummy: std.Io.Threaded = undefined;
+            var value = dummy.io().vtable.*;
+            value.netLookup = holdLookup;
+            break :blk value;
+        };
+        io.vtable = &table;
+    }
+    return io;
+}
+
 pub fn makeProviderWithOptions(
     a: std.mem.Allocator,
     kind: types.ProviderKind,
@@ -176,7 +197,7 @@ pub fn makeProviderWithOptions(
                 c.deinit();
                 a.destroy(c);
             }
-            c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), "", model, base_url);
+            c.* = client_mod.Client.initWithBaseUrl(a, probeIo(io_rt), "", model, base_url);
             c.credential = credential;
             c.dialect_resolver = dialect_resolver;
             c.declared_dialect = options.dialect;

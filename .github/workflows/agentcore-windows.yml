@@ -71,19 +71,5 @@ jobs:
           restore-keys: zig-0.16.0-${{ runner.os }}-${{ runner.arch }}-agentcore-gate-run-
       - name: Build ABI suite once
         run: zig build idle-probe-build sandbox:helper -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSafe
-      - name: Compare single, suite and retained-monitor control
-        shell: pwsh
-        run: |
-          $env:METACODES_TEST_ROOT = "tests/component"
-          $env:METACODES_SANDBOX_HELPER = (Resolve-Path zig-out/bin/metacodes-fs-helper.exe)
-          $env:IDLE_PROBE_POOL = "1"
-          foreach ($case in "before-single", "before-suite", "bound-single", "bound-suite", "bound-leak-single") {
-            $env:IDLE_PROBE_SINGLE = if ($case.EndsWith("single")) { "1" } else { $null }
-            $env:IDLE_PROBE_BOUND = if ($case.StartsWith("bound")) { "1" } else { $null }
-            $env:IDLE_PROBE_LEAK = if ($case.Contains("leak")) { "1" } else { $null }
-            Write-Host "probe begin $case"
-            $clock = [Diagnostics.Stopwatch]::StartNew()
-            & ./zig-out/bin/agentcore-abi-contract.exe
-            Write-Host "probe end $case exit=$LASTEXITCODE elapsed_ms=$($clock.ElapsedMilliseconds)"
-          }
-          exit 0
+      - name: Sample natural and overlapping connection schedules
+        run: python idle_probe.py
