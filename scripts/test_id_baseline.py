@@ -20,6 +20,10 @@ SOURCES = 'tests/test_ids/linux-sources.tsv'
 LEGS = ('units', 'product', 'checks')
 META = 'test-ids-meta.json'
 TSV = 'test-ids.tsv'
+PRE_INVENTORY_WIRING = {
+    ('a4fc3a7282105248eac18302615348722ed06d17', '8c080596871248665c6f05e3d97b80695aa7af8e'),
+    ('f9d1cce3e251a0946354603c26e0b95fae8c74ac', 'd33b70ff8a2a1a8858c8d6520261176991ecbc6d'),
+}
 
 
 def git(*args):
@@ -34,9 +38,8 @@ def require(value, message):
 def expected_sources(rev, event):
     result = subprocess.run(['git', 'show', f'{rev}:{SOURCES}'], capture_output=True, text=True)
     if result.returncode:
-        require(git('rev-parse', f'{rev}:build.zig') == 'a4fc3a7282105248eac18302615348722ed06d17'
-                and git('rev-parse', f'{rev}:.github/workflows/ci.yml') == '8c080596871248665c6f05e3d97b80695aa7af8e',
-                'base predates the Linux ID inventory and has unknown test wiring')
+        wiring = (git('rev-parse', f'{rev}:build.zig'), git('rev-parse', f'{rev}:.github/workflows/ci.yml'))
+        require(wiring in PRE_INVENTORY_WIRING, 'base predates the Linux ID inventory and has unknown test wiring')
         bootstrap = ids.ROOT / SOURCES
         require(sha256(bootstrap) == 'ddfebf5ab1eb5dcb8a1c5ed159d3a31b2b991138d75a226e58e0e76fcd3f2edd',
                 'cannot verify a pre-inventory baseline with a changed source plan')
