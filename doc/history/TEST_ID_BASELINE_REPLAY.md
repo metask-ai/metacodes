@@ -19,9 +19,28 @@ The two decision jobs and the collector each had a three-minute timeout,
 for a ceiling of 69 Linux runner-minutes. The original PR supplied the head
 IDs, so the measurement isolates additional baseline work.
 
+## Result
+
+Both collectors produced the same 9,402 rows (14,399 occurrences, including
+TTY listings), byte for byte. SHA-256 of each `test-ids.tsv` was
+`7f1ab7890bc7b8177ee08d04c2fb6737db02cfd2426f76cb87751e5b5808eb32`.
+The per-leg source and shard counts matched across all 84 raw files. Both
+baselines passed the original PR head and rejected the head with a test
+removed. Omitting one raw integration shard failed the inventory check.
+
+| Baseline collection | Linux runner time | macOS runner time | Windows runner time | Dispatch to IDs | Dispatch to last job |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Historical main dispatch | 100m07s | 69m04s | 122m14s | 16m07s | 34m23s |
+| Pinned Linux replay | 33m15s | 0 | 0 | 14m02s | 14m02s |
+
+The replay saved 258m10s of cumulative runner occupancy on this sample.
+It ran separately from the historical head and deliberately exercised the
+cache-miss path. A same-run production fallback still needs to verify a
+complete baseline without relying on a historical control.
+
 ## Reproducing the comparison
 
-From a repository checkout, set `artifacts` to an empty directory and run:
+From a repository checkout, set `artifacts` to the absolute path of an empty directory and run:
 
 ```sh
 gh run download 45542782310 --name test-ids --dir "$artifacts/head"
@@ -66,10 +85,8 @@ archived complete run because both collections used exactly the same base.
 
 ## Historical cost
 
-The main dispatch took 16m07s to publish the base IDs and 34m23s to finish.
-Summing job durations by runner label gives 100m07s of Linux, 69m04s of
-macOS (hosted and VM) and 122m14s of Windows. These are runner occupancy
-times. The migrated PR passed its retried ID check at 04:21:29 UTC and
+Runner times sum completed job durations by runner label, including the macOS
+VM job. The migrated PR passed its retried ID check at 04:21:29 UTC and
 its [last pre-merge check](https://github.com/metask-ai/metacodes/actions/runs/45542782309/job/138976827272)
 finished at 04:36:58 UTC. This pair can demonstrate a difference in baseline
 cost; it cannot establish a corresponding reduction in time to merge.
