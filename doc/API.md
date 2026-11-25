@@ -328,7 +328,7 @@ share one input pipeline (`apps/cli/src/session_intent.zig` + `apps/cli/src/sess
 - **Run assembly.** `session_service.buildRunOptions` is the only place App
   state is projected into `agent_loop.Options`; hosts add only host-specific
   fields (UI requester, run-control observers, budgets).
-- Equivalence is locked by `tests/component/session_api_parity_test.zig`.
+- Equivalence is locked by `apps/cli/tests/component/session_api_parity_test.zig`.
 
 ### Edit and rerun
 
@@ -1539,7 +1539,7 @@ connecting or reconnecting:
 
 It also carries `session_id`, `additional_dirs`, token usage and cost, the
 agent roster, tasks and `plugin_inventory`.
-`tests/component/web_message_config_test.zig` holds both drivers (`--web` and
+`apps/cli/tests/component/web_message_config_test.zig` holds both drivers (`--web` and
 `serve`, over HTTP and UDS) to this section.
 
 ### SessionHost: a multi-session service for network Hosts

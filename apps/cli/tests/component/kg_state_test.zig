@@ -11,7 +11,7 @@ const platform = @import("platform");
 const pfs = platform.fs;
 const paths = platform.paths;
 const net = platform.net;
-const tinykg_binary = @import("tinykg_binary.zig");
+const tinykg_binary = @import("tinykg_binary");
 
 const KgClient = cc.kg_client.KgClient;
 const DegradedKind = cc.kg_client.DegradedKind;

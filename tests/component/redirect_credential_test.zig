@@ -446,6 +446,7 @@ test "L2 redirect: every HTTP request in src names its redirect policy" {
     }
     try collectZigFiles(allocator, "src", &files);
     try collectZigFiles(allocator, "apps", &files);
+    try collectZigFiles(allocator, "packages", &files);
     try std.testing.expect(files.items.len > 100);
 
     var sites: usize = 0;
@@ -500,6 +501,13 @@ fn requestCall(text: []const u8, from: usize) ?RequestCall {
     return null;
 }
 
+/// `cli/tests/...` under apps/: a package's own tests, not product source.
+fn isPackageTest(path: []const u8) bool {
+    var parts = std.mem.tokenizeAny(u8, path, "/\\");
+    _ = parts.next();
+    return std.mem.eql(u8, parts.next() orelse "", "tests");
+}
+
 fn collectZigFiles(allocator: std.mem.Allocator, root: []const u8, out: *std.ArrayList([]u8)) !void {
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, root, .{ .iterate = true });
     defer dir.close(std.testing.io);
@@ -507,6 +515,7 @@ fn collectZigFiles(allocator: std.mem.Allocator, root: []const u8, out: *std.Arr
     defer walker.deinit();
     while (try walker.next(std.testing.io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (!std.mem.eql(u8, root, "src") and isPackageTest(entry.path)) continue;
         try out.append(allocator, try std.fs.path.join(allocator, &.{ root, entry.path }));
     }
 }

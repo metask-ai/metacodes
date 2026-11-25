@@ -11,7 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
-const tinykg_binary = @import("tinykg_binary.zig");
+const tinykg_binary = @import("tinykg_binary");
 
 const learning = cc.learning_turn;
 const end_of_run = cc.learning_end_of_run;

@@ -543,6 +543,7 @@ fn readTree(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir) ![]const Sou
     var files: std.ArrayList(SourceFile) = .empty;
     try collect(arena, io, root, "src", &files);
     try collect(arena, io, root, "apps", &files);
+    try collect(arena, io, root, "packages", &files);
     try collect(arena, io, root, "tests", &files);
     std.mem.sort(SourceFile, files.items, {}, struct {
         fn lessThan(_: void, left: SourceFile, right: SourceFile) bool {
@@ -777,7 +778,7 @@ fn readBase(arena: std.mem.Allocator, io: std.Io, ref: []const u8) !?Base {
 }
 
 fn movesSince(arena: std.mem.Allocator, io: std.Io, ref: []const u8) ![]const [2][]const u8 {
-    const listing = try git(arena, io, &.{ "git", "diff", "--name-status", "-M", "--diff-filter=R", ref, "--", "src", "apps", "tests" }) orelse return error.InvalidBase;
+    const listing = try git(arena, io, &.{ "git", "diff", "--name-status", "-M", "--diff-filter=R", ref, "--", "src", "apps", "packages", "tests" }) orelse return error.InvalidBase;
     var moves: std.ArrayList([2][]const u8) = .empty;
     var lines = std.mem.tokenizeScalar(u8, listing, '\n');
     while (lines.next()) |line| {

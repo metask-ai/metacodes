@@ -1,11 +1,11 @@
-"""Golden vectors that pin tests/component/vterm.zig to screen.py (#319).
+"""Golden vectors that pin apps/cli/tests/component/vterm.zig to screen.py (#319).
 
-screen.py is the pty suite's terminal model; tests/component/vterm.zig is its
+screen.py is the pty suite's terminal model; apps/cli/tests/component/vterm.zig is its
 Zig port for component tests. This module replays a fixed corpus of byte
 streams through screen.py — hand-picked semantic cases (several ported from
 cases/test_autowrap_align.py, test_sgr_color.py and test_screen_resize.py)
 plus a seeded random corpus — and records screen.py's complete state after
-each. tests/component/vterm_test.zig replays the same operations through the
+each. apps/cli/tests/component/vterm_test.zig replays the same operations through the
 Zig port and must reach the same state; cases/test_vterm_parity.py fails when
 screen.py's answers drift from the committed fixture.
 

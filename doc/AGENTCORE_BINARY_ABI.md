@@ -459,7 +459,7 @@ JSON-bearing strings are not recursively interpreted by the SDK.
 validates the answer count for `ask_question`.
 
 The public `CoreEvent` schema is not the internal frontend/daemon union.
-`src/agentcore/protocol_v1.zig` exhaustively maps internal events to the
+`packages/agentcore/protocol_v1.zig` exhaustively maps internal events to the
 v1 DTO before serialization. Presentation hints (`set_current_tool`,
 `clear_current_tool`), implementation diagnostics (`diag_*`), and
 App/daemon coordination events (`config_changed`, `session_lifecycle`,

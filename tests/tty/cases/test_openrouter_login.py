@@ -6,7 +6,7 @@ dialog asks which way: the browser here (a loopback callback), another device
 OpenRouter address is moved onto a local mock with METACODES_OPENROUTER_URL,
 and the browser case delivers a code only after checking the page address it
 was given is on that mock: no made-up code reaches openrouter.ai. The flows
-themselves are covered by tests/component/openrouter_login_test.zig.
+themselves are covered by apps/cli/tests/component/openrouter_login_test.zig.
 """
 import http.server
 import json

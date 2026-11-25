@@ -667,9 +667,9 @@ const aggregate_test_exclusions = [_][]const u8{
     "component/tool_dispatcher_metadata_test.zig",
 };
 
-fn isAggregateTestExclusion(path: []const u8) bool {
-    for (aggregate_test_exclusions) |excluded| {
-        if (std.mem.eql(u8, path, excluded)) return true;
+fn isListed(list: []const []const u8, path: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, path, item)) return true;
     }
     return false;
 }
@@ -685,22 +685,42 @@ fn countAggregateImport(source: []const u8, expected_line: []const u8) usize {
     return count;
 }
 
+const AggregateRoot = struct { dir: []const u8, prefix: []const u8 };
+
 /// Fail during build-graph construction if a new component/integration test
-/// is not wired into the aggregate suite. The old one-artifact-per-file graph
+/// is not wired into its aggregate suite. The old one-artifact-per-file graph
 /// discovered new files implicitly; aggregation is much faster, but needs this
 /// explicit guard so the speedup can never silently reduce coverage.
 fn validateAggregateTestInventory(b: *std.Build) void {
-    const suite = b.build_root.handle.readFileAlloc(
-        b.graph.io,
-        "tests/integration_suite.zig",
-        b.allocator,
-        .limited(1024 * 1024),
-    ) catch |err| std.debug.panic("cannot read aggregate test inventory: {t}", .{err});
-
-    const roots = [_]struct { dir: []const u8, prefix: []const u8 }{
+    validateSuiteInventory(b, "tests/integration_suite.zig", &.{
         .{ .dir = "tests/component", .prefix = "component" },
         .{ .dir = "tests/integration", .prefix = "integration" },
-    };
+    }, &aggregate_test_exclusions);
+    validateSuiteInventory(b, "apps/cli/tests/suite.zig", &.{
+        .{ .dir = "apps/cli/tests/component", .prefix = "component" },
+    }, &.{});
+    for (aggregate_test_exclusions) |excluded| {
+        const path = b.fmt("tests/{s}", .{excluded});
+        const stat = b.build_root.handle.statFile(b.graph.io, path, .{
+            .follow_symlinks = false,
+        }) catch |err| std.debug.panic("dedicated test exclusion is missing: {s}: {t}", .{ path, err });
+        if (stat.kind != .file) std.debug.panic("dedicated test exclusion is not a regular file: {s}", .{path});
+    }
+}
+
+fn validateSuiteInventory(
+    b: *std.Build,
+    inventory: []const u8,
+    roots: []const AggregateRoot,
+    exclusions: []const []const u8,
+) void {
+    const suite = b.build_root.handle.readFileAlloc(
+        b.graph.io,
+        inventory,
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| std.debug.panic("cannot read aggregate test inventory {s}: {t}", .{ inventory, err });
+
     for (roots) |root| {
         var dir = b.build_root.handle.openDir(b.graph.io, root.dir, .{
             .iterate = true,
@@ -724,25 +744,18 @@ fn validateAggregateTestInventory(b: *std.Build) void {
             std.mem.replaceScalar(u8, path, '\\', '/');
             const expected_line = b.fmt("_ = @import(\"{s}\");", .{path});
             const occurrences = countAggregateImport(suite, expected_line);
-            if (isAggregateTestExclusion(path)) {
+            if (isListed(exclusions, path)) {
                 if (occurrences != 0) std.debug.panic(
-                    "dedicated test {s} must not also appear in tests/integration_suite.zig",
-                    .{path},
+                    "dedicated test {s} must not also appear in {s}",
+                    .{ path, inventory },
                 );
             } else if (occurrences != 1) {
                 std.debug.panic(
-                    "aggregate test inventory requires exactly one @import for {s}; found {}",
-                    .{ path, occurrences },
+                    "{s} requires exactly one @import for {s}; found {}",
+                    .{ inventory, path, occurrences },
                 );
             }
         }
-    }
-    for (aggregate_test_exclusions) |excluded| {
-        const path = b.fmt("tests/{s}", .{excluded});
-        const stat = b.build_root.handle.statFile(b.graph.io, path, .{
-            .follow_symlinks = false,
-        }) catch |err| std.debug.panic("dedicated test exclusion is missing: {s}: {t}", .{ path, err });
-        if (stat.kind != .file) std.debug.panic("dedicated test exclusion is not a regular file: {s}", .{path});
     }
 }
 
@@ -782,7 +795,7 @@ const AgentCoreAbiModuleOptions = struct {
 /// a delivery concern and must never leak into in-tree test executables.
 fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path("src/agentcore/abi_v1.zig"),
+        .root_source_file = b.path("packages/agentcore/abi_v1.zig"),
         .target = options.target,
         .optimize = options.optimize,
         .strip = options.strip,
@@ -795,9 +808,9 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
     if (options.target.result.os.tag == .windows)
         mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
     if (options.target.result.os.tag == .windows and options.target.result.abi == .msvc)
-        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_msvc_crt_shims.c"), .flags = &.{"-std=c11"} });
+        mod.addCSourceFile(.{ .file = b.path("packages/agentcore/windows_msvc_crt_shims.c"), .flags = &.{"-std=c11"} });
     if (options.target.result.os.tag == .windows and options.target.result.abi == .gnu)
-        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_gnu_crt_shims.c"), .flags = &.{"-std=c11"} });
+        mod.addCSourceFile(.{ .file = b.path("packages/agentcore/windows_gnu_crt_shims.c"), .flags = &.{"-std=c11"} });
     return mod;
 }
 
@@ -860,6 +873,72 @@ fn addCoreSuiteRun(
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
         wireLeanKernelTestInputs(run_shard, lean_kernels);
+        report.* = run_shard.captureStdOut(.{
+            .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
+        });
+    }
+    const run_reporter = b.addRunArtifact(reporter);
+    for (reports) |report| run_reporter.addFileArg(report);
+    return &run_reporter.step;
+}
+
+/// One compilation of a component/integration inventory (tests/integration_suite.zig,
+/// apps/cli/tests/suite.zig) whose tests scripts/sharded_test_runner.zig partitions.
+fn addAggregateSuite(
+    b: *std.Build,
+    name: []const u8,
+    root_module: *std.Build.Module,
+    tfilter: ?[]const u8,
+) *std.Build.Step.Compile {
+    return b.addTest(.{
+        .name = name,
+        .root_module = root_module,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/sharded_test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+}
+
+/// What every process of an aggregate suite runs against: the installed CLI,
+/// the test probes, and the staged TinyKG, Lean kernels and ripgrep.
+const AggregateSuiteInputs = struct {
+    cli_bin: []const u8,
+    installs: []const *std.Build.Step,
+    tinykg: ?StagedTinyKg,
+    tinykgd: ?StagedTinyKgd,
+    lean_kernels: StagedLeanKernels,
+    ripgrep: RipgrepBundleInfo,
+};
+
+fn wireAggregateSuiteInputs(b: *std.Build, run: *std.Build.Step.Run, inputs: AggregateSuiteInputs) void {
+    run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", inputs.cli_bin);
+    for (inputs.installs) |install| run.step.dependOn(install);
+    wireTinyKgTestInput(run, inputs.tinykg);
+    wireTinyKgdTestInput(run, inputs.tinykgd);
+    wireLeanKernelTestInputs(run, inputs.lean_kernels);
+    wirePinnedRipgrepTestInput(b, run, inputs.ripgrep);
+}
+
+/// Runs an aggregate suite as `shards` processes; the returned step is the
+/// reporter, which accepts the reports only when together they cover exactly
+/// the compiled test inventory.
+fn addAggregateSuiteRun(
+    b: *std.Build,
+    suite: *std.Build.Step.Compile,
+    shards: u8,
+    reporter: *std.Build.Step.Compile,
+    inputs: AggregateSuiteInputs,
+) *std.Build.Step {
+    const reports = b.allocator.alloc(std.Build.LazyPath, shards) catch @panic("OOM");
+    for (reports, 0..) |*report, shard_index| {
+        const run_shard = addTestRunArtifact(b, suite);
+        run_shard.has_side_effects = true;
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{shards}));
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
+        run_shard.expectExitCode(0);
+        wireAggregateSuiteInputs(b, run_shard, inputs);
         report.* = run_shard.captureStdOut(.{
             .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
         });
@@ -1296,6 +1375,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, test_harness_mod); // harness socket 层走 platform/net(POSIX+Winsock 双后端)
+    // The staged TinyKG resolver, shared by tests/component and apps/cli/tests.
+    const test_tinykg_binary_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/tinykg_binary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // mock MCP server 二进制：测试专用，只装这个 artifact 即可运行 aggregate
     // integration；测试不应依赖全局 install step，否则会顺带冷编译 release/debug/replay。
@@ -1819,7 +1904,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = target.result.ofmt != .macho,
     });
     if (target.result.ofmt == .elf)
-        agentcore_shared_lib.setVersionScript(b.path("src/agentcore/shared_exports.map"));
+        agentcore_shared_lib.setVersionScript(b.path("packages/agentcore/shared_exports.map"));
     const agentcore_shared_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
     agentcore_shared_gate_cmd.addArg("--shared");
     agentcore_shared_gate_cmd.addFileArg(agentcore_shared_lib.getEmittedBin());
@@ -2559,6 +2644,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(units_test_step);
     test_step.dependOn(integration_test_step);
     test_step.dependOn(product_test_step);
+    // `test:cli` is the cli package's tests: the inline tests of apps/cli/src,
+    // the picker root, apps/cli/tests in its shards and the termios spike. It is
+    // part of `test:units`, and what CI runs for a change scripts/ci_scope.py
+    // confines to the cli package.
+    const cli_test_step = b.step("test:cli", "Run the cli package's tests: apps/cli/src inline tests, the picker root and apps/cli/tests (part of `test:units`)");
+    units_test_step.dependOn(cli_test_step);
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
     product_test_step.dependOn(&jev_recall_eval_driver.step);
@@ -2584,7 +2675,7 @@ pub fn build(b: *std.Build) void {
     units_test_step.dependOn(subsystem_boundary_step);
     units_test_step.dependOn(provider_test_step);
     units_test_step.dependOn(mcp_test_step);
-    units_test_step.dependOn(picker_test_step);
+    cli_test_step.dependOn(picker_test_step);
     units_test_step.dependOn(lsp_test_step);
     units_test_step.dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
@@ -2867,7 +2958,7 @@ pub fn build(b: *std.Build) void {
     const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
     units_test_step.dependOn(&rule_control_test_cmd.step);
-    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "apps", "tests" }, .check = true });
+    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "apps", "packages", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
     else
@@ -3046,7 +3137,7 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(test_run, staged_tinykg);
     wireTinyKgdTestInput(test_run, staged_tinykgd);
     wireLeanKernelTestInputs(test_run, staged_lean_kernels);
-    units_test_step.dependOn(&test_run.step);
+    cli_test_step.dependOn(&test_run.step);
     const internal_test = addRecordedTest(b, .{
         .name = "internal-test",
         .root_module = test_cc_mod.import_table.get("metacodes-internal").?,
@@ -3320,11 +3411,9 @@ pub fn build(b: *std.Build) void {
     const spike_step = b.step("test:spike", "Run spike / harness tests");
     const spike_files = [_][]const u8{
         "tests/unit/stream_reader_spike.zig",
-        "tests/unit/termios_spike.zig", // POSIX-only(termios)——Windows 目标下面跳过
         "tests/_harness/mock_sse_server.zig",
     };
     for (spike_files) |f| {
-        if (target.result.os.tag == .windows and std.mem.endsWith(u8, f, "termios_spike.zig")) continue;
         // mock_sse_server 复用共享 harness 模块做 root(它就是同一份编译);其余 spike 各自建。
         const shared_harness = std.mem.endsWith(u8, f, "mock_sse_server.zig");
         const m = if (shared_harness) test_harness_mod else b.createModule(.{
@@ -3342,6 +3431,22 @@ pub fn build(b: *std.Build) void {
         const run_t = addTestRunArtifact(b, t);
         spike_step.dependOn(&run_t.step);
     }
+    // POSIX-only (termios): skipped on Windows targets.
+    if (target.result.os.tag != .windows) {
+        const termios_spike_mod = b.createModule(.{
+            .root_source_file = b.path("apps/cli/tests/unit/termios_spike.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        addPlatform(b, termios_spike_mod);
+        const termios_spike = addRecordedTest(b, .{
+            .name = "spike",
+            .root_module = termios_spike_mod,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
+        cli_test_step.dependOn(&addTestRunArtifact(b, termios_spike).step);
+    }
 
     // Integration / Component tests share one compilation root. The old graph
     // built 67 near-identical binaries (409 CPU-seconds in the 2026-08-06
@@ -3356,51 +3461,38 @@ pub fn build(b: *std.Build) void {
     integration_suite_mod.addImport("harness", test_harness_mod);
     integration_suite_mod.addImport("cc", test_cc_mod);
     addPlatform(b, integration_suite_mod);
-    const integration_suite_test = b.addTest(.{
-        .name = "integration-suite",
-        .root_module = integration_suite_mod,
-        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
-        .test_runner = .{
-            .path = b.path("scripts/sharded_test_runner.zig"),
-            .mode = .simple,
-        },
+    const integration_suite_test = addAggregateSuite(b, "integration-suite", integration_suite_mod, tfilter);
+    const aggregate_suite_inputs: AggregateSuiteInputs = .{
+        .cli_bin = b.getInstallPath(.bin, exe.out_filename),
+        .installs = &.{ install_cli, &install_mock_mcp.step, &install_selfexe_probe.step, &install_update_unit_probe.step },
+        .tinykg = staged_tinykg,
+        .tinykgd = staged_tinykgd,
+        .lean_kernels = staged_lean_kernels,
+        .ripgrep = ripgrep_bundle,
+    };
+    const run_integration_reporter = addAggregateSuiteRun(b, integration_suite_test, integration_test_shards, core_shard_reporter, aggregate_suite_inputs);
+    spike_step.dependOn(run_integration_reporter);
+
+    // The CLI's component tests: their own inventory, compiled and sharded
+    // the same way, and run by `test:cli` (and so by `test:units`).
+    const cli_suite_mod = b.createModule(.{
+        .root_source_file = b.path("apps/cli/tests/suite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
-    const integration_reports = b.allocator.alloc(std.Build.LazyPath, integration_test_shards) catch @panic("OOM");
-    for (0..integration_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, integration_suite_test);
-        run_shard.has_side_effects = true;
-        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{integration_test_shards}));
-        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
-        run_shard.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-        run_shard.expectExitCode(0);
-        run_shard.step.dependOn(install_cli);
-        run_shard.step.dependOn(&install_mock_mcp.step);
-        run_shard.step.dependOn(&install_selfexe_probe.step);
-        run_shard.step.dependOn(&install_update_unit_probe.step);
-        wireTinyKgTestInput(run_shard, staged_tinykg);
-        wireTinyKgdTestInput(run_shard, staged_tinykgd);
-        wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
-        wirePinnedRipgrepTestInput(b, run_shard, ripgrep_bundle);
-        integration_reports[shard_index] = run_shard.captureStdOut(.{
-            .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
-        });
-    }
-    const run_integration_reporter = b.addRunArtifact(core_shard_reporter);
-    for (integration_reports) |report| run_integration_reporter.addFileArg(report);
-    spike_step.dependOn(&run_integration_reporter.step);
+    cli_suite_mod.addImport("harness", test_harness_mod);
+    cli_suite_mod.addImport("cc", test_cc_mod);
+    cli_suite_mod.addImport("tinykg_binary", test_tinykg_binary_mod);
+    cli_suite_mod.addAnonymousImport("vterm_screen_parity", .{ .root_source_file = b.path("tests/fixtures/vterm/screen_parity.jsonl") });
+    addPlatform(b, cli_suite_mod);
+    const cli_suite_test = addAggregateSuite(b, "cli-suite", cli_suite_mod, tfilter);
+    cli_test_step.dependOn(addAggregateSuiteRun(b, cli_suite_test, integration_test_shards, core_shard_reporter, aggregate_suite_inputs));
 
     const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test);
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
-    integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-    integration_monolithic_run.step.dependOn(install_cli);
-    integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
-    integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
-    integration_monolithic_run.step.dependOn(&install_update_unit_probe.step);
-    wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
-    wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
-    wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
-    wirePinnedRipgrepTestInput(b, integration_monolithic_run, ripgrep_bundle);
+    wireAggregateSuiteInputs(b, integration_monolithic_run, aggregate_suite_inputs);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -3414,15 +3506,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
-    integration_timed_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-    integration_timed_run.step.dependOn(install_cli);
-    integration_timed_run.step.dependOn(&install_mock_mcp.step);
-    integration_timed_run.step.dependOn(&install_selfexe_probe.step);
-    integration_timed_run.step.dependOn(&install_update_unit_probe.step);
-    wireTinyKgTestInput(integration_timed_run, staged_tinykg);
-    wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
-    wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);
-    wirePinnedRipgrepTestInput(b, integration_timed_run, ripgrep_bundle);
+    wireAggregateSuiteInputs(b, integration_timed_run, aggregate_suite_inputs);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 
@@ -3516,12 +3600,12 @@ pub fn build(b: *std.Build) void {
         "tests/component/sealed_publication_test.zig",
         "tests/component/recovery_allowance_test.zig",
         "tests/component/agent_session_host_tools_test.zig",
-        "tests/component/plugin_runtime_test.zig",
-        "tests/component/plugin_process_test.zig",
+        "apps/cli/tests/component/plugin_runtime_test.zig",
+        "apps/cli/tests/component/plugin_process_test.zig",
         "tests/component/agent_session_ui_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",
-        "tests/component/base_url_flag_test.zig",
+        "apps/cli/tests/component/base_url_flag_test.zig",
         "tests/component/task_error_test.zig",
         "tests/component/tool_loop_breaker_test.zig",
         "tests/component/rule_author_test.zig",
@@ -3530,7 +3614,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/agent_background_test.zig",
         "tests/component/skill_fileref_test.zig",
         "tests/component/transcript_roundtrip_test.zig",
-        "tests/component/headless_json_test.zig",
+        "apps/cli/tests/component/headless_json_test.zig",
         "tests/component/compound_perm_test.zig",
         "tests/component/protected_skill_inject_test.zig",
         "tests/component/read_state_test.zig",
@@ -3539,19 +3623,19 @@ pub fn build(b: *std.Build) void {
         "tests/component/cache_break_test.zig",
         "tests/component/microcompact_test.zig",
         "tests/component/kg_task_projection_test.zig",
-        "tests/component/goal_state_test.zig",
-        "tests/component/usage_report_test.zig",
-        "tests/component/auth_test.zig",
+        "apps/cli/tests/component/goal_state_test.zig",
+        "apps/cli/tests/component/usage_report_test.zig",
+        "apps/cli/tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",
         "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
         "tests/component/auto_compact_request_test.zig",
-        "tests/component/render_region_test.zig",
+        "apps/cli/tests/component/render_region_test.zig",
         "tests/component/stream_retry_test.zig",
-        "tests/component/ui_state_test.zig",
-        "tests/component/ui_render_test.zig",
-        "tests/component/ui_backend_test.zig",
+        "apps/cli/tests/component/ui_state_test.zig",
+        "apps/cli/tests/component/ui_render_test.zig",
+        "apps/cli/tests/component/ui_backend_test.zig",
         "tests/component/ui_multifrontend_test.zig",
         "tests/component/diagnostics_test.zig",
         "tests/component/provider_vtable_test.zig",
@@ -3561,7 +3645,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/background_main_test.zig",
         "tests/component/harnessmm_test.zig",
         "tests/component/suspend_resume_test.zig",
-        "tests/component/diff_highlight_test.zig",
+        "apps/cli/tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",
         "tests/component/weak_model_test.zig",
         "tests/component/task_batch_test.zig",
@@ -3569,7 +3653,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/swarm_tools_test.zig",
         "tests/component/swarm_dag_test.zig",
         "tests/component/swarm_security_test.zig",
-        "tests/component/swarm_process_test.zig",
+        "apps/cli/tests/component/swarm_process_test.zig",
         "tests/component/add_dir_test.zig",
         "tests/component/dialect_matrix_test.zig",
     };
@@ -3643,13 +3727,14 @@ pub fn build(b: *std.Build) void {
     const kg_governance_step = b.step("test:kg-governance", "Run TinyKG evidence/freshness governance L2 tests");
     {
         const m = b.createModule(.{
-            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .root_source_file = b.path("apps/cli/tests/component/kg_integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
+        m.addImport("tinykg_binary", test_tinykg_binary_mod);
         addPlatform(b, m);
         const t = addRecordedTest(b, .{
             .name = "kg-governance-l2",
@@ -3668,13 +3753,14 @@ pub fn build(b: *std.Build) void {
     const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "Run host-execution to TinyKG ontology feedback L2");
     {
         const m = b.createModule(.{
-            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .root_source_file = b.path("apps/cli/tests/component/kg_integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
+        m.addImport("tinykg_binary", test_tinykg_binary_mod);
         addPlatform(b, m);
         const t = addRecordedTest(b, .{
             .name = "kg-ontology-feedback-l2",
@@ -3693,13 +3779,14 @@ pub fn build(b: *std.Build) void {
     const kg_experience_feedback_step = b.step("test:kg-experience-feedback", "Run TinyKG prior-execution decision feedback L2");
     {
         const m = b.createModule(.{
-            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .root_source_file = b.path("apps/cli/tests/component/kg_integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
+        m.addImport("tinykg_binary", test_tinykg_binary_mod);
         addPlatform(b, m);
         const t = addRecordedTest(b, .{
             .name = "kg-experience-feedback-l2",
@@ -3790,7 +3877,7 @@ pub fn build(b: *std.Build) void {
     }
 
     _ = b.addFmt(.{
-        .paths = &.{ "src/", "apps/" },
+        .paths = &.{ "src/", "apps/", "packages/" },
         .exclude_paths = &.{},
     });
 

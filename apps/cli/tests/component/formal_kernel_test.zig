@@ -3,7 +3,7 @@ const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
-const tinykg_binary = @import("tinykg_binary.zig");
+const tinykg_binary = @import("tinykg_binary");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;

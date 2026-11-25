@@ -159,7 +159,7 @@ pub const RenderRegion = struct {
     /// Where flushed bytes go. Null in the product: stderr through
     /// std.debug.print (the stderr lock, see the module header). Component
     /// tests point it at a buffer and replay the bytes through a virtual
-    /// terminal (tests/component/vterm.zig).
+    /// terminal (apps/cli/tests/component/vterm.zig).
     sink: ?*std.Io.Writer = null,
     /// Test seam: the size `measureSize` reports instead of asking the fd.
     /// Component tests run the region on fd -1, which has no size, so this is

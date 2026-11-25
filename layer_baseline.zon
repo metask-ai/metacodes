@@ -1852,8 +1852,6 @@
     .wiring = .{
     },
     .wide_roots = .{
-        "src/internal.zig",
-        "src/lib.zig",
         "src/lsp_test_root.zig",
         "src/mcp_test_root.zig",
         "src/provider_test_root.zig",

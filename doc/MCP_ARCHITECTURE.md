@@ -15,7 +15,7 @@ inventory below is the record that nothing was dropped on the way.
 | Connection and catalog management | `runtime.zig`, `instance_pool.zig`, `catalog.zig` | A connected server with its canonical catalog, leases, immutable generations, refresh, expiry, declarative apply |
 | Shared runtime integration | `core/tool_exec` (the kernel), `tool_invocation.zig`, `agentcore/mcp_session.zig`, `registry_bridge.zig` | Tool selection, permission, budget, result admission. Every call ends in `McpClient.invokeTool` under the same kernel |
 | CLI/App | `apps/cli/src/app.zig`, `apps/cli/src/app/mcp_startup.zig`, `apps/cli/src/app/mcp_cli.zig`, `src/mcp/config.zig`, `launch.zig`, `naming.zig`, `param_headers.zig` | Configuration imports, startup policy, status presentation |
-| AgentCore facade | `src/agentcore/abi_v1.zig`, `mcp_session.zig`, `mcp_checkpoint.zig` | Public contracts, handles, ABI conversion, callback bridging, Session selection, checkpoints |
+| AgentCore facade | `packages/agentcore/abi_v1.zig`, `mcp_session.zig`, `mcp_checkpoint.zig` | Public contracts, handles, ABI conversion, callback bridging, Session selection, checkpoints |
 
 `zig build test:mcp` builds and runs the shared module alone, and
 `zig build subsystem:boundary` enforces its import closure: it cannot reach the
@@ -67,7 +67,7 @@ keep the existing retry.
 ## Capability inventory
 
 The migration's starting point: `src/mcp/client.zig` (CLI) and
-`src/agentcore/mcp_*.zig` (AgentCore) at the base of #405. Disposition: **kept**
+`packages/agentcore/mcp_*.zig` (AgentCore) at the base of #405. Disposition: **kept**
 (behaviour unchanged, one implementation now), **policy** (a retained difference
 above), **corrected** (see "Behaviour changes"), **evolve** (out of scope, separate).
 

@@ -57,7 +57,7 @@ inputs; moving into a code/input tree takes the wider scope.
 | `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `tests` | one of the above or a test: `scripts/tests/test_*.py`, `tests/tty/**`, or another file of the `tests` package in `layers.zon` | The gates' checks. A changed `tests/**` file outside `tests/tty/` (a fixture may feed both) or harness file runs the unit, integration, product and TTY suites; a changed `tests/tty/**` file runs TTY; a changed script suite that `build.zig` runs keeps `test:units` (Windows included), the others run by name |
-| `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`; integration, product, release, contract snapshots, TTY and SDK as in `full` |
+| `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`, and without the other whole-package unit runs (the ReleaseSafe core gate, the native platform modules); integration, product, release, contract snapshots, TTY and SDK as in `full` |
 | `full` | anything else | Everything |
 
 Manual and scheduled runs are always `full`, and so are a pull request
@@ -67,7 +67,8 @@ run on main is a full run on all three platforms that saves the caches (§5).
 
 ### Affected packages
 
-`layers.zon` assigns every path under `src/` and `tests/` to a package and
+`layers.zon` assigns every path under `src/`, `apps/`, `packages/` and
+`tests/` to a package and
 lists what each may import (`allowed_dependencies`); `layer:check` holds the
 imports to it, except for what `layer_baseline.zon` still lists. A change to
 a product package affects that package and every package that depends on it,
@@ -86,6 +87,15 @@ package by package as the migration empties the baseline, upper packages
 first, because a package's affected set includes everything above it. On
 the tree of 0b (#792) every product package but `agentcore` has entries, and
 `agentcore`'s set includes `cli`, so every product change is still `full`.
+Since migration step 1.3c `cli` is the first package narrowed: it has no
+entries, nothing depends on it, and `test:cli` runs its tests (the inline
+tests of `apps/cli/src`, the picker root, the component suite in
+`apps/cli/tests/` and the termios spike). A change confined to `apps/cli/`
+runs `test:cli` in place of `test:units`. Its tests live in the `tests`
+package (`apps/cli/tests/` is listed there, so they may use the harness),
+but a test inside a product package's directory counts as a change to that
+package. `agentcore` has no entries either, but no `test:agentcore` step
+yet, so its changes are still `full`.
 
 `build.zig`, `build.zig.zon`, `layers.zon`, `layer_baseline.zon`, the
 `testing` package (`tests/_harness/`, `tests/helpers/`), `.github/`,
@@ -395,7 +405,7 @@ ones that land nowhere:
 
 | Adding | Goes into | Runs on | Enforced by |
 |---|---|---|---|
-| A Zig test in an existing root (`src/**`, `tests/component`, the integration inventory) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
+| A Zig test in an existing root (`src/**`, `apps/cli/src/**`, a file the aggregate inventories `tests/integration_suite.zig` or `apps/cli/tests/suite.zig` import) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
 | A new test binary or build step | A test binary is created with `addRecordedTest` (its tests then appear in the test IDs); `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire, unless it holds a fixed host resource (a fixed port or path) that another case also uses: then mark it `tty_driver.runs_alone`, and local `--jobs` runs it by itself | A TTY shard | The TTY case `test_runner_shards` |

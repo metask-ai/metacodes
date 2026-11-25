@@ -54,10 +54,10 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 
 - `screen.py` —— 终端模拟器:最小 ANSI 解释器(CSI A/C/G/K/H/m + \r\n 底部上滚)
   → 虚拟 grid + 光标 + SGR border_class;`char_width` 复刻 `apps/cli/src/repl/tui/term.zig` 的 CJK/emoji 宽度表。
-  它的 Zig 移植 `tests/component/vterm.zig` 给组件测试用(不起 pty)。两者由 golden 向量钉成同一行为:
+  它的 Zig 移植 `apps/cli/tests/component/vterm.zig` 给组件测试用(不起 pty)。两者由 golden 向量钉成同一行为:
   `vterm_parity.py` 用 screen.py 回放一组固定字节流(手写语义用例 + 固定 seed 随机流)写出
   `tests/fixtures/vterm/screen_parity.jsonl`,`cases/test_vterm_parity.py` 检查它仍是 screen.py 的答案,
-  `tests/component/vterm_test.zig` 让 Zig 移植逐 cell 重放同一份。改了 screen.py 的语义就跑
+  `apps/cli/tests/component/vterm_test.zig` 让 Zig 移植逐 cell 重放同一份。改了 screen.py 的语义就跑
   `python tests/tty/vterm_parity.py --write` 并让 vterm.zig 跟上。
 - `tty_driver.py` —— `run(bin, key_events, term_size)`:fork pty + TIOCSWINSZ + 键名映射
   (`type:文本`/`key:shift_enter|backspace|left|right|shift_tab|ctrl_u|enter`/`sleep:N`/

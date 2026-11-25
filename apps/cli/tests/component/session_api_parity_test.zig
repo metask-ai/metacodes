@@ -217,7 +217,7 @@ test "U11 parity: 过程义务门是宿主契约字段,canonical 不带(delivery
     // Codex round 6 (2026-09-21):注入宏 run / web 会话走 canonical 装配,若 canonical 带
     // cadence,一次 `/commit` 就多落一条终局记录,trace 契约(每份 journal 一条)作废。
     // 排除是设计决定,本测试让"顺手接上"变成显式改动。正向面见
-    // tests/component/delivery_cadence_test.zig(REPL 主 run 与 headless 都接)。
+    // apps/cli/tests/component/delivery_cadence_test.zig(REPL 主 run 与 headless 都接)。
     var fx: AppFixture = undefined;
     try fx.setup();
     defer fx.deinit();

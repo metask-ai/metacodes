@@ -8,7 +8,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const cc = @import("cc");
-const tinykg_binary = @import("tinykg_binary.zig");
+const tinykg_binary = @import("tinykg_binary");
 
 const KgClient = cc.kg_client.KgClient;
 

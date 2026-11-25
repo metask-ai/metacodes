@@ -419,7 +419,7 @@ test "L2 验收③: dispatcher 在场的未知名在 default 模式走 ask" {
     try std.testing.expect(std.mem.indexOf(u8, run.content, "does not exist") == null);
 }
 
-/// 精简版 in-memory MCP peer(镜像 src/agentcore/mcp_test_support.zig 的
+/// 精简版 in-memory MCP peer(镜像 packages/agentcore/mcp_test_support.zig 的
 /// modern-era 子集;该 fixture 不在库导出面上,组件测试自带一份)。
 const FixtureMcpServer = struct {
     ttl_ms: u64 = 60_000,

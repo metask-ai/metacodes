@@ -342,7 +342,7 @@ test "login worker: a loopback login that never gets its callback is cancelled t
 }
 
 // The failed path (a token endpoint that answers garbage) is the component
-// test in tests/component/provider_oauth_login_test.zig: it needs a mock
+// test in apps/cli/tests/component/provider_oauth_login_test.zig: it needs a mock
 // server, and a refused connection would print std's `error.Unexpected`
 // stack trace on Windows into a passing test's log.
 test "login worker: the transcript is bounded and says when it was cut" {

@@ -24,7 +24,7 @@ const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
 const ppaths = @import("platform").paths;
-const tinykg_binary = @import("tinykg_binary.zig");
+const tinykg_binary = @import("tinykg_binary");
 
 const testing = std.testing;
 const jev = cc.jev_runtime;

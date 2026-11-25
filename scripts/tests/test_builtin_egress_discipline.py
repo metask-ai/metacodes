@@ -22,7 +22,7 @@ and the build tools under ``scripts``), outside test blocks and comments:
 
 Test blocks are skipped, and so is any file named ``*_test.zig``: their
 fixtures name hosts that never see traffic. The behavioural side of the same
-promise is in ``tests/component/jev_default_test.zig`` (``metacodes doctor`` of
+promise is in ``apps/cli/tests/component/jev_default_test.zig`` (``metacodes doctor`` of
 the real CLI reports the advisor off, and a Run with memories and no advisor
 consults nothing).
 """
@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Where product Zig lives. `src` is the binary and its library; the rest ship or
 # build with it. Missing `src` is an error, not an empty scan.
-SCAN_ROOTS = ("src", "apps", "sdk", "lib", "example", "scripts")
+SCAN_ROOTS = ("src", "apps", "packages", "sdk", "lib", "example", "scripts")
 SKIPPED_DIRS = {".git", ".zig-cache", "zig-out", ".lake", "node_modules", "deps", "vendor"}
 
 # Cleartext destinations the product is allowed to name, keyed by
@@ -132,6 +132,8 @@ def zig_sources(root: Path) -> list[Path]:
         for current, dirnames, filenames in os.walk(top):
             dirnames[:] = [d for d in dirnames if d not in SKIPPED_DIRS]
             here = Path(current).relative_to(root)
+            if name in ("apps", "packages") and len(here.parts) == 2:
+                dirnames[:] = [d for d in dirnames if d != "tests"]
             found.extend(
                 here / filename
                 for filename in filenames
