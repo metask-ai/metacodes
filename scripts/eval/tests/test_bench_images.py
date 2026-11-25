@@ -164,6 +164,49 @@ class BenchPullTest(unittest.TestCase):
         self.assertEqual([r["image"] for r in value["images"]], ["alexgshaw/regex-log:20251031"])
 
 
+class TaskReferencesTest(unittest.TestCase):
+    def test_pull_mirror_and_no_proxy_read_the_same_task(self):
+        main, db = "ghcr.io/org/env:1", "ghcr.io/org/db:2"
+        cases = [
+            ("block", "services:\n  db:\n    image: IMAGE", True, True),
+            ("flow", "services:\n  db: {restart: always, image: IMAGE}", True, True),
+            ("multiline flow", "services:\n  db: {environment: {NOTE: 'a,#b'}, # sidecar\n    image: IMAGE\n  }",
+             True, True),
+            ("quoted keys", '"services":\n  "db":\n    \'image\': "IMAGE"', True, True),
+            ("scalar anchor", "x-image: &base IMAGE\nservices:\n  db:\n    image: *base", True, True),
+            ("mapping anchor", "x-db: &base\n  image: IMAGE\nservices:\n  db: *base", True, True),
+            ("merge", "x-db: &base {image: IMAGE}\nservices:\n  db:\n    <<: *base", True, True),
+            ("override", "x-db: &base {image: ghcr.io/org/unused}\nservices:\n  db: {image: IMAGE, <<: *base}",
+             True, True),
+            ("build", "x-local: &local {build: .}\nservices:\n  db: {<<: *local, image: IMAGE}", False, True),
+            ("variable", "services:\n  db: {image: 'ghcr.io/org/db:$TAG'}", False, False),
+            ("environment key", "services:\n  db:\n    environment:\n      image: IMAGE", False, False),
+        ]
+        for label, compose, pull, mirror in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                dataset = Path(tmp)
+                write_task(dataset, "task", extra={"docker-compose.yaml": compose.replace("IMAGE", db)})
+                (dataset / "task/task.toml").write_text(f'[environment] # runtime\n"docker_image" = "{main}"\n')
+                images_found, builds = images.images_of(dataset, ["task"])
+                self.assertEqual(images_found, {ref: ["task"] for ref in ([main, db] if pull else [main])})
+                self.assertEqual(builds, {})
+                self.assertEqual(egress.ghcr_images(dataset, ["task"]), sorted([main, db] if mirror else [main]))
+                self.assertEqual(egress.task_services(dataset, ["task"]), ["main", "db"])
+
+    def test_each_reader_keeps_its_file_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp)
+            main, db, base = "ghcr.io/org/env", "ghcr.io/org/db", "ghcr.io/org/base"
+            write_task(dataset, "task", main, {
+                "compose.extra.yml": f"services: {{db: {{image: {db}}}}}\n",
+                "verify.Dockerfile": f"FROM {base}\nENV GOPROXY=off\n",
+            })
+            self.assertEqual(images.images_of(dataset, ["task"]), ({main: ["task"]}, {}))
+            self.assertEqual(egress.ghcr_images(dataset, ["task"]), sorted([main, db, base]))
+            self.assertEqual(egress.task_services(dataset, ["task"]), ["main", "db"])
+            self.assertEqual(executors.task_owned_settings(dataset, {"go": "https://go.example"}), [])
+
+
 class SshPullTest(unittest.TestCase):
     def test_ghcr_image_is_pulled_through_the_executor_mirror_and_tagged_back(self) -> None:
         executor = executors.SshExecutor("relay", "relay.example", ghcr_mirror="ghcr.example")
