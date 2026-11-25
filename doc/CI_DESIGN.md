@@ -56,7 +56,7 @@ inputs; moving into a code/input tree takes the wider scope.
 |---|---|---|
 | `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
-| `tests` | one of the above or a test: `scripts/tests/test_*.py`, `tests/tty/**`, or another file of the `tests` package in `layers.zon` | The gates' checks. A changed `tests/**` file outside `tests/tty/` (a fixture may feed both) or harness file runs the unit, integration, product and TTY suites; a changed `tests/tty/**` file runs TTY; a changed script suite that `build.zig` runs keeps `test:units` (Windows included), the others run by name |
+| `tests` | one of the above or a test under `scripts/tests/test_*.py` or in the `tests` package | TTY cases run TTY. Shared TTY helpers and other shared test fixtures run units, integration, product and TTY. Script suites named by `build.zig` keep `test:units` on every platform. Other changed script suites run by name. |
 | `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`, and without the other whole-package unit runs (the ReleaseSafe core gate, the native platform modules); integration, product, release, contract snapshots, TTY and SDK as in `full` |
 | `full` | anything else | Everything |
 
@@ -66,6 +66,18 @@ CI), an empty diff and any error. Neither CI workflow runs on ordinary pushes to
 run on main is a full run on all three platforms that saves the caches (§5).
 
 ### Affected packages
+
+On a narrowed package run confined to the terminal UI (`apps/cli/src/repl/tui/`),
+its package tests (`apps/cli/tests/`) and documentation, the product leg runs
+`test:product-runtime`. This keeps the installed CLI and daemon smokes, including
+the interactive Bench smoke. Changes to the evaluation harness, shared inputs or
+core runtime keep the complete offline evaluation. The nightly run and a migration
+test-ID comparison include it too.
+
+The change summary also reports whether merging requires a provider-backed
+base/head comparison. The existing **Gates (Linux)** check verifies the latest
+maintainer-attested result for that pair. The assessment runs with per-run approval
+outside PR CI. [Evaluation procedure](../evals/README.md)
 
 `layers.zon` assigns every path under `src/`, `apps/`, `packages/` and
 `tests/` to a package and

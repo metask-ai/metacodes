@@ -124,6 +124,8 @@ jobs:
       release_docs: ${{ steps.decide.outputs.release_docs }}
       units: ${{ steps.decide.outputs.units }}
       product: ${{ steps.decide.outputs.product }}
+      offline_eval: ${{ steps.decide.outputs.offline_eval }}
+      model_eval: ${{ steps.decide.outputs.model_eval }}
       packages: ${{ steps.decide.outputs.packages }}
       package_tests: ${{ steps.decide.outputs.package_tests }}
       script_tests: ${{ steps.decide.outputs.script_tests }}
@@ -244,6 +246,7 @@ jobs:
       # the native platform modules).
       UNITS: ${{ needs.scope.outputs.units }}
       PRODUCT: ${{ needs.scope.outputs.product }}
+      OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -513,11 +516,11 @@ jobs:
       # this repository's overlay and `uv sync`s it; the product part below
       # inherits METACODES_WORKBUDDY_CHECKOUT through zig build.
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.OFFLINE_EVAL != 'false'
         with:
           version: "0.11.19"
       - name: Provision the pinned WorkBuddy-Bench checkout
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.OFFLINE_EVAL != 'false'
         shell: bash
         run: |
           set -euo pipefail
@@ -557,10 +560,13 @@ jobs:
           read -r -a steps <<< "$PACKAGE_TESTS"
           zig build "${steps[@]}" test:integration -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (product)
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL != 'false'
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
         run: zig build test:product -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (product runtime)
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL == 'false'
+        run: zig build test:product-runtime -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: ReleaseSafe core gate
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         run: zig build test:lib -Doptimize=ReleaseSafe
@@ -835,6 +841,7 @@ jobs:
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
       UNITS: ${{ needs.scope.outputs.units }}
       PRODUCT: ${{ needs.scope.outputs.product }}
+      OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -874,6 +881,7 @@ jobs:
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
       UNITS: ${{ needs.scope.outputs.units }}
       PRODUCT: ${{ needs.scope.outputs.product }}
+      OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -1141,6 +1149,7 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       UNITS: ${{ needs.scope.outputs.units }}
       PRODUCT: ${{ needs.scope.outputs.product }}
+      OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # As in `gates-linux`.
       ZIG_BUILD_JOBS: "8"
@@ -1346,9 +1355,13 @@ jobs:
         shell: cmd
         run: zig build test:integration -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (product)
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL != 'false'
         shell: cmd
         run: zig build test:product -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (product runtime)
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL == 'false'
+        shell: cmd
+        run: zig build test:product-runtime -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
@@ -1399,6 +1412,7 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       UNITS: ${{ needs.scope.outputs.units }}
       PRODUCT: ${{ needs.scope.outputs.product }}
+      OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.windows_zig_build_jobs }}
@@ -1432,7 +1446,9 @@ jobs:
   # the same way so that it can become required.
   gates-linux-result:
     name: Gates (Linux)
-    needs: [gates-linux, test-ids]
+    needs: [gates-linux, test-ids, scope]
+    permissions:
+      statuses: read
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
@@ -1443,6 +1459,20 @@ jobs:
         run: |
           echo "$NEEDS" | jq -c 'map_values(.result)'
           echo "$NEEDS" | jq -e '.["gates-linux"].result == "success" and (.["test-ids"].result == "success" or .["test-ids"].result == "skipped")' > /dev/null
+      - name: Require the reviewed provider-backed comparison
+        if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.scope.outputs.model_eval != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        shell: bash
+        run: |
+          context="model-eval/$BASE_SHA"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" |
+            jq -e --arg context "$context" 'first(.[][] | select(.context == $context)) | .state == "success" and (.target_url | strings | startswith("https://"))' >/dev/null || {
+              echo "::error::Missing successful $context status with a report URL on $HEAD_SHA. See evals/README.md."
+              exit 1
+            }
 
   # Gates (macOS) and Gates (Windows) pass when the gates passed where they
   # ran: the pool job (through the watch), or the hosted legs
@@ -1534,7 +1564,7 @@ jobs:
     name: Full PR evidence
     # macOS and Windows through their result jobs: the pool job or the hosted
     # legs, wherever the gates ran (§6).
-    needs: [release-fast-path, scope, gates-linux, gates-macos-result, gates-windows-result, tty-linux, tty-windows, sdk-bindings]
+    needs: [release-fast-path, scope, gates-linux-result, gates-macos-result, gates-windows-result, tty-linux, tty-windows, sdk-bindings]
     if: ${{ always() && github.event_name == 'pull_request' && needs.scope.outputs.scope == 'full' && needs.release-fast-path.outputs.fast == 'false' }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
