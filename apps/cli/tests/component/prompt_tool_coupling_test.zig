@@ -486,15 +486,6 @@ test "L2 e2e: execution policy hides deferred tools from schema and system promp
 
 // ── 动态(MCP)deferred 工具的可发现性:提示词列名 → ToolSearch select → 下一请求进 tools ──
 
-fn toolSearchSse(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
-        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_search\",\"name\":\"ToolSearch\",\"input\":{{}}}}}}\n\n" ++
-        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"query\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
-        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
-        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
-        "data: {{\"type\":\"message_stop\"}}\n\n", .{query});
-}
-
 /// 生产 App.activateTool 的最小镜像:dupe 名字记入激活集(ToolSearch 传进来的 name 借用
 /// 工具参数内存,工具返回后就失效)。
 const Activation = struct {
@@ -538,7 +529,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__search — Search a KnowForge knowledge base by keyword. Returns fragments") != null);
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__overview — Knowledge base overview.") != null);
 
-    const search_sse = try toolSearchSse(a, "select:knowforge__search,TaskCreate,TaskUpdate,TaskOutput,CronList,BashOutput");
+    const search_sse = try harness.toolSearchSse(a, "select:knowforge__search,TaskCreate,TaskUpdate,TaskOutput,CronList,BashOutput");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();
@@ -646,7 +637,7 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
     var sw = cc.swarm_context.SwarmContext{ .allocator = a, .state_root = home };
     defer sw.deinit();
 
-    const search_sse = try toolSearchSse(a, "send team message read bash");
+    const search_sse = try harness.toolSearchSse(a, "send team message read bash");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();
