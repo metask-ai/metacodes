@@ -298,9 +298,8 @@ test "JobNotify real awaiting-input notice never carries the prompt text" {
     var jobs = try registry_mod.JobRegistry.init(a);
     defer jobs.deinit();
     const owner = @import("session_id.zig").gen();
-    const entry = try jobs.spawnBackgroundOwned("printf '\\124\\117\\120\\123\\105\\103\\122\\105\\124\\040\\120\\141\\163\\163\\167\\157\\162\\144\\072\\040'; sleep 30", null, owner);
+    const entry = try jobs.spawnBackgroundWatched("printf '\\124\\117\\120\\123\\105\\103\\122\\105\\124\\040\\120\\141\\163\\163\\167\\157\\162\\144\\072\\040'; sleep 30", null, owner, 3_600_000);
     defer jobs.kill(entry.idSlice()) catch {};
-    jobs.armWatchdog(entry.idSlice(), 3_600_000);
     const quiet: util_time.Millis = @intCast(registry_mod.INPUT_STALL_QUIET_MS);
     var now = util_time.nowMs();
     var events: []JobExitEvent = &.{};

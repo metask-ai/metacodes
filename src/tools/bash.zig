@@ -768,9 +768,11 @@ fn executeInner(ctx: *const ToolContext, args: []const u8, attachments: *tool_re
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const cwd_opt: ?[]const u8 = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else null;
-                const limit = watchdogLimitMs(ctx, args, .background);
-                const j = registry.spawnBackgroundSupervised(command, cwd_opt, ctx.session, supervisionFor(limit)) catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
-                if (limit) |limit_ms| registry.armWatchdog(j.idSlice(), limit_ms);
+                const spawned = if (watchdogLimitMs(ctx, args, .background)) |limit_ms|
+                    registry.spawnBackgroundWatched(command, cwd_opt, ctx.session, limit_ms)
+                else
+                    registry.spawnBackgroundOwned(command, cwd_opt, ctx.session);
+                const j = spawned catch |e| return describeSpawnFailure(ctx, e, cwd_opt);
                 // Nothing watches what a detached command writes. Say so on
                 // the file-change contract instead of reporting no changes.
                 if (observesFileChanges(ctx, args)) ctx.file_change_sink.?.noteIncomplete();
@@ -969,8 +971,12 @@ fn runAutoBackgroundable(
             // 达到 auto-background 阈值但未到 timeout：返回 auto_backgrounded。
             // 此刻 job id 进入模型可见结果，BashOutput 随后任何一轮都可能凭它来读
             // → 转为 background 保留期。
+            if (background_limit) |limit_ms| registry.armWatchdog(job_id[0..], limit_ms) catch |err| {
+                registry.kill(job_id[0..]) catch {};
+                registry.releaseSpool(job_id[0..]);
+                return err;
+            };
             registry.promoteToBackground(job_id[0..]);
-            if (background_limit) |limit_ms| registry.armWatchdog(job_id[0..], limit_ms);
             outlived.* = true;
             return try formatAutoBackgroundedAndRemember(allocator, &j, registry);
         }

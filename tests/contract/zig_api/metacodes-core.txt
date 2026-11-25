@@ -3858,6 +3858,10 @@ metacodes-core.job_registry.Supervision: enum
 metacodes-core.job_registry.Supervision.unwatched
 metacodes-core.job_registry.Supervision.watchdog
 metacodes-core.job_registry.test_refuse_sweeper_thread: var bool = false
+metacodes-core.job_registry.TermGate: struct
+metacodes-core.job_registry.TermGate.reached: std.atomic.Value(bool) = .init(false)
+metacodes-core.job_registry.TermGate.released: std.atomic.Value(bool) = .init(false)
+metacodes-core.job_registry.test_term_gate: var ?*TermGate = null
 metacodes-core.job_registry.Watchdog: struct
 metacodes-core.job_registry.Watchdog.limit_ms: u64
 metacodes-core.job_registry.Watchdog.output_bytes: u64 = 0
@@ -3917,7 +3921,8 @@ metacodes-core.job_registry.JobRegistry.init: fn init(allocator: std.mem.Allocat
 metacodes-core.job_registry.JobRegistry.deinit: fn deinit(self: *JobRegistry) void
 metacodes-core.job_registry.JobRegistry.releaseSpool: fn releaseSpool(self: *JobRegistry, id: []const u8) void
 metacodes-core.job_registry.JobRegistry.promoteToBackground: fn promoteToBackground(self: *JobRegistry, id: []const u8) void
-metacodes-core.job_registry.JobRegistry.armWatchdog: fn armWatchdog(self: *JobRegistry, id: []const u8, limit_ms: u64) void
+metacodes-core.job_registry.JobRegistry.armWatchdog: fn armWatchdog(self: *JobRegistry, id: []const u8, limit_ms: u64) error{ JobNotFound, JobUnwatched }!void
+metacodes-core.job_registry.JobRegistry.spawnBackgroundWatched: fn spawnBackgroundWatched(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, limit_ms: u64) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackground: fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackgroundOwned: fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackgroundSupervised: fn spawnBackgroundSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry
