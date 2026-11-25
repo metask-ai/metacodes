@@ -35,7 +35,7 @@ from scripts.eval.harbor import suites
 from scripts.eval.harbor.command import ADVANCED_FEATURES, check_bundle
 from scripts.eval.harbor.store.ingest import PROFILES_DIR
 from scripts.eval.harbor.bench import builds, data, executors
-from scripts.eval.harbor.bench.runner import (ACTIVE, DEFAULT_FEATURES, ExecutorUnreachable, atomic_json,
+from scripts.eval.harbor.bench.runner import (ACTIVE, DEFAULT_CONCURRENCY, DEFAULT_FEATURES, ExecutorUnreachable, atomic_json,
                                               chosen_features, now, settings)
 
 MAX_ITEMS = 16
@@ -287,21 +287,20 @@ class ProfileManager:
     def queue(self, request: Any) -> Dict[str, Any]:
         """Queue datasets on a profile: an existing one (`profile`), or the
         one of a listed bundle and `features`, created when first used.
-        Each dataset is queued once per model (`model`, or several `models`)."""
-        allowed = {"profile", "name", "model", "models", "executor", "attempts", "concurrency", "bundle", "items",
+        Each dataset is queued once per model (`model`, or several `models`),
+        at the profile's concurrency (set_concurrency changes it)."""
+        allowed = {"profile", "name", "model", "models", "executor", "attempts", "bundle", "items",
                    "features", "max_tokens"}
         if not isinstance(request, dict) or set(request) - allowed:
-            raise ValueError("只接受 profile、name、model、models、executor、attempts、concurrency、bundle、items、features、"
-                             "max_tokens")
+            raise ValueError("只接受 profile、name、model、models、executor、attempts、bundle、items、features、"
+                             "max_tokens（并发数在评测配置页面设置）")
         models = checked_models(request)
         items = request.get("items")
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
             raise ValueError(f"每次需要 1–{MAX_ITEMS} 个评测集")
         name = checked_name(request.get("name"))
-        concurrency = request.get("concurrency", 1)
-        if type(concurrency) is not int or concurrency < 1:
-            raise ValueError("concurrency 必须是正整数")
         target = self.target(request)
+        concurrency = target["concurrency"]
         seen, planned = set(), []
         for item in items:
             if not isinstance(item, dict) or set(item) - {"suite", "tasks"}:
@@ -318,7 +317,7 @@ class ProfileManager:
                     run_request["max_tokens"] = request["max_tokens"]
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
                 planned.append(self.planned(target, run_request, request.get("executor"), label))
-        return self.append(target, name, planned)
+        return self.append(target, name, planned, at_profile_concurrency=True)
 
     def launch_now(self, request: Any) -> Dict[str, Any]:
         """One dataset started at once, on the profile of the configured
@@ -358,7 +357,8 @@ class ProfileManager:
             record = self.get(request["profile"])
             if record is None:
                 raise ValueError("评测配置不存在")
-            return {"id": record["id"], "metacodes": record["metacodes"], "features": record.get("features") or []}
+            return {"id": record["id"], "metacodes": record["metacodes"], "features": record.get("features") or [],
+                    "concurrency": profile_concurrency(record)}
         features = chosen_features(request.get("features"))
         cfg = settings(self.runs.config_path)
         choices = bundle_choices(cfg, self.runs.config_path)
@@ -368,7 +368,7 @@ class ProfileManager:
         if choice is None:
             raise ValueError("请选择工作台列出的 metacodes 版本" if wanted else
                              self.runs.run_bundle(cfg, None, None)[1] or "请先配置 metacodes 发行包（bench setup）")
-        return {"id": None, "choice": choice, "features": features}
+        return {"id": None, "choice": choice, "features": features, "concurrency": DEFAULT_CONCURRENCY}
 
     def planned(self, target, run_request, executor, suite_name) -> Dict[str, Any]:
         """A dataset checked by a dry run on the profile's bundle, ready to
@@ -393,13 +393,13 @@ class ProfileManager:
                 "request": run_request, "route": checked["route"], "status": "pending", "run": None,
                 "error": None, "queued_at": None, "started_at": None, "finished_at": None}
 
-    def append(self, target, name, planned) -> Dict[str, Any]:
+    def append(self, target, name, planned, at_profile_concurrency=False) -> Dict[str, Any]:
         with self.lock:
-            record = self._append(target, name, planned)
+            record = self._append(target, name, planned, at_profile_concurrency)
         self.wake()
         return record
 
-    def _append(self, target, name, planned) -> Dict[str, Any]:
+    def _append(self, target, name, planned, at_profile_concurrency=False) -> Dict[str, Any]:
         if target["id"] is None:
             metacodes = freeze(target["choice"], self.runs.config_path)
             git = builds.provenance(target["choice"]["path"])
@@ -419,8 +419,11 @@ class ProfileManager:
             record["name"] = name
         if record["status"] not in PROFILE_ACTIVE:
             record.update(status="queued", cancel_requested=False, finished_at=None)
+        concurrency = pin_concurrency(record)
         queued = now()
         for item in planned:
+            if at_profile_concurrency:
+                item = at_concurrency(item, concurrency)
             record["items"].append({**item, "queued_at": queued})
         self.save(record)
         return record
@@ -436,14 +439,15 @@ class ProfileManager:
         return {"id": record["id"], "name": name}
 
     def set_concurrency(self, profile: Any, concurrency: Any) -> Dict[str, Any]:
+        """The profile's concurrency: every dataset queued on it from now on
+        runs at it, and so do its waiting and running ones."""
         if type(concurrency) is not int or concurrency < 1:
             raise ValueError("concurrency 必须是正整数")
         with self.lock:
             record = self.get(profile)
             if record is None:
                 raise ValueError("评测配置不存在")
-            if record["status"] not in PROFILE_ACTIVE:
-                raise ValueError("评测配置没有正在运行或排队的评测集")
+            record["concurrency"] = concurrency
             active = {r["name"] for r in self.runs.runs() if r.get("status") in ACTIVE}
             for item in record["items"]:
                 if item["status"] not in ("pending", "running"):
@@ -525,7 +529,7 @@ class ProfileManager:
                 raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
             if not tasks:
                 raise ValueError("这个评测集没有要运行的题")
-            record = self._append({"id": record["id"]}, None, [rerun(item, tasks, 0)])
+            record = self._append({"id": record["id"]}, None, [rerun(item, tasks, 0, profile_concurrency(record))])
         self.wake()
         return public(record)
 
@@ -550,7 +554,7 @@ class ProfileManager:
             item["auto_rerun_error"] = f"读取结果失败，没有自动重跑无效的题：{exc}"
             return
         if tasks:
-            record["items"].append({**rerun(item, tasks, next_round), "queued_at": now()})
+            record["items"].append({**rerun(item, tasks, next_round, pin_concurrency(record)), "queued_at": now()})
 
     # -------------------------------------------------------------- scheduler
 
@@ -686,12 +690,13 @@ class ProfileManager:
             pass
 
 
-def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
-    """An ended dataset queued again with `tasks`; `auto_round` counts the
-    automatic reruns of invalid tasks it descends from (0: asked for)."""
+def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int, concurrency: int) -> Dict[str, Any]:
+    """An ended dataset queued again with `tasks` at the profile's
+    `concurrency`; `auto_round` counts the automatic reruns of invalid tasks
+    it descends from (0: asked for)."""
     again = {key: value for key, value in item.items() if key not in ("waiting", "auto_rerun", "auto_rerun_error")}
-    again.update(tasks=list(tasks), request={**item["request"], "tasks": list(tasks)}, status="pending",
-                 run=None, error=None, started_at=None, finished_at=None)
+    again = at_concurrency({**again, "request": {**item["request"], "tasks": list(tasks)}}, concurrency)
+    again.update(tasks=list(tasks), status="pending", run=None, error=None, started_at=None, finished_at=None)
     if auto_round:
         again["auto_rerun"] = auto_round
     return again
@@ -711,10 +716,34 @@ def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]
     return sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
 
 
+def at_concurrency(item: Dict[str, Any], concurrency: int) -> Dict[str, Any]:
+    try:
+        applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
+    except ValueError:  # a suite no longer listed: its launch reports that
+        applied = concurrency
+    return {**item, "concurrency": applied, "request": {**item["request"], "concurrency": applied}}
+
+
+def pin_concurrency(record: Dict[str, Any]) -> int:
+    record["concurrency"] = profile_concurrency(record)
+    return record["concurrency"]
+
+
+def profile_concurrency(record: Dict[str, Any]) -> int:
+    """The profile's concurrency; a profile from before it had one keeps
+    its latest dataset's."""
+    if type(record.get("concurrency")) is int and record["concurrency"] >= 1:
+        return record["concurrency"]
+    latest = next((i.get("concurrency") for i in reversed(record.get("items") or [])
+                   if type(i.get("concurrency")) is int and i["concurrency"] >= 1), None)
+    return latest or DEFAULT_CONCURRENCY
+
+
 def public(record: Dict[str, Any]) -> Dict[str, Any]:
     """A profile record without the internal per-item launch requests."""
     value = json.loads(json.dumps(record))
     value["default_name"] = default_name(record)
+    value["concurrency"] = profile_concurrency(record)
     for item in value.get("items") or []:
         item.pop("request", None)
         item.pop("route", None)

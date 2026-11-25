@@ -32,6 +32,7 @@ SAMPLE_TASKS = list(suites.BY_ID[suites.DEFAULT_SUITE].default_tasks)
 TASK = suites.TASK
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ACTIVE = {"queued", "starting", "running", "cancelling"}
+DEFAULT_CONCURRENCY = 10  # a new profile's, until its page changes it
 
 
 def now():
@@ -370,7 +371,7 @@ class RunManager:
                 "warnings": warnings, "account_summary": account_summary,
                 "account_groups": account_groups,
                 "providers": {"count": len({m["provider"] for m in imported}), "models": len(imported)},
-                "defaults": {"attempts": 4, "concurrency": 10}, "runs": self.runs(),
+                "defaults": {"attempts": 4, "concurrency": DEFAULT_CONCURRENCY}, "runs": self.runs(),
                 "features": [{"id": name, "group": entry["group"], "label": entry["label"]}
                              for name, entry in ADVANCED_FEATURES.items()],
                 "default_features": DEFAULT_FEATURES,
