@@ -6,15 +6,14 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence
 
 from scripts.eval.harbor import suites
-from scripts.eval.harbor.bench import executors
-from scripts.eval.harbor.bench.egress import TOML_IMAGE, mirror_ref
+from scripts.eval.harbor.bench import executors, task_files
+from scripts.eval.harbor.bench.egress import mirror_ref
 from scripts.eval.harbor.bench.executors import Executor, shell_argv
 
 IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$")
-TOML_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*(?:#.*)?$")
 PULL_ATTEMPTS = 3
 PULL_BACKOFF = (10, 30)
 PULL_TIMEOUT = 3600
@@ -39,81 +38,22 @@ def checked_image(task_dir: Path, image: str) -> str:
     return image
 
 
-def toml_images(task_dir: Path) -> Tuple[Optional[str], List[str]]:
-    try:
-        text = (task_dir / "task.toml").read_text(encoding="utf-8")
-    except OSError:
-        raise ValueError("任务缺少 task.toml：" + task_dir.name) from None
-    main, others, section = None, [], ""
-    for line in text.splitlines():
-        header = TOML_SECTION.match(line)
-        if header:
-            section = header.group(1)
-            continue
-        found = TOML_IMAGE.match(line)
-        if not found:
-            continue
-        image = checked_image(task_dir, found.group(1))
-        if section == "environment" and main is None:
-            main = image
-        else:
-            others.append(image)
-    return main, others
-
-
-def flow_mapping(text: str) -> Dict[str, str]:
-    if not (text.startswith("{") and text.endswith("}")):
-        return {}
-    pairs = (item.partition(":") for item in text[1:-1].split(","))
-    return {key.strip().strip("\"'"): value.strip().strip("\"'") for key, _, value in pairs if key.strip()}
-
-
-def compose_images(task_dir: Path) -> List[str]:
-    try:
-        text = (task_dir / "environment" / "docker-compose.yaml").read_text(encoding="utf-8")
-    except OSError:
-        return []
-    services: List[Dict[str, str]] = []
-    inside, indent, child = False, None, None
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        depth = len(line) - len(line.lstrip(" "))
-        if depth == 0:
-            inside, indent = line.strip() == "services:", None
-            continue
-        if not inside:
-            continue
-        if indent is None:
-            indent = depth
-        if depth == indent:
-            services.append(flow_mapping(line.partition(":")[2].strip()))
-            child = None
-            continue
-        if not services:
-            continue
-        if child is None:
-            child = depth
-        if depth == child:
-            key, _, value = line.strip().partition(":")
-            services[-1][key.strip()] = value.strip().strip("\"'")
-    return [checked_image(task_dir, s["image"]) for s in services
-            if s.get("image") and "build" not in s and "$" not in s["image"]]
-
-
 def images_of(dataset: Path, tasks: Sequence[str]):
     images: Dict[str, List[str]] = {}
     builds: Dict[str, Dict] = {}
     for task in tasks:
-        main, others = toml_images(dataset / task)
-        for image in ([main] if main else []) + others + compose_images(dataset / task):
+        task_dir = dataset / task
+        refs = task_files.references(task_files.pull_sources(task_dir))
+        for image in refs.images(include_builds=False):
+            if "$" in image:
+                continue
+            checked_image(task_dir, image)
             users = images.setdefault(image, [])
             if task not in users:
                 users.append(task)
-        if main:
+        if refs.environment_image:
             continue
-        environment = dataset / task / "environment"
+        environment = task_dir / "environment"
         names = executors.tree_files(environment)
         if not names:
             raise ValueError(f"{task} 既没有 docker_image，也没有 environment 目录")

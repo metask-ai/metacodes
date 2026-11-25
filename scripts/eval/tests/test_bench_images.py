@@ -38,18 +38,19 @@ esac
 
 def egress_images(compose: str):
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "docker-compose.yaml").write_text(compose)
+        (Path(tmp) / "docker-compose.yaml").write_text(compose, encoding="utf-8")
         return egress.task_images(Path(tmp))
 
 
 def write_task(dataset: Path, name: str, image=None, extra=None) -> None:
     task = dataset / name
     (task / "environment").mkdir(parents=True)
-    (task / "environment" / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (task / "environment" / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
     for file, text in (extra or {}).items():
-        (task / "environment" / file).write_text(text)
+        (task / "environment" / file).write_text(text, encoding="utf-8")
     environment = f'docker_image = "{image}"\n' if image else ""
-    (task / "task.toml").write_text(f'[task]\nname = "{name}"\n\n[environment]\n{environment}cpus = 1\n')
+    (task / "task.toml").write_text(f'[task]\nname = "{name}"\n\n[environment]\n{environment}cpus = 1\n',
+                                    encoding="utf-8")
 
 
 @requires_posix_exec
@@ -162,6 +163,60 @@ class BenchPullTest(unittest.TestCase):
         code, value = self.bench("--task", "regex-log")
         self.assertEqual(code, 0)
         self.assertEqual([r["image"] for r in value["images"]], ["alexgshaw/regex-log:20251031"])
+
+
+class TaskReferencesTest(unittest.TestCase):
+    def test_pull_mirror_and_no_proxy_read_the_same_task(self):
+        main, db = "ghcr.io/org/env:1", "ghcr.io/org/db:2"
+        cases = [
+            ("block", "services:\n  db:\n    image: IMAGE", True, True),
+            ("extension first", "x-vendor/config: {}\nservices:\n  db:\n    image: IMAGE", True, True),
+            ("byte-order mark", "\ufeffname: bench\nservices:\n  db:\n    image: IMAGE", True, True),
+            ("next-line image", "--- # compose\nservices:\n  db:\n    image:\n      IMAGE", True, True),
+            ("comment on next-line image", "services:\n  db:\n    image:\n      IMAGE # tag: stable", True, True),
+            ("flow", "services:\n  db: {restart: always, image: IMAGE}", True, True),
+            ("multiline flow", "services:\n  db: {environment: {NOTE: 'a,#b'}, # sidecar\n    image: IMAGE\n  }",
+             True, True),
+            ("quoted keys", '"services":\n  "db":\n    \'image\': "IMAGE"', True, True),
+            ("scalar anchor", "x-image: &base IMAGE\nservices:\n  db:\n    image: *base", True, True),
+            ("mapping anchor", "x-db: &base\n  image: IMAGE\nservices:\n  db: *base", True, True),
+            ("next-line flow anchor", "x-db:\n  &base {image: IMAGE}\nservices:\n  db: *base", True, True),
+            ("merge", "x-db: &base {image: IMAGE}\nservices:\n  db:\n    <<: *base", True, True),
+            ("block merge list", "x-db: &base\n  image: IMAGE\nservices:\n  db:\n    <<:\n      - *base", True, True),
+            ("indentless merge list", "x-db: &base {image: IMAGE}\nx-old: &old {image: ghcr.io/org/old}\n"
+             "services:\n  db:\n    <<:\n    - *base\n    - *old", True, True),
+            ("override", "x-db: &base {image: ghcr.io/org/unused}\nservices:\n  db: {image: IMAGE, <<: *base}",
+             True, True),
+            ("build", "x-local: &local {build: .}\nservices:\n  db: {<<: *local, image: IMAGE}", False, True),
+            ("inherited build", "x-local: &base {image: IMAGE, build: .}\nservices:\n  db:\n    <<:\n      - *base",
+             False, True),
+            ("variable", "services:\n  db: {image: 'ghcr.io/org/db:$TAG'}", False, False),
+            ("environment key", "services:\n  db:\n    environment:\n      image: IMAGE", False, False),
+        ]
+        for label, compose, pull, mirror in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                dataset = Path(tmp)
+                write_task(dataset, "task", extra={"docker-compose.yaml": compose.replace("IMAGE", db)})
+                (dataset / "task/task.toml").write_text(f'[environment] # runtime\n"docker_image" = "{main}"\n',
+                                                        encoding="utf-8")
+                images_found, builds = images.images_of(dataset, ["task"])
+                self.assertEqual(images_found, {ref: ["task"] for ref in ([main, db] if pull else [main])})
+                self.assertEqual(builds, {})
+                self.assertEqual(egress.ghcr_images(dataset, ["task"]), sorted([main, db] if mirror else [main]))
+                self.assertEqual(egress.task_services(dataset, ["task"]), ["main", "db"])
+
+    def test_each_reader_keeps_its_file_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp)
+            main, db, base = "ghcr.io/org/env", "ghcr.io/org/db", "ghcr.io/org/base"
+            write_task(dataset, "task", main, {
+                "compose.extra.yml": f"services: {{db: {{image: {db}}}}}\n",
+                "verify.Dockerfile": f"FROM {base}\nENV GOPROXY=off\n",
+            })
+            self.assertEqual(images.images_of(dataset, ["task"]), ({main: ["task"]}, {}))
+            self.assertEqual(egress.ghcr_images(dataset, ["task"]), sorted([main, db, base]))
+            self.assertEqual(egress.task_services(dataset, ["task"]), ["main", "db"])
+            self.assertEqual(executors.task_owned_settings(dataset, {"go": "https://go.example"}), [])
 
 
 class SshPullTest(unittest.TestCase):
