@@ -1230,6 +1230,14 @@ pub fn pollJobWait(registry: anytype, owner: @import("session_id.zig").SessionId
     return .{ .events = try registry.takeUnannouncedExits(owner, allocator), .any_running = any_running };
 }
 
+pub fn takeMonitorNotifications(registry: anytype, owner: @import("session_id.zig").SessionId, allocator: std.mem.Allocator) !?[]u8 {
+    const monitor_stream = @import("monitor_stream.zig");
+    const notices = try registry.takeMonitorEvents(owner, allocator, util_time.nowMs());
+    defer monitor_stream.freeNotices(allocator, notices);
+    if (notices.len == 0) return null;
+    return try job_notification_mod.renderMonitor(allocator, notices);
+}
+
 /// UI → core input (#115). Drains `UiBackend.poll` at a turn boundary — the
 /// previous turn's tool_results are already appended and the next provider
 /// request has not been built yet — so a message the user queued during the
@@ -2592,6 +2600,19 @@ fn runCounted(
                     };
                     log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
                 }
+            }
+            if (opts.preview.monitor_events) monitor_delivery: {
+                const owner = opts.agent_ident orelse opts.session;
+                const text = (takeMonitorNotifications(registry, owner, allocator) catch |err| {
+                    log.warn("agent", "monitor notification skipped: {s}", .{@errorName(err)});
+                    break :monitor_delivery;
+                }) orelse break :monitor_delivery;
+                defer allocator.free(text);
+                conversation.appendHostText(text) catch |err| {
+                    log.warn("agent", "monitor notification skipped: {s} (events dropped)", .{@errorName(err)});
+                    break :monitor_delivery;
+                };
+                log.info("agent", "monitor notification delivered turn={d}", .{turns + 1});
             }
         };
 
@@ -4378,6 +4399,23 @@ fn runCounted(
                         continue :outer_turn;
                     }
                     @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                    if (opts.preview.monitor_events) {
+                        const monitor_text = takeMonitorNotifications(registry, owner, allocator) catch |err| {
+                            log.warn("agent", "monitor notification skipped: {s}", .{@errorName(err)});
+                            break;
+                        };
+                        if (monitor_text) |text| {
+                            defer allocator.free(text);
+                            conversation.appendHostText(text) catch |err| {
+                                log.warn("agent", "monitor notification skipped: {s} (events dropped)", .{@errorName(err)});
+                                break;
+                            };
+                            output_channel.close(.commentary, assistant_text.items);
+                            job_wakeups += 1;
+                            log.info("agent", "monitor notification delivered after wait turn={d} wakeups={d}", .{ turns + 1, job_wakeups });
+                            continue :outer_turn;
+                        }
+                    }
                     // Jobs ended but were already observed via BashOutput/KillShell: nothing to say.
                     if (!poll.any_running) break;
                     if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
