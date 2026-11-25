@@ -12,6 +12,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench has a 监控 page for the execution machine.** It shows the machine's
+  CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,
+  GitHub, PyPI, Hugging Face, astral.sh and every configured mirror answer
+  from there and how fast, Docker's images, containers and build cache with
+  their reclaimable size, and how often downloads were served from a cache:
+  the apt cache, the download cache and, for task images, Docker's local image
+  store. `metacodes bench monitor [--executor NAME] [--json]` prints the same
+  snapshot, and `GET /api/monitor` serves it. Nothing is installed on the
+  machine: each reading runs one read-only script over the existing SSH access.
+  The page's 镜像源 block edits an SSH executor's mirror settings
+  (`pypi_index`, `docker_mirrors`, `ghcr_mirror`, every `container_mirrors`
+  key and `download_cache`): a save is validated by the parser that reads
+  `workbench.json`, keeps a backup of the file, probes the new addresses at
+  once, and each row says when it takes effect and whether setup has to run
+  again.
 - **Bench prepares each task shortly before its turn and shows what its time
   is made of.** Inside a run, trials now take their slots in the order they
   were queued, and the next wave of waiting trials pulls or builds its task
