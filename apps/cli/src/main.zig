@@ -978,6 +978,14 @@ fn loadStartupMetask(slot: *?provider_oauth_mod.Session, allocator: std.mem.Allo
     return &slot.*.?;
 }
 
+fn metaskEndpointBase(endpoint: []const u8) []const u8 {
+    const url = std.mem.trimEnd(u8, endpoint, "/");
+    for ([_][]const u8{ "/v1/messages", "/v1/chat/completions" }) |suffix| {
+        if (std.mem.endsWith(u8, url, suffix)) return url[0 .. url.len - suffix.len];
+    }
+    return url;
+}
+
 fn startupMetaskGateway(allocator: std.mem.Allocator, session: *const provider_oauth_mod.Session) !?[]const u8 {
     const stored = if (session.tokens) |tokens| tokens.gateway_url orelse "" else null;
     return metask_oauth_mod.modelGateway(stored) catch |err| {
@@ -1536,7 +1544,8 @@ pub fn main(init: std.process.Init) !void {
     }
     var startup_metask: ?provider_oauth_mod.Session = null;
     defer if (startup_metask) |*session| session.deinit();
-    const infer_metask_gateway = config.base_url == null and !metask_legacy_requested;
+    const requested_base_url = config.base_url;
+    const infer_metask_gateway = requested_base_url == null and !metask_legacy_requested;
     if (infer_metask_gateway and std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask")) {
         const session = try loadStartupMetask(&startup_metask, init.gpa, config.state_root);
         config.base_url = try startupMetaskGateway(allocator, session);
@@ -1556,7 +1565,11 @@ pub fn main(init: std.process.Init) !void {
         config.provider_kind = inferProviderKind(config.model);
     }
 
-    if (infer_metask_gateway and startup_metask == null and std.ascii.eqlIgnoreCase(config.resolved_provider_id orelse "", "metask")) {
+    const saved_selection = stored_default_applied or preset_applied;
+    if (stored_default_applied and requested_base_url != null and selectedProfileIsMetask(config)) {
+        config.base_url = metaskEndpointBase(requested_base_url.?);
+        applyProviderRoute(&config, allocator, "metask");
+    } else if (infer_metask_gateway and startup_metask == null and std.ascii.eqlIgnoreCase(config.resolved_provider_id orelse "", "metask")) {
         const session = try loadStartupMetask(&startup_metask, init.gpa, config.state_root);
         if (session.tokens != null) if (try startupMetaskGateway(allocator, session)) |gateway| {
             config.base_url = gateway;
@@ -1575,35 +1588,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
     }
-    // The compiled Metask profile keeps the legacy Messages route so old
-    // model-only selections remain unambiguous. Once the caller explicitly
-    // asks for the OpenAI Chat wire, switch the transport to the authenticated
-    // catalog's chat endpoint; App.init will then construct OpenAIClient and
-    // catalog ingestion below can pin the dynamic OpenAI offer.
-    if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.openai_protocol_explicit) {
-        if (config.openai_protocol == .responses) {
-            std.debug.print("error: Metask exposes the OpenAI chat/completions route, not Responses API\n", .{});
-            std.process.exit(2);
-        }
-        const current = config.base_url orelse {
-            std.debug.print("error: Metask gateway route has no endpoint; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
-            std.process.exit(2);
-        };
-        const messages_suffix = "/v1/messages";
-        const origin = if (std.mem.endsWith(u8, current, messages_suffix))
-            current[0 .. current.len - messages_suffix.len]
-        else
-            current;
-        const chat_endpoint = allocator.alloc(u8, origin.len + "/v1/chat/completions".len) catch {
-            std.debug.print("error: out of memory while selecting the Metask chat route\n", .{});
-            std.process.exit(2);
-        };
-        @memcpy(chat_endpoint[0..origin.len], origin);
-        @memcpy(chat_endpoint[origin.len..], "/v1/chat/completions");
-        allocator.free(config.base_url.?);
-        config.base_url = chat_endpoint;
-        config.provider_kind = .openai;
-    };
+    if (std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask") and config.openai_protocol_explicit and config.openai_protocol == .responses) {
+        std.debug.print("error: Metask exposes the OpenAI chat/completions route, not Responses API\n", .{});
+        std.process.exit(2);
+    }
 
     // --- 预置应答队列(Stage 3):--answers-file 优先,METACODES_ANSWERS env 兜底 ---
     if (config.answers_file) |p| {
@@ -1688,7 +1676,9 @@ pub fn main(init: std.process.Init) !void {
             // session authenticates with the browser sign-in's key, on the
             // stored route, as the historical path would; so does a Metask
             // preset (#489).
-            if (no_sign_in and session.tokens == null and (stored_default_applied or preset_applied)) if (browserSignInKey(allocator, config.state_root)) |key| {
+            if (no_sign_in and saved_selection) if (browserSignInKey(allocator, config.state_root)) |key| {
+                config.base_url = if (requested_base_url) |url| metaskEndpointBase(url) else null;
+                applyProviderRoute(&config, allocator, "metask");
                 browser_key = true;
                 break :blk key;
             };
@@ -1733,6 +1723,22 @@ pub fn main(init: std.process.Init) !void {
             unbound = .{ .missing_credential = named };
         }
     }
+
+    // The compiled Metask profile keeps the legacy Messages route so old
+    // model-only selections remain unambiguous. Once the caller explicitly
+    // asks for the OpenAI Chat wire, switch the transport to the authenticated
+    // catalog's chat endpoint; App.init will then construct OpenAIClient and
+    // catalog ingestion below can pin the dynamic OpenAI offer.
+    if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.openai_protocol_explicit) {
+        const current = config.base_url orelse {
+            std.debug.print("error: Metask gateway route has no endpoint; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
+            std.process.exit(2);
+        };
+        const origin = app_mod.MetaskKeyRoute.gatewayOriginOf(current) orelse current;
+        config.base_url = try std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{origin});
+        allocator.free(current);
+        config.provider_kind = .openai;
+    };
 
     // Level 7 of the startup order (#484): with no credential at all, the
     // interactive TUI opens unbound — no model, nothing sent, a reminder of
