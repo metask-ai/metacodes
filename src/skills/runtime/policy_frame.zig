@@ -8,7 +8,7 @@ const std = @import("std");
 const rule_spec = @import("../../permission/rule_spec.zig");
 const workspace = @import("../../core/workspace_policy.zig");
 const types = @import("../../types.zig");
-const tool_types = @import("../../tools.zig");
+const tool_types = @import("../../permission/category.zig");
 
 pub const Error = error{
     OutOfMemory,

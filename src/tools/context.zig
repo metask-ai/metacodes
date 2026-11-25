@@ -346,33 +346,7 @@ pub const RequestTools = struct {
     }
 };
 
-/// Borrowed, immutable upper bound for one execution context. The owner must
-/// keep `ctx` alive until every synchronous tool execution has quiesced.
-///
-/// This interface deliberately does not grant permission. `true` only means
-/// that the ordinary Session permission pipeline may continue; `false` is a
-/// fail-closed denial before dispatch.
-pub const ToolExecutionPolicy = struct {
-    ctx: *const anyopaque,
-    allowsToolFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
-    allowsInvocationFn: *const fn (
-        ctx: *const anyopaque,
-        name: []const u8,
-        arguments_json: []const u8,
-    ) bool,
-
-    pub fn allowsTool(self: ToolExecutionPolicy, name: []const u8) bool {
-        return self.allowsToolFn(self.ctx, name);
-    }
-
-    pub fn allowsInvocation(
-        self: ToolExecutionPolicy,
-        name: []const u8,
-        arguments_json: []const u8,
-    ) bool {
-        return self.allowsInvocationFn(self.ctx, name, arguments_json);
-    }
-};
+pub const ToolExecutionPolicy = @import("../permission/category.zig").ToolExecutionPolicy;
 
 /// Name-level execution ceiling backed by the exact tool definitions selected
 /// for a child agent.  AgentDef filtering must constrain execution as well as

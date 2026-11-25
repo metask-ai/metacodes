@@ -7,6 +7,34 @@ const std = @import("std");
 pub const ToolCategory = enum { read, write, execute };
 pub const RiskLevel = enum { low, medium, high };
 
+/// Borrowed, immutable upper bound for one execution context. The owner must
+/// keep `ctx` alive until every synchronous tool execution has quiesced.
+///
+/// This interface deliberately does not grant permission. `true` only means
+/// that the ordinary Session permission pipeline may continue; `false` is a
+/// fail-closed denial before dispatch.
+pub const ToolExecutionPolicy = struct {
+    ctx: *const anyopaque,
+    allowsToolFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    allowsInvocationFn: *const fn (
+        ctx: *const anyopaque,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) bool,
+
+    pub fn allowsTool(self: ToolExecutionPolicy, name: []const u8) bool {
+        return self.allowsToolFn(self.ctx, name);
+    }
+
+    pub fn allowsInvocation(
+        self: ToolExecutionPolicy,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) bool {
+        return self.allowsInvocationFn(self.ctx, name, arguments_json);
+    }
+};
+
 pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     if (std.mem.eql(u8, tool_name, "Read") or
         std.mem.eql(u8, tool_name, "Grep") or
