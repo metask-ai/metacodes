@@ -1527,7 +1527,6 @@
         .{ "src/skills/sealed/gateway.zig", "src/core/agent_loop.zig" },
         .{ "src/skills/sealed/gateway.zig", "src/core/conversation.zig" },
         .{ "src/skills/sealed/gateway.zig", "src/core/message.zig" },
-        .{ "src/skills/sealed/gateway.zig", "src/core/transcript.zig" },
         .{ "src/skills/sealed/gateway.zig", "src/json.zig" },
         .{ "src/skills/sealed/gateway.zig", "src/permission.zig" },
         .{ "src/skills/sealed/gateway.zig", "src/permission/category.zig" },

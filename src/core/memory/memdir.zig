@@ -3,7 +3,7 @@
 //! 对齐 cc/src/memdir/*。模型用 Write/Read/Grep **自己管理**一个记忆目录(无专用 Memory 工具,
 //! 对齐 cc)。本模块只提供:
 //!   1. 路径解析:memdir = `{state_root}/projects/<cwd_hash>/memory/`
-//!      (复用 transcript.hashCwd —— 与现有 transcript 布局并列;cc 用 sanitized-git-root,
+//!      (复用 platform.paths.hashCwd —— 与现有 transcript 布局并列;cc 用 sanitized-git-root,
 //!       zig-cc 沿用项目既有 cwd_hash 标准,见 spec §2.1 divergence)
 //!   2. MEMORY.md 索引:读取 + 截断(≤200 行 / ≤25KB,对齐 cc MAX_ENTRYPOINT_*)
 //!   3. isAutoMemPath:某写入目标是否落在 memdir 子树内(权限豁免用,realpath 前缀匹配防穿越)
@@ -16,7 +16,6 @@ const std = @import("std");
 const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const builtin = @import("builtin");
-const transcript = @import("../transcript.zig");
 
 /// MEMORY.md 索引上限(对齐 cc MAX_ENTRYPOINT_LINES / MAX_ENTRYPOINT_BYTES)。
 pub const MAX_ENTRYPOINT_LINES = 200;
@@ -36,7 +35,7 @@ pub fn isEnabled() bool {
 /// state_root/cwd 任一为空 → 返回空串(memdir 不可用)。
 pub fn memdirPath(state_root: []const u8, cwd: []const u8, buf: []u8) []const u8 {
     if (state_root.len == 0 or cwd.len == 0) return "";
-    const cwd_hash = transcript.hashCwd(cwd);
+    const cwd_hash = ppaths.hashCwd(cwd);
     return std.fmt.bufPrint(buf, "{s}/projects/{s}/memory", .{ state_root, cwd_hash[0..] }) catch "";
 }
 

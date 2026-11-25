@@ -63,7 +63,6 @@
                 "src/core/shell.zig",
                 "src/core/shutdown.zig",
                 "src/core/tool_observation_journal.zig",
-                "src/core/transcript.zig",
                 "src/mcp/naming.zig",
                 "src/skills/active.zig",
                 "src/skills/runtime/policy_frame.zig",
