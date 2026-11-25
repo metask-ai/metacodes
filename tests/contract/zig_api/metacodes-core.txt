@@ -1033,17 +1033,16 @@ metacodes-core.conversation.Conversation.ToolResultReduction.bytes_after: usize 
 metacodes-core.conversation.Conversation.ToolResultReduction.changed: fn changed(self: ToolResultReduction) bool
 metacodes-core.conversation.Conversation.ToolResultReduction.merge: fn merge(self: *ToolResultReduction, other: ToolResultReduction) void
 metacodes-core.conversation.Conversation.compactWithSummaryReport: fn compactWithSummaryReport( self: *Conversation, keep_n: usize, ctx: anytype, comptime summarize_fn: fn (@TypeOf(ctx), []const msg.Message) ?[]u8, ) !CompactReport
-metacodes-core.conversation.Conversation.microcompactToolResults: fn microcompactToolResults(self: *Conversation, keep_recent_n: usize) usize
-metacodes-core.conversation.Conversation.microcompactToolResultsByRecentResults: fn microcompactToolResultsByRecentResults(self: *Conversation, keep_recent_results: usize) ToolResultReduction
-metacodes-core.conversation.Conversation.truncateLargeToolResults: fn truncateLargeToolResults(self: *Conversation, max_bytes: usize) ToolResultReduction
 metacodes-core.conversation.Conversation.markDelivered: fn markDelivered(self: *Conversation, opts: DeliveryOptions) void
 metacodes-core.conversation.Conversation.ImageTrim: struct
 metacodes-core.conversation.Conversation.ImageTrim.reduction: ToolResultReduction = .{}
 metacodes-core.conversation.Conversation.ImageTrim.remaining_over_cap: usize = 0
-metacodes-core.conversation.Conversation.trimDeliveredImageBytes: fn trimDeliveredImageBytes(self: *Conversation, cap: usize) ImageTrim
 metacodes-core.conversation.Conversation.nonTrimmableImageBytes: fn nonTrimmableImageBytes(self: *Conversation) usize
+metacodes-core.conversation.Conversation.activeImageBytesLocked: fn activeImageBytesLocked(self: *const Conversation, active_start: usize, only_non_trimmable: bool) usize
 metacodes-core.conversation.Conversation.DeliveryOptions: struct
 metacodes-core.conversation.Conversation.DeliveryOptions.image_placeholder_ids: ?[]const []const u8
+metacodes-core.conversation.Conversation.clearToolResultLocked: fn clearToolResultLocked(self: *Conversation, message_index: usize, block_index: usize) ?usize
+metacodes-core.conversation.Conversation.replaceToolResultContentLocked: fn replaceToolResultContentLocked(self: *Conversation, message_index: usize, block_index: usize, content: []u8) void
 metacodes-core.conversation.isCommittedToolResultProjection: fn isCommittedToolResultProjection(content: []const u8) bool
 metacodes-core.compact_summary: file
 metacodes-core.compact_summary.defaultSystemPrompt: fn defaultSystemPrompt() []const u8
@@ -1530,6 +1529,10 @@ metacodes-core.run_input.Queue.adopt: fn adopt(self: *Queue, sequence: u32) void
 metacodes-core.run_input.Queue.close: fn close(self: *Queue) Reconciliation
 metacodes-core.run_input.Queue.reconciliation: fn reconciliation(self: *Queue, run_id: u64) ?Reconciliation
 metacodes-core.file_reference: file
+metacodes-core.file_reference.PathOptions: struct
+metacodes-core.file_reference.PathOptions.home: []const u8
+metacodes-core.file_reference.PathOptions.base_dir: []const u8 = ""
+metacodes-core.file_reference.PathOptions.resolve_relative: bool = false
 metacodes-core.file_reference.MAX_FILE_REFS_PER_TOOL_RESULT_V1: const usize = 32
 metacodes-core.file_reference.MAX_FILE_REF_PATH_BYTES_V1: const usize = 4096
 metacodes-core.file_reference.MAX_FILE_REF_URI_BYTES_V1: const usize = 8192
@@ -1561,8 +1564,8 @@ metacodes-core.file_reference.ResolvedFileTarget.locator_kind: LocatorKind
 metacodes-core.file_reference.ResolvedFileTarget.state: @import("observation.zig").FileTargetState = .unobserved
 metacodes-core.file_reference.isBuiltinFileTool: fn isBuiltinFileTool(name: []const u8) bool
 metacodes-core.file_reference.pathField: fn pathField(name: []const u8) []const u8
-metacodes-core.file_reference.resolveFileTarget: fn resolveFileTarget( allocator: std.mem.Allocator, ctx: *const ToolContext, name: []const u8, input: []const u8, state: @import("observation.zig").FileTargetState, ) !?ResolvedFileTarget
-metacodes-core.file_reference.classifyPath: fn classifyPath( allocator: std.mem.Allocator, ctx: *const ToolContext, raw: []const u8, state: @import("observation.zig").FileTargetState, ) !?ResolvedFileTarget
+metacodes-core.file_reference.resolveFileTarget: fn resolveFileTarget( allocator: std.mem.Allocator, paths: PathOptions, name: []const u8, input: []const u8, state: @import("observation.zig").FileTargetState, ) !?ResolvedFileTarget
+metacodes-core.file_reference.classifyPath: fn classifyPath( allocator: std.mem.Allocator, paths: PathOptions, raw: []const u8, state: @import("observation.zig").FileTargetState, ) !?ResolvedFileTarget
 metacodes-core.file_reference.project: fn project( allocator: std.mem.Allocator, target: ResolvedFileTarget, name: []const u8, ) !FileReference
 metacodes-core.file_change: file
 metacodes-core.file_change.SCHEMA_VERSION: const = "metacodes-file-change-v1"
@@ -1615,7 +1618,7 @@ metacodes-core.file_change.Sink.publish: fn publish(self: Sink, draft: Draft) vo
 metacodes-core.file_change.Sink.noteIncomplete: fn noteIncomplete(self: Sink) void
 metacodes-core.file_change.Collector: struct
 metacodes-core.file_change.Collector.allocator: std.mem.Allocator
-metacodes-core.file_change.Collector.ctx: *const ToolContext
+metacodes-core.file_change.Collector.paths: file_reference.PathOptions
 metacodes-core.file_change.Collector.tool: []const u8
 metacodes-core.file_change.Collector.tool_use_id: []const u8
 metacodes-core.file_change.Collector.agent_depth: u8
@@ -2104,6 +2107,10 @@ metacodes-core.result_projection.hasRecoverableArtifact: fn hasRecoverableArtifa
 metacodes-core.result_projection.isStructuredObject: fn isStructuredObject(content: []const u8) bool
 metacodes-core.result_projection.shrinkStructuredResult: fn shrinkStructuredResult( allocator: std.mem.Allocator, content: []const u8, max_bytes: usize, ) ?[]u8
 metacodes-core.result_projection.shrinkRecoverableEnvelope: fn shrinkRecoverableEnvelope( allocator: std.mem.Allocator, content: []const u8, max_bytes: usize, ) ?[]u8
+metacodes-core.result_projection.microcompactToolResults: fn microcompactToolResults(conversation: *Conversation, keep_recent_n: usize) usize
+metacodes-core.result_projection.microcompactToolResultsByRecentResults: fn microcompactToolResultsByRecentResults(conversation: *Conversation, keep_recent_results: usize) ToolResultReduction
+metacodes-core.result_projection.truncateLargeToolResults: fn truncateLargeToolResults(conversation: *Conversation, max_bytes: usize) ToolResultReduction
+metacodes-core.result_projection.trimDeliveredImageBytes: fn trimDeliveredImageBytes(conversation: *Conversation, cap: usize) Conversation.ImageTrim
 metacodes-core.result_budget: file
 metacodes-core.result_budget.Source: enum(usize)
 metacodes-core.result_budget.Source._

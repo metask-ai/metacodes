@@ -4,10 +4,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const ToolContext = @import("../tools/context.zig").ToolContext;
 const common = @import("../tools/common.zig");
 const json_util = @import("../util/json.zig");
 const path_mod = @import("../util/path.zig");
+
+pub const PathOptions = path_mod.NormalizeOptions;
 
 pub const MAX_FILE_REFS_PER_TOOL_RESULT_V1: usize = 32;
 pub const MAX_FILE_REF_PATH_BYTES_V1: usize = 4096;
@@ -77,7 +78,7 @@ pub fn pathField(name: []const u8) []const u8 {
 /// as a local filesystem path.
 pub fn resolveFileTarget(
     allocator: std.mem.Allocator,
-    ctx: *const ToolContext,
+    paths: PathOptions,
     name: []const u8,
     input: []const u8,
     state: @import("../tools/observation.zig").FileTargetState,
@@ -87,7 +88,7 @@ pub fn resolveFileTarget(
         common.extractJsonArg(input, "path") orelse return null;
     const raw = try json_util.unescapeString(escaped, allocator);
     defer allocator.free(raw);
-    return classifyPath(allocator, ctx, raw, state);
+    return classifyPath(allocator, paths, raw, state);
 }
 
 /// Classify one already-unescaped path string under the same normalization
@@ -97,7 +98,7 @@ pub fn resolveFileTarget(
 /// of re-deriving the rule.
 pub fn classifyPath(
     allocator: std.mem.Allocator,
-    ctx: *const ToolContext,
+    paths: PathOptions,
     raw: []const u8,
     state: @import("../tools/observation.zig").FileTargetState,
 ) !?ResolvedFileTarget {
@@ -108,23 +109,19 @@ pub fn classifyPath(
         return .{ .path = try allocator.dupe(u8, raw), .locator_kind = .uri, .state = state };
     }
 
-    const normalized = path_mod.normalizeChecked(allocator, raw, .{
-        .home = ctx.home_dir,
-        .base_dir = ctx.cwd_abs,
-        .resolve_relative = ctx.resolve_relative_paths,
-    }) catch return null;
+    const normalized = path_mod.normalizeChecked(allocator, raw, paths) catch return null;
     defer allocator.free(normalized);
     if (normalized.len > MAX_FILE_REF_PATH_BYTES_V1) return null;
 
     var normalized_cwd: ?[]u8 = null;
     defer if (normalized_cwd) |cwd| allocator.free(cwd);
-    if (ctx.cwd_abs.len != 0) {
-        normalized_cwd = path_mod.normalizeChecked(allocator, ctx.cwd_abs, .{
-            .home = ctx.home_dir,
+    if (paths.base_dir.len != 0) {
+        normalized_cwd = path_mod.normalizeChecked(allocator, paths.base_dir, .{
+            .home = paths.home,
             .resolve_relative = false,
         }) catch null;
     }
-    const cwd = if (normalized_cwd) |value| value else ctx.cwd_abs;
+    const cwd = if (normalized_cwd) |value| value else paths.base_dir;
     if (workspaceRelative(cwd, normalized)) |relative| {
         return .{ .path = try allocator.dupe(u8, relative), .locator_kind = .workspace_path, .state = state };
     }
@@ -188,14 +185,14 @@ fn samePrefix(a: []const u8, b: []const u8) bool {
 
 test "file reference resolves workspace and absolute locators" {
     const a = std.testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    const inside = (try resolveFileTarget(a, &ctx, "Read", "{\"file_path\":\"src/main.zig\"}", .unobserved)).?;
+    const paths: PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    const inside = (try resolveFileTarget(a, paths, "Read", "{\"file_path\":\"src/main.zig\"}", .unobserved)).?;
     defer {
         a.free(inside.path);
     }
     try std.testing.expectEqual(LocatorKind.workspace_path, inside.locator_kind);
 
-    const outside = (try resolveFileTarget(a, &ctx, "Read", "{\"file_path\":\"/tmp/x\"}", .unobserved)).?;
+    const outside = (try resolveFileTarget(a, paths, "Read", "{\"file_path\":\"/tmp/x\"}", .unobserved)).?;
     defer {
         a.free(outside.path);
     }
@@ -204,10 +201,10 @@ test "file reference resolves workspace and absolute locators" {
 
 test "NotebookEdit uses notebook_path and owns projected metadata" {
     const a = std.testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    const paths: PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
     const target = (try resolveFileTarget(
         a,
-        &ctx,
+        paths,
         "NotebookEdit",
         "{\"notebook_path\":\"notebooks/demo.ipynb\"}",
         .regular_existing,

@@ -59,6 +59,8 @@
                 "src/core/tool_result_artifact.zig",
                 "src/core/answer_queue.zig",
                 "src/core/execution_effect.zig",
+                "src/core/file_change.zig",
+                "src/core/file_reference.zig",
                 "src/core/memory/memdir.zig",
                 "src/core/project_rule_spec.zig",
                 "src/core/prompt_sections.zig",
@@ -145,7 +147,7 @@
     },
     .kernel_budget = .{
         .package = "kernel",
-        .max_lines = 3264,
-        .max_dependencies = .{ "base", "ai", "coding" },
+        .max_lines = 2775,
+        .max_dependencies = .{ "base", "ai" },
     },
 }

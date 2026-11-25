@@ -7,6 +7,7 @@ const Conversation = @import("conversation.zig").Conversation;
 const msg = @import("message.zig");
 const compact_summary = @import("compact_summary.zig");
 const request_gate = @import("request_gate.zig");
+const result_projection = @import("result_projection.zig");
 const provider_mod = @import("../api/provider.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const UsageDelta = @import("../api/stream.zig").UsageDelta;
@@ -337,7 +338,7 @@ pub fn run(
     var emergency_reduced = false;
     if (options.target_tokens) |target| {
         if (after_tokens > target) {
-            const reduction = preview.conversation.microcompactToolResultsByRecentResults(0);
+            const reduction = result_projection.microcompactToolResultsByRecentResults(&preview.conversation, 0);
             emergency_reduced = reduction.changed();
             if (emergency_reduced)
                 after_tokens = estimate(options.estimator, &preview.conversation);

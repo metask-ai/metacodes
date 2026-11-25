@@ -608,7 +608,7 @@ test "L2 native filesystem sandbox: allowed Read Write Edit preserve receipts st
     defer rs.deinit();
     ctx.read_state = &rs;
     const changes = @import("../core/file_change.zig");
-    var collector = changes.Collector{ .allocator = allocator, .ctx = &ctx, .tool = "Write", .tool_use_id = "sandbox-file", .agent_depth = 0 };
+    var collector = changes.Collector{ .allocator = allocator, .paths = .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs, .resolve_relative = ctx.resolve_relative_paths }, .tool = "Write", .tool_use_id = "sandbox-file", .agent_depth = 0 };
     defer collector.deinit();
     ctx.file_change_sink = collector.sink();
     var effect: @import("../tools/observation.zig").EffectSlot = .{};

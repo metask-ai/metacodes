@@ -715,7 +715,7 @@ pub fn executeOne(
     // and `takeFileChanges` empties it on the paths that hand ownership on.
     var change_collector = file_change.Collector{
         .allocator = parent_allocator,
-        .ctx = &job_ctx,
+        .paths = filePaths(&job_ctx),
         .tool = name,
         .tool_use_id = id,
         .agent_depth = base_ctx.agent_depth,
@@ -1158,7 +1158,7 @@ fn synthesizeFileChange(
     // shares the name "Write" is not a native file tool, and must not be
     // reported as one.
     if (!is_builtin_file_tool or !isMutatingFileToolName(name)) return;
-    const target = (file_reference.resolveFileTarget(collector.allocator, ctx, name, input, state) catch return) orelse return;
+    const target = (file_reference.resolveFileTarget(collector.allocator, filePaths(ctx), name, input, state) catch return) orelse return;
     defer collector.allocator.free(target.path);
     // Bytes may already be on disk → `partial`, not `failed`. Erring toward
     // "something may have changed" is the safe direction; the reverse tells the
@@ -1203,7 +1203,7 @@ pub fn rejectedFileChanges(
     if (!is_patch and (!isBuiltinFileTool(ctx, name) or !isMutatingFileToolName(name))) return .{};
     var collector = file_change.Collector{
         .allocator = allocator,
-        .ctx = ctx,
+        .paths = filePaths(ctx),
         .tool = name,
         .tool_use_id = id,
         .agent_depth = ctx.agent_depth,
@@ -1254,6 +1254,10 @@ pub fn isMutatingFileToolName(name: []const u8) bool {
         std.mem.eql(u8, name, "NotebookEdit");
 }
 
+fn filePaths(ctx: *const ToolContext) file_reference.PathOptions {
+    return .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs, .resolve_relative = ctx.resolve_relative_paths };
+}
+
 fn isBuiltinFileTool(ctx: *const ToolContext, name: []const u8) bool {
     if (!file_reference.isBuiltinFileTool(name)) return false;
     if (ctx.tool_dispatcher) |dispatcher| return dispatcher.isBuiltin(name);
@@ -1275,7 +1279,7 @@ fn buildFileReferences(
         std.mem.eql(u8, name, "NotebookEdit")) and
         state != .missing and state != .regular_existing)
         return null;
-    const target = (try file_reference.resolveFileTarget(allocator, ctx, name, input, state)) orelse return null;
+    const target = (try file_reference.resolveFileTarget(allocator, filePaths(ctx), name, input, state)) orelse return null;
     defer allocator.free(target.path);
     var refs = try allocator.alloc(file_reference.FileReference, 1);
     refs[0] = file_reference.project(allocator, target, name) catch |err| {
@@ -1495,7 +1499,7 @@ test "file change: 写盘成功但结果渲染失败时报 partial 而非 failed
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
     var collector = file_change.Collector{
         .allocator = a,
-        .ctx = &ctx,
+        .paths = filePaths(&ctx),
         .tool = "Write",
         .tool_use_id = "tu-partial",
         .agent_depth = 0,
@@ -1525,7 +1529,7 @@ test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 
     const input = "{\"file_path\":\"/work/none.txt\",\"content\":\"x\"}";
 
     {
-        var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t1", .agent_depth = 0 };
+        var collector = file_change.Collector{ .allocator = a, .paths = filePaths(&ctx), .tool = "Write", .tool_use_id = "t1", .agent_depth = 0 };
         defer collector.deinit();
         synthesizeFileChange(&collector, &ctx, "Write", true, input, .missing, false, .failed);
         const rec = collector.items.items[0];
@@ -1535,7 +1539,7 @@ test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 
     }
     {
         // 被拒 = 绝对没写过。即使 effect 槽有残留也不能被升级成 partial。
-        var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t2", .agent_depth = 0 };
+        var collector = file_change.Collector{ .allocator = a, .paths = filePaths(&ctx), .tool = "Write", .tool_use_id = "t2", .agent_depth = 0 };
         defer collector.deinit();
         synthesizeFileChange(&collector, &ctx, "Write", true, input, .regular_existing, true, .rejected);
         const rec = collector.items.items[0];
@@ -1547,7 +1551,7 @@ test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 
 test "file change: host 派发的同名工具不冒充原生文件工具" {
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t", .agent_depth = 0 };
+    var collector = file_change.Collector{ .allocator = a, .paths = filePaths(&ctx), .tool = "Write", .tool_use_id = "t", .agent_depth = 0 };
     defer collector.deinit();
     synthesizeFileChange(
         &collector,

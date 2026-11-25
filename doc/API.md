@@ -1011,9 +1011,9 @@ what made it oversized.
 A structured result that cannot be shrunk — one whose bulk is not in its
 strings — is left oversized rather than mangled, and the generic text
 truncation is reserved for content that was never structured. Being one request
-too large is recoverable; an unparseable result is not. `clearToolResultAt`
-already refuses to erase a result's only recovery capability for the same
-reason.
+too large is recoverable; an unparseable result is not. The microcompact
+clear pass already refuses to erase a result's only recovery capability for
+the same reason.
 
 Recovery has two primitives rather than one. `ReadArtifact` returns byte
 ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a

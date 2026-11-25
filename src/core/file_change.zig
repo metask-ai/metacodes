@@ -43,7 +43,6 @@
 const std = @import("std");
 const util_json = @import("../util/json.zig");
 const file_reference = @import("file_reference.zig");
-const ToolContext = @import("../tools/context.zig").ToolContext;
 // 裁剪 std 无 Thread.Mutex;全仓惯例走 platform.sync(pthread 包装)。
 const sync = @import("platform").sync;
 
@@ -233,7 +232,7 @@ pub const Sink = struct {
 /// "incomplete" instead of quietly showing less than happened.
 pub const Collector = struct {
     allocator: std.mem.Allocator,
-    ctx: *const ToolContext,
+    paths: file_reference.PathOptions,
     tool: []const u8,
     tool_use_id: []const u8,
     agent_depth: u8,
@@ -272,7 +271,7 @@ pub const Collector = struct {
     }
 
     fn build(self: *Collector, draft: Draft) !Record {
-        const target = (try file_reference.classifyPath(self.allocator, self.ctx, draft.path, .unobserved)) orelse
+        const target = (try file_reference.classifyPath(self.allocator, self.paths, draft.path, .unobserved)) orelse
             return error.UnclassifiablePath;
         defer self.allocator.free(target.path);
         const locator = try locatorFor(self.allocator, target);
@@ -281,7 +280,7 @@ pub const Collector = struct {
         var from_locator: ?file_reference.Locator = null;
         errdefer if (from_locator) |loc| freeLocator(self.allocator, loc);
         if (draft.from_path) |from| {
-            if (try file_reference.classifyPath(self.allocator, self.ctx, from, .unobserved)) |from_target| {
+            if (try file_reference.classifyPath(self.allocator, self.paths, from, .unobserved)) |from_target| {
                 defer self.allocator.free(from_target.path);
                 from_locator = try locatorFor(self.allocator, from_target);
             }
@@ -518,10 +517,10 @@ pub fn writeJsonArray(w: *std.Io.Writer, records: []const Record) !void {
 
 const testing = std.testing;
 
-fn testCollector(a: std.mem.Allocator, ctx: *const ToolContext) Collector {
+fn testCollector(a: std.mem.Allocator, paths: file_reference.PathOptions) Collector {
     return .{
         .allocator = a,
-        .ctx = ctx,
+        .paths = paths,
         .tool = "Write",
         .tool_use_id = "tu-1",
         .agent_depth = 0,
@@ -530,8 +529,8 @@ fn testCollector(a: std.mem.Allocator, ctx: *const ToolContext) Collector {
 
 test "collector: a workspace write is classified relative and carries its diff" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     collector.sink().publish(.{
@@ -557,8 +556,8 @@ test "collector: a workspace write is classified relative and carries its diff" 
 
 test "collector: a move keeps both the vacated and the new locator" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     collector.publish(.{
@@ -579,8 +578,8 @@ test "collector: a move keeps both the vacated and the new locator" {
 
 test "collector: a real change without a diff is reported as incomplete evidence" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     collector.publish(.{
@@ -599,8 +598,8 @@ test "collector: a real change without a diff is reported as incomplete evidence
 
 test "collector: a deletion needs no diff to be complete evidence" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     collector.publish(.{ .path = "/work/gone.txt", .kind = .deleted, .status = .applied, .before_bytes = 7 });
@@ -611,8 +610,8 @@ test "collector: a deletion needs no diff to be complete evidence" {
 
 test "collector: an oversized diff is truncated and flagged, never silently shortened" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     const big = try a.alloc(u8, MAX_UNIFIED_DIFF_BYTES_V1 + 32);
@@ -633,8 +632,8 @@ test "collector: an oversized diff is truncated and flagged, never silently shor
 
 test "collector: publishing past the per-call cap sets overflow instead of dropping silently" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     var i: usize = 0;
@@ -647,8 +646,8 @@ test "collector: publishing past the per-call cap sets overflow instead of dropp
 
 test "collector: toOwnedSlice hands ownership over and leaves nothing to double free" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = testCollector(a, &ctx);
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
+    var collector = testCollector(a, paths);
     defer collector.deinit();
 
     collector.publish(.{ .path = "/work/a.txt", .kind = .created, .status = .applied, .unified_diff = "d" });
@@ -661,12 +660,12 @@ test "collector: toOwnedSlice hands ownership over and leaves nothing to double 
 
 test "journal: clones records so it outlives the dispatch that produced them" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
     var journal = Journal.init(a);
     defer journal.deinit();
 
     {
-        var collector = testCollector(a, &ctx);
+        var collector = testCollector(a, paths);
         defer collector.deinit();
         collector.publish(.{
             .path = "/work/a.txt",
@@ -690,11 +689,11 @@ test "journal: clones records so it outlives the dispatch that produced them" {
 
 test "journal: exceeding the retention cap reports truncation" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
     var journal = Journal.init(a);
     defer journal.deinit();
 
-    var collector = testCollector(a, &ctx);
+    var collector = testCollector(a, paths);
     defer collector.deinit();
     collector.publish(.{ .path = "/work/a.txt", .kind = .modified, .status = .applied });
 
@@ -754,7 +753,7 @@ test "json projection: v1 field names, locator kind, and move provenance" {
 
 test "journal: over the diff budget it keeps the change, drops only the text" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
     var journal = Journal.init(a);
     defer journal.deinit();
 
@@ -762,7 +761,7 @@ test "journal: over the diff budget it keeps the change, drops only the text" {
     defer a.free(big);
     @memset(big, '+');
 
-    var collector = testCollector(a, &ctx);
+    var collector = testCollector(a, paths);
     defer collector.deinit();
     collector.publish(.{
         .path = "/work/big.txt",
@@ -796,11 +795,11 @@ test "journal: over the diff budget it keeps the change, drops only the text" {
 
 test "journal: reset drops the retained session and its budget" {
     const a = testing.allocator;
-    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    const paths: file_reference.PathOptions = .{ .home = "", .base_dir = "/work", .resolve_relative = true };
     var journal = Journal.init(a);
     defer journal.deinit();
 
-    var collector = testCollector(a, &ctx);
+    var collector = testCollector(a, paths);
     defer collector.deinit();
     collector.publish(.{ .path = "/work/a.txt", .kind = .created, .status = .applied, .unified_diff = "+a\n" });
     journal.recordAll(collector.items.items);
