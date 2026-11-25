@@ -23,6 +23,17 @@ status, compatibility boundaries, and entry points are defined by
   apart, and list the images preparation found, pulled or built. A failed
   preparation is recorded beside the trial and never decides its result; the
   wait after it is shown as 准备失败后等待, not as ready.
+- **Bench executors can cache what task containers download.**
+  `"download_cache": true` on an SSH executor makes `metacodes bench setup`
+  run `metacodes-download-cache` on the executor, and every run's task
+  containers then fetch PyPI, npm, Go, conda and rustup packages and GitHub
+  release assets (uv, uv's Python) through it: a file is downloaded from the
+  `container_mirrors` mirror once and served from the executor afterwards,
+  concurrent trials share one download, and index pages are served from the
+  stored copy when the mirror is down. `GET <metrics_bind>:3143/_stats`
+  reports hits, misses and bytes per kind. apt keeps its apt-cacher-ng
+  cache; Hugging Face, Docker images and git traffic are not behind it.
+
 - **Bench task containers can take GitHub release and Hugging Face mirrors.**
   `container_mirrors` on an SSH executor accepts `github` (a URL standing for
   `https://github.com`, such as `https://gh-proxy.com/https://github.com`)
