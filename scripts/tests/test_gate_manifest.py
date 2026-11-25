@@ -1,5 +1,8 @@
+import os
 import re
 import shlex
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -82,6 +85,18 @@ SCRIPT_SUITES_RUN_ELSEWHERE = {
 
 
 class GateManifestTest(unittest.TestCase):
+    def test_eval_preflight_reports_the_python_that_needs_repair(self):
+        script = str(ROOT / "scripts/check_eval_python.py")
+        good = subprocess.run([sys.executable, script], capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        missing = subprocess.run(
+            [sys.executable, "-I", "-S", script], capture_output=True, text=True,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        args = [sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]
+        repair = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+        self.assertIn(repair, missing.stderr)
+
     def test_every_script_suite_runs_on_every_pull_request(self):
         """A suite nothing runs passes forever. Every scripts/tests module is
         named by a ci.yml step or a build.zig command (the `test` graph runs on

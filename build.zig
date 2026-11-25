@@ -3011,12 +3011,17 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "Lint Python, shell scripts and GitHub Actions workflows");
     lint_step.dependOn(&gate_lint.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
-    gate_pr_step.dependOn(gate_static_step);
-    gate_pr_step.dependOn(&gate_lint.step);
-    gate_pr_step.dependOn(test_step);
-    gate_pr_step.dependOn(gate_core_suite);
-    gate_pr_step.dependOn(&gate_coverage.step);
-    gate_pr_step.dependOn(doc_check_step);
+    const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    if (evalPythonFailure(b, eval_python_exe)) |message| {
+        gate_pr_step.dependOn(&b.addFail(message).step);
+    } else {
+        gate_pr_step.dependOn(gate_static_step);
+        gate_pr_step.dependOn(&gate_lint.step);
+        gate_pr_step.dependOn(test_step);
+        gate_pr_step.dependOn(gate_core_suite);
+        gate_pr_step.dependOn(&gate_coverage.step);
+        gate_pr_step.dependOn(doc_check_step);
+    }
     const affected_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "scripts/ci_scope.py",
@@ -3180,7 +3185,6 @@ pub fn build(b: *std.Build) void {
     // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
     // compare/gate）。Python 合同测试 + 同宿主原生零付费 smoke；不访问真实模型，
     // 默认 test 也执行，避免评估器或 native 接线漂移后继续给出看似可信的分数。
-    const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
     // The suite runs as shards (scripts/eval/tests/run_shard.py: every N-th
     // module), each with its output captured. As one process inheriting the
     // terminal it ran after every smoke, since the build runner runs such
@@ -3881,6 +3885,16 @@ pub fn build(b: *std.Build) void {
     });
 
     addLayerCheck(b, gate_static_step, units_test_step);
+}
+
+fn evalPythonFailure(b: *std.Build, python: []const u8) ?[]const u8 {
+    if (b.dep_prefix.len != 0) return null;
+    const result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ python, b.pathFromRoot("scripts/check_eval_python.py") },
+        .environ_map = &b.graph.environ_map,
+    }) catch |err| return b.fmt("Cannot run Eval interpreter {s} ({s}). Put Python >= 3.9 on PATH and run {s} -m pip install -r requirements-dev.txt", .{ python, @errorName(err), python });
+    if (result.term == .exited and result.term.exited == 0) return null;
+    return b.fmt("Eval preflight failed ({s}): {s}", .{ python, std.mem.trim(u8, result.stderr, " \t\r\n") });
 }
 
 fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_step: *std.Build.Step) void {

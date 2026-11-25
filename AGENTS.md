@@ -292,7 +292,11 @@ copy steps without compiling the product.
 The local `gate:pr` checklist above remains unchanged. Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
-The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`);
+The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
+`gate:pr` checks these before scheduling the checklist. To check the
+environment before running the commands individually, run
+`python3 scripts/check_eval_python.py` (`python` on Windows) in the same shell.
+
 `scripts/lint.py` needs the linters at the versions `requirements-lint.txt`
 pins (ruff for Python, shellcheck for shell scripts, actionlint for
 workflows) and fails when one is missing.
