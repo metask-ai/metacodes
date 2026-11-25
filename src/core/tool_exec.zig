@@ -351,7 +351,146 @@ pub const OneResult = union(enum) {
     }
 };
 
-fn hostFatalResult(collector: *file_change.Collector) OneResult {
+/// Per-dispatch accumulator installed by `tool_exec.executeOne`. It copies each
+/// draft into `allocator` (the parent allocator) so records outlive the tool's
+/// arena.
+///
+/// Recording never fails a tool: a copy that cannot be made sets `lost`, as does
+/// a tool that says it could not observe everything it may have changed
+/// (`file_change.Sink.noteIncomplete`); an over-cap publication sets `overflow`. Both travel
+/// with the result — even with no record at all — so a consumer can say
+/// "incomplete" instead of quietly showing less than happened.
+pub const Collector = struct {
+    allocator: std.mem.Allocator,
+    ctx: *const ToolContext,
+    tool: []const u8,
+    tool_use_id: []const u8,
+    agent_depth: u8,
+    items: std.ArrayList(file_change.Record) = .empty,
+    overflow: bool = false,
+    lost: bool = false,
+
+    pub fn sink(self: *Collector) file_change.Sink {
+        return .{ .ctx = @ptrCast(self), .publishFn = publishTrampoline, .incompleteFn = incompleteTrampoline };
+    }
+
+    fn publishTrampoline(ctx: *anyopaque, draft: file_change.Draft) void {
+        const self: *Collector = @ptrCast(@alignCast(ctx));
+        self.publish(draft);
+    }
+
+    fn incompleteTrampoline(ctx: *anyopaque) void {
+        const self: *Collector = @ptrCast(@alignCast(ctx));
+        self.lost = true;
+    }
+
+    pub fn publish(self: *Collector, draft: file_change.Draft) void {
+        if (self.items.items.len >= file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1) {
+            self.overflow = true;
+            return;
+        }
+        const record = self.build(draft) catch {
+            self.lost = true;
+            return;
+        };
+        var owned = record;
+        self.items.append(self.allocator, owned) catch {
+            owned.deinit(self.allocator);
+            self.lost = true;
+        };
+    }
+
+    fn build(self: *Collector, draft: file_change.Draft) !file_change.Record {
+        const target = (try file_reference.classifyPath(self.allocator, self.ctx, draft.path, .unobserved)) orelse
+            return error.UnclassifiablePath;
+        defer self.allocator.free(target.path);
+        const locator = try locatorFor(self.allocator, target);
+        errdefer freeLocator(self.allocator, locator);
+
+        var from_locator: ?file_reference.Locator = null;
+        errdefer if (from_locator) |loc| freeLocator(self.allocator, loc);
+        if (draft.from_path) |from| {
+            if (try file_reference.classifyPath(self.allocator, self.ctx, from, .unobserved)) |from_target| {
+                defer self.allocator.free(from_target.path);
+                from_locator = try locatorFor(self.allocator, from_target);
+            }
+        }
+
+        const tool = try self.allocator.dupe(u8, self.tool);
+        errdefer self.allocator.free(tool);
+        const tool_use_id = try self.allocator.dupe(u8, self.tool_use_id);
+        errdefer self.allocator.free(tool_use_id);
+
+        var diff_complete = draft.diff_complete;
+        var diff: ?[]const u8 = null;
+        if (draft.unified_diff) |raw| {
+            if (raw.len > file_change.MAX_UNIFIED_DIFF_BYTES_V1) {
+                diff = try self.allocator.dupe(u8, raw[0..file_change.MAX_UNIFIED_DIFF_BYTES_V1]);
+                diff_complete = false;
+            } else {
+                diff = try self.allocator.dupe(u8, raw);
+            }
+        } else if (draft.status.changedDisk() and draft.kind != .deleted) {
+            // A real content change with no diff attached is incomplete
+            // evidence; say so rather than letting the consumer read the
+            // missing diff as "nothing changed".
+            diff_complete = false;
+        }
+
+        return .{
+            .locator = locator,
+            .from_locator = from_locator,
+            .kind = draft.kind,
+            .status = draft.status,
+            .tool = tool,
+            .tool_use_id = tool_use_id,
+            .agent_depth = self.agent_depth,
+            .before_bytes = draft.before_bytes,
+            .after_bytes = draft.after_bytes,
+            .unified_diff = diff,
+            .diff_complete = diff_complete,
+        };
+    }
+
+    /// Transfer the collected records to the caller. The collector is **always**
+    /// left empty — including when the transfer itself fails — so a later
+    /// `deinit` is a no-op, a caller without a `defer deinit` cannot leak, and a
+    /// double free is impossible. A failed transfer sets `lost`; it never
+    /// silently reports "nothing changed".
+    pub fn toOwnedSlice(self: *Collector) ?[]file_change.Record {
+        if (self.items.items.len == 0) return null;
+        return self.items.toOwnedSlice(self.allocator) catch {
+            for (self.items.items) |*r| r.deinit(self.allocator);
+            self.items.clearRetainingCapacity();
+            self.lost = true;
+            return null;
+        };
+    }
+
+    pub fn deinit(self: *Collector) void {
+        for (self.items.items) |*r| r.deinit(self.allocator);
+        self.items.deinit(self.allocator);
+    }
+};
+
+fn locatorFor(
+    allocator: std.mem.Allocator,
+    target: file_reference.ResolvedFileTarget,
+) !file_reference.Locator {
+    return switch (target.locator_kind) {
+        .workspace_path => .{ .workspace_path = try allocator.dupe(u8, target.path) },
+        .absolute_path => .{ .absolute_path = try allocator.dupe(u8, target.path) },
+        .uri => .{ .uri = try allocator.dupe(u8, target.path) },
+    };
+}
+
+fn freeLocator(allocator: std.mem.Allocator, locator: file_reference.Locator) void {
+    switch (locator) {
+        inline else => |value| allocator.free(value),
+    }
+}
+
+fn hostFatalResult(collector: *Collector) OneResult {
     // `toOwnedSlice` can set `lost`, so take first and snapshot flags only
     // afterwards. Do not rely on struct-field evaluation order here.
     const changes = collector.toOwnedSlice();
@@ -713,7 +852,7 @@ pub fn executeOne(
     // Per-dispatch file-change collector. It copies into `parent_allocator`, so
     // records outlive the arena above; `defer deinit` covers every early return
     // and `takeFileChanges` empties it on the paths that hand ownership on.
-    var change_collector = file_change.Collector{
+    var change_collector = Collector{
         .allocator = parent_allocator,
         .ctx = &job_ctx,
         .tool = name,
@@ -1141,7 +1280,7 @@ pub fn executeOne(
 /// publish. The path comes from the same resolution the native tools use, and
 /// the record explicitly claims no disk change.
 fn synthesizeFileChange(
-    collector: *file_change.Collector,
+    collector: *Collector,
     ctx: *const ToolContext,
     name: []const u8,
     is_builtin_file_tool: bool,
@@ -1201,7 +1340,7 @@ pub fn rejectedFileChanges(
 ) RejectedFileChanges {
     const is_patch = isApplyPatchTool(ctx, name);
     if (!is_patch and (!isBuiltinFileTool(ctx, name) or !isMutatingFileToolName(name))) return .{};
-    var collector = file_change.Collector{
+    var collector = Collector{
         .allocator = allocator,
         .ctx = ctx,
         .tool = name,
@@ -1493,7 +1632,7 @@ test "file change: 写盘成功但结果渲染失败时报 partial 而非 failed
     // effect_slot(工具自报的真实 mutation)判定,是则升级成 partial。
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = file_change.Collector{
+    var collector = Collector{
         .allocator = a,
         .ctx = &ctx,
         .tool = "Write",
@@ -1525,7 +1664,7 @@ test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 
     const input = "{\"file_path\":\"/work/none.txt\",\"content\":\"x\"}";
 
     {
-        var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t1", .agent_depth = 0 };
+        var collector = Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t1", .agent_depth = 0 };
         defer collector.deinit();
         synthesizeFileChange(&collector, &ctx, "Write", true, input, .missing, false, .failed);
         const rec = collector.items.items[0];
@@ -1535,7 +1674,7 @@ test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 
     }
     {
         // 被拒 = 绝对没写过。即使 effect 槽有残留也不能被升级成 partial。
-        var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t2", .agent_depth = 0 };
+        var collector = Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t2", .agent_depth = 0 };
         defer collector.deinit();
         synthesizeFileChange(&collector, &ctx, "Write", true, input, .regular_existing, true, .rejected);
         const rec = collector.items.items[0];
@@ -1547,7 +1686,7 @@ test "file change: 没有观察到 mutation 的失败仍是 failed,拒绝仍是 
 test "file change: host 派发的同名工具不冒充原生文件工具" {
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
-    var collector = file_change.Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t", .agent_depth = 0 };
+    var collector = Collector{ .allocator = a, .ctx = &ctx, .tool = "Write", .tool_use_id = "t", .agent_depth = 0 };
     defer collector.deinit();
     synthesizeFileChange(
         &collector,
@@ -2765,4 +2904,251 @@ test "publishSealedResults publishes an inline body's attachments and withdraws 
     var parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(out_id, parsed.value.object.get("stdout_artifact_id").?.string);
+}
+
+fn testCollector(a: std.mem.Allocator, ctx: *const ToolContext) Collector {
+    return .{
+        .allocator = a,
+        .ctx = ctx,
+        .tool = "Write",
+        .tool_use_id = "tu-1",
+        .agent_depth = 0,
+    };
+}
+
+test "collector: a workspace write is classified relative and carries its diff" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    collector.sink().publish(.{
+        .path = "/work/src/main.zig",
+        .kind = .created,
+        .status = .applied,
+        .before_bytes = 0,
+        .after_bytes = 12,
+        .unified_diff = "--- a\n+++ b\n@@ -0,0 +1 @@\n+hi\n",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), collector.items.items.len);
+    const rec = collector.items.items[0];
+    try std.testing.expectEqualStrings("src/main.zig", rec.locator.workspace_path);
+    try std.testing.expectEqualStrings("src/main.zig", rec.path());
+    try std.testing.expectEqual(file_change.Kind.created, rec.kind);
+    try std.testing.expectEqual(file_change.Status.applied, rec.status);
+    try std.testing.expect(rec.diff_complete);
+    try std.testing.expect(std.mem.indexOf(u8, rec.unified_diff.?, "+hi") != null);
+    try std.testing.expectEqualStrings("Write", rec.tool);
+    try std.testing.expectEqualStrings("tu-1", rec.tool_use_id);
+}
+
+test "collector: a move keeps both the vacated and the new locator" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    collector.publish(.{
+        .path = "/work/dst.txt",
+        .from_path = "/work/src.txt",
+        .kind = .moved,
+        .status = .applied,
+        .before_bytes = 4,
+        .after_bytes = 4,
+        .unified_diff = "",
+    });
+
+    const rec = collector.items.items[0];
+    try std.testing.expectEqualStrings("dst.txt", rec.locator.workspace_path);
+    try std.testing.expectEqualStrings("src.txt", rec.from_locator.?.workspace_path);
+    try std.testing.expectEqual(file_change.Kind.moved, rec.kind);
+}
+
+test "collector: a real change without a diff is reported as incomplete evidence" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    collector.publish(.{
+        .path = "/work/bin.dat",
+        .kind = .modified,
+        .status = .applied,
+        .before_bytes = 10,
+        .after_bytes = 20,
+        .unified_diff = null,
+    });
+
+    const rec = collector.items.items[0];
+    try std.testing.expect(rec.unified_diff == null);
+    try std.testing.expect(!rec.diff_complete);
+}
+
+test "collector: a deletion needs no diff to be complete evidence" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    collector.publish(.{ .path = "/work/gone.txt", .kind = .deleted, .status = .applied, .before_bytes = 7 });
+    const rec = collector.items.items[0];
+    try std.testing.expectEqual(file_change.Kind.deleted, rec.kind);
+    try std.testing.expect(rec.diff_complete);
+}
+
+test "collector: an oversized diff is truncated and flagged, never silently shortened" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    const big = try a.alloc(u8, file_change.MAX_UNIFIED_DIFF_BYTES_V1 + 32);
+    defer a.free(big);
+    @memset(big, '+');
+    collector.publish(.{
+        .path = "/work/huge.txt",
+        .kind = .modified,
+        .status = .applied,
+        .after_bytes = big.len,
+        .unified_diff = big,
+    });
+
+    const rec = collector.items.items[0];
+    try std.testing.expectEqual(file_change.MAX_UNIFIED_DIFF_BYTES_V1, rec.unified_diff.?.len);
+    try std.testing.expect(!rec.diff_complete);
+}
+
+test "collector: publishing past the per-call cap sets overflow instead of dropping silently" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    var i: usize = 0;
+    while (i < file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1 + 3) : (i += 1) {
+        collector.publish(.{ .path = "/work/f.txt", .kind = .modified, .status = .applied });
+    }
+    try std.testing.expectEqual(file_change.MAX_FILE_CHANGES_PER_TOOL_RESULT_V1, collector.items.items.len);
+    try std.testing.expect(collector.overflow);
+}
+
+test "collector: toOwnedSlice hands ownership over and leaves nothing to double free" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+
+    collector.publish(.{ .path = "/work/a.txt", .kind = .created, .status = .applied, .unified_diff = "d" });
+    const taken = collector.toOwnedSlice().?;
+    defer file_change.freeRecords(a, taken);
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqual(@as(usize, 0), collector.items.items.len);
+    try std.testing.expect(collector.toOwnedSlice() == null);
+}
+
+test "journal: clones records so it outlives the dispatch that produced them" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var journal = file_change.Journal.init(a);
+    defer journal.deinit();
+
+    {
+        var collector = testCollector(a, &ctx);
+        defer collector.deinit();
+        collector.publish(.{
+            .path = "/work/a.txt",
+            .kind = .modified,
+            .status = .applied,
+            .before_bytes = 1,
+            .after_bytes = 2,
+            .unified_diff = "-a\n+b\n",
+        });
+        journal.recordAll(collector.items.items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), journal.count());
+    const records = journal.acquire();
+    defer journal.release();
+    const rec = records[0];
+    try std.testing.expectEqualStrings("a.txt", rec.path());
+    try std.testing.expectEqualStrings("-a\n+b\n", rec.unified_diff.?);
+    try std.testing.expect(!journal.truncated);
+}
+
+test "journal: exceeding the retention cap reports truncation" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var journal = file_change.Journal.init(a);
+    defer journal.deinit();
+
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+    collector.publish(.{ .path = "/work/a.txt", .kind = .modified, .status = .applied });
+
+    var i: usize = 0;
+    while (i < file_change.MAX_JOURNAL_ENTRIES_V1 + 2) : (i += 1) journal.recordAll(collector.items.items);
+
+    try std.testing.expectEqual(file_change.MAX_JOURNAL_ENTRIES_V1, journal.count());
+    try std.testing.expect(journal.truncated);
+}
+
+test "journal: over the diff budget it keeps the change, drops only the text" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var journal = file_change.Journal.init(a);
+    defer journal.deinit();
+
+    const big = try a.alloc(u8, file_change.MAX_UNIFIED_DIFF_BYTES_V1);
+    defer a.free(big);
+    @memset(big, '+');
+
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+    collector.publish(.{
+        .path = "/work/big.txt",
+        .kind = .modified,
+        .status = .applied,
+        .after_bytes = big.len,
+        .unified_diff = big,
+    });
+
+    var rounds: usize = 0;
+    while (rounds < (file_change.MAX_JOURNAL_DIFF_BYTES_V1 / file_change.MAX_UNIFIED_DIFF_BYTES_V1) + 2) : (rounds += 1) {
+        journal.recordAll(collector.items.items);
+    }
+
+    try std.testing.expect(journal.truncated);
+    try std.testing.expect(journal.diff_bytes <= file_change.MAX_JOURNAL_DIFF_BYTES_V1);
+    const records = journal.acquire();
+    defer journal.release();
+    try std.testing.expectEqual(rounds, records.len); // every change still recorded
+    var dropped: usize = 0;
+    for (records) |rec| {
+        try std.testing.expectEqualStrings("big.txt", rec.path());
+        try std.testing.expectEqual(file_change.Status.applied, rec.status);
+        if (rec.unified_diff == null) {
+            dropped += 1;
+            try std.testing.expect(!rec.diff_complete);
+        }
+    }
+    try std.testing.expect(dropped > 0);
+}
+
+test "journal: reset drops the retained session and its budget" {
+    const a = std.testing.allocator;
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = "/work", .resolve_relative_paths = true };
+    var journal = file_change.Journal.init(a);
+    defer journal.deinit();
+
+    var collector = testCollector(a, &ctx);
+    defer collector.deinit();
+    collector.publish(.{ .path = "/work/a.txt", .kind = .created, .status = .applied, .unified_diff = "+a\n" });
+    journal.recordAll(collector.items.items);
+    try std.testing.expectEqual(@as(usize, 1), journal.count());
+
+    journal.reset();
+    try std.testing.expectEqual(@as(usize, 0), journal.count());
+    try std.testing.expectEqual(@as(usize, 0), journal.diff_bytes);
+    try std.testing.expect(!journal.truncated);
 }

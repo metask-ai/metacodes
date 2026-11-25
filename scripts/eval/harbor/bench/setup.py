@@ -934,7 +934,8 @@ def step_network(s: Setup):
         proposals.append(("docker_mirrors", list(DEFAULT_DOCKER_MIRRORS), "Docker Hub 镜像加速"))
     if "ghcr" in bad and "ghcr_mirror" not in entry:
         proposals.append(("ghcr_mirror", DEFAULT_GHCR_MIRROR, "ghcr.io 镜像"))
-    if bad & {"github", "pypi"} and "egress" not in entry and "apt" not in (entry.get("container_mirrors") or {}):
+    needs_direct = "apt" in (entry.get("container_mirrors") or {}) or bool(entry.get("download_cache"))
+    if bad & {"github", "pypi"} and "egress" not in entry and not needs_direct:
         # Task verifiers download uv, Python and packages at test time.
         proposals.append(("egress", "workbench", "任务容器经工作台出网"))
     if not proposals:
