@@ -18,6 +18,8 @@ from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.store.backend import Store
 from scripts.eval.harbor.bench import data
 
+HIDDEN_WORKER_JOBS = ".hidden-worker-jobs"
+
 
 def _refresh(row: Dict[str, Any], moment: dt.datetime) -> Dict[str, Any]:
     return data.refresh_running(row, moment)
@@ -142,6 +144,37 @@ class StoreLibrary:
         _refresh(detail["row"], dt.datetime.now(dt.timezone.utc))
         return detail
 
+    def trial_view(self, name, trial):
+        detail = self.trial_detail(name, trial)
+        if detail:
+            view = self.job_view(name)
+            for row in view["rows"] if view else ():
+                if row["trial"] == trial:
+                    detail["row"] = row
+                    break
+        return detail
+
+    def worker_only(self, name=None):
+        query = ("SELECT w.job, j.source_dir FROM worker_jobs w JOIN jobs j ON j.name = w.job "
+                 "WHERE NOT EXISTS (SELECT 1 FROM runs WHERE name = w.job)")
+        args = []
+        if name is not None:
+            query += " AND w.job = ?"
+            args.append(name)
+        with self.store.read() as tx:
+            rows = tx.query(query, args)
+        hidden = set()
+        for job, source in rows:
+            path = Path(source)
+            if (path.name != job or path.parent not in self.roots or not ingest.is_job_dir(path)
+                    or (path.parent / ".bench-runs" / HIDDEN_WORKER_JOBS / job).exists()):
+                hidden.add(job)
+        return hidden
+
+    def _protected_jobs(self, jobs, receipts):
+        with self.store.read() as tx:
+            return set(receipts).union(job for job in jobs if tx.one("SELECT 1 FROM worker_jobs WHERE job = ?", (job,)))
+
     def run_record(self, name: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(name, str) or not data.NAME.match(name):
             return None
@@ -160,38 +193,41 @@ class StoreLibrary:
         return [json.loads(row[0]) for row in rows]
 
     def delete_profile(self, profile: str, jobs: List[str], jobs_dir: Path, manifest: Path,
-                       remove_files: Callable[[], None]) -> None:
+                       remove_files: Callable[[set], None], worker_jobs=()) -> None:
         """Delete a profile this jobs directory owns: its job files, then its
         rows, then its manifest, so a failure at any step leaves a profile
         that a retry finds and finishes."""
         jobs_dir = Path(jobs_dir).resolve()
-        owners = [("profiles", "id", profile, jobs_dir / ingest.PROFILES_DIR)] + _job_owners(jobs, jobs_dir)
         with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
+            worker_jobs = self._protected_jobs(jobs, worker_jobs)
+            owners = [("profiles", "id", profile, jobs_dir / ingest.PROFILES_DIR)] + _job_owners(jobs, jobs_dir, worker_jobs)
             sources = self._owned_sources(owners, f"评测配置 {profile}")
             if sources[("profiles", profile)] is None and not manifest.exists():
                 raise ValueError("评测配置不存在")
-            remove_files()
+            remove_files(worker_jobs)
             with self.store.transaction() as tx:
-                _delete_job_rows(tx, jobs)
+                _delete_job_rows(tx, jobs, worker_jobs)
                 tx.execute("DELETE FROM profiles WHERE id = ?", (profile,))
             try:
                 manifest.unlink(missing_ok=True)
             except OSError as exc:
                 raise ValueError(f"删除评测配置清单失败（{exc}），可以重试") from None
 
-    def delete_job(self, job: str, jobs_dir: Path, remove_files: Callable[[], None]) -> None:
+    def delete_job(self, job: str, jobs_dir: Path, remove_files: Callable[[set], None], worker_jobs=()) -> None:
         """Delete one job this jobs directory owns: its files (`remove_files`
         also unlinks it from the profile manifests), then in one transaction
         its rows and its links from this directory's profile rows, so a
         failure leaves a job that a retry finds and finishes."""
         jobs_dir = Path(jobs_dir).resolve()
         with self._sync_lock, ingest.root_lock(jobs_dir, wait=False):
-            sources = self._owned_sources(_job_owners([job], jobs_dir), f"作业 {job}")
-            if sources[("jobs", job)] is None:
+            worker_jobs = self._protected_jobs([job], worker_jobs)
+            sources = self._owned_sources(_job_owners([job], jobs_dir, worker_jobs), f"作业 {job}")
+            owner = "runs" if job in worker_jobs else "jobs"
+            if sources[(owner, job)] is None:
                 raise ValueError("作业不存在")
-            remove_files()
+            remove_files(worker_jobs)
             with self.store.transaction() as tx:
-                _delete_job_rows(tx, [job])
+                _delete_job_rows(tx, [job], worker_jobs)
                 profiles = tx.query("SELECT id, record_json FROM profiles WHERE source_dir = ?",
                                     (str(jobs_dir / ingest.PROFILES_DIR),))
                 for profile, record_json in profiles:
@@ -224,18 +260,21 @@ class StoreLibrary:
         return {"jobs_dirs": [str(root) for root in self.roots], "database": self.store.describe()}
 
 
-def _job_owners(jobs: List[str], jobs_dir: Path):
+def _job_owners(jobs: List[str], jobs_dir: Path, worker_jobs):
     owners = []
     for job in jobs:
-        owners += [("runs", "name", job, jobs_dir / ".bench-runs"), ("jobs", "name", job, jobs_dir / job)]
+        owners.append(("runs", "name", job, jobs_dir / ".bench-runs"))
+        if job not in worker_jobs:
+            owners.append(("jobs", "name", job, jobs_dir / job))
     return owners
 
 
-def _delete_job_rows(tx, jobs: List[str]) -> None:
+def _delete_job_rows(tx, jobs: List[str], worker_jobs=()) -> None:
     digests: List[str] = []
     for job in jobs:
-        digests += [d for row in tx.query("SELECT sha256, tail_sha256 FROM files WHERE job = ?", (job,)) for d in row]
         digests += [d for row in tx.query("SELECT spec_sha256, log_sha256 FROM runs WHERE name = ?", (job,)) for d in row]
         tx.execute("DELETE FROM runs WHERE name = ?", (job,))
-        tx.execute("DELETE FROM jobs WHERE name = ?", (job,))
+        if job not in worker_jobs:
+            digests += [d for row in tx.query("SELECT sha256, tail_sha256 FROM files WHERE job = ?", (job,)) for d in row]
+            tx.execute("DELETE FROM jobs WHERE name = ? AND NOT EXISTS (SELECT 1 FROM worker_jobs WHERE job = ?)", (job, job))
     ingest.collect_garbage(tx, digests)

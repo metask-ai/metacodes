@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Background Bash jobs can get a time limit and a stuck-prompt notice**
+  (preview feature `background_watchdog`, off by default). With
+  `--preview=background_watchdog`, a `run_in_background` job stops when it
+  reaches its `timeout` (default 30 minutes, at most 2 hours; a command moved
+  to the background after 15s gets the default), and its notification says it
+  was stopped at its time limit. A background job whose output has not grown
+  for 45s and ends in a prompt such as `[y/N]` or `Password:` produces one
+  `running` notification that suggests KillShell and a non-interactive re-run;
+  like every job notification it carries no output bytes. With the feature
+  off, the Bash tool and its jobs behave as before.
 - **`monitor_events` preview: Monitor pushes events instead of being
   polled.** With `--preview=monitor_events`, each batch of the monitored
   command's stdout lines reaches the model as a `<task-notification>` event at

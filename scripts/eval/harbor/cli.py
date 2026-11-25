@@ -435,7 +435,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
                         choices=["open", "info", "list", "run", "stop", "prepare", "pull", "setup", "db", "sync", "provider",
-                                 "build", "monitor"])
+                                 "build", "monitor", "share"])
     parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"] + PROVIDER_COMMANDS,
                         help="bench db 的子命令（status、import、migrate）或 bench provider 的子命令（add、list、remove、probe）")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
@@ -447,6 +447,7 @@ def main(argv=None):
     parser.add_argument("--account-state-dir", type=Path, help="已登录 metacodes 的状态目录（默认当前安装）")
     parser.add_argument("--model", help="provider/model")
     parser.add_argument("--key-env", help="API Key 的环境变量名；不传 Key 本身")
+    parser.add_argument("--peer-env", type=Path, help="share：为这一台 SSH 节点生成的私有模型代理凭据文件")
     parser.add_argument("--harbor", help="Harbor 可执行文件")
     parser.add_argument("--bind", help="监听地址（默认 127.0.0.1；替换运行中的工作台时沿用它的）")
     parser.add_argument("--port", type=int, help="服务端口（默认自动选择；替换运行中的工作台时沿用它的）")
@@ -509,6 +510,10 @@ def main(argv=None):
             root.chmod(0o700)
         config = root / "workbench.json"
         cfg = settings(config)
+        if args.action == "share":
+            from scripts.eval.harbor.bench.share import share
+            return share(cfg, args.executor, args.peer_env, args.port, args.account_state_dir or
+                         cfg.get("account_state_dir") or state)
         if args.store_sqlite:
             store_config.check_sqlite_path(args.store_sqlite)  # before a path collapses `://`
             cfg["store"] = store_config.SqliteConfig(Path(args.store_sqlite).expanduser().resolve()).to_json()
@@ -578,9 +583,10 @@ def main(argv=None):
             if not args.run:
                 parser.error("bench sync 需要 --run NAME")
             from scripts.eval.harbor.bench import executors
-            value = executors.sync_run(jobs_dir, args.run, log=lambda text: print(text, file=sys.stderr, flush=True))
-            print(json.dumps(value, ensure_ascii=False) if args.json else
-                  f"{value['name']}：已同步 {value['files']} 个文件到 {value['local_dir']}（{value['status']}）")
+            value = executors.sync_run(jobs_dir, args.run, store_config=store, log=lambda text: print(text, file=sys.stderr, flush=True))
+            target = "历史作业镜像" if "local_dir" in value else "作业汇总"
+            message = "历史作业已保存在本机数据库" if value.get("archived") else f"已从 {value['executor']} 同步{target}"
+            print(json.dumps(value, ensure_ascii=False) if args.json else f"{value['name']}：{message}")
             return 0
         if args.action == "stop":
             client = client or receipt_client(settings(root / "service.json"), config)

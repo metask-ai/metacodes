@@ -3860,6 +3860,25 @@ metacodes-core.job_registry.PollStreak.last_ms: util_time.Millis = 0
 metacodes-core.job_registry.JobKind: union(enum)
 metacodes-core.job_registry.JobKind.plain
 metacodes-core.job_registry.JobKind.monitor: monitor_stream.State
+metacodes-core.job_registry.INPUT_STALL_QUIET_MS: const u64 = 45_000
+metacodes-core.job_registry.Supervision: enum
+metacodes-core.job_registry.Supervision.unwatched
+metacodes-core.job_registry.Supervision.watchdog
+metacodes-core.job_registry.TermGate: struct
+metacodes-core.job_registry.TermGate.reached: std.atomic.Value(bool) = .init(false)
+metacodes-core.job_registry.TermGate.released: std.atomic.Value(bool) = .init(false)
+metacodes-core.job_registry.test_term_gate: var ?*TermGate = null
+metacodes-core.job_registry.Watchdog: struct
+metacodes-core.job_registry.Watchdog.limit_ms: u64
+metacodes-core.job_registry.Watchdog.output_bytes: u64 = 0
+metacodes-core.job_registry.Watchdog.output_changed_ms: util_time.Millis
+metacodes-core.job_registry.Watchdog.expired: bool = false
+metacodes-core.job_registry.Watchdog.kill_at_ms: ?util_time.Millis = null
+metacodes-core.job_registry.Watchdog.input_notice_sent: bool = false
+metacodes-core.job_registry.JobEventKind: union(enum)
+metacodes-core.job_registry.JobEventKind.ended
+metacodes-core.job_registry.JobEventKind.time_limit: u64
+metacodes-core.job_registry.JobEventKind.awaiting_input
 metacodes-core.job_registry.JobEntry: struct
 metacodes-core.job_registry.JobEntry.id: [12]u8
 metacodes-core.job_registry.JobEntry.proc: process.ProcHandle
@@ -3880,7 +3899,9 @@ metacodes-core.job_registry.JobEntry.stderr_read_offset: u64 = 0
 metacodes-core.job_registry.JobEntry.poll_streak: PollStreak = .{}
 metacodes-core.job_registry.JobEntry.spool_released: bool = false
 metacodes-core.job_registry.JobEntry.kind: JobKind = .plain
+metacodes-core.job_registry.JobEntry.watchdog: ?Watchdog = null
 metacodes-core.job_registry.JobEntry.stop_in_progress: bool = false
+metacodes-core.job_registry.JobEntry.supervision: Supervision = .unwatched
 metacodes-core.job_registry.JobEntry.idSlice: fn idSlice(self: *const JobEntry) []const u8
 metacodes-core.job_registry.JobExitEvent: struct
 metacodes-core.job_registry.JobExitEvent.id: [12]u8
@@ -3891,6 +3912,7 @@ metacodes-core.job_registry.JobExitEvent.ended_ms: ?util_time.Millis
 metacodes-core.job_registry.JobExitEvent.command_preview: []u8
 metacodes-core.job_registry.JobExitEvent.stdout_unread: u64
 metacodes-core.job_registry.JobExitEvent.stderr_unread: u64
+metacodes-core.job_registry.JobExitEvent.kind: JobEventKind = .ended
 metacodes-core.job_registry.JobExitEvent.deinit: fn deinit(self: *JobExitEvent, allocator: std.mem.Allocator) void
 metacodes-core.job_registry.freeJobExitEvents: fn freeJobExitEvents(allocator: std.mem.Allocator, events: []JobExitEvent) void
 metacodes-core.job_registry.JobRegistry: struct
@@ -3906,12 +3928,16 @@ metacodes-core.job_registry.JobRegistry.init: fn init(allocator: std.mem.Allocat
 metacodes-core.job_registry.JobRegistry.deinit: fn deinit(self: *JobRegistry) void
 metacodes-core.job_registry.JobRegistry.releaseSpool: fn releaseSpool(self: *JobRegistry, id: []const u8) void
 metacodes-core.job_registry.JobRegistry.promoteToBackground: fn promoteToBackground(self: *JobRegistry, id: []const u8) void
+metacodes-core.job_registry.JobRegistry.armWatchdog: fn armWatchdog(self: *JobRegistry, id: []const u8, limit_ms: u64) error{ JobNotFound, JobUnwatched }!void
+metacodes-core.job_registry.JobRegistry.spawnBackgroundWatched: fn spawnBackgroundWatched(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, limit_ms: u64) !JobEntry
+metacodes-core.job_registry.JobRegistry.fail_sweeper_spawn_in_tests: var bool = false
 metacodes-core.job_registry.JobRegistry.spawnBackground: fn spawnBackground(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnBackgroundOwned: fn spawnBackgroundOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
+metacodes-core.job_registry.JobRegistry.spawnBackgroundSupervised: fn spawnBackgroundSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnMonitorOwned: fn spawnMonitorOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, description: []const u8, timeout_ms: ?u64) !JobEntry
-metacodes-core.job_registry.JobRegistry.fail_sweeper_spawn_in_tests: var bool = false
 metacodes-core.job_registry.JobRegistry.spawnSynchronous: fn spawnSynchronous(self: *JobRegistry, command: []const u8, cwd: ?[]const u8) !JobEntry
 metacodes-core.job_registry.JobRegistry.spawnSynchronousOwned: fn spawnSynchronousOwned(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId) !JobEntry
+metacodes-core.job_registry.JobRegistry.spawnSynchronousSupervised: fn spawnSynchronousSupervised(self: *JobRegistry, command: []const u8, cwd: ?[]const u8, owner: SessionId, supervision: Supervision) !JobEntry
 metacodes-core.job_registry.JobRegistry.runningCount: fn runningCount(self: *JobRegistry) usize
 metacodes-core.job_registry.JobRegistry.runningCountForOwner: fn runningCountForOwner(self: *JobRegistry, owner: SessionId) usize
 metacodes-core.job_registry.JobRegistry.reapExited: fn reapExited(self: *JobRegistry) void
@@ -3933,9 +3959,11 @@ metacodes-core.job_registry.JobRegistry.PendingNotifySummary.first_preview_len: 
 metacodes-core.job_registry.JobRegistry.PendingNotifySummary.preview: fn preview(self: *const PendingNotifySummary) []const u8
 metacodes-core.job_registry.JobRegistry.pendingNotifySummary: fn pendingNotifySummary(self: *JobRegistry, owner: SessionId) PendingNotifySummary
 metacodes-core.job_registry.JobRegistry.takeUnannouncedExits: fn takeUnannouncedExits(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator) ![]JobExitEvent
+metacodes-core.job_registry.JobRegistry.takeUnannouncedExitsAt: fn takeUnannouncedExitsAt(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now_ms: util_time.Millis) ![]JobExitEvent
 metacodes-core.job_registry.JobRegistry.takeMonitorEvents: fn takeMonitorEvents(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now: util_time.Millis) ![]monitor_stream.Notice
 metacodes-core.job_registry.JobRegistry.kill: fn kill(self: *JobRegistry, id: []const u8) !void
 metacodes-core.job_registry.JobRegistry.activeCount: fn activeCount(self: *JobRegistry) usize
+metacodes-core.job_registry.looksLikeInteractivePrompt: fn looksLikeInteractivePrompt(tail: []const u8) bool
 metacodes-core.job_notification: file
 metacodes-core.job_notification.TASK_NOTIFICATION_TAG: const = "task-notification"
 metacodes-core.job_notification.render: fn render(allocator: std.mem.Allocator, events: []const JobExitEvent) ![]u8
@@ -7567,6 +7595,7 @@ metacodes-core.client.AnthropicProvider.retryAttempt: fn retryAttempt(self: Prov
 metacodes-core.client.ANTHROPIC_API_URL: const = "https://napi.metask-ai.com/v1/messages"
 metacodes-core.client.StreamResult: struct
 metacodes-core.client.StreamResult.request: *http.Client.Request
+metacodes-core.client.StreamResult.manager_client: ?*http.Client = null
 metacodes-core.client.StreamResult.response: http.Client.Response
 metacodes-core.client.StreamResult.transfer_buf: [8192]u8
 metacodes-core.client.StreamResult.id: log.RequestId
@@ -8100,6 +8129,7 @@ metacodes-core.api_metask_oauth.DeviceCode.interval: u32
 metacodes-core.api_metask_oauth.DeviceCode.expires_at: ?i64 = null
 metacodes-core.api_metask_oauth.Error: const = error{ InvalidUrl, RequestFailed, MalformedResponse, AuthorizationPending, SlowDown, ExpiredToken, AccessDenied, InvalidGrant, TimedOut, }
 metacodes-core.api_metask_oauth.siteUrl: fn siteUrl() []const u8
+metacodes-core.api_metask_oauth.modelGateway: fn modelGateway(stored: ?[]const u8) Error!?[]const u8
 metacodes-core.api_metask_oauth.deviceCodeUrl: fn deviceCodeUrl(site: []const u8, buffer: []u8) ![]const u8
 metacodes-core.api_metask_oauth.tokenUrl: fn tokenUrl(site: []const u8, buffer: []u8) ![]const u8
 metacodes-core.api_metask_oauth.revokeUrl: fn revokeUrl(site: []const u8, buffer: []u8) ![]const u8
@@ -8915,14 +8945,16 @@ metacodes-core.types.PreviewFeature: enum
 metacodes-core.types.PreviewFeature.execute_code
 metacodes-core.types.PreviewFeature.teamwork
 metacodes-core.types.PreviewFeature.comment_guard
+metacodes-core.types.PreviewFeature.background_watchdog
 metacodes-core.types.PreviewFeature.monitor_events
 metacodes-core.types.PreviewFeature.parse: fn parse(name: []const u8) ?PreviewFeature
 metacodes-core.types.PreviewFeatures: struct(u8)
 metacodes-core.types.PreviewFeatures.execute_code: bool = false
 metacodes-core.types.PreviewFeatures.teamwork: bool = false
 metacodes-core.types.PreviewFeatures.comment_guard: bool = false
+metacodes-core.types.PreviewFeatures.background_watchdog: bool = false
 metacodes-core.types.PreviewFeatures.monitor_events: bool = false
-metacodes-core.types.PreviewFeatures._unused: u4 = 0
+metacodes-core.types.PreviewFeatures._unused: u3 = 0
 metacodes-core.types.PreviewFeatures.none: const PreviewFeatures = .{}
 metacodes-core.types.PreviewFeatures.all: const PreviewFeatures = blk: { var features: PreviewFeatures = .{}; for (std.enums.values(PreviewFeature)) |feature| @field(features, @tagName(feature)) = true; break :blk features; }
 metacodes-core.types.PreviewFeatures.has: fn has(self: PreviewFeatures, feature: PreviewFeature) bool
@@ -9042,6 +9074,7 @@ metacodes-core.types.Config.resolved_provider_id: ?[]const u8 = null
 metacodes-core.types.Config.auth_scheme: ?@import("credential.zig").AuthScheme = null
 metacodes-core.types.Config.dialect: @import("vendor.zig").Declaration = .{}
 metacodes-core.types.Config.metask_oauth_selected: bool = false
+metacodes-core.types.Config.metask_session_gateway: ?[]const u8 = null
 metacodes-core.types.Config.credential_env_fallback: ?@import("credential.zig").EnvLookup = null
 metacodes-core.types.Config.openai_protocol: OpenAIProtocol = .chat_completions
 metacodes-core.types.Config.openai_protocol_explicit: bool = false

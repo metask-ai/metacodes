@@ -10,6 +10,7 @@ own `metacodes` over SSH and talks to it on the channel's stdin/stdout.
     metacodes bench node attach <spec.json>
     metacodes bench node upgrade <spec.json | runs-dir>
     metacodes bench node build                   # {"ref", "repo"} on stdin
+    metacodes bench node results <summary|final|job|log|trial> <job-dir> [trial]
     metacodes bench node manifest <job-dir>
     metacodes bench node pack <job-dir>          # JSON items on stdin
     metacodes bench node egress-probe <json>
@@ -53,7 +54,7 @@ from scripts.eval.harbor.bench.runner import atomic_json, now, settings
 
 # Raised whenever the workbench and a node stop understanding each other's
 # `info` or `run`; the workbench refuses a node with another protocol.
-PROTOCOL = 9
+PROTOCOL = 10
 PEERS = "peers.json"
 # How long removing a run's image tag may take before the run ends anyway.
 CLEANUP_TIMEOUT = 60
@@ -121,6 +122,11 @@ class Node:
 
     def run(self, spec_path: str) -> int:
         spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+        if spec.get("worker_results"):
+            from scripts.eval.harbor.store.config import for_workbench
+            path = Path(spec_path).resolve().parent / "result-store.json"
+            if not path.exists():
+                atomic_json(path, for_workbench(self.cfg, self.root / "workbench.json").to_json())
         if spec.get("runner") == suites.WORKBUDDY:
             return self.run_workbuddy(spec, Path(spec_path).resolve().parent)
         return remote.run(spec_path)
@@ -227,6 +233,10 @@ def main(argv, state_root, version) -> int:
         value = node.peers()
         print(json.dumps(value, ensure_ascii=False) if "--json" in args else render_peers(value))
         return 0
+    if action == "results" and len(args) in (2, 3):
+        from scripts.eval.harbor.bench.results import worker_result
+        print(json.dumps(worker_result(node, *args), allow_nan=False))
+        return 0
     if action == "run" and len(args) == 1:
         code = node.run(args[0])
         # The control channel's reader may still block on stdin, which the
@@ -250,7 +260,7 @@ def main(argv, state_root, version) -> int:
         return remote.main([action, args[0]])
     print("usage: metacodes bench node info [--json] | peers [--json] | run <spec> | attach <spec> | "
           "upgrade <spec|runs-dir> | build | "
-          "manifest <dir> | pack <dir> | egress-probe <json>", file=sys.stderr)
+          "results <summary|final|job|log|trial> <dir> [trial] | manifest <dir> | pack <dir> | egress-probe <json>", file=sys.stderr)
     return 2
 
 
