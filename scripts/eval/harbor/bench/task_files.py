@@ -59,7 +59,7 @@ def pull_sources(task: Path) -> Iterator[tuple[str, str]]:
 
 
 QUOTED = r'''(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*')'''
-KEY = r"(" + QUOTED + r"|[\w.<>-]+)\s*:"
+KEY = r"(" + QUOTED + r"""|[^\s"'{\[].*?)\s*:"""
 FLOW_PAIR = re.compile(KEY + r"\s*(.*)")
 BLOCK_PAIR = re.compile(KEY + r"(?:\s+(.*)|$)")
 COMMENT = re.compile(QUOTED + r"|(?<!\S)#[^\n]*")
@@ -155,11 +155,11 @@ def compose_value(text, anchors, lines=(), parent_indent=None):
     return value
 
 
-def compose_block(lines, anchors):
+def compose_block(lines, anchors, *, root=False):
     depth = indent(lines[0])
     first = lines[0].lstrip()
     sequence = list_item(first)
-    if not sequence and not BLOCK_PAIR.fullmatch(first):
+    if first.startswith("{") or (not root and not sequence and not BLOCK_PAIR.fullmatch(first)):
         return compose_value(lines.popleft().strip(), anchors, lines, depth)
     block = [] if sequence else {}
     while lines and indent(lines[0]) >= depth:
@@ -182,7 +182,7 @@ def compose_block(lines, anchors):
 def compose_services(text: str) -> Iterator[Service]:
     lines = deque(line.rstrip() for line in text.splitlines()
                   if line.strip() and not line.lstrip().startswith("#") and not DOCUMENT_LINE.fullmatch(line))
-    root = compose_block(lines, {}) if lines else {}
+    root = compose_block(lines, {}, root=True) if lines else {}
     services = root.get("services") if isinstance(root, dict) else None
     if isinstance(services, dict):
         for name, config in services.items():
@@ -199,6 +199,7 @@ FROM_LINE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)", re.I | re.M)
 def references(files: Iterable[tuple[str, str]]) -> TaskReferences:
     task = TaskReferences()
     for kind, text in files:
+        text = text.removeprefix("\ufeff")
         if kind == "compose":
             task.services.extend(compose_services(text))
         elif kind == "dockerfile":

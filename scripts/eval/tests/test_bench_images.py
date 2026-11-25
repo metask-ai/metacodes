@@ -169,6 +169,8 @@ class TaskReferencesTest(unittest.TestCase):
         main, db = "ghcr.io/org/env:1", "ghcr.io/org/db:2"
         cases = [
             ("block", "services:\n  db:\n    image: IMAGE", True, True),
+            ("extension first", "x-vendor/config: {}\nservices:\n  db:\n    image: IMAGE", True, True),
+            ("byte-order mark", "\ufeffname: bench\nservices:\n  db:\n    image: IMAGE", True, True),
             ("next-line image", "--- # compose\nservices:\n  db:\n    image:\n      IMAGE", True, True),
             ("flow", "services:\n  db: {restart: always, image: IMAGE}", True, True),
             ("multiline flow", "services:\n  db: {environment: {NOTE: 'a,#b'}, # sidecar\n    image: IMAGE\n  }",
