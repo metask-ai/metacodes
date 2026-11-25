@@ -6,6 +6,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -298,6 +300,46 @@ class Answers(BaseHTTPRequestHandler):
         pass
 
 
+PAGE_HELPERS = r'''
+const fs = require("fs"), vm = require("vm");
+const nothing = () => {};
+const page = { document: { addEventListener: nothing, querySelector: () => null, querySelectorAll: () => [] },
+               window: { addEventListener: nothing }, location: { hash: "" }, setInterval: nothing, setTimeout: nothing };
+vm.createContext(page);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), page);
+const rows = [{ setting: "pypi_index", kind: "url" }, { setting: "docker_mirrors", kind: "urls" },
+              { setting: "container_mirrors.hf", kind: "url" }, { setting: "container_mirrors.pypi", kind: "url" },
+              { setting: "download_cache", kind: "bool" }];
+const saved = { pypi_index: "https://a.example/simple", docker_mirrors: "", "container_mirrors.hf": "https://hf.old.example",
+                "container_mirrors.pypi": "https://p.example/simple", download_cache: false };
+const values = { ...saved, docker_mirrors: "https://d1.example  https://d2.example", "container_mirrors.hf": "",
+                 "container_mirrors.pypi": "https://q.example/simple", download_cache: true };
+const changes = page.mirrorChanges(rows, values, saved);
+const later = { ...changes, "container_mirrors.pypi": "https://r.example/simple", pypi_index: "https://new.example/simple" };
+console.log(JSON.stringify({ changes, payload: page.mirrorPayload(rows, changes), untouched: page.mirrorPayload(rows, {}),
+                             left: page.mirrorDraftLeft(later, changes), settled: page.mirrorDraftLeft(changes, changes),
+                             other: page.mirrorDraftLeft(undefined, changes) }));
+'''
+
+
+class PageHelpersTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "runs the page's own functions in node")
+    def test_a_save_sends_only_edited_fields_and_clears_only_the_draft_it_submitted(self):
+        script = Path(server.__file__).parent / "static" / "viewer.js"
+        done = subprocess.run(["node", "-e", PAGE_HELPERS, str(script)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        value = json.loads(done.stdout)
+        self.assertEqual(value["changes"], {"docker_mirrors": "https://d1.example  https://d2.example",
+                                            "container_mirrors.hf": "", "container_mirrors.pypi": "https://q.example/simple",
+                                            "download_cache": True})
+        self.assertEqual(value["payload"], {"docker_mirrors": ["https://d1.example", "https://d2.example"],
+                                            "container_mirrors": {"hf": None, "pypi": "https://q.example/simple"},
+                                            "download_cache": True})
+        self.assertEqual((value["untouched"], value["settled"], value["other"]), ({}, {}, {}))
+        self.assertEqual(value["left"], {"container_mirrors.pypi": "https://r.example/simple",
+                                         "pypi_index": "https://new.example/simple"})
+
+
 class MonitorHttpTest(SetupFixture):
     def serve(self, pages):
         handler = type("Pages", (Answers,), {"pages": pages})
@@ -556,9 +598,6 @@ class MonitorHttpTest(SetupFixture):
                            "hf": "https://hf-mirror.example", "pypi": "https://pypi.example/simple"},
                           "ghcr.other.example", "https://pypi.example/simple"))
         self.assertEqual(entry["docker_mirrors"], [self.reachable.rstrip("/")])
-        script = (Path(server.__file__).parent / "static" / "viewer.js").read_text(encoding="utf-8")
-        self.assertIn("settings: mirrorPayload(rows, mirrorChanges(rows, values, saved))", script)
-        self.assertIn("for (const control of controls) control.disabled = true;", script)
 
     def test_a_setting_the_executor_parser_refuses_is_not_saved(self):
         before = self.config.read_bytes()

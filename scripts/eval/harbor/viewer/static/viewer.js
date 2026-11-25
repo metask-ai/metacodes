@@ -1948,6 +1948,9 @@ function mirrorEffect(row) {
 function mirrorChanges(rows, values, saved) {
   return Object.fromEntries(rows.filter((r) => values[r.setting] !== saved[r.setting]).map((r) => [r.setting, values[r.setting]]));
 }
+function mirrorDraftLeft(draft, submitted) {
+  return Object.fromEntries(Object.entries(draft || {}).filter(([key, value]) => submitted[key] !== value));
+}
 function mirrorPayload(rows, changes) {
   const settings = {};
   for (const row of rows) {
@@ -1971,9 +1974,10 @@ function mirrorsPanel(m) {
     h('dt', { text: 'Docker daemon 的 registry-mirrors' }), h('dd', { class: 'mono', text: m.error ? '未探测' : daemon.length ? daemon.join('\n') : '未配置（Docker Hub 直连）' })));
   if (!m.mirrors.editable) return panel('镜像源', '镜像源只在 SSH 执行机器上配置', h('div', {}, facts));
   const saved = Object.fromEntries(rows.map((r) => [r.setting, r.kind === 'bool' ? !!r.value : mirrorText(r)]));
-  const draft = state.mirrorDraft && state.mirrorDraft.executor === name ? state.mirrorDraft.values : {};
-  const values = { ...saved, ...draft };
-  const feedback = h('span', { class: 'muted', role: 'status', text: state.mirrorNote && state.mirrorNote.executor === name ? state.mirrorNote.text : '' });
+  const drafts = state.mirrorDrafts || (state.mirrorDrafts = {});
+  const notes = state.mirrorNotes || (state.mirrorNotes = {});
+  const values = { ...saved, ...(drafts[name] || {}) };
+  const feedback = h('span', { class: 'muted', role: 'status', text: notes[name] || '' });
   const save = h('button', { type: 'submit', class: 'button primary', text: '保存' });
   const undo = h('button', { type: 'button', class: 'button', text: '还原' });
   const sync = () => {
@@ -1982,19 +1986,19 @@ function mirrorsPanel(m) {
     save.disabled = !dirty;
     undo.disabled = !dirty;
     state.editing = dirty;
-    state.mirrorDraft = dirty ? { executor: name, values: changes } : null;
-    if (dirty && state.mirrorNote) { state.mirrorNote = null; feedback.textContent = ''; }
+    if (dirty) drafts[name] = changes; else delete drafts[name];
   };
+  const edited = () => { delete notes[name]; feedback.textContent = ''; sync(); };
   const field = (r) => {
     if (r.kind === 'bool') {
       const box = h('input', { type: 'checkbox', 'aria-label': r.label });
       box.checked = values[r.setting];
-      box.addEventListener('change', () => { values[r.setting] = box.checked; sync(); });
+      box.addEventListener('change', () => { values[r.setting] = box.checked; edited(); });
       return h('label', { class: 'check' }, box, '开启');
     }
     const input = h('input', { type: 'text', class: 'mirror-input mono', value: values[r.setting], placeholder: MIRROR_HINTS[r.kind],
       'aria-label': r.setting, spellcheck: 'false', autocomplete: 'off' });
-    input.addEventListener('input', () => { values[r.setting] = input.value.trim(); sync(); });
+    input.addEventListener('input', () => { values[r.setting] = input.value.trim(); edited(); });
     return input;
   };
   const status = (r) => {
@@ -2013,19 +2017,22 @@ function mirrorsPanel(m) {
     const controls = [...form.querySelectorAll('input, button')];
     for (const control of controls) control.disabled = true;
     feedback.textContent = '正在保存并探测新地址…';
+    const submitted = mirrorChanges(rows, values, saved);
     try {
-      await api('/api/monitor/mirrors', { executor: name, settings: mirrorPayload(rows, mirrorChanges(rows, values, saved)) });
-      state.mirrorDraft = null;
-      state.mirrorNote = { executor: name, text: '已保存到 workbench.json（保存前的版本在 backups/ 里）' };
-      state.editing = false;
-      render();
+      await api('/api/monitor/mirrors', { executor: name, settings: mirrorPayload(rows, submitted) });
+      const left = mirrorDraftLeft(drafts[name], submitted);
+      if (Object.keys(left).length) drafts[name] = left; else delete drafts[name];
+      notes[name] = '已保存到 workbench.json（保存前的版本在 backups/ 里）';
+      if (form.isConnected) { state.editing = false; render(); }
     } catch (error) {
+      notes[name] = '没有保存：' + error.message;
+      if (!form.isConnected) return;
       for (const control of controls) control.disabled = false;
       sync();
-      feedback.textContent = '没有保存：' + error.message;
+      feedback.textContent = notes[name];
     }
   });
-  undo.addEventListener('click', () => { state.mirrorDraft = null; state.mirrorNote = null; state.editing = false; render(); });
+  undo.addEventListener('click', () => { delete drafts[name]; delete notes[name]; state.editing = false; render(); });
   const pending = m.mirrors.pending || [];
   const blocked = m.setup_running ? '一键配置正在进行' : m.busy ? '有评测在运行，结束后才能重新配置' : '';
   const rerun = h('button', { type: 'button', class: 'button', text: '重新配置', disabled: !!blocked });
