@@ -363,8 +363,11 @@ The rules that keep the split from dropping coverage:
   to the job summary. It fails a PR labelled `migration` that drops a test
   without explaining it in `tests/test_ids/` in that PR. The required `Gates (Linux)` check needs this verdict.
   Full-scope migration runs pin the tested merge, its first parent and both
-  trees after scope selection. A verified complete artifact for the same base
-  tree is reused. On a miss, three independent Linux jobs replay the parent
+  trees after scope selection. The baseline uses the full Linux PR inventory,
+  including tests executed in both units and checks. A same-tree artifact is
+  reusable only if its producer covered that inventory. A scheduled or manual
+  main run that skipped a PR-only shard cannot supply the baseline. On a miss,
+  three independent Linux jobs replay the parent
   revision's own test setup and recording steps while the head gates run.
   The base checkout supplies the collector and TTY inventory. The collector
   verifies each leg, source, root and shard against

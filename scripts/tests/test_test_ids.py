@@ -11,7 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import yaml
+
 from scripts import test_id_baseline as baseline
+from scripts.test_id_replay import replay_steps
 from scripts import test_ids
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -362,7 +365,8 @@ class MigrationBaselineTest(unittest.TestCase):
         Path('scripts').mkdir()
         shutil.copy(ROOT / 'scripts/test_ids.py', 'scripts')
         Path('tests/test_ids').mkdir(parents=True)
-        Path(baseline.SOURCES).write_text('units\tzig-suite-0of1\tsrc\t1\nproduct\tpy-eval\ttests\t1\nchecks\tpy-scripts-tests\ttests\t1\n')
+        Path(baseline.SOURCES).write_text('units\tzig-suite-0of1\tsrc\t1\nproduct\tpy-eval\ttests\t1\n'
+                                          'checks\tpy-scripts-tests\ttests\t1\npr-checks\tzig-layer\tsrc\t1\n')
         for rel in (test_ids.RENAMED, test_ids.REMOVED):
             rel.touch()
         self.git('add', '.')
@@ -390,9 +394,10 @@ class MigrationBaselineTest(unittest.TestCase):
         raw = self.root / 'raw'
         for leg, source, location, name in [('units', 'zig-suite-0of1', 'src', 'suite.test.one'),
                                             ('product', 'py-eval', 'tests', 'eval.A.test_one'),
-                                            ('checks', 'py-scripts-tests', 'tests', 'scripts.B.test_two')]:
+                                            ('checks', 'py-scripts-tests', 'tests', 'scripts.B.test_two'),
+                                            ('checks', 'zig-layer', 'src', 'suite.test.one')]:
             directory = raw / ('migration-raw-' + leg)
-            directory.mkdir(parents=True)
+            directory.mkdir(parents=True, exist_ok=True)
             (directory / (source + '--1.tsv')).write_text(f'root\t{location}\npass\t{name}\n')
             (directory / 'revision.json').write_text(json.dumps([self.base, self.pin['tree'], leg]))
         self.head = self.root / 'head' / baseline.TSV
@@ -420,7 +425,7 @@ class MigrationBaselineTest(unittest.TestCase):
         self.assertIn('mode=replay', Path(os.environ['GITHUB_OUTPUT']).read_text())
         self.assertNotEqual(self.git('rev-parse', 'main'), self.pin['base'])
         self.assertEqual(baseline.compare(self.args), 0)
-        self.head.write_text(self.head.read_text().replace('zig:one\tsrc.suite\tpass\t1\n', ''))
+        self.head.write_text(self.head.read_text().replace('zig:one\tsrc.suite\tpass\t2\n', ''))
         self.stamp_head()
         self.assertEqual(baseline.compare(self.args), 1)
         self.assertIn('zig:one', Path(os.environ['GITHUB_STEP_SUMMARY']).read_text(encoding='utf-8'))
@@ -445,21 +450,21 @@ class MigrationBaselineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unexpected raw test source'):
             baseline.compare(self.args)
         extra.unlink()
-        next(self.args.raw.rglob('zig-*.tsv')).unlink()
+        (self.args.raw / 'migration-raw-checks/zig-layer--1.tsv').unlink()
         with self.assertRaisesRegex(ValueError, 'inventory mismatch'):
             baseline.compare(self.args)
 
-    def test_exact_verified_cache_survives_plan_handoff(self):
+    def test_cache_and_replay_both_reject_losing_one_execution(self):
         run = dict(id=88, conclusion='success', path='.github/workflows/ci.yml', repository={'full_name': 'o/r'},
-                   event='workflow_dispatch', head_branch='main', head_sha=self.base)
+                   event='pull_request', head_sha=self.git('rev-parse', 'HEAD^2'))
         def download(producer, name, target):
             self.assertEqual((producer, name), (run, 'test-ids'))
             target.mkdir()
             shutil.copy(self.head, target / baseline.TSV)
-            (target / baseline.META).write_text(json.dumps(dict(commit=self.base, tree=self.pin['tree'],
+            (target / baseline.META).write_text(json.dumps(dict(commit=self.pin['merge'], tree=self.pin['tree'],
                 verified_full_run=88, repository='o/r', scope='full', sha256=baseline.sha256(self.head))))
             return True
-        revision = dict(tree={'sha': self.pin['tree']})
+        revision = dict(tree={'sha': self.pin['tree']}, parents=[{'sha': self.base}, {'sha': run['head_sha']}])
         with mock.patch.object(baseline.ids, 'candidate_runs', return_value=[run]), \
                 mock.patch.object(baseline.ids, 'github_json', return_value=revision), \
                 mock.patch.object(baseline, 'download', side_effect=download):
@@ -469,6 +474,42 @@ class MigrationBaselineTest(unittest.TestCase):
         self.assertEqual(baseline.compare(self.args), 0)
         with mock.patch.dict(os.environ, PIN_TREE='other'), self.assertRaisesRegex(ValueError, 'plan differs'):
             baseline.compare(self.args)
+        self.head.write_text(self.head.read_text().replace('zig:one\tsrc.suite\tpass\t2\n', 'zig:one\tsrc.suite\tpass\t1\n'))
+        self.stamp_head()
+        for mode in ('cache', 'replay'):
+            with self.subTest(mode=mode):
+                self.args.mode = mode
+                summary = Path(os.environ['GITHUB_STEP_SUMMARY'])
+                summary.write_text('')
+                self.assertEqual(baseline.compare(self.args), 1)
+                self.assertIn('zig:one', summary.read_text(encoding='utf-8'))
+
+    def test_main_artifacts_missing_pr_only_sources_trigger_replay(self):
+        run = dict(id=88, conclusion='success', path='.github/workflows/ci.yml', repository={'full_name': 'o/r'},
+                   head_branch='main', head_sha=self.base)
+        def download(producer, name, target):
+            self.assertEqual(name, 'test-ids')
+            target.mkdir()
+            aggregate = target / baseline.TSV
+            aggregate.write_text(self.head.read_text().replace('zig:one\tsrc.suite\tpass\t2\n', 'zig:one\tsrc.suite\tpass\t1\n'))
+            (target / baseline.META).write_text(json.dumps(dict(commit=self.base, tree=self.pin['tree'],
+                verified_full_run=88, repository='o/r', scope='full', sha256=baseline.sha256(aggregate))))
+            return True
+        for event in ('schedule', 'workflow_dispatch'):
+            with self.subTest(event=event), mock.patch.object(baseline, 'download', side_effect=download), \
+                    mock.patch.object(baseline.ids, 'github_json', return_value={'tree': {'sha': self.pin['tree']}}), \
+                    mock.patch.object(baseline.ids, 'candidate_runs', return_value=[dict(run, event=event)]):
+                Path(os.environ['GITHUB_OUTPUT']).write_text('')
+                baseline.plan(self.args)
+                self.assertIn('mode=replay', Path(os.environ['GITHUB_OUTPUT']).read_text())
+
+    def test_replay_includes_the_pr_layer_gate_on_checks(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        for leg in baseline.LEGS:
+            steps = replay_steps(workflow, leg)
+            gate = next(step for step in steps if step.get('name') == 'Layer baseline only shrinks')
+            self.assertTrue(gate['if'].startswith(('true' if leg == 'checks' else 'false') + ' &&'))
+            self.assertIn('zig build layer:check', gate['run'])
 
 
 if __name__ == "__main__":

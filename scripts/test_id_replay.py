@@ -17,8 +17,7 @@ def replay_steps(workflow, leg):
     for step in steps[first:last]:
         condition = step.get('if', '')
         if (condition.startswith(('matrix.release &&', "env.POOL_JOB == 'true'", "env.WARM_CACHE == 'true'"))
-                or step.get('name') in {'Version state gate and release rehearsal', 'Changelog entries are unreleased',
-                                        'Layer baseline only shrinks'}):
+                or step.get('name') in {'Version state gate and release rehearsal', 'Changelog entries are unreleased'}):
             continue
         serialized = json.dumps(step).replace('${{ matrix.leg }}', leg)
         for flag in ('units', 'product', 'checks', 'release'):

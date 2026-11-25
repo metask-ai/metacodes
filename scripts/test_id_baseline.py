@@ -120,7 +120,9 @@ def cached(run, pin, tmp):
             return None
     elif run['head_branch'] != 'main' or run['head_sha'] != meta['commit']:
         return None
-    expected = expected_sources(pin['base'], run['event'])
+    expected = expected_sources(pin['base'], 'pull_request')
+    if run['event'] != 'pull_request' and expected_sources(pin['base'], run['event']) != expected:
+        return None
     if (meta.get('scope') == 'full' and meta.get('verified_full_run') == run['id'] and meta.get('repository') == repo
             and meta.get('sha256') == sha256(artifact / TSV)):
         return (artifact / TSV).read_bytes()
@@ -195,7 +197,7 @@ def compare(args):
         for leg in LEGS:
             stamp = args.raw / f'migration-raw-{leg}' / 'revision.json'
             require(json.loads(stamp.read_text()) == [pin['base'], pin['tree'], leg], f'wrong {leg} baseline')
-        check_raw(args.raw, expected_sources(pin['base'], 'workflow_dispatch'), prefix='migration-raw-')
+        check_raw(args.raw, expected_sources(pin['base'], 'pull_request'), prefix='migration-raw-')
         args.directory.mkdir(parents=True, exist_ok=True)
         collect_base(pin, args.raw, args.directory / TSV)
     base = ids.Base(ids.parse_ids((args.directory / TSV).read_text()), f"Base: {pin['base']} ({args.mode}).", True)
