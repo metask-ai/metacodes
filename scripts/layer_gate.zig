@@ -4,12 +4,14 @@ const Package = struct {
     name: []const u8,
     paths: []const []const u8,
     allowed_dependencies: []const []const u8,
+    root: ?[]const u8 = null,
 };
 
 const KernelBudget = struct {
     package: []const u8,
     max_lines: usize,
     max_dependencies: []const []const u8,
+    raise_reason: []const u8 = "",
 };
 
 const Manifest = struct {
@@ -60,6 +62,11 @@ const Layers = struct {
 
     fn mayDepend(layers: Layers, from: usize, to: usize) bool {
         return from == to or layers.allowed[from][to];
+    }
+
+    fn isRoot(layers: Layers, package: usize, path: []const u8) bool {
+        const root = layers.manifest.packages[package].root orelse return false;
+        return std.mem.eql(u8, root, path);
     }
 };
 
@@ -165,8 +172,15 @@ fn resolveLayers(arena: std.mem.Allocator, manifest: Manifest) !Layers {
             std.debug.print("layers.zon: kernel_budget names unknown package `{s}`\n", .{dependency});
         }
     }
+    const layers: Layers = .{ .manifest = manifest, .allowed = allowed, .kernel = kernel };
+    for (manifest.packages, 0..) |package, position| {
+        const root = package.root orelse continue;
+        if (layers.owner(root) == position) continue;
+        problems += 1;
+        std.debug.print("layers.zon: root `{s}` of `{s}` is not one of its files\n", .{ root, package.name });
+    }
     if (problems != 0) return error.InvalidManifest;
-    return .{ .manifest = manifest, .allowed = allowed, .kernel = kernel };
+    return layers;
 }
 
 fn indexOf(manifest: Manifest, package_name: []const u8) ?usize {
@@ -256,7 +270,7 @@ fn addEdge(
     const location = try std.fmt.allocPrint(arena, "{s}:{d}", .{ path, line });
     if (!layers.mayDepend(from, to)) {
         if (try record(arena, &findings.upward, key, location)) findings.upward_counts[from][to] += 1;
-    } else if (kind == .relative) {
+    } else if (kind == .relative and !layers.isRoot(to, target)) {
         if (try record(arena, &findings.deep, key, location)) findings.deep_counts[from][to] += 1;
     }
 }
@@ -418,6 +432,20 @@ fn checkBudget(layers: Layers, findings: Findings) usize {
         if (findings.depends[layers.kernel][layers.index(dependency).?]) continue;
         problems += 1;
         std.debug.print("layers.zon: package `{s}` no longer depends on `{s}`, so remove it from kernel_budget\n", .{ budget.package, dependency });
+    }
+    return problems;
+}
+
+fn checkRoots(layers: Layers, files: []const SourceFile) usize {
+    var problems: usize = 0;
+    for (layers.manifest.packages) |package| {
+        const root = package.root orelse continue;
+        for (files) |file| {
+            if (std.mem.eql(u8, file.path, root)) break;
+        } else {
+            problems += 1;
+            std.debug.print("layers.zon: root `{s}` of `{s}` does not exist\n", .{ root, package.name });
+        }
     }
     return problems;
 }
@@ -621,10 +649,7 @@ fn growth(
     }
     const budget = manifest.kernel_budget;
     const base_budget = base.manifest.kernel_budget;
-    if (budget.max_lines > base_budget.max_lines) {
-        problems += 1;
-        std.debug.print("layers.zon: kernel_budget.max_lines rises from {d} to {d}; it only goes down\n", .{ base_budget.max_lines, budget.max_lines });
-    }
+    if (budget.max_lines > base_budget.max_lines) problems += checkRaise(budget, base_budget, findings.kernel_lines);
     for (budget.max_dependencies) |dependency| {
         if (indexOfPath(base_budget.max_dependencies, dependency) < base_budget.max_dependencies.len) continue;
         problems += 1;
@@ -641,6 +666,18 @@ fn growth(
         }
     }
     return problems;
+}
+
+fn checkRaise(budget: KernelBudget, base_budget: KernelBudget, kernel_lines: usize) usize {
+    if (budget.raise_reason.len == 0 or std.mem.eql(u8, budget.raise_reason, base_budget.raise_reason)) {
+        std.debug.print("layers.zon: kernel_budget.max_lines rises from {d} to {d} without a new raise_reason; it only goes down\n", .{ base_budget.max_lines, budget.max_lines });
+        return 1;
+    }
+    if (kernel_lines > base_budget.max_lines) {
+        std.debug.print("layers.zon: kernel_budget.max_lines rises from {d} to {d} while the kernel grows to {d} lines; raise it in a change of its own first\n", .{ base_budget.max_lines, budget.max_lines, kernel_lines });
+        return 1;
+    }
+    return 0;
 }
 
 fn carriedByMove(
@@ -803,7 +840,7 @@ fn run(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, wiring_text: []co
     const layers = try resolveLayers(arena, manifest);
     const files = try readTree(arena, io, root);
     const findings = try analyze(arena, layers, files, try parseWiring(arena, wiring_text));
-    var problems = try check(arena, layers, findings, baseline);
+    var problems = try check(arena, layers, findings, baseline) + checkRoots(layers, files);
     if (base) |before| problems += try growth(arena, io, before, layers, files, findings, baseline);
     return .{ .layers = layers, .findings = findings, .problems = problems };
 }
@@ -1110,6 +1147,38 @@ test "a shrinking baseline and budget pass against the base" {
         \\
     ;
     try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, shrunk_layers, shrunk_baseline, test_wiring, base));
+}
+
+fn replaced(comptime text: [:0]const u8, comptime needle: []const u8, comptime with: []const u8) [:0]const u8 {
+    @setEvalBranchQuota(100_000);
+    const at = std.mem.indexOf(u8, text, needle).?;
+    return text[0..at] ++ with ++ text[at + needle.len ..];
+}
+
+test "an import of a package's root is not deep, and the root must be one of its existing files" {
+    const rooted = comptime replaced(test_layers, ".allowed_dependencies = .{} }", ".allowed_dependencies = .{}, .root = \"src/util/root.zig\" }");
+    const tree = clean_tree ++ [_][2][]const u8{
+        .{ "src/util/root.zig", "const fs = @import(\"fs.zig\");\n" },
+        .{ "src/tools/grep.zig", "const util = @import(\"../util/root.zig\");\n" },
+    };
+    try std.testing.expectEqual(@as(usize, 0), try checkTree(&tree, rooted, test_baseline, test_wiring));
+    try std.testing.expectEqual(@as(usize, 1), try checkTree(&tree, test_layers, test_baseline, test_wiring));
+    try std.testing.expectEqual(@as(usize, 1), try checkTree(&clean_tree, rooted, test_baseline, test_wiring));
+    const foreign = comptime replaced(test_layers, ".allowed_dependencies = .{} }", ".allowed_dependencies = .{}, .root = \"src/main.zig\" }");
+    try std.testing.expectError(error.InvalidManifest, checkTree(&clean_tree, foreign, test_baseline, test_wiring));
+}
+
+test "the kernel budget rises only with a new raise_reason, in a change that does not grow the kernel" {
+    const base = TestBase{ .layers = test_layers, .baseline = test_baseline };
+    const unexplained = comptime replaced(test_layers, ".max_lines = 3,", ".max_lines = 9,");
+    const explained = comptime replaced(test_layers, ".max_lines = 3,", ".max_lines = 9, .raise_reason = \"the loop\",");
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&clean_tree, unexplained, test_baseline, test_wiring, base));
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&clean_tree, explained, test_baseline, test_wiring, base));
+    const explained_base = TestBase{ .layers = comptime replaced(test_layers, ".max_lines = 3,", ".max_lines = 3, .raise_reason = \"the loop\","), .baseline = test_baseline };
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&clean_tree, explained, test_baseline, test_wiring, explained_base));
+    var grown = clean_tree;
+    grown[2][1] = "const fs = @import(\"../util/fs.zig\");\nconst bash = @import(\"../tools/bash.zig\");\n\n\n";
+    try std.testing.expectEqual(@as(usize, 1), try checkTreeAgainst(&grown, explained, test_baseline, test_wiring, base));
 }
 
 const split_layers =

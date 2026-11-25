@@ -89,8 +89,14 @@ These rules apply to the entire repository.
   `layer_baseline.zon` records today's violations file edge by file edge and
   only shrinks: a new violation fails, and so does an entry whose violation
   is gone, so delete it in the change that removes it (`zig build
-  layer:baseline` prints the baseline that matches the tree). The kernel's
-  `kernel_budget` (lines and the packages it reaches) only goes down. CI
+  layer:baseline` prints the baseline that matches the tree). A package may
+  name a `root`, one of its own files; a relative import of another package's
+  root is that package's public entry, not a deep import, so new code reaches
+  `base` and `ai` through `src/base.zig` and `src/ai.zig` instead of growing
+  the baseline. The kernel's `kernel_budget` (lines and the packages it
+  reaches) only goes down, except in a change of its own: `max_lines` may rise
+  together with a new `raise_reason` in a PR that does not itself grow the
+  kernel past the base's budget, and the code that needs the room follows. CI
   checks the PR against its base (`zig build layer:check -Dlayer-base=<ref>`)
   and fails when the baseline or the budget grows or `allowed_dependencies`
   widen. A change to the layering itself goes in its own PR. The base
