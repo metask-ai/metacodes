@@ -358,37 +358,44 @@ pub const JobRegistry = struct {
         }
     }
 
+    const KILL_BATCH = 32;
+
     fn killDue(self: *JobRegistry, now_ms: util_time.Millis) void {
-        var to_kill: std.ArrayList(ExpiryStep) = .empty;
-        defer to_kill.deinit(self.allocator);
-        self.lock();
-        for (self.jobs.items) |*entry| {
-            const state = switch (entry.kind) {
-                .plain => continue,
-                .monitor => |*state| state,
-            };
-            const kill_at = state.kill_at_ms orelse continue;
-            if (kill_at > now_ms) continue;
-            to_kill.append(self.allocator, .{ .id = entry.id, .proc = entry.proc }) catch break;
-            state.kill_at_ms = null;
+        while (true) {
+            var batch: [KILL_BATCH]ExpiryStep = undefined;
+            var count: usize = 0;
+            self.lock();
+            for (self.jobs.items) |*entry| {
+                if (count == batch.len) break;
+                const state = switch (entry.kind) {
+                    .plain => continue,
+                    .monitor => |*state| state,
+                };
+                const kill_at = state.kill_at_ms orelse continue;
+                if (kill_at > now_ms) continue;
+                batch[count] = .{ .id = entry.id, .proc = entry.proc };
+                count += 1;
+                state.kill_at_ms = null;
+            }
+            self.unlock();
+            self.forceKillAndReap(batch[0..count]);
+            if (count < batch.len) return;
         }
-        self.unlock();
-        self.forceKillAndReap(to_kill.items);
     }
 
-    fn killScheduled(self: *JobRegistry, steps: []const ExpiryStep) void {
-        var to_kill: std.ArrayList(ExpiryStep) = .empty;
-        defer to_kill.deinit(self.allocator);
+    fn killScheduled(self: *JobRegistry, steps: []ExpiryStep) void {
+        var count: usize = 0;
         self.lock();
         for (steps) |step| {
             const entry = self.getPtrLocked(step.id[0..]) orelse continue;
             const state = &entry.kind.monitor;
             if (state.kill_at_ms == null) continue;
-            to_kill.append(self.allocator, step) catch break;
             state.kill_at_ms = null;
+            steps[count] = step;
+            count += 1;
         }
         self.unlock();
-        self.forceKillAndReap(to_kill.items);
+        self.forceKillAndReap(steps[0..count]);
     }
 
     fn forceKillAndReap(self: *JobRegistry, steps: []const ExpiryStep) void {
@@ -400,7 +407,7 @@ pub const JobRegistry = struct {
         for (steps) |step| self.commitStoppedLocked(step.id[0..]);
     }
 
-    fn stopWithGrace(self: *JobRegistry, steps: []const ExpiryStep) void {
+    fn stopWithGrace(self: *JobRegistry, steps: []ExpiryStep) void {
         if (steps.len == 0) return;
         self.sendTerm(steps);
         util_time.sleepMs(process.KILL_GRACE_MS);
@@ -783,30 +790,11 @@ pub const JobRegistry = struct {
 
     pub fn takeMonitorEvents(self: *JobRegistry, owner: SessionId, allocator: std.mem.Allocator, now: util_time.Millis) ![]monitor_stream.Notice {
         self.stopExpired(owner, now);
-        var notices = std.ArrayList(monitor_stream.Notice).empty;
-        errdefer {
-            for (notices.items) |*notice| notice.deinit(allocator);
-            notices.deinit(allocator);
-        }
-        var flooding = std.ArrayList([12]u8).empty;
+        var flooding = std.ArrayList(ExpiryStep).empty;
         defer flooding.deinit(allocator);
-        try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
-        if (flooding.items.len > 0) {
-            var to_stop = std.ArrayList(ExpiryStep).empty;
-            defer to_stop.deinit(allocator);
-            try to_stop.ensureTotalCapacity(allocator, flooding.items.len);
-            self.lock();
-            for (flooding.items) |id| {
-                const entry = self.getPtrLocked(id[0..]) orelse continue;
-                if (entry.status != .running or entry.stop_in_progress) continue;
-                entry.stop_in_progress = true;
-                to_stop.appendAssumeCapacity(.{ .id = entry.id, .proc = entry.proc });
-            }
-            self.unlock();
-            self.stopWithGrace(to_stop.items);
-            try self.collectMonitorNotices(owner, allocator, now, &notices, &flooding);
-        }
-        return try notices.toOwnedSlice(allocator);
+        const notices = try self.collectMonitorNotices(owner, allocator, now, &flooding);
+        self.stopWithGrace(flooding.items);
+        return notices;
     }
 
     fn collectMonitorNotices(
@@ -814,22 +802,20 @@ pub const JobRegistry = struct {
         owner: SessionId,
         allocator: std.mem.Allocator,
         now: util_time.Millis,
-        notices: *std.ArrayList(monitor_stream.Notice),
-        flooding: *std.ArrayList([12]u8),
-    ) !void {
+        flooding: *std.ArrayList(ExpiryStep),
+    ) ![]monitor_stream.Notice {
         self.lock();
         defer self.unlock();
+        try flooding.ensureUnusedCapacity(allocator, self.jobs.items.len);
         self.reapExitedLocked();
-        const Commit = struct { index: usize, state: monitor_stream.State, announce: bool };
+        const Commit = struct { index: usize, state: monitor_stream.State, announce: bool, flooding: bool };
         var commits = std.ArrayList(Commit).empty;
         defer commits.deinit(allocator);
-        const first_new = notices.items.len;
+        var notices = std.ArrayList(monitor_stream.Notice).empty;
         errdefer {
-            for (notices.items[first_new..]) |*notice| notice.deinit(allocator);
-            notices.shrinkRetainingCapacity(first_new);
+            for (notices.items) |*notice| notice.deinit(allocator);
+            notices.deinit(allocator);
         }
-        const first_flooding = flooding.items.len;
-        errdefer flooding.shrinkRetainingCapacity(first_flooding);
         for (self.jobs.items, 0..) |*entry, index| {
             const current = switch (entry.kind) {
                 .plain => continue,
@@ -838,7 +824,7 @@ pub const JobRegistry = struct {
             if (entry.exit_announced or !std.mem.eql(u8, &entry.owner.bytes, &owner.bytes)) continue;
             const ended = entry.status != .running;
             if (ended and entry.exit_observed) {
-                try commits.append(allocator, .{ .index = index, .state = current, .announce = true });
+                try commits.append(allocator, .{ .index = index, .state = current, .announce = true, .flooding = false });
                 continue;
             }
             var next = current;
@@ -849,10 +835,8 @@ pub const JobRegistry = struct {
             var event_owned = true;
             defer if (event_owned) allocator.free(batch.event);
             next.stdout_cursor += batch.consumed;
-            if (!ended and next.stop == null and next.overBudgetTooLong(now)) {
-                next.stop = .too_much_output;
-                try flooding.append(allocator, entry.id);
-            }
+            const floods = !ended and !entry.stop_in_progress and next.stop == null and next.overBudgetTooLong(now);
+            if (floods) next.stop = .too_much_output;
             const end: ?monitor_stream.End = if (mode == .final) monitorEnd(entry, next) else null;
             if (batch.event.len > 0 or end != null) {
                 const description = try allocator.dupe(u8, next.description);
@@ -860,13 +844,19 @@ pub const JobRegistry = struct {
                 try notices.append(allocator, .{ .id = entry.id, .description = description, .event = batch.event, .end = end });
                 event_owned = false;
             }
-            try commits.append(allocator, .{ .index = index, .state = next, .announce = end != null });
+            try commits.append(allocator, .{ .index = index, .state = next, .announce = end != null, .flooding = floods });
         }
+        const owned = try notices.toOwnedSlice(allocator);
         for (commits.items) |commit| {
             const entry = &self.jobs.items[commit.index];
             entry.kind = .{ .monitor = commit.state };
+            if (commit.flooding) {
+                entry.stop_in_progress = true;
+                flooding.appendAssumeCapacity(.{ .id = entry.id, .proc = entry.proc });
+            }
             if (commit.announce) entry.exit_announced = true;
         }
+        return owned;
     }
 
     /// 持锁内部版:返回内部指针供 kill 就地改 status/exit_code。**调用方必须持锁**且不得
@@ -1511,11 +1501,14 @@ test "a monitor that keeps flooding past the budget for 30 s is stopped with a n
     var attempts: usize = 0;
     while (attempts < 500 and (spoolFileSize(r.get(j.idSlice()).?.stdout_path) catch 0) <= cursor) : (attempts += 1) util_time.sleepMs(10);
 
+    const stopping = try r.takeMonitorEvents(owner, a, t0 + monitor_stream.OVER_BUDGET_STOP_MS);
+    defer monitor_stream.freeNotices(a, stopping);
+    try std.testing.expectEqual(@as(usize, 0), stopping.len);
+    try std.testing.expect(r.get(j.idSlice()).?.status != .running);
     const stopped = try r.takeMonitorEvents(owner, a, t0 + monitor_stream.OVER_BUDGET_STOP_MS);
     defer monitor_stream.freeNotices(a, stopped);
     try std.testing.expectEqual(@as(usize, 1), stopped.len);
     try std.testing.expectEqual(@as(?monitor_stream.End, .too_much_output), stopped[0].end);
-    try std.testing.expect(r.get(j.idSlice()).?.status != .running);
 }
 
 test "a monitor stdout line longer than one read is delivered once, then the next line" {
@@ -1688,4 +1681,83 @@ test "a flooding monitor stopped in the same take as an expiry gets TERM before 
         try std.testing.expect(!entry.stop_in_progress);
         try std.testing.expectEqual(@as(?util_time.Millis, null), entry.kind.monitor.kill_at_ms);
     }
+}
+
+fn spawnOverloadedFlood(r: *JobRegistry, owner: SessionId, now: util_time.Millis) !JobEntry {
+    const j = try r.spawnMonitorOwned("while :; do echo spam; sleep 0.01; done", null, owner, "flood", null);
+    try waitForStdout(r, j.idSlice());
+    r.lock();
+    defer r.unlock();
+    const state = &r.jobs.items[monitorIndex(r, j.idSlice())].kind.monitor;
+    state.tokens = 0;
+    state.refilled_ms = std.math.maxInt(i64) / 2;
+    state.over_budget_since_ms = now - monitor_stream.OVER_BUDGET_STOP_MS;
+    return j;
+}
+
+fn expectFloodStopped(r: *JobRegistry, owner: SessionId, j: JobEntry, already_reported: bool) !void {
+    var reported = already_reported;
+    var takes: usize = 0;
+    while (!reported and takes < 10) : (takes += 1) {
+        const notices = try r.takeMonitorEvents(owner, std.testing.allocator, util_time.nowMs());
+        defer monitor_stream.freeNotices(std.testing.allocator, notices);
+        for (notices) |notice| {
+            if (notice.end) |end| reported = reported or end == .too_much_output;
+        }
+    }
+    try std.testing.expect(reported);
+    const entry = r.get(j.idSlice()).?;
+    try std.testing.expect(entry.status != .running);
+    try std.testing.expect(!entry.stop_in_progress);
+    try r.kill(j.idSlice());
+    try std.testing.expectEqual(@as(usize, 0), r.killAll());
+}
+
+test "an allocation failure at any point of a flood take never leaves the monitor half-claimed" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var r = try JobRegistry.init(std.testing.allocator);
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const now = util_time.nowMs();
+    const j = try spawnOverloadedFlood(&r, owner, now);
+    try std.testing.expect(r.sweeper == null);
+    var reported = false;
+    var fail_index: usize = 0;
+    while (fail_index < 200) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const notices = r.takeMonitorEvents(owner, failing.allocator(), now) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            const entry = r.get(j.idSlice()).?;
+            try std.testing.expect(!entry.stop_in_progress);
+            if (entry.status == .running) try std.testing.expectEqual(@as(?monitor_stream.Stop, null), entry.kind.monitor.stop);
+            continue;
+        };
+        defer monitor_stream.freeNotices(failing.allocator(), notices);
+        for (notices) |notice| {
+            if (notice.end) |end| reported = reported or end == .too_much_output;
+        }
+        break;
+    }
+    try std.testing.expect(fail_index < 200);
+    try expectFloodStopped(&r, owner, j, reported);
+}
+
+test "a flood stop finishes with only persistent monitors when the registry allocator fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var registry_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var r = try JobRegistry.init(registry_allocator.allocator());
+    defer r.deinit();
+    const owner = @import("session_id.zig").gen();
+    const now = util_time.nowMs();
+    const j = try spawnOverloadedFlood(&r, owner, now);
+    try std.testing.expect(r.sweeper == null);
+    registry_allocator.fail_index = registry_allocator.alloc_index;
+    const notices = try r.takeMonitorEvents(owner, std.testing.allocator, now);
+    defer monitor_stream.freeNotices(std.testing.allocator, notices);
+    registry_allocator.fail_index = std.math.maxInt(usize);
+    var reported = false;
+    for (notices) |notice| {
+        if (notice.end) |end| reported = reported or end == .too_much_output;
+    }
+    try expectFloodStopped(&r, owner, j, reported);
 }
