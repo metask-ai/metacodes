@@ -14,7 +14,7 @@
 //! `retry_after_ms` carries the wait the way a `Retry-After` header would.
 
 const std = @import("std");
-const time_context = @import("../core/time_context.zig");
+const timezone = @import("platform").timezone;
 
 pub const Refusal = union(enum) {
     /// The plan's Codex quota is used up. `resets_at` is when it opens again
@@ -33,7 +33,7 @@ pub const Refusal = union(enum) {
 /// server meant: `resetTime` reads it as none, and the failure line says the
 /// server did not say when. Inside the bound, the time plus any zone offset
 /// stays far inside i64 seconds and an i32 year, which
-/// `time_context.localDate` needs.
+/// `timezone.civilDate` needs.
 const latest_reset: i64 = 253_402_300_799;
 
 /// `seconds` when it is a reset time to say and wait for: after 1970 and no
@@ -105,7 +105,7 @@ pub fn summarize(refusal: Refusal, now_unix: i64, offset_minutes: i32, buffer: [
             var offset_buffer: [9]u8 = undefined;
             // `at` is no later than `latest_reset`: no zone offset takes the
             // local time out of range.
-            const date = time_context.localDate(at, offset_minutes);
+            const date = timezone.civilDate(at, offset_minutes);
             const local = at + @as(i64, offset_minutes) * 60;
             const minute_of_day: u64 = @intCast(@mod(@divFloor(local, 60), 24 * 60));
             const detail = std.fmt.bufPrint(buffer, "the plan's Codex quota is used up; it resets at {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} ({s}), {s}", .{
@@ -114,7 +114,7 @@ pub fn summarize(refusal: Refusal, now_unix: i64, offset_minutes: i32, buffer: [
                 date.day,
                 minute_of_day / 60,
                 minute_of_day % 60,
-                time_context.formatOffset(&offset_buffer, offset_minutes),
+                timezone.formatOffset(&offset_buffer, offset_minutes),
                 wait,
             }) catch "the plan's Codex quota is used up";
             return .{ .kind = kind, .detail = detail };

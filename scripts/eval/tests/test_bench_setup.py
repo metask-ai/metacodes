@@ -2423,6 +2423,7 @@ class EgressRunTest(SetupFixture):
         self.assertEqual([c for c in self.calls("ssh") if "-R" in c[1] and " node run " not in c[1][-1]], [])
         local = manager.jobs_dir / run["name"]
         harbor_env = json.loads((local / "harbor-env.json").read_text())
+        self.assertEqual(harbor_env["TZ"], "UTC")
         docker_config = Path(harbor_env["DOCKER_CONFIG"])
         self.assertEqual(docker_config.parent, (self.remote_home / ".metacodes-bench/runs" / run["name"]).resolve())
         self.assertFalse(docker_config.exists())  # removed after the run

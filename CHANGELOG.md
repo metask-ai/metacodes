@@ -292,6 +292,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Bench no longer shows a negative 用时 for a running job.** Harbor writes a
+  job's start and finish times in the executing machine's local time without
+  a zone, and the workbench reads them as UTC, so a job running on a node at
+  UTC+8 showed about eight hours less than it had run. Harbor now runs with
+  `TZ=UTC`, locally and on SSH nodes. Jobs started before this change keep
+  their shifted start time.
+
 - **A provider overload is retried like a 503.** HTTP 529 was an unnamed
   status that ended the turn after one attempt; it is now
   `ServiceUnavailable` and goes through the connect retry (attempt limit,
