@@ -196,7 +196,12 @@ metacodes bench pull --suite terminal-bench-2.1 --task fix-git --task regex-log 
 It runs on the workbench machine. Registry suites are read from the same
 download a run uses (`<state root>/bench/registry-cache/`), harbor-local
 suites from their prepared dataset. It first runs `docker info` on the
-executor and stops with its error when Docker cannot be reached. A named
+executor and stops with its error when Docker cannot be reached. The images
+a task names are its own (`[environment] docker_image`), every other
+`docker_image` of its `task.toml` (a separate verifier's
+`[verifier.environment]`, as in the FrontierHarness tasks), and the
+`image:` of the services in `environment/docker-compose.yaml` that have no
+`build:` (sidecars). A named
 image is checked with `docker image inspect` (over SSH for an SSH executor)
 and pulled only when missing; an executor's `ghcr_mirror` is used for
 `ghcr.io` images, which are then tagged back, and `docker_mirrors` apply
@@ -212,8 +217,9 @@ then takes every step from the build cache, without network access. Pulls
 and builds are tried up to 3 times with a backoff. `--dry-run` only
 inspects (a build counts as ready when its tag exists). Without `--task`
 every task of the suite is covered. WorkBuddy suites prepare their own
-environments and are refused. The exit status is 1 when any image could not
-be pulled or built.
+environments and are refused. The summary also counts the tasks whose
+images are all present (`tasks: {total, ready}` in `--json`). The exit
+status is 1 when any image could not be pulled or built.
 
 ### Adding a harbor-local suite
 

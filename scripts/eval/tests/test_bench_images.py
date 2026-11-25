@@ -99,6 +99,7 @@ class BenchPullTest(unittest.TestCase):
         self.assertEqual({tasks: r["status"] for tasks, r in self.builds(value).items()},
                          {("build-here", "build-here-2"): "missing", ("with-sidecar",): "missing"})
         self.assertFalse([c for c in self.docker_calls() if c.startswith(("pull", "compose"))])
+        self.assertEqual(value["tasks"], {"total": 7, "ready": 2})
 
     def test_builds_each_distinct_environment_like_harbor(self) -> None:
         code, value = self.bench("--task", "build-here", "--task", "build-here-2", "--task", "with-sidecar")
@@ -141,6 +142,7 @@ class BenchPullTest(unittest.TestCase):
         self.assertNotIn("pull alexgshaw/fix-git:20260403", pulls)
         self.assertEqual(pulls.count("pull alexgshaw/overfull-hbox:20251031"), images.PULL_ATTEMPTS)
         self.assertIn("alexgshaw/regex-log:20251031", self.present.read_text().splitlines())
+        self.assertEqual(value["tasks"], {"total": 7, "ready": 6})
 
     def test_unreachable_docker_fails_before_any_image(self) -> None:
         for args in (("--dry-run",), ()):
@@ -195,6 +197,22 @@ class SshPullTest(unittest.TestCase):
         self.assertIn("relay.example", calls[-1])
         self.assertIn(f"ctx=$(cd {remote} && pwd)", calls[-1][-1])
         self.assertIn(f"docker compose -p {images.BUILD_TAG}{digest}", calls[-1][-1])
+
+    def test_verifier_and_sidecar_images_are_pulled_with_the_task_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_task(Path(tmp), "separate", extra={"docker-compose.yaml": (
+                "services:\n  main:\n    image: org/env:1\n    depends_on:\n      db:\n        condition: x\n"
+                "  db:\n    image: \"org/db:2\"\n    expose:\n    - \"5432\"\n"
+                "  local:\n    build: ./local\n    image: org/local:3\n"
+                "  named:\n    image: ${MAIN_IMAGE_NAME}_named\n")})
+            (Path(tmp) / "separate" / "task.toml").write_text(
+                '[task]\nname = "separate"\n\n[verifier]\nenvironment_mode = "separate"\n\n'
+                '[verifier.environment]\ndocker_image = "org/verifier:1"\n\n'
+                '[environment]\ndocker_image = "org/env:1"\n')
+            found, builds = images.images_of(Path(tmp), ["separate"])
+        self.assertEqual(found, {"org/env:1": ["separate"], "org/verifier:1": ["separate"],
+                                 "org/db:2": ["separate"]})
+        self.assertEqual(builds, {})
 
     def test_invalid_image_reference_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
