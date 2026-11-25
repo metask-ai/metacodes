@@ -222,6 +222,56 @@ environments and are refused. The summary also counts the tasks whose
 images are all present (`tasks: {total, ready}` in `--json`). The exit
 status is 1 when any image could not be pulled or built.
 
+### Preparation ahead of the queue
+
+A run also prepares each task by itself, shortly before its turn, so a run
+started without `bench pull` does not pay for every image inside a trial.
+The trial queue hook the metacodes agent installs in Harbor
+(`scripts/eval/harbor/live_concurrency.py`, with the queue in
+`scripts/eval/harbor/trial_lifecycle.py`) gives every trial three stages:
+
+1. **排队**: the trial waits. Slots go to the trials in the order Harbor
+   submitted them, oldest first.
+2. **准备**: once the trial is among the next wave (as many waiting trials
+   as the profile's concurrency), the hook does for its task what
+   `bench pull` does, on the machine Harbor runs on: every image the task
+   names (its `docker_image`, a separate verifier's image and the images of
+   its compose sidecars) is checked with `docker image inspect` and pulled
+   only when the local image store lacks it; a task built from `environment/` is built under its
+   `metacodes-prebuild-<digest>` tag unless that tag exists. Pulls and builds
+   are tried up to 3 times. At most 4 of these run at once, and trials that
+   need the same image or build wait for one operation. The task's clock
+   starts here.
+3. **运行**: the trial takes its slot. When its preparation finished earlier
+   it starts at once (就绪等待 is the time in between; after a preparation
+   that failed the same wait is 准备失败后等待, and Harbor pulls or builds
+   again once the trial starts). When its turn comes
+   while it is still preparing, it keeps preparing inside its slot (开始后准备)
+   and starts when that ends; the first wave of a run always does.
+
+Preparation never decides a trial's result: when it fails, or the task has
+no local directory (a `-d` registry run on the local executor), Harbor
+starts the environment itself as before, and the failure is recorded beside
+the trial, not as its outcome. A WorkBuddy run drives its own Harbor and has
+no such stages.
+
+Each trial's stages are in `<job>/.bench-lifecycle/<trial>.json`, rewritten
+at every transition: `queued_at`, `prepare_started_at`,
+`prepare_finished_at`, `started_at` (the slot), `finished_at`, and `prepare`
+with its `status` (`present` when everything was already there, `prepared`,
+`failed`, `skipped`) and one item per image (`kind` `pull` or `build`,
+`image`, `status` `present` / `pulled` / `built` / `failed`, `seconds`,
+`attempts`, `error`, and `shared` when the trial waited for another trial's
+operation). A trial's row in `GET /api/job` and `GET /api/trial` carries
+`lifecycle`: `queue_s`, `prepare_s` (预准备, before the slot),
+`ready_wait_s` (from a preparation that left everything ready to the slot),
+`unprepared_wait_s` (the same wait after a preparation that failed: the
+page says so, and that Harbor pulls or builds again once the trial starts),
+`prepare_running_s`, `total_s` (from the start of
+preparation, or from the slot when there was none, to the end) and
+`prepare`; it is `null` for a trial without a record. `elapsed_s` and
+`phases` keep their meaning (Harbor's own trial).
+
 ### Adding a harbor-local suite
 
 An adapter is `scripts/eval/harbor/adapters/<name>.py`, registered by an entry
@@ -1467,9 +1517,14 @@ detail:
   apportions the request's measured input tokens by those shares; the
   initial-token metric shows the first request's composition, averaged over
   trials. Runs recorded before this existed show `未采集`.
-- **Time**: Harbor's phases, and the agent phase split into waiting on the
-  model (request durations), running tools (each call's measured execution
-  from the metacodes event stream) and the rest; a per-tool timing table.
+- **Time**: what the task's time is made of, in order: 预准备, 就绪等待 (or
+  准备失败后等待) and 开始后准备 (see [Preparation ahead of the queue](#preparation-ahead-of-the-queue)), then
+  Harbor's phases (环境, 安装, agent, 判分), with the images preparation
+  pulled, built or found. The total counts from the start of preparation;
+  排队 is shown beside it and not counted. The agent phase is split into
+  waiting on the model (request durations), running tools (each call's
+  measured execution from the metacodes event stream) and the rest; a
+  per-tool timing table. The job page's 时间分段 bar has the same parts.
 - **Trajectory**: every step, with each tool call's execution time.
 
 The 数据库 page shows the active store and its contents. It tests a SQLite path or a PostgreSQL DSN (no password in the
@@ -1557,6 +1612,7 @@ there into the evaluation database):
   <job>/
     config.json, result.json       # job configuration and aggregate result
     .bench-metrics/<trial>.jsonl   # numeric request-level timing/usage
+    .bench-lifecycle/<trial>.json  # queue, preparation and slot times of the trial
     <trial>/
       config.json, result.json     # trial score, timings and usage
       agent/                      # NDJSON, transcript, ATIF trajectory, stderr

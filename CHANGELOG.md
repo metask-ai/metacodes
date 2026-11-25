@@ -24,6 +24,17 @@ status, compatibility boundaries, and entry points are defined by
   notice. Event text is XML-escaped and labelled as command output, not
   instructions. Off by default; with it off Monitor is unchanged
   ([API.md](doc/API.md#preview-features)).
+- **Bench prepares each task shortly before its turn and shows what its time
+  is made of.** Inside a run, trials now take their slots in the order they
+  were queued, and the next wave of waiting trials pulls or builds its task
+  image ahead of time (the local image store first, the registry only when
+  the image is missing, up to 3 tries). A trial that is ready before its turn
+  starts at once; one whose turn comes first keeps preparing in its slot. The
+  task page's 耗时 panel and the job page's 时间分段 bar show 预准备, 就绪等待
+  and 开始后准备 before Harbor's own phases, with the time spent queued shown
+  apart, and list the images preparation found, pulled or built. A failed
+  preparation is recorded beside the trial and never decides its result; the
+  wait after it is shown as 准备失败后等待, not as ready.
 - **Bench executors can cache what task containers download.**
   `"download_cache": true` on an SSH executor makes `metacodes bench setup`
   run `metacodes-download-cache` on the executor, and every run's task
