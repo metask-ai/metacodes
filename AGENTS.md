@@ -112,13 +112,19 @@ These rules apply to the entire repository.
   `metacodes-core` facade that re-exports the lower packages, is its own
   `facade` package between `teamwork` and `agentcore`.
 - `kernel` is the counterpart of pi's `pi-agent-core` and holds only
-  `core/conversation`, `core/message`, `core/session_id` and
-  `core/result_budget`. `core/agent_loop`, `core/tool_exec` and `core/protocol/`
-  are the loop with every peripheral attached, pi's `AgentSession`, and belong
-  to `coding`, except the three protocol files `PermissionContext` is typed
-  with (`ui_event`, `ui_request`, `permission_choice`), which belong to
-  `guard`. The minimal kernel loop is extracted in migration step 3.2; until
-  then `agent_loop.Options` keeps its public shape.
+  `core/conversation`, `core/message`, `core/session_id`,
+  `core/result_budget` and the minimal loop under `core/kernel/`, whose root
+  `core/kernel.zig` is how other packages reach it: the loop, the hooks
+  (`prepare_request`, `before_tool`, `after_tool`, `finish_turn`, `event`, run
+  in the order the caller lists them), the tool interface and the sequential
+  and parallel executor, tested only with a fake provider and fake tools.
+  `core/agent_loop`, `core/tool_exec` and `core/protocol/` are the loop with
+  every peripheral attached, pi's `AgentSession`, and belong to `coding`,
+  except the three protocol files `PermissionContext` is typed with
+  (`ui_event`, `ui_request`, `permission_choice`), which belong to `guard`.
+  Nothing calls the minimal loop yet; `agent_loop` moves onto it capability by
+  capability from migration step 3.2b, and until then `agent_loop.Options`
+  keeps its public shape.
 - `cli` reaches the lower packages only through the `metacodes-internal`
   module, rooted at `src/internal.zig` (also in `facade`, and not part of
   `metacodes-core`). Every module rooted at a `cli` file imports it, and `cli`
