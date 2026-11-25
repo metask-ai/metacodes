@@ -747,6 +747,12 @@ usable. Readiness probes are cached for 15 seconds.
 
 ### Bench nodes
 
+For ordinary conversations and Bench runs started independently on a node,
+the manager can keep a certificate-verified HTTPS model connection open between runs with
+`metacodes bench share --executor NAME --peer-env FILE`.
+[Pairing a node](PROVIDERS.md#using-a-managers-login-on-an-ssh-node)
+also covers the node's provider setup and stopping the share.
+
 Every machine with `metacodes` installed is a Bench node. A workbench drives
 an SSH executor the way an editor drives a remote host: it runs that host's
 own `metacodes bench node …` over SSH and talks to it on the channel's stdin

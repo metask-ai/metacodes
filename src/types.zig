@@ -430,6 +430,7 @@ pub const Config = struct {
     /// True only when startup resolved the bearer from the Metask OAuth session;
     /// explicit legacy API-key mode must not load that session or hydrate it.
     metask_oauth_selected: bool = false,
+    metask_session_gateway: ?[]const u8 = null,
     /// The host's layer below the process environment for the variables
     /// credentials are read from (#486): the CLI's `<state root>/.env`, as
     /// `apps/cli/src/app/state_env.zig` accepted it at startup. A name the process

@@ -1834,6 +1834,75 @@ test "a plain start with only the Metask session signs in with it, at the gatewa
     try expectAbsent(out.stderr, SESSION_TOKEN);
 }
 
+test "a saved Metask selection falls back to its API key endpoint after refresh rejection" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var issuer = try harness.MockServer.startRepeatingStatus("{\"error\":\"invalid_grant\"}", "HTTP/1.1 400 Bad Request", "");
+    defer issuer.stop();
+    const model = "claude-sonnet-4-6";
+    const models = "{\"data\":[{\"id\":\"" ++ model ++ "\"}]}";
+    var oauth_gateway = try harness.MockServer.startCassette(&.{ models, ANTHROPIC_SSE, models, ANTHROPIC_SSE }, 0);
+    defer oauth_gateway.stop();
+    var key_gateway = try harness.MockServer.startCassette(&.{ ANTHROPIC_SSE, OPENAI_SSE }, 0);
+    defer key_gateway.stop();
+    var session = try cc.provider_oauth.Session.initHome(testing.allocator, case.state, cc.provider_ids.Slug.lit("metask"));
+    defer session.deinit();
+    try session.importOutcome(.{
+        .access_token = SESSION_TOKEN,
+        .refresh_token = "mrt-expired",
+        .expires_in_seconds = 60,
+        .gateway_url = try originOf(a, oauth_gateway),
+    }, 0);
+    try case.writeSignedIn();
+    try storeDefault(&case, "metask", model);
+    var store = try cc.provider_config_store.Store.initHome(a, case.state);
+    defer store.deinit();
+    var doc = try store.load();
+    defer doc.deinit();
+    _ = try cc.provider_config_store.setPreset(&store, "work", doc.global_selection.?, null, null);
+    const env = [_][]const u8{
+        try std.fmt.allocPrint(a, "METASK_SITE_URL={s}", .{try originOf(a, issuer)}),
+        try std.fmt.allocPrint(a, "METACODES_BASE_URL={s}", .{try key_gateway.urlOwned(a)}),
+    };
+    const starts = [_]struct { args: []const []const u8, request: []const u8 }{
+        .{ .args = &.{ "-p", "hi" }, .request = "POST /v1/messages " },
+        .{ .args = &.{ "--preset", "work", "--openai-protocol", "chat", "-p", "hi" }, .request = "POST /v1/chat/completions " },
+    };
+    for (starts, 0..) |start, index| {
+        const out = try runCli(&case, cli, &env, start.args);
+        try testing.expectEqual(@as(i32, 0), out.exit_code);
+        try testing.expectEqual(index + 1, issuer.requestCount());
+        try testing.expect(std.mem.startsWith(u8, requestLine(issuer.requestAt(index).?), "POST /api/oauth/token "));
+        try testing.expectEqual(@as(usize, 0), oauth_gateway.requestCount());
+        try testing.expectEqual(index + 1, key_gateway.requestCount());
+        const turn = key_gateway.requestAt(index).?;
+        try testing.expect(std.mem.startsWith(u8, requestLine(turn), start.request));
+        try testing.expectEqualStrings("Bearer " ++ METASK_KEY, headerValue(turn, "authorization").?);
+        try testing.expectEqualStrings("\"" ++ model ++ "\"", turn.jsonField("model").?);
+    }
+    try case.storeSession(try originOf(a, oauth_gateway), NEW_SESSION_TOKEN);
+    const live_starts = [_][]const []const u8{ &.{ "-p", "hi" }, &.{ "--preset", "work", "-p", "hi" } };
+    for (live_starts, 0..) |args, index| {
+        const out = try runCli(&case, cli, env[0..1], args);
+        try testing.expectEqual(@as(i32, 0), out.exit_code);
+        const catalog = oauth_gateway.requestAt(index * 2) orelse return error.NoRequestCaptured;
+        const turn = oauth_gateway.requestAt(index * 2 + 1) orelse return error.NoRequestCaptured;
+        try testing.expect(std.mem.startsWith(u8, requestLine(catalog), "GET /v1/models "));
+        try testing.expect(std.mem.startsWith(u8, requestLine(turn), "POST /v1/messages "));
+        try testing.expectEqualStrings("Bearer " ++ NEW_SESSION_TOKEN, headerValue(catalog, "authorization").?);
+        try testing.expectEqualStrings("Bearer " ++ NEW_SESSION_TOKEN, headerValue(turn, "authorization").?);
+    }
+    try testing.expectEqual(@as(usize, 2), issuer.requestCount());
+    try testing.expectEqual(@as(usize, 2), key_gateway.requestCount());
+    try expectNeverSent(oauth_gateway, METASK_KEY);
+    try expectNeverSent(issuer, METASK_KEY);
+    try expectNeverSent(key_gateway, SESSION_TOKEN);
+}
+
 test "a stored default without a credential is passed over with one warning, and used once it has one (#485)" {
     var case: Case = undefined;
     try case.init();

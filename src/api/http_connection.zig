@@ -61,6 +61,39 @@ const http_status = @import("http_status.zig");
 const Request = std.http.Client.Request;
 const Response = std.http.Client.Response;
 
+pub fn managerClient(normal: *std.http.Client, uri: std.Uri, auth: []const u8) !?*std.http.Client {
+    const value = if (std.mem.startsWith(u8, auth, "Bearer ")) auth["Bearer ".len..] else auth;
+    if (!std.mem.startsWith(u8, value, "mcpeer-")) return null;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = uri.getHost(&host_buffer) catch return error.InvalidManagerEndpoint;
+    if (!std.mem.eql(u8, uri.scheme, "https") or !std.mem.eql(u8, host.bytes, "127.0.0.1"))
+        return error.InvalidManagerEndpoint;
+    const split = "mcpeer-".len + 64;
+    if (value.len <= split + 1 or value[split] != '.') return error.InvalidManagerCertificate;
+    const encoded = value[split + 1 ..];
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidManagerCertificate;
+    if (size > 3072) return error.InvalidManagerCertificate;
+    const paired = try normal.allocator.create(std.http.Client);
+    paired.* = .{ .allocator = normal.allocator, .io = normal.io };
+    errdefer releaseManagerClient(paired);
+    const der = try paired.ca_bundle.bytes.addManyAsSlice(normal.allocator, size);
+    decoder.decode(der, encoded) catch return error.InvalidManagerCertificate;
+    const now = std.Io.Clock.real.now(paired.io);
+    paired.ca_bundle.parseCert(paired.allocator, 0, now.toSeconds()) catch return error.InvalidManagerCertificate;
+    if (paired.ca_bundle.map.count() != 1) return error.InvalidManagerCertificate;
+    paired.now = now;
+    return paired;
+}
+
+pub fn releaseManagerClient(client: ?*std.http.Client) void {
+    if (client) |paired| {
+        const allocator = paired.allocator;
+        paired.deinit();
+        allocator.destroy(paired);
+    }
+}
+
 /// What a request says it is when its caller names nothing else.
 pub const user_agent = "metacodes/" ++ version.semver;
 

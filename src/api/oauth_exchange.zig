@@ -123,6 +123,13 @@ pub const MetaskHttpExchange = struct {
     }
 };
 
+pub fn metaskAccessToken(session: *oauth.Session, io: std.Io, now_seconds: i64) oauth.OAuthError![]u8 {
+    var site_buf: [1024]u8 = undefined;
+    const token_url = metask_oauth.tokenUrl(metask_oauth.siteUrl(), &site_buf) catch return error.RefreshFailed;
+    var exchange = MetaskHttpExchange{ .allocator = session.allocator, .io = io, .token_url = token_url };
+    return session.accessToken(now_seconds, exchange.exchange());
+}
+
 fn buildFormBody(
     arena: std.mem.Allocator,
     client_id: []const u8,

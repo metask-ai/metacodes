@@ -7567,6 +7567,7 @@ metacodes-core.client.AnthropicProvider.retryAttempt: fn retryAttempt(self: Prov
 metacodes-core.client.ANTHROPIC_API_URL: const = "https://napi.metask-ai.com/v1/messages"
 metacodes-core.client.StreamResult: struct
 metacodes-core.client.StreamResult.request: *http.Client.Request
+metacodes-core.client.StreamResult.manager_client: ?*http.Client = null
 metacodes-core.client.StreamResult.response: http.Client.Response
 metacodes-core.client.StreamResult.transfer_buf: [8192]u8
 metacodes-core.client.StreamResult.id: log.RequestId
@@ -8100,6 +8101,7 @@ metacodes-core.api_metask_oauth.DeviceCode.interval: u32
 metacodes-core.api_metask_oauth.DeviceCode.expires_at: ?i64 = null
 metacodes-core.api_metask_oauth.Error: const = error{ InvalidUrl, RequestFailed, MalformedResponse, AuthorizationPending, SlowDown, ExpiredToken, AccessDenied, InvalidGrant, TimedOut, }
 metacodes-core.api_metask_oauth.siteUrl: fn siteUrl() []const u8
+metacodes-core.api_metask_oauth.modelGateway: fn modelGateway(stored: ?[]const u8) Error!?[]const u8
 metacodes-core.api_metask_oauth.deviceCodeUrl: fn deviceCodeUrl(site: []const u8, buffer: []u8) ![]const u8
 metacodes-core.api_metask_oauth.tokenUrl: fn tokenUrl(site: []const u8, buffer: []u8) ![]const u8
 metacodes-core.api_metask_oauth.revokeUrl: fn revokeUrl(site: []const u8, buffer: []u8) ![]const u8
@@ -9042,6 +9044,7 @@ metacodes-core.types.Config.resolved_provider_id: ?[]const u8 = null
 metacodes-core.types.Config.auth_scheme: ?@import("credential.zig").AuthScheme = null
 metacodes-core.types.Config.dialect: @import("vendor.zig").Declaration = .{}
 metacodes-core.types.Config.metask_oauth_selected: bool = false
+metacodes-core.types.Config.metask_session_gateway: ?[]const u8 = null
 metacodes-core.types.Config.credential_env_fallback: ?@import("credential.zig").EnvLookup = null
 metacodes-core.types.Config.openai_protocol: OpenAIProtocol = .chat_completions
 metacodes-core.types.Config.openai_protocol_explicit: bool = false

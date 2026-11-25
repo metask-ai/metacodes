@@ -628,6 +628,20 @@ pub fn tryLockExclusive(fd: Fd) error{ WouldBlock, LockFailed }!void {
     }
 }
 
+pub fn lockFirstByte(fd: Fd) error{LockFailed}!void {
+    if (is_windows) {
+        const raw = _get_osfhandle(fd);
+        if (raw == -1) return error.LockFailed;
+        var overlapped: Overlapped = .{};
+        if (LockFileEx(@ptrFromInt(@as(usize, @bitCast(raw))), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped) == 0)
+            return error.LockFailed;
+    } else {
+        while (std.c.flock(fd, std.c.LOCK.EX) != 0) {
+            if (!lastErrnoIs(.INTR)) return error.LockFailed;
+        }
+    }
+}
+
 /// 4 GiB × 0x4000_0000: past any file this lock guards.
 const lock_range_offset_high: u32 = 0x4000_0000;
 const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
