@@ -542,7 +542,7 @@ class Session:
 # ------------------------------------------------------------------ ghcr.io mirror
 
 FROM_LINE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)", re.I | re.M)
-COMPOSE_IMAGE = re.compile(r"^\s*image:\s*[\"']?([^\"'\s#]+)", re.M)
+COMPOSE_IMAGE = re.compile(r"(?:^\s*|[{,]\s*)image:\s*[\"']?([^\"'\s#,}]+)", re.M)
 TOML_IMAGE = re.compile(r"^\s*docker_image\s*=\s*[\"']([^\"']+)[\"']", re.M)
 IMAGE_REF = re.compile(r"^ghcr\.io/[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]{1,128})?(?:@sha256:[0-9a-f]{64})?$")
 

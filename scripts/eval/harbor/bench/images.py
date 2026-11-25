@@ -14,7 +14,7 @@ from scripts.eval.harbor.bench.egress import TOML_IMAGE, mirror_ref
 from scripts.eval.harbor.bench.executors import Executor, shell_argv
 
 IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$")
-TOML_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*$")
+TOML_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*(?:#.*)?$")
 PULL_ATTEMPTS = 3
 PULL_BACKOFF = (10, 30)
 PULL_TIMEOUT = 3600
@@ -61,6 +61,13 @@ def toml_images(task_dir: Path) -> Tuple[Optional[str], List[str]]:
     return main, others
 
 
+def flow_mapping(text: str) -> Dict[str, str]:
+    if not (text.startswith("{") and text.endswith("}")):
+        return {}
+    pairs = (item.partition(":") for item in text[1:-1].split(","))
+    return {key.strip(): value.strip().strip("\"'") for key, _, value in pairs if key.strip()}
+
+
 def compose_images(task_dir: Path) -> List[str]:
     try:
         text = (task_dir / "environment" / "docker-compose.yaml").read_text(encoding="utf-8")
@@ -81,7 +88,7 @@ def compose_images(task_dir: Path) -> List[str]:
         if indent is None:
             indent = depth
         if depth == indent:
-            services.append({})
+            services.append(flow_mapping(line.partition(":")[2].strip()))
             child = None
             continue
         if not services:
