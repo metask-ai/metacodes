@@ -300,6 +300,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`bench pull` also pulls verifier and sidecar images.** It took only the
+  first `docker_image` of a task's `task.toml`, which in the FrontierHarness
+  tasks is the separate verifier's, so their environment images and the
+  sidecars of their `docker-compose.yaml` were never pre-pulled and a trial
+  could finish the agent and then fail on a missing verifier image. The
+  summary now also shows how many of the selected tasks are ready.
+
 - **Bench no longer shows a negative 用时 for a running job.** Harbor writes a
   job's start and finish times in the executing machine's local time without
   a zone, and the workbench reads them as UTC, so a job running on a node at
