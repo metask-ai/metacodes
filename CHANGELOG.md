@@ -21,7 +21,8 @@ status, compatibility boundaries, and entry points are defined by
   task page's 耗时 panel and the job page's 时间分段 bar show 预准备, 就绪等待
   and 开始后准备 before Harbor's own phases, with the time spent queued shown
   apart, and list the images preparation found, pulled or built. A failed
-  preparation is recorded beside the trial and never decides its result.
+  preparation is recorded beside the trial and never decides its result; the
+  wait after it is shown as 准备失败后等待, not as ready.
 
 - **Bench reruns invalid tasks, and can do it automatically.** The profile
   page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest

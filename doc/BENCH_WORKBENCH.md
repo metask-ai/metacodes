@@ -234,15 +234,18 @@ The trial queue hook the metacodes agent installs in Harbor
    submitted them, oldest first.
 2. **准备**: once the trial is among the next wave (as many waiting trials
    as the profile's concurrency), the hook does for its task what
-   `bench pull` does, on the machine Harbor runs on: a `docker_image` is
-   checked with `docker image inspect` and pulled only when the local image
-   store lacks it; a task built from `environment/` is built under its
+   `bench pull` does, on the machine Harbor runs on: every image the task
+   names (its `docker_image`, a separate verifier's image and the images of
+   its compose sidecars) is checked with `docker image inspect` and pulled
+   only when the local image store lacks it; a task built from `environment/` is built under its
    `metacodes-prebuild-<digest>` tag unless that tag exists. Pulls and builds
    are tried up to 3 times. At most 4 of these run at once, and trials that
    need the same image or build wait for one operation. The task's clock
    starts here.
 3. **运行**: the trial takes its slot. When its preparation finished earlier
-   it starts at once (就绪等待 is the time in between). When its turn comes
+   it starts at once (就绪等待 is the time in between; after a preparation
+   that failed the same wait is 准备失败后等待, and Harbor pulls or builds
+   again once the trial starts). When its turn comes
    while it is still preparing, it keeps preparing inside its slot (开始后准备)
    and starts when that ends; the first wave of a run always does.
 
@@ -261,7 +264,10 @@ with its `status` (`present` when everything was already there, `prepared`,
 `attempts`, `error`, and `shared` when the trial waited for another trial's
 operation). A trial's row in `GET /api/job` and `GET /api/trial` carries
 `lifecycle`: `queue_s`, `prepare_s` (预准备, before the slot),
-`ready_wait_s`, `prepare_running_s`, `total_s` (from the start of
+`ready_wait_s` (from a preparation that left everything ready to the slot),
+`unprepared_wait_s` (the same wait after a preparation that failed: the
+page says so, and that Harbor pulls or builds again once the trial starts),
+`prepare_running_s`, `total_s` (from the start of
 preparation, or from the slot when there was none, to the end) and
 `prepare`; it is `null` for a trial without a record. `elapsed_s` and
 `phases` keep their meaning (Harbor's own trial).
@@ -1392,8 +1398,8 @@ detail:
   apportions the request's measured input tokens by those shares; the
   initial-token metric shows the first request's composition, averaged over
   trials. Runs recorded before this existed show `未采集`.
-- **Time**: what the task's time is made of, in order: 预准备, 就绪等待 and
-  开始后准备 (see [Preparation ahead of the queue](#preparation-ahead-of-the-queue)), then
+- **Time**: what the task's time is made of, in order: 预准备, 就绪等待 (or
+  准备失败后等待) and 开始后准备 (see [Preparation ahead of the queue](#preparation-ahead-of-the-queue)), then
   Harbor's phases (环境, 安装, agent, 判分), with the images preparation
   pulled, built or found. The total counts from the start of preparation;
   排队 is shown beside it and not counted. The agent phase is split into

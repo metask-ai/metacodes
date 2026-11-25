@@ -8,7 +8,7 @@ const STATUS = {
 };
 const ORDER = ['pass', 'partial', 'fail', 'timeout', 'invalid', 'running'];
 const PHASES = [['environment', '环境'], ['setup', '安装'], ['agent', 'agent'], ['verifier', '判分']];
-const PREPARE_PARTS = [['prepare_s', '预准备', 'l-prepare'], ['ready_wait_s', '就绪等待', 'l-ready'], ['prepare_running_s', '开始后准备', 'l-running']];
+const PREPARE_PARTS = [['prepare_s', '预准备', 'l-prepare'], ['ready_wait_s', '就绪等待', 'l-ready'], ['unprepared_wait_s', '准备失败后等待', 'l-unprepared'], ['prepare_running_s', '开始后准备', 'l-running']];
 const PREPARE_RESULTS = { present: '命中', pulled: '拉取', built: '构建', failed: '失败' };
 function timeParts(r) {
   const own = r.lifecycle ? PREPARE_PARTS.map(([k, l, cls]) => [cls, r.lifecycle[k], l]) : [];
@@ -1210,9 +1210,13 @@ function tokenPanel(t) {
 
 function prepareCase(life) {
   if (!life.prepare || life.prepare.status === 'skipped') return '没有预准备：' + (life.prepare && life.prepare.error ? life.prepare.error : '这道题的环境由 Harbor 在开始后自己准备');
+  const failed = life.prepare.status === 'failed';
+  const handover = '环境交给 Harbor 在开始后重新拉取或构建';
+  if (life.unprepared_wait_s !== null && life.unprepared_wait_s !== undefined) return `提前准备失败，之后等待 ${dur(life.unprepared_wait_s)} 才排到；${handover}`;
   if (life.ready_wait_s !== null) return `准备好后等待 ${dur(life.ready_wait_s)} 才排到，排到后直接运行`;
-  if (life.prepare_s !== null) return `排到时仍在准备：预准备 ${dur(life.prepare_s)}，开始后又准备了 ${dur(life.prepare_running_s)}`;
-  return `排到时还没开始准备，开始后准备了 ${dur(life.prepare_running_s)}`;
+  const outcome = failed ? `；准备失败，${handover}` : '';
+  if (life.prepare_s !== null) return `排到时仍在准备：预准备 ${dur(life.prepare_s)}，开始后又准备了 ${dur(life.prepare_running_s)}${outcome}`;
+  return `排到时还没开始准备，开始后准备了 ${dur(life.prepare_running_s)}${outcome}`;
 }
 function prepareItems(prepare) {
   if (!prepare || !prepare.items.length) return null;

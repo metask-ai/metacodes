@@ -232,8 +232,8 @@ class EquivalenceTest(StoreCase):
         self.assertEqual(metrics["summary"]["first_pass_rate"], 0.75)
         lives = {r["trial"]: r["lifecycle"] for r in actual["jobs"]["glm-pilot"]["rows"]}
         ready = lives["kv-store__aaa"]
-        self.assertEqual([ready[k] for k in ("queue_s", "prepare_s", "ready_wait_s", "prepare_running_s", "total_s")],
-                         [480, 40, 79, None, 421])
+        self.assertEqual([ready[k] for k in ("queue_s", "prepare_s", "ready_wait_s", "unprepared_wait_s",
+                                             "prepare_running_s", "total_s")], [480, 40, 79, None, None, 421])
         self.assertEqual(ready["prepare"], {"status": "prepared", "error": None, "items": [
             {"kind": "pull", "image": "alexgshaw/kv-store:1", "status": "pulled", "seconds": 38.5, "attempts": 2,
              "shared": False, "error": None},

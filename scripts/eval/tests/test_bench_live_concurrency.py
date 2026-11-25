@@ -284,6 +284,7 @@ class LifecycleTest(LifecycleCase):
         self.assertGreater(rows["first__a"]["prepare_running_s"], 0)
         self.assertIsNone(rows["second__b"]["prepare_running_s"])
         self.assertGreater(rows["second__b"]["ready_wait_s"], 0.2)
+        self.assertIsNone(rows["second__b"]["unprepared_wait_s"])
         self.assertGreater(rows["second__b"]["prepare_s"], 0)
 
     def test_a_trial_whose_turn_comes_while_preparing_keeps_preparing_in_its_slot(self):
@@ -316,6 +317,30 @@ class LifecycleTest(LifecycleCase):
         self.assertGreater(life["prepare_running_s"], 0.2)
         self.assertIsNone(life["ready_wait_s"])
         self.assertGreaterEqual(life["prepare_s"] + life["prepare_running_s"], 0.5)
+
+    def test_a_preparation_that_failed_before_the_turn_is_not_shown_as_ready(self):
+        def operations(task_dir):
+            def run():
+                return {"status": "failed", "attempts": 3, "error": "manifest unknown"}
+            return [trial_lifecycle.Operation("pull:" + task_dir.name, "pull", task_dir.name, run)]
+
+        queue = self.queue(1, operations)
+
+        async def main():
+            return await asyncio.gather(queue._run_trial(self.trial("first__a", seconds=0.4)),
+                                        queue._run_trial(self.trial("second__b")))
+
+        self.assertEqual(asyncio.run(main()), ["first__a", "second__b"])
+        second = self.record("second__b")
+        self.assertLess(second["prepare_finished_at"], second["started_at"])
+        self.assertEqual(second["prepare"]["status"], "failed")
+        self.write_trial_dirs("first__a", "second__b")
+        rows = {r["trial"]: r["lifecycle"] for r in data.job_view(self.job)["rows"]}
+        waiting = rows["second__b"]
+        self.assertIsNone(waiting["ready_wait_s"])
+        self.assertGreater(waiting["unprepared_wait_s"], 0.2)
+        self.assertEqual(waiting["prepare"]["items"][0]["error"], "manifest unknown")
+        self.assertEqual((rows["first__a"]["ready_wait_s"], rows["first__a"]["unprepared_wait_s"]), (None, None))
 
     def write_trial_dirs(self, *names):
         for name in names:
@@ -491,6 +516,35 @@ class DockerPreparationTest(LifecycleCase):
         self.assertEqual((built["kind"], built["status"]), ("build", "built"))
         self.assertTrue(built["image"].startswith(images.BUILD_TAG))
         self.assertEqual(len(self.docker_calls("compose")), 1)
+
+    def test_a_task_with_a_verifier_and_a_sidecar_prepares_all_three_images(self):
+        write_task(self.dataset, "separate", extra={"docker-compose.yaml": (
+            "services:\n  main:\n    image: alexgshaw/env:1\n    depends_on:\n      db:\n        condition: x\n"
+            "  db:\n    image: postgres:16\n")})
+        (self.dataset / "separate" / "task.toml").write_text(
+            '[task]\nname = "separate"\n\n[verifier]\nenvironment_mode = "separate"\n\n'
+            '[verifier.environment]\ndocker_image = "alexgshaw/verifier:1"\n\n'
+            '[environment]\ndocker_image = "alexgshaw/env:1"\n')
+        with self.present.open("a") as present:
+            present.write("alexgshaw/verifier:1\n")
+        found = trial_lifecycle.docker_operations(self.dataset / "separate")
+        self.assertEqual([(o.kind, o.image) for o in found],
+                         [("pull", "alexgshaw/env:1"), ("pull", "alexgshaw/verifier:1"), ("pull", "postgres:16")])
+
+        class Queue(RecordingQueue):
+            pass
+
+        live_concurrency.install(Queue, {live_concurrency.FILE_ENV: str(self.limit)})
+
+        async def main():
+            return await Queue(1)._run_trial(self.trial("separate__a"))
+
+        self.assertEqual(asyncio.run(main()), "separate__a")
+        prepared = self.record("separate__a")["prepare"]
+        self.assertEqual((prepared["status"], {i["image"]: i["status"] for i in prepared["items"]}),
+                         ("prepared", {"alexgshaw/env:1": "pulled", "alexgshaw/verifier:1": "present",
+                                       "postgres:16": "pulled"}))
+        self.assertEqual(sorted(self.docker_calls("pull")), ["pull alexgshaw/env:1", "pull postgres:16"])
 
     def test_operations_follow_what_bench_pull_does_for_the_task(self):
         found = trial_lifecycle.docker_operations(self.dataset / "missing")

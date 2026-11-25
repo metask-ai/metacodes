@@ -213,6 +213,7 @@ def request_rows(trial_dir):
 
 LIFECYCLE_DIR = ".bench-lifecycle"
 PREPARE_STATUSES = ("present", "prepared", "failed", "skipped")
+PREPARED_STATUSES = ("present", "prepared")
 PREPARE_ITEM_STATUSES = ("present", "pulled", "built", "failed")
 
 
@@ -250,6 +251,10 @@ def lifecycle(trial_dir, finished, moment):
     ended = ended or finished
     clock = min(prepare_started, slot) if prepare_started and slot else prepare_started or slot
     ahead = prepare_started is not None and (slot is None or prepare_started < slot)
+    outcome = prepare_outcome(record.get("prepare"))
+    ready = outcome is not None and outcome["status"] in PREPARED_STATUSES
+    waited = (span_seconds(prepare_finished, slot)
+              if prepare_finished is not None and slot is not None and prepare_finished <= slot else None)
     return {
         "queued_at": queued.isoformat(),
         "clock_started_at": clock.isoformat() if clock else None,
@@ -257,13 +262,13 @@ def lifecycle(trial_dir, finished, moment):
         "queue_s": span_seconds(queued, clock or ended or moment),
         "prepare_s": span_seconds(prepare_started, min(prepare_finished or slot or moment, slot or moment))
         if ahead else None,
-        "ready_wait_s": span_seconds(prepare_finished, slot)
-        if prepare_finished is not None and slot is not None and prepare_finished <= slot else None,
+        "ready_wait_s": waited if ready else None,
+        "unprepared_wait_s": None if ready else waited,
         "prepare_running_s": span_seconds(max(prepare_started, slot), prepare_finished or ended or moment)
         if prepare_started is not None and slot is not None and (prepare_finished is None or prepare_finished > slot)
         else None,
         "total_s": span_seconds(clock, ended or moment),
-        "prepare": prepare_outcome(record.get("prepare")),
+        "prepare": outcome,
     }
 
 
