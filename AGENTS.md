@@ -105,6 +105,14 @@ These rules apply to the entire repository.
   be an import the base tree had inside one package. `src/lib.zig`, the
   `metacodes-core` facade that re-exports the lower packages, is its own
   `facade` package between `teamwork` and `agentcore`.
+- `kernel` is the counterpart of pi's `pi-agent-core` and holds only
+  `core/conversation`, `core/message`, `core/session_id` and
+  `core/result_budget`. `core/agent_loop`, `core/tool_exec` and `core/protocol/`
+  are the loop with every peripheral attached, pi's `AgentSession`, and belong
+  to `coding`, except the three protocol files `PermissionContext` is typed
+  with (`ui_event`, `ui_request`, `permission_choice`), which belong to
+  `guard`. The minimal kernel loop is extracted in migration step 3.2; until
+  then `agent_loop.Options` keeps its public shape.
 - `cli` reaches the lower packages only through the `metacodes-internal`
   module, rooted at `src/internal.zig` (also in `facade`, and not part of
   `metacodes-core`). Every module rooted at a `cli` file imports it, and `cli`
