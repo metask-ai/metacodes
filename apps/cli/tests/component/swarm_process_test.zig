@@ -21,7 +21,7 @@ var g_mock_cwd_len: usize = 0;
 /// flag 按**字节**存,不存 slice:`extra_flags` 由 spawnTeammateProcess 在栈上组装,
 /// 断言发生在它返回之后。今天元素恰好都是静态字面量所以存 slice 也不会崩,但那是巧合,
 /// 不是契约——将来有人改成堆上拼的 flag,存 slice 的测试就读到已释放内存了。
-var g_mock_flags: [8][64]u8 = undefined;
+var g_mock_flags: [8][128]u8 = undefined;
 var g_mock_flag_lens: [8]usize = undefined;
 var g_mock_flags_len: usize = 0;
 
@@ -283,7 +283,7 @@ test "L2: lead LSP and preview settings reach the teammate process" {
     const Features = cc.types_mod.PreviewFeatures;
     for ([_]struct { lsp: bool, preview: Features, flag: ?[]const u8 }{
         .{ .lsp = true, .preview = .none, .flag = null },
-        .{ .lsp = true, .preview = .all, .flag = "--preview=execute_code,teamwork,comment_guard" },
+        .{ .lsp = true, .preview = .all, .flag = "--preview=execute_code,teamwork,comment_guard,monitor_events" },
         .{ .lsp = false, .preview = .none, .flag = null },
         .{ .lsp = false, .preview = .{ .comment_guard = true }, .flag = "--preview=comment_guard" },
     }) |scenario| {
