@@ -1350,7 +1350,7 @@ jobs:
           METACODES_PICKER_TRACE: ${{ runner.temp }}\picker.log
         run: zig build test:units -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Picker server events
-        if: failure() && steps.windows_units.outcome == 'failure'
+        if: failure() && matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && steps.windows_units.outcome == 'failure'
         shell: pwsh
         run: |
           $trace = Join-Path $env:RUNNER_TEMP picker.log
