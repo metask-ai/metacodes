@@ -3,11 +3,20 @@
 T18 离线(只打 `/`);T17/T19 打真实模型(无 key 时 SKIP)。
 """
 import os
+import re
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run
+from tty_driver import READY, run
 from asserts import TTYAssert
 from e2e_helpers import run_live_fresh, require_model  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
+
+
+def test_tools_lists_cli_builtins(bin_path):
+    raw = run(bin_path, [READY, "type:/tools", "key:enter", READY, "type:/exit", "key:enter"])
+    output = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", raw)
+    names = set(re.findall(rb"\b([A-Z][A-Za-z0-9]+) - ", output))
+    assert {b"Read", b"Bash"} <= names, names
+    assert names.isdisjoint({b"Glob", b"Grep", b"CodeMap", b"FindSymbol"}), names
 
 
 def test_T18_slash_menu_appears(bin_path):

@@ -115,7 +115,7 @@ pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\A powerful search tool built on ripgrep
         \\
         \\Usage:
-        \\- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.
+        \\- Use Grep to search file contents.
         \\- Supports full regex syntax (e.g., "log.*Error", "function\s+\w+")
         \\- Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
         \\- Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
@@ -159,10 +159,22 @@ const BASH_READONLY_NOTE =
 ;
 
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    const search =
-        "Use the shell to search the workspace, run builds and tests, and inspect Git. " ++
-        "Find files with `rg --files -g '*.zig'` and literal text with `rg -n -F -- 'text' src`. " ++
-        "Narrow the path where possible. When available, use Read for the matching lines, Edit for changes, and Write for new files.";
+    const has_glob = ctx.hasTool("Glob");
+    const has_grep = ctx.hasTool("Grep");
+    const find_files = if (has_glob) "Glob" else "`rg --files -g '*.zig'`";
+    const find_text = if (has_grep) "Grep" else "`rg -n -F -- 'text' src`";
+    const specialized_search = has_glob or has_grep;
+    const shell_role = if (specialized_search)
+        "Use the shell to run builds and tests and inspect Git."
+    else
+        "Use the shell to search the workspace, run builds and tests, and inspect Git.";
+    const fallback = if (specialized_search) "" else if (@import("builtin").os.tag == .windows)
+        " If rg is unavailable, use Get-ChildItem and Select-String."
+    else
+        " If rg is unavailable, use find and grep within the project.";
+    const search = try std.fmt.allocPrint(allocator, "{s} Find files with {s} and literal text with {s}. " ++
+        "Narrow the path where possible. When available, use Read for the matching lines, Edit for changes, and Write for new files.{s}", .{ shell_role, find_files, find_text, fallback });
+    defer allocator.free(search);
     const git_section = if (ctx.include_git and !ctx.isReadonlyAgent()) BASH_GIT_SECTION else "";
     const readonly_note = if (ctx.isReadonlyAgent()) BASH_READONLY_NOTE else "";
     // 复刻 codex 第③层:平台化工具描述。Windows 上用系统自带 PowerShell 跑(零 git-bash),
@@ -176,7 +188,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
             \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
             \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
             \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms); do not append '&'.
-            \\- {s} If rg is unavailable, use Get-ChildItem and Select-String.
+            \\- {s}
             \\- Chain multiple commands with ';'. DO NOT use newlines.
             \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
             \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
@@ -192,7 +204,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
         \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
         \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.
-        \\- {s} If rg is unavailable, use find and grep within the project.
+        \\- {s}
         \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
         \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
         \\- To read truncated output, pass its "<channel>_artifact_id" to ReadArtifact and continue at next_offset.{s}{s}
@@ -272,12 +284,12 @@ test "describeEdit contains exact-replacement marker" {
     try std.testing.expect(std.mem.indexOf(u8, d, "replace_all") != null);
 }
 
-test "describeGrep contains ALWAYS-use-Grep + agent line only when Agent enabled" {
+test "describeGrep describes content search and mentions Agent only when enabled" {
     const a = std.testing.allocator;
     const with_agent = PromptContext{ .enabled_tool_names = &.{ "Grep", "Task" } };
     const d1 = try describeGrep(a, &with_agent);
     defer a.free(d1);
-    try std.testing.expect(std.mem.indexOf(u8, d1, "ALWAYS use Grep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d1, "Use Grep to search file contents") != null);
     try std.testing.expect(std.mem.indexOf(u8, d1, "open-ended searches") != null);
 
     const no_agent = PromptContext{ .enabled_tool_names = &.{"Grep"} };

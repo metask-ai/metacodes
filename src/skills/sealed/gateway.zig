@@ -438,7 +438,7 @@ pub const Gateway = struct {
         var out: std.ArrayList(u8) = .empty;
         out.print(arena, "Base directory for this skill: {s}\n\n{s}", .{ base_dir, rendered }) catch return error.OutOfMemory;
         if (package.sealed_files.len != 0) {
-            out.appendSlice(arena, "\n\nSealed reference files of this Skill (Read, Glob and Grep work on them like on any other file):\n") catch return error.OutOfMemory;
+            out.appendSlice(arena, "\n\nSealed reference files of this Skill:\n") catch return error.OutOfMemory;
             for (package.sealed_files) |path| {
                 out.print(arena, "- {s}/" ++ SEALED_DIR ++ "/{s}\n", .{ base_dir, path }) catch return error.OutOfMemory;
             }

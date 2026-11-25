@@ -946,11 +946,9 @@ test "L2 sealed: sealed files are read on the gateway without a Step; public ass
     try std.testing.expect(std.mem.indexOf(u8, ledger, "SEALED_NOTE_MARKER") == null);
 }
 
-/// Glob results are `repository_structure` (§5): declared, so the Glob over
-/// the Skill directory may run on the client.
 const SEARCH_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\",\"Glob\",\"Grep\"]},\"egress\":{\"classes\":[\"file_contents\",\"repository_structure\"]}}";
 
-test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob over the Skill directory goes to the client" {
+test "L2 sealed: gateway serves sealed searches and the CLI rejects a public Glob" {
     _ = cc.util_toolchain.ripgrepPath() catch return error.SkipZigTest;
     const a = std.testing.allocator;
     var lab: Lab = undefined;
@@ -988,7 +986,7 @@ test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob
 
     // Four model turns: the two sealed searches were answered inside the
     // first Step; the Glob over the Skill directory went to the client as the
-    // only tool_calls Step and saw the public asset.
+    // only tool_calls Step.
     try std.testing.expectEqual(@as(usize, 4), lab.model.requestCount());
     const after_glob = lab.model.requestAt(1) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, after_glob.body(), "sealed/notes.md") != null);
@@ -998,7 +996,8 @@ test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob
     try std.testing.expect(std.mem.indexOf(u8, after_grep.body(), "notes.md:1:SEALED_NOTE_MARKER: the rule nobody else reads") != null);
     try std.testing.expect(std.mem.indexOf(u8, after_grep.body(), "SEALED_RULE_MARKER") == null);
     const after_public = lab.model.requestAt(3) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, after_public.body(), "post.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_public.body(), "Tool 'Glob' is outside the current execution policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_public.body(), "post.py") == null);
     // The brain was shown the client's sealed directory, never the gateway's
     // package directory, in either separator spelling.
     const requests = try lab.allModelRequests(a);

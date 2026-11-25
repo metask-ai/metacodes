@@ -34,7 +34,7 @@ fn deferredProbe(_: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyo
 // ① 核心工具长描述进 defs(对比:无 context 时是短描述)。
 test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     const a = std.testing.allocator;
-    const names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "Task" };
+    const names = [_][]const u8{ "Read", "Write", "Edit", "Bash", "Task" };
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
 
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &pc);
@@ -285,13 +285,15 @@ test "L2: buildUsingTools 段按工具集裁剪" {
     const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false, "/tmp");
     defer a.free(sp_full);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "Bash for workspace searches") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Grep instead of grep") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "TaskCreate tool") != null);
 
     const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Bash" };
     const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false, "/tmp");
     defer a.free(sp_slim);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Bash for workspace searches") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Break down and manage your work") == null);
 

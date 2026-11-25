@@ -476,19 +476,17 @@ test "issue #452: a silent and a visible failure share the request's own re-issu
     }
 }
 
-/// One Glob call `toolu_1` over `root`, closed; `stop` ends the stream with
-/// `tool_use`, otherwise the body ends without a stop report.
-fn globCallSse(a: std.mem.Allocator, root: []const u8, stop: bool) ![]u8 {
+fn readCallSse(a: std.mem.Allocator, path: []const u8, stop: bool) ![]u8 {
     var input: std.Io.Writer.Allocating = .init(a);
     defer input.deinit();
-    try input.writer.print("{{\"pattern\":\"*.md\",\"path\":", .{});
-    try std.json.Stringify.encodeJsonString(root, .{}, &input.writer);
+    try input.writer.writeAll("{\"file_path\":");
+    try std.json.Stringify.encodeJsonString(path, .{}, &input.writer);
     try input.writer.writeAll("}");
     var encoded: std.Io.Writer.Allocating = .init(a);
     defer encoded.deinit();
     try std.json.Stringify.encodeJsonString(input.written(), .{}, &encoded.writer);
     return std.fmt.allocPrint(a, "{s}" ++
-        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Glob\",\"input\":{{}}}}}}\n\n" ++
+        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{{}}}}}}\n\n" ++
         "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n" ++
         "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
         "{s}", .{
@@ -507,14 +505,15 @@ test "issue #452: a re-issued attempt that repeats a withdrawn tool call's id ru
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "marker-452.md", .data = "x" });
-
-    // The withdrawn attempt's Glob is prefetched while it streams; the
-    // re-issued attempt names the same call id, as a gateway with sequential
-    // ids does.
-    const cut = try globCallSse(a, root, false);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.txt", .data = "withdrawn content" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "second.txt", .data = "retried content" });
+    const first_path = try std.fmt.allocPrint(a, "{s}/first.txt", .{root});
+    defer a.free(first_path);
+    const second_path = try std.fmt.allocPrint(a, "{s}/second.txt", .{root});
+    defer a.free(second_path);
+    const cut = try readCallSse(a, first_path, false);
     defer a.free(cut);
-    const again = try globCallSse(a, root, true);
+    const again = try readCallSse(a, second_path, true);
     defer a.free(again);
     var srv = try harness.MockServer.startCassette(&.{ cut, again, ANTHROPIC_COMPLETE }, 0);
     defer srv.stop();
@@ -527,7 +526,7 @@ test "issue #452: a re-issued attempt that repeats a withdrawn tool call's id ru
     defer client.deinit();
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
-    try conv.appendText(.user, "list the markdown files");
+    try conv.appendText(.user, "read the requested file");
     var perm = cc.permission.createContext(.bypass_permissions, a);
     perm.no_interactive_prompt = true;
     const defs = try cc.tools.toToolDefinitions(a);
@@ -553,5 +552,6 @@ test "issue #452: a re-issued attempt that repeats a withdrawn tool call's id ru
     // The call's real result reached the model.
     const third = (srv.requestAt(2) orelse return error.MissingRequest).body();
     try std.testing.expect(std.mem.indexOf(u8, third, "\"tool_use_id\":\"toolu_1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, third, "marker-452.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "retried content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "withdrawn content") == null);
 }

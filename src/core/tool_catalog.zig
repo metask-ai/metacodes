@@ -770,6 +770,28 @@ test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)
     }
 }
 
+test "Bash delegates only the searches covered by the embedding host's selected tools" {
+    const a = std.testing.allocator;
+    var catalog = try Catalog.initBuiltins(a, &.{ "Bash", "Glob", "Grep" });
+    defer catalog.deinit();
+    const cases = [_]struct { names: []const []const u8, files: []const u8, text: []const u8 }{
+        .{ .names = &.{"Bash"}, .files = "rg --files", .text = "rg -n" },
+        .{ .names = &.{ "Bash", "Glob" }, .files = "Find files with Glob", .text = "rg -n" },
+        .{ .names = &.{ "Bash", "Grep" }, .files = "rg --files", .text = "literal text with Grep" },
+        .{ .names = &.{ "Bash", "Glob", "Grep" }, .files = "Find files with Glob", .text = "literal text with Grep" },
+    };
+    for (cases) |case| {
+        var selection = try Selection.init(a, &catalog, case.names);
+        defer selection.deinit();
+        for (selection.definitions) |def| {
+            if (!std.mem.eql(u8, def.name, "Bash")) continue;
+            try std.testing.expect(std.mem.indexOf(u8, def.description, case.files) != null);
+            try std.testing.expect(std.mem.indexOf(u8, def.description, case.text) != null);
+            break;
+        } else return error.MissingBashDefinition;
+    }
+}
+
 test "Selection preserves Host tool descriptions (redescribe skips unknown tools)" {
     // redescribeForContext 对 Host 工具(getTool 返 null)跳过,描述保持 Catalog clone 的原样。
     // 这确保 Host 工具描述不被库改写——描述所有权归 Host。

@@ -45,11 +45,10 @@ test "Subagents E2E: 3 builtins injected on init" {
     try std.testing.expect(set.find("Explore") != null);
     try std.testing.expect(set.find("Plan") != null);
     try std.testing.expect(set.find("general-purpose") != null);
-    // Explore: low 档位 + read-only(tools = Read/Grep/Glob,disallowed 含 Write/Edit/Bash;
-    // 只读由白名单保证,不带权限模式)
     const expl = set.find("Explore").?;
     try std.testing.expectEqualStrings("low", expl.model);
-    try std.testing.expect(expl.tools.len == 3);
+    try std.testing.expectEqual(@as(usize, 1), expl.tools.len);
+    try std.testing.expectEqualStrings("Read", expl.tools[0]);
     try std.testing.expect(expl.disallowed_tools.len == 3);
     try std.testing.expect(expl.permission_mode == null);
 }

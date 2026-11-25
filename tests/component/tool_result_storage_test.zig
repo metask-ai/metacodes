@@ -505,8 +505,11 @@ test "L2 native Grep spools 17MiB from byte zero and keeps the cached tool prefi
     defer conversation.deinit();
     try conversation.appendText(.user, "stream the native grep result");
     const permission = cc.permission.createContext(.bypass_permissions, allocator);
-    const definitions = try cc.tools.toToolDefinitions(allocator);
-    defer allocator.free(definitions);
+    const names = [_][]const u8{ "Grep", "ReadArtifact" };
+    var catalog = try cc.tool_catalog.Catalog.initBuiltins(allocator, &names);
+    defer catalog.deinit();
+    var selection = try cc.tool_catalog.Selection.init(allocator, &catalog, &names);
+    defer selection.deinit();
     const Backend = struct {
         fn emit(_: *anyopaque, _: cc.session_id.SessionId, _: cc.ui_event.CoreEvent) void {}
         fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
@@ -518,9 +521,10 @@ test "L2 native Grep spools 17MiB from byte zero and keeps the cached tool prefi
     const result = try cc.agent_loop.run(
         &conversation,
         client.provider(),
-        definitions,
+        selection.definitions,
         &permission,
         .{
+            .tool_dispatcher = selection.dispatcher(),
             .max_turns = 3,
             .artifact_root = root,
             .colorize = false,

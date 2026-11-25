@@ -361,7 +361,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             if (app.startupSettled()) app.publishMcpServers() catch |err| {
                 cmd_output.print("{s}MCP tools could not be registered: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
             };
-            for (tools.registry) |*t| cmd_output.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
+            for (tools.registry) |t| {
+                if (t.embedding_only) continue;
+                cmd_output.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
+            }
             // 动态工具（Skill / MCP）
             for (app.dyn_registry.entries.items) |e| {
                 cmd_output.print("  \x1b[36m{s}\x1b[0m - {s}\n", .{ e.name, e.description });

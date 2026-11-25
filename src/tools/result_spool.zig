@@ -261,9 +261,7 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
     const callers = .{
         .{ "grep.zig", @embedFile("grep.zig") },
         .{ "mcp_resources.zig", @embedFile("mcp_resources.zig") },
-        .{ "code_map.zig", @embedFile("code_map.zig") },
         .{ "web_fetch.zig", @embedFile("web_fetch.zig") },
-        .{ "find_symbol.zig", @embedFile("find_symbol.zig") },
     };
     var seen: usize = 0;
     inline for (callers) |entry| {
@@ -309,9 +307,9 @@ test "guard: callers hand over ctx.result_budget verbatim, and this file reads o
             cursor = end;
         }
     }
-    if (seen != 6) {
+    if (seen != 4) {
         std.debug.print(
-            "finishCaptureAsBody call sites: expected 6, found {d}. A caller was added, removed or moved: " ++
+            "finishCaptureAsBody call sites: expected 4, found {d}. A caller was added, removed or moved: " ++
                 "update the `callers` list in this guard so the new site is checked too.\n",
             .{seen},
         );

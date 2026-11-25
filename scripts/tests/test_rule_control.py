@@ -251,6 +251,17 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
         self.assertFalse(observation.sensor_ok)
         self.assertIn("automatic_recall_node_identity", observation.missing_declarations)
 
+    def test_glob_in_schema_does_not_hide_executable_governance_wiring(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = root / "src/tools.zig"
+        source.write_text(
+            'const pattern = "**/*.zig";\n' + source.read_text(encoding="utf-8") + "// */\n",
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_evidence_governance(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+
     def test_commented_governance_actuator_is_not_observed_as_runtime_wiring(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
