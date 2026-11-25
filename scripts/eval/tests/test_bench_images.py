@@ -38,18 +38,19 @@ esac
 
 def egress_images(compose: str):
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "docker-compose.yaml").write_text(compose)
+        (Path(tmp) / "docker-compose.yaml").write_text(compose, encoding="utf-8")
         return egress.task_images(Path(tmp))
 
 
 def write_task(dataset: Path, name: str, image=None, extra=None) -> None:
     task = dataset / name
     (task / "environment").mkdir(parents=True)
-    (task / "environment" / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (task / "environment" / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
     for file, text in (extra or {}).items():
-        (task / "environment" / file).write_text(text)
+        (task / "environment" / file).write_text(text, encoding="utf-8")
     environment = f'docker_image = "{image}"\n' if image else ""
-    (task / "task.toml").write_text(f'[task]\nname = "{name}"\n\n[environment]\n{environment}cpus = 1\n')
+    (task / "task.toml").write_text(f'[task]\nname = "{name}"\n\n[environment]\n{environment}cpus = 1\n',
+                                    encoding="utf-8")
 
 
 @requires_posix_exec
@@ -196,7 +197,8 @@ class TaskReferencesTest(unittest.TestCase):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 dataset = Path(tmp)
                 write_task(dataset, "task", extra={"docker-compose.yaml": compose.replace("IMAGE", db)})
-                (dataset / "task/task.toml").write_text(f'[environment] # runtime\n"docker_image" = "{main}"\n')
+                (dataset / "task/task.toml").write_text(f'[environment] # runtime\n"docker_image" = "{main}"\n',
+                                                        encoding="utf-8")
                 images_found, builds = images.images_of(dataset, ["task"])
                 self.assertEqual(images_found, {ref: ["task"] for ref in ([main, db] if pull else [main])})
                 self.assertEqual(builds, {})
