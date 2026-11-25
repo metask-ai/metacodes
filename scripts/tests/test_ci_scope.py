@@ -1062,6 +1062,10 @@ class WorkflowTest(unittest.TestCase):
                 self.assertIn("PACKAGE_TESTS", steps[packages]["run"])
                 self.assertNotIn("test:units", steps[packages]["run"])
                 self.assertTrue(steps["Offline test suite (product)"]["if"].endswith("&& env.PRODUCT != 'false'"))
+                # The lower packages' other unit runs skip with test:units.
+                self.assertTrue(steps["Native platform modules"]["if"].endswith("&& env.PACKAGE_TESTS == ''"))
+        core = next(step for step in self.jobs["gates-linux"]["steps"] if step.get("name") == "ReleaseSafe core gate")
+        self.assertTrue(core["if"].endswith("&& env.PACKAGE_TESTS == ''"))
         integration = next(step for step in self.jobs["windows-gates"]["steps"]
                            if step.get("name") == "Offline test suite (integration)")
         self.assertTrue(integration["if"].endswith("&& env.UNITS != 'false'"))

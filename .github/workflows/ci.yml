@@ -239,7 +239,9 @@ jobs:
       DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
       # The suites a tests or packages scope selects (scripts/ci_scope.py):
-      # 'false' skips a suite step, PACKAGE_TESTS replaces test:units.
+      # 'false' skips a suite step, PACKAGE_TESTS replaces test:units and
+      # skips the other whole-package unit runs (the ReleaseSafe core gate,
+      # the native platform modules).
       UNITS: ${{ needs.scope.outputs.units }}
       PRODUCT: ${{ needs.scope.outputs.product }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
@@ -498,7 +500,7 @@ jobs:
       # the spawn tests are kept out of the build runner (process.zig's
       # `procSpawnTestsEnabled`).
       - name: Native platform modules
-        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
@@ -560,7 +562,7 @@ jobs:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
         run: zig build test:product -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: ReleaseSafe core gate
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         run: zig build test:lib -Doptimize=ReleaseSafe
       - name: Contract snapshots
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
@@ -1209,7 +1211,7 @@ jobs:
       # the product leg here, the shortest suite leg on Windows, where this
       # step takes about two minutes.
       - name: Native platform modules
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"

@@ -4,7 +4,7 @@
 //! graph once and the deterministic runner partitions individual test names
 //! across processes, as it does for tests/integration_suite.zig.
 
-test {
+comptime {
     _ = @import("component/provider_offer_test.zig");
     _ = @import("component/metask_api_key_picker_test.zig");
     _ = @import("component/credential_route_scope_test.zig");

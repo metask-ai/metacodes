@@ -57,7 +57,7 @@ inputs; moving into a code/input tree takes the wider scope.
 | `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `tests` | one of the above or a test: `scripts/tests/test_*.py`, `tests/tty/**`, or another file of the `tests` package in `layers.zon` | The gates' checks. A changed `tests/**` file outside `tests/tty/` (a fixture may feed both) or harness file runs the unit, integration, product and TTY suites; a changed `tests/tty/**` file runs TTY; a changed script suite that `build.zig` runs keeps `test:units` (Windows included), the others run by name |
-| `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`; integration, product, release, contract snapshots, TTY and SDK as in `full` |
+| `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`, and without the other whole-package unit runs (the ReleaseSafe core gate, the native platform modules); integration, product, release, contract snapshots, TTY and SDK as in `full` |
 | `full` | anything else | Everything |
 
 Manual and scheduled runs are always `full`, and so are a pull request
